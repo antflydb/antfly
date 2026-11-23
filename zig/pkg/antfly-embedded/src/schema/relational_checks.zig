@@ -17,7 +17,7 @@ const std = @import("std");
 const wire = @import("antfly_schema_openapi");
 const schema = @import("../storage/schema.zig");
 const codec = @import("../storage/db/algebraic/relational_row_codec.zig");
-const tuples = @import("../storage/db/relational_index_keys.zig");
+const tuples = @import("../storage/db/relational/indexes/keys.zig");
 const impl = @import("table_schema_impl.zig");
 const expressions = @import("relational_expression.zig");
 const Allocator = std.mem.Allocator;
@@ -60,7 +60,7 @@ pub fn valueFromJson(alloc: Allocator, kind: schema.RelationalColumnType, value:
         else
             impl.documentIntegerToI64(value) orelse return error.InvalidBatchRequest },
         .number => .{ .number = impl.documentNumberToF64(value) orelse return error.InvalidBatchRequest },
-        .numeric => .{ .numeric = try @import("../sql/numeric_storage.zig").encodeJsonAlloc(alloc, value) },
+        .numeric => .{ .numeric = try @import("../sql/numeric/storage.zig").encodeJsonAlloc(alloc, value) },
         .boolean => if (value == .bool) .{ .boolean = value.bool } else error.InvalidBatchRequest,
         .datetime => .{ .datetime = signedDateTime(value) orelse return error.InvalidBatchRequest },
         .blob => blk: {

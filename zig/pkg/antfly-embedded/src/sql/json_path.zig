@@ -91,12 +91,12 @@ test "SQL JSON path kernel retains shared cancellation and work admission" {
     const key: [256]u8 = @splat('x');
     for (1..3) |cut| {
         var control: Control = .{ .fail_at = cut };
-        var context: @import("numeric_value.zig").Context = .{ .alloc = std.testing.failing_allocator, .checkpoint = Control.check, .ptr = &control };
+        var context: @import("numeric/value.zig").Context = .{ .alloc = std.testing.failing_allocator, .checkpoint = Control.check, .ptr = &control };
         var work: Budget = .{ .shared = &context };
         try std.testing.expectError(error.QueryCanceled, extract(.null, &key, &work));
         try std.testing.expectError(error.QueryCanceled, extract(.null, &key, &work));
     }
-    var context: @import("numeric_value.zig").Context = .{ .alloc = std.testing.failing_allocator, .remaining = 1 };
+    var context: @import("numeric/value.zig").Context = .{ .alloc = std.testing.failing_allocator, .remaining = 1 };
     var work: Budget = .{ .shared = &context };
     try std.testing.expectError(error.SqlProgramLimitExceeded, extract(.null, "key", &work));
     context.remaining = 100;

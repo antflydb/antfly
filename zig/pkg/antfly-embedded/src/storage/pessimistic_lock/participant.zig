@@ -376,6 +376,27 @@ fn requireOrigin(backing: std.mem.Allocator, txn: anytype, admission: Admission)
     normalized.source.lease.expires_at_ms = previous.source.lease.expires_at_ms;
     if (!std.meta.eql(previous, normalized)) return error.LockEffectChanged;
 }
+/// Physical maintenance borrows a live admitted command's existing grant.
+/// This does not register an owner, acquire a lock, or accept frontend claims
+/// as authority. Check the persisted origin, command, transaction and exact
+/// grant together inside the receiving owner's serialized primary writer.
+pub fn requireTableGrant(backing: std.mem.Allocator, txn: anytype, receiving: @import("../db/doc_identity_namespace.zig").Namespace, admission: Admission, mode: @import("contract.zig").TableMode) !void {
+    try admission.validate();
+    try admission.binding.requireIdentity(receiving);
+    if (admission.purpose != .execution) return error.LockOwnerChanged;
+    try requireOrigin(backing, txn, admission);
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const registered = try admission.registration();
+    const ns = admission.binding.namespace;
+    const scope = try scopes.read(arena.allocator(), txn, ns, registered.lease.backend) orelse return error.LockOwnerNotRegistered;
+    var normalized = admission;
+    normalized.source.lease.expires_at_ms = scope.registration.lease.expires_at_ms;
+    try normalized.requireRegistration(scope.registration);
+    const command_value = scope.command orelse return error.LockOwnerChanged;
+    if (scope.state != .active or scope.releasing or !std.meta.eql(command_value, try admission.command()) or scope.transaction == null or scope.transaction.?.decision != null or !std.mem.eql(u8, &scope.transaction.?.id, &admission.transaction)) return error.LockOwnerChanged;
+    try scopes.ledger.requireHeldGrant(backing, txn, ns, try admission.binding.table(), .{ .table = mode }, .{ .backend = registered.lease.backend, .transaction = admission.transaction });
+}
 fn Context(comptime Authority: type) type {
     return struct {
         backing: std.mem.Allocator,

@@ -22,7 +22,7 @@ pub const requireIndependentRenameIndexes = @import("schema_column_rename.zig").
 
 /// Recheck against the exact admitted table record, not an earlier SQL lookup
 /// whose separately owned index definitions may have changed concurrently.
-pub fn requireTransformIndexBindings(a: std.mem.Allocator, indexes: []const u8, rules: []const @import("../storage/db/relational_rewrite_contract.zig").ColumnTransform) !void {
+pub fn requireTransformIndexBindings(a: std.mem.Allocator, indexes: []const u8, rules: []const @import("../storage/db/relational/schema_change/rewrite_contract.zig").ColumnTransform) !void {
     for (rules) |rule| {
         var parsed = try std.json.parseFromSlice(Value, a, rule.expression_json, .{});
         defer parsed.deinit();
@@ -235,7 +235,7 @@ const setColumnNullability = @import("../schema/column_nullability.zig").setColu
 /// Bind USING against the predecessor, before changing its column definition.
 /// The native immutable-expression compiler is also used by snapshot/tail
 /// replay. Session-dependent or volatile expressions remain explicit guards.
-pub fn prepareColumnTransform(alloc: std.mem.Allocator, schema: Value, ddl: ast.CatalogDdl, limits: @import("immutable_plan.zig").Limits) !?@import("../storage/db/relational_rewrite_contract.zig").ColumnTransform {
+pub fn prepareColumnTransform(alloc: std.mem.Allocator, schema: Value, ddl: ast.CatalogDdl, limits: @import("immutable_plan.zig").Limits) !?@import("../storage/db/relational/schema_change/rewrite_contract.zig").ColumnTransform {
     const change = ddl.schema_change orelse return null;
     if (change == .rename_column) {
         const rule = change.rename_column;
@@ -529,7 +529,7 @@ pub fn applyCandidateWithLimits(alloc: std.mem.Allocator, schema: *Value, ddl: a
                 const property = properties.object.get(period) orelse return error.UndefinedColumn;
                 if (property != .object) return error.InvalidSqlBackendResponse;
                 const kind = property.object.get("type") orelse return error.SqlAssignmentTypeMismatch;
-                if (kind != .string or std.meta.stringToEnum(@import("range_value.zig").Kind, kind.string) == null) return error.SqlAssignmentTypeMismatch;
+                if (kind != .string or std.meta.stringToEnum(@import("range/value.zig").Kind, kind.string) == null) return error.SqlAssignmentTypeMismatch;
             }
             if (constraint.primary) try requirePrimaryColumns(alloc, schema, constraint.columns);
             const constraints = try list(schema, alloc, "unique_constraints");

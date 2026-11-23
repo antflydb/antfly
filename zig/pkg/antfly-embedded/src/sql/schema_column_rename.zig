@@ -261,7 +261,7 @@ test "SQL column rename guards separately owned artifact field paths but not lab
     try requireIndependentIndexes(a, "{\"enrichments\":[],\"resolvers\":{}}", "status");
     try std.testing.expectError(error.UnsupportedSqlShape, requireIndependentIndexes(a, "{\"enrichments\":[{\"name\":\"status\",\"field\":\"body\"}],\"resolvers\":{\"value\":{\"field\":\"body\"}}}", "status"));
     try std.testing.expectError(error.UnsupportedSqlShape, requireIndependentIndexes(a, "{\"enrichments\":[{\"name\":\"embedding\",\"field\":\"status\"}]}", "status"));
-    const alias = [_]@import("../storage/db/relational_rewrite_contract.zig").ColumnTransform{.{ .column = "state", .expression_json = "{\"op\":\"column\",\"column\":\"status\"}" }};
+    const alias = [_]@import("../storage/db/relational/schema_change/rewrite_contract.zig").ColumnTransform{.{ .column = "state", .expression_json = "{\"op\":\"column\",\"column\":\"status\"}" }};
     const bindings = @import("schema_ddl.zig").requireTransformIndexBindings;
     try bindings(a, "{}", &alias);
     // Re-evaluating the identical prepared rename against the current record

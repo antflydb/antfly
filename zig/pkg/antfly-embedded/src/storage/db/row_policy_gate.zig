@@ -131,6 +131,13 @@ pub const Gate = struct {
         return @fromBackingInt(self.phase.load(.acquire));
     }
 
+    /// The caller holds the matching read/write lease while checking this
+    /// stamp so the owner cannot install a replacement epoch concurrently.
+    pub fn requireEpoch(self: *const Gate, generation: u64, catalog_epoch: u64) !void {
+        if (self.generation.load(.acquire) != generation or self.catalog_epoch.load(.acquire) != catalog_epoch)
+            return error.RowPolicyCatalogChanged;
+    }
+
     pub const Lease = struct {
         gate: *Gate,
         released: bool = false,

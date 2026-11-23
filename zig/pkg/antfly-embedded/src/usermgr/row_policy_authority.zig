@@ -115,6 +115,7 @@ pub const Purpose = enum {
 };
 
 pub const Scope = struct {
+    partition: ?@import("../system_catalog/table_partitions.zig").Route = null,
     table_id: u64,
     table: []const u8,
     database: []const u8,
@@ -138,6 +139,7 @@ pub const PinnedRoles = struct {
 };
 
 pub const Payload = struct {
+    partition: ?@import("../system_catalog/table_partitions.zig").Route = null,
     principal: []const u8,
     policy_principal: ?[]const u8 = null,
     setting_principal: ?[]const u8 = null,
@@ -156,6 +158,7 @@ pub const Payload = struct {
     purpose: Purpose = .ordinary,
 
     pub fn jsonStringify(self: Payload, writer: anytype) !void {
+        if (self.partition != null) return writer.write(.{ .partition = self.partition, .principal = self.principal, .policy_principal = self.policy_principal, .setting_principal = self.setting_principal, .roles = self.roles, .sql_roles = self.sql_roles, .auth_revision = self.auth_revision, .table_id = self.table_id, .table = self.table, .database = self.database, .policy_generation = self.policy_generation, .catalog_epoch = self.catalog_epoch, .access = self.access, .expires = self.expires, .purpose = self.purpose });
         if (self.sql_roles.len != 0) return writer.write(.{
             .principal = self.principal,
             .policy_principal = self.policy_principal,
@@ -227,6 +230,10 @@ pub fn sign(
     now_seconds: i64,
 ) ![]u8 {
     if (secret.len < 32 or issuer.len == 0) return error.RowPolicyAuthorityUnavailable;
+    if (scope.partition) |route| {
+        route.validate() catch return error.InvalidRowPolicyPrincipal;
+        if (scope.table_id != route.child_id) return error.InvalidRowPolicyPrincipal;
+    }
     if ((scope.purpose == .sql_write and scope.access != .write) or
         (scope.purpose != .ordinary and scope.purpose != .sql_write and scope.access != .read)) return error.InvalidRowPolicyPrincipal;
     if (!validName(pinned.principal) or !validName(scope.table) or !validName(scope.database) or
@@ -253,6 +260,7 @@ pub fn sign(
         .policy_generation = scope.policy_generation,
         .catalog_epoch = scope.catalog_epoch,
         .access = scope.access,
+        .partition = scope.partition,
         .expires = expires,
         .purpose = scope.purpose,
     }, .{});
@@ -264,7 +272,7 @@ pub fn sign(
     _ = std.base64.url_safe_no_pad.Encoder.encode(encoded, payload);
     const mac = digest(secret, issuer, encoded);
     const hex = std.fmt.bytesToHex(mac, .lower);
-    return std.fmt.allocPrint(alloc, "v1:{s}:{s}", .{ encoded, &hex });
+    return std.fmt.allocPrint(alloc, "{s}:{s}:{s}", .{ if (scope.partition != null) "p1" else "v1", encoded, &hex });
 }
 
 /// The returned parsed value owns the verified principal and role slices.
@@ -276,10 +284,30 @@ pub fn verify(
     now_seconds: i64,
     token: []const u8,
 ) !std.json.Parsed(Payload) {
+    var parsed = try decodeAuthenticated(alloc, secret, issuer, token, scope.partition != null);
+    errdefer parsed.deinit();
+    try requireScope(parsed.value, scope, now_seconds);
+    return parsed;
+}
+
+pub fn verifyPartition(alloc: std.mem.Allocator, secret: []const u8, issuer: []const u8, scope: Scope, member: @import("../system_catalog/table_partitions.zig").Membership, now_seconds: i64, token: []const u8) !std.json.Parsed(Payload) {
+    var parsed = try decodeAuthenticated(alloc, secret, issuer, token, true);
+    errdefer parsed.deinit();
+    const route = parsed.value.partition orelse return error.Forbidden;
+    try route.require(member);
+    var expected = scope;
+    expected.partition = route;
+    expected.policy_generation = if (member.parent_policy.enabled) member.parent_policy.generation else member.membership_generation;
+    expected.catalog_epoch = if (member.parent_policy.enabled) member.parent_policy.catalog_epoch else member.membership_generation;
+    try requireScope(parsed.value, expected, now_seconds);
+    return parsed;
+}
+
+fn decodeAuthenticated(alloc: std.mem.Allocator, secret: []const u8, issuer: []const u8, token: []const u8, partition: bool) !std.json.Parsed(Payload) {
     if (secret.len < 32 or issuer.len == 0) return error.RowPolicyAuthorityUnavailable;
     if (token.len > maximum_token_bytes) return error.Forbidden;
     var parts = std.mem.splitScalar(u8, token, ':');
-    if (!std.mem.eql(u8, parts.next() orelse "", "v1")) return error.Forbidden;
+    if (!std.mem.eql(u8, parts.next() orelse "", if (partition) "p1" else "v1")) return error.Forbidden;
     const encoded = parts.next() orelse return error.Forbidden;
     const signature = parts.next() orelse return error.Forbidden;
     if (parts.next() != null or signature.len != 64) return error.Forbidden;
@@ -292,12 +320,15 @@ pub fn verify(
     const payload = try alloc.alloc(u8, payload_size);
     defer alloc.free(payload);
     std.base64.url_safe_no_pad.Decoder.decode(payload, encoded) catch return error.Forbidden;
-    var parsed = std.json.parseFromSlice(Payload, alloc, payload, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch |err| {
+    return std.json.parseFromSlice(Payload, alloc, payload, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch |err| {
         if (err == error.OutOfMemory) return err;
         return error.Forbidden;
     };
-    errdefer parsed.deinit();
-    const value = parsed.value;
+}
+
+fn requireScope(value: Payload, scope: Scope, now_seconds: i64) !void {
+    if (!std.meta.eql(value.partition, scope.partition)) return error.Forbidden;
+    if (value.partition) |route| route.validate() catch return error.Forbidden;
     if ((value.purpose == .sql_write and value.access != .write) or
         (value.purpose != .ordinary and value.purpose != .sql_write and value.access != .read) or
         (scope.purpose != .ordinary and value.purpose != scope.purpose)) return error.Forbidden;
@@ -316,7 +347,6 @@ pub fn verify(
         if (!validName(principal) or value.access != .read) return error.Forbidden;
     }
     if (value.setting_principal) |principal| if (!validName(principal)) return error.Forbidden;
-    return parsed;
 }
 
 fn validRoleClaims(roles: []const []const u8, instances: []const []const u8) bool {
@@ -442,4 +472,53 @@ test "SQL privileges signed role instances reject native aliases even from a val
     try std.testing.expectError(error.Forbidden, verify(a, secret, "cluster", scope, 100, legacy));
     typed.sql_roles = &.{ "07070707070707070707070707070707", "07070707070707070707070707070707" };
     try std.testing.expectError(error.InvalidRowPolicyPrincipal, sign(a, secret, "cluster", typed, scope, 100));
+}
+
+test "partition scoped role proof binds child owner and immutable routing generation" {
+    const a = std.testing.allocator;
+    const key = "1234567890abcdef1234567890abcdef";
+    const family = @import("../system_catalog/table_partitions.zig");
+    const member: family.Membership = .{
+        .parent_id = 17,
+        .membership_generation = 7,
+        .key_attribute = 1,
+        .key_name = "created_at",
+        .child = .{ .table_id = 41, .schema_version = 2, .definition = @splat(3) },
+        .bounds = .{ .lower = .minvalue, .upper = .maxvalue },
+    };
+    const scope: Scope = .{
+        .table_id = 41,
+        .table = "leaf",
+        .database = "main",
+        .policy_generation = 7,
+        .catalog_epoch = 7,
+        .partition = .{
+            .parent_id = 17,
+            .parent_revision = 8,
+            .parent_descriptor = @splat(1),
+            .child_id = 41,
+            .child_schema_version = 2,
+            .membership_generation = 7,
+            .policy = try member.parent_policy.digest(),
+        },
+    };
+    const proof = try sign(a, key, "cluster-a", .{ .principal = "alice", .roles = &.{}, .auth_revision = 1 }, scope, 100);
+    defer a.free(proof);
+    var checked = try verify(a, key, "cluster-a", scope, 100, proof);
+    defer checked.deinit();
+    try std.testing.expectEqualDeep(scope.partition, checked.value.partition);
+    var native = try verifyPartition(a, key, "cluster-a", scope, member, 100, proof);
+    defer native.deinit();
+    var stale = member;
+    stale.child.schema_version += 1;
+    try std.testing.expectError(error.PartitionCatalogChanged, verifyPartition(a, key, "cluster-a", scope, stale, 100, proof));
+    var changed = scope;
+    changed.partition.?.membership_generation += 1;
+    try std.testing.expectError(error.Forbidden, verify(a, key, "cluster-a", changed, 100, proof));
+    changed = scope;
+    changed.partition = null;
+    try std.testing.expectError(error.Forbidden, verify(a, key, "cluster-a", changed, 100, proof));
+    changed = scope;
+    changed.table_id += 1;
+    try std.testing.expectError(error.InvalidRowPolicyPrincipal, sign(a, key, "cluster-a", .{ .principal = "alice", .roles = &.{}, .auth_revision = 1 }, changed, 100));
 }

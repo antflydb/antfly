@@ -1605,9 +1605,7 @@ const LocalStandaloneMetadata = struct {
     fn applyJobCommandLocked(self: *LocalStandaloneMetadata, command: @import("../metadata/storage/raft_apply_store.zig").TransitionCommand) !void {
         const store = self.lifecycle_store orelse return error.UnsupportedOperation;
         try store.applyStandaloneCommand(group_ids.main_metadata_group_id, command);
-        const state = try store.standaloneRevisionState();
-        self.epoch = @max(1, state.projection_revision);
-        self.durable_revision = state.revision;
+        self.refreshLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
     }
 
     /// CDC status/progress commands (replication source status upserts,
@@ -1856,16 +1854,7 @@ const LocalStandaloneMetadata = struct {
         }
         try store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_restore_staging = bytes });
         try self.refreshLifecycleProjectionLocked();
-        if (try store.loadRestoreStaging(alloc, group_ids.main_metadata_group_id, command.value.id)) |result| {
-            var loaded = result;
-            defer loaded.deinit();
-            return std.json.Stringify.valueAlloc(alloc, loaded.value, .{});
-        }
-        if (command.value.action == .cancel_reservation) {
-            const progress = (try store.loadRestoreStagingProgress(alloc, group_ids.main_metadata_group_id, command.value.id)) orelse return error.RestoreStagingChanged;
-            return std.json.Stringify.valueAlloc(alloc, progress, .{});
-        }
-        return error.RestoreStagingChanged;
+        return @import("../metadata/restore_coordinator_control.zig").appliedResponse(store, alloc, group_ids.main_metadata_group_id, command.value);
     }
 
     fn restoreRetirementOwnership(ptr: *anyopaque, owner_group_id: u64) !antfly.public_api.ProvisionedTableWriteSource.ReplicaRetirementOwnership.State {
@@ -2133,7 +2122,7 @@ const LocalStandaloneMetadata = struct {
         }
     }
 
-    fn acquireRoutingGeneration(ptr: *anyopaque, input_budget: antfly.public_api.table_catalog.RoutingBudget, _: bool) !*antfly.public_api.table_catalog.RoutingGeneration {
+    fn acquireRoutingGeneration(ptr: *anyopaque, input_budget: antfly.public_api.table_catalog.RoutingBudget, authoritative: bool) !*antfly.public_api.table_catalog.RoutingGeneration {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         var budget: antfly.public_api.table_catalog.RoutingBudget = .{ .cancellation = input_budget.cancellation };
         budget.deadline_ns = budget.deadlineFrom(input_budget);
@@ -2142,9 +2131,9 @@ const LocalStandaloneMetadata = struct {
             self.mutex.unlock();
             return error.MetadataMutationOutcomeUnknown;
         }
-        // A failed durable publication/reload must not leave a reusable
-        // projection. Healthy reads keep the in-memory fast path.
-        if (self.lifecycle_store != null and self.durable_revision == 0) self.reloadLifecycleProjectionLocked() catch |err| {
+        // Lifecycle writers can commit outside this facade. Confirm the
+        // persisted head before handing out an authoritative cached cut.
+        if (authoritative or self.durable_revision == 0) self.refreshLifecycleProjectionLocked() catch |err| {
             self.mutex.unlock();
             return err;
         };
@@ -3260,6 +3249,16 @@ const LocalStandaloneMetadata = struct {
             return std.json.Stringify.valueAlloc(alloc, capture.value, .{});
         }
         switch (call) {
+            // These private RPC envelopes are terminated by the hosted metadata service.
+            .restore_coordinator_read, .restore_coordinator_progress, .restore_coordinator_receipt, .restore_coordinator_apply, .restore_coordinator_ack, .backup_cohort_read, .backup_cohort_first, .backup_cohort_write => return error.UnsupportedOperation,
+            .store_report_basis => |store_id| {
+                if (!context.setting_admin) return error.Forbidden;
+                if (store_id == 0) return error.InvalidStoreReporterFence;
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                const basis = try store.storeReportBasis(alloc, group_ids.main_metadata_group_id, store_id);
+                try context.ensureActive();
+                return std.json.Stringify.valueAlloc(alloc, basis, .{});
+            },
             .sql_relation_boot_read => |query| {
                 if (!context.setting_admin) return error.Forbidden;
                 const store = self.lifecycle_store orelse return error.UnsupportedOperation;
@@ -3273,6 +3272,12 @@ const LocalStandaloneMetadata = struct {
             .sql_relation_boot_submit => |bytes| return @import("../metadata/sql/relation_lifecycle/boot_service.zig").submitStandalone(self.lifecycle_store orelse return error.UnsupportedOperation, alloc, group_ids.main_metadata_group_id, context, bytes),
             .query_population_job => unreachable, // Routed to the attached coordinator before locking.
             .scope_retirement_work, .scope_retirement_manifest, .scope_retirement_observation, .scope_retirement_prepare, .table_retirement_prepare => unreachable,
+            .sql_population_lineage => |request| {
+                if (!context.setting_admin) return error.Forbidden;
+                try context.ensureActive();
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                return store.sqlPopulationLineage(alloc, group_ids.main_metadata_group_id, request);
+            },
             .sql_snapshot_cohort => |request| {
                 if (request.owner != null and !context.setting_admin) return error.Forbidden;
                 const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
@@ -3295,10 +3300,10 @@ const LocalStandaloneMetadata = struct {
                 _ = try self.ensureNativeOwnerBindingLocked();
                 const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
                 const protocol = @import("../metadata/topology_protocol.zig");
-                const required = if (request.expected_view != null) protocol.sql_materialized_refresh_version else if (request.materialized_view) protocol.sql_materialized_view_version else protocol.sql_population_version;
+                const required = if (request.sql_generation != null) protocol.sql_catalog_atomic_admission_version else if (request.expected_view != null) protocol.sql_materialized_refresh_version else if (request.materialized_view) protocol.sql_materialized_view_version else protocol.sql_population_version;
                 const activation = (try store.topologyActivation(group_ids.main_metadata_group_id)) orelse return error.TableTopologyProtocolUpgradeRequired;
                 if (activation.version < required) return error.TableTopologyProtocolUpgradeRequired;
-                return store.prepareRelationCreateJsonWithContext(alloc, group_ids.main_metadata_group_id, request, .query_population, context);
+                return store.prepareRelationCreateJsonWithContext(alloc, group_ids.main_metadata_group_id, request, if (request.sql_generation != null) .sql_generation else .query_population, context);
             },
             .lake_source_owner_read, .lake_index_lifecycle_read, .lake_index_lifecycle_work, .lake_index_lifecycle_mutate, .relational_index_begin => unreachable,
             .relational_index_status => |request| {
@@ -4267,6 +4272,38 @@ const LocalStandaloneMetadata = struct {
                 self.refreshLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
                 return store.sqlPreparedOutcome(alloc, group_ids.main_metadata_group_id, request) catch error.MetadataMutationOutcomeUnknown;
             },
+            .sql_restore_reserve, .sql_restore_progress => {
+                if (!context.setting_admin) return error.Forbidden;
+                if (!self.standaloneRelationPublicationSupported()) return error.UnsupportedSqlExecution;
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                const Adapter = struct {
+                    store: *antfly.metadata.RaftApplyStore,
+                    metadata_group_id: u64 = group_ids.main_metadata_group_id,
+                    pub fn proposeTransitionCommandWithReceipt(self_: *@This(), command: @import("../metadata/storage/raft_apply_store.zig").TransitionCommand) !void {
+                        try self_.store.applyStandaloneCommand(self_.metadata_group_id, command);
+                    }
+                    pub fn waitForTransitionAppliedWithContext(_: *@This(), _: void, ctx: antfly.public_api.operation.RequestContext) !void {
+                        try ctx.ensureActive();
+                    }
+                    pub fn ensureLinearizableReadWithContext(_: *@This(), ctx: antfly.public_api.operation.RequestContext) !void {
+                        try ctx.ensureActive();
+                    }
+                    pub fn projectedStore(self_: *@This()) ?*antfly.metadata.RaftApplyStore {
+                        return self_.store;
+                    }
+                };
+                var adapter: Adapter = .{ .store = store };
+                const control = @import("../metadata/restore_coordinator_control.zig");
+                if (call == .sql_restore_progress) {
+                    try control.acceptCatalogProgress(&adapter, alloc, call.sql_restore_progress, context);
+                    return alloc.dupe(u8, "true");
+                }
+                const request = call.sql_restore_reserve;
+                var job = try control.reserveCatalog(&adapter, alloc, request.plan, request.participant, context);
+                defer job.deinit();
+                self.refreshLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
+                return std.json.Stringify.valueAlloc(alloc, job.value, .{});
+            },
             .sql_authorization_read => |request| {
                 if (!context.setting_admin) return error.Forbidden;
                 const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
@@ -4296,6 +4333,12 @@ const LocalStandaloneMetadata = struct {
                 store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_system_catalog = bytes }) catch return error.MetadataMutationOutcomeUnknown;
                 self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
                 return store.sqlAuthorizationOutcome(alloc, group_ids.main_metadata_group_id, try types.observation(alloc, request)) catch error.MetadataMutationOutcomeUnknown;
+            },
+            .sql_collation_snapshot => |request| {
+                if (!context.setting_admin) return error.Forbidden;
+                try context.ensureActive();
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                return store.sqlCollationSnapshot(alloc, group_ids.main_metadata_group_id, request);
             },
             .sql_type_snapshot => |request| {
                 if (!context.setting_admin) return error.Forbidden;
@@ -4356,6 +4399,26 @@ const LocalStandaloneMetadata = struct {
                 store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_system_catalog = bytes }) catch return error.MetadataMutationOutcomeUnknown;
                 self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
                 return store.sqlCastOutcome(alloc, group_ids.main_metadata_group_id, try casts.observation(alloc, request)) catch error.MetadataMutationOutcomeUnknown;
+            },
+            .sql_publication_collection_ack, .sql_publication_slot_control => return error.UnsupportedOperation,
+            .sql_publication_advance => |request| {
+                if (!context.setting_admin) return error.Forbidden;
+                try request.validate();
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                if (!self.standaloneRelationPublicationSupported()) return error.UnsupportedSqlExecution;
+                const command = @import("../system_catalog/catalog_mutations.zig").publicationAdvanceCommand(request);
+                const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
+                defer alloc.free(bytes);
+                if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
+                try context.ensureActive();
+                try store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_system_catalog = bytes });
+                if (request.action == .publish) try self.reloadLifecycleProjectionLocked();
+                return alloc.dupe(u8, "null");
+            },
+            .sql_publication_capture_work => |request| {
+                if (!context.setting_admin) return error.Forbidden;
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                return store.sqlPublicationCaptureWork(alloc, group_ids.main_metadata_group_id, request, context);
             },
             .sql_catalog_outcome => |request| {
                 if (!context.setting_admin) return error.Forbidden;
@@ -4519,11 +4582,10 @@ const LocalStandaloneMetadata = struct {
                 const bytes = try std.json.Stringify.valueAlloc(alloc, request, .{});
                 defer alloc.free(bytes);
                 try context.ensureActive();
-                const prior_revision = self.durable_revision;
                 store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_sql_sequence_counter = bytes }) catch return error.MetadataMutationOutcomeUnknown;
-                // Counter-only commits must not invalidate routing/schema views.
-                const revision = store.standaloneRevisionState() catch return error.MetadataMutationOutcomeUnknown;
-                if (revision.projection_revision <= prior_revision) self.durable_revision = revision.revision else self.refreshLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
+                // Counter-only commits preserve the routing epoch. If an
+                // external writer advanced it, refresh the actual projection.
+                self.refreshLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
                 const outcome = (store.sqlSequenceCounterOutcome(alloc, group_ids.main_metadata_group_id, request) catch return error.MetadataMutationOutcomeUnknown) orelse return error.MetadataMutationOutcomeUnknown;
                 return std.json.Stringify.valueAlloc(alloc, outcome, .{}) catch error.MetadataMutationOutcomeUnknown;
             },
@@ -4643,6 +4705,19 @@ const LocalStandaloneMetadata = struct {
             .relation_replace => |request| return self.replaceRelationLocked(alloc, context, request),
             .native_memory_create => unreachable,
             .mutate, .sql_catalog_prepare => {
+                if (call == .sql_catalog_prepare and (call.sql_catalog_prepare.request.mutation.kind == .collation or call.sql_catalog_prepare.security_label != null)) {
+                    if (!context.setting_admin) return error.Forbidden;
+                    const preparation = call.sql_catalog_prepare;
+                    try preparation.requireCommandFence(context.sql_command_fence);
+                    if (std.mem.allEqual(u8, &preparation.nonce, 0)) return error.InvalidCatalogMutation;
+                    const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                    if (!self.standaloneRelationPublicationSupported()) return error.UnsupportedSqlExecution;
+                    try context.ensureActive();
+                    return if (preparation.security_label != null)
+                        store.prepareSqlSecurityLabel(alloc, group_ids.main_metadata_group_id, preparation)
+                    else
+                        @import("../system_catalog/catalog_mutations.zig").prepareCollation(alloc, store, group_ids.main_metadata_group_id, preparation);
+                }
                 if (call == .sql_catalog_prepare and (call.sql_catalog_prepare.view != null or call.sql_catalog_prepare.relation != null)) {
                     if (!context.setting_admin) return error.Forbidden;
                     if (!std.meta.eql(call.sql_catalog_prepare.command_fence, if (context.sql_command_fence) |fence| fence.* else null)) return error.InvalidCatalogMutation;
@@ -6501,12 +6576,8 @@ const LocalStandaloneMetadata = struct {
     fn refreshLifecycleProjectionLocked(self: *LocalStandaloneMetadata) !void {
         const store = self.lifecycle_store orelse return;
         const current = try store.standaloneRevisionState();
-        if (current.revision == self.durable_revision) {
-            if (self.catalog_privileges_refresh_required) try self.refreshCatalogPrivilegesLocked();
-            return;
-        }
-        if (self.durable_revision != 0 and current.revision > self.durable_revision and
-            current.projection_revision <= self.durable_revision)
+        if (self.durable_revision != 0 and current.revision >= self.durable_revision and
+            @max(1, current.projection_revision) == self.epoch)
         {
             // A lost reply or another owner ACK cannot invalidate pinned
             // catalog rows. No table scan or projection allocation is needed.
@@ -7824,6 +7895,39 @@ pub fn runFromIterator(
     // Publish their final cut before DataServer can initialize any API listener.
     try local_metadata.awaitInitialRelationPublication(setup_io.io(), termination_signals.token());
 
+    const selinux_bootstrap = @import("../pgwire/selinux_bootstrap.zig");
+    const selinux_control = try selinux_bootstrap.Control.fromEnvironment(init.environ_map);
+    var selinux = try selinux_bootstrap.Owner.fromEnvironment(setup_io.io(), alloc, init.environ_map);
+    defer if (selinux) |*owner| owner.deinit();
+    const selinux_endpoint = endpoint: {
+        if (selinux == null and selinux_control == .none) break :endpoint null;
+        const wire = if (loaded_config) |*cfg| cfg.pgwire else null;
+        if (!local_metadata.standaloneRelationPublicationSupported()) return error.InvalidPgwireConfig;
+        if (selinux != null and (wire == null or !wire.?.enabled or !effective_auth_enabled)) return error.InvalidPgwireConfig;
+        if ((selinux_control == .withdraw and selinux != null) or (selinux_control == .rotate and selinux == null))
+            return error.InvalidPgwireConfig;
+        const store = local_metadata.lifecycle_store orelse return error.UnsupportedSqlExecution;
+        const group = group_ids.main_metadata_group_id;
+        var state = try store.sqlSelinuxAuthority(group);
+        const desired = if (selinux) |*owner| try owner.authority() else null;
+        if (try selinux_control.expectedUpdate(state, desired)) |expected| {
+            const incarnation = local_metadata.metadata_incarnation orelse return error.InvalidMetadataIncarnation;
+            var raw_incarnation: [16]u8 = undefined;
+            _ = try std.fmt.hexToBytes(&raw_incarnation, &incarnation);
+            const update: @import("../system_catalog/storage.zig").SelinuxAuthorityUpdate = .{
+                .incarnation = raw_incarnation,
+                .expected_epoch = expected,
+                .active = desired,
+            };
+            const bytes = try std.json.Stringify.valueAlloc(alloc, update, .{});
+            defer alloc.free(bytes);
+            try store.applyStandaloneCommand(group, .{ .update_sql_selinux_authority = bytes });
+            state = try store.sqlSelinuxAuthority(group);
+            if (state.epoch != expected + 1 or (desired == null and state.active != null)) return error.SelinuxAdmissionChanged;
+        }
+        break :endpoint if (selinux) |*owner| try owner.endpoint(state) else null;
+    };
+
     // Initialize DataServer without starting its listener — the unified
     // httpx.Server will serve the public API instead.
     var data_server = antfly.data.runtime.DataServer.initFromLocalMetadataSources(alloc, .{
@@ -7856,6 +7960,7 @@ pub fn runFromIterator(
             .experimental = cli.experimental,
             .mcp_max_tool_result_bytes = if (loaded_config) |*cfg| cfg.mcp.max_tool_result_bytes else antfly.common.config.default_mcp_max_tool_result_bytes,
             .pgwire = if (loaded_config) |*cfg| cfg.pgwire else null,
+            .pgwire_selinux_endpoint = selinux_endpoint,
             .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.resources.query.admission.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
             .graph_execution_limits = if (loaded_config) |*cfg| cfg.resources.query.request_limits.graph else .{},
             .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.resources.write.admission.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
@@ -16666,7 +16771,7 @@ test "standalone catalog restore receipt progress preserves routes until structu
     const plan: Staging.Plan = .{ .id = @splat(7), .cohort_digest = @splat(9), .targets = &.{target} };
     try plan.validate(scratch);
     const digest = try plan.digest(scratch);
-    var job = try Submit.run(&metadata, scratch, .{ .id = plan.id, .action = .reserve, .plan = plan });
+    var job = try Submit.run(&metadata, scratch, .{ .id = plan.id, .action = .reserve, .record_reservation_outcome = true, .plan = plan });
     try std.testing.expectEqual(.importing, job.state);
     try std.testing.expect(metadata.findTableByNameLocked(table.name) == null);
     const store = metadata.lifecycle_store.?;
@@ -16685,14 +16790,30 @@ test "standalone catalog restore receipt progress preserves routes until structu
     try std.testing.expectEqual(reserved.projection_revision, after_jobs.projection_revision);
     try std.testing.expectEqual(reserved.projection_revision, metadata.epoch);
     var receipt: Staging.OwnerReceipt = .{ .group_id = 701, .range_id = 701, .plan_digest = digest, .completion_digest = @splat(3) };
-    const imported: Staging.Command = .{ .id = plan.id, .action = .imported, .expected_revision = job.revision, .receipt = receipt };
-    job = try Submit.run(&metadata, scratch, imported);
-    try std.testing.expectEqual(.validating, job.state);
-    _ = try Submit.run(&metadata, scratch, imported); // Lost reply replay.
+    const Ack = struct {
+        fn run(m: *LocalStandaloneMetadata, alloc: std.mem.Allocator, command: Staging.Command) !Staging.CompactApply {
+            const encoded = try std.json.Stringify.valueAlloc(alloc, command, .{});
+            const result = try LocalStandaloneMetadata.applyRestoreStaging(m, alloc, encoded, .{});
+            return std.json.parseFromSliceLeaky(Staging.CompactApply, alloc, result, .{});
+        }
+    };
+    const imported: Staging.Command = .{ .id = plan.id, .action = .imported, .expected_revision = job.revision, .receipt = receipt, .record_receipt_identity = true };
+    const accepted = try Ack.run(&metadata, scratch, imported);
+    try std.testing.expect(accepted.receipt_accepted);
+    try std.testing.expectEqual(.validating, accepted.restore_progress.state);
+    try std.testing.expect((try Ack.run(&metadata, scratch, imported)).receipt_accepted); // Lost reply replay.
+
+    var wrong_range = imported;
+    wrong_range.receipt.?.range_id += 1;
+    try std.testing.expect(!(try Ack.run(&metadata, scratch, wrong_range)).receipt_accepted);
+    var wrong_plan = imported;
+    wrong_plan.receipt.?.plan_digest[0] ^= 1;
+    try std.testing.expect(!(try Ack.run(&metadata, scratch, wrong_plan)).receipt_accepted);
+
     receipt.completion_digest = @splat(4);
-    job = try Submit.run(&metadata, scratch, .{ .id = plan.id, .action = .validated, .expected_revision = job.revision, .receipt = receipt });
+    job = try Submit.run(&metadata, scratch, .{ .id = plan.id, .action = .validated, .expected_revision = accepted.restore_progress.revision, .receipt = receipt });
     const progress = try store.standaloneRevisionState();
-    try std.testing.expectEqual(after_jobs.revision + 3, progress.revision);
+    try std.testing.expectEqual(after_jobs.revision + 5, progress.revision);
     try std.testing.expectEqual(reserved.projection_revision, progress.projection_revision);
     try std.testing.expectEqual(reloads, metadata.lifecycle_projection_reloads);
     var after = (try antfly.public_api.table_catalog.authoritativeTableRoutingSnapshot(a, metadata.catalogSource(), "serving", null)).?;
@@ -16712,6 +16833,16 @@ test "standalone catalog restore receipt progress preserves routes until structu
     try std.testing.expectEqual(published.projection_revision, metadata.epoch);
     try std.testing.expect(metadata.lifecycle_projection_reloads > reloads);
     try std.testing.expectEqual(table.table_id, metadata.findTableByNameLocked(table.name).?.table_id);
+
+    const cached = try LocalStandaloneMetadata.acquireRoutingGeneration(&metadata, .{}, true);
+    defer cached.release();
+    try store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .upsert_table = .{ .table_id = 81, .name = "independent-publication" } });
+    const current = try LocalStandaloneMetadata.acquireRoutingGeneration(&metadata, .{}, true);
+    defer current.release();
+    try std.testing.expectEqual(published.projection_revision, cached.indexed.snapshot.value.catalog_revision);
+    try std.testing.expect(!cached.indexed.table_indexes.contains("independent-publication"));
+    try std.testing.expect(current.indexed.table_indexes.contains("independent-publication"));
+    try std.testing.expectEqual((try store.standaloneRevisionState()).projection_revision, current.indexed.snapshot.value.catalog_revision);
 }
 
 test "standalone metadata replay refreshes colliding revisions and only publishes complete effects" {
@@ -17403,21 +17534,21 @@ test "standalone native SQL connection enrolls the real durable producer before 
     };
     const connection = try HTTP.open(&server);
     const foreign_connection = try HTTP.open(&server);
-    const producer = @import("../api/sql_command_producer.zig");
+    const producer = @import("../api/sql/session/command_producer.zig");
     var enrolled = (try producer.load(&sessions, a, connection)) orelse return error.TestUnexpectedResult;
     defer enrolled.deinit();
     try std.testing.expectEqual(producer.Phase.idle, enrolled.value.phase);
     try std.testing.expectEqual(connection, enrolled.value.registration.connection);
-    var native: @import("../api/sql_command_execution.zig").Native = .{ .server = &server, .context = .{} };
+    var native: @import("../api/sql/session/command_execution.zig").Native = .{ .server = &server, .context = .{} };
     const controller = try native.controller(connection, null);
     var loan = try controller.take(a, @splat(4));
     errdefer loan.finish(a) catch {};
     const owner = loan.relation_owner orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u8, &enrolled.value.instance, &owner.execution_instance);
-    var other = try @import("../api/sql_connections.zig").load(&sessions, a, foreign_connection, "", 1, platform_time.realtimeNs() / std.time.ns_per_ms);
+    var other = try @import("../api/sql/session/connections.zig").load(&sessions, a, foreign_connection, "", 1, platform_time.realtimeNs() / std.time.ns_per_ms);
     defer other.deinit();
-    const foreign = try @import("../api/sql_relation_lifetimes.zig").ownerFromConnection(other.value, controller.instance, 1);
-    const descriptor = (try @import("../api/sql_relation_lifetimes.zig").descriptor(.temporary, .preserve_rows, 1, 1, @splat(9), 1, owner)).?;
+    const foreign = try @import("../api/sql/catalog/relation_lifetimes.zig").ownerFromConnection(other.value, controller.instance, 1);
+    const descriptor = (try @import("../api/sql/catalog/relation_lifetimes.zig").descriptor(.temporary, .preserve_rows, 1, 1, @splat(9), 1, owner)).?;
     try std.testing.expectError(error.SqlTemporaryRelationNotOwned, descriptor.requireConnectionOwner(foreign));
     var substituted = owner;
     substituted.principal_digest[0] ^= 1;
@@ -18406,7 +18537,7 @@ test "system catalog standalone paired sequence seed materializes live counters 
         // Public recovery is observation of the original bound request even
         // after cold seed installation or DROP. New sequence ingress remains
         // disabled; the token must neither rebind a name nor allocate again.
-        const recovery = @import("../api/sql_catalog_recovery.zig");
+        const recovery = @import("../api/sql/recovery/catalog_recovery.zig");
         var recovery_arena = std.heap.ArenaAllocator.init(alloc);
         defer recovery_arena.deinit();
         const receipt = try recovery.newReceipt(alloc, recovery_arena.allocator(), request, 0);
@@ -19986,7 +20117,7 @@ test "standalone SQL prepared transactions preserve node-zero ownership and row 
             }
             var identity: ?antfly.public_api.http_server.AuthenticatedIdentity = null;
             const encoded_session = std.fmt.bytesToHex(session.txn_id, .lower);
-            var adapter: @import("../api/sql_execution.zig").Adapter = .{ .server = api, .identity = &identity, .context = .{ .sql_command_fence = &frame }, .session_id = &encoded_session, .connection_id = connection_id };
+            var adapter: @import("../api/sql/execution/execution.zig").Adapter = .{ .server = api, .identity = &identity, .context = .{ .sql_command_fence = &frame }, .session_id = &encoded_session, .connection_id = connection_id };
             defer adapter.releaseExecutionOwners();
             var compiled = try @import("antfly_local_sources").sql_compiler.compile(backing, if (named) "INSERT INTO lock_probe(id,v) VALUES ('scoped_named',3)" else "INSERT INTO lock_probe(id,v) VALUES ('scoped',2)", .{});
             defer compiled.deinit();
@@ -20012,8 +20143,8 @@ test "standalone SQL prepared transactions preserve node-zero ownership and row 
                 try std.testing.expectEqual(.retired, (try scopeRead(a, api, backend)).scope.?.state);
                 return;
             }
-            var coordinator: @import("../api/sql_session.zig").Coordinator = .{ .server = api, .identity = &identity, .context = .{ .sql_command_fence = &frame }, .sync_level = .full_index };
-            const decision = try @import("../api/sql_session.zig").Coordinator.commit(&coordinator, .{ .principal = "", .database = "default", .namespace = "public" }, session.txn_id);
+            var coordinator: @import("../api/sql/session/session.zig").Coordinator = .{ .server = api, .identity = &identity, .context = .{ .sql_command_fence = &frame }, .sync_level = .full_index };
+            const decision = try @import("../api/sql/session/session.zig").Coordinator.commit(&coordinator, .{ .principal = "", .database = "default", .namespace = "public" }, session.txn_id);
             try std.testing.expectEqual(.committed, decision.outcome);
             var sql_state = (try api.txn_sessions.getSqlState(backing, session.txn_id)).?;
             defer sql_state.deinit(backing);
@@ -20037,7 +20168,7 @@ test "standalone SQL prepared transactions preserve node-zero ownership and row 
                     try std.testing.expectEqual(@as(u32, 0), current.owner.?.resources);
                     return;
                 }
-                _ = try @import("../api/sql_prepared_coordinator.zig").advanceLockWork(api, &cursor);
+                _ = try @import("../api/sql/session/prepared_coordinator.zig").advanceLockWork(api, &cursor);
             }
             return error.TestUnexpectedResult;
         }

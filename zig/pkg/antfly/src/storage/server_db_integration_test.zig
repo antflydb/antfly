@@ -4089,7 +4089,7 @@ test "db transaction batched acknowledgement migration preserves legacy replay a
         defer read.abort();
         try std.testing.expectError(error.NotFound, read.get(&index_key));
     }
-    try std.testing.expectError(error.InvalidParticipant, db.markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(txn, &.{ "b", "absent" }, .{ .term = 3, .index = 3 }));
+    try std.testing.expectError(error.InvalidParticipant, db.markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(txn, &.{ "b", "absent" }, .{ .term = 3, .index = 3 }, null));
     try std.testing.expectEqual(@as(u64, 2), (try db.orderedApplyReceipt()).?.index);
     {
         var read = try db.core.store.beginProbeTxn();
@@ -4103,7 +4103,7 @@ test "db transaction batched acknowledgement migration preserves legacy replay a
         try std.testing.expectEqualStrings("b", unresolved[0]);
         try std.testing.expectEqualStrings("c", unresolved[1]);
     }
-    try db.markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(txn, &.{"b"}, .{ .term = 3, .index = 3 });
+    try db.markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(txn, &.{"b"}, .{ .term = 3, .index = 3 }, null);
     {
         var read = try db.core.store.beginProbeTxn();
         defer read.abort();
@@ -4114,7 +4114,7 @@ test "db transaction batched acknowledgement migration preserves legacy replay a
     }
     // Exact replay is fenced before payload admission, preserving the durable
     // marker together with the indexed membership and migrated resolution.
-    try db.markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(txn, &.{"absent"}, .{ .term = 3, .index = 3 });
+    try db.markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(txn, &.{"absent"}, .{ .term = 3, .index = 3 }, null);
     db.close();
     opened = false;
     db = try DB.open(alloc, path, .{ .start_index_workers = false });

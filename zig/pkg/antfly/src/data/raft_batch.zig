@@ -115,6 +115,8 @@ fn encodeWithStorageOwnerDescriptorOwned(
     if (internal_batch_forwarding.graphTransactionProtocol(req)) |required| {
         if (protocol_version < required) return error.UnsupportedRaftBatchProtocolVersion;
     }
+    if (req.replicationSourcePermit() != null and protocol_version < @import("../common/data_raft_protocol.zig").batch_replication_source_prepare_protocol_version)
+        return error.UnsupportedRaftBatchProtocolVersion;
     if (req.commit_requires == .direct_enrichments and req.prepared_enrichments_json == null) return error.InvalidBatchRequest;
     const batch_json = try batch_api.encodeBatchRequest(alloc, req);
     defer alloc.free(batch_json);
@@ -196,6 +198,12 @@ pub fn decode(alloc: std.mem.Allocator, payload: []const u8) !OwnedReplicatedBat
     errdefer batch.deinit(alloc);
     if (internal_batch_forwarding.graphTransactionProtocol(batch.req)) |required| {
         if (protocol_version < required) return error.UnsupportedRaftBatchProtocolVersion;
+    }
+    if (batch.req.replicationSourcePermit() != null and protocol_version < @import("../common/data_raft_protocol.zig").batch_replication_source_prepare_protocol_version)
+        return error.UnsupportedRaftBatchProtocolVersion;
+    if (batch.req.transaction) |transaction| {
+        if (transaction == .prepare and transaction.prepare.publication_capture != null and protocol_version < @import("../common/data_raft_protocol.zig").batch_publication_capture_protocol_version)
+            return error.UnsupportedRaftBatchProtocolVersion;
     }
 
     var storage_owner_descriptor: ?OwnedStorageOwnerDescriptor = null;
@@ -705,6 +713,22 @@ fn consumerTests() type {
 }
 comptime {
     if (@import("builtin").is_test) _ = consumer_tests;
+}
+
+test "raft protocol barrier source replication rejects an older encoder" {
+    const a = std.testing.allocator;
+    const permit = @import("antfly_local_sources").storage_db_replication_source_apply_store.fixturePreparation().permit;
+    const req: db_mod.types.BatchRequest = .{ .transaction = .{ .prepare = .{
+        .txn_id = permit.reference.txn_id,
+        .topology_epoch = permit.topology_epoch,
+        .external_decision_owner = permit.decision_owner,
+        .external_activation = true,
+        .replication_source_permit = permit,
+    } } };
+    const required = @import("../common/data_raft_protocol.zig").batch_replication_source_prepare_protocol_version;
+    try std.testing.expectEqual(@as(?u16, required), internal_batch_forwarding.externalTransactionProtocol(req));
+    if (protocol_version < required)
+        try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, encode(a, "rows", req));
 }
 
 test "raft protocol barrier external transaction admission expires only new votes and stamps at the leader" {

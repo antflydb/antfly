@@ -33,7 +33,7 @@ from generate_sql_postgres_reference import (
 
 
 def main():
-    source = (ROOT / "zig/pkg/antfly/src/api/sql_document_root_test.zig").read_text()
+    source = (ROOT / "zig/pkg/antfly/src/api/sql/testing/document_root_test.zig").read_text()
     anchor = 'test "httpx SQL original PostgreSQL mutation syntax errors never access storage"'
     section = source.split(anchor, 1)[1].split("\ntest ", 1)[0]
     ids = re.findall(r'"(sql-\d{4})"', section)

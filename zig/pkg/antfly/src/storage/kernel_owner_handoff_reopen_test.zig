@@ -539,7 +539,7 @@ test "storage owner durable catalog cold open preserves relational and document 
         {
             var seed = try db_mod.DB.open(a, path, options);
             defer seed.close();
-            try local.storage_local_write.configureStorageKernelOwnerDb(a, &seed, "rows", schema_json, "{\"old\":{\"type\":\"full_text\"}}", null, null, null, null, null);
+            try local.storage_local_write.configureStorageKernelOwnerDb(a, &seed, "rows", schema_json, "{\"old\":{\"type\":\"full_text\"}}", null, null, null, null, .{}, null);
             try seed.applyOrderedCommittedMutation(.{ .timestamp_ns = 100, .writes = &.{.{ .key = "a", .value = "{\"n\":1}" }} }, .{ .term = 1, .index = 1 }, false);
             try std.testing.expect(seed.hasIndex("old"));
         }

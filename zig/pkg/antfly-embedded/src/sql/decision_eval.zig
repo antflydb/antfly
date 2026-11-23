@@ -208,7 +208,7 @@ fn evaluateInvocationsCore(a: std.mem.Allocator, provider: ?decisions.DecisionPr
     } else false;
     const frames: []scalar.CallFrames = if (nested) try a.alloc(scalar.CallFrames, rows.len) else &.{};
     for (frames) |*frame| frame.* = .{};
-    const work = try a.alloc(@import("numeric_value.zig").Context, rows.len);
+    const work = try a.alloc(@import("numeric/value.zig").Context, rows.len);
     const bytes = try a.alloc(usize, rows.len);
     @memset(bytes, 0);
     for (work) |*owner| owner.* = .{ .alloc = a, .remaining = base_limits.steps, .checkpoint = base_limits.checkpoint, .ptr = base_limits.checkpoint_context, .parent = base_limits.effect_work };

@@ -34,6 +34,7 @@ pub const Session = Implementation;
 
 pub const Implementation = struct {
     privacy: ?Source.privacy_read.PolicySnapshot = null,
+    required_indexes: ?Source.required_sql_indexes.Lease = null,
     row_policy_lease: ?Source.row_policy_gate.Gate.Lease = null,
     range_proofs: ?[]const Types.range_protection.Proof = null,
     text: ?*Source.text_rows.Owner = null,
@@ -156,11 +157,16 @@ pub const Implementation = struct {
         return session;
     }
 
+    pub fn requiredIndexesDigest(self: *const Implementation) ?[32]u8 {
+        return if (self.required_indexes) |lease| lease.digest else null;
+    }
+
     pub fn textFilterDigest(self: *const Implementation) ?[32]u8 {
         return if (self.text) |text| text.query_digest else null;
     }
 
     pub fn deinit(self: *Implementation) void {
+        if (self.required_indexes) |*lease| lease.deinit();
         if (self.text) |text| text.deinit();
         if (self.row_policy_lease) |*lease| lease.release();
         self.txn.abort();

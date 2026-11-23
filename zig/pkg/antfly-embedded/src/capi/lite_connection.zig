@@ -345,7 +345,7 @@ pub const PreparedPublication = struct {
         defer expected.close();
         var actual = try database.core.store.runtime_store.beginRead();
         defer actual.abort();
-        const row_key = if (self.relational_rows) try @import("../storage/db/relational_store.zig").keyAlloc(alloc, doc_key) else try keys.documentKeyAlloc(alloc, doc_key);
+        const row_key = if (self.relational_rows) try @import("../storage/db/relational/rows/store.zig").keyAlloc(alloc, doc_key) else try keys.documentKeyAlloc(alloc, doc_key);
         defer alloc.free(row_key);
         const ordinal_key = try keys.identityDocToOrdinalKeyAlloc(alloc, doc_key);
         defer alloc.free(ordinal_key);

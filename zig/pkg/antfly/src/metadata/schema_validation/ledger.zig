@@ -59,6 +59,7 @@ pub fn requiredDecoderVersion(bytes: []const u8) u16 {
     if (bytes.len < 48) return protocol.sql_sequence_retirement_version;
     const size: usize = std.mem.readInt(u32, bytes[8..12], .little);
     if (size == 0 or size > bytes.len - 48 or size > plan_mod.max_bytes * 2) return protocol.sql_sequence_retirement_version;
+    if (@import("../schema_reader_wire.zig").requiresPartitionMembership(bytes[16..][0..size])) return protocol.sql_partition_membership_version;
     if (@import("../schema_reader_wire.zig").requiresRetirementCohort(bytes[16..][0..size])) return protocol.table_retirement_survivors_version;
     if (@import("../schema_reader_wire.zig").requiresObjectRenames(bytes[16..][0..size])) return protocol.sql_object_annotations_version;
     if (@import("../schema_reader_wire.zig").requiresSequenceRetirement(bytes[16..][0..size])) return protocol.sql_sequence_retirement_version;
@@ -470,6 +471,14 @@ pub fn discoverActive(txn: anytype, request: @import("read.zig").DiscoveryReques
         try requireParticipantLock(txn, survivor, request.table);
         return .fromHead(survivor);
     }
+    if (lock.kind == .initial_support) {
+        const head = (try resolveActiveHead(txn, request.group, request.table)) orelse return null;
+        const birth = head.initial_partition orelse return null;
+        if (head.table_id != request.table or terminal(head) or !std.mem.eql(u8, &birth.initial_id, &lock.id) or
+            !std.mem.eql(u8, &head.metadata_incarnation, &request.metadata_incarnation)) return error.GenerationPublicationChanged;
+        try requireLock(txn, head);
+        return .fromHead(head);
+    }
     if (lock.kind != .schema_validation) return null;
     const head = (try resolveActiveHead(txn, request.group, request.table)) orelse return error.GenerationPublicationChanged;
     if (terminal(head) or !std.mem.eql(u8, &head.id, &lock.id) or
@@ -526,7 +535,10 @@ pub fn readOwnerInputs(txn: anytype, lookup: Lookup, ordinal: u16, context: anyt
 }
 
 fn requireLock(txn: anytype, head: barriers.Head) !void {
-    if (head.retirement_root) |root| {
+    if (head.initial_partition) |birth| {
+        const lock = (try lifecycle.read(txn, head.metadata_group_id, head.table_id)) orelse return error.GenerationPublicationChanged;
+        if (lock.kind != .initial_support or !std.mem.eql(u8, &lock.id, &birth.initial_id)) return error.GenerationPublicationChanged;
+    } else if (head.retirement_root) |root| {
         try @import("../retirement/table/ledger.zig").requireBorrowedLock(txn, root, retirementCohort(head), head.table_id);
     } else {
         const lock = (try lifecycle.read(txn, head.metadata_group_id, head.table_id)) orelse return error.GenerationPublicationChanged;
@@ -602,7 +614,10 @@ fn stageTerminal(txn: anytype, head: barriers.Head, foreign_constraints: u16) !v
         try txn.delete(rename_key);
     }
     try txn.delete(try storageKey(Lookup.fromHead(head), .active, 0, .ready).encode(&buf));
-    if (head.retirement_root) |root| {
+    if (head.initial_partition) |birth| {
+        if (head.phase == .succeeded)
+            try lifecycle.release(txn, head.metadata_group_id, head.table_id, .{ .kind = .initial_support, .id = birth.initial_id });
+    } else if (head.retirement_root) |root| {
         if (head.phase == .canceled) try @import("../retirement/table/ledger.zig").finishCohort(txn, root, retirementCohort(head), false) else try lifecycle.release(txn, head.metadata_group_id, head.table_id, .{ .kind = .schema_validation, .id = head.id });
     } else try lifecycle.release(txn, head.metadata_group_id, head.table_id, .{ .kind = .schema_validation, .id = head.id });
 }
@@ -631,7 +646,7 @@ pub fn checkBegin(alloc: A, txn: anytype, prepared: *const plan_mod.Prepared, pr
             const cached = (prepared.type_request orelse return error.InvalidGenerationPublication).value;
             if (!std.mem.eql(u8, &try types.boundDigest(alloc, try types.observation(alloc, cached)), &try types.boundDigest(alloc, try types.observation(alloc, actual.request))) or
                 prepared.type_after == null or prepared.type_after.?.id != actual.after.identity.id or prepared.type_after.?.generation != actual.after.identity.generation) return error.InvalidGenerationPublication;
-        } else if (decoded.value.retirement_root != null) {
+        } else if (decoded.value.retirement_root != null or decoded.value.partition_guards != null or decoded.value.initial_partition != null) {
             // The immutable root authority was compared by requireProgress;
             // this cohort has no independent type/sequence mutation intent.
             if (prepared.type_request != null or prepared.type_after != null or prepared.sequence_request != null) return error.InvalidGenerationPublication;
@@ -697,6 +712,9 @@ pub fn checkBegin(alloc: A, txn: anytype, prepared: *const plan_mod.Prepared, pr
             if (prepared.head.retirement_root) |root| {
                 const selected = (try @import("../retirement/table/ledger.zig").member(txn, lookup.group, table)) orelse return error.GenerationPublicationChanged;
                 if (!std.meta.eql(selected.root, root.root) or lock == null or lock.?.kind != .table_retirement or !std.mem.eql(u8, &lock.?.id, &root.root.id)) return error.GenerationPublicationChanged;
+            } else if (prepared.head.initial_partition) |birth| {
+                if (table != prepared.head.table_id or lock == null or lock.?.kind != .initial_support or
+                    !std.mem.eql(u8, &lock.?.id, &birth.initial_id)) return error.GenerationPublicationChanged;
             } else if (lock != null) return error.GenerationPublicationChanged;
         }
     } else {
@@ -713,6 +731,15 @@ pub fn begin(alloc: A, txn: anytype, prepared: *const plan_mod.Prepared, prepara
     const lookup = Lookup.fromHead(prepared.head);
     var buf: [192]u8 = undefined;
     // No expected admission/CAS rejection may be swallowed after this point.
+    if (prepared.head.initial_partition != null) {
+        const Context = switch (@typeInfo(@TypeOf(context))) {
+            .pointer => |pointer| pointer.child,
+            else => @TypeOf(context),
+        };
+        if (comptime @hasDecl(Context, "stageInitialPartitionAdmission")) {
+            try context.stageInitialPartitionAdmission(txn, prepared.head);
+        } else return error.InvalidGenerationPublication;
+    }
     if (prepared.type_request) |request| {
         const Context = switch (@typeInfo(@TypeOf(context))) {
             .pointer => |pointer| pointer.child,
@@ -749,7 +776,7 @@ pub fn begin(alloc: A, txn: anytype, prepared: *const plan_mod.Prepared, prepara
     }
     if (prepared.head.retirement_root) |root| {
         try @import("../retirement/table/ledger.zig").stageCohort(txn, root, retirementCohort(prepared.head));
-    } else try lifecycle.acquire(txn, lookup.group, lookup.table, .{ .kind = .schema_validation, .id = lookup.id });
+    } else if (prepared.head.initial_partition == null) try lifecycle.acquire(txn, lookup.group, lookup.table, .{ .kind = .schema_validation, .id = lookup.id });
     if (prepared.participants) |directory| {
         const encoded = try plan_mod.ParticipantsRecord.init(directory);
         try txn.put(try storageKey(lookup, .participants, 0, .ready).encode(&buf), encoded.slice());
@@ -4659,4 +4686,21 @@ test "schema validation publication sequence cancellation retains exact outcome 
     try TestContext.requireCohort(&read, plan, false);
     try std.testing.expectEqual(.Canceled, (try retainedSequenceOutcome(&read, 1, request, digest, 1)).?.rejected);
     try verifyGroup(a, &read, 1, &context);
+}
+
+test "schema validation publication partition manifests require the partition decoder" {
+    const protocol = @import("../topology_protocol.zig");
+    const fixtures = [_]struct { manifest: []const u8, version: u16 }{
+        .{ .manifest = "{\"begin\":{\"plan\":{\"selection\":{\"partition_membership\":{}}}}}", .version = protocol.sql_partition_membership_version },
+        .{ .manifest = "{\"begin\":{\"plan\":{\"partition_guar\\u0064s\":{}}}}", .version = protocol.sql_partition_membership_version },
+        .{ .manifest = "{\"annotation\":\"partition_membership\",\"partition_guards\":null}", .version = protocol.schema_validation_publication_version },
+    };
+    for (fixtures) |fixture| {
+        var frame: [512]u8 = @splat(0);
+        const length = 48 + fixture.manifest.len;
+        @memcpy(frame[0..8], begin_magic);
+        std.mem.writeInt(u32, frame[8..12], @intCast(fixture.manifest.len), .little);
+        @memcpy(frame[16..][0..fixture.manifest.len], fixture.manifest);
+        try std.testing.expectEqual(fixture.version, requiredDecoderVersion(frame[0..length]));
+    }
 }

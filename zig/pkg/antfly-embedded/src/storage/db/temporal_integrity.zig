@@ -19,9 +19,9 @@
 //! Pending writes are sorted once; memoized skips keep a long deleted chain
 //! from becoming quadratic when a batch replaces many neighboring intervals.
 const std = @import("std");
-const contract = @import("relational_integrity_contract.zig");
+const contract = @import("relational/integrity/contract.zig");
 const temporal = @import("temporal_integrity_contract.zig");
-const ranges = @import("../../sql/range_value.zig");
+const ranges = @import("../../sql/range/value.zig");
 const A = std.mem.Allocator;
 const Operation = contract.Operation;
 const Claim = temporal.Claim;

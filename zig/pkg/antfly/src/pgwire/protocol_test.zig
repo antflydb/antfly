@@ -3364,6 +3364,42 @@ test "pgwire COPY input batches transactional typed rows across simple and exten
     };
 }
 
+test "pgwire COPY FREEZE requires generation admission before the handshake" {
+    const a = std.testing.allocator;
+    const Reference = struct { freeze: struct { id: []const u8, sql: []const u8 } };
+    const reference = try std.json.parseFromSlice(Reference, a, @embedFile("fixtures/copy_input_reference.json"), .{ .ignore_unknown_fields = true });
+    defer reference.deinit();
+    try std.testing.expectEqualStrings("sql-0372", reference.value.freeze.id);
+    const sql = reference.value.freeze.sql;
+    for ([_]bool{ true, false }) |simple| {
+        var input: std.Io.Writer.Allocating = .init(a);
+        defer input.deinit();
+        try startup(&input.writer);
+        if (simple) {
+            const query = try std.fmt.allocPrintSentinel(a, "{s}", .{sql}, 0);
+            defer a.free(query);
+            try frame(&input.writer, 'Q', query[0 .. query.len + 1]);
+        } else {
+            try parse(&input.writer, "q", sql, false);
+            try bind(&input.writer, "p", "q", null);
+            try frame(&input.writer, 'D', "Pp\x00");
+            try execute(&input.writer, "p", 0);
+            try frame(&input.writer, 'S', "");
+        }
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .copy_in = .{ .freeze = true } };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        const messages = try tags(a, output.written());
+        defer a.free(messages);
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "G"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, messages, "E"));
+        try std.testing.expectEqual(@as(usize, 0), mock.executions);
+        try std.testing.expectEqual(@as(usize, 0), mock.copy_batches);
+        if (!simple) try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, messages, "n"));
+    }
+}
+
 test "pgwire COPY input aborts an implicit transaction after a staged batch and drains queued data" {
     const a = std.testing.allocator;
     for ([_]bool{ true, false }) |copy_fail| {
@@ -3911,4 +3947,81 @@ test "pgwire warm descriptions survive prepared close and bound writes reject a 
         try std.testing.expectEqual(@as(usize, if (change_at == 3) 0 else 1), mock.executions);
         try std.testing.expectEqual(change_at == 3, std.mem.indexOf(u8, output.written(), "40001") != null);
     }
+}
+
+test "pgwire logical walsender authenticates before CopyBoth and serializes feedback and stop" {
+    const a = std.testing.allocator;
+    const frontend = @import("logical_replication_frontend.zig");
+    const Fixture = struct {
+        mock: Mock = .{},
+        actions: usize = 0,
+        feedback_seen: bool = false,
+        stopped: bool = false,
+        closed: bool = false,
+
+        fn open(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, _: backend.Request) !frontend.Port {
+            const mock: *Mock = @ptrCast(@alignCast(raw));
+            const self: *@This() = @fieldParentPtr("mock", mock);
+            try std.testing.expectEqual(@as(usize, 1), mock.authentications);
+            return .{ .ptr = self, .vtable = &.{ .command = command, .poll = poll, .feedback = acknowledge, .stop = stop, .heartbeat = heartbeat, .close = close } };
+        }
+        fn command(raw: *anyopaque, _: std.mem.Allocator, _: backend.Request, action: frontend.commands.Command) !frontend.Reply {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.actions += 1;
+            return switch (action) {
+                .identify_system => .{ .identity = .{
+                    .identity = .{ .realm = .{ .group_id = 1, .database_id = 1, .incarnation = @splat('1') }, .system_identifier = 31, .timeline = 1, .database_oid = 1 },
+                    .lsn = 1,
+                    .database = "db",
+                } },
+                .start => .started,
+                else => error.UnexpectedCommand,
+            };
+        }
+        fn poll(_: *anyopaque, _: std.mem.Allocator, _: backend.Request, _: *std.Io.Writer) !bool {
+            return false;
+        }
+        fn acknowledge(raw: *anyopaque, _: std.mem.Allocator, _: backend.Request, bytes: []const u8, _: *std.Io.Writer) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualStrings("feedback", bytes);
+            self.feedback_seen = true;
+        }
+        fn stop(raw: *anyopaque, _: std.mem.Allocator, _: backend.Request) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.feedback_seen);
+            self.stopped = true;
+        }
+        fn heartbeat(_: *anyopaque, _: std.mem.Allocator, _: backend.Request) !void {}
+        fn close(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closed = true;
+            return true;
+        }
+    };
+    var fixture: Fixture = .{};
+    var source = fixture.mock.source();
+    var methods = source.vtable.*;
+    methods.open_replication = Fixture.open;
+    source.vtable = &methods;
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try startupOptions(&input.writer, "replication\x00database\x00");
+    try frame(&input.writer, 'Q', "IDENTIFY_SYSTEM\x00");
+    try frame(&input.writer, 'Q', "START_REPLICATION SLOT testslot LOGICAL 0/1 (proto_version '1', publication_names 'p')\x00");
+    try frame(&input.writer, 'd', "feedback");
+    try frame(&input.writer, 'c', "");
+    try frame(&input.writer, 'X', "");
+    var reader = std.Io.Reader.fixed(input.written());
+    var output = std.Io.Writer.Allocating.init(a);
+    defer output.deinit();
+    {
+        var session: protocol.Session = .{ .alloc = a, .io = std.testing.io, .source = source, .reader = &reader, .writer = &output.writer };
+        defer session.deinit();
+        try session.run();
+    }
+    try std.testing.expectEqual(@as(usize, 2), fixture.actions);
+    try std.testing.expect(fixture.stopped and fixture.closed);
+    const messages = try tags(a, output.written());
+    defer a.free(messages);
+    try std.testing.expect(std.mem.indexOf(u8, messages, "WcCZ") != null);
 }

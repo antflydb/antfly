@@ -19,7 +19,9 @@ const std = @import("std");
 const sessions = @import("transactions.zig");
 const integrity = @import("antfly_local_sources").api_relational_integrity_commit;
 const contract = @import("antfly_local_sources").api_distributed_txn_contract;
-const types = @import("antfly_local_sources").storage_db_types;
+const local = @import("antfly_local_sources");
+const types = local.storage_db_types;
+const generations = @import("../metadata/sql/relation_lifecycle/generation_intents.zig");
 
 /// Statement-only trigger effects have no row key to create a table entry.
 /// Retain their exact server-resolved physical binding in the same durable
@@ -59,6 +61,7 @@ pub fn apply(alloc: std.mem.Allocator, candidate: *sessions.OwnedTransactionComm
         if (update.sql_persistence != null and !std.meta.eql(update.sql_persistence, persistence)) return error.CatalogGenerationChanged;
         try candidate.bindWithPersistence(alloc, label, update.table_name, persistence);
         for (candidate.tables) |*table| if (std.mem.eql(u8, candidate.physicalName(table.table_name), update.table_name)) {
+            if (update.document_revision_handoffs.len != 0) try table.mergeDocumentRevisions(alloc, update.document_revision_handoffs);
             var writes: std.ArrayList(types.BatchWrite) = .empty;
             defer writes.deinit(alloc);
             var deletes: std.ArrayList([]const u8) = .empty;
@@ -106,6 +109,8 @@ pub fn apply(alloc: std.mem.Allocator, candidate: *sessions.OwnedTransactionComm
             .batch = .{ .writes = writes, .deletes = @constCast(update.deletes) },
             .predicates = .{ .items = @constCast(update.predicates), .capacity = update.predicates.len, .pointer_stability = .{} },
         }};
+        defer if (entry[0].document_revisions) |*held| held.deinit();
+        if (update.document_revision_handoffs.len != 0) try entry[0].mergeDocumentRevisions(alloc, update.document_revision_handoffs);
         var binding = [_]sessions.CatalogBinding{.{ .logical = label, .physical = update.table_name, .sql_persistence = persistence }};
         const request: sessions.OwnedTransactionCommitRequest = .{ .tables = &entry, .catalog_bindings = .{ .items = &binding, .capacity = binding.len, .pointer_stability = .{} } };
         try candidate.mergeFrom(alloc, &request);
@@ -123,11 +128,67 @@ pub fn validate(server: anytype, alloc: std.mem.Allocator, previous: ?*const ses
 }
 
 pub fn validateWithEvents(server: anytype, alloc: std.mem.Allocator, previous: ?*const sessions.OwnedTransactionCommitRequest, candidate: *sessions.OwnedTransactionCommitRequest, statement: *const sessions.OwnedTransactionCommitRequest, events: []const contract.TableCommitRequest, context: @import("antfly_local_sources").api_operation.RequestContext) !void {
+    return validateWithGenerations(server, alloc, previous, candidate, statement, events, context, null);
+}
+
+pub fn validateWithGenerations(server: anytype, alloc: std.mem.Allocator, previous: ?*const sessions.OwnedTransactionCommitRequest, candidate: *sessions.OwnedTransactionCommitRequest, statement: *const sessions.OwnedTransactionCommitRequest, events: []const contract.TableCommitRequest, context: local.api_operation.RequestContext, generations_view: ?*const generations.Pending) !void {
     var original = try statement.clone(alloc);
     defer original.deinit(alloc);
     const incoming_view = try original.distributedTables(alloc);
     defer incoming_view.deinit();
-    const incoming = incoming_view.tables;
+    const pending = generations_view orelse return validatePublished(server, alloc, previous, candidate, incoming_view.tables, events, context, null);
+    if (pending.entries.items.len == 0) return validatePublished(server, alloc, previous, candidate, incoming_view.tables, events, context, null);
+
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var published: std.ArrayList(contract.TableCommitRequest) = .empty;
+    var private: std.ArrayList(contract.TableCommitRequest) = .empty;
+    for (incoming_view.tables) |table| {
+        if (pending.ownsPhysical(table.table_name)) try private.append(a, table) else try published.append(a, table);
+    }
+    if (private.items.len != 0) try validatePrivate(alloc, a, pending, previous, candidate, private.items, context);
+    if (published.items.len == 0) return;
+    var published_events: std.ArrayList(contract.TableCommitRequest) = .empty;
+    for (events) |event| if (!pending.ownsPhysical(event.table_name)) try published_events.append(a, event);
+    return validatePublished(server, alloc, previous, candidate, published.items, published_events.items, context, pending);
+}
+
+fn validatePrivate(alloc: std.mem.Allocator, a: std.mem.Allocator, pending: *const generations.Pending, previous: ?*const sessions.OwnedTransactionCommitRequest, candidate: *sessions.OwnedTransactionCommitRequest, incoming: []const contract.TableCommitRequest, context: local.api_operation.RequestContext) !void {
+    const records = try a.alloc(local.common_topology_records.TableRecord, incoming.len);
+    for (incoming, records) |table, *record| {
+        var physical: [16]u8 = undefined;
+        _ = std.fmt.hexToBytes(&physical, table.table_name[6..]) catch return error.CatalogGenerationChanged;
+        const entry = for (pending.entries.items) |entry| {
+            if (std.mem.eql(u8, &entry.physical, &physical)) break entry;
+        } else return error.CatalogGenerationChanged;
+        if (!entry.sameDeclaration(pending.latest(entry.target) orelse return error.CatalogGenerationChanged)) return error.CatalogGenerationChanged;
+        const prepared = try entry.prepared(a);
+        if (prepared.child.table_id != entry.generation or !std.mem.eql(u8, prepared.child.name, table.table_name) or
+            !std.meta.eql(prepared.child.sql_persistence, table.sql_persistence) or table.relational_schema_version == null)
+            return error.CatalogGenerationChanged;
+        record.* = prepared.child;
+    }
+    var prior: std.ArrayList(contract.TableCommitRequest) = .empty;
+    if (previous) |before| {
+        const view = try before.distributedTables(a);
+        for (view.tables) |table| {
+            for (records) |record| {
+                if (!std.mem.eql(u8, table.table_name, record.name)) continue;
+                try prior.append(a, table);
+                break;
+            }
+        }
+    }
+    var historical = context;
+    // Private declarations have no published trigger or FK authority.
+    historical.table_triggers = null;
+    var prepared = try integrity.preparePrivateSessionStatement(alloc, records, prior.items, incoming, historical, candidate.constraint_timing.items);
+    defer prepared.deinit();
+    try apply(alloc, candidate, prepared.tables);
+}
+
+fn validatePublished(server: anytype, alloc: std.mem.Allocator, previous: ?*const sessions.OwnedTransactionCommitRequest, candidate: *sessions.OwnedTransactionCommitRequest, incoming: []const contract.TableCommitRequest, events: []const contract.TableCommitRequest, context: local.api_operation.RequestContext, pending: ?*const generations.Pending) !void {
     try server.validateCommitTablesAgainstSchema(context, incoming);
     const selected = (try server.selectIntegritySnapshot(alloc, incoming, context)) orelse return;
     var snapshot = selected.snapshot;
@@ -137,7 +198,15 @@ pub fn validateWithEvents(server: anytype, alloc: std.mem.Allocator, previous: ?
     defer before.deinit(alloc);
     const staged_view = try before.distributedTables(alloc);
     defer staged_view.deinit();
-    const staged = staged_view.tables;
+    const staged = if (pending) |declarations| filtered: {
+        var published_count: usize = 0;
+        for (staged_view.tables) |table| {
+            if (declarations.ownsPhysical(table.table_name)) continue;
+            staged_view.tables[published_count] = table;
+            published_count += 1;
+        }
+        break :filtered staged_view.tables[0..published_count];
+    } else staged_view.tables;
     var prepared = (if (events.len == 0) integrity.prepareSessionStatementWithTiming(alloc, server.table_reads orelse return error.IntegrityCatalogUnavailable, snapshot.tables, snapshot.ranges, staged, incoming, context, candidate.constraint_timing.items) else integrity.prepareSessionCommandWithTiming(alloc, server.table_reads orelse return error.IntegrityCatalogUnavailable, snapshot.tables, snapshot.ranges, staged, incoming, events, context, candidate.constraint_timing.items)) catch |err| refreshed: {
         // This is read-only preparation of an unpublished session candidate,
         // not a retry of staging or commit. Share REST's bounded authoritative

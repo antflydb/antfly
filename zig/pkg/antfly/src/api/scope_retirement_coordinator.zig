@@ -27,34 +27,29 @@ pub fn step(server: *Server, after: u64, context: local.api_operation.RequestCon
     return stepInternal(server, after, context, null);
 }
 
-/// Standalone has no separate metadata API maintenance issuer. Its closing
-/// source continues only this retained TEMP ancestor after broad maintenance
-/// joins. The same metadata-leader gate and native journal govern each step.
-pub fn stepRetainedTemporary(server: *Server, expected: scopes.Head, context: local.api_operation.RequestContext) !void {
-    try expected.validate();
-    if (expected.temporary_owner == null) return error.InvalidScopeRetirement;
-    _ = try stepInternal(server, expected.sequence - 1, context, expected);
+/// The TEMP close probe captures this exact work with the accepted owner
+/// and reservation receipt. Background queue order does not affect close.
+pub fn stepRetainedTemporary(server: *Server, work: scopes.Work, context: local.api_operation.RequestContext) !void {
+    try work.head.validate();
+    if (work.head.temporary_owner == null or !work.head.active()) return error.InvalidScopeRetirement;
+    _ = try stepInternal(server, work.head.sequence - 1, context, work);
 }
 
-fn stepInternal(server: *Server, after: u64, context: local.api_operation.RequestContext, retained_head: ?scopes.Head) !u64 {
-    const group = server.cfg.prepared_transaction_group_id;
-    if (server.cfg.prepared_transaction_leadership) |leadership| {
-        if (!leadership.isLocalLeader(group)) return after;
-    } else if (server.cfg.deployment_mode != .standalone) return after;
+fn stepInternal(server: *Server, after: u64, context: local.api_operation.RequestContext, retained_work: ?scopes.Work) !u64 {
+    const group = if (retained_work) |work| work.head.lookup.group else server.cfg.prepared_transaction_group_id;
+    const leads_metadata = if (server.cfg.prepared_transaction_leadership) |leadership|
+        leadership.isLocalLeader(group)
+    else
+        server.cfg.deployment_mode == .standalone;
+    const drive_child = if (retained_work) |work| work.head.progress.phase == .retiring_tables else false;
+    if (!leads_metadata and !drive_child) return after;
     var arena = std.heap.ArenaAllocator.init(server.alloc);
     defer arena.deinit();
     const a = arena.allocator();
-    const work = (try std.json.parseFromSliceLeaky(?scopes.Work, a, try server.source.systemCatalog(a, context, .{ .scope_retirement_work = after }), .{})) orelse return 0;
+    const work = retained_work orelse ((try std.json.parseFromSliceLeaky(?scopes.Work, a, try server.source.systemCatalog(a, context, .{ .scope_retirement_work = after }), .{})) orelse return 0);
     const head = work.head;
     try head.validate();
     if (head.lookup.group != group) return error.InvalidScopeRetirement;
-    if (retained_head) |retained| {
-        if (head.sequence < retained.sequence) return error.InvalidScopeRetirement;
-        // A completed ancestor can leave the active feed before this read.
-        // Reobserve its durable outcome instead of executing a later root.
-        if (head.sequence > retained.sequence) return after;
-        if (!std.meta.eql(head.lookup, retained.lookup) or !std.mem.eql(u8, &head.metadata_incarnation, &retained.metadata_incarnation) or !std.mem.eql(u8, &head.target_digest, &retained.target_digest) or !head.creator.eql(retained.creator) or head.force != retained.force or head.temporary_owner == null or !head.temporary_owner.?.eql(retained.temporary_owner.?)) return error.InvalidScopeRetirement;
-    }
     var nonce: [16]u8 = undefined;
     const io = server.sharedApiIo() orelse return error.MissingBackendRuntimeIo;
     try io.randomSecure(&nonce);
@@ -111,6 +106,7 @@ fn stepInternal(server: *Server, after: u64, context: local.api_operation.Reques
             const admitted = try std.json.parseFromSliceLeaky(receipts.Observation, a, try server.source.systemCatalog(a, context, .{ .table_retirement_receipt = expected }), .{});
             try admitted.requireFor(expected);
             if (!admitted.accepted) {
+                if (!leads_metadata) return head.sequence;
                 const command = try (roots.Command{ .scope_begin = child }).encodeAlloc(a);
                 _ = try server.source.systemCatalog(a, context, .{ .table_retirement_submit = command });
                 return head.sequence;
@@ -118,7 +114,13 @@ fn stepInternal(server: *Server, after: u64, context: local.api_operation.Reques
             const bytes = try server.source.systemCatalog(a, context, .{ .table_retirement_owner_work = lookup });
             const current = try std.json.parseFromSliceLeaky(roots.Work, a, bytes, .{});
             if (!std.meta.eql(current.head.scope.parent, @as(?scopes.Child, child))) return error.InvalidScopeRetirement;
-            if (current.head.phase != .physical_ready) return head.sequence;
+            if (current.head.phase != .physical_ready) {
+                // A retiring TEMP source can drive its own admitted child
+                // after the ordinary maintenance lane has been joined.
+                if (retained_work != null) try @import("table_retirement_coordinator.zig").stepObservedScopeChild(server, a, child, current, context);
+                return head.sequence;
+            }
+            if (!leads_metadata) return head.sequence;
             break :blk .{ .child_ready = .{ .lookup = head.lookup, .expected_revision = head.progress.revision, .ordinal = child.ordinal } };
         },
         .publishing_catalog => .{ .publish = .{ .lookup = head.lookup, .expected_revision = head.progress.revision } },
@@ -146,57 +148,40 @@ test "SQL relation lifetime standalone cleanup keeps metadata leadership and exa
     };
     try head.validate();
     const Spy = struct {
-        head: scopes.Head,
         calls: usize = 0,
         fn status(_: *anyopaque) anyerror!@import("../metadata/api.zig").MetadataStatus {
             return error.TestUnexpectedStatusRead;
         }
-        fn catalog(raw: *anyopaque, alloc: std.mem.Allocator, _: local.api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) anyerror![]u8 {
+        fn catalog(raw: *anyopaque, _: std.mem.Allocator, _: local.api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) anyerror![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
-            if (call != .scope_retirement_work or call.scope_retirement_work != 0) return error.TestUnexpectedRetirementEffect;
-            return std.json.Stringify.valueAlloc(alloc, @as(?scopes.Work, .{ .head = self.head, .child = null }), .{});
+            if (call != .scope_retirement_submit) return error.TestUnexpectedRetirementEffect;
+            try std.testing.expectEqual(@as(u64, 2188), call.scope_retirement_submit.operation.drain.lookup.group);
+            return error.TestCapturedRetirementEffect;
         }
         fn notLeader(_: *anyopaque, group: u64) bool {
             std.debug.assert(group == 2188);
             return false;
         }
     };
-    var spy: Spy = .{ .head = head };
-    var server = Server.init(a, .{ .deployment_mode = .distributed, .prepared_transaction_group_id = 2188 }, .{ .ptr = &spy, .vtable = &.{ .status = Spy.status, .system_catalog = Spy.catalog } }, null, null);
+    var spy: Spy = .{};
+    var server = Server.init(a, .{ .deployment_mode = .distributed, .prepared_transaction_group_id = 777, .imported_runtime_io = .{ .api = std.testing.io } }, .{ .ptr = &spy, .vtable = &.{ .status = Spy.status, .system_catalog = Spy.catalog } }, null, null);
     defer server.deinit();
     const context: local.api_operation.RequestContext = .{ .setting_admin = true, .schema_validation_authority = true, .fk_generation_publication_authority = true };
-    try stepRetainedTemporary(&server, head, context);
+    const exact: scopes.Work = .{ .head = head, .child = null };
+    try stepRetainedTemporary(&server, exact, context);
     try std.testing.expectEqual(@as(usize, 0), spy.calls);
     server.cfg.deployment_mode = .standalone;
     server.cfg.prepared_transaction_leadership = .{ .ptr = &spy, .vtable = &.{ .is_local_leader = Spy.notLeader } };
-    try stepRetainedTemporary(&server, head, context);
+    try stepRetainedTemporary(&server, exact, context);
     try std.testing.expectEqual(@as(usize, 0), spy.calls);
     server.cfg.prepared_transaction_leadership = null;
-    spy.head.sequence = 2;
-    spy.head.lookup.reference.id = @splat(9);
-    spy.head.progress.reference = spy.head.lookup.reference;
-    try spy.head.validate();
-    // Completion may replace this feed item with a later unrelated ancestor.
-    // It is observed only; this caller cannot execute that other root.
-    try stepRetainedTemporary(&server, head, context);
+    try std.testing.expectError(error.TestCapturedRetirementEffect, stepRetainedTemporary(&server, exact, context));
     try std.testing.expectEqual(@as(usize, 1), spy.calls);
-    spy.head = head;
-    spy.head.temporary_owner.?.connection_generation += 1;
-    try spy.head.validate();
-    try std.testing.expectError(error.InvalidScopeRetirement, stepRetainedTemporary(&server, head, context));
-    spy.head = head;
-    spy.head.metadata_incarnation[0] ^= 1;
-    try spy.head.validate();
-    try std.testing.expectError(error.InvalidScopeRetirement, stepRetainedTemporary(&server, head, context));
-    spy.head = head;
-    spy.head.target_digest[0] ^= 1;
-    try spy.head.validate();
-    try std.testing.expectError(error.InvalidScopeRetirement, stepRetainedTemporary(&server, head, context));
     var ordinary = head;
     ordinary.temporary_owner = null;
     try ordinary.validate();
     const calls = spy.calls;
-    try std.testing.expectError(error.InvalidScopeRetirement, stepRetainedTemporary(&server, ordinary, context));
+    try std.testing.expectError(error.InvalidScopeRetirement, stepRetainedTemporary(&server, .{ .head = ordinary, .child = null }, context));
     try std.testing.expectEqual(calls, spy.calls);
 }

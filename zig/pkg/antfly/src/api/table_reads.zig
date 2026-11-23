@@ -2613,7 +2613,7 @@ pub const BoundTableReadSource = struct {
         defer if (epoch) |*view| view.release();
         if (epoch == null or epoch.?.storageMode() == .document) {
             const session = try self.db.openDocumentReadSession(alloc, from_key, to_key, opts);
-            return .{ .text_filter_digest = if (session.text) |text| text.query_digest else null, .ptr = session, .vtable = &.{ .next = nextDocumentPage, .close = closeDocumentRead, .normalize = normalizeDocumentRows } };
+            return .{ .text_filter_digest = session.textFilterDigest(), .required_indexes_digest = session.requiredIndexesDigest(), .ptr = session, .vtable = &.{ .next = nextDocumentPage, .close = closeDocumentRead, .normalize = normalizeDocumentRows } };
         }
         const session = try self.db.openRelationalReadSession(alloc, from_key, to_key, opts);
         return .{ .ptr = session, .vtable = &.{ .next = nextRelationalPage, .close = closeRelationalRead, .normalize = normalizeRelationalRows } };
@@ -3905,7 +3905,7 @@ pub const ProvisionedTableReadSource = struct {
             const retained = try alloc.create(Single);
             errdefer alloc.destroy(retained);
             retained.* = .{ .alloc = alloc, .statement = try openRelationalStatement(ptr, alloc, &.{.{ .table = table, .from = from, .to = to, .opts = opts }}, consistency) };
-            return .{ .text_filter_digest = retained.statement.views[0].text_filter_digest, .ptr = retained, .vtable = &.{ .next = Single.next, .close = Single.close, .normalize = Single.normalize } };
+            return .{ .text_filter_digest = retained.statement.views[0].text_filter_digest, .required_indexes_digest = retained.statement.views[0].required_indexes_digest, .ptr = retained, .vtable = &.{ .next = Single.next, .close = Single.close, .normalize = Single.normalize } };
         }
         if (self.local_read_source == null) return null;
         var prepared = try self.prepareRoutedSpanRead(alloc, table, from, to, .{ .scan = .{ .from_key = from, .to_key = to, .opts = opts } }, consistency, .general);
@@ -3919,7 +3919,7 @@ pub const ProvisionedTableReadSource = struct {
             const retained = try alloc.create(RetainedSingleOwnerRead);
             retained.* = .{ .alloc = alloc, .prepared = prepared, .view = combined };
             transferred = true;
-            return .{ .text_filter_digest = combined.text_filter_digest, .ptr = retained, .vtable = &.{ .next = RetainedSingleOwnerRead.next, .close = RetainedSingleOwnerRead.close, .normalize = RetainedSingleOwnerRead.normalize } };
+            return .{ .text_filter_digest = combined.text_filter_digest, .required_indexes_digest = combined.required_indexes_digest, .ptr = retained, .vtable = &.{ .next = RetainedSingleOwnerRead.next, .close = RetainedSingleOwnerRead.close, .normalize = RetainedSingleOwnerRead.normalize } };
         }
         const local_source = self.groupLocalSourceWithFence(prepared.fenceAt(0, opts.execution_deadline_ns, opts.cancellation));
         const view = (try local_source.openRelationalReadGroupLocal(alloc, prepared.group_ids[0], table, from, to, opts, .stale)) orelse return null;
@@ -3927,7 +3927,7 @@ pub const ProvisionedTableReadSource = struct {
         const retained = try alloc.create(RetainedSingleOwnerRead);
         retained.* = .{ .alloc = alloc, .prepared = prepared, .view = view };
         transferred = true;
-        return .{ .text_filter_digest = view.text_filter_digest, .ptr = retained, .vtable = &.{ .next = RetainedSingleOwnerRead.next, .close = RetainedSingleOwnerRead.close, .normalize = RetainedSingleOwnerRead.normalize } };
+        return .{ .text_filter_digest = view.text_filter_digest, .required_indexes_digest = view.required_indexes_digest, .ptr = retained, .vtable = &.{ .next = RetainedSingleOwnerRead.next, .close = RetainedSingleOwnerRead.close, .normalize = RetainedSingleOwnerRead.normalize } };
     }
 
     fn openCoordinatedRelationalRead(self: *ProvisionedTableReadSource, alloc: std.mem.Allocator, prepared: *PreparedSpanRead, table: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions) !@import("antfly_local_sources").api_table_read_source.RelationalReadView {
@@ -4124,16 +4124,28 @@ pub const ProvisionedTableReadSource = struct {
                 for (jobs[0..count]) |job| if (job.failure) |err| return err;
             }
         }
+        fn containsTable(ptr: *anyopaque, table_id: u64) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            for (self.cuts) |cut| if (cut.prepared.table_id == table_id) return true;
+            return false;
+        }
+
+        fn capturedTable(self: *@This(), table: []const u8, table_id: ?u64) !*BoundTableReadSource.CoordinatedStatementSnapshot {
+            for (self.cuts) |*cut| {
+                if (!std.mem.eql(u8, cut.table, table)) continue;
+                if (table_id) |id| if (cut.prepared.table_id != id) return error.CatalogGenerationChanged;
+                return cut;
+            }
+            return error.SqlStatementSnapshotRequired;
+        }
+
         fn open(ptr: *anyopaque, alloc: std.mem.Allocator, input: @import("antfly_local_sources").api_table_read_source.RelationalStatementScan) !@import("antfly_local_sources").api_table_read_source.RelationalReadView {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            for (self.cuts) |*cut| if (std.mem.eql(u8, cut.table, input.table)) return BoundTableReadSource.CoordinatedStatementSnapshot.open(cut, alloc, input);
-            return error.SqlStatementSnapshotRequired;
+            return BoundTableReadSource.CoordinatedStatementSnapshot.open(try self.capturedTable(input.table, input.table_id), alloc, input);
         }
         fn openGuarded(ptr: *anyopaque, alloc: std.mem.Allocator, input: @import("antfly_local_sources").api_table_read_source.RelationalStatementScan) !@import("antfly_local_sources").api_table_read_source.RelationalStatementSnapshot.GuardedRead {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            for (self.cuts) |*cut| if (std.mem.eql(u8, cut.table, input.table)) return BoundTableReadSource.CoordinatedStatementSnapshot.openGuarded(cut, alloc, input);
-            // An unseen relation is never recaptured into an existing cut.
-            return error.SqlStatementSnapshotRequired;
+            return BoundTableReadSource.CoordinatedStatementSnapshot.openGuarded(try self.capturedTable(input.table, input.table_id), alloc, input);
         }
         fn graphPage(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, group_id: u64, request: retained_graph_read.Request) !retained_graph_read.Page {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -4286,7 +4298,7 @@ pub const ProvisionedTableReadSource = struct {
             try wait_budget.sleepNs(std.time.ns_per_ms);
         }
         owned.* = .{ .alloc = alloc, .cuts = cuts, .io = if (self.io_impl) |io| io.io() else null };
-        return .{ .ptr = owned, .vtable = &.{ .renew = SnapshotCohort.renew, .open = SnapshotCohort.open, .open_guarded = SnapshotCohort.openGuarded, .graph_page = SnapshotCohort.graphPage, .close = SnapshotCohort.close } };
+        return .{ .ptr = owned, .vtable = &.{ .renew = SnapshotCohort.renew, .contains_table = SnapshotCohort.containsTable, .open = SnapshotCohort.open, .open_guarded = SnapshotCohort.openGuarded, .graph_page = SnapshotCohort.graphPage, .close = SnapshotCohort.close } };
     }
 
     fn finishRelationalStatement(self: *ProvisionedTableReadSource, alloc: std.mem.Allocator, scans: []const @import("antfly_local_sources").api_table_read_source.RelationalStatementScan, consistency: raft_mod.ReadConsistency, retained: *RetainedStatementRead) !@import("antfly_local_sources").api_table_read_source.RelationalStatementRead {
@@ -4443,6 +4455,59 @@ pub const ProvisionedTableReadSource = struct {
         return .{ .ptr = retained, .views = retained.views, .vtable = &.{ .close = RetainedStatementRead.close, .range_proofs = RetainedStatementRead.rangeProofs } };
     }
 
+    fn openFrozenRelationalSpan(ptr: *anyopaque, alloc: std.mem.Allocator, input: table_read_source.RelationalStatementScan, bindings: []const table_read_source.FrozenBinding) !table_read_source.RelationalReadView {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const executor = if (self.distributed_executor != null) self.distributedInternalExecutor() else null;
+        return self.openFrozenRelationalSpanWithExecutor(alloc, input, bindings, executor);
+    }
+
+    fn openFrozenRelationalSpanWithExecutor(self: *ProvisionedTableReadSource, alloc: std.mem.Allocator, input: table_read_source.RelationalStatementScan, bindings: []const table_read_source.FrozenBinding, executor: ?http_common.RequestExecutor) !table_read_source.RelationalReadView {
+        try self.ensureHotStandbyReadAllowed(.read_index);
+        const row_query = input.opts.relational_query orelse return error.SqlStatementSnapshotRequired;
+        const schema_version = row_query.schema_version orelse return error.SqlStatementSnapshotRequired;
+        if (row_query.index != null or row_query.auto_index or row_query.text_filter != null or row_query.reverse or input.opts.include_range_proofs or input.opts.required_sql_indexes.len != 0)
+            return error.SqlStatementSnapshotRequired;
+
+        var prepared = try self.prepareRoutedSpanRead(alloc, input.table, input.from, input.to, .{ .scan = .{ .from_key = input.from, .to_key = input.to, .opts = input.opts } }, .stale, .general);
+        defer prepared.deinit();
+        prepared.releaseActivity();
+        if (input.table_id != prepared.table_id or prepared.group_ids.len == 0 or prepared.group_ids.len > bindings.len)
+            return error.CatalogGenerationChanged;
+
+        const views = try alloc.alloc(table_read_source.RelationalReadView, prepared.group_ids.len);
+        defer alloc.free(views);
+        var opened: usize = 0;
+        errdefer for (views[0..opened]) |view| view.deinit();
+        for (views, 0..) |*view, index| {
+            if (input.opts.cancellation) |token| try token.check();
+            const fence = prepared.fenceAt(index, input.opts.execution_deadline_ns, input.opts.cancellation);
+            const identity = fence.route.identity_namespace;
+            const binding = for (bindings) |candidate| {
+                if (candidate.namespace.table_id == identity.table_id and candidate.namespace.shard_id == identity.shard_id and candidate.namespace.range_id == identity.range_id)
+                    break candidate;
+            } else return error.CatalogGenerationChanged;
+            if (self.distributed_router) |router| {
+                var dispatch = (try table_router.resolveCapturedGroupRoute(alloc, self.catalog, router.withBudget(.fromRequest(input.opts)), fence, .prefer_leader)) orelse return error.GroupLeaderUnavailable;
+                defer dispatch.deinit(alloc);
+                view.* = switch (dispatch) {
+                    .local => try self.groupLocalSourceWithFence(fence).openFrozenRelationalReadGroupLocal(alloc, input.table, binding, input.from, input.to, input.opts),
+                    .remote => |remote| try @import("retained_read_client.zig").Client.openFrozen(alloc, executor orelse return error.SqlStatementSnapshotRequired, remote.base_uri, input.table, fence, schema_version, binding, input.from, input.to, input.opts),
+                };
+            } else {
+                view.* = try self.groupLocalSourceWithFence(fence).openFrozenRelationalReadGroupLocal(alloc, input.table, binding, input.from, input.to, input.opts);
+            }
+            opened += 1;
+        }
+        return @import("../storage/relational_read_set.zig").Set.create(alloc, views, true);
+    }
+
+    fn openFrozenRelationalReadGroupRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, binding: table_read_source.FrozenBinding, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions) !table_read_source.RelationalReadView {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHotStandbyReadAllowed(.read_index);
+        if (self.local_read_source == null) return error.SqlStatementSnapshotRequired;
+        return self.groupLocalSourceWithFence(fence).openFrozenRelationalReadGroupLocal(alloc, table, binding, from, to, opts);
+    }
+
     fn openRelationalReadGroupRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, from_key: []const u8, to_key: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?@import("antfly_local_sources").api_table_read_source.RelationalReadView {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHotStandbyReadAllowed(consistency);
@@ -4590,6 +4655,8 @@ pub const ProvisionedTableReadSource = struct {
             .open_cypher_statement = openCypherStatement,
             .open_relational_statement = openRelationalStatement,
             .open_relational_statement_snapshot = openRelationalStatementSnapshot,
+            .open_frozen_relational_span = openFrozenRelationalSpan,
+            .open_frozen_relational_read_group_local_routed = openFrozenRelationalReadGroupRouted,
             .open_relational_read_group_local_routed = openRelationalReadGroupRouted,
             .try_statement_read_fence_group_local_routed = tryStatementReadFenceGroupRouted,
             .lookup = lookup,
@@ -5900,6 +5967,8 @@ pub const ProvisionedTableReadSource = struct {
             // admission. The owner must not repeat it while apply waits for
             // that admission, so pass only a local, non-wire proof.
             local_opts.fk_generation_source_read_index_certified = opts.fk_generation_source_control and
+                consistency == .read_index and local_source.strict_read_index_absence;
+            local_opts.sql_lock_read_index_certified = opts.sql_lock_query_json.len != 0 and
                 consistency == .read_index and local_source.strict_read_index_absence;
             local_opts.generation_handoff_install_read_index_certified = certifiedHandoffReceipt(opts, consistency, local_source.strict_read_index_absence);
             return local_source.lookupGroupLocal(alloc, group_id, table_name, key, local_opts, .stale) catch |err| switch (err) {
@@ -7559,6 +7628,7 @@ pub const HostedProvisionedTableReadSource = struct {
         return .{
             .admit_statement_read_group_local_routed = admitStatementReadGroupRouted,
             .open_relational_snapshot_cohort = openRelationalSnapshotCohort,
+            .open_frozen_relational_span = openFrozenRelationalSpan,
             .privacy_policy_version = if (with_privacy) privacyPolicyVersion else null,
             .acquire_join_view = JoinReadBinding(HostedProvisionedTableReadSource).acquire,
             .open_relational_read = openRelationalRead,
@@ -7948,12 +8018,37 @@ pub const HostedProvisionedTableReadSource = struct {
         return openRelationalSnapshotCohort(ptr, alloc, &.{.{ .table = table, .schema_version = schema_version }}, consistency, cancellation, deadline_ns);
     }
 
+    fn openFrozenRelationalSpan(ptr: *anyopaque, alloc: std.mem.Allocator, input: table_read_source.RelationalStatementScan, bindings: []const table_read_source.FrozenBinding) !table_read_source.RelationalReadView {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var coordinator = ProvisionedTableReadSource.init(self.replica_root_dir, self.catalog, self.read_safety_barrier);
+        coordinator.local_read_source = self.local_read_source;
+        coordinator.io_impl = self.io_impl;
+        _ = coordinator.withDistributedRouting(self.router, self.executor, self.internal_service_secret, self.internal_service_issuer);
+        // Returned cursors may outlive this routing adapter. Remote requests
+        // continue through the caller-owned hosted executor.
+        const executor: http_common.RequestExecutor = .{ .ptr = self, .clock_io = self.executor.clock_io, .vtable = &.{ .execute = executeRetainedOwnerRequest } };
+        return coordinator.openFrozenRelationalSpanWithExecutor(alloc, input, bindings, executor);
+    }
+
+    fn executeRetainedOwnerRequest(ptr: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var client = http_client.ApiHttpClient.init(alloc, self.executor);
+        _ = client.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
+        // RetainedReadClient sends the exact fence selected when the cursor
+        // opened. Re-resolving it here could attach a second generation.
+        return client.executeRequest(request);
+    }
+
     fn openRelationalSnapshotCohort(ptr: *anyopaque, alloc: std.mem.Allocator, targets: []const table_read_source.RelationalSnapshotTarget, consistency: raft_mod.ReadConsistency, cancellation: ?@import("antfly_cancellation").CancellationToken, deadline_ns: ?u64) !table_read_source.RelationalStatementSnapshot {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         const Owner = struct {
             alloc: std.mem.Allocator,
             coordinator: ProvisionedTableReadSource,
             snapshot: table_read_source.RelationalStatementSnapshot,
+            fn containsTable(raw: *anyopaque, table_id: u64) bool {
+                const owner: *@This() = @ptrCast(@alignCast(raw));
+                return owner.snapshot.containsTable(table_id);
+            }
             fn renew(raw: *anyopaque, renewal_deadline_ns: ?u64) !void {
                 const owner: *@This() = @ptrCast(@alignCast(raw));
                 try owner.snapshot.renew(renewal_deadline_ns);
@@ -7979,7 +8074,7 @@ pub const HostedProvisionedTableReadSource = struct {
         owner.coordinator.io_impl = self.io_impl;
         _ = owner.coordinator.withDistributedRouting(self.router, self.executor, self.internal_service_secret, self.internal_service_issuer);
         owner.snapshot = try ProvisionedTableReadSource.openRelationalSnapshotCohort(&owner.coordinator, alloc, targets, consistency, cancellation, deadline_ns);
-        return .{ .ptr = owner, .vtable = &.{ .renew = Owner.renew, .open = Owner.open, .open_guarded = Owner.openGuarded, .close = Owner.close } };
+        return .{ .ptr = owner, .vtable = &.{ .renew = Owner.renew, .contains_table = Owner.containsTable, .open = Owner.open, .open_guarded = Owner.openGuarded, .close = Owner.close } };
     }
 
     fn openRemoteRelationalRead(self: *HostedProvisionedTableReadSource, alloc: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !table_read_source.RelationalReadView {

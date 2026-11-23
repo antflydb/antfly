@@ -134,7 +134,7 @@ pub const Catalogs = struct {
     pub fn jsonStringify(self: Catalogs, stream: anytype) @TypeOf(stream.*).Error!void {
         // AIDX contains arbitrary generation/count bytes, not UTF-8. Catalog
         // control messages are bounded and occur once per schema/copy epoch.
-        try @import("relational_integrity_json.zig").write(self, stream);
+        try @import("relational/integrity/json.zig").write(self, stream);
     }
 
     /// Compatibility is about definitions, not owner-local physical generation
@@ -242,7 +242,6 @@ pub fn validateRequest(req: anytype) !void {
     try command.validate();
     const empty: @TypeOf(req) = .{};
     inline for (@typeInfo(@TypeOf(req)).@"struct".field_names, @typeInfo(@TypeOf(req)).@"struct".field_types) |reflected_name, field_type| {
-        if (comptime std.mem.eql(u8, reflected_name, "document_version_scheme")) continue;
         if (comptime !std.mem.eql(u8, reflected_name, "artifact_catalog") and !std.mem.eql(u8, reflected_name, "sync_level") and !std.mem.eql(u8, reflected_name, "online_source") and !std.mem.eql(u8, reflected_name, "merge_checkpoint") and !std.mem.eql(u8, reflected_name, "merge_replication")) {
             if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
                 if (@field(req, reflected_name).len != 0) return error.InvalidArtifactCatalogCommand;

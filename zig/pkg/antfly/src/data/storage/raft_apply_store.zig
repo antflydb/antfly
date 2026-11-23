@@ -2515,6 +2515,16 @@ pub const RaftApplyStore = struct {
             try operations.append(alloc, .{ .set_raft_batch_protocol = version });
             return;
         }
+        if (decoded.batch.req.replicationSourcePermit() != null) {
+            if (!native_source_delegate) return error.StorageKernelOwnerUnavailable;
+            try operations.append(alloc, .{ .require_raft_batch_protocol = .{
+                .version = @import("../../common/data_raft_protocol.zig").batch_replication_source_prepare_protocol_version,
+            } });
+            // The native owner stages PREPARE rows and publishes them only
+            // on committed RESOLVE. Projecting their writes here would expose
+            // uncommitted rows and leave them visible after an abort.
+            return;
+        }
         if (@import("../../api/internal_batch_forwarding.zig").graphTransactionProtocol(decoded.batch.req)) |required| {
             // Replay must verify the durable barrier, even if a producer
             // bypassed live preflight or the log is restored without it.

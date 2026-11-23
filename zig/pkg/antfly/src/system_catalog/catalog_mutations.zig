@@ -25,6 +25,15 @@ pub const Preparation = struct {
     command_fence: ?@import("command_fence.zig").Fence = null,
     view: ?@import("views.zig").Request = null,
     relation: ?@import("relations.zig").Intent = null,
+    security_label: ?@import("security_labels.zig").Intent = null,
+
+    pub fn nativeJsonSkipField(self: Preparation, comptime field: []const u8) bool {
+        return std.mem.eql(u8, field, "security_label") and self.security_label == null;
+    }
+
+    pub fn jsonStringify(self: Preparation, writer: anytype) @TypeOf(writer.*).Error!void {
+        try @import("antfly_local_sources").storage_db_relational_integrity_json.write(self, writer);
+    }
 
     /// Remote preparation carries its original fence in the authenticated
     /// request body. In-process callers additionally pin it in their context.
@@ -58,7 +67,9 @@ pub const Target = struct {
     pub fn validateLabels(self: @This()) !void {
         const domain = @import("antfly_local_sources").system_catalog_domain;
         switch (self.kind) {
-            .table, .database, .namespace, .tablespace, .query_source, .view => {},
+            .table, .database, .namespace, .tablespace, .query_source, .view, .collation => {},
+            .publication, .subscription => if (self.action != .create and self.action != .alter and self.action != .drop) return error.InvalidCatalogMutation,
+            .routine => if (self.action != .alter) return error.InvalidCatalogMutation,
             else => return error.InvalidCatalogMutation,
         }
         try domain.validateResourceName(self.kind, self.name);
@@ -100,7 +111,100 @@ pub fn canonicalDigest(tag: []const u8, value: anytype) ![32]u8 {
     return hashing.hasher.finalResult();
 }
 
+fn requirePublicationEnvelope(command: Command) !void {
+    inline for (@typeInfo(Command).@"struct".field_names) |field| {
+        if (comptime std.mem.eql(u8, field, "version") or std.mem.eql(u8, field, "expected_revision") or
+            std.mem.eql(u8, field, "mutation") or std.mem.eql(u8, field, "sql_catalog_admission") or
+            std.mem.eql(u8, field, "sql_publication_ddl") or std.mem.eql(u8, field, "sql_publication_advance") or std.mem.eql(u8, field, "sql_publication_collection_ack") or std.mem.eql(u8, field, "sql_publication_slot_control")) continue;
+        const value = @field(command, field);
+        switch (@typeInfo(@TypeOf(value))) {
+            .optional => if (value != null) return error.InvalidCatalogMutation,
+            .pointer => if (value.len != 0) return error.InvalidCatalogMutation,
+            else => @compileError("publication command field requires explicit admission"),
+        }
+    }
+}
+
+pub fn publicationCollectionAckCommand(ack: @import("../api/logical_replication_publisher_attestation.zig").CollectionReceipt) Command {
+    return .{ .expected_revision = 0, .mutation = .{ .kind = .publication, .action = .alter, .name = "publication_collection" }, .sql_publication_collection_ack = ack };
+}
+
+pub fn publicationSlotControlCommand(request: @import("replication/decision_journal.zig").ControlRequest) Command {
+    return .{ .expected_revision = 0, .mutation = .{ .kind = .publication, .action = .alter, .name = "publication_slot_control" }, .sql_publication_slot_control = request };
+}
+
 pub fn validate(command: Command) !void {
+    if (command.sql_publication_slot_control) |request| {
+        try request.validate();
+        const expected = publicationSlotControlCommand(request);
+        if (command.version != 1 or command.expected_revision != 0 or command.sql_publication_ddl != null or command.sql_publication_advance != null or
+            command.sql_publication_collection_ack != null or command.sql_catalog_admission != null or
+            !std.mem.eql(u8, &try hash("publication-envelope", command.mutation), &try hash("publication-envelope", expected.mutation)))
+            return error.InvalidCatalogMutation;
+        return requirePublicationEnvelope(command);
+    }
+    if (command.sql_publication_collection_ack) |ack| {
+        const expected = publicationCollectionAckCommand(ack);
+        if (command.version != 1 or command.expected_revision != 0 or command.sql_publication_ddl != null or command.sql_publication_advance != null or
+            command.sql_catalog_admission != null or !std.mem.eql(u8, &try hash("publication-envelope", command.mutation), &try hash("publication-envelope", expected.mutation)))
+            return error.InvalidCatalogMutation;
+        return requirePublicationEnvelope(command);
+    }
+    if (command.sql_publication_advance) |advance| {
+        try advance.validate();
+        const expected = publicationAdvanceCommand(advance);
+        if (command.version != 1 or command.expected_revision != 0 or command.sql_catalog_admission != null or
+            command.sql_publication_ddl != null or !std.mem.eql(u8, &try hash("publication-envelope", command.mutation), &try hash("publication-envelope", expected.mutation)))
+            return error.InvalidCatalogMutation;
+        return requirePublicationEnvelope(command);
+    }
+    if (command.mutation.kind == .publication or command.sql_publication_ddl != null) {
+        const request = command.sql_publication_ddl orelse return error.InvalidCatalogMutation;
+        const admission = command.sql_catalog_admission orelse return error.InvalidCatalogMutation;
+        try request.validate();
+        try admission.validate();
+        const expected = publicationCommand(command.expected_revision, request);
+        if (command.version != 1 or request.kind() != .publication or
+            !std.meta.eql(admission, expected.sql_catalog_admission.?) or
+            !std.mem.eql(u8, &try hash("publication-envelope", command.mutation), &try hash("publication-envelope", expected.mutation)))
+            return error.InvalidCatalogMutation;
+        return requirePublicationEnvelope(command);
+    }
+    if (command.mutation.kind == .subscription or command.sql_subscription_ddl != null) {
+        if (command.version != 1 or command.mutation.kind != .subscription or command.sql_subscription_ddl == null or (command.mutation.action != .create and command.mutation.action != .alter and command.mutation.action != .drop)) return error.InvalidCatalogMutation;
+        try (command.sql_catalog_admission orelse return error.InvalidCatalogMutation).validate();
+        inline for (@typeInfo(Command).@"struct".field_names) |field| {
+            if (comptime std.mem.eql(u8, field, "version") or std.mem.eql(u8, field, "expected_revision") or std.mem.eql(u8, field, "mutation") or std.mem.eql(u8, field, "sql_catalog_admission") or std.mem.eql(u8, field, "sql_subscription_ddl")) continue;
+            const value = @field(command, field);
+            switch (@typeInfo(@TypeOf(value))) {
+                .optional => if (value != null) return error.InvalidCatalogMutation,
+                .pointer => if (value.len != 0) return error.InvalidCatalogMutation,
+                else => @compileError("subscription command field requires explicit admission"),
+            }
+        }
+        return;
+    }
+
+    if (command.mutation.kind == .collation or command.sql_collation_ddl != null) {
+        if (command.mutation.kind != .collation or command.sql_collation_ddl == null or command.version != 1) return error.InvalidCatalogMutation;
+        inline for (@typeInfo(Command).@"struct".field_names) |field| {
+            if (comptime std.mem.eql(u8, field, "sql_collation_ddl") or @import("security_labels.zig").isEnvelopeField(field) and !std.mem.eql(u8, field, "sql_security_label")) continue;
+            const value = @field(command, field);
+            switch (@typeInfo(@TypeOf(value))) {
+                .optional => if (value != null) return error.InvalidCatalogMutation,
+                .pointer => if (value.len != 0) return error.InvalidCatalogMutation,
+                else => @compileError("collation command field requires explicit admission"),
+            }
+        }
+        try (command.sql_catalog_admission orelse return error.InvalidCatalogMutation).validate();
+        switch (command.mutation.action) {
+            .create, .rename, .drop => {},
+            else => return error.InvalidCatalogMutation,
+        }
+        if (command.mutation.table_id != 0 or command.mutation.storage_name.len != 0) return error.InvalidCatalogMutation;
+        return;
+    }
+    if (command.sql_security_label != null) return @import("security_labels.zig").validateCommand(command);
     switch (command.mutation.kind) {
         .table, .database, .namespace, .tablespace, .query_source, .view => {},
         // These have their own typed native journals and preparation proofs.
@@ -121,6 +225,38 @@ pub fn validate(command: Command) !void {
         if (!std.mem.eql(u8, &try hash("antfly:sql-catalog-intent:v1", command.mutation), &try hash("antfly:sql-catalog-intent:v1", expected.mutation)) or command.version != 2 or command.topology != null or command.placement_update != null or command.column_sequences.len != 0 or command.constraint_name_admission != null or command.mutation.table_id != 0 or command.mutation.storage_name.len != 0) return error.InvalidCatalogMutation;
     } else if (command.mutation.kind == .view) return error.InvalidCatalogMutation;
 }
+
+pub fn subscriptionDecoderVersion(command: Command) u16 {
+    const protocol = @import("../metadata/topology_protocol.zig");
+    return if (command.sql_subscription_ddl.?.subscription_apply orelse false)
+        protocol.sql_subscription_apply_version
+    else
+        protocol.sql_replication_catalog_version;
+}
+pub fn publicationAdvanceCommand(request: @import("replication/installation.zig").Command) Command {
+    return .{ .expected_revision = 0, .mutation = .{ .kind = .publication, .action = .alter, .name = "publication_capture" }, .sql_publication_advance = request };
+}
+
+pub fn publicationCommand(revision: u64, request: @import("replication/logical_replication.zig").Request) Command {
+    return .{
+        .expected_revision = revision,
+        .mutation = .{
+            .kind = .publication,
+            .database = request.database,
+            .name = request.name,
+            .expected_parent_id = request.database_id,
+            .action = switch (request.operation) {
+                .create_publication => .create,
+                .alter_publication => .alter,
+                .drop_publication => .drop,
+                else => .create,
+            },
+        },
+        .sql_publication_ddl = request,
+        .sql_catalog_admission = .{ .request = request.admission, .incarnation = request.incarnation },
+    };
+}
+
 pub fn observation(_: A, command: Command) !Observation {
     try validate(command);
     const result: Observation = .{ .admission = command.sql_catalog_admission.?, .target = .{ .kind = command.mutation.kind, .action = command.mutation.action, .database = command.mutation.database, .namespace = command.mutation.namespace, .name = command.mutation.name, .table_id = if (command.mutation.kind == .table) command.mutation.table_id else 0 }, .expected_revision = command.expected_revision, .revision_delta = if (command.sql_relation != null and command.sql_relation.?.action() == .comment) 0 else 1, .digest = try hash("antfly:sql-catalog-command:v1", command) };
@@ -136,6 +272,63 @@ pub fn matchesIntent(_: A, prepared: @import("antfly_local_sources").system_cata
 pub fn matchesViewIntent(_: A, prepared: ?@import("views.zig").Mutation, requested: ?@import("views.zig").Mutation) !bool {
     return std.mem.eql(u8, &try hash("antfly:sql-view-intent:v1", prepared), &try hash("antfly:sql-view-intent:v1", requested));
 }
+/// Collation DDL pins the lookup revision and the journal head on both
+/// clustered and standalone metadata owners.
+pub fn prepareSubscriptionDdl(alloc: A, store: anytype, group: u64, preparation: Preparation) ![]u8 {
+    const request = preparation.request;
+    try request.validateBinding();
+    if (preparation.relation != null or preparation.view != null or preparation.security_label != null or
+        request.create_table_json != null or request.physical_name != null or request.generated_constraint_names.len != 0 or request.column_sequences.len != 0)
+        return error.InvalidCatalogMutation;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const requires_apply = try @import("replication/logical_replication.zig").subscriptionRequiresApply(arena.allocator(), request.mutation);
+    const cut = try store.systemCatalogAdmission(arena.allocator(), group, request.mutation);
+    const command: Command = .{
+        .expected_revision = cut.meta.revision,
+        .mutation = request.mutation,
+        .sql_subscription_ddl = .{ .subscription_apply = if (requires_apply) true else null },
+        .sql_catalog_admission = .{
+            .request = .{ .nonce = preparation.nonce, .head = cut.meta.sequence_outcome_head orelse 0, .command_fence = preparation.command_fence },
+            .incarnation = cut.incarnation,
+        },
+    };
+    try validate(command);
+    const preview = try store.prepareSystemCatalogResult(arena.allocator(), group, command);
+    arena.allocator().free(preview);
+    const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
+    errdefer alloc.free(bytes);
+    if (bytes.len > @import("antfly_local_sources").system_catalog_domain.max_command_bytes) return error.CatalogCommandTooLarge;
+    return bytes;
+}
+
+pub fn prepareCollation(alloc: A, store: anytype, group: u64, preparation: Preparation) ![]u8 {
+    const request = preparation.request;
+    try request.validateBinding();
+    if (request.mutation.kind != .collation or preparation.relation != null or preparation.view != null or preparation.security_label != null or
+        request.create_table_json != null or request.physical_name != null or request.generated_constraint_names.len != 0 or request.column_sequences.len != 0)
+        return error.InvalidCatalogMutation;
+    const revision = request.collation_revision orelse return error.InvalidCatalogMutation;
+    const cut = try store.systemCatalogAdmission(alloc, group, request.mutation);
+    if (cut.meta.revision != revision) return error.CatalogGenerationChanged;
+    const command: @import("../metadata/storage/raft_apply_contract.zig").SystemCatalogCommand = .{
+        .expected_revision = revision,
+        .mutation = request.mutation,
+        .sql_collation_ddl = .{},
+        .sql_catalog_admission = .{
+            .request = .{ .nonce = preparation.nonce, .head = cut.meta.sequence_outcome_head orelse 0, .command_fence = preparation.command_fence },
+            .incarnation = cut.incarnation,
+        },
+    };
+    try validate(command);
+    const preview = try store.prepareSystemCatalogResult(alloc, group, command);
+    alloc.free(preview);
+    const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
+    errdefer alloc.free(bytes);
+    if (bytes.len > @import("antfly_local_sources").system_catalog_domain.max_command_bytes) return error.CatalogCommandTooLarge;
+    return bytes;
+}
+
 /// One read cut binds the immutable view intent to the native journal head.
 /// Publication repeats all semantic checks against its expected revision.
 pub fn prepareView(alloc: A, store: anytype, group: u64, request: Preparation) ![]u8 {

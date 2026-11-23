@@ -97,7 +97,7 @@ fn validateInner(execution: *vm.Execution, view: *const values.View, datum: scal
         .json => if (datum.extension == null and datum.numeric == null and datum.array == null) .{ .json = try roots.pinValue(datum.value) } else return error.SqlTypeMismatch,
         .numeric => blk: {
             const number = datum.numeric orelse return error.SqlTypeMismatch;
-            const codec = @import("numeric_binary.zig");
+            const codec = @import("numeric/binary.zig");
             const count = try codec.encodedSize(&execution.numeric, number.*);
             if (count > execution.bytes.*) return execution.limit();
             execution.bytes.* -= count;

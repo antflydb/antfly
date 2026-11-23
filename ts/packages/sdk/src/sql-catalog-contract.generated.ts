@@ -32,6 +32,8 @@ export const sqlCatalogObjectKinds = [
   "query_source",
   "view",
   "extension",
+  "collation",
+  "subscription",
 ] as const;
 
 export const sqlCatalogOperationKinds = ["create", "alter", "rename", "drop"] as const;

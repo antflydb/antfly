@@ -4764,6 +4764,13 @@ pub fn buildRelationalRowValueForSchemaFromParsedAlloc(
     return prepared.bytes;
 }
 
+/// Size the immutable producer row with the same codec used by prepare.
+pub fn frozenRelationalRowSize(a: Allocator, root: std.json.Value, table: runtime_schema.TableSchema, layout: *const relational_row_codec.PhysicalLayout, json_null_fields: []const []const u8) !usize {
+    const encoded = try buildRelationalRowValueFromParsedInternal(a, a, root, table, layout, layout.required_ordinals, json_null_fields);
+    defer a.free(encoded.bytes);
+    return encoded.bytes.len;
+}
+
 const PreparedEncodedRow = struct {
     bytes: []u8,
     semantic_hash: document_content_hash.Digest,
@@ -4836,7 +4843,7 @@ fn buildRelationalRowValueFromParsedInternal(
                     .is_numeric = column.column_type == .numeric,
                     .enum_record = if (enum_view) |view| &view.record else null,
                     .sql_array_element_type = if (column.column_type == .sql_array) column.sql_element_type else null,
-                    .sql_range_kind = @import("../../sql/range_value.zig").kindFromType(column.column_type),
+                    .sql_range_kind = @import("../../sql/range/value.zig").kindFromType(column.column_type),
                     .is_null = true,
                     .value = relationalZeroValue(value_type),
                 };
@@ -4853,23 +4860,23 @@ fn buildRelationalRowValueFromParsedInternal(
                 if (found != .string) return error.SqlInvalidTextRepresentation;
                 const view = enum_view orelse return error.InvalidSchema;
                 break :blk typed_dv.TypedValue{ .i64_val = (try view.input(found.string)).symbol };
-            } else if (@import("../../sql/range_value.zig").kindFromType(column.column_type)) |kind| blk: {
-                const encoded = try @import("../../sql/range_storage.zig").encodeJsonAlloc(output_alloc, kind, found);
+            } else if (@import("../../sql/range/value.zig").kindFromType(column.column_type)) |kind| blk: {
+                const encoded = try @import("../../sql/range/storage.zig").encodeJsonAlloc(output_alloc, kind, found);
                 errdefer output_alloc.free(encoded);
                 try owned_buffers.append(output_alloc, encoded);
                 break :blk typed_dv.TypedValue{ .bytes_val = encoded };
             } else if (column.column_type == .sql_array) blk: {
                 const kind = column.sql_element_type orelse return error.InvalidBatchRequest;
-                var decoded = try @import("../../sql/array_wire.zig").decodeBorrowedWithModifier(output_alloc, kind, found, column.numeric_modifier, .{});
+                var decoded = try @import("../../sql/array/wire.zig").decodeBorrowedWithModifier(output_alloc, kind, found, column.numeric_modifier, .{});
                 defer decoded.deinit();
-                const encoded = try @import("../../sql/array_storage.zig").encodeAlloc(output_alloc, decoded.value, .{});
+                const encoded = try @import("../../sql/array/storage.zig").encodeAlloc(output_alloc, decoded.value, .{});
                 errdefer output_alloc.free(encoded);
                 try owned_buffers.append(output_alloc, encoded);
                 break :blk typed_dv.TypedValue{ .bytes_val = encoded };
             } else if (column.column_type == .numeric) blk: {
                 if (column.sql_element_type != .numeric) return error.InvalidBatchRequest;
-                var context: @import("../../sql/numeric_value.zig").Context = .{ .alloc = output_alloc };
-                const encoded = try @import("../../sql/numeric_storage.zig").encodeJsonWithModifier(&context, found, column.numeric_modifier);
+                var context: @import("../../sql/numeric/value.zig").Context = .{ .alloc = output_alloc };
+                const encoded = try @import("../../sql/numeric/storage.zig").encodeJsonWithModifier(&context, found, column.numeric_modifier);
                 errdefer output_alloc.free(encoded);
                 try owned_buffers.append(output_alloc, encoded);
                 break :blk typed_dv.TypedValue{ .bytes_val = encoded };
@@ -4893,7 +4900,7 @@ fn buildRelationalRowValueFromParsedInternal(
                 .is_numeric = column.column_type == .numeric,
                 .enum_record = if (enum_view) |view| &view.record else null,
                 .sql_array_element_type = if (column.column_type == .sql_array) column.sql_element_type else null,
-                .sql_range_kind = @import("../../sql/range_value.zig").kindFromType(column.column_type),
+                .sql_range_kind = @import("../../sql/range/value.zig").kindFromType(column.column_type),
                 .value = value,
             };
         }
@@ -7009,9 +7016,9 @@ test "relational index system SQL array preparation roundtrips PostgreSQL fixtur
             defer a.free(rendered);
         }
     };
-    const arrays = @import("../../sql/array_value.zig");
-    const wire = @import("../../sql/array_wire.zig");
-    const storage = @import("../../sql/array_storage.zig");
+    const arrays = @import("../../sql/array/value.zig");
+    const wire = @import("../../sql/array/wire.zig");
+    const storage = @import("../../sql/array/storage.zig");
     const Fixture = struct { entries: []const struct { element_type: arrays.ElementType, binary: []const u8 } };
     const fixture = try std.json.parseFromSlice(Fixture, alloc, @embedFile("../../sql/fixtures/sql_array_binary_reference.json"), .{ .ignore_unknown_fields = true });
     defer fixture.deinit();
@@ -7019,7 +7026,7 @@ test "relational index system SQL array preparation roundtrips PostgreSQL fixtur
         const pg = try alloc.alloc(u8, entry.binary.len / 2);
         defer alloc.free(pg);
         _ = try std.fmt.hexToBytes(pg, entry.binary);
-        var original = try @import("../../sql/array_binary.zig").decode(alloc, entry.element_type, pg, .{});
+        var original = try @import("../../sql/array/binary.zig").decode(alloc, entry.element_type, pg, .{});
         defer original.deinit();
         const envelope = try wire.encodeAlloc(alloc, original.value, .{});
         defer alloc.free(envelope);
@@ -7153,7 +7160,7 @@ test "relational index system NUMERIC modifiers round before row hash and strict
             const digest = try document_content_hash.hashRelationalParsedValue(alloc, row.parsedValue(), schema);
             try std.testing.expectEqualSlices(u8, &row.semantic_hash, &digest);
             const cell = (try relational_row_codec.findCellByOrdinalWithLayout(row.packed_row, schema, physical, 0)).?;
-            const numeric = @import("../../sql/numeric_storage.zig");
+            const numeric = @import("../../sql/numeric/storage.zig");
             const value = try numeric.jsonValueAlloc(alloc, cell.value.bytes_val);
             defer alloc.free(value.number_string);
             try std.testing.expectEqualStrings("12.35", value.number_string);
@@ -7190,7 +7197,7 @@ test "relational index system NUMERIC array modifiers round before hashing and s
             const view = try @import("../../common/sql_array_layout.zig").View.open(.numeric, cell.value.bytes_val, .{});
             try std.testing.expectEqual(@as(usize, 3), view.count);
             try std.testing.expect((try view.cell(1)).sql_null);
-            const value = try @import("../../sql/numeric_storage.zig").jsonValueAlloc(alloc, (try view.cell(0)).bytes);
+            const value = try @import("../../sql/numeric/storage.zig").jsonValueAlloc(alloc, (try view.cell(0)).bytes);
             defer alloc.free(value.number_string);
             try std.testing.expectEqualStrings("12.35", value.number_string);
             const rendered = try relational_row_codec.reconstructDocumentAlloc(alloc, &.{cell});
@@ -7240,8 +7247,8 @@ test "relational index system NUMERIC scalar rows hash logical identity and unwi
     try Run.run(a, schema, &layout);
     var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
     try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ schema, &layout });
-    var ctx: @import("../../sql/numeric_value.zig").Context = .{ .alloc = a };
-    try std.testing.expectError(error.InvalidBatchRequest, @import("../../sql/numeric_storage.zig").fromJson(&ctx, .{ .float = 1.25 }));
+    var ctx: @import("../../sql/numeric/value.zig").Context = .{ .alloc = a };
+    try std.testing.expectError(error.InvalidBatchRequest, @import("../../sql/numeric/storage.zig").fromJson(&ctx, .{ .float = 1.25 }));
 }
 
 test "relational index system SQL float4 preparation hashes and indexes canonical logical values" {

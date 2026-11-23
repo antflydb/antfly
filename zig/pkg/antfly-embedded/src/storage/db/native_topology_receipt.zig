@@ -18,7 +18,7 @@
 
 const replication_ingress = @import("replication_ingress.zig");
 const std = @import("std");
-const topology = @import("relational_integrity_topology_contract.zig");
+const topology = @import("relational/integrity/topology_contract.zig");
 const position = @import("receipt_position.zig");
 const authority = @import("../source_authority.zig");
 

@@ -190,6 +190,7 @@ pub const OutcomeRecord = records.Record(Outcome, "SROT", 8192);
 pub const Observation = struct {
     outcome: ?Outcome,
     current: ?ledger.Head,
+    work: ?ledger.Work = null,
     pub fn requireFor(self: Observation, query: Query) !void {
         try query.validate();
         if (self.outcome) |outcome| {
@@ -199,6 +200,14 @@ pub const Observation = struct {
         if (self.current) |head| {
             try head.validate();
             if (!std.meta.eql(head.lookup, query.lookup)) return error.CatalogGenerationChanged;
+        }
+        if (self.work) |work| {
+            const head = self.current orelse return error.InvalidScopeRetirement;
+            if (!head.active() or !std.meta.eql(head, work.head)) return error.InvalidScopeRetirement;
+            if (work.child) |child| {
+                try child.validate();
+                if (!std.meta.eql(child.lookup, head.lookup) or child.ordinal != head.progress.completed_tables) return error.InvalidScopeRetirement;
+            } else if (head.progress.completed_tables < head.lookup.reference.tables) return error.InvalidScopeRetirement;
         }
         if (self.outcome) |outcome| if (outcome.result == .accepted) {
             const current = self.current orelse return error.InvalidScopeRetirement;
@@ -324,6 +333,7 @@ pub const TemporaryProbe = struct {
     database_id: u64,
     namespace_id: u64,
     nonce: [16]u8,
+    include_work: bool = false,
     pub fn validate(self: TemporaryProbe) !void {
         try self.owner.validate();
         if (self.database_id == 0 or self.namespace_id == 0 or std.mem.allEqual(u8, &self.nonce, 0)) return error.InvalidSqlTemporaryNamespace;
@@ -339,11 +349,15 @@ pub fn temporaryObservation(reader: anytype, group: u64, probe: TemporaryProbe) 
     if (query.lookup.group != group or query.lookup.reference.kind != .namespace or query.lookup.reference.database != probe.database_id or
         query.lookup.reference.root != probe.namespace_id or !std.mem.eql(u8, &query.nonce, &probe.nonce) or
         !std.mem.eql(u8, &query.lookup.reference.id, &probe.nonce)) return error.InvalidSqlTemporaryNamespace;
-    const result: Observation = .{ .outcome = outcome, .current = try ledger.head(reader, query.lookup) };
+    var result: Observation = .{ .outcome = outcome, .current = try ledger.head(reader, query.lookup) };
     try result.requireFor(query);
     if (outcome.result == .accepted) {
         const captured = outcome.result.accepted.temporary_owner orelse return error.InvalidSqlTemporaryNamespace;
         if (!captured.eql(probe.owner)) return error.InvalidSqlTemporaryNamespace;
+        if (probe.include_work and result.current.?.active()) {
+            result.work = try ledger.ownerWork(reader, result.current.?);
+            try result.requireFor(query);
+        }
     }
     return result;
 }

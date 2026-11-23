@@ -85,7 +85,7 @@ fn observe(ctx: *fixture.Context, statement: []const u8, expected: Output, date:
 // original temporal comparison through the real authenticated native adapter.
 fn typedRejection(ctx: *fixture.Context, entry: Entry) !void {
     const pg = @import("../../../../pgwire/backend.zig");
-    var adapter: @import("../../../sql_pgwire.zig").Adapter = .{ .server = ctx.metadata.server.owned_public_http_server orelse return error.MissingMetadataPublicApi };
+    var adapter: @import("../../transport/pgwire.zig").Adapter = .{ .server = ctx.metadata.server.owned_public_http_server orelse return error.MissingMetadataPublicApi };
     const backend = adapter.backend();
     const identity = try backend.vtable.authenticate(backend.context, ctx.alloc, "pk-rewriter", "pk-rewrite-durable-password");
     defer identity.release(identity.context, ctx.alloc);

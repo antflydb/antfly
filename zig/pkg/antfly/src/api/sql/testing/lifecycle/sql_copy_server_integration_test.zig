@@ -104,7 +104,7 @@ const Campaign = struct {
         var source = std.Io.Reader.fixed(input.written());
         var output: std.Io.Writer.Allocating = .init(ctx.alloc);
         defer output.deinit();
-        var adapter: @import("../../../sql_pgwire.zig").Adapter = .{ .server = ctx.metadata.server.owned_public_http_server.? };
+        var adapter: @import("../../transport/pgwire.zig").Adapter = .{ .server = ctx.metadata.server.owned_public_http_server.? };
         var session: protocol.Session = .{ .alloc = ctx.alloc, .io = ctx.io, .source = adapter.backend(), .reader = &source, .writer = &output.writer, .limits = .{ .statement_timeout_ms = timeout_ms } };
         defer session.deinit();
         try session.run();

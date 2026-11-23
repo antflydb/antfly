@@ -3706,7 +3706,7 @@ pub const StorageKernelLookupWireRequest = struct {
             if (comptime std.mem.eql(u8, reflected_name, "include_json_null_fields")) continue;
             try stream.objectField(reflected_name);
             if (comptime std.mem.eql(u8, reflected_name, "key") or std.mem.eql(u8, reflected_name, "restore_staging_scope") or std.mem.eql(u8, reflected_name, "restore_staging_plan_id")) {
-                try @import("../storage/db/relational_integrity_json.zig").write(@field(self, reflected_name), stream);
+                try @import("../storage/db/relational/integrity/json.zig").write(@field(self, reflected_name), stream);
             } else try stream.write(@field(self, reflected_name));
         }
         if (self.include_json_null_fields) {
@@ -3943,7 +3943,7 @@ pub const StorageKernelScanWireRequest = struct {
         inline for (comptime std.meta.fieldNames(StorageKernelScanWireRequest)) |reflected_name| {
             try stream.objectField(reflected_name);
             if (comptime std.mem.eql(u8, reflected_name, "from_key") or std.mem.eql(u8, reflected_name, "to_key")) {
-                try @import("../storage/db/relational_integrity_json.zig").write(@field(self, reflected_name), stream);
+                try @import("../storage/db/relational/integrity/json.zig").write(@field(self, reflected_name), stream);
             } else try stream.write(@field(self, reflected_name));
         }
         try stream.endObject();

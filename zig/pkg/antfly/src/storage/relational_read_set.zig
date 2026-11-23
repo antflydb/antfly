@@ -44,6 +44,8 @@ pub const Set = struct {
     /// owned by the caller. All allocations use the caller's request budget.
     pub fn create(alloc: std.mem.Allocator, views: []const View, primary_order: bool) !View {
         if (views.len == 0 or views.len > 256) return error.SqlProgramLimitExceeded;
+        const required_indexes_digest = views[0].required_indexes_digest;
+        for (views) |view| if (!std.meta.eql(required_indexes_digest, view.required_indexes_digest)) return error.UnsupportedSqlExecution;
         const text_digest = views[0].text_filter_digest;
         for (views) |view| if (!std.meta.eql(text_digest, view.text_filter_digest)) return error.UnsupportedSqlExecution;
         if (text_digest != null and primary_order) return error.UnsupportedSqlExecution;
@@ -54,7 +56,7 @@ pub const Set = struct {
         const heap = try alloc.alloc(usize, views.len);
         for (owners, views) |*owner, view| owner.* = .{ .view = view };
         self.* = .{ .alloc = alloc, .owners = owners, .heap = heap, .primary_order = primary_order, .fetch_rows = @intCast(@max(1, 256 / views.len)) };
-        return .{ .text_filter_digest = text_digest, .ptr = self, .vtable = &.{ .next = next, .close = close, .normalize = normalize } };
+        return .{ .text_filter_digest = text_digest, .required_indexes_digest = required_indexes_digest, .ptr = self, .vtable = &.{ .next = next, .close = close, .normalize = normalize } };
     }
 
     fn ensure(self: *Set, index: usize) !bool {

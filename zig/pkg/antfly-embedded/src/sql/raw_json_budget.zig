@@ -16,7 +16,7 @@
 //! Syntax and logical-value budgets for borrowed JSON output. Fragmented
 //! strings and object keys do not consume extra VM value steps.
 const std = @import("std");
-const Work = @import("numeric_value.zig").Context;
+const Work = @import("numeric/value.zig").Context;
 pub const Limits = struct {
     depth: usize,
     wire_bytes: usize,

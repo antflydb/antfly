@@ -27,7 +27,7 @@ pub const Status = enum(u8) { idle = 'I', in_transaction = 'T', failed = 'E' };
 pub const Scope = struct { principal: []const u8, database: []const u8 = "default", namespace: []const u8 = "public" };
 pub const Begin = struct { isolation: Isolation = .serializable, mode: ReadMode = .read_write, deferrable: bool = false };
 /// Omitted characteristics retain the active transaction's value.
-pub const Characteristics = struct { isolation: ?Isolation = null, mode: ?ReadMode = null, deferrable: ?bool = null };
+pub const Characteristics = struct { isolation: ?Isolation = null, mode: ?ReadMode = null, deferrable: ?bool = null, snapshot: ?[]const u8 = null };
 pub const Transaction = struct {
     id: Id,
     state: State,

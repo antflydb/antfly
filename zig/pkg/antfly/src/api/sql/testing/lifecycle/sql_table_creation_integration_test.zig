@@ -426,7 +426,7 @@ const DefinitionCopyCampaign = struct {
         var arena = std.heap.ArenaAllocator.init(ctx.alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const captured = (try @import("../../../sql_catalog.zig").captureTableAdmission(ctx.metadata.server.owned_public_http_server.?, null, .{}, a, .{ .table = name }, false, null)) orelse return error.MissingCopiedRelation;
+        const captured = (try @import("../../catalog/catalog.zig").captureTableAdmission(ctx.metadata.server.owned_public_http_server.?, null, .{}, a, .{ .table = name }, false, null)) orelse return error.MissingCopiedRelation;
         const store = ctx.metadata.server.svc.projectedStore() orelse return error.MissingMetadataStore;
         const table = (try store.getTable(a, ctx.metadata.server.svc.metadata_group_id, captured.guard.owner.table_id)) orelse return error.MissingCopiedRelation;
         const schema = try std.json.parseFromSliceLeaky(std.json.Value, a, table.schema_json, .{});
@@ -461,7 +461,7 @@ const DefinitionCopyCampaign = struct {
         var arena = std.heap.ArenaAllocator.init(ctx.alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const captured = (try @import("../../../sql_catalog.zig").captureTableAdmission(ctx.metadata.server.owned_public_http_server.?, null, .{}, a, .{ .table = name }, false, null)) orelse return error.MissingCopiedRelation;
+        const captured = (try @import("../../catalog/catalog.zig").captureTableAdmission(ctx.metadata.server.owned_public_http_server.?, null, .{}, a, .{ .table = name }, false, null)) orelse return error.MissingCopiedRelation;
         const store = ctx.metadata.server.svc.projectedStore() orelse return error.MissingMetadataStore;
         var attributes = try store.getSqlColumnIdentities(a, ctx.metadata.server.svc.metadata_group_id, captured.guard);
         defer attributes.deinit();
@@ -810,7 +810,7 @@ const CopyLifetimeCampaign = struct {
         var arena = std.heap.ArenaAllocator.init(ctx.alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const captured = (try @import("../../../sql_catalog.zig").captureTableAdmission(ctx.metadata.server.owned_public_http_server.?, null, .{}, a, .{ .table = "lifetime_copy" }, false, null)) orelse return error.MissingCopy;
+        const captured = (try @import("../../catalog/catalog.zig").captureTableAdmission(ctx.metadata.server.owned_public_http_server.?, null, .{}, a, .{ .table = "lifetime_copy" }, false, null)) orelse return error.MissingCopy;
         const store = ctx.metadata.server.svc.projectedStore() orelse return error.MissingMetadataStore;
         const table = (try store.getTable(a, ctx.metadata.server.svc.metadata_group_id, captured.guard.owner.table_id)) orelse return error.MissingCopy;
         try std.testing.expectEqualStrings("", table.description);

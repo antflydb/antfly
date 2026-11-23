@@ -177,7 +177,7 @@ test "SQL bytea charset conversion polls shared cancellation and unwinds allocat
     const bytes: [1024]u8 = @splat(0xe9);
     for (1..8) |cut| {
         var control: Control = .{ .fail_at = cut };
-        var shared: @import("numeric_value.zig").Context = .{ .alloc = a, .checkpoint = Control.check, .ptr = &control };
+        var shared: @import("numeric/value.zig").Context = .{ .alloc = a, .checkpoint = Control.check, .ptr = &control };
         var work: Budget = .{ .shared = &shared };
         try std.testing.expectError(error.Canceled, convertAlloc(a, &bytes, "LATIN1", true, 4096, &work));
         try std.testing.expectError(error.Canceled, work.consume(0));

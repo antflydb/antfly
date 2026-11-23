@@ -26,7 +26,7 @@ const index_manager_mod = @import("catalog/index_manager.zig");
 const docstore_mod = @import("../docstore.zig");
 const artifact_ids = @import("artifact_ids.zig");
 const internal_keys = @import("../internal_keys.zig");
-const relational_store = @import("relational_store.zig");
+const relational_store = @import("relational/rows/store.zig");
 const lookup_key_scratch = @import("lookup_key_scratch.zig");
 const document_read_scratch = @import("document_read_scratch.zig");
 const sparse_mod = if (builtin.os.tag == .freestanding) @import("sparse_stub.zig") else @import("../../sparse/sparse.zig");

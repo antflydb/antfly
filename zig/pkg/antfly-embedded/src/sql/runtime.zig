@@ -251,7 +251,7 @@ pub fn parameterFallbackTypesNative(arena: std.mem.Allocator, parameters: []cons
     if (native.len != parameters.len) return error.InvalidSqlParameters;
     for (native) |cell| try cell.validateTemporal();
     const kinds = try arena.alloc(?ast.ColumnType, native.len);
-    for (native, kinds) |cell, *kind| kind.* = if (cell.sql_null) null else if (cell.enumeration() != null) .enumeration else if (cell.bytes() != null) .bytea else if (cell.array != null) .array else if (cell.numeric != null) .number else if (cell.range()) |range| @import("range_value.zig").typeFromKind(ast.ColumnType, range.kind) else parameterFallbackType(cell.value);
+    for (native, kinds) |cell, *kind| kind.* = if (cell.sql_null) null else if (cell.enumeration() != null) .enumeration else if (cell.bytes() != null) .bytea else if (cell.array != null) .array else if (cell.numeric != null) .number else if (cell.range()) |range| @import("range/value.zig").typeFromKind(ast.ColumnType, range.kind) else parameterFallbackType(cell.value);
     return kinds;
 }
 
@@ -545,7 +545,7 @@ test "SQL range native parameter identity survives unconstrained transport fallb
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const ranges = @import("range_value.zig");
+    const ranges = @import("range/value.zig");
     var context: ranges.Context = .{ .alloc = a };
     for ([_]ranges.Kind{ .numrange, .daterange, .tsrange, .tstzrange }) |kind| {
         const value = try ranges.parseLeaky(&context, kind, "empty");
@@ -929,7 +929,8 @@ pub const Context = struct {
     /// Preserve the complete typed value until the public result boundary.
     /// Arrays are owned envelopes and NUMERIC values are exact decimal text,
     /// never their JSON-null placeholders.
-    pub fn outputDatum(self: Context, datum: Datum, kind: ?ast.ColumnType, element_type: ?@import("array_value.zig").ElementType) !Json {
+    pub fn outputDatum(self: Context, datum: Datum, kind: ?ast.ColumnType, element_type: ?@import("array/value.zig").ElementType) !Json {
+        try datum.validateTemporal();
         if (datum.bytes()) |bytes| {
             try datum.validateTemporal();
             if (kind != .bytea or element_type != null) return error.SqlTypeMismatch;
@@ -943,27 +944,27 @@ pub const Context = struct {
         }
         if (datum.range()) |range| {
             try datum.validateTemporal();
-            if (kind == null or @import("range_value.zig").kindFromType(kind.?) != range.kind) return error.SqlTypeMismatch;
-            var context: @import("range_value.zig").Context = .{ .alloc = self.arena, .max_output_bytes = self.limits.retained_bytes };
-            return .{ .string = try @import("range_value.zig").formatLeaky(&context, range.*) };
+            if (kind == null or @import("range/value.zig").kindFromType(kind.?) != range.kind) return error.SqlTypeMismatch;
+            var context: @import("range/value.zig").Context = .{ .alloc = self.arena, .max_output_bytes = self.limits.retained_bytes };
+            return .{ .string = try @import("range/value.zig").formatLeaky(&context, range.*) };
         }
         if (datum.temporal() != null) {
-            var text: [@import("temporal_text.zig").output_capacity]u8 = undefined;
+            var text: [@import("temporal/text.zig").output_capacity]u8 = undefined;
             if (kind != .datetime) return error.SqlTypeMismatch;
             try datum.validateTemporal();
-            return .{ .string = try self.arena.dupe(u8, try @import("temporal_text.zig").format(datum.temporal().?.*, &text)) };
+            return .{ .string = try self.arena.dupe(u8, try @import("temporal/text.zig").format(datum.temporal().?.*, &text)) };
         }
         if (kind == .array) {
             const checked = try describe.coerceDatum(self.arena, datum, .array, element_type);
             if (checked.sql_null) return .null;
-            return @import("array_wire.zig").toJsonLeaky(self.arena, checked.array.?.*, .{ .values = .{ .bytes = self.limits.retained_bytes }, .wire_bytes = self.limits.retained_bytes });
+            return @import("array/wire.zig").toJsonLeaky(self.arena, checked.array.?.*, .{ .values = .{ .bytes = self.limits.retained_bytes }, .wire_bytes = self.limits.retained_bytes });
         }
         if (datum.array != null) return error.SqlTypeMismatch;
         if (datum.numeric != null or (kind == .number and element_type == .numeric)) {
             const checked = try describe.coerceDatum(self.arena, datum, kind orelse .number, element_type);
             if (checked.sql_null) return .null;
-            var context: @import("numeric_value.zig").Context = .{ .alloc = self.arena, .max_output_bytes = self.limits.retained_bytes };
-            return .{ .string = try @import("numeric_value.zig").format(&context, checked.numeric.?.*) };
+            var context: @import("numeric/value.zig").Context = .{ .alloc = self.arena, .max_output_bytes = self.limits.retained_bytes };
+            return .{ .string = try @import("numeric/value.zig").format(&context, checked.numeric.?.*) };
         }
         return self.outputCell(datum.value, kind);
     }
@@ -975,7 +976,7 @@ pub const Context = struct {
         return self.storageDatumTyped(datum, column, null);
     }
 
-    pub fn storageDatumTyped(self: Context, datum: Datum, column: catalog.Column, source_identity: ?@import("array_value.zig").ElementType) !Json {
+    pub fn storageDatumTyped(self: Context, datum: Datum, column: catalog.Column, source_identity: ?@import("array/value.zig").ElementType) !Json {
         return encodeStorageDatumTyped(self.arena, datum, column, source_identity, self.limits.retained_bytes) catch |err| {
             if (err == error.SqlNotNullViolation) return @import("errors.zig").notNull(self.backend.error_context, column.name);
             return err;
@@ -1127,7 +1128,7 @@ pub const Context = struct {
                 // Native condition values cannot carry typed arrays or exact
                 // NUMERIC limbs. Keep these comparisons in the typed residual
                 // instead of interpreting their JSON placeholder as SQL NULL.
-                if (column.type == .array or column.element_type == .numeric or @import("range_value.zig").kindFromType(column.type) != null or table_def.isDocumentRoot(column.name) or table_def.isDocumentVersion(column.name)) {
+                if (column.read_type_guard or column.type == .array or column.element_type == .numeric or @import("range/value.zig").kindFromType(column.type) != null or table_def.isDocumentRoot(column.name) or table_def.isDocumentVersion(column.name)) {
                     output.complete = false;
                     return;
                 }
@@ -1162,7 +1163,7 @@ pub const Context = struct {
                 // Row identity has a separate native key boundary; never
                 // pretend it is a document property in a storage predicate.
                 const bound_value = comparison_operand orelse try self.value(comparison.value, column);
-                if (column.type == .json) {
+                if (column.read_type_guard or column.type == .json) {
                     output.complete = false;
                     return;
                 }
@@ -1206,7 +1207,7 @@ pub const Context = struct {
                     if (!test_null.negated) output.empty = true;
                     return;
                 }
-                if (column.type == .json) {
+                if (column.read_type_guard or column.type == .json) {
                     output.complete = false;
                     return;
                 }
@@ -2281,6 +2282,7 @@ pub const Context = struct {
                     if (evaluated) |batch| {
                         if (batch.positions[row_index] == null) continue;
                     } else if (!try self.matchesRow(scratch, expression_cells)) continue;
+                    if (row.stale_frozen_birth) return error.SqlSerializationFailure;
                     if (mutations.items.len >= self.limits.mutation_rows) return error.SqlProgramLimitExceeded;
                     var document: ?Json = null;
                     var json_null_fields: std.ArrayList([]const u8) = .empty;
@@ -2344,7 +2346,7 @@ pub const Context = struct {
                         owned.* = try row.cloneWithLayout(self.arena, retained_layout);
                         break :blk owned;
                     } else null;
-                    try mutations.append(self.arena, .{ .key = key, .expected_version = row.version, .expected_content_digest = row.expected_content_digest, .row = document, .json_null_fields = json_null_fields.items, .previous = previous, .domain_admission = domain_provenance.admission() });
+                    try mutations.append(self.arena, .{ .key = key, .expected_version = row.version, .expected_content_digest = row.expected_content_digest, .expected_mutation_revision = row.expected_mutation_revision, .row = document, .json_null_fields = json_null_fields.items, .previous = previous, .domain_admission = domain_provenance.admission() });
                 }
                 first = end;
             }
@@ -2418,6 +2420,7 @@ pub const Context = struct {
         for (input, prepared) |original, mutation| {
             if (!std.mem.eql(u8, mutation.key, original.key) or mutation.expected_version != original.expected_version or
                 !std.meta.eql(mutation.expected_content_digest, original.expected_content_digest) or
+                mutation.expected_mutation_revision != original.expected_mutation_revision or
                 mutation.unique_absence != original.unique_absence) return error.InvalidSqlBackendResponse;
             if (mutation.trigger_suppressed) {
                 if (!table.has_triggers or mutation.prepared_trigger == null or !mutation.predicate_only or mutation.row != null) return error.InvalidSqlBackendResponse;
@@ -2446,6 +2449,21 @@ pub const Context = struct {
             if (prepared.len != input.len) return error.InvalidSqlBackendResponse;
             output.rows_affected = prepared.len;
         }
+        if (table.storage_mode == .document and prepared.len != 0) if (self.backend.vtable.assign_document_revisions) |assign| {
+            const revisions = try self.arena.alloc(?catalog.DocumentRevision, prepared.len);
+            @memset(revisions, null);
+            try assign(self.backend.ptr, self.arena, table, prepared, revisions);
+            var assigned_mutations: ?[]catalog.Mutation = null;
+            for (revisions, 0..) |revision, index| if (revision) |assignment| {
+                if (assigned_mutations == null) assigned_mutations = try self.arena.dupe(catalog.Mutation, prepared);
+                const mutation = &assigned_mutations.?[index];
+                if (mutation.predicate_only or mutation.trigger_suppressed or assignment.version == 0 or
+                    assignment.version > @import("../storage/document_revision_reservation.zig").max_version) return error.InvalidSqlBackendResponse;
+                try assignment.scope.validate();
+                mutation.document_revision = assignment;
+            };
+            if (assigned_mutations) |owned| prepared = owned;
+        };
         // Command-private admission must precede RETURNING: its expressions
         // can pull sibling producers whose unique lookups depend on this row.
         // Ordinary statements retain their publish-after-projection boundary.
@@ -2572,11 +2590,12 @@ pub const Context = struct {
 
         pub fn row(self: ReturningImages, a: std.mem.Allocator, mutation: catalog.Mutation, original: catalog.Mutation) !catalog.Row {
             if (!std.mem.eql(u8, mutation.key, original.key) or mutation.expected_version != original.expected_version or
-                !std.meta.eql(mutation.expected_content_digest, original.expected_content_digest) or mutation.unique_absence != original.unique_absence or
+                !std.meta.eql(mutation.expected_content_digest, original.expected_content_digest) or
+                mutation.expected_mutation_revision != original.expected_mutation_revision or mutation.unique_absence != original.unique_absence or
                 mutation.conflict_guard != original.conflict_guard or mutation.predicate_only != original.predicate_only or
                 (mutation.row == null) != (original.row == null)) return error.InvalidSqlBackendResponse;
             const datum = mutation.row orelse return (original.previous orelse return error.InvalidSqlBackendResponse).*;
-            if (self.table.storage_mode == .document) for (self.projection.columns) |column| {
+            if (self.table.storage_mode == .document and mutation.document_revision == null) for (self.projection.columns) |column| {
                 if (self.table.isDocumentVersion(column.name)) return error.UnsupportedSqlExecution;
             };
             if (datum != .object) return error.InvalidSqlBackendResponse;
@@ -2587,7 +2606,7 @@ pub const Context = struct {
                 if (!nulls[index] or (try self.table.column(name)).type != .json) return error.InvalidSqlBackendResponse;
                 nulls[index] = false;
             }
-            return self.projection.adaptBorrowed(a, self.layout, .{ .id = mutation.key, .version = if (self.table.storage_mode == .document) mutation.expected_version else try self.table.preparedVersion(datum, self.write_version orelse mutation.expected_version), .document_version_state = if (self.table.storage_mode == .document) .unassigned else .assigned, .value = datum, .sql_nulls = nulls, .document = if (self.table.storage_mode == .document) datum else null });
+            return self.projection.adaptBorrowed(a, self.layout, .{ .id = mutation.key, .version = if (self.table.storage_mode == .document) mutation.expected_version else try self.table.preparedVersion(datum, self.write_version orelse mutation.expected_version), .document_version = if (mutation.document_revision) |revision| revision.version else null, .document_version_state = if (self.table.storage_mode == .document and mutation.document_revision == null) .unassigned else .assigned, .value = datum, .sql_nulls = nulls, .document = if (self.table.storage_mode == .document) datum else null });
         }
     };
 
@@ -2658,7 +2677,8 @@ pub fn encodeStorageDatum(arena: std.mem.Allocator, datum: Datum, column: catalo
     return encodeStorageDatumTyped(arena, datum, column, null, retained_bytes);
 }
 
-pub fn encodeStorageDatumTyped(arena: std.mem.Allocator, datum: Datum, column: catalog.Column, source_identity: ?@import("array_value.zig").ElementType, retained_bytes: usize) !Json {
+pub fn encodeStorageDatumTyped(arena: std.mem.Allocator, datum: Datum, column: catalog.Column, source_identity: ?@import("array/value.zig").ElementType, retained_bytes: usize) !Json {
+    try datum.validateTemporal();
     // Named SQL column binding must supply a pinned catalog domain before
     // this coarse compatibility boundary can perform enum assignments.
     if (column.enum_view != null) {
@@ -2676,9 +2696,9 @@ pub fn encodeStorageDatumTyped(arena: std.mem.Allocator, datum: Datum, column: c
     if (column.type == .enumeration or (datum.enumeration() != null and column.type != .string)) return error.UnsupportedSqlShape;
     if (datum.range()) |range| {
         try datum.validateTemporal();
-        if (@import("range_value.zig").kindFromType(column.type) != range.kind) return error.SqlTypeMismatch;
-        var context: @import("range_value.zig").Context = .{ .alloc = arena, .max_output_bytes = retained_bytes };
-        return .{ .string = try @import("range_value.zig").formatLeaky(&context, range.*) };
+        if (@import("range/value.zig").kindFromType(column.type) != range.kind) return error.SqlTypeMismatch;
+        var context: @import("range/value.zig").Context = .{ .alloc = arena, .max_output_bytes = retained_bytes };
+        return .{ .string = try @import("range/value.zig").formatLeaky(&context, range.*) };
     }
     if (datum.temporal() != null and column.type != .string) {
         try datum.validateTemporal();
@@ -2702,13 +2722,13 @@ pub fn encodeStorageDatumTyped(arena: std.mem.Allocator, datum: Datum, column: c
     // Untyped SQL range literals acquire their owned typed payload during
     // assignment above. Serialize that payload, never its JSON-null carrier.
     if (checked.range()) |range| {
-        var context: @import("range_value.zig").Context = .{ .alloc = arena, .max_output_bytes = retained_bytes };
-        return .{ .string = try @import("range_value.zig").formatLeaky(&context, range.*) };
+        var context: @import("range/value.zig").Context = .{ .alloc = arena, .max_output_bytes = retained_bytes };
+        return .{ .string = try @import("range/value.zig").formatLeaky(&context, range.*) };
     }
-    if (checked.array) |array| return @import("array_wire.zig").toJsonLeaky(arena, array.*, .{ .values = .{ .bytes = retained_bytes }, .wire_bytes = retained_bytes });
+    if (checked.array) |array| return @import("array/wire.zig").toJsonLeaky(arena, array.*, .{ .values = .{ .bytes = retained_bytes }, .wire_bytes = retained_bytes });
     if (checked.numeric) |value| {
-        var context: @import("numeric_value.zig").Context = .{ .alloc = arena, .max_output_bytes = retained_bytes };
-        return .{ .string = try @import("numeric_value.zig").format(&context, value.*) };
+        var context: @import("numeric/value.zig").Context = .{ .alloc = arena, .max_output_bytes = retained_bytes };
+        return .{ .string = try @import("numeric/value.zig").format(&context, value.*) };
     }
     // Unsupported physical domains (currently BYTEA/VOID) and any future
     // extension must never fall through to their JSON carrier. Existing DDL
@@ -2725,12 +2745,12 @@ test "SQL scalar floating storage rejects specials without serializing nullable 
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
-    for ([_]@import("array_value.zig").ElementType{ .float32, .float64 }) |kind| {
+    for ([_]@import("array/value.zig").ElementType{ .float32, .float64 }) |kind| {
         const column: catalog.Column = .{ .name = "n", .path = "n", .type = .number, .element_type = kind, .nullable = true };
         for ([_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64) }) |number| try std.testing.expectError(error.SqlNonFiniteScalarStorage, encodeStorageDatumTyped(scratch, Datum.json(.{ .float = number }), column, kind, 1 << 20));
         for ([_][]const u8{ "NaN", "Infinity", "-Infinity" }) |text| {
-            var context: @import("numeric_value.zig").Context = .{ .alloc = scratch };
-            var number = try @import("numeric_value.zig").parse(&context, text);
+            var context: @import("numeric/value.zig").Context = .{ .alloc = scratch };
+            var number = try @import("numeric/value.zig").parse(&context, text);
             defer number.deinit();
             try std.testing.expectError(error.SqlNonFiniteScalarStorage, encodeStorageDatumTyped(scratch, Datum.typedNumeric(&number.value), column, .numeric, 1 << 20));
             // NUMERIC has a canonical special-value representation already;
@@ -2855,9 +2875,9 @@ fn numericBoundaryScenario(backing: std.mem.Allocator) !void {
     const a = arena.allocator();
     var fixture: TestBackend = .{};
     const context: Context = .{ .alloc = backing, .arena = a, .backend = fixture.iface(), .binding = undefined, .parameters = &.{}, .limits = .{} };
-    var exact_context: @import("numeric_value.zig").Context = .{ .alloc = backing };
+    var exact_context: @import("numeric/value.zig").Context = .{ .alloc = backing };
     const output, const stored = blk: {
-        var source = try @import("numeric_value.zig").parse(&exact_context, "9007199254740993.1200");
+        var source = try @import("numeric/value.zig").parse(&exact_context, "9007199254740993.1200");
         defer source.deinit();
         break :blk .{
             try context.outputDatum(Datum.typedNumeric(&source.value), .number, .numeric),
@@ -2902,7 +2922,7 @@ test "SQL NUMERIC executes exact scalar projections through public result metada
     try std.testing.expectEqualStrings("Infinity", result.output.rows[0][2].string);
     for (result.output.columns) |column| {
         try std.testing.expectEqual(ast.ColumnType.number, column.type);
-        try std.testing.expectEqual(@import("array_value.zig").ElementType.numeric, column.element_type.?);
+        try std.testing.expectEqual(@import("array/value.zig").ElementType.numeric, column.element_type.?);
     }
 }
 
@@ -3091,7 +3111,7 @@ test "SQL NUMERIC predicates preserve inferred and explicit parameters for reads
 
 test "SQL floating predicates retain declared NUMERIC parameters for reads and mutations" {
     const Fixture = struct {
-        element: @import("array_value.zig").ElementType,
+        element: @import("array/value.zig").ElementType,
         sample: f64 = 1.25,
         mutations: usize = 0,
         fn resolve(raw: *anyopaque, a: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
@@ -3130,7 +3150,7 @@ test "SQL floating predicates retain declared NUMERIC parameters for reads and m
         fn checkpoint(_: *anyopaque) !void {}
     };
     const a = std.testing.allocator;
-    for ([_]@import("array_value.zig").ElementType{ .float32, .float64 }) |element| for ([_]bool{ false, true }) |rounded| for ([_][]const u8{
+    for ([_]@import("array/value.zig").ElementType{ .float32, .float64 }) |element| for ([_]bool{ false, true }) |rounded| for ([_][]const u8{
         "SELECT x FROM docs WHERE x = $1",
         "UPDATE docs SET x = x + 1 WHERE x = $1 RETURNING x",
         "DELETE FROM docs WHERE x = $1 RETURNING x",
@@ -3196,7 +3216,7 @@ test "SQL numeric selectors coerce arguments to their common domain" {
     var result = try execute(a, backend, &compiled, &.{.{ .string = "1.123456789" }}, .{});
     defer result.deinit();
     for (result.output.columns, result.output.rows[0]) |column, cell| {
-        try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .float32), column.element_type);
+        try std.testing.expectEqual(@as(?@import("array/value.zig").ElementType, .float32), column.element_type);
         try std.testing.expectEqual(@as(f64, @as(f32, 1.123456789)), cell.float);
     }
 }
@@ -3290,7 +3310,7 @@ test "SQL mixed numeric comparisons preserve prepared ANY ALL probe domains" {
 
 test "SQL mixed numeric comparisons preserve NULLIF equality and return domains" {
     const a = std.testing.allocator;
-    const Kind = @import("array_value.zig").ElementType;
+    const Kind = @import("array/value.zig").ElementType;
     const cases = [_]struct { expression: []const u8, kind: Kind, text: ?[]const u8 }{
         .{ .expression = "NULLIF(1.1::real,1.1::numeric)", .kind = .float32, .text = "1.1" },
         .{ .expression = "NULLIF(1.1::numeric,1.1::real)", .kind = .float64, .text = "1.1" },
@@ -3381,7 +3401,7 @@ test "SQL floating text consumers preserve declared width exponents and signed z
         defer result.deinit();
         try std.testing.expectEqualStrings(case.expected, result.output.rows[0][0].string);
     }
-    for ([_]@import("array_value.zig").ElementType{ .float32, .float64 }) |kind| {
+    for ([_]@import("array/value.zig").ElementType{ .float32, .float64 }) |kind| {
         var fixture: TestBackend = .{ .row_count = 0 };
         var backend = fixture.iface();
         backend.parameter_descriptor_hints = &.{.{ .kind = .number, .element_type = kind }};
@@ -3489,7 +3509,7 @@ test "SQL floating text and JSONB conversion unwinds every allocation failure" {
 
 test "SQL typed windows preserve NUMERIC and REAL semantics in memory and spill" {
     const a = std.testing.allocator;
-    const Case = struct { sql: []const u8, expected: []const ?[]const u8, element: @import("array_value.zig").ElementType };
+    const Case = struct { sql: []const u8, expected: []const ?[]const u8, element: @import("array/value.zig").ElementType };
     const cases = [_]Case{
         .{ .sql = "SELECT SUM(x) OVER () FROM (VALUES (1.20::numeric),(2.30::numeric)) t(x)", .expected = &.{ "3.50", "3.50" }, .element = .numeric },
         .{ .sql = "SELECT AVG(x) OVER () FROM (VALUES (1.20::numeric),(2.30::numeric)) t(x)", .expected = &.{ "1.7500000000000000", "1.7500000000000000" }, .element = .numeric },
@@ -3540,7 +3560,7 @@ test "SQL real SUM retains float4 transitions and result identity in scalar and 
         var result = try execute(a, fixture.iface(), &compiled, &.{}, .{});
         defer result.deinit();
         try std.testing.expectEqual(@as(f64, 0), result.output.rows[0][0].float);
-        try std.testing.expectEqual(@import("array_value.zig").ElementType.float32, result.output.columns[0].element_type.?);
+        try std.testing.expectEqual(@import("array/value.zig").ElementType.float32, result.output.columns[0].element_type.?);
     }
 }
 
@@ -3554,7 +3574,7 @@ test "SQL NUMERIC set projections preserve exact cells across mapped batches" {
     try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
     try std.testing.expectEqualStrings("9007199254740993.1200", result.output.rows[0][0].string);
     try std.testing.expectEqualStrings("9007199254740993.3400", result.output.rows[1][0].string);
-    try std.testing.expectEqual(@import("array_value.zig").ElementType.numeric, result.output.columns[0].element_type.?);
+    try std.testing.expectEqual(@import("array/value.zig").ElementType.numeric, result.output.columns[0].element_type.?);
 }
 
 test "SQL NUMERIC literals preserve PostgreSQL inference precision scale and mixed casts" {
@@ -3613,7 +3633,7 @@ test "SQL NUMERIC scaled rounding resolves PostgreSQL overloads and strict nulls
     try std.testing.expect(result.output.rows[0][0] == .null);
     try std.testing.expect(result.output.rows[0][1] == .null);
     try std.testing.expectEqualStrings("1.26", result.output.rows[0][2].string);
-    for (result.output.columns) |column| try std.testing.expectEqual(@import("array_value.zig").ElementType.numeric, column.element_type.?);
+    for (result.output.columns) |column| try std.testing.expectEqual(@import("array/value.zig").ElementType.numeric, column.element_type.?);
 }
 
 test "SQL NUMERIC SUM AVG execute grouped distinct empty and special reductions" {
@@ -3638,7 +3658,7 @@ test "SQL NUMERIC SUM AVG execute grouped distinct empty and special reductions"
         for (case.rows, result.output.rows) |expected, actual| for (expected, actual) |text, cell| {
             if (text) |value| try std.testing.expectEqualStrings(value, cell.string) else try std.testing.expect(cell == .null);
         };
-        for (result.output.columns) |column| try std.testing.expectEqual(@import("array_value.zig").ElementType.numeric, column.element_type.?);
+        for (result.output.columns) |column| try std.testing.expectEqual(@import("array/value.zig").ElementType.numeric, column.element_type.?);
     }
 }
 
@@ -3656,7 +3676,7 @@ test "SQL NUMERIC grouped extrema preserve exact values and result identity" {
         try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
         try std.testing.expectEqualStrings("9007199254740993.1200", result.output.rows[0][0].string);
         try std.testing.expectEqualStrings("9007199254740996.1200", result.output.rows[0][1].string);
-        for (result.output.columns) |column| try std.testing.expectEqual(@import("array_value.zig").ElementType.numeric, column.element_type.?);
+        for (result.output.columns) |column| try std.testing.expectEqual(@import("array/value.zig").ElementType.numeric, column.element_type.?);
     }
 }
 
@@ -3691,7 +3711,7 @@ fn mutationArrayOwnershipScenario(backing: std.mem.Allocator) !void {
     const a = arena.allocator();
     const context: Context = .{ .alloc = backing, .arena = a, .backend = fixture.iface(), .binding = undefined, .parameters = &.{}, .limits = .{} };
     const column: catalog.Column = .{ .name = "a", .path = "a", .type = .array, .element_type = .jsonb };
-    var input = try @import("array_text.zig").decode(backing, .jsonb, "[0:2]={\"null\",NULL,\"{\\\"x\\\":[1,2]}\"}", .{});
+    var input = try @import("array/text.zig").decode(backing, .jsonb, "[0:2]={\"null\",NULL,\"{\\\"x\\\":[1,2]}\"}", .{});
     const encoded = context.storageDatum(Datum.typedArray(&input.value), column) catch |err| {
         input.deinit();
         return err;
@@ -3740,7 +3760,7 @@ test "SQL result boundary preserves array ownership descriptors and NULL provena
     defer arena.deinit();
     var fixture: TestBackend = .{};
     const context: Context = .{ .alloc = a, .arena = arena.allocator(), .backend = fixture.iface(), .binding = undefined, .parameters = &.{}, .limits = .{} };
-    var input = try @import("array_text.zig").decode(a, .jsonb, "[0:2]={\"null\",NULL,\"{\\\"a\\\":[1,2]}\"}", .{});
+    var input = try @import("array/text.zig").decode(a, .jsonb, "[0:2]={\"null\",NULL,\"{\\\"a\\\":[1,2]}\"}", .{});
     const output = try context.outputDatum(Datum.typedArray(&input.value), .array, .jsonb);
     input.deinit();
     const values = output.object.get("values").?.array.items;
@@ -3751,7 +3771,7 @@ test "SQL result boundary preserves array ownership descriptors and NULL provena
     try std.testing.expectEqual(@as(i64, 0), output.object.get("dimensions").?.array.items[0].object.get("lower_bound").?.integer);
     try std.testing.expect((try context.outputDatum(.{}, .array, .jsonb)) == .null);
     try std.testing.expectError(error.SqlTypeMismatch, context.outputDatum(Datum.json(.null), .array, .jsonb));
-    var integers = try @import("array_text.zig").decode(a, .int64, "{9223372036854775807,NULL}", .{});
+    var integers = try @import("array/text.zig").decode(a, .int64, "{9223372036854775807,NULL}", .{});
     defer integers.deinit();
     const big = try context.outputDatum(Datum.typedArray(&integers.value), .array, .int64);
     try std.testing.expectEqualStrings("9223372036854775807", big.object.get("values").?.array.items[0].string);
@@ -3775,9 +3795,9 @@ test "SQL UUIDv7 executes through runtime with exact extraction and interval met
     try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
     try std.testing.expectEqual(@as(?u4, 7), @import("../common/uuid.zig").version(try @import("../common/uuid.zig").parse(result.output.rows[0][0].string)));
     try std.testing.expectEqualStrings("7", result.output.rows[0][1].string);
-    try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .int16), result.output.columns[1].element_type);
+    try std.testing.expectEqual(@as(?@import("array/value.zig").ElementType, .int16), result.output.columns[1].element_type);
     try std.testing.expectEqual(ast.ColumnType.datetime, result.output.columns[2].type);
-    try std.testing.expectEqual(@as(?@import("temporal_value.zig").Kind, .interval), result.output.columns[3].temporal_kind);
+    try std.testing.expectEqual(@as(?@import("temporal/value.zig").Kind, .interval), result.output.columns[3].temporal_kind);
     try std.testing.expectEqualStrings("1 mon 2 days 03:00:00", result.output.rows[0][3].string);
     for ([_][]const u8{
         "SELECT uuid_extract_version(uuidv7(d.shift)) FROM (SELECT INTERVAL '1 day' AS shift) d",
@@ -3922,10 +3942,10 @@ const TestBackend = struct {
             row.* = .{ .id = try std.fmt.allocPrint(alloc, "{d}", .{index}), .version = 99, .value = .{ .object = object } };
             if (self.stored_arrays) {
                 const elements: []const Datum = if (index == 0) &stored_tag_elements else &.{};
-                const dimensions = try alloc.alloc(@import("array_value.zig").Dimension, 1);
+                const dimensions = try alloc.alloc(@import("array/value.zig").Dimension, 1);
                 dimensions[0] = .{ .length = @intCast(elements.len) };
-                const array = try alloc.create(@import("array_value.zig").Value);
-                array.* = try @import("array_value.zig").Value.init(.text, dimensions, elements, .{});
+                const array = try alloc.create(@import("array/value.zig").Value);
+                array.* = try @import("array/value.zig").Value.init(.text, dimensions, elements, .{});
                 row.* = try catalog.Row.fromDatums(alloc, row.id, try catalog.Row.TypedLayout.init(alloc, &.{ "id", "tags" }), &.{ Datum.fromJson(object.get("id").?), if (index == 2) .{} else Datum.typedArray(array) });
                 row.version = 99;
             }
@@ -4554,7 +4574,7 @@ test "SQL window ranks and ntile preserve PostgreSQL builtin widths and admissio
     defer compiled.deinit();
     var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{});
     defer result.deinit();
-    for (result.output.columns, [_]@import("array_value.zig").ElementType{ .int64, .int64, .int64, .int32, .int32 }) |column, expected| try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, expected), column.element_type);
+    for (result.output.columns, [_]@import("array/value.zig").ElementType{ .int64, .int64, .int64, .int32, .int32 }) |column, expected| try std.testing.expectEqual(@as(?@import("array/value.zig").ElementType, expected), column.element_type);
     for (result.output.rows) |row| try std.testing.expect(row[4] == .null);
     for ([_][]const u8{ "SELECT ntile(2147483648) OVER ()", "SELECT ntile(2::bigint) OVER ()" }) |sql| {
         var rejected = try compiler.compile(std.testing.allocator, sql, .{});
@@ -4590,7 +4610,7 @@ test "SQL integer AVG preserves numeric signatures scale filters sliding exclusi
         var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{});
         defer result.deinit();
         try std.testing.expectEqual(ast.ColumnType.number, result.output.columns[0].type);
-        try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .numeric), result.output.columns[0].element_type);
+        try std.testing.expectEqual(@as(?@import("array/value.zig").ElementType, .numeric), result.output.columns[0].element_type);
         try std.testing.expectEqual(case.values.len, result.output.rows.len);
         for (case.values, result.output.rows) |expected, row| {
             if (expected) |text| try std.testing.expectEqualStrings(text, row[0].string) else try std.testing.expect(row[0] == .null);
@@ -4613,7 +4633,7 @@ test "SQL bigint SUM preserves exact numeric outputs through grouped and window 
         var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{});
         defer result.deinit();
         try std.testing.expectEqual(ast.ColumnType.number, result.output.columns[0].type);
-        try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .numeric), result.output.columns[0].element_type);
+        try std.testing.expectEqual(@as(?@import("array/value.zig").ElementType, .numeric), result.output.columns[0].element_type);
         try std.testing.expectEqual(case.values.len, result.output.rows.len);
         for (case.values, result.output.rows) |expected, row| {
             if (expected) |text| try std.testing.expectEqualStrings(text, row[0].string) else try std.testing.expect(row[0] == .null);
@@ -4632,7 +4652,7 @@ test "SQL recursive type conflicts fail before physical statement admission" {
 }
 
 test "SQL set and VALUES preserve PostgreSQL integer literal builtin widths" {
-    const Case = struct { sql: []const u8, width: @import("array_value.zig").ElementType, rows: usize = 2 };
+    const Case = struct { sql: []const u8, width: @import("array/value.zig").ElementType, rows: usize = 2 };
     for ([_]Case{
         .{ .sql = "SELECT n FROM (VALUES (1),(2),(NULL)) v(n)", .width = .int32, .rows = 3 },
         .{ .sql = "SELECT n FROM (VALUES (1),(2147483648)) v(n)", .width = .int64 },
@@ -4652,7 +4672,7 @@ test "SQL set and VALUES preserve PostgreSQL integer literal builtin widths" {
         try std.testing.expectEqual(@as(usize, 1), result.output.columns.len);
         try std.testing.expectEqualStrings("n", result.output.columns[0].name);
         try std.testing.expectEqual(ast.ColumnType.integer, result.output.columns[0].type);
-        try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, case.width), result.output.columns[0].element_type);
+        try std.testing.expectEqual(@as(?@import("array/value.zig").ElementType, case.width), result.output.columns[0].element_type);
     }
 }
 
@@ -5533,7 +5553,7 @@ test "SQL array scalar contracts execute without catalog or storage access" {
     var array_result = try execute(std.testing.allocator, iface, &array_query, &.{}, .{});
     defer array_result.deinit();
     try std.testing.expectEqual(ast.ColumnType.array, array_result.output.columns[0].type);
-    try std.testing.expectEqual(@import("array_value.zig").ElementType.int32, array_result.output.columns[0].element_type.?);
+    try std.testing.expectEqual(@import("array/value.zig").ElementType.int32, array_result.output.columns[0].element_type.?);
     const envelope = array_result.output.rows[0][0];
     try std.testing.expectEqualStrings("1", envelope.object.get("values").?.array.items[0].string);
     try std.testing.expect(envelope.object.get("sql_nulls").?.array.items[1].bool);
@@ -5816,7 +5836,7 @@ test "SQL shared invocation arrays cross derived set grouped window and recursiv
     defer result.deinit();
     try std.testing.expect(result.output.sql_nulls.?[0][0]);
     try std.testing.expect(!result.output.sql_nulls.?[1][0]);
-    var decoded = try @import("array_wire.zig").decode(std.testing.allocator, .int64, result.output.rows[1][0], .{});
+    var decoded = try @import("array/wire.zig").decode(std.testing.allocator, .int64, result.output.rows[1][0], .{});
     defer decoded.deinit();
     try std.testing.expectEqual(@as(i64, 9007199254740993), decoded.value.flatCell(0).value.integer);
     try std.testing.expectEqual(@as(i32, -1), decoded.value.dimensions[0].lower);
@@ -5832,17 +5852,17 @@ test "SQL shared invocation arrays cross derived set grouped window and recursiv
 test "SQL invocation arrays own public envelopes and reject invalid inputs before reads" {
     const a = std.testing.allocator;
     var fixture: TestBackend = .{};
-    var source = try @import("array_text.zig").decode(a, .int64, "[-1:1]={9007199254740993,NULL,2}", .{});
+    var source = try @import("array/text.zig").decode(a, .int64, "[-1:1]={9007199254740993,NULL,2}", .{});
     defer source.deinit();
     var input: std.heap.ArenaAllocator = .init(a);
-    const envelope = try @import("array_wire.zig").toJsonLeaky(input.allocator(), source.value, .{});
+    const envelope = try @import("array/wire.zig").toJsonLeaky(input.allocator(), source.value, .{});
     var compiled = try compiler.compile(a, "SELECT $1::bigint[] a,$2::integer+1 n", .{});
     defer compiled.deinit();
     var result = try execute(a, fixture.iface(), &compiled, &.{ envelope, .{ .integer = 41 } }, .{});
     defer result.deinit();
     input.deinit();
     try std.testing.expectEqualStrings("42", result.output.rows[0][1].string);
-    var decoded = try @import("array_wire.zig").decode(a, .int64, result.output.rows[0][0], .{});
+    var decoded = try @import("array/wire.zig").decode(a, .int64, result.output.rows[0][0], .{});
     defer decoded.deinit();
     try std.testing.expectEqual(@as(i64, 9007199254740993), decoded.value.flatCell(0).value.integer);
     try std.testing.expectEqual(@as(i32, -1), decoded.value.dimensions[0].lower);
@@ -5878,11 +5898,11 @@ test "SQL typed array navigation promotes defaults without dropping bounds or SQ
             defer compiled.deinit();
             var result = try execute(a, fixture.iface(), &compiled, &.{ .{ .string = "[-1:1]={1,NULL,2}" }, .{ .string = "[0:1]={3.5,NULL}" } }, .{});
             defer result.deinit();
-            try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .float64), result.output.columns[0].element_type);
+            try std.testing.expectEqual(@as(?@import("array/value.zig").ElementType, .float64), result.output.columns[0].element_type);
             try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
-            var first = try @import("array_wire.zig").decode(a, .float64, result.output.rows[0][0], .{});
+            var first = try @import("array/wire.zig").decode(a, .float64, result.output.rows[0][0], .{});
             defer first.deinit();
-            var second = try @import("array_wire.zig").decode(a, .float64, result.output.rows[1][0], .{});
+            var second = try @import("array/wire.zig").decode(a, .float64, result.output.rows[1][0], .{});
             defer second.deinit();
             try std.testing.expectEqual(@as(i32, 0), first.value.dimensions[0].lower);
             try std.testing.expectEqual(@as(f64, 3.5), first.value.flatCell(0).value.float);
@@ -5908,7 +5928,7 @@ test "SQL target parameters preserve PostgreSQL source order and integer widths"
     var description = try describe.describe(std.testing.allocator, backend.iface(), &compiled, &.{});
     defer description.deinit();
     try std.testing.expectEqual(ast.ColumnType.integer, description.binding.parameter_types[0].?);
-    try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .int32), description.binding.parameter_descriptors[0].element_type);
+    try std.testing.expectEqual(@as(?@import("array/value.zig").ElementType, .int32), description.binding.parameter_descriptors[0].element_type);
     var result = try execute(std.testing.allocator, backend.iface(), &compiled, &.{.{ .integer = 41 }}, .{});
     defer result.deinit();
     try std.testing.expectEqualStrings("42", result.output.rows[0][0].string);
@@ -5923,7 +5943,7 @@ test "SQL numeric function parameter contexts use result identity not argument w
     var description = try describe.describe(std.testing.allocator, fixture.iface(), &compiled, &.{});
     defer description.deinit();
     try std.testing.expectEqual(ast.ColumnType.number, description.binding.parameter_types[0].?);
-    try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .float64), description.binding.parameter_descriptors[0].element_type);
+    try std.testing.expectEqual(@as(?@import("array/value.zig").ElementType, .float64), description.binding.parameter_descriptors[0].element_type);
     var result = try execute(std.testing.allocator, fixture.iface(), &compiled, &.{.{ .integer = 3 }}, .{});
     defer result.deinit();
     try std.testing.expect(result.output.rows[0][0].bool and result.output.rows[0][1].bool);
@@ -7810,8 +7830,8 @@ test "SQL native transport results retain typed arrays numeric and null provenan
         try std.testing.expectEqual(@as(usize, 3), cells[0].array.?.cardinality());
         try std.testing.expect(cells[0].array.?.flatCell(1).sql_null);
         try std.testing.expectEqual(@as(i64, 9007199254740993), cells[0].array.?.flatCell(2).value.integer);
-        var numeric_context: @import("numeric_value.zig").Context = .{ .alloc = a };
-        const text = try @import("numeric_value.zig").format(&numeric_context, cells[1].numeric.?.*);
+        var numeric_context: @import("numeric/value.zig").Context = .{ .alloc = a };
+        const text = try @import("numeric/value.zig").format(&numeric_context, cells[1].numeric.?.*);
         defer a.free(text);
         try std.testing.expectEqualStrings("9007199254740993.1200", text);
         try std.testing.expect(!cells[2].sql_null and cells[2].value == .null);
@@ -7869,7 +7889,7 @@ test "SQL native transport mutation returning retains complete typed rows before
 
 test "SQL native transport materialized results avoid public envelopes" {
     const a = std.testing.allocator;
-    const arrays = @import("array_value.zig");
+    const arrays = @import("array/value.zig");
     const cells = try a.alloc(arrays.Element, 32768);
     defer a.free(cells);
     @memset(cells, arrays.Element.json(.{ .integer = 42 }));
@@ -8122,10 +8142,10 @@ test "SQL native transport parameters retain arrays numeric JSON null and source
             var live = true;
             defer if (live) inputs.release();
             const owned = inputs.allocator();
-            const array = try owned.create(@import("array_value.zig").Value);
-            array.* = (try @import("array_text.zig").decodeLeaky(owned, .int64, "[-1:1]={9007199254740993,NULL,-7}", .{ .compact = leased })).value;
-            var ctx: @import("numeric_value.zig").Context = .{ .alloc = owned };
-            const number = try @import("numeric_value.zig").parse(&ctx, "9007199254740993.1200");
+            const array = try owned.create(@import("array/value.zig").Value);
+            array.* = (try @import("array/text.zig").decodeLeaky(owned, .int64, "[-1:1]={9007199254740993,NULL,-7}", .{ .compact = leased })).value;
+            var ctx: @import("numeric/value.zig").Context = .{ .alloc = owned };
+            const number = try @import("numeric/value.zig").parse(&ctx, "9007199254740993.1200");
             const cells = [_]Datum{ .typedArray(array), .typedNumeric(&number.value), .json(.null), .{} };
             var marker: u8 = 0;
             const backend: catalog.Backend = .{ .ptr = &marker, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .checkpoint = checkpoint } };
@@ -8139,8 +8159,8 @@ test "SQL native transport parameters retain arrays numeric JSON null and source
             try std.testing.expectEqual(@as(i64, 9007199254740993), row[0].array.?.flatCell(0).value.integer);
             try std.testing.expectEqual(@as(i32, -1), row[0].array.?.dimensions[0].lower);
             try std.testing.expect(row[0].array.?.flatCell(1).sql_null);
-            var context: @import("numeric_value.zig").Context = .{ .alloc = a };
-            const text = try @import("numeric_value.zig").format(&context, row[1].numeric.?.*);
+            var context: @import("numeric/value.zig").Context = .{ .alloc = a };
+            const text = try @import("numeric/value.zig").format(&context, row[1].numeric.?.*);
             defer a.free(text);
             try std.testing.expectEqualStrings("9007199254740993.1200", text);
             try std.testing.expect(row[2].value == .null and !row[2].sql_null);
@@ -8426,7 +8446,7 @@ test "SQL storage reencodes native timestamptz datums without changing their mic
             var arena = std.heap.ArenaAllocator.init(backing);
             defer arena.deinit();
             const a = arena.allocator();
-            const T = @import("temporal_value.zig");
+            const T = @import("temporal/value.zig");
             const column: catalog.Column = .{ .name = "created_at", .path = "created_at", .type = .datetime, .temporal_kind = .timestamp_tz };
             for ([_]i128{ 0, 1706704496123456000, std.math.maxInt(u64) - @mod(@as(i128, std.math.maxInt(u64)), 1000) }) |nanos| {
                 var value: T.Value = .{ .timestamp_tz = try T.Timestamp.fromUnixNanoseconds(nanos) };
@@ -8459,7 +8479,7 @@ test "SQL collection aggregates retain ordered tuples filters exact types and em
     try std.testing.expectEqualStrings("2", result.output.rows[0][1].object.get("values").?.array.items[0].string);
     try std.testing.expectEqualStrings("3", result.output.rows[0][2].string);
     try std.testing.expectEqualStrings("3", result.output.rows[0][3].string);
-    try std.testing.expectEqual(@import("array_value.zig").ElementType.int32, result.output.columns[1].element_type.?);
+    try std.testing.expectEqual(@import("array/value.zig").ElementType.int32, result.output.columns[1].element_type.?);
     var filtered = try compiler.compile(a, "SELECT string_agg((1/(_id::int-_id::int))::text,',' ORDER BY _id) FILTER(WHERE FALSE),array_agg(NULL::integer ORDER BY _id) FILTER(WHERE FALSE),count(*) FROM things", .{});
     defer filtered.deinit();
     var absent = try execute(a, backend.iface(), &filtered, &.{}, .{ .page_rows = 1 });

@@ -320,8 +320,8 @@ test "SQL tuple membership distinguishes JSONB null and owns typed array keys" {
     const index = try Index.create(a, 2, .{}, null);
     defer index.deinit();
     var elements = [_]Datum{ Datum.json(.{ .integer = 9007199254740993 }), .{} };
-    var dimensions = [_]@import("array_value.zig").Dimension{.{ .length = 2, .lower = -1 }};
-    var array = try @import("array_value.zig").Value.init(.int64, &dimensions, &elements, .{});
+    var dimensions = [_]@import("array/value.zig").Dimension{.{ .length = 2, .lower = -1 }};
+    var array = try @import("array/value.zig").Value.init(.int64, &dimensions, &elements, .{});
     try index.add(&.{ Datum.json(.null), Datum.typedArray(&array) });
     try index.seal();
     try std.testing.expectEqual(Truth.yes, try index.probe(&.{ Datum.json(.null), Datum.typedArray(&array) }));

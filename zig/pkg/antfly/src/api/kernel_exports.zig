@@ -183,13 +183,14 @@ pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
         state.runtime_io.init(borrows) catch |err| return fail(err);
         imported_cfg.imported_runtime_io = state.runtime_io.views();
     }
-    state.server = if (context.flags & CreateContext.fallible_init != 0)
-        server_mod.ApiHttpServer.initWithConfig(owner_alloc, imported_cfg, source.*, reads.*, writes.*) catch |err| {
+    if (context.flags & CreateContext.fallible_init != 0) {
+        state.server.initWithConfigInto(owner_alloc, imported_cfg, source.*, reads.*, writes.*) catch |err| {
             std.log.err("API kernel create failed initializing server: error.{s}", .{@errorName(err)});
             return fail(err);
-        }
-    else
-        server_mod.ApiHttpServer.initWithProcessRequestAllocator(owner_alloc, imported_cfg, source.*, reads.*, writes.*);
+        };
+    } else {
+        state.server = server_mod.ApiHttpServer.initWithProcessRequestAllocator(owner_alloc, imported_cfg, source.*, reads.*, writes.*);
+    }
     state.server.initializeDistributedSql() catch |err| {
         state.server.deinit();
         return fail(err);
@@ -286,7 +287,7 @@ pub fn attachReplicatedRestoreStore(
 }
 
 pub fn authorizeSqlLock(context: *const CallContext) callconv(.c) abi.Status {
-    const Input = @import("sql_data_locks.zig").AuthorizationInput;
+    const Input = @import("sql/session/data_locks.zig").AuthorizationInput;
     const Output = @import("antfly_local_sources").storage_pessimistic_lock_control.Command;
     if (validateCall(Input, Output, context)) |failure| return failure;
     output(Output, context).* = serverState(context).server.authorizeSqlLock(input(Input, context).*) catch |err| return fail(err);

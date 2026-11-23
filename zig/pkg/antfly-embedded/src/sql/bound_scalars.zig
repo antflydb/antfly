@@ -170,7 +170,7 @@ pub fn needsResidual(table: ?catalog.Table, predicate: ?*const ast.Predicate) bo
 fn typedComparisonColumn(table: ?catalog.Table, name: []const u8) bool {
     const definition = table orelse return false;
     const column = definition.column(name) catch return false;
-    return definition.isDocumentVersion(name) or column.type == .json or column.type == .array or column.element_type == .numeric or @import("range_value.zig").kindFromType(column.type) != null;
+    return column.read_type_guard or definition.isDocumentVersion(name) or column.type == .json or column.type == .array or column.element_type == .numeric or @import("range/value.zig").kindFromType(column.type) != null;
 }
 
 // Floating native columns may receive an explicitly typed NUMERIC parameter.
@@ -185,7 +185,7 @@ fn numberColumn(table: ?catalog.Table, name: []const u8) bool {
 fn jsonColumn(table: ?catalog.Table, name: []const u8) bool {
     const definition = table orelse return false;
     const column = definition.column(name) catch return false;
-    return column.type == .json;
+    return column.read_type_guard or column.type == .json;
 }
 
 test "SQL bound scalar cells preserve typed array descriptors and reject JSON substitutes" {
@@ -196,8 +196,8 @@ test "SQL bound scalar cells preserve typed array descriptors and reject JSON su
     var compiled = try @import("compiler.zig").compile(a, "SELECT cardinality(a), array_lower(a, 1), array_upper(a, 1), 9007199254740993 = ANY(a), 9007199254740992 = ANY(a) FROM items", .{});
     defer compiled.deinit();
     const bound = try bind(a, table, compiled.statement, &.{});
-    try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .int64), bound.columns[0].element_type);
-    var array = try @import("array_value.zig").Value.init(.int64, &.{.{ .length = 2, .lower = -3 }}, &.{ scalar.Datum.json(.{ .integer = 9007199254740993 }), .{} }, .{});
+    try std.testing.expectEqual(@as(?@import("array/value.zig").ElementType, .int64), bound.columns[0].element_type);
+    var array = try @import("array/value.zig").Value.init(.int64, &.{.{ .length = 2, .lower = -3 }}, &.{ scalar.Datum.json(.{ .integer = 9007199254740993 }), .{} }, .{});
     const row = try catalog.Row.fromDatums(a, "", try catalog.Row.TypedLayout.init(a, &.{"a"}), &.{scalar.Datum.typedArray(&array)});
     const values = try bound.cells(a, row);
     for (bound.projections[0..3], [_]i64{ 2, -3, -2 }) |program, integer| try std.testing.expectEqual(integer, (try program.?.evaluate(a, values, &.{}, .{})).value.integer);
@@ -228,7 +228,7 @@ test "SQL statements converge typed descriptors before emission and share one ow
         var types: [1]scalar.Type = .{.{ .kind = .array, .element_type = .int64 }};
         const bound = try bindTyped(arena.allocator(), table, compiled.statement, &types, null, &.{});
         try std.testing.expectEqual(@as(?ast.ColumnType, .array), types[0].kind);
-        try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .int64), types[0].element_type);
+        try std.testing.expectEqual(@as(?@import("array/value.zig").ElementType, .int64), types[0].element_type);
         var input = [_]u8{ '{', '1', ',', '2', ',', 'N', 'U', 'L', 'L', '}' };
         var prepared = try bound.prepareParameters(a, &.{.{ .text = &input }}, .{});
         defer prepared.deinit();
@@ -602,7 +602,7 @@ fn arrayAssignmentBindingScenario(backing: Allocator) !void {
     defer compiled.deinit();
     var descriptors = [_]scalar.Type{.{}};
     const bound = try bindTyped(a, table, compiled.statement, &descriptors, null, &.{});
-    try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .int16), descriptors[0].element_type);
+    try std.testing.expectEqual(@as(?@import("array/value.zig").ElementType, .int16), descriptors[0].element_type);
     var prepared = try bound.prepareParameters(backing, &.{.{ .text = "{3,NULL}" }}, .{});
     defer prepared.deinit();
     var none = std.heap.FixedBufferAllocator.init(&.{});
@@ -640,8 +640,8 @@ test "SQL exact NUMERIC assignments prepare plain literals once without floating
                 const value = try program.evaluate(none.allocator(), &.{}, &.{}, .{});
                 if (case.expected) |expected| {
                     try std.testing.expect(value.numeric != null);
-                    var work: @import("numeric_value.zig").Context = .{ .alloc = a };
-                    try std.testing.expectEqualStrings(expected, try @import("numeric_value.zig").format(&work, value.numeric.?.*));
+                    var work: @import("numeric/value.zig").Context = .{ .alloc = a };
+                    try std.testing.expectEqualStrings(expected, try @import("numeric/value.zig").format(&work, value.numeric.?.*));
                     for (0..1000) |_| try std.testing.expect((try program.evaluate(none.allocator(), &.{}, &.{}, .{})).numeric == value.numeric);
                 } else try std.testing.expect(value.sql_null);
             }
@@ -696,7 +696,7 @@ test "SQL undeclared repeated array assignment parameters retain one consistent 
     try std.testing.expectError(error.ConflictingSqlParameterTypes, bindTyped(a, table, compiled.statement, &unknown, null, &.{}));
     var declared = [_]scalar.Type{.{ .kind = .array, .element_type = .int16 }};
     _ = try bindTyped(a, table, compiled.statement, &declared, null, &.{});
-    try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .int16), declared[0].element_type);
+    try std.testing.expectEqual(@as(?@import("array/value.zig").ElementType, .int16), declared[0].element_type);
 }
 
 const Builder = struct {

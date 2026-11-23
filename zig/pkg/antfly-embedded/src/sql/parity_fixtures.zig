@@ -14,6 +14,7 @@
 // limitations under the License.
 
 pub const inventory = @embedFile("fixtures/sql_parity_inventory.json");
+pub const cluster_reference = @embedFile("fixtures/sql_cluster_reference.json");
 pub const prepared_transaction_reference = @embedFile("fixtures/sql_prepared_transaction_reference.json");
 pub const role_defaults_reference = @embedFile("fixtures/sql_role_defaults_reference.json");
 pub const generated_original_reference = @embedFile("fixtures/sql_generated_original_reference.json");
@@ -89,6 +90,7 @@ pub const set_read_reference = @embedFile("fixtures/sql_set_read_campaign_refere
 
 pub const constraint_timing_reference = @embedFile("fixtures/sql_constraint_timing_reference.json");
 pub const transaction_characteristics_reference = @embedFile("fixtures/sql_transaction_characteristics_reference.json");
+pub const tablespace_creation_reference = @embedFile("fixtures/sql_tablespace_creation_reference.json");
 pub const tablespace_lifecycle_reference = @embedFile("fixtures/sql_tablespace_lifecycle_reference.json");
 
 const std = @import("std");
@@ -210,3 +212,5 @@ pub const trigger_reference = @embedFile("fixtures/sql_trigger_reference.json");
 pub const phonetic_reference = @embedFile("fixtures/sql_phonetic_reference.json");
 
 pub const mutation_cte_reference = @embedFile("fixtures/sql_mutation_cte_reference.json");
+
+pub const function_support_reference = @embedFile("fixtures/sql_function_support_reference.json");

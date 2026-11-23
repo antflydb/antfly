@@ -14,5 +14,5 @@
 // limitations under the License.
 
 test {
-    _ = @import("storage/db/relational_index_publication_progress.zig");
+    _ = @import("storage/db/relational/indexes/publication_progress.zig");
 }

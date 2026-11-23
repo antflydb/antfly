@@ -35,7 +35,7 @@ pub fn storageType(declared: ast.RoutineDefinition.Type) !records.Type {
     } };
     if (declared.kind == .numrange or declared.kind == .daterange or declared.kind == .tsrange or declared.kind == .tstzrange)
         return .{ .scalar = std.meta.stringToEnum(records.Type.Scalar, @tagName(declared.kind)).? };
-    const element: @import("array_value.zig").ElementType = declared.element_type orelse switch (declared.kind) {
+    const element: @import("array/value.zig").ElementType = declared.element_type orelse switch (declared.kind) {
         .string => .text,
         .uuid => .uuid,
         .integer => .int64,
@@ -64,15 +64,29 @@ pub fn runtimeType(declared: records.Type) scalar.Type {
         .tstzrange => .tstzrange,
     };
     return .{ .kind = kind, .element_type = switch (declared.scalar) {
-        .text, .uuid, .int16, .int32, .int64, .float32, .float64, .boolean, .jsonb, .numeric => std.meta.stringToEnum(@import("array_value.zig").ElementType, @tagName(declared.scalar)).?,
+        .text, .uuid, .int16, .int32, .int64, .float32, .float64, .boolean, .jsonb, .numeric => std.meta.stringToEnum(@import("array/value.zig").ElementType, @tagName(declared.scalar)).?,
         else => null,
-    }, .temporal_kind = if (kind == .datetime) std.meta.stringToEnum(@import("temporal_value.zig").Kind, @tagName(declared.scalar)).? else null };
+    }, .temporal_kind = if (kind == .datetime) std.meta.stringToEnum(@import("temporal/value.zig").Kind, @tagName(declared.scalar)).? else null };
+}
+
+pub fn argumentSignatureAlloc(a: A, arguments: []const ast.RoutineDefinition.Argument) ![]u8 {
+    if (arguments.len > records.max_arguments) return error.SqlProgramLimitExceeded;
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(a);
+    for (arguments, 0..) |argument, i| {
+        const kind = try storageType(argument.type);
+        if (i != 0) try text.append(a, ';');
+        try text.appendSlice(a, @tagName(kind.scalar));
+        if (kind.array) try text.appendSlice(a, "[]");
+    }
+    return text.toOwnedSlice(a);
 }
 
 pub fn definition(a: A, intent: ast.RoutineDefinition, owner: @import("../system_catalog/owners.zig").Owner) !records.Definition {
+    if (intent.planner_support != null) return error.UnsupportedSqlShape;
     const arguments = try a.alloc(records.Argument, intent.arguments.len);
     for (intent.arguments, arguments) |arg, *out| out.* = .{ .name = if (arg.name) |name| try a.dupe(u8, name) else null, .type = try storageType(arg.type) };
-    const result: records.Definition = .{ .arguments = arguments, .returns_trigger = intent.returns_trigger, .result = if (intent.result) |result| try storageType(result) else null, .language = std.meta.stringToEnum(@FieldType(records.Definition, "language"), @tagName(intent.language)).?, .body = try a.dupe(u8, intent.body), .strict = intent.strict, .volatility = std.meta.stringToEnum(records.Volatility, @tagName(intent.volatility)).?, .owner = owner };
+    const result: records.Definition = .{ .arguments = arguments, .returns_trigger = intent.returns_trigger, .result = if (intent.result) |result| try storageType(result) else null, .language = std.meta.stringToEnum(@FieldType(records.Definition, "language"), @tagName(intent.language)).?, .body = try a.dupe(u8, intent.body orelse return error.SqlInvalidFunctionDefinition), .strict = intent.strict, .volatility = std.meta.stringToEnum(records.Volatility, @tagName(intent.volatility)).?, .owner = owner };
     try result.validate();
     return result;
 }

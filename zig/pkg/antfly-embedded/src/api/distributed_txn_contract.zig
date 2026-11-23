@@ -41,6 +41,7 @@ pub const status_server_response_reserve_ms: u32 = 50;
 /// Process-local execution context established by the receiving node. This is
 /// never serialized directly across the wire.
 pub const PreDecisionContext = struct {
+    document_revision_scope: ?@import("../storage/document_revision_reservation.zig").Scope = null,
     sql_locks: ?@import("../storage/pessimistic_lock/transaction.zig").Ref = null,
     external_decision_owner: ?@import("../storage/transactions.zig").ExternalDecisionOwner = null,
     route_fence: ?@import("../metadata/catalog_route_contract.zig").CatalogRouteFence = null,
@@ -75,6 +76,7 @@ pub const TxnResolveRequest = struct {
 };
 
 pub const TableCommitRequest = struct {
+    document_revision_handoffs: []const @import("../storage/document_revision_reservation.zig").Handoff = &.{},
     graph_preparation: ?@import("../storage/db/prepared_graph_effects.zig").Admission = null,
     /// Immutable processed rows, retained by protected SQL/session staging.
     /// Public ingress rejects this private preparation evidence.
@@ -109,10 +111,10 @@ pub const TableCommitRequest = struct {
     graph_deletes: []const db_types.GraphEdgeDelete = &.{},
     predicates: []const db_types.TransactionVersionPredicate = &.{},
     integrity: []const db_types.TransactionIntegrityOperation = &.{},
-    integrity_commands: []const @import("../storage/db/relational_integrity_contract.zig").Command = &.{},
-    relational_activation: ?@import("../storage/db/relational_integrity_activation_contract.zig").Command = null,
-    relational_retirement: ?@import("../storage/db/relational_integrity_retirement_contract.zig").Command = null,
-    relational_index_maintenance: ?@import("../storage/db/relational_index_maintenance_contract.zig").Command = null,
+    integrity_commands: []const @import("../storage/db/relational/integrity/contract.zig").Command = &.{},
+    relational_activation: ?@import("../storage/db/relational/integrity/activation_contract.zig").Command = null,
+    relational_retirement: ?@import("../storage/db/relational/integrity/retirement_contract.zig").Command = null,
+    relational_index_maintenance: ?@import("../storage/db/relational/indexes/maintenance_contract.zig").Command = null,
     pub fn jsonStringify(self: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
         try stream.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |field| {
@@ -128,7 +130,7 @@ pub const TableCommitRequest = struct {
         return std.mem.eql(u8, field, "relation_owner_minter") or std.mem.eql(u8, field, "trigger_minter");
     }
     pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
-        return (std.mem.eql(u8, field, "bound_catalog_incarnation") and self.bound_catalog_incarnation == null) or ((comptime std.mem.eql(u8, field, "graph_preparation")) and self.graph_preparation == null) or (comptime nativeJsonSkipFieldComptime(field)) or ((comptime std.mem.eql(u8, field, "sql_persistence")) and self.sql_persistence == null) or ((comptime std.mem.eql(u8, field, "graph_writes")) and self.graph_writes.len == 0) or ((comptime std.mem.eql(u8, field, "graph_deletes")) and self.graph_deletes.len == 0);
+        return (std.mem.eql(u8, field, "bound_catalog_incarnation") and self.bound_catalog_incarnation == null) or ((comptime std.mem.eql(u8, field, "document_revision_handoffs")) and self.document_revision_handoffs.len == 0) or ((comptime std.mem.eql(u8, field, "graph_preparation")) and self.graph_preparation == null) or (comptime nativeJsonSkipFieldComptime(field)) or ((comptime std.mem.eql(u8, field, "sql_persistence")) and self.sql_persistence == null) or ((comptime std.mem.eql(u8, field, "graph_writes")) and self.graph_writes.len == 0) or ((comptime std.mem.eql(u8, field, "graph_deletes")) and self.graph_deletes.len == 0);
     }
 };
 

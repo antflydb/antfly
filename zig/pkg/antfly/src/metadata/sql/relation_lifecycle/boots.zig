@@ -134,6 +134,37 @@ pub const PublishedRestoreProof = struct {
     }
 };
 
+pub const ReportBasis = struct {
+    reporter_incarnation: u64,
+    status_generation: u64,
+    cursor: ?@import("../../store_report_update.zig").Cursor,
+    /// Temporary exclusion while an actual generation upload can activate.
+    /// A change here ALONE never proves a prior unknown native call lost.
+    pending_baseline: ?@import("../../store_report_update.zig").Cursor = null,
+    header_digest: [32]u8,
+    pub fn validate(self: @This()) !void {
+        if (self.reporter_incarnation == 0 or std.mem.allEqual(u8, &self.header_digest, 0)) return error.InvalidStoreReporterFence;
+        if (self.cursor) |cursor| if (cursor.reporter_incarnation != self.reporter_incarnation or cursor.sequence == 0 or std.mem.allEqual(u8, &cursor.digest, 0)) return error.InvalidStoreReporterFence;
+        // Reporter replacement can leave an inherited upload awaiting bounded
+        // cleanup. Preserve its ACTUAL cursor rather than fabricating this
+        // header's incarnation; it is still an exclusion, never an ACK.
+        if (self.pending_baseline) |cursor| if (cursor.reporter_incarnation == 0 or cursor.sequence == 0 or std.mem.allEqual(u8, &cursor.digest, 0)) return error.InvalidStoreReporterFence;
+    }
+    pub fn eql(self: @This(), other: @This()) bool {
+        return std.meta.eql(self, other);
+    }
+    /// Only a durable publication/reporter change can settle a lost native
+    /// reply. Upload prepare/displacement/GC may go None→Some→None without
+    /// changing the accepted report, so that transient state is excluded.
+    pub fn stableEql(self: @This(), other: @This()) bool {
+        var left = self;
+        var right = other;
+        left.pending_baseline = null;
+        right.pending_baseline = null;
+        return std.meta.eql(left, right);
+    }
+};
+
 pub const Observation = struct {
     published_restore: ?PublishedRestoreProof = null,
     maintenance: ?MaintenanceLease = null,

@@ -26,7 +26,7 @@
 //! after a lost reply. Public admission must additionally pin the dependency
 //! closure and prevent concurrent metadata changes for this job's lifetime.
 const std = @import("std");
-const topology = @import("../storage/db/relational_integrity_topology.zig");
+const topology = @import("../storage/db/relational/integrity/topology.zig");
 
 pub const Phase = enum { freezing, draining, capturing, releasing, exporting, publishing, reclaiming, completed, cancelling, cancel_reclaiming, cancelled };
 
@@ -54,7 +54,7 @@ pub const SealReceipt = struct {
     handle: @import("../storage/db/native_backup_seal.zig").Handle,
     source_node_id: u64,
     pub fn jsonStringify(self: SealReceipt, writer: anytype) @TypeOf(writer.*).Error!void {
-        try @import("../storage/db/relational_integrity_json.zig").write(self, writer);
+        try @import("../storage/db/relational/integrity/json.zig").write(self, writer);
     }
 };
 
@@ -166,7 +166,7 @@ pub const Job = struct {
     pub const max_encoded_bytes = 2 * 1024 * 1024;
 
     pub fn jsonStringify(self: Job, writer: anytype) @TypeOf(writer.*).Error!void {
-        try @import("../storage/db/relational_integrity_json.zig").write(self, writer);
+        try @import("../storage/db/relational/integrity/json.zig").write(self, writer);
     }
 
     pub fn validate(self: Job) !void {

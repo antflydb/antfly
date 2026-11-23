@@ -1396,15 +1396,26 @@ test "SQL scope retirement temporary nonce recovers canonical ownership after na
     const admitted = try AdmissionHarness.apply(&store, scratch, request, 1, false);
     const head = admitted.current.?;
     try std.testing.expect(head.temporary_owner.?.eql(TemporaryNamespaceFixture.owner));
+    const probe: wire.TemporaryProbe = .{ .owner = TemporaryNamespaceFixture.owner, .database_id = 1, .namespace_id = 901, .nonce = @splat(91), .include_work = true };
+    {
+        var read = try store.store.beginReadTxn();
+        defer read.abort();
+        const active = (try wire.temporaryObservation(&read, group, probe)).?;
+        try std.testing.expectEqualDeep(head, active.work.?.head);
+        var mismatched = active;
+        mismatched.work.?.head.sequence += 1;
+        try std.testing.expectError(error.InvalidScopeRetirement, mismatched.requireFor(active.outcome.?.query));
+    }
     const drained = try AdmissionHarness.apply(&store, scratch, .{ .admission = .{ .nonce = @splat(92), .head = 0 }, .operation = .{ .drain = .{ .lookup = head.lookup, .expected_revision = head.progress.revision } } }, 2, false);
     const published = try AdmissionHarness.apply(&store, scratch, .{ .admission = .{ .nonce = @splat(93), .head = 0 }, .operation = .{ .publish = .{ .lookup = head.lookup, .expected_revision = drained.current.?.progress.revision } } }, 3, false);
     try std.testing.expectEqual(contract.Phase.published, published.current.?.progress.phase);
     var read = try store.store.beginReadTxn();
     defer read.abort();
-    const probe: wire.TemporaryProbe = .{ .owner = TemporaryNamespaceFixture.owner, .database_id = 1, .namespace_id = 901, .nonce = @splat(91) };
+
     const recovered = (try wire.temporaryObservation(&read, group, probe)).?;
     try std.testing.expectEqualDeep(admitted.outcome.?.query, recovered.outcome.?.query);
     try std.testing.expectEqual(contract.Phase.published, recovered.current.?.progress.phase);
+    try std.testing.expect(recovered.work == null);
     var wrong = probe;
     wrong.owner.connection_generation += 1;
     try std.testing.expectError(error.InvalidSqlTemporaryNamespace, wire.temporaryObservation(&read, group, wrong));

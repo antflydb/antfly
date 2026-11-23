@@ -18,8 +18,8 @@
 //! A lease pins the program through page preparation. Replicated staging state,
 //! not this disposable cache, remains the publication/progress authority.
 const std = @import("std");
-const programs = @import("db/relational_rewrite_program.zig");
-const contract = @import("db/relational_rewrite_contract.zig");
+const programs = @import("db/relational/schema_change/rewrite_program.zig");
+const contract = @import("db/relational/schema_change/rewrite_contract.zig");
 const staging = @import("db/restore_staging_contract.zig");
 const resources = @import("resource_manager.zig");
 const RequestContext = @import("../api/operation.zig").RequestContext;

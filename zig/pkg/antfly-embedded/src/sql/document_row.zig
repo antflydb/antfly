@@ -97,6 +97,25 @@ pub fn deriveColumns(alloc: std.mem.Allocator, schema: anytype) ![]const catalog
         }
     };
     for (schema.document_schemas, 0..) |document, document_index| try Collector.collect(temporary, &entries, document.properties, document.required_fields, &.{}, true, document_index);
+    if (comptime @hasField(@TypeOf(schema), "document_sql_columns")) {
+        if (schema.document_sql_columns) |declared| for (declared.value) |column| {
+            const entry = try entries.getOrPut(temporary, column.name);
+            // A declaration cannot shadow another typed/physical column or
+            // silently change a schema-owned identity through lookup order.
+            if (entry.found_existing) return error.DuplicateSqlColumn;
+            entry.value_ptr.* = .{
+                .column = .{ .name = column.name, .path = column.name, .document_path = column.path, .type = switch (column.type) {
+                    .keyword, .text => .string,
+                    .integer => .integer,
+                    .number => .number,
+                    .boolean => .boolean,
+                    .json => .json,
+                }, .nullable = true, .generated = true, .document_null_is_absent = column.type != .json, .read_type_guard = column.type != .json },
+                .required_count = 0,
+                .last_document = 0,
+            };
+        };
+    }
     const columns = try alloc.alloc(catalog.Column, entries.count());
     var initialized: usize = 0;
     errdefer {
@@ -216,7 +235,7 @@ pub fn propertyType(property: anytype) ast.ColumnType {
         if (property.sql_type == .uuid) return .uuid;
     }
     const name = property.field_type orelse return .json;
-    if (std.meta.stringToEnum(@import("range_value.zig").Kind, name)) |kind| return @import("range_value.zig").typeFromKind(ast.ColumnType, kind);
+    if (std.meta.stringToEnum(@import("range/value.zig").Kind, name)) |kind| return @import("range/value.zig").typeFromKind(ast.ColumnType, kind);
     if (std.mem.eql(u8, name, "integer") or property.integer_only) return .integer;
     if (std.mem.eql(u8, name, "number") or std.mem.eql(u8, name, "numeric")) return .number;
     if (std.mem.eql(u8, name, "boolean")) return .boolean;
@@ -298,6 +317,26 @@ pub fn projectValue(alloc: std.mem.Allocator, table: catalog.Table, id: []const 
 /// Decode a declared storage cell once while its native page or prepared
 /// mutation remains pinned. Already typed cells stay borrowed; exact payloads
 /// never pass through the scalar JSON placeholder coercion path.
+/// Only schema-owned read aliases may retain a closed typed failure. The row
+/// remains owned and non-NULL; its scalar or direct-output consumer raises it.
+fn readCell(a: std.mem.Allocator, column: catalog.Column, raw: catalog.Row.Cell) !catalog.Row.Cell {
+    if (raw.read_failure != null) {
+        try raw.validateCarrier();
+        return raw;
+    }
+    const normalized: catalog.Row.Cell = blk: {
+        const value: Json = if (raw.sql_null) .null else if (column.type == .array) try typed_json.clone(a, raw.value) else if (column.element_type == .numeric and column.type == .number) raw.value else coerce(a, raw.value, column.type) catch |err| {
+            if (column.read_type_guard) if (@import("scalar.zig").ReadFailure.fromError(err)) |cause| return .deferredReadFailure(cause);
+            return err;
+        };
+        break :blk .{ .value = value, .sql_null = raw.sql_null };
+    };
+    return declaredCell(a, column, normalized) catch |err| {
+        if (column.read_type_guard) if (@import("scalar.zig").ReadFailure.fromError(err)) |cause| return .deferredReadFailure(cause);
+        return err;
+    };
+}
+
 pub fn declaredCell(alloc: std.mem.Allocator, column: catalog.Column, raw: catalog.Row.Cell) !catalog.Row.Cell {
     if (column.enum_view != null) return @import("describe.zig").coerceDatumTyped(alloc, raw, @import("scalar.zig").columnType(column));
     if (column.type == .datetime and !raw.sql_null and raw.temporal() == null) {
@@ -305,10 +344,10 @@ pub fn declaredCell(alloc: std.mem.Allocator, column: catalog.Column, raw: catal
         // JSON readers may carry RFC3339. Decode once into the SQL temporal
         // datum; formatting and reparsing loses the declared temporal domain.
         if (raw.array != null or raw.numeric != null or raw.patterns() != null) return error.SqlTypeMismatch;
-        const temporal = @import("temporal_value.zig");
+        const temporal = @import("temporal/value.zig");
         const kind = column.temporal_kind orelse .timestamp_tz;
         const value: temporal.Value = if (raw.value == .string) parsed: {
-            const canonical = @import("temporal_text.zig").parseCanonical(kind, raw.value.string) catch |err| {
+            const canonical = @import("temporal/text.zig").parseCanonical(kind, raw.value.string) catch |err| {
                 if (kind != .timestamp_tz) return err;
                 const nanos = datetime.parseDateTimeToSignedNs(raw.value.string) orelse return err;
                 break :parsed .{ .timestamp_tz = try temporal.Timestamp.fromUnixNanoseconds(nanos) };
@@ -329,8 +368,8 @@ pub fn declaredCell(alloc: std.mem.Allocator, column: catalog.Column, raw: catal
     }
     if (column.type == .array and !raw.sql_null and raw.array == null) {
         const kind = column.element_type orelse return error.InvalidSqlBackendResponse;
-        const decoded = try @import("array_wire.zig").decodeBorrowed(alloc, kind, raw.value, .{});
-        const array = try alloc.create(@import("array_value.zig").Value);
+        const decoded = try @import("array/wire.zig").decodeBorrowed(alloc, kind, raw.value, .{});
+        const array = try alloc.create(@import("array/value.zig").Value);
         array.* = decoded.value;
         return catalog.Row.Cell.typedArray(array);
     }
@@ -380,7 +419,7 @@ pub const Projection = struct {
             errdefer if (out.path.ptr != out.name.ptr) alloc.free(out.path);
             out.document_path = try @import("document_path.zig").clone(alloc, column.document_path);
             initialized += 1;
-            has_typed_cells = has_typed_cells or column.document_path.len != 0 or column.type == .array or column.type == .datetime or column.element_type == .numeric or @import("range_value.zig").kindFromType(column.type) != null;
+            has_typed_cells = has_typed_cells or column.document_path.len != 0 or column.type == .array or column.type == .datetime or column.element_type == .numeric or @import("range/value.zig").kindFromType(column.type) != null;
         }
         return .{ .columns = columns, .has_typed_cells = has_typed_cells, .document_root = table.storage_mode == .document };
     }
@@ -449,7 +488,7 @@ pub const Projection = struct {
                 if (!cell.sql_null and ((column.type == .array and cell.array == null) or
                     (column.element_type == .numeric and column.type != .array and cell.numeric == null) or
                     (column.type == .datetime and cell.temporal() == null) or
-                    (@import("range_value.zig").kindFromType(column.type) != null and cell.range() == null)))
+                    (@import("range/value.zig").kindFromType(column.type) != null and cell.range() == null)))
                 {
                     direct = false;
                     break;
@@ -474,7 +513,7 @@ pub const Projection = struct {
                 raw = .{ .value = value orelse .null, .sql_null = value == null or (value.? == .null and column.type != .json) };
             }
             if (raw.sql_null and !column.nullable) return error.InvalidSqlBackendResponse;
-            cell.* = try declaredCell(alloc, column, raw);
+            cell.* = if (column.read_type_guard) try readCell(alloc, column, raw) else try declaredCell(alloc, column, raw);
         }
         var result = row;
         result.value = .null;
@@ -524,8 +563,7 @@ pub const Projection = struct {
                     const item = selected orelse .null;
                     const sql_null = selected == null or (item == .null and column.type != .json);
                     if (sql_null and !column.nullable) return error.InvalidSqlBackendResponse;
-                    const owned = if (sql_null) Json.null else if (column.type == .array) try typed_json.clone(target.alloc, item) else if (column.element_type == .numeric and column.type == .number) item else try coerce(target.alloc, item, column.type);
-                    target.cells[slot] = try declaredCell(target.alloc, column, .{ .value = owned, .sql_null = sql_null });
+                    target.cells[slot] = try readCell(target.alloc, column, .{ .value = item, .sql_null = sql_null });
                     target.presence[slot] = selected != null;
                     slot = target.projection.next_source[slot];
                 }
@@ -559,8 +597,8 @@ pub const Projection = struct {
                     return;
                 }
                 if (homogeneous and column.type == .array and !std.mem.eql(u8, std.mem.trim(u8, bytes, " \t\r\n"), "null")) {
-                    const decoded = try @import("array_wire.zig").decodeBytesLeakyMeasured(target.alloc, column.element_type orelse return error.InvalidSqlBackendResponse, bytes, .{});
-                    const value = try target.alloc.create(@import("array_value.zig").Value);
+                    const decoded = try @import("array/wire.zig").decodeBytesLeakyMeasured(target.alloc, column.element_type orelse return error.InvalidSqlBackendResponse, bytes, .{});
+                    const value = try target.alloc.create(@import("array/value.zig").Value);
                     value.* = decoded.value;
                     var slot = first;
                     while (slot != std.math.maxInt(usize)) {
@@ -650,16 +688,7 @@ pub const Projection = struct {
                 present.* = raw != null;
                 const sql_null = raw == null or (raw.? == .null and column.type != .json);
                 if (sql_null and !column.nullable) return error.InvalidSqlBackendResponse;
-                // Exact decimals parse their original lexeme directly into
-                // owned coefficients. Arrays need an owned envelope because
-                // primitive cells can borrow its strings/JSONB subtrees.
-                const value: Json = if (sql_null) .null else if (column.element_type == .numeric and column.type == .number)
-                    raw.?
-                else if (column.type == .array)
-                    try typed_json.clone(alloc, raw.?)
-                else
-                    try coerce(alloc, raw.?, column.type);
-                cell.* = try declaredCell(alloc, column, .{ .value = value, .sql_null = sql_null });
+                cell.* = try readCell(alloc, column, .{ .value = raw orelse .null, .sql_null = sql_null });
             }
             return .{ .id = try alloc.dupe(u8, id), .version = version, .document_envelope = self.document_root, .value = .null, .typed_cells = .{ .layout = layout, .values = cells, .presence = presence } };
         }
@@ -681,7 +710,7 @@ fn coerce(alloc: std.mem.Allocator, value: Json, kind: ast.ColumnType) !Json {
         .void => error.SqlInvalidTableDefinition,
         .numrange, .daterange, .tsrange, .tstzrange => if (value == .null) .null else range: {
             if (value != .string) return error.SqlTypeMismatch;
-            const ranges = @import("range_value.zig");
+            const ranges = @import("range/value.zig");
             var context: ranges.Context = .{ .alloc = alloc };
             break :range .{ .string = try ranges.formatLeaky(&context, try ranges.parseLeaky(&context, ranges.kindFromType(kind).?, value.string)) };
         },
@@ -861,8 +890,8 @@ test "SQL NUMERIC native projection matches PostgreSQL senders without floating 
         const row = try projection.decode(a, "row", 9, json);
         const cell = try row.cell("n");
         try std.testing.expect(cell.numeric != null and !cell.sql_null and cell.value == .null);
-        var ctx: @import("numeric_value.zig").Context = .{ .alloc = a };
-        const wire = try @import("numeric_binary.zig").encodeAlloc(&ctx, cell.numeric.?.*);
+        var ctx: @import("numeric/value.zig").Context = .{ .alloc = a };
+        const wire = try @import("numeric/binary.zig").encodeAlloc(&ctx, cell.numeric.?.*);
         const expected = try a.alloc(u8, entry.binary.len / 2);
         _ = try std.fmt.hexToBytes(expected, entry.binary);
         try std.testing.expectEqualSlices(u8, expected, wire);
@@ -899,8 +928,8 @@ test "SQL NUMERIC native projection owns exact coefficients presence and mixed t
             try std.testing.expect(!(try owned.cell("j")).sql_null);
             const number = (try owned.cell("n")).numeric.?;
             try std.testing.expectEqual(@as(u16, 4), number.scale);
-            var ctx: @import("numeric_value.zig").Context = .{ .alloc = retained.allocator() };
-            const text = try @import("numeric_value.zig").format(&ctx, number.*);
+            var ctx: @import("numeric/value.zig").Context = .{ .alloc = retained.allocator() };
+            const text = try @import("numeric/value.zig").format(&ctx, number.*);
             try std.testing.expectEqualStrings("9007199254740993.1200", text);
             const array = (try owned.cell("a")).array.?;
             try std.testing.expectEqual(@as(i32, -3), array.dimensions[0].lower);
@@ -1183,7 +1212,7 @@ test "SQL document prepared timestamps enter the typed projection before scalar 
                 if (cell.sql_null) {
                     try std.testing.expect(typed.sql_null);
                 } else {
-                    const expected = try @import("temporal_value.zig").Timestamp.fromUnixNanoseconds(1706704496123456000);
+                    const expected = try @import("temporal/value.zig").Timestamp.fromUnixNanoseconds(1706704496123456000);
                     try std.testing.expectEqual(expected.micros, typed.temporal().?.timestamp_tz.micros);
                 }
             }

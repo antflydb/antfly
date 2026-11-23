@@ -19,7 +19,7 @@
 //! installation of freshly derived target-generation acceptance scopes.
 const std = @import("std");
 const contract = @import("restore_staging_contract.zig");
-const admission = @import("relational_integrity_generation_admission.zig");
+const admission = @import("relational/integrity/generation_admission.zig");
 const positions = @import("receipt_position.zig");
 pub const origin_contract = @import("native_empty_origin.zig");
 pub const Origin = origin_contract.Origin;

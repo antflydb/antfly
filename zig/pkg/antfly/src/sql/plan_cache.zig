@@ -311,14 +311,16 @@ test "SQL plan cache owns callable bodies after request storage and lexer scratc
     for (cases) |entry| {
         const request = try a.dupe(u8, entry.statement);
         defer a.free(request);
-        var lease = try cache.acquire(io, .{ .statement = request }, &diagnostic);
-        // HTTP releases request storage while immutable cached plans survive.
-        @memset(request, 'x');
-        try std.testing.expectEqualStrings(entry.body, lease.compiled().statement.catalog_ddl.routine.?.body);
-        lease.release(io);
+        {
+            var lease = try cache.acquire(io, .{ .statement = request }, &diagnostic);
+            defer lease.release(io);
+            // HTTP releases request storage while immutable cached plans survive.
+            @memset(request, 'x');
+            try std.testing.expectEqualStrings(entry.body, lease.compiled().statement.catalog_ddl.routine.?.body orelse return error.TestUnexpectedResult);
+        }
         var hit = try cache.acquire(io, .{ .statement = entry.statement }, &diagnostic);
         defer hit.release(io);
-        try std.testing.expectEqualStrings(entry.body, hit.compiled().statement.catalog_ddl.routine.?.body);
+        try std.testing.expectEqualStrings(entry.body, hit.compiled().statement.catalog_ddl.routine.?.body orelse return error.TestUnexpectedResult);
         var arena: std.heap.ArenaAllocator = .init(a);
         defer arena.deinit();
         const native = @import("antfly_local_sources").sql_catalog.routines;

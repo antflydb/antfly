@@ -121,6 +121,8 @@ pub const Page = struct {
 fn requireHeadLock(txn: anytype, head: barriers.Head, table: u64, lock: lifecycle.Lock) !void {
     if (head.retirement_root) |root| {
         try @import("../retirement/table/ledger.zig").requireBorrowedLock(txn, root, .{ .table = head.table_id, .id = head.id, .digest = head.plan_digest }, table);
+    } else if (head.initial_partition) |birth| {
+        if (table != head.table_id or lock.kind != .initial_support or !std.mem.eql(u8, &lock.id, &birth.initial_id)) return error.GenerationPublicationChanged;
     } else if (lock.kind != .schema_validation or !std.mem.eql(u8, &lock.id, &head.id)) return error.GenerationPublicationChanged;
 }
 fn currentHead(txn: anytype, query: Query, table: u64, id: [16]u8) !barriers.Head {
@@ -184,17 +186,18 @@ pub fn read(txn: anytype, query: Query) !Page {
         const table = (try lifecycle.tableFromKey(item.key)) orelse return error.InvalidCatalogRecord;
         const lock = try lifecycle.Lock.decode(item.value);
         last = table;
-        if (lock.kind != .schema_validation and lock.kind != .table_retirement) continue;
+        if (lock.kind != .schema_validation and lock.kind != .table_retirement and lock.kind != .initial_support) continue;
         // The cursor already authenticates this lock in the pinned read cut.
         // Reuse it; do not point-read the same lock/head/active tuple twice.
         const head = (try ledger.resolveActiveHead(txn, query.group, table)) orelse {
             // Root/source and unrelated outgoing parent locks have no common
             // schema owner work. Only survivor aliases enter this dispatcher.
-            if (lock.kind == .table_retirement) continue;
+            if (lock.kind == .table_retirement or lock.kind == .initial_support) continue;
             return error.InvalidCatalogRecord;
         };
         if (head.metadata_group_id != query.group or !std.mem.eql(u8, &head.metadata_incarnation, &query.metadata_incarnation) or
             head.phase == .succeeded or head.phase == .canceled) return error.InvalidCatalogRecord;
+        if (lock.kind == .initial_support and head.initial_partition == null) continue;
         try requireHeadLock(txn, head, table, lock);
         if (head.table_id != table) continue;
         const page = try owners(txn, head, 0);

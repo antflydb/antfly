@@ -23,7 +23,7 @@ const compiler = @import("compiler.zig");
 const describe = @import("describe.zig");
 const runtime = @import("runtime.zig");
 const reads = @import("read_stream.zig");
-const delivery = @import("../storage/db/relational_population_contract.zig");
+const delivery = @import("../storage/db/relational/schema_change/population_contract.zig");
 const A = std.mem.Allocator;
 const page_goal_bytes = 256 * 1024;
 
@@ -374,7 +374,7 @@ test "SQL relation population source retains typed descriptors numeric scale and
     var document = try std.json.parseFromSlice(std.json.Value, a, rows[0].document, .{ .parse_numbers = false });
     defer document.deinit();
     try std.testing.expect(document.value.object.get("j").? == .null);
-    try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .int64), source.columns[0].element_type);
+    try std.testing.expectEqual(@as(?@import("array/value.zig").ElementType, .int64), source.columns[0].element_type);
     try std.testing.expectEqual(@as(u16, 12), source.columns[2].numeric_modifier.?.precision);
     try std.testing.expectEqual(@as(i16, 2), source.columns[2].numeric_modifier.?.scale);
     try std.testing.expect(try producer.next(producer.ptr, 128) == null);

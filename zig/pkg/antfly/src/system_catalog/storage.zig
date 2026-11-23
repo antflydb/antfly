@@ -895,6 +895,60 @@ pub fn functionOverloads(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, grou
     return records.toOwnedSlice(a);
 }
 
+pub const SelinuxAuthorityState = struct {
+    epoch: u64 = 0,
+    active: ?domain.security_labels.KernelRelabel.Authority = null,
+};
+
+pub const SelinuxAuthorityUpdate = struct {
+    pub const max_bytes = 1024;
+    incarnation: [16]u8,
+    expected_epoch: u64,
+    active: ?domain.security_labels.KernelRelabel.Authority,
+
+    pub fn validate(self: @This()) !void {
+        if (std.mem.allEqual(u8, &self.incarnation, 0) or self.expected_epoch == std.math.maxInt(u64))
+            return error.InvalidCatalogMutation;
+        if (self.active) |authority| {
+            const Key = std.crypto.sign.Ed25519.PublicKey;
+            if (authority.epoch != 0 or std.mem.allEqual(u8, &authority.policy.digest, 0) or std.mem.allEqual(u8, &authority.verifier, 0))
+                return error.InvalidCatalogMutation;
+            _ = Key.fromBytes(authority.verifier) catch return error.InvalidCatalogMutation;
+        }
+    }
+};
+
+pub fn readSelinuxAuthorityState(a: std.mem.Allocator, txn: anytype, group: u64) !SelinuxAuthorityState {
+    const key = try keyAlloc(a, group, "selinux-authority:v1");
+    defer a.free(key);
+    const bytes = txn.get(key) catch |err| return if (err == error.NotFound) .{} else err;
+    if (bytes.len > SelinuxAuthorityUpdate.max_bytes) return error.InvalidCatalogRecord;
+    var parsed = try std.json.parseFromSlice(SelinuxAuthorityState, a, bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value.epoch == 0) return error.InvalidCatalogRecord;
+    if (parsed.value.active) |authority| if (authority.epoch != parsed.value.epoch) return error.InvalidCatalogRecord;
+    return parsed.value;
+}
+
+pub fn readSelinuxAuthority(a: std.mem.Allocator, txn: anytype, group: u64) !?domain.security_labels.KernelRelabel.Authority {
+    return (try readSelinuxAuthorityState(a, txn, group)).active;
+}
+
+/// Ordered maintenance uses an epoch even when withdrawing the active key,
+/// so a delayed installation cannot restore trust after withdrawal.
+pub fn applySelinuxAuthority(a: std.mem.Allocator, txn: anytype, group: u64, update: SelinuxAuthorityUpdate) !void {
+    try update.validate();
+    const previous = try readSelinuxAuthorityState(a, txn, group);
+    if (previous.epoch != update.expected_epoch) return;
+    var next: SelinuxAuthorityState = .{ .epoch = previous.epoch + 1, .active = update.active };
+    if (next.active) |*authority| authority.epoch = next.epoch;
+    const key = try keyAlloc(a, group, "selinux-authority:v1");
+    defer a.free(key);
+    const bytes = try std.json.Stringify.valueAlloc(a, next, .{});
+    defer a.free(bytes);
+    try txn.put(key, bytes);
+}
+
 pub fn readMeta(alloc: std.mem.Allocator, txn: anytype, group_id: u64) !Meta {
     const key = try keyAlloc(alloc, group_id, "meta");
     defer alloc.free(key);
@@ -1186,8 +1240,13 @@ pub const View = struct {
         const id = if (explicit != 0) explicit else if (namespace.tablespace_id != 0) namespace.tablespace_id else db.tablespace_id;
         return if (id == 0) null else (try self.byId(.tablespace, id)) orelse return error.TablespaceNotFound;
     }
+    pub fn requireNoLogicalReplication(self: View, database: u64) !void {
+        if ((try self.children(.publication, database, 1)).len != 0 or
+            (try self.children(.subscription, database, 1)).len != 0) return error.DatabaseNotEmpty;
+    }
+
     pub fn read(self: View, request: domain.Read) !domain.State {
-        if (domain.namespaceRelation(request.kind)) return error.InvalidCatalogMutation;
+        if (domain.namespaceRelation(request.kind) or domain.logicalReplicationResource(request.kind)) return error.InvalidCatalogMutation;
         const parent = if (request.kind == .namespace) ((try self.lookup(.database, 0, request.database)) orelse return error.DatabaseNotFound).id else 0;
         var out: std.ArrayListUnmanaged(domain.Resource) = .empty;
         if (request.name) |name| {
@@ -1554,6 +1613,7 @@ pub fn graphsForTable(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_i
     return out.items;
 }
 fn writeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, r: domain.Resource) !void {
+    try @import("replication/membership.zig").write(alloc, txn, group_id, r, false);
     try sqlExtensionReferences(alloc, txn, group_id, r, true);
     try r.validateLogicalRelationId();
     if (r.sql_relation_id) |logical| {
@@ -1646,6 +1706,7 @@ fn writeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_
     }
 }
 fn removeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, r: domain.Resource) !void {
+    try @import("replication/membership.zig").write(alloc, txn, group_id, r, true);
     try sqlExtensionReferences(alloc, txn, group_id, r, false);
     if (r.sql_relation_id) |logical| {
         const key = try logicalRelationKeyAlloc(alloc, group_id, logical);
@@ -1953,7 +2014,12 @@ pub fn requireScopeDeltaWritable(alloc: std.mem.Allocator, txn: anytype, group_i
     }
 }
 
-pub fn applyDelta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, delta: domain.Delta, previous: Meta, command_hash: [32]u8) !void {
+pub fn applyDelta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, requested: domain.Delta, previous: Meta, command_hash: [32]u8) !void {
+    var region = std.heap.ArenaAllocator.init(alloc);
+    defer region.deinit();
+    const catalog_alloc = region.allocator();
+    const view: View = .{ .alloc = catalog_alloc, .txn = txn, .group_id = group_id, .meta = previous };
+    const delta = try @import("replication/membership.zig").augment(catalog_alloc, view, requested);
     try requireScopeDeltaWritable(alloc, txn, group_id, delta);
     if (delta.presentation_only and (delta.upserts.len != 1 or delta.removes.len != 0 or delta.next_id != previous.next_id or
         (delta.upserts[0].kind != .database and delta.upserts[0].kind != .namespace and delta.upserts[0].kind != .named_type))) return error.InvalidCatalogMutation;
@@ -1975,14 +2041,18 @@ pub fn applyDelta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_i
             return applyPresentationRecord(alloc, txn, group_id, resource, previous, command_hash);
         }
     }
-    var region = std.heap.ArenaAllocator.init(alloc);
-    defer region.deinit();
-    const catalog_alloc = region.allocator();
     const Identity = struct { kind: domain.Kind, id: u64 };
+    for (delta.removes) |resource| if (resource.kind == .database) try view.requireNoLogicalReplication(resource.id);
     var replacements: std.AutoHashMapUnmanaged(Identity, void) = .empty;
     try replacements.ensureTotalCapacity(catalog_alloc, @intCast(delta.upserts.len));
     var new_tables: std.ArrayList(domain.Resource) = .empty;
     for (delta.upserts) |resource| {
+        const replication = @import("antfly_local_sources").system_catalog_logical_replication_catalog;
+        switch (resource.kind) {
+            .publication => _ = try replication.decodePublication(catalog_alloc, resource),
+            .subscription => _ = try replication.decodeSubscription(catalog_alloc, resource),
+            else => {},
+        }
         if ((try replacements.getOrPut(catalog_alloc, .{ .kind = resource.kind, .id = resource.id })).found_existing) return error.InvalidCatalogMutation;
         if (resource.sql_owner != null) {
             const prior = try getById(catalog_alloc, txn, group_id, resource.kind, resource.id);
@@ -2065,7 +2135,13 @@ pub fn importState(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_
     // The legacy logical envelope has no allocator-state lane. Never turn a
     // portable import into a sequence reset; binary metadata snapshots carry
     // definitions/counters together through their verified projection cut.
-    for (state.resources) |resource| if (resource.kind == .sequence) return error.SequenceCatalogStateRequired;
+    for (state.resources) |resource| {
+        if (resource.kind == .sequence) return error.SequenceCatalogStateRequired;
+        // Publication definitions alone cannot restore capture ownership.
+        // Verified native checkpoints preserve the full metadata journal.
+        if (resource.kind == .publication or resource.sql_publications != null or resource.sql_all_publications != null)
+            return error.LogicalReplicationCatalogStateRequired;
+    }
     const previous = try readMeta(alloc, txn, group_id);
     if (previous.revision != 0) return error.CatalogGenerationChanged;
     if (state.next_id < 3) return error.InvalidCatalogRecord;

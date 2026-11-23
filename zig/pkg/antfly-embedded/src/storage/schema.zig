@@ -492,7 +492,7 @@ pub fn requiredReaderVersion(schema: TableSchema) u32 {
         if (@field(schema, requirement[0])) version = @max(version, requirement[1]);
     }
     for (schema.relational_columns) |column| {
-        if (@import("../sql/range_value.zig").kindFromType(column.column_type) != null) version = @max(version, 35);
+        if (@import("../sql/range/value.zig").kindFromType(column.column_type) != null) version = @max(version, 35);
         if (column.sql_element_type != null) version = @max(version, 16);
         if (column.column_type == .sql_array) version = @max(version, 17);
         if (column.column_type == .numeric or column.sql_element_type == .numeric) version = @max(version, 20);
@@ -1898,7 +1898,7 @@ fn validateRelationalSchema(alloc: Allocator, schema: TableSchema) !void {
             (column.column_type != .numeric and column.column_type != .sql_array)) return error.InvalidSchema;
         modifier.validate() catch return error.InvalidSchema;
     };
-    for (schema.relational_columns) |column| if (@import("../sql/range_value.zig").kindFromType(column.column_type) != null) {
+    for (schema.relational_columns) |column| if (@import("../sql/range/value.zig").kindFromType(column.column_type) != null) {
         if (schema.storage_mode != .relational or !schema.requires_public_schema or column.is_json or column.json_kind != .none or column.sql_element_type != null)
             return error.InvalidSchema;
     };

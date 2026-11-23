@@ -87,7 +87,7 @@ pub const Owner = struct {
         const validator = view.validator() orelse return error.InvalidSqlBackendResponse;
         if (binding.schema_json.len == 0 or binding.schema_version != view.version()) return error.CatalogGenerationChanged;
         const source_digest = validator.source_digest orelse return error.CatalogGenerationChanged;
-        if (!std.mem.eql(u8, &source_digest, &@import("../storage/db/relational_schema_owner_contract.zig").hash(binding.schema_json))) return error.CatalogGenerationChanged;
+        if (!std.mem.eql(u8, &source_digest, &@import("../storage/db/relational/schema_change/schema_owner_contract.zig").hash(binding.schema_json))) return error.CatalogGenerationChanged;
         if (actual) |state| if (state.table_id != binding.id or state.effectiveLogicalRelationId() != binding.effectiveLogicalRelationId()) return error.CatalogGenerationChanged;
         if (captured) |value| {
             if (value.absence) |absent| {

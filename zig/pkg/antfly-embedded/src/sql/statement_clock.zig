@@ -17,7 +17,7 @@
 //! programs: the live source belongs to the statement/cursor owner. A durable
 //! transaction start must come from its authorized owner, not request JSON.
 const std = @import("std");
-const temporal = @import("temporal_value.zig");
+const temporal = @import("temporal/value.zig");
 pub const Instant = temporal.Timestamp;
 pub const Source = union(enum) {
     io: std.Io,

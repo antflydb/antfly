@@ -1598,11 +1598,6 @@ pub fn tableRoutingSnapshotForWrite(
         if (observed.coversKeyspace()) return observed;
         observed.deinit(alloc);
     }
-    if (point_authority) |capture|
-        return try tableRoutingSnapshotFromOwned(alloc, .{
-            .source = projection_source,
-            .value = try capture(catalog.ptr, table_name, deadline_ns),
-        }, table_name);
     return try authoritativeTableRoutingSnapshot(alloc, catalog, table_name, deadline_ns);
 }
 
@@ -1612,6 +1607,18 @@ pub fn authoritativeTableRoutingSnapshot(
     table_name: []const u8,
     deadline_ns: ?u64,
 ) !?AuthoritativeTableRoutingSnapshot {
+    if (catalog.vtable.linearizable_table_routing_snapshot) |capture| {
+        if (catalog.vtable.free_routing_snapshot == unsupportedFreeRoutingSnapshot)
+            return error.CatalogRoutingUnavailable;
+        return try tableRoutingSnapshotFromOwned(alloc, .{
+            .source = .{
+                .ptr = catalog.ptr,
+                .snapshot = unsupportedRoutingSnapshot,
+                .free_snapshot = catalog.vtable.free_routing_snapshot,
+            },
+            .value = try capture(catalog.ptr, table_name, deadline_ns),
+        }, table_name);
+    }
     const routing = try catalog.routingSource();
     return try tableRoutingSnapshotFromOwned(
         alloc,
@@ -2353,18 +2360,7 @@ fn descriptorProjectionFromRoutingSnapshot(
     const table = findTableByName(snapshot.tables, table_name) orelse return null;
     for (snapshot.ranges) |range| {
         if (range.table_id != table.table_id or range.group_id != group_id) continue;
-        var projection = try descriptorProjectionFromValues(
-            alloc,
-            table.table_id,
-            metadata_table_manager.rangeDocIdentityShardId(range),
-            metadata_table_manager.rangeDocIdentityRangeId(range),
-            table.schema_json,
-            if (table.query_indexes_json.len != 0) table.query_indexes_json else table.indexes_json,
-            table.storage,
-            table.sql_persistence,
-            .{ .start = range.start_key, .end = range.end_key orelse "" },
-            restoreIdentityFromRange(range),
-        );
+        var projection = try descriptorProjectionFromTableRange(alloc, table.*, range);
         projection.catalog_observation = .{
             .metadata_group_id = snapshot.metadata_group_id,
             .metadata_incarnation = snapshot.metadata_incarnation,
@@ -2373,6 +2369,22 @@ fn descriptorProjectionFromRoutingSnapshot(
         return projection;
     }
     return null;
+}
+
+pub fn descriptorProjectionFromTableRange(alloc: std.mem.Allocator, table: metadata_table_manager.TableRecord, range: metadata_table_manager.RangeRecord) !TableGroupDescriptorProjection {
+    if (range.table_id != table.table_id) return error.IdentityNamespaceMismatch;
+    return descriptorProjectionFromValues(
+        alloc,
+        table.table_id,
+        metadata_table_manager.rangeDocIdentityShardId(range),
+        metadata_table_manager.rangeDocIdentityRangeId(range),
+        table.schema_json,
+        if (table.query_indexes_json.len != 0) table.query_indexes_json else table.indexes_json,
+        table.storage,
+        table.sql_persistence,
+        .{ .start = range.start_key, .end = range.end_key orelse "" },
+        restoreIdentityFromRange(range),
+    );
 }
 
 test "owner descriptor projection retains the catalog observation with the physical definition" {
@@ -3619,18 +3631,19 @@ fn consumerTests() type {
                     return eventualSnapshot(ptr, deadline_ns);
                 }
 
-                fn linearizableSnapshot(ptr: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+                fn linearizableSnapshot(_: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+                    return error.FullSnapshotUsedForPointRouting;
+                }
+
+                fn linearizableTableSnapshot(ptr: *anyopaque, name: []const u8, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqualStrings("docs", name);
                     self.linearizable_calls += 1;
                     return .{
                         .catalog_revision = 19,
                         .tables = @constCast(tables[0..]),
                         .ranges = @constCast(ranges[0..]),
                     };
-                }
-
-                fn linearizableTableSnapshot(ptr: *anyopaque, _: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
-                    return linearizableSnapshot(ptr, deadline_ns);
                 }
 
                 fn freeRoutingSnapshot(ptr: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {

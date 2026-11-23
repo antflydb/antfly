@@ -209,6 +209,7 @@ const mappings = [_]Mapping{
     .{ .status = .store_report_base_mismatch, .err = error.StoreReportBaseMismatch },
     .{ .status = .table_already_exists, .err = error.TableAlreadyExists },
     .{ .status = .table_topology_protocol_upgrade_required, .err = error.TableTopologyProtocolUpgradeRequired },
+    .{ .status = .schema_reader_upgrade_required, .err = error.SchemaReaderUpgradeRequired },
     .{ .status = .tablespace_in_use, .err = error.TablespaceInUse },
     .{ .status = .tablespace_not_found, .err = error.TablespaceNotFound },
     .{ .status = .ha_seed_snapshot_runtime_busy, .err = error.HASeedSnapshotRuntimeBusy },
@@ -1072,6 +1073,11 @@ const mappings = [_]Mapping{
     .{ .status = .unsupported_native_index_owner, .err = error.UnsupportedNativeIndexOwner },
     .{ .status = .temporal_overlap_violation, .err = error.TemporalOverlapViolation },
     .{ .status = .temporal_empty_range, .err = error.TemporalEmptyRange },
+    .{ .status = .sql_invalid_parameter_value, .err = error.SqlInvalidParameterValue },
+    .{ .status = .sql_wrong_object_type, .err = error.SqlWrongObjectType },
+    .{ .status = .sql_ambiguous_function, .err = error.SqlAmbiguousFunction },
+    .{ .status = .sql_undefined_procedure, .err = error.SqlUndefinedProcedure },
+    .{ .status = .catalog_source_untracked, .err = error.CatalogSourceUntracked },
 };
 
 pub fn statusFromError(err: anyerror) abi.Status {
@@ -1557,7 +1563,7 @@ test "graph preparation errors retain semantic wire identity across compiled rec
 test "native decision uncertainty retains its exact shared runtime identity" {
     const status = statusFromError(error.CommitDecisionUnknown);
     try std.testing.expectEqual(abi.Status.commit_decision_unknown, status);
-    try std.testing.expectEqual(@as(u32, 1044), @backingInt(status));
+    try std.testing.expectEqual(@as(u32, 1055), @backingInt(status));
     try std.testing.expectError(error.CommitDecisionUnknown, statusToError(status));
     var failure = failureFromError(error.CommitDecisionUnknown, .storage_owner, abi.abi_version, 1);
     try validateFailureEnvelope(status, &failure, abi.abi_version);

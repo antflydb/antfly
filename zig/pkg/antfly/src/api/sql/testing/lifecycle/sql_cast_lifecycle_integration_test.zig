@@ -117,7 +117,7 @@ test "mounted SQL original database casts preserve conversion contexts prepared 
     try std.testing.expectEqual(originals.len, checked);
     // Absence is a prepared dependency too: publication cannot silently change
     // an already prepared builtin conversion into a user-defined call.
-    const Binding = @import("../../../sql_prepared.zig").Binding;
+    const Binding = @import("../../session/prepared.zig").Binding;
     const absent: Binding = .{ .kind = .cast, .database = "default", .namespace = "", .name = "jsonb;text", .physical_name = "", .id = 0, .schema_version = 0, .revision = 1, .routine_incarnation = @splat(1), .cast_database_id = 1, .cast_pair = .{ .source = .{ .scalar = .jsonb }, .target = .{ .scalar = .text } } };
     try Binding.verifyCast(&.{absent}, absent);
     var current = absent;
@@ -165,11 +165,11 @@ fn lostAck(ctx: *fixture.Context) !void {
     defer gateway.deinit();
     gateway.embedding_provider_runtime.io = ctx.io;
     var identity: ?http.AuthenticatedIdentity = null;
-    var adapter: @import("../../../sql_execution.zig").Adapter = .{ .server = &gateway, .identity = &identity, .context = .{} };
+    var adapter: @import("../../execution/execution.zig").Adapter = .{ .server = &gateway, .identity = &identity, .context = .{} };
     defer adapter.releaseExecutionOwners();
     var parsed = try local.sql_compiler.compile(ctx.alloc, "CREATE CAST (jsonb AS text) WITH FUNCTION jsonb_to_text(jsonb) AS ASSIGNMENT", .{});
     defer parsed.deinit();
-    const outcome = try @import("../../../sql_cast_ddl.zig").execute(&adapter, .{ .result = ctx.alloc, .scratch = ctx.alloc }, parsed.statement.catalog_ddl);
+    const outcome = try @import("../../catalog/cast_ddl.zig").execute(&adapter, .{ .result = ctx.alloc, .scratch = ctx.alloc }, parsed.statement.catalog_ddl);
     const receipt = outcome.catalog_receipt orelse return error.MissingCastReceipt;
     defer receipt.deinit(ctx.alloc);
     try std.testing.expectEqual(.cast, receipt.kind);
@@ -178,7 +178,7 @@ fn lostAck(ctx: *fixture.Context) !void {
     try std.testing.expect(receipt.recovery_token.len < 2048);
     try command(ctx, "CREATE FUNCTION cast_receipt_noise() RETURNS text LANGUAGE sql AS $$SELECT 'noise'$$");
     probe.hidden = false;
-    const recovered = try @import("../../../sql_catalog_recovery.zig").recover(&gateway, null, .{}, ctx.alloc, receipt.recovery_token);
+    const recovered = try @import("../../recovery/catalog_recovery.zig").recover(&gateway, null, .{}, ctx.alloc, receipt.recovery_token);
     defer recovered.deinit(ctx.alloc);
     try std.testing.expectEqual(.committed, recovered.state);
     const bytes = try original.source.systemCatalog(ctx.alloc, .{ .setting_admin = true }, .{ .sql_cast_snapshot = .{ .database = "default", .pair = .{ .source = .{ .scalar = .jsonb }, .target = .{ .scalar = .text } } } });

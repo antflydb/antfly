@@ -54,7 +54,7 @@ test "SQL RETURNING dense integer slots preserve arithmetic errors across Postgr
     const a = std.testing.allocator;
     var compiled = try @import("compiler.zig").compile(a, "SELECT v/(v-v)", .{});
     defer compiled.deinit();
-    for ([_]@import("array_value.zig").ElementType{ .int16, .int32, .int64 }) |width| {
+    for ([_]@import("array/value.zig").ElementType{ .int16, .int32, .int64 }) |width| {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const owned = arena.allocator();

@@ -413,7 +413,7 @@ test "SQL relation lifetime ordinary frozen proof preserves HTTP and durable wir
     const Wire = struct {
         value: ReadSafetyBarrier.FrozenProof,
         pub fn jsonStringify(self: @This(), stream: anytype) !void {
-            return @import("db/relational_integrity_json.zig").write(self.value, stream);
+            return @import("db/relational/integrity/json.zig").write(self.value, stream);
         }
     };
     const durable = try std.json.Stringify.valueAlloc(a, Wire{ .value = proof }, .{});

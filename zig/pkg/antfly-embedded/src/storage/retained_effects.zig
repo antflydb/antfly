@@ -21,7 +21,7 @@
 //! that immutable schema registry. Derived indexes/artifacts are not this log.
 const std = @import("std");
 const internal_keys = @import("internal_keys.zig");
-const integrity = @import("db/relational_integrity_contract.zig");
+const integrity = @import("db/relational/integrity/contract.zig");
 const retained_frame = @import("retained_frame.zig");
 const Allocator = std.mem.Allocator;
 pub const state_key = "\x00\x00__retained_rows__:state";

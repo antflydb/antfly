@@ -1366,7 +1366,7 @@ test "pessimistic locks native LSM mutation guard uses typed unique equality and
     defer unchanged_key.deinit(a);
     var changed_key = try mapper.PreparedRelationalWrite.init(a, "r", "{\"id\":2,\"value\":10}", schema.validator(), schema.tableSchema().*, schema.physicalLayout());
     defer changed_key.deinit(a);
-    const row_key = try @import("../db/relational_store.zig").keyAlloc(a, "r");
+    const row_key = try @import("../db/relational/rows/store.zig").keyAlloc(a, "r");
     defer a.free(row_key);
     {
         var txn = try store.beginWriteTxn();
@@ -1772,7 +1772,7 @@ test "pessimistic locks native LSM terminal external participants leave range ac
 
 test "SQL relation lifetime abandoned private group drains actual old lock custody without fencing successor or touching rows" {
     const control = @import("control.zig");
-    const topology = @import("../db/relational_integrity_topology.zig");
+    const topology = @import("../db/relational/integrity/topology.zig");
     const p = @import("../../common/relation_persistence.zig");
     const path = try pathFor("abandoned-private-group");
     defer a.free(path);

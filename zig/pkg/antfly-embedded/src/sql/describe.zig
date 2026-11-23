@@ -42,8 +42,8 @@ test "SQL DDL description has no fabricated table or mutation side effects" {
 pub const Column = struct {
     name: []const u8,
     type: ast.ColumnType,
-    temporal_kind: ?@import("temporal_value.zig").Kind = null,
-    element_type: ?@import("array_value.zig").ElementType = null,
+    temporal_kind: ?@import("temporal/value.zig").Kind = null,
+    element_type: ?@import("array/value.zig").ElementType = null,
     numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
     enum_view: ?*const @import("../common/sql_enum_value.zig").View = null,
     domain_view: ?*const @import("../schema/domain_value.zig").View = null,
@@ -106,7 +106,7 @@ test "SQL column JSON excludes internal unknown NULL provenance" {
     const decimal = try std.json.Stringify.valueAlloc(std.testing.allocator, Column{ .name = "n", .type = .number, .element_type = .numeric }, .{});
     defer std.testing.allocator.free(decimal);
     try std.testing.expectEqualStrings("{\"name\":\"n\",\"type\":\"number\",\"element_type\":\"numeric\"}", decimal);
-    for ([_]@import("array_value.zig").ElementType{ .int16, .int32, .int64, .float32, .float64 }) |identity| {
+    for ([_]@import("array/value.zig").ElementType{ .int16, .int32, .int64, .float32, .float64 }) |identity| {
         const text = try std.json.Stringify.valueAlloc(std.testing.allocator, Column{ .name = "typed", .type = if (identity == .float32 or identity == .float64) .number else .integer, .element_type = identity, .untyped_null = true }, .{});
         defer std.testing.allocator.free(text);
         const decoded = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
@@ -369,6 +369,7 @@ fn validateCopyExpression(expression: *const ast.Scalar, depth: usize) !void {
 
 /// Bind COPY input with ordinary INSERT authority and assignment inference.
 /// The one immutable target owns expansion of the implicit column list.
+/// Execution admission, including FREEZE generation ownership, is separate.
 pub fn copyWrite(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled) !struct { compiled: compiler.Compiled, binding_backend: catalog.Backend } {
     const input = compiled.statement.copy_from;
     const adapter = try allocator.create(CopyWriteAdapter);
@@ -923,14 +924,14 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled_inp
         // with internal scan aliases. Subqueries retain their lexical scope.
         if (!relational_returning) returning_backend.statement_ctes = null;
         returning_bound.* = try bindInternal(allocator, returning_backend, &returning_compiled, result.parameter_types);
-        // The primary assigns document revisions at commit. A transaction
-        // stamp or preimage cannot supply the new revision during binding.
-        // An INSERT from SELECT can return no rows or fail on a duplicate
-        // without evaluating RETURNING. Keep those results available; the
-        // row-image adapter rejects any actual unassigned version on this path.
+        // Backends with a revision assignment hook can supply NEW versions
+        // before projecting RETURNING. A source INSERT on other backends can
+        // still return no rows or fail on a duplicate without projecting NEW.
         const may_return_empty_insert = compiled.statement == .insert and
             compiled.statement.insert.source != null and compiled.statement.insert.values_source_rows.len == 0;
-        if (table.storage_mode == .document and compiled.statement != .delete and !may_return_empty_insert) {
+        if (table.storage_mode == .document and compiled.statement != .delete and
+            backend.vtable.assign_document_revisions == null and !may_return_empty_insert)
+        {
             for (selection.columns) |projection| if (!projection.wildcard and projection.expression == null and table.isDocumentVersion(projection.field)) return error.UnsupportedSqlShape;
             for (returning_bound.scalars.required) |ordinal| if (table.isDocumentVersion(returning_bound.scalars.columns[ordinal].name)) return error.UnsupportedSqlShape;
         }
@@ -1275,8 +1276,8 @@ pub fn bindLiteral(allocator: std.mem.Allocator, node: ast.Value, kind: ast.Colu
         error.InvalidUuid => return error.SqlTypeMismatch,
         else => return err,
     } };
-    if (node == .string) if (@import("range_value.zig").kindFromType(kind)) |range_kind| {
-        const ranges = @import("range_value.zig");
+    if (node == .string) if (@import("range/value.zig").kindFromType(kind)) |range_kind| {
+        const ranges = @import("range/value.zig");
         var context: ranges.Context = .{ .alloc = allocator };
         const value = try ranges.parseLeaky(&context, range_kind, node.string);
         return .{ .string = try ranges.formatLeaky(&context, value) };
@@ -1339,7 +1340,7 @@ fn bindOrder(alloc: std.mem.Allocator, table: catalog.Table, statement: ast.Sele
 /// Array element descriptors are part of the type, not inferred from values.
 /// Preserve the source builtin through PostgreSQL assignment casts. In
 /// particular real->numeric must not acquire double precision's formatting.
-pub fn assignDatum(alloc: std.mem.Allocator, raw: @import("scalar.zig").Datum, source_identity: ?@import("array_value.zig").ElementType, kind: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType, limits: @import("scalar.zig").EvalLimits) !@import("scalar.zig").Datum {
+pub fn assignDatum(alloc: std.mem.Allocator, raw: @import("scalar.zig").Datum, source_identity: ?@import("array/value.zig").ElementType, kind: ast.ColumnType, element_type: ?@import("array/value.zig").ElementType, limits: @import("scalar.zig").EvalLimits) !@import("scalar.zig").Datum {
     const assigned = if (kind == .string) try @import("scalar.zig").assignText(alloc, raw, source_identity, limits) else if (kind == .array) try @import("scalar.zig").assignArray(alloc, raw, element_type orelse return error.SqlAssignmentTypeMismatch, limits) else if (kind == .integer or kind == .number) try @import("scalar.zig").assignNumeric(alloc, raw, source_identity, element_type orelse (if (kind == .integer) .int64 else .float64), limits) else raw;
     return coerceDatum(alloc, assigned, kind, element_type);
 }
@@ -1348,6 +1349,10 @@ pub fn assignDatum(alloc: std.mem.Allocator, raw: @import("scalar.zig").Datum, s
 /// Physical assignment keeps the older coarse wrapper and cannot acquire an
 /// interval domain merely because its JSON representation is a string.
 pub fn coerceDatumTyped(alloc: std.mem.Allocator, raw: @import("scalar.zig").Datum, descriptor: @import("scalar.zig").Type) !@import("scalar.zig").Datum {
+    if (raw.read_failure != null) {
+        try raw.validateCarrier();
+        return raw;
+    }
     if (raw.isVoid() and descriptor.kind != .void) return error.SqlTypeMismatch;
     if (descriptor.kind == .void) {
         if (descriptor.element_type != null or descriptor.temporal_kind != null or descriptor.numeric_modifier != null or descriptor.enum_view != null or descriptor.enum_reference != null or descriptor.domainView() != null or descriptor.domainReference() != null) return error.SqlTypeMismatch;
@@ -1365,7 +1370,7 @@ pub fn coerceDatumTyped(alloc: std.mem.Allocator, raw: @import("scalar.zig").Dat
         if (raw.value != .string or raw.extension != null or raw.array != null or raw.numeric != null) return error.SqlTypeMismatch;
         return .typedEnum(try view.input(raw.value.string));
     }
-    if (descriptor.temporal_kind orelse (if (descriptor.kind == .datetime) @as(?@import("temporal_value.zig").Kind, .timestamp_tz) else null)) |kind| {
+    if (descriptor.temporal_kind orelse (if (descriptor.kind == .datetime) @as(?@import("temporal/value.zig").Kind, .timestamp_tz) else null)) |kind| {
         if (descriptor.kind != .datetime or descriptor.element_type != null) return error.SqlTypeMismatch;
         try raw.validateTemporal();
         if (raw.sql_null) return raw;
@@ -1374,8 +1379,8 @@ pub fn coerceDatumTyped(alloc: std.mem.Allocator, raw: @import("scalar.zig").Dat
             return raw;
         }
         if (raw.value != .string or raw.array != null or raw.numeric != null or raw.patterns() != null) return error.SqlTypeMismatch;
-        const value = if (descriptor.temporal_kind != null) try @import("temporal_text.zig").parseCanonical(kind, raw.value.string) else try @import("temporal_text.zig").parseInput(kind, raw.value.string);
-        const owned = try alloc.create(@import("temporal_value.zig").Value);
+        const value = if (descriptor.temporal_kind != null) try @import("temporal/text.zig").parseCanonical(kind, raw.value.string) else try @import("temporal/text.zig").parseInput(kind, raw.value.string);
+        const owned = try alloc.create(@import("temporal/value.zig").Value);
         owned.* = value;
         return .typedTemporal(owned);
     }
@@ -1393,7 +1398,11 @@ fn coerceVoid(raw: @import("scalar.zig").Datum) !@import("scalar.zig").Datum {
     return @import("scalar.zig").Datum.voidValue();
 }
 
-pub fn coerceDatum(alloc: std.mem.Allocator, raw: @import("scalar.zig").Datum, kind: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType) !@import("scalar.zig").Datum {
+pub fn coerceDatum(alloc: std.mem.Allocator, raw: @import("scalar.zig").Datum, kind: ast.ColumnType, element_type: ?@import("array/value.zig").ElementType) !@import("scalar.zig").Datum {
+    if (raw.read_failure != null) {
+        try raw.validateCarrier();
+        return raw;
+    }
     if (kind == .void) {
         if (element_type != null) return error.SqlTypeMismatch;
         return coerceVoid(raw);
@@ -1406,7 +1415,7 @@ pub fn coerceDatum(alloc: std.mem.Allocator, raw: @import("scalar.zig").Datum, k
         return error.SqlTypeMismatch;
     }
     if (raw.bytes() != null) return error.SqlTypeMismatch;
-    const ranges = @import("range_value.zig");
+    const ranges = @import("range/value.zig");
     if (ranges.kindFromType(kind)) |range_kind| {
         try raw.validateTemporal();
         if (element_type != null) return error.SqlTypeMismatch;
@@ -1431,12 +1440,12 @@ pub fn coerceDatum(alloc: std.mem.Allocator, raw: @import("scalar.zig").Datum, k
     if (raw.sql_null and raw.value != .null) return error.SqlTypeMismatch;
     if (raw.numeric) |value| {
         if (kind != .number or element_type != .numeric or raw.sql_null or raw.value != .null or raw.array != null or raw.patterns() != null) return error.SqlTypeMismatch;
-        var context: @import("numeric_value.zig").Context = .{ .alloc = alloc };
-        try @import("numeric_value.zig").validateCanonical(&context, value.*);
+        var context: @import("numeric/value.zig").Context = .{ .alloc = alloc };
+        try @import("numeric/value.zig").validateCanonical(&context, value.*);
         return raw;
     }
     if (kind == .number and element_type == .numeric and !raw.sql_null) {
-        var work: @import("array_value.zig").Budget = .{};
+        var work: @import("array/value.zig").Budget = .{};
         var buffer: [20]u8 = undefined;
         const text = switch (raw.value) {
             .string, .number_string => |text| text,
@@ -2111,7 +2120,7 @@ test "SQL COPY predicate binding separates input row parameters from filter para
         const filter = description.binding.copy_filter.?;
         try std.testing.expectEqual(@as(usize, 1), filter.parameter_descriptors.len);
         try std.testing.expectEqual(@as(?ast.ColumnType, .integer), filter.parameter_descriptors[0].kind);
-        try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .int64), filter.parameter_descriptors[0].element_type);
+        try std.testing.expectEqual(@as(?@import("array/value.zig").ElementType, .int64), filter.parameter_descriptors[0].element_type);
     }
     for ([_]struct { sql: []const u8, failure: anyerror }{
         .{ .sql = "COPY t(id) FROM STDIN WHERE g > 0", .failure = error.SqlCopyGeneratedReference },
@@ -2338,4 +2347,47 @@ test "SQL temporal price literals bind UUID exact NUMERIC and NUMRANGE without p
             }
         }
     }
+}
+
+test "SQL COPY FREEZE original parses and requires native generation admission" {
+    const a = std.testing.allocator;
+    const fixtures = @import("parity_fixtures.zig");
+    var corpus = try fixtures.Corpus.init(a);
+    defer corpus.deinit();
+    var compiled = try compiler.compile(a, (try corpus.get("sql-0372")).sql, .{});
+    defer compiled.deinit();
+    try std.testing.expect(compiled.statement.copy_from.options.freeze);
+    const Probe = struct {
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
+            try std.testing.expectEqual(.write, action);
+            try std.testing.expectEqualStrings("usage_records", name.table);
+            return .{ .id = 17, .physical_name = "physical", .schema_version = 0, .columns = &.{
+                .{ .name = "id", .path = "id", .type = .integer, .element_type = .int64 },
+                .{ .name = "status", .path = "status", .type = .string },
+            } };
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+        fn generate(_: *anyopaque, _: std.mem.Allocator) ![]const u8 {
+            return error.UnexpectedDescribeIdentityAllocation;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const backend: catalog.Backend = .{ .ptr = &arena, .vtable = &.{
+        .resolve = Probe.resolve,
+        .checkpoint = Probe.checkpoint,
+        .scan = undefined,
+        .mutate = undefined,
+        .generate_row_id = Probe.generate,
+    } };
+    const input = try copyWrite(arena.allocator(), backend, &compiled);
+    var description = try describe(a, input.binding_backend, &input.compiled, &.{});
+    defer description.deinit();
+    try std.testing.expectEqualSlices(?ast.ColumnType, &.{ .integer, .string }, description.binding.parameter_types);
+    try std.testing.expect(compiled.statement.copy_from.options.freeze);
+
+    var disabled = try compiler.compile(a, "COPY t FROM STDIN (FREEZE false)", .{});
+    defer disabled.deinit();
+    try std.testing.expect(!disabled.statement.copy_from.options.freeze);
+    try std.testing.expectError(error.SqlInvalidParameterValue, compiler.compile(a, "COPY t TO STDOUT (FREEZE true)", .{}));
 }

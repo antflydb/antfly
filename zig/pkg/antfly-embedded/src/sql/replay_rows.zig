@@ -534,7 +534,7 @@ test "SQL replay rows preserve arrays and unwind every memory and spill allocati
             {
                 const replay = try Replay.create(a, 1, if (spill_bytes) 1 else 64 * 1024, if (spill_bytes) &manager else null);
                 defer replay.deinit();
-                const arrays = @import("array_value.zig");
+                const arrays = @import("array/value.zig");
                 const value = try arrays.Value.init(.int64, &.{.{ .length = 3, .lower = -1 }}, &.{ Datum.json(.{ .integer = 9007199254740993 }), .{}, Datum.json(.{ .integer = 3 }) }, .{});
                 try replay.appendWeighted(&.{Datum.typedArray(&value)}, 3);
                 try replay.finish();

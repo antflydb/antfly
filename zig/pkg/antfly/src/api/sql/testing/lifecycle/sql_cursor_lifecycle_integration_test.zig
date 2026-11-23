@@ -51,7 +51,7 @@ const Campaign = struct {
             var reader = std.Io.Reader.fixed(input.written());
             var output = std.Io.Writer.Allocating.init(ctx.alloc);
             defer output.deinit();
-            var adapter: @import("../../../sql_pgwire.zig").Adapter = .{ .server = api };
+            var adapter: @import("../../transport/pgwire.zig").Adapter = .{ .server = api };
             var session: protocol.Session = .{ .alloc = ctx.alloc, .io = ctx.io, .source = adapter.backend(), .reader = &reader, .writer = &output.writer, .limits = .{ .result_rows = 16 } };
             defer session.deinit();
             try session.run();
@@ -65,7 +65,7 @@ const Campaign = struct {
             var reader = std.Io.Reader.fixed(input.written());
             var output = std.Io.Writer.Allocating.init(ctx.alloc);
             defer output.deinit();
-            var adapter: @import("../../../sql_pgwire.zig").Adapter = .{ .server = api };
+            var adapter: @import("../../transport/pgwire.zig").Adapter = .{ .server = api };
             var session: protocol.Session = .{ .alloc = ctx.alloc, .io = ctx.io, .source = adapter.backend(), .reader = &reader, .writer = &output.writer, .limits = .{ .result_rows = 16 } };
             defer session.deinit();
             try session.run();

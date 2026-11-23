@@ -45,27 +45,19 @@ fn stepInternal(server: *Server, after: u64, context: operation.RequestContext, 
     return stepLookup(server, a, lookup, page.next, context, lose_owner_reply, null);
 }
 
-/// A source shutting down can own a retained TEMP scope whose ancestor runs
-/// on metadata. Drive only its already admitted physical child while ordinary
-/// session maintenance is joined; never discover an unrelated table job.
-pub fn stepScopeChild(server: *Server, child: @import("../metadata/retirement/scope/ledger.zig").Child, context: operation.RequestContext) !void {
-    try child.validate();
-    var arena = std.heap.ArenaAllocator.init(server.alloc);
-    defer arena.deinit();
-    const a = arena.allocator();
+/// The ancestor has already observed the exact child admission and work.
+pub fn stepObservedScopeChild(server: *Server, a: std.mem.Allocator, child: @import("../metadata/retirement/scope/ledger.zig").Child, work: root.Work, context: operation.RequestContext) !void {
     const lookup: root.Lookup = .{ .group = child.lookup.group, .table = child.table, .id = child.id };
-    const receipts = @import("../metadata/retirement/table/receipt.zig");
-    const expected: receipts.Request = .{ .lookup = lookup, .effect = .{ .scope_admission = child } };
-    const bytes = try server.source.systemCatalog(a, context, .{ .table_retirement_receipt = expected });
-    const admitted = try std.json.parseFromSliceLeaky(receipts.Observation, a, bytes, .{});
-    try admitted.requireFor(expected);
-    if (!admitted.accepted) return;
-    _ = try stepLookup(server, a, lookup, 0, context, false, child);
+    _ = try stepWork(server, a, lookup, 0, context, false, child, work);
 }
 
 fn stepLookup(server: *Server, a: std.mem.Allocator, lookup: root.Lookup, next: u64, context: operation.RequestContext, comptime lose_owner_reply: bool, expected_parent: ?@import("../metadata/retirement/scope/ledger.zig").Child) !u64 {
     const work_bytes = try server.source.systemCatalog(a, context, .{ .table_retirement_owner_work = lookup });
     const work = try std.json.parseFromSliceLeaky(root.Work, a, work_bytes, .{});
+    return stepWork(server, a, lookup, next, context, lose_owner_reply, expected_parent, work);
+}
+
+fn stepWork(server: *Server, a: std.mem.Allocator, lookup: root.Lookup, next: u64, context: operation.RequestContext, comptime lose_owner_reply: bool, expected_parent: ?@import("../metadata/retirement/scope/ledger.zig").Child, work: root.Work) !u64 {
     try work.head.validate();
     if (!std.meta.eql(work.head.lookup, lookup)) return error.InvalidCatalogRecord;
     if (expected_parent) |parent| if (!std.meta.eql(work.head.scope.parent, @as(?@import("../metadata/retirement/scope/ledger.zig").Child, parent))) return error.InvalidCatalogRecord;
@@ -114,7 +106,7 @@ fn stepLookup(server: *Server, a: std.mem.Allocator, lookup: root.Lookup, next: 
                 .{ .source = server.executeCapturedFkGenerationSource(a, captured, .{ .plan_id = lookup.id, .child_table_id = lookup.table, .child_table_name = work.root_name, .child_group_id = owner.group, .action = .fence }, context) catch |err| switch (err) {
                     error.TransactionTopologyBusy => {
                         if (work.head.scope.parent != null and captured.table.sql_persistence != null and captured.table.sql_persistence.?.kind == .temporary)
-                            _ = try @import("sql_data_locks.zig").abandonedPrivateQuantum(server, a, context, work.head);
+                            _ = try @import("sql/session/data_locks.zig").abandonedPrivateQuantum(server, a, context, work.head);
                         return next;
                     },
                     else => return err,
@@ -126,7 +118,7 @@ fn stepLookup(server: *Server, a: std.mem.Allocator, lookup: root.Lookup, next: 
                     .parent_acknowledged, .parent_coverage => .acknowledge,
                     else => unreachable,
                 } }, context) };
-            if (step_kind == .source_fenced and work.head.scope.parent != null and captured.table.sql_persistence != null and captured.table.sql_persistence.?.kind == .temporary and !try @import("sql_data_locks.zig").abandonedPrivateQuantum(server, a, context, work.head)) return next;
+            if (step_kind == .source_fenced and work.head.scope.parent != null and captured.table.sql_persistence != null and captured.table.sql_persistence.?.kind == .temporary and !try @import("sql/session/data_locks.zig").abandonedPrivateQuantum(server, a, context, work.head)) return next;
             if (lose_owner_reply) return error.InjectedRetirementOwnerReplyLoss;
             command = .{ .ack = .{ .lookup = lookup, .expected_revision = work.head.revision, .ordinal = owner.ordinal, .step = step_kind, .evidence = proof } };
         },
@@ -155,7 +147,6 @@ fn capturedOwner(manifest: @import("../metadata/retirement/table/manifest.zig").
 
 test "SQL relation lifetime scoped cleanup drives only an admitted exact child and rejects substituted custody before owner effects" {
     const scopes = @import("../metadata/retirement/scope/ledger.zig");
-    const receipts = @import("../metadata/retirement/table/receipt.zig");
     const a = std.testing.allocator;
     const lookup: scopes.Lookup = .{ .group = 2188, .reference = .{ .id = @splat(1), .digest = @splat(2), .database = 1, .root = 2, .kind = .namespace, .tables = 1, .resources = 1 } };
     const child: scopes.Child = .{ .lookup = lookup, .ordinal = 0, .table = 3, .id = try lookup.reference.childId(3), .definition = @splat(4), .ranges = @splat(5) };
@@ -171,44 +162,28 @@ test "SQL relation lifetime scoped cleanup drives only an admitted exact child a
     };
     try head.validate();
     const Spy = struct {
-        child: scopes.Child,
-        head: root.Head,
-        work_head: root.Head,
-        accepted: bool = false,
-        work_reads: usize = 0,
+        effect_reads: usize = 0,
         fn status(_: *anyopaque) anyerror!@import("../metadata/api.zig").MetadataStatus {
             return error.TestUnexpectedStatusRead;
         }
-        fn catalog(raw: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) anyerror![]u8 {
+        fn catalog(raw: *anyopaque, _: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) anyerror![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            return switch (call) {
-                .table_retirement_receipt => |request| blk: {
-                    try std.testing.expectEqualDeep(self.child, request.effect.scope_admission);
-                    const observed: receipts.Observation = .{ .request = request, .head = if (self.accepted) self.head else null, .accepted = self.accepted };
-                    break :blk std.json.Stringify.valueAlloc(alloc, observed, .{});
-                },
-                .table_retirement_owner_work => |selected| blk: {
-                    self.work_reads += 1;
-                    try std.testing.expectEqualDeep(self.head.lookup, selected);
-                    break :blk std.json.Stringify.valueAlloc(alloc, root.Work{ .head = self.work_head, .owner = null }, .{});
-                },
-                // Queue discovery, effects preparation and owner execution
-                // are never allowed from these nonadmitted/mismatched cuts.
-                else => error.TestUnexpectedRetirementEffect,
-            };
+            if (call != .table_retirement_effects) return error.TestUnexpectedCatalogRead;
+            self.effect_reads += 1;
+            return error.TestCapturedRetirementEffect;
         }
     };
     var substituted = head;
     substituted.scope.parent.?.definition[0] ^= 1;
     try substituted.validate();
-    var spy: Spy = .{ .child = child, .head = head, .work_head = substituted };
+    var spy: Spy = .{};
     var server = Server.init(a, .{}, .{ .ptr = &spy, .vtable = &.{ .status = Spy.status, .system_catalog = Spy.catalog } }, null, null);
     defer server.deinit();
-    try stepScopeChild(&server, child, .{ .setting_admin = true, .schema_validation_authority = true, .fk_generation_publication_authority = true });
-    try std.testing.expectEqual(@as(usize, 0), spy.work_reads);
-    spy.accepted = true;
-    try std.testing.expectError(error.InvalidCatalogRecord, stepScopeChild(&server, child, .{ .setting_admin = true, .schema_validation_authority = true, .fk_generation_publication_authority = true }));
-    try std.testing.expectEqual(@as(usize, 1), spy.work_reads);
+    const context: operation.RequestContext = .{ .setting_admin = true, .schema_validation_authority = true, .fk_generation_publication_authority = true };
+    try std.testing.expectError(error.InvalidCatalogRecord, stepObservedScopeChild(&server, a, child, .{ .head = substituted, .owner = null }, context));
+    try std.testing.expectEqual(@as(usize, 0), spy.effect_reads);
+    try std.testing.expectError(error.TestCapturedRetirementEffect, stepObservedScopeChild(&server, a, child, .{ .head = head, .owner = null }, context));
+    try std.testing.expectEqual(@as(usize, 1), spy.effect_reads);
 }
 
 test "SQL relation lifetime retirement delivery preserves the exact captured native owner and range without fresh Raft lookup" {

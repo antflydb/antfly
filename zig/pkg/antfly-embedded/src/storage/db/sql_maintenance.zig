@@ -58,6 +58,16 @@ fn publish(db: anytype, a: A, state: *contract.Progress, expected: ?u64, publish
         const current = try std.json.parseFromSliceLeaky(contract.Progress, a, raw, .{});
         if (expected == null or current.revision != expected.?) return error.MaintenanceBusy;
     } else if (expected != null) return error.MaintenanceBusy;
+    if (state.cluster) |placement| {
+        const indexes = @import("relational/indexes/catalog.zig");
+        try @import("../pessimistic_lock/participant.zig").requireTableGrant(a, &txn, state.identity, state.request.cluster_admission orelse return error.InvalidSqlParameters, .access_exclusive);
+        if (!std.mem.eql(u8, &(try indexes.Head.decode(try txn.get(indexes.head_key))).encode(), &placement.catalog_head)) return error.PreparedGenerationChanged;
+        if (state.phase == .done) {
+            const preference = try std.json.Stringify.valueAlloc(a, placement, .{});
+            try txn.put(contract.cluster_preferred_key, preference);
+            try txn.delete(contract.cluster_cursor_key);
+        }
+    }
     if (publish_statistics) {
         // Column-targeted ANALYZE replaces only its selected observations.
         // Preserve other columns from the same schema/owner, never another
@@ -121,6 +131,194 @@ fn columns(a: A, request: contract.Request, view: ?@import("schema_registry.zig"
     return selected;
 }
 
+/// The coordinator holds its existing native ACCESS EXCLUSIVE grants across
+/// these quanta. Never call this from an unfenced background producer. Each
+/// owner additionally binds the selected immutable index/schema/range image;
+/// its primary transaction publishes bodies, locations and the resume key.
+fn cluster(db: anytype, alloc: A, a: A, request: contract.Request) ![]u8 {
+    const indexes = @import("relational/indexes/catalog.zig");
+    const records = @import("relational/indexes/records.zig");
+    const internal = @import("../internal_keys.zig");
+    const exclusive = request.operation == .cluster;
+    if (exclusive) db.core.lockApplyExclusive() else db.core.lockApplyShared();
+    var locked = true;
+    defer if (locked) {
+        if (exclusive) db.core.unlockApplyExclusive() else db.core.unlockApplyShared();
+    };
+    try matches(db, request);
+    _ = db.core.primary_store_owner.lsmBackend() orelse return error.UnsupportedSqlExecution;
+    var snapshot = db.core.relational_indexes.acquire() orelse return error.SqlIndexNotFound;
+    defer snapshot.deinit();
+    const preferred = if (request.cluster_index == null) try load(contract.Cluster, db, a, contract.cluster_preferred_key) else null;
+    const index = for (snapshot.plan.boundIndexes()) |index| {
+        if (request.cluster_index) |name| {
+            if (std.mem.eql(u8, name, index.name)) break index;
+        } else if (preferred) |prior| {
+            if (prior.index_generation == index.generation and prior.index_slot == index.slot) break index;
+        }
+    } else return error.SqlIndexNotFound;
+    // A partial index cannot describe every heap row. Reject it before
+    // publishing the format fence, cursor, preferred index or any location.
+    if (index.predicate != null) return error.InvalidRelationalIndexDefinition;
+    if (snapshot.head.schema_version != request.schema_version) return error.PreparedGenerationChanged;
+    if (request.operation == .cluster_check) {
+        // Read-only observation of the last completed rewrite, not a source
+        // permit or an authority to resume. This also lets operators verify
+        // that successful SQL actually traversed the physical owner path.
+        var relocated: u64 = 0;
+        if (try load(contract.Progress, db, a, contract.progress_key)) |history| if (history.phase == .done and history.identity.eql(db.core.identity_namespace) and history.request.schema_version == request.schema_version) {
+            if (history.cluster) |placement| if (placement.index_generation == index.generation and placement.index_slot == index.slot and std.mem.eql(u8, &placement.catalog_head, &snapshot.head.encode())) {
+                if (placement.next_ordinal != history.statistics.rows or !std.mem.eql(u8, &(try history.request.fingerprint(a)), &history.fingerprint)) return error.InvalidSqlBackendResponse;
+                relocated = placement.next_ordinal;
+            };
+        };
+        return std.json.Stringify.valueAlloc(alloc, contract.Response{ .table_id = request.table_id, .schema_version = request.schema_version, .done = true, .available = true, .rows_scanned = relocated, .row_heap_format = @import("table_catalog.zig").maximum_row_heap_format }, .{});
+    }
+    const head = snapshot.head.encode();
+    const identity = db.core.identity_namespace;
+    const fingerprint = try request.fingerprint(a);
+    try db.enforceReplicationWriteGate();
+    _ = try db.core.store.collectRowHeap(2048);
+    var writer = try db.core.store.beginWriteTxn();
+    var committed = false;
+    defer if (!committed) writer.abort();
+    try @import("../pessimistic_lock/participant.zig").requireTableGrant(a, &writer, identity, request.cluster_admission.?, .access_exclusive);
+    const actual_head = try indexes.Head.decode(try writer.get(indexes.head_key));
+    if (!actual_head.eql(snapshot.head)) return error.PreparedGenerationChanged;
+    const previous = writer.get(contract.progress_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    const now_ms: u64 = @intCast(platform.time.realtimeNs() / std.time.ns_per_ms);
+    var prior_revision: u64 = 0;
+    var state: contract.Progress = .{
+        .request = request,
+        .identity = identity,
+        .fingerprint = fingerprint,
+        .phase = .cluster,
+        .statistics = .{ .identity = identity, .schema_version = request.schema_version },
+        .cluster = .{ .index_name = index.name, .index_generation = index.generation, .index_slot = index.slot, .catalog_head = head, .generation = request.request_id },
+    };
+    if (previous) |raw| {
+        if (raw.len > contract.max_bytes) return error.InvalidSqlBackendResponse;
+        const old = try std.json.parseFromSliceLeaky(contract.Progress, a, raw, .{ .allocate = .alloc_always });
+        try old.request.validate();
+        try old.statistics.validate();
+        if (old.revision == 0 or !old.statistics.identity.eql(old.identity) or old.statistics.schema_version != old.request.schema_version or !std.mem.eql(u8, &(try old.request.fingerprint(a)), &old.fingerprint)) return error.InvalidSqlBackendResponse;
+        prior_revision = old.revision;
+        if (old.identity.eql(identity) and old.request.schema_version == request.schema_version) {
+            if (std.mem.eql(u8, &old.request.request_id, &request.request_id)) {
+                if (!std.mem.eql(u8, &old.fingerprint, &fingerprint)) return error.IdempotencyConflict;
+                const bound = old.cluster orelse return error.InvalidSqlBackendResponse;
+                if (!std.mem.eql(u8, &bound.catalog_head, &head) or bound.index_generation != index.generation or bound.index_slot != index.slot or !std.mem.eql(u8, &bound.generation, &request.request_id)) return error.PreparedGenerationChanged;
+                if (old.phase != .cluster and old.phase != .cluster_flush and old.phase != .done) return error.InvalidSqlBackendResponse;
+                state = old;
+            } else if (old.phase != .done and old.lease_until_ms > now_ms and old.lease_until_ms <= now_ms +| 1000) return error.MaintenanceBusy;
+            // A new producer restarts the physical walk. Writes may have run
+            // after its predecessor released ACCESS EXCLUSIVE; adopting that
+            // old key would skip moved tuples. Existing locations remain valid.
+        }
+    }
+    if (state.phase == .done) {
+        writer.abort();
+        committed = true;
+        return std.json.Stringify.valueAlloc(alloc, contract.Response{ .table_id = request.table_id, .schema_version = request.schema_version, .done = true, .rows_scanned = state.statistics.rows }, .{});
+    }
+    if (state.after != null) return error.InvalidSqlBackendResponse;
+    var checkpoint: ?[]const u8 = null;
+    if (state.cluster.?.cursor_digest) |expected| {
+        const raw = writer.get(contract.cluster_cursor_key) catch |err| switch (err) {
+            error.NotFound => return error.InvalidSqlBackendResponse,
+            else => return err,
+        };
+        if (!std.mem.eql(u8, &expected, &(try state.cluster.?.cursorDigest(raw)))) return error.InvalidSqlBackendResponse;
+        _ = try records.parseForward(raw, index);
+        checkpoint = try a.dupe(u8, raw);
+    }
+    if (state.phase == .cluster_flush) {
+        // Do not hold the primary writer across a flush/compaction wait.
+        writer.abort();
+        committed = true;
+        const primary = db.core.primary_store_owner.lsmBackend() orelse return error.UnsupportedSqlExecution;
+        db.core.unlockApplyExclusive();
+        locked = false;
+        try primary.flushBufferedWritesWithOptions(.{ .flush = true, .compact = true });
+        state.phase = .done;
+        state.cluster.?.cursor_digest = null;
+        // The identical progress revision still owns publication. A successor
+        // cannot receive a stale completion or preferred-index assignment.
+        try publish(db, a, &state, state.revision, false);
+        return std.json.Stringify.valueAlloc(alloc, contract.Response{ .table_id = request.table_id, .schema_version = request.schema_version, .done = true, .rows_scanned = state.statistics.rows }, .{});
+    }
+    const prefix = try records.forwardPrefix(index.id());
+    const Selected = struct { row_key: []const u8, forward_key: []const u8 };
+    var selected: std.ArrayList(Selected) = .empty;
+    var after: ?[]const u8 = checkpoint;
+    var exhausted = false;
+    {
+        var cursor = try writer.openCursor();
+        defer cursor.close();
+        cursor.setKeysOnly();
+        var current = try cursor.seekAtOrAfter(checkpoint orelse &prefix);
+        if (checkpoint) |key| if (current) |entry| if (std.mem.eql(u8, key, entry.key)) {
+            current = try cursor.next();
+        };
+        var key_bytes: usize = 0;
+        while (current) |entry| {
+            if (!std.mem.startsWith(u8, entry.key, &prefix)) break;
+            if (selected.items.len >= request.max_rows or (selected.items.len != 0 and key_bytes +| entry.key.len > 1024 * 1024)) break;
+            const owner = try records.parseForward(entry.key, index);
+            const document = try internal.decodeBodyAlloc(a, owner.document_component[0 .. owner.document_component.len - 2]);
+            try selected.append(a, .{ .row_key = try internal.relationalRowKeyAlloc(a, document), .forward_key = try a.dupe(u8, entry.key) });
+            key_bytes += entry.key.len;
+            current = try cursor.next();
+        }
+        exhausted = current == null or !std.mem.startsWith(u8, current.?.key, &prefix);
+    }
+    var bytes: u64 = 0;
+    const started = platform.time.monotonicNs();
+    // Catalog writers copy these facts under the same apply fence. Raise the
+    // in-memory requirement before attempting a location so even an ambiguous
+    // commit cannot let a later schema/count write downgrade its durable ATBL8
+    // fence. A failed/aborted attempt may conservatively require the decoder
+    // before any heap row exists; no row-presence or schema fact is inferred.
+    if (selected.items.len != 0) db.core.table_catalog.row_heap_format = @import("table_catalog.zig").maximum_row_heap_format;
+    // A cursor remains unpublished until every selected row is placed. This
+    // loop is row/key bounded; large bodies are additionally capped by the
+    // request arena. No JSON parsing, index rebuilding or row-version bump.
+    for (selected.items, 0..) |row, ordinal| {
+        bytes += writer.relocatePhysicalRow(row.row_key, state.cluster.?.generation, state.cluster.?.next_ordinal) catch |err| switch (err) {
+            error.RowHeapCollectionBusy => return error.MaintenanceBusy,
+            else => return err,
+        };
+        state.cluster.?.next_ordinal = std.math.add(u64, state.cluster.?.next_ordinal, 1) catch return error.SqlProgramLimitExceeded;
+        after = row.forward_key;
+        if (ordinal + 1 != selected.items.len and (bytes >= 16 * 1024 * 1024 or platform.time.monotonicNs() -| started >= 2 * std.time.ns_per_ms)) {
+            exhausted = false;
+            break;
+        }
+    }
+    state.statistics.rows = state.cluster.?.next_ordinal;
+    state.after = null;
+    if (after) |key| {
+        state.cluster.?.cursor_digest = try state.cluster.?.cursorDigest(key);
+        if (selected.items.len != 0) try writer.put(contract.cluster_cursor_key, key);
+    } else {
+        state.cluster.?.cursor_digest = null;
+        try writer.delete(contract.cluster_cursor_key);
+    }
+    if (exhausted) state.phase = .cluster_flush;
+    state.revision = std.math.add(u64, prior_revision, 1) catch return error.SqlProgramLimitExceeded;
+    state.lease_until_ms = now_ms +| 1000;
+    const encoded = try std.json.Stringify.valueAlloc(a, state, .{});
+    if (encoded.len > contract.max_bytes) return error.SqlProgramLimitExceeded;
+    try writer.put(contract.progress_key, encoded);
+    try writer.commit();
+    committed = true;
+    try db.core.store.sync(true);
+    return std.json.Stringify.valueAlloc(alloc, contract.Response{ .table_id = request.table_id, .schema_version = request.schema_version, .done = false, .rows_scanned = state.statistics.rows }, .{});
+}
+
 /// Only an authenticated table-admin operation or an internal planning read
 /// can reach this owner. Durable observations are always bound to its namespace.
 pub fn execute(db: anytype, alloc: A, bytes: []const u8) ![]u8 {
@@ -143,6 +341,11 @@ pub fn execute(db: anytype, alloc: A, bytes: []const u8) ![]u8 {
     defer if (locked) db.core.unlockApplyShared();
     try db.enforcePortableRuntimeGate();
     try matches(db, request);
+    if (request.operation == .cluster or request.operation == .cluster_check) {
+        db.core.unlockApplyShared();
+        locked = false;
+        return cluster(db, alloc, a, request);
+    }
     var pinned = db.core.acquireSchemaView();
     defer if (pinned) |*view| view.release();
     const identity = db.core.identity_namespace;

@@ -99,7 +99,7 @@ test "SQL JSONB text formatting owns exact output and cleans allocation and canc
         }
     };
     var cancel: Cancel = .{};
-    var context: @import("numeric_value.zig").Context = .{ .alloc = a, .checkpoint = Cancel.check, .ptr = &cancel };
+    var context: @import("numeric/value.zig").Context = .{ .alloc = a, .checkpoint = Cancel.check, .ptr = &cancel };
     var work: Budget = .{ .shared = &context };
     // The third poll is in the second pass, after output allocation. Both
     // the retained output and canonical-key scratch must unwind on error.

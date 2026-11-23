@@ -41,7 +41,7 @@ fn once(ctx: *fixture.Context, original: []const u8, name: []const u8, expected:
     const a = arena.allocator();
     const api = if (ctx.data.http_server) |*value| value else return error.MissingNativeSqlApi;
     try std.testing.expect(api.cfg.auth_enabled);
-    var adapter: @import("../../sql_pgwire.zig").Adapter = .{ .server = api };
+    var adapter: @import("../transport/pgwire.zig").Adapter = .{ .server = api };
     var input = std.Io.Writer.Allocating.init(a);
     defer input.deinit();
     const startup = "user\x00pk-rewriter\x00database\x00default\x00\x00";
@@ -184,7 +184,7 @@ pub fn runRejected(ctx: *fixture.Context, original: []const u8, sqlstate: []cons
     const a = arena.allocator();
     const api = if (ctx.data.http_server) |*value| value else return error.MissingNativeSqlApi;
     try std.testing.expect(api.cfg.auth_enabled);
-    var adapter: @import("../../sql_pgwire.zig").Adapter = .{ .server = api };
+    var adapter: @import("../transport/pgwire.zig").Adapter = .{ .server = api };
     var input = std.Io.Writer.Allocating.init(a);
     defer input.deinit();
     const startup = "user\x00pk-rewriter\x00database\x00default\x00\x00";

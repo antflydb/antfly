@@ -18,6 +18,10 @@
 //! and schema together. This is not another durable catalog or storage engine.
 const std = @import("std");
 const ast = @import("ast.zig");
+pub const collations = @import("../system_catalog/collations.zig");
+pub const collation_binding = @import("collation_binding.zig");
+pub const collation_native = @import("native_collation.zig");
+
 pub const graph_relation = @import("graph_relation.zig");
 pub const Count = @import("cypher").multiplicity.Count;
 pub const Multiplicity = @import("cypher").runtime.Multiplicity;
@@ -28,6 +32,8 @@ pub const domain_rows = @import("../schema/domain_row.zig");
 pub const domain_values = @import("../schema/domain_value.zig");
 pub const domain_types = @import("../system_catalog/domain_types.zig");
 pub const named_types = @import("../system_catalog/named_types.zig");
+pub const view_index_requirements = @import("../common/sql_view_index_requirement.zig");
+pub const collation_layouts = @import("../common/sql_collation_layout.zig");
 pub const named_layouts = @import("../common/sql_named_type_layout.zig");
 pub const type_retirement = @import("type_retirement.zig");
 pub const schema_columns = @import("schema_columns.zig");
@@ -44,7 +50,7 @@ test {
     _ = @import("enum_execution_test.zig");
     _ = @import("domain_execution_test.zig");
     _ = @import("domain_mutation.zig");
-    _ = @import("../storage/db/relational_enum_test.zig");
+    _ = @import("../storage/db/relational/rows/enum_test.zig");
 }
 
 pub const cloneDocumentPath = @import("document_path.zig").clone;
@@ -53,10 +59,11 @@ pub const Column = struct {
     name: []const u8,
     path: []const u8,
     /// Compiled literal object keys; path remains the logical SQL cell name.
+    read_type_guard: bool = false,
     document_path: @import("document_path.zig").Path = &.{},
     type: ast.ColumnType,
-    temporal_kind: ?@import("temporal_value.zig").Kind = null,
-    element_type: ?@import("array_value.zig").ElementType = null,
+    temporal_kind: ?@import("temporal/value.zig").Kind = null,
+    element_type: ?@import("array/value.zig").ElementType = null,
     numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
     enum_view: ?*const @import("../common/sql_enum_value.zig").View = null,
     domain_view: ?*const @import("../schema/domain_value.zig").View = null,
@@ -186,6 +193,7 @@ pub const Column = struct {
             hash.update(&id);
             hash.update(&domain.origin_id);
         }
+        if (self.read_type_guard) hash.update("\x00demanded-document-type-guard\x00");
         return hash.finalResult();
     }
 };
@@ -537,9 +545,17 @@ pub const Table = struct {
         }
     };
     /// SQL identity is independent of the opaque physical generation id.
+    /// Runtime-only identity for an unpublished relation in a SQL transaction.
+    private_generation: ?struct { transaction: [16]u8, nonce: [16]u8 } = null,
+    required_indexes: []const @import("../common/sql_view_index_requirement.zig").Requirement = &.{},
     logical_relation_id: ?u64 = null,
     /// Immutable schema declaration; enables complete OLD images during writes.
     has_triggers: bool = false,
+    is_partition_parent: bool = false,
+    partition_family: ?*const PartitionFamily = null,
+    partition_parent: ?*const Table = null,
+    partition_guard: ?*const @import("../system_catalog/domain.zig").RelationMutationGuard = null,
+    partition_route: ?@import("../system_catalog/table_partitions.zig").Route = null,
     /// Fresh source-cut evidence; unknown is not proof of FK absence.
     incoming_foreign_keys: ?@import("../system_catalog/domain.zig").QualifiedIncomingForeignKeys = null,
     has_incoming_foreign_keys: bool = false,
@@ -782,7 +798,7 @@ test "SQL document root virtual columns preserve narrow storage projections and 
     const table: Table = .{ .id = 1, .physical_name = "docs", .schema_version = 1, .storage_mode = .document, .columns = &.{.{ .name = "title", .path = "title", .type = .string }}, .scope = .{ .database = "default", .namespace = "public", .name = "docs", .revision = 1 } };
     const root = try table.column("_doc");
     try std.testing.expectEqual(ast.ColumnType.json, root.type);
-    try std.testing.expectEqual(@import("array_value.zig").ElementType.jsonb, root.element_type.?);
+    try std.testing.expectEqual(@import("array/value.zig").ElementType.jsonb, root.element_type.?);
     try std.testing.expect(table.isDocumentRoot("public\x00docs\x00_doc"));
     try std.testing.expect(!table.isDocumentRoot("other\x00docs\x00_doc"));
     try std.testing.expectError(error.UndefinedColumn, table.column("other\x00docs\x00_doc"));
@@ -932,6 +948,7 @@ pub const Scan = struct {
 pub const Row = struct {
     id: []const u8,
     version: u64,
+    origin_table_id: ?u64 = null,
     /// An explicitly assigned document-envelope version may differ from its
     /// physical OCC fence. Availability below must be preserved independently;
     /// a transaction HLC or TTL value never assigns a document revision.
@@ -944,6 +961,10 @@ pub const Row = struct {
     /// Digest of the exact primary bytes in this snapshot. Timestamps alone
     /// are not a version fence when a custom TTL field is unchanged.
     expected_content_digest: ?[32]u8 = null,
+    expected_mutation_revision: ?u64 = null,
+    stale_frozen_birth: bool = false,
+    frozen_order_key: ?[]const u8 = null,
+    superseded_frozen_birth: bool = false,
     document: ?std.json.Value = null,
     /// Native document metadata is not a relational user column of the same
     /// spelling. Only schema-bound document projections grant this identity.
@@ -1132,6 +1153,7 @@ pub const Row = struct {
     pub fn cloneWithLayout(self: Row, alloc: std.mem.Allocator, layout: ?*const TypedLayout) !Row {
         var result = self;
         result.id = try alloc.dupe(u8, self.id);
+        if (self.frozen_order_key) |key| result.frozen_order_key = try alloc.dupe(u8, key);
         if (self.index_cursor) |cursor| result.index_cursor = try alloc.dupe(u8, cursor);
         if (self.document) |document| result.document = try @import("../storage/typed_json.zig").clone(alloc, document);
         if (self.typed_cells) |cells| {
@@ -1285,10 +1307,10 @@ pub const ColumnPage = struct {
             if (column.values == .decimal128 and !column.nulls.isNull(index)) {
                 const decimal = column.values.decimal128;
                 @import("../common/decimal128.zig").validateCoefficient(decimal.values[index], decimal.precision, decimal.scale) catch return error.InvalidSqlBackendResponse;
-                var context: @import("numeric_value.zig").Context = .{ .alloc = alloc };
-                var number = try @import("numeric_value.zig").fromScaledInteger(&context, decimal.values[index], @intCast(decimal.scale));
+                var context: @import("numeric/value.zig").Context = .{ .alloc = alloc };
+                var number = try @import("numeric/value.zig").fromScaledInteger(&context, decimal.values[index], @intCast(decimal.scale));
                 errdefer number.deinit();
-                const value = try alloc.create(@import("numeric_value.zig").Value);
+                const value = try alloc.create(@import("numeric/value.zig").Value);
                 value.* = number.value;
                 return @import("scalar.zig").Datum.typedNumeric(value);
             }
@@ -1578,7 +1600,13 @@ pub const StatementRead = struct {
     cursors: []const Cursor,
     close: *const fn (*anyopaque) void,
 };
+pub const DocumentRevision = struct {
+    scope: *const @import("../storage/document_revision_reservation.zig").Scope,
+    version: u64,
+};
+
 pub const Mutation = struct {
+    document_revision: ?DocumentRevision = null,
     /// Statement-owned trigger stage; never encoded or trusted from ingress.
     prepared_trigger: ?*const anyopaque = null,
     /// BEFORE ROW returned NULL. Carries no primary write or absence claim.
@@ -1596,6 +1624,7 @@ pub const Mutation = struct {
     key: []const u8,
     expected_version: u64,
     expected_content_digest: ?[32]u8 = null,
+    expected_mutation_revision: ?u64 = null,
     /// A server-authored INSERT identity constraint, rather than an observed read.
     unique_absence: bool = false,
     row: ?std.json.Value,
@@ -1635,7 +1664,7 @@ pub const PopulationSource = struct {
     definition: [32]u8,
     source_definition: [32]u8,
     ptr: *anyopaque,
-    next: *const fn (*anyopaque, u32) anyerror!?[]const @import("../storage/db/relational_population_contract.zig").Row,
+    next: *const fn (*anyopaque, u32) anyerror!?[]const @import("../storage/db/relational/schema_change/population_contract.zig").Row,
     finish: *const fn (*anyopaque) anyerror!void,
 };
 
@@ -1675,6 +1704,8 @@ pub const DefinitionCopyLimits = @import("immutable_plan.zig").Limits;
 
 pub const CreateTableDefinition = struct {
     name: ast.Name,
+    partition_by: ?ast.PartitionBy = null,
+    partition_of: ?ast.PartitionOf = null,
     persistence: ast.RelationPopulation.Persistence = .permanent,
     on_commit: ?ast.RelationPopulation.OnCommit = null,
     creation_sources: []const @import("../system_catalog/domain.zig").RelationMutationGuard = &.{},
@@ -1730,7 +1761,7 @@ pub const DdlReceipt = struct {
 /// Native catalog operations have no physical table/schema receipt. Identity
 /// integers stay native here and stringify as exact decimal strings on wire.
 pub const CatalogOperationReceipt = struct {
-    pub const Kind = enum { sequence, function, procedure, operator, aggregate, cast, type, authorization, table, index, database, namespace, tablespace, query_source, view, extension };
+    pub const Kind = enum { sequence, function, procedure, operator, aggregate, cast, type, authorization, table, index, database, namespace, tablespace, query_source, view, extension, collation, publication, subscription };
     pub const Operation = enum { create, alter, rename, drop };
     pub const State = enum { committed, rejected, unknown, pending };
     pub const Diagnostic = struct { code: []const u8, message: []const u8, retryable: bool };
@@ -1943,6 +1974,7 @@ pub const Backend = struct {
     supports_graph_relations: bool = false,
     /// The DDL owner captures native placement and connection lifetime.
     supports_native_relation_lifetimes: bool = false,
+    supports_native_partition_membership: bool = false,
     /// Captured connection identity for relation namespace lookup only.
     temporary_relation_owner: ?@import("../common/relation_persistence.zig").Owner = null,
     supports_text_predicates: bool = false,
@@ -2083,6 +2115,8 @@ pub const Backend = struct {
         /// after commit. Returned rows preserve key/version/order/deletion.
         open_mutation_preparation: ?*const fn (*anyopaque, std.mem.Allocator, Table, []const u8, bool) anyerror!MutationPreparation = null,
         prepare_mutations: ?*const fn (*anyopaque, std.mem.Allocator, Table, []const Mutation) anyerror![]const Mutation = null,
+        /// Return only owner-assigned revisions in input order.
+        assign_document_revisions: ?*const fn (*anyopaque, std.mem.Allocator, Table, []const Mutation, []?DocumentRevision) anyerror!void = null,
         checkpoint: *const fn (*anyopaque) anyerror!void,
         /// Native authority owns atomic existence checks and durable catalog
         /// publication. SQL must never emulate DDL with read-then-write.
@@ -2121,7 +2155,7 @@ test "SQL row cells distinguish absent SQL NULL and JSON null and reject invalid
 
 test "SQL typed rows own arrays without conflating JSON null or array null elements" {
     const scalar = @import("scalar.zig");
-    const arrays = @import("array_value.zig");
+    const arrays = @import("array/value.zig");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -2169,7 +2203,7 @@ test "SQL native column pages preserve selection JSON null and validate schema w
 
 test "SQL typed array column adapters preserve dimensions and owned index continuation" {
     const scalar = @import("scalar.zig");
-    const arrays = @import("array_value.zig");
+    const arrays = @import("array/value.zig");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -2205,8 +2239,8 @@ test "lake SQL decimal columns distinguish declared NUMERIC from exact string re
     try std.testing.expectEqualStrings("9007199254740993.125", raw.value.string);
     const native = try page.typedCell(a, 0, "n", true);
     try std.testing.expect(native.numeric != null);
-    var context: @import("numeric_value.zig").Context = .{ .alloc = a };
-    try std.testing.expectEqualStrings(raw.value.string, try @import("numeric_value.zig").format(&context, native.numeric.?.*));
+    var context: @import("numeric/value.zig").Context = .{ .alloc = a };
+    try std.testing.expectEqualStrings(raw.value.string, try @import("numeric/value.zig").format(&context, native.numeric.?.*));
 }
 
 test "SQL durable planner sketches merge duplicate keys nulls widths and bounded heavy frequencies" {
@@ -2249,7 +2283,7 @@ test "SQL view temporal domain signatures distinguish every scalar kind and norm
     var explicit = old;
     explicit.temporal_kind = .timestamp_tz;
     try std.testing.expectEqualSlices(u8, &frozen, &try explicit.identitySignature(a));
-    const kinds = [_]@import("temporal_value.zig").Kind{ .date, .time, .time_tz, .timestamp, .timestamp_tz, .interval };
+    const kinds = [_]@import("temporal/value.zig").Kind{ .date, .time, .time_tz, .timestamp, .timestamp_tz, .interval };
     for (kinds) |left| for (kinds) |right| {
         var one = old;
         one.temporal_kind = left;
@@ -2392,3 +2426,40 @@ test "SQL statistic batches reject duplicate slots and malformed bin/support pay
     arguments[1].support.?.value.words = &.{1};
     try page.validateWeights();
 }
+
+pub const PartitionFamily = struct {
+    parent_guard: @import("../system_catalog/domain.zig").RelationMutationGuard,
+    descriptor: @import("../system_catalog/table_partitions.zig").Descriptor,
+    leaves: []const Table,
+
+    pub fn validate(self: PartitionFamily) !void {
+        try self.descriptor.validate();
+        try self.parent_guard.validate();
+        if (self.parent_guard.hasDefinitionIntent() or self.parent_guard.owner.kind != .table or
+            self.parent_guard.owner.table_id != self.descriptor.parent.table_id or
+            self.parent_guard.owner.schema_version != self.descriptor.parent.schema_version or
+            self.leaves.len != self.descriptor.members.len) return error.PartitionCatalogChanged;
+        const descriptor_digest = try self.descriptor.digest();
+        const policy_digest = try self.descriptor.policy.digest();
+        for (self.leaves, self.descriptor.members) |member_table, member| {
+            if (member_table.id != member.relation.table_id or member_table.schema_version != member.relation.schema_version or member_table.partition_family != null) return error.PartitionCatalogChanged;
+            const parent = member_table.partition_parent orelse return error.PartitionCatalogChanged;
+            if (parent.id != self.descriptor.parent.table_id or parent.schema_version != self.descriptor.parent.schema_version or parent.partition_family != null or parent.partition_parent != null or parent.partition_route != null) return error.PartitionCatalogChanged;
+            const guard = member_table.partition_guard orelse return error.PartitionCatalogChanged;
+            try guard.validate();
+            if (guard.hasDefinitionIntent() or !guard.owner.eql(self.parent_guard.owner) or
+                !std.mem.eql(u8, &guard.incarnation, &self.parent_guard.incarnation) or
+                !std.mem.eql(u8, guard.target.database, self.parent_guard.target.database) or
+                !std.mem.eql(u8, guard.target.namespace, self.parent_guard.target.namespace) or
+                !std.mem.eql(u8, guard.target.name, self.parent_guard.target.name) or
+                !std.mem.eql(u8, guard.logical_table, self.parent_guard.logical_table)) return error.PartitionCatalogChanged;
+            const route = member_table.partition_route orelse return error.PartitionCatalogChanged;
+            const expected: @import("../system_catalog/table_partitions.zig").Route = .{ .parent_id = self.descriptor.parent.table_id, .parent_revision = self.descriptor.revision, .parent_descriptor = descriptor_digest, .child_id = member.relation.table_id, .child_schema_version = member.relation.schema_version, .membership_generation = member.membership_generation, .policy = policy_digest, .inherited = try @import("../system_catalog/table_partitions.zig").inheritanceDigest(member.inherited) };
+            if (!std.meta.eql(route, expected)) return error.PartitionCatalogChanged;
+        }
+    }
+    pub fn leaf(self: PartitionFamily, id: u64) !Table {
+        for (self.leaves) |value| if (value.id == id) return value;
+        return error.PartitionCatalogChanged;
+    }
+};

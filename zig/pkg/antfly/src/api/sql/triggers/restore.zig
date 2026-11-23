@@ -63,7 +63,7 @@ pub fn prepare(a: A, server: *http.ApiHttpServer, input_context: operation.Reque
         if (mappings.len != 0) return error.InvalidRequest;
         return;
     }
-    if (demands_execution) try @import("../../sql_preparation_authority_keys.zig").requireConfiguration(server.cfg);
+    if (demands_execution) try @import("../recovery/preparation_authority_keys.zig").requireConfiguration(server.cfg);
     var identity = if (demands_execution) try identityForPrincipal(a, server, principal, actor) else null;
     defer if (identity) |*owned| owned.deinit(a);
     var context = input_context;
@@ -180,7 +180,7 @@ pub fn reauthorize(a: A, server: *http.ApiHttpServer, input_context: operation.R
         break;
     };
     if (!required) return;
-    try @import("../../sql_preparation_authority_keys.zig").requireConfiguration(server.cfg);
+    try @import("../recovery/preparation_authority_keys.zig").requireConfiguration(server.cfg);
     var identity = try identityForPrincipal(a, server, principal, actor);
     defer if (identity) |*owned| owned.deinit(a);
     var context = input_context;
@@ -232,7 +232,7 @@ pub fn reauthorizeJob(a: A, server: *http.ApiHttpServer, context: operation.Requ
         break;
     };
     if (!required or expected.state == .canceled or expected.state == .canceling) return;
-    const recovery = @import("../../sql_relation_recovery_authority.zig");
+    const recovery = @import("../recovery/relation_recovery_authority.zig");
     if (recovery.requiresNativeRecovery(expected.plan)) {
         try recovery.requireAdmitted(server, a, expected.plan, context);
         return;

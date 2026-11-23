@@ -172,7 +172,7 @@ pub const CatalogPreparation = struct {
     alloc: std.mem.Allocator,
     before: @import("mod.zig").PreparedSchemaDefinition,
     after: @import("mod.zig").PreparedSchemaDefinition,
-    catalog: @import("../storage/db/relational_integrity_catalog.zig").Update,
+    catalog: @import("../storage/db/relational/integrity/catalog.zig").Update,
 
     pub fn deinit(self: *@This()) void {
         self.before.deinit(self.alloc);
@@ -182,7 +182,7 @@ pub const CatalogPreparation = struct {
     }
 };
 
-pub fn prepareCatalog(a: std.mem.Allocator, table_id: u64, before_json: []const u8, after_json: []const u8, predecessor: []const u8, names: []const []const u8) !@import("../storage/db/relational_integrity_catalog.zig").Update {
+pub fn prepareCatalog(a: std.mem.Allocator, table_id: u64, before_json: []const u8, after_json: []const u8, predecessor: []const u8, names: []const []const u8) !@import("../storage/db/relational/integrity/catalog.zig").Update {
     var prepared = try prepareCatalogOwned(a, table_id, before_json, after_json, predecessor, names);
     prepared.before.deinit(a);
     prepared.after.deinit(a);
@@ -194,9 +194,9 @@ pub fn prepareCatalog(a: std.mem.Allocator, table_id: u64, before_json: []const 
 pub fn prepareCatalogOwned(a: std.mem.Allocator, table_id: u64, before_json: []const u8, after_json: []const u8, predecessor: []const u8, names: []const []const u8) !CatalogPreparation {
     const api = @import("mod.zig");
     const declarations = @import("relational_declarations.zig");
-    const catalog = @import("../storage/db/relational_integrity_catalog.zig");
+    const catalog = @import("../storage/db/relational/integrity/catalog.zig");
     const native_schema = @import("../storage/schema.zig");
-    const limits = @import("../storage/db/relational_schema_owner_contract.zig");
+    const limits = @import("../storage/db/relational/schema_change/schema_owner_contract.zig");
     if (table_id == 0 or before_json.len == 0 or after_json.len == 0 or before_json.len > limits.max_schema or after_json.len > limits.max_schema or predecessor.len == 0 or predecessor.len > catalog.max_catalog_bytes) return error.InvalidSchemaUpdateRequest;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -220,7 +220,7 @@ pub fn prepareCatalogOwned(a: std.mem.Allocator, table_id: u64, before_json: []c
     defer declarations.freeDefinitions(a, definitions);
     const bytes = try native_schema.serializeSchema(a, after.runtime_schema);
     defer a.free(bytes);
-    const digest = @import("../storage/db/relational_integrity_contract.zig").hash(bytes);
+    const digest = @import("../storage/db/relational/integrity/contract.zig").hash(bytes);
     const update = try catalog.prepareForeignKeyValidation(a, predecessor, try catalog.incarnationFromTableId(table_id), after.runtime_schema.version, digest, definitions, names, previous.checks_digest);
     return .{ .alloc = a, .before = before, .after = after, .catalog = update };
 }
@@ -242,7 +242,7 @@ test "foreign key validation declaration preparation preserves real compiler gen
     var prepared = try prepareCatalog(a, 71, before_json, after_json, predecessor.value, &.{"fk"});
     defer prepared.deinit();
     try std.testing.expectEqual(predecessor.catalog.next_generation, prepared.catalog.next_generation);
-    for ([_]@import("../storage/db/relational_integrity_catalog.zig").Kind{ .unique, .foreign_key }, [_][]const u8{ "pk", "fk" }) |kind, name| {
+    for ([_]@import("../storage/db/relational/integrity/catalog.zig").Kind{ .unique, .foreign_key }, [_][]const u8{ "pk", "fk" }) |kind, name| {
         try std.testing.expectEqualSlices(u8, &predecessor.catalog.find(kind, name).?.generation, &prepared.catalog.find(kind, name).?.generation);
     }
     var after = try api.PreparedSchemaDefinition.init(a, after_json);

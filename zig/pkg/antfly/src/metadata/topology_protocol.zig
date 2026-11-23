@@ -178,7 +178,26 @@ pub const sql_extension_version: u16 = 178;
 /// This build combines the already-published pinned restore decoder with
 /// the independent SQL decoder lineage.
 pub const pinned_restore_job_version: u16 = 94;
-pub const current_version: u16 = 193;
+pub const restore_reservation_outcome_version: u16 = 194;
+pub const sql_security_labels_version: u16 = 195;
+pub const sql_collation_catalog_version: u16 = 196;
+pub const sql_document_view_indexes_version: u16 = 197;
+pub const sql_partition_membership_version: u16 = 198;
+pub const sql_replication_catalog_version: u16 = 199;
+pub const sql_publication_capture_version: u16 = 200;
+pub const sql_publication_terminal_version: u16 = 201;
+pub const sql_publication_decision_journal_version: u16 = 202;
+pub const sql_publication_abort_fence_version: u16 = 203;
+pub const sql_publication_collection_version: u16 = 204;
+pub const sql_publication_slot_version: u16 = 205;
+pub const sql_publication_slot_control_version: u16 = 206;
+pub const sql_subscription_apply_version: u16 = 207;
+pub const sql_catalog_completion_version: u16 = 208;
+pub const sql_catalog_reservation_version: u16 = 209;
+pub const sql_catalog_progress_version: u16 = 210;
+pub const sql_catalog_atomic_admission_version: u16 = 211;
+pub const sql_selinux_approval_version: u16 = 212;
+pub const current_version: u16 = sql_selinux_approval_version;
 /// Immutable, pre-executed statement trigger receipts/results on SQL TRUNCATE.
 pub const sql_truncate_preparation_version: u16 = 177;
 /// Atomically acknowledged trigger-schema and active row-policy pairs.

@@ -23,6 +23,7 @@ const row = @import("row.zig");
 const transactions = @import("../transactions.zig");
 const frozen = @import("transaction.zig");
 const command_control = @import("command_control.zig");
+pub const document_revisions = @import("../document_revision_control.zig");
 const Identity = @import("../db/doc_identity_namespace.zig").Namespace;
 const A = std.mem.Allocator;
 const ledger = scopes.ledger;
@@ -92,7 +93,7 @@ pub const RetirementControl = struct {
     scope_id: [16]u8,
     scope_revision: u64,
     abandonment_digest: [32]u8,
-    physical_fence: @import("../db/relational_integrity_topology_contract.zig").Fence,
+    physical_fence: @import("../db/relational/integrity/topology_contract.zig").Fence,
     participant: scopes.Data.Participant,
 
     pub fn validate(self: RetirementControl, admission: RetirementAdmission) !void {
@@ -125,7 +126,7 @@ pub const RetirementControl = struct {
     }
     pub fn requireFence(self: RetirementControl, txn: anytype, admission: RetirementAdmission) !void {
         try self.validate(admission);
-        const actual = (try @import("../db/relational_integrity_topology.zig").current(txn)) orelse return error.IntegrityTopologyFenceMissing;
+        const actual = (try @import("../db/relational/integrity/topology.zig").current(txn)) orelse return error.IntegrityTopologyFenceMissing;
         if (!actual.eql(self.physical_fence)) return error.IntegrityTopologyChanged;
     }
 };
@@ -147,6 +148,7 @@ pub const Command = struct {
         cancel: struct { effect: ledger.Effect, key: ?[]const u8 = null },
         control: ledger.Effect,
         bound_control: command_control.Request,
+        document_revisions: document_revisions.Control,
         cancel_wait: ledger.Effect,
         finish,
         close,
@@ -176,6 +178,7 @@ pub const Command = struct {
                 if (effect.action != .acquire or !effect.backend.eql((try self.admission.registration()).lease.backend)) return error.InvalidLockEffect;
             },
             .bound_control => |value| try value.validate(self.admission),
+            .document_revisions => |value| try value.validate(self.admission),
             .control => |effect| try (participant.SavepointControl{ .admission = self.admission, .effect = effect }).validate(),
             .prepare, .resolve => |decision| try decision.validate(),
             else => {},
@@ -186,7 +189,7 @@ pub const Command = struct {
     /// intentionally accepts expired sources through its separate fence authority.
     pub fn requireLiveExecution(self: Command, now_ms: u64) !void {
         switch (self.operation) {
-            .begin, .acquire, .row, .cancel, .control, .bound_control, .cancel_wait => {
+            .begin, .acquire, .row, .cancel, .control, .bound_control, .document_revisions, .cancel_wait => {
                 const checked = self.checked orelse return error.Forbidden;
                 try checked.requireExecuting(self.admission);
                 if (checked.source.registration.lease.expires_at_ms <= now_ms) return error.LockEffectExpired;
@@ -212,6 +215,7 @@ pub const Command = struct {
 };
 
 pub const Query = struct {
+    document_revisions: ?document_revisions.Query = null,
     admission: participant.Admission,
     native_control: ?NativeControl = null,
     retirement_control: ?RetirementControl = null,
@@ -221,6 +225,10 @@ pub const Query = struct {
     intent_key: ?[]const u8 = null,
     pub fn validate(self: Query) !void {
         try self.admission.validate();
+        if (self.document_revisions) |query| {
+            if (self.native_control != null or self.retirement_control != null or self.effect != null or self.row_request != null or self.command_control or self.intent_key != null) return error.InvalidLockScope;
+            try query.validate(self.admission);
+        }
         if (self.native_control) |control| {
             try control.validate(self.admission);
             if (self.effect != null or self.row_request != null or self.command_control or self.intent_key != null) return error.InvalidLockScope;
@@ -231,7 +239,7 @@ pub const Query = struct {
         }
     }
     pub fn nativeJsonSkipField(self: Query, comptime field: []const u8) bool {
-        return ((comptime std.mem.eql(u8, field, "native_control")) and self.native_control == null) or
+        return ((comptime std.mem.eql(u8, field, "document_revisions")) and self.document_revisions == null) or ((comptime std.mem.eql(u8, field, "native_control")) and self.native_control == null) or
             ((comptime std.mem.eql(u8, field, "retirement_control")) and self.retirement_control == null);
     }
     pub fn jsonStringify(self: Query, writer: anytype) !void {
@@ -244,6 +252,7 @@ pub const Query = struct {
     }
 };
 pub const Snapshot = struct {
+    document_revisions: ?document_revisions.Observation = null,
     scope: ?scopes.Record,
     owner: ?ledger.Owner,
     receipt: ?ledger.Receipt = null,
@@ -253,6 +262,16 @@ pub const Snapshot = struct {
     prepared_owner: ?ledger.Owner = null,
     bound_control: ?ledger.Effect = null,
     intent_owner: ?transactions.TxnId = null,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |field| {
+            if (!(comptime std.mem.eql(u8, field, "document_revisions")) or self.document_revisions != null) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
 };
 
 pub fn snapshot(a: A, txn: anytype, receiving: Identity, query: Query) !Snapshot {
@@ -276,6 +295,10 @@ pub fn snapshot(a: A, txn: anytype, receiving: Identity, query: Query) !Snapshot
         result.intent_owner = try transactions.pendingIntentOwner(a, txn, key, query.admission.transaction);
     }
     const observed = result.scope orelse return result;
+    if (query.document_revisions) |selection| {
+        try query.admission.requireRegistration(observed.registration);
+        result.document_revisions = try document_revisions.observe(a, txn, selection);
+    }
     const context: Observer = .{ .admission = query.admission, .registration = observed.registration };
     if (query.row_request) |request| {
         if (query.effect != null or !std.meta.eql(request.acquisition.admission, query.admission)) return error.InvalidLockEffect;
@@ -308,6 +331,9 @@ pub fn apply(a: A, txn: anytype, receiving: Identity, group: u64, mode: @import(
     const context: Authority = .{ .a = a, .command = command };
     switch (command.operation) {
         .begin => _ = try participant.admit(a, txn, receiving, command.admission, context),
+        .document_revisions => {
+            if (try participant.admit(a, txn, receiving, command.admission, context) == .completed) return error.LockEffectExpired;
+        },
         .acquire => |effect| _ = try participant.acquire(a, txn, receiving, .{ .admission = command.admission, .effect = effect }, context),
         .row => |value| _ = try row.acquire(a, txn, receiving, mode, command.rowRequest(value), context),
         .cancel => |value| _ = try participant.cancel(a, txn, receiving, .{ .admission = command.admission, .effect = value.effect, .physical_key = value.key }, context),

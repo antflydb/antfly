@@ -24,7 +24,7 @@ const runtime = local.sql_runtime;
 const catalog = local.sql_catalog;
 const wire = @import("../../../pgwire/backend.zig");
 const http = @import("../../http_server.zig");
-const Adapter = @import("../../sql_execution.zig").Adapter;
+const Adapter = @import("../execution/execution.zig").Adapter;
 const Endpoint = @import("io.zig").Endpoint;
 const Batch = @import("input_batch.zig").Batch;
 
@@ -148,8 +148,8 @@ const State = struct {
             var result = self.control("ROLLBACK") catch return;
             result.deinit();
         } else {
-            var coordinator: @import("../../sql_session.zig").Coordinator = .{ .server = self.adapter.server, .identity = self.adapter.identity, .context = self.adapter.context };
-            @import("../../sql_session.zig").Coordinator.failed(&coordinator, .{ .principal = http.transactionPrincipal(self.adapter.identity.*) orelse "", .database = self.adapter.database, .namespace = self.adapter.session_namespace orelse self.adapter.namespace }, @import("../../distributed_txn.zig").parseTxnIdHex(&self.session.?) catch return) catch {};
+            var coordinator: @import("../session/session.zig").Coordinator = .{ .server = self.adapter.server, .identity = self.adapter.identity, .context = self.adapter.context };
+            @import("../session/session.zig").Coordinator.failed(&coordinator, .{ .principal = http.transactionPrincipal(self.adapter.identity.*) orelse "", .database = self.adapter.database, .namespace = self.adapter.session_namespace orelse self.adapter.namespace }, @import("../../distributed_txn.zig").parseTxnIdHex(&self.session.?) catch return) catch {};
             self.adapter.transaction_status = .failed;
         }
     }
@@ -160,14 +160,32 @@ const State = struct {
         const a = arena.allocator();
         const old_copy = self.adapter.copy_input;
         const old_filter = self.adapter.copy_filter;
+        const old_freeze = self.adapter.copy_freeze_origin;
         self.adapter.copy_input = true;
         defer self.adapter.copy_input = old_copy;
         defer self.adapter.copy_filter = old_filter;
+        defer self.adapter.copy_freeze_origin = old_freeze;
         const backend = self.backend orelse self.adapter.backend();
-        const lowered = try local.sql_describe.copyWrite(a, backend, self.compiled);
+        const lowered = resolve: {
+            const previous_transaction = self.adapter.active_transaction;
+            const previous_private = self.adapter.active_private_mutation;
+            if (self.session) |id| {
+                self.adapter.active_transaction = try @import("../../distributed_txn.zig").parseTxnIdHex(&id);
+                self.adapter.active_private_mutation = true;
+            }
+            defer {
+                self.adapter.active_transaction = previous_transaction;
+                self.adapter.active_private_mutation = previous_private;
+            }
+            break :resolve try local.sql_describe.copyWrite(a, backend, self.compiled);
+        };
         var description = try local.sql_describe.describe(self.alloc, lowered.binding_backend, &lowered.compiled, &.{});
         defer description.deinit();
         const table = description.binding.table orelse return error.InvalidSqlBackendResponse;
+        if (command.options.freeze) {
+            const id = self.session orelse return error.SqlCopyFreezeGenerationRequired;
+            self.adapter.copy_freeze_origin = try @import("../execution/private_relation.zig").freezeOrigin(self.adapter, a, table, try @import("../../distributed_txn.zig").parseTxnIdHex(&id));
+        }
         const columns = try a.alloc(wire.Column, lowered.compiled.statement.insert.columns.len);
         for (columns, lowered.compiled.statement.insert.columns) |*out, name| {
             const column = try table.column(name);
@@ -356,8 +374,8 @@ const Output = struct {
         }
         var scratch: std.heap.ArenaAllocator = .init(self.state.alloc);
         defer scratch.deinit();
-        var cells: @import("../../sql_wire_cells.zig").OutputCells = .{ .output = output };
-        const result: wire.Result = .{ .columns = self.encoder.?.columns, .rows = if (output.native_rows == null) output.rows else &.{}, .sql_nulls = if (output.native_rows == null) output.sql_nulls else null, .cells = if (output.native_rows != null) .{ .context = &cells, .count = output.rowCount(), .width = output.columns.len, .read = @import("../../sql_wire_cells.zig").OutputCells.read } else null, .command_tag = "SELECT" };
+        var cells: @import("../transport/wire_cells.zig").OutputCells = .{ .output = output };
+        const result: wire.Result = .{ .columns = self.encoder.?.columns, .rows = if (output.native_rows == null) output.rows else &.{}, .sql_nulls = if (output.native_rows == null) output.sql_nulls else null, .cells = if (output.native_rows != null) .{ .context = &cells, .count = output.rowCount(), .width = output.columns.len, .read = @import("../transport/wire_cells.zig").OutputCells.read } else null, .command_tag = "SELECT" };
         for (0..output.rowCount()) |i| {
             try State.checkpoint(self.state);
             _ = scratch.reset(.retain_capacity);

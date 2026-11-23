@@ -28,7 +28,7 @@ const internal_keys = @import("../internal_keys.zig");
 const docstore_mod = @import("../docstore.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
 const mapper = @import("document_mapper.zig");
-const relational_store = @import("relational_store.zig");
+const relational_store = @import("relational/rows/store.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const replay_source_mod = @import("derived/replay_source.zig");
 const mem_backend_mod = @import("../mem_backend.zig");
@@ -37,8 +37,8 @@ const range_state_mod = @import("range_state.zig");
 const schema_mod = @import("../schema.zig");
 const public_schema_mod = @import("../../schema/mod.zig");
 const schema_registry_mod = @import("schema_registry.zig");
-const relational_index_catalog_mod = @import("relational_index_catalog.zig");
-const integrity_catalog_mod = @import("relational_integrity_catalog.zig");
+const relational_index_catalog_mod = @import("relational/indexes/catalog.zig");
+const integrity_catalog_mod = @import("relational/integrity/catalog.zig");
 const table_catalog_mod = @import("table_catalog.zig");
 const public_schema_json_key = internal_keys.public_schema_json_key;
 const shard_mod = @import("../shard.zig");
@@ -128,14 +128,14 @@ pub const PreparedSchemaMetadata = struct {
     same_version_layout_matches: bool = false,
     legacy_public_binding: bool = false,
     generated_semantics_match: bool = true,
-    reserved_index: ?@import("relational_index_owner_job.zig").Binding = null,
+    reserved_index: ?@import("relational/indexes/owner_job.zig").Binding = null,
     reserved_public_schema_digest: ?[32]u8 = null,
-    reserved_activation: ?@import("relational_integrity_activation.zig").PreparedIndexPublication = null,
+    reserved_activation: ?@import("relational/integrity/activation.zig").PreparedIndexPublication = null,
     validated_nullability: ?struct {
-        binding: @import("relational_nullability_job.zig").Binding,
+        binding: @import("relational/schema_change/nullability_job.zig").Binding,
         ready_digest: [32]u8,
     } = null,
-    native_child_control: ?@import("relational_integrity_topology_contract.zig").Command = null,
+    native_child_control: ?@import("relational/integrity/topology_contract.zig").Command = null,
     native_child_digest: ?[32]u8 = null,
     combined_writes: []docstore_mod.KVPair,
 
@@ -1402,10 +1402,10 @@ pub const DBCore = struct {
         self: *DBCore,
         table_schema: schema_mod.TableSchema,
         metadata_writes: []const docstore_mod.KVPair,
-        binding: @import("relational_nullability_job.zig").Binding,
-        candidate: *const @import("relational_nullability_job.zig").Candidate,
+        binding: @import("relational/schema_change/nullability_job.zig").Binding,
+        candidate: *const @import("relational/schema_change/nullability_job.zig").Candidate,
     ) !PreparedSchemaMetadata {
-        const job = @import("relational_nullability_job.zig");
+        const job = @import("relational/schema_change/nullability_job.zig");
         try job.requireCandidate(binding, candidate);
         if (!binding.fence.namespace.eql(self.identity_namespace)) return error.IdentityNamespaceMismatch;
         const ready_cut = blk: {
@@ -1427,7 +1427,7 @@ pub const DBCore = struct {
             versioned_public = versioned_public or historical;
         }
         if (!active_public or !versioned_public) return error.SchemaValidationJobChanged;
-        if (binding.purpose != .not_null and !binding.purpose.schemaOnly() and binding.purpose != .domain_not_null and (binding.purpose != .foreign_key_source or ready_cut.transaction_coverage == null))
+        if (!binding.purpose.canInstall(ready_cut.transaction_coverage != null))
             return error.ForeignKeyValidationRequired;
         const retiring_dependencies = binding.purpose == .dependent_object_retirement;
         var prepared = try self.prepareSchemaMetadataMode(table_schema, metadata_writes, retiring_dependencies, binding.before_version, null, if (binding.purpose == .foreign_key_source or binding.purpose == .object_rename) candidate else null);
@@ -1439,7 +1439,7 @@ pub const DBCore = struct {
         var rename_region = std.heap.ArenaAllocator.init(self.alloc);
         defer rename_region.deinit();
         const rename_hints: []const @import("../../system_catalog/object_annotations.zig").Rename = if (binding.purpose == .object_rename) blk: {
-            const parts = try @import("relational_nullability_job.zig").Candidate.parts(candidate.inputs);
+            const parts = try @import("relational/schema_change/nullability_job.zig").Candidate.parts(candidate.inputs);
             break :blk try std.json.parseFromSliceLeaky([]const @import("../../system_catalog/object_annotations.zig").Rename, rename_region.allocator(), parts[3], .{});
         } else &.{};
         if (prepared.base_relational_indexes) |base| {
@@ -1479,8 +1479,8 @@ pub const DBCore = struct {
     }
 
     pub const ReservedIndexPreparation = struct {
-        binding: @import("relational_index_owner_job.zig").Binding,
-        candidate: *const @import("relational_index_candidate.zig").Candidate,
+        binding: @import("relational/indexes/owner_job.zig").Binding,
+        candidate: *const @import("relational/indexes/candidate.zig").Candidate,
     };
 
     /// Prepare the reserved physical/integrity generations against the real
@@ -1498,11 +1498,11 @@ pub const DBCore = struct {
         published_child: bool,
         expected_version: ?u32,
         reserved_index: ?ReservedIndexPreparation,
-        validated_foreign_key: ?*const @import("relational_nullability_job.zig").Candidate,
+        validated_foreign_key: ?*const @import("relational/schema_change/nullability_job.zig").Candidate,
     ) !PreparedSchemaMetadata {
         try relational_index_catalog_mod.Controller.validateExtraMetadata(metadata_writes, &.{});
-        const reserved_inputs: ?@import("relational_index_inputs.zig").View = if (reserved_index) |reserved|
-            try @import("relational_index_inputs.zig").decode(reserved.candidate.inputs.bytes)
+        const reserved_inputs: ?@import("relational/indexes/inputs.zig").View = if (reserved_index) |reserved|
+            try @import("relational/indexes/inputs.zig").decode(reserved.candidate.inputs.bytes)
         else
             null;
         if (reserved_inputs) |inputs| {
@@ -1532,9 +1532,9 @@ pub const DBCore = struct {
                 table_schema.version != binding.physical_candidate.schema_version) return error.PrivateIndexOwnerJobChanged;
             var txn = try self.store.beginReadTxn();
             defer txn.abort();
-            try @import("relational_index_owner_job.zig").requireReserved(&txn, binding);
+            try @import("relational/indexes/owner_job.zig").requireReserved(&txn, binding);
             const candidate = reserved.candidate;
-            const inputs_mod = @import("relational_index_inputs.zig");
+            const inputs_mod = @import("relational/indexes/inputs.zig");
             if (!std.mem.eql(u8, &inputs_mod.digest(candidate.inputs.bytes), &binding.inputs_digest) or
                 !std.mem.eql(u8, &inputs_mod.digest(candidate.next.value), &binding.integrity_candidate) or
                 !std.mem.eql(u8, &inputs_mod.digest(candidate.reservation.value), &binding.integrity_reserved) or
@@ -1586,7 +1586,7 @@ pub const DBCore = struct {
         var rename_region = std.heap.ArenaAllocator.init(self.alloc);
         defer rename_region.deinit();
         const object_renames: []const @import("../../system_catalog/object_annotations.zig").Rename = if (validated_foreign_key) |candidate| if (candidate.purpose == .object_rename) blk: {
-            const parts = try @import("relational_nullability_job.zig").Candidate.parts(candidate.inputs);
+            const parts = try @import("relational/schema_change/nullability_job.zig").Candidate.parts(candidate.inputs);
             break :blk try std.json.parseFromSliceLeaky([]const @import("../../system_catalog/object_annotations.zig").Rename, rename_region.allocator(), parts[3], .{});
         } else &.{} else &.{};
 
@@ -1679,9 +1679,9 @@ pub const DBCore = struct {
                         // parent owners. Other constraint kinds still need
                         // their ordinary retirement proof.
                         if (published_child and binding.definition.kind == .foreign_key) continue;
-                        const proof = (try self.getStoreValue(self.alloc, @import("relational_integrity_retirement.zig").key)) orelse return error.ConstraintRetirementRequired;
+                        const proof = (try self.getStoreValue(self.alloc, @import("relational/integrity/retirement.zig").key)) orelse return error.ConstraintRetirementRequired;
                         defer self.alloc.free(proof);
-                        const retirement = try @import("relational_integrity_retirement.zig").Progress.decode(proof);
+                        const retirement = try @import("relational/integrity/retirement.zig").Progress.decode(proof);
                         if (retirement.phase != .ready or !retirement.includes(binding.generation) or !std.mem.eql(u8, &retirement.target_schema_digest, &digest)) return error.ConstraintRetirementRequired;
                     }
                 }
@@ -1690,9 +1690,9 @@ pub const DBCore = struct {
         if (reserved_index) |reserved| {
             var read = try self.store.beginReadTxn();
             defer read.abort();
-            if (try @import("relational_index_validation.zig").Seal.load(self.alloc, &read, reserved.binding) != null) {
+            if (try @import("relational/indexes/validation.zig").Seal.load(self.alloc, &read, reserved.binding) != null) {
                 const inputs = reserved_inputs.?;
-                prepared.reserved_activation = try @import("relational_integrity_activation.zig").PreparedIndexPublication.init(self.alloc, &read, reserved.binding, inputs.predecessor, &prepared.integrity_catalog.?, inputs.name);
+                prepared.reserved_activation = try @import("relational/integrity/activation.zig").PreparedIndexPublication.init(self.alloc, &read, reserved.binding, inputs.predecessor, &prepared.integrity_catalog.?, inputs.name);
             }
         }
         return prepared;
@@ -1721,8 +1721,8 @@ pub const DBCore = struct {
         decision: [32]u8,
         entry: ?@import("apply_receipts.zig").OrderedApplyReceipt,
         participant: anytype,
-    ) !@import("relational_nullability_job.zig").Header {
-        const job = @import("relational_nullability_job.zig");
+    ) !@import("relational/schema_change/nullability_job.zig").Header {
+        const job = @import("relational/schema_change/nullability_job.zig");
         if (comptime @TypeOf(participant) == @TypeOf(null)) @compileError("schema installation requires an authoritative replay/outbox participant");
         const binding = (prepared.validated_nullability orelse return error.SchemaValidationJobRequired).binding;
         const ready_digest = prepared.validated_nullability.?.ready_digest;
@@ -1785,10 +1785,10 @@ pub const DBCore = struct {
         self: *DBCore,
         prepared: *PreparedSchemaMetadata,
         metadata_writes: []const docstore_mod.KVPair,
-        command: @import("relational_index_validation.zig").InstallCommand,
+        command: @import("relational/indexes/validation.zig").InstallCommand,
         replay: ?@import("receipt_position.zig").Native,
         participant: anytype,
-    ) !@import("relational_index_validation.zig").Installed {
+    ) !@import("relational/indexes/validation.zig").Installed {
         if (command.validation.command.binding.authority != .native) return error.InvalidControlReceiptPosition;
         return self.commitPreparedSchemaMetadataReservedIndexAt(prepared, metadata_writes, command, if (replay) |cut| .{ .native = cut } else null, participant);
     }
@@ -1797,11 +1797,11 @@ pub const DBCore = struct {
         self: *DBCore,
         prepared: *PreparedSchemaMetadata,
         metadata_writes: []const docstore_mod.KVPair,
-        command: @import("relational_index_validation.zig").InstallCommand,
+        command: @import("relational/indexes/validation.zig").InstallCommand,
         replay: ?@import("receipt_position.zig").Position,
         participant: anytype,
-    ) !@import("relational_index_validation.zig").Installed {
-        const verification = @import("relational_index_validation.zig");
+    ) !@import("relational/indexes/validation.zig").Installed {
+        const verification = @import("relational/indexes/validation.zig");
         const IndexInstallState = struct {
             alloc: Allocator,
             command: verification.InstallCommand,
@@ -1830,7 +1830,7 @@ pub const DBCore = struct {
             const versioned = std.mem.eql(u8, write.key, public_version_key);
             if (!active and !versioned) continue;
             if ((active and active_public) or (versioned and versioned_public) or
-                !std.mem.eql(u8, &@import("relational_index_inputs.zig").digest(write.value), &public_digest)) return error.InvalidPrivateIndexInputs;
+                !std.mem.eql(u8, &@import("relational/indexes/inputs.zig").digest(write.value), &public_digest)) return error.InvalidPrivateIndexInputs;
             active_public = active_public or active;
             versioned_public = versioned_public or versioned;
         }
@@ -1858,7 +1858,7 @@ pub const DBCore = struct {
         metadata_writes: []const docstore_mod.KVPair,
         metadata_deletes: []const []const u8,
         reconciled_row_count: ?u64,
-        source_fence: @import("relational_integrity_topology_contract.zig").Fence,
+        source_fence: @import("relational/integrity/topology_contract.zig").Fence,
     ) !bool {
         if (source_fence.role != .child_generation_source and source_fence.role != .child_generation_dual) return error.InvalidIntegrityTopologyFence;
         return self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, metadata_deletes, reconciled_row_count, false, source_fence, null, null);
@@ -1885,7 +1885,7 @@ pub const DBCore = struct {
         metadata_deletes: []const []const u8,
         reconciled_row_count: ?u64,
         rehydrate_only: bool,
-        child_fence: ?@import("relational_integrity_topology_contract.zig").Fence,
+        child_fence: ?@import("relational/integrity/topology_contract.zig").Fence,
         installation: anytype,
         policy_amendment: ?PolicyCatalogAmendment,
     ) !bool {
@@ -1983,7 +1983,7 @@ pub const DBCore = struct {
             prepared: *PreparedSchemaMetadata,
             row_count: u64,
             namespace: doc_identity.Namespace,
-            child_fence: ?@import("relational_integrity_topology_contract.zig").Fence,
+            child_fence: ?@import("relational/integrity/topology_contract.zig").Fence,
             installation: if (@TypeOf(installation) == @TypeOf(null)) void else @TypeOf(installation),
 
             pub fn validateBefore(participants: @This(), txn: anytype) !void {
@@ -2006,7 +2006,7 @@ pub const DBCore = struct {
                     if (retention.active() and std.mem.eql(u8, &retention.namespace, &source_namespace))
                         return error.IntegrityTopologyBusy;
                 }
-                const topology = @import("relational_integrity_topology.zig");
+                const topology = @import("relational/integrity/topology.zig");
                 if (comptime @TypeOf(installation) != @TypeOf(null)) {
                     var manager = try participants.core.initTxnManager();
                     defer manager.deinit();
@@ -2016,9 +2016,9 @@ pub const DBCore = struct {
                     var manager = try participants.core.initTxnManager();
                     defer manager.deinit();
                     try topology.requireDrained(txn, &manager, expected);
-                    try @import("relational_integrity_generation_admission.zig").requireDualInstallReady(txn, expected);
+                    try @import("relational/integrity/generation_admission.zig").requireDualInstallReady(txn, expected);
                     if (expected.role == .child_generation_dual)
-                        try @import("relational_integrity_generation_admission.zig").requireDualCatalogMatch(
+                        try @import("relational/integrity/generation_admission.zig").requireDualCatalogMatch(
                             participants.core.alloc,
                             txn,
                             expected.namespace.table_id,
@@ -2039,21 +2039,21 @@ pub const DBCore = struct {
                     if (!command.fence.eql(fence) or command.action != .install_child_schema) return error.InvalidControlReceiptPosition;
                     const digest = participants.prepared.native_child_digest orelse return error.InvalidControlReceiptPosition;
                     const stamp = try @import("native_topology_receipt.zig").stageWithDigest(txn, command, digest, null);
-                    try @import("relational_integrity_generation_admission.zig").AppliedReceipt.stageNative(txn, @import("relational_integrity_generation_admission.zig").source_install_receipt_key, stamp.receipt);
+                    try @import("relational/integrity/generation_admission.zig").AppliedReceipt.stageNative(txn, @import("relational/integrity/generation_admission.zig").source_install_receipt_key, stamp.receipt);
                 }
                 if (comptime @TypeOf(installation) != @TypeOf(null))
                     try participants.installation.stage(txn, participants.prepared.integrity_catalog.?.catalog);
                 if (participants.child_fence) |expected| {
                     if (expected.role == .child_generation_dual)
-                        try txn.delete(@import("relational_integrity_generation_admission.zig").dual_acknowledged_fence_key);
-                    try @import("relational_integrity_topology.zig").stageRelease(txn, expected);
+                        try txn.delete(@import("relational/integrity/generation_admission.zig").dual_acknowledged_fence_key);
+                    try @import("relational/integrity/topology.zig").stageRelease(txn, expected);
                 }
             }
 
             pub fn stageChanges(participants: @This(), txn: anytype) !void {
                 if (participants.prepared.relational_indexes) |*indexes| _ = try indexes.metadata.stage(txn);
                 if (participants.prepared.integrity_catalog) |*catalog| {
-                    const retirement_mod = @import("relational_integrity_retirement.zig");
+                    const retirement_mod = @import("relational/integrity/retirement.zig");
                     // Reopening the exact durable catalog is not DDL. Keep
                     // the retirement proof intact so its worker can resume;
                     // only a changed catalog may consume a ready target proof.
@@ -2080,12 +2080,12 @@ pub const DBCore = struct {
                     } else if (comptime validation_installation) {
                         const binding = participants.prepared.validated_nullability.?.binding;
                         if (binding.purpose == .foreign_key_source)
-                            try @import("relational_integrity_activation.zig").stageValidatedForeignKey(participants.prepared.alloc, txn, catalog.catalog, binding)
+                            try @import("relational/integrity/activation.zig").stageValidatedForeignKey(participants.prepared.alloc, txn, catalog.catalog, binding)
                         else if (binding.purpose == .dependent_object_retirement)
-                            try @import("relational_integrity_activation.zig").stageDependencyRetirement(participants.prepared.alloc, txn, catalog.expected orelse return error.IntegrityCatalogChanged, catalog.catalog, binding)
+                            try @import("relational/integrity/activation.zig").stageDependencyRetirement(participants.prepared.alloc, txn, catalog.expected orelse return error.IntegrityCatalogChanged, catalog.catalog, binding)
                         else
-                            try @import("relational_integrity_activation.zig").stageSchema(participants.prepared.alloc, txn, catalog.catalog, participants.row_count);
-                    } else try @import("relational_integrity_activation.zig").stageSchema(participants.prepared.alloc, txn, catalog.catalog, participants.row_count);
+                            try @import("relational/integrity/activation.zig").stageSchema(participants.prepared.alloc, txn, catalog.catalog, participants.row_count);
+                    } else try @import("relational/integrity/activation.zig").stageSchema(participants.prepared.alloc, txn, catalog.catalog, participants.row_count);
                 }
             }
         };
@@ -2107,7 +2107,7 @@ pub const DBCore = struct {
             if (child_fence) |expected| {
                 var replay = try self.store.beginReadTxn();
                 defer replay.abort();
-                const topology = @import("relational_integrity_topology.zig");
+                const topology = @import("relational/integrity/topology.zig");
                 const completed = (try topology.completed(&replay)) orelse return error.IntegrityTopologyFenceMissing;
                 if (!completed.eql(expected)) return error.IntegrityTopologyChanged;
             }

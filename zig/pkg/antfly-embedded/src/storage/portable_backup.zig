@@ -23,13 +23,13 @@ const backup_bundle = @import("backup_bundle.zig");
 const internal_keys = @import("internal_keys.zig");
 const docstore_mod = @import("docstore.zig");
 const doc_identity = @import("db/doc_identity.zig");
-const relational_store = @import("db/relational_store.zig");
+const relational_store = @import("db/relational/rows/store.zig");
 const relational_row_codec = @import("db/algebraic/relational_row_codec.zig");
 const table_catalog = @import("db/table_catalog.zig");
-const relational_index_catalog = @import("db/relational_index_catalog.zig");
-const relational_index_records = @import("db/relational_index_records.zig");
-const relational_index_plans = @import("db/relational_index_plan.zig");
-const relational_index_keys = @import("db/relational_index_keys.zig");
+const relational_index_catalog = @import("db/relational/indexes/catalog.zig");
+const relational_index_records = @import("db/relational/indexes/records.zig");
+const relational_index_plans = @import("db/relational/indexes/plan.zig");
+const relational_index_keys = @import("db/relational/indexes/keys.zig");
 const schema_registry = @import("db/schema_registry.zig");
 const storage_schema = @import("schema.zig");
 const SchemaSpool = @import("schema_spool.zig").Spool;
@@ -62,7 +62,7 @@ pub const SourceGenerationAdmissionSummaryEntry = struct {
     child_table_id: u64,
     child_table_name: []const u8,
     constraint_name: []const u8,
-    active_generation: ?@import("db/relational_integrity_contract.zig").Generation,
+    active_generation: ?@import("db/relational/integrity/contract.zig").Generation,
     /// Binds the backup manifest to the complete durable source scope,
     /// including its revision and original publication decision.
     source_scope_digest: [32]u8,
@@ -82,8 +82,8 @@ pub fn freeSourceGenerationAdmissionSummary(alloc: Allocator, entries: []SourceG
 /// returned descriptors are sorted by logical child/constraint.
 fn sourceGenerationAdmissionSummaryTxnAlloc(alloc: Allocator, read: *DocStore.Txn, proof: CohortProof) ![]SourceGenerationAdmissionSummaryEntry {
     _ = try proof.encode();
-    const admission = @import("db/relational_integrity_generation_admission.zig");
-    const topology = @import("db/relational_integrity_topology.zig");
+    const admission = @import("db/relational/integrity/generation_admission.zig");
+    const topology = @import("db/relational/integrity/topology.zig");
     const namespace = try doc_identity.loadNamespaceTxn(read) orelse return error.BackupIntegrityFailure;
     if (!namespace.eql(proof.namespace)) return error.BackupIntegrityFailure;
     const raw_fence = try read.get(topology.fence_key);
@@ -183,8 +183,8 @@ pub const SourceGenerationAdmissionProofPage = struct {
 };
 
 pub fn sourceGenerationAdmissionProofPageAlloc(alloc: Allocator, read: *DocStore.Txn, namespace: doc_identity.Namespace) !SourceGenerationAdmissionProofPage {
-    const admission = @import("db/relational_integrity_generation_admission.zig");
-    const topology = @import("db/relational_integrity_topology.zig");
+    const admission = @import("db/relational/integrity/generation_admission.zig");
+    const topology = @import("db/relational/integrity/topology.zig");
     const stored_namespace = try doc_identity.loadNamespaceTxn(read) orelse return error.RestoreSourceProofMissing;
     if (!stored_namespace.eql(namespace)) return error.RestoreSourceProofMissing;
     const cohort_bytes = read.get(cohort_proof_key) catch |err| switch (err) {
@@ -884,17 +884,17 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
     // A retirement can have already removed its last catalog binding while
     // still retaining cross-table cleanup authority. The catalog alone cannot
     // establish that this is a portable, table-local image.
-    const retirement = scan.get(@import("db/relational_integrity_retirement.zig").key) catch |err| switch (err) {
+    const retirement = scan.get(@import("db/relational/integrity/retirement.zig").key) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
     };
     if (retirement != null) return error.CoordinatedConstraintPortableBackupUnsupported;
-    const generation_retirement = scan.get(@import("db/relational_integrity_generation_retirement.zig").key) catch |err| switch (err) {
+    const generation_retirement = scan.get(@import("db/relational/integrity/generation_retirement.zig").key) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
     };
     if (generation_retirement != null) return error.CoordinatedConstraintPortableBackupUnsupported;
-    const generation_gc = @import("db/relational_integrity_generation_retirement.zig");
+    const generation_gc = @import("db/relational/integrity/generation_retirement.zig");
     const gc_progress = scan.get(generation_gc.gc_progress_key) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
@@ -915,7 +915,7 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
     if (try retired_cursor.seekAtOrAfter(generation_gc.active_prefix)) |entry| {
         if (std.mem.startsWith(u8, entry.key, generation_gc.active_prefix)) return error.CoordinatedConstraintPortableBackupUnsupported;
     }
-    const admitted_prefix = @import("db/relational_integrity_generation_admission.zig").prefix;
+    const admitted_prefix = @import("db/relational/integrity/generation_admission.zig").prefix;
     if (try retired_cursor.seekAtOrAfter(admitted_prefix)) |entry| {
         // A certified source-copy stream is a private logical decoder, not
         // an independently restorable database. It carries the pinned row
@@ -924,13 +924,13 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
         if (std.mem.startsWith(u8, entry.key, admitted_prefix) and cohort == null and source_copy == null)
             return error.CoordinatedConstraintPortableBackupUnsupported;
     }
-    const topology_fence = scan.get(@import("db/relational_integrity_topology.zig").fence_key) catch |err| switch (err) {
+    const topology_fence = scan.get(@import("db/relational/integrity/topology.zig").fence_key) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
     };
     if (cohort) |proof| {
         _ = try proof.encode();
-        const fence = try @import("db/relational_integrity_topology.zig").Fence.decode(topology_fence orelse return error.BackupIntegrityFailure);
+        const fence = try @import("db/relational/integrity/topology.zig").Fence.decode(topology_fence orelse return error.BackupIntegrityFailure);
         if (!fence.eql(proof.seal.fence)) return error.BackupIntegrityFailure;
         const namespace = try doc_identity.loadNamespaceTxn(scan) orelse return error.BackupIntegrityFailure;
         if (!namespace.eql(proof.namespace)) return error.BackupIntegrityFailure;
@@ -939,7 +939,7 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
     // relocate globally routed claims. Do not silently export declarations
     // while dropping their enforcement records. Native coordinated snapshots
     // retain these records; portable support needs its distributed barrier.
-    const integrity_catalog = scan.get(@import("db/relational_integrity_catalog.zig").key) catch |err| switch (err) {
+    const integrity_catalog = scan.get(@import("db/relational/integrity/catalog.zig").key) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
     };
@@ -1056,12 +1056,12 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
         defer alloc.free(payload);
         try out.writeBlock(.metadata_batch, payload);
         if (integrity_catalog) |raw_catalog| {
-            const catalog_mod = @import("db/relational_integrity_catalog.zig");
+            const catalog_mod = @import("db/relational/integrity/catalog.zig");
             var compiled = try catalog_mod.decode(alloc, raw_catalog);
             defer compiled.deinit();
-            const activation = @import("db/relational_integrity_activation.zig");
+            const activation = @import("db/relational/integrity/activation.zig");
             if (compiled.bindings.len != 0 and activation.hasActive(compiled)) {
-                const catalog_digest = @import("db/relational_integrity_contract.zig").hash(raw_catalog);
+                const catalog_digest = @import("db/relational/integrity/contract.zig").hash(raw_catalog);
                 if (!std.mem.eql(u8, &catalog_digest, &proof.scope.fence.catalog_digest)) {
                     return error.SourceSnapshotCutMismatch;
                 }
@@ -1093,7 +1093,7 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
     // canonical proof-only metadata, checked again by the v3 reader, for the
     // distributed activation barrier to remap after all rows validate.
     if (cohort != null) {
-        const admission = @import("db/relational_integrity_generation_admission.zig");
+        const admission = @import("db/relational/integrity/generation_admission.zig");
         var proofs: std.ArrayListUnmanaged(backup_codec.KeyValueEntry) = .empty;
         defer deinitKeyValueBatch(alloc, &proofs);
         var proof_bytes: usize = 0;
@@ -1188,8 +1188,8 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
     // traversal. Only the certified source-copy format may carry them; cohort
     // restore continues rebuilding target claims from canonical primary rows.
     if (source_copy != null) {
-        const integrity = @import("db/relational_integrity_contract.zig");
-        const companions = @import("db/relational_integrity.zig");
+        const integrity = @import("db/relational/integrity/contract.zig");
+        const companions = @import("db/relational/integrity/integrity.zig");
         const transfer_view = try companions.TransferView.init(scan);
         var integrity_batch: std.ArrayListUnmanaged(backup_codec.KeyValueEntry) = .empty;
         defer deinitKeyValueBatch(alloc, &integrity_batch);
@@ -1450,19 +1450,19 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
 /// generation, CHECK activation, routed claim/reference/job, or orphaned state
 /// still requires the coordinated cohort path.
 pub fn requireUncoordinatedIntegrityState(alloc: Allocator, scan: *DocStore.Txn, raw_catalog: ?[]const u8) !void {
-    const catalog_mod = @import("db/relational_integrity_catalog.zig");
+    const catalog_mod = @import("db/relational/integrity/catalog.zig");
     if (raw_catalog) |bytes| {
         var catalog = try catalog_mod.decode(alloc, bytes);
         defer catalog.deinit();
         if (catalog.bindings.len != 0 or catalog.next_generation != 1 or !std.mem.allEqual(u8, &catalog.checks_digest, 0))
             return error.CoordinatedConstraintPortableBackupUnsupported;
     }
-    const activation = scan.get(@import("db/relational_integrity_activation_contract.zig").key) catch |err| switch (err) {
+    const activation = scan.get(@import("db/relational/integrity/activation_contract.zig").key) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
     };
     if (activation != null) return error.CoordinatedConstraintPortableBackupUnsupported;
-    const integrity = @import("db/relational_integrity_contract.zig");
+    const integrity = @import("db/relational/integrity/contract.zig");
     var cursor = try scan.openCursor();
     defer cursor.close();
     if (try cursor.seekAtOrAfter(integrity.namespace)) |entry| {
@@ -1775,9 +1775,9 @@ pub fn isPortableMetadataKey(key: []const u8) bool {
     // `schema_v` below denotes versioned row layouts, not source-local
     // schema_validation jobs/inputs/cursors. Never export their authority as
     // logical table metadata (nor exact ordered outcomes/history heads).
-    if (std.mem.startsWith(u8, key, @import("db/relational_nullability_job.zig").family_prefix) or
-        std.mem.startsWith(u8, key, @import("db/relational_schema_apply_outcome.zig").family_prefix) or
-        std.mem.startsWith(u8, key, @import("db/relational_schema_apply_outcome.zig").head_family_prefix)) return false;
+    if (std.mem.startsWith(u8, key, @import("db/relational/schema_change/nullability_job.zig").family_prefix) or
+        std.mem.startsWith(u8, key, @import("db/relational/schema_change/schema_apply_outcome.zig").family_prefix) or
+        std.mem.startsWith(u8, key, @import("db/relational/schema_change/schema_apply_outcome.zig").head_family_prefix)) return false;
     return @import("db/group_source_index.zig").isRevisionClockKey(key) or (key.len == 20 and std.mem.startsWith(u8, key, @import("db/group_source_state.zig").lease_clock_prefix)) or std.mem.eql(u8, key, @import("db/group_source_mutations.zig").table_identity_key) or std.mem.eql(u8, key, cohort_proof_key) or std.mem.eql(u8, key, source_copy_proof_key) or
         std.mem.startsWith(u8, key, source_generation_admission_prefix) or
         std.mem.eql(u8, key, source_integrity_key) or std.mem.eql(u8, key, source_integrity_catalog_key) or std.mem.eql(u8, key, source_integrity_activation_key) or
@@ -2529,7 +2529,7 @@ const CohortImportCheckpoint = struct {
     source_integrity_last_key: []const u8 = "",
     source_proof_last_digest: []const u8 = "",
     pub fn jsonStringify(self: @This(), jw: anytype) @TypeOf(jw.*).Error!void {
-        try @import("db/relational_integrity_json.zig").write(self, jw);
+        try @import("db/relational/integrity/json.zig").write(self, jw);
     }
 };
 
@@ -3570,7 +3570,7 @@ fn importPortablePrimaryBlocks(alloc: Allocator, store: *DocStore, reader: anyty
 
 fn uncoordinatedCohortNamespace(bytes: []const u8) !doc_identity.Namespace {
     if (bytes.len != 168 or std.mem.allEqual(u8, bytes[136..168], 0)) return error.BackupIntegrityFailure;
-    const fence = @import("db/relational_integrity_topology.zig").Fence.decode(bytes[0..136]) catch return error.BackupIntegrityFailure;
+    const fence = @import("db/relational/integrity/topology.zig").Fence.decode(bytes[0..136]) catch return error.BackupIntegrityFailure;
     if (fence.role != .backup_snapshot) return error.BackupIntegrityFailure;
     return fence.namespace;
 }
@@ -3752,9 +3752,9 @@ const PortableArchiveValidation = struct {
     source_copy: ?SourceCopyProof = null,
     saw_source_copy: bool = false,
     source_integrity: ?@import("db/merge_page_contract.zig").IntegrityBinding = null,
-    source_integrity_catalog: ?@import("db/relational_integrity_catalog.zig").Catalog = null,
+    source_integrity_catalog: ?@import("db/relational/integrity/catalog.zig").Catalog = null,
     source_integrity_activation: bool = false,
-    source_integrity_last_key: [@import("db/relational_integrity_contract.zig").key_len + 32]u8 = undefined,
+    source_integrity_last_key: [@import("db/relational/integrity/contract.zig").key_len + 32]u8 = undefined,
     source_integrity_last_key_len: usize = 0,
     source_proof_last_digest: ?[32]u8 = null,
     source_generation_admissions: std.AutoHashMapUnmanaged([32]u8, void) = .empty,
@@ -3824,8 +3824,8 @@ const PortableArchiveValidation = struct {
 
         const IndexSource = struct {
             tuple: ?relational_index_keys.TuplePlan = null,
-            cover: ?@import("db/relational_index_cover.zig").Source = null,
-            predicate: ?@import("db/relational_index_predicate.zig").Source = null,
+            cover: ?@import("db/relational/indexes/cover.zig").Source = null,
+            predicate: ?@import("db/relational/indexes/predicate.zig").Source = null,
 
             pub fn deinit(self: *IndexSource) void {
                 if (self.tuple) |*tuple| tuple.deinit();
@@ -4397,7 +4397,7 @@ fn validateSourceIntegrityBatch(alloc: Allocator, payload: []const u8, archive: 
     if (archive.source_copy == null or !archive.saw_source_copy) return error.SourceCopyRestoreUnsupported;
     const compiled = archive.source_integrity_catalog orelse return error.BackupIntegrityFailure;
     if (!archive.source_integrity_activation) return error.BackupIntegrityFailure;
-    const integrity = @import("db/relational_integrity_contract.zig");
+    const integrity = @import("db/relational/integrity/contract.zig");
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     const entries = try backup_codec.decodeKeyValueBatch(scratch.allocator(), payload);
@@ -4501,7 +4501,7 @@ fn validateAndImportDocumentEntries(alloc: Allocator, store: *DocStore, entries:
 
 test "relational index system portable empty catalog admits no retired claims or activation authority" {
     const alloc = std.testing.allocator;
-    const catalog_mod = @import("db/relational_integrity_catalog.zig");
+    const catalog_mod = @import("db/relational/integrity/catalog.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try openTestStore(alloc, &tmp);
@@ -4521,7 +4521,7 @@ test "relational index system portable empty catalog admits no retired claims or
         for ([_][]const u8{ active.value, retired.value, checks.value }) |catalog|
             try std.testing.expectError(error.CoordinatedConstraintPortableBackupUnsupported, requireUncoordinatedIntegrityState(alloc, &read, catalog));
     }
-    const orphan = @import("db/relational_integrity_contract.zig").namespace ++ "orphan";
+    const orphan = @import("db/relational/integrity/contract.zig").namespace ++ "orphan";
     try store.put(orphan, "stale claim or action");
     {
         var read = try store.beginReadTxn();
@@ -4529,7 +4529,7 @@ test "relational index system portable empty catalog admits no retired claims or
         try std.testing.expectError(error.CoordinatedConstraintPortableBackupUnsupported, requireUncoordinatedIntegrityState(alloc, &read, empty.value));
         try std.testing.expectError(error.CoordinatedConstraintPortableBackupUnsupported, requireUncoordinatedIntegrityState(alloc, &read, null));
     }
-    try store.putBatch(&.{.{ .key = @import("db/relational_integrity_activation_contract.zig").key, .value = "stale activation job" }}, &.{orphan});
+    try store.putBatch(&.{.{ .key = @import("db/relational/integrity/activation_contract.zig").key, .value = "stale activation job" }}, &.{orphan});
     var read = try store.beginReadTxn();
     defer read.abort();
     try std.testing.expectError(error.CoordinatedConstraintPortableBackupUnsupported, requireUncoordinatedIntegrityState(alloc, &read, empty.value));
@@ -4902,17 +4902,17 @@ fn validateMetadataEntries(
         } else if (std.mem.eql(u8, entry.key, source_integrity_catalog_key)) {
             if (archive.source_copy == null) return error.SourceCopyRestoreUnsupported;
             const binding = archive.source_integrity orelse return error.BackupIntegrityFailure;
-            if (archive.source_integrity_catalog != null or entry.value.len > 1024 * 1024 or !std.mem.eql(u8, &@import("db/relational_integrity_contract.zig").hash(entry.value), &binding.catalog_digest)) return error.BackupIntegrityFailure;
-            var compiled = try @import("db/relational_integrity_catalog.zig").decode(alloc, entry.value);
+            if (archive.source_integrity_catalog != null or entry.value.len > 1024 * 1024 or !std.mem.eql(u8, &@import("db/relational/integrity/contract.zig").hash(entry.value), &binding.catalog_digest)) return error.BackupIntegrityFailure;
+            var compiled = try @import("db/relational/integrity/catalog.zig").decode(alloc, entry.value);
             errdefer compiled.deinit();
-            if (!std.mem.eql(u8, &@import("db/relational_integrity_activation.zig").generationSet(compiled), &binding.generation_set)) return error.BackupIntegrityFailure;
+            if (!std.mem.eql(u8, &@import("db/relational/integrity/activation.zig").generationSet(compiled), &binding.generation_set)) return error.BackupIntegrityFailure;
             archive.source_integrity_catalog = compiled;
         } else if (std.mem.eql(u8, entry.key, source_integrity_activation_key)) {
             if (archive.source_copy == null) return error.SourceCopyRestoreUnsupported;
             const binding = archive.source_integrity orelse return error.BackupIntegrityFailure;
             const compiled = archive.source_integrity_catalog orelse return error.BackupIntegrityFailure;
             if (archive.source_integrity_activation or entry.value.len > 4096) return error.BackupIntegrityFailure;
-            const coverage = try @import("db/relational_integrity_activation.zig").Progress.decode(entry.value);
+            const coverage = try @import("db/relational/integrity/activation.zig").Progress.decode(entry.value);
             if (coverage.state != .enforced or coverage.schema_version != compiled.schema_version or !std.mem.eql(u8, &coverage.generation_set, &binding.generation_set)) return error.BackupIntegrityFailure;
             archive.source_integrity_activation = true;
         } else if (std.mem.eql(u8, entry.key, cohort_proof_key)) {
@@ -4932,7 +4932,7 @@ fn validateMetadataEntries(
                 archive.cohort == null or !archive.saw_cohort or
                 entry.key.len != source_generation_admission_prefix.len + 32)
                 return error.CoordinatedConstraintPortableBackupUnsupported;
-            const admission = @import("db/relational_integrity_generation_admission.zig");
+            const admission = @import("db/relational/integrity/generation_admission.zig");
             const scope = admission.Scope.decode(entry.value) catch return error.InvalidMetadataBatch;
             if (scope.phase != .active) return error.InvalidMetadataBatch;
             const canonical = scope.encode(alloc) catch return error.InvalidMetadataBatch;
@@ -6160,18 +6160,18 @@ test "portable backup refuses retained retirement and topology authority without
     defer store.close();
     var output: ArrayList(u8) = .empty;
     defer output.deinit(alloc);
-    inline for (.{ @import("db/relational_integrity_retirement.zig").key, @import("db/relational_integrity_generation_retirement.zig").key, @import("db/relational_integrity_generation_retirement.zig").gc_progress_key, @import("db/relational_integrity_topology.zig").fence_key }) |key| {
+    inline for (.{ @import("db/relational/integrity/retirement.zig").key, @import("db/relational/integrity/generation_retirement.zig").key, @import("db/relational/integrity/generation_retirement.zig").gc_progress_key, @import("db/relational/integrity/topology.zig").fence_key }) |key| {
         try store.put(key, "retained authority");
         try std.testing.expectError(error.CoordinatedConstraintPortableBackupUnsupported, exportPortable(alloc, &store, &output));
         try std.testing.expectEqual(@as(usize, 0), output.items.len);
         try store.delete(key);
     }
-    const active_key = @import("db/relational_integrity_generation_retirement.zig").activeKey(@splat(7));
+    const active_key = @import("db/relational/integrity/generation_retirement.zig").activeKey(@splat(7));
     try store.put(&active_key, "retained authority");
     try std.testing.expectError(error.CoordinatedConstraintPortableBackupUnsupported, exportPortable(alloc, &store, &output));
     try std.testing.expectEqual(@as(usize, 0), output.items.len);
     try store.delete(&active_key);
-    const admission_key = try @import("db/relational_integrity_generation_admission.zig").scopeKey("children", "fk");
+    const admission_key = try @import("db/relational/integrity/generation_admission.zig").scopeKey("children", "fk");
     try store.put(&admission_key, "retained authority");
     try std.testing.expectError(error.CoordinatedConstraintPortableBackupUnsupported, exportPortable(alloc, &store, &output));
     try std.testing.expectEqual(@as(usize, 0), output.items.len);
@@ -6235,7 +6235,7 @@ test "portable standalone import detaches informational cohort without granting 
 
 test "portable accepted-generation proof requires a sealed v3 reader and canonical unique scope" {
     const alloc = std.testing.allocator;
-    const admission = @import("db/relational_integrity_generation_admission.zig");
+    const admission = @import("db/relational/integrity/generation_admission.zig");
     const namespace: doc_identity.Namespace = .{ .table_id = 10, .shard_id = 20, .range_id = 20 };
     const proof: CohortProof = .{
         .seal = .{ .fence = .{
@@ -6335,7 +6335,7 @@ test "portable accepted-generation proof page reads only canonical sealed decode
         try std.testing.expectEqual(@as(usize, 0), empty.artifacts.len);
     }
 
-    const admission = @import("db/relational_integrity_generation_admission.zig");
+    const admission = @import("db/relational/integrity/generation_admission.zig");
     const scope: admission.Scope = .{
         .child_table_id = 11,
         .child_table_name = "children",

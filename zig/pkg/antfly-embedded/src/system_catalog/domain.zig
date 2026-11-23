@@ -32,7 +32,15 @@ pub const object_definitions = @import("object_definitions.zig");
 pub const object_annotation_store = @import("object_annotation_store.zig");
 pub const ServiceOwner = @import("../common/service_ownership.zig").Owner;
 pub const RelationPersistence = @import("../common/relation_persistence.zig");
-pub const Kind = enum { database, namespace, tablespace, table, query_source, graph, view, sequence, routine, cast, named_type, role, extension };
+pub const PublicationMembership = struct {
+    count: u32,
+    digest: [32]u8,
+    pub fn validate(self: @This()) !void {
+        if (self.count == 0 or self.count > 4096 or std.mem.allEqual(u8, &self.digest, 0)) return error.InvalidCatalogRecord;
+    }
+};
+
+pub const Kind = enum { database, namespace, tablespace, table, query_source, graph, view, sequence, routine, cast, named_type, role, extension, collation, publication, subscription };
 
 /// One parent directory policy for admission, listing and ancestor retirement.
 /// New catalog kinds must choose a scope here instead of silently escaping
@@ -41,9 +49,13 @@ pub const ParentScope = enum { global, database, namespace };
 pub fn parentScope(kind: Kind) ParentScope {
     return switch (kind) {
         .database, .tablespace, .query_source, .role, .graph => .global,
-        .namespace, .cast, .extension => .database,
-        .table, .view, .sequence, .routine, .named_type => .namespace,
+        .namespace, .cast, .extension, .publication, .subscription => .database,
+        .table, .view, .sequence, .routine, .named_type, .collation => .namespace,
     };
+}
+
+pub fn logicalReplicationResource(kind: Kind) bool {
+    return kind == .publication or kind == .subscription;
 }
 
 pub fn namespaceRelation(kind: Kind) bool {
@@ -124,7 +136,100 @@ pub const QualifiedIncomingForeignKeys = struct {
     }
 };
 
+/// Private, same-cut partition projection. A leaf's ordinary ACL remains its
+/// own; parent traversal authority is granted only by the separate native route.
+pub const ResolvedPartitionLeaf = struct {
+    table: ResolvedTable,
+    guard: RelationMutationGuard,
+};
+pub const ResolvedPartitionFamily = struct {
+    descriptor: @import("table_partitions.zig").Descriptor,
+    parent_guard: RelationMutationGuard,
+    leaves: []const ResolvedPartitionLeaf,
+
+    pub fn validate(self: @This(), parent: ResolvedTable) !void {
+        try self.descriptor.validate();
+        try self.parent_guard.validate();
+        if (parent.table_id != self.descriptor.parent.table_id or
+            self.parent_guard.owner.table_id != parent.table_id or
+            self.parent_guard.owner.schema_version != self.descriptor.parent.schema_version or
+            self.parent_guard.hasDefinitionIntent() or self.parent_guard.owner.kind != .table or
+            !std.mem.eql(u8, self.parent_guard.logical_table, self.parent_guard.target.name) or
+            self.leaves.len != self.descriptor.members.len or parent.query_definition == null or
+            parent.query_definition.?.table_id != parent.table_id)
+            return error.InvalidSqlBackendResponse;
+        const hash = @import("../storage/db/relational/schema_change/schema_owner_contract.zig").hash;
+        if (!std.mem.eql(u8, &self.parent_guard.owner.schema_digest, &hash(parent.query_definition.?.schema_json))) return error.InvalidSqlBackendResponse;
+        for (self.leaves, self.descriptor.members) |leaf, member| {
+            try leaf.guard.validate();
+            if (leaf.table.table_id != member.relation.table_id or
+                leaf.table.partition_family != null or leaf.table.query_definition == null or
+                leaf.guard.owner.table_id != member.relation.table_id or
+                leaf.guard.owner.schema_version != member.relation.schema_version or
+                leaf.guard.hasDefinitionIntent() or leaf.guard.owner.kind != .table or
+                !std.mem.eql(u8, leaf.guard.logical_table, leaf.guard.target.name) or
+                leaf.table.query_definition.?.table_id != leaf.table.table_id or
+                !std.mem.eql(u8, &leaf.guard.owner.schema_digest, &hash(leaf.table.query_definition.?.schema_json)) or
+                !std.mem.eql(u8, leaf.guard.target.database, self.parent_guard.target.database) or
+                !std.mem.eql(u8, &leaf.guard.incarnation, &self.parent_guard.incarnation))
+                return error.InvalidSqlBackendResponse;
+        }
+    }
+    fn cloneGuard(a: std.mem.Allocator, source: RelationMutationGuard) !RelationMutationGuard {
+        try source.validate();
+        if (source.hasDefinitionIntent()) return error.InvalidSqlBackendResponse;
+        var owned = source;
+        owned.target.database = try a.dupe(u8, source.target.database);
+        errdefer a.free(owned.target.database);
+        owned.target.namespace = try a.dupe(u8, source.target.namespace);
+        errdefer a.free(owned.target.namespace);
+        owned.target.name = try a.dupe(u8, source.target.name);
+        errdefer a.free(owned.target.name);
+        owned.logical_table = try a.dupe(u8, source.logical_table);
+        return owned;
+    }
+
+    fn clone(self: @This(), a: std.mem.Allocator) anyerror!*const @This() {
+        var descriptor = try self.descriptor.clone(a);
+        errdefer descriptor.deinit(a);
+        var parent_guard = try cloneGuard(a, self.parent_guard);
+        errdefer parent_guard.deinitOwned(a);
+        const leaves = try a.alloc(ResolvedPartitionLeaf, self.leaves.len);
+        errdefer a.free(leaves);
+        var initialized: usize = 0;
+        errdefer for (leaves[0..initialized]) |leaf| {
+            leaf.table.deinit(a);
+            var guard = leaf.guard;
+            guard.deinitOwned(a);
+        };
+        for (self.leaves, leaves) |source, *leaf| {
+            if (source.table.partition_family != null) return error.InvalidSqlBackendResponse;
+            const table = try source.table.clone(a);
+            errdefer table.deinit(a);
+            leaf.* = .{ .table = table, .guard = try cloneGuard(a, source.guard) };
+            initialized += 1;
+        }
+        const owned = try a.create(@This());
+        owned.* = .{ .descriptor = descriptor, .parent_guard = parent_guard, .leaves = leaves };
+        return owned;
+    }
+
+    pub fn deinit(self: *const @This(), a: std.mem.Allocator) void {
+        var descriptor = self.descriptor;
+        descriptor.deinit(a);
+        var parent = self.parent_guard;
+        parent.deinitOwned(a);
+        for (self.leaves) |leaf| {
+            leaf.table.deinit(a);
+            var guard = leaf.guard;
+            guard.deinitOwned(a);
+        }
+        a.free(self.leaves);
+    }
+};
+
 pub const ResolvedTable = struct {
+    partition_family: ?*const ResolvedPartitionFamily = null,
     logical_relation_id: ?u64 = null,
     sql_incoming_foreign_keys: ?QualifiedIncomingForeignKeys = null,
     sql_trigger_functions_active: bool = false,
@@ -152,6 +257,7 @@ pub const ResolvedTable = struct {
         if (self.sql_persistence) |descriptor| try descriptor.requireConnectionOwner(owner);
     }
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        if (self.partition_family != null) return jw.write(.{ .partition_family = self.partition_family, .table_id = self.table_id, .name = self.name, .native_service = self.native_service, .query_definition = self.query_definition, .sql_access = self.sql_access, .sql_persistence = self.sql_persistence, .sql_incoming_foreign_keys = self.sql_incoming_foreign_keys, .sql_trigger_functions_active = self.sql_trigger_functions_active, .logical_relation_id = self.logical_relation_id });
         if (self.logical_relation_id != null) return jw.write(.{ .table_id = self.table_id, .name = self.name, .native_service = self.native_service, .query_definition = self.query_definition, .sql_access = self.sql_access, .sql_persistence = self.sql_persistence, .sql_incoming_foreign_keys = self.sql_incoming_foreign_keys, .sql_trigger_functions_active = self.sql_trigger_functions_active, .logical_relation_id = self.logical_relation_id });
         if (self.sql_incoming_foreign_keys != null or self.sql_trigger_functions_active) return jw.write(.{ .table_id = self.table_id, .name = self.name, .native_service = self.native_service, .query_definition = self.query_definition, .sql_access = self.sql_access, .sql_persistence = self.sql_persistence, .sql_incoming_foreign_keys = self.sql_incoming_foreign_keys, .sql_trigger_functions_active = self.sql_trigger_functions_active });
         if (self.sql_persistence != null) return jw.write(.{ .table_id = self.table_id, .name = self.name, .native_service = self.native_service, .query_definition = self.query_definition, .sql_access = self.sql_access, .sql_persistence = self.sql_persistence });
@@ -167,10 +273,20 @@ pub const ResolvedTable = struct {
     pub fn clone(self: @This(), alloc: std.mem.Allocator) !@This() {
         const name = try alloc.dupe(u8, self.name);
         errdefer alloc.free(name);
-        return .{ .logical_relation_id = self.logical_relation_id, .sql_trigger_functions_active = self.sql_trigger_functions_active, .sql_incoming_foreign_keys = self.sql_incoming_foreign_keys, .sql_persistence = self.sql_persistence, .sql_access = self.sql_access, .native_service = self.native_service, .table_id = self.table_id, .name = name, .query_definition = if (self.query_definition) |definition| try definition.clone(alloc) else null };
+        const definition = if (self.query_definition) |value| try value.clone(alloc) else null;
+        errdefer if (definition) |value| value.deinit(alloc);
+        const family = if (self.partition_family) |value| family: {
+            try value.validate(self);
+            break :family try value.clone(alloc);
+        } else null;
+        return .{ .partition_family = family, .logical_relation_id = self.logical_relation_id, .sql_trigger_functions_active = self.sql_trigger_functions_active, .sql_incoming_foreign_keys = self.sql_incoming_foreign_keys, .sql_persistence = self.sql_persistence, .sql_access = self.sql_access, .native_service = self.native_service, .table_id = self.table_id, .name = name, .query_definition = definition };
     }
 
     pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+        if (self.partition_family) |family| {
+            family.deinit(alloc);
+            alloc.destroy(@constCast(family));
+        }
         alloc.free(self.name);
         if (self.query_definition) |definition| definition.deinit(alloc);
     }
@@ -208,7 +324,13 @@ pub fn nextRelationOid(reader: anytype, first: u64) !u64 {
     return first;
 }
 
+pub const security_labels = @import("security_labels.zig");
+pub const selinux_linux = @import("selinux_linux.zig");
+
 pub const Resource = struct {
+    sql_publications: ?PublicationMembership = null,
+    sql_all_publications: ?PublicationMembership = null,
+    sql_security_labels: []const security_labels.Entry = &.{},
     /// Assigned bounded SQL OID, stable across same-object generation cuts.
     /// Nil preserves a mainline table without an assigned SQL identity.
     sql_relation_id: ?u64 = null,
@@ -249,10 +371,28 @@ pub const Resource = struct {
         return next;
     }
     pub fn validateLogicalRelationId(self: @This()) !void {
+        if (self.sql_publications) |membership| {
+            if (self.kind != .table or self.sql_relation_id == null) return error.InvalidCatalogRecord;
+            try membership.validate();
+        }
+        if (self.sql_all_publications) |membership| {
+            if (self.kind != .database) return error.InvalidCatalogRecord;
+            try membership.validate();
+        }
+        if (self.sql_security_labels.len != 0) {
+            try security_labels.validateEntries(self.sql_security_labels);
+            switch (self.kind) {
+                .table => if (self.sql_relation_id == null) return error.InvalidCatalogRecord,
+                .namespace, .routine => {},
+                else => return error.InvalidCatalogRecord,
+            }
+        }
         if (self.sql_relation_id) |id| if (self.kind != .table or self.id == 0 or id == 0 or id > max_relation_oid) return error.InvalidCatalogRecord;
     }
     pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
-        return ((std.mem.eql(u8, field, "graph_tables") or std.mem.eql(u8, field, "graph_indexes") or std.mem.eql(u8, field, "graph_revision")) and self.kind != .graph) or (std.mem.eql(u8, field, "sql_relation_id") and self.sql_relation_id == null) or (std.mem.eql(u8, field, "sql_temporary_owner") and self.sql_temporary_owner == null) or (std.mem.eql(u8, field, "sql_owner") and self.sql_owner == null) or (std.mem.eql(u8, field, "signature") and self.signature == null) or (std.mem.eql(u8, field, "native_service") and self.native_service == null) or (std.mem.eql(u8, field, "description") and self.description == null);
+        return (std.mem.eql(u8, field, "sql_publications") and self.sql_publications == null) or
+            (std.mem.eql(u8, field, "sql_all_publications") and self.sql_all_publications == null) or
+            (std.mem.eql(u8, field, "sql_security_labels") and self.sql_security_labels.len == 0) or ((std.mem.eql(u8, field, "graph_tables") or std.mem.eql(u8, field, "graph_indexes") or std.mem.eql(u8, field, "graph_revision")) and self.kind != .graph) or (std.mem.eql(u8, field, "sql_relation_id") and self.sql_relation_id == null) or (std.mem.eql(u8, field, "sql_temporary_owner") and self.sql_temporary_owner == null) or (std.mem.eql(u8, field, "sql_owner") and self.sql_owner == null) or (std.mem.eql(u8, field, "signature") and self.signature == null) or (std.mem.eql(u8, field, "native_service") and self.native_service == null) or (std.mem.eql(u8, field, "description") and self.description == null);
     }
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try writer.beginObject();
@@ -443,6 +583,7 @@ pub const Mutation = struct {
     expected_incarnation: ?[16]u8 = null,
     expected_parent_id: ?u64 = null,
     expected_tablespace_id: ?u64 = null,
+    expected_collation: ?@import("collations.zig").Reference = null,
     /// Populated only by native table admission, never accepted from public JSON.
     table_id: u64 = 0,
     storage_name: []const u8 = "",
@@ -451,7 +592,7 @@ pub const Mutation = struct {
 
     pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
         if (comptime std.mem.eql(u8, field, "expected_incarnation") or std.mem.eql(u8, field, "expected_resource_id") or std.mem.eql(u8, field, "expected_parent_id") or std.mem.eql(u8, field, "expected_tablespace_id")) return @field(self, field) == null;
-        return (std.mem.eql(u8, field, "expected_graph_revision") and self.expected_graph_revision == null) or (std.mem.eql(u8, field, "sql_temporary_owner") and self.sql_temporary_owner == null) or (std.mem.eql(u8, field, "sql_owner") and self.sql_owner == null) or (std.mem.eql(u8, field, "native_service") and self.native_service == null) or (std.mem.eql(u8, field, "description") and self.description == null);
+        return (std.mem.eql(u8, field, "expected_collation") and self.expected_collation == null) or (std.mem.eql(u8, field, "expected_graph_revision") and self.expected_graph_revision == null) or (std.mem.eql(u8, field, "sql_temporary_owner") and self.sql_temporary_owner == null) or (std.mem.eql(u8, field, "sql_owner") and self.sql_owner == null) or (std.mem.eql(u8, field, "native_service") and self.native_service == null) or (std.mem.eql(u8, field, "description") and self.description == null);
     }
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try writer.beginObject();
@@ -581,6 +722,7 @@ pub const StateIndex = struct {
                 if (r.storage_name.len != 0 or r.tablespace_id != 0 or r.native_service != null or !std.mem.eql(u8, r.location_json, "null")) return error.InvalidCatalogRecord;
                 const record = try @import("routines.zig").Record.decode(alloc, r.source_json);
                 defer record.deinit();
+                if (r.sql_security_labels.len != 0 and record.value.kind != .procedure) return error.InvalidCatalogRecord;
                 const signature = try record.value.catalogSignatureAlloc(alloc);
                 defer alloc.free(signature);
                 if (record.value.id != r.id or !std.mem.eql(u8, signature, r.signature.?)) return error.InvalidCatalogRecord;
@@ -598,6 +740,22 @@ pub const StateIndex = struct {
                 if (record.value.identity.id != r.id or record.value.identity.namespace_id != r.parent_id) return error.InvalidCatalogRecord;
                 const origin = try type_origins.getOrPut(alloc, record.value.identity.origin_id);
                 if (origin.found_existing) return error.InvalidCatalogRecord;
+            }
+            if (r.kind == .publication or r.kind == .subscription) {
+                var scratch: std.heap.ArenaAllocator = .init(alloc);
+                defer scratch.deinit();
+                const replication = @import("logical_replication_catalog.zig");
+                if (r.kind == .publication)
+                    _ = try replication.decodePublication(scratch.allocator(), r)
+                else
+                    _ = try replication.decodeSubscription(scratch.allocator(), r);
+            }
+            if (r.kind == .collation) {
+                if (r.storage_name.len != 0 or r.tablespace_id != 0 or r.native_service != null or !std.mem.eql(u8, r.location_json, "null")) return error.InvalidCatalogRecord;
+                var record = try @import("collations.zig").Record.decode(alloc, r.source_json);
+                defer record.deinit();
+                if (record.value.reference.id != r.id or record.value.reference.namespace_id != r.parent_id) return error.InvalidCatalogRecord;
+                if ((try type_origins.getOrPut(alloc, record.value.reference.origin_id)).found_existing) return error.InvalidCatalogRecord;
             }
             if (r.kind == .cast) {
                 if (r.storage_name.len != 0 or r.tablespace_id != 0 or r.native_service != null or !std.mem.eql(u8, r.location_json, "null")) return error.InvalidCatalogRecord;
@@ -637,6 +795,12 @@ pub const StateIndex = struct {
                 count.value_ptr.* += 1;
             }
         }
+        for (state.resources) |r| if (r.kind == .collation) {
+            var record = try @import("collations.zig").Record.decode(alloc, r.source_json);
+            defer record.deinit();
+            const namespace = self.byId(.namespace, r.parent_id) orelse return error.InvalidCatalogRecord;
+            if (record.value.reference.database_id != namespace.parent_id) return error.InvalidCatalogRecord;
+        };
         for (state.resources) |r| if (r.sql_temporary_owner) |owner| {
             var buffer: [72]u8 = undefined;
             owner.validate() catch return error.InvalidCatalogRecord;
@@ -1159,12 +1323,15 @@ pub fn cloneResource(alloc: std.mem.Allocator, source: Resource) !Resource {
     errdefer alloc.free(r.graph_indexes);
     r.location_json = try alloc.dupe(u8, source.location_json);
     errdefer alloc.free(r.location_json);
+    r.sql_security_labels = try security_labels.cloneEntries(alloc, source.sql_security_labels);
+    errdefer security_labels.freeEntries(alloc, r.sql_security_labels);
     r.description = if (source.description) |value| try alloc.dupe(u8, value) else null;
     errdefer if (r.description) |value| alloc.free(value);
     if (source.placement_policy.placement_role) |role| r.placement_policy.placement_role = try alloc.dupe(u8, role);
     return r;
 }
 fn freeResource(alloc: std.mem.Allocator, r: Resource) void {
+    security_labels.freeEntries(alloc, r.sql_security_labels);
     if (r.signature) |signature| alloc.free(signature);
     alloc.free(r.name);
     alloc.free(r.storage_name);
@@ -1189,12 +1356,14 @@ pub const Delta = struct {
     /// borrowed from the pinned reader until MutableState clones the resource.
     owned_graph_tables: []GraphTableBinding = &.{},
     owned_graph_indexes: []GraphIndexBinding = &.{},
+    owned_collation_json: ?[]u8 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.upserts);
         alloc.free(self.removes);
         alloc.free(self.owned_graph_tables);
         alloc.free(self.owned_graph_indexes);
+        if (self.owned_collation_json) |bytes| alloc.free(bytes);
         self.* = undefined;
     }
 };
@@ -1232,6 +1401,17 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
 /// Only an actual metadata activation may select the new SQL identity profile.
 /// Legacy committed mutations retain their original physical-only semantics.
 pub fn planWithTopologyAndSqlOids(alloc: std.mem.Allocator, reader: anytype, next: u64, request: Mutation, dropping_table: bool, assign_sql_oid: bool) !Delta {
+    return planWithAuthority(alloc, reader, next, request, dropping_table, assign_sql_oid, false);
+}
+
+pub fn planCollation(alloc: std.mem.Allocator, reader: anytype, next: u64, request: Mutation) !Delta {
+    if (request.kind != .collation) return error.InvalidCatalogMutation;
+    return planWithAuthority(alloc, reader, next, request, false, false, true);
+}
+
+fn planWithAuthority(alloc: std.mem.Allocator, reader: anytype, next: u64, request: Mutation, dropping_table: bool, assign_sql_oid: bool, collation_authority: bool) !Delta {
+    if (logicalReplicationResource(request.kind)) return error.CatalogReplicationAdmissionRequired;
+    if (request.kind == .collation and !collation_authority) return error.CatalogRoutineAdmissionRequired;
     if (request.sql_temporary_owner) |owner| {
         try owner.validate();
         var buffer: [72]u8 = undefined;
@@ -1252,6 +1432,12 @@ pub fn planWithTopologyAndSqlOids(alloc: std.mem.Allocator, reader: anytype, nex
     if (request.kind == .view) return error.CatalogViewAdmissionRequired;
     if (request.kind == .sequence) return error.CatalogSequenceAdmissionRequired;
     if (request.action == .alter) return error.InvalidCatalogMutation;
+    if (request.expected_collation != null and (request.kind != .collation or request.action == .create)) return error.InvalidCatalogMutation;
+    if (request.kind == .collation) switch (request.action) {
+        .create => {},
+        .rename, .drop => try (request.expected_collation orelse return error.InvalidCatalogMutation).validate(),
+        else => return error.InvalidCatalogMutation,
+    };
     try validateDescription(request.description);
     if (request.action != .comment and request.description != null) return error.InvalidCatalogMutation;
     if (request.action == .comment and ((request.kind != .database and request.kind != .namespace) or
@@ -1263,7 +1449,11 @@ pub fn planWithTopologyAndSqlOids(alloc: std.mem.Allocator, reader: anytype, nex
     if (request.tablespace) |name| try validateName(name);
     try request.placement_policy.validate();
     if (request.native_service != null and (request.kind != .table or request.action != .create)) return error.InvalidCatalogMutation;
-    if (request.kind == .query_source and request.action == .create) {
+    if (request.kind == .collation and request.action == .create) {
+        var create = try @import("collations.zig").Create.decode(alloc, request.source_json);
+        defer create.deinit();
+        try create.value.validate();
+    } else if (request.kind == .query_source and request.action == .create) {
         try validateQuerySource(alloc, request.source_json);
     } else if (request.kind == .graph and (request.action == .create or request.action == .set_definition)) {
         var region = std.heap.ArenaAllocator.init(alloc);
@@ -1297,6 +1487,12 @@ pub fn planWithTopologyAndSqlOids(alloc: std.mem.Allocator, reader: anytype, nex
         if (try reader.lookup(.named_type, parent_id, request.name) != null) return error.SqlDuplicateType;
     }
     var found = try reader.lookup(request.kind, parent_id, request.name);
+    if (request.expected_collation) |expected| {
+        const resource = found orelse return error.CatalogGenerationChanged;
+        var record = try @import("collations.zig").Record.decode(alloc, resource.source_json);
+        defer record.deinit();
+        if (!expected.eql(record.value.reference)) return error.CatalogGenerationChanged;
+    }
     if (found == null and request.kind == .table and parent_id == default_namespace_id and request.action != .create) {
         if (try reader.physicalByName(request.name)) |table| if (try reader.byId(.table, table.id) == null) {
             found = .{ .kind = .table, .id = table.id, .parent_id = default_namespace_id, .name = table.name, .storage_name = table.name };
@@ -1316,6 +1512,8 @@ pub fn planWithTopologyAndSqlOids(alloc: std.mem.Allocator, reader: anytype, nex
     var removes = std.ArrayListUnmanaged(Resource).empty;
     defer removes.deinit(alloc);
     var next_id = next;
+    var collation_json: ?[]u8 = null;
+    errdefer if (collation_json) |bytes| alloc.free(bytes);
     var graph_tables: []GraphTableBinding = &.{};
     errdefer alloc.free(graph_tables);
     var graph_indexes: []GraphIndexBinding = &.{};
@@ -1347,6 +1545,20 @@ pub fn planWithTopologyAndSqlOids(alloc: std.mem.Allocator, reader: anytype, nex
             if (replacing) {
                 resource.graph_revision = std.math.add(u64, resource.graph_revision, 1) catch return error.CatalogIdExhausted;
                 resource.source_json = request.source_json;
+            }
+            if (request.kind == .collation) {
+                if (binding != 0 or resource.id == 0) return error.InvalidCatalogMutation;
+                var parsed_create = try @import("collations.zig").Create.decode(alloc, request.source_json);
+                defer parsed_create.deinit();
+                const declared = parsed_create.value;
+                const namespace = (try reader.byId(.namespace, parent_id)) orelse return error.NamespaceNotFound;
+                if (declared.expected_namespace_id != namespace.id or declared.expected_database_id != namespace.parent_id) return error.CatalogGenerationChanged;
+                const record: @import("collations.zig").Record = .{
+                    .reference = .{ .id = resource.id, .namespace_id = parent_id, .database_id = namespace.parent_id, .origin_id = declared.origin_id, .generation = 1 },
+                    .definition = declared.definition,
+                };
+                collation_json = try record.encode(alloc);
+                resource.source_json = collation_json.?;
             }
             if (request.kind == .graph) {
                 var region = std.heap.ArenaAllocator.init(alloc);
@@ -1444,13 +1656,14 @@ pub fn planWithTopologyAndSqlOids(alloc: std.mem.Allocator, reader: anytype, nex
                 } else {
                     switch (existing.kind) {
                         .database => {
-                            if ((try reader.children(.extension, existing.id, 1)).len != 0 or (try reader.children(.cast, existing.id, 1)).len != 0) return error.DatabaseNotEmpty;
+                            if ((try reader.children(.extension, existing.id, 1)).len != 0 or (try reader.children(.cast, existing.id, 1)).len != 0 or
+                                (try reader.children(.publication, existing.id, 1)).len != 0 or (try reader.children(.subscription, existing.id, 1)).len != 0) return error.DatabaseNotEmpty;
                             const namespaces = try reader.children(.namespace, existing.id, 0);
                             for (namespaces) |namespace| {
                                 if ((try reader.children(.table, namespace.id, 1)).len != 0) return error.DatabaseNotEmpty;
                                 if ((try reader.children(.view, namespace.id, 1)).len != 0) return error.DatabaseNotEmpty;
                                 if ((try reader.children(.sequence, namespace.id, 1)).len != 0) return error.DatabaseNotEmpty;
-                                if ((try reader.children(.routine, namespace.id, 1)).len != 0 or (try reader.children(.named_type, namespace.id, 1)).len != 0) return error.DatabaseNotEmpty;
+                                if ((try reader.children(.routine, namespace.id, 1)).len != 0 or (try reader.children(.named_type, namespace.id, 1)).len != 0 or (try reader.children(.collation, namespace.id, 1)).len != 0) return error.DatabaseNotEmpty;
                                 try removes.append(alloc, namespace);
                             }
                         },
@@ -1458,11 +1671,16 @@ pub fn planWithTopologyAndSqlOids(alloc: std.mem.Allocator, reader: anytype, nex
                             if ((try reader.children(.table, existing.id, 1)).len != 0 or
                                 (try reader.children(.view, existing.id, 1)).len != 0 or
                                 (try reader.children(.sequence, existing.id, 1)).len != 0 or
-                                (try reader.children(.routine, existing.id, 1)).len != 0 or (try reader.children(.named_type, existing.id, 1)).len != 0) return error.NamespaceNotEmpty;
+                                (try reader.children(.routine, existing.id, 1)).len != 0 or (try reader.children(.named_type, existing.id, 1)).len != 0 or (try reader.children(.collation, existing.id, 1)).len != 0) return error.NamespaceNotEmpty;
                         },
                         .tablespace => if (try reader.tablespaceInUse(existing.id)) return error.TablespaceInUse,
                         .query_source, .graph => {},
-                        .view, .sequence, .routine, .cast, .named_type, .role, .extension => unreachable,
+                        .collation => {
+                            const Reader = if (@typeInfo(@TypeOf(reader)) == .pointer) @typeInfo(@TypeOf(reader)).pointer.child else @TypeOf(reader);
+                            if (!@hasDecl(Reader, "collationInUse")) return error.CatalogRoutineAdmissionRequired;
+                            if (try reader.collationInUse(existing.id)) return error.SqlDependentCollation;
+                        },
+                        .view, .sequence, .routine, .cast, .named_type, .role, .extension, .publication, .subscription => unreachable,
                         .table => {
                             if (!dropping_table) return error.CatalogTableTopologyRequired;
                             if (request.table_id != existing.id or !std.mem.eql(u8, request.storage_name, existing.storage_name)) return error.CatalogGenerationChanged;
@@ -1475,7 +1693,7 @@ pub fn planWithTopologyAndSqlOids(alloc: std.mem.Allocator, reader: anytype, nex
     }
     const owned_upserts = try upserts.toOwnedSlice(alloc);
     errdefer alloc.free(owned_upserts);
-    return .{ .upserts = owned_upserts, .removes = try removes.toOwnedSlice(alloc), .next_id = next_id, .presentation_only = request.action == .comment, .owned_graph_tables = graph_tables, .owned_graph_indexes = graph_indexes };
+    return .{ .upserts = owned_upserts, .removes = try removes.toOwnedSlice(alloc), .next_id = next_id, .presentation_only = request.action == .comment, .owned_graph_tables = graph_tables, .owned_graph_indexes = graph_indexes, .owned_collation_json = collation_json };
 }
 
 /// Projection captured during admission and returned only after exact receipt
@@ -1669,8 +1887,10 @@ pub const Request = struct {
     creation_comment_sources: []const u64 = &.{},
     creation_object_comments: []const object_annotations.Copy = &.{},
     creation_revision: ?u64 = null,
+    collation_revision: ?u64 = null,
 
     pub fn validateBinding(self: Request) !void {
+        if (self.collation_revision != null and self.mutation.kind != .collation) return error.InvalidCatalogMutation;
         try validateCreationSources(self.creation_sources);
         try validateCreationCommentSources(self.creation_sources, self.creation_comment_sources);
         try validateCreationObjectComments(self.creation_sources, self.creation_object_comments);
@@ -1687,6 +1907,7 @@ pub const Request = struct {
     }
 
     pub fn jsonStringify(self: Request, writer: anytype) !void {
+        if (self.collation_revision != null) return writer.write(.{ .mutation = self.mutation, .collation_revision = self.collation_revision });
         if (self.creation_object_comments.len != 0) return writer.write(.{ .mutation = self.mutation, .binding_guard = self.binding_guard, .create_table_json = self.create_table_json, .physical_name = self.physical_name, .generated_constraint_names = self.generated_constraint_names, .column_sequences = self.column_sequences, .creation_sources = self.creation_sources, .creation_comment_sources = self.creation_comment_sources, .creation_object_comments = self.creation_object_comments, .creation_revision = self.creation_revision });
         if (self.creation_sources.len != 0) return writer.write(.{ .mutation = self.mutation, .binding_guard = self.binding_guard, .create_table_json = self.create_table_json, .physical_name = self.physical_name, .generated_constraint_names = self.generated_constraint_names, .column_sequences = self.column_sequences, .creation_sources = self.creation_sources, .creation_comment_sources = self.creation_comment_sources, .creation_revision = self.creation_revision });
         if (self.binding_guard != null) return writer.write(.{ .mutation = self.mutation, .binding_guard = self.binding_guard, .create_table_json = self.create_table_json, .physical_name = self.physical_name, .generated_constraint_names = self.generated_constraint_names, .column_sequences = self.column_sequences });
@@ -1994,6 +2215,7 @@ pub const ResolveMany = struct {
     /// Captured with forward bindings in the same immutable catalog read.
     storage_names: []const []const u8 = &.{},
     include_query_definitions: bool = false,
+    include_partition_families: bool = false,
     /// Opt-in indexed physical identities, aligned with storage_names.
     include_storage_bindings: bool = false,
     /// Request the tracked physical relation source cut alongside the logical
@@ -2007,6 +2229,14 @@ pub const ResolveMany = struct {
     expected_relation_epoch: ?@import("relation_reconciliation.zig").Epoch = null,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        if (self.include_partition_families) return jw.write(.{
+            .include_partition_families = true,
+            .include_query_definitions = self.include_query_definitions,
+            .include_source_epoch = self.include_source_epoch,
+            .relations = self.relations,
+            .expected_relation_epoch = self.expected_relation_epoch,
+            .expected_revision = self.expected_revision,
+        });
         if (self.include_storage_bindings) return jw.write(.{ .sql_principal = self.sql_principal, .include_source_epoch = self.include_source_epoch, .targets = self.targets, .storage_names = self.storage_names, .include_query_definitions = self.include_query_definitions, .expected_revision = self.expected_revision, .relations = self.relations, .name_allocation = self.name_allocation, .expected_relation_epoch = self.expected_relation_epoch, .sql_sources = self.sql_sources, .include_storage_bindings = true });
         if (self.sql_principal != null) return jw.write(.{ .sql_principal = self.sql_principal, .include_source_epoch = self.include_source_epoch, .targets = self.targets, .storage_names = self.storage_names, .include_query_definitions = self.include_query_definitions, .expected_revision = self.expected_revision, .relations = self.relations, .name_allocation = self.name_allocation, .expected_relation_epoch = self.expected_relation_epoch, .sql_sources = self.sql_sources });
         if (self.sql_sources.len != 0) return jw.write(.{ .include_source_epoch = self.include_source_epoch, .targets = self.targets, .storage_names = self.storage_names, .include_query_definitions = self.include_query_definitions, .expected_revision = self.expected_revision, .relations = self.relations, .name_allocation = self.name_allocation, .expected_relation_epoch = self.expected_relation_epoch, .sql_sources = self.sql_sources });
@@ -2145,7 +2375,7 @@ pub const Read = struct {
 /// Selected resources plus the related records needed to render their labels.
 /// Values borrow the index; the caller owns only the returned slice.
 pub fn projectRead(alloc: std.mem.Allocator, index: *const StateIndex, request: Read) ![]Resource {
-    if (namespaceRelation(request.kind)) return error.InvalidCatalogMutation;
+    if (namespaceRelation(request.kind) or logicalReplicationResource(request.kind)) return error.InvalidCatalogMutation;
     const parent = if (parentScope(request.kind) == .database) (index.find(.database, 0, request.database) orelse return error.DatabaseNotFound).id else 0;
     var out: std.ArrayListUnmanaged(Resource) = .empty;
     errdefer out.deinit(alloc);
@@ -2194,6 +2424,9 @@ pub const TableStatusTarget = union(enum) {
 
 pub fn httpStatus(err: anyerror) u16 {
     return switch (err) {
+        error.SqlInvalidParameterValue, error.SqlWrongObjectType, error.SqlAmbiguousFunction => 400,
+        error.SqlUndefinedProcedure => 404,
+        error.CatalogSourceUntracked => 409,
         error.SqlIndexAlreadyExists, error.SqlConstraintAlreadyExists, error.ScopeRetirementChanged, error.SequenceAdmissionConflict => 409,
         error.CatalogGenerationExhausted, error.ProgramLimitExceeded, error.UndefinedColumn, error.SqlViewColumnRename, error.SqlViewColumnTypeChanged, error.SqlViewColumnDropped, error.SqlViewCycle, error.SqlProgramLimitExceeded => 400,
         error.SqlDependentObjectsExist => 409,
@@ -2411,7 +2644,7 @@ pub fn validateTableName(name: []const u8) !void {
 
 pub fn validateResourceName(kind: Kind, name: []const u8) !void {
     if (kind == .role) return @import("privileges.zig").validateRoleName(name);
-    if (namespaceRelation(kind) or kind == .routine or kind == .cast or kind == .named_type) return validateTableName(name);
+    if (namespaceRelation(kind) or kind == .routine or kind == .cast or kind == .named_type or kind == .collation) return validateTableName(name);
     return validateName(name);
 }
 
@@ -3060,4 +3293,116 @@ test "system catalog published graph kind remains before branch SQL kinds" {
     try std.testing.expect(@backingInt(Kind.view) > @backingInt(Kind.graph));
     try std.testing.expectEqual(ParentScope.global, parentScope(.graph));
     try std.testing.expectEqual(ParentScope.namespace, parentScope(.view));
+}
+
+test "system catalog security label resources preserve owned values and reject unstable table identity" {
+    const a = std.testing.allocator;
+    const labels = [_]security_labels.Entry{.{
+        .provider = "antfly",
+        .label = "internal",
+        .policy_digest = security_labels.native_policy_digest,
+    }};
+    var resource: Resource = .{ .kind = .table, .id = 100, .name = "t", .sql_security_labels = &labels };
+    try std.testing.expectError(error.InvalidCatalogRecord, resource.validateLogicalRelationId());
+    resource.sql_relation_id = 7;
+    try resource.validateLogicalRelationId();
+    const owned = try cloneResource(a, resource);
+    defer freeResource(a, owned);
+    try std.testing.expect(owned.sql_security_labels[0].label.ptr != resource.sql_security_labels[0].label.ptr);
+    const encoded = try std.json.Stringify.valueAlloc(a, owned, .{});
+    defer a.free(encoded);
+    var decoded = try std.json.parseFromSlice(Resource, a, encoded, .{});
+    defer decoded.deinit();
+    try decoded.value.validateLogicalRelationId();
+    try std.testing.expectEqualStrings("internal", decoded.value.sql_security_labels[0].label);
+    const replacement = try resource.withPhysicalRelationId(101);
+    try std.testing.expectEqual(resource.sql_relation_id, replacement.sql_relation_id);
+    try std.testing.expectEqualStrings("internal", replacement.sql_security_labels[0].label);
+    resource.sql_security_labels = &.{};
+    const unlabeled = try std.json.Stringify.valueAlloc(a, resource, .{});
+    defer a.free(unlabeled);
+    try std.testing.expect(std.mem.indexOf(u8, unlabeled, "sql_security_labels") == null);
+}
+
+test "system catalog ICU collation retains scoped identity across serialization and rename" {
+    const a = std.testing.allocator;
+    const types = @import("collations.zig");
+    const record: types.Record = .{
+        .reference = .{ .database_id = 1, .namespace_id = 2, .id = 3, .origin_id = @splat(5), .generation = 1 },
+        .definition = .{ .locale = "und-u-ks-level2", .version = .{ .collation = .{ 153, 120, 0, 0 }, .uca = .{ 15, 1, 0, 0 } }, .owner = .auth_disabled },
+    };
+    const definition = try record.encode(a);
+    defer a.free(definition);
+    var resources = [_]Resource{
+        .{ .kind = .database, .id = 1, .name = "db" },
+        .{ .kind = .namespace, .id = 2, .parent_id = 1, .name = "public" },
+        .{ .kind = .collation, .id = 3, .parent_id = 2, .name = "before", .source_json = definition },
+    };
+    const state = State{ .next_id = 4, .resources = &resources };
+    var index = try StateIndex.init(a, state);
+    defer index.deinit(a);
+    try std.testing.expectEqualStrings("before", index.byId(.collation, 3).?.name);
+    resources[2].name = "after";
+    const encoded = try std.json.Stringify.valueAlloc(a, state, .{});
+    defer a.free(encoded);
+    var decoded = try std.json.parseFromSlice(State, a, encoded, .{});
+    defer decoded.deinit();
+    var renamed = try StateIndex.init(a, decoded.value);
+    defer renamed.deinit(a);
+    const rebound = renamed.byId(.collation, 3).?;
+    try std.testing.expectEqualStrings("after", rebound.name);
+    var parsed = try types.Record.decode(a, rebound.source_json);
+    defer parsed.deinit();
+    try record.bound().requireRecord(parsed.value);
+    resources[2].parent_id = 1;
+    try std.testing.expectError(error.InvalidCatalogRecord, StateIndex.init(a, state));
+}
+
+test "system catalog collation planner fences create scope and rename or drop by reference" {
+    const a = std.testing.allocator;
+    const types = @import("collations.zig");
+    const resources = [_]Resource{
+        .{ .kind = .database, .id = 1, .name = "db" },
+        .{ .kind = .namespace, .id = 2, .parent_id = 1, .name = "public" },
+    };
+    var initial = try StateIndex.init(a, .{ .next_id = 3, .resources = &resources });
+    defer initial.deinit(a);
+    const reader: MemoryReader = .{ .index = &initial, .tables = &.{} };
+    var declaration: types.Create = .{
+        .expected_database_id = 1,
+        .expected_namespace_id = 2,
+        .origin_id = @splat(7),
+        .definition = .{ .locale = "und-u-ks-level2", .version = .{ .collation = .{ 153, 120, 0, 0 }, .uca = .{ 15, 1, 0, 0 } }, .owner = .auth_disabled },
+    };
+    const declaration_json = try std.json.Stringify.valueAlloc(a, declaration, .{});
+    defer a.free(declaration_json);
+    const create: Mutation = .{ .kind = .collation, .action = .create, .name = "ordering", .database = "db", .source_json = declaration_json };
+    try std.testing.expectError(error.CatalogRoutineAdmissionRequired, planWithReader(a, reader, 3, create));
+    var created = try planCollation(a, reader, 3, create);
+    defer created.deinit(a);
+    var record = try types.Record.decode(a, created.upserts[0].source_json);
+    defer record.deinit();
+    try std.testing.expectEqual(@as(u64, 3), record.value.reference.id);
+    try std.testing.expectEqual(@as(u64, 4), created.next_id);
+
+    declaration.expected_namespace_id = 9;
+    const stale_json = try std.json.Stringify.valueAlloc(a, declaration, .{});
+    defer a.free(stale_json);
+    var stale_create = create;
+    stale_create.source_json = stale_json;
+    try std.testing.expectError(error.CatalogGenerationChanged, planCollation(a, reader, 3, stale_create));
+
+    var current = try StateIndex.init(a, .{ .next_id = 4, .resources = &(resources ++ [_]Resource{created.upserts[0]}) });
+    defer current.deinit(a);
+    const view: MemoryReader = .{ .index = &current, .tables = &.{} };
+    var rename: Mutation = .{ .kind = .collation, .action = .rename, .name = "ordering", .new_name = "renamed", .database = "db", .expected_collation = record.value.reference };
+    var renamed = try planCollation(a, view, 4, rename);
+    defer renamed.deinit(a);
+    try std.testing.expectEqualStrings("renamed", renamed.upserts[0].name);
+    try std.testing.expectEqualStrings(created.upserts[0].source_json, renamed.upserts[0].source_json);
+    rename.expected_collation.?.origin_id[0] ^= 1;
+    try std.testing.expectError(error.CatalogGenerationChanged, planCollation(a, view, 4, rename));
+
+    const drop: Mutation = .{ .kind = .collation, .action = .drop, .name = "ordering", .database = "db", .expected_collation = record.value.reference };
+    try std.testing.expectError(error.CatalogRoutineAdmissionRequired, planCollation(a, view, 4, drop));
 }

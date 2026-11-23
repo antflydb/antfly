@@ -23,7 +23,7 @@ const A = std.mem.Allocator;
 /// Conservative physical payload estimate before cardinality is known.
 /// Allocation admission still accounts for actual vector/hash capacity growth.
 pub fn retainedCellBytes(value: Datum) !usize {
-    if (value.isVoid()) return 1 + @sizeOf(Extension);
+    if (value.read_failure != null or value.isVoid()) return 1 + @sizeOf(Extension);
     if (fixedCoefficient(value) != null) return 19;
     return 1 +| (if (value.patterns() != null) @sizeOf(?*scalar.PatternSet) else @as(usize, 0)) +| switch (value.value) {
         .integer, .float => @as(usize, 8),
@@ -184,12 +184,12 @@ fn Numeric(comptime T: type) type {
 fn fixedCoefficient(value: Datum) ?struct { coefficient: i128, scale: u16 } {
     const number = value.numeric orelse return null;
     if (number.kind != .finite or number.scale > 38) return null;
-    const coefficient = @import("numeric_value.zig").coefficientAtScale(number.*, number.scale) orelse return null;
+    const coefficient = @import("numeric/value.zig").coefficientAtScale(number.*, number.scale) orelse return null;
     if (@abs(coefficient) >= 100000000000000000000000000000000000000) return null;
     return .{ .coefficient = coefficient, .scale = number.scale };
 }
 const Fixed = struct {
-    const Cells = std.AutoHashMapUnmanaged(usize, *const @import("numeric_value.zig").Value);
+    const Cells = std.AutoHashMapUnmanaged(usize, *const @import("numeric/value.zig").Value);
     cells: *Cells,
     values: std.ArrayList(i128) = .empty,
     scales: std.ArrayList(u16) = .empty,
@@ -202,19 +202,19 @@ const Fixed = struct {
     /// Scalar adapters borrow their result from the consumer's region. Shared
     /// indexes must never grow persistent per-row NUMERIC memo tables on reads.
     fn scratchCell(self: Fixed, a: A, row: usize) !Datum {
-        var context: @import("numeric_value.zig").Context = .{ .alloc = a };
-        var owned = try @import("numeric_value.zig").fromScaledInteger(&context, self.values.items[row], self.scales.items[row]);
+        var context: @import("numeric/value.zig").Context = .{ .alloc = a };
+        var owned = try @import("numeric/value.zig").fromScaledInteger(&context, self.values.items[row], self.scales.items[row]);
         errdefer owned.deinit();
-        const number = try a.create(@import("numeric_value.zig").Value);
+        const number = try a.create(@import("numeric/value.zig").Value);
         number.* = owned.value;
         return Datum.typedNumeric(number);
     }
     fn cell(self: Fixed, a: A, row: usize) !Datum {
         if (self.cells.get(row)) |number| return Datum.typedNumeric(number);
-        var context: @import("numeric_value.zig").Context = .{ .alloc = a };
-        var owned = try @import("numeric_value.zig").fromScaledInteger(&context, self.values.items[row], self.scales.items[row]);
+        var context: @import("numeric/value.zig").Context = .{ .alloc = a };
+        var owned = try @import("numeric/value.zig").fromScaledInteger(&context, self.values.items[row], self.scales.items[row]);
         errdefer owned.deinit();
-        const number = try a.create(@import("numeric_value.zig").Value);
+        const number = try a.create(@import("numeric/value.zig").Value);
         number.* = owned.value;
         try self.cells.put(a, row, number);
         return Datum.typedNumeric(number);
@@ -316,6 +316,10 @@ const JsonPayload = struct {
 const Extension = struct {
     bits: usize = 0,
     fn from(value: Datum) Extension {
+        if (value.read_failure) |cause| return .{ .bits = switch (cause) {
+            .type_mismatch => 2,
+            .numeric_out_of_range => 3,
+        } };
         // Address zero cannot name an owned extension. Reserve its range tag
         // for the payload-free void pseudotype without growing retained cells.
         if (value.isVoid()) return .{ .bits = 1 };
@@ -332,13 +336,13 @@ const Extension = struct {
             return .{ .bits = address | 2 };
         }
         if (value.range()) |range| {
-            comptime std.debug.assert(@alignOf(@import("range_value.zig").Value) >= 4);
+            comptime std.debug.assert(@alignOf(@import("range/value.zig").Value) >= 4);
             const address = @intFromPtr(range);
             std.debug.assert(address & 3 == 0);
             return .{ .bits = address | 1 };
         }
         if (value.temporal()) |temporal| {
-            comptime std.debug.assert(@alignOf(@import("temporal_value.zig").Value) >= 4);
+            comptime std.debug.assert(@alignOf(@import("temporal/value.zig").Value) >= 4);
             const address = @intFromPtr(temporal);
             std.debug.assert(address & 3 == 0);
             return .{ .bits = address };
@@ -348,6 +352,8 @@ const Extension = struct {
     fn datum(self: Extension) Datum {
         std.debug.assert(self.bits != 0);
         if (self.bits == 1) return Datum.voidValue();
+        if (self.bits == 2) return Datum.deferredReadFailure(.type_mismatch);
+        if (self.bits == 3) return Datum.deferredReadFailure(.numeric_out_of_range);
         return switch (self.bits & 3) {
             0 => Datum.typedTemporal(@ptrFromInt(self.bits)),
             1 => Datum.typedRange(@ptrFromInt(self.bits & ~@as(usize, 3))),
@@ -383,8 +389,8 @@ const Column = struct {
     json_cache: ?*JsonCache = null,
     nulls: std.ArrayList(u64) = .empty,
     patterns: std.ArrayList(?*scalar.PatternSet) = .empty,
-    arrays: std.ArrayList(?*const @import("array_value.zig").Value) = .empty,
-    numerics: std.ArrayList(?*const @import("numeric_value.zig").Value) = .empty,
+    arrays: std.ArrayList(?*const @import("array/value.zig").Value) = .empty,
+    numerics: std.ArrayList(?*const @import("numeric/value.zig").Value) = .empty,
     extensions: std.ArrayList(Extension) = .empty,
     /// Sparse directory: all retained occurrences of a symbol share its
     /// immutable owned payload. Primitive columns allocate no directory.
@@ -466,7 +472,7 @@ const Column = struct {
         var referenced: usize = 0;
         for (source.values, remap) |value, id| {
             if (id == std.math.maxInt(u32)) continue;
-            if (value.patterns() != null or value.array != null or value.numeric != null or value.temporal() != null or value.range() != null or value.enumeration() != null or value.bytes() != null or value.isVoid()) return false;
+            if (value.read_failure != null or value.patterns() != null or value.array != null or value.numeric != null or value.temporal() != null or value.range() != null or value.enumeration() != null or value.bytes() != null or value.isVoid()) return false;
             if (value.sql_null) continue;
             const actual = std.meta.activeTag(value.value);
             if (actual != .integer and actual != .float and actual != .string and actual != .number_string) return false;
@@ -590,8 +596,8 @@ const Column = struct {
         self.json_bytes.?.items[row] = payload;
     }
     fn append(self: *Column, a: A, owned: A, scratch: A, row: usize, value: Datum) !void {
-        try value.validateTemporal();
-        if (self.extensions.items.len != 0 or value.range() != null or value.enumeration() != null or value.temporal() != null or value.bytes() != null or value.isVoid()) {
+        try value.validateCarrier();
+        if (value.read_failure != null or self.extensions.items.len != 0 or value.range() != null or value.enumeration() != null or value.temporal() != null or value.bytes() != null or value.isVoid()) {
             if (self.extensions.items.len == 0) {
                 try self.extensions.resize(a, row);
                 @memset(self.extensions.items, .{});
@@ -1074,8 +1080,8 @@ pub const Store = struct {
                     bytes +|= source.len +| @sizeOf(JsonPayload) +| 64;
                 } else {
                     _ = cell_region.reset(.retain_capacity);
-                    var coefficient: @import("numeric_value.zig").ScaledInteger = undefined;
-                    var number: @import("numeric_value.zig").Value = undefined;
+                    var coefficient: @import("numeric/value.zig").ScaledInteger = undefined;
+                    var number: @import("numeric/value.zig").Value = undefined;
                     const datum = if (decimal) |view| try view.cell(index, &coefficient, &number) else if (physical) |view| try view.cell(index) else try batch.cell(cell_region.allocator(), index, column);
                     bytes +|= try self.cellAppendBytes(column, datum);
                 }
@@ -1162,8 +1168,8 @@ pub const Store = struct {
             if (column.fixed != null or (column.values == .unknown and column.numerics.items.len == 0 and column.arrays.items.len == 0 and column.patterns.items.len == 0)) {
                 if (try batch.decimalColumnSelected(scratch.allocator(), ordinal, null)) |decimal| {
                     for (0..batch.len()) |index| {
-                        var coefficient: @import("numeric_value.zig").ScaledInteger = undefined;
-                        var number: @import("numeric_value.zig").Value = undefined;
+                        var coefficient: @import("numeric/value.zig").ScaledInteger = undefined;
+                        var number: @import("numeric/value.zig").Value = undefined;
                         const value = try decimal.cell(index, &coefficient, &number);
                         try column.append(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, value);
                     }
@@ -1289,7 +1295,7 @@ pub const Store = struct {
                 continue;
             }
             if (stored.fixed) |fixed| {
-                var coefficient = try @import("numeric_value.zig").ScaledInteger.init(fixed.values.items[row_index], fixed.scales.items[row_index]);
+                var coefficient = try @import("numeric/value.zig").ScaledInteger.init(fixed.values.items[row_index], fixed.scales.items[row_index]);
                 const number = coefficient.view();
                 if ((try scalar.compareDatums(Datum.typedNumeric(&number), value)) != .eq) return false;
                 continue;
@@ -1317,7 +1323,7 @@ pub const Store = struct {
 test "SQL exact NUMERIC retained columns own limbs preserve scale and reject placeholder equality" {
     const Harness = struct {
         fn run(a: A) !void {
-            const numeric = @import("numeric_value.zig");
+            const numeric = @import("numeric/value.zig");
             var context: numeric.Context = .{ .alloc = a };
             var original = try numeric.parse(&context, "9007199254740993.1200");
             defer original.deinit();
@@ -1346,7 +1352,7 @@ test "SQL exact NUMERIC retained columns own limbs preserve scale and reject pla
 test "SQL typed array retained columns preserve bounds ownership and type separation under allocation faults" {
     const Harness = struct {
         fn run(a: A) !void {
-            const arrays = @import("array_value.zig");
+            const arrays = @import("array/value.zig");
             var text: [3]u8 = "abc".*;
             var dimensions = [_]arrays.Dimension{.{ .length = 3, .lower = -2 }};
             const value = try arrays.Value.init(.text, &dimensions, &.{ Datum.json(.{ .string = &text }), .{}, Datum.json(.{ .string = "tail" }) }, .{});
@@ -1534,14 +1540,14 @@ fn nativeFixedScenario(a: A) !void {
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
     const sa = scratch.allocator();
-    var context: @import("numeric_value.zig").Context = .{ .alloc = sa };
+    var context: @import("numeric/value.zig").Context = .{ .alloc = sa };
     const before = try store.cell(budget.allocator(), 0, 0);
-    try std.testing.expectEqualStrings("1.2300", try @import("numeric_value.zig").format(&context, before.numeric.?.*));
-    var work: @import("array_value.zig").Budget = .{};
+    try std.testing.expectEqualStrings("1.2300", try @import("numeric/value.zig").format(&context, before.numeric.?.*));
+    var work: @import("array/value.zig").Budget = .{};
     const wide = try scalar.numericTextLeaky(sa, "1e100", &work);
     _ = try store.append(&.{wide});
     try std.testing.expect(store.columns[0].fixed == null);
-    try std.testing.expectEqualStrings("1.2300", try @import("numeric_value.zig").format(&context, (try store.cell(budget.allocator(), 0, 0)).numeric.?.*));
+    try std.testing.expectEqualStrings("1.2300", try @import("numeric/value.zig").format(&context, (try store.cell(budget.allocator(), 0, 0)).numeric.?.*));
     try std.testing.expect((try store.cell(budget.allocator(), 2, 0)).sql_null);
     try std.testing.expectEqual(@as(usize, 4), store.len);
 }
@@ -1885,7 +1891,7 @@ test "native projection refinements benchmark shared JSON lease hash work" {
 }
 
 test "SQL range retained columns and spill own typed endpoints and preserve observable display" {
-    const ranges = @import("range_value.zig");
+    const ranges = @import("range/value.zig");
     const a = std.testing.allocator;
     const Entry = struct { kind: ranges.Kind, input: []const u8, text: ?[]const u8 = null, sqlstate: ?[]const u8 };
     var reference = try std.json.parseFromSlice(struct { entries: []const Entry }, a, @embedFile("fixtures/sql_range_reference.json"), .{ .ignore_unknown_fields = true });
@@ -1970,4 +1976,18 @@ test "SQL advisory void retained columns preserve pseudotype without per cell pa
     };
     try Harness.run(std.testing.allocator);
     try @import("allocation_test_support.zig").checkAllAllocationFailures(Harness.run, .{});
+}
+
+test "typed retention keeps a document read failure separate from NULL and adjacent values" {
+    const a = std.testing.allocator;
+    var store = Store.init(a);
+    defer store.deinit();
+    _ = try store.append(&.{Datum.json(.{ .string = "before" })});
+    _ = try store.append(&.{Datum.deferredReadFailure(.type_mismatch)});
+    _ = try store.append(&.{Datum.json(.{ .string = "after" })});
+    try std.testing.expectEqualStrings("before", (try store.cell(a, 0, 0)).value.string);
+    const held = try store.cell(a, 1, 0);
+    try std.testing.expect(!held.sql_null);
+    try std.testing.expectError(error.SqlAssignmentTypeMismatch, held.demand());
+    try std.testing.expectEqualStrings("after", (try store.cell(a, 2, 0)).value.string);
 }

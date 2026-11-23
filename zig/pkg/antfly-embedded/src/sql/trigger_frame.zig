@@ -122,7 +122,7 @@ pub const Owned = struct {
             if (comptime @import("builtin").mode == .debug) std.debug.print("trigger frame rejected logical relation identity id={} exceeds_signed=true\n", .{self.layout.table_id});
             return error.InvalidSqlTriggerManifest;
         }
-        const array = @import("array_value.zig");
+        const array = @import("array/value.zig");
         const values = self.frame.values[self.layout.width * 2 ..];
         values[0] = .json(.{ .string = entry.name });
         values[1] = .json(.{ .string = if (entry.timing == .before) "BEFORE" else "AFTER" });

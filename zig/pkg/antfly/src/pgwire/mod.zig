@@ -27,6 +27,9 @@ comptime {
         _ = @import("copy_out.zig");
         _ = @import("copy_in.zig");
         _ = @import("protocol_test.zig");
+        _ = @import("logical_replication_commands.zig");
+        _ = @import("logical_replication_pgoutput.zig");
+        _ = @import("logical_replication_frontend.zig");
         _ = server;
     }
 }

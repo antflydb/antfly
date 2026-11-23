@@ -288,9 +288,9 @@ fn hashRelationalCellCanonical(
         },
         .numrange, .daterange, .tsrange, .tstzrange => {
             var none = std.heap.FixedBufferAllocator.init(&.{});
-            const ranges = @import("../../sql/range_value.zig");
+            const ranges = @import("../../sql/range/value.zig");
             var context: ranges.Context = .{ .alloc = none.allocator() };
-            const range = try @import("../../sql/range_binary.zig").View.open(&context, ranges.kindFromType(column.column_type).?, cell.value.bytes_val);
+            const range = try @import("../../sql/range/binary.zig").View.open(&context, ranges.kindFromType(column.column_type).?, cell.value.bytes_val);
             hasher.update("R");
             try range.hash(&context, hasher);
         },
@@ -302,7 +302,7 @@ fn hashRelationalCellCanonical(
         .sql_array => {
             const kind = column.sql_element_type orelse return error.InvalidBatchRequest;
             const view = try @import("../../common/sql_array_layout.zig").View.openAuthenticated(kind, cell.value.bytes_val, .{});
-            try @import("../../sql/array_storage.zig").updateLogicalHash(alloc, view, hasher);
+            try @import("../../sql/array/storage.zig").updateLogicalHash(alloc, view, hasher);
         },
         .string, .blob, .geoshape => {
             hasher.update("s");
@@ -512,7 +512,7 @@ test "SQL JSONB strict canonical matching streams large payloads without a secon
     try std.testing.expect(!try canonicalJsonbValueMatches(std.mem.Allocator.failing, .{ .number_string = "1e5" }, "1e5", &work));
     work = .{};
     try std.testing.expect(try canonicalJsonbValueMatches(std.mem.Allocator.failing, .{ .number_string = "0.00" }, "0.00", &work));
-    var context: @import("../../sql/numeric_value.zig").Context = .{ .alloc = std.mem.Allocator.failing, .remaining = 1 };
+    var context: @import("../../sql/numeric/value.zig").Context = .{ .alloc = std.mem.Allocator.failing, .remaining = 1 };
     work = .{ .shared = &context };
     try std.testing.expectError(error.SqlProgramLimitExceeded, canonicalJsonbValueMatches(std.mem.Allocator.failing, .{ .string = payload }, encoded, &work));
     try std.testing.expect(context.failure.? == error.SqlProgramLimitExceeded);
@@ -974,27 +974,27 @@ fn hashRelationalColumnValue(
         },
         .sql_array => {
             const kind = column.sql_element_type orelse return error.InvalidBatchRequest;
-            var decoded = try @import("../../sql/array_wire.zig").decodeBorrowedWithModifier(alloc, kind, value, column.numeric_modifier, .{});
+            var decoded = try @import("../../sql/array/wire.zig").decodeBorrowedWithModifier(alloc, kind, value, column.numeric_modifier, .{});
             defer decoded.deinit();
-            const bytes = try @import("../../sql/array_storage.zig").encodeAlloc(alloc, decoded.value, .{});
+            const bytes = try @import("../../sql/array/storage.zig").encodeAlloc(alloc, decoded.value, .{});
             defer alloc.free(bytes);
             const view = try @import("../../common/sql_array_layout.zig").View.open(kind, bytes, .{});
-            try @import("../../sql/array_storage.zig").updateLogicalHash(alloc, view, hasher);
+            try @import("../../sql/array/storage.zig").updateLogicalHash(alloc, view, hasher);
         },
         .numrange, .daterange, .tsrange, .tstzrange => {
             if (value != .string) return error.InvalidBatchRequest;
             var scratch = std.heap.ArenaAllocator.init(alloc);
             defer scratch.deinit();
-            const ranges = @import("../../sql/range_value.zig");
+            const ranges = @import("../../sql/range/value.zig");
             var context: ranges.Context = .{ .alloc = scratch.allocator() };
             const range = try ranges.parseLeaky(&context, ranges.kindFromType(column.column_type).?, value.string);
             hasher.update("R");
             try ranges.hash(&context, range, hasher);
         },
         .numeric => {
-            const numeric = @import("../../sql/numeric_value.zig");
+            const numeric = @import("../../sql/numeric/value.zig");
             var ctx: numeric.Context = .{ .alloc = alloc };
-            var parsed = try @import("../../sql/numeric_storage.zig").fromJson(&ctx, value);
+            var parsed = try @import("../../sql/numeric/storage.zig").fromJson(&ctx, value);
             defer parsed.deinit();
             hasher.update("N");
             if (column.numeric_modifier) |modifier| {

@@ -17,10 +17,10 @@
 //! continuation is proposed work only; row guards, parent attachments and this
 //! exact predecessor must commit through the existing distributed transaction.
 const std = @import("std");
-const contract = @import("relational_integrity_activation_contract.zig");
-const activation = @import("relational_integrity_activation.zig");
+const contract = @import("relational/integrity/activation_contract.zig");
+const activation = @import("relational/integrity/activation.zig");
 const validation = @import("foreign_key_validation.zig");
-const input_contract = @import("relational_schema_owner_contract.zig");
+const input_contract = @import("relational/schema_change/schema_owner_contract.zig");
 const rows = @import("read_session_backend").RelationalRows;
 const A = std.mem.Allocator;
 

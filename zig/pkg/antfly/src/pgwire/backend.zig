@@ -61,7 +61,11 @@ pub const Identity = struct {
     release: *const fn (*anyopaque, std.mem.Allocator) void,
 };
 
+pub const SelinuxIngress = @import("antfly_local_sources").system_catalog_domain.security_labels.KernelRelabel.Ingress;
+
 pub const Request = struct {
+    /// Borrowed from the accepted transport for this request only.
+    selinux_ingress: ?SelinuxIngress = null,
     backend_pid: i32 = 0,
     capture_cursor_authority: bool = false,
     completion: ?*@import("completion.zig").Completion = null,
@@ -69,6 +73,8 @@ pub const Request = struct {
     statement: []const u8,
     /// Internal ingress intent: preserve PostgreSQL COPY/RLS admission on every batch.
     copy_input: bool = false,
+    copy_freeze_admission: bool = false,
+    copy_has_active_cursor: bool = false,
     copy_source_statement: ?[]const u8 = null,
     copy_source_inputs: []const @import("antfly_local_sources").sql_parameter_frame.Input = &.{},
     copy_source_descriptors: []const Parameter = &.{},
@@ -203,6 +209,7 @@ pub const Description = struct {
 };
 
 pub const CopyInput = struct {
+    freeze_admitted: bool = false,
     source_statement: ?[]const u8 = null,
     table: @import("antfly_local_sources").sql_ast.Name,
     columns: []const Column,
@@ -302,6 +309,7 @@ pub const Backend = struct {
 
     pub const VTable = struct {
         native_parameters: bool = false,
+        open_replication: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!@import("logical_replication_frontend.zig").Port = null,
         start_connection: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!void = null,
         discard_connection: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!void = null,
         has_notifications: ?*const fn (*anyopaque, Identity) bool = null,

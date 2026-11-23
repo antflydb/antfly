@@ -88,7 +88,9 @@ def postgres_binary_dir():
 
 
 @contextmanager
-def postgres(*, max_prepared_transactions=0):
+def postgres(
+    *, max_prepared_transactions=0, logical_replication=False, listen_port=None, server_env=None
+):
     import psycopg
 
     if (
@@ -96,6 +98,14 @@ def postgres(*, max_prepared_transactions=0):
         or not 0 <= max_prepared_transactions <= 128
     ):
         raise ValueError("max_prepared_transactions must be between 0 and 128")
+    if not isinstance(logical_replication, bool):
+        raise ValueError("logical_replication must be a boolean")
+    if listen_port is not None and (
+        type(listen_port) is not int or not 1024 <= listen_port <= 65535
+    ):
+        raise ValueError("listen_port must be an unprivileged TCP port")
+    connection_port = listen_port or 5432
+    listen_addresses = "127.0.0.1,::1" if listen_port is not None else ""
     binary = postgres_binary_dir()
     with TemporaryDirectory(prefix="antfly-sql-pg-", dir="/tmp") as directory:
         data = Path(directory) / "data"
@@ -122,15 +132,17 @@ def postgres(*, max_prepared_transactions=0):
                     "-l",
                     Path(directory) / "server.log",
                     "-o",
-                    f"-k {directory} -c listen_addresses=''"
+                    f"-k {directory} -p {connection_port} -c listen_addresses='{listen_addresses}'"
                     + (
                         f" -c max_prepared_transactions={max_prepared_transactions}"
                         if max_prepared_transactions
                         else ""
-                    ),
+                    )
+                    + (" -c wal_level=logical" if logical_replication else ""),
                     "-w",
                     "start",
                 ],
+                env=server_env,
                 check=True,
                 capture_output=True,
                 timeout=30,
@@ -138,7 +150,7 @@ def postgres(*, max_prepared_transactions=0):
             started = True
             with psycopg.connect(
                 host=directory,
-                port=5432,
+                port=connection_port,
                 user=getpass.getuser(),
                 dbname="postgres",
                 autocommit=True,

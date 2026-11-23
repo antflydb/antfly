@@ -2709,6 +2709,18 @@ pub const RelationalTransitionReadRequest = extern struct {
     table_name: BorrowedBytes = .{},
     request_json: BorrowedBytes = .{},
 };
+pub const NativePublicationCaptureControlRequest = extern struct {
+    pub const operation: u32 = 13;
+    version: u32 = abi_version,
+    control: ControlledJsonOperationRequest = .{},
+};
+pub extern fn antfly_storage_owner_native_publication_capture_control(
+    owner: ?*anyopaque,
+    request: *const NativePublicationCaptureControlRequest,
+    out_result: *OwnedBytes,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+
 pub extern fn antfly_storage_owner_relational_transition_read(
     owner: ?*anyopaque,
     request: *const RelationalTransitionReadRequest,

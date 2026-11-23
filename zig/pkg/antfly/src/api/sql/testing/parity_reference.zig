@@ -420,7 +420,7 @@ fn executeWithTransport(alloc: std.mem.Allocator, handler: anytype, case: *const
             var compiled = try compiler.compile(alloc, case.sql, .{});
             defer compiled.deinit();
             var identity: ?@import("../../http_server.zig").AuthenticatedIdentity = null;
-            var adapter: @import("../../sql_execution.zig").Adapter = .{ .server = handler.api_server, .identity = &identity, .context = .{} };
+            var adapter: @import("../execution/execution.zig").Adapter = .{ .server = handler.api_server, .identity = &identity, .context = .{} };
             var description = try @import("antfly_local_sources").sql_describe.describe(alloc, adapter.backend(), &compiled, &.{});
             defer description.deinit();
             parameters = try describedParameters(parameter_arena.allocator(), parameters, description.binding.parameter_descriptors);

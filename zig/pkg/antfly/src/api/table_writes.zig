@@ -23634,7 +23634,7 @@ pub const ProvisionedTableWriteSource = struct {
             try self.applyRestoreStagingBatch(alloc, table_name, group_id, .{
                 .restore_staging_scope = scope,
                 .restore_staging_plan_id = context.restore_staging_plan_id,
-                .transaction = .{ .begin = .{ .txn_id = txn_id, .begin_timestamp = begin_timestamp, .created_at_ns = nextTxnTimestamp(if (self.backend_runtime) |runtime| runtime.io() else null), .topology_epoch = topology_epoch, .retain_terminal = retain_terminal or context.external_decision_owner != null, .external_decision_owner = context.external_decision_owner, .sql_locks = context.sql_locks, .participants = participants } },
+                .transaction = .{ .begin = .{ .txn_id = txn_id, .begin_timestamp = begin_timestamp, .created_at_ns = nextTxnTimestamp(if (self.backend_runtime) |runtime| runtime.io() else null), .topology_epoch = topology_epoch, .retain_terminal = retain_terminal or context.external_decision_owner != null, .external_decision_owner = context.external_decision_owner, .sql_locks = context.sql_locks, .document_revision_scope = context.document_revision_scope, .participants = participants } },
             }, context);
             return {};
         }
@@ -23658,6 +23658,7 @@ pub const ProvisionedTableWriteSource = struct {
                     .retain_terminal = retain_terminal or context.external_decision_owner != null,
                     .external_decision_owner = context.external_decision_owner,
                     .sql_locks = context.sql_locks,
+                    .document_revision_scope = context.document_revision_scope,
                     .participants = participants,
                 } },
             }, context);
@@ -23704,6 +23705,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .retain_terminal = retain_terminal or context.external_decision_owner != null,
                 .external_decision_owner = context.external_decision_owner,
                 .sql_locks = context.sql_locks,
+                .document_revision_scope = context.document_revision_scope,
                 .participants = participants,
             } } });
             lockAtomic(&self.local_db_mutex);
@@ -23722,6 +23724,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .retain_terminal = retain_terminal or context.external_decision_owner != null,
                 .external_decision_owner = context.external_decision_owner,
                 .sql_locks = context.sql_locks,
+                .document_revision_scope = context.document_revision_scope,
                 .participants = participants,
             } } });
             self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
@@ -23752,7 +23755,7 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try ensurePreDecisionContextActive(context);
-        try @import("sql_graph_vote.zig").require(alloc, self.catalog, table_name, req.asBatch(txn_id, topology_epoch), context.deadline_ns);
+        try @import("sql/execution/graph_vote.zig").require(alloc, self.catalog, table_name, req.asBatch(txn_id, topology_epoch), context.deadline_ns);
         if (req.range_guards.len != 0 and context.route_fence == null) return error.CatalogRouteFenceRequired;
         var guarded_admission: ?RoutedWriteAdmission = null;
         defer if (guarded_admission) |*admission| admission.deinit();
@@ -27362,6 +27365,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .retain_terminal = retain_terminal or context.external_decision_owner != null,
                 .external_decision_owner = context.external_decision_owner,
                 .sql_locks = context.sql_locks,
+                .document_revision_scope = context.document_revision_scope,
                 .participants = participants,
             } },
         }, topology_epoch, context);

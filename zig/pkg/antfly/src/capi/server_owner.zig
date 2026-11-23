@@ -2153,8 +2153,13 @@ pub fn metadataApplyStoreProjection(
                 const value = handle.store.loadRestoreStagingProgress(alloc, request.group_id, id) catch |err| break :blk storageOwnerStatusFromError(err);
                 break :blk metadataProjectionJson(alloc, out_json, value);
             }
-            const state = std.enums.fromInt(antfly.capi_dependencies.metadata_restore_staging.State, request.arg0) orelse break :blk .invalid_argument;
-            const value = handle.store.loadRestoreStagingReceipt(alloc, request.group_id, id, state, request.arg1) catch |err| break :blk storageOwnerStatusFromError(err);
+            const staging = antfly.capi_dependencies.metadata_restore_staging;
+            const flag = staging.receipt_identity_projection_flag;
+            const state = std.enums.fromInt(staging.State, request.arg0 & ~flag) orelse break :blk .invalid_argument;
+            const value = (if (request.arg0 & flag != 0)
+                handle.store.loadRestoreStagingReceiptIdentity(alloc, request.group_id, id, state, request.arg1)
+            else
+                handle.store.loadRestoreStagingReceipt(alloc, request.group_id, id, state, request.arg1)) catch |err| break :blk storageOwnerStatusFromError(err);
             defer if (value) |bytes| alloc.free(bytes);
             break :blk metadataProjectionJson(alloc, out_json, value);
         },
@@ -2255,6 +2260,10 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.exportStandalonePortableCatalog(a) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .sql_population_lineage => |input| {
+                    const value = handle.store.sqlPopulationLineage(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .sql_snapshot_cohort => |cohort_request| {
                     const value = handle.store.sqlSnapshotCohort(a, group_id, cohort_request) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
@@ -2289,6 +2298,22 @@ pub fn metadataApplyStoreProjection(
                 },
                 .catalog_bind_column_sequences => |input| {
                     const value = handle.store.bindTableColumnSequences(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .sql_collation_snapshot => |input| {
+                    const value = handle.store.sqlCollationSnapshot(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .catalog_selinux_authority => {
+                    const value = handle.store.sqlSelinuxAuthority(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .catalog_security_label_prepare => |input| {
+                    const value = handle.store.prepareSqlSecurityLabel(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(switch (err) {
+                        error.NoSecurityLabelProviders, error.SecurityLabelProviderNotLoaded, error.SecurityLabelProviderRequired, error.InvalidSecurityLabel, error.InvalidSecurityLabelProvider, error.SecurityLabelTooLarge => error.SqlInvalidParameterValue,
+                        error.InvalidSecurityLabelRecord => error.InvalidCatalogMutation,
+                        else => err,
+                    });
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .catalog_prepare => |input| {
@@ -2413,6 +2438,12 @@ pub fn metadataApplyStoreProjection(
                         error.SequenceAdmissionExpired, error.SequenceAdmissionConflict => error.MetadataMutationOutcomeUnknown,
                         else => err,
                     });
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .sql_publication_capture_work => |input| {
+                    if (request.control.version != kernel_owner_abi.query_abi_version) break :blk .invalid_abi;
+                    const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .setting_admin = true, .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
+                    const value = handle.store.sqlPublicationCaptureWork(a, group_id, input, context) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .sql_graph_preparation_read => |input| {
@@ -2829,6 +2860,11 @@ pub fn metadataApplyStoreProjection(
                 .scope_retirement_work => |input| {
                     const value = handle.store.scopeRetirementWorkJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionBytes(alloc, out_json, value);
+                },
+                .store_report_basis => |store_id| {
+                    if (store_id == 0) break :blk storageOwnerStatusFromError(error.InvalidStoreReporterFence);
+                    const value = handle.store.storeReportBasis(a, group_id, store_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .sql_relation_boot => |input| {
                     const value = handle.store.sqlRelationBootJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
@@ -7695,7 +7731,7 @@ pub fn storageOwnerRelationalReadProvider(
     const out: *provider.Provider = @ptrCast(@alignCast(output));
     // Provider callbacks resolve the registry id on every call. Returning the
     // raw Handle here would fail that check and could outlive its generation.
-    out.* = .{ .ptr = owner.?, .vtable = &.{ .open = StorageRelationalRead.open, .try_fence = StorageRelationalRead.tryFence } };
+    out.* = .{ .ptr = owner.?, .vtable = &.{ .open = StorageRelationalRead.open, .try_fence = StorageRelationalRead.tryFence, .open_frozen = StorageRelationalRead.openFrozen } };
     return .ok;
 }
 
@@ -7808,12 +7844,109 @@ pub const StorageRelationalRead = struct {
         return openAny(&handle.db, alloc, from, to, opts);
     }
 
+    const FrozenRead = struct {
+        alloc: std.mem.Allocator,
+        archive: db_mod.DB,
+        session: *db_mod.DB.RelationalReadSession,
+        primary: ?antfly.capi_dependencies.storage_docstore.DocStore.Txn = null,
+        serving_policy: @import("antfly_local_sources").storage_db_row_policy_gate.Gate.Lease,
+
+        fn nextPage(raw: *anyopaque, alloc: std.mem.Allocator, limit: u32) !View.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var page = try self.session.nextViewPage(alloc, limit);
+            errdefer page.deinit();
+            const primary = if (self.primary) |*read| read else return page;
+            const sources = @import("antfly_local_sources");
+            const keys = sources.storage_db_relational_population_contract.frozen_key;
+            const revisions = sources.storage_document_mutation_revision;
+            const backing = page.arena.allocator();
+            const rows = try backing.dupe(View.Row, page.rows);
+            for (rows) |*row| {
+                const birth = try keys.decode(row.id);
+                if (birth.lineage != .surviving) {
+                    row.stale_frozen_birth = true;
+                    continue;
+                }
+                const document = try birth.logicalAlloc(backing);
+                const physical = try sources.storage_internal_keys.relationalRowKeyAlloc(backing, document);
+                const revision_key = revisions.keyForPhysical(physical) orelse return error.InvalidRelationalRowsRequest;
+                // SQL population imports each distinct key into a new owner
+                // once. The primary revision advances even on same-value
+                // writes and survives deletion of the physical row.
+                if (try revisions.load(primary, revision_key) != 1) {
+                    row.stale_frozen_birth = true;
+                    continue;
+                }
+                const value = primary.get(physical) catch |err| switch (err) {
+                    error.NotFound => {
+                        row.stale_frozen_birth = true;
+                        continue;
+                    },
+                    else => return err,
+                };
+                var digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(value, &digest, .{});
+                row.expected_content_digest = digest;
+                row.expected_mutation_revision = 1;
+            }
+            page.rows = rows;
+            return page;
+        }
+
+        fn closeView(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.session.deinit();
+            if (self.primary) |*read| read.abort();
+            self.archive.close();
+            self.serving_policy.release();
+            self.alloc.destroy(self);
+        }
+    };
+
+    pub fn openFrozen(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, binding: antfly.capi_dependencies.relational_read_provider.FrozenBinding, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions) !View {
+        const handle = asHandle(ptr) orelse return error.InvalidArgument;
+        _ = storageOwnerTableName(handle, .fromSlice(table)) orelse return error.InvalidArgument;
+        if (opts.relational_query == null or opts.row_policy_principal_proof.len != 0)
+            return error.SqlStatementSnapshotRequired;
+        if (opts.include_range_proofs or opts.required_sql_indexes.len != 0 or opts.sql_document_preimage)
+            return error.SqlStatementSnapshotRequired;
+        try handle.prepareScanRequest(from, to, opts);
+        // The historic archive cannot grant access that the current owner
+        // has revoked. Retain current RAW-read admission through cursor close.
+        var policy = try handle.db.local_execution.row_policy_gate.enterRawRead();
+        errdefer policy.release();
+        const owned = try alloc.create(FrozenRead);
+        errdefer alloc.destroy(owned);
+        owned.alloc = alloc;
+        owned.serving_policy = policy;
+        owned.archive = handle.db.openPublishedFrozenImage(binding, opts.cancellation orelse .none) catch |err| switch (err) {
+            error.RelationPopulationChanged, error.IdentityNamespaceMismatch => return error.SqlRelationOwnerChanged,
+            else => return err,
+        };
+        errdefer owned.archive.close();
+        const key = @import("antfly_local_sources").storage_db_relational_population_contract.frozen_key;
+        // All births of one logical key occupy a contiguous physical interval.
+        // Apply SQL/routing inclusivity to the entire interval.
+        const start = if (from.len == 0) "" else if (opts.inclusive_from) try key.lower(alloc, from) else try key.upper(alloc, from);
+        defer if (start.len != 0) alloc.free(start);
+        const end = if (to.len == 0) "" else if (opts.exclusive_to) try key.lower(alloc, to) else try key.upper(alloc, to);
+        defer if (end.len != 0) alloc.free(end);
+        owned.primary = if (opts.include_content_hashes) try handle.db.core.store.beginReadTxn() else null;
+        errdefer if (owned.primary) |*read| read.abort();
+        var bounded = opts;
+        bounded.include_content_hashes = false;
+        bounded.inclusive_from = true;
+        bounded.exclusive_to = true;
+        owned.session = try owned.archive.openRelationalReadSession(alloc, start, end, bounded);
+        return .{ .ptr = owned, .vtable = &.{ .next = FrozenRead.nextPage, .close = FrozenRead.closeView } };
+    }
+
     pub fn openAny(db: *db_mod.DB, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions) !View {
         var schema = db.core.acquireSchemaView();
         defer if (schema) |*epoch| epoch.release();
         if (schema == null or schema.?.storageMode() == .document) {
             const session = try db.openDocumentReadSession(alloc, from, to, opts);
-            return .{ .text_filter_digest = session.textFilterDigest(), .ptr = session, .vtable = &.{ .next = nextDocument, .close = closeDocument, .normalize = normalizeDocument, .range_proofs = documentRangeProofs } };
+            return .{ .text_filter_digest = session.textFilterDigest(), .required_indexes_digest = session.requiredIndexesDigest(), .ptr = session, .vtable = &.{ .next = nextDocument, .close = closeDocument, .normalize = normalizeDocument, .range_proofs = documentRangeProofs } };
         }
         const session = try db.openRelationalReadSession(alloc, from, to, opts);
         return .{ .ptr = session, .vtable = &.{ .next = next, .close = close, .normalize = normalize, .range_proofs = rangeProofs } };
@@ -8990,6 +9123,36 @@ pub fn storageOwnerRestoreControlJson(owner_ptr: ?*anyopaque, request: *const ke
     return .ok;
 }
 
+pub fn storageOwnerNativePublicationCaptureControl(owner: ?*anyopaque, request: *const kernel_owner_abi.NativePublicationCaptureControlRequest, out_result: *kernel_owner_abi.OwnedBytes, out_failure: *kernel_owner_abi.FailureIdentity) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    out_failure.* = .{};
+    const Failure = struct {
+        fn result(err: anyerror, out: *kernel_owner_abi.FailureIdentity) kernel_owner_abi.Status {
+            out.* = kernel_error_identity.failureFromError(err, .storage_owner, kernel_owner_abi.abi_version, kernel_owner_abi.NativePublicationCaptureControlRequest.operation);
+            return out.status;
+        }
+    };
+    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.query_abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
+    if (request.control.request_json.len == 0 or request.control.request_json.len > 32 * 1024 or request.control.request_json.ptr == null or request.control.has_execution_deadline > 1 or request.control._reserved0 != 0 or !std.mem.allEqual(u8, &request.control._reserved1, 0)) return Failure.result(error.InvalidArgument, out_failure);
+    const entered = handleRegistry().enter(owner) orelse return Failure.result(error.InvalidArgument, out_failure);
+    defer HandleRegistry.leave(entered[1]);
+    const handle = entered[0];
+    _ = storageOwnerTableName(handle, request.control.table_name) orelse return Failure.result(error.InvalidArgument, out_failure);
+    if (handle.storage_owner_lifetime_recovery) return Failure.result(error.SqlRelationRecoveryIncomplete, out_failure);
+    const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
+    context.ensureActive() catch |err| return Failure.result(err, out_failure);
+    const Capture = @import("antfly_local_sources").system_catalog_logical_replication_capture;
+    const command = std.json.parseFromSlice(Capture.Control, handle.alloc, request.control.request_json.slice(), .{}) catch |err| return Failure.result(err, out_failure);
+    defer command.deinit();
+    if (command.value.binding.owner_group_id != handle.storage_owner_group_id) return Failure.result(error.IdentityNamespaceMismatch, out_failure);
+    var response = BoundedOwnerJsonResponse(32 * 1024).init() catch |err| return Failure.result(err, out_failure);
+    defer response.deinit();
+    const outcome = handle.db.executeNativePublicationCaptureControl(command.value, context) catch |err| return Failure.result(err, out_failure);
+    const used = response.encode(outcome) catch |err| return Failure.result(err, out_failure);
+    out_result.* = response.detach(used);
+    return .ok;
+}
+
 pub fn storageOwnerRelationalTransitionRead(owner_ptr: ?*anyopaque, request: *const kernel_owner_abi.RelationalTransitionReadRequest, out_result: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
     out_result.* = .{};
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
@@ -9038,6 +9201,52 @@ pub fn storageOwnerRelationalTransitionRead(owner_ptr: ?*anyopaque, request: *co
             var result = (handle.db.lookup(alloc, "", .{ .relational_topology_json = "{\"mode\":\"sql_relation_binding\"}" }) catch |err| return storageOwnerStatusFromError(err)) orelse return storageOwnerStatusFromError(error.InvalidSqlRelationPersistence);
             defer result.deinit(alloc);
             output.writer.writeAll(result.json) catch |err| return storageOwnerStatusFromError(err);
+        },
+        .publication_capture_native_observe => |input| {
+            if (input.owner_group_id != handle.storage_owner_group_id) return storageOwnerStatusFromError(error.IdentityNamespaceMismatch);
+            const value = handle.db.observeNativePublicationCaptureOwner(input, .{}) catch |err| return storageOwnerStatusFromError(err);
+            antfly.capi_dependencies.storage_db_relational_integrity_json.write(value, &stream) catch |err| return storageOwnerStatusFromError(err);
+        },
+        .publication_outbox_page => |input| {
+            if (input.reference.group_id != handle.storage_owner_group_id) return storageOwnerStatusFromError(error.IdentityNamespaceMismatch);
+            const bytes = handle.db.readPublicationOutboxPage(alloc, input) catch |err| return storageOwnerStatusFromError(err);
+            defer alloc.free(bytes);
+            output.writer.writeAll(bytes) catch |err| return storageOwnerStatusFromError(err);
+        },
+        .publication_collection => |input| {
+            if (input.debt.reference.group_id != handle.storage_owner_group_id) return storageOwnerStatusFromError(error.IdentityNamespaceMismatch);
+            const value = handle.db.observePublicationCollection(input) catch |err| return storageOwnerStatusFromError(err);
+            antfly.capi_dependencies.storage_db_relational_integrity_json.write(value, &stream) catch |err| return storageOwnerStatusFromError(err);
+        },
+        .replication_source_receipt => |input| {
+            if (input.permit().owner_group_id != handle.storage_owner_group_id) return storageOwnerStatusFromError(error.IdentityNamespaceMismatch);
+            const value = handle.db.observeReplicationSource(input) catch |err| return storageOwnerStatusFromError(err);
+            antfly.capi_dependencies.storage_db_relational_integrity_json.write(value, &stream) catch |err| return storageOwnerStatusFromError(err);
+        },
+        .publication_capture_terminal => |input| {
+            if (input.owner_group_id != handle.storage_owner_group_id) return storageOwnerStatusFromError(error.IdentityNamespaceMismatch);
+            const value = handle.db.observePublicationTerminal(input) catch |err| return storageOwnerStatusFromError(err);
+            antfly.capi_dependencies.storage_db_relational_integrity_json.write(value, &stream) catch |err| return storageOwnerStatusFromError(err);
+        },
+        .publication_capture_outbox => |input| {
+            if (input.owner_group_id != handle.storage_owner_group_id) return storageOwnerStatusFromError(error.IdentityNamespaceMismatch);
+            const value = handle.db.observePublicationOutbox(input) catch |err| return storageOwnerStatusFromError(err);
+            antfly.capi_dependencies.storage_db_relational_integrity_json.write(value, &stream) catch |err| return storageOwnerStatusFromError(err);
+        },
+        .publication_capture_capacity => |input| {
+            if (input.demand.owner_group_id != handle.storage_owner_group_id) return storageOwnerStatusFromError(error.IdentityNamespaceMismatch);
+            const value = handle.db.observePublicationCapacity(input, .{}) catch |err| return storageOwnerStatusFromError(err);
+            antfly.capi_dependencies.storage_db_relational_integrity_json.write(value, &stream) catch |err| return storageOwnerStatusFromError(err);
+        },
+        .publication_capture_observe => |input| {
+            if (input.owner_group_id != handle.storage_owner_group_id) return storageOwnerStatusFromError(error.IdentityNamespaceMismatch);
+            const value = handle.db.observePublicationCaptureOwner(input, .{}) catch |err| return storageOwnerStatusFromError(err);
+            antfly.capi_dependencies.storage_db_relational_integrity_json.write(value, &stream) catch |err| return storageOwnerStatusFromError(err);
+        },
+        .publication_capture_control => |control| {
+            if (control.binding.owner_group_id != handle.storage_owner_group_id) return storageOwnerStatusFromError(error.IdentityNamespaceMismatch);
+            const value = handle.db.observePublicationCaptureControl(control, .{}) catch |err| return storageOwnerStatusFromError(err);
+            antfly.capi_dependencies.storage_db_relational_integrity_json.write(value, &stream) catch |err| return storageOwnerStatusFromError(err);
         },
         .identity => antfly.capi_dependencies.storage_db_relational_integrity_json.write(handle.db.relationalTopologyIdentity() catch |err| return storageOwnerStatusFromError(err), &stream) catch |err| return storageOwnerStatusFromError(err),
         .status => antfly.capi_dependencies.storage_db_relational_integrity_json.write(handle.db.relationalTopologyStatus() catch |err| return storageOwnerStatusFromError(err), &stream) catch |err| return storageOwnerStatusFromError(err),

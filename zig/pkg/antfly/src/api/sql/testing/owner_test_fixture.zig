@@ -419,12 +419,33 @@ pub fn runWithState(comptime Campaign: type, initial: Campaign) !void {
     const session_path = try std.fmt.allocPrint(alloc, "{s}/sql-sessions", .{root});
     defer alloc.free(session_path);
     const local = @import("antfly_local_sources");
-    var session_backend: ?local.storage_lsm_backend.BackendHandle = if (native_sessions) try local.storage_lsm_backend.BackendHandle.open(alloc, session_path, .{}) else null;
+    const native_restore_jobs = if (@hasDecl(Campaign, "native_restore_jobs")) Campaign.native_restore_jobs else false;
+    var session_backend: ?local.storage_lsm_backend.BackendHandle = if (native_sessions or native_restore_jobs) try local.storage_lsm_backend.BackendHandle.open(alloc, session_path, .{}) else null;
     defer if (session_backend) |*backend| backend.close();
-    var session_store: ?local.storage_backend_erased.Store = if (session_backend) |*backend| try backend.backend.runtimeStore(alloc, .{ .name = "system/api-transaction-sessions" }) else null;
+    var session_store: ?local.storage_backend_erased.Store = if (native_sessions) try session_backend.?.backend.runtimeStore(alloc, .{ .name = "system/api-transaction-sessions" }) else null;
     defer if (session_store) |*store| store.deinit();
+    var restore_job_store: ?local.storage_backend_erased.Store = if (native_restore_jobs)
+        try (if (session_backend) |*backend| backend else return error.RestoreJobPersistenceUnavailable).backend.runtimeStore(alloc, .{ .name = "system/api-restore-jobs" })
+    else
+        null;
+    defer if (restore_job_store) |*store| store.deinit();
     var sessions = if (session_store) |*store| @import("../../transactions.zig").DurableSessionStore.initRuntime(alloc, store) else null;
     defer if (sessions) |*store| store.deinitVolatilePayloads();
+    const shared_artifacts = if (@hasDecl(Campaign, "shared_artifacts")) Campaign.shared_artifacts else false;
+    const artifact_path: ?[]u8 = if (shared_artifacts) try std.fmt.allocPrint(alloc, "{s}/shared-artifacts", .{root}) else null;
+    defer if (artifact_path) |path| alloc.free(path);
+    const FsStore = @import("../../../serverless/artifacts/fs_store.zig").FsStore;
+    var artifact_owner: ?FsStore = if (artifact_path) |path| try FsStore.init(alloc, path) else null;
+    defer if (artifact_owner) |*owner| owner.deinit();
+    const artifact_store = if (artifact_owner) |*owner| store: {
+        var store = owner.artifactStore();
+        store.shared_across_owners = true;
+        var identity: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(artifact_path.?, &identity, .{});
+        store.namespace_identity = identity;
+        break :store store;
+    } else null;
+    const metadata_auth = if (@hasDecl(Campaign, "metadata_auth_disabled")) !Campaign.metadata_auth_disabled else true;
     const metadata_cfg: metadata_runtime.ServerConfig = .{
         .local_node_id = 1,
         .metadata_group_id = 2188,
@@ -432,7 +453,7 @@ pub fn runWithState(comptime Campaign: type, initial: Campaign) !void {
         .replica_catalog_path = meta_catalog,
         .snapshot_root_dir = snapshots,
         .observe_local_replica_root = true,
-        .api_server_cfg = .{ .node_config = if (@hasDecl(Campaign, "nodeConfig")) campaign.nodeConfig() else null, .auth_enabled = true, .user_manager = &auth_manager, .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = issuer, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce" },
+        .api_server_cfg = .{ .document_artifact_store = artifact_store, .node_config = if (@hasDecl(Campaign, "nodeConfig")) campaign.nodeConfig() else null, .auth_enabled = metadata_auth, .user_manager = if (metadata_auth) &auth_manager else null, .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = issuer, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce" },
     };
     var metadata = try metadata_runtime.Server.init(process_alloc, metadata_cfg);
     var metadata_live = true;
@@ -457,7 +478,7 @@ pub fn runWithState(comptime Campaign: type, initial: Campaign) !void {
         .replica_root_dir = data_root,
         .replica_catalog_path = data_catalog,
         .store_registration = .{ .node_id = 9, .store_id = 9, .role = "data" },
-        .api_server_cfg = .{ .node_config = if (@hasDecl(Campaign, "nodeConfig")) campaign.nodeConfig() else null, .deployment_mode = .distributed, .sql_preparation_secret = "fixture-private-sql-preparation-key-v1-32bytes", .sql_preparation_issuer = issuer, .auth_enabled = native_auth, .user_manager = if (native_auth) &auth_manager else null, .trusted_principal_secret = if (public_anonymous) null else trusted_secret, .trusted_principal_issuer = issuer, .setting_authority_secret = if (public_anonymous) trusted_secret else null, .setting_authority_issuer = if (public_anonymous) issuer else null, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce", .session_store = if (sessions) |*store| store else null },
+        .api_server_cfg = .{ .document_artifact_store = artifact_store, .node_config = if (@hasDecl(Campaign, "nodeConfig")) campaign.nodeConfig() else null, .deployment_mode = .distributed, .sql_preparation_secret = "fixture-private-sql-preparation-key-v1-32bytes", .sql_preparation_issuer = issuer, .auth_enabled = native_auth, .user_manager = if (native_auth) &auth_manager else null, .trusted_principal_secret = if (public_anonymous) null else trusted_secret, .trusted_principal_issuer = issuer, .setting_authority_secret = if (public_anonymous) trusted_secret else null, .setting_authority_issuer = if (public_anonymous) issuer else null, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce", .session_store = if (sessions) |*store| store else null, .restore_job_store = if (restore_job_store) |*store| store else null },
     }, metadata_uri);
     var data_live = true;
     defer if (data_live) data.deinit();
@@ -554,10 +575,17 @@ pub fn runWithState(comptime Campaign: type, initial: Campaign) !void {
         sessions = null;
         if (session_store) |*store| store.deinit();
         session_store = null;
+        if (restore_job_store) |*store| store.deinit();
+        restore_job_store = null;
         if (session_backend) |*backend| backend.close();
         session_backend = null;
-        if (native_sessions) {
+        if (native_sessions or native_restore_jobs) {
             session_backend = try local.storage_lsm_backend.BackendHandle.open(alloc, session_path, .{});
+        }
+        if (native_restore_jobs) {
+            restore_job_store = try session_backend.?.backend.runtimeStore(alloc, .{ .name = "system/api-restore-jobs" });
+        }
+        if (native_sessions) {
             session_store = try session_backend.?.backend.runtimeStore(alloc, .{ .name = "system/api-transaction-sessions" });
             sessions = @import("../../transactions.zig").DurableSessionStore.initRuntime(alloc, &session_store.?);
         }
@@ -584,7 +612,7 @@ pub fn runWithState(comptime Campaign: type, initial: Campaign) !void {
         .replica_root_dir = data_root,
         .replica_catalog_path = data_catalog,
         .store_registration = .{ .node_id = 9, .store_id = 9, .role = "data" },
-        .api_server_cfg = .{ .node_config = if (@hasDecl(Campaign, "nodeConfig")) campaign.nodeConfig() else null, .deployment_mode = .distributed, .sql_preparation_secret = "fixture-private-sql-preparation-key-v1-32bytes", .sql_preparation_issuer = issuer, .auth_enabled = native_auth, .user_manager = if (native_auth) &auth_manager else null, .trusted_principal_secret = if (public_anonymous) null else trusted_secret, .trusted_principal_issuer = issuer, .setting_authority_secret = if (public_anonymous) trusted_secret else null, .setting_authority_issuer = if (public_anonymous) issuer else null, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce", .session_store = if (sessions) |*store| store else null },
+        .api_server_cfg = .{ .document_artifact_store = artifact_store, .node_config = if (@hasDecl(Campaign, "nodeConfig")) campaign.nodeConfig() else null, .deployment_mode = .distributed, .sql_preparation_secret = "fixture-private-sql-preparation-key-v1-32bytes", .sql_preparation_issuer = issuer, .auth_enabled = native_auth, .user_manager = if (native_auth) &auth_manager else null, .trusted_principal_secret = if (public_anonymous) null else trusted_secret, .trusted_principal_issuer = issuer, .setting_authority_secret = if (public_anonymous) trusted_secret else null, .setting_authority_issuer = if (public_anonymous) issuer else null, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce", .session_store = if (sessions) |*store| store else null, .restore_job_store = if (restore_job_store) |*store| store else null },
     }, metadata_uri);
     data_live = true;
     if (@hasDecl(Campaign, "configureData")) try campaign.configureData(&data, io_impl.io());

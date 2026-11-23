@@ -117,7 +117,7 @@ fn lostAckOperation(ctx: *fixture.Context, procedure: bool, comment: bool, aggre
     defer gateway.deinit();
     gateway.embedding_provider_runtime.io = ctx.io;
     var identity: ?http.AuthenticatedIdentity = null;
-    var adapter: @import("../../../sql_execution.zig").Adapter = .{ .server = &gateway, .identity = &identity, .context = .{} };
+    var adapter: @import("../../execution/execution.zig").Adapter = .{ .server = &gateway, .identity = &identity, .context = .{} };
     defer adapter.releaseExecutionOwners();
     const padding = try ctx.alloc.alloc(u8, 12000);
     defer ctx.alloc.free(padding);
@@ -135,7 +135,7 @@ fn lostAckOperation(ctx: *fixture.Context, procedure: bool, comment: bool, aggre
     defer ctx.alloc.free(text);
     var parsed = try local.sql_compiler.compile(ctx.alloc, text, .{});
     defer parsed.deinit();
-    const outcome = try @import("../../../sql_routine_ddl.zig").execute(&adapter, .{ .result = ctx.alloc, .scratch = ctx.alloc }, parsed.statement.catalog_ddl);
+    const outcome = try @import("../../catalog/routine_ddl.zig").execute(&adapter, .{ .result = ctx.alloc, .scratch = ctx.alloc }, parsed.statement.catalog_ddl);
     const receipt = outcome.catalog_receipt orelse return error.MissingRoutineReceipt;
     defer receipt.deinit(ctx.alloc);
     try std.testing.expectEqual(.unknown, receipt.state);
@@ -147,7 +147,7 @@ fn lostAckOperation(ctx: *fixture.Context, procedure: bool, comment: bool, aggre
     // Publication of unrelated functions cannot replace this exact receipt.
     try command(ctx, "CREATE OR REPLACE FUNCTION unrelated_ack() RETURNS text LANGUAGE sql AS $$SELECT 'ok'$$");
     probe.hidden = false;
-    const recovered = try @import("../../../sql_catalog_recovery.zig").recover(&gateway, null, .{}, ctx.alloc, receipt.recovery_token);
+    const recovered = try @import("../../recovery/catalog_recovery.zig").recover(&gateway, null, .{}, ctx.alloc, receipt.recovery_token);
     defer recovered.deinit(ctx.alloc);
     try std.testing.expectEqual(.committed, recovered.state);
     try std.testing.expect(recovered.object_id != null);
@@ -299,4 +299,116 @@ test "mounted SQL original trigger-function definitions preserve authenticated d
         try std.testing.expectEqualStrings((try corpus.get(id)).sql, entry.sql);
     }
     try fixture.runWithState(TriggerCampaign, .{ .reference = reference.value });
+}
+
+const FunctionSupportReference = struct {
+    format: u8,
+    reference: []const u8,
+    original: struct { id: []const u8, sql: []const u8, sqlstate: []const u8 },
+    bootstrap: []const []const u8,
+    setup: []const []const u8,
+    probes: []const struct { sql: []const u8, sqlstate: []const u8 },
+    query: []const u8,
+    output: Output,
+    target_absent: bool,
+    preserved_on_refusal: bool,
+    search_path: []const u8,
+};
+const FunctionSupportCampaign = struct {
+    pub const native_auth = true;
+    pub const native_sessions = true;
+    pub const cold_catalog = true;
+    pub const configureAuth = Campaign.configureAuth;
+    reference: FunctionSupportReference,
+    credentials: client.ApiKeyHeaders = .{},
+
+    fn snapshot(ctx: *fixture.Context) !std.json.Parsed(local.system_catalog_domain.State) {
+        const source = @import("../../../http_server.zig").StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+        const bytes = try source.systemCatalog(ctx.alloc, .{}, .snapshot);
+        defer ctx.alloc.free(bytes);
+        return std.json.parseFromSlice(local.system_catalog_domain.State, ctx.alloc, bytes, .{ .allocate = .alloc_always });
+    }
+    fn unchanged(ctx: *fixture.Context, before: local.system_catalog_domain.State) !void {
+        var after = try snapshot(ctx);
+        defer after.deinit();
+        try std.testing.expectEqualDeep(before, after.value);
+        for (after.value.resources) |resource| if (resource.kind == .routine) {
+            try std.testing.expect(!std.mem.eql(u8, resource.name, "support_audit"));
+        };
+    }
+    fn verify(self: *@This(), ctx: *fixture.Context) !void {
+        var before = try snapshot(ctx);
+        defer before.deinit();
+        for (self.reference.probes) |probe| {
+            try rejected(ctx, probe.sql, probe.sqlstate);
+            try unchanged(ctx, before.value);
+        }
+        try observe(ctx, self.reference.query, self.reference.output);
+        // A reader cannot use SUPPORT resolution to inspect an unauthorized
+        // CREATE scope. This refusal must also leave all catalog state intact.
+        var denied = try request(ctx, self.reference.original.sql, true);
+        defer denied.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 403), denied.status);
+        try unchanged(ctx, before.value);
+    }
+    fn searchPath(self: *@This(), ctx: *fixture.Context) !void {
+        var authenticated = ctx.*;
+        authenticated.headers = ctx.admin_headers;
+        var response = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.base, "/db/v1/sql/connections", .POST, "{}", 15_000);
+        defer response.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        var parsed = try std.json.parseFromSlice(wire.SQLConnectionResponse, ctx.alloc, response.body, .{});
+        defer parsed.deinit();
+        const connection = parsed.value.connection_id;
+        const statement = try std.fmt.allocPrint(ctx.alloc, "SET search_path TO {s}", .{self.reference.search_path});
+        defer ctx.alloc.free(statement);
+        var set = try client.executeConnected(&authenticated, null, connection, statement, .never);
+        defer set.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 200), set.status);
+        var before = try snapshot(ctx);
+        defer before.deinit();
+        var rejected_response = try client.executeConnected(&authenticated, null, connection, self.reference.original.sql, .never);
+        defer rejected_response.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 400), rejected_response.status);
+        var diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, ctx.alloc, rejected_response.body, .{});
+        defer diagnostic.deinit();
+        try std.testing.expectEqualStrings(self.reference.original.sqlstate, diagnostic.value.code);
+        try unchanged(ctx, before.value);
+        const suffix = try std.fmt.allocPrint(ctx.alloc, "/db/v1/sql/connections/{s}", .{connection});
+        defer ctx.alloc.free(suffix);
+        var closed = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.base, suffix, .DELETE, null, 15_000);
+        defer closed.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 200), closed.status);
+    }
+    pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+        try self.credentials.activateWithCatalog(ctx, true);
+        for (self.reference.bootstrap) |statement| try command(ctx, statement);
+        var before = try snapshot(ctx);
+        defer before.deinit();
+        try rejected(ctx, self.reference.original.sql, self.reference.original.sqlstate);
+        try unchanged(ctx, before.value);
+        for (self.reference.setup) |statement| try command(ctx, statement);
+        try self.verify(ctx);
+        try self.searchPath(ctx);
+    }
+    pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+        try self.verify(ctx);
+        try self.searchPath(ctx);
+    }
+};
+
+test "mounted SQL original planner SUPPORT rejects absent internal signatures without publication across cold owners" {
+    // sql-0394 runs unchanged before and after real same-name text overloads.
+    const a = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(FunctionSupportReference, a, local.sql_parity_fixtures.function_support_reference, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const reference = parsed.value;
+    try std.testing.expectEqual(@as(u8, 1), reference.format);
+    try std.testing.expectEqualStrings("PostgreSQL exact SUPPORT catalog admission", reference.reference);
+    try std.testing.expectEqualStrings("sql-0394", reference.original.id);
+    try std.testing.expect(reference.target_absent and reference.preserved_on_refusal);
+    var corpus = try local.sql_parity_fixtures.Corpus.init(a);
+    defer corpus.deinit();
+    try std.testing.expectEqualStrings((try corpus.get("sql-0394")).sql, reference.original.sql);
+    try fixture.runWithState(FunctionSupportCampaign, .{ .reference = reference });
 }

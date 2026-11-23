@@ -23,7 +23,7 @@ test {
     _ = @import("api/tables.zig");
     _ = @import("api/fk_generation_publication_coordinator.zig");
     _ = @import("api/fk_initial_create_coordinator.zig");
-    _ = @import("api/sql_truncate.zig");
+    _ = @import("api/sql/catalog/truncate.zig");
     _ = @import("api/relational_row_merge.zig");
     _ = @import("api/relational_index/mutation.zig");
     _ = @import("api/relational_index/maintenance.zig");

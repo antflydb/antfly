@@ -263,7 +263,7 @@ test "graph preparation schema NONE is distinct from version zero schema and exa
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const graph: @import("../storage/db/prepared_graph_effects.zig").Admission = .{ .metadata_group_id = 11, .incarnation = @splat(1), .source_revision = 9, .table_id = 7, .schema_digest = @import("../storage/db/relational_schema_owner_contract.zig").hash(""), .indexes = &.{.{ .name = "g", .digest = @splat(3) }} };
+    const graph: @import("../storage/db/prepared_graph_effects.zig").Admission = .{ .metadata_group_id = 11, .incarnation = @splat(1), .source_revision = 9, .table_id = 7, .schema_digest = @import("../storage/db/relational/schema_change/schema_owner_contract.zig").hash(""), .indexes = &.{.{ .name = "g", .digest = @splat(3) }} };
     var absent = try manifests.Absence.fromAdmission(graph, 0);
     absent.schema_present = false;
     try absent.requireNoSchema();
@@ -294,7 +294,7 @@ test "graph preparation schema NONE is distinct from version zero schema and exa
             return 0;
         }
         pub fn validator(_: @This()) ?struct { source_digest: ?[32]u8 } {
-            return .{ .source_digest = @import("../storage/db/relational_schema_owner_contract.zig").hash("") };
+            return .{ .source_digest = @import("../storage/db/relational/schema_change/schema_owner_contract.zig").hash("") };
         }
     };
     try std.testing.expectError(error.CatalogGenerationChanged, admission.verify(a, ZeroView{}, request, "actual-user-authority-key", "issuer", 101, false));

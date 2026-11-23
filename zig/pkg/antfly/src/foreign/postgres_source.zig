@@ -28,6 +28,75 @@ fn ensureExecutionDeadline(deadline_ns: ?u64) !void {
     if (platform_time.monotonicNs() >= deadline) return error.Timeout;
 }
 
+test "postgres source native cleanup owns optional publication copies on executor failure and allocation cuts" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        original_slot: [*]const u8,
+        original_publication: ?[*]const u8 = null,
+        failed: bool = false,
+        calls: usize = 0,
+        fn query(_: *anyopaque, allocator: Allocator, _: []const u8, prepared: sql.PreparedQuery, _: ?u64, _: ?CancellationToken) !foreign_source.QueryResult {
+            var owned = prepared;
+            defer owned.deinit(allocator);
+            return error.TestUnexpectedResult;
+        }
+        fn statistics(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !foreign_source.TableStatistics {
+            return error.TestUnexpectedResult;
+        }
+        fn cleanup(raw: *anyopaque, _: Allocator, _: []const u8, params: foreign_source.ReplicationCleanupParams) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expect(params.slot_name.ptr != self.original_slot);
+            if (self.original_publication) |original| {
+                try std.testing.expect(params.publication_name.?.ptr != original);
+            } else try std.testing.expect(params.publication_name == null);
+            if (params.native_source) |native| {
+                try std.testing.expect(params.publication_name == null);
+                try std.testing.expectEqual(@as([32]u8, @splat(1)), native.provider_identity);
+            } else try std.testing.expect(params.publication_name != null);
+            if (self.failed) return error.TestCleanupFailure;
+        }
+        fn check(_: *anyopaque) !void {}
+        fn observe(_: *anyopaque, _: foreign_source.SubscriptionOrigin.Observation) !void {
+            return error.TestUnexpectedResult;
+        }
+        fn acknowledged(_: *anyopaque, _: []const u8) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    const slot = "antfly_owned_slot";
+    const publication = "antfly_owned_publication";
+    var fixture: Fixture = .{ .original_slot = slot.ptr };
+    var registry: foreign_source.Registry = .{};
+    defer registry.deinit(a);
+    try registerExecutor(a, &registry, .{ .ptr = &fixture, .vtable = &.{ .query = Fixture.query, .statistics = Fixture.statistics, .cleanup_replication = Fixture.cleanup } });
+    var source = try registry.create(a, .{ .kind = .postgres, .dsn = try a.dupe(u8, "postgres://fixture") });
+    defer source.deinit(a);
+    var params: foreign_source.ReplicationCleanupParams = .{
+        .slot_name = @constCast(slot),
+        .native_source = .{ .provider_identity = @splat(1), .snapshot_checkpoint = 1, .durable_checkpoint = 1, .lock_name = "actual-source-lock", .authority = .{ .ptr = &fixture, .check_fn = Fixture.check, .observe_fn = Fixture.observe, .acknowledged_fn = Fixture.acknowledged } },
+    };
+    const Probe = struct {
+        fn run(allocator: Allocator, src: foreign_source.Source, request: foreign_source.ReplicationCleanupParams) !void {
+            src.cleanupReplication(allocator, request) catch |err| switch (err) {
+                error.TestCleanupFailure => return,
+                else => return err,
+            };
+            return error.TestUnexpectedResult;
+        }
+    };
+    const native = params.native_source;
+    for ([_]bool{ false, true }) |owns_publication| {
+        params.native_source = if (owns_publication) null else native;
+        params.publication_name = if (owns_publication) @constCast(publication) else null;
+        fixture.original_publication = if (owns_publication) publication.ptr else null;
+        fixture.failed = false;
+        try source.cleanupReplication(a, params);
+        fixture.failed = true;
+        try std.testing.checkAllAllocationFailures(a, Probe.run, .{ source, params });
+    }
+}
+
 pub const QueryExecutor = struct {
     ptr: *anyopaque,
     vtable: *const QueryExecutor.VTable,
@@ -38,8 +107,46 @@ pub const QueryExecutor = struct {
 
         pub const VTable = struct {
             deinit: *const fn (ptr: *anyopaque, alloc: Allocator) void,
+            abort_subscription: ?*const fn (*anyopaque, Allocator) anyerror!void = null,
+            capture_query: ?*const fn (*anyopaque, Allocator, sql.PreparedQuery, usize, ?u64) anyerror!foreign_source.QueryResult = null,
+            capture_query_control: ?*const fn (*anyopaque, Allocator, sql.PreparedQuery, usize, ?u64, CancellationToken) anyerror!foreign_source.QueryResult = null,
+            replication_identity_control: ?*const fn (*anyopaque, Allocator, []const u8, ?u64, CancellationToken) anyerror!foreign_source.ReplicationIdentity = null,
+            replication_identity: ?*const fn (*anyopaque, Allocator, []const u8, ?u64) anyerror!foreign_source.ReplicationIdentity = null,
             query: *const fn (ptr: *anyopaque, alloc: Allocator, prepared: sql.PreparedQuery, execution_deadline_ns: ?u64) anyerror!foreign_source.QueryResult,
         };
+
+        pub fn capturePreparedControlled(self: @This(), a: Allocator, prepared: sql.PreparedQuery, rows: usize, deadline: u64, cancellation: CancellationToken) !foreign_source.QueryResult {
+            const callback = self.vtable.capture_query_control orelse {
+                var owned = prepared;
+                owned.deinit(a);
+                return error.UnsupportedExactCutover;
+            };
+            cancellation.check() catch |err| {
+                var owned = prepared;
+                owned.deinit(a);
+                return err;
+            };
+            return callback(self.ptr, a, prepared, rows, deadline, cancellation);
+        }
+        pub fn replicationIdentityControlled(self: @This(), a: Allocator, table: []const u8, deadline: u64, cancellation: CancellationToken) !foreign_source.ReplicationIdentity {
+            const callback = self.vtable.replication_identity_control orelse return error.UnsupportedExactCutover;
+            try cancellation.check();
+            return callback(self.ptr, a, table, deadline, cancellation);
+        }
+
+        pub fn capturePrepared(self: @This(), a: Allocator, prepared: sql.PreparedQuery, page_rows: usize, deadline: ?u64) !foreign_source.QueryResult {
+            const callback = self.vtable.capture_query orelse {
+                var owned = prepared;
+                owned.deinit(a);
+                return error.UnsupportedConsistentSnapshot;
+            };
+            return callback(self.ptr, a, prepared, page_rows, deadline);
+        }
+
+        pub fn replicationIdentity(self: @This(), a: Allocator, table: []const u8, deadline: ?u64) !?foreign_source.ReplicationIdentity {
+            const callback = self.vtable.replication_identity orelse return null;
+            return try callback(self.ptr, a, table, deadline);
+        }
 
         pub fn deinit(self: *@This(), alloc: Allocator) void {
             self.vtable.deinit(self.ptr, alloc);
@@ -57,17 +164,65 @@ pub const QueryExecutor = struct {
     };
 
     pub const PreparedReplicationSnapshot = struct {
+        origin: ?foreign_source.ReplicationIdentity = null,
         checkpoint: []u8,
+        snapshot_token: ?[]u8 = null,
         snapshot_query: SnapshotQuery,
 
         pub fn deinit(self: *@This(), alloc: Allocator) void {
             alloc.free(self.checkpoint);
+            if (self.snapshot_token) |token| alloc.free(token);
             self.snapshot_query.deinit(alloc);
             self.* = undefined;
         }
     };
 
+    pub const PreparedSubscriptionSnapshot = struct {
+        origin: foreign_source.SubscriptionOrigin.Observation,
+        checkpoint: []u8,
+        snapshot_token: []u8,
+        snapshot_query: SnapshotQuery,
+        next_relation: usize = 0,
+        /// Sequential cursors share the exact one imported roster cut. Every
+        /// page uses the frozen publisher projection/predicate and actual OID.
+        pub fn captureRelation(self: *@This(), a: Allocator, relation_id: u32, page_rows: usize, deadline: u64, cancellation: CancellationToken) !foreign_source.QueryResult {
+            try ensureExecutionDeadline(deadline);
+            if (self.next_relation >= self.origin.relations.len or self.origin.relations[self.next_relation].id != relation_id) return error.InvalidReplicationSnapshotCursor;
+            const relation = self.origin.relations[self.next_relation];
+            const namespace = try sql.postgresDialect().quote_identifier(a, relation.namespace);
+            defer a.free(namespace);
+            const name = try sql.postgresDialect().quote_identifier(a, relation.name);
+            defer a.free(name);
+            const table = try std.fmt.allocPrint(a, "{s}.{s}", .{ namespace, name });
+            defer a.free(table);
+            const actual = try self.snapshot_query.replicationIdentityControlled(a, table, deadline, cancellation);
+            if (actual.relation_id != relation.id or !std.mem.eql(u8, &actual.provider_identity, &self.origin.provider_identity)) return error.ForeignProviderIdentityMismatch;
+            const fields = try a.alloc([]const u8, relation.columns.len);
+            defer a.free(fields);
+            for (relation.columns, fields) |column, *field| field.* = column.name;
+            const statement = try sql.buildSelectStatementAlloc(a, sql.postgresDialect(), .{ .table = table, .fields = fields, .where_sql = relation.row_filter });
+            var result = try self.snapshot_query.capturePreparedControlled(a, .{ .sql_text = statement, .args = &.{} }, page_rows, deadline, cancellation);
+            errdefer result.deinit(a);
+            try ensureExecutionDeadline(deadline);
+            if (result.rows.len == 0) self.next_relation += 1;
+            return result;
+        }
+        pub fn deinit(self: *@This(), a: Allocator) void {
+            self.origin.deinit(a);
+            a.free(self.checkpoint);
+            a.free(self.snapshot_token);
+            self.snapshot_query.deinit(a);
+            self.* = undefined;
+        }
+    };
+
     pub const VTable = struct {
+        transaction_envelopes: bool = false,
+        begin_subscription_snapshot: ?*const fn (*anyopaque, Allocator, []const u8, foreign_source.SubscriptionRequest) anyerror!PreparedSubscriptionSnapshot = null,
+        poll_subscription: ?*const fn (*anyopaque, Allocator, []const u8, foreign_source.SubscriptionRequest) anyerror!foreign_source.SubscriptionPollResult = null,
+        acknowledge_subscription: ?*const fn (*anyopaque, Allocator, []const u8, foreign_source.SubscriptionRequest) anyerror!void = null,
+
+        begin_replication_snapshot_query: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!SnapshotQuery = null,
         deinit: ?*const fn (ptr: *anyopaque, alloc: Allocator) void = null,
         query: *const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, prepared: sql.PreparedQuery, execution_deadline_ns: ?u64, cancellation: ?CancellationToken) anyerror!foreign_source.QueryResult,
         statistics: *const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, table: []const u8) anyerror!foreign_source.TableStatistics,
@@ -120,6 +275,12 @@ pub const QueryExecutor = struct {
         return try begin_fn(self.ptr, alloc, dsn);
     }
 
+    pub fn beginReplicationSnapshotQuery(self: @This(), a: Allocator, dsn: []const u8) !SnapshotQuery {
+        if (self.vtable.begin_replication_snapshot_query) |callback| return try callback(self.ptr, a, dsn);
+        if (self.vtable.transaction_envelopes) return error.UnsupportedConsistentSnapshot;
+        return self.beginSnapshotQuery(a, dsn);
+    }
+
     pub fn beginPreparedReplicationSnapshot(
         self: @This(),
         alloc: Allocator,
@@ -141,7 +302,27 @@ pub const QueryExecutor = struct {
         return try poll_fn(self.ptr, alloc, dsn, params);
     }
 
+    pub fn beginSubscriptionSnapshot(self: @This(), a: Allocator, dsn: []const u8, request: foreign_source.SubscriptionRequest) !PreparedSubscriptionSnapshot {
+        try request.validate(a);
+        try ensureExecutionDeadline(request.execution_deadline_ns);
+        const callback = self.vtable.begin_subscription_snapshot orelse return error.UnsupportedExactCutover;
+        return callback(self.ptr, a, dsn, request);
+    }
+    pub fn pollSubscription(self: @This(), a: Allocator, dsn: []const u8, request: foreign_source.SubscriptionRequest) !foreign_source.SubscriptionPollResult {
+        try request.validate(a);
+        try ensureExecutionDeadline(request.execution_deadline_ns);
+        const callback = self.vtable.poll_subscription orelse return error.UnsupportedReplicationStreaming;
+        return callback(self.ptr, a, dsn, request);
+    }
+    pub fn acknowledgeSubscription(self: @This(), a: Allocator, dsn: []const u8, request: foreign_source.SubscriptionRequest) !void {
+        try request.validate(a);
+        try ensureExecutionDeadline(request.execution_deadline_ns);
+        const callback = self.vtable.acknowledge_subscription orelse return error.UnsupportedReplicationStreaming;
+        return callback(self.ptr, a, dsn, request);
+    }
+
     pub fn cleanupReplication(self: @This(), alloc: Allocator, dsn: []const u8, params: foreign_source.ReplicationCleanupParams) !void {
+        try params.check();
         const cleanup_fn = self.vtable.cleanup_replication orelse return error.UnsupportedReplicationCleanup;
         return try cleanup_fn(self.ptr, alloc, dsn, params);
     }
@@ -237,21 +418,71 @@ pub const RuntimeSource = struct {
     }
 
     pub fn asSource(self: *@This()) foreign_source.Source {
-        return .{
-            .ptr = self,
-            .vtable = &.{
-                .deinit = RuntimeSource.destroy,
-                .query = RuntimeSource.query,
-                .aggregate = aggregate,
-                .statistics = statistics,
-                .statistics_with_deadline = statisticsWithDeadline,
-                .begin_snapshot_query = beginSnapshotQuery,
-                .begin_prepared_replication_snapshot = beginPreparedReplicationSnapshot,
-                .prepare_replication = prepareReplication,
-                .poll_changes = pollChanges,
-                .cleanup_replication = cleanupReplication,
-            },
+        // Every table is compile-time storage. Building &.{...} with a
+        // runtime capability inside would return an escaping stack pointer.
+        const legacy: foreign_source.Source.VTable = .{
+            .begin_replication_snapshot_query = beginReplicationSnapshotQuery,
+            .deinit = RuntimeSource.destroy,
+            .query = RuntimeSource.query,
+            .aggregate = aggregate,
+            .statistics = statistics,
+            .statistics_with_deadline = statisticsWithDeadline,
+            .begin_snapshot_query = beginSnapshotQuery,
+            .begin_prepared_replication_snapshot = beginPreparedReplicationSnapshot,
+            .prepare_replication = prepareReplication,
+            .poll_changes = pollChanges,
+            .cleanup_replication = cleanupReplication,
         };
+        const atomic: foreign_source.Source.VTable = comptime block: {
+            var table = legacy;
+            table.transaction_envelopes = true;
+            break :block table;
+        };
+        const subscription: foreign_source.Source.VTable = comptime block: {
+            var table = atomic;
+            table.subscription_transactions = true;
+            table.begin_subscription_snapshot = beginSubscriptionSnapshot;
+            table.poll_subscription = pollSubscription;
+            table.acknowledge_subscription = acknowledgeSubscription;
+            break :block table;
+        };
+        const has_subscription = self.executor.vtable.transaction_envelopes and self.executor.vtable.begin_subscription_snapshot != null and
+            self.executor.vtable.poll_subscription != null and self.executor.vtable.acknowledge_subscription != null;
+        return .{ .ptr = self, .vtable = if (has_subscription) &subscription else if (self.executor.vtable.transaction_envelopes) &atomic else &legacy };
+    }
+
+    const SubscriptionReader = struct {
+        value: QueryExecutor.PreparedSubscriptionSnapshot,
+        fn close(ptr: *anyopaque, a: Allocator) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.value.deinit(a);
+            a.destroy(self);
+        }
+        fn abort(ptr: *anyopaque, a: Allocator) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const reader = self.value.snapshot_query;
+            const cancel = reader.vtable.abort_subscription orelse return error.UnsupportedReplicationCleanup;
+            try cancel(reader.ptr, a);
+        }
+        fn capture(ptr: *anyopaque, a: Allocator, relation: u32, rows: usize, deadline: u64, cancellation: CancellationToken) !foreign_source.QueryResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.value.captureRelation(a, relation, rows, deadline, cancellation);
+        }
+    };
+    fn beginSubscriptionSnapshot(ptr: *anyopaque, a: Allocator, request: foreign_source.SubscriptionRequest) !foreign_source.SubscriptionSnapshot {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const reader = try a.create(SubscriptionReader);
+        errdefer a.destroy(reader);
+        reader.* = .{ .value = try self.executor.beginSubscriptionSnapshot(a, self.dsn, request) };
+        return .{ .ptr = reader, .vtable = &.{ .deinit = SubscriptionReader.close, .abort = SubscriptionReader.abort, .capture_relation = SubscriptionReader.capture }, .origin = reader.value.origin, .checkpoint = reader.value.checkpoint, .snapshot_token = reader.value.snapshot_token };
+    }
+    fn pollSubscription(ptr: *anyopaque, a: Allocator, request: foreign_source.SubscriptionRequest) !foreign_source.SubscriptionPollResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.executor.pollSubscription(a, self.dsn, request);
+    }
+    fn acknowledgeSubscription(ptr: *anyopaque, a: Allocator, request: foreign_source.SubscriptionRequest) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.executor.acknowledgeSubscription(a, self.dsn, request);
     }
 
     fn destroy(ptr: *anyopaque, _: Allocator) void {
@@ -406,13 +637,22 @@ pub const RuntimeSource = struct {
         }
 
         fn asSnapshotReader(self: *@This()) foreign_source.SnapshotReader {
-            return .{
-                .ptr = self,
-                .vtable = &.{
-                    .deinit = RuntimeSnapshotReader.destroy,
-                    .query = RuntimeSnapshotReader.query,
-                },
+            const ordinary: foreign_source.SnapshotReader.VTable = .{
+                .deinit = RuntimeSnapshotReader.destroy,
+                .query = RuntimeSnapshotReader.query,
             };
+            const replication: foreign_source.SnapshotReader.VTable = .{
+                .deinit = RuntimeSnapshotReader.destroy,
+                .query = RuntimeSnapshotReader.query,
+                .capture_query = RuntimeSnapshotReader.capture,
+                .replication_identity = RuntimeSnapshotReader.replicationIdentity,
+            };
+            return .{ .ptr = self, .vtable = if (self.snapshot_query.vtable.replication_identity != null) &replication else &ordinary };
+        }
+
+        fn replicationIdentity(ptr: *anyopaque, a: Allocator, table: []const u8, deadline: ?u64) !foreign_source.ReplicationIdentity {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return (try self.snapshot_query.replicationIdentity(a, table, deadline)) orelse error.UnsupportedReplicationStreaming;
         }
 
         fn destroy(ptr: *anyopaque, _: Allocator) void {
@@ -422,7 +662,14 @@ pub const RuntimeSource = struct {
             alloc.destroy(self);
         }
 
+        fn capture(ptr: *anyopaque, a: Allocator, params: foreign_source.QueryParams) !foreign_source.QueryResult {
+            if (params.offset != 0 or params.limit == null or params.limit.? == 0 or params.limit.? > 4096) return error.InvalidReplicationSnapshotCursor;
+            return queryMode(ptr, a, params, true);
+        }
         fn query(ptr: *anyopaque, alloc: Allocator, params: foreign_source.QueryParams) !foreign_source.QueryResult {
+            return queryMode(ptr, alloc, params, false);
+        }
+        fn queryMode(ptr: *anyopaque, alloc: Allocator, params: foreign_source.QueryParams, capturing: bool) !foreign_source.QueryResult {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try ensureExecutionDeadline(params.execution_deadline_ns);
             var owned_params = try cloneQueryParamsAlloc(alloc, params);
@@ -464,8 +711,8 @@ pub const RuntimeSource = struct {
                     .fields = owned_params.fields,
                     .where_sql = if (translated_filter) |value| if (value.where_sql.len > 0) value.where_sql else null else null,
                     .order_by = owned_params.order_by,
-                    .limit = owned_params.limit,
-                    .offset = owned_params.offset,
+                    .limit = if (capturing) null else owned_params.limit,
+                    .offset = if (capturing) 0 else owned_params.offset,
                 });
                 ensureExecutionDeadline(owned_params.execution_deadline_ns) catch |err| {
                     alloc.free(sql_text);
@@ -478,10 +725,11 @@ pub const RuntimeSource = struct {
                     }
                 else
                     &.{};
-                var result = try self.snapshot_query.queryPrepared(alloc, .{
-                    .sql_text = sql_text,
-                    .args = args,
-                }, owned_params.execution_deadline_ns);
+                const prepared: sql.PreparedQuery = .{ .sql_text = sql_text, .args = args };
+                var result = if (capturing)
+                    try self.snapshot_query.capturePrepared(alloc, prepared, owned_params.limit.?, owned_params.execution_deadline_ns)
+                else
+                    try self.snapshot_query.queryPrepared(alloc, prepared, owned_params.execution_deadline_ns);
                 errdefer result.deinit(alloc);
                 try ensureExecutionDeadline(owned_params.execution_deadline_ns);
                 return result;
@@ -505,6 +753,16 @@ pub const RuntimeSource = struct {
             .dsn = try alloc.dupe(u8, self.dsn),
             .snapshot_query = snapshot_query,
         };
+        return reader.asSnapshotReader();
+    }
+
+    fn beginReplicationSnapshotQuery(ptr: *anyopaque, a: Allocator) !foreign_source.SnapshotReader {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var snapshot_query = try self.executor.beginReplicationSnapshotQuery(a, self.dsn);
+        errdefer snapshot_query.deinit(a);
+        const reader = try a.create(RuntimeSnapshotReader);
+        errdefer a.destroy(reader);
+        reader.* = .{ .alloc = a, .executor = self.executor, .dsn = try a.dupe(u8, self.dsn), .snapshot_query = snapshot_query };
         return reader.asSnapshotReader();
     }
 
@@ -536,7 +794,9 @@ pub const RuntimeSource = struct {
         };
 
         return .{
+            .origin = prepared.origin,
             .checkpoint = prepared.checkpoint,
+            .snapshot_token = prepared.snapshot_token,
             .reader = reader.asSnapshotReader(),
         };
     }
@@ -557,18 +817,21 @@ pub const RuntimeSource = struct {
 
     fn cleanupReplication(ptr: *anyopaque, alloc: Allocator, params: foreign_source.ReplicationCleanupParams) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        try params.check();
         const slot_name = try alloc.dupe(u8, params.slot_name);
-        const publication_name = alloc.dupe(u8, params.publication_name) catch |err| {
+        const publication_name = if (params.publication_name) |name| alloc.dupe(u8, name) catch |err| {
             alloc.free(slot_name);
             return err;
-        };
+        } else null;
         var owned_params = foreign_source.ReplicationCleanupParams{
             .slot_name = slot_name,
             .publication_name = publication_name,
+            .native_source = params.native_source,
             .execution_deadline_ns = params.execution_deadline_ns,
+            .password_required = params.password_required,
         };
         defer owned_params.deinit(alloc);
-        return try self.executor.cleanupReplication(alloc, self.dsn, owned_params);
+        return self.executor.cleanupReplication(alloc, self.dsn, owned_params);
     }
 
     fn aggregateParamsAlloc(
@@ -1050,6 +1313,8 @@ fn cloneReplicationPollParamsAlloc(
 ) !foreign_source.ReplicationPollParams {
     var out = foreign_source.ReplicationPollParams{
         .table = try alloc.dupe(u8, params.table),
+        .expected_origin = params.expected_origin,
+        .initialization_origin = params.initialization_origin,
         .limit = params.limit,
         .execution_deadline_ns = params.execution_deadline_ns,
         .reclaim_exact_cutover_slot = params.reclaim_exact_cutover_slot,
@@ -2465,4 +2730,25 @@ test "postgres executor registration map failure preserves caller ownership and 
     try std.testing.expectEqual(@as(usize, 0), probe.destroyed);
     executor.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), probe.destroyed);
+}
+
+test "PostgreSQL replication parameter clones preserve origin fences and joined initialization custody" {
+    const Probe = struct {
+        calls: usize = 0,
+        fn check(_: *anyopaque) !void {}
+        fn observe(raw: *anyopaque, actual: foreign_source.ReplicationIdentity) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(u32, 91), actual.relation_id);
+        }
+    };
+    var probe: Probe = .{};
+    const origin: foreign_source.ReplicationIdentity = .{ .provider_identity = @splat(3), .relation_id = 91 };
+    var copy = try cloneReplicationPollParamsAlloc(std.testing.allocator, .{ .table = @constCast("items"), .slot_name = @constCast("native_birth_7"), .expected_origin = origin, .initialization_origin = .{ .ptr = &probe, .observe_fn = Probe.observe, .check_fn = Probe.check } });
+    defer copy.deinit(std.testing.allocator);
+    try std.testing.expectEqualDeep(@as(?foreign_source.ReplicationIdentity, origin), copy.expected_origin);
+    try copy.observeInitializationOrigin(origin);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectError(error.ForeignProviderIdentityMismatch, copy.observeInitializationOrigin(.{ .provider_identity = @splat(4), .relation_id = 91 }));
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
 }

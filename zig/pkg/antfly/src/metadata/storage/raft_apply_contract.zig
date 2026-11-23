@@ -288,7 +288,23 @@ pub const SystemCatalogCommand = struct {
     constraint_name_admission: ?@import("antfly_local_sources").system_catalog_relation_names.constraint_naming.Admission = null,
     sql_view: ?@import("../../system_catalog/views.zig").Mutation = null,
     sql_relation: ?@import("../../system_catalog/relations.zig").Prepared = null,
+    sql_security_label: ?@import("../../system_catalog/security_labels.zig").Prepared = null,
+    sql_collation_ddl: ?struct {} = null,
     sql_catalog_admission: ?@import("../../system_catalog/catalog_mutations.zig").Admission = null,
+    sql_subscription_ddl: ?struct {
+        subscription_apply: ?bool = null,
+
+        pub fn jsonStringify(self: @This(), writer: anytype) !void {
+            if (self.subscription_apply) |connected|
+                return writer.write(.{ .subscription_apply = connected });
+            try writer.beginObject();
+            try writer.endObject();
+        }
+    } = null,
+    sql_publication_ddl: ?@import("../../system_catalog/replication/logical_replication.zig").Request = null,
+    sql_publication_advance: ?@import("../../system_catalog/replication/installation.zig").Command = null,
+    sql_publication_collection_ack: ?@import("../../api/logical_replication_publisher_attestation.zig").CollectionReceipt = null,
+    sql_publication_slot_control: ?@import("../../system_catalog/replication/decision_journal.zig").ControlRequest = null,
     sql_native_index: ?@import("../../system_catalog/native_indexes.zig").Mutation = null,
     sql_extension: ?@import("../../system_catalog/sql_extensions.zig").Mutation = null,
     sql_routine: ?@import("../../system_catalog/routines.zig").Mutation = null,
@@ -314,6 +330,31 @@ pub const SystemCatalogCommand = struct {
     }
 
     pub fn jsonStringify(self: SystemCatalogCommand, writer: anytype) !void {
+        if (self.sql_collation_ddl != null) {
+            @import("../../system_catalog/catalog_mutations.zig").validate(self) catch return error.WriteFailed;
+            return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_collation_ddl = self.sql_collation_ddl, .sql_catalog_admission = self.sql_catalog_admission });
+        }
+        if (self.sql_security_label != null) {
+            @import("../../system_catalog/security_labels.zig").validateCommand(self) catch return error.WriteFailed;
+            return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_security_label = self.sql_security_label, .sql_catalog_admission = self.sql_catalog_admission });
+        }
+        if (self.sql_subscription_ddl != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_subscription_ddl = self.sql_subscription_ddl, .sql_catalog_admission = self.sql_catalog_admission });
+        if (self.sql_publication_ddl != null) {
+            @import("../../system_catalog/catalog_mutations.zig").validate(self) catch return error.WriteFailed;
+            return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_publication_ddl = self.sql_publication_ddl, .sql_catalog_admission = self.sql_catalog_admission });
+        }
+        if (self.sql_publication_slot_control != null) {
+            @import("../../system_catalog/catalog_mutations.zig").validate(self) catch return error.WriteFailed;
+            return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_publication_slot_control = self.sql_publication_slot_control });
+        }
+        if (self.sql_publication_collection_ack != null) {
+            @import("../../system_catalog/catalog_mutations.zig").validate(self) catch return error.WriteFailed;
+            return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_publication_collection_ack = self.sql_publication_collection_ack });
+        }
+        if (self.sql_publication_advance != null) {
+            @import("../../system_catalog/catalog_mutations.zig").validate(self) catch return error.WriteFailed;
+            return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_publication_advance = self.sql_publication_advance });
+        }
         if (self.sql_catalog_admission != null and self.sql_relation != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_relation = self.sql_relation, .sql_catalog_admission = self.sql_catalog_admission });
         if (self.sql_catalog_admission != null and self.sql_view != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_view = self.sql_view, .sql_catalog_admission = self.sql_catalog_admission });
         if (self.sql_catalog_admission != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update, .constraint_name_admission = self.constraint_name_admission, .column_sequences = self.column_sequences, .creation_sources = self.creation_sources, .creation_comment_sources = self.creation_comment_sources, .creation_object_comments = self.creation_object_comments, .sql_catalog_admission = self.sql_catalog_admission });
@@ -339,11 +380,14 @@ pub const CatalogAdmission = struct { incarnation: [16]u8 = @splat(0), meta: sys
 
 pub fn transitionMutatesRelationSource(command: anytype) bool {
     return switch (command) {
+        .apply_sql_prepared_transaction => |bytes| @import("../schema_reader_wire.zig").requiresSqlPreparedCatalogAtomicAdmission(bytes),
         .apply_system_catalog,
         .apply_schema_validation,
         .apply_table_retirement,
         .apply_scope_retirement,
         .apply_restore_staging,
+        .reserve_sql_catalog_restore,
+        .accept_sql_catalog_progress,
         .create_restore_job_with_staging,
         .apply_sql_completion_reference,
         .apply_fk_generation_publication,
@@ -403,6 +447,7 @@ pub const CatalogProjectionRequest = union(enum) {
     catalog_checkpoint: []const u8,
     catalog_checkpoint_projection: @import("../../system_catalog/projection.zig").Export.NativeCheckpoint,
     catalog_export_standalone_portable: void,
+    sql_population_lineage: @import("../../system_catalog/server_call.zig").SqlPopulationLineageRequest,
     sql_snapshot_cohort: @import("../../system_catalog/server_call.zig").SqlSnapshotCohortRequest,
     catalog_list_tables: system_catalog.TableList,
     privacy_due_table: i64,
@@ -410,6 +455,9 @@ pub const CatalogProjectionRequest = union(enum) {
     catalog_meta: void,
     catalog_admission: system_catalog.Mutation,
     catalog_admission_bound: struct { mutation: system_catalog.Mutation, binding_guard: system_catalog.RelationMutationGuard },
+    catalog_security_label_prepare: @import("../../system_catalog/catalog_mutations.zig").Preparation,
+    catalog_selinux_authority: void,
+    sql_collation_snapshot: @import("antfly_local_sources").sql_catalog.collations.SnapshotRequest,
     catalog_prepare: SystemCatalogCommand,
     catalog_bind_column_sequences: SystemCatalogCommand,
     catalog_column_sequence_handoffs: @import("../column_sequence_handoff.zig").Request,
@@ -489,6 +537,7 @@ pub const CatalogProjectionRequest = union(enum) {
     table_retirement_publication_projection: @import("../retirement/table/ledger.zig").Lookup,
     table_retirement_receipt: @import("../retirement/table/receipt.zig").Request,
     scope_retirement_work: u64,
+    store_report_basis: u64,
     sql_relation_boot: @import("../sql/relation_lifecycle/boots.zig").Query,
     sql_relation_boot_preflight: []const u8,
     sql_relation_lifetimes: @import("../sql/relation_lifecycle/lifetimes.zig").PageRequest,
@@ -538,6 +587,7 @@ pub const CatalogProjectionRequest = union(enum) {
     schema_validation_prepare: @import("../schema_validation/admission.zig").Request,
     schema_validation_status: @import("../schema_validation/admission.zig").StatusRequest,
     schema_validation_receipt_read: @import("../schema_validation/receipt.zig").Request,
+    sql_publication_capture_work: @import("../../system_catalog/replication/installation.zig").WorkRequest,
     sql_graph_preparation_read: @import("../../system_catalog/graph_preparation.zig").Source,
     sql_graph_preparation_outcome: @import("../../system_catalog/graph_preparation.zig").Observation,
     sql_trigger_snapshot: @import("../../system_catalog/trigger_snapshot.zig").Request,

@@ -66,7 +66,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     extension_store_audit.addFileArg2(extension_store_inventory.captureStdErr(.{}), .{ .make_absolute = true });
     extension_store_run.step.dependOn(&extension_store_audit.step);
     b.step("antfly-metadata-sql-extension-test", "Verify native extension catalog atomic outcomes and cold membership").dependOn(&extension_store_run.step);
-    const native_routing_filters: []const []const u8 = &.{"SQL native runtime reports preserve catalog projection and publication proofs across observation time"};
+    const native_routing_filters: []const []const u8 = &.{ "SQL native runtime reports preserve catalog projection and publication proofs across observation time", "SQL native transaction session custody preserves standalone routing projection across cold reopen" };
     const native_routing_tests = b.addTest(.{
         .root_module = options.metadata_storage_test_mod,
         .filters = native_routing_filters,
@@ -259,7 +259,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-metadata-backup-cohort-test", "Run durable backup cohort admission and recovery contracts").dependOn(&addFilteredTestRunArtifact(b, backup_cohort_tests).step);
     const restore_staging_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "relational integrity restore staging", "restore staging authority", "SQL relation OID reservation rejoins exact restore phase binding and immutable plan", "SQL relation lifetime native restore authority reads bind exact hidden plan and owner without Raft placement", "graph retirement digest", "metadata module compiles", "metadata storage module compiles" },
+        .filters = &.{ "relational integrity restore staging", "restore staging authority", "SQL relation population", "SQL generation intents keyed content", "SQL generation population seals repeated frozen births", "SQL generation intents frozen tuple keys", "SQL relation OID reservation rejoins exact restore phase binding and immutable plan", "SQL relation lifetime native restore authority reads bind exact hidden plan and owner without Raft placement", "graph retirement digest", "metadata module compiles", "metadata storage module compiles" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const restore_staging_run = addFilteredTestRunArtifact(b, restore_staging_tests);

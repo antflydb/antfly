@@ -15,6 +15,7 @@
 
 //! Owning root for private batch wire compatibility contracts.
 test {
+    _ = @import("storage/document_revision_reservation.zig");
     _ = @import("api/batch_internal.zig");
     _ = @import("api/batch_internal.zig").consumer_tests;
 }

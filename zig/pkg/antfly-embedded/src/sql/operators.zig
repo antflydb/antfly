@@ -650,8 +650,8 @@ pub const Aggregate = struct {
     alloc: Allocator,
     kind: Kind,
     input_type: ?ast.ColumnType,
-    input_element: ?@import("array_value.zig").ElementType = null,
-    numeric: ?*@import("numeric_aggregate.zig").Reducer = null,
+    input_element: ?@import("array/value.zig").ElementType = null,
+    numeric: ?*@import("numeric/aggregate.zig").Reducer = null,
     wide: ?*@import("wide_aggregate.zig").State = null,
     count: u64 = 0,
     integer_sum: i128 = 0,
@@ -674,7 +674,7 @@ pub const Aggregate = struct {
         retained_bytes: usize = 0,
         elements: usize = 0,
         fn append(self: *@This(), value: Datum, borrowed: bool) !void {
-            const limits: @import("array_value.zig").Limits = .{};
+            const limits: @import("array/value.zig").Limits = .{};
             const elements = if (value.array) |array| array.cardinality() else 1;
             const bytes = try datumBytes(value);
             if (elements > limits.elements -| self.elements or bytes > limits.bytes -| self.retained_bytes) return error.SqlProgramLimitExceeded;
@@ -699,12 +699,12 @@ pub const Aggregate = struct {
         return initTyped(alloc, kind, input_type, null);
     }
 
-    pub fn initTyped(alloc: Allocator, kind: Kind, input_type: ?ast.ColumnType, input_element: ?@import("array_value.zig").ElementType) !Aggregate {
+    pub fn initTyped(alloc: Allocator, kind: Kind, input_type: ?ast.ColumnType, input_element: ?@import("array/value.zig").ElementType) !Aggregate {
         try validate(kind, input_type);
         var result: Aggregate = .{ .alloc = alloc, .kind = kind, .input_type = input_type, .input_element = input_element, .boolean = kind == .bool_and };
         if (input_element == .numeric and (kind == .sum or kind == .avg)) {
             if (input_type != .number) return error.SqlTypeMismatch;
-            const reducer = try alloc.create(@import("numeric_aggregate.zig").Reducer);
+            const reducer = try alloc.create(@import("numeric/aggregate.zig").Reducer);
             reducer.* = .{ .alloc = alloc };
             result.numeric = reducer;
         }
@@ -949,15 +949,15 @@ pub const Aggregate = struct {
         };
     }
 
-    pub fn bigintSum(kind: Kind, input_type: ?ast.ColumnType, identity: ?@import("array_value.zig").ElementType) bool {
+    pub fn bigintSum(kind: Kind, input_type: ?ast.ColumnType, identity: ?@import("array/value.zig").ElementType) bool {
         return kind == .sum and input_type == .integer and identity == .int64;
     }
 
-    pub fn integerAverage(kind: Kind, input_type: ?ast.ColumnType, identity: ?@import("array_value.zig").ElementType) bool {
+    pub fn integerAverage(kind: Kind, input_type: ?ast.ColumnType, identity: ?@import("array/value.zig").ElementType) bool {
         return kind == .avg and input_type == .integer and (identity == .int16 or identity == .int32 or identity == .int64);
     }
 
-    pub fn integerNumericOutput(kind: Kind, input_type: ?ast.ColumnType, identity: ?@import("array_value.zig").ElementType) bool {
+    pub fn integerNumericOutput(kind: Kind, input_type: ?ast.ColumnType, identity: ?@import("array/value.zig").ElementType) bool {
         return bigintSum(kind, input_type, identity) or integerAverage(kind, input_type, identity);
     }
 
@@ -985,7 +985,7 @@ pub const Aggregate = struct {
     pub fn finishOutput(self: *const Aggregate, result: Allocator) !Datum {
         if (self.kind == .array_agg) {
             if (self.count == 0) return .{};
-            const arrays = @import("array_value.zig");
+            const arrays = @import("array/value.zig");
             const state = self.collection.?;
             const input_array = if (self.input_type == .array) state.values.items[0].array else null;
             const element = if (input_array) |input| input.element_type else self.input_element orelse switch (self.input_type.?) {
@@ -1020,7 +1020,7 @@ pub const Aggregate = struct {
     /// The bounded division kernel supplies PostgreSQL's NUMERIC result scale.
     pub fn integerAverageOutput(result: Allocator, sum: i128, count: u64) !Datum {
         if (count == 0 or count > std.math.maxInt(i64)) return error.InvalidSqlBackendResponse;
-        const numeric = @import("numeric_value.zig");
+        const numeric = @import("numeric/value.zig");
         var numerator_digits: [10]u16 = undefined;
         var denominator_digits: [5]u16 = undefined;
         const numerator = numeric.integer128View(sum, &numerator_digits);
@@ -1036,7 +1036,7 @@ pub const Aggregate = struct {
     }
 
     pub fn integerSumOutput(result: Allocator, sum: i128) !Datum {
-        const numeric = @import("numeric_value.zig");
+        const numeric = @import("numeric/value.zig");
         var storage: [10]u16 = undefined;
         const view = numeric.integer128View(sum, &storage);
         const value = try result.create(numeric.Value);
@@ -1065,8 +1065,8 @@ test "SQL integer AVG finalization preserves exact allocation free transitions" 
             const value = try state.finishOutput(a);
             defer a.destroy(@constCast(value.numeric.?));
             defer a.free(value.numeric.?.digits);
-            var context: @import("numeric_value.zig").Context = .{ .alloc = a };
-            const text = try @import("numeric_value.zig").format(&context, value.numeric.?.*);
+            var context: @import("numeric/value.zig").Context = .{ .alloc = a };
+            const text = try @import("numeric/value.zig").format(&context, value.numeric.?.*);
             defer a.free(text);
             try std.testing.expectEqualStrings("9007199254740993.5000", text);
         }
@@ -1099,8 +1099,8 @@ test "SQL integer AVG partial merges retain exact widened sums and consumer owne
         try std.testing.expectEqual(@as(i128, std.math.maxInt(i64)) * 2, restored.integer_sum);
         break :blk try restored.finishOutput(arena.allocator());
     };
-    var context: @import("numeric_value.zig").Context = .{ .alloc = arena.allocator() };
-    try std.testing.expectEqualStrings("9223372036854775807", try @import("numeric_value.zig").format(&context, result.numeric.?.*));
+    var context: @import("numeric/value.zig").Context = .{ .alloc = arena.allocator() };
+    try std.testing.expectEqualStrings("9223372036854775807", try @import("numeric/value.zig").format(&context, result.numeric.?.*));
 }
 
 test "SQL integer AVG spills exact vector and DISTINCT sums without per input numeric allocation" {
@@ -1122,8 +1122,8 @@ test "SQL integer AVG spills exact vector and DISTINCT sums without per input nu
         while (true) {
             _ = arena.reset(.free_all);
             const row = (try group.nextResult(arena.allocator())) orelse break;
-            var context: @import("numeric_value.zig").Context = .{ .alloc = arena.allocator() };
-            try std.testing.expectEqualStrings(if (distinct) "1.5000000000000000" else "1.6666666666666667", try @import("numeric_value.zig").format(&context, row.aggregates[0].numeric.?.*));
+            var context: @import("numeric/value.zig").Context = .{ .alloc = arena.allocator() };
+            try std.testing.expectEqualStrings(if (distinct) "1.5000000000000000" else "1.6666666666666667", try @import("numeric/value.zig").format(&context, row.aggregates[0].numeric.?.*));
             seen += 1;
         }
         try std.testing.expectEqual(@as(usize, 1000), seen);
@@ -1146,8 +1146,8 @@ test "SQL bigint SUM output failures preserve allocation free transitions" {
             const value = try state.finishOutput(a);
             defer a.destroy(@constCast(value.numeric.?));
             defer a.free(value.numeric.?.digits);
-            var context: @import("numeric_value.zig").Context = .{ .alloc = a };
-            const text = try @import("numeric_value.zig").format(&context, value.numeric.?.*);
+            var context: @import("numeric/value.zig").Context = .{ .alloc = a };
+            const text = try @import("numeric/value.zig").format(&context, value.numeric.?.*);
             defer a.free(text);
             try std.testing.expectEqualStrings("18446744073709551614", text);
         }
@@ -1174,8 +1174,8 @@ test "SQL bigint SUM spilled vector and distinct reducers retain exact outputs" 
         while (true) {
             _ = arena.reset(.free_all);
             const row = (try group.nextResult(arena.allocator())) orelse break;
-            var context: @import("numeric_value.zig").Context = .{ .alloc = arena.allocator() };
-            const text = try @import("numeric_value.zig").format(&context, row.aggregates[0].numeric.?.*);
+            var context: @import("numeric/value.zig").Context = .{ .alloc = arena.allocator() };
+            const text = try @import("numeric/value.zig").format(&context, row.aggregates[0].numeric.?.*);
             try std.testing.expectEqualStrings(if (distinct) "9223372036854775806" else "18446744073709551612", text);
             seen += 1;
         }
@@ -1199,11 +1199,11 @@ test "SQL bigint SUM partials retain i128 transitions and own numeric output" {
         defer restored.deinit();
         break :blk try restored.finishOutput(arena.allocator());
     };
-    var context: @import("numeric_value.zig").Context = .{ .alloc = arena.allocator() };
-    try std.testing.expectEqualStrings("18446744073709551614", try @import("numeric_value.zig").format(&context, result.numeric.?.*));
+    var context: @import("numeric/value.zig").Context = .{ .alloc = arena.allocator() };
+    try std.testing.expectEqualStrings("18446744073709551614", try @import("numeric/value.zig").format(&context, result.numeric.?.*));
 }
 
-pub const AggregateSpec = struct { kind: Aggregate.Kind, input_type: ?ast.ColumnType = null, input_element: ?@import("array_value.zig").ElementType = null, distinct: bool = false };
+pub const AggregateSpec = struct { kind: Aggregate.Kind, input_type: ?ast.ColumnType = null, input_element: ?@import("array/value.zig").ElementType = null, distinct: bool = false };
 
 /// Associative exact states may use worker and hash-partition reduction.
 /// This is not primitive SIMD eligibility: NUMERIC has its own flat lane.
@@ -3513,7 +3513,7 @@ pub const Grouped = struct {
         var state_bytes: usize = 0;
         for (states) |state| {
             if (state.wide) |wide| state_bytes +|= (@sizeOf(@import("wide_aggregate.zig").State) + (wide.total.value.digits.len + wide.count.value.digits.len) *| @sizeOf(u16)) *| 8;
-            if (state.numeric) |reducer| state_bytes +|= (reducer.state.buckets.items.len *| @sizeOf(i128) +| @sizeOf(@import("numeric_aggregate.zig").Reducer)) *| 4;
+            if (state.numeric) |reducer| state_bytes +|= (reducer.state.buckets.items.len *| @sizeOf(i128) +| @sizeOf(@import("numeric/aggregate.zig").Reducer)) *| 4;
             if (state.distinct_support) |support| state_bytes +|= support.words.count() *| 64 +| 256;
             if (state.selected) |selected| state_bytes +|= (try datumBytes(selected.row.values[0])) *| 4;
             for (state.distinct_values.items) |entry| state_bytes +|= (try datumBytes(entry.row.row.values[0]) +| @sizeOf(Aggregate)) *| 4;
@@ -3785,7 +3785,8 @@ pub const Grouped = struct {
 };
 
 pub fn cloneDatum(alloc: Allocator, value: Datum) anyerror!Datum {
-    try value.validateTemporal();
+    try value.validateCarrier();
+    if (value.read_failure != null) return value;
     if (value.isVoid()) return value;
     if (value.bytes()) |bytes| {
         const owned = try alloc.create(@import("bytea_value.zig").Value);
@@ -3795,7 +3796,7 @@ pub fn cloneDatum(alloc: Allocator, value: Datum) anyerror!Datum {
     }
     if (value.enumeration()) |atom| return Datum.typedEnum(try atom.clone(alloc));
     if (value.range()) |range| {
-        const ranges = @import("range_value.zig");
+        const ranges = @import("range/value.zig");
         const owned = try alloc.create(ranges.Value);
         errdefer alloc.destroy(owned);
         owned.* = range.*;
@@ -3809,13 +3810,13 @@ pub fn cloneDatum(alloc: Allocator, value: Datum) anyerror!Datum {
         return Datum.typedRange(owned);
     }
     if (value.temporal()) |temporal| {
-        const owned = try alloc.create(@import("temporal_value.zig").Value);
+        const owned = try alloc.create(@import("temporal/value.zig").Value);
         owned.* = temporal.*;
         return Datum.typedTemporal(owned);
     }
     if (value.numeric) |number| {
         if (value.sql_null or value.array != null or value.patterns() != null or value.value != .null) return error.SqlTypeMismatch;
-        const exact = @import("numeric_value.zig");
+        const exact = @import("numeric/value.zig");
         var ctx: exact.Context = .{ .alloc = alloc };
         try exact.validateCanonical(&ctx, number.*);
         const owned = try alloc.create(exact.Value);
@@ -3826,8 +3827,8 @@ pub fn cloneDatum(alloc: Allocator, value: Datum) anyerror!Datum {
     }
     if (value.array) |array| {
         if (value.sql_null or value.patterns() != null or value.value != .null) return error.SqlTypeMismatch;
-        const owned = try alloc.create(@import("array_value.zig").Value);
-        const dimensions = try alloc.dupe(@import("array_value.zig").Dimension, array.dimensions);
+        const owned = try alloc.create(@import("array/value.zig").Value);
+        const dimensions = try alloc.dupe(@import("array/value.zig").Dimension, array.dimensions);
         if (array.stored) |stored| {
             const copy = try alloc.create(@import("../common/sql_array_layout.zig").View);
             copy.* = stored.*;
@@ -3836,7 +3837,7 @@ pub fn cloneDatum(alloc: Allocator, value: Datum) anyerror!Datum {
             return Datum.typedArray(owned);
         }
         const elements = try alloc.alloc(Datum, array.cardinality());
-        var footprint: usize = @sizeOf(@import("array_value.zig").Value) + dimensions.len * @sizeOf(@import("array_value.zig").Dimension);
+        var footprint: usize = @sizeOf(@import("array/value.zig").Value) + dimensions.len * @sizeOf(@import("array/value.zig").Dimension);
         for (0..array.cardinality(), elements) |array_cell_0, *out| {
             const element = array.flatCell(array_cell_0);
             if (element.array != null) return error.SqlTypeMismatch;
@@ -3850,7 +3851,7 @@ pub fn cloneDatum(alloc: Allocator, value: Datum) anyerror!Datum {
 }
 
 fn temporalOperatorOwnershipScenario(a: Allocator) !void {
-    const temporal = @import("temporal_value.zig");
+    const temporal = @import("temporal/value.zig");
     const values = [_]temporal.Value{
         .{ .date = .{ .days = temporal.min_date } },
         .{ .date = .{ .days = 0 } },
@@ -3950,7 +3951,7 @@ test "SQL temporal operator ownership sort distinct spill and aggregate checkpoi
 }
 
 test "SQL temporal Datums reject mixed payloads and preserve bounded ingress" {
-    const temporal = @import("temporal_value.zig");
+    const temporal = @import("temporal/value.zig");
     const value: temporal.Value = .{ .interval = .{ .months = 1 } };
     const equivalent: temporal.Value = .{ .interval = .{ .days = 30 } };
     const cell = Datum.typedTemporal(&value);
@@ -3962,14 +3963,14 @@ test "SQL temporal Datums reject mixed payloads and preserve bounded ingress" {
         try std.testing.expectError(error.SqlTypeMismatch, scalar.semanticHashDatum(bad));
         try std.testing.expectError(error.SqlTypeMismatch, cloneDatum(std.testing.allocator, bad));
     }
-    try std.testing.expectError(error.SqlTypeMismatch, @import("array_value.zig").Value.init(.jsonb, &.{.{ .length = 1, .lower = 1 }}, &.{cell}, .{}));
+    try std.testing.expectError(error.SqlTypeMismatch, @import("array/value.zig").Value.init(.jsonb, &.{.{ .length = 1, .lower = 1 }}, &.{cell}, .{}));
     try std.testing.expect((try @import("vector_eval.zig").binary(.eq, cell, Datum.typedTemporal(&equivalent))).value.bool);
     try std.testing.expectError(error.SqlTypeMismatch, @import("vector_eval.zig").binary(.add, cell, cell));
     try std.testing.expectError(error.UnsupportedSqlShape, @import("describe.zig").coerceDatum(std.testing.allocator, cell, .datetime, null));
     var bytes: [16]u8 = undefined;
     const binary = try temporal.encode(value, &bytes);
     var none = std.heap.FixedBufferAllocator.init(&.{});
-    var work: @import("array_value.zig").Budget = .{ .remaining = 0 };
+    var work: @import("array/value.zig").Budget = .{ .remaining = 0 };
     try std.testing.expectError(error.SqlProgramLimitExceeded, scalar.temporalBinaryLeaky(none.allocator(), .interval, binary, &work));
     work = .{};
     try std.testing.expectError(error.OutOfMemory, scalar.temporalBinaryLeaky(none.allocator(), .interval, binary, &work));
@@ -4004,10 +4005,10 @@ fn cloneJson(alloc: Allocator, value: Json, depth: usize) error{ OutOfMemory, Sq
 pub fn datumBytes(value: Datum) anyerror!usize {
     try value.validateTemporal();
     if (value.enumeration()) |atom| return @sizeOf(Datum) + @sizeOf(@import("../common/sql_enum_value.zig").Value) + atom.text.len + atom.order_key.len;
-    if (value.range()) |range| return @sizeOf(Datum) + @import("range_value.zig").retainedSize(range.*);
-    if (value.temporal() != null) return @sizeOf(Datum) + @sizeOf(@import("temporal_value.zig").Value);
+    if (value.range()) |range| return @sizeOf(Datum) + @import("range/value.zig").retainedSize(range.*);
+    if (value.temporal() != null) return @sizeOf(Datum) + @sizeOf(@import("temporal/value.zig").Value);
     if (value.bytes()) |bytes| return @sizeOf(Datum) + @sizeOf(scalar.Bytea.Value) + bytes.len;
-    if (value.numeric) |number| return @sizeOf(Datum) + @sizeOf(@import("numeric_value.zig").Value) + number.digits.len * 2;
+    if (value.numeric) |number| return @sizeOf(Datum) + @sizeOf(@import("numeric/value.zig").Value) + number.digits.len * 2;
     if (value.array) |array| return @sizeOf(Datum) +| try array.retainedBytes();
     return jsonBytes(value.value, 0);
 }
@@ -4031,7 +4032,7 @@ test "SQL range sorting preserves endpoint order and semantic ties" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    const ranges = @import("range_value.zig");
+    const ranges = @import("range/value.zig");
     var context: ranges.Context = .{ .alloc = arena.allocator() };
     const inputs = [_][]const u8{ "[1,10)", "empty", "(,)", "[1.00,10.000)", "[-Infinity,Infinity]", "[NaN,NaN]" };
     const values = try arena.allocator().alloc(ranges.Value, inputs.len);
@@ -4056,7 +4057,7 @@ test "SQL range sorting preserves endpoint order and semantic ties" {
 }
 
 test "SQL typed array physical keys preserve ordering hashes join equality and copied ownership" {
-    const arrays = @import("array_value.zig");
+    const arrays = @import("array/value.zig");
     const a = std.testing.allocator;
     const elements = &.{ Datum.json(.{ .integer = 1 }), Datum.json(.{ .integer = 2 }) };
     const first = try arrays.Value.init(.int32, &.{.{ .length = 2, .lower = 0 }}, elements, .{});
@@ -4213,7 +4214,7 @@ test "SQL array aggregation retains typed nulls ordered duplicates and portable 
 }
 
 test "SQL array aggregation extends array rank and preserves source bounds" {
-    const arrays = @import("array_value.zig");
+    const arrays = @import("array/value.zig");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -4685,7 +4686,7 @@ test "SQL spilled aggregate partials merge averages extrema booleans and high ca
 }
 
 test "SQL NUMERIC aggregate exponent gaps spill before row worker and checkpoint mutation" {
-    const numeric = @import("numeric_value.zig");
+    const numeric = @import("numeric/value.zig");
     const a = std.testing.allocator;
     var context: numeric.Context = .{ .alloc = a };
     var high = try numeric.parse(&context, "1e10000");
@@ -5197,8 +5198,8 @@ test "SQL weighted bags preserve exact numeric states DISTINCT NULLs and spill" 
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const pa = arena.allocator();
-        var numeric_context: @import("numeric_value.zig").Context = .{ .alloc = pa };
-        var numeric = try @import("numeric_value.zig").parse(&numeric_context, "12345678901234567890.12345");
+        var numeric_context: @import("numeric/value.zig").Context = .{ .alloc = pa };
+        var numeric = try @import("numeric/value.zig").parse(&numeric_context, "12345678901234567890.12345");
         defer numeric.deinit();
         const input = [_]Datum{
             Datum.json(.{ .integer = 1 }),      Datum.json(.{ .integer = std.math.maxInt(i64) }),
@@ -5624,7 +5625,7 @@ test "SQL exact NUMERIC checkpoint columns admit exponent unions and preserve SU
     var sums: [32]Datum = undefined;
     var averages: [32]Datum = undefined;
     var ordinals: [32]u64 = undefined;
-    var work: @import("array_value.zig").Budget = .{};
+    var work: @import("array/value.zig").Budget = .{};
     for (&keys, &sums, &averages, &ordinals, 0..) |*key, *sum, *average, *ordinal, i| {
         key.* = Datum.json(.{ .integer = @intCast(i % 2) });
         ordinal.* = 100 - i;
@@ -6256,7 +6257,7 @@ test "SQL native spill keys share cache pressure across scalar and cohort writes
 
 test "SQL native cohort sizing reuses immutable array estimates and validates each key" {
     const Fixture = struct {
-        array: *@import("array_value.zig").Value,
+        array: *@import("array/value.zig").Value,
         reads: usize = 0,
         fn read(raw: *anyopaque, _: Allocator, _: usize, _: usize) !Datum {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -6270,7 +6271,7 @@ test "SQL native cohort sizing reuses immutable array estimates and validates ea
             const sa = source.allocator();
             const elements = try sa.alloc(Datum, cardinality);
             for (elements, 0..) |*element, index| element.* = Datum.json(.{ .integer = @intCast(index) });
-            var array = try @import("array_value.zig").Value.init(.int64, &.{.{ .length = @intCast(cardinality) }}, elements, .{});
+            var array = try @import("array/value.zig").Value.init(.int64, &.{.{ .length = @intCast(cardinality) }}, elements, .{});
             var fixture: @This() = .{ .array = &array };
             var dummy: u8 = 0;
             var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = check, .compression = .none, .async_writes = false };
@@ -7188,7 +7189,7 @@ test "SQL collection aggregates own reducer outputs after state destruction" {
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
             const out = arena.allocator();
-            const numeric = @import("numeric_value.zig");
+            const numeric = @import("numeric/value.zig");
             var context: numeric.Context = .{ .alloc = a };
             var parsed = try numeric.parse(&context, "12.375");
             defer parsed.deinit();

@@ -28,7 +28,7 @@ fn unpublishedAdmissionBusy(operation: @FieldType(rpc.Request, "operation"), sta
         .admit, .admit_graph, .capture, .validate, .snapshot, .open => true,
         // These operations can run after query evaluation/row delivery. A
         // negative reply never authorizes replay of an advanced cursor.
-        .open_snapshot, .next, .normalize, .range_proofs, .close, .cancel, .renew_snapshot, .graph_page, .graph_snapshot, .graph_invoke, .graph_open => false,
+        .open_snapshot, .open_frozen, .next, .normalize, .range_proofs, .close, .cancel, .renew_snapshot, .graph_page, .graph_snapshot, .graph_invoke, .graph_open => false,
     };
 }
 
@@ -82,6 +82,37 @@ pub const Client = struct {
         defer self.destroy();
         var response = try self.call(.{ .operation = .admit, .schema_version = schema_version });
         defer response.deinit(alloc);
+    }
+
+    pub fn openFrozen(alloc: std.mem.Allocator, executor: http.RequestExecutor, base_uri: []const u8, table: []const u8, route: metadata.CatalogRouteFence, schema_version: u32, binding: reads.FrozenBinding, from: []const u8, to: []const u8, opts: types.ScanOptions) !reads.RelationalReadView {
+        if (opts.required_sql_indexes.len != 0 or opts.sql_document_preimage or opts.include_range_proofs) return error.InvalidRetainedReadQuery;
+        const self = try create(alloc, executor, base_uri, table, route, schema_version, opts.execution_deadline_ns);
+        errdefer self.destroy();
+        const query = opts.relational_query orelse return error.InvalidRetainedReadQuery;
+        errdefer self.cancelUnknown();
+        var response = try self.callWithCancellation(.{
+            .operation = .open_frozen,
+            .frozen = binding,
+            .schema_version = schema_version,
+            .connection = self.connection,
+            .lease_ms = rpc.max_lease_ms,
+            .from = from,
+            .to = to,
+            .query = query,
+            .filter_query_json = opts.filter_query_json,
+            .inclusive_from = opts.inclusive_from,
+            .exclusive_to = opts.exclusive_to,
+            .include_content_hashes = opts.include_content_hashes,
+            .include_range_proofs = opts.include_range_proofs,
+            .privacy_policy_version = opts.privacy_policy_version,
+            .row_policy_principal_proof = opts.row_policy_principal_proof,
+            .row_policy_database = opts.row_policy_database,
+        }, opts.cancellation);
+        defer response.deinit(alloc);
+        var parsed = try std.json.parseFromSlice(rpc.Response, alloc, response.body, .{});
+        defer parsed.deinit();
+        self.token = parsed.value.token orelse return error.InvalidRetainedReadResponse;
+        return .{ .ptr = self, .vtable = &.{ .next = next, .close = close } };
     }
 
     pub fn admitGraph(alloc: std.mem.Allocator, executor: http.RequestExecutor, base_uri: []const u8, table: []const u8, route: metadata.CatalogRouteFence, schema_version: u32, deadline_ns: ?u64) !void {
@@ -179,6 +210,10 @@ pub const Client = struct {
                     return err;
                 }
             }
+        }
+        if (request.operation == .next and response.status == 409 and std.mem.eql(u8, response.body, "VersionConflict")) {
+            self.poisoned = true;
+            return error.VersionConflict;
         }
         // These canonical failures never authorize cursor reuse. Preserve the
         // Cypher owner error identity while poisoning this handle, without
@@ -330,6 +365,7 @@ pub const Client = struct {
     }
 
     fn openKind(self: *Client, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: types.ScanOptions, kind: @FieldType(rpc.Request, "operation"), table: []const u8) !reads.RelationalReadView {
+        if (kind != .open and opts.required_sql_indexes.len != 0) return error.UnsupportedSqlExecution;
         var parsed_query: ?std.json.Parsed(types.RelationalRowQuery) = null;
         defer if (parsed_query) |*parsed| parsed.deinit();
         const query = opts.relational_query orelse blk: {
@@ -344,7 +380,7 @@ pub const Client = struct {
         const route = try alloc.dupe(u8, self.route);
         errdefer alloc.free(route);
         errdefer self.cancelUnknown();
-        var response = try self.call(.{ .operation = kind, .graph_table = table, .schema_version = self.schema_version, .token = self.token, .connection = self.connection, .lease_ms = rpc.max_lease_ms, .from = from, .to = to, .query = query, .filter_query_json = opts.filter_query_json, .inclusive_from = opts.inclusive_from, .exclusive_to = opts.exclusive_to, .sql_document_preimage = opts.sql_document_preimage, .include_content_hashes = opts.include_content_hashes, .include_range_proofs = opts.include_range_proofs, .row_policy_principal_proof = opts.row_policy_principal_proof, .row_policy_database = opts.row_policy_database, .privacy_policy_version = opts.privacy_policy_version });
+        var response = try self.call(.{ .operation = kind, .graph_table = table, .schema_version = self.schema_version, .token = self.token, .connection = self.connection, .lease_ms = rpc.max_lease_ms, .from = from, .to = to, .query = query, .required_sql_indexes = opts.required_sql_indexes, .filter_query_json = opts.filter_query_json, .inclusive_from = opts.inclusive_from, .exclusive_to = opts.exclusive_to, .sql_document_preimage = opts.sql_document_preimage, .include_content_hashes = opts.include_content_hashes, .include_range_proofs = opts.include_range_proofs, .row_policy_principal_proof = opts.row_policy_principal_proof, .row_policy_database = opts.row_policy_database, .privacy_policy_version = opts.privacy_policy_version });
         defer response.deinit(self.alloc);
         var parsed = try std.json.parseFromSlice(rpc.Response, alloc, response.body, .{});
         defer parsed.deinit();
@@ -353,8 +389,9 @@ pub const Client = struct {
             std.crypto.hash.sha2.Sha256.hash(text.query, &expected, .{});
             if (parsed.value.text_filter_digest == null or !std.mem.eql(u8, &expected, &parsed.value.text_filter_digest.?)) return error.UnsupportedSqlExecution;
         } else if (parsed.value.text_filter_digest != null) return error.InvalidRetainedReadResponse;
+        try types.sql_view_index_requirements.requireDigest(opts.required_sql_indexes, parsed.value.required_indexes_digest);
         cursor.* = .{ .alloc = alloc, .executor = self.executor, .uri = uri, .route = route, .schema_version = self.schema_version, .deadline_ns = self.deadline_ns, .token = parsed.value.token orelse return error.InvalidRetainedReadResponse, .connection = self.connection, .native_descriptor = self.native_descriptor, .owner_minter = self.owner_minter, .table_id = self.table_id, .group_id = self.group_id };
-        return .{ .text_filter_digest = parsed.value.text_filter_digest, .ptr = cursor, .vtable = &.{ .next = next, .close = close, .normalize = normalize, .range_proofs = rangeProofs } };
+        return .{ .text_filter_digest = parsed.value.text_filter_digest, .required_indexes_digest = parsed.value.required_indexes_digest, .ptr = cursor, .vtable = &.{ .next = next, .close = close, .normalize = normalize, .range_proofs = rangeProofs } };
     }
 
     fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !reads.RelationalReadView.Page {

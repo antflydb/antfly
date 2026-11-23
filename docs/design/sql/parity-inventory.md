@@ -203,6 +203,22 @@ evidence from cases without recorded evidence and identify original rejection
 contracts; neither category is an inferred count of missing features.
 Zig 0.17 gates use repeatable `-Dtest-filter=...` compile options. Filters for the
 same owner/build options share one build without broadening other selected gates.
+
+The SELinux evidence gate for `sql-0153` requires enforcing Linux. Set
+`ANTFLY_TEST_SELINUX_ALLOW_CONTEXT` and `ANTFLY_TEST_SELINUX_DENY_CONTEXT` to two
+valid object contexts. The test process needs permission to read the active
+policy, relabel from the initial unlabeled table context, and relabel to only
+the allowed context. The gate verifies the original statement, denial, and
+allowed relabel through the Unix pgwire listener and metadata Raft. On a
+different build host, use `antfly-api-sql-selinux-live-build` to produce the
+test executable for transfer to the enforcing host.
+
+Standalone startup enrolls the signer on first use. To rotate the signer or
+policy, set `ANTFLY_PGWIRE_SELINUX_ROTATE_EPOCH` to the currently enrolled epoch
+and start with the replacement signing seed and policy. To withdraw trust,
+remove the SELinux socket and seed configuration and set
+`ANTFLY_PGWIRE_SELINUX_WITHDRAW_EPOCH` to the current epoch. Startup checks the
+durable result, and an epoch mismatch leaves the existing verifier intact.
 `--gate` requires `--evidence`; it cannot narrow the release gate. A family report
 used with `--release` still checks every original ID.
 Release checking fails while any case is unresolved or deferred. Once all cases

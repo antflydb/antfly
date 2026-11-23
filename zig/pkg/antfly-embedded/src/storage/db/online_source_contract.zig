@@ -27,7 +27,7 @@ pub fn finalCutDigest(scope: Scope, sequence: u64, applied_index: u64) [32]u8 {
     hash.update(&cut);
     return hash.finalResult();
 }
-const topology = @import("relational_integrity_topology_contract.zig");
+const topology = @import("relational/integrity/topology_contract.zig");
 const identity = @import("doc_identity_namespace.zig");
 pub const Authority = @import("../source_authority.zig").Kind;
 pub const scope_encoded_size = 192;
@@ -55,7 +55,7 @@ pub const Scope = struct {
     fence: topology.Fence,
     receiver_namespace: identity.Namespace,
     consumer_epoch: u64,
-    copy_attempt: @import("relational_integrity_handoff_contract.zig").MergeCopyAttempt,
+    copy_attempt: @import("relational/integrity/handoff_contract.zig").MergeCopyAttempt,
 
     pub fn validate(self: Scope) !void {
         if (self.version != 2 or self.consumer_epoch == 0 or self.copy_attempt.sequence == 0 or (self.fence.role != .merge_source and self.fence.role != .rewrite_source) or
@@ -160,7 +160,7 @@ pub const Command = union(enum) {
         }
     }
     pub fn jsonStringify(self: Command, jw: anytype) @TypeOf(jw.*).Error!void {
-        try @import("relational_integrity_json.zig").write(self, jw);
+        try @import("relational/integrity/json.zig").write(self, jw);
     }
 };
 

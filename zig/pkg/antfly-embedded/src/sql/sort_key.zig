@@ -41,7 +41,7 @@ pub fn encode(values: []const Datum, orders: anytype) ?Key {
         if (value.isVoid() or value.array != null or value.range() != null or value.enumeration() != null or value.bytes() != null) return null;
         if (value.temporal()) |temporal| {
             value.validateTemporal() catch return null;
-            const codec = @import("temporal_ops.zig");
+            const codec = @import("temporal/ops.zig");
             var scratch: [codec.key_size]u8 = undefined;
             const bytes = codec.key(temporal.*, &scratch) catch return null;
             key.types |= @as(u64, 7 + @as(u8, @backingInt(temporal.kind()))) << @as(u6, @intCast(index * 4));
@@ -51,8 +51,8 @@ pub fn encode(values: []const Datum, orders: anytype) ?Key {
             continue;
         }
         if (value.numeric) |number| {
-            const numeric = @import("numeric_value.zig");
-            const keys = @import("numeric_key.zig");
+            const numeric = @import("numeric/value.zig");
+            const keys = @import("numeric/key.zig");
             var scratch: [32]u8 = undefined;
             var writer: std.Io.Writer = .fixed(&scratch);
             // Small exact keys stay allocation-free. Wide values use the

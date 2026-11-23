@@ -53,13 +53,13 @@ const platform_clock = @import("antfly_platform").clock;
 const platform_time = @import("antfly_platform").time;
 const range_cardinality = @import("range_cardinality.zig");
 const range_state_mod = @import("range_state.zig");
-const relational_index_catalog = @import("relational_index_catalog.zig");
-const relational_index_jobs = @import("relational_index_jobs.zig");
-const relational_index_plans = @import("relational_index_plan.zig");
-const relational_index_records = @import("relational_index_records.zig");
+const relational_index_catalog = @import("relational/indexes/catalog.zig");
+const relational_index_jobs = @import("relational/indexes/jobs.zig");
+const relational_index_plans = @import("relational/indexes/plan.zig");
+const relational_index_records = @import("relational/indexes/records.zig");
 const wal_trace = @import("../write_amplification_trace.zig");
 const relational_row_codec = @import("algebraic/relational_row_codec.zig");
-const relational_store = @import("relational_store.zig");
+const relational_store = @import("relational/rows/store.zig");
 const replay_reference = @import("derived/replay_reference.zig");
 const replication_commit = @import("commit_integration.zig");
 const replication_contract = @import("replication_contract.zig");
@@ -413,7 +413,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 return @import("antfly_source_root").antfly_sources.storage_engine.call("batchPrepared", .{ self, req, profile, opts, generated_memo, prepared_row_allocator });
             }
             @setEvalBranchQuota(100_000);
-            const maintenance_contract = @import("relational_index_maintenance_contract.zig");
+            const maintenance_contract = @import("relational/indexes/maintenance_contract.zig");
             var maintenance_attempted = false;
             defer if (maintenance_attempted) {
                 // Only a scheduling hint: the worker re-reads durable desired state.
@@ -423,13 +423,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
             for (req.writes) |write| if (relational_index_catalog.Controller.isReservedMetadataKey(write.key)) {
                 const trusted = opts.transaction_resolution != null or opts.replication_applied_lsn_marker != null;
-                const validation = @import("relational_integrity_activation_contract.zig");
+                const validation = @import("relational/integrity/activation_contract.zig");
                 if (trusted and std.mem.eql(u8, write.key, validation.validation_key)) {
                     _ = try validation.ForeignKeyValidationRecord.decode(write.value);
                     continue;
                 }
                 if (trusted and std.mem.eql(u8, write.key, validation.validation_inputs_key)) {
-                    _ = try @import("relational_schema_owner_contract.zig").inputParts(write.value);
+                    _ = try @import("relational/schema_change/schema_owner_contract.zig").inputParts(write.value);
                     continue;
                 }
                 if (!trusted or !maintenance_contract.isControlKey(write.key)) return error.ReservedRelationalIndexMetadataKey;
@@ -498,6 +498,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             const preparation_timestamp_ns = if (req.document_version_scheme == .revision_v1 or req.timestamp_ns != 0) req.timestamp_ns else S.ownerField(self, "backend_runtime").*.clock().nowRealtimeNs();
             const preparation_alloc = prepared_row_allocator.allocator();
+            var reserved_document_versions = std.StringHashMapUnmanaged(u64).empty;
+            defer reserved_document_versions.deinit(preparation_alloc);
+            if (opts.transaction_resolution) |resolution| {
+                for (resolution.document_revision_references) |reference| {
+                    if (reference.version == 0 or reference.version > @import("../document_revision_reservation.zig").max_version) return error.InvalidTxnRecord;
+                    const slot = try reserved_document_versions.getOrPut(preparation_alloc, reference.key);
+                    if (slot.found_existing) return error.InvalidTxnRecord;
+                    slot.value_ptr.* = reference.version;
+                }
+            }
 
             // Everything below through the index-plan/writer scratch lives only
             // until this attempt's commit completes (same lifetime the explicit
@@ -1166,6 +1176,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var apply_mutex_held = true;
             const apply_lock_acquired_ns = monotonicTimeNs();
             errdefer if (apply_mutex_held) unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
+            if (opts.transaction_resolution == null) {
+                var publication = try S.ownerField(self, "core").*.store.beginProbeTxn();
+                defer publication.abort();
+                try @import("logical_replication_outbox.zig").requireOrdinaryRequest(preparation_alloc, &publication, effective_req);
+            }
             // A durable epoch survives active-schema publication, not replacement
             // of the entire database namespace with reused version/transaction IDs.
             if (schema_namespace != S.ownerField(self, "core").*.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
@@ -1391,6 +1406,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         resolution.commit_version,
                         .{
                             .external_decision_owner = resolution.external_decision_owner,
+                            .replication_resolution = resolution.replication_resolution,
+                            .publication_ordered_position = if (opts.ordered_apply_receipt) |cut| .{ .term = cut.term, .index = cut.index } else null,
                             .completion_writes = completion_writes,
                             .resolved_participant = resolution.resolved_participant,
                             .expected_intent_revision = resolution.expected_intent_revision,
@@ -1439,7 +1456,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var coordinated_handoff = false;
             if (req.split_replication != null or req.split_checkpoint != null) {
                 const topology_read = try batchProbe(&batch_probe, self);
-                coordinated_handoff = try @import("relational_integrity_handoff.zig").admitSplitRequest(S.ownerField(self, "alloc").*, topology_read, req);
+                coordinated_handoff = try @import("relational/integrity/handoff.zig").admitSplitRequest(S.ownerField(self, "alloc").*, topology_read, req);
                 if (hasCoordinatedConstraints(request_schema_view) and !coordinated_handoff) return error.CoordinatedConstraintTopologyUnsupported;
             }
             if (req.merge_replication != null or req.merge_checkpoint != null or req.merge_page != null) {
@@ -1452,7 +1469,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (retained.active() and std.mem.eql(u8, &retained.namespace, &namespace)) return error.IntegrityTopologyBusy;
                 }
                 coordinated_handoff = try @import("online_integrity_shadow.zig").admit(S.ownerField(self, "alloc").*, topology_read, req, S.ownerField(self, "core").*.identity_namespace);
-                if (!coordinated_handoff) coordinated_handoff = try @import("relational_integrity_handoff.zig").admitMergeRequest(S.ownerField(self, "alloc").*, topology_read, req);
+                if (!coordinated_handoff) coordinated_handoff = try @import("relational/integrity/handoff.zig").admitMergeRequest(S.ownerField(self, "alloc").*, topology_read, req);
                 if (hasCoordinatedConstraints(request_schema_view) and !coordinated_handoff) return error.CoordinatedConstraintTopologyUnsupported;
             }
             // hot-standby carries already committed effects, including prepared decisions
@@ -1462,7 +1479,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 effective_req.graph_writes.len != 0 or effective_req.graph_deletes.len != 0))
             {
                 const topology_read = try batchProbe(&batch_probe, self);
-                try @import("relational_integrity_topology.zig").requireWriteUnfenced(topology_read);
+                try @import("relational/integrity/topology.zig").requireWriteUnfenced(topology_read);
             }
 
             // A pending coalescer flush may itself run a complete nested batch and
@@ -1546,7 +1563,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // revision independently of their admitted wall-clock timestamp.
             // Untagged historical commands retain their original semantics.
             const document_revisions = effective_req.document_version_scheme != .legacy;
-            const document_version = if (document_revisions and relationalColumns(self) == null)
+            if (reserved_document_versions.count() != 0 and (!document_revisions or relationalColumns(self) != null or opts.restore_timestamps != null or opts.restore_document_version_floor != 0)) return error.InvalidTxnRecord;
+            const document_version = if (reserved_document_versions.count() == 0 and document_revisions and relationalColumns(self) == null)
                 try @import("../ttl.zig").nextDocumentVersionTxn(try batchProbe(&batch_probe, self), S.ownerField(self, "alloc").*, batch_timestamp_ns, effective_req.writes, effective_req.deletes)
             else
                 null;
@@ -1609,6 +1627,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         .key = predicate.key,
                         .expected_version = predicate.expected_version,
                         .expected_content_digest = predicate.expected_content_digest,
+                        .expected_mutation_revision = predicate.expected_mutation_revision,
                         .unique_absence = predicate.unique_absence,
                     });
                 }
@@ -2149,7 +2168,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             else if (!document_revisions and restored_version == null)
                                 try encodeTimestampValue(S.ownerField(self, "alloc").*, std.math.cast(u64, resolved_write_timestamp_ns.?) orelse return error.InvalidArgument)
                             else
-                                try encodeDocumentTimestampValue(S.ownerField(self, "alloc").*, if (effective_req.document_version_scheme == .revision_v1) document_version orelse batch_timestamp_ns else batch_timestamp_ns, resolved_write_timestamp_ns.?, restored_version);
+                                try encodeDocumentTimestampValue(S.ownerField(self, "alloc").*, if (reserved_document_versions.count() != 0) reserved_document_versions.get(write.key) orelse return error.InvalidTxnRecord else if (effective_req.document_version_scheme == .revision_v1) document_version orelse batch_timestamp_ns else batch_timestamp_ns, resolved_write_timestamp_ns.?, restored_version);
                         };
                         errdefer if (!use_preprepared_rows) S.ownerField(self, "alloc").*.free(timestamp_value);
                         try write_buffers.timestamp_writes.append(S.ownerField(self, "alloc").*, .{
@@ -3258,10 +3277,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             if (req.split_checkpoint) |checkpoint| {
                 if (coordinated_handoff and checkpoint.kind == .destination_complete) {
-                    const raw_catalog = (try S.ownerField(self, "core").*.getStoreValue(S.ownerField(self, "alloc").*, @import("relational_integrity_catalog.zig").key)) orelse return error.IntegrityCatalogChanged;
+                    const raw_catalog = (try S.ownerField(self, "core").*.getStoreValue(S.ownerField(self, "alloc").*, @import("relational/integrity/catalog.zig").key)) orelse return error.IntegrityCatalogChanged;
                     defer S.ownerField(self, "alloc").*.free(raw_catalog);
-                    integrity_coverage_value = try @import("relational_integrity_handoff.zig").coverageForRange(S.ownerField(self, "alloc").*, raw_catalog, S.ownerField(self, "core").*.identity_namespace, .{ .start = checkpoint.range_start, .end = checkpoint.range_end });
-                    try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("relational_integrity_activation.zig").key, .value = integrity_coverage_value.? });
+                    integrity_coverage_value = try @import("relational/integrity/handoff.zig").coverageForRange(S.ownerField(self, "alloc").*, raw_catalog, S.ownerField(self, "core").*.identity_namespace, .{ .start = checkpoint.range_start, .end = checkpoint.range_end });
+                    try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("relational/integrity/activation.zig").key, .value = integrity_coverage_value.? });
                 }
                 if (checkpoint.kind != .source_ack) {
                     persisted_range = .{ .start = checkpoint.range_start, .end = checkpoint.range_end };
@@ -3371,12 +3390,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, shadow.range_key);
                 }
                 if (plan.applies_checkpoint and coordinated_handoff and (checkpoint.kind == .finalize or checkpoint.kind == .rollback)) {
-                    const catalog = @import("relational_integrity_catalog.zig");
+                    const catalog = @import("relational/integrity/catalog.zig");
                     const raw_catalog = try S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, catalog.key);
                     defer S.ownerField(self, "alloc").*.free(raw_catalog);
-                    const coverage = try @import("relational_integrity_handoff.zig").coverageForRange(S.ownerField(self, "alloc").*, raw_catalog, S.ownerField(self, "core").*.identity_namespace, plan.range);
+                    const coverage = try @import("relational/integrity/handoff.zig").coverageForRange(S.ownerField(self, "alloc").*, raw_catalog, S.ownerField(self, "core").*.identity_namespace, plan.range);
                     try write_buffers.owned_store_values.append(S.ownerField(self, "alloc").*, coverage);
-                    try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("relational_integrity_activation.zig").key, .value = coverage });
+                    try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("relational/integrity/activation.zig").key, .value = coverage });
                 }
             }
             if (persisted_range) |range| try S.ownerField(self, "core").*.index_manager.validateRangeTransition(range);
@@ -3446,13 +3465,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // have been checked under this same apply fence. The physical
                 // shadow records commit with primary/index effects and receipt.
                 if (!coordinated_handoff) return error.CoordinatedConstraintTopologyUnsupported;
-                const catalog_mod = @import("relational_integrity_catalog.zig");
+                const catalog_mod = @import("relational/integrity/catalog.zig");
                 const raw = try S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, catalog_mod.key);
                 defer S.ownerField(self, "alloc").*.free(raw);
                 var compiled = try catalog_mod.decode(S.ownerField(self, "alloc").*, raw);
                 defer compiled.deinit();
                 for (page.integrity) |effect| {
-                    const address = (try @import("relational_integrity_contract.zig").parseKey(effect.key)).address;
+                    const address = (try @import("relational/integrity/contract.zig").parseKey(effect.key)).address;
                     if (page.phase != .cleanup_integrity and compiled.findGeneration(address.generation) == null) return error.IntegrityCatalogChanged;
                     if (effect.value) |value| try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = effect.key, .value = value }) else try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, effect.key);
                 }
@@ -4396,6 +4415,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     resolution.commit_version,
                     .{
                         .external_decision_owner = resolution.external_decision_owner,
+                        .replication_resolution = resolution.replication_resolution,
+                        .publication_ordered_position = if (opts.ordered_apply_receipt) |cut| .{ .term = cut.term, .index = cut.index } else null,
                         .commit_participant = commit_participant,
                         .writes = write_buffers.store_writes.items,
                         .deletes = write_buffers.delete_keys.items,
@@ -5359,24 +5380,24 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn isProtectedIntegrityKey(key: []const u8) bool {
             if (@import("../artifact_footprint.zig").isKey(key)) return true;
-            if (@import("relational_index_catalog.zig").Controller.isReservedMetadataKey(key)) return true;
+            if (@import("relational/indexes/catalog.zig").Controller.isReservedMetadataKey(key)) return true;
             if (@import("retirement_set_summary.zig").isKey(key)) return true;
             if (@import("native_topology_receipt.zig").isKey(key)) return true;
-            const generation_admission = @import("relational_integrity_generation_admission.zig");
-            const validation = @import("relational_integrity_activation_contract.zig");
+            const generation_admission = @import("relational/integrity/generation_admission.zig");
+            const validation = @import("relational/integrity/activation_contract.zig");
             if (std.mem.eql(u8, key, validation.validation_key) or std.mem.eql(u8, key, validation.validation_inputs_key)) return true;
-            return std.mem.eql(u8, key, @import("restore_staging.zig").key) or std.mem.eql(u8, key, @import("restore_staging.zig").bootstrap_key) or @import("relational_integrity.zig").isKey(key) or std.mem.eql(u8, key, @import("relational_integrity_catalog.zig").key) or
-                std.mem.eql(u8, key, @import("relational_integrity_activation.zig").key) or
-                std.mem.eql(u8, key, @import("relational_integrity_topology.zig").fence_key) or
-                std.mem.eql(u8, key, @import("relational_integrity_topology.zig").receipt_key) or
-                std.mem.startsWith(u8, key, @import("relational_integrity_topology.zig").abort_prefix) or
-                std.mem.eql(u8, key, @import("relational_integrity_retirement.zig").key) or
-                std.mem.eql(u8, key, @import("relational_integrity_generation_retirement.zig").key) or
-                std.mem.startsWith(u8, key, @import("relational_integrity_generation_retirement.zig").active_prefix) or
-                std.mem.eql(u8, key, @import("relational_integrity_generation_retirement.zig").gc_progress_key) or
-                std.mem.eql(u8, key, @import("relational_integrity_generation_retirement.zig").activation_receipt_key) or
-                std.mem.eql(u8, key, @import("relational_integrity_generation_retirement.zig").completed_pending_key) or
-                std.mem.eql(u8, key, @import("relational_integrity_generation_retirement.zig").acknowledged_receipt_key) or
+            return std.mem.eql(u8, key, @import("restore_staging.zig").key) or std.mem.eql(u8, key, @import("restore_staging.zig").bootstrap_key) or @import("relational/integrity/integrity.zig").isKey(key) or std.mem.eql(u8, key, @import("relational/integrity/catalog.zig").key) or
+                std.mem.eql(u8, key, @import("relational/integrity/activation.zig").key) or
+                std.mem.eql(u8, key, @import("relational/integrity/topology.zig").fence_key) or
+                std.mem.eql(u8, key, @import("relational/integrity/topology.zig").receipt_key) or
+                std.mem.startsWith(u8, key, @import("relational/integrity/topology.zig").abort_prefix) or
+                std.mem.eql(u8, key, @import("relational/integrity/retirement.zig").key) or
+                std.mem.eql(u8, key, @import("relational/integrity/generation_retirement.zig").key) or
+                std.mem.startsWith(u8, key, @import("relational/integrity/generation_retirement.zig").active_prefix) or
+                std.mem.eql(u8, key, @import("relational/integrity/generation_retirement.zig").gc_progress_key) or
+                std.mem.eql(u8, key, @import("relational/integrity/generation_retirement.zig").activation_receipt_key) or
+                std.mem.eql(u8, key, @import("relational/integrity/generation_retirement.zig").completed_pending_key) or
+                std.mem.eql(u8, key, @import("relational/integrity/generation_retirement.zig").acknowledged_receipt_key) or
                 std.mem.startsWith(u8, key, generation_admission.prefix) or
                 std.mem.eql(u8, key, generation_admission.staged_receipt_key) or
                 std.mem.eql(u8, key, generation_admission.activation_receipt_key) or
@@ -5387,10 +5408,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 std.mem.eql(u8, key, generation_admission.source_cancel_receipt_key) or
                 std.mem.eql(u8, key, generation_admission.source_fence_receipt_key) or
                 std.mem.eql(u8, key, generation_admission.source_install_receipt_key) or
-                std.mem.eql(u8, key, @import("relational_initial_child_publication.zig").key) or
-                std.mem.eql(u8, key, @import("relational_integrity_handoff.zig").manifest_key) or
-                std.mem.eql(u8, key, @import("relational_integrity_handoff.zig").progress_key) or
-                std.mem.eql(u8, key, @import("relational_integrity_handoff.zig").prune_key);
+                std.mem.eql(u8, key, @import("relational/integrity/initial_child_publication.zig").key) or
+                std.mem.eql(u8, key, @import("relational/integrity/handoff.zig").manifest_key) or
+                std.mem.eql(u8, key, @import("relational/integrity/handoff.zig").progress_key) or
+                std.mem.eql(u8, key, @import("relational/integrity/handoff.zig").prune_key);
         }
 
         pub fn isProtectedRangeWriteKey(key: []const u8) bool {
@@ -5440,13 +5461,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             alloc: Allocator,
             schema_version: ?u32,
             generation_set: ?[32]u8,
-            commands: []const @import("relational_integrity_contract.zig").Command,
-            child_exists: ?@import("relational_integrity.zig").ChildExistenceCheck,
+            commands: []const @import("relational/integrity/contract.zig").Command,
+            child_exists: ?@import("relational/integrity/integrity.zig").ChildExistenceCheck,
         ) ![]const transactions_mod.WriteIntent {
             if (commands.len == 0) return &.{};
-            const integrity_mod = @import("relational_integrity.zig");
-            const catalog_mod = @import("relational_integrity_catalog.zig");
-            const retirement_mod = @import("relational_integrity_retirement.zig");
+            const integrity_mod = @import("relational/integrity/integrity.zig");
+            const catalog_mod = @import("relational/integrity/catalog.zig");
+            const retirement_mod = @import("relational/integrity/retirement.zig");
             const shadow_mod = @import("online_integrity_shadow.zig");
             const store = S.ownerField(self, "core").*.store;
             const byte_range = S.ownerField(self, "core").*.byteRange();
@@ -5471,7 +5492,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var catalog = try catalog_mod.decode(alloc, raw_catalog);
             defer catalog.deinit();
             if (generation_set) |expected| {
-                const actual = @import("relational_integrity_activation.zig").generationSet(catalog);
+                const actual = @import("relational/integrity/activation.zig").generationSet(catalog);
                 if (!std.mem.eql(u8, &expected, &actual)) return error.IntegrityCatalogChanged;
             }
             const version = schema_version orelse return error.PreparedGenerationChanged;
@@ -5655,6 +5676,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             ordered_receipt: ?OrderedApplyReceipt,
             resolved_participant: ?[]const u8,
             external_decision_owner: ?transactions_mod.ExternalDecisionOwner,
+            replication_resolution: ?transactions_mod.ReplicationOrderedPhase,
         ) !void {
             var preparation: RequestPreparationContext = undefined;
             preparation.init(self);
@@ -5668,6 +5690,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 ordered_receipt,
                 resolved_participant,
                 external_decision_owner,
+                replication_resolution,
                 &preparation.guard,
             ) catch |err| return preparation.mapError(err);
         }
@@ -5682,6 +5705,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             ordered_receipt: ?OrderedApplyReceipt,
             resolved_participant: ?[]const u8,
             external_decision_owner: ?transactions_mod.ExternalDecisionOwner,
+            replication_resolution: ?transactions_mod.ReplicationOrderedPhase,
             preparation: *PreparedRowAllocator,
         ) !void {
             const alloc = preparation.allocator();
@@ -5711,6 +5735,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 } else &.{};
                 _ = S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{
                     .external_decision_owner = external_decision_owner,
+                    .replication_resolution = replication_resolution,
+                    .publication_ordered_position = if (ordered_receipt) |cut| .{ .term = cut.term, .index = cut.index } else null,
                     .completion_writes = marker_writes,
                     .resolved_participant = resolved_participant,
                 }) catch |err| switch (err) {
@@ -5765,6 +5791,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         commit_version,
                         .{
                             .external_decision_owner = external_decision_owner,
+                            .replication_resolution = replication_resolution,
+                            .publication_ordered_position = if (ordered_receipt) |cut| .{ .term = cut.term, .index = cut.index } else null,
                             .completion_writes = marker_writes,
                             .resolved_participant = resolved_participant,
                             .expected_intent_revision = intents.revision,
@@ -5837,7 +5865,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .prepared_graph_indexes = required_graph_indexes,
                     .transaction_resolution = .{
                         .prepared_graph_effects_checked = true,
+                        .document_revision_references = intents.document_revision_references,
                         .external_decision_owner = external_decision_owner,
+                        .replication_resolution = replication_resolution,
                         .txn_id = txn_id,
                         .status = status,
                         .commit_version = commit_version,
@@ -5981,20 +6011,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn validateLiveReplicationIntegrityEffects(self: anytype, alloc: Allocator, txn: anytype, req: types.BatchRequest) !void {
-            const integrity = @import("relational_integrity.zig");
-            const activation = @import("relational_integrity_activation.zig");
-            const retirement = @import("relational_integrity_retirement.zig");
-            const catalog_mod = @import("relational_integrity_catalog.zig");
+            const integrity = @import("relational/integrity/integrity.zig");
+            const activation = @import("relational/integrity/activation.zig");
+            const retirement = @import("relational/integrity/retirement.zig");
+            const catalog_mod = @import("relational/integrity/catalog.zig");
             var loaded: ?catalog_mod.Catalog = null;
             defer if (loaded) |*catalog| catalog.deinit();
             for (req.writes) |write| {
                 if (!isProtectedIntegrityKey(write.key)) continue;
-                const maintenance = @import("relational_index_maintenance_contract.zig");
+                const maintenance = @import("relational/indexes/maintenance_contract.zig");
                 if (maintenance.isControlKey(write.key)) {
                     // Index maintenance does not require an FK/unique catalog.
                     // The replicated desired state is fenced by its index identity,
                     // never by this replica's independent coverage progress.
-                    const id = try @import("relational_index_records.zig").Id.decode(write.key[maintenance.control_prefix.len..]);
+                    const id = try @import("relational/indexes/records.zig").Id.decode(write.key[maintenance.control_prefix.len..]);
                     var pinned = S.ownerField(self, "core").*.relational_indexes.acquire() orelse return error.PreparedGenerationChanged;
                     defer pinned.deinit();
                     const index = for (pinned.plan.boundIndexes()) |candidate| {
@@ -6025,8 +6055,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         break;
                     };
                     if (expected == null) expected = (try activation.ValidationRecord.decode(try txn.get(activation.validation_key))).binding.inputs;
-                    if (!std.mem.eql(u8, &@import("relational_schema_owner_contract.zig").hash(write.value), &expected.?)) return error.SchemaValidationJobChanged;
-                    _ = try @import("relational_schema_owner_contract.zig").inputParts(write.value);
+                    if (!std.mem.eql(u8, &@import("relational/schema_change/schema_owner_contract.zig").hash(write.value), &expected.?)) return error.SchemaValidationJobChanged;
+                    _ = try @import("relational/schema_change/schema_owner_contract.zig").inputParts(write.value);
                 } else if (std.mem.eql(u8, write.key, activation.key)) {
                     const next = try activation.Progress.decode(write.value);
                     if (!next.matches(catalog, try activation.ownership(txn)) or next.schema_version != catalog.schema_version)
@@ -6092,7 +6122,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn validateResolvedKeyOwnership(self: anytype, key: []const u8) !void {
-            const integrity = @import("relational_integrity.zig");
+            const integrity = @import("relational/integrity/integrity.zig");
             if (integrity.isKey(key)) {
                 const parsed = try integrity.parseKey(key);
                 return S.ownerField(self, "core").*.validateKeyOwnership(&parsed.address.routing);
@@ -6102,9 +6132,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn validateRestoreStagingReplicationEffects(self: anytype, alloc: Allocator, txn: anytype, req: types.BatchRequest) !void {
             if (req.relational_index_maintenance != null) return error.InvalidRestoreStagingCommand;
-            const integrity = @import("relational_integrity.zig");
-            const activation = @import("relational_integrity_activation.zig");
-            const catalog_mod = @import("relational_integrity_catalog.zig");
+            const integrity = @import("relational/integrity/integrity.zig");
+            const activation = @import("relational/integrity/activation.zig");
+            const catalog_mod = @import("relational/integrity/catalog.zig");
             if (req.transforms.len != 0 or req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.relational_repair or req.relational_activation != null or req.relational_retirement != null or req.integrity.len != 0 or req.integrity_commands.len != 0) return error.InvalidRestoreStagingCommand;
             const raw_catalog = txn.get(catalog_mod.key) catch |err| switch (err) {
                 error.NotFound => return error.IntegrityCatalogChanged,

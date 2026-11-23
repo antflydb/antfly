@@ -18,7 +18,7 @@
 const std = @import("std");
 const local = @import("antfly_local_sources");
 const http = @import("../../http_server.zig");
-const producer = @import("../../sql_command_producer.zig");
+const producer = @import("../session/command_producer.zig");
 const authority = @import("../../../system_catalog/lock_authority.zig");
 const journal = @import("../../../system_catalog/sql_notifications.zig");
 const types = local.sql_ast.notifications;
@@ -58,7 +58,7 @@ pub const Owner = struct {
         const store = self.server.txn_sessions.durable orelse return error.SqlConnectionUnavailable;
         const principal = http.transactionPrincipal(self.user) orelse "";
         const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
-        var connection = try @import("../../sql_connections.zig").load(store, a, self.connection, principal, self.server.localSessionNodeId(), now);
+        var connection = try @import("../session/connections.zig").load(store, a, self.connection, principal, self.server.localSessionNodeId(), now);
         defer connection.deinit();
         try http.requireSqlPrincipalInstance(self.server, self.user, connection.value.principal_instance);
         if (connection.value.state != .idle and (acknowledgement == null or connection.value.state != .active)) {
@@ -76,7 +76,7 @@ pub const Owner = struct {
             if (acknowledgement != null) return error.SqlConnectionBusy;
             return .{ .deferred = true, .waiting = true };
         }
-        const actor = try @import("../../sql_authorization_recovery.zig").actor(self.server, self.user);
+        const actor = try @import("../recovery/authorization_recovery.zig").actor(self.server, self.user);
         var native: producer.NativePort = .{ .server = self.server, .context = self.context };
         const port = native.port();
         const hub_key: hub.Key = .{ .group = source.value.registration.group, .database = source.value.registration.lease.database, .incarnation = source.value.registration.lease.backend.incarnation };

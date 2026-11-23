@@ -117,7 +117,7 @@ const Campaign = struct {
         var output: std.Io.Writer.Allocating = .init(a);
         defer output.deinit();
         const api = if (ctx.data.http_server) |*api| api else return error.MissingDataApi;
-        var adapter: @import("../../../sql_pgwire.zig").Adapter = .{ .server = api };
+        var adapter: @import("../../transport/pgwire.zig").Adapter = .{ .server = api };
         var session: protocol.Session = .{ .alloc = a, .io = ctx.io, .source = adapter.backend(), .reader = &reader, .writer = &output.writer, .limits = .{ .statement_timeout_ms = 15_000 } };
         defer session.deinit();
         try session.run();

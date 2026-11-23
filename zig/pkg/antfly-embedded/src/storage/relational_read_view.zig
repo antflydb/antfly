@@ -22,6 +22,7 @@ pub const View = struct {
     /// Acknowledgement of an exact unranked text selection. Missing proof is
     /// never permission to run a primary scan for a requested text predicate.
     text_filter_digest: ?[32]u8 = null,
+    required_indexes_digest: ?[32]u8 = null,
     ptr: *anyopaque,
     vtable: *const VTable,
     boundary_dispatch: Abi.Dispatch = Abi.local_dispatch,
@@ -34,6 +35,8 @@ pub const View = struct {
         /// Complete native SQL cells, owned by the page arena.
         typed_cells: ?@import("../sql/catalog.zig").Row.TypedCells = null,
         expected_content_digest: ?[32]u8 = null,
+        expected_mutation_revision: ?u64 = null,
+        stale_frozen_birth: bool = false,
         document: ?std.json.Value = null,
         /// SQL NULL flags aligned with value.object insertion order. A JSON
         /// payload containing null has a false flag.
@@ -42,7 +45,7 @@ pub const View = struct {
         /// Borrowed SQL view; payload lifetime is exactly the owning page.
         /// Native and legacy providers share the same cell/null accessor.
         pub fn sqlRow(self: Row) @import("../sql/catalog.zig").Row {
-            return .{ .id = self.id, .version = self.version, .value = self.value, .typed_cells = self.typed_cells, .sql_nulls = self.sql_nulls, .expected_content_digest = self.expected_content_digest, .document = self.document };
+            return .{ .id = self.id, .version = self.version, .value = self.value, .typed_cells = self.typed_cells, .sql_nulls = self.sql_nulls, .expected_content_digest = self.expected_content_digest, .expected_mutation_revision = self.expected_mutation_revision, .stale_frozen_birth = self.stale_frozen_birth, .document = self.document };
         }
 
         pub fn cell(self: Row, name: []const u8) !@import("../sql/catalog.zig").Row.Cell {

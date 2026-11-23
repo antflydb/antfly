@@ -24,7 +24,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const change_journal = @import("derived/change_journal.zig");
 pub const primary_effect = @import("primary_effect.zig");
-pub const schema_owner_control = @import("relational_schema_owner_control.zig");
+pub const schema_owner_control = @import("relational/schema_change/schema_owner_control.zig");
+pub const publication_control = @import("logical_replication_control_frame.zig");
 const db_types = @import("types.zig");
 
 const replication_record = @import("replication_record.zig");
@@ -49,7 +50,7 @@ pub const AppendMetadataMutationOptions = struct {
 };
 
 pub const BatchMutationPayload = struct {
-    index_owner_control: ?@import("relational_index_owner_control.zig").Frame = null,
+    index_owner_control: ?@import("relational/indexes/owner_control.zig").Frame = null,
     /// Original authority for ordinary rows and coordinated resolutions. Input
     /// provenance cannot substitute a standby-local replay sequence.
     ordinary_raft_entry: ?db_types.OrderedApplyReceipt = null,
@@ -247,7 +248,7 @@ pub fn encodeInitialChildMutationRequestAlloc(alloc: Allocator, request: db_type
 
 test "storage.hot_standby initial hidden FK HA payload preserves exact Raft receipt identity" {
     const alloc = std.testing.allocator;
-    const fence: @import("relational_integrity_topology_contract.zig").Fence = .{
+    const fence: @import("relational/integrity/topology_contract.zig").Fence = .{
         .role = .child_generation_source,
         .transition_id = 7,
         .attempt = 1,
@@ -548,7 +549,7 @@ pub fn encodeRowPolicyMetadataMutationAlloc(
 /// An HA standby must replay the same source-fence cut as the primary, not a
 /// generic schema update that would bypass (or fail) FK generation admission.
 pub const PublishedChildSchema = struct {
-    fence: @import("relational_integrity_topology_contract.zig").Fence,
+    fence: @import("relational/integrity/topology_contract.zig").Fence,
     before_schema_json_digest: [32]u8,
     schema_json_digest: [32]u8,
     before_catalog_digest: [32]u8,
@@ -833,14 +834,14 @@ pub fn decodeBatchMutationRequest(
         .allocate = .alloc_always,
     });
     errdefer parsed.deinit();
-    if (parsed.value.index_owner_control != null or parsed.value.schema_version == @import("relational_index_owner_control.zig").envelope_version) {
-        if (record.payload.len > @import("relational_index_owner_control.zig").max_wire_bytes) return error.InvalidBatchRequest;
+    if (parsed.value.index_owner_control != null or parsed.value.schema_version == @import("relational/indexes/owner_control.zig").envelope_version) {
+        if (record.payload.len > @import("relational/indexes/owner_control.zig").max_wire_bytes) return error.InvalidBatchRequest;
         // Private control envelopes have exactly these fields. An ignored
         // unknown field or ordinary batch effect must never enter this path.
         const Strict = struct {
             schema_version: u32,
             request: struct {},
-            index_owner_control: @import("relational_index_owner_control.zig").Frame,
+            index_owner_control: @import("relational/indexes/owner_control.zig").Frame,
         };
         var strict = std.json.parseFromSlice(Strict, alloc, record.payload, .{}) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -904,7 +905,7 @@ fn canonicalRequestHash(request: db_types.BatchRequest) ![32]u8 {
 }
 
 pub fn validateIndexOwnerPayload(payload: BatchMutationPayload) !void {
-    const control = @import("relational_index_owner_control.zig");
+    const control = @import("relational/indexes/owner_control.zig");
     if (payload.schema_version != control.envelope_version) return error.InvalidBatchRequest;
     const frame = payload.index_owner_control orelse return error.InvalidBatchRequest;
     try frame.validate();
@@ -964,7 +965,7 @@ pub fn decodeRestoreFinishForReplay(
     };
     var parsed = try std.json.parseFromSlice(Projection, alloc, record.payload, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    if (parsed.value.index_owner_control != null or parsed.value.schema_version == @import("relational_index_owner_control.zig").envelope_version) {
+    if (parsed.value.index_owner_control != null or parsed.value.schema_version == @import("relational/indexes/owner_control.zig").envelope_version) {
         var control = try decodeBatchMutationRequest(alloc, record);
         defer control.deinit();
         return null;

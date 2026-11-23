@@ -48,7 +48,10 @@ fn indexPredicate(alloc: std.mem.Allocator, condition: relational_wire.Relationa
 }
 
 pub const TableSchema = struct {
+    document_sql_columns: ?std.json.Parsed([]const @import("document_sql_columns.zig").Column) = null,
+    sql_view_requirements: ?std.json.Parsed([]const @import("sql_view_requirements.zig").Declaration) = null,
     sql_triggers: ?std.json.Parsed(@import("../system_catalog/triggers.zig").State) = null,
+    sql_partition: ?std.json.Parsed(@import("../system_catalog/table_partitions.zig").State) = null,
     version: u32 = 0,
     column_lineage: u32 = 0,
     storage_mode: StorageMode = .document,
@@ -68,8 +71,16 @@ pub const TableSchema = struct {
     generated_columns: ?std.json.Parsed(std.json.Value) = null,
     named_types: ?named_layouts.Registry = null,
 
+    pub fn hasDocumentSqlDeclarations(self: TableSchema) bool {
+        return (if (self.document_sql_columns) |columns| columns.value.len != 0 else false) or
+            (if (self.sql_view_requirements) |requirements| requirements.value.len != 0 else false);
+    }
+
     pub fn deinit(self: *TableSchema, alloc: std.mem.Allocator) void {
+        if (self.document_sql_columns) |*columns| columns.deinit();
+        if (self.sql_view_requirements) |*requirements| requirements.deinit();
         if (self.sql_triggers) |*state| state.deinit();
+        if (self.sql_partition) |*state| state.deinit();
         if (self.external_base_source) |*source| source.deinit(alloc);
         if (self.relational_indexes) |*indexes| indexes.deinit();
         if (self.checks) |*checks| checks.deinit();
@@ -701,7 +712,7 @@ pub const CompiledValidationPlan = struct {
                         else => return error.InvalidBatchRequest,
                     };
                 } else {
-                    _ = @import("../sql/array_wire.zig").normalize(column.kind, cell, preserve, .{ .context = &execution.numeric, .values = .{
+                    _ = @import("../sql/array/wire.zig").normalize(column.kind, cell, preserve, .{ .context = &execution.numeric, .values = .{
                         .work = @intCast(@min(execution.numeric.remaining, std.math.maxInt(usize))),
                     } }) catch |err| {
                         if (err == error.SqlProgramLimitExceeded) return execution.limit();
@@ -824,7 +835,7 @@ const RuntimeValidationContext = struct {
     numeric_execution: ?*@import("numeric_constraints.zig").Execution = null,
     preparation_execution: ?*@import("relational_expression.zig").Execution = null,
     numeric_domain_value: ?*const std.json.Value = null,
-    numeric_parsed: ?@import("../sql/numeric_value.zig").Value = null,
+    numeric_parsed: ?@import("../sql/numeric/value.zig").Value = null,
     active_root_ref_values: std.ArrayListUnmanaged(usize) = .{ .items = &.{}, .capacity = 0, .pointer_stability = .{} },
 
     fn findProperty(self: *const RuntimeValidationContext, properties: []const DocumentProperty, name: []const u8) ?DocumentProperty {
@@ -939,6 +950,7 @@ fn parseSchemaRequest(alloc: std.mem.Allocator, body: []const u8, allow_inferenc
         try validateRelationalExpressions(alloc, schema);
     }
     if (schema.sql_triggers) |state| try @import("table_triggers.zig").canonicalize(parsed.arena.allocator(), &parsed.value, state.value);
+    if (schema.sql_partition) |state| try @import("table_partitions.zig").canonicalize(parsed.arena.allocator(), &parsed.value, state.value);
     if (schema.named_types) |registry| try named_layouts.canonicalizeSchemaLeaky(parsed.arena.allocator(), &parsed.value, registry.records);
     return try stringifyJsonValue(alloc, parsed.value);
 }
@@ -999,17 +1011,17 @@ fn validateDocumentSqlAliasPaths(property: *const DocumentProperty, fixed_path: 
 }
 
 fn validateDocumentSqlAliases(alloc: std.mem.Allocator, schema: TableSchema) !void {
+    if (schema.hasDocumentSqlDeclarations() and schema.storage_mode != .document) return error.InvalidSchemaUpdateRequest;
+    var has_aliases = if (schema.document_sql_columns) |columns| columns.value.len != 0 else false;
     for (schema.document_schemas) |document| {
         const root = makeRootDocumentProperty(document);
         try validateDocumentSqlAliasPaths(&root, schema.storage_mode == .document);
+        has_aliases = has_aliases or documentPropertiesHaveSqlAliases(document.properties);
     }
-    if (schema.storage_mode == .document) {
-        for (schema.document_schemas) |document| if (documentPropertiesHaveSqlAliases(document.properties)) {
-            var arena = std.heap.ArenaAllocator.init(alloc);
-            defer arena.deinit();
-            _ = @import("../sql/document_row.zig").deriveColumns(arena.allocator(), schema) catch |err| return if (err == error.OutOfMemory) err else error.InvalidSchemaUpdateRequest;
-            break;
-        };
+    if (schema.storage_mode == .document and has_aliases) {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        _ = @import("../sql/document_row.zig").deriveColumns(arena.allocator(), schema) catch |err| return if (err == error.OutOfMemory) err else error.InvalidSchemaUpdateRequest;
     }
 }
 
@@ -1596,6 +1608,7 @@ fn validateDocumentValueInternal(
     const execution = shared_execution orelse &local_execution;
     try execution.charge(0);
     if (!sql_admitted) if (compiled) |plan| try plan.normalizeSql(execution, value, true, .all);
+    if (schema.sql_partition) |state| try @import("table_partitions.zig").validateJson(state.value, value.*);
     if (verify_generated) if (compiled) |plan| {
         if (plan.expressions) |expressions| try expressions.verifyJsonWithExecution(execution, value.*);
     } else if (schema.generated_columns != null) {
@@ -1821,7 +1834,7 @@ fn validateSchemaValue(value: std.json.Value, strict_native_keywords: bool) !voi
         else => return error.InvalidSchemaUpdateRequest,
     };
 
-    if (strict_native_keywords and root.contains("sql_triggers")) return error.InvalidSchemaUpdateRequest;
+    if (strict_native_keywords and (root.contains("sql_triggers") or root.contains(@import("table_partitions.zig").field))) return error.InvalidSchemaUpdateRequest;
     if (root.get("version")) |version| if (version != .null) try validateNonNegativeInteger(version);
     if (root.get("storage_mode")) |storage_mode| if (storage_mode != .null) switch (storage_mode) {
         .string => |text| {
@@ -1933,12 +1946,13 @@ fn validateNativeSchemaKeywordPlacement(object: std.json.ObjectMap) !void {
         .{ "x-antfly-column-name", {} }, .{ "x-antfly-sql-type-id", {} },
     });
     const table_only = comptime std.StaticStringMap(void).initComptime(.{
-        .{ "storage_mode", {} },      .{ "default_type", {} },       .{ "enforce_types", {} },
-        .{ "document_schemas", {} },  .{ "dynamic_templates", {} },  .{ "index_sort", {} },
-        .{ "ttl", {} },               .{ "ttl_field", {} },          .{ "ttl_duration", {} },
-        .{ "ttl_duration_ns", {} },   .{ "relational_indexes", {} }, .{ "unique_constraints", {} },
-        .{ "foreign_keys", {} },      .{ "checks", {} },             .{ "column_defaults", {} },
-        .{ "generated_columns", {} }, .{ "named_types", {} },
+        .{ "storage_mode", {} },          .{ "default_type", {} },       .{ "enforce_types", {} },
+        .{ "document_schemas", {} },      .{ "dynamic_templates", {} },  .{ "index_sort", {} },
+        .{ "ttl", {} },                   .{ "ttl_field", {} },          .{ "ttl_duration", {} },
+        .{ "ttl_duration_ns", {} },       .{ "relational_indexes", {} }, .{ "unique_constraints", {} },
+        .{ "foreign_keys", {} },          .{ "checks", {} },             .{ "column_defaults", {} },
+        .{ "generated_columns", {} },     .{ "named_types", {} },        .{ "document_sql_columns", {} },
+        .{ "sql_view_requirements", {} },
     });
     for (object.keys()) |key| {
         if (table_only.has(key) or (std.mem.startsWith(u8, key, "x-antfly-") and !native.has(key)))
@@ -2492,7 +2506,7 @@ fn validateTypeArrayDefinition(value: std.json.Array, require_object_only: bool)
 }
 
 fn validateTypeName(schema_type_name: []const u8, require_object_only: bool) ![]const u8 {
-    if (!require_object_only and std.meta.stringToEnum(@import("../sql/range_value.zig").Kind, schema_type_name) != null) return schema_type_name;
+    if (!require_object_only and std.meta.stringToEnum(@import("../sql/range/value.zig").Kind, schema_type_name) != null) return schema_type_name;
     if (require_object_only) {
         if (!std.mem.eql(u8, schema_type_name, "object")) return error.InvalidSchemaUpdateRequest;
         return schema_type_name;
@@ -3039,7 +3053,23 @@ fn parseTableSchemaValueMode(alloc: std.mem.Allocator, value: std.json.Value, un
     };
     errdefer parsed.deinit(alloc);
 
+    if (root.get("document_sql_columns")) |columns| {
+        if (columns != .null) parsed.document_sql_columns = try @import("document_sql_columns.zig").parseValue(alloc, columns);
+    }
+    if (root.get("sql_view_requirements")) |requirements| {
+        if (requirements != .null) parsed.sql_view_requirements = try @import("sql_view_requirements.zig").parseValue(alloc, requirements);
+    }
     if (root.get("sql_triggers")) |state| parsed.sql_triggers = try @import("table_triggers.zig").parseValue(alloc, state);
+    if (root.get(@import("table_partitions.zig").field)) |raw| {
+        const partitions = @import("table_partitions.zig");
+        parsed.sql_partition = try partitions.parseValue(alloc, raw);
+        const relation = switch (parsed.sql_partition.?.value) {
+            .parent => |parent| parent.parent,
+            .member => |member| member.child,
+        };
+        const digest = try partitions.digestDefinitionObject(root);
+        if (!std.mem.eql(u8, &digest, &relation.definition)) return error.InvalidPartitionDescriptor;
+    }
     if (root.get("version")) |version| {
         if (version != .null) parsed.version = std.math.cast(u32, exactU64JsonNumber(version) orelse return error.InvalidSchemaUpdateRequest) orelse return error.InvalidSchemaUpdateRequest;
     }
@@ -3381,6 +3411,13 @@ fn bindNamedTypesMode(schema: *TableSchema, unresolved: bool) !void {
 }
 
 fn validateParsedStorageModeSchema(schema: TableSchema) !void {
+    if (schema.sql_partition) |state| {
+        const version = switch (state.value) {
+            .parent => |parent| parent.parent.schema_version,
+            .member => |member| member.child.schema_version,
+        };
+        if (schema.storage_mode != .relational or schema.external_base_source != null or schema.version != version) return error.InvalidPartitionDescriptor;
+    }
     if (schema.storage_mode == .relational) return;
     for (schema.document_schemas) |document_schema| {
         const root_property = makeRootDocumentProperty(document_schema);
@@ -3390,7 +3427,7 @@ fn validateParsedStorageModeSchema(schema: TableSchema) !void {
 
 fn propertyContainsRelationalOnlySchemaType(property: *const DocumentProperty) bool {
     if (property.named_type_id != null) return true;
-    if (property.field_type) |kind| if (std.meta.stringToEnum(@import("../sql/range_value.zig").Kind, kind) != null) return true;
+    if (property.field_type) |kind| if (std.meta.stringToEnum(@import("../sql/range/value.zig").Kind, kind) != null) return true;
     if (property.sql_type != null) return true;
     if (property.field_type) |field_type| {
         if (std.mem.eql(u8, field_type, "geopoint") or
@@ -3478,7 +3515,7 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
                 (constraint.origin orelse .constraint) == .index) return error.InvalidSchemaUpdateRequest;
             const property = findDocumentProperty(document_schema.properties, period) orelse return error.InvalidSchemaUpdateRequest;
             const kind = property.field_type orelse return error.InvalidSchemaUpdateRequest;
-            if (std.meta.stringToEnum(@import("../sql/range_value.zig").Kind, kind) == null) return error.InvalidSchemaUpdateRequest;
+            if (std.meta.stringToEnum(@import("../sql/range/value.zig").Kind, kind) == null) return error.InvalidSchemaUpdateRequest;
         }
         if (constraint.primary orelse false) {
             primary_count += 1;
@@ -3724,7 +3761,7 @@ test "relational declarations SQL row array ingress preserves cancellation and a
 
 test "relational declarations exact NUMERIC composition parses once and shares the scalar work budget" {
     const a = std.testing.allocator;
-    const exact = @import("../sql/numeric_value.zig");
+    const exact = @import("../sql/numeric/value.zig");
     var definition = try std.json.parseFromSlice(std.json.Value, a, "{\"type\":\"number\",\"allOf\":[{\"minimum\":1},{\"maximum\":2}]}", .{ .parse_numbers = false });
     defer definition.deinit();
     const scope: SchemaContext = .{ .document_root = definition.value.object, .scope_schema = definition.value.object, .numeric_domain = true };
@@ -3891,7 +3928,7 @@ fn relationalPhysicalConstraintsAreExactForKind(property: DocumentProperty, inhe
     // validated as JSON but never lowered into physical numeric cells, so their
     // constraints do not need to fit a relational scalar encoding.
     if (documentPropertyUsesJsonEncoding(property) or propertyIsSqlArray(property)) return true;
-    if (property.field_type) |kind| if (std.meta.stringToEnum(@import("../sql/range_value.zig").Kind, kind) != null) return true;
+    if (property.field_type) |kind| if (std.meta.stringToEnum(@import("../sql/range/value.zig").Kind, kind) != null) return true;
 
     const kind = inherited_kind orelse relationalNumericKind(property);
     if (kind) |numeric_kind| {
@@ -3956,7 +3993,7 @@ fn relationalNumericLiteralIsEncodable(literal: []const u8, kind: RelationalNume
 }
 
 fn isRelationalStorageProperty(property: DocumentProperty) bool {
-    if (property.field_type) |kind| if (std.meta.stringToEnum(@import("../sql/range_value.zig").Kind, kind) != null) return !relationalPropertyContainsRootRef(property);
+    if (property.field_type) |kind| if (std.meta.stringToEnum(@import("../sql/range/value.zig").Kind, kind) != null) return !relationalPropertyContainsRootRef(property);
     // A root reference is context-sensitive: validation resolves it against
     // the enclosing document schema, while the physical column catalog only
     // sees this property. Reject recursive relational shapes until the catalog
@@ -4258,7 +4295,7 @@ fn parseScalarPropertyKeywords(alloc: std.mem.Allocator, numeric_domain: bool, o
     if (property.field_type) |physical| if (std.mem.eql(u8, physical, "sql_array") and property.sql_type == null) return error.InvalidSchemaUpdateRequest;
     property.numeric_modifier = if (object.get("x-antfly-sql-numeric-modifier")) |value| blk: {
         if (property.sql_type != .numeric) return error.InvalidSchemaUpdateRequest;
-        break :blk @import("../sql/numeric_storage.zig").modifierFromJson(value) catch return error.InvalidSchemaUpdateRequest;
+        break :blk @import("../sql/numeric/storage.zig").modifierFromJson(value) catch return error.InvalidSchemaUpdateRequest;
     } else null;
     property.format = if (object.get("format")) |format_value|
         switch (format_value) {
@@ -5610,12 +5647,12 @@ fn validateDocumentFieldValueWithContext(
     if (!exact_numeric) try validateNumericKeywordsWithContext(context, property, value.*);
 
     const field_type = property.field_type orelse return;
-    if (std.meta.stringToEnum(@import("../sql/range_value.zig").Kind, field_type)) |kind| {
+    if (std.meta.stringToEnum(@import("../sql/range/value.zig").Kind, field_type)) |kind| {
         if (value.* != .string) return error.InvalidBatchRequest;
         var scratch = std.heap.ArenaAllocator.init(context.alloc);
         defer scratch.deinit();
-        var range_context: @import("../sql/range_value.zig").Context = .{ .alloc = scratch.allocator() };
-        _ = try @import("../sql/range_value.zig").parseLeaky(&range_context, kind, value.string);
+        var range_context: @import("../sql/range/value.zig").Context = .{ .alloc = scratch.allocator() };
+        _ = try @import("../sql/range/value.zig").parseLeaky(&range_context, kind, value.string);
         return;
     }
 
@@ -5648,7 +5685,7 @@ fn validateDocumentFieldValueWithContext(
         if (!context.validated_sql_arrays) {
             const kind = property.sql_type orelse return error.InvalidBatchRequest;
             var envelope = value.*;
-            _ = @import("../sql/array_wire.zig").normalize(@import("../common/sql_builtin_type.zig").Type.fromWire(kind), &envelope, true, .{}) catch return error.InvalidBatchRequest;
+            _ = @import("../sql/array/wire.zig").normalize(@import("../common/sql_builtin_type.zig").Type.fromWire(kind), &envelope, true, .{}) catch return error.InvalidBatchRequest;
         }
         return;
     }
@@ -6911,6 +6948,12 @@ test "schema rejects invalid patterns before instance evaluation" {
             \\{"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"name":{"type":"string","pattern":"["}}}}}}
         ),
     );
+}
+
+test "public schema requests refuse private partition metadata before decoding it" {
+    const body = "{\"sql_partition\":null}";
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseCreateSchemaRequest(std.testing.allocator, body));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchemaUpdateRequest(std.testing.allocator, body));
 }
 
 test "public schema mutations admit wired relational storage" {

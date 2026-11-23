@@ -825,7 +825,7 @@ test "relational index system source pin prepared crash blocks markers then reop
             // A parent may already accept a child generation. Private source
             // decoding must still export its exact pinned row cut, without
             // making that accepted scope portable as a database backup.
-            const admission = @import("relational_integrity_generation_admission.zig");
+            const admission = @import("relational/integrity/generation_admission.zig");
             const accepted = try (admission.Scope{
                 .child_table_id = 9,
                 .child_table_name = "children",
@@ -946,7 +946,7 @@ test "relational index system source pin prepared crash blocks markers then reop
         try std.testing.expectError(error.SourceCopyRestoreUnsupported, portable.importPortableWithOptions(alloc, decoder.core.store, bytes, .{}));
         try portable.importPortableWithOptions(alloc, decoder.core.store, bytes, .{ .source_copy = proof, .unpublished_staging = true });
         try portable.validateCompleteSourceCopyImage(alloc, decoder.core.store, proof);
-        try std.testing.expectError(error.NotFound, decoder.core.store.get(alloc, &try @import("relational_integrity_generation_admission.zig").scopeKey("children", "parent_fk")));
+        try std.testing.expectError(error.NotFound, decoder.core.store.get(alloc, &try @import("relational/integrity/generation_admission.zig").scopeKey("children", "parent_fk")));
         if (trial == 0) {
             const restored_graph = try decoder.core.store.get(alloc, graph_key);
             defer alloc.free(restored_graph);

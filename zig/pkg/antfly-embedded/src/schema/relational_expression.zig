@@ -27,8 +27,8 @@ fn scalarJson(alloc: Allocator, kind: Kind, value: std.json.Value, literal: bool
 }
 const Numeric = @import("../common/sql_builtin_type.zig").Type;
 const casts = @import("../sql/builtin_cast.zig");
-const exact = @import("../sql/numeric_value.zig");
-const binary = @import("../sql/numeric_binary.zig");
+const exact = @import("../sql/numeric/value.zig");
+const binary = @import("../sql/numeric/binary.zig");
 const text_kernel = @import("../sql/text_value.zig");
 pub const max_nodes = 128;
 pub const max_depth = 16;
@@ -540,18 +540,18 @@ pub fn numericJson(execution: *Execution, input: std.json.Value) !Value {
     var scratch: NumericScratch = undefined;
     scratch.init(execution);
     defer scratch.deinit();
-    const parsed = @import("../sql/numeric_storage.zig").fromJson(&execution.numeric, input) catch |err| return scratch.failure(err);
+    const parsed = @import("../sql/numeric/storage.zig").fromJson(&execution.numeric, input) catch |err| return scratch.failure(err);
     return scratch.encode(parsed.value) catch |err| return scratch.failure(err);
 }
 
-fn rangeJson(execution: *Execution, kind: @import("../sql/range_value.zig").Kind, input: std.json.Value) !Value {
+fn rangeJson(execution: *Execution, kind: @import("../sql/range/value.zig").Kind, input: std.json.Value) !Value {
     try execution.charge(0);
     if (input == .null) return .null;
     if (input != .string) return error.InvalidRelationalExpressionInput;
     var scratch: NumericScratch = undefined;
     scratch.init(execution);
     defer scratch.deinit();
-    const ranges = @import("../sql/range_value.zig");
+    const ranges = @import("../sql/range/value.zig");
     const value = ranges.parseLeaky(&execution.numeric, kind, input.string) catch |err| return scratch.failure(err);
     const size = ranges.encodedSize(&execution.numeric, value) catch |err| return scratch.failure(err);
     if (size > execution.bytes.* -| scratch.memory.footprint()) return execution.limit();
@@ -562,11 +562,11 @@ fn rangeJson(execution: *Execution, kind: @import("../sql/range_value.zig").Kind
     return .{ .range = .{ .kind = kind, .bytes = output } };
 }
 
-fn rangeJsonOutput(execution: *Execution, range: @import("../sql/range_value.zig").Encoded) !std.json.Value {
+fn rangeJsonOutput(execution: *Execution, range: @import("../sql/range/value.zig").Encoded) !std.json.Value {
     var scratch: NumericScratch = undefined;
     scratch.init(execution);
     defer scratch.deinit();
-    const ranges = @import("../sql/range_value.zig");
+    const ranges = @import("../sql/range/value.zig");
     const value = ranges.decodeCanonicalLeaky(&execution.numeric, range.kind, range.bytes) catch |err| return scratch.failure(err);
     const text = ranges.formatLeaky(&execution.numeric, value) catch |err| return scratch.failure(err);
     if (text.len > execution.bytes.* -| scratch.memory.footprint()) return execution.limit();
@@ -580,7 +580,7 @@ fn rangeJsonOutput(execution: *Execution, range: @import("../sql/range_value.zig
 /// This adapter does not admit array expressions or ordered array keys by itself.
 pub fn arrayJson(
     execution: *Execution,
-    kind: @import("../sql/array_value.zig").ElementType,
+    kind: @import("../sql/array/value.zig").ElementType,
     input: std.json.Value,
     modifier: ?exact.TypeModifier,
 ) !Value {
@@ -589,9 +589,9 @@ pub fn arrayJson(
     var scratch: NumericScratch = undefined;
     scratch.init(execution);
     defer scratch.deinit();
-    const wire = @import("../sql/array_wire.zig");
-    const storage = @import("../sql/array_storage.zig");
-    const limits: @import("../sql/array_value.zig").Limits = .{ .bytes = execution.bytes.* };
+    const wire = @import("../sql/array/wire.zig");
+    const storage = @import("../sql/array/storage.zig");
+    const limits: @import("../sql/array/value.zig").Limits = .{ .bytes = execution.bytes.* };
     var decoded = wire.decodeBorrowedWithModifier(scratch.arena.allocator(), kind, input, modifier, .{
         .context = &execution.numeric,
         .values = limits,
@@ -619,8 +619,8 @@ fn arrayJsonOutputLeaky(execution: *Execution, array: @import("../sql/row_value.
     var scratch: NumericScratch = undefined;
     scratch.init(execution);
     defer scratch.deinit();
-    const limits: @import("../sql/array_value.zig").Limits = .{ .bytes = execution.bytes.* };
-    const decoded = @import("../sql/array_storage.zig").decodeLeaky(scratch.arena.allocator(), array.element_type, array.bytes, .{
+    const limits: @import("../sql/array/value.zig").Limits = .{ .bytes = execution.bytes.* };
+    const decoded = @import("../sql/array/storage.zig").decodeLeaky(scratch.arena.allocator(), array.element_type, array.bytes, .{
         .context = &execution.numeric,
         .values = limits,
         .wire_bytes = execution.numeric.max_output_bytes,
@@ -631,12 +631,12 @@ fn arrayJsonOutputLeaky(execution: *Execution, array: @import("../sql/row_value.
         .monotonic = true,
     };
     defer execution.bytes.* -|= retained.footprint();
-    var output = @import("../sql/array_wire.zig").toJsonLeaky(retained.allocator(), decoded.value, .{
+    var output = @import("../sql/array/wire.zig").toJsonLeaky(retained.allocator(), decoded.value, .{
         .context = &execution.numeric,
         .values = limits,
         .wire_bytes = execution.numeric.max_output_bytes,
     }) catch |err| return if (err == error.OutOfMemory and retained.isExhausted()) execution.limit() else scratch.failure(err);
-    var work: @import("../sql/array_value.zig").Budget = .{ .shared = &execution.numeric };
+    var work: @import("../sql/array/value.zig").Budget = .{ .shared = &execution.numeric };
     @import("../sql/json_order.zig").rehomeArrayAllocators(&output, execution.alloc, &work, 0) catch |err| return scratch.failure(err);
     return output;
 }
@@ -655,7 +655,7 @@ pub fn normalizeNumericJson(execution: *Execution, input: std.json.Value, modifi
 
 fn normalizeNumericJsonInner(scratch: *NumericScratch, input: std.json.Value, modifier: ?exact.TypeModifier, preserve: bool) !std.json.Value {
     const ctx = &scratch.execution.numeric;
-    const parsed = try @import("../sql/numeric_storage.zig").fromJson(ctx, input);
+    const parsed = try @import("../sql/numeric/storage.zig").fromJson(ctx, input);
     const constrained = if (modifier) |target| try exact.applyTypeModifier(ctx, parsed.value, target) else parsed;
     if (preserve) {
         if (modifier != null and try exact.order(ctx, parsed.value, constrained.value) != .eq) return error.InvalidRelationalGeneratedValue;
@@ -669,7 +669,7 @@ fn normalizeNumericJsonInner(scratch: *NumericScratch, input: std.json.Value, mo
 /// complete admission, preserving dimensions, SQL NULLs and signed bounds.
 pub fn normalizeNumericArrayJson(execution: *Execution, input: *std.json.Value, modifier: ?exact.TypeModifier, preserve: bool) !void {
     execution.numeric.charge(0) catch |err| return executionFailure(err);
-    const wire = @import("../sql/array_wire.zig");
+    const wire = @import("../sql/array/wire.zig");
     // Borrowed input has its existing wire/domain bounds; only actual scratch
     // and owned output consume the preparation allocation allowance.
     const inspected = wire.inspectNumericEnvelope(input.*, .{ .context = &execution.numeric, .values = .{
@@ -738,7 +738,7 @@ fn normalizeNumericArrayBinding(execution: *Execution, input: Value, modifier: e
     if (input == .null) return input;
     if (input != .sql_array or input.sql_array.element_type != .numeric) return error.InvalidRelationalExpressionInput;
     try modifier.validate();
-    const storage = @import("../sql/array_storage.zig");
+    const storage = @import("../sql/array/storage.zig");
     const view = storage.validateCanonical(execution.alloc, .numeric, input.sql_array.bytes, .{
         .context = &execution.numeric,
         .wire_bytes = max_output_bytes,
@@ -826,9 +826,9 @@ fn jsonFunction(op: Op) bool {
     };
 }
 
-fn numericFunction(op: Op) ?@import("../sql/numeric_functions.zig").Function {
+fn numericFunction(op: Op) ?@import("../sql/numeric/functions.zig").Function {
     return switch (op) {
-        inline .abs, .ceil, .floor, .round, .trunc, .sign, .sqrt => |tag| @field(@import("../sql/numeric_functions.zig").Function, @tagName(tag)),
+        inline .abs, .ceil, .floor, .round, .trunc, .sign, .sqrt => |tag| @field(@import("../sql/numeric/functions.zig").Function, @tagName(tag)),
         else => null,
     };
 }
@@ -878,7 +878,7 @@ const Node = struct {
     numeric_modifier: ?exact.TypeModifier = null,
     enum_view: ?*const @import("../common/sql_enum_value.zig").View = null,
     replace_pattern: ?text_kernel.Pattern = null,
-    uuid_shift: ?@import("../sql/temporal_value.zig").Interval = null,
+    uuid_shift: ?@import("../sql/temporal/value.zig").Interval = null,
     clock_precision: u8 = 6,
 };
 
@@ -1144,8 +1144,8 @@ pub const Plan = struct {
     }
 
     fn evaluateArray(self: *const Plan, execution: *Execution, source: Source, node: Node) !Value {
-        const arrays = @import("../sql/array_value.zig");
-        const storage = @import("../sql/array_storage.zig");
+        const arrays = @import("../sql/array/value.zig");
+        const storage = @import("../sql/array/storage.zig");
         const kind = node.sql_type.?;
         if (node.children.len != 0 and self.nodes[node.children[0]].kind == .sql_array) {
             var parts: [32]?storage.layout.View = undefined;
@@ -1238,7 +1238,7 @@ pub const Plan = struct {
                 }
                 if (node.kind == .blob) break :blk try decodeBlob(execution, try BlobOperand.fromJson(input));
                 if (node.kind == .sql_array) break :blk try arrayJson(execution, node.sql_type.?, input, null);
-                if (@import("../sql/range_value.zig").kindFromType(node.kind)) |kind| break :blk try rangeJson(execution, kind, input);
+                if (@import("../sql/range/value.zig").kindFromType(node.kind)) |kind| break :blk try rangeJson(execution, kind, input);
                 break :blk if (node.kind == .numeric) try numericJson(execution, input) else try scalarJson(alloc, node.kind, input, false);
             },
             .row, .bound_row => |row| blk: {
@@ -1258,7 +1258,7 @@ pub const Plan = struct {
                     .integer => .{ .integer = cell.value.i64_val },
                     .number => .{ .number = cell.value.f64_val },
                     .numeric => .{ .numeric = cell.value.bytes_val },
-                    .numrange, .daterange, .tsrange, .tstzrange => .{ .range = .{ .kind = @import("../sql/range_value.zig").kindFromType(node.kind).?, .bytes = cell.value.bytes_val } },
+                    .numrange, .daterange, .tsrange, .tstzrange => .{ .range = .{ .kind = @import("../sql/range/value.zig").kindFromType(node.kind).?, .bytes = cell.value.bytes_val } },
                     .sql_array => .{ .sql_array = .{ .element_type = node.sql_type.?, .bytes = cell.value.bytes_val } },
                     .boolean => .{ .boolean = cell.value.bool_val },
                     .datetime => .{ .datetime = cell.value.u64_val },
@@ -1408,7 +1408,7 @@ pub const Plan = struct {
                 return numericCast(.{ .integer = if (input < 0) std.math.negate(input) catch return error.RelationalExpressionOverflow else input }, node.sql_type orelse .int64);
             }
             if (args[0] == .number) {
-                const result = @import("../sql/numeric_functions.zig").floating(&execution.numeric, function, args[0].number) catch |err| return executionFailure(err);
+                const result = @import("../sql/numeric/functions.zig").floating(&execution.numeric, function, args[0].number) catch |err| return executionFailure(err);
                 return numericCast(.{ .number = result }, node.sql_type orelse .float64);
             }
             if (function == .abs) return numericOperation(execution, node, args[0..1], self.nodes[node.children[0]]);
@@ -1425,7 +1425,7 @@ pub const Plan = struct {
             defer scratch.deinit();
             const input = numericOperand(&execution.numeric, args[0], false) catch |err| return scratch.failure(err);
             const scale: i32 = if (node.children.len == 2) std.math.cast(i32, args[1].integer) orelse return error.RelationalExpressionOverflow else 0;
-            const result = @import("../sql/numeric_functions.zig").numeric(&execution.numeric, function, input, scale) catch |err| return scratch.failure(err);
+            const result = @import("../sql/numeric/functions.zig").numeric(&execution.numeric, function, input, scale) catch |err| return scratch.failure(err);
             // The scratch owner pins borrowed limbs through canonical encoding.
             return scratch.encode(result.value) catch |err| return scratch.failure(err);
         }
@@ -1654,7 +1654,7 @@ test "relational index system SQL durable numeric functions unwind faults and re
             if (self.polls == self.fail_at) return error.QueryCanceled;
         }
     };
-    inline for (comptime std.meta.fieldNames(@import("../sql/numeric_functions.zig").Function)) |function| {
+    inline for (comptime std.meta.fieldNames(@import("../sql/numeric/functions.zig").Function)) |function| {
         var parsed = try Harness.definition(a, function);
         defer parsed.deinit();
         // Force arena growth through allocations: backing allocator resize
@@ -1784,7 +1784,7 @@ test "relational index system SQL durable text dynamic search and cancellation s
 fn numericOperand(ctx: *exact.Context, value: Value, real: bool) !exact.Value {
     return switch (value) {
         .numeric => |bytes| (try binary.decodeCanonical(ctx, bytes)).value,
-        .integer => |integer| (try @import("../sql/numeric_storage.zig").fromJson(ctx, .{ .integer = integer })).value,
+        .integer => |integer| (try @import("../sql/numeric/storage.zig").fromJson(ctx, .{ .integer = integer })).value,
         .number => |number| (try exact.fromFloat(ctx, number, real)).value,
         else => error.InvalidRelationalExpressionInput,
     };
@@ -2011,7 +2011,7 @@ fn compareValues(execution: *Execution, a: Value, b: Value, fold_ascii: bool) !s
         var scratch: ExecutionScratch = undefined;
         scratch.init(execution);
         defer scratch.deinit();
-        return @import("../sql/array_comparison.zig").order(try a.sql_array.view(), try b.sql_array.view(), &execution.numeric, execution.bytes.*) catch |err| return scratch.failure(err);
+        return @import("../sql/array/comparison.zig").order(try a.sql_array.view(), try b.sql_array.view(), &execution.numeric, execution.bytes.*) catch |err| return scratch.failure(err);
     }
     return valueOrderWithContext(a, b, fold_ascii, &execution.numeric);
 }
@@ -2027,10 +2027,10 @@ test "relational declarations typed array programs share PostgreSQL values acros
         const r = region.allocator();
         const pg = try r.alloc(u8, entry.binary.len / 2);
         _ = try std.fmt.hexToBytes(pg, entry.binary);
-        var original = try @import("../sql/array_binary.zig").decode(r, entry.element_type, pg, .{});
+        var original = try @import("../sql/array/binary.zig").decode(r, entry.element_type, pg, .{});
         defer original.deinit();
-        const canonical = try @import("../sql/array_storage.zig").encodeAlloc(r, original.value, .{});
-        const envelope = try @import("../sql/array_wire.zig").encodeAlloc(r, original.value, .{});
+        const canonical = try @import("../sql/array/storage.zig").encodeAlloc(r, original.value, .{});
+        const envelope = try @import("../sql/array/wire.zig").encodeAlloc(r, original.value, .{});
         const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_array_expressions = true, .relational_columns = &.{
             .{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = entry.element_type },
         } };
@@ -2212,10 +2212,10 @@ test "relational declarations public array defaults and direct CHECKs match Post
         for ([_][]const u8{ entry.left_binary, entry.right_binary }, 0..) |hex, i| {
             const pg = try r.alloc(u8, hex.len / 2);
             _ = try std.fmt.hexToBytes(pg, hex);
-            var array = try @import("../sql/array_binary.zig").decode(r, entry.element_type, pg, .{});
+            var array = try @import("../sql/array/binary.zig").decode(r, entry.element_type, pg, .{});
             defer array.deinit();
-            envelopes[i] = try @import("../sql/array_wire.zig").toJsonLeaky(r, array.value, .{});
-            canonical[i] = try @import("../sql/array_storage.zig").encodeAlloc(r, array.value, .{});
+            envelopes[i] = try @import("../sql/array/wire.zig").toJsonLeaky(r, array.value, .{});
+            canonical[i] = try @import("../sql/array/storage.zig").encodeAlloc(r, array.value, .{});
         }
         var public = try std.json.parseFromSliceLeaky(std.json.Value, r,
             \\{"version":1,"storage_mode":"relational","default_type":"row","column_defaults":[{"column":"a","expression":{"op":"literal","type":"sql_array","sql_type":"int64","value":null}}],"checks":[{"name":"bound","column":"a","op":"gte","value":null}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":"sql_array","x-antfly-sql-type":"int64"}},"additionalProperties":false}}}}
@@ -2299,15 +2299,15 @@ test "relational declarations SQL ARRAY constructors activate defaults generated
     defer document.deinit();
     const r = document.arena.allocator();
     try validator.execution.expressions.?.applyJson(r, &document.value);
-    const arrays = @import("../sql/array_value.zig");
+    const arrays = @import("../sql/array/value.zig");
     for ([_]struct { name: []const u8, text: []const u8 }{
         .{ .name = "a", .text = "{1,NULL,2}" },
         .{ .name = "g", .text = "{12,NULL,13}" },
         .{ .name = "matrix", .text = "{{12,NULL},{13,14}}" },
     }) |expected| {
-        var decoded = try @import("../sql/array_wire.zig").decode(r, .int32, document.value.object.get(expected.name).?, .{});
+        var decoded = try @import("../sql/array/wire.zig").decode(r, .int32, document.value.object.get(expected.name).?, .{});
         defer decoded.deinit();
-        var reference = try @import("../sql/array_text.zig").decode(r, .int32, expected.text, .{});
+        var reference = try @import("../sql/array/text.zig").decode(r, .int32, expected.text, .{});
         defer reference.deinit();
         var work: arrays.Budget = .{};
         try std.testing.expectEqual(std.math.Order.eq, try decoded.value.compare(reference.value, &work));
@@ -2318,9 +2318,9 @@ test "relational declarations SQL ARRAY constructors activate defaults generated
 
 test "relational declarations typed array JSON adapter owns canonical PostgreSQL values and unwinds faults" {
     const a = std.testing.allocator;
-    const arrays = @import("../sql/array_value.zig");
-    const storage = @import("../sql/array_storage.zig");
-    const wire = @import("../sql/array_wire.zig");
+    const arrays = @import("../sql/array/value.zig");
+    const storage = @import("../sql/array/storage.zig");
+    const wire = @import("../sql/array/wire.zig");
     const Fixture = struct { entries: []const struct { element_type: arrays.ElementType, binary: []const u8 } };
     var fixture = try std.json.parseFromSlice(Fixture, a, @embedFile("../sql/fixtures/sql_array_binary_reference.json"), .{ .ignore_unknown_fields = true });
     defer fixture.deinit();
@@ -2349,7 +2349,7 @@ test "relational declarations typed array JSON adapter owns canonical PostgreSQL
         const pg = try a.alloc(u8, entry.binary.len / 2);
         defer a.free(pg);
         _ = try std.fmt.hexToBytes(pg, entry.binary);
-        var original = try @import("../sql/array_binary.zig").decode(a, entry.element_type, pg, .{});
+        var original = try @import("../sql/array/binary.zig").decode(a, entry.element_type, pg, .{});
         defer original.deinit();
         const expected = try storage.encodeAlloc(a, original.value, .{});
         defer a.free(expected);
@@ -2370,8 +2370,8 @@ test "relational declarations typed array JSON adapter owns canonical PostgreSQL
 
 test "relational declarations typed array result DOM owns PostgreSQL values and rehomes allocator lifetimes" {
     const a = std.testing.allocator;
-    const arrays = @import("../sql/array_value.zig");
-    const storage = @import("../sql/array_storage.zig");
+    const arrays = @import("../sql/array/value.zig");
+    const storage = @import("../sql/array/storage.zig");
     const Fixture = struct { entries: []const struct { element_type: arrays.ElementType, binary: []const u8 } };
     var fixture = try std.json.parseFromSlice(Fixture, a, @embedFile("../sql/fixtures/sql_array_binary_reference.json"), .{ .ignore_unknown_fields = true });
     defer fixture.deinit();
@@ -2415,7 +2415,7 @@ test "relational declarations typed array result DOM owns PostgreSQL values and 
         const pg = try a.alloc(u8, entry.binary.len / 2);
         defer a.free(pg);
         _ = try std.fmt.hexToBytes(pg, entry.binary);
-        var original = try @import("../sql/array_binary.zig").decode(a, entry.element_type, pg, .{});
+        var original = try @import("../sql/array/binary.zig").decode(a, entry.element_type, pg, .{});
         defer original.deinit();
         const bytes = try storage.encodeAlloc(a, original.value, .{});
         defer a.free(bytes);
@@ -2425,8 +2425,8 @@ test "relational declarations typed array result DOM owns PostgreSQL values and 
 
 test "relational declarations typed array result DOM admission is sticky across scratch and retained quotas" {
     const a = std.testing.allocator;
-    const arrays = @import("../sql/array_value.zig");
-    const storage = @import("../sql/array_storage.zig");
+    const arrays = @import("../sql/array/value.zig");
+    const storage = @import("../sql/array/storage.zig");
     var object = try std.json.parseFromSlice(std.json.Value, a, "{\"a\":[1,null,true],\"b\":\"text\"}", .{});
     defer object.deinit();
     const cells: [20]arrays.Element = @splat(arrays.Element.json(object.value));
@@ -2481,8 +2481,8 @@ test "relational declarations typed array JSON adapter preserves sticky cancella
 
 test "relational declarations typed row values compare canonical arrays under shared scratch admission" {
     const a = std.testing.allocator;
-    const arrays = @import("../sql/array_value.zig");
-    const storage = @import("../sql/array_storage.zig");
+    const arrays = @import("../sql/array/value.zig");
+    const storage = @import("../sql/array/storage.zig");
     var object = try std.json.parseFromSlice(std.json.Value, a, "{\"a\":[1,null,true],\"b\":\"text\"}", .{});
     defer object.deinit();
     const elements: [50]arrays.Element = @splat(arrays.Element.json(object.value));
@@ -2553,7 +2553,7 @@ fn valueOrderWithContext(a: Value, b: Value, fold_ascii: bool, context: *exact.C
         .integer => |value| std.math.order(value, b.integer),
         .number => |value| std.math.order(value, b.number),
         .datetime => |value| std.math.order(value, b.datetime),
-        .sql_array => |array| @import("../sql/array_comparison.zig").order(try array.view(), try b.sql_array.view(), context, max_allocated_bytes),
+        .sql_array => |array| @import("../sql/array/comparison.zig").order(try array.view(), try b.sql_array.view(), context, max_allocated_bytes),
         .range => |range| (try range.view(context)).order(context, try b.range.view(context)),
         .json => |json| blk: {
             var work: @import("../sql/json_order.zig").Budget = .{ .shared = context };
@@ -2634,7 +2634,7 @@ fn finite(value: f64) !Value {
 fn valueHasKind(value: Value, kind: Kind) bool {
     return switch (value) {
         .null => true,
-        .range => |range| @import("../sql/range_value.zig").kindFromType(kind) == range.kind,
+        .range => |range| @import("../sql/range/value.zig").kindFromType(kind) == range.kind,
         inline else => |_, tag| std.mem.eql(u8, @tagName(tag), @tagName(kind)),
     };
 }
@@ -2804,10 +2804,10 @@ const Compiler = struct {
                 node.sql_type = .uuid;
                 if (input.object.get("shift")) |shift| {
                     if (op != .uuidv7 or shift != .string or shift.string.len == 0 or shift.string.len > 128) return error.InvalidRelationalExpression;
-                    const value = try @import("../sql/temporal_text.zig").parseCanonical(.interval, shift.string);
+                    const value = try @import("../sql/temporal/text.zig").parseCanonical(.interval, shift.string);
                     node.uuid_shift = value.interval;
                     var encoded: [16]u8 = undefined;
-                    self.frame(try @import("../sql/temporal_value.zig").encode(value, &encoded));
+                    self.frame(try @import("../sql/temporal/value.zig").encode(value, &encoded));
                 }
             },
             .literal => {
@@ -2836,7 +2836,7 @@ const Compiler = struct {
                 }
                 var json_literal: ?JsonLiteral = null;
                 if (node.kind == .json and (value != .null or json_null)) json_literal = try prepareJsonLiteral(self.execution, value);
-                node.literal = (if (node.kind == .enumeration) (if (value == .null) Value.null else if (value == .string) Value{ .enumeration = try node.enum_view.?.input(value.string) } else return error.InvalidRelationalExpressionType) else if (json_literal) |literal| literal.value else if (node.kind == .sql_array) arrayJson(self.execution, node.sql_type.?, value, null) else if (node.kind == .numeric) numericJson(self.execution, value) else if (@import("../sql/range_value.zig").kindFromType(node.kind)) |range_kind| rangeJson(self.execution, range_kind, value) else scalarJson(self.alloc, node.kind, value, true)) catch |err| switch (err) {
+                node.literal = (if (node.kind == .enumeration) (if (value == .null) Value.null else if (value == .string) Value{ .enumeration = try node.enum_view.?.input(value.string) } else return error.InvalidRelationalExpressionType) else if (json_literal) |literal| literal.value else if (node.kind == .sql_array) arrayJson(self.execution, node.sql_type.?, value, null) else if (node.kind == .numeric) numericJson(self.execution, value) else if (@import("../sql/range/value.zig").kindFromType(node.kind)) |range_kind| rangeJson(self.execution, range_kind, value) else scalarJson(self.alloc, node.kind, value, true)) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     error.SqlProgramLimitExceeded, error.RelationalExpressionBudgetExceeded => return err,
                     else => return error.InvalidRelationalExpressionType,
@@ -3064,7 +3064,7 @@ const Compiler = struct {
         }
         if (input.object.get("numeric_modifier")) |constraint| {
             if (node.op != .cast or (node.kind != .numeric and node.kind != .sql_array) or node.sql_type != .numeric) return error.InvalidRelationalExpressionType;
-            const modifier = @import("../sql/numeric_storage.zig").modifierFromJson(constraint) catch return error.InvalidRelationalExpressionType;
+            const modifier = @import("../sql/numeric/storage.zig").modifierFromJson(constraint) catch return error.InvalidRelationalExpressionType;
             node.numeric_modifier = modifier;
             self.frame("SQL NUMERIC cast modifier v1");
             var identity: [4]u8 = undefined;
@@ -3302,7 +3302,7 @@ test "relational declarations NUMERIC modifier SQL lowering matches PostgreSQL a
             defer plan.deinit();
             const result = try plan.evaluate(alloc, &.{});
             if (result == .null) return .null;
-            return @import("../sql/numeric_storage.zig").jsonValueAlloc(alloc, result.numeric);
+            return @import("../sql/numeric/storage.zig").jsonValueAlloc(alloc, result.numeric);
         }
     };
     var tested: usize = 0;
@@ -3367,7 +3367,7 @@ test "relational declarations NUMERIC modifier casts own rounding scratch and re
             var plan = try Plan.init(alloc, .{ .storage_mode = .relational }, lowered.expression, .numeric);
             defer plan.deinit();
             const value = try plan.evaluate(arena.allocator(), &.{});
-            const text = try @import("../sql/numeric_storage.zig").jsonValueAlloc(arena.allocator(), value.numeric);
+            const text = try @import("../sql/numeric/storage.zig").jsonValueAlloc(arena.allocator(), value.numeric);
             try std.testing.expectEqualStrings("1.3", text.number_string);
         }
         fn canceled(_: ?*anyopaque) anyerror!void {
@@ -3821,8 +3821,8 @@ test "relational declarations NUMERIC JSON assignments share PostgreSQL scalar a
 
 test "relational declarations canonical NUMERIC array assignment streams with fault and preservation safety" {
     const a = std.testing.allocator;
-    const arrays = @import("../sql/array_value.zig");
-    const storage = @import("../sql/array_storage.zig");
+    const arrays = @import("../sql/array/value.zig");
+    const storage = @import("../sql/array/storage.zig");
     var parsing: exact.Context = .{ .alloc = a };
     var number = try exact.parse(&parsing, "12.345");
     defer number.deinit();
@@ -3905,8 +3905,8 @@ test "relational declarations canonical NUMERIC array assignment streams with fa
 
 test "relational declarations canonical NUMERIC array assignment bounds scratch independently of cell count" {
     const a = std.testing.allocator;
-    const arrays = @import("../sql/array_value.zig");
-    const storage = @import("../sql/array_storage.zig");
+    const arrays = @import("../sql/array/value.zig");
+    const storage = @import("../sql/array/storage.zig");
     var parsing: exact.Context = .{ .alloc = a };
     var number = try exact.parse(&parsing, "123.4567");
     defer number.deinit();
@@ -4025,7 +4025,7 @@ test "relational declarations NUMERIC JSON array validation reuses bounded scrat
 
 test "relational declarations NUMERIC constrained bindings reuse canonical bytes with sticky admission" {
     const a = std.testing.allocator;
-    const bytes = try @import("../sql/numeric_storage.zig").encodeJsonAlloc(a, .{ .string = "1.25" });
+    const bytes = try @import("../sql/numeric/storage.zig").encodeJsonAlloc(a, .{ .string = "1.25" });
     defer a.free(bytes);
     var none = std.heap.FixedBufferAllocator.init(&.{});
     var remaining: usize = max_allocated_bytes;
@@ -4724,7 +4724,7 @@ pub const Set = struct {
                 .integer => .{ .integer = cell.value.i64_val },
                 .number => .{ .number = cell.value.f64_val },
                 .numeric => .{ .numeric = cell.value.bytes_val },
-                .numrange, .daterange, .tsrange, .tstzrange => .{ .range = .{ .kind = @import("../sql/range_value.zig").kindFromType(column.column_type).?, .bytes = cell.value.bytes_val } },
+                .numrange, .daterange, .tsrange, .tstzrange => .{ .range = .{ .kind = @import("../sql/range/value.zig").kindFromType(column.column_type).?, .bytes = cell.value.bytes_val } },
                 .sql_array => .{ .sql_array = .{ .element_type = column.sql_element_type orelse return error.InvalidRelationalGeneratedValue, .bytes = cell.value.bytes_val } },
                 .boolean => .{ .boolean = cell.value.bool_val },
                 .datetime => .{ .datetime = cell.value.u64_val },
@@ -4813,7 +4813,7 @@ pub const Set = struct {
                     value.* = .{ .enumeration = try view.input(scalar.string) };
                 },
                 .numeric => value.* = try numericJson(execution, scalar),
-                .numrange, .daterange, .tsrange, .tstzrange => value.* = try rangeJson(execution, @import("../sql/range_value.zig").kindFromType(column.column_type).?, scalar),
+                .numrange, .daterange, .tsrange, .tstzrange => value.* = try rangeJson(execution, @import("../sql/range/value.zig").kindFromType(column.column_type).?, scalar),
                 .sql_array => value.* = try arrayJson(execution, column.sql_element_type orelse return error.InvalidRelationalExpressionInput, scalar, null),
                 .blob => value.* = try decodeBlob(execution, try BlobOperand.fromJson(scalar)),
                 .json => {
@@ -4960,7 +4960,7 @@ test "relational index system generated restore rejects display forgeries with u
     const right_bytes = try binary.encodeAlloc(&numeric_context, right_number.value);
     try Helper.check(a, .{ .numeric = left_bytes }, .{ .numeric = right_bytes });
     try Helper.check(a, .{ .number = -0.0 }, .{ .number = 0.0 });
-    const arrays = @import("../sql/array_value.zig");
+    const arrays = @import("../sql/array/value.zig");
     for ([_]Numeric{ .jsonb, .numeric, .float64 }) |element| {
         const left_cell: arrays.Element = switch (element) {
             .jsonb => arrays.Element.json(.{ .number_string = "1.20" }),
@@ -4972,8 +4972,8 @@ test "relational index system generated restore rejects display forgeries with u
             .numeric => arrays.Element.typedNumeric(&right_number.value),
             else => arrays.Element.json(.{ .float = 0.0 }),
         };
-        const left_array = try @import("../sql/array_storage.zig").encodeAlloc(alloc, try arrays.Value.init(element, &.{.{ .length = 2, .lower = -3 }}, &.{ left_cell, .{} }, .{}), .{});
-        const right_array = try @import("../sql/array_storage.zig").encodeAlloc(alloc, try arrays.Value.init(element, &.{.{ .length = 2, .lower = -3 }}, &.{ right_cell, .{} }, .{}), .{});
+        const left_array = try @import("../sql/array/storage.zig").encodeAlloc(alloc, try arrays.Value.init(element, &.{.{ .length = 2, .lower = -3 }}, &.{ left_cell, .{} }, .{}), .{});
+        const right_array = try @import("../sql/array/storage.zig").encodeAlloc(alloc, try arrays.Value.init(element, &.{.{ .length = 2, .lower = -3 }}, &.{ right_cell, .{} }, .{}), .{});
         try Helper.check(a, .{ .sql_array = .{ .element_type = element, .bytes = left_array } }, .{ .sql_array = .{ .element_type = element, .bytes = right_array } });
     }
 }
@@ -5015,13 +5015,13 @@ test "relational index system generated logical restore normalizes typmod displa
 
 test "relational index system generated array display verification streams authenticated bytes without allocations" {
     const a = std.testing.allocator;
-    const arrays = @import("../sql/array_value.zig");
+    const arrays = @import("../sql/array/value.zig");
     var region: std.heap.ArenaAllocator = .init(a);
     defer region.deinit();
     const json = try std.json.parseFromSliceLeaky(std.json.Value, region.allocator(), "{\"n\":1.20,\"a\":[null,true]}", .{ .parse_numbers = false });
     const cells = try region.allocator().alloc(arrays.Element, 1000);
     @memset(cells, arrays.Element.json(json));
-    const encoded = try @import("../sql/array_storage.zig").encodeAlloc(region.allocator(), try arrays.Value.init(.jsonb, &.{.{ .length = 1000 }}, cells, .{}), .{});
+    const encoded = try @import("../sql/array/storage.zig").encodeAlloc(region.allocator(), try arrays.Value.init(.jsonb, &.{.{ .length = 1000 }}, cells, .{}), .{});
     const value: Value = .{ .sql_array = .{ .element_type = .jsonb, .bytes = encoded } };
     const independent = try region.allocator().dupe(u8, encoded);
     const other: Value = .{ .sql_array = .{ .element_type = .jsonb, .bytes = independent } };
@@ -5264,8 +5264,8 @@ fn valueToJson(alloc: Allocator, value: Value) !std.json.Value {
         },
         .integer => |integer| .{ .integer = integer },
         .number => |number| .{ .float = number },
-        .numeric => |bytes| @import("../sql/numeric_storage.zig").jsonValueAlloc(alloc, bytes),
-        .range => |range| @import("../sql/range_storage.zig").jsonValueAlloc(alloc, range.kind, range.bytes),
+        .numeric => |bytes| @import("../sql/numeric/storage.zig").jsonValueAlloc(alloc, bytes),
+        .range => |range| @import("../sql/range/storage.zig").jsonValueAlloc(alloc, range.kind, range.bytes),
         .boolean => |boolean| .{ .bool = boolean },
         .datetime => |datetime| .{ .number_string = try std.fmt.allocPrint(alloc, "{d}", .{datetime}) },
         .sql_array => |array| blk: {
@@ -6156,7 +6156,7 @@ test "relational declarations column CHECKs compare large logical values without
         try std.testing.expectEqual(@as(?usize, null), try set.firstViolationRowWithExecution(&execution, row));
         try std.testing.expectEqual(@as(usize, 0), denied.alloc_index);
         try std.testing.expect(allowance < max_allocated_bytes);
-        var tuple = try @import("../storage/db/relational_index_keys.zig").TuplePlan.init(a, set.table, &set.layout, &.{.{ .column = "b" }});
+        var tuple = try @import("../storage/db/relational/indexes/keys.zig").TuplePlan.init(a, set.table, &set.layout, &.{.{ .column = "b" }});
         defer tuple.deinit();
         var key = std.ArrayList(u8).empty;
         defer key.deinit(a);
@@ -6200,7 +6200,7 @@ test "relational declarations mixed CHECKs share JSON and ordinal row quotas wit
             const set = compiled.checks.?;
             const json = try std.json.parseFromSlice(std.json.Value, alloc, "{\"n\":1.25,\"s\":\"keep\"}", .{ .parse_numbers = false });
             defer json.deinit();
-            const number = try @import("../sql/numeric_storage.zig").encodeJsonAlloc(alloc, json.value.object.get("n").?);
+            const number = try @import("../sql/numeric/storage.zig").encodeJsonAlloc(alloc, json.value.object.get("n").?);
             defer alloc.free(number);
             var cells: [2]codec.Cell = undefined;
             const n = set.layout.ordinalForName(set.table.relational_columns, "n").?;
@@ -6572,10 +6572,10 @@ test "relational declarations physical restore discharges unconstrained SQL doma
     var context: exact.Context = .{ .alloc = a };
     var parsed = try exact.parse(&context, "1.25");
     defer parsed.deinit();
-    const arrays = @import("../sql/array_value.zig");
+    const arrays = @import("../sql/array/value.zig");
     const elements = [_]arrays.Element{ arrays.Element.typedNumeric(&parsed.value), .{} };
     const array = try arrays.Value.init(.numeric, &.{.{ .length = 2, .lower = -3 }}, &elements, .{});
-    const payload = try @import("../sql/array_storage.zig").encodeAlloc(a, array, .{});
+    const payload = try @import("../sql/array/storage.zig").encodeAlloc(a, array, .{});
     defer a.free(payload);
     const ordinal = layout.ordinalForName(table.relational_columns, "a").?;
     const cell: codec.Cell = .{ .ordinal = @intCast(ordinal), .path = "a", .value_type = .bytes_val, .sql_array_element_type = .numeric, .value = .{ .bytes_val = payload } };
@@ -6608,9 +6608,9 @@ test "relational declarations physical restore shares generated CHECK and field 
             defer layout.deinit();
             const n = layout.ordinalForName(table.relational_columns, "n").?;
             const g = layout.ordinalForName(table.relational_columns, "g").?;
-            const number = try @import("../sql/numeric_storage.zig").encodeJsonAlloc(alloc, .{ .string = "1.25" });
+            const number = try @import("../sql/numeric/storage.zig").encodeJsonAlloc(alloc, .{ .string = "1.25" });
             defer alloc.free(number);
-            const generated = try @import("../sql/numeric_storage.zig").encodeJsonAlloc(alloc, .{ .string = "2.25" });
+            const generated = try @import("../sql/numeric/storage.zig").encodeJsonAlloc(alloc, .{ .string = "2.25" });
             defer alloc.free(generated);
             var cells: [2]codec.Cell = .{
                 .{ .ordinal = @intCast(n), .path = "n", .value_type = .bytes_val, .is_numeric = true, .value = .{ .bytes_val = number } },

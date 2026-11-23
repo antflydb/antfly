@@ -205,7 +205,7 @@ test "native local catalog route binds exact owner while ordinary wire and local
     const Generic = struct {
         value: CatalogRouteFence,
         pub fn jsonStringify(self: @This(), stream: anytype) !void {
-            return @import("../storage/db/relational_integrity_json.zig").write(self.value, stream);
+            return @import("../storage/db/relational/integrity/json.zig").write(self.value, stream);
         }
     };
     const durable_ordinary = try std.json.Stringify.valueAlloc(a, Generic{ .value = fence }, .{});

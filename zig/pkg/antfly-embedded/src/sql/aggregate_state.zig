@@ -29,7 +29,7 @@ pub const Column = struct {
         count: u64 = 0,
         coefficient: i128 = 0,
         scale: u16 = 0,
-        canonical: ?@import("numeric_value.zig").Owned = null,
+        canonical: ?@import("numeric/value.zig").Owned = null,
         fn clear(self: *@This()) void {
             if (self.canonical) |*number| number.deinit();
             self.canonical = null;
@@ -47,8 +47,8 @@ pub const Column = struct {
         fn finish(self: *@This()) !Datum {
             if (self.count == 0) return .{};
             if (self.canonical == null) {
-                var context: @import("numeric_value.zig").Context = .{ .alloc = self.alloc };
-                self.canonical = try @import("numeric_value.zig").fromScaledInteger(&context, self.coefficient, self.scale);
+                var context: @import("numeric/value.zig").Context = .{ .alloc = self.alloc };
+                self.canonical = try @import("numeric/value.zig").fromScaledInteger(&context, self.coefficient, self.scale);
             }
             return Datum.typedNumeric(&self.canonical.?.value);
         }
@@ -58,7 +58,7 @@ pub const Column = struct {
         integers: std.ArrayList(Integer),
         numbers: std.ArrayList(Number),
         fixed: std.ArrayList(Fixed),
-        exact: std.ArrayList(@import("numeric_aggregate.zig").Reducer),
+        exact: std.ArrayList(@import("numeric/aggregate.zig").Reducer),
         booleans: std.ArrayList(Boolean),
         bytes: std.ArrayList(Bytes),
         dynamic: std.ArrayList(operators.Aggregate),
@@ -217,19 +217,19 @@ pub const Column = struct {
         }
         var state: operators.Aggregate = .{ .alloc = a, .kind = self.spec.kind, .input_type = self.spec.input_type, .input_element = self.spec.input_element, .boolean = self.spec.kind == .bool_and };
         var selected: ?Datum = null;
-        var fixed_digits: @import("numeric_value.zig").ScaledInteger = undefined;
-        var fixed_number: @import("numeric_value.zig").Value = undefined;
+        var fixed_digits: @import("numeric/value.zig").ScaledInteger = undefined;
+        var fixed_number: @import("numeric/value.zig").Value = undefined;
         switch (self.values) {
             .fixed => |v| {
                 const from = v.items[index];
                 state.count = from.count;
-                fixed_digits = try @import("numeric_value.zig").ScaledInteger.init(from.coefficient, from.scale);
+                fixed_digits = try @import("numeric/value.zig").ScaledInteger.init(from.coefficient, from.scale);
                 fixed_number = fixed_digits.view();
                 selected = Datum.typedNumeric(&fixed_number);
             },
             .counts => |v| state.count = v.items[index],
             .exact => |v| {
-                const reducer = try a.create(@import("numeric_aggregate.zig").Reducer);
+                const reducer = try a.create(@import("numeric/aggregate.zig").Reducer);
                 errdefer a.destroy(reducer);
                 reducer.* = try v.items[index].clone(a);
                 state.numeric = reducer;
@@ -350,7 +350,7 @@ pub const Column = struct {
         return 0;
     }
     pub fn numericGrowth(self: *const Column, index: ?usize, weight: i32, length: usize) usize {
-        var state: @import("numeric_aggregate.zig").State = .{};
+        var state: @import("numeric/aggregate.zig").State = .{};
         if (index) |slot| switch (self.values) {
             .exact => |values| state = values.items[slot].state,
             .dynamic => |values| if (values.items[slot].numeric) |reducer| {
@@ -364,7 +364,7 @@ pub const Column = struct {
     fn fixedValue(value: Datum) ?struct { coefficient: i128, scale: u16 } {
         const number = value.numeric orelse return null;
         if (number.kind != .finite or number.scale > 38) return null;
-        const coefficient = @import("numeric_value.zig").coefficientAtScale(number.*, number.scale) orelse return null;
+        const coefficient = @import("numeric/value.zig").coefficientAtScale(number.*, number.scale) orelse return null;
         @import("../common/decimal128.zig").validateCoefficient(coefficient, 38, number.scale) catch return null;
         return .{ .coefficient = coefficient, .scale = number.scale };
     }
@@ -531,7 +531,7 @@ pub const Column = struct {
                     try self.values.fixed.items[id].add(coefficients.values[row], scale, 1, self.spec.kind == .min);
                     continue;
                 }
-                const number = try @import("numeric_value.zig").ScaledInteger.init(coefficients.values[row], scale);
+                const number = try @import("numeric/value.zig").ScaledInteger.init(coefficients.values[row], scale);
                 try self.values.exact.items[id].add(number.view());
             }
             return;
@@ -562,8 +562,8 @@ pub const Column = struct {
         if (self.values == .exact or self.values == .fixed or self.values == .counts) if (try source.decimalColumnSelected(scratch.allocator(), 0, null)) |decimal| {
             for (positions, 0..) |position, lane| {
                 if (position >= ids.len) return error.InvalidSqlBackendResponse;
-                var fixed: @import("numeric_value.zig").ScaledInteger = undefined;
-                var number: @import("numeric_value.zig").Value = undefined;
+                var fixed: @import("numeric/value.zig").ScaledInteger = undefined;
+                var number: @import("numeric/value.zig").Value = undefined;
                 const value = try decimal.cell(lane, &fixed, &number);
                 if (!value.sql_null) try self.update(a, ids[position], value);
             }
@@ -1098,7 +1098,7 @@ test "SQL typed partial merge batches select exact NUMERIC lanes" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    var work: @import("array_value.zig").Budget = .{};
+    var work: @import("array/value.zig").Budget = .{};
     const scalar = @import("scalar.zig");
     const low = try scalar.numericTextLeaky(arena.allocator(), "1.1", &work);
     const high = try scalar.numericTextLeaky(arena.allocator(), "2.2", &work);
@@ -1238,8 +1238,8 @@ test "SQL decimal coefficient aggregates widen without per-lane allocations and 
     try state.updateEncoded(alloc, &ids, batch);
     try std.testing.expectEqual(before, tracked.alloc_index);
     const result = try state.finish(0);
-    var context: @import("numeric_value.zig").Context = .{ .alloc = a };
-    const text = try @import("numeric_value.zig").format(&context, result.numeric.?.*);
+    var context: @import("numeric/value.zig").Context = .{ .alloc = a };
+    const text = try @import("numeric/value.zig").format(&context, result.numeric.?.*);
     defer a.free(text);
     try std.testing.expectEqualStrings("8779999999999999999999999999999999999.9122", text);
 }
@@ -1272,14 +1272,14 @@ fn nativeExtremaScenario(a: A) !void {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const sa = arena.allocator();
-        var context: @import("numeric_value.zig").Context = .{ .alloc = sa };
-        try std.testing.expectEqualStrings(if (kind == .min) "-12.000" else "1.2300", try @import("numeric_value.zig").format(&context, (try column.finish(0)).numeric.?.*));
+        var context: @import("numeric/value.zig").Context = .{ .alloc = sa };
+        try std.testing.expectEqualStrings(if (kind == .min) "-12.000" else "1.2300", try @import("numeric/value.zig").format(&context, (try column.finish(0)).numeric.?.*));
         var merged = Column.init(spec);
         defer merged.clear(a);
         try merged.append(a);
         try merged.mergeBatch(a, &.{0}, &column, 0);
         try std.testing.expect(merged.values == .fixed);
-        var work: @import("array_value.zig").Budget = .{};
+        var work: @import("array/value.zig").Budget = .{};
         try merged.update(a, 0, try @import("scalar.zig").numericTextLeaky(sa, "1e100", &work));
         try std.testing.expect(merged.values == .dynamic);
     }

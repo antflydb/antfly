@@ -347,7 +347,7 @@ fn oldRowPolicyBundle(a: A, generation: u64, phase: policies.Publication.Phase, 
     return std.json.Stringify.valueAlloc(a, parsed.value, .{});
 }
 fn physicalRow(a: A, db: *DB, key: []const u8) ![]u8 {
-    const storage = @import("relational_store.zig");
+    const storage = @import("relational/rows/store.zig");
     const encoded = try storage.keyAlloc(a, key);
     defer a.free(encoded);
     return db.core.store.get(a, encoded);
@@ -355,7 +355,7 @@ fn physicalRow(a: A, db: *DB, key: []const u8) ![]u8 {
 fn expectPhysicalRow(a: A, db: *DB, key: []const u8, version: u32, expected: ?[]const u8) !void {
     const bytes = try physicalRow(a, db, key);
     defer a.free(bytes);
-    try std.testing.expectEqual(version, try @import("relational_store.zig").rowSchemaVersion(bytes));
+    try std.testing.expectEqual(version, try @import("relational/rows/store.zig").rowSchemaVersion(bytes));
     if (expected) |before| try std.testing.expectEqualSlices(u8, before, bytes);
 }
 fn expectProtectedScan(a: A, db: *DB, expected: []const []const u8) !void {

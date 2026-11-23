@@ -128,6 +128,9 @@ const SqlCursor = struct {
 };
 
 pub const Session = struct {
+    selinux_ingress: ?backend.SelinuxIngress = null,
+    logical: ?@import("logical_replication_frontend.zig").Port = null,
+    replication_failed: bool = false,
     alloc: std.mem.Allocator,
     io: std.Io,
     source: backend.Backend,
@@ -192,6 +195,10 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Session) void {
+        if (self.logical) |logical| {
+            if (!logical.vtable.close(logical.ptr)) self.completion.unknown = true;
+            self.logical = null;
+        }
         self.diagnostic.clearNotices();
         if (self.hooks) |hooks| hooks.unregister(hooks.context, self);
         // Retained readers may still reference the authenticated credential.
@@ -273,6 +280,7 @@ pub const Session = struct {
             self.diagnostic = .{ .notice_allocator = self.alloc };
             self.mutation_ack_pending = false;
             self.dispatch(tag, payload) catch |err| {
+                if (self.replication_failed) return err;
                 const completion_code: []const u8 = if (self.diagnostic.code) |*code| code else sqlstate(err);
                 if (std.mem.eql(u8, completion_code, "40003") and !self.mutation_ack_pending) {
                     self.completion_safe = false;
@@ -338,6 +346,7 @@ pub const Session = struct {
                 196608 => {
                     var username: ?[]const u8 = null;
                     var database: ?[]const u8 = null;
+                    var replication: ?bool = null;
                     while (true) {
                         const key = try cursor.string();
                         if (key.len == 0) break;
@@ -348,6 +357,9 @@ pub const Session = struct {
                         } else if (std.mem.eql(u8, key, "database")) {
                             if (database != null) return error.ProtocolViolation;
                             database = value;
+                        } else if (std.mem.eql(u8, key, "replication")) {
+                            if (replication != null) return error.ProtocolViolation;
+                            if (std.ascii.eqlIgnoreCase(value, "database")) replication = true else if (std.ascii.eqlIgnoreCase(value, "false") or std.ascii.eqlIgnoreCase(value, "off") or std.mem.eql(u8, value, "0")) replication = false else return error.UnsupportedStartupOption;
                         } else if (std.mem.eql(u8, key, "client_encoding")) {
                             formatting.validateEncoding(value) catch |err| {
                                 self.diagnostic.set("22021", "unsupported startup parameter client_encoding; only UTF8 is supported", null, null);
@@ -418,6 +430,10 @@ pub const Session = struct {
                             break;
                         }
                         if (!accepted) return error.SqlBackendPidInUse;
+                    }
+                    if (replication orelse false) {
+                        const open = self.source.vtable.open_replication orelse return error.UnsupportedStartupOption;
+                        self.logical = try open(self.source.context, self.alloc, self.identity.?, self.request("", &.{}, &.{}));
                     }
                     try self.message('R', &.{ 0, 0, 0, 0 });
                     if (self.identity.?.renewable) {
@@ -526,6 +542,7 @@ pub const Session = struct {
 
     fn request(self: *Session, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type) backend.Request {
         return .{
+            .selinux_ingress = self.selinux_ingress,
             .backend_pid = self.backend_pid,
             .statement = statement,
             .scratch_allocator = self.alloc,
@@ -609,6 +626,7 @@ pub const Session = struct {
         self.executing.store(true, .release);
         defer self.executing.store(false, .release);
         var req = self.request(statement, &.{}, types);
+        if (commands.isCopy(statement)) req.scratch_allocator = alloc;
         req.parameter_descriptors = descriptors;
         req.parameter_oids = declared_oids;
         try req.check();
@@ -753,6 +771,8 @@ pub const Session = struct {
         defer self.executing.store(self.copy_running, .release);
         var req = self.request(statement, parameters, types);
         req.copy_input = self.copy_running;
+        if (self.copy_running) req.scratch_allocator = alloc;
+        if (self.sql_cursors.count() != 0 or self.portals.count() != 0) req.copy_has_active_cursor = self.hasActiveCopyCursor();
         if (self.identity.?.renewable) {
             req.completion = &self.completion;
             req.completion_allocator = self.alloc;
@@ -1144,6 +1164,7 @@ pub const Session = struct {
     }
 
     fn dispatch(self: *Session, tag: u8, payload: []const u8) !void {
+        if (tag == 'Q' or tag == 'E') if (self.logical) |logical| if (logical.vtable.command_boundary) |boundary| boundary(logical.ptr);
         var cursor = Cursor{ .bytes = payload };
         switch (tag) {
             'Q' => {
@@ -1157,6 +1178,19 @@ pub const Session = struct {
                 } else {
                     var arena = std.heap.ArenaAllocator.init(self.alloc);
                     defer arena.deinit();
+                    if (self.logical) |logical| {
+                        if (try @import("logical_replication_commands.zig").parse(arena.allocator(), statement)) |replication_command| {
+                            if (self.status != .idle) {
+                                self.diagnostic.set("25001", "Logical replication commands cannot run inside a transaction block.", null, false);
+                                return error.SqlDdlInsideTransaction;
+                            }
+                            const result = try logical.vtable.command(logical.ptr, arena.allocator(), self.request(statement, &.{}, &.{}), replication_command);
+                            try @import("logical_replication_frontend.zig").reply(arena.allocator(), self.writer, result);
+                            if (result == .started) try self.logicalCopyBoth(logical);
+                            try self.ready();
+                            return;
+                        }
+                    }
                     if (try self.sessionCommand(arena.allocator(), statement)) {
                         if (self.status == .idle) {
                             self.clearPortals();
@@ -2091,6 +2125,7 @@ pub const Session = struct {
         }
         self.copy_instant = try (@import("antfly_local_sources").sql_statement_clock.Source{ .io = self.io }).sample();
         const implicit = self.status == .idle;
+        if (input.options.freeze and implicit) return error.SqlCopyFreezeGenerationRequired;
         if (implicit) {
             var begin = try self.execute(a, "BEGIN", &.{}, &.{}, null, null);
             defer begin.deinit();
@@ -2105,6 +2140,19 @@ pub const Session = struct {
                 self.status = .failed;
                 self.diagnostic.transaction_status = .failed;
             }
+        }
+        if (input.options.freeze) {
+            if (self.hasActiveCopyCursor()) return error.SqlCopyFreezeActiveCursor;
+            var scratch: std.heap.ArenaAllocator = .init(self.alloc);
+            defer scratch.deinit();
+            var preflight = self.request(input.source_statement orelse return error.InvalidResult, &.{}, description.parameter_types);
+            preflight.copy_freeze_admission = true;
+            preflight.scratch_allocator = scratch.allocator();
+            preflight.binding_guard = description.binding_guard;
+            preflight.parameter_descriptors = description.parameter_descriptors;
+            try preflight.check();
+            const checked = try self.source.vtable.describe(self.source.context, scratch.allocator(), self.identity orelse return error.AuthenticationFailed, preflight);
+            if (checked.copy_in == null or !checked.copy_in.?.freeze_admitted) return error.SqlCopyFreezeGenerationRequired;
         }
         var decoder = try @import("copy_in.zig").Decoder.init(self.alloc, input.options, width, self.limits.frame_bytes);
         defer decoder.deinit();
@@ -2144,6 +2192,19 @@ pub const Session = struct {
         }
         var tag: [64]u8 = undefined;
         try self.command(try std.fmt.bufPrint(&tag, "COPY {d}", .{batch.total}));
+    }
+
+    fn hasActiveCopyCursor(self: *Session) bool {
+        if (self.sql_cursors.count() != 0) return true;
+        var portals = self.portals.valueIterator();
+        while (portals.next()) |entry| {
+            const portal = entry.*;
+            if ((portal.stream != null and !portal.stream_complete) or
+                portal.cursor_capture != null or
+                (portal.result != null and portal.offset < portal.result.?.rows.len))
+                return true;
+        }
+        return false;
     }
 
     fn receiveCopy(self: *Session, decoder: *@import("copy_in.zig").Decoder, batch: *CopyBatch) !void {
@@ -2388,6 +2449,80 @@ pub const Session = struct {
         if (stream.copy_out == null) try self.rowDescription(stream.columns, &.{});
         try self.executeStream(&portal, 0);
         return true;
+    }
+
+    const LogicalFrame = struct { tag: u8, len: usize, body: [4097]u8 = undefined };
+    fn logicalFrame(reader: *std.Io.Reader) !LogicalFrame {
+        const tag = try reader.takeByte();
+        const size = try reader.takeInt(u32, .big);
+        if (size < 4 or size > 4101) return error.ProtocolViolation;
+        var result: LogicalFrame = .{ .tag = tag, .len = size - 4 };
+        try reader.readSliceAll(result.body[0..result.len]);
+        return result;
+    }
+    fn logicalTick(io: std.Io, backlog: bool) std.Io.Cancelable!void {
+        try io.sleep(.fromMilliseconds(if (backlog) 1 else 250), .awake);
+    }
+    fn logicalCopyBoth(self: *Session, logical: @import("logical_replication_frontend.zig").Port) !void {
+        // One reader survives timer ticks, including fragmented headers and
+        // feedback payloads. Only this coordinator writes or mutates the sender.
+        errdefer {
+            self.replication_failed = true;
+            self.setDeadline(self.limits.statement_timeout_ms);
+            var cleanup: std.heap.ArenaAllocator = .init(self.alloc);
+            defer cleanup.deinit();
+            logical.vtable.stop(logical.ptr, cleanup.allocator(), self.request("", &.{}, &.{})) catch {};
+        }
+        try self.writer.flush();
+        const Outcome = union(enum) { frame: anyerror!LogicalFrame, tick: std.Io.Cancelable!void };
+        var outcomes: [2]Outcome = undefined;
+        var select = std.Io.Select(Outcome).init(self.io, &outcomes);
+        defer select.cancelDiscard();
+        try select.concurrent(.frame, logicalFrame, .{self.reader});
+        try select.concurrent(.tick, logicalTick, .{ self.io, true });
+        while (true) switch (try select.await()) {
+            .tick => |outcome| {
+                try outcome;
+                self.setDeadline(self.limits.statement_timeout_ms);
+                var arena: std.heap.ArenaAllocator = .init(self.alloc);
+                defer arena.deinit();
+                const backlog = try logical.vtable.poll(logical.ptr, arena.allocator(), self.request("", &.{}, &.{}), self.writer);
+                try select.concurrent(.tick, logicalTick, .{ self.io, backlog });
+            },
+            .frame => |outcome| {
+                const frame = try outcome;
+                var arena: std.heap.ArenaAllocator = .init(self.alloc);
+                defer arena.deinit();
+                self.setDeadline(self.limits.statement_timeout_ms);
+                switch (frame.tag) {
+                    'd' => try logical.vtable.feedback(logical.ptr, arena.allocator(), self.request("", &.{}, &.{}), frame.body[0..frame.len], self.writer),
+                    'c' => {
+                        if (frame.len != 0) return error.ProtocolViolation;
+                        try logical.vtable.stop(logical.ptr, arena.allocator(), self.request("", &.{}, &.{}));
+                        try self.message('c', "");
+                        try self.message('C', "COPY 0\x00");
+                        return;
+                    },
+                    'p' => {
+                        if (!self.identity.?.renewable or frame.len < 2 or frame.body[frame.len - 1] != 0) return error.Unauthorized;
+                        const renew = self.source.vtable.refresh orelse return error.Unauthorized;
+                        try renew(self.source.context, self.alloc, self.identity.?, frame.body[0 .. frame.len - 1]);
+                    },
+                    'f' => {
+                        if (frame.len == 0 or frame.body[frame.len - 1] != 0) return error.ProtocolViolation;
+                        try logical.vtable.stop(logical.ptr, arena.allocator(), self.request("", &.{}, &.{}));
+                        try self.sendError("57014", "Logical replication was canceled by the client.");
+                        return;
+                    },
+                    'X' => {
+                        if (frame.len != 0) return error.ProtocolViolation;
+                        return error.EndOfStream;
+                    },
+                    else => return error.ProtocolViolation,
+                }
+                try select.concurrent(.frame, logicalFrame, .{self.reader});
+            },
+        };
     }
 
     fn message(self: *Session, tag: u8, payload: []const u8) !void {
@@ -2696,9 +2831,9 @@ fn sqlstate(err: anyerror) []const u8 {
         error.DuplicateSqlColumn => "42701",
         error.SqlInvalidParameterValue => "22023",
         error.InvalidReadRequirements, error.ReadReceiptGenerationMismatch => "22023",
-        error.UnsupportedReadVisibility => "0A000",
+        error.UnsupportedReadVisibility, error.SqlPartitionUniqueKeyMissing, error.SqlPartitionRoutingRequired => "0A000",
         error.ReadRequirementNotReady => "53300",
-        error.CatalogGenerationChanged, error.RowPolicyCatalogChanged, error.ReadSnapshotTooOld => "40001",
+        error.CatalogGenerationChanged, error.PartitionCatalogChanged, error.RowPolicyCatalogChanged, error.ReadSnapshotTooOld => "40001",
         error.InFailedSqlTransaction => "25P02",
         error.CursorMustBeInTransaction, error.NoActiveSqlTransaction => "25P01",
         error.CursorNotScrollable => "55000",
@@ -2706,6 +2841,8 @@ fn sqlstate(err: anyerror) []const u8 {
         error.SqlSubstringError => "22011",
         error.InvalidSqlCharacterCode => "54000",
         error.SqlNotNullViolation => "23502",
+        error.SqlPartitionBoundViolation, error.SqlNoPartitionForRow => "23514",
+        error.SqlPartitionOverlap, error.SqlEmptyPartitionBound, error.SqlPartitionFamilyDdlRequired, error.SqlAlreadyPartition, error.SqlNotPartition, error.SqlPartitionCycle => @import("antfly_local_sources").sql_errors.describe(err).code,
         error.SqlProgramLimitExceeded, error.SqlResultTooLarge, error.SqlLimitExceeded, error.SettingLimitExceeded, error.RowPolicyLimitExceeded => "54000",
         error.UnknownSetting => "42704",
         error.SettingCatalogChanged => "55000",

@@ -567,6 +567,7 @@ pub const Query = struct {
     actor: prepared.Actor,
     database: u64,
     backend: ?locks.Backend = null,
+    failed_root: ?struct { transaction: [16]u8, command: scopes.Command, nonce: [16]u8 } = null,
     work: ?struct { observed_at_ms: u64, after: ?scopes.Work = null, wrap: bool = false } = null,
     effect: ?scopes.ledger.Effect = null,
     /// Bounded ingress anchor: one database lookup, no backend/work scan.
@@ -579,6 +580,16 @@ pub const Query = struct {
         generation: u64,
         route: struct { spec: scopes.Data.Spec, transaction: [16]u8 },
     } = null,
+    pub fn jsonStringify(self: Query, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(Query).@"struct".field_names) |field| {
+            if (!std.mem.eql(u8, field, "failed_root") or self.failed_root != null) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
     pub fn requiredDecoderVersion(self: Query) u16 {
         if (self.abandoned_private != null) return @import("../metadata/topology_protocol.zig").sql_relation_persistence_version;
         return if (self.database_work != null) @import("../metadata/topology_protocol.zig").sql_scope_retirement_version else decoder_version;
@@ -605,6 +616,12 @@ pub const Query = struct {
         }
         if (self.notifications) |selection| if (self.backend == null or self.participant != null or self.effect != null or selection.generation == 0 or selection.maximum == 0 or selection.maximum > 128) return error.InvalidCatalogMutation;
         if (self.participant != null and (self.backend == null or self.effect != null)) return error.InvalidCatalogMutation;
+        if (self.failed_root) |request| {
+            if (self.backend == null or self.participant == null or self.participant.? != .generation or
+                self.actor.session_user.kind != .bootstrap or self.actor.current_role != null or
+                std.mem.allEqual(u8, &request.transaction, 0) or std.mem.allEqual(u8, &request.nonce, 0))
+                return error.InvalidCatalogMutation;
+        }
         if (self.participant) |selector| switch (selector) {
             .generation => |generation| if (generation == 0) return error.InvalidCatalogMutation,
             .route => |route| {
@@ -630,6 +647,7 @@ pub const Snapshot = struct {
     notification_work: ?@import("sql_notifications.zig").Work = null,
     notifications: ?@import("sql_notifications.zig").Page = null,
     notification_capable: bool = false,
+    failed_root_verified: ?bool = null,
 
     group: u64 = local.common_group_ids.main_metadata_group_id,
     incarnation: [16]u8,
@@ -645,7 +663,7 @@ pub const Snapshot = struct {
     pub fn jsonStringify(self: Snapshot, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(Snapshot).@"struct".field_names) |field| {
-            if (comptime std.mem.eql(u8, field, "abandoned_private") or std.mem.eql(u8, field, "database_after") or std.mem.eql(u8, field, "notifications") or std.mem.eql(u8, field, "notification_work") or std.mem.eql(u8, field, "notification_binding")) {
+            if (comptime std.mem.eql(u8, field, "abandoned_private") or std.mem.eql(u8, field, "database_after") or std.mem.eql(u8, field, "notifications") or std.mem.eql(u8, field, "notification_work") or std.mem.eql(u8, field, "notification_binding") or std.mem.eql(u8, field, "failed_root_verified")) {
                 if (@field(self, field)) |page| {
                     try writer.objectField(field);
                     try writer.write(page);

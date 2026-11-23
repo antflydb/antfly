@@ -1653,6 +1653,22 @@ pub const UserManager = struct {
         return self.sqlCredentialPermitsUnlocked(io, username, instance, credential, table, required);
     }
 
+    /// Resolve a retained SQL credential by identity, including API keys
+    /// whose owner differs from the current SQL role.
+    pub fn sqlRetainedCredentialPermits(self: *UserManager, instance: [16]u8, credential: []const u8, table: []const u8, required: u16) !bool {
+        var receiver = try self.io_borrow.receive();
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
+        const username = if (std.mem.startsWith(u8, credential, "basic:"))
+            credential["basic:".len..]
+        else if (std.mem.startsWith(u8, credential, "api-key:"))
+            (self.api_keys.get(credential["api-key:".len..]) orelse return false).key.username
+        else
+            return false;
+        return self.sqlCredentialPermitsUnlocked(io, username, instance, credential, table, required);
+    }
+
     /// Administrative SQL mutations obey the key's explicit resource caps,
     /// independently of grant options supplied by the SQL catalog.
     pub fn sqlCredentialCatalogPermits(self: *UserManager, username: []const u8, instance: [16]u8, credential: []const u8, resource_type: ResourceType, resource: []const u8) !bool {
@@ -2931,12 +2947,17 @@ test "SQL privileges credential caps and policy aliases preserve native permissi
     defer native_claims.deinit();
     try std.testing.expectEqual(@as(usize, 1), native_claims.value.roles.len);
     try std.testing.expectEqualStrings("tenant", native_claims.value.roles[0]);
+    try std.testing.expect(try manager.sqlRetainedCredentialPermits(user.instance_id, read_credential, "docs", sql.Access.bit(.select)));
+    try std.testing.expect(!try manager.sqlRetainedCredentialPermits(user.instance_id, read_credential, "docs", sql.Access.bit(.insert)));
+    try std.testing.expect(!try manager.sqlRetainedCredentialPermits(user.instance_id, expired_credential, "", 0));
     try manager.deleteApiKey("alice", read_key.key.key_id);
+    try std.testing.expect(!try manager.sqlRetainedCredentialPermits(user.instance_id, read_credential, "", 0));
     try std.testing.expect(!try manager.sqlCredentialPermits("alice", user.instance_id, read_credential, "docs", sql.Access.bit(.select)));
     try manager.deleteUser("alice");
     var replacement = try manager.createUser("alice", "new-secret", &.{});
     defer replacement.deinit(a);
     try std.testing.expect(!try manager.sqlCredentialPermits("alice", user.instance_id, "basic:alice", "docs", sql.Access.bit(.select)));
+    try std.testing.expect(!try manager.sqlRetainedCredentialPermits(user.instance_id, "basic:alice", "", 0));
 }
 
 test "SQL privileges API key snapshots retain authenticated instances through allocation failures" {

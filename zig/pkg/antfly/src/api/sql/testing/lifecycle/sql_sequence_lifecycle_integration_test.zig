@@ -372,7 +372,7 @@ const ExecutionCampaign = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const protocol = @import("../../../../pgwire/protocol.zig");
-        var adapter: @import("../../../sql_pgwire.zig").Adapter = .{ .server = if (ctx.data.http_server) |*api| api else return error.MissingNativeSqlApi };
+        var adapter: @import("../../transport/pgwire.zig").Adapter = .{ .server = if (ctx.data.http_server) |*api| api else return error.MissingNativeSqlApi };
         var input = std.Io.Writer.Allocating.init(a);
         defer input.deinit();
         const startup = "user\x00pk-rewriter\x00database\x00default\x00\x00";

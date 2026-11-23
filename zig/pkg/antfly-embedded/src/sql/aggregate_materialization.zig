@@ -27,7 +27,7 @@ pub const Key = struct {
     path: []const u8,
     type: @import("ast.zig").ColumnType,
     nullable: bool,
-    element_type: ?@import("array_value.zig").ElementType = null,
+    element_type: ?@import("array/value.zig").ElementType = null,
     numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
     enum_view: ?*const @import("../common/sql_enum_value.zig").View = null,
     domain_view: ?*const @import("../schema/domain_value.zig").View = null,

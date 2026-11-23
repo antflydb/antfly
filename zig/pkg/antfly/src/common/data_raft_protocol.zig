@@ -40,7 +40,11 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 40;
+/// Version 41 admits isolated logical publication capture controls.
+pub const batch_publication_capture_protocol_version: u16 = 41;
+pub const batch_publication_collection_protocol_version: u16 = 42;
+pub const batch_replication_source_prepare_protocol_version: u16 = 43;
+pub const batch_protocol_version: u16 = batch_replication_source_prepare_protocol_version;
 pub const maximum_decodable_batch_protocol_version: u16 = batch_protocol_version;
 pub const batch_graph_transaction_protocol_version: u16 = 36;
 pub const batch_coupled_schema_policy_protocol_version: u16 = 37;

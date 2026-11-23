@@ -24,7 +24,7 @@ const compiler = @import("compiler.zig");
 const Allocator = std.mem.Allocator;
 pub const Kind = enum { row_number, rank, dense_rank, percent_rank, cume_dist, ntile, lag, lead, first_value, last_value, nth_value, count, sum, avg, min, max, bool_and, bool_or };
 pub const Sort = struct { partition: []const usize, order: []const usize, directions: []const @import("operators.zig").Order };
-pub const Spec = struct { input_coercion: ?*const scalar.Program = null, default_coercion: ?*const scalar.Program = null, domain_view: ?*const @import("../schema/domain_value.zig").View = null, kind: Kind, arguments: []const usize, filter: ?usize, sort: usize, frame: ?ast.Window.Frame, type: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType = null, enum_view: ?*const @import("../common/sql_enum_value.zig").View = null, integer_numeric_result: bool = false, star: bool };
+pub const Spec = struct { input_coercion: ?*const scalar.Program = null, default_coercion: ?*const scalar.Program = null, domain_view: ?*const @import("../schema/domain_value.zig").View = null, kind: Kind, arguments: []const usize, filter: ?usize, sort: usize, frame: ?ast.Window.Frame, type: ast.ColumnType, element_type: ?@import("array/value.zig").ElementType = null, enum_view: ?*const @import("../common/sql_enum_value.zig").View = null, integer_numeric_result: bool = false, star: bool };
 pub const Bound = struct {
     input: *const describe.BoundStatement,
     statement: ast.Select,
@@ -302,8 +302,8 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
                 if (nargs == 3 and !default_null and !(first_domain != null and default_unknown)) {
                     const default_type = input.columns[pending.arguments[2]].type;
                     if ((input_type == .integer or input_type == .number) and (default_type == .integer or default_type == .number)) {
-                        const left = input_element orelse (if (input_type == .integer) @import("array_value.zig").ElementType.int64 else .float64);
-                        const right = input.columns[pending.arguments[2]].element_type orelse (if (default_type == .integer) @import("array_value.zig").ElementType.int64 else .float64);
+                        const left = input_element orelse (if (input_type == .integer) @import("array/value.zig").ElementType.int64 else .float64);
+                        const right = input.columns[pending.arguments[2]].element_type orelse (if (default_type == .integer) @import("array/value.zig").ElementType.int64 else .float64);
                         input_element = try @import("builtin_cast.zig").commonNumeric(left, right);
                         if (default_type == .number) input_type = .number;
                     } else if (default_type != input_type) return error.SqlTypeMismatch;
@@ -335,12 +335,12 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
             .bool_and, .bool_or => .boolean,
             else => input_type,
         };
-        const result_element = if (integer_numeric_result) @import("array_value.zig").ElementType.numeric else switch (kind) {
-            .row_number, .rank, .dense_rank, .count => @import("array_value.zig").ElementType.int64,
-            .ntile => @import("array_value.zig").ElementType.int32,
+        const result_element = if (integer_numeric_result) @import("array/value.zig").ElementType.numeric else switch (kind) {
+            .row_number, .rank, .dense_rank, .count => @import("array/value.zig").ElementType.int64,
+            .ntile => @import("array/value.zig").ElementType.int32,
             .avg => average_type.element_type,
-            .percent_rank, .cume_dist => @import("array_value.zig").ElementType.float64,
-            .bool_and, .bool_or => @import("array_value.zig").ElementType.boolean,
+            .percent_rank, .cume_dist => @import("array/value.zig").ElementType.float64,
+            .bool_and, .bool_or => @import("array/value.zig").ElementType.boolean,
             .sum => sum_type.element_type,
             else => input_element,
         };

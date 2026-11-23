@@ -396,3 +396,85 @@ pub fn buildTableRetirement(owners: anytype, alloc: std.mem.Allocator, io: std.I
     const lookup: ledger.Lookup = .fromHead(prepared.head);
     return .{ .arena = arena, .prepared = prepared, .command = command, .lookup = lookup, .recovery_token = try recovery.Token.encode(lookup) };
 }
+
+pub fn buildPartition(owners: anytype, alloc: std.mem.Allocator, io: std.Io, context: operation.RequestContext, activation: @import("../../metadata/schema_validation/publication.zig").OwnerCut, before: []const manager.TableRecord, input_selection: local.schema_table_partitions.Transition, input_guards: plans.PartitionGuards) !Owned {
+    if (!context.setting_admin or !context.schema_validation_authority) return error.Forbidden;
+    try context.ensureActive();
+    try input_selection.validate(alloc);
+    if (before.len != 2 or before[0].table_id >= before[1].table_id or activation.ranges.len < 2) return error.InvalidGenerationPublication;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const change_json = try std.json.Stringify.valueAlloc(a, .{ .transition = input_selection, .guards = input_guards }, .{});
+    const change = try std.json.parseFromSliceLeaky(struct { transition: local.schema_table_partitions.Transition, guards: plans.PartitionGuards }, a, change_json, .{ .allocate = .alloc_always });
+    const selection: contract.InputSelection = .{ .partition_membership = change.transition };
+    const pairs = try a.alloc(plans.TablePair, 2);
+    for (before, pairs) |table, *pair| {
+        pair.before = try manager.cloneTable(a, table);
+        pair.after = try manager.cloneTable(a, table);
+        const schema = try change.transition.schemaAlloc(a, table.table_id, table.schema_json);
+        a.free(pair.after.schema_json);
+        pair.after.schema_json = schema;
+        var definition = try local.schema_mod.PreparedSchemaDefinition.init(a, schema);
+        defer definition.deinit(a);
+        pair.after.schema_reader_requirements = definition.readerRequirements();
+    }
+    if (comptime @hasDecl(@typeInfo(@TypeOf(owners)).pointer.child, "prepareCohort")) try owners.prepareCohort(activation.ranges, context);
+    var id: [16]u8 = undefined;
+    while (true) {
+        try context.ensureActive();
+        try io.randomSecure(&id);
+        if (std.mem.readInt(u64, id[0..8], .little) != 0 and std.mem.readInt(u64, id[8..16], .little) != 0) break;
+    }
+    const captured = try prepareCatalogOwners(owners, alloc, a, context, activation, pairs, selection, id, contract.hash(&id), std.mem.readInt(u64, id[8..16], .little));
+    const plan: plans.Plan = .{ .version = 6, .metadata_group_id = activation.metadata_group_id, .metadata_incarnation = activation.metadata_incarnation, .id = id, .before = pairs[0].before, .after = pairs[0].after, .additional_tables = pairs[1..], .selection = selection, .owners = captured.intents, .partition_guards = change.guards };
+    var prepared = try plans.Prepared.init(alloc, plan);
+    errdefer prepared.deinit();
+    for (captured.intents, prepared.owners, captured.preparations) |*intent, owner, signed| {
+        intent.binding = owner.binding;
+        try signed.verifyFor(owner.binding, owner.physical_root_incarnation);
+    }
+    try context.ensureActive();
+    const command = try ledger.encodeBegin(alloc, .{ .plan = plan, .preparations = captured.preparations, .inputs = captured.inputs });
+    errdefer alloc.free(command);
+    const lookup: ledger.Lookup = .fromHead(prepared.head);
+    return .{ .arena = arena, .prepared = prepared, .command = command, .lookup = lookup, .recovery_token = try recovery.Token.encode(lookup) };
+}
+
+pub fn buildInitialPartition(owners: anytype, alloc: std.mem.Allocator, io: std.Io, context: operation.RequestContext, activation: @import("../../metadata/schema_validation/publication.zig").OwnerCut, initial: @import("../../metadata/fk_generation_publication.zig").InitialPublication) !Owned {
+    if (!context.setting_admin or !context.schema_validation_authority) return error.Forbidden;
+    try context.ensureActive();
+    try initial.validateState(alloc);
+    const birth = initial.plan.partition_birth orelse return error.InvalidGenerationPublication;
+    if (initial.phase != .provisioning_child or initial.partition_journal != null or
+        initial.child_provisioned.len != initial.plan.child_ranges.len) return error.GenerationPublicationChanged;
+    try birth.validate(alloc, initial.plan.child);
+    if (activation.ranges.len != birth.parent_ranges.len) return error.GenerationPublicationChanged;
+    for (activation.ranges, birth.parent_ranges) |actual, expected| if (!manager.rangeRecordsEqual(actual, expected)) return error.GenerationPublicationChanged;
+    if (comptime @hasDecl(@typeInfo(@TypeOf(owners)).pointer.child, "prepareCohort")) try owners.prepareCohort(activation.ranges, context);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const encoded_birth = try std.json.Stringify.valueAlloc(a, birth, .{});
+    const owned = try std.json.parseFromSliceLeaky(@import("../../metadata/initial_partition.zig").Intent, a, encoded_birth, .{ .allocate = .alloc_always });
+    const selection: contract.InputSelection = .{ .partition_membership = owned.transition };
+    const pairs = [_]plans.TablePair{.{ .before = owned.parent_before, .after = owned.parent_after }};
+    var id: [16]u8 = undefined;
+    while (true) {
+        try context.ensureActive();
+        try io.randomSecure(&id);
+        if (!std.mem.eql(u8, &id, &initial.plan.id) and std.mem.readInt(u64, id[0..8], .little) != 0 and std.mem.readInt(u64, id[8..16], .little) != 0) break;
+    }
+    const captured = try prepareCatalogOwners(owners, alloc, a, context, activation, &pairs, selection, id, contract.hash(&id), std.mem.readInt(u64, id[8..16], .little));
+    const plan: plans.Plan = .{ .version = 7, .metadata_group_id = activation.metadata_group_id, .metadata_incarnation = activation.metadata_incarnation, .id = id, .table_guard = owned.parent_guard, .before = owned.parent_before, .after = owned.parent_after, .selection = selection, .owners = captured.intents, .initial_partition = try initial.partitionReference() };
+    var prepared = try plans.Prepared.init(alloc, plan);
+    errdefer prepared.deinit();
+    for (captured.intents, prepared.owners, captured.preparations) |*intent, owner, signed| {
+        intent.binding = owner.binding;
+        try signed.verifyFor(owner.binding, owner.physical_root_incarnation);
+    }
+    const command = try ledger.encodeBegin(alloc, .{ .plan = plan, .preparations = captured.preparations, .inputs = captured.inputs });
+    errdefer alloc.free(command);
+    const lookup: ledger.Lookup = .fromHead(prepared.head);
+    return .{ .arena = arena, .prepared = prepared, .command = command, .lookup = lookup, .recovery_token = try recovery.Token.encode(lookup) };
+}

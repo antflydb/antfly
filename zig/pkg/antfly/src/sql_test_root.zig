@@ -15,10 +15,10 @@
 
 test {
     _ = @import("antfly_local_sources").system_catalog_privileges;
-    _ = @import("api/sql_statistics_cache.zig");
-    _ = @import("api/sql_persisted_expressions.zig");
+    _ = @import("api/sql/execution/statistics_cache.zig");
+    _ = @import("api/sql/execution/persisted_expressions.zig");
     _ = @import("antfly_local_sources").api_sql_maintenance_contract;
-    _ = @import("api/sql_group_guard.zig");
+    _ = @import("api/sql/execution/group_guard.zig");
     _ = @import("sql/test_root.zig");
     _ = @import("sql/subquery_shape_test.zig");
     _ = @import("sql/joined_mutation_test.zig");
@@ -26,6 +26,18 @@ test {
     _ = @import("antfly_local_sources").storage_db_row_policy_bundle;
     _ = @import("antfly_local_sources").storage_db_table_catalog;
     _ = @import("antfly_local_sources").system_catalog_domain;
+    _ = @import("antfly_local_sources").system_catalog_table_partitions;
+    _ = @import("antfly_local_sources").schema_table_partitions;
+    _ = @import("antfly_local_sources").system_catalog_logical_replication;
+    _ = @import("antfly_local_sources").system_catalog_logical_replication_catalog;
+    _ = @import("antfly_local_sources").system_catalog_logical_replication_origin;
+    _ = @import("antfly_local_sources").system_catalog_logical_replication_publisher;
+    _ = @import("antfly_local_sources").system_catalog_logical_replication_capture;
+    _ = @import("antfly_local_sources").storage_publication_prepare_sink;
+    _ = @import("antfly_local_sources").storage_db_logical_replication_outbox_contract;
+    _ = @import("antfly_local_sources").storage_db_logical_replication_outbox;
+    _ = @import("antfly_local_sources").storage_db_logical_replication_prepare_frame;
+    _ = @import("antfly_local_sources").storage_db_logical_replication_terminal_frame;
     _ = @import("usermgr/mod.zig");
     // Keep SQL schema lowering and native uniqueness/conflict admission in
     // one qualification gate; the build selects the cross-layer contract.

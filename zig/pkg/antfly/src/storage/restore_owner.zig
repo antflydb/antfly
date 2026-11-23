@@ -278,6 +278,18 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
     var before = (try target.restoreStagingStatus(alloc)) orelse return error.RestoreStagingScopeChanged;
     defer before.deinit();
     if (!std.mem.eql(u8, &before.value.scope.digest(), &input.scope.digest())) return error.RestoreStagingScopeChanged;
+    if (input.action == .capture_initial) {
+        // The request declares no output handle. Only this accepting writer's
+        // actual sealed row cursor can mint the physical initial-image receipt.
+        const frozen = @import("antfly_local_sources").storage_db_relational_frozen_contract;
+        const binding = try frozen.Binding.fromProgress(before.value);
+        const deadline = (try context.platformDeadline()).deadline_ns orelse
+            (@import("antfly_platform").time.monotonicNs() +| 30 * std.time.ns_per_s);
+        const handle = try target.captureFrozenImage(binding, context.cancellation, deadline);
+        try handle.requireScope(input.scope);
+        try context.ensureActive();
+        return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt(), .population = before.value.population, .frozen_image = handle };
+    }
     // Metadata/owner receipts survive restart; physical index coverage belongs
     // to this replica. Recheck it before acknowledging recovered readiness.
     // Cancellation must remain available even when a projection is broken.
@@ -512,7 +524,7 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
             }
         },
         .publish, .cancel => try env.proposer.propose(env.proposer.ptr, .{ .restore_staging = .{ .finish = .{ .scope = input.scope.digest(), .phase = desired.? } } }, context),
-        .status => unreachable,
+        .status, .capture_initial => unreachable,
     }
     var after = (try target.restoreStagingStatus(alloc)) orelse return error.RestoreStagingScopeChanged;
     defer after.deinit();
@@ -1133,6 +1145,30 @@ fn testVerifiedDecoderOrigin(comptime portable: bool, comptime repository: bool)
 }
 
 test "restore owner SQL population commits bounded typed rows and completion through native replay and reopen" {
+    try testNativePopulation(null);
+}
+
+test "restore owner SQL population preserves manifested keys through native LSM replay and reopen" {
+    try testNativePopulation(.current);
+}
+
+test "restore owner SQL population seals exact frozen upload after reply loss and cold reopen" {
+    try testNativePopulation(.frozen);
+}
+
+fn testPopulationRow(a: std.mem.Allocator, ordinal: u64, image: ?@import("antfly_local_sources").storage_db_relational_population_contract.Image) !@import("antfly_local_sources").storage_db_relational_population_contract.Row {
+    const population = @import("antfly_local_sources").storage_db_relational_population_contract;
+    const logical_key = if (image != null) try std.fmt.allocPrint(a, "sql:{x:0>16}", .{ordinal}) else null;
+    return .{
+        .ordinal = ordinal,
+        .document = try std.fmt.allocPrint(a, "{{\"n\":{d},\"j\":null}}", .{ordinal}),
+        .json_null_fields = if (ordinal % 2 == 0) &.{"j"} else &.{},
+        .key = if (image == .frozen) try population.frozen_key.encodeBirth(a, logical_key.?, ordinal, .surviving) else logical_key,
+    };
+}
+
+fn testNativePopulation(image: ?@import("antfly_local_sources").storage_db_relational_population_contract.Image) !void {
+    const keyed = image != null;
     const a = std.testing.allocator;
     const io = std.testing.io;
     const local = @import("antfly_local_sources");
@@ -1155,8 +1191,13 @@ test "restore owner SQL population commits bounded typed rows and completion thr
     const declaration = try local.sql_ddl_runtime.createSchemaAlloc(owned, create.statement.create_table);
     try target.setSchemaJson(a, declaration);
     const schema = try local.storage_schema.serializeSchema(owned, target.core.schema.?);
-    const binding: population.Binding = .{ .capture_id = @splat(1), .definition = @splat(2), .source_definition = @splat(3), .target_schema = staging.digest(schema), .principal_instance = @splat(5), .catalog_revision = 6, .write_version = 42, .partition = 22 };
-    const scope: staging.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = try binding.digest(), .source_namespace = .{ .table_id = 0, .shard_id = 0, .range_id = 0 }, .target_namespace = options.identity_namespace.?, .target_schema_digest = binding.target_schema, .population = binding };
+    var binding: population.Binding = .{ .capture_id = @splat(1), .definition = @splat(2), .source_definition = @splat(3), .target_schema = staging.digest(schema), .principal_instance = @splat(5), .catalog_revision = 6, .write_version = 42, .partition = 22 };
+    if (keyed) {
+        var content = population.contentStart();
+        for (0..257) |ordinal| content = try population.contentNext(content, try testPopulationRow(owned, ordinal, image));
+        binding.transaction_rows = .{ .image = image.?, .transaction = @splat(10), .generation_nonce = @splat(11), .source_rows = 257, .rows = 257, .content = content };
+    }
+    const scope: staging.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = try binding.digest(), .source_namespace = .{ .table_id = 0, .shard_id = 0, .range_id = 0 }, .target_namespace = options.identity_namespace.?, .target_schema_digest = binding.target_schema, .population = binding, .catalog_intent_digest = if (keyed) @splat(12) else null };
     try target.reserveRestoreStagingScoped(a, scope);
     const Apply = struct {
         target: *db.DB,
@@ -1180,12 +1221,17 @@ test "restore owner SQL population commits bounded typed rows and completion thr
     const env: Environment = .{ .io = io, .runtime = &runtime, .location_options = .{}, .cache_path = try std.fmt.allocPrint(owned, "{s}/unused-source", .{root}), .proposer = .{ .ptr = &apply, .propose = Apply.propose } };
     var response = try executeResident(a, &target, env, .{ .scope = scope, .action = .begin }, .{});
     try std.testing.expectEqual(@as(u64, 0), response.population.?.rows);
+    const capture: Request = .{ .scope = scope, .action = .capture_initial };
+    try std.testing.expectError(
+        if (image == .frozen) error.RelationPopulationChanged else error.InvalidRestoreStagingCommand,
+        executeResident(a, &target, env, capture, .{}),
+    );
     try std.testing.expectError(error.RestoreStagingInProgress, executeResident(a, &target, env, .{ .scope = scope, .action = .validate }, .{}));
     var offset: u64 = 0;
     while (offset < 257) {
         const count: usize = @intCast(@min(128, 257 - offset));
         const rows = try owned.alloc(population.Row, count);
-        for (rows, 0..) |*row, index| row.* = .{ .ordinal = offset + index, .document = try std.fmt.allocPrint(owned, "{{\"n\":{d},\"j\":null}}", .{offset + index}), .json_null_fields = if ((offset + index) % 2 == 0) &.{"j"} else &.{} };
+        for (rows, 0..) |*row, index| row.* = try testPopulationRow(owned, offset + index, image);
         const cursor = response.population.?;
         const page: population.Page = .{ .binding = cursor.binding, .sequence = cursor.pages, .first_row = cursor.rows, .previous = cursor.chain, .rows = rows };
         const request: Request = .{ .scope = scope, .action = .import_page, .population_page = page };
@@ -1195,7 +1241,12 @@ test "restore owner SQL population commits bounded typed rows and completion thr
             defer prepared.deinit();
             var corrupted = prepared.batch.?;
             const changed = try owned.dupe(db.types.BatchWrite, corrupted.writes);
-            changed[0].value = "{\"n\":999,\"j\":null}";
+            if (keyed) {
+                changed[0].key = "forged-primary-key";
+                const timestamps = try owned.dupe(staging.Timestamp, corrupted.restore_staging.?.import_page.timestamps);
+                timestamps[0].key = changed[0].key;
+                corrupted.restore_staging.?.import_page.timestamps = timestamps;
+            } else changed[0].value = "{\"n\":999,\"j\":null}";
             corrupted.writes = changed;
             corrupted.restore_staging_scope = scope.digest();
             try std.testing.expectError(error.InvalidRelationPopulation, @import("server_db_adapter.zig").applyOrdered(&target, corrupted, .{ .term = 1, .index = apply.index + 1 }));
@@ -1224,12 +1275,27 @@ test "restore owner SQL population commits bounded typed rows and completion thr
     try std.testing.expectEqual(sealed_index, apply.index);
     try std.testing.expect(response.population.?.sealed);
     try std.testing.expectEqual(staging.Phase.imported, response.phase);
+    if (image == .frozen) {
+        const captured = try executeResident(a, &target, env, capture, .{});
+        const handle = captured.frozen_image orelse return error.MissingPopulationRow;
+        try handle.requireScope(scope);
+        target.close();
+        live = false;
+        target = try db.DB.open(a, path, options);
+        live = true;
+        const reopened = try executeResident(a, &target, env, capture, .{});
+        try std.testing.expectEqualDeep(handle, reopened.frozen_image.?);
+        try std.testing.expectEqual(sealed_index, apply.index);
+        return;
+    }
     response = try executeResident(a, &target, env, .{ .scope = scope, .action = .validate }, .{});
     try std.testing.expectEqual(staging.Phase.validated, response.phase);
     response = try executeResident(a, &target, env, .{ .scope = scope, .action = .publish }, .{});
     try std.testing.expectEqual(staging.Phase.published, response.phase);
     for (0..257) |ordinal| {
-        const value = (try target.get(a, &population.rowKey(binding.capture_id, ordinal))) orelse return error.MissingPopulationRow;
+        const generated = population.rowKey(binding.capture_id, ordinal);
+        const key = if (keyed) (try testPopulationRow(owned, ordinal, image)).key.? else &generated;
+        const value = (try target.get(a, key)) orelse return error.MissingPopulationRow;
         defer a.free(value);
         var row = try std.json.parseFromSlice(std.json.Value, a, value, .{});
         defer row.deinit();
@@ -1257,7 +1323,7 @@ test "restore owner SQL population query delivery resolves lost ACKs and refuses
     const io = std.testing.io;
     const local = @import("antfly_local_sources");
     const population = local.storage_db_relational_population_contract;
-    const delivery = @import("../api/sql_population_delivery.zig");
+    const delivery = @import("../api/sql/execution/population_delivery.zig");
     const catalog = local.sql_catalog;
     const Backend = struct {
         fn resolve(_: *anyopaque, _: std.mem.Allocator, _: local.sql_ast.Name, _: catalog.Action) !catalog.Table {
@@ -1431,7 +1497,7 @@ test "restore owner SQL population query delivery resolves lost ACKs and refuses
 }
 
 test {
-    _ = @import("../api/sql_population_delivery.zig");
-    _ = @import("../api/sql_population_recovery.zig");
+    _ = @import("../api/sql/execution/population_delivery.zig");
+    _ = @import("../api/sql/recovery/population_recovery.zig");
     _ = @import("sql_population_cohort_test.zig");
 }

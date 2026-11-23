@@ -37,22 +37,22 @@ fn outputCellDatum(a: std.mem.Allocator, value: Json, sql_null: bool, column: de
     if (column.type == .bytea) {
         if (sql_null) return .{};
         if (value != .string or column.element_type != null) return error.SqlTypeMismatch;
-        const bytes = try @import("bytea_value.zig").parseAlloc(a, value.string, (@import("array_value.zig").Limits{}).bytes);
+        const bytes = try @import("bytea_value.zig").parseAlloc(a, value.string, (@import("array/value.zig").Limits{}).bytes);
         const owned = try a.create(@import("bytea_value.zig").Value);
         owned.* = .{ .bytes = bytes };
         return @import("scalar.zig").Datum.typedBytes(owned);
     }
-    if (column.enum_view != null or @import("range_value.zig").kindFromType(column.type) != null or column.temporal_kind != null) {
+    if (column.enum_view != null or @import("range/value.zig").kindFromType(column.type) != null or column.temporal_kind != null) {
         return describe.coerceDatumTyped(a, .{ .value = value, .sql_null = sql_null }, .{ .kind = column.type, .element_type = column.element_type, .enum_view = column.enum_view, .temporal_kind = column.temporal_kind });
     }
     if (column.type == .number and column.element_type == .numeric and !sql_null) {
         if (value != .string) return error.SqlTypeMismatch;
-        var work: @import("array_value.zig").Budget = .{};
+        var work: @import("array/value.zig").Budget = .{};
         return @import("scalar.zig").numericTextLeaky(a, value.string, &work);
     }
     if (column.type != .array or sql_null) return .{ .value = value, .sql_null = sql_null };
-    const array = try a.create(@import("array_value.zig").Value);
-    array.* = try @import("array_wire.zig").decodeLeaky(a, column.element_type orelse return error.SqlTypeMismatch, value, .{});
+    const array = try a.create(@import("array/value.zig").Value);
+    array.* = try @import("array/wire.zig").decodeLeaky(a, column.element_type orelse return error.SqlTypeMismatch, value, .{});
     return .{ .array = array, .sql_null = false };
 }
 

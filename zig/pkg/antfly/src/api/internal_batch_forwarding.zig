@@ -191,6 +191,10 @@ pub fn graphTransactionProtocol(req: @import("antfly_local_sources").storage_db_
 }
 
 pub fn externalTransactionProtocol(req: @import("antfly_local_sources").storage_db_types.BatchRequest) ?u16 {
+    if (req.replicationSourcePermit() != null) return data_raft_protocol.batch_replication_source_prepare_protocol_version;
+    if (req.logical_publication_gc != null) return data_raft_protocol.batch_publication_collection_protocol_version;
+    if (req.logical_publication_control != null) return data_raft_protocol.batch_publication_capture_protocol_version;
+    if (req.transaction) |transaction| if (transaction == .prepare and transaction.prepare.publication_capture != null) return data_raft_protocol.batch_publication_capture_protocol_version;
     if (req.sql_lock != null) return @import("../common/data_raft_protocol.zig").batch_sql_lock_protocol_version;
     if (req.transaction) |transaction| if (transaction == .begin and transaction.begin.sql_locks != null) return @import("../common/data_raft_protocol.zig").batch_sql_lock_protocol_version;
     if (req.transaction) |transaction| switch (transaction) {

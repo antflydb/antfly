@@ -79,11 +79,16 @@ pub const Acceptance = struct {
         try self.proof.verify(try self.digest());
     }
     pub fn requireLogical(self: Acceptance, group: u64, plan: Digest, scope: Digest, install: native.Install, descriptor: lifetime.Descriptor, namespace: identity.Namespace) !void {
+        if (!std.mem.eql(u8, &install.scope, &scope)) return error.InvalidRestoreStaging;
+        return self.requireLogicalProof(group, plan, scope, install.origin.kind(), try install.origin.digest(), try install.digest(), descriptor, namespace);
+    }
+
+    pub fn requireLogicalProof(self: Acceptance, group: u64, plan: Digest, scope: Digest, origin_kind: @FieldType(@FieldType(Acceptance, "installed"), "origin_kind"), origin_digest: Digest, install_digest: Digest, descriptor: lifetime.Descriptor, namespace: identity.Namespace) !void {
         try self.verify();
         if (descriptor.kind != .unlogged or group != self.group_id or self.range_id != namespace.range_id or
             !std.mem.eql(u8, &plan, &self.plan_digest) or !std.mem.eql(u8, &scope, &self.installed.scope) or
-            !std.mem.eql(u8, &install.scope, &scope) or self.installed.origin_kind != install.origin.kind() or !std.mem.eql(u8, &try install.origin.digest(), &self.installed.origin_digest) or
-            !std.mem.eql(u8, &try install.digest(), &self.installed.install_digest) or
+            self.installed.origin_kind != origin_kind or !std.mem.eql(u8, &origin_digest, &self.installed.origin_digest) or
+            !std.mem.eql(u8, &install_digest, &self.installed.install_digest) or
             !std.mem.eql(u8, &try descriptor.fingerprint(), &self.descriptor_fingerprint)) return error.InvalidRestoreStaging;
         const pin = self.proof.native_pin.?;
         if (pin.data_generation != descriptor.data_generation or pin.table_id != namespace.table_id or pin.shard_id != namespace.shard_id or pin.range_id != namespace.range_id or

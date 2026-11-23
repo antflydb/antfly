@@ -39,8 +39,8 @@ pub const Scalar = union(enum) {
     cast: struct {
         operand: *const Scalar,
         type: ColumnType,
-        temporal_kind: ?@import("temporal_value.zig").Kind = null,
-        element_type: ?@import("array_value.zig").ElementType = null,
+        temporal_kind: ?@import("temporal/value.zig").Kind = null,
+        element_type: ?@import("array/value.zig").ElementType = null,
         numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
         /// Normalized declaration spelling, resolved once during preparation.
         named_type: ?Name = null,
@@ -380,7 +380,7 @@ pub const Column = struct {
     /// Exact declared builtin identity, including an array's element width.
     /// Declared array dimensions are not PostgreSQL type identity and are not
     /// retained here. Durable schema admission must not infer this from rows.
-    element_type: ?@import("array_value.zig").ElementType = null,
+    element_type: ?@import("array/value.zig").ElementType = null,
     numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
     nullable: bool = true,
     default_expression: ?*const Scalar = null,
@@ -420,7 +420,16 @@ pub const LikeOptions = packed struct {
 };
 pub const LikeTable = struct { source: Name, column_offset: usize, options: LikeOptions = .{} };
 
-pub const CreateTable = struct { table: Name, columns: []const Column, constraints: []const SchemaChange = &.{}, like_tables: []const LikeTable = &.{}, if_not_exists: bool = false, tablespace: ?[]const u8 = null, document: ?*const DocumentTable = null, persistence: RelationPopulation.Persistence = .permanent, on_commit: ?RelationPopulation.OnCommit = null };
+pub const PartitionBound = union(enum) { minvalue, maxvalue, expression: *const Scalar };
+pub const PartitionRange = struct { lower: PartitionBound, upper: PartitionBound };
+pub const PartitionBy = struct { columns: []const []const u8 };
+pub const PartitionOf = struct { parent: Name, bounds: PartitionRange };
+pub const PartitionAlter = union(enum) {
+    attach: struct { child: Name, bounds: PartitionRange },
+    detach: Name,
+};
+
+pub const CreateTable = struct { partition_by: ?PartitionBy = null, partition_of: ?PartitionOf = null, table: Name, columns: []const Column, constraints: []const SchemaChange = &.{}, like_tables: []const LikeTable = &.{}, if_not_exists: bool = false, tablespace: ?[]const u8 = null, document: ?*const DocumentTable = null, persistence: RelationPopulation.Persistence = .permanent, on_commit: ?RelationPopulation.OnCommit = null };
 pub const DropTable = struct { table: Name, if_exists: bool = false, cascade: bool = false };
 /// Immutable SQL intent, not a catalog identity. OWNED BY names must bind to
 /// stable relation/attribute IDs in the authoritative catalog transaction.
@@ -486,7 +495,8 @@ pub const RelationPopulation = struct {
 /// SQL maintenance intent. Physical execution is bound to a table generation
 /// by the catalog adapter, never supplied by the SQL client.
 pub const Maintenance = struct {
-    operation: enum { vacuum, analyze, reindex },
+    operation: enum { vacuum, analyze, reindex, cluster },
+    cluster_index: ?[]const u8 = null,
     full: bool = false,
     verbose: bool = false,
     analyze: bool = false,
@@ -531,9 +541,18 @@ pub const NativeIndex = struct {
     operator_class: ?OperatorClass = null,
 };
 
+test {
+    _ = @import("../system_catalog/domain.zig");
+    _ = @import("native_collation.zig");
+    _ = @import("collation_binding.zig");
+    _ = @import("../common/sql_collation_layout.zig");
+}
+
 pub const CatalogDdl = struct {
-    kind: enum { database, namespace, tablespace, table, index, view, role, sequence, function, procedure, operator, aggregate, cast, named_type, extension },
-    action: enum { create, drop, rename, set_tablespace, alter_schema, truncate, setting_default, comment, alter_sequence, populate, maintenance },
+    partition: ?PartitionAlter = null,
+    collation_definition: ?struct { locale: []const u8, deterministic: bool = true } = null,
+    kind: enum { database, namespace, tablespace, table, index, view, role, sequence, function, procedure, operator, aggregate, cast, named_type, extension, publication, subscription, collation },
+    action: enum { create, drop, rename, set_tablespace, alter_schema, truncate, setting_default, comment, alter_sequence, populate, maintenance, security_label },
     name: Name,
     new_name: ?[]const u8 = null,
     tablespace: ?[]const u8 = null,
@@ -553,6 +572,7 @@ pub const CatalogDdl = struct {
     view_definition: ?ViewDefinition = null,
     setting_default: ?struct { name: []const u8, all: bool = false, database: ?[]const u8, value: ?Value } = null,
     authorization: ?Authorization = null,
+    security_label: ?struct { provider: ?[]const u8, label: ?[]const u8 } = null,
     comment_value: ?[]const u8 = null,
     comment_column: ?[]const u8 = null,
     comment_object: ?@import("../system_catalog/object_annotations.zig").Key = null,
@@ -565,6 +585,7 @@ pub const CatalogDdl = struct {
     routine: ?RoutineDefinition = null,
     routine_signature: ?[]const RoutineDefinition.Type = null,
     operator_function: ?Name = null,
+    replication: ?@import("replication_ddl.zig").Syntax = null,
     maintenance: ?Maintenance = null,
     named_type_kind: enum { enumeration, domain } = .enumeration,
     domain_definition: ?DomainDefinition = null,
@@ -592,15 +613,16 @@ pub const CatalogDdl = struct {
 pub const RoutineDefinition = struct {
     pub const Type = struct {
         kind: ColumnType,
-        element_type: ?@import("array_value.zig").ElementType = null,
-        temporal_kind: ?@import("temporal_value.zig").Kind = null,
+        element_type: ?@import("array/value.zig").ElementType = null,
+        temporal_kind: ?@import("temporal/value.zig").Kind = null,
     };
     pub const Argument = struct { name: ?[]const u8 = null, type: Type };
     arguments: []const Argument,
     result: ?Type = null,
     returns_trigger: bool = false,
     language: enum { sql, plpgsql } = .sql,
-    body: []const u8,
+    body: ?[]const u8,
+    planner_support: ?Name = null,
     replace: bool = false,
     strict: bool = false,
     volatility: enum { immutable, stable, @"volatile" } = .@"volatile",
@@ -665,6 +687,7 @@ pub const CopyOptions = struct {
     null_string: ?[]const u8 = null,
     quote: ?u8 = null,
     escape: ?u8 = null,
+    freeze: bool = false,
     header: bool = false,
     header_match: bool = false,
     force_null_all: bool = false,

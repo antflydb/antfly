@@ -258,6 +258,7 @@ pub const Target = struct {
             (std.mem.eql(u8, name, "native_reset") and self.native_reset == null) or
             (std.mem.eql(u8, name, "schema_only_snapshot") and self.schema_only_snapshot == null) or
             (std.mem.eql(u8, name, "native_loss_generations") and self.native_loss_generations.len == 0) or
+            (std.mem.eql(u8, name, "frozen_population") and self.frozen_population == null) or
             (std.mem.eql(u8, name, "population") and self.population == null) or
             (std.mem.eql(u8, name, "materialized_view") and self.materialized_view == null) or
             (std.mem.eql(u8, name, "creation_guard") and self.creation_guard == null) or
@@ -277,6 +278,10 @@ pub const Target = struct {
     schema_only_snapshot: ?@FieldType(@import("antfly_local_sources").storage_db_native_empty_origin.Origin, "schema_only_snapshot") = null,
     native_loss_generations: []const NativeLossGeneration = &.{},
     population: ?@import("antfly_local_sources").storage_db_relational_population_contract.Capture = null,
+    frozen_population: ?struct {
+        schema_json: []const u8,
+        capture: @import("antfly_local_sources").storage_db_relational_population_contract.Capture,
+    } = null,
     /// The definition and backing rows publish in one catalog transaction.
     materialized_view: ?MaterializedView = null,
     sequence_handoffs: []const @import("column_sequence_handoff.zig").Move = &.{},
@@ -725,6 +730,11 @@ pub const Plan = struct {
     /// Rejoining a burned logical OID must require this same completed phase,
     /// not assume every restore/CTAS passes through target activation.
     pub fn catalogPublicationReady(self: Plan, progress: Progress) bool {
+        const phase = self.catalogPublicationPhase() orelse return false;
+        return progress.state == phase.state and progress.completed_owners == phase.owners;
+    }
+
+    pub fn catalogPublicationPhase(self: Plan) ?struct { state: State, owners: usize } {
         var targets: usize = 0;
         var old: usize = 0;
         var parents: usize = 0;
@@ -740,10 +750,84 @@ pub const Plan = struct {
             admissions += target.generation_handoffs.len;
         }
         for (self.external_fk_parents) |parent| parents += parent.ranges.len;
-        if (targets == 0) return false;
-        const expected_state: State = if (parents + admissions != 0) .activating else if (old != 0) .cutover else .validating;
-        const expected_count = if (parents + admissions != 0) parents + admissions else if (old != 0) old else targets;
-        return progress.state == expected_state and progress.completed_owners == expected_count;
+        if (targets == 0) return null;
+        return .{
+            .state = if (parents + admissions != 0) .activating else if (old != 0) .cutover else .validating,
+            .owners = if (parents + admissions != 0) parents + admissions else if (old != 0) old else targets,
+        };
+    }
+
+    /// Catalog cancellation emits the new-owner prefix in plan order. This
+    /// makes the durable completed count a restart cursor across target owners.
+    pub fn catalogCancelTarget(self: Plan, completed: u32) ?struct { target: Target, range_index: usize } {
+        if (self.preparing_sources) return null;
+        var ordinal: usize = completed;
+        for (self.targets) |target| {
+            if (ordinal < target.ranges.len) return .{ .target = target, .range_index = ordinal };
+            ordinal -= target.ranges.len;
+        }
+        return null;
+    }
+
+    pub const CatalogPredecessor = struct {
+        target: Target,
+        table: records.TableRecord,
+        range: records.RangeRecord,
+        fence: @import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Fence,
+    };
+
+    pub fn catalogCancelPredecessor(self: Plan, completed: u32) !?CatalogPredecessor {
+        var ordinal: usize = completed;
+        if (!self.preparing_sources) for (self.targets) |target| {
+            if (ordinal < target.ranges.len) return null;
+            ordinal -= target.ranges.len;
+        };
+        return self.catalogPredecessorAt(ordinal);
+    }
+
+    pub fn catalogPredecessorAt(self: Plan, index: usize) !?CatalogPredecessor {
+        var ordinal = index;
+        for (self.targets) |target| {
+            if (target.native_reset != null) continue;
+            const old = target.replace orelse continue;
+            if (ordinal >= old.ranges.len) {
+                ordinal -= old.ranges.len;
+                continue;
+            }
+            const range = old.ranges[ordinal];
+            const fence = for (old.fences) |candidate| {
+                if (candidate.owner_group_id == range.group_id) break candidate;
+            } else return error.RestoreSourceProofMissing;
+            return .{ .target = target, .table = old.table, .range = range, .fence = fence };
+        }
+        return null;
+    }
+
+    pub fn catalogActivationOwnerAt(self: Plan, index: usize) ?struct { target: Target, range: records.RangeRecord, handoff: GenerationHandoffRange } {
+        var ordinal = index;
+        for (self.targets) |target| {
+            if (ordinal < target.generation_handoffs.len) return .{
+                .target = target,
+                .range = target.ranges[ordinal],
+                .handoff = target.generation_handoffs[ordinal],
+            };
+            ordinal -= target.generation_handoffs.len;
+        }
+        return null;
+    }
+
+    pub fn cancellationOwnerCount(self: Plan) usize {
+        var owners: usize = 0;
+        for (self.targets) |target| {
+            if (!self.preparing_sources) owners += target.ranges.len;
+            if (target.native_reset == null) if (target.replace) |old| {
+                owners += old.ranges.len;
+            };
+        }
+        if (!self.preparing_sources) for (self.external_fk_parents) |parent| {
+            owners += parent.ranges.len;
+        };
+        return owners;
     }
 
     pub fn readerPublicationRequired(self: Plan) bool {
@@ -759,12 +843,14 @@ pub const Plan = struct {
         // Preserve the canonical digest of in-flight plans created before
         // external parents became an optional part of the envelope.
         if (std.mem.eql(u8, name, "expected_incarnation")) return self.expected_incarnation == null;
-        return (std.mem.eql(u8, name, "external_fk_parents") and self.external_fk_parents.len == 0) or
+        return (std.mem.eql(u8, name, "catalog_binding") and self.catalog_binding == null) or
+            (std.mem.eql(u8, name, "external_fk_parents") and self.external_fk_parents.len == 0) or
             (std.mem.eql(u8, name, "constraint_name_guard") and self.constraint_name_guard == null) or
             (std.mem.eql(u8, name, "type_retirement") and self.type_retirement == null) or
             (std.mem.eql(u8, name, "truncate_preparation") and self.truncate_preparation == null);
     }
 
+    catalog_binding: ?@import("../system_catalog/prepared_transactions.zig").CatalogBinding = null,
     id: Id,
     expected_incarnation: ?[32]u8 = null,
     /// Authenticated server-issued aggregate manifest identity, not an
@@ -801,6 +887,37 @@ pub const Plan = struct {
     }
 
     pub fn validate(self: Plan, alloc: std.mem.Allocator) !void {
+        // The public restore writer cannot confer a SQL decision on a cohort.
+        if (self.catalog_binding != null) return error.InvalidRestoreStaging;
+        try self.validateShape(alloc, false);
+    }
+
+    /// The reservation writer must first authenticate the native command and
+    /// recover these declarations from its bound SQL session.
+    pub fn validateCatalog(self: Plan, alloc: std.mem.Allocator, group: u64, pending: *const @import("sql/relation_lifecycle/generation_intents.zig").Pending) !void {
+        const binding = self.catalog_binding orelse return error.InvalidRestoreStaging;
+        try binding.validate(group);
+        if (!std.mem.eql(u8, &binding.intent_digest, &pending.digest())) return error.InvalidRestoreStaging;
+        try self.validateRetainedCatalogShape(alloc);
+        try pending.requireTargets(alloc, self.targets);
+    }
+
+    /// On the receiving side of a trusted metadata projection, validate the
+    /// immutable shape. Only the accepting writer can check a live session.
+    fn validateRetainedCatalogShape(self: Plan, alloc: std.mem.Allocator) !void {
+        const binding = self.catalog_binding orelse return error.InvalidRestoreStaging;
+        try binding.validate(binding.fence.group);
+        const incarnation = self.expected_incarnation orelse return error.InvalidRestoreStaging;
+        if (!std.mem.eql(u8, &incarnation, &std.fmt.bytesToHex(binding.fence.backend.incarnation, .lower)) or
+            self.source_location.len != 0 or self.source_connection.len != 0 or self.skipped_tables.len != 0 or
+            self.preparing_sources or self.constraint_name_guard != null or self.type_retirement != null or
+            self.truncate_preparation != null) return error.InvalidRestoreStaging;
+        try self.validateShape(alloc, true);
+        if (!std.mem.eql(u8, &self.cohort_digest, &try @import("relation_create.zig").fingerprint(alloc, self.targets)))
+            return error.InvalidRestoreStaging;
+    }
+
+    fn validateShape(self: Plan, alloc: std.mem.Allocator, catalog: bool) !void {
         if (self.truncate_preparation) |preparation| try preparation.validate(alloc, self);
         if (self.targets.len == 0 or self.targets.len > 128 or self.external_fk_parents.len > 128) return error.InvalidRestoreStaging;
         for (self.targets) |target| if (target.catalog_binding) |binding| try binding.validateLogicalRelationId();
@@ -925,20 +1042,25 @@ pub const Plan = struct {
             if (old_range_count > 4096) return error.InvalidRestoreStaging;
             schema_bytes = std.math.add(usize, schema_bytes, parent.table.schema_json.len +| parent.table.read_schema_json.len +| parent.table.indexes_json.len) catch return error.InvalidRestoreStaging;
             if (schema_bytes > 4 * 1024 * 1024) return error.InvalidRestoreStaging;
+            var parent_fences: std.AutoHashMapUnmanaged(u64, usize) = .empty;
+            defer parent_fences.deinit(alloc);
+            try parent_fences.ensureTotalCapacity(alloc, @intCast(parent.fences.len));
+            for (parent.fences, 0..) |fence, ordinal| {
+                const slot = parent_fences.getOrPutAssumeCapacity(fence.owner_group_id);
+                if (slot.found_existing) return error.InvalidRestoreStaging;
+                slot.value_ptr.* = ordinal;
+            }
             for (parent.ranges) |range| {
                 if (range.table_id != parent.table.table_id or range.restore_backup_id.len != 0) return error.InvalidRestoreStaging;
                 try @import("antfly_local_sources").common_group_ids.requireDataGroupId(range.group_id);
                 if ((try group_ids.getOrPut(alloc, range.group_id)).found_existing) return error.InvalidRestoreStaging;
-                const fence = for (parent.fences) |item| {
-                    if (item.owner_group_id == range.group_id) break item;
-                } else return error.InvalidRestoreStaging;
+                const fence = parent.fences[parent_fences.get(range.group_id) orelse return error.InvalidRestoreStaging];
                 _ = try fence.encode();
                 if (fence.role != .truncate_parent or fence.namespace.table_id != parent.table.table_id or
                     fence.namespace.shard_id != tables.rangeDocIdentityShardId(range) or fence.namespace.range_id != tables.rangeDocIdentityRangeId(range) or
                     fence.peer_group_id != range.group_id or fence.transition_id != std.mem.readInt(u64, self.id[0..8], .little) or
                     fence.attempt != std.mem.readInt(u64, self.id[8..16], .little)) return error.InvalidRestoreStaging;
             }
-            for (parent.fences, 0..) |fence, index| for (parent.fences[0..index]) |prior| if (prior.owner_group_id == fence.owner_group_id) return error.InvalidRestoreStaging;
             for (parent.foreign_keys, 0..) |foreign, index| {
                 if (foreign.child_table_id == 0 or foreign.child_table_name.len == 0 or foreign.child_table_name.len > 256 or
                     foreign.constraint_name.len == 0 or foreign.constraint_name.len > 256 or std.mem.allEqual(u8, &foreign.generation, 0) or
@@ -968,14 +1090,35 @@ pub const Plan = struct {
             }
         }
         for (self.targets, 0..) |target, index| {
+            if (!catalog and target.frozen_population != null) return error.InvalidRestoreStaging;
+            const replacement = catalog and target.replace != null;
+            if (catalog) {
+                const capture = target.population orelse return error.InvalidRestoreStaging;
+                const rows = capture.transaction_rows orelse return error.InvalidRestoreStaging;
+                if (!std.mem.eql(u8, &rows.transaction, &self.catalog_binding.?.transaction) or
+                    target.attribute_renames.len != 0 or
+                    !std.mem.eql(u8, &capture.capture_id, &rows.generation_nonce) or
+                    (replacement != (target.generation_handoffs.len != 0)))
+                    return error.InvalidRestoreStaging;
+                if (target.frozen_population) |frozen| {
+                    const historical = frozen.capture;
+                    if (!std.mem.eql(u8, &historical.capture_id, historical.source_definition[0..16]) or
+                        !std.mem.eql(u8, historical.principal_name, capture.principal_name) or
+                        !std.mem.eql(u8, &historical.principal_instance, &capture.principal_instance) or
+                        historical.catalog_revision != capture.catalog_revision or
+                        historical.write_version != capture.write_version or historical.expires_at_ms != capture.expires_at_ms)
+                        return error.InvalidRestoreStaging;
+                }
+            }
             const table = target.table;
             if ((target.materialized_view != null) != (table.sql_materialized_view_id != null) or
                 (target.materialized_view != null and target.population == null)) return error.InvalidRestoreStaging;
             if (target.population) |capture| {
+                if (catalog != (capture.transaction_rows != null)) return error.InvalidRestoreStaging;
                 try capture.validate();
-                if (target.source_table_id != 0 or (target.replace != null and target.materialized_view == null) or target.catalog_binding == null or self.preparing_sources or
+                if ((!replacement and (target.source_table_id != 0 or (target.replace != null and target.materialized_view == null) or target.generation_handoffs.len != 0)) or target.catalog_binding == null or self.preparing_sources or
                     target.empty_generation or target.rewrite != null or target.rewrite_sources.len != 0 or target.source_artifacts.len != 0 or
-                    target.source_generation_admissions.len != 0 or target.generation_handoffs.len != 0 or target.sequence_handoffs.len != 0 or
+                    target.source_generation_admissions.len != 0 or target.sequence_handoffs.len != 0 or
                     target.graph_retirement_digest != null or self.external_fk_parents.len != 0 or
                     !std.mem.eql(u8, &capture.target_schema, &try runtimeSchemaDigestForTable(alloc, table.schema_json))) return error.InvalidRestoreStaging;
                 if (target.materialized_view) |view| {
@@ -1005,13 +1148,15 @@ pub const Plan = struct {
                 defer schema.deinit(alloc);
                 if (schema.storage_mode != .relational or schema.external_base_source != null or table.read_schema_json.len != 0 or
                     try hasGraphIndex(alloc, table.indexes_json)) return error.InvalidRestoreStaging;
-                if (schema.foreign_keys) |constraints| if (constraints.value.len != 0) return error.InvalidRestoreStaging;
-                if (schema.unique_constraints) |constraints| if (constraints.value.len != 0) return error.InvalidRestoreStaging;
-                if (schema.checks) |constraints| if (constraints.value.len != 0) return error.InvalidRestoreStaging;
-                if (schema.relational_indexes) |indexes| if (indexes.value.len != 0) return error.InvalidRestoreStaging;
-                inline for (.{ schema.column_defaults, schema.generated_columns }) |expressions| if (expressions) |values| {
-                    if (values.value != .array or values.value.array.items.len != 0) return error.InvalidRestoreStaging;
-                };
+                if (!catalog) {
+                    if (schema.foreign_keys) |constraints| if (constraints.value.len != 0) return error.InvalidRestoreStaging;
+                    if (schema.unique_constraints) |constraints| if (constraints.value.len != 0) return error.InvalidRestoreStaging;
+                    if (schema.checks) |constraints| if (constraints.value.len != 0) return error.InvalidRestoreStaging;
+                    if (schema.relational_indexes) |indexes| if (indexes.value.len != 0) return error.InvalidRestoreStaging;
+                    inline for (.{ schema.column_defaults, schema.generated_columns }) |expressions| if (expressions) |values| {
+                        if (values.value != .array or values.value.array.items.len != 0) return error.InvalidRestoreStaging;
+                    };
+                }
             }
             if (target.rewrite != null and target.generation_handoffs.len != target.ranges.len)
                 return error.RestoreSourceProofMissing;
@@ -1020,7 +1165,7 @@ pub const Plan = struct {
             }
             if ((target.empty_generation and target.schema_only_snapshot == null) or target.generation_handoffs.len != 0) {
                 const old = target.replace orelse return error.InvalidRestoreStaging;
-                if ((target.empty_generation and (self.preparing_sources or target.rewrite != null or target.rewrite_sources.len != 0 or target.source_artifacts.len != 0)) or (!target.empty_generation and target.rewrite == null) or old.table.table_id != target.source_table_id or old.fences.len != (if (target.native_reset != null) @as(usize, 0) else old.ranges.len) or old.ranges.len != target.ranges.len) return error.InvalidRestoreStaging;
+                if ((target.empty_generation and (self.preparing_sources or target.rewrite != null or target.rewrite_sources.len != 0 or target.source_artifacts.len != 0)) or (!target.empty_generation and target.rewrite == null and !replacement) or old.table.table_id != target.source_table_id or old.fences.len != (if (target.native_reset != null) @as(usize, 0) else old.ranges.len) or old.ranges.len != target.ranges.len) return error.InvalidRestoreStaging;
                 if (target.generation_handoffs.len != (if (target.native_reset != null) @as(usize, 0) else old.ranges.len)) return error.InvalidRestoreStaging;
                 if (target.empty_generation) {
                     var destination_attributes = try @import("column_identity_definition.zig").initial(alloc, table);
@@ -1041,11 +1186,19 @@ pub const Plan = struct {
                     const expected = (try graphRetirementDigest(alloc, old.table.table_id, table.table_id, table.indexes_json)) orelse return error.InvalidRestoreStaging;
                     if (!std.mem.eql(u8, &retirement_digest, &expected)) return error.InvalidRestoreStaging;
                 }
+                var fences_by_owner: std.AutoHashMapUnmanaged(u64, usize) = .empty;
+                defer fences_by_owner.deinit(alloc);
+                if (target.native_reset == null) {
+                    try fences_by_owner.ensureTotalCapacity(alloc, @intCast(old.fences.len));
+                    for (old.fences, 0..) |fence, ordinal| {
+                        const slot = fences_by_owner.getOrPutAssumeCapacity(fence.owner_group_id);
+                        if (slot.found_existing) return error.InvalidRestoreStaging;
+                        slot.value_ptr.* = ordinal;
+                    }
+                }
                 if (target.native_reset == null) for (old.ranges, target.ranges, target.generation_handoffs) |source, destination, handoff| {
                     if (!std.mem.eql(u8, source.start_key, destination.start_key) or !std.mem.eql(u8, source.end_key orelse "", destination.end_key orelse "")) return error.InvalidRestoreStaging;
-                    const fence = for (old.fences) |item| {
-                        if (item.owner_group_id == source.group_id) break item;
-                    } else return error.InvalidRestoreStaging;
+                    const fence = old.fences[fences_by_owner.get(source.group_id) orelse return error.InvalidRestoreStaging];
                     if (fence.role != .rewrite_source or fence.peer_group_id != destination.group_id or fence.transition_id != std.mem.readInt(u64, self.id[0..8], .little) or fence.attempt != std.mem.readInt(u64, self.id[8..16], .little)) return error.InvalidRestoreStaging;
                     if (handoff.source_group_id != source.group_id or handoff.target_group_id != destination.group_id or
                         !handoff.source_namespace.eql(fence.namespace) or
@@ -1090,7 +1243,7 @@ pub const Plan = struct {
                     if (mapped_index != handoff.mappings.len) return error.InvalidRestoreStaging;
                 };
             }
-            if (!target.empty_generation and (target.graph_retirement_digest != null or (target.generation_handoffs.len != 0 and target.rewrite == null))) return error.InvalidRestoreStaging;
+            if (!target.empty_generation and (target.graph_retirement_digest != null or (target.generation_handoffs.len != 0 and target.rewrite == null and !replacement))) return error.InvalidRestoreStaging;
             if (target.source_generation_admissions.len != 0) {
                 if (target.source_table_name.len == 0 or target.source_table_name.len > 256 or
                     target.target_schema_digest == null or
@@ -1176,11 +1329,19 @@ pub const Plan = struct {
                 }
                 if (self.preparing_sources or target.rewrite_sources.len != 0) {
                     if (target.rewrite_sources.len != target.ranges.len or target.replace.?.ranges.len != target.ranges.len or target.replace.?.fences.len != target.ranges.len) return error.InvalidRestoreStaging;
-                    for (target.rewrite_sources, target.ranges, target.replace.?.ranges) |scope, destination, original_range| {
+                    const old = target.replace.?;
+                    var rewrite_fences: std.AutoHashMapUnmanaged(u64, usize) = .empty;
+                    defer rewrite_fences.deinit(alloc);
+                    try rewrite_fences.ensureTotalCapacity(alloc, @intCast(old.fences.len));
+                    for (old.fences, 0..) |fence, ordinal| {
+                        const slot = rewrite_fences.getOrPutAssumeCapacity(fence.owner_group_id);
+                        if (slot.found_existing) return error.InvalidRestoreStaging;
+                        slot.value_ptr.* = ordinal;
+                    }
+                    for (target.rewrite_sources, target.ranges, old.ranges) |scope, destination, original_range| {
                         try scope.validate();
-                        for (target.replace.?.fences) |fence| {
-                            if (fence.eql(scope.fence)) break;
-                        } else return error.InvalidRestoreStaging;
+                        const ordinal = rewrite_fences.get(scope.fence.owner_group_id) orelse return error.InvalidRestoreStaging;
+                        if (!old.fences[ordinal].eql(scope.fence)) return error.InvalidRestoreStaging;
                         if (scope.fence.role != .rewrite_source or scope.fence.namespace.table_id != target.source_table_id or
                             scope.fence.owner_group_id != original_range.group_id or scope.fence.namespace.shard_id != tables.rangeDocIdentityShardId(original_range) or
                             scope.fence.namespace.range_id != tables.rangeDocIdentityRangeId(original_range) or scope.fence.peer_group_id != destination.group_id or
@@ -1209,13 +1370,17 @@ pub const Plan = struct {
                 for (old.ranges) |range| if (range.table_id != old.table.table_id or range.restore_backup_id.len != 0) return error.InvalidRestoreStaging;
                 if (old.fences.len != 0) {
                     if (old.fences.len != old.ranges.len) return error.InvalidRestoreStaging;
-                    for (old.fences, 0..) |fence, fence_index| {
+                    var ranges: std.AutoHashMapUnmanaged(u64, usize) = .empty;
+                    defer ranges.deinit(alloc);
+                    try ranges.ensureTotalCapacity(alloc, @intCast(old.ranges.len));
+                    for (old.ranges, 0..) |range, ordinal| ranges.putAssumeCapacityNoClobber(range.group_id, ordinal);
+                    for (old.fences) |fence| {
                         _ = try fence.encode();
-                        if (fence.namespace.table_id != old.table.table_id) return error.InvalidRestoreStaging;
-                        for (old.fences[0..fence_index]) |previous| if (previous.owner_group_id == fence.owner_group_id) return error.InvalidRestoreStaging;
-                        for (old.ranges) |range| {
-                            if (range.group_id == fence.owner_group_id and tables.rangeDocIdentityShardId(range) == fence.namespace.shard_id and tables.rangeDocIdentityRangeId(range) == fence.namespace.range_id) break;
-                        } else return error.InvalidRestoreStaging;
+                        const match = ranges.fetchRemove(fence.owner_group_id) orelse return error.InvalidRestoreStaging;
+                        const range = old.ranges[match.value];
+                        if (fence.namespace.table_id != old.table.table_id or
+                            tables.rangeDocIdentityShardId(range) != fence.namespace.shard_id or
+                            tables.rangeDocIdentityRangeId(range) != fence.namespace.range_id) return error.InvalidRestoreStaging;
                     }
                 }
                 for (self.targets) |candidate| if (candidate.table.table_id == old.table.table_id) return error.InvalidRestoreStaging;
@@ -1229,7 +1394,18 @@ pub const Plan = struct {
             tables.validateCompleteKeyspaceRanges(target.ranges) catch return error.InvalidRestoreStaging;
             if (target.source_artifacts.len != 0) {
                 if (!self.preparing_sources and target.source_artifacts.len != target.ranges.len) return error.InvalidRestoreStaging;
-                for (target.source_artifacts, 0..) |artifact, artifact_index| {
+                var target_owners: std.AutoHashMapUnmanaged(u64, void) = .empty;
+                defer target_owners.deinit(alloc);
+                try target_owners.ensureTotalCapacity(alloc, @intCast(target.ranges.len));
+                for (target.ranges) |range| {
+                    if (target_owners.getOrPutAssumeCapacity(range.group_id).found_existing) return error.InvalidRestoreStaging;
+                }
+                var rewrite_pins: std.AutoHashMapUnmanaged(Digest, void) = .empty;
+                defer rewrite_pins.deinit(alloc);
+                try rewrite_pins.ensureTotalCapacity(alloc, @intCast(target.rewrite_sources.len));
+                for (target.rewrite_sources) |source| _ = rewrite_pins.getOrPutAssumeCapacity(source.pin());
+
+                for (target.source_artifacts) |artifact| {
                     if (artifact.repository_schema_digest != null and (artifact.cohort_seal != null or artifact.rewrite != null)) return error.InvalidRestoreStaging;
                     if (target.rewrite) |rewrite| {
                         if (artifact.repository_schema_digest != null or artifact.format != .portable or artifact.cohort_seal != null) return error.InvalidRestoreStaging;
@@ -1241,18 +1417,11 @@ pub const Plan = struct {
                         if (source_scope.fence.transition_id != std.mem.readInt(u64, self.id[0..8], .little) or
                             source_scope.fence.attempt != std.mem.readInt(u64, self.id[8..16], .little)) return error.InvalidRestoreStaging;
                         if (!std.mem.eql(u8, &rewrite.program_digest, &binding.program_digest)) return error.InvalidRestoreStaging;
-                        if (target.rewrite_sources.len != 0) {
-                            for (target.rewrite_sources) |expected| {
-                                if (std.mem.eql(u8, &expected.pin(), &source_scope.pin())) break;
-                            } else return error.InvalidRestoreStaging;
-                        }
+                        if (target.rewrite_sources.len != 0 and !rewrite_pins.contains(source_scope.pin())) return error.InvalidRestoreStaging;
                     } else if (artifact.rewrite != null) return error.InvalidRestoreStaging;
                     if (artifact.source_namespace.table_id != target.source_table_id or artifact.source_namespace.shard_id == 0 or artifact.source_namespace.range_id == 0 or
                         artifact.snapshot_path.len == 0 or artifact.snapshot_path.len > 4096 or std.mem.allEqual(u8, &artifact.artifact_sha256, 0)) return error.InvalidRestoreStaging;
-                    for (target.source_artifacts[0..artifact_index]) |previous| if (previous.target_group_id == artifact.target_group_id) return error.InvalidRestoreStaging;
-                    for (target.ranges) |range| {
-                        if (range.group_id == artifact.target_group_id) break;
-                    } else return error.InvalidRestoreStaging;
+                    if (!target_owners.remove(artifact.target_group_id)) return error.InvalidRestoreStaging;
                 }
             }
             for (target.ranges) |range| {
@@ -1448,6 +1617,15 @@ pub fn generationHandoffSealDigest(fence: @import("antfly_local_sources").storag
     return result;
 }
 
+pub fn predecessorCancelDigest(fence: @import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Fence) !Digest {
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update("restore old owner canceled v1");
+    hash.update(&try fence.encode());
+    var digest: Digest = undefined;
+    hash.final(&digest);
+    return digest;
+}
+
 /// One old_fenced receipt must prove both protocols when a graph index and
 /// accepted FK generations coexist on the same retired physical owner.
 pub fn generationHandoffOldFenceDigest(fence: @import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Fence, handoff_seal_digest: Digest, graph_seal_digest: ?Digest) !Digest {
@@ -1461,35 +1639,117 @@ pub fn generationHandoffOldFenceDigest(fence: @import("antfly_local_sources").st
     return result;
 }
 
+/// The immutable row populations published by one SQL catalog transaction.
+pub const SqlPopulationLineage = struct {
+    logical_resource_id: u64,
+    predecessor_table_id: ?u64,
+    table_id: u64,
+    write_version: u64,
+    frozen: ?@import("antfly_local_sources").storage_db_relational_frozen_contract.Binding,
+};
+
 pub const Job = struct {
     plan: Plan,
     plan_digest: Digest,
     state: State = .importing,
     revision: u64 = 1,
     completed_owners: u32 = 0,
+    published_owners: u32 = 0,
+
+    /// Validate a retained metadata job, never a reserve command supplied by
+    /// a caller. The digest includes catalog custody and both image bindings.
+    pub fn validateRetained(self: Job, alloc: std.mem.Allocator) !void {
+        if (!std.mem.eql(u8, &self.plan_digest, &try self.plan.digest(alloc))) return error.InvalidRestoreStaging;
+        if (self.plan.catalog_binding != null) {
+            try self.plan.validateRetainedCatalogShape(alloc);
+        } else {
+            try self.plan.validate(alloc);
+        }
+    }
+
+    /// Project one exact owner from the published job selected by its immutable
+    /// group reservation. Ordinary restores and rewrites carry no SQL
+    /// snapshot visibility exception.
+    pub fn publishedSqlPopulation(self: Job, alloc: std.mem.Allocator, table_id: u64, group_id: u64) !?SqlPopulationLineage {
+        if (self.state != .published or self.plan.catalog_binding == null) return null;
+        const target = for (self.plan.targets) |candidate| {
+            if (candidate.table.table_id == table_id) break candidate;
+        } else return null;
+        const logical = target.catalog_binding orelse return error.InvalidRestoreStaging;
+        if (logical.kind != .table) return null;
+        const population = target.population orelse return null;
+        const range = for (target.ranges) |candidate| {
+            if (candidate.group_id == group_id) break candidate;
+        } else return null;
+        const predecessor = if (target.replace) |before| before.table.table_id else null;
+        if (predecessor) |id| {
+            if (id == 0 or id == table_id or id != target.source_table_id) return error.InvalidRestoreStaging;
+        } else if (target.source_table_id != 0) return error.InvalidRestoreStaging;
+        const scope = try ownerScope(alloc, self.plan, self.plan_digest, target, range);
+        return .{
+            .logical_resource_id = logical.id,
+            .predecessor_table_id = predecessor,
+            .table_id = scope.target_namespace.table_id,
+            .write_version = population.write_version,
+            .frozen = scope.frozen_base,
+        };
+    }
+
+    pub fn nativeJsonSkipField(self: Job, comptime name: []const u8) bool {
+        return std.mem.eql(u8, name, "published_owners") and self.published_owners == 0;
+    }
 
     pub fn jsonStringify(self: Job, jw: anytype) @TypeOf(jw.*).Error!void {
         try @import("antfly_local_sources").storage_db_relational_integrity_json.write(self, jw);
     }
 };
 
+const OwnerContract = @import("antfly_local_sources").storage_db_restore_staging_contract;
+const Population = @import("antfly_local_sources").storage_db_relational_population_contract;
+
+fn populationOwnerScope(plan: Plan, plan_digest: Digest, target: Target, range: records.RangeRecord, capture: Population.Capture, schema_digest: Digest) !OwnerContract.Scope {
+    if (range.table_id != target.table.table_id) return error.InvalidRestoreStaging;
+    const binding = capture.forPartition(tables.rangeDocIdentityShardId(range));
+    const intent = if (binding.transaction_rows) |rows| intent: {
+        const catalog = plan.catalog_binding orelse return error.InvalidRestoreStaging;
+        if (!std.mem.eql(u8, &catalog.transaction, &rows.transaction)) return error.InvalidRestoreStaging;
+        break :intent catalog.intent_digest;
+    } else null;
+    return .{
+        .plan_id = plan.id,
+        .plan_digest = plan_digest,
+        .source_artifact_digest = try binding.digest(),
+        .source_namespace = .{ .table_id = 0, .shard_id = 0, .range_id = 0 },
+        .target_namespace = .{ .table_id = target.table.table_id, .shard_id = tables.rangeDocIdentityShardId(range), .range_id = tables.rangeDocIdentityRangeId(range) },
+        .target_schema_digest = schema_digest,
+        .catalog_intent_digest = intent,
+        .population = binding,
+    };
+}
+
+fn frozenOwnerScope(plan: Plan, plan_digest: Digest, target: Target, range: records.RangeRecord) !OwnerContract.Scope {
+    const image = target.frozen_population orelse return error.InvalidRestoreStaging;
+    const scope = try populationOwnerScope(plan, plan_digest, target, range, image.capture, image.capture.target_schema);
+    const rows = scope.population.?.transaction_rows orelse return error.InvalidRestoreStaging;
+    if (rows.image != .frozen) return error.InvalidRestoreStaging;
+    try scope.validate();
+    return scope;
+}
+
 /// One canonical derivation shared by metadata provisioning and the restore
 /// coordinator. Hash the encoded runtime schema, not the public JSON spelling.
 pub fn ownerScope(alloc: std.mem.Allocator, plan: Plan, plan_digest: Digest, target: Target, range: records.RangeRecord) !@import("antfly_local_sources").storage_db_restore_staging_contract.Scope {
     if (range.table_id != target.table.table_id) return error.InvalidRestoreStaging;
-    const schema_digest = target.target_schema_digest orelse try runtimeSchemaDigestForTable(alloc, target.table.schema_json);
     if (target.population) |capture| {
-        const binding = capture.forPartition(tables.rangeDocIdentityShardId(range));
-        return .{
-            .plan_id = plan.id,
-            .plan_digest = plan_digest,
-            .source_artifact_digest = try binding.digest(),
-            .source_namespace = .{ .table_id = 0, .shard_id = 0, .range_id = 0 },
-            .target_namespace = .{ .table_id = target.table.table_id, .shard_id = tables.rangeDocIdentityShardId(range), .range_id = tables.rangeDocIdentityRangeId(range) },
-            .target_schema_digest = schema_digest,
-            .population = binding,
-        };
+        var scope = try populationOwnerScope(plan, plan_digest, target, range, capture, target.target_schema_digest orelse capture.target_schema);
+        if (target.frozen_population != null) {
+            const frozen = @import("antfly_local_sources").storage_db_relational_frozen_contract;
+            scope.frozen_base = try frozen.Binding.fromScope(try frozenOwnerScope(plan, plan_digest, target, range));
+        }
+        return scope;
     }
+    const schema_digest = target.target_schema_digest orelse try runtimeSchemaDigestForTable(alloc, target.table.schema_json);
+
     if (target.schema_only_snapshot != null) {
         const origin = (try nativeEmptyOriginForTarget(plan, plan_digest, target)) orelse return error.InvalidRestoreStaging;
         return .{ .plan_id = plan.id, .plan_digest = plan_digest, .source_artifact_digest = @splat(0), .source_namespace = .{ .table_id = 0, .shard_id = 0, .range_id = 0 }, .target_namespace = .{ .table_id = target.table.table_id, .shard_id = tables.rangeDocIdentityShardId(range), .range_id = tables.rangeDocIdentityRangeId(range) }, .target_schema_digest = schema_digest, .empty_generation = true, .native_empty_origin = origin };
@@ -1539,6 +1799,38 @@ pub const MappedGenerationAdmission = struct {
 /// One bounded projection for snapshot provisioning and cold RPC recovery.
 /// Callers already hold the validated immutable plan and an owner ordinal;
 /// never rediscover its proof by scanning the entire cohort.
+/// Historical rows use the same owner namespace to identify the logical
+/// partition. Their scope selects a separate store with encoded tuple bounds.
+pub fn frozenOwnerBootstrap(a: std.mem.Allocator, plan: Plan, plan_digest: Digest, target: Target, index: usize) !OwnerContract.OwnerBootstrap {
+    if (index >= target.ranges.len) return error.InvalidRestoreStaging;
+    const image = target.frozen_population orelse return error.InvalidRestoreStaging;
+    const range = target.ranges[index];
+    const bootstrap: OwnerContract.OwnerBootstrap = .{
+        .scope = try frozenOwnerScope(plan, plan_digest, target, range),
+        .table_name = target.table.name,
+        .schema_json = image.schema_json,
+        .indexes_json = "{}",
+        .byte_range = try Population.frozen_key.physicalRange(a, .{ .start = range.start_key, .end = range.end_key orelse "" }),
+    };
+    errdefer if (bootstrap.byte_range.start.len != 0) a.free(bootstrap.byte_range.start);
+    errdefer if (bootstrap.byte_range.end.len != 0) a.free(bootstrap.byte_range.end);
+    try bootstrap.validate();
+    return bootstrap;
+}
+
+pub fn ownerBootstrapForScope(a: std.mem.Allocator, plan: Plan, plan_digest: Digest, target: Target, index: usize, expected: Digest) !OwnerContract.OwnerBootstrap {
+    if (index >= target.ranges.len) return error.InvalidRestoreStaging;
+    const range = target.ranges[index];
+    if (target.frozen_population != null) {
+        const frozen = try frozenOwnerScope(plan, plan_digest, target, range);
+        if (std.mem.eql(u8, &frozen.digest(), &expected))
+            return frozenOwnerBootstrap(a, plan, plan_digest, target, index);
+    }
+    const current = try ownerBootstrapForRangeIndex(a, plan, plan_digest, target, index);
+    if (!std.mem.eql(u8, &current.scope.digest(), &expected)) return error.RestoreStagingScopeChanged;
+    return current;
+}
+
 pub fn ownerBootstrapForRangeIndex(alloc: std.mem.Allocator, plan: Plan, plan_digest: Digest, target: Target, index: usize) !@import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap {
     const contract = @import("antfly_local_sources").storage_db_restore_staging_contract;
     if (index >= target.ranges.len) return error.InvalidRestoreStaging;
@@ -1611,7 +1903,8 @@ pub fn mappedEmptyGenerationHandoffForGroup(alloc: std.mem.Allocator, plan: Plan
 }
 
 pub fn emptyGenerationDestinationFence(plan: Plan, target: Target, range: records.RangeRecord, handoff: GenerationHandoffRange, scope: @import("antfly_local_sources").storage_db_restore_staging_contract.Scope) !@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Fence {
-    if ((!(target.empty_generation or target.rewrite != null)) or range.group_id != handoff.target_group_id or
+    const catalog_replacement = plan.catalog_binding != null and target.replace != null and scope.isCatalogCurrentPopulation();
+    if (!(target.empty_generation or target.rewrite != null or catalog_replacement) or range.group_id != handoff.target_group_id or
         handoff.source_group_id == 0 or !scope.target_namespace.eql(.{
         .table_id = target.table.table_id,
         .shard_id = tables.rangeDocIdentityShardId(range),
@@ -1702,16 +1995,22 @@ pub const TypeRetirementProgress = struct {
     catalog_revision: u64 = 0,
     failure: ?@import("../system_catalog/sequence_outcomes.zig").Rejection = null,
 };
+pub const ReservationRejection = enum { name_conflict, dependent_view };
+
 pub const Progress = struct {
     state: State = .importing,
     revision: u64 = 1,
     completed_owners: u32 = 0,
+    published_owners: u32 = 0,
     type_retirement: ?TypeRetirementProgress = null,
+    reservation_rejection: ?ReservationRejection = null,
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try @import("antfly_local_sources").storage_db_relational_integrity_json.write(self, writer);
     }
     pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
-        return std.mem.eql(u8, name, "type_retirement") and self.type_retirement == null;
+        return (std.mem.eql(u8, name, "published_owners") and self.published_owners == 0) or
+            (std.mem.eql(u8, name, "type_retirement") and self.type_retirement == null) or
+            (std.mem.eql(u8, name, "reservation_rejection") and self.reservation_rejection == null);
     }
 };
 
@@ -1863,11 +2162,46 @@ pub fn progressKey(buf: []u8, metadata_group_id: u64, id: Id) ![]const u8 {
 pub fn populationProgressKey(buf: []u8, metadata_group_id: u64, id: Id, table_id: u64) ![]const u8 {
     return std.fmt.bufPrint(buf, "\x00\x00__metadata__:restore_staging:{d}:population:{s}:{d}", .{ metadata_group_id, std.fmt.bytesToHex(id, .lower), table_id });
 }
-pub const PopulationProgress = struct { source_rows: u64, rows: u64 = 0, owners: u32 = 0 };
+pub const PopulationProgress = struct {
+    source_rows: u64,
+    rows: u64 = 0,
+    owners: u32 = 0,
+    frozen: ?struct { source_rows: u64, rows: u64 = 0 } = null,
+
+    pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
+        return std.mem.eql(u8, name, "frozen") and self.frozen == null;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) @TypeOf(jw.*).Error!void {
+        try @import("antfly_local_sources").storage_db_relational_integrity_json.write(self, jw);
+    }
+
+    pub fn accept(self: @This(), receipt: OwnerReceipt, owner_count: usize, frozen_source_rows: ?u64) !@This() {
+        const live = receipt.population orelse return error.InvalidRestoreStaging;
+        if (!live.sealed or live.source_rows != self.source_rows or
+            (receipt.frozen_population != null) != (frozen_source_rows != null))
+            return error.InvalidRestoreStaging;
+        var next = self;
+        next.rows = std.math.add(u64, self.rows, live.rows) catch return error.InvalidRestoreStaging;
+        next.owners = std.math.add(u32, self.owners, 1) catch return error.InvalidRestoreStaging;
+        if (next.rows > next.source_rows or next.owners > owner_count or
+            (next.owners == owner_count and next.rows != next.source_rows)) return error.InvalidRestoreStaging;
+        if (receipt.frozen_population) |archive| {
+            const total = frozen_source_rows.?;
+            if (self.owners == 0 and next.frozen == null) next.frozen = .{ .source_rows = total };
+            const frozen = if (next.frozen != null) &next.frozen.? else return error.InvalidRestoreStaging;
+            if (frozen.source_rows != total) return error.InvalidRestoreStaging;
+            frozen.rows = std.math.add(u64, frozen.rows, archive.rows) catch return error.InvalidRestoreStaging;
+            if (frozen.rows > total or (next.owners == owner_count and frozen.rows != total)) return error.InvalidRestoreStaging;
+        } else if (next.frozen != null) return error.InvalidRestoreStaging;
+        return next;
+    }
+};
 
 pub const OwnerReceipt = struct {
     pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
         return (std.mem.eql(u8, name, "population") and self.population == null) or
+            (std.mem.eql(u8, name, "frozen_population") and self.frozen_population == null) or
             (std.mem.eql(u8, name, "native_empty_acceptance") and self.native_empty_acceptance == null);
     }
     pub fn jsonStringify(self: @This(), jw: anytype) @TypeOf(jw.*).Error!void {
@@ -1875,12 +2209,26 @@ pub const OwnerReceipt = struct {
     }
     native_empty_acceptance: ?@import("native_restore_acceptance.zig").Acceptance = null,
     population: ?@import("antfly_local_sources").storage_db_relational_population_contract.Cursor = null,
+    frozen_population: ?@import("antfly_local_sources").storage_db_relational_frozen_contract.Binding = null,
     group_id: u64,
     range_id: u64,
     plan_digest: Digest,
     /// Opaque durable owner completion identity. Native import/constraint
     /// validation must commit this identity before metadata reports it.
     completion_digest: Digest,
+    /// Verify both images against the sealed owner descriptor. The cursor's
+    /// logical content and counts must match the exact partition manifest.
+    pub fn requirePopulation(self: @This(), scope: OwnerContract.Scope) !void {
+        if (self.group_id != scope.target_namespace.shard_id or self.range_id != scope.target_namespace.range_id or
+            !std.mem.eql(u8, &self.plan_digest, &scope.plan_digest)) return error.InvalidRestoreStaging;
+        if (!std.meta.eql(self.frozen_population, scope.frozen_base)) return error.InvalidRestoreStaging;
+        if (scope.population) |expected| {
+            const cursor = self.population orelse return error.InvalidRestoreStaging;
+            try cursor.validate();
+            if (!cursor.sealed or !std.mem.eql(u8, &cursor.binding, &try expected.digest()) or
+                !std.meta.eql(cursor.transaction_rows, expected.transaction_rows)) return error.InvalidRestoreStaging;
+        } else if (self.population != null) return error.InvalidRestoreStaging;
+    }
     pub fn encodeDurable(self: @This(), a: std.mem.Allocator) ![]u8 {
         if (self.native_empty_acceptance != null) {
             try self.validateNative();
@@ -1893,7 +2241,7 @@ pub const OwnerReceipt = struct {
     }
     pub fn validateNative(self: @This()) !void {
         const accepted = self.native_empty_acceptance orelse return error.InvalidRestoreStaging;
-        if (self.population != null or accepted.group_id != self.group_id or accepted.range_id != self.range_id or
+        if (self.population != null or self.frozen_population != null or accepted.group_id != self.group_id or accepted.range_id != self.range_id or
             !std.mem.eql(u8, &accepted.plan_digest, &self.plan_digest) or
             !std.mem.eql(u8, &try accepted.digest(), &self.completion_digest)) return error.InvalidRestoreStaging;
         try accepted.verify();
@@ -1911,25 +2259,90 @@ pub const OwnerReceipt = struct {
     }
 };
 
+pub const RejectedReserve = struct { restore_reservation_rejection: ReservationRejection };
+
+pub const CompactApply = struct {
+    restore_progress: Progress,
+    receipt_accepted: bool,
+};
+
 pub const Command = struct {
     id: Id,
     expected_revision: u64 = 0,
-    action: enum { reserve, cancel_reservation, imported, validated, source_handoff_checked, begin_cutover, old_fenced, begin_activation, parent_activated, target_admissions_activated, publish, begin_cancel, canceled, finish_cancel, freeze_rewrite, rewrite_source_ready, parent_fenced },
+    action: Action,
+    record_reservation_outcome: bool = false,
+    record_receipt_identity: bool = false,
     plan: ?Plan = null,
     receipt: ?OwnerReceipt = null,
     source_artifact: ?SourceArtifact = null,
+
+    pub const Action = enum { reserve, cancel_reservation, imported, validated, source_handoff_checked, begin_cutover, old_fenced, begin_activation, parent_activated, target_admissions_activated, publish, begin_cancel, canceled, finish_cancel, freeze_rewrite, rewrite_source_ready, parent_fenced, catalog_owner_published };
+
+    pub fn receiptPhase(action: Action) ?State {
+        return switch (action) {
+            .imported => .importing,
+            .validated, .source_handoff_checked => .validating,
+            .old_fenced, .parent_fenced => .cutover,
+            .parent_activated, .target_admissions_activated => .activating,
+            .canceled => .canceling,
+            .catalog_owner_published => .published,
+            else => null,
+        };
+    }
+
+    pub fn isProgressOnly(action: Action) bool {
+        return switch (action) {
+            .imported, .validated, .source_handoff_checked, .old_fenced, .parent_fenced, .parent_activated, .target_admissions_activated, .canceled, .catalog_owner_published => true,
+            else => false,
+        };
+    }
 
     pub fn jsonStringify(self: Command, jw: anytype) @TypeOf(jw.*).Error!void {
         try @import("antfly_local_sources").storage_db_relational_integrity_json.write(self, jw);
     }
 
+    pub fn nativeJsonSkipField(self: Command, comptime name: []const u8) bool {
+        return (std.mem.eql(u8, name, "record_reservation_outcome") and !self.record_reservation_outcome) or
+            (std.mem.eql(u8, name, "record_receipt_identity") and !self.record_receipt_identity);
+    }
+
+    pub fn receiptIdentity(self: Command, alloc: std.mem.Allocator) !Digest {
+        const receipt = self.receipt orelse return error.InvalidRestoreStaging;
+        const bytes = try std.json.Stringify.valueAlloc(alloc, .{ .action = self.action, .receipt = receipt }, .{});
+        defer alloc.free(bytes);
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("antfly.restore.owner-receipt.v1");
+        hash.update(bytes);
+        var out: Digest = undefined;
+        hash.final(&out);
+        return out;
+    }
+
     pub fn validate(self: Command, alloc: std.mem.Allocator) !void {
+        try self.validateWithCatalog(alloc, null, false);
+    }
+
+    pub const CatalogReservation = struct {
+        group: u64,
+        pending: *const @import("sql/relation_lifecycle/generation_intents.zig").Pending,
+        /// Digest of the immutable plan produced from the frozen session,
+        /// including both population manifests when frozen births exist.
+        plan_digest: Digest,
+    };
+
+    fn validateWithCatalog(self: Command, alloc: std.mem.Allocator, reservation: ?CatalogReservation, catalog_import: bool) !void {
+        if (self.action == .catalog_owner_published and !catalog_import) return error.InvalidRestoreStaging;
+        if (reservation != null and self.action != .reserve) return error.InvalidRestoreStaging;
+        if (self.record_reservation_outcome and self.action != .reserve) return error.InvalidRestoreStaging;
         if (std.mem.allEqual(u8, &self.id, 0)) return error.InvalidRestoreStaging;
         if ((self.action == .rewrite_source_ready) != (self.source_artifact != null)) return error.InvalidRestoreStaging;
         if (self.action == .reserve) {
             const plan = self.plan orelse return error.InvalidRestoreStaging;
             if (self.expected_revision != 0 or self.receipt != null or !std.mem.eql(u8, &plan.id, &self.id)) return error.InvalidRestoreStaging;
-            try plan.validate(alloc);
+            if (reservation) |authority| {
+                try plan.validateCatalog(alloc, authority.group, authority.pending);
+                if (!std.mem.eql(u8, &authority.plan_digest, &try plan.digest(alloc))) return error.InvalidRestoreStaging;
+            } else try plan.validate(alloc);
             for (plan.targets) |target| if (target.rewrite != null and (!plan.preparing_sources or target.source_artifacts.len != 0)) return error.InvalidRestoreStaging;
         } else if (self.action == .freeze_rewrite) {
             const plan = self.plan orelse return error.InvalidRestoreStaging;
@@ -1948,15 +2361,20 @@ pub const Command = struct {
                 !artifact.source_namespace.eql(scope.fence.namespace) or artifact.target_group_id != scope.fence.peer_group_id or
                 scope.fence.transition_id != std.mem.readInt(u64, self.id[0..8], .little) or scope.fence.attempt != std.mem.readInt(u64, self.id[8..16], .little)) return error.InvalidRestoreStaging;
         }
-        const needs_receipt = self.action == .imported or self.action == .validated or self.action == .source_handoff_checked or self.action == .old_fenced or self.action == .canceled or self.action == .parent_fenced or self.action == .parent_activated or self.action == .target_admissions_activated;
+        const needs_receipt = self.action == .catalog_owner_published or self.action == .imported or self.action == .validated or self.action == .source_handoff_checked or self.action == .old_fenced or self.action == .canceled or self.action == .parent_fenced or self.action == .parent_activated or self.action == .target_admissions_activated;
+        if (self.record_receipt_identity and !needs_receipt) return error.InvalidRestoreStaging;
         if (needs_receipt != (self.receipt != null)) return error.InvalidRestoreStaging;
         if (self.receipt) |receipt| {
+            if (receipt.frozen_population) |archive| {
+                if (!catalog_import or self.action != .imported) return error.InvalidRestoreStaging;
+                try archive.validate();
+            }
             if (receipt.native_empty_acceptance != null) {
                 if (self.action != .target_admissions_activated) return error.InvalidRestoreStaging;
                 try receipt.validateNative();
             }
             if (receipt.population) |cursor| {
-                if (self.action != .imported or !cursor.sealed) return error.InvalidRestoreStaging;
+                if ((self.action != .imported and self.action != .catalog_owner_published) or !cursor.sealed or (cursor.transaction_rows != null) != catalog_import) return error.InvalidRestoreStaging;
                 try cursor.validate();
             }
             if (receipt.group_id == 0 or receipt.range_id == 0 or std.mem.allEqual(u8, &receipt.plan_digest, 0) or
@@ -1966,10 +2384,53 @@ pub const Command = struct {
 };
 
 pub fn parseCommand(alloc: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(Command) {
+    return parseCommandWithCatalog(alloc, bytes, null);
+}
+
+/// Only the native SQL writer may supply a reservation authority. The
+/// declarations and plan digest are out-of-band, never deserialized here.
+pub fn parseCatalogReservation(alloc: std.mem.Allocator, bytes: []const u8, authority: Command.CatalogReservation) !std.json.Parsed(Command) {
+    return parseCommandWithCatalog(alloc, bytes, authority);
+}
+
+/// Raft apply obtains its authority from the same metadata write transaction
+/// that will own the reservation. The wire carries only the command.
+pub fn parseCatalogReservationTxn(a: std.mem.Allocator, bytes: []const u8, txn: anytype, group: u64) !Command {
+    if (bytes.len == 0 or bytes.len > max_encoded_bytes) return error.InvalidRestoreStaging;
+    const command = try std.json.parseFromSliceLeaky(Command, a, bytes, .{});
+    const plan = command.plan orelse return error.InvalidRestoreStaging;
+    const registry = @import("../system_catalog/prepared_transactions.zig");
+    const authority = try registry.catalogReservationAuthority(a, txn, group, plan);
+    try command.validateWithCatalog(a, authority, false);
+    return command;
+}
+
+/// Private Raft progress acknowledgment. The writer must rejoin the exact
+/// immutable job and advance only its matching phase.
+pub fn parseCatalogProgress(a: std.mem.Allocator, bytes: []const u8) !Command {
+    if (bytes.len == 0 or bytes.len > 8192) return error.InvalidRestoreStaging;
+    const command = try std.json.parseFromSliceLeaky(Command, a, bytes, .{});
+    if (command.record_receipt_identity != (command.receipt != null)) return error.InvalidRestoreStaging;
+    switch (command.action) {
+        .imported, .catalog_owner_published => if (command.receipt == null or command.receipt.?.population == null) return error.InvalidRestoreStaging,
+        .validated, .source_handoff_checked, .old_fenced, .parent_fenced, .parent_activated, .target_admissions_activated, .canceled => {
+            const receipt = command.receipt orelse return error.InvalidRestoreStaging;
+            if (receipt.population != null or receipt.frozen_population != null or receipt.native_empty_acceptance != null)
+                return error.InvalidRestoreStaging;
+        },
+        .begin_cutover, .begin_activation, .begin_cancel => if (command.receipt != null) return error.InvalidRestoreStaging,
+        else => return error.InvalidRestoreStaging,
+    }
+    if (command.receipt) |receipt| if (receipt.native_empty_acceptance != null) return error.InvalidRestoreStaging;
+    try command.validateWithCatalog(a, null, true);
+    return command;
+}
+
+fn parseCommandWithCatalog(alloc: std.mem.Allocator, bytes: []const u8, authority: ?Command.CatalogReservation) !std.json.Parsed(Command) {
     if (bytes.len == 0 or bytes.len > max_encoded_bytes) return error.InvalidRestoreStaging;
     var parsed = try std.json.parseFromSlice(Command, alloc, bytes, .{ .allocate = .alloc_always });
     errdefer parsed.deinit();
-    try parsed.value.validate(alloc);
+    try parsed.value.validateWithCatalog(alloc, authority, false);
     return parsed;
 }
 
@@ -1977,8 +2438,12 @@ pub fn jobKey(buf: []u8, metadata_group_id: u64, id: Id) ![]const u8 {
     return std.fmt.bufPrint(buf, "\x00\x00__metadata__:restore_staging:{d}:job:{s}", .{ metadata_group_id, std.fmt.bytesToHex(id, .lower) });
 }
 
+pub fn allGroupsPrefix() []const u8 {
+    return "\x00\x00__metadata__:restore_staging:";
+}
+
 pub fn prefix(buf: []u8, metadata_group_id: u64) ![]const u8 {
-    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:restore_staging:{d}:", .{metadata_group_id});
+    return std.fmt.bufPrint(buf, "{s}{d}:", .{ allGroupsPrefix(), metadata_group_id });
 }
 
 pub fn jobPrefix(buf: []u8, metadata_group_id: u64) ![]const u8 {
@@ -1999,6 +2464,41 @@ pub fn nameKey(buf: []u8, metadata_group_id: u64, name: []const u8) ![]const u8 
 
 pub fn identityKey(buf: []u8, metadata_group_id: u64, kind: enum { table, group, old_table, parent_table, parent_group }, id: u64) ![]const u8 {
     return std.fmt.bufPrint(buf, "\x00\x00__metadata__:restore_staging:{d}:{s}:{d}", .{ metadata_group_id, @tagName(kind), id });
+}
+
+pub const receipt_identity_projection_flag: u64 = 1 << 63;
+
+pub const ReceiptRecord = struct {
+    const magic = "AFRSTACK1";
+    const header = magic.len + @sizeOf(Digest);
+    identity: ?Digest = null,
+    payload: []const u8,
+
+    pub fn encode(alloc: std.mem.Allocator, identity: Digest, payload: []const u8) ![]u8 {
+        return std.mem.concat(alloc, u8, &.{ magic, &identity, payload });
+    }
+
+    pub fn decode(bytes: []const u8) !ReceiptRecord {
+        if (bytes.len == @sizeOf(Digest)) return .{ .payload = bytes };
+        if (bytes.len > @sizeOf(Digest) and bytes[0] == '{' and bytes.len <= 8192) return .{ .payload = bytes };
+        if (!std.mem.startsWith(u8, bytes, magic) or bytes.len < header + @sizeOf(Digest)) return error.InvalidRestoreStaging;
+        const payload = bytes[header..];
+        if (payload.len != @sizeOf(Digest) and (payload[0] != '{' or payload.len > 8192)) return error.InvalidRestoreStaging;
+        return .{ .identity = bytes[magic.len..header][0..@sizeOf(Digest)].*, .payload = payload };
+    }
+};
+
+test "restore receipt record keeps exact retry identity with the completion payload" {
+    const a = std.testing.allocator;
+    const payload: Digest = @splat(8);
+    const identity: Digest = @splat(9);
+    const bytes = try ReceiptRecord.encode(a, identity, &payload);
+    defer a.free(bytes);
+    const decoded = try ReceiptRecord.decode(bytes);
+    try std.testing.expectEqual(identity, decoded.identity.?);
+    try std.testing.expectEqualSlices(u8, &payload, decoded.payload);
+    try std.testing.expectError(error.InvalidRestoreStaging, ReceiptRecord.decode(bytes[0 .. bytes.len - 1]));
+    try std.testing.expect((try ReceiptRecord.decode(&payload)).identity == null);
 }
 
 pub fn receiptKey(buf: []u8, metadata_group_id: u64, id: Id, state: State, owner: u64) ![]const u8 {
@@ -2358,6 +2858,32 @@ test "relational integrity restore staging query population derives owner scopes
     targets[0].population = capture;
     targets[0].catalog_binding = null;
     try std.testing.expectError(error.InvalidRestoreStaging, plan.validate(a));
+    targets[0].catalog_binding = .{ .kind = .table, .id = 11, .parent_id = 2, .name = "populated", .storage_name = "population_storage" };
+    const population = local.storage_db_relational_population_contract;
+    targets[0].population.?.transaction_rows = .{
+        .transaction = @splat(6),
+        .generation_nonce = @splat(10),
+        .source_rows = 0,
+        .partitions = &.{.{ .partition = 701, .rows = 0, .content = population.contentStart() }},
+    };
+    try targets[0].population.?.validate();
+    try std.testing.expectError(error.InvalidRestoreStaging, plan.validate(a));
+    var unbound = first;
+    unbound.population = targets[0].population.?.forPartition(701);
+    unbound.source_artifact_digest = try unbound.population.?.digest();
+    try std.testing.expectError(error.InvalidRestoreStagingCommand, unbound.validate());
+    const owner_contract = local.storage_db_restore_staging_contract;
+    var cursor = try population.Cursor.init(first.population.?);
+    cursor.transaction_rows = unbound.population.?.transaction_rows;
+    cursor.content = population.contentStart();
+    const progress: owner_contract.Progress = .{
+        .scope = first,
+        .population = cursor,
+        .source_generation_proofs_complete = true,
+        .artifacts_complete = true,
+        .logical_digest = cursor.chain,
+    };
+    try std.testing.expectError(error.InvalidRestoreStagingCommand, progress.encode(a));
     var forged = first;
     forged.source_namespace = .{ .table_id = 9, .shard_id = 4, .range_id = 4 };
     try std.testing.expectError(error.InvalidRestoreStagingCommand, forged.validate());

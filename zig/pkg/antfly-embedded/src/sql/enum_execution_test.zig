@@ -546,8 +546,8 @@ test "SQL named enum compatibility boundaries never reinterpret enum placeholder
     var source = try Fixture.init(a, 5, 1);
     defer source.deinit(a);
     const empty = try source.value("");
-    var budget: @import("array_value.zig").Budget = .{};
-    try std.testing.expectError(error.SqlTypeMismatch, @import("array_value.zig").validateElement(.jsonb, empty, &budget));
+    var budget: @import("array/value.zig").Budget = .{};
+    try std.testing.expectError(error.SqlTypeMismatch, @import("array/value.zig").validateElement(.jsonb, empty, &budget));
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     try std.testing.expectError(error.SqlTypeMismatch, @import("describe.zig").coerceDatum(arena.allocator(), empty, .json, null));
@@ -563,7 +563,7 @@ test "SQL named enum retained numeric transitions preserve both domains in eithe
     defer source.deinit(a);
     var owner = std.heap.ArenaAllocator.init(a);
     defer owner.deinit();
-    var work: @import("array_value.zig").Budget = .{};
+    var work: @import("array/value.zig").Budget = .{};
     const number = try scalar.numericTextLeaky(owner.allocator(), "9007199254740993.1250", &work);
     const atom = try source.value("z");
     for ([_]bool{ false, true }) |reverse| {

@@ -31,8 +31,8 @@ pub const Column = struct {
     /// Derived relations and aliases deliberately do not inherit this scope.
     scope: ?catalog.Table.Scope = null,
     type: ast.ColumnType,
-    temporal_kind: ?@import("temporal_value.zig").Kind = null,
-    element_type: ?@import("array_value.zig").ElementType = null,
+    temporal_kind: ?@import("temporal/value.zig").Kind = null,
+    element_type: ?@import("array/value.zig").ElementType = null,
     numeric_modifier: ?scalar.NumericModifier = null,
     enum_view: ?*const @import("../common/sql_enum_value.zig").View = null,
     domain_view: ?*const @import("../schema/domain_value.zig").View = null,
@@ -40,6 +40,7 @@ pub const Column = struct {
     visible: bool = true,
     /// Original USING keys remain available to qualified names and stars.
     unqualified_visible: bool = true,
+    read_type_guard: bool = false,
     untyped_null: bool = false,
     /// Symbolic lineage exists only during the pre-emission constraint pass.
     origin: ?*const ast.Scalar = null,
@@ -1018,7 +1019,7 @@ const Builder = struct {
     }
     fn virtualTable(self: *Builder, columns: []const Column) !catalog.Table {
         const result = try self.alloc.alloc(catalog.Column, columns.len);
-        for (columns, result) |column, *out| out.* = .{ .name = column.internal, .path = column.internal, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .domain_view = scalar.domainViewOf(column), .temporal_kind = column.temporal_kind, .nullable = column.nullable };
+        for (columns, result) |column, *out| out.* = .{ .name = column.internal, .path = column.internal, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .domain_view = scalar.domainViewOf(column), .temporal_kind = column.temporal_kind, .read_type_guard = column.read_type_guard, .nullable = column.nullable };
         return .{ .id = 0, .physical_name = virtual_table_name, .schema_version = 0, .columns = result };
     }
     fn scalarColumns(self: *Builder, columns: []const Column) ![]const scalar.Column {
@@ -1346,7 +1347,7 @@ const Builder = struct {
         if (expression_.* != .literal) return error.InvalidSqlBackendResponse;
         const value = expression_.literal;
         if (value == .numeric) {
-            var budget: @import("array_value.zig").Budget = .{};
+            var budget: @import("array/value.zig").Budget = .{};
             return scalar.numericTextLeaky(a, value.numeric, &budget);
         }
         return .{ .value = switch (value) {
@@ -1657,12 +1658,14 @@ const Builder = struct {
         const columns = try self.alloc.alloc(Column, bound.columns.len);
         for (bound.columns, columns, 0..) |column, *out, index| {
             var untyped = column.untyped_null;
+            var guarded_read = false;
             if (lowered.columns.len > index and lowered.columns[index].expression == null) {
                 for (child.columns) |source_column| if (std.mem.eql(u8, source_column.internal, lowered.columns[index].field)) {
                     untyped = untyped or source_column.untyped_null;
+                    guarded_read = source_column.read_type_guard;
                 };
             }
-            out.* = .{ .name = try self.alloc.dupe(u8, if (names.len == 0) column.name else names[index]), .internal = try self.internal(), .qualifier = alias, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .domain_view = scalar.domainViewOf(column), .temporal_kind = column.temporal_kind, .nullable = true, .untyped_null = !resolve_unknown and untyped };
+            out.* = .{ .name = try self.alloc.dupe(u8, if (names.len == 0) column.name else names[index]), .internal = try self.internal(), .qualifier = alias, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .domain_view = scalar.domainViewOf(column), .temporal_kind = column.temporal_kind, .nullable = true, .untyped_null = !resolve_unknown and untyped, .read_type_guard = guarded_read };
         }
         const constants = try self.alloc.alloc(Node.ConstantRef, lowered.invocation_constants.len);
         for (lowered.invocation_constants, constants) |name, *reference| {
@@ -2034,7 +2037,7 @@ const Builder = struct {
                 const source_columns = try self.alloc.alloc([]const u8, columns.len);
                 const fields = try self.alloc.alloc([]const u8, table.columns.len);
                 for (table.columns, columns[0..table.columns.len], source_columns[0..table.columns.len], fields, 0..) |column, *out, *source_name, *field_name, position| {
-                    out.* = .{ .name = try self.alloc.dupe(u8, column.name), .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .scope = physicalScope(table, reference.name, reference.alias != null), .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .domain_view = scalar.domainViewOf(column), .temporal_kind = column.temporal_kind, .nullable = column.nullable };
+                    out.* = .{ .name = try self.alloc.dupe(u8, column.name), .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .scope = physicalScope(table, reference.name, reference.alias != null), .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .domain_view = scalar.domainViewOf(column), .temporal_kind = column.temporal_kind, .read_type_guard = column.read_type_guard, .nullable = column.nullable };
                     source_name.* = column.name;
                     field_name.* = column.path;
                     if (self.capture_dependencies) try self.dependency_origins.put(self.alloc, out.internal, .{ .table_id = table.id, .column = column, .ordinal = @intCast(position), .virtual = false });
@@ -2971,7 +2974,7 @@ pub fn normalizeTargetProjection(alloc: Allocator, backend: catalog.Backend, tab
     var builder: Builder = .{ .alloc = alloc, .backend = backend, .parameters = &.{} };
     const virtual_columns = table.virtualColumns();
     const columns = try alloc.alloc(Column, table.columns.len + virtual_columns.len);
-    for (table.columns, columns[0..table.columns.len]) |column, *out| out.* = .{ .name = column.name, .internal = column.name, .qualifier = name.table, .scope = physicalScope(table, name, aliased), .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .domain_view = scalar.domainViewOf(column), .temporal_kind = column.temporal_kind, .nullable = column.nullable };
+    for (table.columns, columns[0..table.columns.len]) |column, *out| out.* = .{ .name = column.name, .internal = column.name, .qualifier = name.table, .scope = physicalScope(table, name, aliased), .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .domain_view = scalar.domainViewOf(column), .temporal_kind = column.temporal_kind, .read_type_guard = column.read_type_guard, .nullable = column.nullable };
     for (virtual_columns, columns[table.columns.len..]) |column, *out| out.* = .{ .name = column.name, .internal = column.name, .qualifier = name.table, .scope = physicalScope(table, name, aliased), .type = column.type, .element_type = column.element_type, .nullable = column.nullable, .visible = false };
     const source: Node = .{ .columns = columns, .operation = .singleton };
     return (try builder.lower(&source, .{ .table = name, .columns = projections })).columns;

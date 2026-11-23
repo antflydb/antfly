@@ -21,15 +21,15 @@ const ranges = @import("range_state.zig");
 const ByteRange = @import("types.zig").ByteRange;
 const types = @import("types.zig");
 const pages = @import("merge_page_contract.zig");
-const integrity = @import("relational_integrity_contract.zig");
-const catalog = @import("relational_integrity_catalog.zig");
+const integrity = @import("relational/integrity/contract.zig");
+const catalog = @import("relational/integrity/catalog.zig");
 pub const range_key = "\x00\x00__metadata__:online_integrity_shadow_range";
 pub const key = "\x00\x00__metadata__:online_integrity_shadow";
 pub const State = struct {
     source: pages.Source,
     context: types.MergeReplicationContext,
     pub fn jsonStringify(self: @This(), stream: anytype) !void {
-        try @import("relational_integrity_json.zig").write(self, stream);
+        try @import("relational/integrity/json.zig").write(self, stream);
     }
 };
 
@@ -52,8 +52,8 @@ pub fn requireBinding(alloc: std.mem.Allocator, txn: anytype, source: pages.Sour
     if (!std.mem.eql(u8, &integrity.hash(raw), &binding.catalog_digest)) return error.IntegrityCatalogChanged;
     var compiled = try catalog.decode(alloc, raw);
     defer compiled.deinit();
-    if (!std.mem.eql(u8, &@import("relational_integrity_activation.zig").generationSet(compiled), &binding.generation_set)) return error.IntegrityCatalogChanged;
-    try @import("relational_integrity_activation.zig").requireReady(txn, compiled);
+    if (!std.mem.eql(u8, &@import("relational/integrity/activation.zig").generationSet(compiled), &binding.generation_set)) return error.IntegrityCatalogChanged;
+    try @import("relational/integrity/activation.zig").requireReady(txn, compiled);
 }
 
 /// Admission is local proof, not publication: all serving operations remain
@@ -62,7 +62,7 @@ pub fn admit(alloc: std.mem.Allocator, txn: anytype, req: types.BatchRequest, na
     if (req.merge_checkpoint) |checkpoint| if (checkpoint.kind == .accept and checkpoint.page_source != null and checkpoint.page_source.?.integrity != null) {
         if (checkpoint.page_receiver_namespace == null or !checkpoint.page_receiver_namespace.?.eql(namespace) or checkpoint.allow_doc_identity_reassignment) return error.MergeCopyFenced;
         try requireBinding(alloc, txn, checkpoint.page_source.?);
-        if (try @import("relational_integrity_topology.zig").current(txn) != null or try @import("relational_integrity_retirement.zig").active(txn)) return error.IntegrityTopologyBusy;
+        if (try @import("relational/integrity/topology.zig").current(txn) != null or try @import("relational/integrity/retirement.zig").active(txn)) return error.IntegrityTopologyBusy;
         if (try load(alloc, txn)) |value| {
             var current = value;
             defer current.deinit();
@@ -210,7 +210,7 @@ test "relational index system online integrity shadow cleanup publication and re
     defer donor.close();
     try donor.updateRange(.{ .start = "", .end = "\xff" });
     try donor.setSchemaJson(alloc, schema);
-    const generations = @import("relational_integrity_activation.zig").generationSet(compiled);
+    const generations = @import("relational/integrity/activation.zig").generationSet(compiled);
     const create = try donor.beginTransactionWithId(@splat(71), 100);
     try donor.writeTransaction(create, .{ .relational_schema_version = 1, .relational_integrity_generation_set = generations, .writes = &.{.{ .key = "parent", .value = "{\"id\":1}" }}, .integrity_commands = &.{.{ .address = address, .operation = .{ .establish = claim } }} });
     try donor.commitTransaction(create, 123);
@@ -260,7 +260,7 @@ test "relational index system online integrity shadow cleanup publication and re
     wrong_checkpoint = checkpoint;
     wrong_checkpoint.copy_attempt.sequence += 1;
     try std.testing.expectError(error.MergeCopyFenced, db.batch(.{ .merge_checkpoint = wrong_checkpoint }));
-    try std.testing.expectError(error.IntegrityTopologyBusy, @import("relational_integrity_activation.zig").Page.prepare(alloc, db.backend_runtime.io(), db.core, .{}));
+    try std.testing.expectError(error.IntegrityTopologyBusy, @import("relational/integrity/activation.zig").Page.prepare(alloc, db.backend_runtime.io(), db.core, .{}));
     try std.testing.expectError(error.IntegrityTopologyBusy, db.setSchemaJson(alloc,
         \\{"version":2,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
     ));
@@ -314,7 +314,7 @@ test "relational index system online integrity shadow cleanup publication and re
     {
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
-        try @import("relational_integrity_activation.zig").requireReady(&read, compiled);
+        try @import("relational/integrity/activation.zig").requireReady(&read, compiled);
         try requireServing(&read, db.getRange(), "\xffbase");
         try std.testing.expectError(error.KeyOutOfRange, requireServing(&read, db.getRange(), &address.routing));
     }
@@ -341,5 +341,5 @@ test "relational index system online integrity shadow cleanup publication and re
     var read = try db.core.store.beginReadTxn();
     defer read.abort();
     try std.testing.expect(try rawRange(&read) == null);
-    try @import("relational_integrity_activation.zig").requireReady(&read, compiled);
+    try @import("relational/integrity/activation.zig").requireReady(&read, compiled);
 }

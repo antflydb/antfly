@@ -26,7 +26,7 @@ fn allowed(comptime kind: Kind, comptime name: []const u8) bool {
     if (std.mem.eql(u8, name, "execution_deadline_ns") or std.mem.eql(u8, name, "execution_io") or std.mem.eql(u8, name, "cancellation")) return true;
     return switch (kind) {
         .policy_receipt => std.mem.eql(u8, name, "row_policy_receipt"),
-        .sql_lock => std.mem.eql(u8, name, "sql_lock_query_json") or std.mem.eql(u8, name, "relation_owner_minter"),
+        .sql_lock => std.mem.eql(u8, name, "sql_lock_query_json") or std.mem.eql(u8, name, "relation_owner_minter") or std.mem.eql(u8, name, "sql_lock_read_index_certified"),
         .handoff_install, .handoff_identity => std.mem.eql(u8, name, "relational_topology_json") or std.mem.eql(u8, name, "restore_staging_scope") or std.mem.eql(u8, name, "restore_staging_plan_id"),
     };
 }

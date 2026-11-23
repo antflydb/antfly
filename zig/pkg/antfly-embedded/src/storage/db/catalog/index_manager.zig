@@ -80,7 +80,7 @@ const schema_registry_mod = @import("../schema_registry.zig");
 const analysis_mod = @import("../../../search/analysis.zig");
 const ttl_mod = @import("../../ttl.zig");
 const mapper = @import("../document_mapper.zig");
-const relational_store = @import("../relational_store.zig");
+const relational_store = @import("../relational/rows/store.zig");
 const relational_row_codec = @import("../algebraic/relational_row_codec.zig");
 const typed_dv = @import("../../../section/typed_doc_values.zig");
 const typed_dv_coverage = @import("../typed_doc_values_coverage.zig");
@@ -1965,6 +1965,10 @@ pub const IndexManager = struct {
 
         pub fn lockAnalysisShared(self: *TextIndex) void {
             self.analysis_mutex.lockShared();
+        }
+
+        pub fn tryLockAnalysisShared(self: *TextIndex) bool {
+            return self.analysis_mutex.tryLockShared();
         }
 
         pub fn unlockAnalysisShared(self: *TextIndex) void {
@@ -13134,7 +13138,7 @@ pub const IndexManager = struct {
         if (enrichments_changed) {
             const enrichment_data = try enrichment_catalog.serializeCatalog(self.alloc, self.enrichments.items);
             defer self.alloc.free(enrichment_data);
-            try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, enrichment_catalog_key, enrichment_data);
+            try @import("../relational/integrity/topology.zig").requireUnfencedOrUnchanged(&txn, enrichment_catalog_key, enrichment_data);
             try txn.put(enrichment_catalog_key, enrichment_data);
         }
         if (self.resolvers.items.len != resolver_checkpoint) {
@@ -13146,7 +13150,7 @@ pub const IndexManager = struct {
         const reader_version = try self.stampCatalogReaderVersion(&txn, resolver_data);
         const merge_data = try self.serializeResolverMerges(self.alloc);
         defer self.alloc.free(merge_data);
-        try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog.merge_catalog_key, merge_data);
+        try @import("../relational/integrity/topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog.merge_catalog_key, merge_data);
         try txn.put(resolver_catalog.merge_catalog_key, merge_data);
         try @import("../artifact_inventory.zig").refresh(&txn);
         try txn.commit();
@@ -25449,7 +25453,7 @@ pub const IndexManager = struct {
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
-        try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, index_catalog_key, data);
+        try @import("../relational/integrity/topology.zig").requireUnfencedOrUnchanged(&txn, index_catalog_key, data);
         try txn.put(index_catalog_key, data);
         if (atomic_mutation) |mutation| switch (mutation) {
             .batch => |batch| {
@@ -25637,7 +25641,7 @@ pub const IndexManager = struct {
                 (self.get(excluded_name) != null and self.get(job.name) == null and std.mem.eql(u8, job.old, excluded_name));
             if (retiring_reservation) try self.requireReplacementGenerationOwnership(&txn, job);
         }
-        try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, index_catalog_key, data);
+        try @import("../relational/integrity/topology.zig").requireUnfencedOrUnchanged(&txn, index_catalog_key, data);
         try @import("../artifact_projection_certificate.zig").remove(&txn, excluded_name);
         try txn.put(index_catalog_key, data);
         if (scope_deletes) |deletes| try txn.putIndexCatalogBatch(deletes.scope, deletes.mutations);
@@ -25791,7 +25795,7 @@ pub const IndexManager = struct {
         };
         const enrichment_data = try enrichment_catalog.serializeCatalog(self.alloc, retained_producers);
         defer self.alloc.free(enrichment_data);
-        try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, enrichment_catalog_key, enrichment_data);
+        try @import("../relational/integrity/topology.zig").requireUnfencedOrUnchanged(&txn, enrichment_catalog_key, enrichment_data);
         try txn.put(enrichment_catalog_key, enrichment_data);
         // Allocate the complete post-commit catalog before crossing durability.
         var next_active: std.ArrayListUnmanaged(ResolverConfig) = .empty;
@@ -25813,7 +25817,7 @@ pub const IndexManager = struct {
         defer self.alloc.free(resolver_data);
         const merge_data = try resolver_catalog.serializeMergeState(self.alloc, definitions);
         defer self.alloc.free(merge_data);
-        try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog.merge_catalog_key, merge_data);
+        try @import("../relational/integrity/topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog.merge_catalog_key, merge_data);
         try txn.put(resolver_catalog.merge_catalog_key, merge_data);
         // Revisions and durable replay cursors publish with ownership removal.
         if (resolver_released or legacy_routing_repaired or routing_changed) {
@@ -25897,7 +25901,7 @@ pub const IndexManager = struct {
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
-        try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, enrichment_catalog_key, data);
+        try @import("../relational/integrity/topology.zig").requireUnfencedOrUnchanged(&txn, enrichment_catalog_key, data);
         // Removed source definitions lose readiness in the same durable DDL
         // transaction. Re-adding identical configuration must backfill again.
         var arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -26081,7 +26085,7 @@ pub const IndexManager = struct {
             null;
         defer if (fenced_catalog) |data| self.alloc.free(data);
         const stored_catalog = fenced_catalog orelse catalog;
-        try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(txn, resolver_catalog_key, stored_catalog);
+        try @import("../relational/integrity/topology.zig").requireUnfencedOrUnchanged(txn, resolver_catalog_key, stored_catalog);
         try txn.put(resolver_catalog_key, stored_catalog);
         // Native binding maintenance can introduce durable projection jobs in
         // this same transaction. Preserve its reader fence and envelope.
@@ -26157,7 +26161,7 @@ pub const IndexManager = struct {
             const fenced_catalog = try resolver_catalog.versionedCatalog(self.alloc, catalog, version);
             defer self.alloc.free(fenced_catalog);
             encoding = try resolver_catalog.catalogEncoding(self.alloc, fenced_catalog);
-            try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog_key, fenced_catalog);
+            try @import("../relational/integrity/topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog_key, fenced_catalog);
             try txn.put(resolver_catalog_key, fenced_catalog);
             try @import("../artifact_inventory.zig").refresh(&txn);
         }
@@ -26376,7 +26380,7 @@ pub const IndexManager = struct {
         const reader_version = try self.stampCatalogReaderVersion(&txn, data);
         const merge_data = try self.serializeResolverMerges(self.alloc);
         defer self.alloc.free(merge_data);
-        try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog.merge_catalog_key, merge_data);
+        try @import("../relational/integrity/topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog.merge_catalog_key, merge_data);
         try txn.put(resolver_catalog.merge_catalog_key, merge_data);
         try @import("../artifact_inventory.zig").refresh(&txn);
         if (mode == .mark_reresolve_dirty or routing_changed) {

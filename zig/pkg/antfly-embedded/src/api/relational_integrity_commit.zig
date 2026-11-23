@@ -24,7 +24,7 @@ const declarations = @import("../schema/relational_declarations.zig");
 const schema = @import("../storage/schema.zig");
 const registry = @import("../storage/db/schema_registry.zig");
 const mapper = @import("../storage/db/document_mapper.zig");
-const catalog = @import("../storage/db/relational_integrity_catalog.zig");
+const catalog = @import("../storage/db/relational/integrity/catalog.zig");
 const planner = @import("relational_integrity.zig");
 const types = @import("../storage/db/types.zig");
 const native = @import("../storage/relational_index.zig");
@@ -303,7 +303,7 @@ fn temporalProbeQuery(alloc: Allocator, address: planner.storage.Address, schema
             try stream.objectField("generation_set");
             try stream.write(value.generation_set);
             try stream.objectField("batches");
-            try @import("../storage/db/relational_integrity_json.zig").write(value.batches, stream);
+            try @import("../storage/db/relational/integrity/json.zig").write(value.batches, stream);
             try stream.endObject();
         }
     };
@@ -339,7 +339,7 @@ fn observationQuery(alloc: Allocator, keys: []const []const u8, schema_version: 
             try stream.objectField("typed_nulls");
             try stream.write(true);
             try stream.objectField("keys");
-            try @import("../storage/db/relational_integrity_json.zig").write(value.keys, stream);
+            try @import("../storage/db/relational/integrity/json.zig").write(value.keys, stream);
             try stream.objectField("schema_version");
             try stream.write(value.schema_version);
             try stream.objectField("generation_set");
@@ -362,6 +362,7 @@ const Builder = struct {
     read_view: ?*reads.JoinReadView = null,
     read_view_attempted: bool = false,
     metadata: []const TableRecord,
+    unpublished: bool = false,
     ranges: []const RangeRecord = &.{},
     loaded: std.ArrayList(*Loaded) = .empty,
     output: std.ArrayList(contract.TableCommitRequest) = .empty,
@@ -430,6 +431,7 @@ const Builder = struct {
 
     fn lookupCaptured(self: *Builder, table: []const u8, key: []const u8, options: types.LookupOptions, observation_preimages: bool) !?reads.LookupResponse {
         try self.control.ensureActive();
+        if (self.unpublished) return null;
         // Preparation observes many primary rows and claims. Pin one routing
         // generation for the request instead of fetching the catalog for each
         // point read. Owner read-index and commit predicates still establish
@@ -488,7 +490,7 @@ const Builder = struct {
             try parent_keys.append(self.alloc, .{ .column = right });
         }
         if (child_keys.items.len == 0) return false;
-        const tuple_mod = @import("../storage/db/relational_index_keys.zig");
+        const tuple_mod = @import("../storage/db/relational/indexes/keys.zig");
         var left = try tuple_mod.TuplePlan.init(self.alloc, child.view.tableSchema().*, child.view.physicalLayout(), child_keys.items);
         defer left.deinit();
         var right = try tuple_mod.TuplePlan.init(self.alloc, parent.view.tableSchema().*, parent.view.physicalLayout(), parent_keys.items);
@@ -509,7 +511,7 @@ const Builder = struct {
         defer row.deinit(self.alloc);
         const keys = try self.alloc.alloc(native.RelationalIndexKey, definition.columns.len);
         for (keys, definition.columns) |*target, column| target.* = .{ .column = column };
-        var tuple = try @import("../storage/db/relational_index_keys.zig").TuplePlan.init(self.alloc, parent.view.tableSchema().*, parent.view.physicalLayout(), keys);
+        var tuple = try @import("../storage/db/relational/indexes/keys.zig").TuplePlan.init(self.alloc, parent.view.tableSchema().*, parent.view.physicalLayout(), keys);
         defer tuple.deinit();
         const encoded = (try planner.encodeUnique(self.alloc, tuple, try row.typedView(parent.view.tableSchema().*, parent.view.physicalLayout()), definition.nulls_not_distinct, key)) orelse return error.InvalidIntegrityRecord;
         return .{ .address = try planner.storage.Address.init(dependency.parent_generation, encoded), .key = try self.alloc.dupe(u8, key) };
@@ -635,7 +637,7 @@ const Builder = struct {
     }
 
     fn observeWork(self: *Builder, table: *Loaded, keys: []const []const u8) !void {
-        const query = try observationQuery(self.alloc, keys, table.view.version(), @import("../storage/db/relational_integrity_activation_contract.zig").generationSet(table.catalog));
+        const query = try observationQuery(self.alloc, keys, table.view.version(), @import("../storage/db/relational/integrity/activation_contract.zig").generationSet(table.catalog));
         try self.observeWorkQuery(table, keys, query);
     }
 
@@ -683,10 +685,10 @@ const Builder = struct {
             var offset: usize = 0;
             while (offset < bucket.keys.items.len) {
                 var end = @min(offset + 8, bucket.keys.items.len);
-                var query = try observationQuery(self.alloc, bucket.keys.items[offset..end], table.view.version(), @import("../storage/db/relational_integrity_activation_contract.zig").generationSet(table.catalog));
+                var query = try observationQuery(self.alloc, bucket.keys.items[offset..end], table.view.version(), @import("../storage/db/relational/integrity/activation_contract.zig").generationSet(table.catalog));
                 while (query.len > 4096 and end > offset + 1) {
                     end -= 1;
-                    query = try observationQuery(self.alloc, bucket.keys.items[offset..end], table.view.version(), @import("../storage/db/relational_integrity_activation_contract.zig").generationSet(table.catalog));
+                    query = try observationQuery(self.alloc, bucket.keys.items[offset..end], table.view.version(), @import("../storage/db/relational/integrity/activation_contract.zig").generationSet(table.catalog));
                 }
                 if (query.len > 4096) return error.TransactionTooLarge;
                 try self.observeWorkQuery(table, bucket.keys.items[offset..end], query);
@@ -700,6 +702,7 @@ const Builder = struct {
     /// the builder's mutable arena. Drain every bounded Io task before copying
     /// results and publishing predicates on the caller, including on failure.
     fn preloadWork(self: *Builder, table: *Loaded, keys: []const []const u8) !void {
+        if (self.unpublished) return;
         if (try self.preloadOwnerObservations(table, keys)) return;
         if (self.source.strict_read_index_absence) {
             var offset: usize = 0;
@@ -1068,7 +1071,7 @@ const Builder = struct {
         defer row.deinit(self.alloc);
         const keys = try self.alloc.alloc(native.RelationalIndexKey, definition.child_columns.len);
         for (keys, definition.child_columns) |*key, column| key.* = .{ .column = column };
-        var tuple_plan = try @import("../storage/db/relational_index_keys.zig").TuplePlan.init(self.alloc, view.tableSchema().*, view.physicalLayout(), keys);
+        var tuple_plan = try @import("../storage/db/relational/indexes/keys.zig").TuplePlan.init(self.alloc, view.tableSchema().*, view.physicalLayout(), keys);
         defer tuple_plan.deinit();
         var tuple = try tuple_plan.encodeAlloc(self.alloc, try row.typedView(view.tableSchema().*, view.physicalLayout()));
         defer tuple.deinit(self.alloc);
@@ -1283,7 +1286,12 @@ const Builder = struct {
         if (current.len == 0) return error.InvalidIntegrityCommand;
         try batches.append(self.alloc, current);
         const definition = try self.load(table);
-        const query = try temporalProbeQuery(self.alloc, address, schema_version orelse definition.view.version(), generation_set orelse @import("../storage/db/relational_integrity_activation_contract.zig").generationSet(definition.catalog), batches.items);
+        if (self.unpublished) {
+            if (schema_version != null and schema_version.? != definition.view.version()) return error.PreparedGenerationChanged;
+            if (generation_set) |expected| if (!std.mem.eql(u8, &expected, &@import("../storage/db/relational/integrity/activation_contract.zig").generationSet(definition.catalog))) return error.PreparedGenerationChanged;
+            return EmptyGeneration.validate(self.alloc, batches.items);
+        }
+        const query = try temporalProbeQuery(self.alloc, address, schema_version orelse definition.view.version(), generation_set orelse @import("../storage/db/relational/integrity/activation_contract.zig").generationSet(definition.catalog), batches.items);
         try self.charge(query.len);
         var response = (try self.lookup(table, &address.routing, .{ .relational_integrity_jobs_json = query })) orelse return error.IntegrityCatalogUnavailable;
         defer response.deinit(self.alloc);
@@ -1304,19 +1312,34 @@ const Builder = struct {
 
     fn validateStatement(self: *Builder) !void {
         var seen: std.AutoHashMapUnmanaged(planner.storage.Address, void) = .empty;
-        for (self.output.items, self.command_lists.items) |table, commands| for (commands.items) |command| {
-            if ((try seen.getOrPut(self.alloc, command.address)).found_existing) continue;
-            if (try self.deferredUnique(table.table_name, command.address)) continue;
-            if (command.isTemporal()) {
-                try self.temporalProbe(table.table_name, command.address, commands.items, null, null);
-                continue;
+        for (self.output.items, self.command_lists.items) |table, commands| {
+            // Small statements use the short existing phase walk. Index the
+            // address once for larger COPY batches, where scanning each full
+            // command list for each independent key is quadratic.
+            var by_address: std.AutoHashMapUnmanaged(planner.storage.Address, std.ArrayList(planner.storage.Command)) = .empty;
+            if (commands.items.len >= 128) {
+                for (commands.items) |command| {
+                    const entry = try by_address.getOrPut(self.alloc, command.address);
+                    if (!entry.found_existing) entry.value_ptr.* = .empty;
+                    try entry.value_ptr.append(self.alloc, command);
+                }
             }
-            var state = try self.statementState(table.table_name, command.address);
-            try self.applyStatementCommands(&state, command.address, commands.items, true);
-        };
+            for (commands.items) |command| {
+                if ((try seen.getOrPut(self.alloc, command.address)).found_existing) continue;
+                if (try self.deferredUnique(table.table_name, command.address)) continue;
+                const selected = if (by_address.get(command.address)) |group| group.items else commands.items;
+                if (command.isTemporal()) {
+                    try self.temporalProbe(table.table_name, command.address, selected, null, null);
+                    continue;
+                }
+                var state = try self.statementState(table.table_name, command.address);
+                try self.applyStatementCommands(&state, command.address, selected, true);
+            }
+        }
     }
 
     fn deferredUnique(self: *Builder, name: []const u8, address: planner.storage.Address) !bool {
+        if (!self.statement) return false;
         const table = try self.load(name);
         for (table.uniques) |unique| {
             const binding = table.catalog.find(.unique, unique.name) orelse return error.PreparedGenerationChanged;
@@ -1395,31 +1418,27 @@ const Builder = struct {
         validator_owned = false;
         var view: registry.SchemaView = .{ .epoch = epoch };
         errdefer view.release();
-        // Route by the exact first-range boundary, like integrityCatalog().
-        // Private reads carry their operation in options, never a synthetic
-        // document key that can select a different owner or transport path.
-        var response = (try self.lookup(name, "", .{ .relational_integrity_catalog = true })) orelse return error.IntegrityCatalogUnavailable;
-        defer response.deinit(self.alloc);
-        var envelope = try std.json.parseFromSlice(struct { catalog: []const u8, schema_version: u32, table_id: []const u8 }, self.alloc, response.json, .{});
-        defer envelope.deinit();
-        if (envelope.value.schema_version != view.version() or (std.fmt.parseInt(u64, envelope.value.table_id, 10) catch return error.InvalidIntegrityCatalog) != record.table_id) return error.PreparedGenerationChanged;
-        const size = std.base64.standard.Decoder.calcSizeForSlice(envelope.value.catalog) catch return error.InvalidIntegrityCatalog;
-        if (size > catalog.max_catalog_bytes) return error.InvalidIntegrityCatalog;
-        const bytes = try self.alloc.alloc(u8, size);
-        defer self.alloc.free(bytes);
-        std.base64.standard.Decoder.decode(bytes, envelope.value.catalog) catch return error.InvalidIntegrityCatalog;
-        var bindings = try catalog.decode(self.alloc, bytes);
-        errdefer bindings.deinit();
-        if (bindings.schema_version != view.version() or !std.mem.eql(u8, &bindings.incarnation, &(try catalog.incarnationFromTableId(record.table_id)))) return error.PreparedGenerationChanged;
         const native_schema = try schema.serializeSchema(self.alloc, view.tableSchema().*);
         defer self.alloc.free(native_schema);
         var schema_digest: planner.storage.Digest = undefined;
         std.crypto.hash.Blake3.hash(native_schema, &schema_digest, .{});
-        if (!std.mem.eql(u8, &schema_digest, &bindings.schema_digest)) return error.PreparedGenerationChanged;
         const checks_digest: [32]u8 = if (view.validator().?.execution.checks) |checks| checks.validationFingerprint() else @splat(0);
-        if (!std.mem.eql(u8, &checks_digest, &bindings.checks_digest)) return error.PreparedGenerationChanged;
         const expected = try declarations.definitionFingerprints(self.alloc, view.validator().?.schema, view.tableSchema().*);
         defer declarations.freeDefinitions(self.alloc, expected);
+        const bytes = if (self.unpublished) private: {
+            const declared = view.validator().?.schema;
+            if (declared.foreign_keys != null or declared.sql_partition != null or declared.sql_triggers != null)
+                return error.UnsupportedSqlExecution;
+            var initial = try catalog.prepareWithChecks(self.alloc, null, try catalog.incarnationFromTableId(record.table_id), view.version(), schema_digest, expected, checks_digest);
+            defer initial.deinit();
+            break :private try self.alloc.dupe(u8, initial.value);
+        } else try self.fetchCatalog(record, view.version());
+        defer self.alloc.free(bytes);
+        var bindings = try catalog.decode(self.alloc, bytes);
+        errdefer bindings.deinit();
+        if (bindings.schema_version != view.version() or !std.mem.eql(u8, &bindings.incarnation, &(try catalog.incarnationFromTableId(record.table_id)))) return error.PreparedGenerationChanged;
+        if (!std.mem.eql(u8, &schema_digest, &bindings.schema_digest) or
+            !std.mem.eql(u8, &checks_digest, &bindings.checks_digest)) return error.PreparedGenerationChanged;
         for (expected) |definition| {
             const binding = bindings.find(definition.kind, definition.name) orelse return error.PreparedGenerationChanged;
             if (!std.mem.eql(u8, &binding.definition.fingerprint, &definition.fingerprint)) return error.PreparedGenerationChanged;
@@ -1430,12 +1449,29 @@ const Builder = struct {
             .view = view,
             .table_id = record.table_id,
             .catalog = bindings,
-            .catalog_digest = @import("../storage/db/relational_schema_owner_contract.zig").hash(bytes),
+            .catalog_digest = @import("../storage/db/relational/schema_change/schema_owner_contract.zig").hash(bytes),
             .uniques = try view.validator().?.schema.relationalUniqueDefinitions(self.alloc),
             .foreign = try view.validator().?.schema.relationalForeignKeyDefinitions(self.alloc),
         };
         try self.loaded.append(self.alloc, table);
         return table;
+    }
+
+    fn fetchCatalog(self: *Builder, record: TableRecord, version: u32) ![]const u8 {
+        // Route by the exact first-range boundary, like integrityCatalog().
+        // Private reads carry their operation in options, never a synthetic
+        // document key that can select a different owner or transport path.
+        var response = (try self.lookup(record.name, "", .{ .relational_integrity_catalog = true })) orelse return error.IntegrityCatalogUnavailable;
+        defer response.deinit(self.alloc);
+        var envelope = try std.json.parseFromSlice(struct { catalog: []const u8, schema_version: u32, table_id: []const u8 }, self.alloc, response.json, .{});
+        defer envelope.deinit();
+        if (envelope.value.schema_version != version or (std.fmt.parseInt(u64, envelope.value.table_id, 10) catch return error.InvalidIntegrityCatalog) != record.table_id) return error.PreparedGenerationChanged;
+        const size = std.base64.standard.Decoder.calcSizeForSlice(envelope.value.catalog) catch return error.InvalidIntegrityCatalog;
+        if (size > catalog.max_catalog_bytes) return error.InvalidIntegrityCatalog;
+        const bytes = try self.alloc.alloc(u8, size);
+        errdefer self.alloc.free(bytes);
+        std.base64.standard.Decoder.decode(bytes, envelope.value.catalog) catch return error.InvalidIntegrityCatalog;
+        return bytes;
     }
 
     fn bindingPlan(self: *Builder, table: *Loaded) !*planner.Plan {
@@ -1447,11 +1483,11 @@ const Builder = struct {
         return self.bindingPlanFiltered(table, with_unique, with_foreign, null);
     }
 
-    fn bindingPlanFiltered(self: *Builder, table: *Loaded, with_unique: bool, with_foreign: bool, retirement: ?@import("../storage/db/relational_integrity_retirement_contract.zig").Progress) !planner.Plan {
+    fn bindingPlanFiltered(self: *Builder, table: *Loaded, with_unique: bool, with_foreign: bool, retirement: ?@import("../storage/db/relational/integrity/retirement_contract.zig").Progress) !planner.Plan {
         return self.bindingPlanSelection(table, with_unique, with_foreign, retirement, null);
     }
 
-    fn bindingPlanSelection(self: *Builder, table: *Loaded, with_unique: bool, with_foreign: bool, retirement: ?@import("../storage/db/relational_integrity_retirement_contract.zig").Progress, validation_names: ?[]const []const u8) !planner.Plan {
+    fn bindingPlanSelection(self: *Builder, table: *Loaded, with_unique: bool, with_foreign: bool, retirement: ?@import("../storage/db/relational/integrity/retirement_contract.zig").Progress, validation_names: ?[]const []const u8) !planner.Plan {
         const unique_defs = if (with_unique) table.uniques else &.{};
         const foreign_defs = if (with_foreign) table.foreign else &.{};
         var uniques = std.ArrayList(planner.UniqueBinding).empty;
@@ -1491,7 +1527,7 @@ const Builder = struct {
 
     fn outputIndex(self: *Builder, table_name: []const u8, version: u32) !usize {
         const loaded = try self.load(table_name);
-        const generation_set = @import("../storage/db/relational_integrity_activation_contract.zig").generationSet(loaded.catalog);
+        const generation_set = @import("../storage/db/relational/integrity/activation_contract.zig").generationSet(loaded.catalog);
         for (self.output.items, 0..) |*table, i| if (std.mem.eql(u8, table.table_name, table_name)) {
             if (table.relational_schema_version) |old| if (old != version) return error.PreparedGenerationChanged;
             table.relational_schema_version = version;
@@ -1559,9 +1595,13 @@ fn prepareModeRoutedWithEvents(alloc: Allocator, source: reads.TableReadSource, 
 }
 
 fn prepareModeSelected(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, requests: []const contract.TableCommitRequest, request_control: RequestContext, repair_tables: []const []const u8, statement: bool, previous: []const contract.TableCommitRequest, validate_statement: bool, modes: []const native.ConstraintTiming, repair_admission: ?RepairAdmission, events: []const contract.TableCommitRequest, unique_only: bool) !Prepared {
+    return prepareSelected(alloc, source, metadata, ranges, requests, request_control, repair_tables, statement, previous, validate_statement, modes, repair_admission, events, unique_only, false);
+}
+
+fn prepareSelected(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, requests: []const contract.TableCommitRequest, request_control: RequestContext, repair_tables: []const []const u8, statement: bool, previous: []const contract.TableCommitRequest, validate_statement: bool, modes: []const native.ConstraintTiming, repair_admission: ?RepairAdmission, events: []const contract.TableCommitRequest, unique_only: bool, unpublished: bool) !Prepared {
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
-    var builder: Builder = .{ .alloc = arena.allocator(), .scratch_alloc = alloc, .source = source, .metadata = metadata, .ranges = ranges, .control = try boundedControl(request_control), .repair_tables = repair_tables, .repair_admission = repair_admission, .statement = statement, .previous = previous, .constraint_timing = modes, .unique_only = unique_only };
+    var builder: Builder = .{ .alloc = arena.allocator(), .scratch_alloc = alloc, .source = source, .metadata = metadata, .ranges = ranges, .control = try boundedControl(request_control), .repair_tables = repair_tables, .repair_admission = repair_admission, .statement = statement, .previous = previous, .constraint_timing = modes, .unique_only = unique_only, .unpublished = unpublished };
     defer builder.deinit();
     for (requests) |request| builder.default_commit_requires = types.CommitRequires.strongest(builder.default_commit_requires, request.default_commit_requires);
     try builder.output.appendSlice(builder.alloc, requests);
@@ -1600,11 +1640,11 @@ fn prepareModeSelected(alloc: Allocator, source: reads.TableReadSource, metadata
         if (record.schema_json.len == 0) continue;
         var declaration = try schema_api.parseValidatedTableSchema(builder.alloc, record.schema_json);
         defer declaration.deinit(builder.alloc);
-        if (!hasSequenceDefaults(declaration) and declaration.unique_constraints == null and declaration.foreign_keys == null and ((repair_tables.len == 0 and repair_admission == null) or declaration.checks == null)) continue;
+        if (!unpublished and !hasSequenceDefaults(declaration) and declaration.unique_constraints == null and declaration.foreign_keys == null and ((repair_tables.len == 0 and repair_admission == null) or declaration.checks == null)) continue;
         if (request.transforms.len != 0) return error.UnsupportedOperation;
         const table = try builder.load(request.table_name);
         if (request.relational_integrity_generation_set) |expected| {
-            const current = @import("../storage/db/relational_integrity_activation_contract.zig").generationSet(table.catalog);
+            const current = @import("../storage/db/relational/integrity/activation_contract.zig").generationSet(table.catalog);
             if (!std.mem.eql(u8, &expected, &current)) return error.CatalogGenerationChanged;
         }
         _ = try builder.outputIndex(table.name, table.view.version());
@@ -1747,6 +1787,76 @@ fn prepareModeSelected(alloc: Allocator, source: reads.TableReadSource, metadata
     }
     const owned_result_tables = try builder.output.toOwnedSlice(builder.alloc);
     return .{ .arena = arena, .tables = owned_result_tables };
+}
+
+fn unavailableReadSource() reads.TableReadSource {
+    const Unavailable = struct {
+        var marker: u8 = 0;
+        fn lookup(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: types.LookupOptions, _: @import("../storage/read_consistency.zig").ReadConsistency) anyerror!?reads.LookupResponse {
+            return error.IntegrityCatalogUnavailable;
+        }
+        fn scan(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: types.ScanOptions, _: @import("../storage/read_consistency.zig").ReadConsistency) anyerror!?reads.ScanResponse {
+            return error.IntegrityCatalogUnavailable;
+        }
+        fn query(_: *anyopaque, _: Allocator, _: []const u8, _: types.SearchRequest, _: @import("../storage/read_consistency.zig").ReadConsistency) anyerror!?@import("query_response.zig").QueryResponse {
+            return error.IntegrityCatalogUnavailable;
+        }
+    };
+    return .{ .ptr = &Unavailable.marker, .vtable = &.{ .lookup = Unavailable.lookup, .scan = Unavailable.scan, .query = Unavailable.query } };
+}
+
+const EmptyGeneration = struct {
+    const Entry = struct { key: []const u8, value: []const u8 };
+    pub fn get(_: *@This(), _: []const u8) ![]const u8 {
+        return error.NotFound;
+    }
+    pub fn openCursor(_: *@This()) !Cursor {
+        return .{};
+    }
+    const Cursor = struct {
+        pub fn close(_: *@This()) void {}
+        pub fn first(_: *@This()) !?Entry {
+            return null;
+        }
+        pub fn last(_: *@This()) !?Entry {
+            return null;
+        }
+        pub fn next(_: *@This()) !?Entry {
+            return null;
+        }
+        pub fn prev(_: *@This()) !?Entry {
+            return null;
+        }
+        pub fn seekAtOrAfter(_: *@This(), _: []const u8) !?Entry {
+            return null;
+        }
+        pub fn seekAtOrBefore(_: *@This(), _: []const u8) !?Entry {
+            return null;
+        }
+        pub fn setLowerBound(_: *@This(), _: ?[]const u8) void {}
+        pub fn setUpperBound(_: *@This(), _: ?[]const u8) void {}
+    };
+    fn validate(a: Allocator, batches: []const []const planner.storage.Command) !void {
+        var empty: @This() = .{};
+        var effects = try @import("../storage/db/relational/integrity/integrity.zig").prepareBatches(a, &empty, batches);
+        defer effects.deinit();
+    }
+};
+/// Validate writes using declarations owned by the caller's SQL transaction
+/// and the transaction's staged rows. All named relations must belong to that
+/// private cohort. This path makes no published routing or availability claim.
+pub fn preparePrivateSessionStatement(alloc: Allocator, declarations_: []const TableRecord, previous: []const contract.TableCommitRequest, statement: []const contract.TableCommitRequest, control: RequestContext, modes: []const native.ConstraintTiming) !Prepared {
+    const source = unavailableReadSource();
+    var before = try prepareSelected(alloc, source, declarations_, &.{}, previous, control, &.{}, true, &.{}, false, modes, null, &.{}, false, true);
+    defer before.deinit();
+    return prepareSelected(alloc, source, declarations_, &.{}, statement, control, &.{}, true, before.tables, true, modes, null, &.{}, false, true);
+}
+
+/// Reconstruct final constraint effects from the surviving rows. Intermediate
+/// generations and timing deferrals cannot establish a publication claim.
+pub fn validatePrivateCommit(alloc: Allocator, records: []const TableRecord, tables: []const contract.TableCommitRequest, control: RequestContext) !void {
+    var result = try prepareSelected(alloc, unavailableReadSource(), records, &.{}, tables, control, &.{}, false, &.{}, true, &.{}, null, &.{}, false, true);
+    defer result.deinit();
 }
 
 /// A session stage is one statement. Its read-your-writes view includes all
@@ -1914,7 +2024,7 @@ test "distributed txn constraint timing excludes index ownership without native 
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
 }
 
-pub const BackfillRow = @import("../storage/db/relational_integrity_activation_contract.zig").Row;
+pub const BackfillRow = @import("../storage/db/relational/integrity/activation_contract.zig").Row;
 
 /// Request-owned arbiter proof. SQL carries this opaque envelope to its native
 /// commit adapter; only this existing integrity authority understands claims.
@@ -1960,7 +2070,7 @@ pub fn resolveConflictTargetOwnersWithScratch(alloc: Allocator, scratch_alloc: A
     const selected = if (target.constraint_name) |constraint_name| try plan.bindNamedConflict(alloc, constraint_name) else try plan.bindConflictExpressions(alloc, target.columns, target.expressions, target.predicate);
     defer alloc.free(selected);
     const owners = try alloc.alloc(ConflictOwner, writes.len);
-    const generation_set = @import("../storage/db/relational_integrity_activation_contract.zig").generationSet(table.catalog);
+    const generation_set = @import("../storage/db/relational/integrity/activation_contract.zig").generationSet(table.catalog);
     for (writes, owners) |write, *owner| {
         try builder.control.ensureActive();
         try builder.charge(write.key.len + write.value.len);
@@ -2147,7 +2257,7 @@ pub const UniqueAdmission = struct {
                     @memcpy(batches[0..entry.value_ptr.items.len], entry.value_ptr.items);
                     batches[batches.len - 1] = batch;
                     const loaded = try self.builder.load(name);
-                    const query = try temporalProbeQuery(a, group.key_ptr.*, loaded.view.version(), @import("../storage/db/relational_integrity_activation_contract.zig").generationSet(loaded.catalog), batches);
+                    const query = try temporalProbeQuery(a, group.key_ptr.*, loaded.view.version(), @import("../storage/db/relational/integrity/activation_contract.zig").generationSet(loaded.catalog), batches);
                     var response = (try self.builder.lookup(name, &group.key_ptr.routing, .{ .relational_integrity_jobs_json = query })) orelse return error.IntegrityCatalogUnavailable;
                     defer response.deinit(self.builder.alloc);
                     const result = try std.json.parseFromSliceLeaky(struct { validated: bool, address: planner.storage.Address }, a, response.json, .{});
@@ -2307,7 +2417,7 @@ pub const UniqueAdmission = struct {
             const addresses = try plan.conflictAddresses(scratch, selected, try row.typedView(loaded.view.tableSchema().*, loaded.view.physicalLayout()));
             const guards = try a.alloc(planner.storage.Command, addresses.len);
             const identities = try a.alloc([]const u8, addresses.len);
-            owner.* = .{ .key = null, .identity = null, .identities = identities, .generation_set = @import("../storage/db/relational_integrity_activation_contract.zig").generationSet(loaded.catalog), .guards = guards };
+            owner.* = .{ .key = null, .identity = null, .identities = identities, .generation_set = @import("../storage/db/relational/integrity/activation_contract.zig").generationSet(loaded.catalog), .guards = guards };
             for (addresses, guards, identities) |address, *guard, *identity| {
                 const state = try self.claim(name, address.address);
                 identity.* = try a.dupe(u8, &address.address.claimKey());
@@ -2357,7 +2467,7 @@ fn ensureUniqueCoverageControlled(alloc: Allocator, source: reads.TableReadSourc
 }
 
 fn requireUniqueCoverageFor(builder: *Builder, ranges: []const RangeRecord, table_names: []const []const u8) !void {
-    const activation = @import("../storage/db/relational_integrity_activation_contract.zig");
+    const activation = @import("../storage/db/relational/integrity/activation_contract.zig");
     var checked = std.StringHashMapUnmanaged(void).empty;
     for (table_names) |name| {
         if ((try checked.getOrPut(builder.alloc, name)).found_existing) continue;
@@ -2605,14 +2715,14 @@ fn validateRepairTargets(alloc: Allocator, metadata: []const TableRecord, reques
 /// Backfill writes only globally routed derived claims/references, never the
 /// primary rows. Source versions remain real read-only 2PC participants. The
 /// caller enlists its owner-bound activation checkpoint in this SAME decision.
-pub fn prepareRetirementPage(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, table_name: []const u8, rows: []const BackfillRow, progress: @import("../storage/db/relational_integrity_retirement_contract.zig").Progress, request: RequestContext) !Prepared {
+pub fn prepareRetirementPage(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, table_name: []const u8, rows: []const BackfillRow, progress: @import("../storage/db/relational/integrity/retirement_contract.zig").Progress, request: RequestContext) !Prepared {
     if (rows.len > 128 or (progress.phase != .foreign_keys and progress.phase != .unique)) return error.InvalidConstraintRetirement;
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
     var builder: Builder = .{ .alloc = arena.allocator(), .scratch_alloc = alloc, .source = source, .metadata = metadata, .control = try boundedControl(request) };
     defer builder.deinit();
     const table = try builder.load(table_name);
-    if (table.view.version() != progress.schema_version or !std.mem.eql(u8, &@import("../storage/db/relational_integrity_activation_contract.zig").generationSet(table.catalog), &progress.generation_set)) return error.ConstraintRetirementChanged;
+    if (table.view.version() != progress.schema_version or !std.mem.eql(u8, &@import("../storage/db/relational/integrity/activation_contract.zig").generationSet(table.catalog), &progress.generation_set)) return error.ConstraintRetirementChanged;
     const row_table_index = try builder.outputIndex(table_name, table.view.version());
     var plan = try builder.bindingPlanFiltered(table, progress.phase == .unique, progress.phase == .foreign_keys, progress);
     defer plan.deinit();
@@ -2751,7 +2861,7 @@ fn prepareBackfillControlled(alloc: Allocator, source: reads.TableReadSource, me
 /// rewrites the child row or grants historical missing-parent exemptions.
 pub const ForeignKeyValidationSource = struct {
     arena: std.heap.ArenaAllocator,
-    value: @import("../storage/db/relational_schema_owner_contract.zig").ForeignKeySource,
+    value: @import("../storage/db/relational/schema_change/schema_owner_contract.zig").ForeignKeySource,
     pub fn deinit(self: *@This()) void {
         self.arena.deinit();
         self.* = undefined;
@@ -2763,7 +2873,7 @@ pub const ForeignKeyValidationSource = struct {
 /// builder cache amortize reads across constraints sharing a parent. This is
 /// preparation only: each later parent effect still has its ordinary 2PC guard.
 pub fn captureForeignKeyValidationSource(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, table_name: []const u8, names: []const []const u8, request: RequestContext) !ForeignKeyValidationSource {
-    const owner = @import("../storage/db/relational_schema_owner_contract.zig");
+    const owner = @import("../storage/db/relational/schema_change/schema_owner_contract.zig");
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     var builder: Builder = .{ .alloc = scratch.allocator(), .scratch_alloc = alloc, .source = source, .metadata = metadata, .control = try boundedControl(request) };
@@ -3208,7 +3318,7 @@ pub fn testConflictTuple(alloc: Allocator, source: reads.TableReadSource, metada
 
 test "distributed txn global unique coverage checks every owner and rejects stale incomplete proofs" {
     const alloc = std.testing.allocator;
-    const activation = @import("../storage/db/relational_integrity_activation_contract.zig");
+    const activation = @import("../storage/db/relational/integrity/activation_contract.zig");
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
     ;
@@ -3480,7 +3590,7 @@ test "distributed txn deferred unique overlay permits repair and validates immed
         }
     };
     var empty: Empty = .{};
-    try std.testing.expectError(error.UniqueConstraintViolation, @import("../storage/db/relational_integrity.zig").prepare(alloc, &empty, final.tables[0].integrity_commands, null));
+    try std.testing.expectError(error.UniqueConstraintViolation, @import("../storage/db/relational/integrity/integrity.zig").prepare(alloc, &empty, final.tables[0].integrity_commands));
     // The first half of a two-statement swap collides with a live row. The
     // second statement repairs the complete overlay; no transient claim is
     // published, and COMMIT recomputes both releases from original rows.
@@ -3542,11 +3652,11 @@ test "distributed txn expression partial unique declarations bind activation ret
     try std.testing.expectEqual(@as(usize, 1), claims.len);
     try std.testing.expectEqualDeep(established.address, claims[0].address);
     const generation = loaded.catalog.find(.unique, "email_key").?.generation;
-    const progress: @import("../storage/db/relational_integrity_retirement_contract.zig").Progress = .{
+    const progress: @import("../storage/db/relational/integrity/retirement_contract.zig").Progress = .{
         .job_id = @splat(1),
         .owner = @splat(2),
         .target_schema_digest = @splat(3),
-        .generation_set = @import("../storage/db/relational_integrity_activation_contract.zig").generationSet(loaded.catalog),
+        .generation_set = @import("../storage/db/relational/integrity/activation_contract.zig").generationSet(loaded.catalog),
         .schema_version = 1,
         .phase = .unique,
         .generations = &.{generation},
@@ -3686,11 +3796,11 @@ test "distributed txn activation projection validates selected fields without fu
     const loaded = try builder.load("parents");
     inline for (.{ .{ .unique, "pk", "id" }, .{ .foreign_key, "parent", "parent_id" } }) |selection| {
         const generation = loaded.catalog.find(selection[0], selection[1]).?.generation;
-        const progress: @import("../storage/db/relational_integrity_retirement_contract.zig").Progress = .{
+        const progress: @import("../storage/db/relational/integrity/retirement_contract.zig").Progress = .{
             .job_id = @splat(1),
             .owner = @splat(2),
             .target_schema_digest = @splat(3),
-            .generation_set = @import("../storage/db/relational_integrity_activation_contract.zig").generationSet(loaded.catalog),
+            .generation_set = @import("../storage/db/relational/integrity/activation_contract.zig").generationSet(loaded.catalog),
             .schema_version = 1,
             .phase = if (selection[0] == .unique) .unique else .foreign_keys,
             .generations = &.{generation},
@@ -3885,7 +3995,7 @@ test "distributed txn atomic cascade closure handles delete cycles update cycles
                         references: []const planner.storage.Reference,
                         next: ?[]const u8 = null,
                         pub fn jsonStringify(self_response: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
-                            return @import("../storage/db/relational_integrity_json.zig").write(self_response, stream);
+                            return @import("../storage/db/relational/integrity/json.zig").write(self_response, stream);
                         }
                     };
                     return .{ .json = try std.json.Stringify.valueAlloc(allocator, Response{ .address = self.addresses[i], .claim = self.claims[i], .references = self.references[i..][0..1] }, .{}), .version = 0 };
@@ -3975,7 +4085,7 @@ test "distributed txn deferred NO ACTION retains unchanged child proof through f
                 var output: std.Io.Writer.Allocating = .init(allocator);
                 defer output.deinit();
                 var stream: std.json.Stringify = .{ .writer = &output.writer };
-                try @import("../storage/db/relational_integrity_json.zig").write(.{ .address = self.address, .claim = self.claim, .references = @as([]const planner.storage.Reference, &.{self.reference}), .next = @as(?[]const u8, null) }, &stream);
+                try @import("../storage/db/relational/integrity/json.zig").write(.{ .address = self.address, .claim = self.claim, .references = @as([]const planner.storage.Reference, &.{self.reference}), .next = @as(?[]const u8, null) }, &stream);
                 return .{ .json = try output.toOwnedSlice(), .version = 0 };
             }
             if (std.mem.eql(u8, key, "new")) return null;
@@ -4379,7 +4489,7 @@ test "foreign key validation pages select pending constraints retain row guards 
     defer parent_schema.deinit(a);
     var parent_catalog = try declarations.compileCatalog(a, parent_schema.public_schema, 88, null);
     defer parent_catalog.deinit();
-    const status = try std.json.Stringify.valueAlloc(a, .{ .schema_version = @as(u32, 1), .schema_digest = parent_catalog.catalog.schema_digest, .generation_set = @import("../storage/db/relational_integrity_activation_contract.zig").generationSet(parent_catalog.catalog), .owner = @as([32]u8, @splat(5)), .range_start = "", .range_end = "", .unique_covered = true, .state = "enforced", .phase = "foreign_key", .rows_scanned = @as(u64, 1), .failure = "" }, .{});
+    const status = try std.json.Stringify.valueAlloc(a, .{ .schema_version = @as(u32, 1), .schema_digest = parent_catalog.catalog.schema_digest, .generation_set = @import("../storage/db/relational/integrity/activation_contract.zig").generationSet(parent_catalog.catalog), .owner = @as([32]u8, @splat(5)), .range_start = "", .range_end = "", .unique_covered = true, .state = "enforced", .phase = "foreign_key", .rows_scanned = @as(u64, 1), .failure = "" }, .{});
     defer a.free(status);
     const fixture: F = .{ .child_envelope = child_envelope, .parent_envelope = parent_envelope, .status = status };
     const tables = [_]TableRecord{ .{ .table_id = 71, .name = "children", .schema_json = children }, .{ .table_id = 88, .name = "parents", .schema_json = parents } };
@@ -4524,7 +4634,7 @@ const UniqueAdmissionTest = struct {
         try std.base64.standard.Decoder.decode(bytes, parsed.value.catalog);
         var decoded = try catalog.decode(a, bytes);
         defer decoded.deinit();
-        return .{ .envelope = envelope, .schema_digest = decoded.schema_digest, .generation_set = @import("../storage/db/relational_integrity_activation_contract.zig").generationSet(decoded) };
+        return .{ .envelope = envelope, .schema_digest = decoded.schema_digest, .generation_set = @import("../storage/db/relational/integrity/activation_contract.zig").generationSet(decoded) };
     }
     fn deinit(self: *@This(), a: Allocator) void {
         a.free(self.envelope);
@@ -4540,7 +4650,7 @@ const UniqueAdmissionTest = struct {
         }
         if (options.relational_activation_json.len != 0) {
             self.coverage_reads += 1;
-            return .{ .json = try std.json.Stringify.valueAlloc(a, .{ .schema_version = @as(u32, 1), .schema_digest = self.schema_digest, .generation_set = self.generation_set, .owner = @as([32]u8, @splat(1)), .range_start = @as([]const u8, ""), .range_end = @as([]const u8, ""), .unique_covered = self.ready, .state = @import("../storage/db/relational_integrity_activation_contract.zig").State.validating, .phase = @import("../storage/db/relational_integrity_activation_contract.zig").Phase.foreign_key, .rows_scanned = @as(u64, 0), .failure = @as([]const u8, "") }, .{}), .version = 1 };
+            return .{ .json = try std.json.Stringify.valueAlloc(a, .{ .schema_version = @as(u32, 1), .schema_digest = self.schema_digest, .generation_set = self.generation_set, .owner = @as([32]u8, @splat(1)), .range_start = @as([]const u8, ""), .range_end = @as([]const u8, ""), .unique_covered = self.ready, .state = @import("../storage/db/relational/integrity/activation_contract.zig").State.validating, .phase = @import("../storage/db/relational/integrity/activation_contract.zig").Phase.foreign_key, .rows_scanned = @as(u64, 0), .failure = @as([]const u8, "") }, .{}), .version = 1 };
         }
         if (options.relational_integrity_jobs_json.len != 0) {
             self.claim_reads += 1;
@@ -4916,4 +5026,46 @@ test "SQL relation lifetime integrity preparation retains trusted lookup minter 
     try std.testing.expectError(error.SqlTemporaryRelationNotOwned, authorizedLookupOptions(control, std.testing.allocator, "owned", conflicting));
     const absent = try authorizedLookupOptions(.{}, std.testing.allocator, "owned", .{ .relational_integrity_catalog = true });
     try std.testing.expect(absent.relation_owner_minter == null);
+}
+
+test "SQL generation intents private rows enforce uniqueness against the staged overlay" {
+    const a = std.testing.allocator;
+    const json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"id_key","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const private = [_]TableRecord{.{ .table_id = 23, .name = "private_rows", .schema_json = json }};
+    const previous = [_]contract.TableCommitRequest{.{
+        .table_name = "private_rows",
+        .relational_schema_version = 1,
+        .writes = &.{.{ .key = "first", .value = "{\"id\":1}" }},
+    }};
+    var next = [_]contract.TableCommitRequest{.{
+        .table_name = "private_rows",
+        .relational_schema_version = 1,
+        .writes = &.{.{ .key = "second", .value = "{\"id\":1}" }},
+    }};
+    try std.testing.expectError(error.UniqueConstraintViolation, preparePrivateSessionStatement(a, &private, &previous, &next, .{}, &.{}));
+    next[0].deletes = &.{"first"};
+    var result = try preparePrivateSessionStatement(a, &private, &previous, &next, .{}, &.{});
+    defer result.deinit();
+    try std.testing.expectEqualStrings("second", result.tables[0].writes[0].key);
+    next[0].table_name = "published";
+    try std.testing.expectError(error.TableNotFound, preparePrivateSessionStatement(a, &private, &previous, &next, .{}, &.{}));
+
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const temporary = scratch.allocator();
+    var writes: [129]types.TransactionWrite = undefined;
+    for (&writes, 0..) |*write, i| write.* = .{
+        .key = try std.fmt.allocPrint(temporary, "row-{d}", .{i}),
+        .value = try std.fmt.allocPrint(temporary, "{{\"id\":{d}}}", .{i + 2}),
+    };
+    next[0] = .{ .table_name = "private_rows", .relational_schema_version = 1, .writes = &writes };
+    var batch = try preparePrivateSessionStatement(a, &private, &previous, &next, .{}, &.{});
+    defer batch.deinit();
+    try std.testing.expectEqual(writes.len, batch.tables[0].writes.len);
+    try validatePrivateCommit(a, &private, &next, .{});
+    writes[writes.len - 1].value = writes[0].value;
+    try std.testing.expectError(error.UniqueConstraintViolation, preparePrivateSessionStatement(a, &private, &previous, &next, .{}, &.{}));
+    try std.testing.expectError(error.UniqueConstraintViolation, validatePrivateCommit(a, &private, &next, .{}));
 }

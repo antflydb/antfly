@@ -27,6 +27,224 @@ CREATE = "CREATE TABLE usage_records(id BIGINT PRIMARY KEY,status TEXT CHECK(sta
 READ = "SELECT id,status,amount,normalized FROM usage_records ORDER BY id"
 
 
+def freeze_reference(db, original):
+    import psycopg
+
+    create = "CREATE TABLE usage_records(id bigint PRIMARY KEY,status text DEFAULT 'PENDING')"
+    data = "id,status\n1,READY\nbad,ignored\n2,n/a\n"
+
+    def copy(payload=data):
+        with db.cursor() as cursor:
+            with cursor.copy(original["sql"]) as stream:
+                stream.write(payload)
+            return cursor.statusmessage
+
+    def rows():
+        return [list(row) for row in db.execute("SELECT id,status FROM usage_records ORDER BY id")]
+
+    def rejection():
+        try:
+            with db.transaction():
+                copy()
+        except psycopg.Error as error:
+            if error.sqlstate != "55000":
+                raise
+            return error.sqlstate
+        raise AssertionError("COPY FREEZE accepted a generation from another subtransaction")
+
+    db.execute("DROP TABLE usage_records")
+    db.execute(create)
+    existing = rejection()
+    assert not rows()
+    with db.transaction():
+        db.execute("TRUNCATE usage_records")
+        child_after_truncate = rejection()
+        truncate_tag = copy()
+        truncated = rows()
+    try:
+        with db.transaction():
+            db.execute("TRUNCATE usage_records")
+            db.execute("DECLARE freeze_cursor CURSOR FOR SELECT 1")
+            copy()
+    except psycopg.Error as error:
+        if error.sqlstate != "25000":
+            raise
+        open_cursor = error.sqlstate
+    else:
+        raise AssertionError("COPY FREEZE accepted an open cursor")
+    assert rows() == truncated
+    after_select = {}
+    for isolation in ("READ COMMITTED", "REPEATABLE READ"):
+        with db.transaction(force_rollback=True):
+            db.execute(f"SET TRANSACTION ISOLATION LEVEL {isolation}")
+            db.execute("TRUNCATE usage_records")
+            db.execute("SELECT 1").fetchone()
+            after_select[isolation] = copy()
+            assert after_select[isolation] == "COPY 2"
+        assert rows() == truncated
+    with db.transaction(force_rollback=True):
+        db.execute("TRUNCATE usage_records")
+        assert copy() == "COPY 2"
+        db.execute("UPDATE usage_records SET status='rolled back'")
+    after_rollback = rows()
+    db.execute("DROP TABLE usage_records")
+    with db.transaction():
+        db.execute(create)
+        child_after_create = rejection()
+        create_tag = copy()
+    created = rows()
+    assert truncate_tag == create_tag == "COPY 2"
+    assert truncated == after_rollback == created == [[1, "READY"], [2, "PENDING"]]
+    # Rollback must discard a child's generation and any frozen tuples. A
+    # parent with no generation still cannot freeze after the child aborts.
+    try:
+        with db.transaction():
+            with db.transaction(force_rollback=True):
+                db.execute("TRUNCATE usage_records")
+                assert copy() == "COPY 2"
+            copy()
+    except psycopg.Error as error:
+        if error.sqlstate != "55000":
+            raise
+        rolled_back_child_sqlstate = error.sqlstate
+    else:
+        raise AssertionError("COPY FREEZE reused an aborted generation")
+    assert rows() == created
+
+    # The parent sees its own empty replacement again, but PostgreSQL
+    # does not restore FREEZE eligibility after a nested replacement aborts.
+    try:
+        with db.transaction():
+            db.execute("TRUNCATE usage_records")
+            with db.transaction(force_rollback=True):
+                db.execute("TRUNCATE usage_records")
+                assert copy() == "COPY 2"
+            assert not rows()
+            copy()
+    except psycopg.Error as error:
+        if error.sqlstate != "55000":
+            raise
+        restored_parent_sqlstate = error.sqlstate
+    else:
+        raise AssertionError("COPY FREEZE restored eligibility after a replacement aborted")
+    assert rows() == created
+
+    # The logical CREATE witness survives rollback of a replacement, even
+    # when the creating subtransaction already truncated its new relation.
+    created_parent_tags = []
+    for truncate in (False, True):
+        with db.transaction(force_rollback=True):
+            db.execute("DROP TABLE usage_records")
+            db.execute(create)
+            if truncate:
+                db.execute("TRUNCATE usage_records")
+            with db.transaction(force_rollback=True):
+                db.execute("TRUNCATE usage_records")
+                assert copy() == "COPY 2"
+            assert not rows()
+            created_parent_tags.append(copy())
+            assert rows() == created
+        assert rows() == created
+    assert created_parent_tags == ["COPY 2", "COPY 2"]
+
+    # Take the old snapshot without locking the target ahead of TRUNCATE.
+    # Once the writer commits, frozen tuples bypass that snapshot's xmin cut.
+    visibility = {}
+    normal_copy = original["sql"].replace("FREEZE true,", "")
+    assert normal_copy != original["sql"]
+    with psycopg.connect(db.info.dsn, autocommit=True) as reader:
+        for label, statement in (("frozen", original["sql"]), ("ordinary", normal_copy)):
+            with reader.transaction():
+                reader.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                reader.execute("SELECT pg_current_snapshot()").fetchone()
+                with db.transaction():
+                    db.execute("TRUNCATE usage_records")
+                    with db.cursor().copy(statement) as stream:
+                        stream.write(data)
+                visibility[label] = [
+                    list(row)
+                    for row in reader.execute(
+                        "SELECT id,status FROM usage_records ORDER BY id"
+                    )
+                ]
+            assert rows() == created
+    assert visibility == {"frozen": created, "ordinary": []}
+    # Releasing the creating savepoint transfers eligibility to its parent.
+    with db.transaction(force_rollback=True):
+        with db.transaction():
+            db.execute("TRUNCATE usage_records")
+        released_child_tag = copy()
+        assert released_child_tag == "COPY 2"
+    assert rows() == created
+
+    with psycopg.connect(db.info.dsn, autocommit=True) as reader:
+        with reader.transaction():
+            reader.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            reader.execute("SELECT pg_current_snapshot()").fetchone()
+            with db.transaction():
+                db.execute("TRUNCATE usage_records")
+                assert copy() == "COPY 2"
+                db.execute("UPDATE usage_records SET status='updated' WHERE id=1")
+                db.execute("DELETE FROM usage_records WHERE id=2")
+                db.execute("INSERT INTO usage_records VALUES (3, 'ordinary')")
+            mixed_older_rows = [
+                list(row)
+                for row in reader.execute(
+                    "SELECT id,status FROM usage_records ORDER BY id"
+                )
+            ]
+    mixed_current_rows = rows()
+    assert mixed_older_rows == created
+    assert mixed_current_rows == [[1, "updated"], [3, "ordinary"]]
+
+    # An old snapshot retains both frozen tuple births for a reused key.
+    # A current read still sees only the last row under the primary key.
+    with psycopg.connect(db.info.dsn, autocommit=True) as reader:
+        with reader.transaction():
+            reader.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            reader.execute("SELECT pg_current_snapshot()").fetchone()
+            with db.transaction():
+                db.execute("TRUNCATE usage_records")
+                assert copy("id,status\n7,first\n") == "COPY 1"
+                db.execute("DELETE FROM usage_records WHERE id=7")
+                assert copy("id,status\n7,second\n") == "COPY 1"
+            repeated_older_rows = [
+                list(row)
+                for row in reader.execute(
+                    "SELECT id,status FROM usage_records ORDER BY id,status"
+                )
+            ]
+    repeated_current_rows = rows()
+    assert repeated_older_rows == [[7, "first"], [7, "second"]]
+    assert repeated_current_rows == [[7, "second"]]
+
+    return {
+        "id": original["id"],
+        "sql": original["sql"],
+        "create": create,
+        "data": data,
+        "existing_sqlstate": existing,
+        "open_cursor_sqlstate": open_cursor,
+        "after_select_tags": after_select,
+        "child_after_truncate_sqlstate": child_after_truncate,
+        "child_after_create_sqlstate": child_after_create,
+        "create_tag": create_tag,
+        "truncate_tag": truncate_tag,
+        "created_rows": created,
+        "truncated_rows": truncated,
+        "rows_after_rollback": after_rollback,
+        "older_snapshot_rows": visibility,
+        "released_child_tag": released_child_tag,
+        "rolled_back_child_sqlstate": rolled_back_child_sqlstate,
+        "restored_parent_sqlstate": restored_parent_sqlstate,
+        "created_parent_tags_after_child_rollback": created_parent_tags,
+        "mixed_older_snapshot_rows": mixed_older_rows,
+        "mixed_current_rows": mixed_current_rows,
+        "repeated_older_snapshot_rows": repeated_older_rows,
+        "repeated_current_rows": repeated_current_rows,
+    }
+
+
 def reference():
     import psycopg
 
@@ -438,6 +656,7 @@ def reference():
         db.execute("RESET ROLE")
         if db.execute("SELECT * FROM copy_rls").fetchall():
             raise AssertionError("RLS COPY wrote rows")
+        freeze = freeze_reference(db, inventory["sql-0372"])
     return {
         "reference": "PostgreSQL exact COPY input",
         "create": CREATE,
@@ -454,6 +673,7 @@ def reference():
         },
         "identity": identity,
         "rls_sqlstate": "0A000",
+        "freeze": freeze,
     }
 
 

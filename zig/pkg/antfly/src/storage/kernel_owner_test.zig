@@ -724,6 +724,113 @@ test "opaque owner runtime source authority crosses compiled boundary and surviv
     }
 }
 
+test "opaque owner publication capture crosses compiled boundary and survives reopen" {
+    const alloc = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const capture = local.system_catalog_logical_replication_capture;
+    const ns: local.storage_db_doc_identity.Namespace = .{ .table_id = 71, .shard_id = 7101, .range_id = 7102 };
+    const schema_json = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"n\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(path);
+    const options: abi.OpenRequest = .{
+        .path = .fromSlice(path),
+        .table_name = .fromSlice("docs"),
+        .group_id = ns.shard_id,
+        .has_identity_namespace = 1,
+        .identity_table_id = ns.table_id,
+        .identity_shard_id = ns.shard_id,
+        .identity_range_id = ns.range_id,
+        .online_source_authority = @backingInt(local.storage_source_authority.Kind.native),
+        .schema_json = .fromSlice(schema_json),
+    };
+    const request: capture.ObservationRequest = .{
+        .scope = .{ .realm = .{ .group_id = 7, .incarnation = @splat('1'), .database_id = 1 }, .subject = .{ .publication = .{ .id = 8, .generation = 1 } }, .operation_id = @splat(2), .change_digest = @splat(3) },
+        .namespace = ns,
+        .physical_table_id = ns.table_id,
+        .logical_relation_id = 100,
+        .owner_group_id = ns.shard_id,
+        .catalog_revision = 7,
+        .schema_version = 1,
+        .schema_digest = try @import("../metadata/restore_staging.zig").runtimeSchemaDigestForTable(alloc, schema_json),
+        .previous = .{},
+        .next = .{ .table = .{ .count = 1, .digest = @splat(4) } },
+    };
+    const call = struct {
+        fn read(comptime T: type, a: std.mem.Allocator, owner: *client.Owner, input: local.storage_db_relational_transition_contract.Request) !std.json.Parsed(T) {
+            const body = try std.json.Stringify.valueAlloc(a, input, .{});
+            defer a.free(body);
+            var output: abi.OwnedBytes = .{};
+            defer abi.antfly_storage_owner_buffer_destroy(&output);
+            try error_identity.statusToError(abi.antfly_storage_owner_relational_transition_read(owner.handle, &.{ .table_name = .fromSlice("docs"), .request_json = .fromSlice(body) }, &output));
+            return std.json.parseFromSlice(T, a, output.slice(), .{ .allocate = .alloc_always });
+        }
+    };
+    const control = blk: {
+        var owner = try client.Owner.open(options);
+        defer owner.deinit();
+        const observed = try call.read(capture.OwnerObservation, alloc, &owner, .{ .publication_capture_native_observe = request });
+        defer observed.deinit();
+        try observed.value.require(request);
+        const control: capture.Control = .{ .binding = try observed.value.binding(), .action = .prepare };
+        const body = try std.json.Stringify.valueAlloc(alloc, control, .{});
+        defer alloc.free(body);
+        var result = try owner.nativePublicationCaptureControl("docs", body, .{});
+        defer result.deinit();
+        const prepared = try std.json.parseFromSlice(capture.NativeOutcome, alloc, result.bytes(), .{});
+        defer prepared.deinit();
+        try std.testing.expect(!prepared.value.duplicate and !prepared.value.replication_pending);
+        try prepared.value.receipt.?.require(control);
+        break :blk control;
+    };
+    var reopened = try client.Owner.open(options);
+    defer reopened.deinit();
+    const retained = try call.read(?capture.Receipt, alloc, &reopened, .{ .publication_capture_control = control });
+    defer retained.deinit();
+    try retained.value.?.require(control);
+
+    var activate = control;
+    activate.action = .activate;
+    const activation_body = try std.json.Stringify.valueAlloc(alloc, activate, .{});
+    defer alloc.free(activation_body);
+    var activation = try reopened.nativePublicationCaptureControl("docs", activation_body, .{});
+    defer activation.deinit();
+    const activated = try std.json.parseFromSlice(capture.NativeOutcome, alloc, activation.bytes(), .{});
+    defer activated.deinit();
+    try activated.value.receipt.?.require(activate);
+
+    const capacity = local.system_catalog_logical_replication_capacity;
+    const hashes = local.storage_db_logical_replication_request;
+    const publisher = local.system_catalog_logical_replication_publisher;
+    const intent: local.storage_db_types.TransactionIntentRequest = .{
+        .external_decision_owner = .{ .metadata_incarnation = @splat('1'), .operation_id = @splat(6), .admission_digest = @splat(7), .expires_at_unix_ns = 1000 },
+        .writes = &.{.{ .key = "row", .value = "{\"n\":42}" }},
+        .schema_version = 1,
+    };
+    const roster: publisher.PublishedRelation = .{
+        .relation = .{ .logical_relation_id = request.logical_relation_id, .physical_table_id = ns.table_id, .database_id = 1, .namespace_id = 2, .relation_oid = 100, .namespace = "public", .name = "docs", .schema_version = 1, .schema_digest = request.schema_digest, .replica_identity = .full, .columns = &.{.{ .attnum = 1, .name = "n", .type_oid = 20 }} },
+        .memberships = &.{.{ .publication = .{ .id = 8, .generation = 1, .digest = @splat(4) }, .parameters = .{} }},
+    };
+    const txn: [16]u8 = @splat(5);
+    const digest = try hashes.digests(alloc, .{ .namespace = ns, .owner_group_id = ns.shard_id, .topology_epoch = 1, .transaction_id = txn, .member = 0 }, intent);
+    const demand: capture.Demand = .{
+        .owner = intent.external_decision_owner.?,
+        .transaction_id = txn,
+        .member = 0,
+        .owner_group_id = ns.shard_id,
+        .topology_epoch = 1,
+        .roster = roster,
+        .reference = .{ .realm = request.scope.realm, .guard_digest = try control.binding.digest(alloc), .roster_digest = try capture.canonicalDigest(alloc, "antfly/logical-capture-roster/v1\x00", roster), .pregrant_body_digest = digest.body, .request_digest = digest.request },
+    };
+    const size_request = try capacity.Request.init(alloc, demand, intent);
+    defer alloc.free(size_request.frame);
+    const result = try call.read(capacity.Observation, alloc, &reopened, .{ .publication_capture_capacity = size_request });
+    defer result.deinit();
+    try result.value.require(alloc, demand);
+    try std.testing.expectEqualDeep(activated.value.receipt.?.position, result.value.position);
+}
+
 test "opaque owner online source controls and status survive compiled boundary restart" {
     const alloc = std.testing.allocator;
     const contract = @import("antfly_local_sources").api_local_query_contract;

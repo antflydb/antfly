@@ -190,7 +190,7 @@ test {
 
 const change_journal_mod = @import("derived/change_journal.zig");
 const replication_effects_mod = @import("replication_effects.zig");
-const native_index_control = @import("relational_index_owner_control.zig");
+const native_index_control = @import("relational/indexes/owner_control.zig");
 
 const replication_mutation_barrier_mod = @import("antfly_runtime_abi").mutation_barrier;
 
@@ -331,12 +331,12 @@ const row_policy_gate_mod = @import("row_policy_gate.zig");
 const row_policy_bundle_mod = @import("row_policy_bundle.zig");
 const row_policy_authority_mod = @import("../../usermgr/row_policy_authority.zig");
 const schema_registry_mod = @import("schema_registry.zig");
-const relational_index_plans = @import("relational_index_plan.zig");
-const relational_index_records = @import("relational_index_records.zig");
-const relational_index_catalog = @import("relational_index_catalog.zig");
-const relational_index_jobs = @import("relational_index_jobs.zig");
-const relational_constraint_jobs = @import("relational_constraint_jobs.zig");
-const relational_index_gc = @import("relational_index_gc.zig");
+const relational_index_plans = @import("relational/indexes/plan.zig");
+const relational_index_records = @import("relational/indexes/records.zig");
+const relational_index_catalog = @import("relational/indexes/catalog.zig");
+const relational_index_jobs = @import("relational/indexes/jobs.zig");
+const relational_constraint_jobs = @import("relational/integrity/constraint_jobs.zig");
+const relational_index_gc = @import("relational/indexes/gc.zig");
 const SchemaCacheAdmission = @import("schema_cache_admission.zig").Admission;
 const public_table_schema = @import("../../schema/mod.zig");
 const ttl_mod = @import("../ttl.zig");
@@ -365,10 +365,10 @@ const graph_query_mod = @import("../../graph/query.zig");
 const graph_pattern_mod = @import("../../graph/pattern.zig");
 const graph_node_identity = @import("../../graph/node_identity.zig");
 const mapper = @import("document_mapper.zig");
-const relational_store = @import("relational_store.zig");
+const relational_store = @import("relational/rows/store.zig");
 const lookup_key_scratch = @import("lookup_key_scratch.zig");
 const document_read_scratch = @import("document_read_scratch.zig");
-const relational_columns = @import("relational_columns.zig");
+const relational_columns = @import("relational/schema_change/columns.zig");
 const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 const planning_adapter_mod = @import("planning_adapter.zig");
 const planning_bindings_mod = @import("planning_bindings.zig");
@@ -630,7 +630,7 @@ pub const OpenOptions = struct {
     /// Immutable query cuts retain the full catalog while opening only these assets.
     query_indexes: ?[]const []const u8 = null,
     initial_owner_range: ?range_state_mod.InitialOwnerRange = null,
-    initial_child_bootstrap: ?@import("relational_initial_child_publication.zig").Bootstrap = null,
+    initial_child_bootstrap: ?@import("relational/integrity/initial_child_publication.zig").Bootstrap = null,
     /// Recover an existing physical catalog for committed control, never seed
     /// a namespace/schema from current metadata hints or create an empty root.
     /// Requires an exact namespace and already-bound source authority.
@@ -3179,7 +3179,7 @@ pub const DB = struct {
     rewrite_tail_cache: @import("../rewrite_tail_spool.zig").Cache = .{},
     restore_decoder_cache: @import("../restore_decoder_cache.zig").Cache = .{},
     native_index_build_cache: native_index_control.BuildCache = .{},
-    schema_audit_cache: @import("relational_schema_audit_cache.zig").Cache = .{},
+    schema_audit_cache: @import("relational/schema_change/schema_audit_cache.zig").Cache = .{},
     source_vector_storage: ?*lsm_backend_mod.NativeStorage = null,
     closed: bool = false,
     close_workers_drained: bool = false,
@@ -3606,7 +3606,7 @@ pub const DB = struct {
     pub fn collectCanceledNativeIndexGarbageStep(self: *DB, identity: NativeIndexOwnerIdentity) !NativeIndexCleanupMaintenanceOutcome {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         try self.enforcePortableRuntimeGate();
-        const jobs = @import("relational_index_owner_job.zig");
+        const jobs = @import("relational/indexes/owner_job.zig");
         const binding = (try self.nativeIndexOwnerState(identity)) orelse return error.PrivateIndexJobRequired;
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
@@ -3626,7 +3626,7 @@ pub const DB = struct {
         if (page) |*value| {
             var manager = try self.core.initTxnManager();
             defer manager.deinit();
-            try manager.checkOrdinaryWriteConflict(&@import("relational_index_maintenance_contract.zig").controlKey(binding.index));
+            try manager.checkOrdinaryWriteConflict(&@import("relational/indexes/maintenance_contract.zig").controlKey(binding.index));
             var txn = try self.core.store.beginWriteTxn();
             errdefer txn.abort();
             _ = try jobs.requireCancellationCleanup(&txn, binding);
@@ -3653,7 +3653,7 @@ pub const DB = struct {
     pub fn collectCanceledNativeIndexClaimsStep(self: *DB, identity: NativeIndexOwnerIdentity) !NativeIndexClaimCleanupMaintenanceOutcome {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         try self.enforcePortableRuntimeGate();
-        const claims = @import("relational_index_private_claims.zig");
+        const claims = @import("relational/indexes/private_claims.zig");
         const binding = (try self.nativeIndexOwnerState(identity)) orelse return error.PrivateIndexJobRequired;
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
@@ -3672,7 +3672,7 @@ pub const DB = struct {
         if (page) |*value| {
             var manager = try self.core.initTxnManager();
             defer manager.deinit();
-            try manager.checkOrdinaryWriteConflict(&@import("relational_index_maintenance_contract.zig").controlKey(binding.index));
+            try manager.checkOrdinaryWriteConflict(&@import("relational/indexes/maintenance_contract.zig").controlKey(binding.index));
             var txn = try self.core.store.beginWriteTxn();
             errdefer txn.abort();
             try value.stage(&txn);
@@ -3712,7 +3712,7 @@ pub const DB = struct {
         if (index.generation != generation) return error.PreparedGenerationChanged;
         var maintenance_manager = try self.core.initTxnManager();
         defer maintenance_manager.deinit();
-        try maintenance_manager.checkOrdinaryWriteConflict(&@import("relational_index_maintenance_contract.zig").controlKey(index.id()));
+        try maintenance_manager.checkOrdinaryWriteConflict(&@import("relational/indexes/maintenance_contract.zig").controlKey(index.id()));
         var txn = try self.core.store.beginWriteTxn();
         errdefer txn.abort();
         const current_progress = try relational_index_jobs.status(&txn, index);
@@ -3731,24 +3731,24 @@ pub const DB = struct {
         return true;
     }
 
-    pub fn requireRewriteSourceManifest(self: *DB, alloc: Allocator, program: *const @import("relational_rewrite_program.zig").ProgramSet, cancellation: types.CancellationToken) !void {
+    pub fn requireRewriteSourceManifest(self: *DB, alloc: Allocator, program: *const @import("relational/schema_change/rewrite_program.zig").ProgramSet, cancellation: types.CancellationToken) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("requireRewriteSourceManifest", .{ self, alloc, program, cancellation });
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
         var read = try self.core.store.beginReadTxn();
         defer read.abort();
-        const manifest = try @import("relational_rewrite_manifest.zig").read(scratch.allocator(), &read, cancellation);
+        const manifest = try @import("relational/schema_change/rewrite_manifest.zig").read(scratch.allocator(), &read, cancellation);
         try program.requireSourceManifest(alloc, manifest, try read.get("\x00\x00__metadata__:schema_json"));
     }
 
-    pub fn verifyColdInitialChildSeed(self: *DB, expected: @import("relational_initial_child_publication.zig").Bootstrap) !void {
+    pub fn verifyColdInitialChildSeed(self: *DB, expected: @import("relational/integrity/initial_child_publication.zig").Bootstrap) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("verifyColdInitialChildSeed", .{ self, expected });
         var read = try self.core.store.beginReadTxn();
         defer read.abort();
-        if (try @import("relational_initial_child_publication.zig").load(&read)) |record| {
+        if (try @import("relational/integrity/initial_child_publication.zig").load(&read)) |record| {
             if (!expected.matches(record) or record.row_count != 0) return error.SeedReplicaIdentityMismatch;
         } else {
-            const hidden_catalog = read.get(@import("relational_integrity_catalog.zig").key) catch null;
+            const hidden_catalog = read.get(@import("relational/integrity/catalog.zig").key) catch null;
             const schema_json = read.get("\x00\x00__metadata__:schema_json") catch null;
             if (hidden_catalog != null or schema_json != null) return error.SeedReplicaIdentityMismatch;
         }
@@ -3836,6 +3836,7 @@ pub const DB = struct {
         defer if (view) |*schema| schema.release();
         var read = try self.core.store.beginReadTxn();
         errdefer read.abort();
+        try self.requireNativeRestoreServing(&read);
         try transactions_mod.checkExternalReadAdmission(&read);
         if (self.local_execution.row_policy_gate.currentPhase() != initial_phase or
             self.local_execution.row_policy_gate.generation.load(.acquire) != policy_generation or
@@ -4414,8 +4415,8 @@ pub const DB = struct {
                 const policy_schema_pinned = core_owner.table_catalog.row_policy_phase != .disabled and
                     !try schema_mod.schemasEqual(alloc, core_owner.schema orelse return error.RowPolicyCatalogChanged, opts.schema_before_index_load.?.runtime_schema);
                 break :protected policy_schema_pinned or
-                    try @import("relational_index_owner_job.zig").protectsOwnerCatalog(&read, core_owner.identity_namespace) or
-                    try @import("relational_nullability_job.zig").protectedOwnerCatalog(alloc, &read, core_owner.identity_namespace) != null;
+                    try @import("relational/indexes/owner_job.zig").protectsOwnerCatalog(&read, core_owner.identity_namespace) or
+                    try @import("relational/schema_change/nullability_job.zig").protectedOwnerCatalog(alloc, &read, core_owner.identity_namespace) != null;
             } else false;
             // Reject a stale catalog-authoritative descriptor as soon as the
             // durable schema is known, before binding source authority or
@@ -4658,7 +4659,7 @@ pub const DB = struct {
             {
                 var hidden_read = try db.core.store.beginReadTxn();
                 defer hidden_read.abort();
-                if (try @import("relational_initial_child_publication.zig").load(&hidden_read)) |hidden| {
+                if (try @import("relational/integrity/initial_child_publication.zig").load(&hidden_read)) |hidden| {
                     if (opts.initial_child_bootstrap) |bootstrap| if (!bootstrap.matches(hidden)) return error.InitialChildPublicationChanged;
                     db.local_execution.initial_child_hidden.store(hidden.phase != .released, .release);
                 }
@@ -8301,7 +8302,7 @@ pub const DB = struct {
     /// record. Autocommit (`sql.zig`'s `mutate`) passes `null`: its own
     /// ambiguous-outcome contract is the plain receipt-text scheme
     /// (`outcome_receipts.zig`), not a `transaction_id`.
-    pub fn batchLocalCoordinated(self: *DB, req: types.BatchRequest, primary_committed: *bool, marker: ?apply_receipts.OutcomeMarker, child_exists: ?@import("relational_integrity.zig").ChildExistenceCheck) anyerror!void {
+    pub fn batchLocalCoordinated(self: *DB, req: types.BatchRequest, primary_committed: *bool, marker: ?apply_receipts.OutcomeMarker, child_exists: ?@import("relational/integrity/integrity.zig").ChildExistenceCheck) anyerror!void {
         primary_committed.* = false;
         var marker_key: [apply_receipts.outcome_marker_key_len]u8 = undefined;
         var marker_value: [apply_receipts.outcome_marker_value_len]u8 = undefined;
@@ -8457,6 +8458,16 @@ pub const DB = struct {
     /// share a store transaction; server replay policy is supplied by the caller.
     pub fn applyOrderedCommittedMutation(self: *DB, request: types.BatchRequest, identity: OrderedApplyReceipt, bypass_write_gate: bool) anyerror!void {
         if (comptime storage_engine.enabled) return storage_engine.call("applyOrderedCommittedMutation", .{ self, request, identity, bypass_write_gate });
+        if (request.logical_publication_gc) |collection| {
+            try Publisher.validateCollectionBatch(request);
+            _ = try self.applyPublicationCollection(collection, identity, .{});
+            return;
+        }
+        if (request.logical_publication_control) |control| {
+            try PublicationCapture.validateControlBatch(request);
+            _ = try self.applyPublicationCaptureControl(control, identity, .{});
+            return;
+        }
         // Transaction controls belong to the server transaction dispatcher.
         // Treating one as an empty row batch would persist a receipt without
         // executing its decision or acknowledgements.
@@ -8681,25 +8692,42 @@ pub const DB = struct {
             if (hasCoordinatedConstraints(view)) {
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
-                const topology = @import("relational_integrity_topology.zig");
+                const topology = @import("relational/integrity/topology.zig");
                 const fence = (try topology.current(&read)) orelse return error.CoordinatedConstraintTopologyUnsupported;
                 if (fence.role != .split_source or fence.transition_id != transition.transition_id or fence.attempt != transition.attempt_epoch or fence.peer_group_id != transition.destination_group_id) return error.IntegrityTopologyChanged;
                 try topology.requireDrained(&read, &transaction_manager, fence);
-                const raw_catalog = try read.get(@import("relational_integrity_catalog.zig").key);
-                var compiled = try @import("relational_integrity_catalog.zig").decode(self.alloc, raw_catalog);
+                const raw_catalog = try read.get(@import("relational/integrity/catalog.zig").key);
+                var compiled = try @import("relational/integrity/catalog.zig").decode(self.alloc, raw_catalog);
                 defer compiled.deinit();
-                try @import("relational_integrity_activation.zig").requireReady(&read, compiled);
-                integrity_coverage = try @import("relational_integrity_handoff.zig").coverageForRange(self.alloc, raw_catalog, self.core.identity_namespace, range);
+                try @import("relational/integrity/activation.zig").requireReady(&read, compiled);
+                integrity_coverage = try @import("relational/integrity/handoff.zig").coverageForRange(self.alloc, raw_catalog, self.core.identity_namespace, range);
                 receipt = try fence.encode();
-                try metadata_writes.appendSlice(self.alloc, &.{ .{ .key = @import("relational_integrity_activation.zig").key, .value = integrity_coverage.? }, .{ .key = topology.receipt_key, .value = &receipt } });
+                try metadata_writes.appendSlice(self.alloc, &.{ .{ .key = @import("relational/integrity/activation.zig").key, .value = integrity_coverage.? }, .{ .key = topology.receipt_key, .value = &receipt } });
             } else {
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
-                try @import("relational_integrity_topology.zig").requireUnfenced(&read);
+                try @import("relational/integrity/topology.zig").requireUnfenced(&read);
             }
         }
         try rebaseRangeCoverageMetadata(self.alloc, self.core.store, self.core.index_manager, range, metadata_writes.items);
         self.core.adoptRangeInMemoryOwned(start, end);
+    }
+
+    pub fn transferableFrozenBase(self: *DB) !?@import("relational/rows/frozen_contract.zig").Binding {
+        var read = try self.core.store.beginProbeTxn();
+        defer read.abort();
+        return transferableFrozenBaseTxn(self.alloc, &read);
+    }
+
+    fn transferableFrozenBaseTxn(a: Allocator, read: anytype) !?@import("relational/rows/frozen_contract.zig").Binding {
+        const staging = @import("restore_staging_contract.zig");
+        const raw = read.get(staging.key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        var progress = try staging.Progress.decode(a, raw);
+        defer progress.deinit();
+        return progress.value.scope.frozen_base;
     }
 
     /// Pin primary data and its ordered receipt under the local apply lock.
@@ -8711,14 +8739,16 @@ pub const DB = struct {
         var namespace: [24]u8 = undefined;
         doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
         var origin: ?native_backup.Origin = null;
-        var schema_header: ?@import("relational_schema_owner_contract.zig").Header = null;
+        var schema_header: ?@import("relational/schema_change/schema_owner_contract.zig").Header = null;
+        var frozen_base: ?@import("relational/rows/frozen_contract.zig").Binding = null;
         {
             var read = try self.core.store.beginProbeTxn();
             defer read.abort();
             try @import("../source_pin_state.zig").requireNoPrepared(&read, namespace);
             try @import("online_source.zig").requireTransferableSnapshots(&read, namespace);
             if (self.root_incarnation != 0) origin = try native_backup.Origin.capture(&read, self.root_incarnation, try doc_identity.loadNamespaceTxn(&read));
-            schema_header = try @import("relational_nullability_job.zig").load(&read);
+            schema_header = try @import("relational/schema_change/nullability_job.zig").load(&read);
+            frozen_base = try transferableFrozenBaseTxn(self.alloc, &read);
         }
         const marker = if (origin) |value| value.applied else try readOrderedApplyReceipt(self.alloc, self.core.store);
         var primary = try self.core.pinNativeSnapshot();
@@ -8727,7 +8757,7 @@ pub const DB = struct {
             .logical => return error.UnsupportedSnapshotFormat,
             .lsm => |checkpoint| if (!checkpoint.storage.supportsHostPathGenerationPublication()) return error.UnsupportedSnapshotFormat,
         }
-        return .{ .alloc = self.alloc, .io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable, .namespace = namespace, .receipt = marker, .primary = primary, .origin = origin, .schema_header = schema_header };
+        return .{ .alloc = self.alloc, .io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable, .namespace = namespace, .receipt = marker, .primary = primary, .origin = origin, .schema_header = schema_header, .frozen_base = frozen_base };
     }
 
     pub const TransferablePrimarySnapshot = struct {
@@ -8737,7 +8767,8 @@ pub const DB = struct {
         receipt: ?OrderedApplyReceipt,
         primary: db_core.PinnedStoreSnapshot,
         origin: ?native_backup.Origin = null,
-        schema_header: ?@import("relational_schema_owner_contract.zig").Header = null,
+        schema_header: ?@import("relational/schema_change/schema_owner_contract.zig").Header = null,
+        frozen_base: ?@import("relational/rows/frozen_contract.zig").Binding = null,
     };
 
     pub fn verifyTransferablePrimarySnapshot(self: *DB, namespace: [24]u8, receipt: ?OrderedApplyReceipt) !void {
@@ -8766,8 +8797,8 @@ pub const DB = struct {
             (if (marker) |value| value.term else 0) != (if (receipt) |value| value.term else 0)) return error.InvalidSnapshot;
         try @import("../source_pin_state.zig").requireNoPrepared(&read, namespace);
         try @import("online_source.zig").requireTransferableSnapshots(&read, namespace);
-        _ = try @import("relational_schema_apply_outcome.zig").validateSnapshot(&read, stored_namespace, types.CancellationToken.none);
-        try @import("relational_nullability_job.zig").validateSnapshot(self.alloc, &read, stored_namespace, .{ .io = self.backend_runtime.filesystemIo() orelse std.Options.debug_io, .directory = self.core.path, .resource_manager = self.core.index_manager.resource_manager });
+        _ = try @import("relational/schema_change/schema_apply_outcome.zig").validateSnapshot(&read, stored_namespace, types.CancellationToken.none);
+        try @import("relational/schema_change/nullability_job.zig").validateSnapshot(self.alloc, &read, stored_namespace, .{ .io = self.backend_runtime.filesystemIo() orelse std.Options.debug_io, .directory = self.core.path, .resource_manager = self.core.index_manager.resource_manager });
     }
 
     pub fn orderedApplyReceipt(self: *DB) !?OrderedApplyReceipt {
@@ -9061,7 +9092,7 @@ pub const DB = struct {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
             try self.requireOnlineArtifactCatalogMutableLocked(&read);
-            try @import("relational_integrity_topology.zig").requireUnfenced(&read);
+            try @import("relational/integrity/topology.zig").requireUnfenced(&read);
         }
         diagnostic_stage = "gate_preparation";
         // Multiple owner supervisors can commit the same phase at different
@@ -9386,7 +9417,7 @@ pub const DB = struct {
         defer if (prepared_recovery) |*prepared| prepared.deinit();
         const versioned_key = try public_table_schema.versionedSchemaKeyAlloc(self.alloc, table_schema.version);
         defer self.alloc.free(versioned_key);
-        const admission = @import("relational_integrity_generation_admission.zig");
+        const admission = @import("relational/integrity/generation_admission.zig");
         const receipt_digest = try admission.sourceInstallDigest(published.fence, published.before_schema_json_digest, published.schema_json_digest, published.before_catalog_digest, published.after_catalog_digest);
         const receipt_bytes = (admission.AppliedReceipt{ .digest = receipt_digest, .term = published.applied_term, .index = published.applied_index }).encode();
         var lsn_buf: [replication_applied_lsn_value_len]u8 = undefined;
@@ -9411,7 +9442,7 @@ pub const DB = struct {
         var before_schema_digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(current_schema, &before_schema_digest, .{});
         if (!std.mem.eql(u8, &before_schema_digest, &published.before_schema_json_digest)) return error.IntegrityCatalogChanged;
-        const current_catalog = (try self.core.getStoreValue(self.alloc, @import("relational_integrity_catalog.zig").key)) orelse return error.IntegrityCatalogChanged;
+        const current_catalog = (try self.core.getStoreValue(self.alloc, @import("relational/integrity/catalog.zig").key)) orelse return error.IntegrityCatalogChanged;
         defer self.alloc.free(current_catalog);
         var before_digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(current_catalog, &before_digest, .{});
@@ -9464,7 +9495,7 @@ pub const DB = struct {
                     var prepared = blk: {
                         var read = try self.core.store.beginReadTxn();
                         defer read.abort();
-                        const page = @import("relational_index_private_claims.zig").InventoryValidation.Prepared.replay(self.alloc, &read, command) catch |err| {
+                        const page = @import("relational/indexes/private_claims.zig").InventoryValidation.Prepared.replay(self.alloc, &read, command) catch |err| {
                             if (try self.replicationMutationAlreadyApplied(sequence)) return;
                             return err;
                         };
@@ -9569,7 +9600,7 @@ pub const DB = struct {
         try self.batchInternal(request, null, options);
     }
 
-    pub const RaftIndexOwnerControl = @import("relational_index_raft_control.zig");
+    pub const RaftIndexOwnerControl = @import("relational/indexes/raft_control.zig");
 
     /// Advisory local compilation, not admission. The actual owner scope is
     /// independent of metadata input; no transport copy/base64 or write txn.
@@ -9582,7 +9613,7 @@ pub const DB = struct {
         var prepared = try RaftIndexOwnerControl.PreparedAdmission.init(self.alloc, view, &txn, header, manifest);
         defer prepared.deinit();
         const result: RaftIndexOwnerControl.AdmissionPreparation = .{ .format_version = 1, .binding = prepared.binding };
-        try result.validate(header, @import("relational_index_inputs.zig").digest(manifest));
+        try result.validate(header, @import("relational/indexes/inputs.zig").digest(manifest));
         return result;
     }
 
@@ -9609,52 +9640,52 @@ pub const DB = struct {
         return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
     }
 
-    pub fn applyCommittedRaftIndexBuild(self: *DB, prepared: *@import("relational_index_owner_control.zig").PreparedBuild, owner_group: u64, entry: OrderedApplyReceipt) !void {
+    pub fn applyCommittedRaftIndexBuild(self: *DB, prepared: *@import("relational/indexes/owner_control.zig").PreparedBuild, owner_group: u64, entry: OrderedApplyReceipt) !void {
         if (prepared.command.binding.authority != .raft) return error.InvalidControlReceiptPosition;
         return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
     }
 
-    pub fn applyCommittedRaftIndexConsumption(self: *DB, prepared: *@import("relational_index_owner_control.zig").PreparedConsumption, owner_group: u64, entry: OrderedApplyReceipt) !void {
+    pub fn applyCommittedRaftIndexConsumption(self: *DB, prepared: *@import("relational/indexes/owner_control.zig").PreparedConsumption, owner_group: u64, entry: OrderedApplyReceipt) !void {
         if (prepared.command.binding.authority != .raft) return error.InvalidControlReceiptPosition;
         return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
     }
 
-    pub fn applyCommittedRaftIndexClaims(self: *DB, prepared: *@import("relational_index_owner_control.zig").PreparedClaims, owner_group: u64, entry: OrderedApplyReceipt) !void {
+    pub fn applyCommittedRaftIndexClaims(self: *DB, prepared: *@import("relational/indexes/owner_control.zig").PreparedClaims, owner_group: u64, entry: OrderedApplyReceipt) !void {
         if (prepared.command.binding.authority != .raft) return error.InvalidControlReceiptPosition;
         return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
     }
 
-    pub fn applyCommittedRaftIndexInventory(self: *DB, prepared: *@import("relational_index_owner_control.zig").PreparedInventoryValidation, owner_group: u64, entry: OrderedApplyReceipt) !void {
+    pub fn applyCommittedRaftIndexInventory(self: *DB, prepared: *@import("relational/indexes/owner_control.zig").PreparedInventoryValidation, owner_group: u64, entry: OrderedApplyReceipt) !void {
         if (prepared.batch.command.binding.authority != .raft) return error.InvalidControlReceiptPosition;
         return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
     }
 
-    pub fn applyCommittedRaftIndexGeneration(self: *DB, prepared: *@import("relational_index_owner_control.zig").PreparedGenerationValidation, owner_group: u64, entry: OrderedApplyReceipt) !void {
+    pub fn applyCommittedRaftIndexGeneration(self: *DB, prepared: *@import("relational/indexes/owner_control.zig").PreparedGenerationValidation, owner_group: u64, entry: OrderedApplyReceipt) !void {
         if (prepared.page.command.binding.authority != .raft) return error.InvalidControlReceiptPosition;
         return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
     }
 
-    pub fn applyCommittedRaftIndexValidation(self: *DB, prepared: *@import("relational_index_owner_control.zig").PreparedValidationSeal, owner_group: u64, entry: OrderedApplyReceipt) !void {
+    pub fn applyCommittedRaftIndexValidation(self: *DB, prepared: *@import("relational/indexes/owner_control.zig").PreparedValidationSeal, owner_group: u64, entry: OrderedApplyReceipt) !void {
         if (prepared.command.binding.authority != .raft) return error.InvalidControlReceiptPosition;
         return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
     }
 
-    pub fn applyCommittedRaftIndexInstallation(self: *DB, prepared: *@import("relational_index_owner_control.zig").PreparedInstall, owner_group: u64, entry: OrderedApplyReceipt) !void {
+    pub fn applyCommittedRaftIndexInstallation(self: *DB, prepared: *@import("relational/indexes/owner_control.zig").PreparedInstall, owner_group: u64, entry: OrderedApplyReceipt) !void {
         if (prepared.command.validation.command.binding.authority != .raft) return error.InvalidControlReceiptPosition;
         return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
     }
 
-    pub fn applyCommittedRaftIndexRelease(self: *DB, prepared: *@import("relational_index_owner_control.zig").PreparedRelease, owner_group: u64, entry: OrderedApplyReceipt) !void {
+    pub fn applyCommittedRaftIndexRelease(self: *DB, prepared: *@import("relational/indexes/owner_control.zig").PreparedRelease, owner_group: u64, entry: OrderedApplyReceipt) !void {
         if (prepared.intent.installed.position != .raft) return error.InvalidControlReceiptPosition;
         return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
     }
 
-    pub fn applyCommittedRaftIndexReleaseGc(self: *DB, prepared: *@import("relational_index_owner_control.zig").PreparedReleaseGc, owner_group: u64, entry: OrderedApplyReceipt) !void {
+    pub fn applyCommittedRaftIndexReleaseGc(self: *DB, prepared: *@import("relational/indexes/owner_control.zig").PreparedReleaseGc, owner_group: u64, entry: OrderedApplyReceipt) !void {
         if (prepared.command.record.position != .raft) return error.InvalidControlReceiptPosition;
         return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
     }
 
-    pub fn applyCommittedRaftIndexCancellation(self: *DB, prepared: *@import("relational_index_owner_control.zig").PreparedCancellation, owner_group: u64, entry: OrderedApplyReceipt) !void {
+    pub fn applyCommittedRaftIndexCancellation(self: *DB, prepared: *@import("relational/indexes/owner_control.zig").PreparedCancellation, owner_group: u64, entry: OrderedApplyReceipt) !void {
         return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
     }
 
@@ -9662,21 +9693,21 @@ pub const DB = struct {
         return self.applyCommittedRaftIndexEffectMode(prepared, owner_group, entry, true);
     }
 
-    pub fn applyCommittedRaftIndexCancellationCleanup(self: *DB, prepared: *@import("relational_index_owner_control.zig").PreparedCleanup, owner_group: u64, entry: OrderedApplyReceipt) !void {
+    pub fn applyCommittedRaftIndexCancellationCleanup(self: *DB, prepared: *@import("relational/indexes/owner_control.zig").PreparedCleanup, owner_group: u64, entry: OrderedApplyReceipt) !void {
         if (prepared.binding.authority != .raft) return error.InvalidControlReceiptPosition;
         return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
     }
 
-    pub fn applyCommittedRaftIndexCancellationGc(self: *DB, prepared: *@import("relational_index_owner_control.zig").PreparedCancellationGc, owner_group: u64, entry: OrderedApplyReceipt) !void {
+    pub fn applyCommittedRaftIndexCancellationGc(self: *DB, prepared: *@import("relational/indexes/owner_control.zig").PreparedCancellationGc, owner_group: u64, entry: OrderedApplyReceipt) !void {
         return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
     }
 
-    pub fn applyCommittedRaftIndexCancellationCompletion(self: *DB, prepared: *@import("relational_index_owner_control.zig").PreparedCancellationCompletion, owner_group: u64, entry: OrderedApplyReceipt) !void {
+    pub fn applyCommittedRaftIndexCancellationCompletion(self: *DB, prepared: *@import("relational/indexes/owner_control.zig").PreparedCancellationCompletion, owner_group: u64, entry: OrderedApplyReceipt) !void {
         if (prepared.binding.authority != .raft) return error.InvalidControlReceiptPosition;
         return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
     }
 
-    pub fn applyCommittedRaftIndexCancellationRelease(self: *DB, prepared: *@import("relational_index_owner_control.zig").PreparedCancellationRelease, owner_group: u64, entry: OrderedApplyReceipt) !void {
+    pub fn applyCommittedRaftIndexCancellationRelease(self: *DB, prepared: *@import("relational/indexes/owner_control.zig").PreparedCancellationRelease, owner_group: u64, entry: OrderedApplyReceipt) !void {
         if (prepared.intent.canceled.position != .raft) return error.InvalidControlReceiptPosition;
         return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
     }
@@ -9714,7 +9745,7 @@ pub const DB = struct {
                 }
                 const SchemaParticipant = struct {
                     entry: OrderedApplyReceipt,
-                    pub fn stage(participant: @This(), txn: anytype, installed: @import("relational_index_validation.zig").Installed) !void {
+                    pub fn stage(participant: @This(), txn: anytype, installed: @import("relational/indexes/validation.zig").Installed) !void {
                         if (installed.position != .raft or installed.position.raft.term != participant.entry.term or installed.position.raft.index != participant.entry.index) return error.InvalidControlReceiptPosition;
                         if (try orderedApplyDisposition(try apply_receipts.readOrderedApplyReceiptTxn(txn), participant.entry) != .apply) return error.InvalidControlReceiptPosition;
                         var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
@@ -9748,7 +9779,7 @@ pub const DB = struct {
     /// The trusted owner handle supplies its actual group separately from the
     /// independently obtained metadata identity. No physical index allocation
     /// or mutation.
-    pub fn raftIndexOwnerState(self: *DB, owner_group: u64, expected: RaftIndexOwnerControl.Identity) !?@import("relational_index_owner_job.zig").Binding {
+    pub fn raftIndexOwnerState(self: *DB, owner_group: u64, expected: RaftIndexOwnerControl.Identity) !?@import("relational/indexes/owner_job.zig").Binding {
         try self.requireRaftIndexOwnerIdentity(owner_group, expected);
         var txn = try self.core.store.beginReadTxn();
         defer txn.abort();
@@ -9778,7 +9809,7 @@ pub const DB = struct {
         return prepared;
     }
 
-    pub fn raftIndexOwnerBuildProgress(self: *DB, owner_group: u64, table_name: []const u8, request: native_index_control.BuildRequest, context: @import("../../api/operation.zig").RequestContext) !@import("relational_index_raft_contract.zig").BuildProgress {
+    pub fn raftIndexOwnerBuildProgress(self: *DB, owner_group: u64, table_name: []const u8, request: native_index_control.BuildRequest, context: @import("../../api/operation.zig").RequestContext) !@import("relational/indexes/raft_contract.zig").BuildProgress {
         try context.ensureActive();
         try request.validate();
         if (request.target_expectation != null) return error.InvalidGenerationPublication;
@@ -9796,9 +9827,9 @@ pub const DB = struct {
 
     pub const RaftIndexValidationPreparation = struct {
         work: union(enum) {
-            inventory: @import("relational_index_private_claims.zig").InventoryValidation.Command,
+            inventory: @import("relational/indexes/private_claims.zig").InventoryValidation.Command,
             generation: native_index_control.PreparedGenerationValidation,
-            progress: @import("relational_index_raft_contract.zig").ValidationProgress,
+            progress: @import("relational/indexes/raft_contract.zig").ValidationProgress,
         },
         cache_lease: ?native_index_control.BuildCache.Lease = null,
         pub fn deinit(self: *@This()) void {
@@ -9806,7 +9837,7 @@ pub const DB = struct {
             if (self.cache_lease) |*lease| lease.deinit();
             self.* = undefined;
         }
-        pub fn view(self: *const @This()) @import("relational_index_raft_contract.zig").BuildPreparation {
+        pub fn view(self: *const @This()) @import("relational/indexes/raft_contract.zig").BuildPreparation {
             return switch (self.work) {
                 .inventory => |command| .{ .inventory_page = command },
                 .generation => |value| .{ .generation_page = value.page.command },
@@ -9819,13 +9850,13 @@ pub const DB = struct {
         try context.ensureActive();
         try request.validate();
         const expected = request.target_expectation orelse return error.PrivateIndexTargetValidationRequired;
-        if (!std.mem.eql(u8, &@import("relational_integrity_contract.zig").hash(table_name), &expected.table_name_digest)) return error.PrivateIndexOwnerJobChanged;
+        if (!std.mem.eql(u8, &@import("relational/integrity/contract.zig").hash(table_name), &expected.table_name_digest)) return error.PrivateIndexOwnerJobChanged;
         const binding = (try self.raftIndexOwnerState(owner_group, request.identity)) orelse return error.PrivateIndexRootRecoveryRequired;
         try request.requireRaftBinding(binding);
         {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
-            if (try @import("relational_index_private_claims.zig").InventoryValidation.Prepared.prepare(alloc, &read, binding, expected, request.budget, context)) |page|
+            if (try @import("relational/indexes/private_claims.zig").InventoryValidation.Prepared.prepare(alloc, &read, binding, expected, request.budget, context)) |page|
                 return .{ .work = .{ .inventory = page.command } };
         }
         const progress = try self.raftIndexOwnerValidationProgress(alloc, owner_group, table_name, request, context);
@@ -9841,20 +9872,20 @@ pub const DB = struct {
         return .{ .work = .{ .progress = recovered } };
     }
 
-    pub fn raftIndexOwnerValidationProgress(self: *DB, alloc: Allocator, owner_group: u64, table_name: []const u8, request: native_index_control.BuildRequest, context: @import("../../api/operation.zig").RequestContext) !@import("relational_index_raft_contract.zig").ValidationProgress {
+    pub fn raftIndexOwnerValidationProgress(self: *DB, alloc: Allocator, owner_group: u64, table_name: []const u8, request: native_index_control.BuildRequest, context: @import("../../api/operation.zig").RequestContext) !@import("relational/indexes/raft_contract.zig").ValidationProgress {
         try context.ensureActive();
         try self.requireRaftIndexOwnerIdentity(owner_group, request.identity);
         try request.validate();
         const expected = request.target_expectation orelse return error.PrivateIndexTargetValidationRequired;
-        if (!std.mem.eql(u8, &@import("relational_integrity_contract.zig").hash(table_name), &expected.table_name_digest)) return error.PrivateIndexOwnerJobChanged;
+        if (!std.mem.eql(u8, &@import("relational/integrity/contract.zig").hash(table_name), &expected.table_name_digest)) return error.PrivateIndexOwnerJobChanged;
         var read = try self.core.store.beginReadTxn();
         defer read.abort();
         const binding = (try RaftIndexOwnerControl.inspect(&read, request.identity)) orelse return error.PrivateIndexRootRecoveryRequired;
         try request.requireRaftBinding(binding);
         try native_index_control.PreparedBuild.verifyRecovery(&read, binding);
-        var loaded = try @import("relational_index_validation.zig").load(alloc, &read, binding);
+        var loaded = try @import("relational/indexes/validation.zig").load(alloc, &read, binding);
         defer if (loaded) |*value| value.deinit();
-        const result: @import("relational_index_raft_contract.zig").ValidationProgress = .{ .binding = binding, .inventory = try @import("relational_index_private_claims.zig").InventoryValidation.load(alloc, &read, binding), .generation = if (loaded) |value| value.summary else null, .seal = try @import("relational_index_validation.zig").Seal.load(alloc, &read, binding) };
+        const result: @import("relational/indexes/raft_contract.zig").ValidationProgress = .{ .binding = binding, .inventory = try @import("relational/indexes/private_claims.zig").InventoryValidation.load(alloc, &read, binding), .generation = if (loaded) |value| value.summary else null, .seal = try @import("relational/indexes/validation.zig").Seal.load(alloc, &read, binding) };
         try result.validateFor(request);
         try context.ensureActive();
         return result;
@@ -9869,12 +9900,12 @@ pub const DB = struct {
 
     /// Recovery reads the original committed phase cut; it never uses the
     /// current leader term or invents a receipt from the latest watermark.
-    pub fn raftIndexOwnerReceipt(self: *DB, owner_group: u64, binding: @import("relational_index_owner_job.zig").Binding, effect: RaftIndexOwnerControl.Effect) !?@import("relational_index_publication_progress.zig").Receipt {
+    pub fn raftIndexOwnerReceipt(self: *DB, owner_group: u64, binding: @import("relational/indexes/owner_job.zig").Binding, effect: RaftIndexOwnerControl.Effect) !?@import("relational/indexes/publication_progress.zig").Receipt {
         if (owner_group == 0 or owner_group != binding.fence.owner_group_id) return error.PrivateIndexOwnerJobChanged;
         if (!binding.fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
         var txn = try self.core.store.beginReadTxn();
         defer txn.abort();
-        if (try @import("relational_index_owner_job.zig").load(&txn) == null) return null;
+        if (try @import("relational/indexes/owner_job.zig").load(&txn) == null) return null;
         return RaftIndexOwnerControl.receipt(&txn, binding, effect);
     }
 
@@ -9896,15 +9927,15 @@ pub const DB = struct {
         try enforceReplicationWriteGateOptional(self.local_execution.replication_write_gate);
     }
 
-    pub fn nativeIndexOwnerState(self: *DB, expected: NativeIndexOwnerIdentity) !?@import("relational_index_owner_job.zig").Binding {
+    pub fn nativeIndexOwnerState(self: *DB, expected: NativeIndexOwnerIdentity) !?@import("relational/indexes/owner_job.zig").Binding {
         try expected.validate();
         if (!expected.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
         var txn = try self.core.store.beginReadTxn();
         defer txn.abort();
-        return @import("relational_index_owner_job.zig").inspectNative(&txn, expected);
+        return @import("relational/indexes/owner_job.zig").inspectNative(&txn, expected);
     }
 
-    pub const NativeIndexOwnerCancellationState = @import("relational_index_owner_job.zig").CancellationState;
+    pub const NativeIndexOwnerCancellationState = @import("relational/indexes/owner_job.zig").CancellationState;
 
     /// One checkpoint-verified source batch in the same snapshot as the actual
     /// native job and mirror-debt check. Never compile a candidate or mint cuts.
@@ -9917,8 +9948,8 @@ pub const DB = struct {
         defer if (needs_recovery) self.scheduleDurableReplicationOutboxRecovery();
         var read = try self.core.store.beginReadTxn();
         defer read.abort();
-        const binding = (try @import("relational_index_owner_job.zig").inspectNative(&read, identity)) orelse return error.PrivateIndexRootRecoveryRequired;
-        try @import("relational_index_owner_job.zig").requireReserved(&read, binding);
+        const binding = (try @import("relational/indexes/owner_job.zig").inspectNative(&read, identity)) orelse return error.PrivateIndexRootRecoveryRequired;
+        try @import("relational/indexes/owner_job.zig").requireReserved(&read, binding);
         if (try durable_outbox_store.hasPendingTxn(&read)) {
             self.local_execution.durable_replication_outbox_maybe.store(true, .release);
             needs_recovery = true;
@@ -9926,7 +9957,7 @@ pub const DB = struct {
         }
         var result: native_index_control.SourceRead = .{ .binding = binding, .batch = try PreparedNativeIndexOwnerBuild.peekClaimSource(alloc, &read, binding) };
         errdefer result.deinit();
-        const Source = @import("relational_index_private_claims.zig").SourceStream;
+        const Source = @import("relational/indexes/private_claims.zig").SourceStream;
         if (try Source.load(&read, binding)) |head| result.consumed = try Source.loadConsumption(&read, binding, head);
         try context.ensureActive();
         return result;
@@ -9945,11 +9976,11 @@ pub const DB = struct {
         var read = try self.core.store.beginReadTxn();
         defer read.abort();
         const binding = (try RaftIndexOwnerControl.inspect(&read, identity)) orelse return error.PrivateIndexRootRecoveryRequired;
-        try @import("relational_index_owner_job.zig").requireReserved(&read, binding);
+        try @import("relational/indexes/owner_job.zig").requireReserved(&read, binding);
         if (consumed_only) try PreparedNativeIndexOwnerBuild.verifyRecovery(&read, binding);
         var result: native_index_control.SourceRead = .{ .binding = binding, .batch = if (consumed_only) null else try PreparedNativeIndexOwnerBuild.peekClaimSource(alloc, &read, binding) };
         errdefer result.deinit();
-        const Source = @import("relational_index_private_claims.zig").SourceStream;
+        const Source = @import("relational/indexes/private_claims.zig").SourceStream;
         if (try Source.load(&read, binding)) |head| result.consumed = try Source.loadConsumption(&read, binding, head);
         try result.requireRaftIdentity(identity);
         try context.ensureActive();
@@ -9977,11 +10008,11 @@ pub const DB = struct {
         return outcome;
     }
 
-    pub fn raftIndexOwnerCancellationState(self: *DB, owner_group: u64, expected: RaftIndexOwnerControl.Identity) !@import("relational_index_owner_job.zig").RaftCancellationState {
+    pub fn raftIndexOwnerCancellationState(self: *DB, owner_group: u64, expected: RaftIndexOwnerControl.Identity) !@import("relational/indexes/owner_job.zig").RaftCancellationState {
         try self.requireRaftIndexOwnerIdentity(owner_group, expected);
         var txn = try self.core.store.beginReadTxn();
         defer txn.abort();
-        return @import("relational_index_owner_job.zig").inspectRaftCancellation(&txn, expected);
+        return @import("relational/indexes/owner_job.zig").inspectRaftCancellation(&txn, expected);
     }
 
     pub fn nativeIndexOwnerCancellationState(self: *DB, expected: NativeIndexOwnerIdentity) !NativeIndexOwnerCancellationState {
@@ -9989,7 +10020,7 @@ pub const DB = struct {
         if (!expected.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
         var txn = try self.core.store.beginReadTxn();
         defer txn.abort();
-        return @import("relational_index_owner_job.zig").inspectCancellation(&txn, expected);
+        return @import("relational/indexes/owner_job.zig").inspectCancellation(&txn, expected);
     }
 
     /// Receipt recovery never recompiles a candidate or creates another source
@@ -10024,7 +10055,7 @@ pub const DB = struct {
         try self.enforceNativeOwnerReadAuthority();
         var txn = try self.core.store.beginReadTxn();
         defer txn.abort();
-        const jobs = @import("relational_index_owner_job.zig");
+        const jobs = @import("relational/indexes/owner_job.zig");
         const binding = (try jobs.inspectNative(&txn, request.identity)) orelse return null;
         const effect: jobs.NativeEffect = switch (request.effect) {
             .fenced => .fenced,
@@ -10120,23 +10151,23 @@ pub const DB = struct {
     /// progress. The receiving owner supplies its pinned signing authority;
     /// the physical incarnation comes from this live DB. Both lifecycle leases
     /// must remain held. This grants no publication or adoption authority.
-    pub fn stepNativeIndexOwnerAudit(self: *DB, table_name: []const u8, request: NativeIndexOwnerBuildRequest, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext) !@import("relational_index_audit_checkpoint.zig").Summary {
+    pub fn stepNativeIndexOwnerAudit(self: *DB, table_name: []const u8, request: NativeIndexOwnerBuildRequest, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext) !@import("relational/indexes/audit_checkpoint.zig").Summary {
         return self.stepIndexOwnerAudit(table_name, request, signing_root_dir, signing_root_incarnation, context, false);
     }
 
-    pub fn stepRaftIndexOwnerAudit(self: *DB, owner_group: u64, table_name: []const u8, request: NativeIndexOwnerBuildRequest, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext) !@import("relational_index_audit_checkpoint.zig").Summary {
+    pub fn stepRaftIndexOwnerAudit(self: *DB, owner_group: u64, table_name: []const u8, request: NativeIndexOwnerBuildRequest, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext) !@import("relational/indexes/audit_checkpoint.zig").Summary {
         try self.requireRaftIndexOwnerIdentity(owner_group, request.identity);
         return self.stepIndexOwnerAudit(table_name, request, signing_root_dir, signing_root_incarnation, context, true);
     }
 
-    fn stepIndexOwnerAudit(self: *DB, table_name: []const u8, request: NativeIndexOwnerBuildRequest, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext, comptime replicated: bool) !@import("relational_index_audit_checkpoint.zig").Summary {
+    fn stepIndexOwnerAudit(self: *DB, table_name: []const u8, request: NativeIndexOwnerBuildRequest, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext, comptime replicated: bool) !@import("relational/indexes/audit_checkpoint.zig").Summary {
         try context.ensureActive();
         try request.validate();
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         // Replica-local verification is not a replicated mutation and must
         // also work on followers. Adoption still needs independent authority.
         const expected = request.target_expectation orelse return error.PrivateIndexTargetValidationRequired;
-        if (!std.mem.eql(u8, &@import("relational_integrity_contract.zig").hash(table_name), &expected.table_name_digest)) return error.PrivateIndexOwnerJobChanged;
+        if (!std.mem.eql(u8, &@import("relational/integrity/contract.zig").hash(table_name), &expected.table_name_digest)) return error.PrivateIndexOwnerJobChanged;
         const binding = (if (replicated) try self.raftIndexOwnerState(request.identity.owner_group_id, request.identity) else try self.nativeIndexOwnerState(request.identity)) orelse return error.PrivateIndexRootRecoveryRequired;
         if (replicated) try request.requireRaftBinding(binding) else try request.requireBinding(binding);
         const io = self.backend_runtime.io() orelse return error.UnsupportedPlatform;
@@ -10153,23 +10184,23 @@ pub const DB = struct {
     /// owner still supplies independent metadata/root authorization. Each page
     /// opens a fresh snapshot and checks the real successor before using the
     /// cached immutable predecessor; no snapshot survives a request boundary.
-    pub fn stepNativeIndexOwnerInstallationAudit(self: *DB, table_name: []const u8, intent: @import("relational_index_validation.zig").InstallIntent, page_budget: @import("relational_index_jobs.zig").Budget, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext) !@import("relational_index_audit_checkpoint.zig").Summary {
+    pub fn stepNativeIndexOwnerInstallationAudit(self: *DB, table_name: []const u8, intent: @import("relational/indexes/validation.zig").InstallIntent, page_budget: @import("relational/indexes/jobs.zig").Budget, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext) !@import("relational/indexes/audit_checkpoint.zig").Summary {
         return self.stepIndexOwnerInstallationAudit(table_name, intent, page_budget, signing_root_dir, signing_root_incarnation, context, false);
     }
-    pub fn stepRaftIndexOwnerInstallationAudit(self: *DB, owner_group: u64, table_name: []const u8, intent: @import("relational_index_validation.zig").InstallIntent, page_budget: @import("relational_index_jobs.zig").Budget, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext) !@import("relational_index_audit_checkpoint.zig").Summary {
+    pub fn stepRaftIndexOwnerInstallationAudit(self: *DB, owner_group: u64, table_name: []const u8, intent: @import("relational/indexes/validation.zig").InstallIntent, page_budget: @import("relational/indexes/jobs.zig").Budget, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext) !@import("relational/indexes/audit_checkpoint.zig").Summary {
         const b = intent.validation.command.binding;
         try self.requireRaftIndexOwnerIdentity(owner_group, .{ .id = b.id, .plan_digest = b.plan_digest, .owner_digest = b.owner_digest, .ordinal = b.ordinal, .namespace = b.fence.namespace, .owner_group_id = b.fence.owner_group_id });
         return self.stepIndexOwnerInstallationAudit(table_name, intent, page_budget, signing_root_dir, signing_root_incarnation, context, true);
     }
-    fn stepIndexOwnerInstallationAudit(self: *DB, table_name: []const u8, intent: @import("relational_index_validation.zig").InstallIntent, page_budget: @import("relational_index_jobs.zig").Budget, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext, comptime replicated: bool) !@import("relational_index_audit_checkpoint.zig").Summary {
-        const jobs = @import("relational_index_owner_job.zig");
+    fn stepIndexOwnerInstallationAudit(self: *DB, table_name: []const u8, intent: @import("relational/indexes/validation.zig").InstallIntent, page_budget: @import("relational/indexes/jobs.zig").Budget, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext, comptime replicated: bool) !@import("relational/indexes/audit_checkpoint.zig").Summary {
+        const jobs = @import("relational/indexes/owner_job.zig");
         try context.ensureActive();
         try intent.validate();
         try page_budget.validate();
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         const binding = intent.validation.command.binding;
         const expected = intent.validation.command.expected;
-        if (!std.mem.eql(u8, &@import("relational_integrity_contract.zig").hash(table_name), &expected.table_name_digest) or
+        if (!std.mem.eql(u8, &@import("relational/integrity/contract.zig").hash(table_name), &expected.table_name_digest) or
             !binding.fence.namespace.eql(self.core.identity_namespace)) return error.PrivateIndexOwnerJobChanged;
         const identity: NativeIndexOwnerIdentity = .{ .id = binding.id, .plan_digest = binding.plan_digest, .owner_digest = binding.owner_digest, .ordinal = binding.ordinal, .namespace = binding.fence.namespace, .owner_group_id = binding.fence.owner_group_id };
         var request = if (replicated) try NativeIndexOwnerBuildRequest.initRaft(identity, binding, page_budget) else try NativeIndexOwnerBuildRequest.init(identity, binding, page_budget);
@@ -10199,10 +10230,10 @@ pub const DB = struct {
         };
     }
 
-    fn stepInstalledIndexAuditWithAllocator(self: *DB, task_alloc: Allocator, io: std.Io, request: NativeIndexOwnerBuildRequest, intent: @import("relational_index_validation.zig").InstallIntent, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext) !@import("relational_index_audit_checkpoint.zig").Summary {
-        const verification = @import("relational_index_validation.zig");
-        const claims = @import("relational_index_private_claims.zig");
-        const checkpoint = @import("relational_index_audit_checkpoint.zig");
+    fn stepInstalledIndexAuditWithAllocator(self: *DB, task_alloc: Allocator, io: std.Io, request: NativeIndexOwnerBuildRequest, intent: @import("relational/indexes/validation.zig").InstallIntent, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext) !@import("relational/indexes/audit_checkpoint.zig").Summary {
+        const verification = @import("relational/indexes/validation.zig");
+        const claims = @import("relational/indexes/private_claims.zig");
+        const checkpoint = @import("relational/indexes/audit_checkpoint.zig");
         const binding = intent.validation.command.binding;
         const expected = intent.validation.command.expected;
         const page_budget = request.budget;
@@ -10232,9 +10263,9 @@ pub const DB = struct {
         return guard.summary(state.?);
     }
 
-    fn stepNativeIndexOwnerAuditWithAllocator(self: *DB, alloc: Allocator, io: std.Io, request: NativeIndexOwnerBuildRequest, signing_root_dir: []const u8, signing_root_incarnation: u128, binding: @import("relational_index_owner_job.zig").Binding, expected: @import("relational_index_private_claims.zig").TargetExpectation, context: @import("../../api/operation.zig").RequestContext) !@import("relational_index_audit_checkpoint.zig").Summary {
-        const checkpoint = @import("relational_index_audit_checkpoint.zig");
-        const claims = @import("relational_index_private_claims.zig");
+    fn stepNativeIndexOwnerAuditWithAllocator(self: *DB, alloc: Allocator, io: std.Io, request: NativeIndexOwnerBuildRequest, signing_root_dir: []const u8, signing_root_incarnation: u128, binding: @import("relational/indexes/owner_job.zig").Binding, expected: @import("relational/indexes/private_claims.zig").TargetExpectation, context: @import("../../api/operation.zig").RequestContext) !@import("relational/indexes/audit_checkpoint.zig").Summary {
+        const checkpoint = @import("relational/indexes/audit_checkpoint.zig");
+        const claims = @import("relational/indexes/private_claims.zig");
         var guard = try checkpoint.open(alloc, io, signing_root_dir, signing_root_incarnation, self.root_incarnation, binding, expected, context);
         defer guard.deinit();
         var state = try guard.load();
@@ -10250,7 +10281,7 @@ pub const DB = struct {
             var lease = if (binding.authority == .raft) try self.native_index_build_cache.acquireRaft(io, self.alloc, self.core.index_manager.resource_manager, self.core, request, binding, context) else try self.native_index_build_cache.acquire(io, self.alloc, self.core.index_manager.resource_manager, self.core, request, binding, context);
             defer lease.deinit();
             const addition = if (binding.authority == .raft) &lease.raftReservation().artifacts.?.addition else &lease.reservation().artifacts.?.addition;
-            const next = try @import("relational_index_validation.zig").auditPage(alloc, self.core, binding, expected, addition, self.root_incarnation, state.?.inventory, if (state.?.generation) |*value| value else null, request.budget, context);
+            const next = try @import("relational/indexes/validation.zig").auditPage(alloc, self.core, binding, expected, addition, self.root_incarnation, state.?.inventory, if (state.?.generation) |*value| value else null, request.budget, context);
             if (state.?.generation) |*value| value.deinit();
             state.?.generation = next;
         }
@@ -10258,10 +10289,10 @@ pub const DB = struct {
         return guard.summary(state.?);
     }
 
-    fn stepNativeIndexInventoryValidation(self: *DB, table_name: []const u8, request: NativeIndexOwnerBuildRequest, binding: @import("relational_index_owner_job.zig").Binding, context: @import("../../api/operation.zig").RequestContext) !NativeIndexOwnerBuildResponse {
-        const claims = @import("relational_index_private_claims.zig");
+    fn stepNativeIndexInventoryValidation(self: *DB, table_name: []const u8, request: NativeIndexOwnerBuildRequest, binding: @import("relational/indexes/owner_job.zig").Binding, context: @import("../../api/operation.zig").RequestContext) !NativeIndexOwnerBuildResponse {
+        const claims = @import("relational/indexes/private_claims.zig");
         const expected = request.target_expectation.?;
-        if (!std.mem.eql(u8, &@import("relational_integrity_contract.zig").hash(table_name), &expected.table_name_digest)) return error.PrivateIndexOwnerJobChanged;
+        if (!std.mem.eql(u8, &@import("relational/integrity/contract.zig").hash(table_name), &expected.table_name_digest)) return error.PrivateIndexOwnerJobChanged;
         var budget = if (self.core.index_manager.resource_manager) |manager| resource_manager_mod.BudgetedAllocator.initReclaiming(manager, .relational_preparation_working_set, self.alloc, 1) else null;
         defer if (budget) |*value| value.deinit();
         const alloc = if (budget) |*value| value.allocator() else self.alloc;
@@ -10304,7 +10335,7 @@ pub const DB = struct {
         return .{ .inventory = outcome };
     }
 
-    fn stepNativeIndexGenerationValidation(self: *DB, request: NativeIndexOwnerBuildRequest, binding: @import("relational_index_owner_job.zig").Binding, context: @import("../../api/operation.zig").RequestContext) !NativeIndexOwnerBuildResponse {
+    fn stepNativeIndexGenerationValidation(self: *DB, request: NativeIndexOwnerBuildRequest, binding: @import("relational/indexes/owner_job.zig").Binding, context: @import("../../api/operation.zig").RequestContext) !NativeIndexOwnerBuildResponse {
         const io = self.backend_runtime.io() orelse return error.UnsupportedPlatform;
         var lease = try self.native_index_build_cache.acquire(io, self.alloc, self.core.index_manager.resource_manager, self.core, request, binding, context);
         defer lease.deinit();
@@ -10324,9 +10355,9 @@ pub const DB = struct {
             try self.enforceNativeOwnerReadAuthority();
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
-            var loaded = (try @import("relational_index_validation.zig").load(alloc, &read, binding)) orelse return error.InvalidRelationalIndexValidation;
+            var loaded = (try @import("relational/indexes/validation.zig").load(alloc, &read, binding)) orelse return error.InvalidRelationalIndexValidation;
             defer loaded.deinit();
-            const frozen = try @import("relational_index_private_claims.zig").InventoryValidation.requireReady(alloc, &read, binding, request.target_expectation.?);
+            const frozen = try @import("relational/indexes/private_claims.zig").InventoryValidation.requireReady(alloc, &read, binding, request.target_expectation.?);
             if (!std.mem.eql(u8, &loaded.summary.inventory_digest, &frozen.digest) or loaded.summary.source_members != frozen.source_members or loaded.summary.position != .native or loaded.summary.position.native.sequence <= frozen.position.sequence) return error.PrivateIndexOwnerJobChanged;
             var result: native_index_control.GenerationOutcome = .{ .binding = binding, .record = loaded.summary, .position = loaded.summary.position.native, .duplicate = true };
             if (try durable_outbox_store.hasPendingTxn(&read)) {
@@ -10356,7 +10387,7 @@ pub const DB = struct {
         return self.sealNativeIndexOwnerValidationImpl(request, try audit.logicalCommand(), context);
     }
 
-    fn sealNativeIndexOwnerValidationImpl(self: *DB, request: NativeIndexOwnerBuildRequest, audited: ?@import("relational_index_validation.zig").SealCommand, context: @import("../../api/operation.zig").RequestContext) !native_index_control.ValidationSealOutcome {
+    fn sealNativeIndexOwnerValidationImpl(self: *DB, request: NativeIndexOwnerBuildRequest, audited: ?@import("relational/indexes/validation.zig").SealCommand, context: @import("../../api/operation.zig").RequestContext) !native_index_control.ValidationSealOutcome {
         try context.ensureActive();
         try request.validate();
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
@@ -10370,7 +10401,7 @@ pub const DB = struct {
         var prepared: native_index_control.PreparedValidationSeal = .{ .alloc = alloc, .command = audited orelse command: {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
-            break :command @import("relational_index_validation.zig").SealCommand.prepare(alloc, &read, binding, expected) catch |err| {
+            break :command @import("relational/indexes/validation.zig").SealCommand.prepare(alloc, &read, binding, expected) catch |err| {
                 if (budget) |value| if (value.denied()) return error.ResourceBudgetExceeded;
                 return err;
             };
@@ -10414,7 +10445,7 @@ pub const DB = struct {
         defer view.release();
         var txn = try self.core.store.beginReadTxn();
         defer txn.abort();
-        const cancellation = @import("relational_index_cancellation_intent.zig");
+        const cancellation = @import("relational/indexes/cancellation_intent.zig");
         const intent = (try cancellation.load(&txn)) orelse return error.PrivateIndexCancellationRequired;
         if (!intent.intent.eql(header)) return error.PrivateIndexOwnerJobChanged;
         var prepared = try native_index_control.Prepared.admission(self.alloc, view, &txn, header, manifest);
@@ -10428,7 +10459,7 @@ pub const DB = struct {
         defer view.release();
         var txn = try self.core.store.beginReadTxn();
         defer txn.abort();
-        try @import("relational_index_cancellation_intent.zig").requireCanceled(&txn, command.binding);
+        try @import("relational/indexes/cancellation_intent.zig").requireCanceled(&txn, command.binding);
         var prepared = try native_index_control.Prepared.control(self.alloc, view, &txn, command);
         errdefer prepared.deinit();
         return native_index_control.PreparedCancellationControl.init(self.alloc, &txn, prepared);
@@ -10492,11 +10523,11 @@ pub const DB = struct {
     /// One commit/replication machinery for native index controls and intent.
     /// Storage adapter only. The receiving owner must independently authorize
     /// the metadata decision and physical root before preparing installation.
-    pub fn prepareNativeIndexOwnerInstallation(self: *DB, command: @import("relational_index_validation.zig").InstallCommand, context: @import("../../api/operation.zig").RequestContext) !native_index_control.PreparedInstall {
+    pub fn prepareNativeIndexOwnerInstallation(self: *DB, command: @import("relational/indexes/validation.zig").InstallCommand, context: @import("../../api/operation.zig").RequestContext) !native_index_control.PreparedInstall {
         return native_index_control.PreparedInstall.init(self.alloc, self.core, command, context);
     }
 
-    pub fn prepareNativeIndexOwnerInstallationIntent(self: *DB, intent: @import("relational_index_validation.zig").InstallIntent, context: @import("../../api/operation.zig").RequestContext) !native_index_control.PreparedInstall {
+    pub fn prepareNativeIndexOwnerInstallationIntent(self: *DB, intent: @import("relational/indexes/validation.zig").InstallIntent, context: @import("../../api/operation.zig").RequestContext) !native_index_control.PreparedInstall {
         return native_index_control.PreparedInstall.initIntent(self.alloc, self.core, intent, context);
     }
 
@@ -10506,7 +10537,7 @@ pub const DB = struct {
 
     /// Trusted owner adapter only: metadata must independently grant release
     /// after accepting installation on every owner and this exact live root.
-    pub fn prepareNativeIndexOwnerRelease(self: *DB, intent: @import("relational_index_release.zig").Intent, context: @import("../../api/operation.zig").RequestContext) !native_index_control.PreparedRelease {
+    pub fn prepareNativeIndexOwnerRelease(self: *DB, intent: @import("relational/indexes/release.zig").Intent, context: @import("../../api/operation.zig").RequestContext) !native_index_control.PreparedRelease {
         return native_index_control.PreparedRelease.init(self.alloc, self.core, intent, context);
     }
 
@@ -10531,7 +10562,7 @@ pub const DB = struct {
 
     /// Trusted owner adapter only. The receiving server must pin the accepted
     /// cleanup root and obtain fresh all-owner metadata release permission.
-    pub fn prepareNativeIndexOwnerCancellationRelease(self: *DB, intent: @import("relational_index_release.zig").CancellationIntent, context: @import("../../api/operation.zig").RequestContext) !native_index_control.PreparedCancellationRelease {
+    pub fn prepareNativeIndexOwnerCancellationRelease(self: *DB, intent: @import("relational/indexes/release.zig").CancellationIntent, context: @import("../../api/operation.zig").RequestContext) !native_index_control.PreparedCancellationRelease {
         return native_index_control.PreparedCancellationRelease.init(self.alloc, self.core, intent, context);
     }
 
@@ -10544,9 +10575,9 @@ pub const DB = struct {
     /// Canonical private-companion retirement, using the same transaction,
     /// clock, replay marker and outbox path as the terminal release itself.
     /// Standbys only replay these commands; they never choose cleanup pages.
-    pub fn collectReleasedNativeIndexCompanionsStep(self: *DB) !?@import("relational_index_release.zig").Gc.Outcome {
+    pub fn collectReleasedNativeIndexCompanionsStep(self: *DB) !?@import("relational/indexes/release.zig").Gc.Outcome {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        const release_mod = @import("relational_index_release.zig");
+        const release_mod = @import("relational/indexes/release.zig");
         var budget = if (self.core.index_manager.resource_manager) |manager| resource_manager_mod.BudgetedAllocator.initReclaiming(manager, .relational_preparation_working_set, self.alloc, 1) else null;
         defer if (budget) |*value| value.deinit();
         const alloc = if (budget) |*value| value.allocator() else self.alloc;
@@ -10606,7 +10637,7 @@ pub const DB = struct {
 
     /// Preparation owns its off-lock payload; only its bounded effect stages
     /// under apply-exclusive, together with the transport marker and outbox.
-    pub const SchemaOwnerControl = @import("relational_schema_owner_control.zig");
+    pub const SchemaOwnerControl = @import("relational/schema_change/schema_owner_control.zig");
     pub const NativeSchemaOwnerControl = SchemaOwnerControl;
 
     pub const SchemaOwnerCatalogPolicy = enum { unprotected, readable, deferred };
@@ -10616,7 +10647,7 @@ pub const DB = struct {
     /// installation remains unpublished until coordinated release. Historical
     /// descriptors only force deferral, never grant serving/mutation authority.
     pub fn schemaOwnerCatalogPolicy(self: *DB, schema_json: []const u8, historical: bool) !SchemaOwnerCatalogPolicy {
-        const job = @import("relational_nullability_job.zig");
+        const job = @import("relational/schema_change/nullability_job.zig");
         self.core.lockApplyShared();
         var apply_shared = true;
         defer if (apply_shared) self.core.unlockApplyShared();
@@ -10651,7 +10682,7 @@ pub const DB = struct {
                 return error.RowPolicyCatalogChanged;
             }
         }
-        const index_job = @import("relational_index_owner_job.zig");
+        const index_job = @import("relational/indexes/owner_job.zig");
         if (try index_job.protectsOwnerCatalog(&read, self.core.identity_namespace)) {
             const binding = (try index_job.load(&read)) orelse return .deferred;
             if (historical or schema_json.len == 0 or binding.phase == .installed) return .deferred;
@@ -10661,16 +10692,16 @@ pub const DB = struct {
             } else {
                 _ = try RaftIndexOwnerControl.inspect(&read, identity);
             }
-            var inputs = try @import("relational_index_inputs.zig").Prepared.load(self.alloc, &read, binding.inputs_digest);
+            var inputs = try @import("relational/indexes/inputs.zig").Prepared.load(self.alloc, &read, binding.inputs_digest);
             defer inputs.deinit();
-            const parts = try @import("relational_index_inputs.zig").decode(inputs.bytes);
+            const parts = try @import("relational/indexes/inputs.zig").decode(inputs.bytes);
             const before = std.mem.eql(u8, schema_json, parts.before_json);
             if (!before and !std.mem.eql(u8, schema_json, parts.after_json)) return error.PrivateIndexOwnerJobChanged;
             if (!before) return .deferred;
             const view = resident.view orelse return error.PrivateIndexRootRecoveryRequired;
             const encoded = try schema_mod.serializeSchema(self.alloc, view.tableSchema().*);
             defer self.alloc.free(encoded);
-            if (!std.mem.eql(u8, &@import("relational_index_inputs.zig").digest(encoded), &binding.schema_before)) return error.PrivateIndexRootRecoveryRequired;
+            if (!std.mem.eql(u8, &@import("relational/indexes/inputs.zig").digest(encoded), &binding.schema_before)) return error.PrivateIndexRootRecoveryRequired;
             const expected = if (binding.phase == .reserved) binding.physical_reserved else binding.physical_before;
             if (expected) |head| {
                 const indexes = resident.indexes orelse return error.PrivateIndexRootRecoveryRequired;
@@ -10692,8 +10723,8 @@ pub const DB = struct {
     /// retained cut independently binds its actual schemas, catalogs, source
     /// authority and physical root, including after an older job was released.
     /// No caller-supplied source position or DB incarnation is accepted.
-    pub fn prepareSchemaOwnerObservation(self: *DB, candidate: *const @import("relational_nullability_job.zig").Candidate, id: [16]u8, provisional_plan: [32]u8, fence: @import("relational_integrity_topology.zig").Fence, authority: @import("../source_authority.zig").Kind, context: @import("../../api/operation.zig").RequestContext) !@import("relational_schema_owner_contract.zig").Preparation {
-        const job = @import("relational_nullability_job.zig");
+    pub fn prepareSchemaOwnerObservation(self: *DB, candidate: *const @import("relational/schema_change/nullability_job.zig").Candidate, id: [16]u8, provisional_plan: [32]u8, fence: @import("relational/integrity/topology.zig").Fence, authority: @import("../source_authority.zig").Kind, context: @import("../../api/operation.zig").RequestContext) !@import("relational/schema_change/schema_owner_contract.zig").Preparation {
+        const job = @import("relational/schema_change/nullability_job.zig");
         try context.ensureActive();
         if (!fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
@@ -10707,7 +10738,7 @@ pub const DB = struct {
         const physical_root = self.root_incarnation;
         self.core.unlockApplyShared();
         apply_shared = false;
-        if (try @import("relational_integrity_topology.zig").current(&read) != null) return error.IntegrityTopologyBusy;
+        if (try @import("relational/integrity/topology.zig").current(&read) != null) return error.IntegrityTopologyBusy;
         if (try job.load(&read)) |prior| {
             if ((prior.phase != .released and prior.phase != .canceled) or prior.binding.fence.admission_epoch >= fence.admission_epoch)
                 return error.SchemaValidationJobChanged;
@@ -10721,7 +10752,7 @@ pub const DB = struct {
             .{ .raft = .{ .term = entry.term, .index = entry.index } }
         else
             null;
-        const result: @import("relational_schema_owner_contract.zig").Preparation = .{
+        const result: @import("relational/schema_change/schema_owner_contract.zig").Preparation = .{
             .binding = binding,
             .physical_root_incarnation = physical_root,
             .position = position,
@@ -10735,7 +10766,7 @@ pub const DB = struct {
     /// Read one actual owner cut without manufacturing publication permission
     /// or performing recovery. Debt is checked in the same immutable snapshot
     /// as the header; installed progress additionally requires its live runtime.
-    pub fn observeNativeSchemaOwner(self: *DB, binding: @import("relational_nullability_job.zig").Binding, context: @import("../../api/operation.zig").RequestContext) !NativeSchemaOwnerControl.Observation {
+    pub fn observeNativeSchemaOwner(self: *DB, binding: @import("relational/schema_change/nullability_job.zig").Binding, context: @import("../../api/operation.zig").RequestContext) !NativeSchemaOwnerControl.Observation {
         try context.ensureActive();
         try binding.validate();
         if (binding.authority != .native) return error.InvalidControlReceiptPosition;
@@ -10752,8 +10783,8 @@ pub const DB = struct {
         self.core.unlockApplyShared();
         apply_shared = false;
         const source = try @import("../source_authority.zig").require(&txn, .native, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace));
-        const header = if (try @import("relational_nullability_job.zig").load(&txn) != null)
-            try @import("relational_nullability_job.zig").observe(self.alloc, &txn, binding)
+        const header = if (try @import("relational/schema_change/nullability_job.zig").load(&txn) != null)
+            try @import("relational/schema_change/nullability_job.zig").observe(self.alloc, &txn, binding)
         else
             null;
         if (header) |value| {
@@ -10771,7 +10802,7 @@ pub const DB = struct {
             .sequence = source.sequence,
             .header = header,
             .replication_pending = try durable_outbox_store.hasPendingTxn(&txn),
-            .transaction_debt = try @import("relational_nullability_job.zig").observeTransactionDebt(&txn, binding),
+            .transaction_debt = try @import("relational/schema_change/nullability_job.zig").observeTransactionDebt(&txn, binding),
         };
         try result.validateFor(binding);
         try context.ensureActive();
@@ -10790,7 +10821,7 @@ pub const DB = struct {
         if (binding.purpose != .foreign_key_source) return;
         var read = try self.core.store.beginReadTxn();
         defer read.abort();
-        if (try @import("relational_nullability_job.zig").load(&read)) |header| {
+        if (try @import("relational/schema_change/nullability_job.zig").load(&read)) |header| {
             // Cleanup may consume an admitted, uninstalled job on a new root.
             // It cannot convert copied transaction coverage into row validity.
             // stageCancel still checks the actual fence, committed clock and
@@ -10803,11 +10834,11 @@ pub const DB = struct {
                 if (header.transaction_coverage) |coverage| if (coverage.physical_root != self.root_incarnation) return error.SchemaValidationRuntimeRecoveryRequired;
             }
         }
-        const raw = read.get(@import("relational_integrity_activation_contract.zig").validation_key) catch |err| {
+        const raw = read.get(@import("relational/integrity/activation_contract.zig").validation_key) catch |err| {
             if (err == error.NotFound) return;
             return err;
         };
-        const record = try @import("relational_integrity_activation_contract.zig").ForeignKeyValidationRecord.decode(raw);
+        const record = try @import("relational/integrity/activation_contract.zig").ForeignKeyValidationRecord.decode(raw);
         if (record.progress.state != .invalid and record.physical_root != self.root_incarnation) return error.SchemaValidationRuntimeRecoveryRequired;
     }
 
@@ -10818,7 +10849,7 @@ pub const DB = struct {
         return self.applyPreparedNativeOwnerEffect(prepared, replay);
     }
 
-    pub fn prepareSchemaOwnerProposalBytes(self: *DB, output: Allocator, descriptor: @import("relational_schema_owner_contract.zig").CommandDescriptor, budget: @import("read_session_types").types.values.Budget, context: @import("../../api/operation.zig").RequestContext) !?[]u8 {
+    pub fn prepareSchemaOwnerProposalBytes(self: *DB, output: Allocator, descriptor: @import("relational/schema_change/schema_owner_contract.zig").CommandDescriptor, budget: @import("read_session_types").types.values.Budget, context: @import("../../api/operation.zig").RequestContext) !?[]u8 {
         if (comptime storage_engine.enabled) return storage_engine.call("prepareSchemaOwnerProposalBytes", .{ self, output, descriptor, budget, context });
         try context.ensureActive();
         try descriptor.binding.validate();
@@ -10850,10 +10881,11 @@ pub const DB = struct {
         };
         var admission: FrameAdmission = .{ .memory = if (memory) |*manager| manager else null };
         defer if (admission.reservation) |*reservation| reservation.release();
-        return try value.command.encodeRaftWithAdmission(output, &admission);
+        const frame: @TypeOf(value.command).VerifiedRaft = .{ .command = value.command, .identity = value.command_identity };
+        return try frame.encode(output, &admission);
     }
 
-    pub fn executeNativeSchemaOwnerControl(self: *DB, command: @import("relational_schema_owner_contract.zig").Command, budget: @import("read_session_types").types.values.Budget, context: @import("../../api/operation.zig").RequestContext) !@import("relational_schema_owner_contract.zig").NativeOutcome {
+    pub fn executeNativeSchemaOwnerControl(self: *DB, command: @import("relational/schema_change/schema_owner_contract.zig").Command, budget: @import("read_session_types").types.values.Budget, context: @import("../../api/operation.zig").RequestContext) !@import("relational/schema_change/schema_owner_contract.zig").NativeOutcome {
         if (comptime storage_engine.enabled) return storage_engine.call("executeNativeSchemaOwnerControl", .{ self, command, budget, context });
         try context.ensureActive();
         if (command.binding.authority != .native) return error.InvalidControlReceiptPosition;
@@ -10871,6 +10903,316 @@ pub const DB = struct {
         return self.applyPreparedNativeSchemaOwnerControl(&prepared, null);
     }
 
+    const PublicationCapture = @import("../../system_catalog/logical_replication_capture.zig");
+
+    const PublicationCapacity = @import("../../system_catalog/logical_replication_capacity.zig");
+
+    /// Read ordered terminal custody or a durable late-prepare fence.
+    const ReplicationSourceStore = @import("replication_source_apply_store.zig");
+
+    pub fn observeReplicationSource(self: *DB, request: ReplicationSourceStore.ObservationRequest) !?ReplicationSourceStore.Observation {
+        if (comptime storage_engine.enabled) return storage_engine.call("observeReplicationSource", .{ self, request });
+        const permit = request.permit();
+        if (!permit.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        try self.enforcePortableRuntimeGate();
+        self.core.lockApplyShared();
+        defer self.core.unlockApplyShared();
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        _ = try @import("../source_authority.zig").require(&read, .raft, @import("online_source_contract.zig").namespaceBytes(permit.namespace));
+        var arena: std.heap.ArenaAllocator = .init(self.alloc);
+        defer arena.deinit();
+        const observed = (try ReplicationSourceStore.observe(arena.allocator(), &read, request, self.root_incarnation)) orelse return null;
+        const position = switch (observed) {
+            inline else => |receipt| receipt.position,
+        };
+        const cut = (try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(&read)) orelse return error.ReplicationCutoverAuthorityLost;
+        if (position != .raft or cut.index < position.raft.index or cut.term < position.raft.term) return error.ReplicationCutoverAuthorityLost;
+        return observed;
+    }
+
+    pub fn observePublicationTerminal(self: *DB, demand: PublicationCapacity.Observation) !?PublicationCapacity.TerminalObservation {
+        if (comptime storage_engine.enabled) return storage_engine.call("observePublicationTerminal", .{ self, demand });
+        try demand.validate();
+        if (self.sql_persistence != null or !demand.namespace.eql(self.core.identity_namespace)) return error.InvalidLogicalCaptureControl;
+        try self.enforcePortableRuntimeGate();
+        self.core.lockApplyShared();
+        defer self.core.unlockApplyShared();
+        var arena: std.heap.ArenaAllocator = .init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        const outbox = @import("logical_replication_outbox.zig");
+        if (try outbox.readOrderedTerminal(a, &read, demand.transaction_id)) |terminal| {
+            try demand.requireCapture(a, terminal.capture_ref);
+            return .{ .captured = terminal };
+        }
+        if (try outbox.forTransaction(a, &read, demand.transaction_id, demand.owner, demand.namespace) != null or
+            try outbox.capacityHeader(a, &read, demand.owner, demand.member) != null) return null;
+        const evidence = (try transactions_mod.publicationAbortFence(&read, demand.transaction_id, demand.owner)) orelse return null;
+        const cut = (try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(&read)) orelse return null;
+        const fence: PublicationCapacity.AbortAbsence = .{
+            .evidence = evidence,
+            .owner = demand.owner,
+            .transaction_id = demand.transaction_id,
+            .member = demand.member,
+            .group_id = demand.owner_group_id,
+            .namespace = demand.namespace,
+            .physical_root_incarnation = self.root_incarnation,
+            .position = .{ .term = cut.term, .index = cut.index },
+            .capacity_digest = try demand.digest(a),
+        };
+        try fence.require(a, demand);
+        return .{ .absent = fence };
+    }
+
+    pub fn observePublicationOutbox(self: *DB, demand: @import("../../system_catalog/logical_replication_capacity.zig").Observation) !?@import("../../system_catalog/logical_replication_publisher.zig").CaptureRef {
+        if (comptime storage_engine.enabled) return storage_engine.call("observePublicationOutbox", .{ self, demand });
+        try demand.validate();
+        if (self.sql_persistence != null or !demand.namespace.eql(self.core.identity_namespace)) return error.InvalidLogicalCaptureControl;
+        try self.enforcePortableRuntimeGate();
+        self.core.lockApplyShared();
+        defer self.core.unlockApplyShared();
+        var arena: std.heap.ArenaAllocator = .init(self.alloc);
+        defer arena.deinit();
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        const header = (try @import("logical_replication_outbox.zig").capacityHeader(arena.allocator(), &read, demand.owner, demand.member)) orelse return null;
+        try demand.requireCapture(arena.allocator(), header.reference);
+        if (!header.reference.namespace.eql(self.core.identity_namespace)) return error.LogicalCaptureControlChanged;
+        return header.reference;
+    }
+
+    pub fn observePublicationCapacity(self: *DB, request: @import("../../system_catalog/logical_replication_capacity.zig").Request, context: @import("../../api/operation.zig").RequestContext) !@import("../../system_catalog/logical_replication_capacity.zig").Observation {
+        if (comptime storage_engine.enabled) return storage_engine.call("observePublicationCapacity", .{ self, request, context });
+        try context.ensureActive();
+        try self.enforcePortableRuntimeGate();
+        if (self.sql_persistence != null) return error.UnsupportedReplicationType;
+        self.core.lockApplyShared();
+        defer self.core.unlockApplyShared();
+        var arena: std.heap.ArenaAllocator = .init(self.alloc);
+        defer arena.deinit();
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        return @import("logical_replication_outbox.zig").observeCapacity(arena.allocator(), &read, request, self.core.identity_namespace, self.core.schema orelse return error.RelationalTableRequired, self.root_incarnation, context);
+    }
+
+    pub fn observePublicationCaptureControl(self: *DB, control: PublicationCapture.Control, context: @import("../../api/operation.zig").RequestContext) !?PublicationCapture.Receipt {
+        if (comptime storage_engine.enabled) return storage_engine.call("observePublicationCaptureControl", .{ self, control, context });
+        try context.ensureActive();
+        try control.validate();
+        try self.enforcePortableRuntimeGate();
+        if (!self.core.identity_namespace.eql(control.binding.namespace) or self.sql_persistence != null) return error.LogicalCaptureControlChanged;
+        self.core.lockApplyShared();
+        defer self.core.unlockApplyShared();
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        const state = try @import("logical_replication_outbox.zig").loadGuard(arena.allocator(), &read);
+        const receipt = try publicationControlReceipt(state, control, self.root_incarnation);
+        if (receipt) |held| if (held.position == .native) {
+            try self.enforceNativeOwnerReadAuthority();
+            if (try durable_outbox_store.hasPendingTxn(&read)) return null;
+        };
+        try context.ensureActive();
+        return receipt;
+    }
+
+    fn publicationControlReceipt(state: ?PublicationCapture.State, control: PublicationCapture.Control, root: u128) !?PublicationCapture.Receipt {
+        const current = state orelse return null;
+        if (!current.binding.eql(control.binding) or current.physical_root_incarnation != root) return error.LogicalCaptureControlChanged;
+        const action: PublicationCapture.Action = switch (current.phase) {
+            .preparing => return null,
+            .prepared => .prepare,
+            .active => .activate,
+            .canceled => .cancel,
+        };
+        const receipt: PublicationCapture.Receipt = .{ .binding = current.binding, .action = action, .position = current.position, .physical_root_incarnation = root };
+        try receipt.require(control);
+        return receipt;
+    }
+
+    pub fn observePublicationCaptureOwner(self: *DB, request: PublicationCapture.ObservationRequest, context: @import("../../api/operation.zig").RequestContext) !PublicationCapture.OwnerObservation {
+        if (comptime storage_engine.enabled) return storage_engine.call("observePublicationCaptureOwner", .{ self, request, context });
+        return self.observePublicationCaptureOwnerFor(request, null, context);
+    }
+
+    pub fn observeNativePublicationCaptureOwner(self: *DB, request: PublicationCapture.ObservationRequest, context: @import("../../api/operation.zig").RequestContext) !PublicationCapture.OwnerObservation {
+        if (comptime storage_engine.enabled) return storage_engine.call("observeNativePublicationCaptureOwner", .{ self, request, context });
+        return self.observePublicationCaptureOwnerFor(request, .native, context);
+    }
+
+    fn observePublicationCaptureOwnerFor(self: *DB, request: PublicationCapture.ObservationRequest, expected: ?@import("../source_authority.zig").Kind, context: @import("../../api/operation.zig").RequestContext) !PublicationCapture.OwnerObservation {
+        try context.ensureActive();
+        try request.validate();
+        if (self.sql_persistence != null or !self.core.identity_namespace.eql(request.namespace)) return error.LogicalCaptureControlChanged;
+        if (expected != null and expected.? == .native) try self.enforceNativeOwnerReadAuthority() else try self.enforcePortableRuntimeGate();
+        self.core.lockApplyShared();
+        const read_cut = self.core.store.beginReadTxn();
+        const root = self.root_incarnation;
+        self.core.unlockApplyShared();
+        var read = try read_cut;
+        defer read.abort();
+        const source = (try @import("../source_authority.zig").load(&read)) orelse return error.OnlineSourceScopeChanged;
+        if (expected) |kind| if (source.kind != kind) return error.OnlineSourceScopeChanged;
+        _ = try @import("../source_authority.zig").require(&read, source.kind, @import("online_source_contract.zig").namespaceBytes(request.namespace));
+        const schema_bytes = try read.get(schema_mod.schema_key);
+        var schema_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(schema_bytes, &schema_digest, .{});
+        var catalog_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(try read.get(@import("relational/integrity/catalog.zig").key), &catalog_digest, .{});
+        const applied = try apply_receipts.readOrderedApplyReceiptTxn(&read);
+        const table_catalog = try table_catalog_mod.Catalog.decode(try read.get(table_catalog_mod.key));
+        if (!table_catalog.mode_initialized or table_catalog.storage_mode != .relational or table_catalog.active_schema_version != request.schema_version or table_catalog.sql_persistence != null)
+            return error.LogicalCaptureControlChanged;
+        const actual_user_data = user: {
+            var cursor = try read.openCursor();
+            defer cursor.close();
+            const first = try cursor.seekAtOrAfter(&.{internal_keys.user_namespace});
+            break :user table_catalog.row_count != 0 or (if (first) |entry| internal_keys.isInternalUserKey(entry.key) else false);
+        };
+        const result: PublicationCapture.OwnerObservation = .{
+            .request = request,
+            .schema_digest = schema_digest,
+            .catalog_digest = catalog_digest,
+            .physical_root_incarnation = root,
+            .position = if (source.kind == .native)
+                (if (source.sequence != 0) .{ .native = .{ .namespace = request.namespace, .sequence = source.sequence } } else null)
+            else if (applied) |entry| .{ .raft = .{ .term = entry.term, .index = entry.index } } else null,
+            .has_user_data = actual_user_data,
+            .has_transaction_state = try transactions_mod.TxnManager.hasPublicationCaptureDebtInView(self.alloc, &read),
+        };
+        try result.require(request);
+        try context.ensureActive();
+        return result;
+    }
+
+    /// Data admits this private ordered control against the actual pending
+    /// metadata change before proposal. Null is genuine pending debt, never a
+    /// prepared ACK. A later actual ordered retry observes durable progress.
+    pub fn applyPublicationCaptureControl(self: *DB, control: PublicationCapture.Control, ordered: OrderedApplyReceipt, context: @import("../../api/operation.zig").RequestContext) !?PublicationCapture.Receipt {
+        if (comptime storage_engine.enabled) return storage_engine.call("applyPublicationCaptureControl", .{ self, control, ordered, context });
+        try context.ensureActive();
+        try control.validate();
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (ordered.term == 0 or ordered.index == 0 or self.sql_persistence != null) return error.InvalidLogicalCaptureControl;
+        var mutation = self.core.snapshot_admission.acquireMutation();
+        defer mutation.release();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        try self.enforceReplicationWriteGate();
+        if (self.local_execution.replication_async_metadata_mirror != null or self.local_execution.replication_async_batch_mirror != null) return error.ReplicationPublisherUnavailable;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        var txn = try self.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        if (try orderedApplyDisposition(try apply_receipts.readOrderedApplyReceiptTxn(&txn), ordered) == .already_applied) {
+            const state = try @import("logical_replication_outbox.zig").loadGuard(arena.allocator(), &txn);
+            txn.abort();
+            // A replay of an older entry must leave the newer receipt and
+            // marker intact. Only the same persisted control can answer it.
+            if (state) |value| if (value.position != .raft or value.position.raft.index > ordered.index) return null;
+            return publicationControlReceipt(state, control, self.root_incarnation) catch |err| switch (err) {
+                error.LogicalCaptureControlChanged => null,
+                else => err,
+            };
+        }
+        const result = try @import("logical_replication_owner_control.zig").stage(arena.allocator(), self.core.identity_namespace, &txn, control, self.root_incarnation, .{ .ordered = ordered }, context);
+        // Even duplicate logical controls advance the real ordered marker.
+        var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+        const marker = orderedApplyReceiptWrite(ordered, &marker_bytes);
+        try txn.put(marker.key, marker.value);
+        try txn.commit();
+        self.core.table_catalog.logical_capture_format = @max(self.core.table_catalog.logical_capture_format, 1);
+        return result.receipt;
+    }
+
+    const PublisherCollection = @import("logical_replication_collection.zig");
+    const Publisher = @import("../../system_catalog/logical_replication_publisher.zig");
+
+    pub fn readPublicationOutboxPage(self: *DB, out: Allocator, request: @import("logical_replication_outbox_contract.zig").PageRequest) ![]u8 {
+        if (comptime storage_engine.enabled) return storage_engine.call("readPublicationOutboxPage", .{ self, out, request });
+        if (self.sql_persistence != null or !request.reference.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        try self.enforcePortableRuntimeGate();
+        var arena: std.heap.ArenaAllocator = .init(self.alloc);
+        defer arena.deinit();
+        const page = pinned: {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            break :pinned try @import("logical_replication_outbox.zig").readPage(arena.allocator(), &read, request);
+        };
+        return @import("logical_replication_outbox_contract.zig").encodePage(page, out, request.max_bytes);
+    }
+
+    pub fn observePublicationCollection(self: *DB, permission: Publisher.GcPermission) !?Publisher.GcObservation {
+        if (comptime storage_engine.enabled) return storage_engine.call("observePublicationCollection", .{ self, permission });
+        try permission.validate();
+        if (self.sql_persistence != null or permission.debt.reference.position != .raft or
+            !permission.debt.reference.namespace.eql(self.core.identity_namespace)) return error.InvalidLogicalOutbox;
+        try self.enforcePortableRuntimeGate();
+        self.core.lockApplyShared();
+        defer self.core.unlockApplyShared();
+        var arena: std.heap.ArenaAllocator = .init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        return switch (permission.action) {
+            .purge => PublisherCollection.readObservation(a, &read, permission),
+            .clear_marker => PublisherCollection.observeCleared(a, self.core.identity_namespace, &read, permission, self.root_incarnation),
+        };
+    }
+
+    /// The authenticated Raft ingress supplies the canonical metadata permission.
+    pub fn applyPublicationCollection(self: *DB, permission: Publisher.GcPermission, ordered: OrderedApplyReceipt, context: @import("../../api/operation.zig").RequestContext) !?Publisher.GcObservation {
+        if (comptime storage_engine.enabled) return storage_engine.call("applyPublicationCollection", .{ self, permission, ordered, context });
+        try context.ensureActive();
+        try permission.validate();
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (ordered.term == 0 or ordered.index == 0 or self.sql_persistence != null) return error.InvalidLogicalOutbox;
+        var mutation = self.core.snapshot_admission.acquireMutation();
+        defer mutation.release();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        try self.enforceReplicationWriteGate();
+        if (self.local_execution.replication_async_metadata_mirror != null or self.local_execution.replication_async_batch_mirror != null) return error.ReplicationPublisherUnavailable;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var txn = try self.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        if (try orderedApplyDisposition(try apply_receipts.readOrderedApplyReceiptTxn(&txn), ordered) == .already_applied) {
+            const observed = switch (permission.action) {
+                .purge => try PublisherCollection.readObservation(a, &txn, permission),
+                .clear_marker => try PublisherCollection.observeCleared(a, self.core.identity_namespace, &txn, permission, self.root_incarnation),
+            };
+            txn.abort();
+            return observed;
+        }
+        const result = try PublisherCollection.stage(a, self.core.identity_namespace, &txn, permission, self.root_incarnation, .{ .term = ordered.term, .index = ordered.index }, context);
+        var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+        const marker = orderedApplyReceiptWrite(ordered, &marker_bytes);
+        try txn.put(marker.key, marker.value);
+        try txn.commit();
+        return result;
+    }
+
+    pub fn executeNativePublicationCaptureControl(self: *DB, control: PublicationCapture.Control, context: @import("../../api/operation.zig").RequestContext) !PublicationCapture.NativeOutcome {
+        if (comptime storage_engine.enabled) return storage_engine.call("executeNativePublicationCaptureControl", .{ self, control, context });
+        if (self.sql_persistence != null) return error.UnsupportedReplicationType;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        var prepared: @import("logical_replication_owner_control.zig").Prepared = .{ .alloc = arena.allocator(), .command = control, .root = self.root_incarnation, .context = context };
+        defer prepared.deinit();
+        var outcome = try self.applyPreparedNativeOwnerEffect(&prepared, null);
+        if (outcome.replication_pending) outcome.receipt = null;
+        return outcome;
+    }
+
     pub fn retainRaftSchemaOwnerPreparation(self: *DB, command_bytes: []const u8, owner_group: u64, entry: OrderedApplyReceipt, context: @import("../../api/operation.zig").RequestContext) !@import("read_session_types").types.contract.Handle {
         if (comptime storage_engine.enabled) return storage_engine.call("retainRaftSchemaOwnerPreparation", .{ self, command_bytes, owner_group, entry, context });
         try context.ensureActive();
@@ -10880,7 +11222,7 @@ pub const DB = struct {
         const Purpose = struct {
             db: *DB,
             prepared: ?SchemaOwnerControl.Prepared,
-            binding: @import("relational_schema_owner_contract.zig").Binding,
+            binding: @import("relational/schema_change/schema_owner_contract.zig").Binding,
             command_identity: [32]u8,
             owner_group: u64,
             entry: OrderedApplyReceipt,
@@ -10909,7 +11251,7 @@ pub const DB = struct {
         return protocol.Handle.issue(.schema_preparation, held, &Purpose.operations, protocol.Boundary.local_dispatch, &self.alloc);
     }
 
-    pub fn prepareNativeSchemaOwnerPage(self: *DB, binding: @import("relational_nullability_job.zig").Binding, budget: RelationalRows.Budget, context: @import("../../api/operation.zig").RequestContext) !NativeSchemaOwnerControl.Prepared {
+    pub fn prepareNativeSchemaOwnerPage(self: *DB, binding: @import("relational/schema_change/nullability_job.zig").Binding, budget: RelationalRows.Budget, context: @import("../../api/operation.zig").RequestContext) !NativeSchemaOwnerControl.Prepared {
         return NativeSchemaOwnerControl.Prepared.preparePage(self.alloc, self.core, binding, budget, context);
     }
 
@@ -10917,11 +11259,11 @@ pub const DB = struct {
         return SchemaOwnerControl.Prepared.initRaft(self.alloc, self.core, command, context);
     }
 
-    pub fn prepareRaftSchemaOwnerPage(self: *DB, binding: @import("relational_nullability_job.zig").Binding, budget: RelationalRows.Budget, context: @import("../../api/operation.zig").RequestContext) !SchemaOwnerControl.Prepared {
+    pub fn prepareRaftSchemaOwnerPage(self: *DB, binding: @import("relational/schema_change/nullability_job.zig").Binding, budget: RelationalRows.Budget, context: @import("../../api/operation.zig").RequestContext) !SchemaOwnerControl.Prepared {
         return SchemaOwnerControl.Prepared.prepareRaftPage(self.alloc, self.core, binding, budget, context);
     }
 
-    pub fn prepareSchemaOwnerTransactionDebtPage(self: *DB, binding: @import("relational_nullability_job.zig").Binding, context: @import("../../api/operation.zig").RequestContext) !?SchemaOwnerControl.Prepared {
+    pub fn prepareSchemaOwnerTransactionDebtPage(self: *DB, binding: @import("relational/schema_change/nullability_job.zig").Binding, context: @import("../../api/operation.zig").RequestContext) !?SchemaOwnerControl.Prepared {
         return SchemaOwnerControl.Prepared.prepareTransactionDebtPage(self.alloc, self.core, binding, context);
     }
 
@@ -10929,11 +11271,11 @@ pub const DB = struct {
     /// A stable DB-owned snapshot survives bounded turns, including ordinary
     /// writes on released tables. Full transaction/provenance qualification
     /// remains the receiving recovery protocol's additional obligation.
-    pub fn stepSchemaOwnerRowAudit(self: *DB, owner_group: u64, binding: @import("relational_schema_owner_contract.zig").Binding, inputs: []const u8, budget: @import("read_session_types").types.values.Budget, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext) !@import("relational_schema_audit_checkpoint.zig").Result {
+    pub fn stepSchemaOwnerRowAudit(self: *DB, owner_group: u64, binding: @import("relational/schema_change/schema_owner_contract.zig").Binding, inputs: []const u8, budget: @import("read_session_types").types.values.Budget, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext) !@import("relational/schema_change/schema_audit_checkpoint.zig").Result {
         if (comptime storage_engine.enabled) return storage_engine.call("stepSchemaOwnerRowAudit", .{ self, owner_group, binding, inputs, budget, signing_root_dir, signing_root_incarnation, context });
         try context.ensureActive();
         try budget.validate();
-        if (inputs.len != 0 and !std.mem.eql(u8, &@import("relational_schema_owner_contract.zig").hash(inputs), &binding.inputs)) return error.SchemaValidationJobChanged;
+        if (inputs.len != 0 and !std.mem.eql(u8, &@import("relational/schema_change/schema_owner_contract.zig").hash(inputs), &binding.inputs)) return error.SchemaValidationJobChanged;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         if (owner_group == 0 or owner_group != binding.fence.owner_group_id) return error.SchemaValidationJobChanged;
         const expected = switch (binding.authority) {
@@ -10959,10 +11301,10 @@ pub const DB = struct {
         };
     }
 
-    fn stepSchemaOwnerRowAuditLease(self: *DB, a: Allocator, io: std.Io, lease: *@import("relational_schema_audit_cache.zig").Cache.Lease, budget: @import("read_session_types").types.values.Budget, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext) !@import("relational_schema_audit_checkpoint.zig").Result {
+    fn stepSchemaOwnerRowAuditLease(self: *DB, a: Allocator, io: std.Io, lease: *@import("relational/schema_change/schema_audit_cache.zig").Cache.Lease, budget: @import("read_session_types").types.values.Budget, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext) !@import("relational/schema_change/schema_audit_checkpoint.zig").Result {
         try lease.requireCurrent();
         const audit = lease.audit();
-        var guard = try @import("relational_schema_audit_checkpoint.zig").open(a, io, signing_root_dir, signing_root_incarnation, self.root_incarnation, audit, context);
+        var guard = try @import("relational/schema_change/schema_audit_checkpoint.zig").open(a, io, signing_root_dir, signing_root_incarnation, self.root_incarnation, audit, context);
         defer guard.deinit();
         try lease.restoreCheckpoint(&guard, context);
         var request_context = context;
@@ -10972,7 +11314,7 @@ pub const DB = struct {
                 try value.ensureActive();
             }
         };
-        const control: @import("relational_nullability.zig").Control = .{ .context = &request_context, .checkpoint = Check.active };
+        const control: @import("relational/schema_change/nullability.zig").Control = .{ .context = &request_context, .checkpoint = Check.active };
         const complete = try audit.step(io, budget, control);
         const summary = try guard.persist(audit);
         if (!complete) {
@@ -11005,7 +11347,7 @@ pub const DB = struct {
     /// Pins the runtime and durable read at one apply cut; expensive history
     /// verification then runs outside the shared apply lock. This does not
     /// grant leadership, metadata publication or replacement-root adoption.
-    pub fn observeRaftSchemaOwner(self: *DB, binding: @import("relational_schema_owner_contract.zig").Binding, owner_group: u64, context: @import("../../api/operation.zig").RequestContext) !@import("relational_schema_owner_contract.zig").RaftObservation {
+    pub fn observeRaftSchemaOwner(self: *DB, binding: @import("relational/schema_change/schema_owner_contract.zig").Binding, owner_group: u64, context: @import("../../api/operation.zig").RequestContext) !@import("relational/schema_change/schema_owner_contract.zig").RaftObservation {
         try context.ensureActive();
         try self.requireRaftSchemaOwnerScope(binding, owner_group);
         try self.enforcePortableRuntimeGate();
@@ -11021,10 +11363,10 @@ pub const DB = struct {
         apply_shared = false;
         _ = try @import("../source_authority.zig").require(&read, .raft, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace));
         const applied = try apply_receipts.readOrderedApplyReceiptTxn(&read);
-        const job = @import("relational_nullability_job.zig");
+        const job = @import("relational/schema_change/nullability_job.zig");
         const header = if (try job.load(&read) != null) try job.observe(self.alloc, &read, binding) else null;
         if (header) |value| if (value.phase == .installed) try resident.require(value);
-        const result: @import("relational_schema_owner_contract.zig").RaftObservation = .{
+        const result: @import("relational/schema_change/schema_owner_contract.zig").RaftObservation = .{
             .binding = binding,
             .physical_root_incarnation = physical_root_incarnation,
             .applied = if (applied) |entry| .{ .term = entry.term, .index = entry.index } else null,
@@ -11036,7 +11378,7 @@ pub const DB = struct {
         return result;
     }
 
-    fn requireRaftSchemaOwnerScope(self: *DB, binding: @import("relational_schema_owner_contract.zig").Binding, owner_group: u64) !void {
+    fn requireRaftSchemaOwnerScope(self: *DB, binding: @import("relational/schema_change/schema_owner_contract.zig").Binding, owner_group: u64) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         if (self.local_execution.restore_staging_required.load(.acquire)) return error.RestoreStagingScopeChanged;
         try binding.validate();
@@ -11045,7 +11387,7 @@ pub const DB = struct {
         if (!binding.fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
     }
 
-    fn raftSchemaOwnerControlAlreadyApplied(self: *DB, binding: @import("relational_schema_owner_contract.zig").Binding, owner_group: u64, entry: OrderedApplyReceipt, command_identity: [32]u8) !bool {
+    fn raftSchemaOwnerControlAlreadyApplied(self: *DB, binding: @import("relational/schema_change/schema_owner_contract.zig").Binding, owner_group: u64, entry: OrderedApplyReceipt, command_identity: [32]u8) !bool {
         try self.requireRaftSchemaOwnerScope(binding, owner_group);
         self.core.lockApplyShared();
         defer self.core.unlockApplyShared();
@@ -11053,12 +11395,12 @@ pub const DB = struct {
         defer read.abort();
         _ = try @import("../source_authority.zig").require(&read, .raft, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace));
         const applied = try apply_receipts.readOrderedApplyReceiptTxn(&read);
-        _ = try @import("relational_schema_apply_outcome.zig").requireHeadCut(&read, binding.fence.namespace, applied);
+        _ = try @import("relational/schema_change/schema_apply_outcome.zig").requireHeadCut(&read, binding.fence.namespace, applied);
         if (try orderedApplyDisposition(applied, entry) != .already_applied) {
-            if (try @import("relational_schema_apply_outcome.zig").read(&read, binding.fence.namespace, entry.index) != null) return error.CorruptSchemaApplyOutcome;
+            if (try @import("relational/schema_change/schema_apply_outcome.zig").read(&read, binding.fence.namespace, entry.index) != null) return error.CorruptSchemaApplyOutcome;
             return false;
         }
-        try @import("relational_schema_apply_outcome.zig").requireReplay(&read, binding.fence.namespace, applied.?, entry, command_identity);
+        try @import("relational/schema_change/schema_apply_outcome.zig").requireReplay(&read, binding.fence.namespace, applied.?, entry, command_identity);
         return true;
     }
 
@@ -11099,7 +11441,7 @@ pub const DB = struct {
     /// guards remain mandatory, including for a duplicate ticket.
     /// Cancellation callbacks are scoped to this call, never retained by work
     /// prepared asynchronously on another invocation's stack.
-    pub fn applyPreparedRaftSchemaOwnerCommand(self: *DB, prepared: ?*SchemaOwnerControl.Prepared, binding: @import("relational_schema_owner_contract.zig").Binding, command_identity: [32]u8, owner_group: u64, entry: OrderedApplyReceipt, context: @import("../../api/operation.zig").RequestContext) !void {
+    pub fn applyPreparedRaftSchemaOwnerCommand(self: *DB, prepared: ?*SchemaOwnerControl.Prepared, binding: @import("relational/schema_change/schema_owner_contract.zig").Binding, command_identity: [32]u8, owner_group: u64, entry: OrderedApplyReceipt, context: @import("../../api/operation.zig").RequestContext) !void {
         try context.ensureActive();
         if (try self.raftSchemaOwnerControlAlreadyApplied(binding, owner_group, entry, command_identity)) return;
         const value = prepared orelse return error.InvalidOrderedApplyReceipt;
@@ -11134,20 +11476,20 @@ pub const DB = struct {
             defer read.abort();
             _ = try @import("../source_authority.zig").require(&read, .raft, @import("online_source_contract.zig").namespaceBytes(prepared.command.binding.fence.namespace));
             const prior = try apply_receipts.readOrderedApplyReceiptTxn(&read);
-            _ = try @import("relational_schema_apply_outcome.zig").requireHeadCut(&read, prepared.command.binding.fence.namespace, prior);
+            _ = try @import("relational/schema_change/schema_apply_outcome.zig").requireHeadCut(&read, prepared.command.binding.fence.namespace, prior);
             if (try orderedApplyDisposition(prior, entry) == .already_applied) {
-                try @import("relational_schema_apply_outcome.zig").requireReplay(&read, prepared.command.binding.fence.namespace, prior.?, entry, prepared.command_identity);
+                try @import("relational/schema_change/schema_apply_outcome.zig").requireReplay(&read, prepared.command.binding.fence.namespace, prior.?, entry, prepared.command_identity);
                 return;
             }
             if (prior) |value| if (entry.term < value.term) return error.InvalidOrderedApplyReceipt;
-            if (try @import("relational_schema_apply_outcome.zig").read(&read, prepared.command.binding.fence.namespace, entry.index) != null) return error.CorruptSchemaApplyOutcome;
+            if (try @import("relational/schema_change/schema_apply_outcome.zig").read(&read, prepared.command.binding.fence.namespace, entry.index) != null) return error.CorruptSchemaApplyOutcome;
         }
-        const outcomes = @import("relational_schema_apply_outcome.zig");
+        const outcomes = @import("relational/schema_change/schema_apply_outcome.zig");
         if (prepared.requiresSchemaCommit()) {
             var txn = try self.core.store.beginWriteTxn();
             var active = true;
             defer if (active) txn.abort();
-            if (try @import("relational_nullability_job.zig").guardRejection(&txn, prepared.command)) |reason| {
+            if (try @import("relational/schema_change/nullability_job.zig").guardRejection(&txn, prepared.command)) |reason| {
                 // No attempted effect has been staged. Only a verified durable
                 // guard result, its exact command identity and the real Raft
                 // marker commit here; I/O/decoding/allocation errors propagate.
@@ -11168,7 +11510,7 @@ pub const DB = struct {
                     if (try orderedApplyDisposition(try apply_receipts.readOrderedApplyReceiptTxn(txn), participant.entry) != .apply)
                         return error.InvalidOrderedApplyReceipt;
                 }
-                pub fn stage(participant: @This(), txn: anytype, installed: @import("relational_nullability_job.zig").Header) !void {
+                pub fn stage(participant: @This(), txn: anytype, installed: @import("relational/schema_change/nullability_job.zig").Header) !void {
                     if (installed.updated != .raft or installed.updated.raft.term != participant.entry.term or
                         installed.updated.raft.index != participant.entry.index) return error.InvalidControlReceiptPosition;
                     var bytes: [ordered_apply_receipt_value_len]u8 = undefined;
@@ -11182,7 +11524,7 @@ pub const DB = struct {
             var txn = try self.core.store.beginWriteTxn();
             var active = true;
             defer if (active) txn.abort();
-            var rejection = try @import("relational_nullability_job.zig").guardRejection(&txn, prepared.command);
+            var rejection = try @import("relational/schema_change/nullability_job.zig").guardRejection(&txn, prepared.command);
             if (rejection == null) effect: {
                 // A former rejection cannot authorize missing preparation.
                 // Reprepare on control instead of retrying the same ticket.
@@ -11216,6 +11558,18 @@ pub const DB = struct {
     pub fn applyReplicatedSchemaOwnerControl(self: *DB, record: @import("replication_record.zig").RecordView) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("applyReplicatedSchemaOwnerControl", .{ self, record });
         if (record.kind != .metadata_mutation or record.payload_codec != .binary or record.lsn == 0) return error.InvalidSchemaOwnerControl;
+        const publication = @import("logical_replication_owner_control.zig");
+        if (publication.Frame.isFrame(record.payload)) {
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            const frame = try publication.Frame.decode(arena.allocator(), record.payload);
+            if (record.table_id != frame.position.namespace.table_id or record.shard_id != frame.position.namespace.shard_id or
+                !frame.position.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+            var prepared: publication.Prepared = .{ .alloc = arena.allocator(), .command = frame.control, .root = frame.root, .context = .{} };
+            defer prepared.deinit();
+            _ = try self.applyPreparedNativeOwnerEffect(&prepared, .{ .position = frame.position, .lsn = record.lsn });
+            return;
+        }
         const frame = try NativeSchemaOwnerControl.Frame.decode(record.payload);
         if (record.table_id != frame.position.namespace.table_id or record.shard_id != frame.position.namespace.shard_id or
             !frame.position.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
@@ -11303,7 +11657,7 @@ pub const DB = struct {
                         replay: ?NativeIndexReplay,
                         mirrored: bool,
                         pub fn validateBefore(_: @This(), _: anytype) !void {}
-                        pub fn stage(participant: @This(), txn: anytype, installed: if (@hasDecl(@TypeOf(prepared.*), "SchemaRecord")) @TypeOf(prepared.*).SchemaRecord else @import("relational_index_validation.zig").Installed) !void {
+                        pub fn stage(participant: @This(), txn: anytype, installed: if (@hasDecl(@TypeOf(prepared.*), "SchemaRecord")) @TypeOf(prepared.*).SchemaRecord else @import("relational/indexes/validation.zig").Installed) !void {
                             const position = if (comptime metadata_control) installed.updated.native else installed.position.native;
                             if (participant.replay) |value| {
                                 if (!std.meta.eql(position, value.position)) return error.InvalidControlReceiptPosition;
@@ -11631,6 +11985,7 @@ pub const DB = struct {
     /// the global serialization fence. The bound prevents catalog churn from
     /// turning one request into unbounded CPU/provider work.
     pub fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
+        if (req.logical_publication_control != null or req.logical_publication_gc != null) return error.OrderedApplyRequired;
         if (comptime storage_engine.enabled) return storage_engine.call("batchInternal", .{ self, req, profile, opts });
         var committed = false;
         var tracked = opts;
@@ -11771,14 +12126,57 @@ pub const DB = struct {
                 else => null,
             };
             if (physical_key) |key_value| if (!self.core.byteRange().contains(key_value)) return error.IdentityNamespaceMismatch;
+            var revision_plan: ?transactions_mod.TxnManager.StagedDocumentRevisions = null;
+            defer if (revision_plan) |*plan| plan.deinit();
             var control_batch = try self.core.store.beginWriteBatch();
             errdefer control_batch.abort();
             var txn = control_batch.asTxn();
-            if (self.local_execution.restore_staging_required.load(.acquire)) return error.RestoreStagingInProgress;
+            // The flag is a fast path. A reopened or recovered owner can
+            // still carry it after durable publication. Use the same scope
+            // gate as row mutations, inside this lock write transaction.
+            if (self.local_execution.restore_staging_required.load(.acquire))
+                try @import("restore_staging.zig").requireScope(self.alloc, &txn, null, false);
             try self.requireSqlLockTopologyAdmission(&txn, command);
             if (command.native_control) |control|
                 try self.requireNativeSqlLockControl(&txn, command.admission.transaction, control);
             try locks.apply(self.alloc, &txn, self.core.identity_namespace, command.admission.binding.namespace.group, self.core.table_catalog.storage_mode, command);
+            if (command.operation == .document_revisions) {
+                const control = command.operation.document_revisions;
+                if (self.core.table_catalog.storage_mode != .document) return error.InvalidLockScope;
+                for (control.keys) |key| if (!self.core.byteRange().contains(key)) return error.IdentityNamespaceMismatch;
+                for (control.references) |reference| if (!self.core.byteRange().contains(reference.key)) return error.IdentityNamespaceMismatch;
+                const checked = command.checked orelse return error.Forbidden;
+                const now_ns = std.math.mul(u64, checked.admitted_at_ms, std.time.ns_per_ms) catch return error.InvalidLockScope;
+                const max_lease_ms = @divExact(@import("../document_revision_reservation.zig").max_lease_ns, std.time.ns_per_ms);
+                const expiry_ms = @min(checked.source.registration.lease.expires_at_ms, checked.admitted_at_ms +| max_lease_ms);
+                const expiry_ns = std.math.mul(u64, expiry_ms, std.time.ns_per_ms) catch return error.InvalidLockScope;
+                var manager = try self.core.initTxnManager();
+                defer manager.deinit();
+                revision_plan = switch (control.action) {
+                    .reserve => plan: {
+                        try locks.document_revisions.requirePredicates(self.alloc, &txn, control.predicates);
+                        break :plan try manager.prepareDocumentRevisionsAtSubtransaction(&txn, control.scope, control.keys, now_ns, expiry_ns, control.subtransaction);
+                    },
+                    .release => try manager.prepareDocumentRevisionRelease(&txn, control.scope, control.references),
+                    .renew => try manager.prepareDocumentRevisionRenewal(&txn, control.scope, now_ns, expiry_ns),
+                };
+            } else if ((command.operation == .bound_control or command.operation == .control) and self.core.table_catalog.transaction_effect_format >= 2) {
+                const action = if (command.operation == .bound_control) command.operation.bound_control.control else command.operation.control.action.control;
+                var manager = try self.core.initTxnManager();
+                defer manager.deinit();
+                revision_plan = try manager.prepareDocumentRevisionSavepoint(&txn, command.admission.transaction, command.admission.source.lease.principal, action);
+            } else if (command.operation == .close and self.core.table_catalog.transaction_effect_format >= 2) {
+                const reservation = @import("../document_revision_reservation.zig");
+                if (try reservation.load(&txn, command.admission.transaction) != null) {
+                    const finalized_at = if (command.checked) |checked|
+                        std.math.mul(u64, checked.admitted_at_ms, std.time.ns_per_ms) catch return error.InvalidLockScope
+                    else if (opts.ordered_apply_receipt != null) req.timestamp_ns else @max(1, currentTimeNs());
+                    var manager = try self.core.initTxnManager();
+                    defer manager.deinit();
+                    revision_plan = try manager.prepareAbandonDocumentRevisions(&txn, command.admission.transaction, command.admission.source.lease.principal, finalized_at);
+                }
+            }
+            if (revision_plan) |*plan| try plan.stage(&txn);
             for (opts.extra_store_writes) |write| try txn.put(write.key, write.value);
             if (opts.ordered_apply_receipt) |entry| {
                 var buffer: [ordered_apply_receipt_value_len]u8 = undefined;
@@ -11792,6 +12190,10 @@ pub const DB = struct {
             }
             try self.stageRestoreStagingReplicationOutbox(&txn, payload);
             try control_batch.commit();
+            if (command.operation == .document_revisions and command.operation.document_revisions.action == .reserve) {
+                const format: u8 = if (command.operation.document_revisions.subtransaction == 0) 2 else 3;
+                self.core.table_catalog.transaction_effect_format = @max(self.core.table_catalog.transaction_effect_format, format);
+            }
         }
         if (payload != null) try self.flushDurableReplicationOutboxes();
     }
@@ -11818,13 +12220,32 @@ pub const DB = struct {
     /// for new execution. Keep the ordinary topology, artifact and validation
     /// admission unchanged for every other SQL lock operation.
     fn requireSqlLockTopologyAdmission(self: *DB, txn: anytype, command: @import("../pessimistic_lock/control.zig").Command) !void {
-        const topology = @import("relational_integrity_topology.zig");
+        const topology = @import("relational/integrity/topology.zig");
         try @import("artifact_reconcile_intent.zig").requireAbsent(txn);
         try topology.requireNoActiveValidation(txn);
         const fence = (try topology.current(txn)) orelse return;
-        const descriptor = self.sql_persistence orelse return error.IntegrityTopologyBusy;
         try command.validate();
         if (!fence.namespace.eql(self.core.identity_namespace) or fence.owner_group_id != command.admission.binding.namespace.group) return error.IntegrityTopologyBusy;
+        const descriptor = self.sql_persistence orelse {
+            // A replicated predecessor can hold the replacing transaction's
+            // own prepared locks. Only its already resolved external decision
+            // may release them while a topology fence blocks fresh work.
+            if (command.operation != .resolve or command.native_control != null or command.retirement_control != null)
+                return error.IntegrityTopologyBusy;
+            const id = command.admission.transaction;
+            const actual = (try transactions_mod.externalParticipant(txn, id)) orelse return error.ExternalTransactionDecisionChanged;
+            const owner = actual.owner orelse return error.ExternalTransactionDecisionChanged;
+            if (actual.status == .pending) return error.LockOwnerBusy;
+            try transactions_mod.requireResolvedExternalLockControl(txn, id);
+            var scratch = std.heap.ArenaAllocator.init(self.alloc);
+            defer scratch.deinit();
+            const frozen = (try @import("../pessimistic_lock/transaction.zig").read(scratch.allocator(), txn, id)) orelse
+                return error.ExternalTransactionDecisionChanged;
+            try frozen.ref.validate(id, owner);
+            if (!std.meta.eql(frozen.ref.admission, command.admission) or !std.meta.eql(frozen.ref.decision, command.operation.resolve))
+                return error.ExternalTransactionDecisionChanged;
+            return;
+        };
         if (command.retirement_control) |control| {
             if (command.operation != .close) return error.IntegrityTopologyBusy;
             try control.requireFence(txn, command.admission);
@@ -11889,6 +12310,10 @@ pub const DB = struct {
         const locks = @import("../pessimistic_lock/control.zig");
         const query = try std.json.parseFromSliceLeaky(locks.Query, arena.allocator(), raw, .{});
         try query.validate();
+        if (query.document_revisions) |selection| {
+            if (self.core.table_catalog.storage_mode != .document) return error.InvalidLockScope;
+            for (selection.keys) |key| if (!self.core.byteRange().contains(key)) return error.IdentityNamespaceMismatch;
+        }
         if (self.sql_persistence != null and query.admission.purpose == .resolution and
             query.native_control == null and query.retirement_control == null) return error.ExternalTransactionDecisionChanged;
         var read = try self.core.store.beginReadTxn();
@@ -11951,7 +12376,7 @@ pub const DB = struct {
         const graph_cleanup_maintenance = req.graph_endpoint_cleanup or req.activate_range_tracking;
         const sql_drop_control = if (req.relational_topology) |command| command.sql_drop_control else false;
         if (sql_drop_control) {
-            try @import("relational_integrity_topology_contract.zig").validateSqlDropBatch(req);
+            try @import("relational/integrity/topology_contract.zig").validateSqlDropBatch(req);
             if (!trusted_replay and opts.native_fk_generation_entry == null and !opts.native_fk_generation_control) return error.InvalidControlReceiptPosition;
         }
         if ((!trusted_replay and !graph_cleanup_maintenance) or req.row_policy_principal_proof.len != 0)
@@ -12110,7 +12535,7 @@ pub const DB = struct {
                     for (page.artifacts) |artifact| {
                         if (page.source_generation_proof_page) {
                             const portable = @import("../portable_backup.zig");
-                            const accepted = @import("relational_integrity_generation_admission.zig");
+                            const accepted = @import("relational/integrity/generation_admission.zig");
                             if (!std.mem.startsWith(u8, artifact.key, portable.source_generation_admission_prefix) or
                                 artifact.key.len != portable.source_generation_admission_prefix.len + 32) return error.InvalidRestoreStagingCommand;
                             const decoded = accepted.Scope.decode(artifact.value) catch return error.InvalidRestoreStagingCommand;
@@ -22635,7 +23060,7 @@ pub const DB = struct {
     }
 
     fn lookupRelationalIntegrityCatalog(self: *DB, alloc: Allocator) !?types.LookupResult {
-        const catalog_mod = @import("relational_integrity_catalog.zig");
+        const catalog_mod = @import("relational/integrity/catalog.zig");
         self.core.lockApplyShared();
         defer self.core.unlockApplyShared();
         var pinned = self.core.acquireSchemaView() orelse return error.InvalidRelationalRowsRequest;
@@ -22662,7 +23087,7 @@ pub const DB = struct {
     }
 
     fn lookupRelationalIndexStatus(self: *DB, alloc: Allocator, bytes: []const u8, opts: types.LookupOptions) !?types.LookupResult {
-        const contract = @import("relational_index_status_contract.zig");
+        const contract = @import("relational/indexes/status_contract.zig");
         if (bytes.len > 4096) return error.InvalidArgument;
         var request = try std.json.parseFromSlice(contract.Request, alloc, bytes, .{});
         defer request.deinit();
@@ -22745,7 +23170,7 @@ pub const DB = struct {
     }
 
     fn lookupRelationalIntegrityAction(self: *DB, alloc: Allocator, routing: []const u8) !?types.LookupResult {
-        const integrity = @import("relational_integrity.zig");
+        const integrity = @import("relational/integrity/integrity.zig");
         if (routing.len != 32) return error.InvalidIntegrityAddress;
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
@@ -22770,7 +23195,7 @@ pub const DB = struct {
             page: *const integrity.ActionPage,
 
             pub fn jsonStringify(response: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
-                try @import("relational_integrity_json.zig").write(.{
+                try @import("relational/integrity/json.zig").write(.{
                     .address = response.address,
                     .claim = response.page.claim,
                     .job = response.page.job,
@@ -22784,7 +23209,7 @@ pub const DB = struct {
     }
 
     fn lookupRelationalIntegrityJobs(self: *DB, alloc: Allocator, request_json: []const u8, options: types.LookupOptions) !?types.LookupResult {
-        const integrity = @import("relational_integrity.zig");
+        const integrity = @import("relational/integrity/integrity.zig");
         if (request_json.len > integrity.max_preparation_bytes) return error.InvalidIntegrityBudget;
         var kind = try std.json.parseFromSlice(struct { kind: []const u8 = "discover" }, alloc, request_json, .{ .ignore_unknown_fields = true });
         defer kind.deinit();
@@ -22861,7 +23286,7 @@ pub const DB = struct {
             pub fn jsonStringify(response: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
                 try stream.beginObject();
                 try stream.objectField("jobs");
-                try @import("relational_integrity_json.zig").write(response.jobs, stream);
+                try @import("relational/integrity/json.zig").write(response.jobs, stream);
                 try stream.objectField("next");
                 try stream.write(response.next);
                 try stream.endObject();
@@ -22873,21 +23298,21 @@ pub const DB = struct {
     /// A single routed ReadIndex gate covers this bounded owner-local read.
     /// All addresses must belong to this physical range; topology changes fail
     /// closed rather than silently routing part of the batch elsewhere.
-    fn validateIntegrityReadGeneration(alloc: Allocator, read: *@import("relational_integrity.zig").CurrentView, expected_schema: ?u32, expected_set: ?@import("relational_integrity.zig").Digest) !void {
+    fn validateIntegrityReadGeneration(alloc: Allocator, read: *@import("relational/integrity/integrity.zig").CurrentView, expected_schema: ?u32, expected_set: ?@import("relational/integrity/integrity.zig").Digest) !void {
         if (expected_schema == null and expected_set == null) return;
         const schema_version = expected_schema orelse return error.InvalidIntegrityAddress;
         const generation_set = expected_set orelse return error.InvalidIntegrityAddress;
-        const catalog = @import("relational_integrity_catalog.zig");
+        const catalog = @import("relational/integrity/catalog.zig");
         const encoded = read.get(catalog.key) catch |err| switch (err) {
             error.NotFound => return error.PreparedGenerationChanged,
             else => return err,
         };
         var bindings = try catalog.decode(alloc, encoded);
         defer bindings.deinit();
-        if (bindings.schema_version != schema_version or !std.mem.eql(u8, &generation_set, &@import("relational_integrity_activation_contract.zig").generationSet(bindings))) return error.PreparedGenerationChanged;
+        if (bindings.schema_version != schema_version or !std.mem.eql(u8, &generation_set, &@import("relational/integrity/activation_contract.zig").generationSet(bindings))) return error.PreparedGenerationChanged;
     }
 
-    fn lookupPreparationObservations(self: *DB, alloc: Allocator, keys: []const []const u8, outer: types.LookupOptions, expected_schema: ?u32, expected_set: ?@import("relational_integrity.zig").Digest, typed_nulls: bool) !?types.LookupResult {
+    fn lookupPreparationObservations(self: *DB, alloc: Allocator, keys: []const []const u8, outer: types.LookupOptions, expected_schema: ?u32, expected_set: ?@import("relational/integrity/integrity.zig").Digest, typed_nulls: bool) !?types.LookupResult {
         if (expected_schema == null or expected_set == null) return error.InvalidIntegrityAddress;
         if (keys.len == 0 or keys.len > 8) return error.InvalidIntegrityBudget;
         const Item = struct { key: []const u8, row: ?types.LookupResult };
@@ -22899,7 +23324,7 @@ pub const DB = struct {
         defer self.core.unlockApplyShared();
         var probe = try self.core.store.beginReadTxn();
         defer probe.abort();
-        var serving = try @import("relational_integrity.zig").CurrentView.init(self.core.store);
+        var serving = try @import("relational/integrity/integrity.zig").CurrentView.init(self.core.store);
         defer serving.deinit();
         try validateIntegrityReadGeneration(scratch, &serving, expected_schema, expected_set);
         var retained: usize = 0;
@@ -22929,7 +23354,7 @@ pub const DB = struct {
                 for (value.observations) |item| {
                     try stream.beginObject();
                     try stream.objectField("key");
-                    try @import("relational_integrity_json.zig").write(item.key, stream);
+                    try @import("relational/integrity/json.zig").write(item.key, stream);
                     try stream.objectField("row");
                     // Primary JSON remains an encoded document string. Binary
                     // digests are fixed arrays and cannot lose byte identity.
@@ -22952,7 +23377,7 @@ pub const DB = struct {
     }
 
     fn lookupTemporalIntegrityProbe(self: *DB, alloc: Allocator, json: []const u8, options: types.LookupOptions) !?types.LookupResult {
-        const integrity = @import("relational_integrity.zig");
+        const integrity = @import("relational/integrity/integrity.zig");
         const Query = struct {
             kind: []const u8,
             address: integrity.Address,
@@ -22985,8 +23410,8 @@ pub const DB = struct {
         return .{ .json = try std.json.Stringify.valueAlloc(alloc, .{ .validated = true, .address = query.address }, .{}) };
     }
 
-    fn lookupRelationalIntegrityClaims(self: *DB, alloc: Allocator, addresses: []const @import("relational_integrity.zig").Address, expected_schema: ?u32, expected_set: ?@import("relational_integrity.zig").Digest) !?types.LookupResult {
-        const integrity = @import("relational_integrity.zig");
+    fn lookupRelationalIntegrityClaims(self: *DB, alloc: Allocator, addresses: []const @import("relational/integrity/integrity.zig").Address, expected_schema: ?u32, expected_set: ?@import("relational/integrity/integrity.zig").Digest) !?types.LookupResult {
+        const integrity = @import("relational/integrity/integrity.zig");
         if (expected_schema == null or expected_set == null) return error.InvalidIntegrityAddress;
         if (addresses.len == 0 or addresses.len > 8) return error.InvalidIntegrityBudget;
         const Item = struct { address: integrity.Address, claim: ?integrity.Claim };
@@ -23020,15 +23445,15 @@ pub const DB = struct {
             pub fn jsonStringify(value: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
                 try stream.beginObject();
                 try stream.objectField("claims");
-                try @import("relational_integrity_json.zig").write(value.claims, stream);
+                try @import("relational/integrity/json.zig").write(value.claims, stream);
                 try stream.endObject();
             }
         };
         return .{ .json = try std.json.Stringify.valueAlloc(alloc, Response{ .claims = items }, .{}) };
     }
 
-    fn lookupRelationalIntegrityReferences(self: *DB, alloc: Allocator, address: @import("relational_integrity.zig").Address, after: ?[]const u8, limit: u32, expected_schema: ?u32, expected_set: ?@import("relational_integrity.zig").Digest) !?types.LookupResult {
-        const integrity = @import("relational_integrity.zig");
+    fn lookupRelationalIntegrityReferences(self: *DB, alloc: Allocator, address: @import("relational/integrity/integrity.zig").Address, after: ?[]const u8, limit: u32, expected_schema: ?u32, expected_set: ?@import("relational/integrity/integrity.zig").Digest) !?types.LookupResult {
+        const integrity = @import("relational/integrity/integrity.zig");
         const prefix = address.referencePrefix();
         _ = try integrity.parseKey(&address.claimKey());
         var scratch = std.heap.ArenaAllocator.init(alloc);
@@ -23077,7 +23502,7 @@ pub const DB = struct {
             }
             if (self.backend_runtime.io()) |io| try io.checkCancel();
             const reference = try integrity.Reference.decode(item.key, item.value);
-            if (!try @import("relational_integrity_generation_retirement.zig").isRetired(&read, reference)) {
+            if (!try @import("relational/integrity/generation_retirement.zig").isRetired(&read, reference)) {
                 const copy = try owned.dupe(u8, item.value);
                 try references.append(owned, try integrity.Reference.decode(item.key, copy));
             }
@@ -23099,11 +23524,11 @@ pub const DB = struct {
             pub fn jsonStringify(response: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
                 try stream.beginObject();
                 try stream.objectField("address");
-                try @import("relational_integrity_json.zig").write(response.address, stream);
+                try @import("relational/integrity/json.zig").write(response.address, stream);
                 try stream.objectField("claim");
-                try @import("relational_integrity_json.zig").write(response.claim, stream);
+                try @import("relational/integrity/json.zig").write(response.claim, stream);
                 try stream.objectField("references");
-                try @import("relational_integrity_json.zig").write(response.references, stream);
+                try @import("relational/integrity/json.zig").write(response.references, stream);
                 try stream.objectField("next");
                 try stream.write(response.next);
                 try stream.endObject();
@@ -23629,8 +24054,8 @@ pub const DB = struct {
     }
 
     fn lookupRelationalRetirement(self: *DB, alloc: Allocator, request_json: []const u8) !?types.LookupResult {
-        const retirement = @import("relational_integrity_retirement.zig");
-        const activation = @import("relational_integrity_activation.zig");
+        const retirement = @import("relational/integrity/retirement.zig");
+        const activation = @import("relational/integrity/activation.zig");
         var request = try std.json.parseFromSlice(struct { kind: []const u8, mode: enum { status, page } = .status, max_rows: u32 = 128, include_catalog: bool = true }, alloc, request_json, .{});
         defer request.deinit();
         if (request.value.max_rows == 0 or request.value.max_rows > 128) return error.InvalidIntegrityBudget;
@@ -23643,8 +24068,8 @@ pub const DB = struct {
             const owned = arena.allocator();
             const raw_progress = (try self.core.getStoreValue(owned, retirement.key)) orelse return null;
             const progress = try retirement.Progress.decode(raw_progress);
-            const raw_bindings = (try self.core.getStoreValue(owned, @import("relational_integrity_catalog.zig").key)) orelse return error.IntegrityCatalogChanged;
-            var bindings = try @import("relational_integrity_catalog.zig").decode(owned, raw_bindings);
+            const raw_bindings = (try self.core.getStoreValue(owned, @import("relational/integrity/catalog.zig").key)) orelse return error.IntegrityCatalogChanged;
+            var bindings = try @import("relational/integrity/catalog.zig").decode(owned, raw_bindings);
             defer bindings.deinit();
             if (view.version() != progress.schema_version or !std.mem.eql(u8, &progress.generation_set, &activation.generationSet(bindings))) return error.ConstraintRetirementChanged;
             var fields = std.ArrayList([]const u8).empty;
@@ -23675,13 +24100,13 @@ pub const DB = struct {
                     for (response.rows) |row| {
                         try jw.beginObject();
                         try jw.objectField("key");
-                        try @import("relational_integrity_json.zig").write(row.key, jw);
+                        try @import("relational/integrity/json.zig").write(row.key, jw);
                         try jw.objectField("json");
                         try jw.write(row.json);
                         try jw.objectField("version");
                         try jw.write(row.version);
                         try jw.objectField("expected_content_digest");
-                        try @import("relational_integrity_json.zig").write(row.expected_content_digest, jw);
+                        try @import("relational/integrity/json.zig").write(row.expected_content_digest, jw);
                         try jw.endObject();
                     }
                     try jw.endArray();
@@ -23696,9 +24121,9 @@ pub const DB = struct {
         }
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
-        var read = try @import("relational_integrity.zig").CurrentView.init(self.core.store);
+        var read = try @import("relational/integrity/integrity.zig").CurrentView.init(self.core.store);
         defer read.deinit();
-        const raw_catalog: []const u8 = if (request.value.include_catalog) read.get(@import("relational_integrity_catalog.zig").key) catch |err| switch (err) {
+        const raw_catalog: []const u8 = if (request.value.include_catalog) read.get(@import("relational/integrity/catalog.zig").key) catch |err| switch (err) {
             error.NotFound => return null,
             else => return err,
         } else "";
@@ -23713,7 +24138,7 @@ pub const DB = struct {
             range_start: []const u8,
             range_end: []const u8,
             pub fn jsonStringify(response: @This(), jw: anytype) @TypeOf(jw.*).Error!void {
-                try @import("relational_integrity_json.zig").write(response, jw);
+                try @import("relational/integrity/json.zig").write(response, jw);
             }
         };
         const serving_range = try @import("online_integrity_shadow.zig").servingRange(&read, self.core.byteRange());
@@ -23721,8 +24146,8 @@ pub const DB = struct {
     }
 
     fn lookupRelationalActivation(self: *DB, alloc: Allocator, request_json: []const u8, opts: types.LookupOptions) !?types.LookupResult {
-        const activation = @import("relational_integrity_activation.zig");
-        const catalog_mod = @import("relational_integrity_catalog.zig");
+        const activation = @import("relational/integrity/activation.zig");
+        const catalog_mod = @import("relational/integrity/catalog.zig");
         if (request_json.len > 1024) return error.InvalidConstraintActivation;
         var request = try std.json.parseFromSlice(struct { mode: enum { status, page, retry, validation_status, validation_page, validation_recovery_status } = .status, max_rows: u32 = 128, schema_version: ?u32 = null, validation_id: ?[16]u8 = null }, alloc, request_json, .{});
         defer request.deinit();
@@ -23758,7 +24183,7 @@ pub const DB = struct {
             };
             var page = (try @import("foreign_key_validation_page.zig").prepare(alloc, self.backend_runtime.io(), self.core, self.root_incarnation, request.value.validation_id.?, .{ .rows = request.value.max_rows, .output_bytes = 1024 * 1024, .time_ns = 100 * std.time.ns_per_ms }, .{ .context = @constCast(&context), .checkpoint = Check.active })) orelse return null;
             defer page.deinit();
-            const Row = @import("relational_integrity_activation_contract.zig").Row;
+            const Row = @import("relational/integrity/activation_contract.zig").Row;
             const projected = try alloc.alloc(Row, page.rows.rows.len);
             defer alloc.free(projected);
             for (projected, page.rows.rows) |*row, source| row.* = .{ .key = source.key, .json = source.json, .version = source.version, .expected_content_digest = source.expected_content_digest, .json_null_fields = source.json_null_fields };
@@ -23768,7 +24193,7 @@ pub const DB = struct {
                 phase: activation.Phase = .foreign_key,
                 constraints: []const []const u8,
                 pub fn jsonStringify(response: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
-                    try @import("relational_integrity_json.zig").write(response, stream);
+                    try @import("relational/integrity/json.zig").write(response, stream);
                 }
             };
             return .{ .json = try std.json.Stringify.valueAlloc(alloc, Response{ .rows = projected, .command = page.command, .constraints = page.constraints }, .{}) };
@@ -23783,7 +24208,7 @@ pub const DB = struct {
             const unique_count = if (public_schema.unique_constraints) |values| values.value.len else 0;
             const foreign_count = if (public_schema.foreign_keys) |values| values.value.len else 0;
             const per_row = @max(@as(usize, 1), @max(unique_count, foreign_count));
-            const declaration_limit = @max(@as(usize, 1), @import("relational_integrity.zig").max_commands / (2 * per_row));
+            const declaration_limit = @max(@as(usize, 1), @import("relational/integrity/integrity.zig").max_commands / (2 * per_row));
             // Activation pages commit through distributed 2PC. A bounded
             // 100 ms source scan amortizes that commit without changing the
             // reusable reader's caller-specified budget or its row/byte caps.
@@ -23794,7 +24219,7 @@ pub const DB = struct {
             })) orelse return null;
             defer page.deinit();
             if (page.progress.schema_version != view.version()) return error.PreparedGenerationChanged;
-            const Row = @import("relational_integrity_activation_contract.zig").Row;
+            const Row = @import("relational/integrity/activation_contract.zig").Row;
             const rows = try alloc.alloc(Row, page.rows.rows.len);
             defer alloc.free(rows);
             for (rows, page.rows.rows) |*row, source| row.* = .{ .key = source.key, .json = source.json, .version = source.version, .expected_content_digest = source.expected_content_digest, .json_null_fields = source.json_null_fields };
@@ -23804,14 +24229,14 @@ pub const DB = struct {
                 phase: activation.Phase,
 
                 pub fn jsonStringify(response: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
-                    try @import("relational_integrity_json.zig").write(response, stream);
+                    try @import("relational/integrity/json.zig").write(response, stream);
                 }
             };
             return .{ .json = try std.json.Stringify.valueAlloc(alloc, Response{ .rows = rows, .command = page.command, .phase = page.phase }, .{}) };
         }
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
-        var read = try @import("relational_integrity.zig").CurrentView.init(self.core.store);
+        var read = try @import("relational/integrity/integrity.zig").CurrentView.init(self.core.store);
         defer read.deinit();
         const raw_catalog = read.get(catalog_mod.key) catch |err| switch (err) {
             error.NotFound => return null,
@@ -23837,7 +24262,7 @@ pub const DB = struct {
             range: types.ByteRange,
 
             pub fn jsonStringify(response: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
-                try @import("relational_integrity_json.zig").write(.{
+                try @import("relational/integrity/json.zig").write(.{
                     .schema_version = response.progress.schema_version,
                     .schema_digest = response.catalog.schema_digest,
                     .generation_set = response.progress.generation_set,
@@ -24596,7 +25021,7 @@ pub const DB = struct {
 
     /// Cohort capture verifies the exact durable owner fence and drained
     /// participant set under the same apply lock that pins the native root.
-    pub fn snapshotRelationalCohort(self: *DB, id: []const u8, expected: @import("relational_integrity_topology.zig").Fence, cancellation: types.CancellationToken) !u64 {
+    pub fn snapshotRelationalCohort(self: *DB, id: []const u8, expected: @import("relational/integrity/topology.zig").Fence, cancellation: types.CancellationToken) !u64 {
         if (comptime storage_engine.enabled) return storage_engine.call("snapshotRelationalCohort", .{ self, id, expected, cancellation });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
@@ -24606,7 +25031,7 @@ pub const DB = struct {
 
     /// Seal an exact common-cut owner generation durably. No corpus copy or
     /// hashing is performed while the write fence is held.
-    pub fn sealBackupCohort(self: *DB, id: []const u8, expected: @import("relational_integrity_topology.zig").Fence, cancellation: types.CancellationToken) !@import("native_backup_seal.zig").Handle {
+    pub fn sealBackupCohort(self: *DB, id: []const u8, expected: @import("relational/integrity/topology.zig").Fence, cancellation: types.CancellationToken) !@import("native_backup_seal.zig").Handle {
         if (comptime storage_engine.enabled) return storage_engine.call("sealBackupCohort", .{ self, id, expected, cancellation });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
@@ -24757,7 +25182,7 @@ pub const DB = struct {
 
     /// Cancellation consumes a planned seal even when its response was lost
     /// or delivery is delayed. Caller authority is the exact cohort fence.
-    pub fn cancelBackupCohort(self: *DB, fence: @import("relational_integrity_topology.zig").Fence) !void {
+    pub fn cancelBackupCohort(self: *DB, fence: @import("relational/integrity/topology.zig").Fence) !void {
         if (fence.role != .backup_snapshot or !fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
         lockAtomicWithBackoff(&self.snapshot_publication_mutex);
         defer self.snapshot_publication_mutex.unlock();
@@ -24798,7 +25223,7 @@ pub const DB = struct {
         const cache_id = try request.cacheId(self.alloc, self.core.identity_namespace);
         defer self.alloc.free(cache_id);
         try cut.admit(self.alloc, io, self.core.path, cache_id, .{}, control.token());
-        _ = try self.snapshotInternalWithStatementFence(cache_id, true, control.token(), control.deadline_ns, null, false, request, fence);
+        _ = try self.snapshotInternalWithStatementFence(cache_id, true, control.token(), control.deadline_ns, null, false, request, fence, null);
     }
 
     /// Statement cuts are local, unpublished generations with no continuation
@@ -25135,6 +25560,125 @@ pub const DB = struct {
         }
     }
 
+    pub fn captureFrozenImage(self: *DB, binding: @import("relational/rows/frozen_image.zig").Binding, cancellation: types.CancellationToken, deadline_ns: u64) !@import("relational/rows/frozen_image.zig").Handle {
+        if (comptime storage_engine.enabled) return storage_engine.call("captureFrozenImage", .{ self, binding, cancellation, deadline_ns });
+        try binding.validate();
+        if (!binding.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        const id = try binding.id();
+        const control: @import("native_query_cut.zig").Control = .{ .parent = cancellation, .deadline_ns = deadline_ns };
+        _ = try self.snapshotInternalWithStatementFence(&id, true, control.token(), self.snapshotMaintenanceDeadline(deadline_ns), null, false, null, null, binding);
+        const image = @import("relational/rows/frozen_image.zig");
+        const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+        const path = try image.pathAlloc(self.alloc, self.core.path, binding);
+        defer self.alloc.free(path);
+        return image.readHandle(self.alloc, io, path, binding, cancellation);
+    }
+    /// Journal records irrelevant to an index do not require replaying its
+    /// rows. Under the captured primary/replay/catalog fences, certify only a
+    /// mutation-free suffix through the existing durable checkpoint boundary.
+    fn advanceUnchangedSnapshotCheckpoints(self: *DB, selected: ?[]const []const u8, target: u64) !void {
+        // The durable hint maxima commit atomically with primary replay and
+        // survive pruning. An absent replay index is not proof of no changes.
+        if (!try self.core.store.hasReplayEntries()) return;
+        const configs = try self.core.listIndexes(self.alloc);
+        defer types.freeIndexConfigs(self.alloc, configs);
+        for (configs) |cfg| {
+            if (!@import("cypher").dependencies.contains(selected, cfg.name)) continue;
+            const checkpoint = try self.core.loadProjectionCheckpoint(self.alloc, cfg.name);
+            if (checkpoint.status != .clean or checkpoint.config_hash != types.indexConfigHash(cfg) or checkpoint.applied_sequence >= target) continue;
+            const relevant = try self.core.replaySource().latestMatchingSequence(self.alloc, checkpoint.applied_sequence, managedIndexReplayHint(cfg.kind));
+            if (relevant > checkpoint.applied_sequence) continue;
+            try self.core.saveAppliedSequence(cfg.name, target);
+        }
+    }
+    fn requireFrozenImageSource(self: *DB, binding: @import("relational/rows/frozen_image.zig").Binding) !void {
+        const stage = @import("restore_staging_contract.zig");
+        const raw = (try self.core.getStoreValue(self.alloc, stage.key)) orelse return error.RestoreStagingScopeChanged;
+        defer self.alloc.free(raw);
+        var progress = try stage.Progress.decode(self.alloc, raw);
+        defer progress.deinit();
+        try binding.requireProgress(progress.value);
+        if (!binding.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+    }
+    /// Internal storage operation. The SQL read owner must first admit the
+    /// retained reader against the published generation; a Handle alone is
+    /// never a public read grant. No fallback captures later live rows.
+    pub fn openFrozenImage(self: *DB, handle: @import("relational/rows/frozen_image.zig").Handle, cancellation: types.CancellationToken) !DB {
+        if (comptime storage_engine.enabled) return storage_engine.call("openFrozenImage", .{ self, handle, cancellation });
+        const image = @import("relational/rows/frozen_image.zig");
+        try handle.validate();
+        if (!handle.binding.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        const path = try image.pathAlloc(self.alloc, self.core.path, handle.binding);
+        defer self.alloc.free(path);
+        return self.openFrozenImageAt(path, handle.binding, handle.physical, cancellation);
+    }
+
+    pub fn openPublishedFrozenImage(self: *DB, binding: @import("relational/rows/frozen_image.zig").Binding, cancellation: types.CancellationToken) !DB {
+        if (comptime storage_engine.enabled) return storage_engine.call("openPublishedFrozenImage", .{ self, binding, cancellation });
+        const image = @import("relational/rows/frozen_image.zig");
+        try binding.validate();
+        if (!binding.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        const expected = (try self.transferableFrozenBase()) orelse return error.RelationPopulationChanged;
+        if (!std.meta.eql(expected, binding)) return error.RelationPopulationChanged;
+
+        const contract = @import("relational/rows/frozen_contract.zig");
+        const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+        const installed = try contract.installedPathAlloc(self.alloc, self.core.path, binding.scope);
+        defer self.alloc.free(installed);
+        if (try snapshotPathExists(io, installed)) return self.openFrozenImport(installed, binding, cancellation);
+        const historical = try contract.importPathAlloc(self.alloc, self.core.path, binding.scope);
+        defer self.alloc.free(historical);
+        const path = try image.pathAlloc(self.alloc, historical, binding);
+        defer self.alloc.free(path);
+        if (try snapshotPathExists(io, path)) return self.openFrozenImageAt(path, binding, null, cancellation);
+
+        // A promoted replica has the sealed import in its own Raft-applied
+        // store. Snapshot directories are local artifacts and may never
+        // have been captured on this replica. Verify its persisted seal
+        // before serving; never make a new capture from the current store.
+        if (!try snapshotPathExists(io, historical)) return error.RelationPopulationChanged;
+        return self.openFrozenImport(historical, binding, cancellation);
+    }
+
+    fn openFrozenImport(self: *DB, path: []const u8, binding: @import("relational/rows/frozen_contract.zig").Binding, cancellation: types.CancellationToken) !DB {
+        const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+        const lease_path = try std.fmt.allocPrint(self.alloc, "{s}.lease", .{path});
+        defer self.alloc.free(lease_path);
+        var reader = try @import("native_query_cut.zig").readLeaseAtPathOwned(self.alloc, io, lease_path, cancellation);
+        errdefer reader.deinit() catch unreachable;
+        return self.openFrozenDatabase(path, binding, reader, cancellation);
+    }
+
+    fn openFrozenImageAt(self: *DB, path: []const u8, binding: @import("relational/rows/frozen_image.zig").Binding, physical: ?[32]u8, cancellation: types.CancellationToken) !DB {
+        const image = @import("relational/rows/frozen_image.zig");
+        const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+        const lease_path = try std.fmt.allocPrint(self.alloc, "{s}.lease", .{path});
+        defer self.alloc.free(lease_path);
+        var reader = try @import("native_query_cut.zig").readLeaseAtPathOwned(self.alloc, io, lease_path, cancellation);
+        errdefer reader.deinit() catch unreachable;
+        if (physical) |checksum| {
+            try image.validate(self.alloc, io, path, .{ .binding = binding, .physical = checksum }, cancellation);
+        } else {
+            _ = try image.readHandle(self.alloc, io, path, binding, cancellation);
+        }
+        return self.openFrozenDatabase(path, binding, reader, cancellation);
+    }
+
+    fn openFrozenDatabase(self: *DB, path: []const u8, binding: @import("relational/rows/frozen_image.zig").Binding, reader: @import("native_query_cut_contract.zig").ReadLease, cancellation: types.CancellationToken) !DB {
+        var readonly = try DB.open(self.alloc, path, .{ .open_mode = .query_readonly, .backend_runtime = self.backend_runtime, .identity_namespace = binding.namespace, .prefer_existing_identity_namespace = true });
+        if (self.owned_backend_runtime) |owned| readonly.owned_backend_runtime = owned.retain();
+        errdefer readonly.close();
+        try readonly.requireFrozenImageSource(binding);
+        // This verified immutable projection is no longer a mutable staging
+        // owner. Its source record stays intact for provenance verification.
+        readonly.local_execution.restore_staging_required.store(false, .release);
+        try self.copyQueryCutRowPolicyAuthority(&readonly);
+        try self.attachRetainedQueryRecovery(&readonly);
+        try cancellation.check();
+        readonly.retained_query_lease = reader;
+        return readonly;
+    }
+
     pub fn openQueryCut(self: *DB, request: @import("native_query_cut_contract.zig").Request, cancellation: types.CancellationToken) !DB {
         if (comptime storage_engine.enabled) return storage_engine.call("openQueryCut", .{ self, request, cancellation });
         const cut = @import("native_query_cut.zig");
@@ -25306,12 +25850,12 @@ pub const DB = struct {
         requested_generated: bool,
         cancellation: types.CancellationToken,
         maintenance_deadline_ns: ?u64,
-        expected_topology_fence: ?@import("relational_integrity_topology.zig").Fence,
+        expected_topology_fence: ?@import("relational/integrity/topology.zig").Fence,
         backup_seal_only: bool,
         query_cut: ?@import("native_query_cut_contract.zig").Request,
     ) !u64 {
         if (comptime storage_engine.enabled) return storage_engine.call("snapshotInternal", .{ self, id, requested_generated, cancellation, maintenance_deadline_ns, expected_topology_fence, backup_seal_only, query_cut });
-        return self.snapshotInternalWithStatementFence(id, requested_generated, cancellation, maintenance_deadline_ns, expected_topology_fence, backup_seal_only, query_cut, null);
+        return self.snapshotInternalWithStatementFence(id, requested_generated, cancellation, maintenance_deadline_ns, expected_topology_fence, backup_seal_only, query_cut, null, null);
     }
 
     fn snapshotInternalWithStatementFence(
@@ -25320,10 +25864,11 @@ pub const DB = struct {
         requested_generated: bool,
         cancellation: types.CancellationToken,
         maintenance_deadline_ns: ?u64,
-        expected_topology_fence: ?@import("relational_integrity_topology.zig").Fence,
+        expected_topology_fence: ?@import("relational/integrity/topology.zig").Fence,
         backup_seal_only: bool,
         query_cut: ?@import("native_query_cut_contract.zig").Request,
         statement_fence: ?*const StatementReadFence,
+        frozen_image: ?@import("relational/rows/frozen_image.zig").Binding,
     ) !u64 {
         if (statement_fence) |fence| {
             if (query_cut == null or !requested_generated or !fence.primary.active or !fence.replay.active or
@@ -25331,13 +25876,14 @@ pub const DB = struct {
                 return error.InvalidArgument;
         }
         const selected_indexes = if (query_cut) |request| request.indexes else null;
-        const seal_only = backup_seal_only or query_cut != null;
+        const native_image = query_cut != null or frozen_image != null;
+        const seal_only = backup_seal_only or native_image;
         // Out-of-line payloads require their immutable physical authority even
         // for the embedded snapshot API; a primary-only KV copy is incomplete.
         const include_generated = requested_generated or self.local_execution.table_storage.dense_embeddings == .vector_store;
         var profile = QueryCaptureProfile.init(query_cut != null and benchQueryProfileEnabled(), "snapshot_publication_lock");
         defer profile.finish();
-        if (query_cut == null and !backup_seal_only) try self.ensureSnapshotStorage(include_generated);
+        if (!seal_only) try self.ensureSnapshotStorage(include_generated);
         // Serialize only snapshot construction/publication. Normal writes can
         // resume before native manifest hashing, while same-ID captures cannot
         // race the fresh-directory check or atomic rename.
@@ -25364,7 +25910,7 @@ pub const DB = struct {
             }
         }
         const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
-        const snapshot_parent = try std.fmt.allocPrint(self.alloc, "{s}.{s}", .{ self.core.path, if (query_cut != null) "query-pins" else if (seal_only) "backup-pins" else "snapshots" });
+        const snapshot_parent = try std.fmt.allocPrint(self.alloc, "{s}.{s}", .{ self.core.path, if (frozen_image != null) "generation-images" else if (query_cut != null) "query-pins" else if (seal_only) "backup-pins" else "snapshots" });
         defer self.alloc.free(snapshot_parent);
         var pin_lock: ?@import("native_backup_seal.zig").StoreLock = if (backup_seal_only) try @import("native_backup_seal.zig").StoreLock.acquire(self.alloc, io, self.core.path, cancellation) else null;
         defer if (pin_lock) |*held| held.deinit();
@@ -25376,11 +25922,15 @@ pub const DB = struct {
             defer self.alloc.free(tombstone);
             if (try snapshotPathExists(io, tombstone)) return error.BackupSealReleased;
             if (try snapshotPathExists(io, snapshot_root)) {
+                if (frozen_image) |binding| {
+                    _ = try @import("relational/rows/frozen_image.zig").readHandle(self.alloc, io, snapshot_root, binding, cancellation);
+                    return 0;
+                }
                 if (query_cut) |request| try @import("native_query_cut.zig").validate(self.alloc, io, snapshot_root, request, self.core.identity_namespace, cancellation) else _ = try @import("native_backup_seal.zig").readHandle(self.alloc, io, snapshot_root, expected_topology_fence.?);
                 return 0;
             }
         } else if (try snapshotPathExists(io, snapshot_root)) return error.SnapshotAlreadyExists;
-        if (query_cut != null) try self.requireQueryCutStorage();
+        if (native_image) try self.requireQueryCutStorage();
         const staging_root = if (seal_only) blk: {
             // One deterministic unpublished namespace per exact attempt lets
             // restart/retry reclaim abandoned pins without a directory scan.
@@ -25448,7 +25998,7 @@ pub const DB = struct {
         defer if (statement_fence == null) capture.release();
         // Migration may have won admission after the optimistic entry check.
         // Its structural mutation uses this same snapshot fence.
-        if (query_cut == null and !backup_seal_only) try self.ensureSnapshotStorage(include_generated) else try self.requireQueryCutStorage();
+        if (!seal_only) try self.ensureSnapshotStorage(include_generated) else try self.requireQueryCutStorage();
         if (builtin.is_test) {
             if (test_snapshot_fence_hook) |hook| hook.after_capture_admission(hook.ptr);
         }
@@ -25551,13 +26101,17 @@ pub const DB = struct {
         }
 
         profile.next("checkpoint_pin");
-        if (query_cut == null and !backup_seal_only) try self.ensureSnapshotStorageLocked(include_generated) else try self.requireQueryCutStorage();
+        if (!seal_only) try self.ensureSnapshotStorageLocked(include_generated) else try self.requireQueryCutStorage();
         if (expected_topology_fence) |expected| {
             var read = try self.core.store.beginProbeTxn();
             defer read.abort();
             var manager = try self.core.initTxnManager();
             defer manager.deinit();
-            try @import("relational_integrity_topology.zig").requireDrained(&read, &manager, expected);
+            try @import("relational/integrity/topology.zig").requireDrained(&read, &manager, expected);
+        }
+        if (frozen_image) |binding| {
+            try self.requireFrozenImageSource(binding);
+            try self.advanceUnchangedSnapshotCheckpoints(selected_indexes, capture_target_sequence);
         }
         try self.core.syncStore(true);
         try self.core.index_manager.syncSelected(true, selected_indexes);
@@ -25726,7 +26280,7 @@ pub const DB = struct {
                 if (hook.before_artifact_materialize) |run| run(hook.ptr);
             };
             profile.next("seal_and_publish");
-            const primary_root = if (query_cut != null) try self.alloc.dupe(u8, staging_root) else try std.fmt.allocPrint(self.alloc, "{s}/primary-lsm", .{staging_root});
+            const primary_root = if (native_image) try self.alloc.dupe(u8, staging_root) else try std.fmt.allocPrint(self.alloc, "{s}/primary-lsm", .{staging_root});
             defer self.alloc.free(primary_root);
             var total: u64 = switch (primary_snapshot) {
                 .lsm => |*checkpoint| try checkpoint.seal(io, primary_root, cancellation),
@@ -25739,7 +26293,9 @@ pub const DB = struct {
             // trees before its inventory and atomic publication.
             try std.Io.Dir.cwd().deleteTree(io, generated_native_pin_root);
             try std.Io.Dir.cwd().deleteTree(io, generated_metadata_pin_root);
-            if (query_cut) |request| {
+            if (frozen_image) |binding| {
+                try @import("relational/rows/frozen_image.zig").finish(self.alloc, io, staging_root, binding, capture_target_sequence, cancellation);
+            } else if (query_cut) |request| {
                 try @import("native_query_cut.zig").finishWithReuseDigest(self.alloc, io, staging_root, request, self.core.identity_namespace, capture_target_sequence, reuse_digest, cancellation);
             } else _ = try seal.finish(self.alloc, io, staging_root, expected_topology_fence.?, capture_target_sequence, .{
                 .artifact_format = primary_snapshot.artifactFormat(),
@@ -26572,18 +27128,18 @@ pub const DB = struct {
             if (native_manifest) |manifest| if (manifest.primary.origin) |origin|
                 try origin.requireImage(&read, try doc_identity.loadNamespaceTxn(&read));
             if (try doc_identity.loadNamespaceTxn(&read)) |namespace| {
-                _ = try @import("relational_schema_apply_outcome.zig").validateSnapshot(&read, namespace, cancellation);
-                try @import("relational_nullability_job.zig").validateSnapshot(alloc, &read, namespace, .{ .io = shared_io orelse std.Options.debug_io, .directory = path, .cancellation = cancellation, .resource_manager = opts.resource_manager });
+                _ = try @import("relational/schema_change/schema_apply_outcome.zig").validateSnapshot(&read, namespace, cancellation);
+                try @import("relational/schema_change/nullability_job.zig").validateSnapshot(alloc, &read, namespace, .{ .io = shared_io orelse std.Options.debug_io, .directory = path, .cancellation = cancellation, .resource_manager = opts.resource_manager });
             } else {
                 // Empty predecessor databases can lack an identity row, but
                 // exact outcomes/jobs cannot acquire one by being restored.
                 var cursor = try read.openCursor();
                 defer cursor.close();
-                for ([_][]const u8{ @import("relational_schema_apply_outcome.zig").family_prefix, @import("relational_schema_apply_outcome.zig").head_family_prefix, @import("../transaction_debt.zig").family_prefix, @import("relational_nullability_job.zig").family_prefix }) |prefix| {
+                for ([_][]const u8{ @import("relational/schema_change/schema_apply_outcome.zig").family_prefix, @import("relational/schema_change/schema_apply_outcome.zig").head_family_prefix, @import("../transaction_debt.zig").family_prefix, @import("relational/schema_change/nullability_job.zig").family_prefix }) |prefix| {
                     if (try cursor.seekAtOrAfter(prefix)) |row|
                         if (std.mem.startsWith(u8, row.key, prefix)) return error.IdentityNamespaceMismatch;
                 }
-                if (read.get(@import("relational_nullability_job.zig").key)) |_| {
+                if (read.get(@import("relational/schema_change/nullability_job.zig").key)) |_| {
                     return error.IdentityNamespaceMismatch;
                 } else |err| if (err != error.NotFound) return err;
                 _ = try transactions_mod.TxnManager.validateTopologyDebtSnapshot(alloc, &read, null, .{ .io = shared_io orelse std.Options.debug_io, .directory = path, .cancellation = cancellation, .resource_manager = opts.resource_manager });
@@ -26594,19 +27150,19 @@ pub const DB = struct {
         // cluster-coordinated restore/activation barrier is available.
         var detach_backup_fence = false;
         if (purpose == .historical_table) {
-            const topology_fence = opened_primary.store.get(alloc, @import("relational_integrity_topology.zig").fence_key) catch |err| switch (err) {
+            const topology_fence = opened_primary.store.get(alloc, @import("relational/integrity/topology.zig").fence_key) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
             };
             if (topology_fence) |bytes| {
                 defer alloc.free(bytes);
-                const fence = try @import("relational_integrity_topology.zig").Fence.decode(bytes);
+                const fence = try @import("relational/integrity/topology.zig").Fence.decode(bytes);
                 if (fence.role != .backup_snapshot) return error.CoordinatedConstraintRestoreRequired;
                 var read = try opened_primary.store.beginReadTxn();
                 defer read.abort();
                 const namespace = (try doc_identity.loadNamespaceTxn(&read)) orelse return error.IdentityNamespaceMismatch;
                 if (!namespace.eql(fence.namespace)) return error.IdentityNamespaceMismatch;
-                const catalog = read.get(@import("relational_integrity_catalog.zig").key) catch |err| switch (err) {
+                const catalog = read.get(@import("relational/integrity/catalog.zig").key) catch |err| switch (err) {
                     error.NotFound => null,
                     else => return err,
                 };
@@ -26616,7 +27172,7 @@ pub const DB = struct {
                 };
                 detach_backup_fence = true;
             }
-            const retirement = opened_primary.store.get(alloc, @import("relational_integrity_retirement.zig").key) catch |err| switch (err) {
+            const retirement = opened_primary.store.get(alloc, @import("relational/integrity/retirement.zig").key) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
             };
@@ -26625,20 +27181,20 @@ pub const DB = struct {
                 return error.CoordinatedConstraintRestoreRequired;
             }
         }
-        const restored_integrity = opened_primary.store.get(alloc, @import("relational_integrity_catalog.zig").key) catch |err| switch (err) {
+        const restored_integrity = opened_primary.store.get(alloc, @import("relational/integrity/catalog.zig").key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
         };
         if (restored_integrity) |bytes| {
             defer alloc.free(bytes);
-            var catalog = try @import("relational_integrity_catalog.zig").decode(alloc, bytes);
+            var catalog = try @import("relational/integrity/catalog.zig").decode(alloc, bytes);
             defer catalog.deinit();
-            if (@import("relational_integrity_activation.zig").hasActive(catalog)) switch (purpose) {
+            if (@import("relational/integrity/activation.zig").hasActive(catalog)) switch (purpose) {
                 .historical_table => return error.CoordinatedConstraintRestoreRequired,
                 .identity_preserving => |expected_namespace| {
                     const stored_namespace = (try doc_identity.loadNamespaceFromStore(&opened_primary.store)) orelse return error.IdentityNamespaceMismatch;
                     if (!stored_namespace.eql(expected_namespace)) return error.IdentityNamespaceMismatch;
-                    const incarnation = try @import("relational_integrity_catalog.zig").incarnationFromTableId(expected_namespace.table_id);
+                    const incarnation = try @import("relational/integrity/catalog.zig").incarnationFromTableId(expected_namespace.table_id);
                     if (!std.mem.eql(u8, &incarnation, &catalog.incarnation)) return error.IntegrityCatalogIncarnationMismatch;
                 },
             };
@@ -26647,7 +27203,7 @@ pub const DB = struct {
         // its source backup's writer fence. Other topology roles, retirement,
         // active/historical constraints and integrity records remain rejected.
         if (detach_backup_fence)
-            try opened_primary.store.delete(@import("relational_integrity_topology.zig").fence_key);
+            try opened_primary.store.delete(@import("relational/integrity/topology.zig").fence_key);
         if (!streaming_store)
             try db_core.importChangeJournalSnapshot(alloc, &opened_primary.store, snapshot_root);
         // The candidate root owns its identity. Creating it while the staged
@@ -28626,18 +29182,18 @@ pub const DB = struct {
     }
 
     pub const PublishedChildSchema = struct {
-        fence: @import("relational_integrity_topology_contract.zig").Fence,
+        fence: @import("relational/integrity/topology_contract.zig").Fence,
         before_schema_json_digest: [32]u8,
         schema_json_digest: [32]u8,
         before_catalog_digest: [32]u8,
         after_catalog_digest: [32]u8,
         ordered_receipt: OrderedApplyReceipt,
         native: bool = false,
-        native_control: ?@import("relational_integrity_topology_contract.zig").Command = null,
+        native_control: ?@import("relational/integrity/topology_contract.zig").Command = null,
     };
 
     pub const InitialHiddenChild = struct {
-        fence: @import("relational_integrity_topology_contract.zig").Fence,
+        fence: @import("relational/integrity/topology_contract.zig").Fence,
         child_table_name: []const u8,
         plan_id: [16]u8,
         plan_digest: [32]u8,
@@ -28653,7 +29209,7 @@ pub const DB = struct {
     /// one write; Raft owners also persist the Raft marker, while native
     /// owners use the record itself as their exact durable operation receipt.
     pub fn provisionInitialHiddenChild(self: *DB, schema_json: []const u8, input: InitialHiddenChild, replication_lsn: ?u64, replication_payload: ?[]const u8) !void {
-        const hidden = @import("relational_initial_child_publication.zig");
+        const hidden = @import("relational/integrity/initial_child_publication.zig");
         if (self.local_execution.initial_child_bootstrap) |bootstrap| {
             if (!std.mem.eql(u8, &bootstrap.plan_id, &input.plan_id) or
                 !std.mem.eql(u8, &bootstrap.plan_digest, &input.plan_digest) or
@@ -28730,7 +29286,7 @@ pub const DB = struct {
         // their accepted generation scopes in the same durable transaction as
         // the initial schema and hidden gate, before any release can route a
         // row. External-parent scopes use the separate parent protocol.
-        const admission = @import("relational_integrity_generation_admission.zig");
+        const admission = @import("relational/integrity/generation_admission.zig");
         const fks = try parsed.relationalForeignKeyDefinitions(self.alloc);
         defer if (fks.len > 0) self.alloc.free(fks);
         var self_arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -28821,7 +29377,7 @@ pub const DB = struct {
             self.alloc.free(prior_schema);
             return error.InitialChildPublicationChanged;
         }
-        if (try self.core.getStoreValue(self.alloc, @import("relational_integrity_catalog.zig").key)) |prior_catalog| {
+        if (try self.core.getStoreValue(self.alloc, @import("relational/integrity/catalog.zig").key)) |prior_catalog| {
             self.alloc.free(prior_catalog);
             return error.InitialChildPublicationChanged;
         }
@@ -28856,8 +29412,8 @@ pub const DB = struct {
         self.reconcilePublishedSchemaIndexes(runtime_schema.version);
     }
 
-    fn applyInitialChildPhase(self: *DB, fence: @import("relational_integrity_topology_contract.zig").Fence, control: @import("relational_integrity_topology_contract.zig").InitialChildControl, phase: @import("relational_initial_child_publication.zig").Phase, entry: OrderedApplyReceipt, native: bool, replication_lsn: ?u64, replication_payload: ?[]const u8) !void {
-        const hidden = @import("relational_initial_child_publication.zig");
+    fn applyInitialChildPhase(self: *DB, fence: @import("relational/integrity/topology_contract.zig").Fence, control: @import("relational/integrity/topology_contract.zig").InitialChildControl, phase: @import("relational/integrity/initial_child_publication.zig").Phase, entry: OrderedApplyReceipt, native: bool, replication_lsn: ?u64, replication_payload: ?[]const u8) !void {
+        const hidden = @import("relational/integrity/initial_child_publication.zig");
         if (fence.role != .child_generation_source or !fence.namespace.eql(self.core.identity_namespace) or
             std.mem.allEqual(u8, &control.plan_id, 0) or std.mem.allEqual(u8, &control.plan_digest, 0) or
             !std.mem.eql(u8, &control.catalog_digest, &fence.catalog_digest) or
@@ -28957,7 +29513,7 @@ pub const DB = struct {
             try txn.commit();
             return;
         }
-        const stored_catalog = txn.get(@import("relational_integrity_catalog.zig").key) catch return error.IntegrityCatalogChanged;
+        const stored_catalog = txn.get(@import("relational/integrity/catalog.zig").key) catch return error.IntegrityCatalogChanged;
         var catalog_digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(stored_catalog, &catalog_digest, .{});
         if (!std.mem.eql(u8, &catalog_digest, &current.catalog_digest)) return error.IntegrityCatalogChanged;
@@ -28968,7 +29524,7 @@ pub const DB = struct {
         if (phase == .released) {
             var parsed_schema = try public_table_schema.parseValidatedTableSchema(self.alloc, stored_schema);
             defer parsed_schema.deinit(self.alloc);
-            var parsed_catalog = try @import("relational_integrity_catalog.zig").decode(self.alloc, stored_catalog);
+            var parsed_catalog = try @import("relational/integrity/catalog.zig").decode(self.alloc, stored_catalog);
             defer parsed_catalog.deinit();
             const fks = try parsed_schema.relationalForeignKeyDefinitions(self.alloc);
             defer if (fks.len > 0) self.alloc.free(fks);
@@ -28979,7 +29535,7 @@ pub const DB = struct {
                 if (!std.mem.startsWith(u8, fk.parent_table, "table:")) continue;
                 const physical_id = std.hash.Wyhash.hash(0x54424c45, fk.parent_table);
                 if ((if (physical_id == 0) @as(u64, 1) else physical_id) != current.namespace.table_id) continue;
-                const scope = (try @import("relational_integrity_generation_admission.zig").load(&txn, fk.parent_table, fk.name)) orelse return error.InitialChildPublicationChanged;
+                const scope = (try @import("relational/integrity/generation_admission.zig").load(&txn, fk.parent_table, fk.name)) orelse return error.InitialChildPublicationChanged;
                 const binding = parsed_catalog.find(.foreign_key, fk.name) orelse return error.IntegrityCatalogChanged;
                 if (scope.phase != .active or scope.active_generation == null or
                     !std.mem.eql(u8, &scope.active_generation.?, &binding.generation) or
@@ -29021,7 +29577,7 @@ pub const DB = struct {
             // Raft high-water mark that could suppress a later publication.
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
-            const admission = @import("relational_integrity_generation_admission.zig");
+            const admission = @import("relational/integrity/generation_admission.zig");
             const raw = read.get(admission.source_install_receipt_key) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
@@ -29030,7 +29586,7 @@ pub const DB = struct {
                 const receipt = try admission.AppliedReceipt.decode(bytes);
                 const expected = try admission.sourceInstallDigest(publication.fence, publication.before_schema_json_digest, publication.schema_json_digest, publication.before_catalog_digest, publication.after_catalog_digest);
                 if (std.mem.eql(u8, &receipt.digest, &expected)) {
-                    const completed = (try @import("relational_integrity_topology.zig").completed(&read)) orelse return error.GenerationAdmissionChanged;
+                    const completed = (try @import("relational/integrity/topology.zig").completed(&read)) orelse return error.GenerationAdmissionChanged;
                     if (!completed.eql(publication.fence)) return error.GenerationAdmissionChanged;
                     if (publication.native_control != null) {
                         try (try receipt.position()).requireNamespace(publication.fence.namespace);
@@ -29039,7 +29595,7 @@ pub const DB = struct {
                     const actual = try read.get(public_schema_json_key);
                     if (!std.mem.eql(u8, actual, schema_json)) return error.IntegrityCatalogChanged;
                     var actual_digest: [32]u8 = undefined;
-                    std.crypto.hash.Blake3.hash(try read.get(@import("relational_integrity_catalog.zig").key), &actual_digest, .{});
+                    std.crypto.hash.Blake3.hash(try read.get(@import("relational/integrity/catalog.zig").key), &actual_digest, .{});
                     if (!std.mem.eql(u8, &actual_digest, &publication.after_catalog_digest)) return error.IntegrityCatalogChanged;
                     return;
                 }
@@ -29133,7 +29689,7 @@ pub const DB = struct {
                 schema_metadata_writes[schema_metadata_write_count] = marker;
                 schema_metadata_write_count += 1;
             }
-            const admission = @import("relational_integrity_generation_admission.zig");
+            const admission = @import("relational/integrity/generation_admission.zig");
             const digest = try admission.sourceInstallDigest(published.fence, published.before_schema_json_digest, published.schema_json_digest, published.before_catalog_digest, published.after_catalog_digest);
             source_receipt_buffer = (admission.AppliedReceipt{ .digest = digest, .term = published.ordered_receipt.term, .index = published.ordered_receipt.index }).encode();
             schema_metadata_writes[schema_metadata_write_count] = .{ .key = admission.source_install_receipt_key, .value = &source_receipt_buffer };
@@ -29152,7 +29708,7 @@ pub const DB = struct {
             prepared_schema.native_child_digest = try @import("native_topology_receipt.zig").commandDigest(self.alloc, command);
         };
         if (publication) |published| {
-            const current_catalog = (try self.core.getStoreValue(self.alloc, @import("relational_integrity_catalog.zig").key)) orelse return error.IntegrityCatalogChanged;
+            const current_catalog = (try self.core.getStoreValue(self.alloc, @import("relational/integrity/catalog.zig").key)) orelse return error.IntegrityCatalogChanged;
             defer self.alloc.free(current_catalog);
             var before_digest: [32]u8 = undefined;
             std.crypto.hash.Blake3.hash(current_catalog, &before_digest, .{});
@@ -29338,6 +29894,7 @@ pub const DB = struct {
     /// Bind external decision authority at enlistment, before a vote can race
     /// timeout recovery. Replicated admissions use the leader's durable time.
     pub fn beginExternalTransaction(self: *DB, request: types.ExternalTransactionBegin) !transactions_mod.TxnId {
+        if (request.document_revision_scope != null and request.restore_staging_scope != null) return error.InvalidTxnRequest;
         if (comptime storage_engine.enabled) return storage_engine.call("beginExternalTransaction", .{ self, request });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var policy: ?row_policy_gate_mod.Gate.Lease = null;
@@ -29377,6 +29934,7 @@ pub const DB = struct {
             try writes.append(self.alloc, .{ .key = &lock_key, .value = lock_bytes.? });
         }
         return self.core.beginTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(request.txn_id, request.begin_timestamp, request.created_at_ns, request.participants, request.coordinator, true, .{
+            .document_revision_scope = request.document_revision_scope,
             .external_decision_owner = request.owner,
             .native_pin = try self.relationPhysicalPin(),
             .writes = writes.items,
@@ -29527,7 +30085,7 @@ pub const DB = struct {
             defer topology_read.abort();
             if (self.local_execution.restore_staging_required.load(.acquire)) try @import("restore_staging.zig").requireScope(preparation_alloc, &topology_read, null, false);
             if (intents.len != 0 and self.local_execution.materialized_view_read_only.load(.acquire)) try @import("restore_staging.zig").requirePrimaryWritable(preparation_alloc, &topology_read);
-            try @import("relational_integrity_topology.zig").admitPrepare(&topology_read, &topology_manager, preparation_alloc, txn_id);
+            try @import("relational/integrity/topology.zig").admitPrepare(&topology_read, &topology_manager, preparation_alloc, txn_id);
         }
         try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
         const index_spans = try self.collectIndexSpanReservations(preparation_alloc, prepared_intents, view);
@@ -29759,6 +30317,10 @@ pub const DB = struct {
 
     const TransactionPolicyPhase = enum { shape, verify, principal_gate, raw_gate, prepare };
     fn writeTransactionInternalMode(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest, ordered_receipt: ?OrderedApplyReceipt, atomic_execution: ?*NativeAtomicExecution) !backend_erased_mod.Ticket {
+        if (req.replication_source_permit != null and (ordered_receipt == null or atomic_execution != null))
+            return error.UnsupportedReplicationParticipant;
+        // Native standalone capture needs the standby publication sink.
+        if (req.publication_capture != null and ordered_receipt == null) return error.LogicalPublicationTransactionRequired;
         if (req.external_activation) {
             try self.activateExternalTransaction(txn_id, req, ordered_receipt);
             return backend_erased_mod.Ticket.alreadyDurable();
@@ -29800,7 +30362,9 @@ pub const DB = struct {
                 try self.local_execution.row_policy_gate.enterVerifiedPrincipal(&verified_principal.?.value, now_seconds);
         } else if (req.row_policy_database.len != 0 or req.row_policy_admitted_at_seconds != 0) {
             return error.RowPolicyAuthenticationRequired;
-        } else if (ordered_receipt == null) {
+        } else if (ordered_receipt == null or req.replication_source_permit != null) {
+            // A replicated PREPARE without a principal proof must hold the
+            // disabled-policy lease through the durable participant vote.
             policy_phase.* = .raw_gate;
             row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         } else if (self.local_execution.row_policy_gate.currentPhase() != .disabled and
@@ -29809,6 +30373,8 @@ pub const DB = struct {
             return error.RowPolicyAuthenticationRequired;
         }
         defer if (row_policy_lease) |*lease| lease.release();
+        if (req.replication_source_permit) |permit|
+            try self.local_execution.row_policy_gate.requireEpoch(permit.policy_epoch.generation, permit.policy_epoch.catalog_epoch);
         policy_phase.* = .prepare;
         var preparation: RequestPreparationContext = undefined;
         preparation.init(self);
@@ -29846,6 +30412,28 @@ pub const DB = struct {
         atomic_execution: ?*NativeAtomicExecution,
     ) !backend_erased_mod.Ticket {
         var req = incoming_req;
+        const capture_input: ?@import("logical_replication_outbox.zig").Preparation = if (req.publication_capture) |demand| capture: {
+            const ordered = ordered_receipt orelse return error.LogicalPublicationTransactionRequired;
+            const owner = req.external_decision_owner orelse return error.ExternalTransactionDecisionRequired;
+            if (!owner.eql(demand.owner) or !std.mem.eql(u8, &txn_id, &demand.transaction_id) or
+                req.external_activation or req.transforms.len != 0 or req.commit_requires != null or req.prepared_enrichments_json != null)
+                return error.InvalidLogicalCaptureControl;
+            const hashes = try @import("logical_replication_request.zig").digests(preparation_alloc, .{
+                .namespace = self.core.identity_namespace,
+                .owner_group_id = demand.owner_group_id,
+                .transaction_id = txn_id,
+                .member = demand.member,
+                .topology_epoch = demand.topology_epoch,
+            }, req);
+            break :capture .{
+                .demand = demand,
+                .request_digest = hashes.request,
+                .pregrant_body_digest = hashes.body,
+                .namespace = self.core.identity_namespace,
+                .physical_root_incarnation = self.root_incarnation,
+                .ordered = .{ .term = ordered.term, .index = ordered.index },
+            };
+        } else null;
         var packet = if (req.prepared_enrichments_json) |json|
             try std.json.parseFromSlice(execution_resources.PreparedEnrichments, preparation_alloc, json, .{ .allocate = .alloc_always })
         else
@@ -29979,6 +30567,7 @@ pub const DB = struct {
                 .key = predicate.key,
                 .expected_version = predicate.expected_version,
                 .expected_content_digest = predicate.expected_content_digest,
+                .expected_mutation_revision = predicate.expected_mutation_revision,
                 .unique_absence = predicate.unique_absence,
             });
         }
@@ -30027,8 +30616,9 @@ pub const DB = struct {
         if (prepared_schema_view) |view| if (view.tableSchema().external_base_source != null and
             (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0 or graph_sources.len != 0)) return error.ExternalLakeReadOnly;
         if (req.schema_version) |version| {
-            const view = prepared_schema_view orelse return error.PreparedGenerationChanged;
-            if (view.version() != version) return error.PreparedGenerationChanged;
+            if (prepared_schema_view) |view| {
+                if (view.version() != version) return error.PreparedGenerationChanged;
+            } else if (version != 0 or req.replication_source_permit == null) return error.PreparedGenerationChanged;
         }
         try @import("../../sql/trigger_native_admission.zig").requireSchemaView(req.asBatch(txn_id, 0), prepared_schema_view != null);
         try @import("../../sql/trigger_native_admission.zig").requireOwnerTable(req.asBatch(txn_id, 0), self.core.identity_namespace.table_id);
@@ -30080,7 +30670,7 @@ pub const DB = struct {
         };
         var guarded_indexes: std.AutoHashMapUnmanaged([tracking.index_id_bytes]u8, void) = .empty;
         defer guarded_indexes.deinit(preparation_alloc);
-        var index_plan: ?@import("relational_index_catalog.zig").WriteSnapshot = null;
+        var index_plan: ?@import("relational/indexes/catalog.zig").WriteSnapshot = null;
         defer if (index_plan) |*plan| plan.deinit();
         var index_read: ?docstore_mod.DocStore.Txn = null;
         defer if (index_read) |*read| read.abort();
@@ -30091,9 +30681,9 @@ pub const DB = struct {
             if (index_plan == null) {
                 index_plan = self.core.relational_indexes.acquire() orelse return error.PreparedGenerationChanged;
                 index_read = try self.core.store.beginProbeTxn();
-                const head_raw = try index_read.?.get(@import("relational_index_catalog.zig").head_key);
-                if (!(try @import("relational_index_catalog.zig").Head.decode(head_raw)).eql(index_plan.?.head)) return error.PreparedGenerationChanged;
-                try CaptureMetadata.add(preparation_alloc, &range_metadata_buffers, &predicates, &index_read.?, @import("relational_index_catalog.zig").head_key);
+                const head_raw = try index_read.?.get(@import("relational/indexes/catalog.zig").head_key);
+                if (!(try @import("relational/indexes/catalog.zig").Head.decode(head_raw)).eql(index_plan.?.head)) return error.PreparedGenerationChanged;
+                try CaptureMetadata.add(preparation_alloc, &range_metadata_buffers, &predicates, &index_read.?, @import("relational/indexes/catalog.zig").head_key);
             }
             const index = for (index_plan.?.plan.boundIndexes()) |candidate| {
                 const candidate_id = candidate.id().encode();
@@ -30101,7 +30691,7 @@ pub const DB = struct {
             } else return error.PreparedGenerationChanged;
             if ((try relational_index_jobs.status(&index_read.?, index)).state != .ready) return error.RelationalIndexNotReady;
             const progress_key = relational_index_jobs.progressKey(index.id());
-            const control_key = @import("relational_index_maintenance_contract.zig").controlKey(index.id());
+            const control_key = @import("relational/indexes/maintenance_contract.zig").controlKey(index.id());
             try CaptureMetadata.add(preparation_alloc, &range_metadata_buffers, &predicates, &index_read.?, &progress_key);
             try CaptureMetadata.add(preparation_alloc, &range_metadata_buffers, &predicates, &index_read.?, &control_key);
         }
@@ -30109,7 +30699,7 @@ pub const DB = struct {
         var prepared_documents = try self.prepareTransactionRows(preparation_alloc, intents.items, prepared_schema_view, req.normalized_graph_rows);
         defer if (prepared_documents) |*documents| documents.deinit();
 
-        const integrity_catalog_mod = @import("relational_integrity_catalog.zig");
+        const integrity_catalog_mod = @import("relational/integrity/catalog.zig");
         var integrity_catalog: ?integrity_catalog_mod.Catalog = null;
         var integrity_catalog_digest: ?[32]u8 = null;
         defer if (integrity_catalog) |*catalog| catalog.deinit();
@@ -30121,7 +30711,7 @@ pub const DB = struct {
             std.crypto.hash.Blake3.hash(raw_catalog, &digest, .{});
             integrity_catalog_digest = digest;
             if (req.relational_integrity_generation_set) |expected| {
-                const actual = @import("relational_integrity_activation.zig").generationSet(integrity_catalog.?);
+                const actual = @import("relational/integrity/activation.zig").generationSet(integrity_catalog.?);
                 if (!std.mem.eql(u8, &expected, &actual)) return error.IntegrityCatalogChanged;
             }
             const view = prepared_schema_view orelse return error.IntegrityCatalogChanged;
@@ -30143,7 +30733,7 @@ pub const DB = struct {
             schema_namespace: u64,
             binding: ?transactions_mod.SchemaBinding,
             prepared_schema_view: ?schema_registry_mod.SchemaView,
-            integrity_catalog: ?@import("relational_integrity_catalog.zig").Catalog,
+            integrity_catalog: ?@import("relational/integrity/catalog.zig").Catalog,
             integrity_catalog_digest: ?[32]u8,
             initial_intents: []const transactions_mod.WriteIntent,
             initial_predicates: []const transactions_mod.VersionPredicate,
@@ -30188,8 +30778,8 @@ pub const DB = struct {
                     const view = view_snapshot orelse return error.RowPolicyCatalogChanged;
                     try owner_db.enforceRowPolicyIntentsLocked(view, planned_intents.items, request.predicates, context.graph_sources, principal, plan_alloc, &planned_predicates, plan_alloc);
                 }
-                const integrity_mod = @import("relational_integrity.zig");
-                const activation_mod = @import("relational_integrity_activation.zig");
+                const integrity_mod = @import("relational/integrity/integrity.zig");
+                const activation_mod = @import("relational/integrity/activation.zig");
                 var repair_checkpoint: ?[]const u8 = null;
                 var restore_checkpoint: ?[]const u8 = null;
                 var topology_manager = try owner_db.core.initTxnManager();
@@ -30205,9 +30795,9 @@ pub const DB = struct {
                         restore_checkpoint = try plan_alloc.dupe(u8, checkpoint);
                         try planned_predicates.append(plan_alloc, .{ .key = @import("restore_staging.zig").key, .comparison = .exact_value, .expected_value = restore_checkpoint });
                     }
-                    try @import("relational_integrity_topology.zig").admitPrepare(&topology_read, &topology_manager, plan_alloc, transaction_id);
+                    try @import("relational/integrity/topology.zig").admitPrepare(&topology_read, &topology_manager, plan_alloc, transaction_id);
                 }
-                var maintenance_preparation: ?@import("relational_index_maintenance.zig").Prepared = null;
+                var maintenance_preparation: ?@import("relational/indexes/maintenance.zig").Prepared = null;
                 if (request.relational_index_maintenance) |command| {
                     const view = view_snapshot orelse return error.RelationalTableRequired;
                     if (view.version() != command.schema_version) return error.PreparedGenerationChanged;
@@ -30216,7 +30806,7 @@ pub const DB = struct {
                     if (plan.plan.schemaView().epoch != view.epoch) return error.PreparedGenerationChanged;
                     var maintenance_read = try owner_db.core.store.beginProbeTxn();
                     defer maintenance_read.abort();
-                    maintenance_preparation = try @import("relational_index_maintenance.zig").prepareCommand(
+                    maintenance_preparation = try @import("relational/indexes/maintenance.zig").prepareCommand(
                         plan_alloc,
                         &maintenance_read,
                         plan.plan,
@@ -30248,17 +30838,17 @@ pub const DB = struct {
                         if (context.write_count != 0 or context.delete_count != 0 or request.relational_activation != null or request.relational_repair) return error.InvalidConstraintRetirementCommand;
                         try @import("online_integrity_shadow.zig").requireCatalogMutable(&integrity_read);
                         try @import("online_integrity_shadow.zig").requireServing(&integrity_read, owner_db.core.byteRange(), command.routing_key);
-                        const retirement = try @import("relational_integrity_retirement.zig").prepareCommand(plan_alloc, &integrity_read, catalog_snapshot.?, command);
-                        const after = try @import("relational_integrity_retirement.zig").Progress.decode(command.next);
+                        const retirement = try @import("relational/integrity/retirement.zig").prepareCommand(plan_alloc, &integrity_read, catalog_snapshot.?, command);
+                        const after = try @import("relational/integrity/retirement.zig").Progress.decode(command.next);
                         if (command.expected) |expected| {
-                            const before = try @import("relational_integrity_retirement.zig").Progress.decode(expected);
+                            const before = try @import("relational/integrity/retirement.zig").Progress.decode(expected);
                             if (schema_binding == null and before.phase == .fenced and after.phase != .fenced and try topology_manager.hasSchemaLeases()) return error.SchemaInUse;
                         }
                         try planned_intents.append(plan_alloc, retirement.intent);
                         try planned_predicates.append(plan_alloc, retirement.predicate);
                     }
                     if (request.relational_activation) |command| {
-                        try @import("relational_integrity_retirement.zig").requireMutable(&integrity_read);
+                        try @import("relational/integrity/retirement.zig").requireMutable(&integrity_read);
                         try @import("online_integrity_shadow.zig").requireCatalogMutable(&integrity_read);
                         // A backfill page changes claims and its durable cursor, never
                         // primary rows. Its observed rows are retained read guards.
@@ -30269,7 +30859,7 @@ pub const DB = struct {
                         if (activation.inputs) |inputs| try planned_intents.append(plan_alloc, inputs);
                         try planned_predicates.append(plan_alloc, activation.predicate);
                     } else if (context.write_count != 0 or context.delete_count != 0) {
-                        try @import("relational_integrity_retirement.zig").requireMutable(&integrity_read);
+                        try @import("relational/integrity/retirement.zig").requireMutable(&integrity_read);
                         if (request.relational_repair) {
                             const repair_guard = try activation_mod.repairPredicate(plan_alloc, &integrity_read, catalog_snapshot.?);
                             repair_checkpoint = repair_guard.expected_value;
@@ -30277,8 +30867,8 @@ pub const DB = struct {
                         } else try activation_mod.requireReady(&integrity_read, catalog_snapshot.?);
                     }
                     if (request.integrity.len != 0 and request.integrity_commands.len != 0) return error.InvalidIntegrityOperation;
-                    if (request.integrity.len != 0) try @import("relational_integrity_retirement.zig").requireMutable(&integrity_read);
-                    try @import("relational_integrity_retirement.zig").admitCommands(&integrity_read, request.integrity_commands);
+                    if (request.integrity.len != 0) try @import("relational/integrity/retirement.zig").requireMutable(&integrity_read);
+                    try @import("relational/integrity/retirement.zig").admitCommands(&integrity_read, request.integrity_commands);
                     const integrity_operations = if (request.integrity_commands.len != 0) operations: {
                         integrity_effects = try integrity_mod.prepare(plan_alloc, &integrity_read, request.integrity_commands);
                         break :operations integrity_effects.?.operations;
@@ -30309,7 +30899,7 @@ pub const DB = struct {
                 }
                 if (request.graph_preparation) |proof| {
                     try @import("prepared_graph_effects.zig").requireDefinitions(plan_alloc, owner_db.core.index_manager, proof);
-                    const schema_digest = if (view_snapshot) |view| view.validator().?.source_digest orelse return error.PreparedGenerationChanged else @import("relational_schema_owner_contract.zig").hash("");
+                    const schema_digest = if (view_snapshot) |view| view.validator().?.source_digest orelse return error.PreparedGenerationChanged else @import("relational/schema_change/schema_owner_contract.zig").hash("");
                     if (!std.mem.eql(u8, &proof.schema_digest, &schema_digest)) return error.PreparedGenerationChanged;
                 }
                 try owner_db.prepareGraphIntentEffectsLocked(plan_alloc, planned_intents.items, context.graph_writes, context.graph_deletes, request.graph_preparation);
@@ -30404,6 +30994,30 @@ pub const DB = struct {
                 .already_applied => return backend_erased_mod.Ticket.alreadyDurable(),
                 .apply => {},
             }
+            const source_prepare: ?transactions_mod.ReplicationPrepare = if (req.replication_source_permit) |permit| blk: {
+                if (!std.mem.eql(u8, &txn_id, &permit.reference.txn_id) or req.schema_version != permit.schema_version)
+                    return error.ReplicationCutoverAuthorityLost;
+                const owner = req.external_decision_owner orelse return error.ExternalTransactionDecisionRequired;
+                if (!owner.eql(permit.decision_owner) or !self.core.identity_namespace.eql(permit.namespace))
+                    return error.ReplicationCutoverAuthorityLost;
+                if ((permit.sql_rights != 0 or req.relational_integrity_generation_set != null) and try @import("../../api/replication_source_apply.zig").intentRights(req) != permit.sql_rights)
+                    return error.ReplicationCutoverAuthorityLost;
+                const hashes = try @import("logical_replication_request.zig").digests(preparation_alloc, .{
+                    .namespace = permit.namespace,
+                    .owner_group_id = permit.owner_group_id,
+                    .transaction_id = txn_id,
+                    .member = permit.member,
+                    .topology_epoch = permit.topology_epoch,
+                }, req);
+                if (!std.mem.eql(u8, &hashes.body, &permit.pregrant_body_digest) or !std.mem.eql(u8, &hashes.request, &permit.request_digest))
+                    return error.ReplicationCutoverAuthorityLost;
+                const schema = if (prepared_schema_view) |view| view.tableSchema().* else schema_mod.TableSchema{};
+                break :blk .{
+                    .preparation = try @import("replication_source_apply_store.zig").preparationForSchema(preparation_alloc, permit, schema, self.root_incarnation, self.core.identity_namespace),
+                    .position = .{ .raft = .{ .term = identity.term, .index = identity.index } },
+                    .catalog = self.core.table_catalog,
+                };
+            } else null;
             var value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
             const marker = orderedApplyReceiptWrite(identity, &value_buf);
             // Wait here, not in the caller: the staged commit borrows this
@@ -30412,12 +31026,15 @@ pub const DB = struct {
                 txn_id,
                 locked.final_intents,
                 locked.final_predicates,
-                .{ .prepared_enrichments_json = req.prepared_enrichments_json, .external_decision_owner = req.external_decision_owner, .native_pin = try self.relationPhysicalPin(), .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
+                .{ .document_revision_scope = if (req.document_revision_handoff) |value| value.scope else null, .document_revision_references = if (req.document_revision_handoff) |value| value.references else &.{}, .replication_prepare = source_prepare, .publication_capture = capture_input, .prepared_enrichments_json = req.prepared_enrichments_json, .external_decision_owner = req.external_decision_owner, .native_pin = try self.relationPhysicalPin(), .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
             );
             try ticket.wait();
+            if (source_prepare != null) self.core.table_catalog.logical_capture_format = @max(self.core.table_catalog.logical_capture_format, table_catalog_mod.replication_source_apply_format);
             return backend_erased_mod.Ticket.alreadyDurable();
         } else {
             const ticket = try self.core.writeIntentsExtraBatchStaged(txn_id, locked.final_intents, locked.final_predicates, .{
+                .document_revision_scope = if (req.document_revision_handoff) |value| value.scope else null,
+                .document_revision_references = if (req.document_revision_handoff) |value| value.references else &.{},
                 .external_decision_owner = req.external_decision_owner,
                 .native_pin = try self.relationPhysicalPin(),
                 .prepared_enrichments_json = req.prepared_enrichments_json,
@@ -30982,6 +31599,7 @@ pub const DB = struct {
             null,
             null,
             null,
+            null,
         );
     }
 
@@ -31005,18 +31623,31 @@ pub const DB = struct {
             identity,
             resolved_participant,
             null,
+            null,
         );
     }
 
     pub fn resolveExternalTransaction(self: *DB, request: types.ExternalTransactionResolution) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("resolveExternalTransaction", .{ self, request });
         try request.owner.validate();
-        try self.resolveTransactionIntentsInternal(request.txn_id, request.status, request.commit_version, request.sync_level, request.visibility_cancellation, request.ordered_receipt, request.resolved_participant, request.owner);
+        const replication_resolution: ?transactions_mod.ReplicationOrderedPhase = if (request.replication_source_permit) |permit| blk: {
+            const position = request.ordered_receipt orelse return error.OrderedApplyRequired;
+            if (!permit.decision_owner.eql(request.owner) or !permit.namespace.eql(self.core.identity_namespace))
+                return error.ReplicationCutoverAuthorityLost;
+            break :blk .{ .permit = permit, .physical_root = self.root_incarnation, .position = .{ .raft = .{ .term = position.term, .index = position.index } } };
+        } else null;
+        try self.resolveTransactionIntentsInternal(request.txn_id, request.status, request.commit_version, request.sync_level, request.visibility_cancellation, request.ordered_receipt, request.resolved_participant, request.owner, replication_resolution);
     }
 
     fn activateExternalTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest, ordered: ?OrderedApplyReceipt) !void {
         const owner = req.external_decision_owner orelse return error.InvalidBatchRequest;
         if (req.asBatch(txn_id, 0).externalActivationOwner() == null) return error.InvalidBatchRequest;
+        const replication_activation: ?transactions_mod.ReplicationOrderedPhase = if (req.replication_source_permit) |permit| blk: {
+            const position = ordered orelse return error.OrderedApplyRequired;
+            if (!permit.decision_owner.eql(owner) or !permit.namespace.eql(self.core.identity_namespace))
+                return error.ReplicationCutoverAuthorityLost;
+            break :blk .{ .permit = permit, .physical_root = self.root_incarnation, .position = .{ .raft = .{ .term = position.term, .index = position.index } } };
+        } else null;
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         var marker: [ordered_apply_receipt_value_len]u8 = undefined;
@@ -31029,7 +31660,7 @@ pub const DB = struct {
         } else &.{};
         var manager = try self.core.initTxnManager();
         defer manager.deinit();
-        try manager.activateExternalDecision(txn_id, owner, .{ .writes = writes });
+        try manager.activateExternalDecision(txn_id, owner, .{ .writes = writes, .replication_activation = replication_activation });
     }
 
     pub const resolveTransactionIntentsInternal = local_mutation.resolveTransactionIntentsInternal;
@@ -31133,7 +31764,7 @@ pub const DB = struct {
 
     pub const validateResolvedKeyOwnership = local_mutation.validateResolvedKeyOwnership;
 
-    pub const RelationalTopologyIdentity = @import("relational_integrity_topology_contract.zig").Identity;
+    pub const RelationalTopologyIdentity = @import("relational/integrity/topology_contract.zig").Identity;
 
     fn lookupRelationalTopology(self: *DB, alloc: Allocator, request_json: []const u8, opts: types.LookupOptions) !?types.LookupResult {
         var request = try std.json.parseFromSlice(struct {
@@ -31146,7 +31777,7 @@ pub const DB = struct {
         errdefer output.deinit();
         var stream: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
         switch (request.value.mode) {
-            .identity => try @import("relational_integrity_json.zig").write(try self.relationalTopologyIdentity(), &stream),
+            .identity => try @import("relational/integrity/json.zig").write(try self.relationalTopologyIdentity(), &stream),
             .native_empty_identity => {
                 if (!@import("native_empty_origin.zig").identityLookupMatches("", opts)) return error.RestoreStagingScopeChanged;
                 const native = self.sql_persistence orelse return error.InvalidSqlRelationPersistence;
@@ -31164,7 +31795,7 @@ pub const DB = struct {
                         !std.mem.eql(u8, &opts.restore_staging_scope.?, &bootstrap.value.scope.digest()) or
                         !std.mem.eql(u8, &opts.restore_staging_plan_id.?, &bootstrap.value.scope.plan_id)) return error.RestoreStagingScopeChanged;
                 }
-                try @import("relational_integrity_json.zig").write(try self.relationalTopologyIdentity(), &stream);
+                try @import("relational/integrity/json.zig").write(try self.relationalTopologyIdentity(), &stream);
             },
             .native_empty_finalization => {
                 if (!@import("native_empty_origin.zig").finalizationLookupMatches("", opts)) return error.RestoreStagingScopeChanged;
@@ -31219,7 +31850,7 @@ pub const DB = struct {
                 };
                 const proof: native.Finalization = .{ .plan_id = bootstrap.value.scope.plan_id, .binding = binding, .installed = installed };
                 try proof.require(bootstrap.value.scope.digest(), bootstrap.value.scope.plan_id, installed);
-                try @import("relational_integrity_json.zig").write(proof, &stream);
+                try @import("relational/integrity/json.zig").write(proof, &stream);
             },
             .generation_handoff_identity => {
                 const scope = opts.restore_staging_scope orelse return error.RestoreStagingScopeChanged;
@@ -31237,9 +31868,9 @@ pub const DB = struct {
                         !std.mem.eql(u8, &scope, &bootstrap.value.scope.digest()) or
                         !std.mem.eql(u8, &plan_id, &bootstrap.value.scope.plan_id)) return error.RestoreStagingScopeChanged;
                 }
-                try @import("relational_integrity_json.zig").write(try self.relationalTopologyIdentity(), &stream);
+                try @import("relational/integrity/json.zig").write(try self.relationalTopologyIdentity(), &stream);
             },
-            .status => try @import("relational_integrity_json.zig").write(try self.relationalTopologyStatus(), &stream),
+            .status => try @import("relational/integrity/json.zig").write(try self.relationalTopologyStatus(), &stream),
             .retirement_status => {
                 if (!opts.fk_generation_source_control) return error.InvalidSqlRelationPersistence;
                 self.core.lockApplyShared();
@@ -31248,13 +31879,13 @@ pub const DB = struct {
                 if (descriptor.kind == .permanent or !std.meta.eql(self.sql_persistence, @as(?@import("../../common/relation_persistence.zig").Descriptor, descriptor))) return error.SqlRelationOwnerChanged;
                 var read = try self.core.store.beginReadTxn();
                 defer read.abort();
-                const fence = try @import("relational_integrity_topology.zig").current(&read);
+                const fence = try @import("relational/integrity/topology.zig").current(&read);
                 if (fence) |actual| switch (actual.role) {
                     .document_retirement_source, .child_generation_source, .child_generation_dual => {},
                     else => return error.InvalidIntegrityTopologyFence,
                 };
                 const status: RelationalTopologyStatus = .{ .fence = fence, .drained = !try transactions_mod.TxnManager.hasRelationLifetimeDebtInView(alloc, &read) };
-                try @import("relational_integrity_json.zig").write(status, &stream);
+                try @import("relational/integrity/json.zig").write(status, &stream);
             },
             .sql_relation_binding => {
                 self.core.lockApplyShared();
@@ -31286,21 +31917,21 @@ pub const DB = struct {
                     .has_transaction_state = has_transaction_state,
                 };
                 try binding.validate();
-                try @import("relational_integrity_json.zig").write(binding, &stream);
+                try @import("relational/integrity/json.zig").write(binding, &stream);
             },
             .schema_owner => {
                 self.core.lockApplyShared();
                 defer self.core.unlockApplyShared();
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
-                const state: @import("relational_schema_owner_contract.zig").OwnerState = .{
+                const state: @import("relational/schema_change/schema_owner_contract.zig").OwnerState = .{
                     .namespace = self.core.identity_namespace,
                     .physical_root_incarnation = self.root_incarnation,
-                    .header = try @import("relational_nullability_job.zig").load(&read),
+                    .header = try @import("relational/schema_change/nullability_job.zig").load(&read),
                 };
-                try @import("relational_integrity_json.zig").write(state, &stream);
+                try @import("relational/integrity/json.zig").write(state, &stream);
             },
-            .online_source_status => try @import("relational_integrity_json.zig").write(try self.onlineSourceStatus(request.value.scope.?), &stream),
+            .online_source_status => try @import("relational/integrity/json.zig").write(try self.onlineSourceStatus(request.value.scope.?), &stream),
             .merge_copy_receipt => {
                 self.core.lockApplyShared();
                 defer self.core.unlockApplyShared();
@@ -31322,7 +31953,7 @@ pub const DB = struct {
                     break :blk catalog.mode_initialized and catalog.storage_mode == .document and
                         try @import("online_merge_io.zig").rowDerivedIndexesAssumeApply(self, alloc);
                 } else false;
-                try @import("relational_integrity_json.zig").write(@import("merge_contract.zig").CopyReceipt{
+                try @import("relational/integrity/json.zig").write(@import("merge_contract.zig").CopyReceipt{
                     .namespace = self.core.identity_namespace,
                     .range = self.core.byteRange(),
                     .state = state,
@@ -31334,25 +31965,25 @@ pub const DB = struct {
                 defer self.core.unlockApplyShared();
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
-                try @import("relational_integrity_json.zig").write(try @import("relational_integrity_topology.zig").completed(&read), &stream);
+                try @import("relational/integrity/json.zig").write(try @import("relational/integrity/topology.zig").completed(&read), &stream);
             },
             .parent_activation => {
                 self.core.lockApplyShared();
                 defer self.core.unlockApplyShared();
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
-                const retirement = @import("relational_integrity_generation_retirement.zig");
+                const retirement = @import("relational/integrity/generation_retirement.zig");
                 const value = try retirement.ownerStatus(alloc, &read);
                 defer if (value) |status| alloc.free(status.entries);
-                try @import("relational_integrity_json.zig").write(value, &stream);
+                try @import("relational/integrity/json.zig").write(value, &stream);
             },
             .generation_publication => {
                 self.core.lockApplyShared();
                 defer self.core.unlockApplyShared();
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
-                const value = try @import("relational_integrity_generation_admission.zig").ownerStatus(&read);
-                try @import("relational_integrity_json.zig").write(value, &stream);
+                const value = try @import("relational/integrity/generation_admission.zig").ownerStatus(&read);
+                try @import("relational/integrity/json.zig").write(value, &stream);
             },
             .generation_handoff_summary => {
                 self.core.lockApplyShared();
@@ -31375,21 +32006,21 @@ pub const DB = struct {
                 };
                 var value = try @import("empty_generation_handoff.zig").summaryAllocControlled(alloc, &read, self.core.identity_namespace, .{ .ptr = &scan_options, .check_fn = Scan.check });
                 defer value.deinit(alloc);
-                try @import("relational_integrity_json.zig").write(value, &stream);
+                try @import("relational/integrity/json.zig").write(value, &stream);
             },
             .generation_handoff_seal => {
                 self.core.lockApplyShared();
                 defer self.core.unlockApplyShared();
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
-                try @import("relational_integrity_json.zig").write(try @import("empty_generation_handoff.zig").sealStatus(&read, self.core.identity_namespace), &stream);
+                try @import("relational/integrity/json.zig").write(try @import("empty_generation_handoff.zig").sealStatus(&read, self.core.identity_namespace), &stream);
             },
             .generation_handoff_install => {
                 self.core.lockApplyShared();
                 defer self.core.unlockApplyShared();
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
-                try @import("relational_integrity_json.zig").write(try @import("empty_generation_handoff.zig").loadInstallReceipt(&read), &stream);
+                try @import("relational/integrity/json.zig").write(try @import("empty_generation_handoff.zig").loadInstallReceipt(&read), &stream);
             },
             .leann_plan => {
                 const proposals = try self.planLeannRecords(alloc);
@@ -31412,23 +32043,23 @@ pub const DB = struct {
                 if (try self.prepareGraphEndpointCleanupBatch(alloc)) |owned| {
                     var cleanup = owned;
                     defer cleanup.deinit();
-                    try @import("relational_integrity_json.zig").write(types.GraphEndpointCleanupStatus{ .pending = true, .guards = cleanup.page.guards, .graph_deletes = cleanup.graph_deletes, .deletes = cleanup.page.deletes, .merge_artifacts = cleanup.replay_writes }, &stream);
-                } else try @import("relational_integrity_json.zig").write(types.GraphEndpointCleanupStatus{}, &stream);
+                    try @import("relational/integrity/json.zig").write(types.GraphEndpointCleanupStatus{ .pending = true, .guards = cleanup.page.guards, .graph_deletes = cleanup.graph_deletes, .deletes = cleanup.page.deletes, .merge_artifacts = cleanup.replay_writes }, &stream);
+                } else try @import("relational/integrity/json.zig").write(types.GraphEndpointCleanupStatus{}, &stream);
             },
             .graph_retirement => {
                 self.core.lockApplyShared();
                 defer self.core.unlockApplyShared();
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
-                try @import("relational_integrity_json.zig").write(try @import("graph_retirement_seal.zig").status(&read), &stream);
+                try @import("relational/integrity/json.zig").write(try @import("graph_retirement_seal.zig").status(&read), &stream);
             },
             .initial_child_publication => {
                 self.core.lockApplyShared();
                 defer self.core.unlockApplyShared();
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
-                const value = try @import("relational_initial_child_publication.zig").load(&read);
-                try @import("relational_integrity_json.zig").write(value, &stream);
+                const value = try @import("relational/integrity/initial_child_publication.zig").load(&read);
+                try @import("relational/integrity/json.zig").write(value, &stream);
             },
             .initial_child_preflight => {
                 self.core.lockApplyShared();
@@ -31444,16 +32075,16 @@ pub const DB = struct {
                     error.NotFound => null,
                     else => return err,
                 };
-                const existing_catalog = read.get(@import("relational_integrity_catalog.zig").key) catch |err| switch (err) {
+                const existing_catalog = read.get(@import("relational/integrity/catalog.zig").key) catch |err| switch (err) {
                     error.NotFound => null,
                     else => return err,
                 };
-                try @import("relational_integrity_json.zig").write(.{
+                try @import("relational/integrity/json.zig").write(.{
                     .namespace = self.core.identity_namespace,
                     .row_count = row_count,
                     .has_schema = existing_schema != null,
                     .has_catalog = existing_catalog != null,
-                    .hidden = try @import("relational_initial_child_publication.zig").load(&read),
+                    .hidden = try @import("relational/integrity/initial_child_publication.zig").load(&read),
                 }, &stream);
             },
             .public_schema => {
@@ -31471,13 +32102,13 @@ pub const DB = struct {
                 // support point reads only and cannot open the required cursor.
                 var read = try self.core.store.beginReadTxn();
                 defer read.abort();
-                if (try @import("relational_integrity_topology.zig").current(&read) != null) {
-                    try @import("relational_integrity_json.zig").write(@as(?@import("relational_integrity_generation_retirement.zig").GcCommand, null), &stream);
+                if (try @import("relational/integrity/topology.zig").current(&read) != null) {
+                    try @import("relational/integrity/json.zig").write(@as(?@import("relational/integrity/generation_retirement.zig").GcCommand, null), &stream);
                 } else {
-                    var page = try @import("relational_integrity_generation_retirement.zig").prepareGcPage(alloc, &read, 64, 512 * 1024);
+                    var page = try @import("relational/integrity/generation_retirement.zig").prepareGcPage(alloc, &read, 64, 512 * 1024);
                     defer if (page) |*owned_page| owned_page.deinit();
-                    const value: ?@import("relational_integrity_generation_retirement.zig").GcCommand = if (page) |*owned_page| owned_page.command(0, self.core.identity_namespace) else null;
-                    try @import("relational_integrity_json.zig").write(value, &stream);
+                    const value: ?@import("relational/integrity/generation_retirement.zig").GcCommand = if (page) |*owned_page| owned_page.command(0, self.core.identity_namespace) else null;
+                    try @import("relational/integrity/json.zig").write(value, &stream);
                 }
             },
             .handoff_progress => {
@@ -31485,35 +32116,35 @@ pub const DB = struct {
                 defer self.core.unlockApplyShared();
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
-                var progress = try @import("relational_integrity_handoff.zig").loadProgress(alloc, &read);
+                var progress = try @import("relational/integrity/handoff.zig").loadProgress(alloc, &read);
                 defer progress.deinit();
-                try @import("relational_integrity_json.zig").write(progress.value, &stream);
+                try @import("relational/integrity/json.zig").write(progress.value, &stream);
             },
             .handoff_manifest => {
                 self.core.lockApplyShared();
                 defer self.core.unlockApplyShared();
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
-                const bytes = read.get(@import("relational_integrity_handoff.zig").manifest_key) catch |err| switch (err) {
+                const bytes = read.get(@import("relational/integrity/handoff.zig").manifest_key) catch |err| switch (err) {
                     error.NotFound => "null",
                     else => return err,
                 };
-                var manifest = try std.json.parseFromSlice(?@import("relational_integrity_handoff.zig").Manifest, alloc, bytes, .{});
+                var manifest = try std.json.parseFromSlice(?@import("relational/integrity/handoff.zig").Manifest, alloc, bytes, .{});
                 defer manifest.deinit();
-                try @import("relational_integrity_json.zig").write(manifest.value, &stream);
+                try @import("relational/integrity/json.zig").write(manifest.value, &stream);
             },
             .prune_progress => {
                 self.core.lockApplyShared();
                 defer self.core.unlockApplyShared();
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
-                const bytes = read.get(@import("relational_integrity_handoff.zig").prune_key) catch |err| switch (err) {
+                const bytes = read.get(@import("relational/integrity/handoff.zig").prune_key) catch |err| switch (err) {
                     error.NotFound => "null",
                     else => return err,
                 };
-                var progress = try std.json.parseFromSlice(?@import("relational_integrity_handoff.zig").PruneProgress, alloc, bytes, .{});
+                var progress = try std.json.parseFromSlice(?@import("relational/integrity/handoff.zig").PruneProgress, alloc, bytes, .{});
                 defer progress.deinit();
-                try @import("relational_integrity_json.zig").write(progress.value, &stream);
+                try @import("relational/integrity/json.zig").write(progress.value, &stream);
             },
         }
         return .{ .json = try output.toOwnedSlice() };
@@ -31525,14 +32156,14 @@ pub const DB = struct {
         defer self.core.unlockApplyShared();
         var read = try self.core.store.beginProbeTxn();
         defer read.abort();
-        const raw = read.get(@import("relational_integrity_catalog.zig").key) catch |err| switch (err) {
+        const raw = read.get(@import("relational/integrity/catalog.zig").key) catch |err| switch (err) {
             error.NotFound => "",
             else => return err,
         };
         var digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(raw, &digest, .{});
         const authority = try @import("../source_authority.zig").load(&read);
-        const handoff_authority: @import("relational_integrity_topology_contract.zig").GenerationHandoffReceiptAuthority = if (authority) |value|
+        const handoff_authority: @import("relational/integrity/topology_contract.zig").GenerationHandoffReceiptAuthority = if (authority) |value|
             if (std.mem.eql(u8, &value.namespace, &@import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace)))
                 if (value.kind == .raft) .raft else .native
             else
@@ -31542,7 +32173,7 @@ pub const DB = struct {
         return .{
             .namespace = self.core.identity_namespace,
             .catalog_digest = digest,
-            .next_epoch = try @import("relational_integrity_topology.zig").nextEpoch(&read),
+            .next_epoch = try @import("relational/integrity/topology.zig").nextEpoch(&read),
             .catalog_checks_identity_supported = true,
             .generation_handoff_receipt_authority = handoff_authority,
             .backup_seal_supported = self.primary_backend == .lsm and self.physical_root_mode == .filesystem_managed and
@@ -31551,14 +32182,14 @@ pub const DB = struct {
         };
     }
 
-    pub const RelationalTopologyStatus = struct { fence: ?@import("relational_integrity_topology.zig").Fence, drained: bool };
+    pub const RelationalTopologyStatus = struct { fence: ?@import("relational/integrity/topology.zig").Fence, drained: bool };
     pub fn relationalTopologyStatus(self: *DB) !RelationalTopologyStatus {
         if (comptime storage_engine.enabled) return storage_engine.call("relationalTopologyStatus", .{self});
         self.core.lockApplyShared();
         defer self.core.unlockApplyShared();
         var read = try self.core.store.beginProbeTxn();
         defer read.abort();
-        const fence = try @import("relational_integrity_topology.zig").current(&read);
+        const fence = try @import("relational/integrity/topology.zig").current(&read);
         var manager = try self.core.initTxnManager();
         defer manager.deinit();
         return .{ .fence = fence, .drained = !try manager.hasTopologySensitiveTransactions() };
@@ -31567,11 +32198,11 @@ pub const DB = struct {
     fn childGenerationSourceFence(core: *db_core.DBCore) !bool {
         var read = try core.store.beginProbeTxn();
         defer read.abort();
-        const fence = (try @import("relational_integrity_topology.zig").current(&read)) orelse return false;
+        const fence = (try @import("relational/integrity/topology.zig").current(&read)) orelse return false;
         if (fence.role != .child_generation_source and fence.role != .child_generation_dual) return false;
         _ = core.schema orelse return error.IntegrityCatalogChanged;
         if (!fence.namespace.eql(core.identity_namespace)) return error.IdentityNamespaceMismatch;
-        const encoded_catalog = read.get(@import("relational_integrity_catalog.zig").key) catch return error.IntegrityCatalogChanged;
+        const encoded_catalog = read.get(@import("relational/integrity/catalog.zig").key) catch return error.IntegrityCatalogChanged;
         var digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(encoded_catalog, &digest, .{});
         if (!std.mem.eql(u8, &digest, &fence.catalog_digest)) return error.IntegrityCatalogChanged;
@@ -31613,12 +32244,12 @@ pub const DB = struct {
     pub fn relationalHandoffManifest(
         self: *DB,
         alloc: Allocator,
-        source: @import("relational_integrity_topology.zig").Fence,
-        destination: @import("relational_integrity_topology.zig").Fence,
+        source: @import("relational/integrity/topology.zig").Fence,
+        destination: @import("relational/integrity/topology.zig").Fence,
         lower: []const u8,
         upper: []const u8,
         primary_sequence: u64,
-    ) !@import("relational_integrity_handoff.zig").Manifest {
+    ) !@import("relational/integrity/handoff.zig").Manifest {
         if (comptime storage_engine.enabled) return storage_engine.call("relationalHandoffManifest", .{ self, alloc, source, destination, lower, upper, primary_sequence });
         self.core.lockApplyShared();
         defer self.core.unlockApplyShared();
@@ -31626,14 +32257,14 @@ pub const DB = struct {
         defer read.abort();
         var manager = try self.core.initTxnManager();
         defer manager.deinit();
-        try @import("relational_integrity_topology.zig").requireDrained(&read, &manager, source);
+        try @import("relational/integrity/topology.zig").requireDrained(&read, &manager, source);
         const owned_range = self.core.byteRange();
         if (std.mem.order(u8, lower, owned_range.start) == .lt or
             (owned_range.end.len != 0 and (upper.len == 0 or std.mem.order(u8, upper, owned_range.end) == .gt))) return error.KeyOutOfRange;
-        const raw_catalog = try read.get(@import("relational_integrity_catalog.zig").key);
-        var compiled = try @import("relational_integrity_catalog.zig").decode(alloc, raw_catalog);
+        const raw_catalog = try read.get(@import("relational/integrity/catalog.zig").key);
+        var compiled = try @import("relational/integrity/catalog.zig").decode(alloc, raw_catalog);
         defer compiled.deinit();
-        try @import("relational_integrity_activation.zig").requireReady(&read, compiled);
+        try @import("relational/integrity/activation.zig").requireReady(&read, compiled);
         return .{
             .source = source,
             .destination = destination,
@@ -31642,12 +32273,12 @@ pub const DB = struct {
             .source_range_start = try alloc.dupe(u8, owned_range.start),
             .source_range_end = try alloc.dupe(u8, owned_range.end),
             .catalog_bytes = try alloc.dupe(u8, raw_catalog),
-            .activation_bytes = try alloc.dupe(u8, try read.get(@import("relational_integrity_activation.zig").key)),
+            .activation_bytes = try alloc.dupe(u8, try read.get(@import("relational/integrity/activation.zig").key)),
             .primary_sequence = primary_sequence,
         };
     }
 
-    pub fn relationalHandoffPage(self: *DB, alloc: Allocator, manifest: @import("relational_integrity_handoff.zig").Manifest, progress: @import("relational_integrity_handoff.zig").Progress) !@import("relational_integrity_handoff.zig").Page {
+    pub fn relationalHandoffPage(self: *DB, alloc: Allocator, manifest: @import("relational/integrity/handoff.zig").Manifest, progress: @import("relational/integrity/handoff.zig").Progress) !@import("relational/integrity/handoff.zig").Page {
         if (comptime storage_engine.enabled) return storage_engine.call("relationalHandoffPage", .{ self, alloc, manifest, progress });
         self.core.lockApplyShared();
         defer self.core.unlockApplyShared();
@@ -31655,8 +32286,8 @@ pub const DB = struct {
         defer read.abort();
         var manager = try self.core.initTxnManager();
         defer manager.deinit();
-        try @import("relational_integrity_topology.zig").requireDrained(&read, &manager, manifest.source);
-        return @import("relational_integrity_handoff.zig").readPage(alloc, self.core.store, manifest, progress);
+        try @import("relational/integrity/topology.zig").requireDrained(&read, &manager, manifest.source);
+        return @import("relational/integrity/handoff.zig").readPage(alloc, self.core.store, manifest, progress);
     }
 
     /// Private replicated lifecycle control. Begin fences new work without
@@ -31664,7 +32295,7 @@ pub const DB = struct {
     /// apply. Callers separately poll drained before snapshot or cutover.
     pub fn applyRelationalTopologyControl(
         self: *DB,
-        command: @import("relational_integrity_topology.zig").Command,
+        command: @import("relational/integrity/topology.zig").Command,
         ordered_receipt: ?OrderedApplyReceipt,
     ) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("applyRelationalTopologyControl", .{ self, command, ordered_receipt });
@@ -31792,7 +32423,7 @@ pub const DB = struct {
             if (command == .final_fence) {
                 var manager = try self.core.initTxnManager();
                 defer manager.deinit();
-                try @import("relational_integrity_topology.zig").requireDrained(&txn, &manager, command.scope().fence);
+                try @import("relational/integrity/topology.zig").requireDrained(&txn, &manager, command.scope().fence);
             }
             if (command == .admit) {
                 // Candidate discovery is advisory. Recheck the durable local
@@ -31901,7 +32532,7 @@ pub const DB = struct {
             if (try authority.load(&txn) != null) _ = try authority.require(&txn, .raft, source.scope().namespace());
             try @import("online_source.zig").stage(&txn, source, entry.index);
         } else if (req.merge_checkpoint) |checkpoint| {
-            if (try @import("relational_integrity_topology.zig").current(&txn) != null) return error.IntegrityTopologyBusy;
+            if (try @import("relational/integrity/topology.zig").current(&txn) != null) return error.IntegrityTopologyBusy;
             if (checkpoint.page_source) |source| {
                 try source.validate();
                 if (source.artifact_catalog) |binding| if (!binding.compatible(req.artifact_catalog.?.binding)) return error.InvalidArtifactCatalogCommand;
@@ -31911,7 +32542,7 @@ pub const DB = struct {
                 if (retained.active() and std.mem.eql(u8, &retained.namespace, &namespace)) return error.IntegrityTopologyBusy;
             }
             var coordinated = try @import("online_integrity_shadow.zig").admit(self.alloc, &txn, req, self.core.identity_namespace);
-            if (!coordinated) coordinated = try @import("relational_integrity_handoff.zig").admitMergeRequest(self.alloc, &txn, req);
+            if (!coordinated) coordinated = try @import("relational/integrity/handoff.zig").admitMergeRequest(self.alloc, &txn, req);
             var schema_view = self.core.schema_registry.acquire();
             defer if (schema_view) |*view| view.release();
             if (hasCoordinatedConstraints(schema_view) and !coordinated) return error.CoordinatedConstraintTopologyUnsupported;
@@ -32945,7 +33576,7 @@ pub const DB = struct {
                     std.mem.eql(u8, &value.namespace, &namespace) and std.mem.eql(u8, &value.catalog_digest, &command.catalog_digest) else false;
                 if (!same) {
                     try self.requireOnlineArtifactCatalogMutableLocked(&txn);
-                    try @import("relational_integrity_topology.zig").requireUnfenced(&txn);
+                    try @import("relational/integrity/topology.zig").requireUnfenced(&txn);
                     try publication.stageAuthority(&txn, command);
                     if (ordered_value.value.command.binding.effect_protocol >= 15) {
                         try @import("artifact_producer_obligations.zig").begin(self.alloc, &txn, (try publication.authority(&txn)).?);
@@ -33164,7 +33795,7 @@ pub const DB = struct {
             errdefer txn.abort();
             // The active source cut pins the existing catalog until release.
             try self.requireOnlineArtifactCatalogMutableLocked(&txn);
-            try @import("relational_integrity_topology.zig").requireUnfenced(&txn);
+            try @import("relational/integrity/topology.zig").requireUnfenced(&txn);
             try inventory.stageOrdered(self.alloc, &txn, command, entry.index);
             for (opts.extra_store_writes) |write| try txn.put(write.key, write.value);
             if (opts.outcome_marker_write) |write| try txn.put(write.key, write.value);
@@ -33281,8 +33912,8 @@ pub const DB = struct {
         // activation or topology fence before its Raft entry applies. Such an
         // admitted entry must still advance the applied marker on every
         // replica; the next bounded sweep will reprepare from durable state.
-        if (try @import("relational_integrity_topology.zig").current(&txn) == null) {
-            @import("relational_integrity_generation_retirement.zig").applyGcPage(&txn, req.relational_generation_gc.?) catch |err| switch (err) {
+        if (try @import("relational/integrity/topology.zig").current(&txn) == null) {
+            @import("relational/integrity/generation_retirement.zig").applyGcPage(&txn, req.relational_generation_gc.?) catch |err| switch (err) {
                 error.GenerationRetirementChanged => {},
                 else => return err,
             };
@@ -33448,7 +34079,7 @@ pub const DB = struct {
 
     fn applyRelationalTopologyControlWithReplication(
         self: *DB,
-        command: @import("relational_integrity_topology.zig").Command,
+        command: @import("relational/integrity/topology.zig").Command,
         ordered_receipt: ?OrderedApplyReceipt,
         replication_lsn: ?u64,
         replication_payload: ?[]const u8,
@@ -33486,7 +34117,7 @@ pub const DB = struct {
         } else {
             try doc_identity.writeNamespaceTxn(&txn, command.fence.namespace);
         }
-        const topology = @import("relational_integrity_topology.zig");
+        const topology = @import("relational/integrity/topology.zig");
         if (ordered_receipt != null) try @import("../source_authority.zig").requireRaftMarkerAllowed(&txn);
         if ((command.action == .transfer) != (command.transfer != null) or
             (command.action == .seal_graph_retirement and command.graph_retirement == null) or
@@ -33536,12 +34167,12 @@ pub const DB = struct {
                 }
                 if (try topology.current(&txn) == null) {
                     if (command.fence.role == .split_destination) {
-                        const previous_manifest = txn.get(@import("relational_integrity_handoff.zig").manifest_key) catch |err| switch (err) {
+                        const previous_manifest = txn.get(@import("relational/integrity/handoff.zig").manifest_key) catch |err| switch (err) {
                             error.NotFound => null,
                             else => return err,
                         };
                         if (previous_manifest) |bytes| {
-                            var previous = try std.json.parseFromSlice(@import("relational_integrity_handoff.zig").Manifest, self.alloc, bytes, .{});
+                            var previous = try std.json.parseFromSlice(@import("relational/integrity/handoff.zig").Manifest, self.alloc, bytes, .{});
                             defer previous.deinit();
                             if (!previous.value.destination.eql(command.fence)) return error.IntegrityHandoffDestinationResetRequired;
                         }
@@ -33602,7 +34233,7 @@ pub const DB = struct {
                     close_graph_after_commit = true;
                 }
                 if (command.fence.role == .child_generation_source or command.fence.role == .child_generation_dual or command.fence.role == .document_retirement_source)
-                    try @import("relational_integrity_generation_admission.zig").stageSourceFencedReceipt(&txn, command.fence, if (receipt_entry) |entry| entry.term else 0, if (receipt_entry) |entry| entry.index else 0);
+                    try @import("relational/integrity/generation_admission.zig").stageSourceFencedReceipt(&txn, command.fence, if (receipt_entry) |entry| entry.term else 0, if (receipt_entry) |entry| entry.index else 0);
             },
             .seal_graph_retirement => {
                 const scope = command.graph_retirement.?;
@@ -33613,7 +34244,13 @@ pub const DB = struct {
                 _ = try @import("graph_retirement_seal.zig").stageSealPosition(&txn, scope, stamp orelse return error.InvalidBatchRequest);
             },
             .seal_generation_handoff => {
-                try @import("empty_generation_handoff.zig").stageSealPosition(&txn, command.fence, command.generation_handoff_seal.?, stamp orelse return error.InvalidBatchRequest);
+                const handoff = @import("empty_generation_handoff.zig");
+                // Seal only the drained owner cut observed by this writer.
+                // A prior read-index status is not proof at Raft apply.
+                if (try handoff.loadSeal(&txn) == null and
+                    try transactions_mod.TxnManager.hasTopologySensitiveTransactionsInView(self.alloc, &txn))
+                    return error.IntegrityTopologyBusy;
+                try handoff.stageSealPosition(&txn, command.fence, command.generation_handoff_seal.?, stamp orelse return error.InvalidBatchRequest);
             },
             .install_generation_handoff => {
                 if (command.fence.role != .rewrite_destination) return error.InvalidGenerationHandoff;
@@ -33648,7 +34285,7 @@ pub const DB = struct {
                 if (command.fence.role == .child_generation_parent or command.fence.role == .child_generation_source or command.fence.role == .child_generation_dual or command.fence.role == .truncate_parent)
                     return error.GenerationAdmissionActivationRequired;
                 if ((command.fence.role == .split_destination or command.fence.role == .merge_destination) and try topology.current(&txn) != null) {
-                    var progress = try @import("relational_integrity_handoff.zig").loadProgress(self.alloc, &txn);
+                    var progress = try @import("relational/integrity/handoff.zig").loadProgress(self.alloc, &txn);
                     defer progress.deinit();
                     if (!progress.value.ready) return error.IntegrityHandoffIncomplete;
                     if (command.fence.role == .split_destination) {
@@ -33659,15 +34296,15 @@ pub const DB = struct {
                         defer state.deinit(self.alloc);
                         if (state.phase != .finalized or state.transition_id != command.fence.transition_id or state.donor_group_id != command.fence.peer_group_id) return error.MergeTransitionNotReady;
                     }
-                    var compiled = try @import("relational_integrity_catalog.zig").decode(self.alloc, try txn.get(@import("relational_integrity_catalog.zig").key));
+                    var compiled = try @import("relational/integrity/catalog.zig").decode(self.alloc, try txn.get(@import("relational/integrity/catalog.zig").key));
                     defer compiled.deinit();
-                    try @import("relational_integrity_activation.zig").requireReady(&txn, compiled);
+                    try @import("relational/integrity/activation.zig").requireReady(&txn, compiled);
                 } else if (command.fence.role != .backup_snapshot and try topology.current(&txn) != null) return error.IntegrityTopologyCutoverRequired;
                 try topology.stageRelease(&txn, command.fence);
                 if (command.fence.role == .merge_destination) {
-                    try txn.delete(@import("relational_integrity_handoff.zig").manifest_key);
-                    try txn.delete(@import("relational_integrity_handoff.zig").progress_key);
-                    try txn.delete(@import("relational_integrity_handoff.zig").prune_key);
+                    try txn.delete(@import("relational/integrity/handoff.zig").manifest_key);
+                    try txn.delete(@import("relational/integrity/handoff.zig").progress_key);
+                    try txn.delete(@import("relational/integrity/handoff.zig").prune_key);
                 }
             },
             .cancel => {
@@ -33681,18 +34318,18 @@ pub const DB = struct {
                 // admit a delayed old-generation attach after activation.
                 if (command.fence.role == .child_generation_source) return error.GenerationAdmissionActivationRequired;
                 if (command.fence.role == .child_generation_parent or command.fence.role == .child_generation_dual) {
-                    const admission = @import("relational_integrity_generation_admission.zig");
+                    const admission = @import("relational/integrity/generation_admission.zig");
                     const transitions = command.child_generations.?;
                     try admission.validateTransitions(transitions);
                     for (transitions) |transition| try admission.cancelTransition(self.alloc, &txn, transition);
                     try admission.stageCanceledReceipt(&txn, command.fence, transitions, if (receipt_entry) |entry| entry.term else 0, if (receipt_entry) |entry| entry.index else 0);
                 }
                 if (command.fence.role == .child_generation_dual)
-                    try txn.delete(@import("relational_integrity_generation_admission.zig").dual_acknowledged_fence_key);
+                    try txn.delete(@import("relational/integrity/generation_admission.zig").dual_acknowledged_fence_key);
                 try topology.stageCancel(&txn, command.fence);
                 if (command.fence.role == .child_generation_dual) {
                     const encoded_fence = try command.fence.encode();
-                    try txn.put(@import("relational_integrity_generation_admission.zig").dual_canceled_fence_key, &encoded_fence);
+                    try txn.put(@import("relational/integrity/generation_admission.zig").dual_canceled_fence_key, &encoded_fence);
                 }
                 if (command.fence.role == .rewrite_source)
                     open_graph_after_commit = try @import("graph_retirement_seal.zig").stageCancel(&txn, command.fence);
@@ -33702,7 +34339,7 @@ pub const DB = struct {
                     const active = (try topology.current(&txn)).?;
                     if (active.role != command.fence.role or active.transition_id != command.fence.transition_id or
                         active.peer_group_id != command.fence.peer_group_id or active.attempt > command.fence.attempt) return error.IntegrityTopologyChanged;
-                    const handoff = @import("relational_integrity_handoff.zig");
+                    const handoff = @import("relational/integrity/handoff.zig");
                     // An ambiguously delivered begin with no imported proof
                     // can be canceled immediately. Once copying started,
                     // rollback must first restore the range and drain all
@@ -33732,16 +34369,16 @@ pub const DB = struct {
                 var manager = try self.core.initTxnManager();
                 defer manager.deinit();
                 try topology.requireDrained(&txn, &manager, command.fence);
-                try @import("relational_integrity_handoff.zig").apply(self.alloc, &txn, command.fence, command.transfer.?);
+                try @import("relational/integrity/handoff.zig").apply(self.alloc, &txn, command.fence, command.transfer.?);
             },
             .stage_parent_retirement => {
                 var manager = try self.core.initTxnManager();
                 defer manager.deinit();
                 const stage = command.parent_retirement.?;
-                try @import("relational_integrity_generation_retirement.zig").stagePending(self.alloc, &txn, &manager, command.fence, stage.plan_digest, stage.entries);
+                try @import("relational/integrity/generation_retirement.zig").stagePending(self.alloc, &txn, &manager, command.fence, stage.plan_digest, stage.entries);
             },
             .activate_parent_retirement => {
-                const retirement = @import("relational_integrity_generation_retirement.zig");
+                const retirement = @import("relational/integrity/generation_retirement.zig");
                 const activation = command.parent_activation.?;
                 if (command.fence.role != .truncate_parent or std.mem.allEqual(u8, &activation.plan_id, 0) or
                     !std.mem.eql(u8, &activation.publication_digest, &retirement.publicationDigest(activation.plan_id, activation.plan_digest)))
@@ -33764,7 +34401,7 @@ pub const DB = struct {
                 }
             },
             .acknowledge_parent_retirement => {
-                const retirement = @import("relational_integrity_generation_retirement.zig");
+                const retirement = @import("relational/integrity/generation_retirement.zig");
                 const activation = command.parent_activation.?;
                 if (command.fence.role != .truncate_parent or std.mem.allEqual(u8, &activation.plan_id, 0) or
                     !std.mem.eql(u8, &activation.publication_digest, &retirement.publicationDigest(activation.plan_id, activation.plan_digest)))
@@ -33776,7 +34413,7 @@ pub const DB = struct {
                 var manager = try self.core.initTxnManager();
                 defer manager.deinit();
                 try topology.requireDrained(&txn, &manager, command.fence);
-                const admission = @import("relational_integrity_generation_admission.zig");
+                const admission = @import("relational/integrity/generation_admission.zig");
                 const transitions = command.child_generations.?;
                 try admission.validateTransitions(transitions);
                 for (transitions) |transition| try admission.stageTransition(self.alloc, &txn, transition);
@@ -33784,7 +34421,7 @@ pub const DB = struct {
             },
             .activate_child_generation => {
                 if (command.fence.role != .child_generation_parent and command.fence.role != .child_generation_dual) return error.InvalidGenerationAdmission;
-                const admission = @import("relational_integrity_generation_admission.zig");
+                const admission = @import("relational/integrity/generation_admission.zig");
                 const transitions = command.child_generations.?;
                 try admission.validateTransitions(transitions);
                 if (try topology.current(&txn)) |actual| {
@@ -33793,7 +34430,7 @@ pub const DB = struct {
                     defer manager.deinit();
                     try topology.requireDrained(&txn, &manager, command.fence);
                     for (transitions) |transition| try admission.activateTransition(self.alloc, &txn, transition);
-                    try @import("relational_integrity_generation_retirement.zig").stageChildGenerationRetirements(self.alloc, &txn, command.fence, transitions);
+                    try @import("relational/integrity/generation_retirement.zig").stageChildGenerationRetirements(self.alloc, &txn, command.fence, transitions);
                     try admission.stageCompletion(&txn, command.fence, transitions, if (receipt_entry) |entry| entry.term else 0, if (receipt_entry) |entry| entry.index else 0);
                     if (command.child_generation_reference_coverage_required)
                         try admission.stageReferenceCoveragePending(&txn, try admission.completionReceipt(command.fence, transitions));
@@ -33812,7 +34449,7 @@ pub const DB = struct {
             },
             .acknowledge_child_generation => {
                 if (command.fence.role != .child_generation_parent and command.fence.role != .child_generation_dual) return error.InvalidGenerationAdmission;
-                const admission = @import("relational_integrity_generation_admission.zig");
+                const admission = @import("relational/integrity/generation_admission.zig");
                 if (command.child_reference_coverage_ready)
                     try admission.stageReferenceCoverageAcknowledgement(&txn, command.fence, command.child_generations.?, if (receipt_entry) |entry| entry.term else 0, if (receipt_entry) |entry| entry.index else 0)
                 else
@@ -33825,16 +34462,16 @@ pub const DB = struct {
                 // The source has no accepted-generation state to undo; the
                 // exact fence receipt consumes its admission epoch forever.
                 if (command.fence.role == .child_generation_dual) {
-                    try @import("relational_integrity_generation_admission.zig").requireDualParentCanceled(&txn, command.fence);
-                    try txn.delete(@import("relational_integrity_generation_admission.zig").dual_acknowledged_fence_key);
-                    try txn.delete(@import("relational_integrity_generation_admission.zig").dual_canceled_fence_key);
+                    try @import("relational/integrity/generation_admission.zig").requireDualParentCanceled(&txn, command.fence);
+                    try txn.delete(@import("relational/integrity/generation_admission.zig").dual_acknowledged_fence_key);
+                    try txn.delete(@import("relational/integrity/generation_admission.zig").dual_canceled_fence_key);
                 }
                 try topology.stageCancel(&txn, command.fence);
-                try @import("relational_integrity_generation_admission.zig").stageCanceledReceipt(&txn, command.fence, null, if (receipt_entry) |entry| entry.term else 0, if (receipt_entry) |entry| entry.index else 0);
+                try @import("relational/integrity/generation_admission.zig").stageCanceledReceipt(&txn, command.fence, null, if (receipt_entry) |entry| entry.term else 0, if (receipt_entry) |entry| entry.index else 0);
             },
             .install_child_schema => unreachable, // Handled before generic topology transaction.
             .provision_initial_child, .release_initial_child, .cancel_initial_child => unreachable, // Handled before generic topology transaction.
-            .prune => try @import("relational_integrity_handoff.zig").prune(self.alloc, &txn, command.fence, self.core.byteRange()),
+            .prune => try @import("relational/integrity/handoff.zig").prune(self.alloc, &txn, command.fence, self.core.byteRange()),
         };
         if (ordered_receipt) |entry| {
             var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
@@ -33847,7 +34484,7 @@ pub const DB = struct {
             try txn.put(marker.key, marker.value);
         }
         if (native_prepared) |prepared| {
-            const admission = @import("relational_integrity_generation_admission.zig");
+            const admission = @import("relational/integrity/generation_admission.zig");
             const key: ?[]const u8 = switch (command.action) {
                 .begin => if (command.fence.role == .child_generation_source or command.fence.role == .child_generation_dual or command.fence.role == .document_retirement_source) admission.source_fence_receipt_key else null,
                 .stage_child_generation => admission.staged_receipt_key,
@@ -33921,8 +34558,8 @@ pub const DB = struct {
         };
     }
 
-    pub fn markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(self: *DB, txn_id: transactions_mod.TxnId, participants: []const []const u8, identity: OrderedApplyReceipt) !void {
-        if (comptime storage_engine.enabled) return storage_engine.call("markReplicatedTransactionParticipantsResolvedAtOrderedReceipt", .{ self, txn_id, participants, identity });
+    pub fn markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(self: *DB, txn_id: transactions_mod.TxnId, participants: []const []const u8, identity: OrderedApplyReceipt, completion: ?@import("../../api/replication_source_apply.zig").AckCompletion) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("markReplicatedTransactionParticipantsResolvedAtOrderedReceipt", .{ self, txn_id, participants, identity, completion });
         lockApply(self);
         defer self.core.unlockApply();
         switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity)) {
@@ -33934,9 +34571,17 @@ pub const DB = struct {
         self.core.markTransactionParticipantsResolvedExtraBatch(
             txn_id,
             participants,
-            .{ .writes = &.{marker} },
+            .{
+                .writes = &.{marker},
+                .external_decision_owner = if (completion) |ack| ack.permit.decision_owner else null,
+                .replication_ack = if (completion) |ack| .{
+                    .completion = ack,
+                    .physical_root = self.root_incarnation,
+                    .position = .{ .raft = .{ .term = identity.term, .index = identity.index } },
+                } else null,
+            },
         ) catch |err| switch (err) {
-            transactions_mod.TxnError.TxnNotFound => try self.core.store.putBatch(&.{marker}, &.{}),
+            transactions_mod.TxnError.TxnNotFound => if (completion != null) return err else try self.core.store.putBatch(&.{marker}, &.{}),
             else => return err,
         };
     }
@@ -35031,11 +35676,11 @@ pub const DB = struct {
     }
 
     fn requireArtifactReconcileUnfenced(self: *DB, txn: anytype, context: ?@import("artifact_reconcile_intent.zig").Context) !void {
-        try @import("relational_integrity_topology.zig").requireNoActiveValidation(txn);
+        try @import("relational/integrity/topology.zig").requireNoActiveValidation(txn);
         if (context) |value| {
             try @import("artifact_reconcile_intent.zig").requireContext(self.alloc, txn, value);
-            if (try @import("relational_integrity_topology.zig").current(txn) != null) return error.IntegrityTopologyBusy;
-        } else try @import("relational_integrity_topology.zig").requireUnfenced(txn);
+            if (try @import("relational/integrity/topology.zig").current(txn) != null) return error.IntegrityTopologyBusy;
+        } else try @import("relational/integrity/topology.zig").requireUnfenced(txn);
     }
 
     fn requireOnlineArtifactCatalogMutableWithContextLocked(self: *DB, txn: anytype, context: ?@import("artifact_reconcile_intent.zig").Context) !void {
@@ -37014,7 +37659,7 @@ pub const DB = struct {
                 defer read.abort();
                 try self.requireOnlineArtifactCatalogMutableLocked(&read);
                 try self.requireArtifactReconcileUnfenced(&read, null);
-                try @import("relational_integrity_retirement.zig").requireMutable(&read);
+                try @import("relational/integrity/retirement.zig").requireMutable(&read);
                 try @import("restore_staging.zig").requireScope(alloc, &read, null, false);
                 if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
                 // Local administration cannot invent an ordered publication
@@ -39109,6 +39754,13 @@ pub const DB = struct {
                 _ = try self.runRelationalIndexMaintenancePass();
                 return false;
             },
+            .row_heap => {
+                if (!self.core.store.row_heap_active.load(.acquire) or openModeRequiresReadOnlyBackends(self.open_mode)) return false;
+                self.core.lockApplyShared();
+                defer self.core.unlockApplyShared();
+                try self.enforceReplicationWriteGate();
+                return (try self.core.store.collectRowHeap(128)).rows != 0;
+            },
             .replay_retirement => return try self.advanceReplayJournalRetirement(),
         }
     }
@@ -39158,6 +39810,7 @@ pub const DB = struct {
             .producers = self.artifact_producer_scheduler.active(self.independentMaintenanceNowNs()),
             .indexes = self.local_execution.relational_index_maintenance_sweep.isPending() and platform_time.monotonicNs() >= self.local_execution.relational_index_retry_after_ns.load(.acquire),
             .columns = self.relational_column_maintenance.pending.load(.acquire) and !self.relational_column_maintenance.backing_off.load(.acquire),
+            .row_heap = self.core.store.row_heap_collection_pending.load(.acquire),
             .scan_pause_ns = if (source) |value| value.activeScanPauseNs() else null,
             .background_checkpoint = if (source) |value| value.background_checkpoint else false,
         };
@@ -44792,7 +45445,7 @@ pub const DB = struct {
         identity_summary: ?doc_identity.VisibilitySummary,
         schema: ?schema_mod.TableSchema,
         schema_replacement: schema_registry_mod.Registry.PreparedReplacement,
-        relational_indexes: ?@import("relational_index_catalog.zig").WriteSnapshot,
+        relational_indexes: ?@import("relational/indexes/catalog.zig").WriteSnapshot,
         table_catalog: table_catalog_mod.Catalog,
         row_policy_lease: row_policy_gate_mod.Gate.Lease,
         recovery: ?db_core.PreparedRecoveryRelationalState,
@@ -44845,7 +45498,7 @@ pub const DB = struct {
         var schema_replacement = try self.core.prepareSchemaRegistryReplacement(prepared_epoch);
         prepared_epoch_owned = false;
         errdefer schema_replacement.deinit();
-        var restored_indexes = try @import("relational_index_catalog.zig").Controller.loadSnapshot(
+        var restored_indexes = try @import("relational/indexes/catalog.zig").Controller.loadSnapshot(
             self.alloc,
             source_store,
             if (prepared_epoch) |epoch| .{ .epoch = epoch } else null,
@@ -45309,19 +45962,19 @@ pub const DB = struct {
 
     /// A cold, read-only physical proof for canceled initial FK retirement.
     /// This does not consult or synthesize a public catalog route.
-    pub fn readInitialChildPublicationRecord(self: *DB) !?@import("relational_initial_child_publication.zig").Record {
+    pub fn readInitialChildPublicationRecord(self: *DB) !?@import("relational/integrity/initial_child_publication.zig").Record {
         if (comptime storage_engine.enabled) return storage_engine.call("readInitialChildPublicationRecord", .{self});
         var txn = try self.core.store.beginReadTxn();
         defer txn.abort();
-        return @import("relational_initial_child_publication.zig").load(&txn);
+        return @import("relational/integrity/initial_child_publication.zig").load(&txn);
     }
 
     /// Local terminal retirement only, after Raft and all physical owners have
     /// drained under an authenticated exact-root cancellation ticket. This is
     /// not a Raft receipt and must never be used to publish/release a child.
-    pub fn cancelColdInitialChildForRetirement(self: *DB, expected: @import("relational_initial_child_publication.zig").Record, cancel_revision: u64) !void {
+    pub fn cancelColdInitialChildForRetirement(self: *DB, expected: @import("relational/integrity/initial_child_publication.zig").Record, cancel_revision: u64) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("cancelColdInitialChildForRetirement", .{ self, expected, cancel_revision });
-        const hidden = @import("relational_initial_child_publication.zig");
+        const hidden = @import("relational/integrity/initial_child_publication.zig");
         try expected.validate();
         if (cancel_revision == 0 or expected.phase == .released) return error.InitialChildPublicationChanged;
         var txn = try self.core.store.beginWriteTxn();
@@ -45598,7 +46251,7 @@ pub const DB = struct {
             // ordered-index entries even if a corrupt counter says zero.
             var cursor = try txn.openPhysicalCursorAdapter();
             defer cursor.close();
-            for ([_][]const u8{ @import("relational_integrity_contract.zig").namespace, @import("relational_index_records.zig").forward_namespace, @import("relational_index_records.zig").ownership_namespace }) |prefix| {
+            for ([_][]const u8{ @import("relational/integrity/contract.zig").namespace, @import("relational/indexes/records.zig").forward_namespace, @import("relational/indexes/records.zig").ownership_namespace }) |prefix| {
                 if (try cursor.seekAtOrAfter(prefix)) |entry| if (std.mem.startsWith(u8, entry.key, prefix)) return error.RestoreStagingTargetNotEmpty;
             }
         }
@@ -45619,16 +46272,16 @@ pub const DB = struct {
                 try txn.put(&internal_keys.range_document_count_key, &zero);
             }
         }
-        const raw_catalog = txn.get(@import("relational_integrity_catalog.zig").key) catch |err| switch (err) {
+        const raw_catalog = txn.get(@import("relational/integrity/catalog.zig").key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
         };
         if (raw_catalog) |bytes| {
-            var catalog = try @import("relational_integrity_catalog.zig").decode(alloc, bytes);
+            var catalog = try @import("relational/integrity/catalog.zig").decode(alloc, bytes);
             defer catalog.deinit();
             if (try staging.initialCoverage(alloc, &txn, catalog)) |coverage| {
                 defer alloc.free(coverage);
-                try txn.put(@import("relational_integrity_activation.zig").key, coverage);
+                try txn.put(@import("relational/integrity/activation.zig").key, coverage);
             }
         }
         const bootstrap_raw = txn.get(staging.bootstrap_key) catch |err| switch (err) {
@@ -45644,7 +46297,7 @@ pub const DB = struct {
         }
         var progress: staging.Progress = .{ .scope = scope, .phase = if (scope.empty_generation) .imported else .importing, .source_generation_proofs_complete = !source_proofs_required, .rewrite = if (scope.rewrite) |rewrite| .{ .sequence = rewrite.retained_start } else null };
         if (scope.population) |binding| {
-            progress.population = try @import("relational_population_contract.zig").Cursor.init(binding);
+            progress.population = try @import("relational/schema_change/population_contract.zig").Cursor.init(binding);
             progress.logical_digest = progress.population.?.chain;
             progress.artifacts_complete = true;
         }
@@ -45687,14 +46340,14 @@ pub const DB = struct {
         return self.prepareRestoreStagingPageInternal(alloc, scope, source, max_rows, cancellation, null);
     }
 
-    pub fn prepareRewriteStagingPage(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Scope, source: *DB, max_rows: usize, cancellation: types.CancellationToken, program: *const @import("relational_rewrite_staging.zig").ProgramSet) !@import("restore_staging.zig").PreparedPage {
+    pub fn prepareRewriteStagingPage(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Scope, source: *DB, max_rows: usize, cancellation: types.CancellationToken, program: *const @import("relational/schema_change/rewrite_staging.zig").ProgramSet) !@import("restore_staging.zig").PreparedPage {
         if (comptime storage_engine.enabled) return storage_engine.call("prepareRewriteStagingPage", .{ self, alloc, scope, source, max_rows, cancellation, program });
         try program.requireScope(scope);
-        try @import("relational_rewrite_staging.zig").requireSnapshotSource(alloc, scope, source);
+        try @import("relational/schema_change/rewrite_staging.zig").requireSnapshotSource(alloc, scope, source);
         return self.prepareRestoreStagingPageInternal(alloc, scope, source, max_rows, cancellation, program);
     }
 
-    fn prepareRestoreStagingPageInternal(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Scope, source: *DB, max_rows: usize, cancellation: types.CancellationToken, program: ?*const @import("relational_rewrite_staging.zig").ProgramSet) !@import("restore_staging.zig").PreparedPage {
+    fn prepareRestoreStagingPageInternal(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Scope, source: *DB, max_rows: usize, cancellation: types.CancellationToken, program: ?*const @import("relational/schema_change/rewrite_staging.zig").ProgramSet) !@import("restore_staging.zig").PreparedPage {
         const staging = @import("restore_staging.zig");
         if (max_rows == 0 or max_rows > 128 or source.open_mode != .query_readonly or !source.core.identity_namespace.eql(scope.source_namespace)) return error.InvalidRestoreStagingCommand;
         if (!std.mem.eql(u8, source.core.byteRange().start, self.core.byteRange().start) or !std.mem.eql(u8, source.core.byteRange().end, self.core.byteRange().end)) return error.RestoreStagingScopeChanged;
@@ -45976,7 +46629,7 @@ pub const DB = struct {
             hash.update(&length);
             hash.update(document_key);
             hash.update(json);
-            @import("relational_rewrite_program.zig").hashJsonNullFields(&hash, json_null_fields);
+            @import("relational/schema_change/rewrite_program.zig").hashJsonNullFields(&hash, json_null_fields);
             hash.final(&next.logical_digest);
             next.rows = std.math.add(u64, next.rows, 1) catch return error.InvalidRestoreStagingCommand;
             continuation_buffer.clearRetainingCapacity();
@@ -46106,14 +46759,14 @@ pub const DB = struct {
             // receive the same PreparedRow writes. Seal their durable state
             // before acknowledging this owner's completion receipt.
             try self.core.index_manager.syncAll(true);
-            const raw_catalog = txn.get(@import("relational_integrity_catalog.zig").key) catch |err| switch (err) {
+            const raw_catalog = txn.get(@import("relational/integrity/catalog.zig").key) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
             };
             if (raw_catalog) |bytes| {
-                var catalog = try @import("relational_integrity_catalog.zig").decode(alloc, bytes);
+                var catalog = try @import("relational/integrity/catalog.zig").decode(alloc, bytes);
                 defer catalog.deinit();
-                try @import("relational_integrity_activation.zig").requireReady(&txn, catalog);
+                try @import("relational/integrity/activation.zig").requireReady(&txn, catalog);
             }
         }
         next.phase = phase;
@@ -46407,6 +47060,37 @@ pub const DB = struct {
         return identity_stats;
     }
 
+    fn requiredSqlIndexReadyForReport(self: *DB, alloc: Allocator, cfg: types.IndexConfig) !bool {
+        if (cfg.coverage_generation == 0) return false;
+        const config_hash = cfg.coverage_config_fingerprint orelse return false;
+        var view = self.core.acquireSchemaView() orelse return false;
+        defer view.release();
+        const validator = view.validator() orelse return false;
+        const declarations = validator.schema.sql_view_requirements orelse return false;
+        const declared = for (declarations.value) |declaration| {
+            for (declaration.required_indexes) |name| {
+                if (std.mem.eql(u8, name, cfg.name)) break;
+            } else continue;
+            break true;
+        } else false;
+        if (!declared) return false;
+
+        self.failIfIndexQuarantined(cfg.name) catch return false;
+        const guard = @import("../../common/sql_view_index_requirement.zig").Requirement{
+            .name = cfg.name,
+            .incarnation = cfg.coverage_generation,
+            .config_hash = config_hash,
+        };
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        var lease = @import("required_sql_indexes.zig").capture(self.core, alloc, &txn, &.{guard}) catch |err| switch (err) {
+            error.IndexNotFound, error.PreparedGenerationChanged, error.SqlStatementReadUnavailable, error.StorageReadTemporarilyUnavailable, error.UnsupportedSqlExecution => return false,
+            else => return err,
+        };
+        defer if (lease) |*held| held.deinit();
+        return lease != null;
+    }
+
     fn statsLocked(self: *DB, alloc: Allocator) !types.DBStats {
         // Serialize owner captures, not HTTP reads. A stamp orders the whole
         // coherent capture; concurrent captures cannot assign a newer revision
@@ -46498,6 +47182,7 @@ pub const DB = struct {
             var serving_observed = false;
             switch (cfg.kind) {
                 .full_text => {
+                    item.serving_snapshot_ready = try self.requiredSqlIndexReadyForReport(alloc, cfg);
                     if (self.core.textIndex(cfg.name)) |entry| {
                         const text_snapshot = entry.acquireSnapshot();
                         defer text_snapshot.release();
@@ -46766,6 +47451,7 @@ pub const DB = struct {
             item.repair_degraded = item.repair_degraded or !index_repair_summary.ready or item.repair_issue_count != 0;
             switch (cfg.kind) {
                 .full_text => {
+                    item.serving_snapshot_ready = try self.requiredSqlIndexReadyForReport(alloc, cfg);
                     if (self.core.textIndex(cfg.name)) |entry| {
                         item.doc_count = entry.snapshot().liveDocCount();
                         indexed_doc_count = @max(indexed_doc_count orelse 0, item.doc_count);
@@ -47835,16 +48521,43 @@ pub const DB = struct {
     pub const DocumentReadSession = @import("read_session_backend").Document;
 
     pub fn openDocumentReadSession(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) !*DocumentReadSession {
-        if (comptime storage_engine.enabled) return DocumentReadSession.fromHandle(alloc, try storage_engine.call("openDocumentReadSession", .{ self, alloc, from_key, to_key, opts }));
+        if (comptime storage_engine.enabled) {
+            const session = try DocumentReadSession.fromHandle(alloc, try storage_engine.call("openDocumentReadSession", .{ self, alloc, from_key, to_key, opts }));
+            errdefer session.deinit();
+            try @import("../../common/sql_view_index_requirement.zig").requireDigest(opts.required_sql_indexes, session.requiredIndexesDigest());
+            return session;
+        }
         return self.openDocumentReadSessionAtSnapshot(alloc, from_key, to_key, opts, null);
     }
 
+    /// Public native scans must agree with transaction and point admission
+    /// when metadata has selected a successor whose local publish is pending.
+    fn requireNativeRestoreServing(self: *DB, txn: anytype) !void {
+        if (self.sql_persistence == null or !self.local_execution.restore_staging_required.load(.acquire)) return;
+        @import("restore_staging.zig").requireScope(self.alloc, txn, null, false) catch |err|
+            return if (err == error.RestoreStagingInProgress) error.SqlRelationRecoveryIncomplete else err;
+    }
+
+    fn checkNativeRestoreServing(self: *DB) !void {
+        if (self.sql_persistence == null or !self.local_execution.restore_staging_required.load(.acquire)) return;
+        var read = try self.core.store.beginProbeTxn();
+        defer read.abort();
+        try self.requireNativeRestoreServing(&read);
+    }
+
     pub fn openDocumentReadSessionAtSnapshot(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, statement: ?*RelationalStatementSnapshot) !*DocumentReadSession {
-        if (comptime storage_engine.enabled) return DocumentReadSession.fromHandle(alloc, try storage_engine.call("openDocumentReadSessionAtSnapshot", .{ self, alloc, from_key, to_key, opts, if (statement) |cut| cut.handle else null }));
+        if (comptime storage_engine.enabled) {
+            const session = try DocumentReadSession.fromHandle(alloc, try storage_engine.call("openDocumentReadSessionAtSnapshot", .{ self, alloc, from_key, to_key, opts, if (statement) |cut| cut.handle else null }));
+            errdefer session.deinit();
+            try @import("../../common/sql_view_index_requirement.zig").requireDigest(opts.required_sql_indexes, session.requiredIndexesDigest());
+            return session;
+        }
+        if (statement == null) try self.checkNativeRestoreServing();
         if (statement) |cut| if (!cut.document) return error.PreparedGenerationChanged;
         if (opts.relational_query_json.len > 1024 * 1024) return error.InvalidRelationalRowsRequest;
         if (opts.relational_query) |input| {
             if (input.text_filter) |text| {
+                if (opts.required_sql_indexes.len != 0) return error.UnsupportedSqlExecution;
                 if (statement != null) return error.SqlStatementSnapshotRequired;
                 return self.openDocumentTextReadSession(alloc, from_key, to_key, opts, text);
             }
@@ -47852,6 +48565,7 @@ pub const DB = struct {
             var parsed = try std.json.parseFromSlice(types.RelationalRowQuery, alloc, opts.relational_query_json, .{});
             defer parsed.deinit();
             if (parsed.value.text_filter) |text| {
+                if (opts.required_sql_indexes.len != 0) return error.UnsupportedSqlExecution;
                 if (statement != null) return error.SqlStatementSnapshotRequired;
                 return self.openDocumentTextReadSession(alloc, from_key, to_key, opts, text);
             }
@@ -47875,12 +48589,24 @@ pub const DB = struct {
         defer alloc.free(start);
         const end = try alloc.dupe(u8, borrowed.end);
         defer alloc.free(end);
-        const txn = if (statement) |cut| try cut.read.forkRead() else try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+        var txn = if (statement) |cut| try cut.read.forkRead() else try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+        var owns_txn = true;
+        errdefer if (owns_txn) txn.abort();
+        var required: ?@import("required_sql_indexes.zig").Lease = null;
+        errdefer if (required) |*lease| lease.deinit();
+        if (opts.required_sql_indexes.len != 0) {
+            try @import("../../common/sql_view_index_requirement.zig").validate(opts.required_sql_indexes);
+            for (opts.required_sql_indexes) |guard| try self.failIfIndexQuarantined(guard.name);
+            required = try @import("required_sql_indexes.zig").capture(self.core, alloc, &txn, opts.required_sql_indexes);
+        }
         const now = if (statement) |cut| cut.read_at_ns else currentTimeNs();
         self.core.unlockApplyShared();
         locked = false;
+        owns_txn = false;
         const session = try DocumentReadSession.openSnapshot(alloc, self.core.store, txn, schema, .{ .start = start, .end = end }, from_key, to_key, opts, now);
         errdefer session.deinit();
+        session.required_indexes = required;
+        required = null;
         try self.initializeDocumentReadSessionPrivacy(session, opts);
         session.preparation_runtime = if (self.backend_runtime.io()) |io| .{ .io = io } else null;
         session.row_policy_lease = row_policy_lease;
@@ -47985,14 +48711,17 @@ pub const DB = struct {
     }
 
     pub fn openRelationalReadSessionAtSnapshot(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, statement: ?*RelationalStatementSnapshot) !*RelationalReadSession {
+        if (opts.required_sql_indexes.len != 0) return error.UnsupportedSqlExecution;
         if (comptime storage_engine.enabled) {
             const snapshot_handle: ?@import("../read_session_contract.zig").Handle = if (statement) |cut| cut.handle else null;
             return RelationalReadSession.fromHandle(alloc, try storage_engine.call("openRelationalReadSessionAtSnapshot", .{ self, alloc, from_key, to_key, opts, snapshot_handle }));
         }
+        if (statement == null) try self.checkNativeRestoreServing();
         try self.maybeFinalizePendingRowPolicyPublication();
         var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
         defer if (verified_principal) |*proof| proof.deinit();
-        var row_policy_lease = if (opts.row_policy_principal_proof.len != 0) bound: {
+        const partition_proof = std.mem.startsWith(u8, opts.row_policy_principal_proof, "p1:");
+        var row_policy_lease = if (opts.row_policy_principal_proof.len != 0 and !partition_proof) bound: {
             if (opts.row_policy_principal_proof.len > row_policy_authority_mod.maximum_token_bytes or
                 opts.row_policy_database.len == 0) return error.RowPolicyAuthenticationRequired;
             if (statement) |cut| if (cut.row_policy_phase != .active) return error.RowPolicyCatalogChanged;
@@ -48035,6 +48764,29 @@ pub const DB = struct {
         var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
         defer view.release();
         if (view.storageMode() != .relational) return error.RelationalTableRequired;
+        if (partition_proof) {
+            // Verify against the same immutable view used to prepare the
+            // actual reader, after acquiring the disabled-policy lease.
+            const validator = view.validator() orelse return error.PartitionCatalogChanged;
+            const partition = validator.schema.sql_partition orelse return error.PartitionCatalogChanged;
+            if (partition.value != .member) return error.PartitionCatalogChanged;
+            const member = partition.value.member;
+            if (member.parent_policy.enabled) return error.RowPolicyUnsupported;
+            const secret = self.local_execution.sql_preparation_secret orelse self.local_execution.row_policy_authority_secret orelse return error.RowPolicyAuthorityUnavailable;
+            const issuer = self.local_execution.sql_preparation_issuer orelse self.local_execution.row_policy_authority_issuer orelse return error.RowPolicyAuthorityUnavailable;
+            const table = self.local_execution.row_policy_table_name orelse return error.RowPolicyAuthorityUnavailable;
+            const now_seconds: i64 = @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s));
+            var authority = try row_policy_authority_mod.verifyPartition(alloc, secret, issuer, .{
+                .table_id = self.core.identity_namespace.table_id,
+                .table = table,
+                .database = opts.row_policy_database,
+                .policy_generation = member.membership_generation,
+                .catalog_epoch = member.membership_generation,
+            }, member, now_seconds, opts.row_policy_principal_proof);
+            defer authority.deinit();
+            if (view.version() != member.child.schema_version) return error.PartitionCatalogChanged;
+            row_policy_lease.expires_at_seconds = authority.value.expires;
+        }
         if (opts.include_range_proofs and view.tableSchema().ttl_duration_ns != 0) return error.UnsupportedSqlExecution;
         if (parsed.value.schema_version) |version| if (version != view.version()) return error.PreparedGenerationChanged;
         var arena = std.heap.ArenaAllocator.init(alloc);
@@ -48231,6 +48983,7 @@ pub const DB = struct {
     /// graph statement root. Projection/filtering use the same stored bytes.
     pub fn scanVisitAtCypherSnapshot(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, visitor: types.ScanVisitor, cut: ?*CypherPinnedSnapshot) !void {
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        try self.checkNativeRestoreServing();
         var privacy_arena = std.heap.ArenaAllocator.init(alloc);
         defer privacy_arena.deinit();
         const privacy = @import("privacy_read.zig");
@@ -60698,10 +61451,10 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
     {
         var lifecycle = try ctx.store.beginReadTxn();
         defer lifecycle.abort();
-        try @import("relational_integrity_topology.zig").requireWriteUnfenced(&lifecycle);
-        try @import("relational_integrity_retirement.zig").requireMutable(&lifecycle);
+        try @import("relational/integrity/topology.zig").requireWriteUnfenced(&lifecycle);
+        try @import("relational/integrity/retirement.zig").requireMutable(&lifecycle);
         try @import("restore_staging.zig").requireScope(ctx.alloc, &lifecycle, null, false);
-        const catalog_mod = @import("relational_integrity_catalog.zig");
+        const catalog_mod = @import("relational/integrity/catalog.zig");
         const raw = lifecycle.get(catalog_mod.key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
@@ -61267,8 +62020,8 @@ fn expireDirectGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: 
     {
         var lifecycle = try ctx.store.beginReadTxn();
         defer lifecycle.abort();
-        try @import("relational_integrity_topology.zig").requireWriteUnfenced(&lifecycle);
-        try @import("relational_integrity_retirement.zig").requireMutable(&lifecycle);
+        try @import("relational/integrity/topology.zig").requireWriteUnfenced(&lifecycle);
+        try @import("relational/integrity/retirement.zig").requireMutable(&lifecycle);
         try @import("restore_staging.zig").requireScope(ctx.alloc, &lifecycle, null, false);
     }
     var txn_manager = try transactions_mod.TxnManager.init(ctx.alloc, ctx.store);
@@ -61431,8 +62184,8 @@ fn expireGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: GraphT
     {
         var lifecycle = try ctx.store.beginReadTxn();
         defer lifecycle.abort();
-        try @import("relational_integrity_topology.zig").requireWriteUnfenced(&lifecycle);
-        try @import("relational_integrity_retirement.zig").requireMutable(&lifecycle);
+        try @import("relational/integrity/topology.zig").requireWriteUnfenced(&lifecycle);
+        try @import("relational/integrity/retirement.zig").requireMutable(&lifecycle);
         try @import("restore_staging.zig").requireScope(ctx.alloc, &lifecycle, null, false);
     }
     var txn_manager = try transactions_mod.TxnManager.init(ctx.alloc, ctx.store);
@@ -67125,7 +67878,7 @@ fn finalizePrimarySplitPreservingMetadata(
     try self.core.store.ensureGraphIncomingDirectory();
     try putIdentityMetadataRows(self.alloc, self.core.store, identity_rows);
     try reconcileRelationalIndexRange(self, self.core.store, retained_range);
-    try @import("relational_integrity_range.zig").pruneOutside(self.alloc, self.backend_runtime.io(), self.core.store, retained_range.start, retained_range.end);
+    try @import("relational/integrity/range.zig").pruneOutside(self.alloc, self.backend_runtime.io(), self.core.store, retained_range.start, retained_range.end);
     try rebaseRangeCoverageMetadata(
         self.alloc,
         self.core.store,
@@ -67182,7 +67935,7 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
     try range_state_mod.saveRange(dest_store, byte_range);
     try self.core.saveSchemaCloneTo(dest_store);
     try relational_index_catalog.copyToUnpublished(self.alloc, self.core.store, dest_store);
-    try @import("relational_integrity_range.zig").copyToUnpublished(self.alloc, self.backend_runtime.io(), self.core.store, dest_store, byte_range.start, byte_range.end);
+    try @import("relational/integrity/range.zig").copyToUnpublished(self.alloc, self.backend_runtime.io(), self.core.store, dest_store, byte_range.start, byte_range.end);
     // Replicated apply reopens prepared shards from their local manifest;
     // it cannot consult metadata while metadata is waiting for that apply.
     // Keep public validation/provenance alongside the internal runtime schema.
@@ -75704,7 +76457,7 @@ test "relational index restore projects historical rows without requiring unused
 test "relational index catalog core publishes schema bound plans and recovers on reopen" {
     const alloc = std.testing.allocator;
     const native_indexes = @import("../relational_index.zig");
-    const catalog = @import("relational_index_catalog.zig");
+    const catalog = @import("relational/indexes/catalog.zig");
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
     const path = path_tmp.path().ptr;
@@ -134756,12 +135509,12 @@ fn testChildGenerationInstall(native: bool, lifetime: bool) !void {
     defer parsed_next.deinit(alloc);
     const next_schema = try public_table_schema.deriveRuntimeTableSchema(alloc, parsed_next);
     defer schema_mod.freeSchema(alloc, next_schema);
-    var fence: @import("relational_integrity_topology.zig").Fence = undefined;
+    var fence: @import("relational/integrity/topology.zig").Fence = undefined;
     {
         var db = try DB.open(alloc, std.mem.span(path), .{ .identity_namespace = namespace, .online_source_authority = if (native) .native else .raft, .sql_persistence = descriptor, .sql_persistence_context = host, .persistence_boot = boot, .start_optional_runtimes = false });
         defer db.close();
         try db.setSchemaJson(alloc, old_json);
-        const catalog = try db.core.store.get(alloc, @import("relational_integrity_catalog.zig").key);
+        const catalog = try db.core.store.get(alloc, @import("relational/integrity/catalog.zig").key);
         defer alloc.free(catalog);
         var catalog_digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(catalog, &catalog_digest, .{});
@@ -134798,7 +135551,7 @@ fn testChildGenerationInstall(native: bool, lifetime: bool) !void {
         const public_json = try reopened.core.store.get(alloc, public_schema_json_key);
         defer alloc.free(public_json);
         try std.testing.expectEqualStrings(old_json, public_json);
-        const old_catalog = try reopened.core.store.get(alloc, @import("relational_integrity_catalog.zig").key);
+        const old_catalog = try reopened.core.store.get(alloc, @import("relational/integrity/catalog.zig").key);
         defer alloc.free(old_catalog);
         var before_catalog_digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(old_catalog, &before_catalog_digest, .{});
@@ -134840,14 +135593,14 @@ fn testChildGenerationInstall(native: bool, lifetime: bool) !void {
     const installed_public = try installed.core.store.get(alloc, public_schema_json_key);
     defer alloc.free(installed_public);
     try std.testing.expectEqualStrings(next_json, installed_public);
-    const installed_catalog = try installed.core.store.get(alloc, @import("relational_integrity_catalog.zig").key);
+    const installed_catalog = try installed.core.store.get(alloc, @import("relational/integrity/catalog.zig").key);
     defer alloc.free(installed_catalog);
     var installed_digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(installed_catalog, &installed_digest, .{});
     try std.testing.expectEqual(after_catalog_digest, installed_digest);
-    const receipt_bytes = try installed.core.store.get(alloc, @import("relational_integrity_generation_admission.zig").source_install_receipt_key);
+    const receipt_bytes = try installed.core.store.get(alloc, @import("relational/integrity/generation_admission.zig").source_install_receipt_key);
     defer alloc.free(receipt_bytes);
-    const receipt = try @import("relational_integrity_generation_admission.zig").AppliedReceipt.decode(receipt_bytes);
+    const receipt = try @import("relational/integrity/generation_admission.zig").AppliedReceipt.decode(receipt_bytes);
     if (lifetime) {
         try std.testing.expectEqual(@as(u64, 0), receipt.term);
         try std.testing.expectEqual(@as(u64, 0), receipt.index);
@@ -134866,7 +135619,7 @@ fn testChildGenerationInstall(native: bool, lifetime: bool) !void {
     // A later DROP publication fences the already-installed v1 layout. The
     // schema pin is intentionally false for an equal version, but cold owner
     // index reconciliation must still wait for this dual-role fence.
-    const dual_fence: @import("relational_integrity_topology.zig").Fence = .{
+    const dual_fence: @import("relational/integrity/topology.zig").Fence = .{
         .admission_epoch = 2,
         .transition_id = 2,
         .attempt = 1,
@@ -137844,18 +138597,18 @@ test "db coordinated ttl retains visible rows and emits snapshot bound observati
     try db.setSchemaJson(alloc,
         \\{"version":1,"storage_mode":"relational","default_type":"row","ttl":{"duration":"1s","field":"expires"},"unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"expires":{"type":"datetime"},"value":{"type":"integer"}},"additionalProperties":false}}}}
     );
-    const integrity = @import("relational_integrity.zig");
-    const catalog_mod = @import("relational_integrity_catalog.zig");
+    const integrity = @import("relational/integrity/integrity.zig");
+    const catalog_mod = @import("relational/integrity/catalog.zig");
     const catalog_raw = (try db.core.getStoreValue(alloc, catalog_mod.key)).?;
     defer alloc.free(catalog_raw);
     var catalog = try catalog_mod.decode(alloc, catalog_raw);
     defer catalog.deinit();
-    const generation_set = @import("relational_integrity_activation.zig").generationSet(catalog);
+    const generation_set = @import("relational/integrity/activation.zig").generationSet(catalog);
     var view = db.core.acquireSchemaView().?;
     defer view.release();
     try std.testing.expect(view.hasCoordinatedConstraints());
     try std.testing.expectEqual(@as(u64, 0), view.visibilityTtlDurationNs());
-    var tuple_plan = try @import("relational_index_keys.zig").TuplePlan.init(alloc, view.tableSchema().*, view.physicalLayout(), &.{.{ .column = "id" }});
+    var tuple_plan = try @import("relational/indexes/keys.zig").TuplePlan.init(alloc, view.tableSchema().*, view.physicalLayout(), &.{.{ .column = "id" }});
     defer tuple_plan.deinit();
     var tuple: std.ArrayList(u8) = .empty;
     defer tuple.deinit(alloc);
@@ -150454,7 +151207,7 @@ test "source vector migration converts legacy ANN generations in both modes" {
 
 test "db cold initial FK retirement cancels exact hidden publication durably" {
     const alloc = std.testing.allocator;
-    const hidden = @import("relational_initial_child_publication.zig");
+    const hidden = @import("relational/integrity/initial_child_publication.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cold-retirement", .{tmp.sub_path});
@@ -152340,16 +153093,16 @@ test "db transaction integrity contention precedes stale claim semantics" {
         try db.setSchemaJson(alloc,
             \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
         );
-        const integrity = @import("relational_integrity.zig");
-        const catalog_mod = @import("relational_integrity_catalog.zig");
+        const integrity = @import("relational/integrity/integrity.zig");
+        const catalog_mod = @import("relational/integrity/catalog.zig");
         const raw = (try db.core.getStoreValue(alloc, catalog_mod.key)).?;
         defer alloc.free(raw);
         var catalog = try catalog_mod.decode(alloc, raw);
         defer catalog.deinit();
-        const generation_set = @import("relational_integrity_activation.zig").generationSet(catalog);
+        const generation_set = @import("relational/integrity/activation.zig").generationSet(catalog);
         var view = db.core.acquireSchemaView().?;
         defer view.release();
-        var plan = try @import("relational_index_keys.zig").TuplePlan.init(alloc, view.tableSchema().*, view.physicalLayout(), &.{.{ .column = "id" }});
+        var plan = try @import("relational/indexes/keys.zig").TuplePlan.init(alloc, view.tableSchema().*, view.physicalLayout(), &.{.{ .column = "id" }});
         defer plan.deinit();
         var tuple: std.ArrayList(u8) = .empty;
         defer tuple.deinit(alloc);
@@ -156845,7 +157598,7 @@ test "capi resolver topology busy leaves pending replacement and resolver config
     var resolver: index_manager_mod.ResolverConfig = .{ .name = "concepts", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "entity/{{ uslug _entity.text }}", .promote = false, .min_confidence = 0.2 };
     try db.addResolver(resolver);
     const generation = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
-    const topology = @import("relational_integrity_topology.zig");
+    const topology = @import("relational/integrity/topology.zig");
     var digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash("", &digest, .{});
     const fence: topology.Fence = .{ .transition_id = 1, .attempt = 1, .peer_group_id = 2, .owner_group_id = 1, .role = .backup_snapshot, .namespace = db.core.identity_namespace, .catalog_digest = digest };
@@ -159429,7 +160182,7 @@ test "source vector sealed backup retains exact payloads across writes and porta
     try std.testing.expectEqual(@as(u64, 0), remaining_wal);
     const identity = try source.relationalTopologyIdentity();
     try std.testing.expect(identity.backup_seal_supported);
-    const fence: @import("relational_integrity_topology.zig").Fence = .{ .role = .backup_snapshot, .transition_id = 900, .attempt = 1, .peer_group_id = 1, .owner_group_id = 1, .admission_epoch = identity.next_epoch, .namespace = identity.namespace, .catalog_digest = identity.catalog_digest };
+    const fence: @import("relational/integrity/topology.zig").Fence = .{ .role = .backup_snapshot, .transition_id = 900, .attempt = 1, .peer_group_id = 1, .owner_group_id = 1, .admission_epoch = identity.next_epoch, .namespace = identity.namespace, .catalog_digest = identity.catalog_digest };
     try source.applyRelationalTopologyControl(.{ .fence = fence, .action = .begin }, null);
     const handle = try source.sealBackupCohort("vectors", fence, .none);
     try source.applyRelationalTopologyControl(.{ .fence = fence, .action = .release }, null);
@@ -161514,8 +162267,8 @@ test "SQL ordered lock admission yields without holding snapshot or writer owner
 
 test "db document retirement source fences pristine populated and cold owners without relational catalogs" {
     const alloc = std.testing.allocator;
-    const topology = @import("relational_integrity_topology.zig");
-    const admission = @import("relational_integrity_generation_admission.zig");
+    const topology = @import("relational/integrity/topology.zig");
+    const admission = @import("relational/integrity/generation_admission.zig");
     for (0..3) |variant| {
         var temporary = try TestDirectory.init("db-document-retirement-source");
         defer temporary.cleanup();
@@ -161541,7 +162294,7 @@ test "db document retirement source fences pristine populated and cold owners wi
             first = (try admission.ownerStatus(&read)).source_fence_receipt.?;
             try std.testing.expectEqualSlices(u8, &try admission.sourceFenceDigest(fence), &first.digest);
             try std.testing.expect(first.term != 0 and first.index != 0);
-            try std.testing.expectError(error.NotFound, read.get(@import("relational_integrity_catalog.zig").key));
+            try std.testing.expectError(error.NotFound, read.get(@import("relational/integrity/catalog.zig").key));
         }
         // The original native source receipt is a cold, durable witness. A
         // lost response retries the exact barrier without advancing identity.
@@ -161554,7 +162307,7 @@ test "db document retirement source fences pristine populated and cold owners wi
             const status = try admission.ownerStatus(&read);
             try std.testing.expect(status.fence.?.eql(fence));
             try std.testing.expectEqual(first, status.source_fence_receipt.?);
-            try std.testing.expectError(error.NotFound, read.get(@import("relational_integrity_catalog.zig").key));
+            try std.testing.expectError(error.NotFound, read.get(@import("relational/integrity/catalog.zig").key));
             try std.testing.expectError(error.InvalidBatchRequest, db.batchNativeFkGenerationApply(.{ .relational_topology = .{ .action = .cancel_child_generation_source, .fence = fence, .sql_drop_control = true, .document_schema_digest = schema_digest } }));
         }
     }
@@ -161575,13 +162328,13 @@ test "db document retirement waits for producer replay before durable source adm
     var schema_digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash("", &schema_digest, .{});
     const identity = try db.relationalTopologyIdentity();
-    const fence: @import("relational_integrity_topology.zig").Fence = .{ .transition_id = 71, .attempt = 72, .admission_epoch = identity.next_epoch, .owner_group_id = 719, .peer_group_id = 719, .role = .document_retirement_source, .namespace = namespace, .catalog_digest = identity.catalog_digest };
+    const fence: @import("relational/integrity/topology.zig").Fence = .{ .transition_id = 71, .attempt = 72, .admission_epoch = identity.next_epoch, .owner_group_id = 719, .peer_group_id = 719, .role = .document_retirement_source, .namespace = namespace, .catalog_digest = identity.catalog_digest };
     try std.testing.expectError(error.IntegrityTopologyBusy, db.batchNativeFkGenerationApply(.{ .relational_topology = .{ .action = .begin, .fence = fence, .sql_drop_control = true, .document_schema_digest = schema_digest } }));
     {
         var read = try db.core.store.beginProbeTxn();
         defer read.abort();
-        try std.testing.expect((try @import("relational_integrity_topology.zig").current(&read)) == null);
-        try std.testing.expect((try @import("relational_integrity_generation_admission.zig").ownerStatus(&read)).source_fence_receipt == null);
+        try std.testing.expect((try @import("relational/integrity/topology.zig").current(&read)) == null);
+        try std.testing.expect((try @import("relational/integrity/generation_admission.zig").ownerStatus(&read)).source_fence_receipt == null);
     }
     try db.runUntilIdle();
     try db.batchNativeFkGenerationApply(.{ .relational_topology = .{ .action = .begin, .fence = fence, .sql_drop_control = true, .document_schema_digest = schema_digest } });
@@ -161630,7 +162383,7 @@ fn qualifyNativeEmptyTarget(schema_only: bool) !void {
     };
     const origin: loss.Origin = if (schema_only) .{ .schema_only_snapshot = .{ .manifest_digest = @splat(66), .schema_digest = schema_digest, .source_table_id = 101 } } else .{ .lost_source = .{ .checkpoint_digest = @splat(3), .source = .{ .physical_root_incarnation = std.math.maxInt(u128) - 1, .table_id = 101, .shard_id = 102, .range_id = 102, .data_generation = 1 } } };
     const scope: staging.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(0), .source_namespace = if (schema_only) .{} else .{ .table_id = 101, .shard_id = 102, .range_id = 102 }, .target_namespace = namespace, .target_schema_digest = schema_digest, .empty_generation = true, .native_empty_origin = origin };
-    const transitions = [_]@import("relational_integrity_generation_admission.zig").Transition{.{ .child_table_id = 301, .child_table_name = "children", .constraint_name = "fk_lost", .expected_generation = null, .next_generation = @splat(4), .plan_id = scope.plan_id, .decision_digest = scope.digest() }};
+    const transitions = [_]@import("relational/integrity/generation_admission.zig").Transition{.{ .child_table_id = 301, .child_table_name = "children", .constraint_name = "fk_lost", .expected_generation = null, .next_generation = @splat(4), .plan_id = scope.plan_id, .decision_digest = scope.digest() }};
     const command: loss.Install = .{ .scope = scope.digest(), .origin = origin, .transitions = &transitions };
     const bootstrap: staging.OwnerBootstrap = .{
         .scope = scope,
@@ -161745,7 +162498,7 @@ fn qualifyNativeEmptyTarget(schema_only: bool) !void {
     {
         var corrupt = try reopened.core.store.beginWriteTxn();
         defer corrupt.abort();
-        const acceptance = @import("relational_integrity_generation_admission.zig");
+        const acceptance = @import("relational/integrity/generation_admission.zig");
         const key = try acceptance.scopeKey("children", "fk_lost");
         const saved = try a.dupe(u8, try corrupt.get(&key));
         defer a.free(saved);
@@ -161829,7 +162582,7 @@ test "db native never acknowledged generation initializes an actual empty image 
 test "db native source retirement waits terminal external ACKs while ordinary topology remains quiescent" {
     const a = std.testing.allocator;
     const persistence = @import("../../common/relation_persistence.zig");
-    const topology = @import("relational_integrity_topology.zig");
+    const topology = @import("relational/integrity/topology.zig");
     for ([_]persistence.Kind{ .temporary, .unlogged }) |kind| {
         var temporary = try TestDirectory.init("db-native-retirement-ack-debt");
         defer temporary.cleanup();
@@ -162097,7 +162850,7 @@ test "db graph schema NONE protected prepare pins actual absence through cold at
         defer old.deinit(a);
         const index = db.core.index_manager.graphIndex("g").?;
         const index_digest = (try @import("graph_retirement_config.zig").fromLoaded(scratch, &.{index.config})).?;
-        const proof: @import("prepared_graph_effects.zig").Admission = .{ .metadata_group_id = 11, .incarnation = @splat(1), .source_revision = 9, .table_id = 7, .schema_digest = @import("relational_schema_owner_contract.zig").hash(""), .indexes = &.{.{ .name = "g", .digest = index_digest }} };
+        const proof: @import("prepared_graph_effects.zig").Admission = .{ .metadata_group_id = 11, .incarnation = @splat(1), .source_revision = 9, .table_id = 7, .schema_digest = @import("relational/schema_change/schema_owner_contract.zig").hash(""), .indexes = &.{.{ .name = "g", .digest = index_digest }} };
         var absent = try manifests.Absence.fromAdmission(proof, 0);
         absent.schema_present = false;
         const program: manifests.Manifest = .{ .format = 2, .metadata_incarnation = proof.incarnation, .catalog_revision = 9, .table = try absent.table(), .absence = absent, .routines = &.{} };
@@ -162186,8 +162939,8 @@ test "db native checked atomic intent commits rows and unique effects once witho
     retention_contract.layout_id ^= 1;
     try std.testing.expectError(error.UnsupportedVersion, storage_engine.validateExternalRetentionContract(storage_engine.descriptor_version, retention_contract));
     const persistence = @import("../../common/relation_persistence.zig");
-    const integrity = @import("relational_integrity.zig");
-    const catalog_mod = @import("relational_integrity_catalog.zig");
+    const integrity = @import("relational/integrity/integrity.zig");
+    const catalog_mod = @import("relational/integrity/catalog.zig");
     const codec = @import("../../api/batch_internal.zig");
     var directory = try TestDirectory.init("native-checked-atomic");
     defer directory.cleanup();
@@ -162205,10 +162958,10 @@ test "db native checked atomic intent commits rows and unique effects once witho
         defer a.free(raw);
         var catalog = try catalog_mod.decode(a, raw);
         defer catalog.deinit();
-        const generation_set = @import("relational_integrity_activation.zig").generationSet(catalog);
+        const generation_set = @import("relational/integrity/activation.zig").generationSet(catalog);
         var view = db.core.acquireSchemaView().?;
         defer view.release();
-        var plan = try @import("relational_index_keys.zig").TuplePlan.init(a, view.tableSchema().*, view.physicalLayout(), &.{.{ .column = "id" }});
+        var plan = try @import("relational/indexes/keys.zig").TuplePlan.init(a, view.tableSchema().*, view.physicalLayout(), &.{.{ .column = "id" }});
         defer plan.deinit();
         var tuple: std.ArrayList(u8) = .empty;
         defer tuple.deinit(a);
@@ -162840,7 +163593,7 @@ test "privacy ordinary SQL session projects genuine receipts and rejects text an
 test "db native source retirement admits only exact captured close and resolved native decision cleanup" {
     const a = std.testing.allocator;
     const persistence = @import("../../common/relation_persistence.zig");
-    const topology = @import("relational_integrity_topology.zig");
+    const topology = @import("relational/integrity/topology.zig");
     const locks = @import("../pessimistic_lock/control.zig");
     const scopes = @import("../pessimistic_lock/authority.zig");
     const frozen = @import("../pessimistic_lock/transaction.zig");
@@ -162875,7 +163628,40 @@ test "db native source retirement admits only exact captured close and resolved 
         try checked.requireExecuting(admission);
         // Real primary scope admission precedes the physical fence. Checked is
         // the existing component receiver input, never a fabricated ACK.
-        if (kind == .temporary) try db.batch(.{ .sql_lock = .{ .admission = admission, .checked = checked, .operation = .begin } });
+        if (kind == .temporary) {
+            const staging = @import("restore_staging.zig");
+            var progress: staging.Progress = .{
+                .phase = .validated,
+                .scope = .{
+                    .plan_id = @splat(1),
+                    .plan_digest = @splat(2),
+                    .source_artifact_digest = @splat(3),
+                    .source_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+                    .target_namespace = namespace,
+                    .target_schema_digest = @splat(4),
+                },
+            };
+            const hidden = try progress.encode(a);
+            defer a.free(hidden);
+            try db.core.store.put(staging.key, hidden);
+            db.local_execution.restore_staging_required.store(true, .release);
+            defer db.local_execution.restore_staging_required.store(false, .release);
+            const begin: types.BatchRequest = .{ .sql_lock = .{ .admission = admission, .checked = checked, .operation = .begin } };
+            try std.testing.expectError(error.RestoreStagingInProgress, db.batch(begin));
+            try std.testing.expectError(error.SqlRelationRecoveryIncomplete, db.scan(a, "", "", .{}));
+            try std.testing.expectError(error.SqlRelationRecoveryIncomplete, db.captureRelationalStatementSnapshot());
+
+            // Model an already-published marker seen by a handle retaining
+            // the earlier conservative cache value.
+            progress.phase = .published;
+            const published = try progress.encode(a);
+            defer a.free(published);
+            try db.core.store.put(staging.key, published);
+            var visible = try db.scan(a, "", "", .{ .include_documents = true });
+            defer visible.deinit(a);
+            try std.testing.expectEqual(@as(usize, 0), visible.documents.len);
+            try db.batch(begin);
+        }
         const identity = try db.relationalTopologyIdentity();
         const fence: topology.Fence = .{ .transition_id = 71, .attempt = 72, .admission_epoch = identity.next_epoch, .owner_group_id = group, .peer_group_id = group, .role = .document_retirement_source, .namespace = namespace, .catalog_digest = identity.catalog_digest };
         var schema_digest: [32]u8 = undefined;
@@ -164847,7 +165633,7 @@ test "db backup producer freeze uses lane-specific committed replay frontiers" {
     defer a.free(record);
     try db.core.store.appendReplayOpaque(a, unrelated, record);
     const identity = try db.relationalTopologyIdentity();
-    const fence: @import("relational_integrity_topology_contract.zig").Fence = .{ .transition_id = 1, .attempt = 1, .admission_epoch = identity.next_epoch, .owner_group_id = 2, .peer_group_id = 2, .role = .backup_snapshot, .namespace = identity.namespace, .catalog_digest = identity.catalog_digest };
+    const fence: @import("relational/integrity/topology_contract.zig").Fence = .{ .transition_id = 1, .attempt = 1, .admission_epoch = identity.next_epoch, .owner_group_id = 2, .peer_group_id = 2, .role = .backup_snapshot, .namespace = identity.namespace, .catalog_digest = identity.catalog_digest };
     try db.applyRelationalTopologyControl(.{ .fence = fence, .action = .begin }, null);
     try std.testing.expect((try db.relationalTopologyStatus()).fence.?.eql(fence));
     try db.applyRelationalTopologyControl(.{ .fence = fence, .action = .cancel }, null);
@@ -166849,4 +167635,319 @@ test "optional numeric range graph admission preserves legacy indexed predicates
         .index_name = "ft",
         .filter_query_json = conjunction,
     }, &.{"a"}));
+}
+
+test "Source physical ordered DB PREPARE binds schema and durable Raft receipt" {
+    const a = std.testing.allocator;
+    const source = @import("replication_source_apply_store.zig");
+    var input = source.fixturePreparation();
+    const id = input.permit.reference.txn_id;
+    const owner = input.permit.decision_owner;
+    const namespace = input.permit.namespace;
+    var directory = try TestDirectory.init("source-ordered-prepare");
+    defer directory.cleanup();
+    const options: OpenOptions = .{
+        .identity_namespace = namespace,
+        .executor = .{ .backend = .manual },
+        .start_optional_runtimes = false,
+        .start_independent_maintenance = false,
+    };
+    const prepared_position: OrderedApplyReceipt = .{ .term = 1, .index = 2 };
+    var completion: source.contract.AckCompletion = undefined;
+    const ids: []const []const u8 = &.{"owner"};
+    const ack_position: OrderedApplyReceipt = .{ .term = 1, .index = 5 };
+    const commit_position: OrderedApplyReceipt = .{ .term = 1, .index = 4 };
+    {
+        var db = try DB.open(a, directory.path(), options);
+        defer db.close();
+        {
+            var txn = try db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            try @import("../source_authority.zig").bind(&txn, .raft, @import("online_source_contract.zig").namespaceBytes(namespace));
+            try txn.commit();
+        }
+        _ = try db.beginExternalTransaction(.{
+            .txn_id = id,
+            .owner = owner,
+            .begin_timestamp = 10,
+            .created_at_ns = 11,
+            .participants = &.{"owner"},
+            .coordinator = false,
+            .ordered_receipt = .{ .term = 1, .index = 1 },
+            .admission_timestamp_ns = 12,
+        });
+        const encoded = try schema_mod.serializeSchema(a, db.core.schema orelse schema_mod.TableSchema{});
+        defer a.free(encoded);
+        std.crypto.hash.Blake3.hash(encoded, &input.permit.schema_digest, .{});
+        var intent: types.TransactionIntentRequest = .{
+            .schema_version = 0,
+            .external_decision_owner = owner,
+            .timestamp_ns = 13,
+            .writes = &.{.{ .key = "row", .value = "{\"v\":1}" }},
+        };
+        const witnesses = try @import("logical_replication_request.zig").digests(a, .{
+            .namespace = namespace,
+            .owner_group_id = input.permit.owner_group_id,
+            .transaction_id = id,
+            .member = input.permit.member,
+            .topology_epoch = input.permit.topology_epoch,
+        }, intent);
+        input.permit.request_digest = witnesses.request;
+        input.permit.pregrant_body_digest = witnesses.body;
+        intent.replication_source_permit = input.permit;
+        intent.replication_source_permit.?.policy_epoch = .{ .generation = 1, .catalog_epoch = 1 };
+        try std.testing.expectError(error.RowPolicyCatalogChanged, db.writeReplicatedTransactionAtOrderedReceipt(id, intent, prepared_position));
+        intent.replication_source_permit = input.permit;
+        try db.writeReplicatedTransactionAtOrderedReceipt(id, intent, prepared_position);
+        try db.writeReplicatedTransactionAtOrderedReceipt(id, intent, prepared_position);
+        try std.testing.expect((try db.observeReplicationSource(.{ .stage = .{ .permit = input.permit, .stage = .activated } })) == null);
+        const activation: types.TransactionIntentRequest = .{
+            .external_decision_owner = owner,
+            .external_activation = true,
+            .replication_source_permit = input.permit,
+        };
+        try db.writeReplicatedTransactionAtOrderedReceipt(id, activation, .{ .term = 1, .index = 3 });
+        try db.writeReplicatedTransactionAtOrderedReceipt(id, activation, .{ .term = 1, .index = 3 });
+        const resolution: types.ExternalTransactionResolution = .{
+            .txn_id = id,
+            .owner = owner,
+            .status = .committed,
+            .commit_version = 20,
+            .ordered_receipt = commit_position,
+            .replication_source_permit = input.permit,
+        };
+        try db.resolveExternalTransaction(resolution);
+        try db.resolveExternalTransaction(resolution);
+        completion = .{
+            .permit = input.permit,
+            .participant_count = 1,
+            .participant_ids_digest = try source.contract.participantIdsDigest(ids),
+            .participant_id_digest = source.contract.participantIdDigest(ids[0]),
+            .decision = .committed,
+            .decision_version = 20,
+            .terminal_receipts_digest = @splat(1),
+        };
+        try std.testing.expectError(error.ReplicationCutoverAuthorityLost, db.markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(id, ids, ack_position, null));
+        try db.markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(id, ids, ack_position, completion);
+        try db.markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(id, ids, ack_position, completion);
+    }
+    var db = try DB.open(a, directory.path(), options);
+    defer db.close();
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    const receipt = (try source.readPrepared(arena.allocator(), &read, input.permit)).?;
+    try std.testing.expectEqual(prepared_position.index, receipt.receipt.position.raft.index);
+    try std.testing.expectEqual(@as(u64, 1), receipt.intent_count);
+    const observed_activation = (try db.observeReplicationSource(.{ .stage = .{ .permit = input.permit, .stage = .activated } })).?;
+    try std.testing.expectEqual(@as(u64, 3), observed_activation.stage.position.raft.index);
+    try std.testing.expectEqualDeep(receipt.receipt.marker_digest, observed_activation.stage.marker_digest);
+    const applied = (try source.readApplied(arena.allocator(), &read, input.permit)).?;
+    try std.testing.expectEqual(commit_position.index, applied.position.raft.index);
+    const observed_apply = (try db.observeReplicationSource(.{ .stage = .{ .permit = input.permit, .stage = .applied } })).?;
+    try std.testing.expectEqualDeep(applied, observed_apply.stage);
+    try std.testing.expect((try db.observeReplicationSource(.{ .stage = .{ .permit = input.permit, .stage = .aborted } })) == null);
+    const observed_ack = (try db.observeReplicationSource(.{ .acknowledged = completion })).?;
+    const ack = (try source.readAcknowledged(arena.allocator(), &read, completion)).?;
+    try std.testing.expectEqualDeep(ack, observed_ack.acknowledged);
+    try std.testing.expectEqual(ack_position.index, ack.position.raft.index);
+    try std.testing.expectEqualDeep(ack_position, (try db.orderedApplyReceipt()).?);
+    const row = (try db.lookup(a, "row", .{})).?;
+    defer a.free(row.json);
+    try std.testing.expectEqualStrings("{\"v\":1}", row.json);
+}
+
+test "Source physical ordered DB abort fences a missing or unprepared participant across recovery" {
+    const a = std.testing.allocator;
+    const source = @import("replication_source_apply_store.zig");
+    const permit = source.fixturePreparation().permit;
+    const id = permit.reference.txn_id;
+    const ids: []const []const u8 = &.{ "owner", "peer" };
+    const options: OpenOptions = .{
+        .identity_namespace = permit.namespace,
+        .executor = .{ .backend = .manual },
+        .start_optional_runtimes = false,
+        .start_independent_maintenance = false,
+    };
+    for ([_]bool{ false, true }) |begun| {
+        var directory = try TestDirectory.init("source-ordered-abort");
+        defer directory.cleanup();
+        const abort_cut: OrderedApplyReceipt = .{ .term = 1, .index = if (begun) 2 else 1 };
+        var begin: types.ExternalTransactionBegin = .{
+            .txn_id = id,
+            .owner = permit.decision_owner,
+            .begin_timestamp = 10,
+            .created_at_ns = 11,
+            .admission_timestamp_ns = 12,
+            .participants = ids,
+            .coordinator = false,
+            .ordered_receipt = .{ .term = 1, .index = 1 },
+        };
+        {
+            var db = try DB.open(a, directory.path(), options);
+            defer db.close();
+            {
+                var txn = try db.core.store.beginWriteTxn();
+                errdefer txn.abort();
+                try @import("../source_authority.zig").bind(&txn, .raft, @import("online_source_contract.zig").namespaceBytes(permit.namespace));
+                try txn.commit();
+            }
+            if (begun) _ = try db.beginExternalTransaction(begin);
+            try db.resolveExternalTransaction(.{
+                .txn_id = id,
+                .owner = permit.decision_owner,
+                .status = .aborted,
+                .commit_version = 20,
+                .ordered_receipt = abort_cut,
+                .replication_source_permit = permit,
+            });
+        }
+        var db = try DB.open(a, directory.path(), options);
+        defer db.close();
+        const observed = (try db.observeReplicationSource(.{ .stage = .{ .permit = permit, .stage = .aborted } })).?;
+        try std.testing.expectEqual(abort_cut.index, observed.stage.position.raft.index);
+        if (begun) {
+            const demand: @import("../../system_catalog/logical_replication_capacity.zig").Observation = .{
+                .owner = permit.decision_owner,
+                .transaction_id = id,
+                .member = permit.member,
+                .owner_group_id = permit.owner_group_id,
+                .topology_epoch = permit.topology_epoch,
+                .namespace = permit.namespace,
+                .physical_root_incarnation = db.root_incarnation,
+                .position = .{ .raft = .{ .term = 1, .index = 1 } },
+                .reference = .{
+                    .realm = .{
+                        .group_id = permit.semantic.metadata_group,
+                        .incarnation = permit.semantic.metadata_incarnation,
+                        .database_id = permit.reference.owner.logical_subscription.database_id,
+                    },
+                    .guard_digest = @splat(1),
+                    .roster_digest = @splat(2),
+                    .pregrant_body_digest = permit.pregrant_body_digest,
+                    .request_digest = permit.request_digest,
+                },
+                .demand_digest = @splat(3),
+                .before_digest = @splat(4),
+                .max_payload_bytes = 1024,
+            };
+            const terminal = (try db.observePublicationTerminal(demand)).?;
+            try std.testing.expect(terminal == .absent and terminal.absent.evidence == .aborted_record);
+            try terminal.require(a, demand);
+            try std.testing.expectEqual(abort_cut.index, terminal.absent.position.index);
+        }
+        try std.testing.expect(!try db.cleanupTransactionMetadataIfEligible(id, 1000, 1000));
+        const ack_cut: OrderedApplyReceipt = .{ .term = 1, .index = abort_cut.index + 1 };
+        begin.ordered_receipt = ack_cut;
+        try std.testing.expectError(error.DecisionConflict, db.beginExternalTransaction(begin));
+        const completion: source.contract.AckCompletion = .{
+            .permit = permit,
+            .participant_count = ids.len,
+            .participant_ids_digest = try source.contract.participantIdsDigest(ids),
+            .participant_id_digest = source.contract.participantIdDigest(ids[permit.member]),
+            .decision = .aborted,
+            .decision_version = 20,
+            .terminal_receipts_digest = @splat(1),
+        };
+        const wrong: []const []const u8 = &.{ "owner", "impostor" };
+        try std.testing.expectError(error.ReplicationCutoverAuthorityLost, db.markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(id, wrong, ack_cut, completion));
+        try db.markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(id, ids, ack_cut, completion);
+        const acknowledged = (try db.observeReplicationSource(.{ .acknowledged = completion })).?;
+        try std.testing.expectEqual(ack_cut.index, acknowledged.acknowledged.position.raft.index);
+    }
+}
+test "db reopens persisted frozen image retaining primary and indexes across later mutations" {
+    const a = std.testing.allocator;
+    const stage = @import("restore_staging_contract.zig");
+    const population = @import("relational/schema_change/population_contract.zig");
+    const image = @import("relational/rows/frozen_image.zig");
+    const schema_json =
+        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"body":{"type":"string"}},"additionalProperties":false}}}}
+    ;
+    var public = try public_table_schema.parseValidatedTableSchema(a, schema_json);
+    defer public.deinit(a);
+    const runtime = try public_table_schema.deriveRuntimeTableSchema(a, public);
+    defer schema_mod.freeSchema(a, runtime);
+    const serialized = try schema_mod.serializeSchema(a, runtime);
+    defer a.free(serialized);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/frozen", .{tmp.sub_path});
+    defer a.free(path);
+    const options: OpenOptions = .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 }, .schema_before_index_load = .{ .runtime_schema = runtime, .public_schema_json = schema_json }, .start_index_workers = false, .start_optional_runtime_workers = false, .ttl_cleanup = .{ .enabled = false } };
+    const keys = @import("relational/rows/frozen_key.zig");
+    const first_key = try keys.encodeBirth(a, "a", 0, .surviving);
+    defer a.free(first_key);
+    const second_key = try keys.encodeBirth(a, "a", 1, .superseded);
+    defer a.free(second_key);
+    const rows = [_]population.Row{
+        .{ .ordinal = 0, .key = first_key, .document = "{\"body\":\"original\"}" },
+        .{ .ordinal = 1, .key = second_key, .document = "{\"body\":\"original deleted\"}" },
+    };
+    var content = population.contentStart();
+    for (rows) |row| content = try population.contentNext(content, row);
+    const source: population.Binding = .{ .transaction_rows = .{ .image = .frozen, .transaction = @splat(1), .generation_nonce = @splat(2), .source_rows = 2, .rows = 2, .content = content }, .capture_id = @splat(3), .definition = @splat(4), .source_definition = @splat(4), .target_schema = stage.digest(serialized), .principal_instance = @splat(5), .catalog_revision = 1, .write_version = 7, .partition = 1 };
+    const scope: stage.Scope = .{ .plan_id = @splat(6), .plan_digest = @splat(7), .source_artifact_digest = try source.digest(), .source_namespace = .{ .table_id = 0 }, .target_namespace = options.identity_namespace.?, .target_schema_digest = source.target_schema, .population = source, .catalog_intent_digest = @splat(9) };
+    const historical = try @import("relational/rows/frozen_contract.zig").importPathAlloc(a, path, scope.digest());
+    defer a.free(historical);
+    var handle: image.Handle = undefined;
+    {
+        var db = try DB.open(a, historical, options);
+        defer db.close();
+        try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+        try db.beginRestoreStaging(a, scope);
+        const initial = try population.Cursor.init(source);
+        const page: population.Page = .{ .binding = initial.binding, .sequence = 0, .first_row = 0, .previous = initial.chain, .rows = &rows };
+        {
+            var prepared = try @import("relational/schema_change/population_staging.zig").prepare(a, &db, scope, .{ .page = page });
+            defer prepared.deinit();
+            try db.batch(prepared.batch.?);
+        }
+        const cursor = (try initial.admit(page)).apply;
+        {
+            var prepared = try @import("relational/schema_change/population_staging.zig").prepare(a, &db, scope, .{ .complete = cursor.completionForSource(rows.len) });
+            defer prepared.deinit();
+            try db.batch(prepared.batch.?);
+        }
+        const raw = (try db.core.getStoreValue(a, stage.key)).?;
+        defer a.free(raw);
+        var progress = try stage.Progress.decode(a, raw);
+        defer progress.deinit();
+        const binding = try image.Binding.fromProgress(progress.value);
+        var wrong = binding;
+        wrong.rows += 1;
+        try std.testing.expectError(error.RelationPopulationChanged, db.captureFrozenImage(wrong, .none, monotonicTimeNs() + 30 * std.time.ns_per_s));
+        handle = try db.captureFrozenImage(binding, .none, monotonicTimeNs() + 30 * std.time.ns_per_s);
+        _ = try db.finishRestoreStaging(a, scope.digest(), .validated);
+        _ = try db.finishRestoreStaging(a, scope.digest(), .published);
+        try db.batch(.{ .writes = &.{.{ .key = first_key, .value = "{\"body\":\"changed\"}" }}, .deletes = &.{second_key}, .sync_level = .full_index });
+        const retry = try db.captureFrozenImage(binding, .none, monotonicTimeNs() + 30 * std.time.ns_per_s);
+        try std.testing.expectEqualDeep(handle, retry);
+        var current = try db.search(a, .{ .full_text = .{ .match = .{ .field = "body", .text = "original" } } });
+        defer current.deinit();
+        try std.testing.expectEqual(@as(usize, 0), current.hits.len);
+    }
+    var reopened = try DB.open(a, historical, options);
+    defer reopened.close();
+    var frozen = try reopened.openFrozenImage(handle, .none);
+    defer frozen.close();
+    const io = reopened.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+    const lease_path = try std.fmt.allocPrint(a, "{s}.lease", .{frozen.core.path});
+    defer a.free(lease_path);
+    const retirement_lease = try std.Io.Dir.cwd().openFile(io, lease_path, .{ .mode = .read_write });
+    defer retirement_lease.close(io);
+    try std.testing.expect(!(try retirement_lease.tryLock(io, .exclusive)));
+    var row = (try frozen.lookup(a, first_key, .{})).?;
+    defer row.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, row.json, "original") != null);
+    var deleted = (try frozen.lookup(a, second_key, .{})).?;
+    defer deleted.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, deleted.json, "deleted") != null);
+    var hits = try frozen.search(a, .{ .full_text = .{ .match = .{ .field = "body", .text = "original" } } });
+    defer hits.deinit();
+    try std.testing.expectEqual(@as(usize, 2), hits.hits.len);
+    var corrupted = handle;
+    corrupted.physical[0] ^= 1;
+    try std.testing.expectError(error.RelationPopulationChanged, reopened.openFrozenImage(corrupted, .none));
 }

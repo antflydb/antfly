@@ -18,9 +18,9 @@ const document_mapper = @import("antfly_local_sources").storage_db_document_mapp
 
 pub const cluster = @import("cluster.zig");
 pub const operation = @import("antfly_local_sources").api_operation;
-const sql_execution = @import("sql_execution.zig");
-const sql_pgwire = @import("sql_pgwire.zig");
-const sql_session = @import("sql_session.zig");
+const sql_execution = @import("sql/execution/execution.zig");
+const sql_pgwire = @import("sql/transport/pgwire.zig");
+const sql_session = @import("sql/session/session.zig");
 pub const probe_operations = @import("probe_operations.zig");
 pub const storage_maintenance_operations = @import("storage_maintenance_operations.zig");
 pub const batch = @import("antfly_local_sources").api_batch;
@@ -247,27 +247,27 @@ test "join inequality: incomparable types return 0" {
 }
 
 test "api module compiles" {
-    _ = @import("sql_session_overlay.zig");
+    _ = @import("sql/session/session_overlay.zig");
     _ = @import("relational_integrity_errors.zig");
-    _ = @import("sql_catalog_campaign_test.zig");
-    _ = @import("sql_name_resolution_test.zig");
-    _ = @import("sql_document_root_test.zig");
-    _ = @import("sql_conflict_scope_test.zig");
-    _ = @import("sql_join_campaign_test.zig");
-    _ = @import("sql_text_campaign_test.zig");
-    _ = @import("sql_array_expansion_test.zig");
-    _ = @import("sql_array_mutation_test.zig");
+    _ = @import("sql/testing/catalog_campaign_test.zig");
+    _ = @import("sql/testing/name_resolution_test.zig");
+    _ = @import("sql/testing/document_root_test.zig");
+    _ = @import("sql/testing/conflict_scope_test.zig");
+    _ = @import("sql/testing/join_campaign_test.zig");
+    _ = @import("sql/testing/text_campaign_test.zig");
+    _ = @import("sql/testing/array_expansion_test.zig");
+    _ = @import("sql/testing/array_mutation_test.zig");
     _ = @import("online_merge_io.zig");
-    _ = @import("sql_truncate.zig");
-    _ = @import("sql_policy_ddl.zig");
+    _ = @import("sql/catalog/truncate.zig");
+    _ = @import("sql/catalog/policy_ddl.zig");
     _ = sql_execution;
-    _ = @import("sql_schema_cache.zig");
-    _ = @import("sql_retained_snapshot.zig");
+    _ = @import("sql/execution/schema_cache.zig");
+    _ = @import("sql/execution/retained_snapshot.zig");
     _ = sql_pgwire;
     _ = sql_session;
-    _ = @import("sql_prepared.zig");
-    _ = @import("sql_connection_record.zig");
-    _ = @import("sql_connections.zig");
+    _ = @import("sql/session/prepared.zig");
+    _ = @import("sql/session/connection_record.zig");
+    _ = @import("sql/session/connections.zig");
     _ = cluster;
     _ = batch;
     _ = backups;
@@ -561,5 +561,5 @@ test "api query contract tensor program envelope preserves dictionary identity" 
 }
 
 comptime {
-    if (@import("builtin").is_test) _ = @import("sql_text_campaign_test.zig");
+    if (@import("builtin").is_test) _ = @import("sql/testing/text_campaign_test.zig");
 }

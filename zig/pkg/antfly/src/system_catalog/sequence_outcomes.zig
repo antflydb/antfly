@@ -140,6 +140,7 @@ pub const Rejection = enum {
     ProtectedCatalogResource,
     TablespaceInUse,
     CatalogNotFound,
+    LogicalReplicationLifecyclePending,
     TablespaceNotFound,
     ForeignKeyValidationRequired,
     ConstraintRetirementRequired,
@@ -220,6 +221,9 @@ pub const Rejection = enum {
     InvalidSqlEnumOrder,
     SqlTypeActivationRequired,
     SqlDependentType,
+    SqlDependentCollation,
+    InvalidSqlCollationRecord,
+    UnsupportedSqlCollation,
     SqlDependentObjectsExist,
     SqlIdentitySequenceOwnership,
     SqlNotNullViolation,
@@ -284,10 +288,14 @@ pub const Pending = struct {
         sequence_schema: @import("../metadata/schema_validation/read.zig").Lookup,
         restore: RestoreWork,
         policy_pair: PolicyPairWork,
+        publication: struct { group: u64, incarnation: [16]u8, operation: [16]u8 },
     },
     pub fn validate(self: @This()) !void {
         try self.identity.validate();
         switch (self.work) {
+            .publication => |value| {
+                if (value.group == 0 or std.mem.allEqual(u8, &value.incarnation, 0) or std.mem.allEqual(u8, &value.operation, 0)) return error.InvalidSequenceOutcome;
+            },
             .policy_pair => |pair| {
                 if (pair.group == 0 or pair.table_id == 0 or pair.logical_relation_id != self.identity.id or
                     pair.logical_relation_id > std.math.maxInt(u32) or pair.schema_version == 0 or self.identity.generation != pair.schema_version or
@@ -304,6 +312,7 @@ pub const Pending = struct {
         return switch (self.work) {
             .schema, .sequence_schema => |lookup| std.mem.eql(u8, &lookup.metadata_incarnation, &std.fmt.bytesToHex(incarnation, .lower)),
             .restore => |lookup| std.mem.eql(u8, &lookup.incarnation, &incarnation),
+            .publication => |value| std.mem.eql(u8, &value.incarnation, &incarnation),
             .policy_pair => |pair| std.mem.eql(u8, &pair.incarnation, &incarnation),
         };
     }
@@ -429,6 +438,10 @@ pub fn Store(comptime Txn: type) type {
             if (parsed.value.outcome == .pending) {
                 const pending = parsed.value.outcome.pending;
                 if (!pending.matchesIncarnation(self.incarnation)) return error.InvalidSequenceOutcome;
+                if (pending.work == .publication) {
+                    if (pending.work.publication.group != self.group) return error.InvalidSequenceOutcome;
+                    return parsed.value;
+                }
                 if (pending.work == .policy_pair) {
                     const work = pending.work.policy_pair;
                     if (work.group != self.group) return error.InvalidSequenceOutcome;

@@ -17,8 +17,8 @@
 //! current SQL temporal capability is UTC, never the process's ambient TZ.
 const std = @import("std");
 const uuid = @import("../common/uuid.zig");
-const temporal = @import("temporal_value.zig");
-const text = @import("temporal_text.zig");
+const temporal = @import("temporal/value.zig");
+const text = @import("temporal/text.zig");
 
 /// Shared by SQL evaluation and owned native default preparation. A request
 /// may inject its own clock for qualification; no schema epoch owns I/O state.

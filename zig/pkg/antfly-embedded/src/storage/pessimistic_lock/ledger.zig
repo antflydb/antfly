@@ -273,6 +273,24 @@ pub fn readResourceStamp(backing: A, txn: anytype, ns: Namespace, resource: [32]
 /// this read-only check cannot grant access based on a caller's backend claim.
 pub const AccessOwner = struct { backend: locks.Backend, transaction: [16]u8 };
 
+/// Observe an exact already acquired transaction grant. Compatibility with a
+/// requested mode is insufficient here: physical maintenance needs proof that
+/// the caller actually owns ACCESS EXCLUSIVE, not merely an uncontended table.
+/// The caller must separately bind this owner to its admitted native command.
+pub fn requireHeldGrant(backing: A, txn: anytype, ns: Namespace, resource: [32]u8, mode: locks.Mode, attachment: AccessOwner) !void {
+    try ns.validate();
+    try attachment.backend.validate();
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const held = try readOwner(arena.allocator(), txn, ns, attachment.backend) orelse return error.LockOwnerNotRegistered;
+    if (held.state != .active or held.waiting != null or held.job != null or !std.meta.eql(held.transaction, @as(?[16]u8, attachment.transaction))) return error.LockOwnerChanged;
+    var buffer: [256]u8 = undefined;
+    const raw = (try optional(txn, try key(&buffer, ns, .holder, attachment.backend, resource, 0))) orelse return error.LockOwnerNotRegistered;
+    const grant = try locks.Grant.decode(raw);
+    if (!grant.backend.eql(attachment.backend) or !std.mem.eql(u8, &grant.resource, &resource) or grant.class != mode.class() or !std.meta.eql(grant.transaction, @as(?[16]u8, attachment.transaction))) return error.InvalidLockRecord;
+    if (grant.mask() & (@as(u8, 1) << mode.index()) == 0) return error.LockOwnerBusy;
+}
+
 /// Check ordinary native access in the same serialized apply section as its
 /// effect. The caller retains that section until commit; a preflight probe is
 /// insufficient. This neither registers an owner nor increments grant counts.

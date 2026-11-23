@@ -27,7 +27,7 @@ pub const PhysicalColumn = struct {
     /// Contiguous borrowed coordinates need no per-lane identity array.
     range: ?struct { begin: usize = 0, count: usize } = null,
     kind: @import("ast.zig").ColumnType,
-    element: ?@import("array_value.zig").ElementType = null,
+    element: ?@import("array/value.zig").ElementType = null,
     pub fn len(self: @This()) usize {
         return if (self.range) |span| span.count else self.selection.len;
     }
@@ -68,7 +68,7 @@ pub const PhysicalColumn = struct {
     /// Normalize only selected lanes; excluded payloads remain lazy. Narrow
     /// integers are checked without copying, and REAL values round once into
     /// a compact native vector using the scalar width/underflow contract.
-    pub fn coerce(self: @This(), a: A, kind_: @import("ast.zig").ColumnType, element_: ?@import("array_value.zig").ElementType) !?@This() {
+    pub fn coerce(self: @This(), a: A, kind_: @import("ast.zig").ColumnType, element_: ?@import("array/value.zig").ElementType) !?@This() {
         if (self.kind != kind_) return null;
         const compatible = switch (kind_) {
             .integer => element_ == null or element_ == .int16 or element_ == .int32 or element_ == .int64,
@@ -188,13 +188,13 @@ pub const DecimalColumn = struct {
         if (scale > 38) return error.InvalidDecimal128;
         return scale;
     }
-    pub fn cell(self: @This(), index: usize, fixed: *@import("numeric_value.zig").ScaledInteger, value: *@import("numeric_value.zig").Value) !scalar.Datum {
+    pub fn cell(self: @This(), index: usize, fixed: *@import("numeric/value.zig").ScaledInteger, value: *@import("numeric/value.zig").Value) !scalar.Datum {
         const row = self.physical.rowAt(index);
         if (self.physical.vector.nulls.isNull(row)) return .{};
         const decimal = self.physical.vector.values.decimal128;
         const scale = try self.scaleAt(index);
         try @import("../common/decimal128.zig").validateCoefficient(decimal.values[row], decimal.precision, scale);
-        fixed.* = try @import("numeric_value.zig").ScaledInteger.init(decimal.values[row], scale);
+        fixed.* = try @import("numeric/value.zig").ScaledInteger.init(decimal.values[row], scale);
         value.* = fixed.view();
         return scalar.Datum.typedNumeric(value);
     }
@@ -203,8 +203,8 @@ pub const DecimalColumn = struct {
 /// Escaping keys are copied by the existing typed group/join stores.
 pub const NumericScratch = struct {
     views: []?DecimalColumn,
-    fixed: []@import("numeric_value.zig").ScaledInteger,
-    numbers: []@import("numeric_value.zig").Value,
+    fixed: []@import("numeric/value.zig").ScaledInteger,
+    numbers: []@import("numeric/value.zig").Value,
     pub fn init(a: A, columns: []const Batch) !NumericScratch {
         var present = false;
         for (columns) |column| if (try column.decimalColumnSelected(a, 0, null) != null) {
@@ -214,9 +214,9 @@ pub const NumericScratch = struct {
         if (!present) return .{ .views = &.{}, .fixed = &.{}, .numbers = &.{} };
         const views = try a.alloc(?DecimalColumn, columns.len);
         errdefer a.free(views);
-        const fixed = try a.alloc(@import("numeric_value.zig").ScaledInteger, columns.len);
+        const fixed = try a.alloc(@import("numeric/value.zig").ScaledInteger, columns.len);
         errdefer a.free(fixed);
-        const numbers = try a.alloc(@import("numeric_value.zig").Value, columns.len);
+        const numbers = try a.alloc(@import("numeric/value.zig").Value, columns.len);
         errdefer a.free(numbers);
         for (columns, views) |column, *view| view.* = try column.decimalColumnSelected(a, 0, null);
         return .{ .views = views, .fixed = fixed, .numbers = numbers };
@@ -490,7 +490,7 @@ pub const Batch = union(enum) {
             fn read(raw: *anyopaque, alloc: A, row_index: usize, _: usize) !scalar.Datum {
                 const self: *@This() = @ptrCast(@alignCast(raw));
                 if (self.nulls[row_index] != 0) return .{};
-                const number = @import("numeric_value.zig");
+                const number = @import("numeric/value.zig");
                 var context: number.Context = .{ .alloc = alloc };
                 var value = try number.fromScaledInteger(&context, self.values[row_index], if (self.scales.len == 0) self.scale else self.scales[row_index]);
                 errdefer value.deinit();
@@ -810,8 +810,8 @@ fn selectedDictionaryScenario(a: A) !void {
     for (0..mapped.len()) |row| try std.testing.expectEqualDeep(try mapped.cell(a, row, 0), try reordered.cell(a, row, 0));
 }
 test "SQL NUMERIC batch mappings borrow exact cells without placeholder coercion" {
-    var context: @import("numeric_value.zig").Context = .{ .alloc = std.testing.allocator };
-    var number = try @import("numeric_value.zig").parse(&context, "9007199254740993.1200");
+    var context: @import("numeric/value.zig").Context = .{ .alloc = std.testing.allocator };
+    var number = try @import("numeric/value.zig").parse(&context, "9007199254740993.1200");
     defer number.deinit();
     const source: Batch = .{ .rows = &.{ &.{scalar.Datum.typedNumeric(&number.value)}, &.{.{}} } };
     var mapping: Batch = .{ .mapped = .{ .source = &source, .ordinals = &.{0}, .types = &.{.{ .kind = .number, .element_type = .numeric }}, .selection = &.{ 0, 1 } } };
@@ -836,8 +836,8 @@ test "external lake mapped batches retain exact NUMERIC declarations before coer
     const mapped: Batch = .{ .mapped = .{ .source = &source, .ordinals = &.{0}, .types = &.{.{ .kind = .number, .element_type = .numeric }}, .selection = &.{ 0, 1, 2 } } };
     for ([_][]const u8{ "9007199254740993", "9007199254740993.125" }, 0..) |text, row| {
         const value = try mapped.cell(a, row, 0);
-        var context: @import("numeric_value.zig").Context = .{ .alloc = a };
-        try std.testing.expectEqualStrings(text, try @import("numeric_value.zig").format(&context, value.numeric.?.*));
+        var context: @import("numeric/value.zig").Context = .{ .alloc = a };
+        try std.testing.expectEqualStrings(text, try @import("numeric/value.zig").format(&context, value.numeric.?.*));
     }
     try std.testing.expect((try mapped.cell(a, 2, 0)).sql_null);
 }
@@ -999,7 +999,7 @@ test "SQL scalar row descriptors reuse bounded storage without retiring expressi
 }
 
 test "SQL mutation temporal batches preserve exact borrowed domains through selection and projection" {
-    const temporal = @import("temporal_value.zig");
+    const temporal = @import("temporal/value.zig");
     const values = [_]temporal.Value{
         .{ .date = .{ .days = 0 } },
         .{ .time = .{ .micros = 12345 } },

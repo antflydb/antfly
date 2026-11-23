@@ -21,7 +21,7 @@ const Namespace = @import("doc_identity_namespace.zig").Namespace;
 const namespaceBytes = @import("online_source_contract.zig").namespaceBytes;
 const source = @import("../source_authority.zig");
 const receipts = @import("apply_receipts.zig");
-const outcomes = @import("relational_schema_apply_outcome.zig");
+const outcomes = @import("relational/schema_change/schema_apply_outcome.zig");
 const debt = @import("../transaction_debt.zig");
 const job_key = "\x00\x00__metadata__:schema_validation_job:v1";
 const Digest = [32]u8;
@@ -244,14 +244,14 @@ fn pointDigest(txn: anytype, key: []const u8) !?Digest {
         if (err == error.NotFound) return null;
         return err;
     };
-    if (bytes.len > 44 + @import("relational_schema_owner_contract.zig").max_header) return error.InvalidNativeBackupOrigin;
+    if (bytes.len > 44 + @import("relational/schema_change/schema_owner_contract.zig").max_header) return error.InvalidNativeBackupOrigin;
     var result: Digest = undefined;
     std.crypto.hash.Blake3.hash(bytes, &result, .{});
     return result;
 }
 
 test "native backup origin binds image facts without confusing native and Raft clocks" {
-    try std.testing.expectEqualStrings(@import("relational_nullability_job.zig").key, job_key);
+    try std.testing.expectEqualStrings(@import("relational/schema_change/nullability_job.zig").key, job_key);
     const ns: Namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 };
     const Reader = struct {
         authority: ?[source.encoded_size]u8 = null,
@@ -279,7 +279,7 @@ test "native backup origin binds image facts without confusing native and Raft c
     read.directory = "validated directory";
     const native = try Origin.capture(&read, 7, ns);
     try std.testing.expectEqualDeep(native, try Origin.decode(&try native.encode()));
-    const oversized: [45 + @import("relational_schema_owner_contract.zig").max_header]u8 = @splat(0);
+    const oversized: [45 + @import("relational/schema_change/schema_owner_contract.zig").max_header]u8 = @splat(0);
     read.header = &oversized;
     try std.testing.expectError(error.InvalidNativeBackupOrigin, Origin.capture(&read, 7, ns));
     read.header = "validated header";

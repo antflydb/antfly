@@ -43,7 +43,7 @@ pub const Request = struct {
     /// Read-only fixed capability projection under this exact owner scope.
     native_empty_identity: bool = false,
     scope: staging.Scope,
-    action: enum { begin, import_page, status, validate, install_generation_admissions, publish, cancel, install_native_empty },
+    action: enum { begin, import_page, status, validate, install_generation_admissions, publish, cancel, install_native_empty, capture_initial },
     generation_admissions: ?staging.InstallGenerationAdmissions = null,
     native_empty_install: ?@import("antfly_local_sources").storage_db_native_empty_generation.Install = null,
     source: ?Source = null,
@@ -71,6 +71,11 @@ pub const Request = struct {
         try self.scope.validate();
         if (self.native_empty_identity and (self.action != .status or !self.scope.empty_generation or self.scope.native_empty_origin == null or self.source != null or self.source_chunk != null or self.rewrite != null or self.rewrite_tail != null or self.rewrite_finish != null or self.generation_admissions != null or self.native_empty_install != null or self.population_page != null or self.population_complete != null)) return error.InvalidRestoreStagingCommand;
         if (self.native_execution) |native| try native.validate();
+        if (self.action == .capture_initial) {
+            const binding = self.scope.population orelse return error.InvalidRestoreStagingCommand;
+            const rows = binding.transaction_rows orelse return error.InvalidRestoreStagingCommand;
+            if (rows.image != .frozen) return error.InvalidRestoreStagingCommand;
+        }
         if (self.scope.population) |binding| {
             const fields = @as(u8, @intFromBool(self.population_page != null)) + @intFromBool(self.population_complete != null);
             if ((self.action == .import_page and fields != 1) or (self.action != .import_page and fields != 0) or
@@ -138,6 +143,7 @@ pub const Response = struct {
     native_empty_commit: ?@import("antfly_local_sources").storage_db_native_empty_generation.Receipt = null,
     native_empty_acceptance: ?@import("../metadata/native_restore_acceptance.zig").Acceptance = null,
     population: ?@import("antfly_local_sources").storage_db_relational_population_contract.Cursor = null,
+    frozen_image: ?@import("antfly_local_sources").storage_db_relational_frozen_contract.Handle = null,
     rewrite: ?@import("antfly_local_sources").storage_db_relational_rewrite_contract.Progress = null,
     tail_next: u32 = 0,
     source_next_offset: u64 = 0,
@@ -145,6 +151,7 @@ pub const Response = struct {
         return ((comptime std.mem.eql(u8, field, "native_empty_identity")) and self.native_empty_identity == null) or
             ((comptime std.mem.eql(u8, field, "native_empty_receipt")) and self.native_empty_receipt == null) or
             ((comptime std.mem.eql(u8, field, "native_empty_commit")) and self.native_empty_commit == null) or
+            ((comptime std.mem.eql(u8, field, "frozen_image")) and self.frozen_image == null) or
             ((comptime std.mem.eql(u8, field, "native_empty_acceptance")) and self.native_empty_acceptance == null);
     }
     pub fn jsonStringify(self: @This(), writer: anytype) !void {

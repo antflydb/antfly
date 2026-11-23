@@ -19,7 +19,7 @@
 const std = @import("std");
 const schema = @import("table_schema_impl.zig");
 const native = @import("../storage/schema.zig");
-const catalog = @import("../storage/db/relational_integrity_catalog.zig");
+const catalog = @import("../storage/db/relational/integrity/catalog.zig");
 
 /// Coverage is explicit in durable plans; legacy entries retain their identity.
 pub const CatalogCoverage = enum { legacy, checks_v1 };
@@ -103,9 +103,9 @@ pub fn definitionFingerprints(alloc: std.mem.Allocator, public: schema.TableSche
             for (unique.columns, values) |column, *key| key.* = .{ .column = column };
             break :blk values;
         };
-        var tuple = try @import("../storage/db/relational_index_keys.zig").TuplePlan.init(arena, runtime, &layout.?, keys);
+        var tuple = try @import("../storage/db/relational/indexes/keys.zig").TuplePlan.init(arena, runtime, &layout.?, keys);
         defer tuple.deinit();
-        var predicate = if (unique.where.len != 0) try @import("../storage/db/relational_index_predicate.zig").Plan.init(arena, runtime, &layout.?, unique.where) else null;
+        var predicate = if (unique.where.len != 0) try @import("../storage/db/relational/indexes/predicate.zig").Plan.init(arena, runtime, &layout.?, unique.where) else null;
         defer if (predicate) |*plan| plan.deinit();
         // Preserve generations of existing plain-column declarations. New
         // shapes use compiled identities, including referenced types and the
@@ -167,7 +167,7 @@ pub fn uniqueFields(alloc: std.mem.Allocator, runtime: native.TableSchema, layou
     errdefer fields.deinit(alloc);
     try fields.appendSlice(alloc, unique.columns);
     if (unique.keys.len != 0) {
-        var tuple = try @import("../storage/db/relational_index_keys.zig").TuplePlan.init(alloc, runtime, layout, unique.keys);
+        var tuple = try @import("../storage/db/relational/indexes/keys.zig").TuplePlan.init(alloc, runtime, layout, unique.keys);
         defer tuple.deinit();
         for (tuple.keys) |key| {
             if (key.expression) |expression| {

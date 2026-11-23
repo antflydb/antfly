@@ -21,10 +21,10 @@
 const std = @import("std");
 const registry = @import("../storage/db/schema_registry.zig");
 const codec = @import("../storage/db/algebraic/relational_row_codec.zig");
-const tuples = @import("../storage/db/relational_index_keys.zig");
-const partial_predicate = @import("../storage/db/relational_index_predicate.zig");
+const tuples = @import("../storage/db/relational/indexes/keys.zig");
+const partial_predicate = @import("../storage/db/relational/indexes/predicate.zig");
 const native = @import("../storage/relational_index.zig");
-pub const storage = @import("../storage/db/relational_integrity_contract.zig");
+pub const storage = @import("../storage/db/relational/integrity/contract.zig");
 const Allocator = std.mem.Allocator;
 
 pub const UniqueBinding = struct {
@@ -40,7 +40,7 @@ pub const ForeignBinding = struct {
     parent: registry.SchemaView,
     parent_unique: native.UniqueConstraint,
 };
-const PeriodColumn = struct { name: []const u8, kind: @import("../sql/range_value.zig").Kind };
+const PeriodColumn = struct { name: []const u8, kind: @import("../sql/range/value.zig").Kind };
 const BoundUnique = struct { generation: storage.Generation, definition: native.UniqueConstraint, tuple: tuples.TuplePlan, predicate: ?partial_predicate.Plan = null, period: ?PeriodColumn = null };
 const BoundForeign = struct { generation: storage.Generation, parent_generation: storage.Generation, definition: native.ForeignKey, tuple: tuples.TuplePlan };
 
@@ -135,7 +135,7 @@ pub const Plan = struct {
             const period: ?PeriodColumn = if (def.without_overlaps_column) |name| blk: {
                 if (def.keys.len != 0 or def.columns.len == 0 or !std.mem.eql(u8, def.columns[def.columns.len - 1], name) or def.where.len != 0) return error.UnsupportedIntegrityDefinition;
                 const ordinal = view.physicalLayout().ordinalForName(view.tableSchema().relational_columns, name) orelse return error.RelationalIndexColumnNotFound;
-                const kind = @import("../sql/range_value.zig").kindFromType(view.tableSchema().relational_columns[ordinal].column_type) orelse return error.UnsupportedIntegrityDefinition;
+                const kind = @import("../sql/range/value.zig").kindFromType(view.tableSchema().relational_columns[ordinal].column_type) orelse return error.UnsupportedIntegrityDefinition;
                 copied.without_overlaps_column = try owned.dupe(u8, name);
                 break :blk .{ .name = copied.without_overlaps_column.?, .kind = kind };
             } else null;
@@ -187,7 +187,7 @@ pub const Plan = struct {
             .period = .{ .kind = period.kind, .bytes = try a.dupe(u8, cell.value.bytes_val) },
         };
         var none = std.heap.FixedBufferAllocator.init(&.{});
-        var context: @import("../sql/range_value.zig").Context = .{ .alloc = none.allocator() };
+        var context: @import("../sql/range/value.zig").Context = .{ .alloc = none.allocator() };
         _ = try result.view(&context);
         return result;
     }

@@ -3628,6 +3628,52 @@ fn idempotencyMapKeyAlloc(alloc: std.mem.Allocator, namespace: []const u8, key: 
     return try std.fmt.allocPrint(alloc, "{d}:{s}:{s}", .{ namespace.len, namespace, key });
 }
 
+pub const storageKeyAlloc = jobKey;
+
+const CatalogOwnerProof = struct {
+    job_id: u64,
+    staging_attempt_id: u64,
+    staging_resolution: StagingResolution,
+    source_kind: SourceKind,
+    phase: Phase,
+    idempotency_namespace: []const u8,
+    idempotency_key: []const u8,
+};
+
+pub fn catalogJobAttempt(a: std.mem.Allocator, bytes: []const u8) !?struct { staging: [16]u8, operation: [16]u8 } {
+    if (std.mem.indexOf(u8, bytes, "sql-catalog:") == null) return null;
+    if (bytes.len > max_restore_job_record_bytes) return error.CorruptRestoreJobStore;
+    var parsed = try std.json.parseFromSlice(CatalogOwnerProof, a, bytes, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const job = parsed.value;
+    if (job.source_kind != .query_population or !std.mem.startsWith(u8, job.idempotency_namespace, "sql-catalog:") or job.staging_attempt_id == 0) return null;
+    if (job.idempotency_key.len != 65 or job.idempotency_key[32] != ':' or
+        job.job_id != try jobIdForIdempotency(a, job.idempotency_namespace, job.idempotency_key)) return error.CorruptRestoreJobStore;
+    var operation: [16]u8 = undefined;
+    _ = std.fmt.hexToBytes(&operation, job.idempotency_key[33..]) catch return error.CorruptRestoreJobStore;
+    return .{ .staging = try @import("../metadata/restore_staging.zig").idForAttempt(job.job_id, job.staging_attempt_id), .operation = operation };
+}
+
+pub fn catalogOwnerAcks(a: std.mem.Allocator, bytes: []const u8, staging_id: [16]u8, transaction: [16]u8, operation: [16]u8, outcome: @import("../system_catalog/prepared_transactions.zig").CatalogOutcome) !bool {
+    if (bytes.len == 0 or bytes.len > max_restore_job_record_bytes) return error.CorruptRestoreJobStore;
+    var parsed = try std.json.parseFromSlice(CatalogOwnerProof, a, bytes, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const proof = parsed.value;
+    if (proof.source_kind != .query_population or !std.mem.startsWith(u8, proof.idempotency_namespace, "sql-catalog:")) return false;
+    var buffer: [65]u8 = undefined;
+    const expected = try std.fmt.bufPrint(&buffer, "{s}:{s}", .{ std.fmt.bytesToHex(transaction, .lower), std.fmt.bytesToHex(operation, .lower) });
+    if (!std.mem.eql(u8, proof.idempotency_key, expected) or
+        proof.job_id != try jobIdForIdempotency(a, proof.idempotency_namespace, proof.idempotency_key)) return false;
+    if (proof.staging_attempt_id == 0) return false;
+    const id = try @import("../metadata/restore_staging.zig").idForAttempt(proof.job_id, proof.staging_attempt_id);
+    if (!std.mem.eql(u8, &id, &staging_id)) return false;
+    return switch (outcome) {
+        .pending => false,
+        .published => proof.phase == .succeeded and proof.staging_resolution == .published,
+        .canceled => (proof.phase == .cancelled or proof.phase == .failed) and proof.staging_resolution == .canceled,
+    };
+}
+
 fn jobKey(alloc: std.mem.Allocator, job_id: u64) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{s}{x:0>16}", .{ key_prefix, job_id });
 }
@@ -5928,4 +5974,40 @@ test "restore trigger actor incarnation survives recovery and cannot change thro
 pub fn projectTruncatePreparationResultAlloc(a: std.mem.Allocator, base_result: ?[]const u8, prepared: @import("../metadata/restore_staging.zig").TruncatePreparation, digest: [32]u8, include_notices: bool, release_after: bool) ![]u8 {
     if (prepared.format_version != 1 or prepared.vm_contract_version != @import("antfly_local_sources").sql_catalog.trigger_runtime.predecision_contract_version) return error.InvalidRestoreStaging;
     return if (include_notices) prepared.projectResultAlloc(a, base_result, digest, release_after) else prepared.projectReferenceAlloc(a, base_result, digest);
+}
+
+test "SQL prepared transaction catalog owner acknowledgements bind the exact restore attempt" {
+    const a = std.testing.allocator;
+    const transaction: [16]u8 = @splat(1);
+    const operation: [16]u8 = @splat(2);
+    const namespace = "sql-catalog:alice";
+    const key = try std.fmt.allocPrint(a, "{s}:{s}", .{ std.fmt.bytesToHex(transaction, .lower), std.fmt.bytesToHex(operation, .lower) });
+    defer a.free(key);
+    const id = try jobIdForIdempotency(a, namespace, key);
+    const stages = @import("../metadata/restore_staging.zig");
+    const staging_id = try stages.idForAttempt(id, 1);
+    var proof: CatalogOwnerProof = .{
+        .job_id = id,
+        .staging_attempt_id = @as(u64, 1),
+        .staging_resolution = StagingResolution.published,
+        .source_kind = SourceKind.query_population,
+        .phase = Phase.running,
+        .idempotency_namespace = namespace,
+        .idempotency_key = key,
+    };
+    const running = try std.json.Stringify.valueAlloc(a, proof, .{});
+    defer a.free(running);
+    try std.testing.expect(!try catalogOwnerAcks(a, running, staging_id, transaction, operation, .published));
+    proof.phase = .succeeded;
+    const terminal = try std.json.Stringify.valueAlloc(a, proof, .{});
+    defer a.free(terminal);
+    try std.testing.expect(try catalogOwnerAcks(a, terminal, staging_id, transaction, operation, .published));
+    try std.testing.expect(!try catalogOwnerAcks(a, terminal, try stages.idForAttempt(id, 2), transaction, operation, .published));
+    try std.testing.expect(!try catalogOwnerAcks(a, terminal, staging_id, transaction, @splat(3), .published));
+    try std.testing.expect(!try catalogOwnerAcks(a, terminal, staging_id, transaction, operation, .canceled));
+    proof.phase = .cancelled;
+    proof.staging_resolution = .canceled;
+    const canceled = try std.json.Stringify.valueAlloc(a, proof, .{});
+    defer a.free(canceled);
+    try std.testing.expect(try catalogOwnerAcks(a, canceled, staging_id, transaction, operation, .canceled));
 }

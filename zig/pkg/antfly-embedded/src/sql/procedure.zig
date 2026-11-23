@@ -266,7 +266,7 @@ pub fn execute(context: @import("runtime.zig").Context, call: Call) anyerror!@im
     const decision = @import("decision_eval.zig");
     const a = context.arena;
     const arguments = try a.alloc(scalar.Datum, call.arguments.len);
-    var work: @import("numeric_value.zig").Context = .{ .alloc = context.alloc, .remaining = 65536, .checkpoint = if (context.backend.scalar_control) |control| control.checkpoint else null, .ptr = if (context.backend.scalar_control) |control| control.ptr else null };
+    var work: @import("numeric/value.zig").Context = .{ .alloc = context.alloc, .remaining = 65536, .checkpoint = if (context.backend.scalar_control) |control| control.checkpoint else null, .ptr = if (context.backend.scalar_control) |control| control.ptr else null };
     var bytes: usize = 0;
     var limits = decision.limitsFor(context.backend);
     limits.effect_work = &work;
@@ -346,7 +346,7 @@ pub fn executeTrigger(context: @import("runtime.zig").Context, prepared: *Resolv
     if (!prepared.returns_trigger) return error.SqlWrongObjectType;
     try images.validate();
     const decision = @import("decision_eval.zig");
-    var work: @import("numeric_value.zig").Context = .{ .alloc = context.alloc, .remaining = 65536, .checkpoint = if (context.backend.scalar_control) |control| control.checkpoint else null, .ptr = if (context.backend.scalar_control) |control| control.ptr else null };
+    var work: @import("numeric/value.zig").Context = .{ .alloc = context.alloc, .remaining = 65536, .checkpoint = if (context.backend.scalar_control) |control| control.checkpoint else null, .ptr = if (context.backend.scalar_control) |control| control.ptr else null };
     var bytes: usize = 0;
     var limits = decision.limitsFor(context.backend);
     limits.effect_work = &work;

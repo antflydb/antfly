@@ -484,7 +484,7 @@ test "mounted SQL original column comment preserves stable identities rows privi
             var arena = std.heap.ArenaAllocator.init(ctx.alloc);
             defer arena.deinit();
             const a = arena.allocator();
-            const api = @import("../../../sql_catalog.zig");
+            const api = @import("../../catalog/catalog.zig");
             const captured = (try api.captureTableAdmission(ctx.metadata.server.owned_public_http_server.?, null, .{}, a, .{ .table = "usage_records" }, false, null)) orelse return error.MissingSourceRelation;
             const store = ctx.metadata.server.svc.projectedStore() orelse return error.MissingMetadataStore;
             var attributes = try store.getSqlColumnIdentities(a, 2188, captured.guard);
@@ -663,74 +663,69 @@ const Campaign = struct {
         try std.testing.expectEqual(before.digest, after.digest);
     }
 
-    fn verifyStagedVersions(ctx: *fixture.Context) !void {
+    fn verifyStagedVersions(ctx: *fixture.Context, commit_new_row: bool) !?u64 {
         const physical = try physicalName(ctx);
         defer ctx.alloc.free(physical);
         const before = try primaryFingerprint(ctx, physical);
         try std.testing.expectEqual(before.version, try version(ctx, null, "SELECT _version FROM docs WHERE _id='doc:a'"));
-        // A failed precommit version projection cannot publish the candidate.
-        try unsupportedVersion(ctx, null, "UPDATE docs SET title='must_not_commit' WHERE _id='doc:a' RETURNING _version");
-        try unchanged(ctx, before);
         var opened = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, "/db/v1/sql/connections", .POST, "{}", 15_000);
         defer opened.deinit(ctx.alloc);
         try std.testing.expectEqual(@as(u16, 200), opened.status);
         var connection = try std.json.parseFromSlice(wire.SQLConnectionResponse, ctx.alloc, opened.body, .{});
         defer connection.deinit();
         const id = connection.value.connection_id;
-        var began = try client.executeConnected(ctx, null, id, "BEGIN ISOLATION LEVEL READ COMMITTED", .never);
-        defer began.deinit(ctx.alloc);
-        try std.testing.expectEqual(@as(u16, 200), began.status);
-        try expectTitle(ctx, id, "UPDATE docs SET title='staged' WHERE _id='doc:a' RETURNING title", "staged");
-        try expectTitle(ctx, id, "SELECT title FROM docs WHERE _id='doc:a'", "staged");
-        // A second mutation still uses the original primary/content fence.
+        const Control = struct {
+            fn run(context: *fixture.Context, connection_id: []const u8, sql: []const u8) !void {
+                var response = try client.executeConnected(context, null, connection_id, sql, .never);
+                defer response.deinit(context.alloc);
+                if (response.status != 200) std.debug.print("revision control {s}: status={} body={s}\n", .{ sql, response.status, response.body });
+                try std.testing.expectEqual(@as(u16, 200), response.status);
+            }
+        };
+        try Control.run(ctx, id, "BEGIN ISOLATION LEVEL READ COMMITTED");
+        const assigned = try version(ctx, id, "UPDATE docs SET title='staged' WHERE _id='doc:a' RETURNING _version");
+        try std.testing.expect(assigned > before.version);
+        try std.testing.expectEqual(assigned, try version(ctx, id, "SELECT _version FROM docs WHERE _id='doc:a'"));
         try expectTitle(ctx, id, "UPDATE docs SET title='staged_again' WHERE _id='doc:a' RETURNING title", "staged_again");
-        try expectTitle(ctx, id, "SELECT title FROM docs WHERE _id='doc:a'", "staged_again");
-        // DELETE of an updated overlay has only its original OCC fence, not
-        // a durable revision for that staged postimage.
-        try unsupportedVersion(ctx, id, "DELETE FROM docs WHERE _id='doc:a' RETURNING _version");
+        try std.testing.expectEqual(assigned, try version(ctx, id, "SELECT _version FROM docs WHERE _id='doc:a'"));
         try unchanged(ctx, before);
-        var rolled_back = try client.executeConnected(ctx, null, id, "ROLLBACK", .never);
-        defer rolled_back.deinit(ctx.alloc);
-        try std.testing.expectEqual(@as(u16, 200), rolled_back.status);
+        try Control.run(ctx, id, "SAVEPOINT nested");
+        const retired = try version(ctx, id, "INSERT INTO docs(_id,title) VALUES('doc:retired','new') RETURNING _version");
+        try Control.run(ctx, id, "ROLLBACK TO SAVEPOINT nested");
+        const replacement = try version(ctx, id, "INSERT INTO docs(_id,title) VALUES('doc:retired','replacement') RETURNING _version");
+        try std.testing.expect(replacement > retired);
+        try Control.run(ctx, id, "ROLLBACK TO SAVEPOINT nested");
+        try Control.run(ctx, id, "RELEASE SAVEPOINT nested");
+        try std.testing.expectEqual(assigned, try version(ctx, id, "DELETE FROM docs WHERE _id='doc:a' RETURNING _version"));
+        try unchanged(ctx, before);
+        try Control.run(ctx, id, "ROLLBACK");
         try unchanged(ctx, before);
         try std.testing.expectEqual(before.version, try version(ctx, id, "SELECT _version FROM docs WHERE _id='doc:a'"));
-        var select_begin = try client.executeConnected(ctx, null, id, "BEGIN ISOLATION LEVEL READ COMMITTED", .never);
-        defer select_begin.deinit(ctx.alloc);
-        try std.testing.expectEqual(@as(u16, 200), select_begin.status);
-        try expectTitle(ctx, id, "UPDATE docs SET title='staged_select' WHERE _id='doc:a' RETURNING title", "staged_select");
-        try unsupportedVersion(ctx, id, "SELECT _version FROM docs WHERE _id='doc:a'");
-        var select_rollback = try client.executeConnected(ctx, null, id, "ROLLBACK", .never);
-        defer select_rollback.deinit(ctx.alloc);
-        try std.testing.expectEqual(@as(u16, 200), select_rollback.status);
-        try unchanged(ctx, before);
-        var delete_begin = try client.executeConnected(ctx, null, id, "BEGIN ISOLATION LEVEL READ COMMITTED", .never);
-        defer delete_begin.deinit(ctx.alloc);
-        try std.testing.expectEqual(@as(u16, 200), delete_begin.status);
-        try std.testing.expectEqual(before.version, try version(ctx, id, "DELETE FROM docs WHERE _id='doc:a' RETURNING _version"));
-        try unchanged(ctx, before);
-        var delete_rollback = try client.executeConnected(ctx, null, id, "ROLLBACK", .never);
-        defer delete_rollback.deinit(ctx.alloc);
-        try std.testing.expectEqual(@as(u16, 200), delete_rollback.status);
-        try unchanged(ctx, before);
-        var insert_begin = try client.executeConnected(ctx, null, id, "BEGIN ISOLATION LEVEL READ COMMITTED", .never);
-        defer insert_begin.deinit(ctx.alloc);
-        try std.testing.expectEqual(@as(u16, 200), insert_begin.status);
-        try expectTitle(ctx, id, "INSERT INTO docs(_id,title) VALUES('doc:unassigned','new') RETURNING title", "new");
-        try expectTitle(ctx, id, "SELECT title FROM docs WHERE _id='doc:unassigned'", "new");
-        try unsupportedVersion(ctx, id, "DELETE FROM docs WHERE _id='doc:unassigned' RETURNING _version");
-        var insert_rollback = try client.executeConnected(ctx, null, id, "ROLLBACK", .never);
-        defer insert_rollback.deinit(ctx.alloc);
-        try std.testing.expectEqual(@as(u16, 200), insert_rollback.status);
+        try Control.run(ctx, id, "BEGIN ISOLATION LEVEL READ COMMITTED");
+        const inserted = try version(ctx, id, "INSERT INTO docs(_id,title) VALUES('doc:unassigned','new') RETURNING _version");
+        try std.testing.expectEqual(inserted, try version(ctx, id, "SELECT _version FROM docs WHERE _id='doc:unassigned'"));
+        try std.testing.expectEqual(inserted, try version(ctx, id, "DELETE FROM docs WHERE _id='doc:unassigned' RETURNING _version"));
+        try Control.run(ctx, id, "ROLLBACK");
         const reads = ctx.data.http_server.?.table_reads orelse return error.MissingDocumentReader;
-        var absent = try reads.lookup(ctx.alloc, physical, "doc:unassigned", .{ .include_primary_digest = true }, .read_index);
-        defer if (absent) |*value| value.deinit(ctx.alloc);
-        try std.testing.expect(absent == null);
+        for ([_][]const u8{ "doc:retired", "doc:unassigned" }) |key| {
+            var absent = try reads.lookup(ctx.alloc, physical, key, .{ .include_primary_digest = true }, .read_index);
+            defer if (absent) |*value| value.deinit(ctx.alloc);
+            try std.testing.expect(absent == null);
+        }
         try unchanged(ctx, before);
+        const committed = if (commit_new_row) blk: {
+            try Control.run(ctx, id, "BEGIN ISOLATION LEVEL READ COMMITTED");
+            const revision = try version(ctx, id, "INSERT INTO docs(_id,title) VALUES('doc:published','committed') RETURNING _version");
+            try Control.run(ctx, id, "COMMIT");
+            try std.testing.expectEqual(revision, try version(ctx, null, "SELECT _version FROM docs WHERE _id='doc:published'"));
+            break :blk revision;
+        } else null;
         const suffix = try std.fmt.allocPrint(ctx.alloc, "/db/v1/sql/connections/{s}", .{id});
         defer ctx.alloc.free(suffix);
         var closed = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, suffix, .DELETE, null, 15_000);
         defer closed.deinit(ctx.alloc);
         try std.testing.expectEqual(@as(u16, 200), closed.status);
+        return committed;
     }
 
     fn verify(self: *@This(), ctx: *fixture.Context, cold: bool) !void {
@@ -839,7 +834,7 @@ const Campaign = struct {
                 }
             } else try std.testing.expectEqual(@as(usize, 0), output.value.rows.len);
         }
-        if (std.mem.eql(u8, self.state.entry.id, "sql-0927") and self.state.entry.occupied == false) try verifyStagedVersions(ctx);
+        if (std.mem.eql(u8, self.state.entry.id, "sql-0927") and self.state.entry.occupied == false) _ = try verifyStagedVersions(ctx, false);
         try self.verify(ctx, false);
     }
 
@@ -980,12 +975,13 @@ test "mounted SQL original document identities enforce create only conflicts ret
     }
 }
 
-test "mounted SQL document revision contract rejects unassigned previews and retains cold committed versions" {
+test "mounted SQL document revision contract retains reserved and committed versions across cold recovery" {
     // Supplemental storage/SQL contract only; no original parity case credit.
     const Revision = struct {
         pub const native_sessions = true;
         credentials: client.ApiKeyHeaders = .{},
         retained_version: u64 = 0,
+        published_revision: u64 = 0,
         retained_digest: [32]u8 = undefined,
         pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
             try self.credentials.activate(ctx);
@@ -1006,7 +1002,7 @@ test "mounted SQL document revision contract rejects unassigned previews and ret
             try Campaign.expectTitle(ctx, null, "UPDATE docs SET title='committed' WHERE _id='doc:a' RETURNING title", "committed");
             const observed = try Campaign.primaryFingerprint(ctx, physical);
             try std.testing.expect(observed.version > high);
-            try Campaign.verifyStagedVersions(ctx);
+            self.published_revision = (try Campaign.verifyStagedVersions(ctx, true)) orelse return error.MissingDocumentPostimage;
             try Campaign.expectTitle(ctx, null, "SELECT title FROM docs WHERE _id='doc:a'", "committed");
             self.retained_version = observed.version;
             self.retained_digest = observed.digest;
@@ -1019,6 +1015,7 @@ test "mounted SQL document revision contract rejects unassigned previews and ret
             try std.testing.expectEqual(self.retained_version, observed.version);
             try std.testing.expectEqual(self.retained_digest, observed.digest);
             try std.testing.expectEqual(observed.version, try Campaign.version(ctx, null, "SELECT _version FROM docs WHERE _id='doc:a'"));
+            try std.testing.expectEqual(self.published_revision, try Campaign.version(ctx, null, "SELECT _version FROM docs WHERE _id='doc:published'"));
             try Campaign.expectTitle(ctx, null, "SELECT title FROM docs WHERE _id='doc:a'", "committed");
         }
     };
@@ -1621,7 +1618,7 @@ test "mounted SQL original index and constraint comments preserve schemas rows a
             var arena = std.heap.ArenaAllocator.init(ctx.alloc);
             defer arena.deinit();
             const a = arena.allocator();
-            const captured = (try @import("../../../sql_catalog.zig").captureTableAdmission(ctx.metadata.server.owned_public_http_server.?, null, .{}, a, .{ .table = "usage_records" }, false, null)) orelse return error.MissingSourceRelation;
+            const captured = (try @import("../../catalog/catalog.zig").captureTableAdmission(ctx.metadata.server.owned_public_http_server.?, null, .{}, a, .{ .table = "usage_records" }, false, null)) orelse return error.MissingSourceRelation;
             const store = ctx.metadata.server.svc.projectedStore() orelse return error.MissingMetadataStore;
             const current = (try store.getTable(a, 2188, captured.guard.owner.table_id)) orelse return error.MissingSourceRelation;
             try std.testing.expect(@import("../../../../metadata/table_manager.zig").tableDefinitionsEqual(self.initial.?, current));
@@ -1648,7 +1645,7 @@ test "mounted SQL original index and constraint comments preserve schemas rows a
             try fixture.waitRelationPublication(ctx.alloc, ctx.io, ctx.metadata, "usage_records");
             {
                 const a = self.inner.retained.allocator();
-                const captured = (try @import("../../../sql_catalog.zig").captureTableAdmission(ctx.metadata.server.owned_public_http_server.?, null, .{}, a, .{ .table = "usage_records" }, false, null)) orelse return error.MissingSourceRelation;
+                const captured = (try @import("../../catalog/catalog.zig").captureTableAdmission(ctx.metadata.server.owned_public_http_server.?, null, .{}, a, .{ .table = "usage_records" }, false, null)) orelse return error.MissingSourceRelation;
                 const store = ctx.metadata.server.svc.projectedStore() orelse return error.MissingMetadataStore;
                 _ = try fixture.waitServingSchema(ctx, "usage_records", captured.guard.owner.schema_version);
                 const time = @import("antfly_platform").time;

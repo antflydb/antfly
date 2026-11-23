@@ -55,7 +55,13 @@ fn commandTag(statement: ast.Statement) ![]const u8 {
             .enable => "ALTER TABLE ENABLE ROW LEVEL SECURITY",
             .disable => "ALTER TABLE DISABLE ROW LEVEL SECURITY",
         },
-        .catalog_ddl => |ddl| if (ddl.trigger) |trigger| tag: {
+        .catalog_ddl => |ddl| if (ddl.replication) |replication| tag: {
+            try replication.validateClassification(ddl);
+            break :tag replication.commandTag();
+        } else if (ddl.kind == .publication or ddl.kind == .subscription) return error.InvalidSqlSyntax else if (ddl.partition != null) tag: {
+            if (ddl.kind != .table or ddl.action != .alter_schema or ddl.schema_change != null or ddl.trigger != null) return error.InvalidSqlSyntax;
+            break :tag "ALTER TABLE";
+        } else if (ddl.trigger) |trigger| tag: {
             if (ddl.kind != .table or ddl.action != .alter_schema or ddl.schema_change != null) return error.InvalidSqlSyntax;
             break :tag switch (trigger.operation) {
                 .create => "CREATE TRIGGER",
@@ -79,8 +85,10 @@ fn commandTag(statement: ast.Statement) ![]const u8 {
                 .vacuum => "VACUUM",
                 .analyze => "ANALYZE",
                 .reindex => "REINDEX",
+                .cluster => "CLUSTER",
             },
             .comment => "COMMENT",
+            .security_label => "SECURITY LABEL",
             .populate => return error.UnsupportedSqlExecution,
             .setting_default => if (ddl.kind == .database) "ALTER DATABASE" else "ALTER ROLE",
             .alter_sequence => "ALTER SEQUENCE",
@@ -104,8 +112,9 @@ fn commandTag(statement: ast.Statement) ![]const u8 {
                 .aggregate => "CREATE AGGREGATE",
                 .cast => "CREATE CAST",
                 .extension => "CREATE EXTENSION",
+                .collation => "CREATE COLLATION",
                 .named_type => if (ddl.named_type_kind == .domain) "CREATE DOMAIN" else "CREATE TYPE",
-                .table => return error.InvalidSqlSyntax,
+                .table, .publication, .subscription => return error.InvalidSqlSyntax,
             },
             .drop => switch (ddl.kind) {
                 .database => "DROP DATABASE",
@@ -121,8 +130,9 @@ fn commandTag(statement: ast.Statement) ![]const u8 {
                 .aggregate => "DROP AGGREGATE",
                 .cast => "DROP CAST",
                 .extension => "DROP EXTENSION",
+                .collation => "DROP COLLATION",
                 .named_type => if (ddl.named_type_kind == .domain) "DROP DOMAIN" else "DROP TYPE",
-                .table => return error.InvalidSqlSyntax,
+                .table, .publication, .subscription => return error.InvalidSqlSyntax,
             },
             .rename, .set_tablespace => switch (ddl.kind) {
                 .database => "ALTER DATABASE",
@@ -139,6 +149,8 @@ fn commandTag(statement: ast.Statement) ![]const u8 {
                 .aggregate => "ALTER AGGREGATE",
                 .cast => "ALTER CAST",
                 .extension => "ALTER EXTENSION",
+                .collation => "ALTER COLLATION",
+                .publication, .subscription => return error.InvalidSqlSyntax,
                 .named_type => if (ddl.named_type_kind == .domain) "ALTER DOMAIN" else "ALTER TYPE",
             },
         },
@@ -147,6 +159,7 @@ fn commandTag(statement: ast.Statement) ![]const u8 {
 }
 
 pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, input: ast.Statement) !Output {
+    if (input == .catalog_ddl and input.catalog_ddl.partition != null and !backend.supports_native_partition_membership) return error.UnsupportedSqlExecution;
     const command_tag = try commandTag(input);
     const alloc = allocators.scratch;
     var type_region = std.heap.ArenaAllocator.init(alloc);
@@ -166,6 +179,10 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, inpu
     if (statement == .catalog_ddl and (statement.catalog_ddl.action == .populate or (statement.catalog_ddl.materialized and statement.catalog_ddl.action != .drop))) return error.UnsupportedSqlExecution;
     const dispatch = backend.vtable.ddl orelse return error.UnsupportedSqlExecution;
     try backend.vtable.checkpoint(backend.ptr);
+    if (statement == .create_table and (statement.create_table.partition_by != null or statement.create_table.partition_of != null)) {
+        if (!backend.supports_native_partition_membership or statement.create_table.like_tables.len != 0 or statement.create_table.document != null)
+            return error.UnsupportedSqlExecution;
+    }
     const copies_definition = statement == .create_table and statement.create_table.like_tables.len != 0;
     if (!copies_definition) if (backend.validate_persisted_expressions) |validate| try validate.validate(validate.ptr, alloc, statement);
     const preparation: @import("immutable_plan.zig").Limits = if (backend.scalar_control) |control| .{ .checkpoint = control.checkpoint, .checkpoint_context = control.ptr } else .{};
@@ -180,7 +197,7 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, inpu
         .create_table => |create| .{ .create_table = if (copies_definition) copied: {
             const provider = backend.prepare_definition_copy orelse return error.UnsupportedSqlExecution;
             break :copied try provider.prepare(provider.ptr, type_region.allocator(), create, preparation);
-        } else .{ .name = create.table, .persistence = create.persistence, .on_commit = create.on_commit, .schema_json = try createSchemaAllocWithLimits(alloc, create, preparation), .if_not_exists = create.if_not_exists, .tablespace = create.tablespace, .generated_constraint_names = generated_names, .column_sequences = column_sequences.items } },
+        } else .{ .name = create.table, .partition_by = create.partition_by, .partition_of = create.partition_of, .persistence = create.persistence, .on_commit = create.on_commit, .schema_json = if (create.partition_of != null) try alloc.dupe(u8, "{}") else try createSchemaAllocWithLimits(alloc, create, preparation), .if_not_exists = create.if_not_exists, .tablespace = create.tablespace, .generated_constraint_names = generated_names, .column_sequences = column_sequences.items } },
         .drop_table => |drop| .{ .drop_table = drop },
         .catalog_ddl => |ddl| .{ .catalog_ddl = ddl },
         .policy_ddl => |ddl| .{ .policy_ddl = ddl },
@@ -422,6 +439,7 @@ pub fn createSchemaFromDefinitionsAlloc(alloc: std.mem.Allocator, create: ast.Cr
 }
 
 pub fn createSchemaFromDefinitionsAndSequencesAlloc(alloc: std.mem.Allocator, create: ast.CreateTable, definitions: []const std.json.Value, sequences: []const @import("../system_catalog/column_sequences.zig").Creation, limits: @import("immutable_plan.zig").Limits) anyerror![]u8 {
+    if (create.partition_of != null) return error.UnsupportedSqlExecution;
     // Physical row layout is independent of relation lifetime. The DDL
     // backend, rather than this schema encoder, owns lifetime admission.
     if (create.persistence != .temporary and create.on_commit != null) return error.InvalidSqlRelationPersistence;
@@ -692,7 +710,7 @@ pub fn columnProperty(alloc: std.mem.Allocator, column: ast.Column, nullable: bo
     return property;
 }
 
-pub fn bindDefault(alloc: std.mem.Allocator, value: ast.Value, kind: ast.ColumnType, element: ?@import("array_value.zig").ElementType) !std.json.Value {
+pub fn bindDefault(alloc: std.mem.Allocator, value: ast.Value, kind: ast.ColumnType, element: ?@import("array/value.zig").ElementType) !std.json.Value {
     const describe = @import("describe.zig");
     const literal = try describe.bindLiteral(alloc, value, kind);
     return (try describe.coerceDatum(alloc, .{ .value = literal, .sql_null = literal == .null }, kind, element)).value;
@@ -701,7 +719,7 @@ pub fn bindDefault(alloc: std.mem.Allocator, value: ast.Value, kind: ast.ColumnT
 /// PostgreSQL retains assignment casts on numeric defaults. Their overflow is
 /// an INSERT/UPDATE DEFAULT failure, not a schema-publication failure. Keep
 /// the source literal separate from its target domain in the durable plan.
-pub fn defaultExpression(alloc: std.mem.Allocator, value: ast.Value, kind: ast.ColumnType, element: ?@import("array_value.zig").ElementType) !std.json.Value {
+pub fn defaultExpression(alloc: std.mem.Allocator, value: ast.Value, kind: ast.ColumnType, element: ?@import("array/value.zig").ElementType) !std.json.Value {
     if (kind == .array and value == .null) return std.json.parseFromSliceLeaky(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, .{
         .op = "literal",
         .type = "sql_array",
@@ -710,7 +728,7 @@ pub fn defaultExpression(alloc: std.mem.Allocator, value: ast.Value, kind: ast.C
     }, .{}), .{});
     if (kind == .array) return error.UnsupportedSqlShape;
     if (value == .numeric and (kind == .integer or kind == .number)) {
-        const target = element orelse if (kind == .integer) @as(@import("array_value.zig").ElementType, .int64) else .float64;
+        const target = element orelse if (kind == .integer) @as(@import("array/value.zig").ElementType, .int64) else .float64;
         const source = try @import("schema_expression.zig").numericLiteral(alloc, .{ .string = value.numeric });
         // Keep the exact source and assignment domain separate. Overflow and
         // rounding belong to mutation execution, just as for integer defaults.
@@ -724,9 +742,9 @@ pub fn defaultExpression(alloc: std.mem.Allocator, value: ast.Value, kind: ast.C
     const numeric = (kind == .integer and value == .integer) or (kind == .number and (value == .integer or value == .number));
     if (numeric) {
         const source: ast.ColumnType = if (value == .integer) .integer else .number;
-        const source_type: @import("array_value.zig").ElementType = if (value == .integer) (if (std.math.cast(i32, value.integer) != null) .int32 else .int64) else .float64;
+        const source_type: @import("array/value.zig").ElementType = if (value == .integer) (if (std.math.cast(i32, value.integer) != null) .int32 else .int64) else .float64;
         const literal: std.json.Value = if (value == .integer) .{ .integer = value.integer } else .{ .float = value.number };
-        const target_type: @import("array_value.zig").ElementType = element orelse if (kind == .integer) .int64 else .float64;
+        const target_type: @import("array/value.zig").ElementType = element orelse if (kind == .integer) .int64 else .float64;
         return std.json.parseFromSliceLeaky(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, .{
             .op = "cast",
             .type = if (target_type == .numeric) "numeric" else @tagName(kind),
@@ -1936,4 +1954,31 @@ test "SQL CREATE TABLE contextual range defaults retain temporal constraint doma
     const expression = defaults[0].object.get("expression").?;
     try std.testing.expectEqualStrings("numrange", expression.object.get("type").?.string);
     try std.testing.expectEqualStrings("[5,15)", expression.object.get("value").?.string);
+}
+
+test "SQL logical replication classifies every original DDL before dispatch" {
+    const a = std.testing.allocator;
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(a);
+    defer corpus.deinit();
+    const tags = [_][]const u8{
+        "CREATE PUBLICATION",  "CREATE PUBLICATION",  "ALTER PUBLICATION",
+        "DROP PUBLICATION",    "DROP PUBLICATION",    "CREATE SUBSCRIPTION",
+        "CREATE SUBSCRIPTION", "CREATE SUBSCRIPTION", "ALTER SUBSCRIPTION",
+        "ALTER SUBSCRIPTION",  "DROP SUBSCRIPTION",   "DROP SUBSCRIPTION",
+    };
+    const ids = [_][]const u8{
+        "sql-0114", "sql-0115", "sql-0116", "sql-0117", "sql-0118", "sql-0119",
+        "sql-0120", "sql-0121", "sql-0122", "sql-0123", "sql-0124", "sql-0125",
+    };
+    for (tags, ids) |tag, id| {
+        var compiled = try @import("compiler.zig").compile(a, (try corpus.get(id)).sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectEqualStrings(tag, try commandTag(compiled.statement));
+        var malformed = compiled.statement;
+        malformed.catalog_ddl.kind = .table;
+        try std.testing.expectError(error.InvalidSqlSyntax, commandTag(malformed));
+        malformed = compiled.statement;
+        malformed.catalog_ddl.replication = null;
+        try std.testing.expectError(error.InvalidSqlSyntax, commandTag(malformed));
+    }
 }

@@ -259,6 +259,8 @@ pub const Record = struct {
             references.deinit(a);
         }
         for (definition.sources, self.source_columns) |source, columns| {
+            try @import("antfly_local_sources").sql_catalog.view_index_requirements.validate(source.required_indexes);
+            if (source.required_indexes.len != 0 and (source.kind != .table or self.materialization != null)) return error.InvalidSqlViewRecord;
             if (source.table_id == 0 or (source.kind == .view and source.schema_version == 0) or
                 std.mem.allEqual(u8, &source.schema_digest, 0) or
                 source.columns.len > identities.max_columns or

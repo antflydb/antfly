@@ -799,11 +799,11 @@ test "MERGE arm domains retain array identity and shared assignment inference" {
         }
         const bound = try bindCandidates(a, backend, target, &compiled, &.{});
         const returning = bound.returning_plan.?;
-        for (returning.columns, [_]@import("array_value.zig").ElementType{ .int64, .int16, .jsonb }) |column, element| {
+        for (returning.columns, [_]@import("array/value.zig").ElementType{ .int64, .int16, .jsonb }) |column, element| {
             try std.testing.expectEqual(ast.ColumnType.array, column.type);
             try std.testing.expectEqual(element, column.element_type.?);
         }
-        const source = try @import("array_text.zig").decodeLeaky(a, .int16, "[3:4]={3,NULL}", .{});
+        const source = try @import("array/text.zig").decodeLeaky(a, .int16, "[3:4]={3,NULL}", .{});
         const cells = try a.alloc(scalar.Datum, bound.query.columns.len);
         @memset(cells, .{});
         var source_found = false;
@@ -817,9 +817,9 @@ test "MERGE arm domains retain array identity and shared assignment inference" {
         if (compiled.parameter_count != 0) {
             try std.testing.expectEqual(@as(usize, 1), owner.descriptors.len);
             try std.testing.expectEqual(@as(?ast.ColumnType, .array), owner.descriptors[0].kind);
-            try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .int64), owner.descriptors[0].element_type);
-            const parameter = try @import("array_text.zig").decodeLeaky(a, .int64, "[5:6]={9223372036854775807,NULL}", .{});
-            const wire = try @import("array_wire.zig").toJsonLeaky(a, parameter.value, .{});
+            try std.testing.expectEqual(@as(?@import("array/value.zig").ElementType, .int64), owner.descriptors[0].element_type);
+            const parameter = try @import("array/text.zig").decodeLeaky(a, .int64, "[5:6]={9223372036854775807,NULL}", .{});
+            const wire = try @import("array/wire.zig").toJsonLeaky(a, parameter.value, .{});
             try owner.prepareJson(a, &.{wire}, .{});
         }
         for (bound.arms, 0..) |arm, ordinal| {
@@ -827,7 +827,7 @@ test "MERGE arm domains retain array identity and shared assignment inference" {
                 .update, .insert => |values| values,
                 else => unreachable,
             };
-            try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .int64), assignments[0].program.?.output_type.element_type);
+            try std.testing.expectEqual(@as(?@import("array/value.zig").ElementType, .int64), assignments[0].program.?.output_type.element_type);
             const values = try bound.evaluateValues(a, ordinal, cells, &.{});
             try std.testing.expectEqual(@as(usize, 1), values.len);
             if (case.lower) |lower| {
@@ -865,7 +865,7 @@ test "MERGE arm domains retain array identity and shared assignment inference" {
                 const stored = prepared[0].row.?.object.get("a").?;
                 if (case.lower) |lower| {
                     try std.testing.expect(stored != .null);
-                    const decoded = try @import("array_wire.zig").decodeLeaky(a, .int64, stored, .{});
+                    const decoded = try @import("array/wire.zig").decodeLeaky(a, .int64, stored, .{});
                     try std.testing.expectEqual(lower, decoded.dimensions[0].lower);
                     try std.testing.expectEqual(case.first, decoded.flatCell(0).value.integer);
                     try std.testing.expect(decoded.flatCell(1).sql_null);

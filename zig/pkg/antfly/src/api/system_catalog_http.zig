@@ -119,7 +119,7 @@ fn projectMutation(alloc: std.mem.Allocator, a: std.mem.Allocator, kind: domain.
         .tablespace => response(alloc, status, try tablespaceValue(a, resource)),
         .query_source => response(alloc, status, try sourceValue(a, resource)),
         .graph => response(alloc, status, try graphValue(a, null, resource)),
-        .table, .view, .sequence, .routine, .cast, .named_type, .role, .extension => error.InvalidCatalogMutation,
+        .table, .view, .sequence, .routine, .cast, .named_type, .role, .extension, .collation, .publication, .subscription => error.InvalidCatalogMutation,
     };
 }
 
@@ -148,7 +148,7 @@ fn projectSnapshot(alloc: std.mem.Allocator, a: std.mem.Allocator, route: routes
             .tablespace => response(alloc, status, try tablespaceValue(a, resource)),
             .query_source => response(alloc, status, try sourceValue(a, resource)),
             .graph => response(alloc, status, try graphValue(a, state, resource)),
-            .table, .view, .sequence, .routine, .cast, .named_type, .role, .extension => failure(alloc, error.InvalidCatalogMutation),
+            .table, .view, .sequence, .routine, .cast, .named_type, .role, .extension, .collation, .publication, .subscription => failure(alloc, error.InvalidCatalogMutation),
         };
     }
     switch (route.kind) {
@@ -192,7 +192,7 @@ fn projectSnapshot(alloc: std.mem.Allocator, a: std.mem.Allocator, route: routes
             for (state.resources) |r| if (r.kind == .graph) try out.append(a, try graphValue(a, state, r));
             return response(alloc, status, out.items);
         },
-        .table, .view, .sequence, .routine, .cast, .named_type, .role, .extension => return failure(alloc, error.InvalidCatalogMutation),
+        .table, .view, .sequence, .routine, .cast, .named_type, .role, .extension, .collation, .publication, .subscription => return failure(alloc, error.InvalidCatalogMutation),
     }
 }
 

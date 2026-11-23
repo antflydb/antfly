@@ -17,17 +17,17 @@
 //! every scalar program once; the row loop only borrows validated typed cells.
 const std = @import("std");
 const scalar = @import("scalar.zig");
-const arrays = @import("array_value.zig");
+const arrays = @import("array/value.zig");
 const operators = @import("operators.zig");
-const text = @import("array_text.zig");
-const binary = @import("array_binary.zig");
+const text = @import("array/text.zig");
+const binary = @import("array/binary.zig");
 const MemoryBudget = @import("memory_budget.zig");
 const A = std.mem.Allocator;
 
 test "SQL exact NUMERIC frames arrays and constant casts retain typed ownership" {
     const a = std.testing.allocator;
     const compiler = @import("compiler.zig");
-    const numeric = @import("numeric_value.zig");
+    const numeric = @import("numeric/value.zig");
     var compiled = try compiler.compileScalar(a, "'9007199254740993.1200'::numeric", .{});
     defer compiled.deinit();
     var program = try scalar.bindTyped(a, compiled.expression, &.{}, &.{}, .{});
@@ -44,18 +44,18 @@ test "SQL exact NUMERIC frames arrays and constant casts retain typed ownership"
     try std.testing.expectEqual(std.math.Order.eq, try scalar.compareDatums(constant, frame.values[0]));
     const array = frame.values[1].array.?;
     try std.testing.expectEqual(@as(i32, -1), array.dimensions[0].lower);
-    const storage = @import("array_storage.zig");
+    const storage = @import("array/storage.zig");
     const bytes = try storage.encodeAlloc(a, array.*, .{});
     defer a.free(bytes);
     var restored = try storage.decode(a, .numeric, bytes, .{});
     defer restored.deinit();
     var work: arrays.Budget = .{};
     try std.testing.expectEqual(std.math.Order.eq, try array.compare(restored.value, &work));
-    const envelope = try @import("array_wire.zig").encodeAlloc(a, restored.value, .{});
+    const envelope = try @import("array/wire.zig").encodeAlloc(a, restored.value, .{});
     defer a.free(envelope);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, envelope, .{});
     defer parsed.deinit();
-    var wire = try @import("array_wire.zig").decode(a, .numeric, parsed.value, .{});
+    var wire = try @import("array/wire.zig").decode(a, .numeric, parsed.value, .{});
     defer wire.deinit();
     try std.testing.expectEqual(std.math.Order.eq, try array.compare(wire.value, &work));
 }
@@ -184,7 +184,7 @@ test "SQL JSON parameter ingress owns typed envelopes and shares wire and work a
     var source = try text.decode(a, .jsonb, "[0:2]={\"null\",NULL,\"{\\\"x\\\":[1,2]}\"}", .{});
     defer source.deinit();
     var input_owner: std.heap.ArenaAllocator = .init(a);
-    const envelope = try @import("array_wire.zig").toJsonLeaky(input_owner.allocator(), source.value, .{});
+    const envelope = try @import("array/wire.zig").toJsonLeaky(input_owner.allocator(), source.value, .{});
     const encoded = try std.json.Stringify.valueAlloc(a, envelope, .{});
     defer a.free(encoded);
     var frame = try Frame.prepareJson(a, &.{descriptor}, &.{envelope}, .{ .wire_bytes = encoded.len });
@@ -203,10 +203,10 @@ test "SQL JSON parameter ingress owns typed envelopes and shares wire and work a
     };
     var retained: std.heap.ArenaAllocator = .init(a);
     defer retained.deinit();
-    const input = try @import("array_wire.zig").toJsonLeaky(retained.allocator(), source.value, .{});
+    const input = try @import("array/wire.zig").toJsonLeaky(retained.allocator(), source.value, .{});
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Faults.run, .{input});
     try std.testing.expectError(error.SqlProgramLimitExceeded, Frame.prepareJson(a, &.{ descriptor, descriptor }, &.{ input, input }, .{ .wire_bytes = encoded.len * 2 - 1 }));
-    const measured = try @import("array_wire.zig").decodeLeakyMeasured(retained.allocator(), .jsonb, input, .{});
+    const measured = try @import("array/wire.zig").decodeLeakyMeasured(retained.allocator(), .jsonb, input, .{});
     try std.testing.expectError(error.SqlProgramLimitExceeded, Frame.prepareJson(a, &.{ descriptor, descriptor }, &.{ input, input }, .{ .work = measured.work * 2 + 1 }));
     var json = try Frame.prepareJson(a, &.{.{ .kind = .json }}, &.{.{ .string = "null" }}, .{});
     defer json.deinit();
@@ -469,7 +469,7 @@ test "SQL datetime parameters preserve signed epoch instants across JSON and tex
                 defer text_frame.deinit();
                 const actual = json.values[0].temporal().?;
                 try std.testing.expectEqual(@as(?i128, -1_000_000), actual.timestamp_tz.unixNanoseconds());
-                try std.testing.expectEqual(std.math.Order.eq, try @import("temporal_ops.zig").compare(actual.*, text_frame.values[0].temporal().?.*));
+                try std.testing.expectEqual(std.math.Order.eq, try @import("temporal/ops.zig").compare(actual.*, text_frame.values[0].temporal().?.*));
             }
         }
     };
@@ -562,7 +562,7 @@ const MembershipCache = struct {
         };
         // Build work is bounded once per execution, independently of row work.
         // Cancellation still belongs to the evaluating row and stays sticky.
-        var context: @import("numeric_value.zig").Context = .{ .alloc = self.memory.allocator(), .remaining = self.remaining, .checkpoint = Poll.check, .ptr = caller };
+        var context: @import("numeric/value.zig").Context = .{ .alloc = self.memory.allocator(), .remaining = self.remaining, .checkpoint = Poll.check, .ptr = caller };
         var work_budget: arrays.Budget = .{ .remaining = self.remaining, .shared = &context };
         defer self.remaining = work_budget.remaining;
         const index = self.memory.allocator().create(arrays.Membership) catch |err| {
@@ -774,7 +774,7 @@ fn prepareLeaky(a: A, descriptors: []const scalar.Type, inputs: []const Input, l
 }
 
 test "SQL temporal parameter ingress validates payloads before NULL normalization" {
-    const temporal = @import("temporal_value.zig");
+    const temporal = @import("temporal/value.zig");
     const valid: temporal.Value = .{ .timestamp_tz = .{ .micros = 0 } };
     const invalid: temporal.Value = .{ .time = .{ .micros = -1 } };
     var null_payload = scalar.Datum.typedTemporal(&valid);
@@ -833,7 +833,7 @@ fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work
         return scalar.Datum.typedBytes(owned);
     }
     if (input == .datum and input.datum.bytes() != null) return error.SqlTypeMismatch;
-    const ranges = @import("range_value.zig");
+    const ranges = @import("range/value.zig");
     if (descriptor.kind) |tag| if (ranges.kindFromType(tag)) |range_kind| {
         if (input == .array_envelope) return error.SqlTypeMismatch;
         var context = work.numericContext(a);
@@ -864,9 +864,9 @@ fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work
         return @import("operators.zig").cloneDatum(a, value);
     }
     if (input == .datum and (input.datum.range() != null or input.datum.enumeration() != null)) return error.SqlTypeMismatch;
-    if (descriptor.temporal_kind orelse (if (descriptor.kind == .datetime) @as(?@import("temporal_value.zig").Kind, .timestamp_tz) else null)) |temporal_kind| {
+    if (descriptor.temporal_kind orelse (if (descriptor.kind == .datetime) @as(?@import("temporal/value.zig").Kind, .timestamp_tz) else null)) |temporal_kind| {
         if (input == .array_envelope) return error.SqlTypeMismatch;
-        const temporal = @import("temporal_value.zig");
+        const temporal = @import("temporal/value.zig");
         const owned = try a.create(temporal.Value);
         if (input == .datum and input.datum.temporal() != null) {
             if (input.datum.temporal().?.kind() != temporal_kind) return error.ConflictingSqlParameterTypes;
@@ -874,7 +874,7 @@ fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work
         } else {
             const raw = if (input == .text) input.text else if (input == .binary) input.binary else if (input.datum.array == null and input.datum.value == .string) input.datum.value.string else return error.SqlTypeMismatch;
             try work.consume(raw.len);
-            owned.* = if (input == .binary) try temporal.decode(temporal_kind, raw) else try @import("temporal_text.zig").parseInput(temporal_kind, raw);
+            owned.* = if (input == .binary) try temporal.decode(temporal_kind, raw) else try @import("temporal/text.zig").parseInput(temporal_kind, raw);
         }
         return scalar.Datum.typedTemporal(owned);
     }
@@ -902,7 +902,7 @@ fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work
             try work.consume(decoded.work);
             value.* = decoded.value;
         } else {
-            const decoded = try @import("array_wire.zig").decodeLeakyMeasured(a, kind, input.array_envelope, .{ .values = value_limits, .wire_bytes = limits.wire_bytes - wire_bytes.* });
+            const decoded = try @import("array/wire.zig").decodeLeakyMeasured(a, kind, input.array_envelope, .{ .values = value_limits, .wire_bytes = limits.wire_bytes - wire_bytes.* });
             try work.consume(decoded.work);
             wire_bytes.* += decoded.wire_bytes;
             value.* = decoded.value;
@@ -917,7 +917,7 @@ fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work
             var owned = datum;
             if (kind == .numeric and datum.numeric == null) {
                 if (datum.value == .float) {
-                    const exact = @import("numeric_value.zig");
+                    const exact = @import("numeric/value.zig");
                     const parsed = conversion: {
                         var context: exact.Context = .{ .alloc = a, .remaining = work.remaining, .max_output_bytes = limits.bytes };
                         const initial = context.remaining;
@@ -1015,10 +1015,10 @@ test "SQL native parameter payload leases avoid compact frame copies" {
     defer a.free(elements);
     @memset(elements, .json(.{ .integer = 42 }));
     const value = try arrays.Value.init(.int64, &.{.{ .length = 32768 }}, elements, .{});
-    const bytes = try @import("array_storage.zig").encodeAlloc(a, value, .{});
+    const bytes = try @import("array/storage.zig").encodeAlloc(a, value, .{});
     defer a.free(bytes);
     const compact = try ingress.allocator().create(arrays.Value);
-    compact.* = try @import("array_storage.zig").viewLeaky(ingress.allocator(), .int64, bytes, .{});
+    compact.* = try @import("array/storage.zig").viewLeaky(ingress.allocator(), .int64, bytes, .{});
     var peaks: [2]usize = undefined;
     for ([_]bool{ false, true }, 0..) |leased, i| {
         var nr: test_alloc.NoResizeAllocator = .{ .backing = a };
@@ -1112,7 +1112,7 @@ test "SQL prepared equality cache unwinds allocation failures limits and cancele
         }
     };
     var cancel: Cancel = .{};
-    var owner: @import("numeric_value.zig").Context = .{ .alloc = a, .checkpoint = Cancel.check, .ptr = &cancel };
+    var owner: @import("numeric/value.zig").Context = .{ .alloc = a, .checkpoint = Cancel.check, .ptr = &cancel };
     var cancel_work: arrays.Budget = .{ .shared = &owner };
     try std.testing.expectError(error.Canceled, canceled.equalAny(0, canceled.values[0].array.?, .json(.{ .integer = 128 }), &cancel_work));
     try std.testing.expectEqual(@as(usize, 0), canceled.memberships.?.memory.live);
@@ -1123,7 +1123,7 @@ test "SQL prepared equality lookup measures warm native rows without row allocat
     const a = std.testing.allocator;
     var region = std.heap.ArenaAllocator.init(a);
     defer region.deinit();
-    var builder = try @import("array_compact.zig").ResultBuilder.initKnown(region.allocator(), .int64, &.{.{ .length = 8192 }}, 8192, 8192, .{});
+    var builder = try @import("array/compact.zig").ResultBuilder.initKnown(region.allocator(), .int64, &.{.{ .length = 8192 }}, 8192, 8192, .{});
     var work: arrays.Budget = .{};
     for (0..8192) |i| try builder.append(.json(.{ .integer = @intCast(i) }), &work);
     const source = try builder.finish(region.allocator(), .{}, &work);
@@ -1236,7 +1236,7 @@ test "SQL prepared equality admission measures cold short early tail and miss ro
     const a = std.testing.allocator;
     var region = std.heap.ArenaAllocator.init(a);
     defer region.deinit();
-    var builder = try @import("array_compact.zig").ResultBuilder.initKnown(region.allocator(), .int64, &.{.{ .length = 8192 }}, 8192, 8192, .{});
+    var builder = try @import("array/compact.zig").ResultBuilder.initKnown(region.allocator(), .int64, &.{.{ .length = 8192 }}, 8192, 8192, .{});
     var work: arrays.Budget = .{};
     for (0..8192) |i| try builder.append(.json(.{ .integer = @intCast(i) }), &work);
     const source = try builder.finish(region.allocator(), .{}, &work);
@@ -1281,8 +1281,8 @@ test "SQL prepared equality admission keeps long first hits cheap and adapts to 
     // Exercise both scalar cells and native text, including rank/lower bounds.
     var region = std.heap.ArenaAllocator.init(a);
     defer region.deinit();
-    const bytes = try @import("array_storage.zig").encodeAlloc(region.allocator(), source, .{});
-    const native = try @import("array_storage.zig").viewLeaky(region.allocator(), .text, bytes, .{});
+    const bytes = try @import("array/storage.zig").encodeAlloc(region.allocator(), source, .{});
+    const native = try @import("array/storage.zig").viewLeaky(region.allocator(), .text, bytes, .{});
     for ([_]*const arrays.Value{ &source, &native }) |input| {
         var frame = try Frame.prepare(a, &.{.{ .kind = .array, .element_type = .text }}, &.{.{ .datum = .typedArray(input) }}, .{});
         defer frame.deinit();
@@ -1308,7 +1308,7 @@ test "SQL prepared equality admits large equivalent representations within index
     const cells = try region.allocator().alloc(scalar.Datum, 32768);
     for (cells, 0..) |*cell, i| cell.* = .json(.{ .integer = @intCast(i) });
     const source = try arrays.Value.init(.int64, &.{.{ .length = @intCast(cells.len) }}, cells, .{});
-    const storage = @import("array_storage.zig");
+    const storage = @import("array/storage.zig");
     const bytes = try storage.encodeAlloc(region.allocator(), source, .{});
     const native = try storage.viewLeaky(region.allocator(), .int64, bytes, .{});
     var compiled = try @import("compiler.zig").compileScalar(a, "needle = ANY($1)", .{});
@@ -1337,7 +1337,7 @@ test "SQL prepared equality recent admission adapts after long cheap phases and 
     const a = std.testing.allocator;
     var region = std.heap.ArenaAllocator.init(a);
     defer region.deinit();
-    var builder = try @import("array_compact.zig").ResultBuilder.initKnown(region.allocator(), .int64, &.{.{ .length = 8192 }}, 8192, 8192, .{});
+    var builder = try @import("array/compact.zig").ResultBuilder.initKnown(region.allocator(), .int64, &.{.{ .length = 8192 }}, 8192, 8192, .{});
     var initial: arrays.Budget = .{};
     for (0..8192) |i| try builder.append(.json(.{ .integer = @intCast(i) }), &initial);
     const source = try builder.finish(region.allocator(), .{}, &initial);
@@ -1431,7 +1431,7 @@ test "SQL frame array capabilities reuse admitted JSONB and survive owner moves"
             return error.Canceled;
         }
     };
-    var context: @import("numeric_value.zig").Context = .{ .alloc = a, .checkpoint = Cancel.check };
+    var context: @import("numeric/value.zig").Context = .{ .alloc = a, .checkpoint = Cancel.check };
     var interrupted: arrays.Budget = .{ .shared = &context };
     try std.testing.expectError(error.Canceled, arrays.Membership.initFrameOwnedWithBudget(std.testing.failing_allocator, capability, 128 * 1024, &interrupted));
     try std.testing.expectError(error.Canceled, interrupted.consume(0));
@@ -1486,7 +1486,7 @@ test "SQL frame array capabilities preserve ingress admission and allocation fau
     var refreshed = try Frame.prepare(a, &.{.{ .kind = .array, .element_type = .jsonb }}, &.{.{ .datum = .typedArray(&stale) }}, .{});
     defer refreshed.deinit();
     try std.testing.expectEqual(source.prepared_footprint, refreshed.values[0].array.?.prepared_footprint);
-    var zero: @import("numeric_value.zig").Value = .{};
+    var zero: @import("numeric/value.zig").Value = .{};
     var malformed = scalar.Datum.typedArray(&source);
     malformed.numeric = &zero;
     try std.testing.expectError(error.SqlTypeMismatch, Frame.prepare(a, &.{.{ .kind = .array, .element_type = .jsonb }}, &.{.{ .datum = malformed }}, .{}));

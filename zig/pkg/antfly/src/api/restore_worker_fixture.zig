@@ -1445,7 +1445,7 @@ pub fn runPopulation(comptime Driver: type, scenario: PopulationScenario) !void 
         input.next = Interrupted.next;
         input.finish = Interrupted.finish;
     }
-    const delivery = @import("sql_population_delivery.zig");
+    const delivery = @import("sql/execution/population_delivery.zig");
     const delivered = delivery.deliver(alloc, .{ .port = .{ .ptr = &fixture, .execute_fn = Fixture.owner }, .table = "parent", .group = 701, .scope = scope }, input, .{});
     if (abandoned) try std.testing.expectError(error.Cancelled, delivered) else {
         const cursor = try delivered;

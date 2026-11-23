@@ -204,7 +204,7 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
     return result;
 }
 
-fn assignmentIdentity(binding: Bound, assignment: ast.Assignment, index: usize) !?@import("array_value.zig").ElementType {
+fn assignmentIdentity(binding: Bound, assignment: ast.Assignment, index: usize) !?@import("array/value.zig").ElementType {
     if (binding.assignments[index]) |program| return program.output_type.element_type;
     if (assignment.deferred_scalar) {
         if (index >= binding.deferred.len) return error.InvalidSqlBackendResponse;
@@ -728,8 +728,8 @@ fn conflictArrayOwnershipScenario(backing: std.mem.Allocator) !void {
     var input_live = true;
     defer if (input_live) input.deinit();
     const a = input.allocator();
-    const integers = try @import("array_text.zig").decodeLeaky(a, .int64, "[-1:1]={9007199254740993,NULL,2}", .{});
-    const json = try @import("array_text.zig").decodeLeaky(a, .jsonb, "{\"null\",NULL}", .{});
+    const integers = try @import("array/text.zig").decodeLeaky(a, .int64, "[-1:1]={9007199254740993,NULL,2}", .{});
+    const json = try @import("array/text.zig").decodeLeaky(a, .jsonb, "{\"null\",NULL}", .{});
     const layout = try catalog.Row.TypedLayout.init(a, &.{ "a", "j", "n", "missing" });
     const values = try a.dupe(scalar.Datum, &.{ scalar.Datum.typedArray(&integers.value), scalar.Datum.typedArray(&json.value), scalar.Datum.fromJson(.{ .integer = 1 }), .{} });
     const previous: catalog.Row = .{ .id = "identity", .version = 7, .value = .null, .typed_cells = .{ .layout = layout, .values = values, .presence = &.{ true, true, true, false } } };
@@ -765,11 +765,11 @@ fn conflictArrayOwnershipScenario(backing: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(i64, 7), mutation.row.?.object.get("n").?.integer);
     try std.testing.expect(!mutation.row.?.object.contains("missing"));
     try std.testing.expectEqual(@as(usize, 0), mutation.json_null_fields.len);
-    const array = try @import("array_wire.zig").decodeBorrowed(alloc, .int64, mutation.row.?.object.get("a").?, .{});
+    const array = try @import("array/wire.zig").decodeBorrowed(alloc, .int64, mutation.row.?.object.get("a").?, .{});
     try std.testing.expectEqual(@as(i32, -1), array.value.dimensions[0].lower);
     try std.testing.expectEqual(@as(i64, 9007199254740993), array.value.flatCell(0).value.integer);
     try std.testing.expect(array.value.flatCell(1).sql_null);
-    const json_array = try @import("array_wire.zig").decodeBorrowed(alloc, .jsonb, mutation.row.?.object.get("j").?, .{});
+    const json_array = try @import("array/wire.zig").decodeBorrowed(alloc, .jsonb, mutation.row.?.object.get("j").?, .{});
     try std.testing.expect(json_array.value.flatCell(0).value == .null);
     try std.testing.expect(!json_array.value.flatCell(0).sql_null);
     try std.testing.expect(json_array.value.flatCell(1).sql_null);

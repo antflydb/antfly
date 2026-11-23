@@ -16,7 +16,7 @@
 //! Shared literal-text kernels. Inputs borrow a pinned UTF-8 owner. Search,
 //! copies and unpublished allocations share invocation work and cancellation.
 const std = @import("std");
-const Context = @import("numeric_value.zig").Context;
+const Context = @import("numeric/value.zig").Context;
 const Allocator = std.mem.Allocator;
 
 /// Validate and count UTF-8 in one pass without allocating. Admission remains

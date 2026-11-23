@@ -16,17 +16,17 @@
 //! Typed FK validation projections and composable reference-set witnesses.
 //! These are read-side facts, not schema-publication or parent-root authority.
 const std = @import("std");
-const contract = @import("relational_integrity_contract.zig");
+const contract = @import("relational/integrity/contract.zig");
 const registry = @import("schema_registry.zig");
 const codec = @import("algebraic/relational_row_codec.zig");
-const keys = @import("relational_index_keys.zig");
+const keys = @import("relational/indexes/keys.zig");
 const schema = @import("../schema.zig");
 const native = @import("../relational_index.zig");
 const expressions = @import("../../schema/relational_expression.zig");
 const A = std.mem.Allocator;
-pub const Control = @import("relational_nullability.zig").Control;
+pub const Control = @import("relational/schema_change/nullability.zig").Control;
 
-pub const Witness = @import("relational_reference_witness.zig").Witness;
+pub const Witness = @import("relational/integrity/reference_witness.zig").Witness;
 
 pub const Rule = struct {
     name: []const u8,
@@ -667,8 +667,8 @@ test "foreign key validation repeated historical rows retain scratch without hea
 /// preparations. A child owner proves its own schema/catalog and tuple codec;
 /// it does not copy every parent's complete catalog into every child input.
 /// These descriptors alone grant no parent or publication authority.
-pub const ParentScope = @import("relational_schema_owner_contract.zig").ForeignKeyParent;
-pub const SourceConfig = @import("relational_schema_owner_contract.zig").ForeignKeySource;
+pub const ParentScope = @import("relational/schema_change/schema_owner_contract.zig").ForeignKeyParent;
+pub const SourceConfig = @import("relational/schema_change/schema_owner_contract.zig").ForeignKeySource;
 
 /// Child identities are hints until metadata joins independently signed source
 /// and parent preparations. The parent verifies its own UNIQUE declaration and
@@ -688,7 +688,7 @@ pub const ChildScope = struct {
 };
 
 pub const ParentConfig = struct {
-    purpose: @import("relational_schema_owner_contract.zig").Purpose = .foreign_key_parent,
+    purpose: @import("relational/schema_change/schema_owner_contract.zig").Purpose = .foreign_key_parent,
     table_name: []const u8,
     children: []const ChildScope,
 
@@ -728,7 +728,7 @@ fn addNameBytes(total: *usize, name: []const u8) !void {
 
 test "foreign key validation parent candidate verifies its own catalog and owns every scope" {
     const a = std.testing.allocator;
-    const job = @import("relational_nullability_job.zig");
+    const job = @import("relational/schema_change/nullability_job.zig");
     const api = @import("../../schema/mod.zig");
     const declarations = @import("../../schema/relational_declarations.zig");
     const F = struct {
@@ -801,7 +801,7 @@ test "foreign key validation parent scopes reject conflicting child epochs alias
 
 test "foreign key validation source candidate owns compact scopes through every allocation failure" {
     const a = std.testing.allocator;
-    const job = @import("relational_nullability_job.zig");
+    const job = @import("relational/schema_change/nullability_job.zig");
     const api = @import("../../schema/mod.zig");
     const declarations = @import("../../schema/relational_declarations.zig");
     const F = struct {

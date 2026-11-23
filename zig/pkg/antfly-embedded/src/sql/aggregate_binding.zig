@@ -56,7 +56,7 @@ pub const Collection = struct {
     captures: []const usize,
     constants: []const ?scalar.Datum = &.{},
     distinct: bool,
-    element_type: ?@import("array_value.zig").ElementType = null,
+    element_type: ?@import("array/value.zig").ElementType = null,
     input_array: bool = false,
     reducer: operators.AggregateSpec = .{ .kind = .count },
 };
@@ -71,7 +71,7 @@ pub fn collectionArity(call: @FieldType(ast.Scalar, "call")) !usize {
     return arity;
 }
 
-fn domainElement(domain: scalar.Type) ?@import("array_value.zig").ElementType {
+fn domainElement(domain: scalar.Type) ?@import("array/value.zig").ElementType {
     return domain.element_type orelse switch (domain.kind orelse return null) {
         .string => .text,
         .integer => .int64,
@@ -956,7 +956,7 @@ test "ordered aggregate binding separates grouped direct arguments and shares on
     defer array.deinit();
     const array_bound = try bind(arena.allocator(), table, array.statement.select, &.{});
     try std.testing.expectEqual(ast.ColumnType.array, array_bound.outputs[0].output_type.kind.?);
-    try std.testing.expectEqual(@import("array_value.zig").ElementType.float64, array_bound.outputs[0].output_type.element_type.?);
+    try std.testing.expectEqual(@import("array/value.zig").ElementType.float64, array_bound.outputs[0].output_type.element_type.?);
 }
 
 test {

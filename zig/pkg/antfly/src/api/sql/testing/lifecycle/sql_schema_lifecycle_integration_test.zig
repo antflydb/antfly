@@ -470,6 +470,108 @@ test "mounted SQL original tablespace names preserve bound owners deletion guard
         try fixture.runWithState(TablespaceCampaign, .{ .case = case });
     }
 }
+const TablespaceCreationCampaign = struct {
+    pub const native_auth = true;
+    pub const native_sessions = true;
+    pub const cold_catalog = true;
+    pub const configureAuth = TablespaceCampaign.configureAuth;
+    const Reference = struct {
+        format: u8,
+        reference: []const u8,
+        oracle_location: []const u8,
+        id: []const u8,
+        sql: []const u8,
+        location: []const u8,
+        command_tag: []const u8,
+        duplicate_sqlstate: []const u8,
+        in_use_sqlstate: []const u8,
+        bound_identity: bool,
+        preserved_on_refusal: bool,
+        rows: []const []const []const u8,
+    };
+    reference: Reference,
+    bound: TablespaceCampaign,
+
+    fn nativeRecord(self: *@This(), ctx: *fixture.Context) !void {
+        var response = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.metadata_uri, "/db/v1/tablespaces/fastspace", .GET, null, 15_000);
+        defer response.deinit(ctx.alloc);
+        if (response.status != 200) std.debug.print("tablespace native GET status={d} body={s}\n", .{ response.status, response.body });
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        var record = try std.json.parseFromSlice(wire.TablespaceCatalogRecord, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
+        defer record.deinit();
+        try std.testing.expectEqual(self.bound.tablespace_id, record.value.tablespace_id);
+        try std.testing.expectEqualStrings("fastspace", record.value.name);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(record.value.location_json, &digest, .{});
+        try std.testing.expectEqualSlices(u8, &self.bound.location_hash, &digest);
+    }
+
+    pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+        var corpus = try local.sql_parity_fixtures.Corpus.init(ctx.alloc);
+        defer corpus.deinit();
+        const original = try corpus.get(self.bound.case.id);
+        try std.testing.expectEqual(@as(usize, 0), original.params.len);
+        try std.testing.expectEqualStrings(self.reference.sql, original.sql);
+        var declaration = try local.sql_compiler.compile(ctx.alloc, original.sql, .{});
+        defer declaration.deinit();
+        try std.testing.expectEqualStrings(self.reference.location, declaration.statement.catalog_ddl.location.?);
+        const location = try std.json.Stringify.valueAlloc(ctx.alloc, declaration.statement.catalog_ddl.location.?, .{});
+        defer ctx.alloc.free(location);
+        {
+            var before = try TablespaceCampaign.snapshot(ctx);
+            defer before.deinit();
+            try std.testing.expect(before.value.find(.tablespace, 0, "fastspace") == null);
+        }
+        try self.bound.originalCommand(ctx, original.sql);
+        {
+            var created = try TablespaceCampaign.snapshot(ctx);
+            defer created.deinit();
+            const space = created.value.find(.tablespace, 0, "fastspace") orelse return error.MissingSqlTablespace;
+            try std.testing.expectEqualStrings(location, space.location_json);
+            self.bound.tablespace_id = space.id;
+            std.crypto.hash.sha2.Sha256.hash(space.location_json, &self.bound.location_hash, .{});
+        }
+        try self.nativeRecord(ctx);
+        try command(ctx, "CREATE TABLE usage_records(id UUID,status TEXT) TABLESPACE fastspace", null);
+        self.bound.owner = try readyTable(ctx, "usage_records", 0);
+        try command(ctx, "INSERT INTO usage_records(id,status) VALUES ('00000000-0000-0000-0000-000000000001','retained')", null);
+        var before_refusals = try TablespaceCampaign.snapshot(ctx);
+        defer before_refusals.deinit();
+        try command(ctx, original.sql, self.reference.duplicate_sqlstate);
+        try command(ctx, "DROP TABLESPACE fastspace", self.reference.in_use_sqlstate);
+        try self.bound.verifyBinding(ctx);
+        var after_refusals = try TablespaceCampaign.snapshot(ctx);
+        defer after_refusals.deinit();
+        try std.testing.expectEqual(before_refusals.value.revision, after_refusals.value.revision);
+        try std.testing.expectEqual(before_refusals.value.next_id, after_refusals.value.next_id);
+    }
+
+    pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+        try self.bound.afterRestart(ctx);
+        try self.nativeRecord(ctx);
+    }
+};
+
+test "mounted SQL original tablespace creation shares native placement identity refusals and cold owners" {
+    // sql-0110 uses the exact corpus CREATE, including its original LOCATION.
+    var parsed = try std.json.parseFromSlice(TablespaceCreationCampaign.Reference, std.testing.allocator, local.sql_parity_fixtures.tablespace_creation_reference, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const reference = parsed.value;
+    try std.testing.expectEqual(@as(u8, 1), reference.format);
+    try std.testing.expectEqualStrings("PostgreSQL tablespace CREATE with isolated LOCATION fixture", reference.reference);
+    try std.testing.expectEqualStrings("owned temporary directory; only LOCATION literal substituted", reference.oracle_location);
+    try std.testing.expectEqualStrings("sql-0110", reference.id);
+    try std.testing.expect(reference.bound_identity and reference.preserved_on_refusal);
+    try fixture.runWithState(TablespaceCreationCampaign, .{ .reference = reference, .bound = .{ .case = .{
+        .id = reference.id,
+        .setup = &.{},
+        .name = "fastspace",
+        .present = true,
+        .command_tag = reference.command_tag,
+        .witness = .{ .in_use_sqlstate = reference.in_use_sqlstate, .preserved_binding = reference.bound_identity, .rows = reference.rows },
+    } } });
+}
+
 const RelatedImage = struct { statement: []const u8, output: Rows };
 const Probe = struct { preserve_owner: bool = false, related_after: []const RelatedImage = &.{}, statement: []const u8, sqlstate: ?[]const u8, after: Rows, repeat_on_reopen: bool = false, reopen: ?struct { sqlstate: ?[]const u8 = null } = null, absent_table: ?[]const u8 = null, declared_not_valid: ?bool = null };
 const Outcome = struct { command_tag: []const u8, result: Rows };
@@ -575,7 +677,7 @@ fn execute(ctx: *fixture.Context, statement: []const u8, read: bool) !@import(".
 }
 
 fn expectDiagnostic(ctx: *fixture.Context, response: anytype, expected: []const u8) !void {
-    const status: u16 = if (std.mem.eql(u8, expected, "0A000")) 501 else 400;
+    const status = (local.sql_errors.Diagnostic{ .code = expected, .message = "" }).httpStatus();
     if (response.status != status) std.debug.print("schema rejection status={d} body={s}\n", .{ response.status, response.body });
     try std.testing.expectEqual(status, response.status);
     var parsed = try std.json.parseFromSlice(struct { code: []const u8 }, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
@@ -1969,7 +2071,7 @@ test "mounted SQL object comment renames preserve CHECK UNIQUE backing index and
             var arena = std.heap.ArenaAllocator.init(ctx.alloc);
             defer arena.deinit();
             const a = arena.allocator();
-            const bound = (try @import("../../../sql_catalog.zig").captureTableAdmission(ctx.metadata.server.owned_public_http_server.?, null, .{}, a, .{ .table = "annotated_child" }, false, null)) orelse return error.MissingSourceRelation;
+            const bound = (try @import("../../catalog/catalog.zig").captureTableAdmission(ctx.metadata.server.owned_public_http_server.?, null, .{}, a, .{ .table = "annotated_child" }, false, null)) orelse return error.MissingSourceRelation;
             const store = ctx.metadata.server.svc.projectedStore() orelse return error.MissingMetadataStore;
             const raw = try store.getSqlObjectAnnotation(a, 2188, .{ .guard = bound.guard, .key = .{ .kind = kind, .name = name } });
             const value = try std.json.parseFromSliceLeaky(domain.object_annotation_store.Snapshot, a, raw, .{});
@@ -2235,16 +2337,16 @@ test "mounted SQL connection command admission fences concurrent close commit an
                 .docstore => |backend| blk: {
                     var txn = try backend.beginReadTxn();
                     defer txn.abort();
-                    break :blk try @import("../../../sql_connection_record.zig").loadTxn(&txn, ctx.alloc, &id);
+                    break :blk try @import("../../session/connection_record.zig").loadTxn(&txn, ctx.alloc, &id);
                 },
                 .runtime => |backend| blk: {
                     var txn = try backend.beginRead();
                     defer txn.abort();
-                    break :blk try @import("../../../sql_connection_record.zig").loadTxn(&txn, ctx.alloc, &id);
+                    break :blk try @import("../../session/connection_record.zig").loadTxn(&txn, ctx.alloc, &id);
                 },
             };
             defer connection.deinit();
-            const key: @import("../../../sql_connection_admission.zig").Key = .init(id, connection.value.principal);
+            const key: @import("../../session/connection_admission.zig").Key = .init(id, connection.value.principal);
             var held = try api.sql_connection_admission.acquire(api.alloc, io, key);
             defer held.release(io);
             var busy = try connected(ctx, &id, "BEGIN");

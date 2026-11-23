@@ -387,6 +387,7 @@ pub const MetadataServer = struct {
                 owned_sessions = try MetadataSessions.create(alloc, svc);
                 api_server_cfg.session_store = &owned_sessions.?.durable;
                 api_server_cfg.session_store_scope = .cluster_shared;
+                api_server_cfg.sql_catalog_session_authority = true;
                 if (api_server_cfg.session_owner_lease_ttl_ns == null) api_server_cfg.session_owner_lease_ttl_ns = 15 * std.time.ns_per_s;
             }
             api_server_cfg.restore_owner_progress_generation = &svc.restore_owner_progress_generation;

@@ -21,7 +21,7 @@ pub fn encodeGenerationSet(alloc: std.mem.Allocator, value: [32]u8) ![]u8 {
     const NumericBytes = struct {
         value: [32]u8,
         pub fn jsonStringify(self: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
-            try @import("../storage/db/relational_integrity_json.zig").write(self.value, stream);
+            try @import("../storage/db/relational/integrity/json.zig").write(self.value, stream);
         }
     };
     return std.json.Stringify.valueAlloc(alloc, NumericBytes{ .value = value }, .{});
@@ -41,7 +41,7 @@ pub fn parseGenerationSet(value: std.json.Value) ![32]u8 {
 }
 const types = @import("../storage/db/types.zig");
 const Operation = types.TransactionIntegrityOperation;
-pub const Command = @import("../storage/db/relational_integrity_contract.zig").Command;
+pub const Command = @import("../storage/db/relational/integrity/contract.zig").Command;
 pub const max_operations = 65_536;
 pub const max_bytes = 16 * 1024 * 1024;
 
@@ -62,7 +62,7 @@ test "distributed txn HA preserves arbitrary binary coordinator generation evide
 }
 
 pub fn appendCommands(alloc: std.mem.Allocator, out: *std.ArrayList(u8), commands: []const Command) !void {
-    _ = try @import("../storage/db/relational_integrity_contract.zig").validateCommandAdmission(commands);
+    _ = try @import("../storage/db/relational/integrity/contract.zig").validateCommandAdmission(commands);
     const encoded = try std.json.Stringify.valueAlloc(alloc, commands, .{});
     defer alloc.free(encoded);
     if (encoded.len > max_bytes) return error.InvalidTxnRequest;
@@ -70,10 +70,10 @@ pub fn appendCommands(alloc: std.mem.Allocator, out: *std.ArrayList(u8), command
 }
 
 pub fn parseCommands(alloc: std.mem.Allocator, value: std.json.Value) !std.json.Parsed([]const Command) {
-    if (value != .array or value.array.items.len > @import("../storage/db/relational_integrity_contract.zig").max_commands) return error.InvalidTxnRequest;
+    if (value != .array or value.array.items.len > @import("../storage/db/relational/integrity/contract.zig").max_commands) return error.InvalidTxnRequest;
     var parsed = try std.json.parseFromValue([]const Command, alloc, value, .{ .allocate = .alloc_always });
     errdefer parsed.deinit();
-    _ = try @import("../storage/db/relational_integrity_contract.zig").validateCommandAdmission(parsed.value);
+    _ = try @import("../storage/db/relational/integrity/contract.zig").validateCommandAdmission(parsed.value);
     return parsed;
 }
 
@@ -211,7 +211,7 @@ test "distributed txn integrity wire rejects ambiguous or invalid effects and re
 
 test "distributed txn semantic commands roundtrip binary tuples for native and internal wire" {
     const alloc = std.testing.allocator;
-    const integrity = @import("../storage/db/relational_integrity_contract.zig");
+    const integrity = @import("../storage/db/relational/integrity/contract.zig");
     const address = try integrity.Address.init(@splat(1), "\xff\x00\xfe");
     const commands = [_]Command{ .{ .address = address, .operation = .{ .establish = .{
         .tuple = "\xff\x00\xfe",

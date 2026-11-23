@@ -112,8 +112,7 @@ pub fn validate(alloc: std.mem.Allocator, public_tables: []const tables.TableRec
         if (bytes.len > staging.max_encoded_bytes) return error.InvalidRestoreStaging;
         var parsed = try std.json.parseFromSlice(staging.Job, alloc, bytes, .{ .allocate = .alloc_always });
         defer parsed.deinit();
-        try parsed.value.plan.validate(alloc);
-        if (!std.mem.eql(u8, &parsed.value.plan_digest, &(try parsed.value.plan.digest(alloc)))) return error.InvalidRestoreStaging;
+        try parsed.value.validateRetained(alloc);
         switch (parsed.value.state) {
             .importing, .validating, .cutover, .activating, .canceling => {},
             .published, .canceled, .preparing_sources => return error.InvalidRestoreStaging,
@@ -133,7 +132,10 @@ pub fn validate(alloc: std.mem.Allocator, public_tables: []const tables.TableRec
         // owners are projected into this private routing view.
         const maximum = switch (parsed.value.state) {
             .cutover => old_owners + parent_owners,
-            .activating => parent_owners,
+            .activating => if (parsed.value.plan.catalog_binding != null)
+                (parsed.value.plan.catalogPublicationPhase() orelse return error.InvalidRestoreStaging).owners
+            else
+                parent_owners,
             .canceling => new_owners + old_owners + parent_owners,
             else => new_owners,
         };

@@ -90,6 +90,10 @@ pub fn requiresSequenceRetirement(bytes: []const u8) bool {
     return requiresMarker(bytes, "sequence_change") or requiresMarker(bytes, "sequence_retirement") or requiresMarker(bytes, "sequence_active");
 }
 
+pub fn requiresPartitionMembership(bytes: []const u8) bool {
+    return requiresMarker(bytes, "partition_membership") or requiresMarker(bytes, "partition_guards") or requiresMarker(bytes, "partition_parent") or requiresMarker(bytes, "partition_birth") or requiresMarker(bytes, "sql_partition");
+}
+
 pub fn requiresTypeCohort(bytes: []const u8) bool {
     return requiresMarker(bytes, "type_change");
 }
@@ -126,6 +130,142 @@ pub fn requiresSqlNotifications(bytes: []const u8) bool {
     return requiresMarker(bytes, "@sql-notifications");
 }
 
+pub fn requiresSqlSubscriptionDdl(bytes: []const u8) bool {
+    return requiresMarker(bytes, "sql_subscription_ddl");
+}
+
+pub fn requiresSqlPreparedPublicationAbortFence(bytes: []const u8) bool {
+    return requiresMarker(bytes, "publication_abort_fence") or requiresMarker(bytes, "publication_abort_fences");
+}
+
+pub fn requiresSqlPreparedPublicationDecisionJournal(bytes: []const u8) bool {
+    return requiresMarker(bytes, "commit_time_unix_us");
+}
+
+pub fn requiresSqlPreparedCatalogAtomicAdmission(bytes: []const u8) bool {
+    return requiresMarker(bytes, "admit") and requiresMarker(bytes, "catalog_participant");
+}
+
+pub fn requiresSqlPreparedCatalogCompletion(bytes: []const u8) bool {
+    return requiresMarker(bytes, "catalog_complete") or requiresMarker(bytes, "catalog_participant");
+}
+
+pub fn requiresSqlPreparedPublicationTerminal(bytes: []const u8) bool {
+    return requiresMarker(bytes, "publication_terminal") or requiresMarker(bytes, "publication_terminals");
+}
+
+pub fn requiresSqlPreparedPublicationCapture(bytes: []const u8) bool {
+    return requiresMarker(bytes, "publication_capture") or requiresMarker(bytes, "publication_capacity") or requiresMarker(bytes, "publication_vote");
+}
+
+pub fn requiresSqlSubscriptionApplyState(bytes: []const u8) bool {
+    return requiresMarker(bytes, "replication_source") or requiresMarker(bytes, "provider_export") or requiresMarker(bytes, "provider_preflight_identity");
+}
+
+pub fn requiresSqlPublicationCollectedState(bytes: []const u8) bool {
+    return requiresMarker(bytes, "purged");
+}
+
+pub fn requiresSqlPublicationSlotControl(bytes: []const u8) bool {
+    return requiresMarker(bytes, "sql_publication_slot_control");
+}
+
+pub fn requiresSqlSubscriptionLifecycleCompletion(bytes: []const u8) bool {
+    return requiresSqlPublicationSlotControl(bytes) and (requiresMarker(bytes, "finish_subscription_disable") or requiresMarker(bytes, "finish_subscription_drop") or requiresMarker(bytes, "bind_subscription_export") or requiresMarker(bytes, "transition_subscription_export") or requiresMarker(bytes, "provider_preflight_identity"));
+}
+
+pub fn requiresSqlSubscriptionApplyDdl(bytes: []const u8) bool {
+    return requiresSqlSubscriptionDdl(bytes) and requiresMarker(bytes, "subscription_apply");
+}
+
+pub fn requiresSqlPublicationCollection(bytes: []const u8) bool {
+    return requiresMarker(bytes, "sql_publication_collection_ack");
+}
+
+pub fn requiresSqlPublicationDdl(bytes: []const u8) bool {
+    return requiresMarker(bytes, "sql_publication_ddl") or requiresMarker(bytes, "sql_publication_advance");
+}
+
+pub fn requiresSqlCollationDdl(bytes: []const u8) bool {
+    return requiresMarker(bytes, "sql_collation_ddl");
+}
+
+pub const CatalogMarker = enum {
+    sql_subscription_ddl,
+    subscription_apply,
+    sql_publication_slot_control,
+    finish_subscription_disable,
+    finish_subscription_drop,
+    bind_subscription_export,
+    transition_subscription_export,
+    provider_preflight_identity,
+    sql_publication_collection_ack,
+    sql_publication_ddl,
+    sql_publication_advance,
+    sql_collation_ddl,
+    sql_security_label,
+    sql_security_labels,
+    selinux_approval,
+    sql_catalog_admission,
+};
+pub const CatalogMarkers = std.EnumSet(CatalogMarker);
+
+pub fn catalogMarkers(bytes: []const u8) ?CatalogMarkers {
+    if (bytes.len > 64 * 1024 * 1024) return null;
+    var buffer: [4096]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+    const alloc = fixed.allocator();
+    var scanner = std.json.Scanner.initCompleteInput(alloc, bytes);
+    defer scanner.deinit();
+    if ((scanner.peekNextTokenType() catch return null) != .object_begin) return null;
+    var result: CatalogMarkers = .initEmpty();
+    walkCatalogMarkers(&scanner, alloc, 0, &result) catch return null;
+    if ((scanner.next() catch return null) != .end_of_document) return null;
+    return result;
+}
+
+fn walkCatalogMarkers(scanner: *std.json.Scanner, alloc: std.mem.Allocator, depth: usize, result: *CatalogMarkers) !void {
+    if (depth >= 128) return error.InvalidMetadataTransitionEncoding;
+    switch (try scanner.peekNextTokenType()) {
+        .object_begin => {
+            _ = try scanner.next();
+            while (try scanner.peekNextTokenType() != .object_end) {
+                const key = try scanner.nextAllocMax(alloc, .alloc_if_needed, 1024);
+                const marker = switch (key) {
+                    .string => |value| std.meta.stringToEnum(CatalogMarker, value),
+                    .allocated_string => |value| blk: {
+                        defer alloc.free(value);
+                        break :blk std.meta.stringToEnum(CatalogMarker, value);
+                    },
+                    else => return error.InvalidMetadataTransitionEncoding,
+                };
+                if (marker) |name| if (try scanner.peekNextTokenType() != .null) {
+                    result.insert(name);
+                };
+                try walkCatalogMarkers(scanner, alloc, depth + 1, result);
+            }
+            _ = try scanner.next();
+        },
+        .array_begin => {
+            _ = try scanner.next();
+            while (try scanner.peekNextTokenType() != .array_end) {
+                try walkCatalogMarkers(scanner, alloc, depth + 1, result);
+            }
+            _ = try scanner.next();
+        },
+        .string, .number, .true, .false, .null => try scanner.skipValue(),
+        else => return error.InvalidMetadataTransitionEncoding,
+    }
+}
+
+pub fn requiresSqlSelinuxApproval(bytes: []const u8) bool {
+    return requiresMarker(bytes, "sql_security_label") and requiresMarker(bytes, "selinux_approval");
+}
+
+pub fn requiresSqlSecurityLabels(bytes: []const u8) bool {
+    return requiresMarker(bytes, "sql_security_label") or requiresMarker(bytes, "sql_security_labels");
+}
+
 pub fn requiresSqlCatalogJournal(bytes: []const u8) bool {
     return requiresMarker(bytes, "sql_catalog_admission");
 }
@@ -136,6 +276,10 @@ pub fn requiresSqlCommandFence(bytes: []const u8) bool {
 
 pub fn requiresSqlNativeIndex(bytes: []const u8) bool {
     return requiresMarker(bytes, "sql_native_index") or requiresMarker(bytes, "sql_native_indexes_json");
+}
+
+pub fn requiresRestoreReservationOutcome(bytes: []const u8) bool {
+    return requiresMarker(bytes, "record_reservation_outcome") or requiresMarker(bytes, "record_receipt_identity");
 }
 
 pub fn requiresLogicalRelations(bytes: []const u8) bool {
@@ -164,6 +308,10 @@ pub fn requiresMaterializedRefresh(bytes: []const u8) bool {
 
 pub fn requiresMaterializedView(bytes: []const u8) bool {
     return requiresMarker(bytes, "materialized_view") or requiresMarker(bytes, "sql_materialized_view_id") or requiresMarker(bytes, "materialized");
+}
+
+pub fn requiresSqlViewIndexProofs(bytes: []const u8) bool {
+    return requiresMarker(bytes, "required_indexes");
 }
 
 pub fn requiresPopulation(bytes: []const u8) bool {
@@ -278,11 +426,19 @@ pub fn validatePublication(comptime Requirements: type, bytes: []const u8) !void
     };
 }
 
-const Projection = enum { marker, validate, newer_readers };
+const Projection = enum { marker, validate, newer_readers, document_view_readers };
 
 /// Project only authoritative requirement objects; encoded schemas and row
 /// strings are skipped without allocation. Invalid envelopes stay conservative.
 pub fn requiresClockReaders(bytes: []const u8) bool {
+    return requiresReaders(bytes, .newer_readers);
+}
+
+pub fn requiresSqlDocumentViewReaders(bytes: []const u8) bool {
+    return requiresReaders(bytes, .document_view_readers);
+}
+
+fn requiresReaders(bytes: []const u8, comptime projection: Projection) bool {
     const Requirements = struct { semantic_version: u32 = 0, encoding_version: u32 = 0 };
     if (bytes.len > 64 * 1024 * 1024) return true;
     var buffer: [4096]u8 = undefined;
@@ -290,7 +446,7 @@ pub fn requiresClockReaders(bytes: []const u8) bool {
     var scanner = std.json.Scanner.initCompleteInput(fixed.allocator(), bytes);
     defer scanner.deinit();
     if ((scanner.peekNextTokenType() catch return true) != .object_begin) return true;
-    if (walk(Requirements, .newer_readers, "schema_reader_requirements", &scanner, fixed.allocator(), 0) catch return true) return true;
+    if (walk(Requirements, projection, "schema_reader_requirements", &scanner, fixed.allocator(), 0) catch return true) return true;
     return (scanner.next() catch return true) != .end_of_document;
 }
 
@@ -374,6 +530,8 @@ fn walk(comptime Requirements: type, comptime mode: Projection, comptime marker_
                         return error.InvalidSchemaReaderRequirements;
                     if (comptime mode == .newer_readers) {
                         if (requirement.semantic_version >= 34 or requirement.encoding_version >= 34) return true;
+                    } else if (comptime mode == .document_view_readers) {
+                        if (requirement.semantic_version >= @import("antfly_local_sources").common_schema_readers.sql_view_index_semantic_version) return true;
                     } else {
                         if (!requirement.valid()) return error.InvalidSchemaReaderRequirements;
                         found = true;
@@ -659,4 +817,19 @@ test "SQL TRUNCATE preparation sender recognizes required source attachments wit
 test "SQL extension decoder marker ignores source text and recognizes escaped keys" {
     for ([_][]const u8{ "{}", "{\"source_json\":\"sql_extension\"}", "{\"sql_extension\":null}" }) |bytes| try std.testing.expect(!requiresSqlExtension(bytes));
     for ([_][]const u8{ "{\"sql_extension\":{}}", "{\"sql_extens\\u0069on\":{}}", "{" }) |bytes| try std.testing.expect(requiresSqlExtension(bytes));
+}
+
+test "SQL security label approval requires the independent SELinux decoder" {
+    try std.testing.expect(requiresSqlSelinuxApproval(
+        \\{"sql_security_label":{"selinux_approval":{"signature":[0]}}}
+    ));
+    try std.testing.expect(requiresSqlSelinuxApproval(
+        \\{"sql_security_label":{"selinux_\u0061pproval":{}}}
+    ));
+    try std.testing.expect(!requiresSqlSelinuxApproval(
+        \\{"sql_security_label":{"selinux_approval":null,"label":"selinux_approval"}}
+    ));
+    try std.testing.expect(!requiresSqlSelinuxApproval(
+        \\{"other":{"selinux_approval":{}}}
+    ));
 }

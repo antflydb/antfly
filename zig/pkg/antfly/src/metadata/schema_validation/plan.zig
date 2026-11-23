@@ -138,6 +138,27 @@ pub const Participants = struct {
 };
 pub const ParticipantsRecord = barriers.Record(Participants, "SVPT", 4096);
 
+pub const PartitionGuards = struct {
+    parent: local.system_catalog_domain.RelationMutationGuard,
+    child: local.system_catalog_domain.RelationMutationGuard,
+
+    pub fn forTable(self: PartitionGuards, table_id: u64) !local.system_catalog_domain.RelationMutationGuard {
+        if (self.parent.owner.table_id == table_id) return self.parent;
+        if (self.child.owner.table_id == table_id) return self.child;
+        return error.InvalidGenerationPublication;
+    }
+
+    fn validate(self: PartitionGuards, transition: local.schema_table_partitions.Transition, incarnation: local.metadata_incarnation.MetadataClusterIncarnation) !void {
+        if (self.parent.owner.table_id != transition.before.parent.table_id or self.child.owner.table_id != transition.child_before.table_id or
+            !std.mem.eql(u8, self.parent.target.database, self.child.target.database)) return error.InvalidGenerationPublication;
+        for ([_]local.system_catalog_domain.RelationMutationGuard{ self.parent, self.child }) |guard| {
+            try guard.validate();
+            if (guard.owner.kind != .table or guard.hasDefinitionIntent() or !std.mem.eql(u8, guard.target.name, guard.logical_table) or
+                !std.mem.eql(u8, &std.fmt.bytesToHex(guard.incarnation, .lower), &incarnation)) return error.InvalidGenerationPublication;
+        }
+    }
+};
+
 pub const Plan = struct {
     version: u16 = 2,
     metadata_group_id: u64,
@@ -152,9 +173,11 @@ pub const Plan = struct {
     type_change: ?TypeChange = null,
     sequence_change: ?SequenceChange = null,
     retirement_root: ?@import("../retirement/table/authority.zig").Authority = null,
+    partition_guards: ?PartitionGuards = null,
+    initial_partition: ?@import("../initial_partition.zig").Reference = null,
 
     pub fn cohort(self: Plan) bool {
-        return self.type_change != null or self.sequence_change != null or self.retirement_root != null;
+        return self.type_change != null or self.sequence_change != null or self.retirement_root != null or self.selection == .partition_membership;
     }
 
     pub fn participantCount(self: Plan) usize {
@@ -176,7 +199,9 @@ pub const Plan = struct {
             const skip = (comptime std.mem.eql(u8, field, "additional_tables")) and self.additional_tables.len == 0 or
                 (comptime std.mem.eql(u8, field, "type_change")) and self.type_change == null or
                 (comptime std.mem.eql(u8, field, "sequence_change")) and self.sequence_change == null or
-                (comptime std.mem.eql(u8, field, "retirement_root")) and self.retirement_root == null;
+                (comptime std.mem.eql(u8, field, "retirement_root")) and self.retirement_root == null or
+                (comptime std.mem.eql(u8, field, "partition_guards")) and self.partition_guards == null or
+                (comptime std.mem.eql(u8, field, "initial_partition")) and self.initial_partition == null;
             if (!skip) {
                 try writer.objectField(field);
                 try writer.write(@field(self, field));
@@ -195,6 +220,24 @@ pub const Plan = struct {
                 self.metadata_group_id != root.root.group or self.participantCount() != root.effects.survivors or
                 std.mem.eql(u8, &self.id, &root.root.id) or self.selection.dependent_object_retirement.relations.len != 1 or
                 self.selection.dependent_object_retirement.relations[0].table_id != root.root.table) return error.InvalidGenerationPublication;
+        }
+        if ((self.selection == .partition_membership) != (self.partition_guards != null or self.initial_partition != null)) return error.InvalidGenerationPublication;
+        if (self.selection == .partition_membership) {
+            const transition = self.selection.partition_membership;
+            if (self.type_change != null or self.sequence_change != null or self.retirement_root != null) return error.InvalidGenerationPublication;
+            if (self.initial_partition) |birth| {
+                try birth.validate();
+                const guard = self.table_guard orelse return error.InvalidGenerationPublication;
+                if (self.version != 7 or self.partition_guards != null or self.additional_tables.len != 0 or transition.operation != .birth or
+                    self.before.table_id != transition.before.parent.table_id or birth.child_table_id != transition.child_after.table_id or
+                    guard.owner.table_id != self.before.table_id or
+                    !std.mem.eql(u8, &std.fmt.bytesToHex(guard.incarnation, .lower), &self.metadata_incarnation)) return error.InvalidGenerationPublication;
+            } else {
+                if (self.version != 6 or self.table_guard != null or self.additional_tables.len != 1 or transition.operation == .birth) return error.InvalidGenerationPublication;
+                const first = @min(transition.before.parent.table_id, transition.child_before.table_id);
+                const second = @max(transition.before.parent.table_id, transition.child_before.table_id);
+                if (self.before.table_id != first or self.additional_tables[0].before.table_id != second) return error.InvalidGenerationPublication;
+            }
         }
         if ((self.type_change != null and self.sequence_change != null) or
             (!self.cohort() and (self.version != 2 or self.additional_tables.len != 0 or self.selection == .enum_epoch or self.selection == .domain_not_null or self.selection == .sequence_default_removal)) or
@@ -251,7 +294,7 @@ pub const Plan = struct {
     pub fn digest(self: Plan) !Digest {
         try self.requireBoundedShape();
         var hash = std.crypto.hash.Blake3.init(.{});
-        hash.update(if (self.retirement_root != null) "antfly/schema-validation-immutable-plan/v5" else if (self.sequence_change != null) "antfly/schema-validation-immutable-plan/v4" else if (self.type_change != null) "antfly/schema-validation-immutable-plan/v3" else "antfly/schema-validation-immutable-plan/v2");
+        hash.update(if (self.initial_partition != null) "antfly/schema-validation-immutable-plan/v7" else if (self.selection == .partition_membership) "antfly/schema-validation-immutable-plan/v6" else if (self.retirement_root != null) "antfly/schema-validation-immutable-plan/v5" else if (self.sequence_change != null) "antfly/schema-validation-immutable-plan/v4" else if (self.type_change != null) "antfly/schema-validation-immutable-plan/v3" else "antfly/schema-validation-immutable-plan/v2");
         var writer = std.Io.Writer.Hashing(std.crypto.hash.Blake3).initHasher(hash, &.{});
         try std.json.Stringify.value(.{
             .version = self.version,
@@ -275,6 +318,13 @@ pub const Plan = struct {
         if (self.retirement_root) |root| {
             try writer.writer.writeByte(0);
             try std.json.Stringify.value(.{ .additional_tables = self.additional_tables, .retirement_root = root }, .{}, &writer.writer);
+        }
+        if (self.initial_partition) |birth| {
+            try writer.writer.writeByte(0);
+            try std.json.Stringify.value(birth, .{}, &writer.writer);
+        } else if (self.selection == .partition_membership) {
+            try writer.writer.writeByte(0);
+            try std.json.Stringify.value(.{ .additional_tables = self.additional_tables, .partition_guards = self.partition_guards.? }, .{}, &writer.writer);
         }
         for (self.owners) |owner| {
             var binding = owner.binding;
@@ -388,6 +438,14 @@ pub const Plan = struct {
             head.retirement_root = root;
             projection = try self.selection.dependent_object_retirement.fingerprint();
             _ = std.fmt.hexToBytes(&incarnation, &self.metadata_incarnation) catch return error.MetadataIncarnationMismatch;
+        } else if (self.selection == .partition_membership) {
+            const transition = self.selection.partition_membership;
+            try transition.validate(a);
+            if (self.partition_guards) |guards| try guards.validate(transition, self.metadata_incarnation);
+            head.initial_partition = self.initial_partition;
+            head.partition_parent = transition.before.parent.table_id;
+            projection = try transition.fingerprint();
+            _ = std.fmt.hexToBytes(&incarnation, &self.metadata_incarnation) catch return error.MetadataIncarnationMismatch;
         } else {
             const change = self.sequence_change orelse return error.InvalidGenerationPublication;
             try change.validate();
@@ -416,10 +474,17 @@ pub const Plan = struct {
                 try local.sql_catalog.named_layouts.epochSchemaAlloc(a, pair.before.schema_json, change.before, change.after)
             else if (self.retirement_root != null)
                 try self.selection.dependent_object_retirement.schemaAlloc(a, pair.before.table_id, pair.before.schema_json)
+            else if (self.selection == .partition_membership)
+                try self.selection.partition_membership.schemaAlloc(a, pair.before.table_id, pair.before.schema_json)
             else
                 try self.sequence_change.?.selector().schemaAlloc(a, pair.before.table_id, pair.before.schema_json);
             a.free(expected.schema_json);
             expected.schema_json = schema;
+            if (self.selection == .partition_membership) {
+                var prepared = try local.schema_mod.PreparedSchemaDefinition.init(a, schema);
+                defer prepared.deinit(a);
+                expected.schema_reader_requirements = prepared.readerRequirements();
+            }
             if (!tables.tableDefinitionsEqual(expected, pair.after)) return error.InvalidGenerationPublication;
             if (pair.before.schema_reader_requirements) |required| floor = try floor.include(required);
             if (pair.after.schema_reader_requirements) |required| floor = try floor.include(required);
@@ -427,6 +492,10 @@ pub const Plan = struct {
             const after_version = try api.schemaVersion(pair.after.schema_json);
             const before_public = contract.hash(pair.before.schema_json);
             const after_public = contract.hash(pair.after.schema_json);
+            if (self.partition_guards) |guards| {
+                const guard = try guards.forTable(pair.before.table_id);
+                if (guard.owner.schema_version != before_version or !std.mem.eql(u8, &guard.owner.schema_digest, &before_public)) return error.InvalidGenerationPublication;
+            }
             var count: usize = 0;
             while (ordinal < self.owners.len and self.owners[ordinal].range.table_id == pair.before.table_id) : (ordinal += 1) {
                 const intent = self.owners[ordinal];
@@ -474,7 +543,7 @@ pub const Plan = struct {
         if (initial.metadata_group_id != head.metadata_group_id or
             !std.mem.eql(u8, &initial.metadata_incarnation, &head.metadata_incarnation) or
             !std.mem.eql(u8, &initial.id, &head.id) or !std.mem.eql(u8, &initial.plan_digest, &head.plan_digest) or
-            initial.table_id != head.table_id or initial.owner_count != head.owner_count or initial.input_count != head.input_count or
+            !std.meta.eql(initial.initial_partition, head.initial_partition) or initial.partition_parent != head.partition_parent or initial.table_id != head.table_id or initial.owner_count != head.owner_count or initial.input_count != head.input_count or
             !std.meta.eql(initial.retirement_root, head.retirement_root) or !std.meta.eql(initial.sequence_retirement, head.sequence_retirement) or initial.type_id != head.type_id or initial.type_generation != head.type_generation or !std.mem.eql(u8, &initial.type_admission_digest, &head.type_admission_digest) or initial.participant_count != head.participant_count or !std.mem.eql(u8, &initial.participants_digest, &head.participants_digest) or
             !std.meta.eql(initial.reader_requirements, head.reader_requirements) or owners.len != self.owners.len)
             return error.InvalidGenerationPublication;
@@ -1087,5 +1156,110 @@ test "schema validation publication retirement cohort binds immutable root effec
     try std.testing.expect(!std.mem.eql(u8, &try forged.digest(), &prepared.head.plan_digest));
     forged = value;
     forged.id = forged.retirement_root.?.root.id;
+    try std.testing.expectError(error.InvalidGenerationPublication, Prepared.init(a, forged));
+}
+
+test "schema validation publication partition plan binds both exact successors" {
+    const a = std.testing.allocator;
+    const partition = local.system_catalog_table_partitions;
+    const images = local.schema_table_partitions;
+    var fixture = try Fixture.init(a);
+    defer fixture.deinit();
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const scratch = region.allocator();
+
+    // The independently created child can be older than the parent.
+    var child = Fixture.before;
+    child.schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"created_at":{"type":"datetime"}},"additionalProperties":false}}}}
+    ;
+    var parent = child;
+    parent.table_id = child.table_id + 1;
+    parent.name = "partition_parent";
+    const definition = try images.definitionDigest(scratch, child.schema_json);
+    const descriptor: partition.Descriptor = .{
+        .parent = .{ .table_id = parent.table_id, .schema_version = 1, .definition = definition },
+        .revision = 1,
+        .key_attribute = 1,
+        .key_name = "created_at",
+    };
+    const child_relation: partition.Relation = .{ .table_id = child.table_id, .schema_version = 1, .definition = definition };
+    var successor = child_relation;
+    successor.schema_version += 1;
+    const bounds: partition.Range = .{ .lower = .minvalue, .upper = .maxvalue };
+    var directory = try descriptor.attach(scratch, .{ .relation = successor, .bounds = bounds });
+    directory.parent.schema_version += 1;
+    const transition: images.Transition = .{
+        .operation = .attach,
+        .before = descriptor,
+        .after = directory,
+        .child_before = child_relation,
+        .child_after = successor,
+        .bounds = bounds,
+    };
+
+    var root = try std.json.parseFromSliceLeaky(std.json.Value, scratch, parent.schema_json, .{ .parse_numbers = false });
+    try images.canonicalize(scratch, &root, .{ .parent = descriptor });
+    parent.schema_json = try std.json.Stringify.valueAlloc(scratch, root, .{});
+    parent.schema_reader_requirements = try local.schema_mod.readerRequirementsForDefinitions(scratch, parent.schema_json, "");
+    var child_after = child;
+    child_after.schema_json = try transition.schemaAlloc(scratch, child.table_id, child.schema_json);
+    var parent_after = parent;
+    parent_after.schema_json = try transition.schemaAlloc(scratch, parent.table_id, parent.schema_json);
+    child_after.schema_reader_requirements = try local.schema_mod.readerRequirementsForDefinitions(scratch, child_after.schema_json, "");
+    parent_after.schema_reader_requirements = try local.schema_mod.readerRequirementsForDefinitions(scratch, parent_after.schema_json, "");
+
+    var intents = fixture.intents;
+    const before = [_]records.TableRecord{ child, parent };
+    const after = [_]records.TableRecord{ child_after, parent_after };
+    for (&intents, before, after) |*owner, old, next| {
+        owner.range.table_id = old.table_id;
+        owner.range.start_key = "";
+        owner.range.end_key = null;
+        owner.binding.fence.namespace.table_id = old.table_id;
+        owner.binding.purpose = .partition_membership;
+        owner.binding.before_public = contract.hash(old.schema_json);
+        owner.binding.after_public = contract.hash(next.schema_json);
+        owner.binding.projection_identity = try transition.fingerprint();
+    }
+    const extra = [_]TablePair{.{ .before = parent, .after = parent_after }};
+    var plan = fixture.plan();
+    plan.version = 6;
+    plan.before = child;
+    plan.after = child_after;
+    plan.additional_tables = &extra;
+    plan.owners = &intents;
+    plan.selection = .{ .partition_membership = transition };
+    var incarnation: [16]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&incarnation, &plan.metadata_incarnation);
+    plan.partition_guards = .{
+        .parent = .{ .target = .{ .name = parent.name }, .logical_table = parent.name, .owner = .{ .table_id = parent.table_id, .schema_version = 1, .schema_digest = contract.hash(parent.schema_json), .kind = .table }, .incarnation = incarnation },
+        .child = .{ .target = .{ .name = child.name }, .logical_table = child.name, .owner = .{ .table_id = child.table_id, .schema_version = 1, .schema_digest = contract.hash(child.schema_json), .kind = .table }, .incarnation = incarnation },
+    };
+
+    var prepared = try Prepared.init(a, plan);
+    defer prepared.deinit();
+    try std.testing.expectEqual(parent.table_id, prepared.head.partition_parent);
+    try std.testing.expectEqual(@as(u16, 2), prepared.head.participant_count);
+    try std.testing.expectEqual(local.common_schema_readers.sql_partition_semantic_version, prepared.head.reader_requirements.?.semantic_version);
+    var decoded = try parse(a, prepared.encoded);
+    defer decoded.deinit();
+    try decoded.value.requireProgress(a, prepared.head, prepared.owners);
+
+    var forged_head = prepared.head;
+    forged_head.partition_parent = child.table_id;
+    try std.testing.expectError(error.InvalidGenerationPublication, decoded.value.requireProgress(a, forged_head, prepared.owners));
+    var forged = plan;
+    forged.partition_guards = null;
+    try std.testing.expectError(error.InvalidGenerationPublication, Prepared.init(a, forged));
+    forged = plan;
+    forged.partition_guards.?.child.owner.schema_digest[0] ^= 1;
+    try std.testing.expectError(error.InvalidGenerationPublication, Prepared.init(a, forged));
+    forged = plan;
+    forged.additional_tables = &.{};
+    try std.testing.expectError(error.InvalidGenerationPublication, Prepared.init(a, forged));
+    forged = plan;
+    forged.after = child;
     try std.testing.expectError(error.InvalidGenerationPublication, Prepared.init(a, forged));
 }

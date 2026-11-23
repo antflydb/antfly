@@ -22,7 +22,7 @@ const row_codec = @import("algebraic/relational_row_codec.zig");
 pub const key = "\x00\x00__metadata__:table_catalog";
 pub const encoded_len: usize = 72;
 pub const Encoded = struct {
-    bytes: [encoded_len + 1 + persistence_codec.descriptor_bytes + persistence_codec.owner_bytes]u8 = @splat(0),
+    bytes: [encoded_len + 4 + persistence_codec.descriptor_bytes + persistence_codec.owner_bytes]u8 = @splat(0),
     len: usize = encoded_len,
     pub fn slice(self: *const Encoded) []const u8 {
         return self.bytes[0..self.len];
@@ -30,7 +30,12 @@ pub const Encoded = struct {
 };
 const magic = "ATBL";
 const format_version: u32 = 3;
-pub const maximum_transaction_effect_format: u8 = 1;
+pub const maximum_transaction_effect_format: u8 = 3;
+pub const maximum_row_heap_format: u8 = 1;
+pub const replication_source_apply_format: u8 = 3;
+pub const maximum_logical_capture_format: u8 = replication_source_apply_format;
+const logical_capture_catalog_version: u32 = 6;
+const row_heap_catalog_version: u32 = 8;
 pub const default_transaction_admission_bytes: u64 = 128 * 1024 * 1024;
 
 pub const IndexState = enum(u8) {
@@ -77,11 +82,13 @@ pub const Catalog = struct {
     /// Sticky graph-intent decoder fence. First admission updates this catalog
     /// in the same primary-store batch as the prepare vote and row intents.
     transaction_effect_format: u8 = 0,
+    row_heap_format: u8 = 0,
+    logical_capture_format: u8 = 0,
 
     /// The legacy image remains byte-identical for permanent tables. Callers
     /// persisting a potentially process-owned table must use encodeDurable.
     pub fn encode(self: Catalog) [encoded_len]u8 {
-        std.debug.assert(self.sql_persistence == null and self.transaction_effect_format == 0);
+        std.debug.assert(self.sql_persistence == null and self.transaction_effect_format == 0 and self.row_heap_format == 0 and self.logical_capture_format == 0);
         var out: [encoded_len]u8 = @splat(0);
         @memcpy(out[0..4], magic);
         std.mem.writeInt(u32, out[4..8], format_version, .little);
@@ -105,17 +112,31 @@ pub const Catalog = struct {
         var base = self;
         base.sql_persistence = null;
         base.transaction_effect_format = 0;
+        base.row_heap_format = 0;
+        base.logical_capture_format = 0;
         var out: Encoded = .{};
         @memcpy(out.bytes[0..encoded_len], &base.encode());
         if (self.transaction_effect_format > maximum_transaction_effect_format) return error.UnsupportedTableCatalogVersion;
-        if (self.transaction_effect_format != 0) {
+        if (self.row_heap_format > maximum_row_heap_format or self.logical_capture_format > maximum_logical_capture_format) return error.UnsupportedTableCatalogVersion;
+        if (self.row_heap_format != 0) {
+            std.mem.writeInt(u32, out.bytes[4..8], row_heap_catalog_version, .little);
+            out.bytes[encoded_len] = self.transaction_effect_format;
+            out.bytes[encoded_len + 1] = self.logical_capture_format;
+            out.bytes[encoded_len + 3] = self.row_heap_format;
+            out.len += 4;
+        } else if (self.logical_capture_format != 0) {
+            std.mem.writeInt(u32, out.bytes[4..8], logical_capture_catalog_version, .little);
+            out.bytes[encoded_len] = self.transaction_effect_format;
+            out.bytes[encoded_len + 1] = self.logical_capture_format;
+            out.len += 2;
+        } else if (self.transaction_effect_format != 0) {
             std.mem.writeInt(u32, out.bytes[4..8], 5, .little);
             out.bytes[encoded_len] = self.transaction_effect_format;
             out.len += 1;
         }
         if (self.sql_persistence) |descriptor| {
             const encoded = try persistence_codec.encodeFixed(descriptor);
-            if (self.transaction_effect_format == 0) std.mem.writeInt(u32, out.bytes[4..8], 4, .little);
+            if (self.transaction_effect_format == 0 and self.row_heap_format == 0 and self.logical_capture_format == 0) std.mem.writeInt(u32, out.bytes[4..8], 4, .little);
             @memcpy(out.bytes[out.len..][0..encoded.len], encoded.slice());
             out.len += encoded.len;
         }
@@ -123,10 +144,14 @@ pub const Catalog = struct {
     }
 
     pub fn decode(data: []const u8) !Catalog {
+        return decodeWithLogicalCaptureMaximum(data, maximum_logical_capture_format);
+    }
+
+    pub fn decodeWithLogicalCaptureMaximum(data: []const u8, supported: u8) !Catalog {
         if (data.len < 48 or !std.mem.eql(u8, data[0..4], magic)) return error.InvalidTableCatalog;
         const version = std.mem.readInt(u32, data[4..8], .little);
-        if (version != format_version and version != 2 and version != 4 and version != 5) return error.UnsupportedTableCatalogVersion;
-        if ((version == 2 and data.len != 48) or (version == format_version and data.len != encoded_len) or (version == 4 and data.len <= encoded_len) or (version == 5 and data.len < encoded_len + 1)) return error.InvalidTableCatalog;
+        if (version != format_version and version != 2 and version != 4 and version != 5 and version != logical_capture_catalog_version and version != row_heap_catalog_version) return error.UnsupportedTableCatalogVersion;
+        if ((version == 2 and data.len != 48) or (version == format_version and data.len != encoded_len) or (version == 4 and data.len <= encoded_len) or (version == 5 and data.len < encoded_len + 1) or (version == logical_capture_catalog_version and data.len < encoded_len + 2) or (version == row_heap_catalog_version and data.len < encoded_len + 4)) return error.InvalidTableCatalog;
         const row_count = std.mem.readInt(u64, data[24..32], .little);
         if (data[8] > 1 or data[9] > @backingInt(schema_mod.StorageMode.relational) or
             data[10] > @backingInt(IndexState.failed) or data[11] > 1 or row_count > 1)
@@ -146,12 +171,28 @@ pub const Catalog = struct {
             .row_policy_generation = if (version == 2) 0 else std.mem.readInt(u64, data[56..64], .little),
             .row_policy_catalog_epoch = if (version == 2) 0 else std.mem.readInt(u64, data[64..72], .little),
         };
-        if (version == 5) {
+        if (version == 5 or version == logical_capture_catalog_version or version == row_heap_catalog_version) {
             catalog.transaction_effect_format = data[encoded_len];
-            if (catalog.transaction_effect_format == 0 or catalog.transaction_effect_format > maximum_transaction_effect_format) return error.UnsupportedTableCatalogVersion;
+            if ((version == 5 and catalog.transaction_effect_format == 0) or catalog.transaction_effect_format > maximum_transaction_effect_format) return error.UnsupportedTableCatalogVersion;
         }
-        if (version == 4 or (version == 5 and data.len > encoded_len + 1)) {
-            var pos: usize = encoded_len + @as(usize, @intFromBool(version == 5));
+        if (version == logical_capture_catalog_version or version == row_heap_catalog_version) {
+            catalog.logical_capture_format = data[encoded_len + 1];
+            if ((version == logical_capture_catalog_version and catalog.logical_capture_format == 0) or
+                catalog.logical_capture_format > @min(supported, maximum_logical_capture_format)) return error.UnsupportedTableCatalogVersion;
+        }
+        if (version == row_heap_catalog_version) {
+            if (data[encoded_len + 2] != 0) return error.UnsupportedTableCatalogVersion;
+            catalog.row_heap_format = data[encoded_len + 3];
+            if (catalog.row_heap_format == 0 or catalog.row_heap_format > maximum_row_heap_format) return error.UnsupportedTableCatalogVersion;
+        }
+        const extension: usize = switch (version) {
+            5 => 1,
+            logical_capture_catalog_version => 2,
+            row_heap_catalog_version => 4,
+            else => 0,
+        };
+        if (version == 4 or (extension != 0 and data.len > encoded_len + extension)) {
+            var pos: usize = encoded_len + extension;
             catalog.sql_persistence = persistence_codec.read(data, &pos) catch return error.InvalidTableCatalog;
             if (pos != data.len) return error.InvalidTableCatalog;
         }
@@ -199,6 +240,18 @@ pub fn stageReaderFormat(txn: anytype, required: u8) !Catalog {
     var current = try Catalog.decode(try txn.get(key));
     if (current.transaction_effect_format >= required) return current;
     current.transaction_effect_format = required;
+    const encoded = try current.encodeDurable();
+    try txn.put(key, encoded.slice());
+    return current;
+}
+
+/// The caller stages this with the capture guard. Compatibility can never
+/// be lowered by canceling a publication or clearing owner state.
+pub fn stageLogicalCaptureFormat(txn: anytype, required: u8) !Catalog {
+    if (required == 0 or required > maximum_logical_capture_format) return error.UnsupportedLogicalCaptureFormat;
+    var current = try Catalog.decode(try txn.get(key));
+    if (current.logical_capture_format >= required) return current;
+    current.logical_capture_format = required;
     const encoded = try current.encodeDurable();
     try txn.put(key, encoded.slice());
     return current;
@@ -505,4 +558,16 @@ test "graph intent reader fence is sticky and ordinary physical catalog bytes re
     var truncated = encoded;
     truncated.len = encoded_len;
     try std.testing.expectError(error.InvalidTableCatalog, Catalog.decode(truncated.slice()));
+}
+
+test "logical publication catalog floor preserves transaction and row heap profiles" {
+    for ([_]u8{ 0, 1 }) |heap| {
+        for ([_]u8{ 1, 2 }) |format| {
+            const catalog: Catalog = .{ .transaction_effect_format = 3, .row_heap_format = heap, .logical_capture_format = format };
+            const encoded = try catalog.encodeDurable();
+            try std.testing.expectEqualDeep(catalog, try Catalog.decode(encoded.slice()));
+            try std.testing.expectError(error.UnsupportedTableCatalogVersion, Catalog.decodeWithLogicalCaptureMaximum(encoded.slice(), format - 1));
+            try std.testing.expectError(error.InvalidTableCatalog, Catalog.decode(encoded.slice()[0 .. encoded.len - 1]));
+        }
+    }
 }

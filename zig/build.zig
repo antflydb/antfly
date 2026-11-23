@@ -1080,7 +1080,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_standalone_initial_fk_tests = antfly_tests_build.addFilteredTestRunArtifact(b, standalone_initial_fk_tests);
     b.step("antfly-standalone-initial-fk-test", "Run linked native standalone initial-FK owner publication tests").dependOn(&run_standalone_initial_fk_tests.step);
     const sql_connection_admission_tests = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/api/sql_connection_admission.zig"),
+        .root_source_file = b.path("pkg/antfly/src/api/sql/session/connection_admission.zig"),
         .target = target,
         .optimize = optimize,
     }) });

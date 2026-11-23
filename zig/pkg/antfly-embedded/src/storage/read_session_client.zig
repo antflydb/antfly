@@ -114,6 +114,7 @@ pub const Relational = struct {
 };
 pub const Document = struct {
     text_filter_digest: ?[32]u8,
+    required_indexes_digest: ?[32]u8,
     handle: contract.Handle,
     alloc: A,
     pub fn fromHandle(alloc: A, handle: contract.Handle) !*Document {
@@ -122,8 +123,11 @@ pub const Document = struct {
         const self = try alloc.create(Document);
         errdefer alloc.destroy(self);
         const metadata = try contract.call("document_metadata", .document, handle, .{handle});
-        self.* = .{ .alloc = alloc, .handle = handle, .text_filter_digest = metadata.text_filter_digest };
+        self.* = .{ .alloc = alloc, .handle = handle, .text_filter_digest = metadata.text_filter_digest, .required_indexes_digest = metadata.required_indexes_digest };
         return self;
+    }
+    pub fn requiredIndexesDigest(self: *const Document) ?[32]u8 {
+        return self.required_indexes_digest;
     }
     pub fn textFilterDigest(self: *const Document) ?[32]u8 {
         return self.text_filter_digest;

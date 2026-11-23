@@ -148,7 +148,13 @@ pub const SqlSnapshotCohort = struct {
 /// Each call observes a fresh catalog cut, including projection replacement.
 pub const GraphAuthority = struct { name: []const u8, graph_id: u64 };
 pub const GraphAuthorityResult = struct { present: bool };
+pub const SqlPopulationLineageRequest = struct {
+    table_id: u64,
+    owner_group_id: u64,
+};
+
 pub const Call = union(enum) {
+    sql_population_lineage: SqlPopulationLineageRequest,
     sql_snapshot_cohort: SqlSnapshotCohortRequest,
     resolver_authority_mutate: @import("../metadata/resolver_authority.zig").Write,
     lake_index_lifecycle_read: u64,
@@ -172,6 +178,16 @@ pub const Call = union(enum) {
     policy_publication_mutate: @import("antfly_local_sources").system_catalog_policies.PublicationCommand,
     scope_retirement_prepare: domain.scope_retirement.Prepare,
     scope_retirement_work: u64,
+    restore_coordinator_read: [16]u8,
+    restore_coordinator_progress: [16]u8,
+    restore_coordinator_receipt: struct { id: [16]u8, state: @import("../metadata/restore_staging.zig").State, owner_group: u64 },
+    restore_coordinator_apply: []const u8,
+    restore_coordinator_ack: []const u8,
+    backup_cohort_read: u64,
+    backup_cohort_first: struct { after: ?[]const u8 = null },
+    backup_cohort_write: @import("../metadata/storage/raft_apply_store.zig").BackupCohortWrite,
+    /// Private linearizable report publication cut.
+    store_report_basis: u64,
     sql_relation_boot_read: @import("../metadata/sql/relation_lifecycle/boots.zig").Query,
     sql_relation_lifetime_page: @import("../metadata/sql/relation_lifecycle/lifetimes.zig").PageRequest,
     sql_relation_boot_submit: []const u8,
@@ -241,11 +257,17 @@ pub const Call = union(enum) {
     sql_lock_mutate: @import("lock_authority.zig").Request,
     sql_lock_outcome: @import("lock_authority.zig").Request,
     sql_prepared_mutate: @import("prepared_transactions.zig").Mutation,
+    sql_restore_progress: @import("../metadata/restore_staging.zig").Command,
+    sql_restore_reserve: struct {
+        plan: @import("../metadata/restore_staging.zig").Plan,
+        participant: @import("prepared_transactions.zig").CatalogParticipant,
+    },
     sql_prepared_outcome: @import("prepared_transactions.zig").Mutation,
     sql_authorization_read: @import("authorization.zig").Read,
     sql_authorization_mutate: @import("authorization.zig").Mutation,
     sql_authorization_outcome: @import("authorization.zig").Observation,
     sql_index_annotations: domain.object_annotations.IndexDescriptionsRead,
+    sql_collation_snapshot: @import("antfly_local_sources").sql_catalog.collations.SnapshotRequest,
     sql_type_snapshot: @import("named_types.zig").SnapshotRequest,
     sql_type_bindings: @import("named_types.zig").BindingsRequest,
     sql_type_mutate: @import("named_types.zig").Mutation,
@@ -254,6 +276,10 @@ pub const Call = union(enum) {
     sql_cast_mutate: @import("casts.zig").Mutation,
     sql_cast_outcome: @import("casts.zig").OutcomeRequest,
     sql_routine_snapshot: @import("routines.zig").SnapshotRequest,
+    sql_publication_capture_work: @import("replication/installation.zig").WorkRequest,
+    sql_publication_advance: @import("replication/installation.zig").Command,
+    sql_publication_slot_control: @import("replication/decision_journal.zig").ControlRequest,
+    sql_publication_collection_ack: @import("../api/logical_replication_publisher_attestation.zig").CollectionReceipt,
     sql_catalog_prepare: @import("catalog_mutations.zig").Preparation,
     sql_catalog_mutate: @import("../metadata/storage/raft_apply_contract.zig").SystemCatalogCommand,
     sql_catalog_outcome: @import("catalog_mutations.zig").Observation,
@@ -381,14 +407,17 @@ pub const Call = union(enum) {
 
     pub fn requiresAdministrativeGrant(self: @This()) bool {
         return switch (self) {
-            .sql_graph_preparation_read, .sql_graph_preparation_admit, .sql_graph_preparation_outcome => true,
-            .sql_relation_boot_read, .sql_relation_lifetime_page, .sql_relation_boot_submit => true,
+            .restore_coordinator_read, .restore_coordinator_progress, .restore_coordinator_receipt, .restore_coordinator_apply, .restore_coordinator_ack => true,
+            .backup_cohort_read, .backup_cohort_first, .backup_cohort_write => true,
+            .sql_publication_advance, .sql_publication_collection_ack, .sql_publication_slot_control, .sql_publication_capture_work, .sql_graph_preparation_read, .sql_graph_preparation_admit, .sql_graph_preparation_outcome => true,
+            .store_report_basis, .sql_relation_boot_read, .sql_relation_lifetime_page, .sql_relation_boot_submit => true,
             .resolve_many => |request| request.sql_principal != null,
+            .sql_population_lineage => true,
             .sql_snapshot_cohort => |request| request.owner != null,
             .mutate => |request| request.mutation.action == .comment or request.mutation.sql_owner != null or request.mutation.sql_temporary_owner != null,
             .query_population_job, .query_population_prepare, .schema_validation_prepare, .schema_validation_status, .scope_retirement_prepare, .scope_retirement_submit, .scope_retirement_observation, .scope_retirement_work, .scope_retirement_manifest, .table_retirement_prepare, .table_retirement_submit, .table_retirement_receipt, .table_retirement_queue, .table_retirement_effects, .table_retirement_owner_work => true,
             .schema_validation_submit => |bytes| @import("../metadata/schema_validation/ledger.zig").requiresAdmissionAuthority(bytes),
-            .sql_extension_snapshot, .sql_extension_mutate, .sql_extension_outcome, .sql_index_annotations, .sql_lock_read, .sql_lock_mutate, .sql_lock_outcome, .sql_prepared_read, .sql_prepared_mutate, .sql_prepared_outcome, .sql_authorization_read, .sql_authorization_mutate, .sql_authorization_outcome, .sql_type_snapshot, .sql_type_bindings, .sql_type_mutate, .sql_type_outcome, .sql_cast_snapshot, .sql_cast_mutate, .sql_cast_outcome, .sql_catalog_prepare, .sql_catalog_mutate, .sql_catalog_outcome, .sql_native_index_prepare, .sql_native_index_mutate, .sql_native_index_outcome, .sql_trigger_snapshot, .sql_routine_snapshot, .sql_routine_mutate, .sql_routine_outcome, .sql_column_sequence_handoffs, .sql_sequence_prepare, .sql_sequence_counter_mutate, .sql_sequence_counter_outcome, .sql_view_mutate, .sql_sequence_snapshot, .sql_sequence_admission_head, .sql_sequence_mutate, .sql_sequence_outcome, .relation_replace, .relation_schema_mutate, .relation_description_mutate, .constraint_name_prepare, .constraint_name_check, .relational_index_status, .relational_index_prepare, .relational_index_begin, .native_memory_create, .policy_definition_read => true,
+            .sql_extension_snapshot, .sql_extension_mutate, .sql_extension_outcome, .sql_index_annotations, .sql_lock_read, .sql_lock_mutate, .sql_lock_outcome, .sql_prepared_read, .sql_prepared_mutate, .sql_prepared_outcome, .sql_restore_progress, .sql_restore_reserve, .sql_authorization_read, .sql_authorization_mutate, .sql_authorization_outcome, .sql_collation_snapshot, .sql_type_snapshot, .sql_type_bindings, .sql_type_mutate, .sql_type_outcome, .sql_cast_snapshot, .sql_cast_mutate, .sql_cast_outcome, .sql_catalog_prepare, .sql_catalog_mutate, .sql_catalog_outcome, .sql_native_index_prepare, .sql_native_index_mutate, .sql_native_index_outcome, .sql_trigger_snapshot, .sql_routine_snapshot, .sql_routine_mutate, .sql_routine_outcome, .sql_column_sequence_handoffs, .sql_sequence_prepare, .sql_sequence_counter_mutate, .sql_sequence_counter_outcome, .sql_view_mutate, .sql_sequence_snapshot, .sql_sequence_admission_head, .sql_sequence_mutate, .sql_sequence_outcome, .relation_replace, .relation_schema_mutate, .relation_description_mutate, .constraint_name_prepare, .constraint_name_check, .relational_index_status, .relational_index_prepare, .relational_index_begin, .native_memory_create, .policy_definition_read => true,
             .sql_completion_reference_mutate, .lake_index_lifecycle_mutate, .setting_mutate, .policy_definition_mutate, .policy_publication_mutate, .policy_publication_begin, .fk_generation_publication_begin, .fk_generation_publication_mutate, .fk_initial_create_begin, .fk_initial_create_mutate, .store_root_enroll, .store_root_enrollment_status => true,
             else => false,
         };
@@ -400,9 +429,10 @@ pub const Call = union(enum) {
     /// internal service, but ordinary table reads need no setting authority.
     pub fn requiresSettingAuthorityReadGrant(self: @This()) bool {
         return switch (self) {
-            .sql_graph_preparation_read, .sql_graph_preparation_outcome => true,
+            .sql_publication_capture_work, .sql_graph_preparation_read, .sql_graph_preparation_outcome => true,
+            .sql_population_lineage => true,
             .sql_snapshot_cohort => |request| request.owner != null,
-            .sql_relation_boot_read, .sql_relation_lifetime_page => true,
+            .store_report_basis, .sql_relation_boot_read, .sql_relation_lifetime_page => true,
             .lake_index_lifecycle_read,
             .lake_source_owner_read,
             .lake_index_lifecycle_work,
@@ -460,7 +490,7 @@ pub const Call = union(enum) {
     /// Calls whose native owners report the first possible durable effect.
     pub fn tracksSQLSubmission(self: @This()) bool {
         return switch (self) {
-            .sql_graph_preparation_admit => true,
+            .restore_coordinator_apply, .restore_coordinator_ack, .backup_cohort_write, .sql_graph_preparation_admit => true,
             .query_population_job => true,
             .policy_definition_mutate, .policy_publication_begin, .policy_publication_mutate => true,
             .mutate, .sql_catalog_mutate, .relation_replace, .relation_schema_mutate, .relation_description_mutate, .fk_initial_create_begin, .fk_generation_publication_begin, .schema_validation_submit, .table_retirement_submit, .scope_retirement_submit => true,
@@ -469,16 +499,19 @@ pub const Call = union(enum) {
     }
 
     pub fn isMutation(self: @This()) bool {
-        if (self == .sql_graph_preparation_read or self == .sql_graph_preparation_outcome or self == .sql_extension_snapshot or self == .sql_extension_outcome) return false;
-        if (self == .sql_graph_preparation_admit) return true;
+        if (self == .backup_cohort_read or self == .backup_cohort_first) return false;
+        if (self == .backup_cohort_write or self == .restore_coordinator_apply or self == .restore_coordinator_ack) return true;
+        if (self == .restore_coordinator_read or self == .restore_coordinator_progress or self == .restore_coordinator_receipt) return false;
+        if (self == .sql_publication_capture_work or self == .sql_graph_preparation_read or self == .sql_graph_preparation_outcome or self == .sql_extension_snapshot or self == .sql_extension_outcome) return false;
+        if (self == .sql_publication_advance or self == .sql_publication_collection_ack or self == .sql_publication_slot_control or self == .sql_graph_preparation_admit) return true;
         // The owner narrows visibility and requires a body-bound read grant;
         // capturing a cohort never mutates the catalog or its topology.
-        if (self == .sql_snapshot_cohort) return false;
-        if (self == .sql_relation_boot_read or self == .sql_relation_lifetime_page) return false;
+        if (self == .sql_snapshot_cohort or self == .sql_population_lineage) return false;
+        if (self == .store_report_basis or self == .sql_relation_boot_read or self == .sql_relation_lifetime_page) return false;
         if (self == .query_population_job) return self.query_population_job.isMutation();
         if (self == .query_population_prepare) return false;
         return self == .schema_validation_submit or self == .mutate or self == .fk_initial_retirement_ack or self == .relational_index_owner_ack or self == .relational_index_publish_decide or self == .relational_index_cancel or self == .relational_index_source_accept or self == .relational_index_source_complete or
-            (self != .sql_catalog_prepare and self != .sql_catalog_outcome and self != .sql_native_index_prepare and self != .sql_native_index_outcome and self != .resolve_many and self != .sql_index_annotations and self != .sql_lock_read and self != .sql_lock_outcome and self != .sql_prepared_read and self != .sql_prepared_outcome and self != .sql_authorization_read and self != .sql_authorization_outcome and self != .sql_type_snapshot and self != .sql_type_bindings and self != .sql_type_outcome and self != .sql_cast_snapshot and self != .sql_cast_outcome and self != .sql_trigger_snapshot and self != .sql_routine_snapshot and self != .sql_routine_outcome and self != .sql_column_sequence_handoffs and self != .schema_validation_prepare and self != .scope_retirement_prepare and self != .scope_retirement_observation and self != .scope_retirement_work and self != .scope_retirement_manifest and self != .table_retirement_prepare and self != .table_retirement_receipt and self != .table_retirement_queue and self != .table_retirement_effects and self != .table_retirement_owner_work and self != .schema_validation_status and self != .sql_sequence_counter_outcome and self != .sql_sequence_snapshot and self != .sql_sequence_admission_head and self != .sql_sequence_outcome and self != .policy_definition_read and self != .store_root_enrollment_status and self != .constraint_name_prepare and self != .constraint_name_check and self != .relational_index_status and self != .relational_index_prepare and self.requiresAdministrativeGrant());
+            (self != .sql_catalog_prepare and self != .sql_catalog_outcome and self != .sql_native_index_prepare and self != .sql_native_index_outcome and self != .resolve_many and self != .sql_index_annotations and self != .sql_lock_read and self != .sql_lock_outcome and self != .sql_prepared_read and self != .sql_prepared_outcome and self != .sql_authorization_read and self != .sql_authorization_outcome and self != .sql_collation_snapshot and self != .sql_type_snapshot and self != .sql_type_bindings and self != .sql_type_outcome and self != .sql_cast_snapshot and self != .sql_cast_outcome and self != .sql_trigger_snapshot and self != .sql_routine_snapshot and self != .sql_routine_outcome and self != .sql_column_sequence_handoffs and self != .schema_validation_prepare and self != .scope_retirement_prepare and self != .scope_retirement_observation and self != .scope_retirement_work and self != .scope_retirement_manifest and self != .table_retirement_prepare and self != .table_retirement_receipt and self != .table_retirement_queue and self != .table_retirement_effects and self != .table_retirement_owner_work and self != .schema_validation_status and self != .sql_sequence_counter_outcome and self != .sql_sequence_snapshot and self != .sql_sequence_admission_head and self != .sql_sequence_outcome and self != .policy_definition_read and self != .store_root_enrollment_status and self != .constraint_name_prepare and self != .constraint_name_check and self != .relational_index_status and self != .relational_index_prepare and self.requiresAdministrativeGrant());
     }
 
     pub fn isRelationalIndexOwnerCall(self: @This()) bool {
@@ -1005,4 +1038,18 @@ test "SQL extension preparation and exact outcome observation do not bind a late
     try std.testing.expect(outcome.requiresAdministrativeGrant());
     try std.testing.expectEqualDeep(snapshot, try snapshot.withCommandFence(null));
     try std.testing.expectEqualDeep(outcome, try outcome.requireCommandFence(null));
+}
+
+test "store report basis observation requires body bound administrative read authority without SQL submission" {
+    const observation: Call = .{ .store_report_basis = 17 };
+    try std.testing.expect(observation.requiresAdministrativeGrant());
+    try std.testing.expect(observation.requiresSettingAuthorityReadGrant());
+    try std.testing.expect(!observation.isMutation());
+    try std.testing.expect(!observation.tracksSQLSubmission());
+    const a = std.testing.allocator;
+    const bytes = try std.json.Stringify.valueAlloc(a, observation, .{});
+    defer a.free(bytes);
+    var decoded = try std.json.parseFromSlice(Call, a, bytes, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u64, 17), decoded.value.store_report_basis);
 }

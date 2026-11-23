@@ -277,7 +277,12 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         b,
         native_inference_mod,
         "antfly-inference-core",
-        @import("shared_library.zig").inferenceCompileMaxRss(target.result.os.tag, antfly_imports.shared_inference_core, antfly_imports.darwin_release_memory, antfly_imports.darwin_cross_release_memory),
+        // Darwin -> Linux ARM64 Debug peaked at 13.02 GB.
+        if (b.graph.host.result.os.tag == .macos and target.result.os.tag == .linux and
+            target.result.cpu.arch == .aarch64 and optimize == .debug)
+            14 * 1024 * 1024 * 1024
+        else
+            @import("shared_library.zig").inferenceCompileMaxRss(target.result.os.tag, antfly_imports.shared_inference_core, antfly_imports.darwin_release_memory, antfly_imports.darwin_cross_release_memory),
     );
     native_inference.link_function_sections = true;
     native_inference.link_data_sections = true;

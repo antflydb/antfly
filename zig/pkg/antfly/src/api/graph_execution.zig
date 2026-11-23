@@ -64,7 +64,7 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
     const state = try std.json.parseFromSliceLeaky(domain.State, scratch, bytes, .{ .allocate = .alloc_always });
     const record = state.find(.graph, 0, name) orelse return error.CatalogNotFound;
     var graph = try domain.graphForExecution(scratch, record);
-    var sql: @import("sql_execution.zig").Adapter = .{ .server = server, .identity = identity, .context = context };
+    var sql: @import("sql/execution/execution.zig").Adapter = .{ .server = server, .identity = identity, .context = context };
     var tables: std.ArrayList(port.GraphTable) = .empty;
     var targets: std.ArrayList(domain.Target) = .empty;
     const positions = try scratch.alloc(usize, graph.labels.len);

@@ -29,6 +29,9 @@ pub const installed_origin_file_name = InstalledOrigin.file_name;
 pub const max_files = 1_000_000;
 pub const header_size = wire.header_size;
 const max_file_bytes: u64 = 1 << 40;
+const frozen = @import("antfly_local_sources").storage_db_relational_frozen_contract;
+const frozen_header_bytes: usize = 104;
+const frozen_magic = "NRSP3\x00\x00\x00";
 pub const Identity = wire.Identity;
 pub const StreamReceipt = wire.StreamReceipt;
 pub const MaterializationWitness = wire.MaterializationWitness;
@@ -39,25 +42,28 @@ pub const Capture = struct {
     identity: Identity,
     primary: core.PinnedStoreSnapshot,
 
+    archive: ?Frozen = null,
+
+    pub const Frozen = struct {
+        primary: core.PinnedStoreSnapshot,
+        owner: *anyopaque,
+        release: *const fn (*anyopaque) void,
+    };
+
     pub fn encodedSize(self: *const Capture) !u64 {
         try self.identity.validate();
-        const checkpoint = switch (self.primary) {
-            .lsm => |*value| value,
-            .logical => return error.UnsupportedSnapshotFormat,
-        };
-        var size: u64 = header_size + 32 + 48 + checkpoint.manifest_bytes.len;
+        if ((self.archive != null) != (self.identity.frozen_base != null)) return error.InvalidSnapshot;
+        var size: u64 = header_size + 32 + try checkpointSize(self.io, &self.primary);
         if (self.identity.origin != null) size += try self.originSize();
-        for (checkpoint.run_paths) |path| {
-            var file = try std.Io.Dir.cwd().openFile(self.io, path, .{});
-            defer file.close(self.io);
-            const stat = try file.stat(self.io);
-            if (stat.kind != .file or stat.size > max_file_bytes) return error.InvalidSnapshot;
-            size = std.math.add(u64, size, 48 + stat.size) catch return error.SnapshotTooLarge;
-        }
+        if (self.archive) |*archive| size = try std.math.add(u64, size, 8 + try checkpointSize(self.io, &archive.primary));
         return size;
     }
 
     pub fn deinit(self: *Capture) void {
+        if (self.archive) |*archive| {
+            archive.primary.deinit();
+            archive.release(archive.owner);
+        }
         self.primary.deinit();
         self.* = undefined;
     }
@@ -69,7 +75,7 @@ pub const Capture = struct {
     }
 
     fn originSize(self: *const Capture) !usize {
-        var size: usize = Origin.encoded_len + 4;
+        var size: usize = Origin.encoded_len + 4 + @as(usize, if (self.identity.frozen_base != null) frozen_header_bytes else 0);
         if (self.identity.schema_header) |header| {
             var buffer: [schema_contract.max_header + 44]u8 = undefined;
             var fixed = std.heap.FixedBufferAllocator.init(&buffer);
@@ -81,29 +87,16 @@ pub const Capture = struct {
     pub fn writeWithReceipt(self: *Capture, writer: *std.Io.Writer, cancellation: Cancellation) !StreamReceipt {
         try cancellation.check();
         try self.identity.validate();
-        const checkpoint = switch (self.primary) {
-            .lsm => |*value| value,
-            .logical => return error.UnsupportedSnapshotFormat,
-        };
-        if (!checkpoint.storage.supportsHostPathGenerationPublication()) return error.UnsupportedSnapshotFormat;
-        if (checkpoint.run_ids.len >= max_files) return error.SnapshotTooLarge;
-        const Entry = struct { id: u64, path: []const u8 };
-        const entries = try self.alloc.alloc(Entry, checkpoint.run_ids.len);
-        defer self.alloc.free(entries);
-        for (entries, checkpoint.run_ids, checkpoint.run_paths) |*entry, id, path| entry.* = .{ .id = id, .path = path };
-        std.mem.sort(Entry, entries, {}, struct {
-            fn less(_: void, a: Entry, b: Entry) bool {
-                return a.id < b.id;
-            }
-        }.less);
+        if ((self.archive != null) != (self.identity.frozen_base != null)) return error.InvalidSnapshot;
+        const count = try checkpointCount(&self.primary);
         var header: [header_size]u8 = @splat(0);
-        @memcpy(header[0..8], if (self.identity.origin != null) "NRSP2\x00\x00\x00" else "NRSP1\x00\x00\x00");
+        @memcpy(header[0..8], if (self.archive != null) frozen_magic else if (self.identity.origin != null) "NRSP2\x00\x00\x00" else "NRSP1\x00\x00\x00");
         std.mem.writeInt(u64, header[8..16], self.identity.group_id, .little);
         header[16..40].* = self.identity.namespace;
         std.mem.writeInt(u64, header[40..48], self.identity.through_index, .little);
         std.mem.writeInt(u64, header[48..56], self.identity.native_term, .little);
         std.mem.writeInt(u64, header[56..64], self.identity.native_index, .little);
-        std.mem.writeInt(u64, header[64..72], entries.len + 1, .little);
+        std.mem.writeInt(u64, header[64..72], count, .little);
         if (self.identity.origin != null) std.mem.writeInt(u64, header[72..80], try self.originSize(), .little);
         var overall = Sha.init(.{});
         try emit(writer, &overall, &header);
@@ -117,35 +110,20 @@ pub const Capture = struct {
             try emit(writer, &overall, &length);
             try emit(writer, &overall, bytes);
         }
-        try emitBytes(writer, &overall, 0, checkpoint.manifest_bytes);
-        var previous: u64 = 0;
-        var buffer: [64 * 1024]u8 = undefined;
-        for (entries) |entry| {
-            try cancellation.check();
-            if (entry.id <= previous) return error.InvalidSnapshot;
-            previous = entry.id;
-            var file = try std.Io.Dir.cwd().openFile(self.io, entry.path, .{});
-            defer file.close(self.io);
-            const stat = try file.stat(self.io);
-            if (stat.kind != .file or stat.size > max_file_bytes) return error.InvalidSnapshot;
-            var frame: [16]u8 = undefined;
-            std.mem.writeInt(u64, frame[0..8], entry.id, .little);
-            std.mem.writeInt(u64, frame[8..16], stat.size, .little);
-            try emit(writer, &overall, &frame);
-            var hash = Sha.init(.{});
-            var remaining = stat.size;
-            var file_reader = file.reader(self.io, &.{});
-            while (remaining > 0) {
-                try cancellation.check();
-                const part = buffer[0..@min(remaining, buffer.len)];
-                try file_reader.interface.readSliceAll(part);
-                try emit(writer, &overall, part);
-                hash.update(part);
-                remaining -= part.len;
-            }
-            var digest: [32]u8 = undefined;
-            hash.final(&digest);
-            try emit(writer, &overall, &digest);
+        if (self.identity.frozen_base) |base| {
+            var witness: [frozen_header_bytes]u8 = undefined;
+            witness[0..32].* = base.scope;
+            witness[32..64].* = base.population;
+            witness[64..96].* = base.content;
+            std.mem.writeInt(u64, witness[96..104], base.rows, .little);
+            try emit(writer, &overall, &witness);
+        }
+        try writeCheckpoint(self.alloc, self.io, &self.primary, writer, &overall, cancellation);
+        if (self.archive) |*archive| {
+            var archive_count: [8]u8 = undefined;
+            std.mem.writeInt(u64, &archive_count, try checkpointCount(&archive.primary), .little);
+            try emit(writer, &overall, &archive_count);
+            try writeCheckpoint(self.alloc, self.io, &archive.primary, writer, &overall, cancellation);
         }
         try cancellation.check();
         var digest: [32]u8 = undefined;
@@ -154,6 +132,72 @@ pub const Capture = struct {
         return .{ .identity = self.identity, .footer_digest = digest };
     }
 };
+
+fn checkpointCount(primary: *const core.PinnedStoreSnapshot) !u64 {
+    return switch (primary.*) {
+        .lsm => |checkpoint| if (checkpoint.run_ids.len < max_files) checkpoint.run_ids.len + 1 else error.SnapshotTooLarge,
+        .logical => error.UnsupportedSnapshotFormat,
+    };
+}
+
+fn checkpointSize(io: std.Io, primary: *const core.PinnedStoreSnapshot) !u64 {
+    _ = try checkpointCount(primary);
+    const checkpoint = &primary.lsm;
+    var size: u64 = 48 + checkpoint.manifest_bytes.len;
+    for (checkpoint.run_paths) |path| {
+        var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
+        const stat = try file.stat(io);
+        if (stat.kind != .file or stat.size > max_file_bytes) return error.InvalidSnapshot;
+        size = try std.math.add(u64, size, 48 + stat.size);
+    }
+    return size;
+}
+
+fn writeCheckpoint(alloc: std.mem.Allocator, io: std.Io, primary: *const core.PinnedStoreSnapshot, writer: *std.Io.Writer, overall: *Sha, cancellation: Cancellation) !void {
+    _ = try checkpointCount(primary);
+    const checkpoint = &primary.lsm;
+    if (!checkpoint.storage.supportsHostPathGenerationPublication()) return error.UnsupportedSnapshotFormat;
+    const Entry = struct { id: u64, path: []const u8 };
+    const entries = try alloc.alloc(Entry, checkpoint.run_ids.len);
+    defer alloc.free(entries);
+    for (entries, checkpoint.run_ids, checkpoint.run_paths) |*entry, id, path| entry.* = .{ .id = id, .path = path };
+    std.mem.sort(Entry, entries, {}, struct {
+        fn less(_: void, a: Entry, b: Entry) bool {
+            return a.id < b.id;
+        }
+    }.less);
+    try emitBytes(writer, overall, 0, checkpoint.manifest_bytes);
+    var previous: u64 = 0;
+    var buffer: [64 * 1024]u8 = undefined;
+    for (entries) |entry| {
+        try cancellation.check();
+        if (entry.id <= previous) return error.InvalidSnapshot;
+        previous = entry.id;
+        var file = try std.Io.Dir.cwd().openFile(io, entry.path, .{});
+        defer file.close(io);
+        const stat = try file.stat(io);
+        if (stat.kind != .file or stat.size > max_file_bytes) return error.InvalidSnapshot;
+        var frame: [16]u8 = undefined;
+        std.mem.writeInt(u64, frame[0..8], entry.id, .little);
+        std.mem.writeInt(u64, frame[8..16], stat.size, .little);
+        try emit(writer, overall, &frame);
+        var hash = Sha.init(.{});
+        var remaining = stat.size;
+        var file_reader = file.reader(io, &.{});
+        while (remaining > 0) {
+            try cancellation.check();
+            const part = buffer[0..@min(remaining, buffer.len)];
+            try file_reader.interface.readSliceAll(part);
+            try emit(writer, overall, part);
+            hash.update(part);
+            remaining -= part.len;
+        }
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        try emit(writer, overall, &digest);
+    }
+}
 
 test "native Raft snapshot origin emission waits for the durable group decoder barrier" {
     const protocol = @import("../../common/data_raft_protocol.zig");
@@ -217,20 +261,36 @@ pub fn loadInstalledOrigin(alloc: std.mem.Allocator, io: std.Io, root: []const u
 
 pub fn identity(raw: []const u8) !Identity {
     if (raw.len < header_size + 32) return error.InvalidSnapshot;
+    const v3 = std.mem.eql(u8, raw[0..8], frozen_magic);
     const v2 = std.mem.eql(u8, raw[0..8], "NRSP2\x00\x00\x00");
+    const archive_size: usize = if (v3) frozen_header_bytes else 0;
     const origin_size = std.mem.readInt(u64, raw[72..80], .little);
     var schema_header: ?schema_contract.Header = null;
-    const origin: ?Origin = if (v2) blk: {
-        if (origin_size < Origin.encoded_len + 4 or origin_size > Origin.encoded_len + 4 + schema_contract.max_header + 44 or
+    const origin: ?Origin = if (v2 or v3) blk: {
+        if (origin_size < Origin.encoded_len + 4 + archive_size or origin_size > Origin.encoded_len + 4 + schema_contract.max_header + 44 + archive_size or
             raw.len < header_size + origin_size + 32) return error.InvalidSnapshot;
         const length = std.mem.readInt(u32, raw[header_size + Origin.encoded_len ..][0..4], .little);
-        if (origin_size != Origin.encoded_len + 4 + @as(u64, length)) return error.InvalidSnapshot;
+        if (origin_size != Origin.encoded_len + 4 + @as(u64, length) + archive_size) return error.InvalidSnapshot;
         if (length != 0) schema_header = schema_contract.Header.decode(raw[header_size + Origin.encoded_len + 4 ..][0..length]) catch return error.InvalidSnapshot;
         break :blk Origin.decode(raw[header_size..][0..Origin.encoded_len]) catch return error.InvalidSnapshot;
     } else blk: {
         if (!std.mem.eql(u8, raw[0..8], "NRSP1\x00\x00\x00") or origin_size != 0) return error.InvalidSnapshot;
         break :blk null;
     };
+    const archive_binding: ?frozen.Binding = if (v3) blk: {
+        const base = raw[header_size + @as(usize, @intCast(origin_size)) - frozen_header_bytes ..][0..frozen_header_bytes];
+        break :blk .{
+            .scope = base[0..32].*,
+            .population = base[32..64].*,
+            .content = base[64..96].*,
+            .rows = std.mem.readInt(u64, base[96..104], .little),
+            .namespace = .{
+                .table_id = std.mem.readInt(u64, raw[16..24], .big),
+                .shard_id = std.mem.readInt(u64, raw[24..32], .big),
+                .range_id = std.mem.readInt(u64, raw[32..40], .big),
+            },
+        };
+    } else null;
     const value: Identity = .{
         .group_id = std.mem.readInt(u64, raw[8..16], .little),
         .namespace = raw[16..40].*,
@@ -239,6 +299,7 @@ pub fn identity(raw: []const u8) !Identity {
         .native_index = std.mem.readInt(u64, raw[56..64], .little),
         .origin = origin,
         .schema_header = schema_header,
+        .frozen_base = archive_binding,
     };
     try value.validate();
     return value;
@@ -256,6 +317,27 @@ pub fn extract(alloc: std.mem.Allocator, io: std.Io, raw: []const u8, root: []co
     var overall = Sha.init(.{});
     var offset: usize = header_size + @as(usize, @intCast(std.mem.readInt(u64, raw[72..80], .little)));
     overall.update(raw[0..offset]);
+    offset = try extractCheckpoint(alloc, io, raw, offset, count, root, &overall, cancellation);
+    if (actual.frozen_base) |base| {
+        if (raw.len - offset < 8 + 32) return error.InvalidSnapshot;
+        const archive_count = std.mem.readInt(u64, raw[offset..][0..8], .little);
+        overall.update(raw[offset..][0..8]);
+        offset += 8;
+        const archive = try frozen.installedPathAlloc(alloc, root, base.scope);
+        defer alloc.free(archive);
+        offset = try extractCheckpoint(alloc, io, raw, offset, archive_count, archive, &overall, cancellation);
+    }
+    if (raw.len - offset != 32) return error.InvalidSnapshot;
+    var digest: [32]u8 = undefined;
+    overall.final(&digest);
+    if (!std.mem.eql(u8, &digest, raw[offset..])) return error.InvalidSnapshot;
+    try cancellation.check();
+    try fs.syncDirPortable(io, root);
+}
+
+fn extractCheckpoint(alloc: std.mem.Allocator, io: std.Io, raw: []const u8, start: usize, count: u64, root: []const u8, overall: *Sha, cancellation: Cancellation) !usize {
+    if (count == 0 or count > max_files) return error.InvalidSnapshot;
+    var offset = start;
     var previous: u64 = 0;
     const runs = try std.fmt.allocPrint(alloc, "{s}/runs", .{root});
     defer alloc.free(runs);
@@ -293,13 +375,9 @@ pub fn extract(alloc: std.mem.Allocator, io: std.Io, raw: []const u8, root: []co
         try writer.end();
         try file.sync(io);
     }
-    if (raw.len - offset != 32) return error.InvalidSnapshot;
-    var digest: [32]u8 = undefined;
-    overall.final(&digest);
-    if (!std.mem.eql(u8, &digest, raw[offset..])) return error.InvalidSnapshot;
-    try cancellation.check();
     try fs.syncDirPortable(io, runs);
     try fs.syncDirPortable(io, root);
+    return offset;
 }
 
 test "relational index system native Raft snapshot preserves exact typed primary and later writes are excluded" {
@@ -446,4 +524,116 @@ test "relational index system native Raft snapshot preserves exact typed primary
     try extract(alloc, std.testing.io, legacy.written(), legacy_path, capture.identity, .none);
     try persistInstalledOrigin(alloc, std.testing.io, legacy_path, capture.identity, @splat(5), 99);
     try std.testing.expect(try loadInstalledOrigin(alloc, std.testing.io, legacy_path, 22, capture.identity.namespace, 99) == null);
+}
+
+test "relational index system native Raft snapshot transfers the frozen archive under the staged primary" {
+    const local = @import("antfly_local_sources");
+    const DB = local.storage_db_mod.DB;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var region: std.heap.ArenaAllocator = .init(a);
+    defer region.deinit();
+    const scratch = region.allocator();
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const root = try temp.dir.realPathFileAlloc(io, ".", scratch);
+    const primary_path = try std.fs.path.join(scratch, &.{ root, "source" });
+    const target_path = try std.fs.path.join(scratch, &.{ root, "staged" });
+    const ns: local.storage_db_doc_identity.Namespace = .{ .table_id = 21, .shard_id = 22, .range_id = 23 };
+    const opts: local.storage_db_mod.OpenOptions = .{
+        .identity_namespace = ns,
+        .primary_backend = .{ .lsm = .{} },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+    };
+    const population = local.storage_db_relational_population_contract;
+    const stage = local.storage_db_restore_staging_contract;
+    const adapter = @import("../../storage/server_db_adapter.zig");
+    var input: population.Binding = .{
+        .transaction_rows = .{ .image = .frozen, .transaction = @splat(1), .generation_nonce = @splat(2), .source_rows = 0, .rows = 0, .content = population.contentStart() },
+        .capture_id = @splat(3),
+        .definition = @splat(4),
+        .source_definition = @splat(4),
+        .target_schema = @splat(5),
+        .principal_instance = @splat(6),
+        .catalog_revision = 1,
+        .write_version = ns.table_id,
+        .partition = ns.shard_id,
+    };
+    var scope: stage.Scope = .{
+        .plan_id = @splat(7),
+        .plan_digest = @splat(8),
+        .source_artifact_digest = try input.digest(),
+        .source_namespace = .{ .table_id = 0 },
+        .target_namespace = ns,
+        .target_schema_digest = input.target_schema,
+        .population = input,
+        .catalog_intent_digest = @splat(17),
+    };
+    const initial = try population.Cursor.init(input);
+    const historical_cursor = try initial.seal(initial.completion());
+    const historical: stage.Progress = .{
+        .scope = scope,
+        .phase = .validated,
+        .source_generation_proofs_complete = true,
+        .population = historical_cursor,
+        .logical_digest = historical_cursor.chain,
+        .artifacts_complete = true,
+        .rows_complete = true,
+    };
+    const binding = try frozen.Binding.fromProgress(historical);
+    const archive_path = try frozen.importPathAlloc(scratch, primary_path, binding.scope);
+    {
+        var archive = try DB.open(a, archive_path, opts);
+        defer archive.close();
+        try archive.core.store.put(stage.key, try historical.encode(scratch));
+        try archive.core.store.put("snapshot-transfer-fixture", "historical");
+        var flushed = try archive.pinTransferablePrimarySnapshot();
+        flushed.primary.deinit();
+    }
+    input.transaction_rows.?.image = .current;
+    scope.source_artifact_digest = try input.digest();
+    scope.population = input;
+    scope.frozen_base = binding;
+    const live_initial = try population.Cursor.init(input);
+    const live_cursor = try live_initial.seal(live_initial.completion());
+    var live = historical;
+    live.scope = scope;
+    live.phase = .published;
+    live.population = live_cursor;
+    live.logical_digest = live_cursor.chain;
+
+    var source = try DB.open(a, primary_path, opts);
+    defer source.close();
+    try adapter.applyOrdered(&source, .{ .timestamp_ns = 1, .writes = &.{.{ .key = "row", .value = "{}" }} }, .{ .term = 1, .index = 1 });
+    try source.core.store.put(stage.key, try live.encode(scratch));
+    try source.core.store.put("snapshot-transfer-fixture", "current");
+    var capture = try adapter.captureSnapshot(&source, 22, 10);
+    defer capture.deinit();
+
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    const receipt = try capture.writeWithReceipt(&output.writer, .none);
+    try std.testing.expectEqual(try capture.encodedSize(), output.written().len);
+    try std.testing.expectEqualDeep(receipt.identity, try identity(output.written()));
+    try std.testing.expectEqualStrings(frozen_magic, output.written()[0..8]);
+    try extract(a, io, output.written(), target_path, receipt.identity, .none);
+    var restored = try DB.open(a, target_path, .{ .open_mode = .query_readonly, .primary_only_readonly = true, .identity_namespace = ns });
+    defer restored.close();
+    try adapter.verifySnapshot(&restored, receipt.identity);
+    var unpaired = receipt.identity;
+    unpaired.frozen_base = null;
+    try std.testing.expectError(error.InvalidSnapshot, adapter.verifySnapshot(&restored, unpaired));
+    var retained = try restored.openPublishedFrozenImage(binding, .none);
+    defer retained.close();
+    const current = try restored.core.store.get(a, "snapshot-transfer-fixture");
+    defer a.free(current);
+    try std.testing.expectEqualStrings("current", current);
+    const value = try retained.core.store.get(a, "snapshot-transfer-fixture");
+    defer a.free(value);
+    try std.testing.expectEqualStrings("historical", value);
+
+    var bad = receipt.identity;
+    bad.frozen_base.?.content[0] ^= 1;
+    try std.testing.expectError(error.InvalidSnapshot, extract(a, io, output.written(), target_path, bad, .none));
 }

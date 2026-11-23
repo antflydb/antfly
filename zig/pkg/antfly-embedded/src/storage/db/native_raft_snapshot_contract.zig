@@ -16,7 +16,7 @@
 //! Pure frozen-image provenance shared by the native writer and restore
 //! producer. No DB implementation, file owner, key, or publication authority.
 const std = @import("std");
-const schema_contract = @import("relational_schema_owner_contract.zig");
+const schema_contract = @import("relational/schema_change/schema_owner_contract.zig");
 pub const Origin = @import("native_backup_origin.zig").Origin;
 pub const InstalledOrigin = @import("native_backup_origin.zig").Installation;
 pub const header_size = 80;
@@ -29,10 +29,25 @@ pub const Identity = struct {
     native_index: u64,
     origin: ?Origin = null,
     schema_header: ?schema_contract.Header = null,
+    frozen_base: ?@import("relational/rows/frozen_contract.zig").Binding = null,
+
+    pub fn nativeJsonSkipField(self: Identity, comptime name: []const u8) bool {
+        return std.mem.eql(u8, name, "frozen_base") and self.frozen_base == null;
+    }
+
+    pub fn jsonStringify(self: Identity, writer: anytype) @TypeOf(writer.*).Error!void {
+        try @import("relational/integrity/json.zig").write(self, writer);
+    }
 
     pub fn validate(self: Identity) !void {
         if (self.group_id == 0 or self.native_index > self.through_index or
             (self.native_index == 0) != (self.native_term == 0)) return error.InvalidSnapshot;
+        if (self.frozen_base) |base| {
+            try base.validate();
+            if (self.origin == null or base.namespace.shard_id != self.group_id or
+                !std.mem.eql(u8, &@import("online_source_contract.zig").namespaceBytes(base.namespace), &self.namespace))
+                return error.InvalidSnapshot;
+        }
         if (self.origin) |origin| {
             try origin.requireRaftTransfer(self.namespace, self.through_index);
             if ((if (origin.applied) |cut| cut.index else 0) != self.native_index or

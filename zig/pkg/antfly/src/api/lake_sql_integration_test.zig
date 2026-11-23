@@ -27,7 +27,7 @@ test "lake SQL admission retains physical float key precision in its WAL payload
     try std.testing.expect(std.mem.indexOf(u8, payload, "16777217") == null);
 }
 const server_mod = @import("http_server.zig");
-const Adapter = @import("sql_execution.zig").Adapter;
+const Adapter = @import("sql/execution/execution.zig").Adapter;
 const domain = @import("antfly_local_sources").system_catalog_domain;
 const operation = @import("antfly_local_sources").api_operation;
 const reads = @import("antfly_local_sources").api_table_read_source;

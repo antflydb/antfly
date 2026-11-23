@@ -21,7 +21,7 @@ const scalar = @import("scalar.zig");
 const Json = std.json.Value;
 const ExpressionContext = enum { generation, index_key, index_predicate, column_default };
 
-fn nativeType(kind: ast.ColumnType, identity: ?@import("array_value.zig").ElementType) []const u8 {
+fn nativeType(kind: ast.ColumnType, identity: ?@import("array/value.zig").ElementType) []const u8 {
     return if (kind == .array) "sql_array" else if (kind == .number and identity == .numeric) "numeric" else if (kind == .uuid) "string" else @tagName(kind);
 }
 
@@ -48,8 +48,8 @@ fn promoteNumeric(alloc: std.mem.Allocator, value: Json, source: scalar.Type, ta
         return value;
     }
     if (target.kind != .integer and target.kind != .number) return value;
-    const identity: @import("array_value.zig").ElementType = target.element_type orelse if (target.kind == .integer) .int64 else .float64;
-    const source_identity: @import("array_value.zig").ElementType = source.element_type orelse if (source.kind == .integer) .int64 else .float64;
+    const identity: @import("array/value.zig").ElementType = target.element_type orelse if (target.kind == .integer) .int64 else .float64;
+    const source_identity: @import("array/value.zig").ElementType = source.element_type orelse if (source.kind == .integer) .int64 else .float64;
     if (source.kind == target.kind and source_identity == identity) return value;
     // Widen an integer literal's declared identity directly. Wrapping every
     // candidate in a cast needlessly doubles durable IN-list node admission.
@@ -102,18 +102,18 @@ fn inputLiteral(alloc: std.mem.Allocator, result: scalar.Type, value: scalar.Dat
         .op = "literal",
         .type = "sql_array",
         .sql_type = @tagName(identity orelse return error.SqlTypeMismatch),
-        .value = if (value.sql_null) Json.null else try @import("array_wire.zig").toJsonLeaky(alloc, value.array.?.*, .{}),
+        .value = if (value.sql_null) Json.null else try @import("array/wire.zig").toJsonLeaky(alloc, value.array.?.*, .{}),
     });
     if (value.range()) |range| {
         try value.validateTemporal();
-        const ranges = @import("range_value.zig");
+        const ranges = @import("range/value.zig");
         if (ranges.kindFromType(kind) != range.kind) return error.SqlTypeMismatch;
         var context: ranges.Context = .{ .alloc = alloc };
         return json(alloc, .{ .op = "literal", .type = @tagName(range.kind), .value = try ranges.formatLeaky(&context, range.*) });
     }
     if (value.numeric) |number| {
-        var context: @import("numeric_value.zig").Context = .{ .alloc = alloc };
-        return json(alloc, .{ .op = "literal", .type = "numeric", .sql_type = "numeric", .value = try @import("numeric_value.zig").format(&context, number.*) });
+        var context: @import("numeric/value.zig").Context = .{ .alloc = alloc };
+        return json(alloc, .{ .op = "literal", .type = "numeric", .sql_type = "numeric", .value = try @import("numeric/value.zig").format(&context, number.*) });
     }
     if (kind == .json) return json(alloc, .{
         .op = "literal",
@@ -133,8 +133,8 @@ fn inputLiteral(alloc: std.mem.Allocator, result: scalar.Type, value: scalar.Dat
 /// literal to schema validation, whose malformed-program errors are broader.
 pub fn numericLiteral(alloc: std.mem.Allocator, value: Json) !Json {
     if (value != .null) {
-        var context: @import("numeric_value.zig").Context = .{ .alloc = alloc };
-        var parsed = try @import("numeric_storage.zig").fromJson(&context, value);
+        var context: @import("numeric/value.zig").Context = .{ .alloc = alloc };
+        var parsed = try @import("numeric/storage.zig").fromJson(&context, value);
         defer parsed.deinit();
     }
     // SQL numeric lexemes (for example .00994) are not necessarily JSON
@@ -149,7 +149,7 @@ pub fn lower(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scal
     return (try lowerTyped(alloc, schema, expression, expected)).expression;
 }
 
-const Lowered = struct { expression: Json, type: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType, enum_id: ?u64 = null, enum_origin: ?[16]u8 = null };
+const Lowered = struct { expression: Json, type: ast.ColumnType, element_type: ?@import("array/value.zig").ElementType, enum_id: ?u64 = null, enum_origin: ?[16]u8 = null };
 
 pub fn lowerTyped(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scalar, expected: ?ast.ColumnType) !Lowered {
     return lowerTypedPolicy(alloc, schema, expression, expected, null, .{});
@@ -415,8 +415,8 @@ fn lowerProgramPolicy(alloc: std.mem.Allocator, program: *const scalar.Program, 
                     if (argument.sql_null) break :blk try inputLiteral(alloc, instruction.type, .{});
                     const interval = argument.temporal() orelse return error.SqlTypeMismatch;
                     if (interval.kind() != .interval) return error.SqlTypeMismatch;
-                    var text: [@import("temporal_text.zig").output_capacity]u8 = undefined;
-                    break :blk try json(alloc, .{ .op = "uuidv7", .shift = try @import("temporal_text.zig").format(interval.*, &text) });
+                    var text: [@import("temporal/text.zig").output_capacity]u8 = undefined;
+                    break :blk try json(alloc, .{ .op = "uuidv7", .shift = try @import("temporal/text.zig").format(interval.*, &text) });
                 }
                 if (part.function == .@"$array") {
                     const identity = instruction.type.element_type orelse return error.SqlTypeMismatch;
@@ -485,7 +485,7 @@ fn lowerProgramPolicy(alloc: std.mem.Allocator, program: *const scalar.Program, 
                         break :converted result;
                     }
                     if ((source.kind == .integer or source.kind == .number) and (part.type == .integer or part.type == .number)) {
-                        const target_type: @import("array_value.zig").ElementType = part.element_type orelse if (part.type == .integer) .int64 else .float64;
+                        const target_type: @import("array/value.zig").ElementType = part.element_type orelse if (part.type == .integer) .int64 else .float64;
                         break :converted try json(alloc, .{ .op = "cast", .type = nativeType(part.type, target_type), .sql_type = @tagName(target_type), .args = &[_]Json{values[part.operand]} });
                     }
                     // Validate unknown input with the exact NUMERIC input function;
@@ -524,7 +524,7 @@ fn lowerProgramPolicy(alloc: std.mem.Allocator, program: *const scalar.Program, 
                 else if (kind == .array)
                     try json(alloc, .{ .op = "literal", .type = "sql_array", .sql_type = @tagName(instruction.type.element_type orelse return error.UnsupportedSqlShape), .value = @as(?u8, null) })
                 else if (kind == .integer or kind == .number)
-                    try json(alloc, .{ .op = "literal", .type = nativeType(kind, instruction.type.element_type), .sql_type = @tagName(instruction.type.element_type orelse if (kind == .integer) @as(@import("array_value.zig").ElementType, .int64) else .float64), .value = @as(?u8, null) })
+                    try json(alloc, .{ .op = "literal", .type = nativeType(kind, instruction.type.element_type), .sql_type = @tagName(instruction.type.element_type orelse if (kind == .integer) @as(@import("array/value.zig").ElementType, .int64) else .float64), .value = @as(?u8, null) })
                 else
                     try json(alloc, .{ .op = "literal", .type = if (kind == .uuid) "string" else @tagName(kind), .value = @as(?u8, null) });
                 break :blk try json(alloc, .{ .op = "case_when", .args = args });
@@ -668,7 +668,7 @@ test "SQL index key lowering reuses bound instructions without demanding unrelat
             \\{"op":"lower_ascii","args":[{"op":"column","column":"email"}]}
         , encoded);
         try std.testing.expectEqual(ast.ColumnType.string, key.type);
-        try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .text), key.element_type);
+        try std.testing.expectEqual(@as(?@import("array/value.zig").ElementType, .text), key.element_type);
         try std.testing.expectEqual(original_root, program.root);
         try std.testing.expectEqualDeep(original_type, program.output_type);
         try std.testing.expectError(error.InvalidSqlProgram, lowerIndexInstruction(arena.allocator(), &program, std.math.maxInt(u32), &canonical, .{}));
@@ -695,7 +695,7 @@ test "SQL index key lowering preserves comparison coercions instead of matching 
     defer program.deinit();
     const root = program.instructions[program.root].operation.binary.left;
     const key = try lowerIndexInstruction(arena.allocator(), &program, root, &columns, .{});
-    try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .float64), key.element_type);
+    try std.testing.expectEqual(@as(?@import("array/value.zig").ElementType, .float64), key.element_type);
     try std.testing.expectEqualStrings("cast", key.expression.object.get("op").?.string);
     try std.testing.expectEqualStrings("float64", key.expression.object.get("sql_type").?.string);
     try std.testing.expectEqualStrings("amount", key.expression.object.get("args").?.array.items[0].object.get("column").?.string);
@@ -837,7 +837,7 @@ pub fn lowerAssignmentWithLimits(alloc: std.mem.Allocator, schema: Json, express
     // The primitive JSON literal path loses the typed range Datum. Reuse the
     // same contextual assignment cast and immutable lowering as row writes.
     const contextual = if (expression.* == .literal and expression.literal == .string and
-        (column.type == .uuid or @import("range_value.zig").kindFromType(column.type) != null))
+        (column.type == .uuid or @import("range/value.zig").kindFromType(column.type) != null))
         try scalar.assignmentExpression(alloc, expression, .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier })
     else
         expression;
@@ -874,7 +874,7 @@ fn finishAssignment(alloc: std.mem.Allocator, lowered: Lowered, column: ast.Colu
         // Untyped SQL decimal arithmetic requires an exact decimal value
         // domain; never persist binary-float evaluation under that contract.
         if (lowered.type == .number and lowered.element_type == null) return error.UnsupportedSqlShape;
-        const target: @import("array_value.zig").ElementType = column.element_type orelse if (column.type == .integer) .int64 else .float64;
+        const target: @import("array/value.zig").ElementType = column.element_type orelse if (column.type == .integer) .int64 else .float64;
         return json(alloc, .{ .op = "cast", .type = nativeType(column.type, target), .sql_type = @tagName(target), .args = &[_]Json{lowered.expression} });
     }
     if (column.type == .string and lowered.type == .uuid) return lowered.expression;
@@ -1205,7 +1205,7 @@ test "SQL durable JSON lowering executes independent PostgreSQL path contracts" 
             else => return error.UnexpectedJsonFixture,
         };
         try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(owned, entry.value, .{}), try std.json.Stringify.valueAlloc(owned, result, .{}));
-        if (entry.oid == 23) try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .int32), plan.result_sql_type);
+        if (entry.oid == 23) try std.testing.expectEqual(@as(?@import("array/value.zig").ElementType, .int32), plan.result_sql_type);
         count += 1;
     }
     try std.testing.expectEqual(@as(usize, 25), count);
@@ -1300,7 +1300,7 @@ test "SQL schema array column comparisons branches and nulls share query and dur
         .{ .name = "b", .type = .array, .element_type = .int32 },
         .{ .name = "flag", .type = .boolean },
     };
-    const empty = try @import("array_value.zig").Value.init(.int32, &.{}, &.{}, .{});
+    const empty = try @import("array/value.zig").Value.init(.int32, &.{}, &.{}, .{});
     const canonical: native.Value = .{ .sql_array = .{ .element_type = .int32, .bytes = &.{ 1, 0, 0, 0, 0, 0, 0, 0 } } };
     for ([_]struct { sql: []const u8, expected: bool }{
         .{ .sql = "a IS NULL", .expected = false },
@@ -1336,13 +1336,13 @@ test "SQL schema NUMERIC array casts share query and durable execution" {
     defer region.deinit();
     const a = region.allocator();
     const native = @import("../schema/relational_expression.zig");
-    const storage = @import("array_storage.zig");
+    const storage = @import("array/storage.zig");
     const codec = @import("../storage/db/algebraic/relational_row_codec.zig");
     const columns = [_]scalar.Column{.{ .name = "a", .type = .array, .element_type = .numeric }};
     const table: @import("../storage/schema.zig").TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{
         .{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = .numeric },
     } };
-    var original = try @import("array_text.zig").decode(a, .numeric, "[-3:-1]={12.345,NULL,-12.345}", .{});
+    var original = try @import("array/text.zig").decode(a, .numeric, "[-3:-1]={12.345,NULL,-12.345}", .{});
     defer original.deinit();
     const canonical = try storage.encodeAlloc(a, original.value, .{});
     const input: native.Value = .{ .sql_array = .{ .element_type = .numeric, .bytes = canonical } };
@@ -1378,7 +1378,7 @@ test "SQL schema NUMERIC array casts share query and durable execution" {
         try std.testing.expectEqualSlices(u8, expected, converted.sql_array.bytes);
         try std.testing.expectEqualSlices(u8, expected, (try durable.evaluateRow(a, row)).sql_array.bytes);
         var document: Json = .{ .object = .empty };
-        try document.object.put(a, "a", try @import("array_wire.zig").toJsonLeaky(a, original.value, .{}));
+        try document.object.put(a, "a", try @import("array/wire.zig").toJsonLeaky(a, original.value, .{}));
         try std.testing.expectEqualSlices(u8, expected, (try durable.evaluateJson(a, document)).sql_array.bytes);
     }
 }
@@ -1388,8 +1388,8 @@ test "SQL schema ARRAY constructors share PostgreSQL values and errors across qu
     defer region.deinit();
     const a = region.allocator();
     const native = @import("../schema/relational_expression.zig");
-    const arrays = @import("array_value.zig");
-    const storage = @import("array_storage.zig");
+    const arrays = @import("array/value.zig");
+    const storage = @import("array/storage.zig");
     const codec = @import("../storage/db/algebraic/relational_row_codec.zig");
     const Fixture = struct { entries: []const struct { sql: []const u8, text: ?[]const u8 = null, pg_type: ?[]const u8 = null, sqlstate: ?[]const u8 = null } };
     const fixture = try std.json.parseFromSliceLeaky(Fixture, a, @embedFile("fixtures/sql_array_constructor_reference.json"), .{ .ignore_unknown_fields = true });
@@ -1420,9 +1420,9 @@ test "SQL schema ARRAY constructors share PostgreSQL values and errors across qu
         .{ .name = "e", .path = "e", .column_type = .sql_array, .sql_element_type = .int32 },
         .{ .name = "z", .path = "z", .column_type = .sql_array, .sql_element_type = .int32 },
     } };
-    var left = try @import("array_text.zig").decode(a, .int32, "[-2:-1]={1,NULL}", .{});
+    var left = try @import("array/text.zig").decode(a, .int32, "[-2:-1]={1,NULL}", .{});
     defer left.deinit();
-    var right = try @import("array_text.zig").decode(a, .int32, "[-2:-1]={3,4}", .{});
+    var right = try @import("array/text.zig").decode(a, .int32, "[-2:-1]={3,4}", .{});
     defer right.deinit();
     const empty = try arrays.Value.init(.int32, &.{}, &.{}, .{});
     const l = try storage.encodeAlloc(a, left.value, .{});
@@ -1445,9 +1445,9 @@ test "SQL schema ARRAY constructors share PostgreSQL values and errors across qu
     try document.object.put(a, "n", .{ .integer = 12 });
     try document.object.put(a, "t", .{ .string = "hello" });
     try document.object.put(a, "flag", .{ .bool = true });
-    try document.object.put(a, "a", try @import("array_wire.zig").toJsonLeaky(a, left.value, .{}));
-    try document.object.put(a, "b", try @import("array_wire.zig").toJsonLeaky(a, right.value, .{}));
-    try document.object.put(a, "e", try @import("array_wire.zig").toJsonLeaky(a, empty, .{}));
+    try document.object.put(a, "a", try @import("array/wire.zig").toJsonLeaky(a, left.value, .{}));
+    try document.object.put(a, "b", try @import("array/wire.zig").toJsonLeaky(a, right.value, .{}));
+    try document.object.put(a, "e", try @import("array/wire.zig").toJsonLeaky(a, empty, .{}));
     try document.object.put(a, "z", .null);
     for (fixture.entries) |entry| {
         var parsed = try @import("compiler.zig").compileScalar(a, entry.sql, .{});
@@ -1485,7 +1485,7 @@ test "SQL schema ARRAY constructors share PostgreSQL values and errors across qu
             .uuid => "uuid[]",
             .jsonb => "jsonb[]",
         });
-        var expected_value = try @import("array_text.zig").decode(a, kind, entry.text.?, .{});
+        var expected_value = try @import("array/text.zig").decode(a, kind, entry.text.?, .{});
         defer expected_value.deinit();
         const expected = try storage.encodeAlloc(a, expected_value.value, .{});
         const evaluated = try query.evaluate(a, &values, &.{}, .{});
@@ -1498,8 +1498,8 @@ test "SQL schema ARRAY constructors share PostgreSQL values and errors across qu
 
 test "SQL schema ARRAY constructors unwind lowering and durable execution allocation failures" {
     const a = std.testing.allocator;
-    const arrays = @import("array_value.zig");
-    const storage = @import("array_storage.zig");
+    const arrays = @import("array/value.zig");
+    const storage = @import("array/storage.zig");
     const native = @import("../schema/relational_expression.zig");
     const columns = [_]scalar.Column{.{ .name = "n", .type = .integer, .element_type = .int32 }};
     const table: @import("../storage/schema.zig").TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{
@@ -1524,7 +1524,7 @@ test "SQL schema ARRAY constructors unwind lowering and durable execution alloca
     }) |entry| {
         var parsed = try @import("compiler.zig").compileScalar(a, entry.sql, .{});
         defer parsed.deinit();
-        var reference = try @import("array_text.zig").decode(a, entry.kind, entry.text, .{});
+        var reference = try @import("array/text.zig").decode(a, entry.kind, entry.text, .{});
         defer reference.deinit();
         const expected = try storage.encodeAlloc(a, reference.value, .{});
         defer a.free(expected);
@@ -1558,7 +1558,7 @@ test "SQL schema partial index constant bounds match PostgreSQL domains and erro
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const owned = arena.allocator();
-        const identity = std.meta.stringToEnum(@import("array_value.zig").ElementType, case.identity).?;
+        const identity = std.meta.stringToEnum(@import("array/value.zig").ElementType, case.identity).?;
         const physical: []const u8 = switch (identity) {
             .numeric, .float32, .float64 => "number",
             .int16, .int32, .int64 => "integer",
@@ -1604,7 +1604,7 @@ test "SQL durable numeric functions lower and execute independent PostgreSQL con
     const a = std.testing.allocator;
     const native = @import("../schema/relational_expression.zig");
     const storage = @import("../storage/schema.zig");
-    const exact = @import("numeric_value.zig");
+    const exact = @import("numeric/value.zig");
     const Entry = struct { domain: enum { numeric, float64 }, input: ?[]const u8, sql: []const u8, expected: ?[]const u8, sqlstate: ?[]const u8 };
     const fixture = try std.json.parseFromSlice(struct { entries: []const Entry }, a, @embedFile("fixtures/sql_numeric_functions_reference.json"), .{ .ignore_unknown_fields = true });
     defer fixture.deinit();
@@ -1638,7 +1638,7 @@ test "SQL durable numeric functions lower and execute independent PostgreSQL con
         try std.testing.expectEqual(entry.expected == null, result == .null);
         if (result == .null) continue;
         if (entry.domain == .numeric) {
-            var output = try @import("numeric_binary.zig").decodeCanonical(&execution.numeric, result.numeric);
+            var output = try @import("numeric/binary.zig").decodeCanonical(&execution.numeric, result.numeric);
             defer output.deinit();
             try std.testing.expectEqualStrings(entry.expected.?, try exact.format(&execution.numeric, output.value));
         } else {

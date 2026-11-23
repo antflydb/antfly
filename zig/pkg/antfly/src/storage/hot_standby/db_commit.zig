@@ -162,8 +162,8 @@ fn recover(mirror: ReplicationAsyncEffectMirror, kind: outbox.Kind, pending: out
 }
 
 fn validateMetadataControl(payload: []const u8, namespace: Namespace) !void {
-    const frame = try replication_effects_mod.schema_owner_control.Frame.decode(payload);
-    if (!frame.position.namespace.eql(namespace)) return error.IdentityNamespaceMismatch;
+    const actual = (try replication_effects_mod.metadataControlNamespace(payload)) orelse return error.InvalidMetadataMutationPayload;
+    if (!actual.eql(namespace)) return error.IdentityNamespaceMismatch;
 }
 
 fn preflight(mirror: ReplicationAsyncEffectMirror, record_decision: bool) !void {

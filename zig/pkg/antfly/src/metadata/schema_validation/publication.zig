@@ -108,6 +108,8 @@ pub const Head = struct {
     catalog_revision: u64 = 0,
     sequence_retirement: ?SequenceRetirement = null,
     retirement_root: ?@import("../retirement/table/authority.zig").Authority = null,
+    partition_parent: u64 = 0,
+    initial_partition: ?@import("../initial_partition.zig").Reference = null,
     participant_count: u16 = 1,
     participants_digest: Digest = @splat(0),
     /// Derived once from the immutable before/after layouts. The accepting
@@ -128,6 +130,10 @@ pub const Head = struct {
     terminal_chain: Digest = @splat(0),
     failure_digest: Digest = @splat(0),
 
+    pub fn tableCohort(self: Head) bool {
+        return self.catalogEffect() or self.partition_parent != 0;
+    }
+
     pub fn catalogEffect(self: Head) bool {
         return self.type_id != 0 or self.sequence_retirement != null or self.retirement_root != null;
     }
@@ -140,7 +146,9 @@ pub const Head = struct {
             const absent_catalog = !self.catalogEffect() and (comptime std.mem.eql(u8, field, "catalog_revision"));
             const absent_sequence = self.sequence_retirement == null and (comptime std.mem.eql(u8, field, "sequence_retirement"));
             const absent_root = self.retirement_root == null and (comptime std.mem.eql(u8, field, "retirement_root"));
-            if (!absent_type and !absent_catalog and !absent_sequence and !absent_root and
+            const absent_partition = self.partition_parent == 0 and (comptime std.mem.eql(u8, field, "partition_parent"));
+            const absent_birth = self.initial_partition == null and (comptime std.mem.eql(u8, field, "initial_partition"));
+            if (!absent_type and !absent_catalog and !absent_sequence and !absent_root and !absent_partition and !absent_birth and
                 !(ordinary and (comptime std.mem.eql(u8, field, "participant_count") or std.mem.eql(u8, field, "participants_digest"))))
             {
                 try writer.objectField(field);
@@ -158,6 +166,12 @@ pub const Head = struct {
                 root.effects.survivors != self.participant_count or root.root.table == self.table_id or
                 std.mem.eql(u8, &root.root.id, &self.id) or !nonzero(&self.participants_digest)) return error.InvalidGenerationPublication;
         }
+        if (self.initial_partition) |birth| {
+            try birth.validate();
+            if (self.partition_parent == 0 or self.table_id != self.partition_parent or birth.child_table_id == self.table_id or
+                std.mem.eql(u8, &self.id, &birth.initial_id)) return error.InvalidGenerationPublication;
+        }
+        if (self.partition_parent != 0 and (self.catalogEffect() or self.participant_count != (if (self.initial_partition != null) @as(u16, 1) else 2) or !nonzero(&self.participants_digest))) return error.InvalidGenerationPublication;
         if (self.sequence_retirement) |retirement| {
             try retirement.validate();
             if (self.type_id != 0 or !nonzero(&self.participants_digest)) return error.InvalidGenerationPublication;
@@ -611,12 +625,14 @@ pub fn validateCohort(head: Head, owners: []const Owner) !void {
     var table_base: usize = 0;
     var tables: usize = 0;
     var previous_table: u64 = 0;
+    var contains_partition_parent = false;
     for (owners, 0..) |owner, ordinal| {
         try owner.validate(head);
         if (owner.ordinal != ordinal) return error.InvalidGenerationPublication;
-        if (head.catalogEffect()) {
+        if (head.tableCohort()) {
             const table = owner.binding.fence.namespace.table_id;
-            if (table < previous_table or (if (head.retirement_root != null) owner.binding.purpose != .dependent_object_retirement else if (head.sequence_retirement != null) owner.binding.purpose != .sequence_default_removal else owner.binding.purpose != .enum_epoch and owner.binding.purpose != .domain_not_null) or
+            contains_partition_parent = contains_partition_parent or table == head.partition_parent;
+            if (table < previous_table or (if (head.partition_parent != 0) owner.binding.purpose != .partition_membership else if (head.retirement_root != null) owner.binding.purpose != .dependent_object_retirement else if (head.sequence_retirement != null) owner.binding.purpose != .sequence_default_removal else owner.binding.purpose != .enum_epoch and owner.binding.purpose != .domain_not_null) or
                 owner.binding.purpose != owners[0].binding.purpose or
                 owner.binding.columns != owners[0].binding.columns or
                 !std.mem.eql(u8, &owner.binding.projection_identity, &owners[0].binding.projection_identity)) return error.InvalidGenerationPublication;
@@ -633,7 +649,7 @@ pub fn validateCohort(head: Head, owners: []const Owner) !void {
         inline for (.{ "before_version", "after_version", "columns", "before_schema", "after_schema", "before_public", "after_public", "projection_identity" }) |field|
             if (!std.meta.eql(@field(owner.binding, field), @field(owners[table_base].binding, field))) return error.InvalidGenerationPublication;
     }
-    if (head.catalogEffect() and tables != head.participant_count) return error.InvalidGenerationPublication;
+    if ((head.tableCohort() and tables != head.participant_count) or (head.partition_parent != 0 and !contains_partition_parent)) return error.InvalidGenerationPublication;
     var ordinals: [max_owners]u16 = undefined;
     for ([_]Stage{ .ready, .installed, .released, .canceled, .failed }) |stage| {
         const index = @backingInt(stage);

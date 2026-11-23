@@ -1155,7 +1155,7 @@ test "SQL exact NUMERIC raw and checkpoint blocks reduce typed columns" {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const pa = arena.allocator();
-        var work: @import("array_value.zig").Budget = .{};
+        var work: @import("array/value.zig").Budget = .{};
         const input = try scalar.numericTextLeaky(pa, "1.25", &work);
         var states: [2]operators.Aggregate = undefined;
         for (&states, specs) |*state, spec| state.* = try operators.Aggregate.initTyped(a, spec.kind, spec.input_type, spec.input_element);

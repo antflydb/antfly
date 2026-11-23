@@ -22,7 +22,7 @@ const authority = local.common_trigger_preparation_authority;
 const handoff = local.sql_catalog.trigger_handoff;
 const A = std.mem.Allocator;
 
-const keys = @import("../../sql_preparation_authority_keys.zig");
+const keys = @import("../recovery/preparation_authority_keys.zig");
 pub const Key = keys.Key;
 pub const configured = keys.configured;
 pub const requireConfiguration = keys.requireConfiguration;

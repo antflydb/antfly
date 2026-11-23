@@ -1281,6 +1281,16 @@ pub const Owner = struct {
         return response;
     }
 
+    pub fn nativePublicationCaptureControl(self: *Owner, table: []const u8, body: []const u8, options: QueryOptions) !Response {
+        var response: Response = .{};
+        errdefer response.deinit();
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_native_publication_capture_control(self.handle, &.{ .control = controlledRequest(table, body, options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn) }, &response.buffer, &failure);
+        if (status != .ok and (failure.boundary != .storage_owner or failure.operation != abi.NativePublicationCaptureControlRequest.operation)) return error.InvalidBoundaryFailureIdentity;
+        try acceptStorageOwnerFailure(status, failure, "native publication capture control");
+        return response;
+    }
+
     pub fn nativeFkGenerationControlJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_native_fk_generation_control_json(self.handle, &.{

@@ -199,8 +199,11 @@ fn encodeBounded(comptime direct: bool, alloc: A, output_budget: *sources.sql_me
         try blob(w, row.id);
         try w.writeInt(u64, row.version, .little);
         try w.writeInt(u32, row.schema_version, .little);
-        try w.writeByte(@intFromBool(row.expected_content_digest != null));
-        if (row.expected_content_digest) |digest| try w.writeAll(&digest);
+        if (row.stale_frozen_birth and (row.expected_content_digest != null or row.expected_mutation_revision != null)) return error.InvalidRetainedReadPage;
+        const digest_present: u8 = if (row.stale_frozen_birth) 3 else if (row.expected_mutation_revision != null) 2 else @intFromBool(row.expected_content_digest != null);
+        try w.writeByte(digest_present);
+        if (row.expected_content_digest) |digest| try w.writeAll(&digest) else if (digest_present == 2) return error.InvalidRetainedReadPage;
+        if (row.expected_mutation_revision) |revision| try w.writeInt(u64, revision, .little);
         if (row.document) |document| {
             const json = try std.json.Stringify.valueAlloc(a, document, .{});
             try blob(w, json);
@@ -337,10 +340,12 @@ pub fn decode(alloc: A, bytes: []const u8, sequence: u64, schema_version: u32, l
         if (try r.int(u32) != schema_version) return error.InvalidRetainedReadPage;
         const has_digest = try r.int(u8);
         const digest: ?[32]u8 = switch (has_digest) {
-            0 => null,
-            1 => (try r.take(32))[0..32].*,
+            0, 3 => null,
+            1, 2 => (try r.take(32))[0..32].*,
             else => return error.InvalidRetainedReadPage,
         };
+        const revision: ?u64 = if (has_digest == 2) try r.int(u64) else null;
+        if (revision == 0) return error.InvalidRetainedReadPage;
         const document = if (try r.optional()) |json| try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{ .allocate = .alloc_if_needed, .parse_numbers = false }) else null;
         const presence = try a.alloc(bool, width);
         for (presence) |*flag| flag.* = switch (try r.int(u8)) {
@@ -348,7 +353,7 @@ pub fn decode(alloc: A, bytes: []const u8, sequence: u64, schema_version: u32, l
             1 => true,
             else => return error.InvalidRetainedReadPage,
         };
-        row.* = .{ .id = id, .version = version, .schema_version = schema_version, .value = .null, .typed_cells = .{ .layout = layout, .presence = presence }, .expected_content_digest = digest, .document = document };
+        row.* = .{ .id = id, .version = version, .schema_version = schema_version, .value = .null, .typed_cells = .{ .layout = layout, .presence = presence }, .expected_content_digest = digest, .expected_mutation_revision = revision, .stale_frozen_birth = has_digest == 3, .document = document };
     }
     var cache_blocks: std.ArrayList(spill.ColumnarBlock) = .empty;
     errdefer for (cache_blocks.items) |block| block.deinit();

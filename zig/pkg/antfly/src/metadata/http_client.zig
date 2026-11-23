@@ -1314,6 +1314,11 @@ pub const MetadataHttpClient = struct {
         if (input == .query_population_job and response.status != 200) {
             if (@import("query_population_job.zig").definiteHttpFailure(response.status, response.body)) |err| return err;
         }
+        if (input == .sql_catalog_prepare and input.sql_catalog_prepare.security_label != null and response.status != 200) {
+            inline for (.{ error.SqlInvalidParameterValue, error.SqlWrongObjectType, error.SqlAmbiguousFunction, error.SqlUndefinedProcedure, error.CatalogSourceUntracked }) |err| {
+                if (response.status == system_catalog.httpStatus(err) and std.mem.eql(u8, response.body, @errorName(err))) return err;
+            }
+        }
         if ((input == .sql_catalog_prepare or input == .table_retirement_prepare or input == .fk_initial_create_prepare or input == .query_population_prepare or input == .constraint_name_prepare or input == .constraint_name_check) and response.status != 200) {
             if (system_catalog.definiteNamingError(response.status, response.body)) |err| return err;
             if (response.status == 405 and std.mem.eql(u8, response.body, "ExtensionOwnedObject")) return error.ExtensionOwnedObject;
@@ -5627,6 +5632,11 @@ test "system catalog schema validation client binds exact identity projection fr
 fn catalogResponseLimit(input: @import("../system_catalog/server_call.zig").Call) ?usize {
     const publication = @import("relational_index/publication.zig");
     return switch (input) {
+        .restore_coordinator_read, .restore_coordinator_apply => @import("restore_staging.zig").max_encoded_bytes,
+        .restore_coordinator_progress, .restore_coordinator_receipt, .restore_coordinator_ack => 4096,
+        .backup_cohort_read => @import("antfly_local_sources").metadata_backup_cohort.Job.max_encoded_bytes,
+        .backup_cohort_first => 2 * @import("antfly_local_sources").metadata_backup_cohort.Job.max_encoded_bytes + 1024,
+        .backup_cohort_write => 16,
         .sql_index_annotations => @import("antfly_local_sources").system_catalog_domain.object_annotations.max_index_description_bytes,
         .relational_index_prepare => publication.PrepareCut.max_wire_bytes,
         .relational_index_status, .relational_index_begin, .relational_index_admission_status => publication.AdmissionStatus.max_wire_bytes,
@@ -5639,8 +5649,10 @@ fn catalogResponseLimit(input: @import("../system_catalog/server_call.zig").Call
         .schema_validation_work => @import("schema_validation/work.zig").max_wire_bytes,
         .schema_validation_prepare => @import("schema_validation/admission.zig").max_wire_bytes,
         .scope_retirement_work => 8192,
+        .store_report_basis => 4096,
         .sql_relation_boot_read => |query| if (query.recovery_capture != null) @import("../system_catalog/trigger_snapshot.zig").max_snapshot_bytes else 64 * 1024,
         .sql_relation_boot_submit => 64 * 1024,
+        .sql_publication_capture_work => @import("../system_catalog/replication/installation.zig").max_work_bytes,
         .sql_graph_preparation_read => @import("../system_catalog/trigger_snapshot.zig").max_snapshot_bytes + 512,
         .sql_graph_preparation_admit, .sql_graph_preparation_outcome => @import("../system_catalog/sequence_outcomes.zig").max_record_bytes,
         .sql_relation_lifetime_page => 128 * @import("sql/relation_lifecycle/lifetimes.zig").max_record_bytes,

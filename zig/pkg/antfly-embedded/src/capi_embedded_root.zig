@@ -43,11 +43,11 @@ pub const public_api = struct {
     pub const indexes = @import("api/indexes.zig");
 };
 pub const capi_dependencies = struct {
-    pub const storage_db_relational_integrity = @import("storage/db/relational_integrity.zig");
-    pub const storage_db_relational_integrity_topology_contract = @import("storage/db/relational_integrity_topology_contract.zig");
-    pub const storage_db_relational_integrity_catalog = @import("storage/db/relational_integrity_catalog.zig");
-    pub const storage_db_relational_integrity_activation_contract = @import("storage/db/relational_integrity_activation_contract.zig");
-    pub const storage_db_relational_integrity_retirement_contract = @import("storage/db/relational_integrity_retirement_contract.zig");
+    pub const storage_db_relational_integrity = @import("storage/db/relational/integrity/integrity.zig");
+    pub const storage_db_relational_integrity_topology_contract = @import("storage/db/relational/integrity/topology_contract.zig");
+    pub const storage_db_relational_integrity_catalog = @import("storage/db/relational/integrity/catalog.zig");
+    pub const storage_db_relational_integrity_activation_contract = @import("storage/db/relational/integrity/activation_contract.zig");
+    pub const storage_db_relational_integrity_retirement_contract = @import("storage/db/relational/integrity/retirement_contract.zig");
     pub const schema_relational_declarations = @import("schema/relational_declarations.zig");
     pub const storage_schema = @import("storage/schema.zig");
     pub const sql_catalog = @import("sql/catalog.zig");

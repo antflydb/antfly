@@ -165,11 +165,52 @@ original, omitted defaults, prepared numeric/NULL parameters, excluded invalid
 constraints and sequence effects. The native campaign also checks unchanged
 postimages after predicate/type/framing/constraint failures and cold replay.
 
-FREEZE remains unactivated, including the exact all-options original that
-requests it. It needs proof of creation/truncation in the current subtransaction
-and compatible snapshot ownership; it cannot be accepted as an unchecked
-transport option. Non-UTF8 encodings remain unsupported. This work does not
-complete SQL parity.
+FREEZE admission checks that the current subtransaction owns the exact
+relation generation created by CREATE TABLE or TRUNCATE. Mounted pgwire tests
+verify rejection before CopyInResponse for missing generation ownership and
+active cursors. The writer publishes the replacement generation through the
+durable catalog decision after sealing its drained predecessor. The unchanged
+all-options COPY statement and the transactional TRUNCATE replacement both
+retain the expected rows after a cold restart.
+
+The PostgreSQL 18 reference fixture verifies the original all-options input,
+generation ownership across savepoints, and rollback. An open cursor causes
+SQLSTATE 25000. A completed SELECT over a constant permits COPY after TRUNCATE
+in both READ COMMITTED and REPEATABLE READ. A second connection with a
+REPEATABLE READ snapshot taken before TRUNCATE sees the frozen rows after the
+writer commits. The same snapshot sees an empty relation after ordinary COPY in
+an otherwise identical transaction. The visibility exception therefore needs to
+survive publication of the new generation and apply only to frozen tuple
+versions. If the writer also updates or deletes frozen rows before commit, the
+older snapshot sees their original versions. A fresh reader sees the updates,
+deletes, and ordinary inserts. Releasing the savepoint that created the
+generation transfers FREEZE eligibility to its parent. Rolling back a child
+replacement discards its frozen rows and leaves an existing table ineligible.
+If the parent had already truncated that table, PostgreSQL restores the parent’s
+empty generation while still rejecting FREEZE with SQLSTATE 55000. Native
+rollback must track eligibility independently of the restored generation. A
+relation created by the parent retains its CREATE eligibility through that
+same child rollback, even if the parent had already truncated the new relation.
+The existing staged TRUNCATE plan supplies empty physical roots and captures
+the catalog and range preimages. For transactional DDL, the SQL session must
+own those roots and expose them only through its transaction-local binding.
+Commit has to join the staged plan and prepared row effects to the same durable
+decision. Recovery can then publish that exact plan after restart, while abort
+retires its unpublished roots. Savepoint release and rollback must update the
+binding and the FREEZE eligibility under that same session authority.
+
+Antfly currently pins the database's physical read cohort when a transaction
+takes its first snapshot, even for a scalar query. A reader that takes an old
+snapshot without touching the target must be able to resolve a subsequently
+published generation while retaining the original transaction visibility cut.
+The replacement generation's frozen row versions remain visible at that cut.
+Ordinary inserts, updates and deletes continue to use their normal transaction
+visibility rules, including when they share the publishing transaction. The
+PostgreSQL witness also deletes and reloads a primary key with FREEZE in the
+same generation. An older snapshot sees both frozen row versions, while a
+current reader sees only the second. Frozen history therefore needs a row birth
+identity independent of the logical primary key.
+Non-UTF8 encodings remain unsupported.
 
 ## Server files and programs
 

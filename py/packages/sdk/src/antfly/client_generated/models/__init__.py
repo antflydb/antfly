@@ -397,6 +397,8 @@ from .document_schema import DocumentSchema
 from .document_schema_schema import DocumentSchemaSchema
 from .document_source import DocumentSource
 from .document_source_media_type import DocumentSourceMediaType
+from .document_sql_column import DocumentSQLColumn
+from .document_sql_column_type import DocumentSQLColumnType
 from .document_subfield_mapping import DocumentSubfieldMapping
 from .document_subfield_mapping_missing_null_policy import DocumentSubfieldMappingMissingNullPolicy
 from .drop_extension_request import DropExtensionRequest
@@ -2536,6 +2538,7 @@ from .sql_setting_value_type_1 import SqlSettingValueType1
 from .sql_setting_value_type_2 import SqlSettingValueType2
 from .sql_temporal_kind import SQLTemporalKind
 from .sql_transaction_status import SQLTransactionStatus
+from .sql_view_index_requirement import SQLViewIndexRequirement
 from .sqlddl_receipt import SQLDDLReceipt
 from .sqlddl_receipt_state import SQLDDLReceiptState
 from .sse_error import SSEError
@@ -3143,6 +3146,8 @@ __all__ = (
     "DocumentSchemaSchema",
     "DocumentSource",
     "DocumentSourceMediaType",
+    "DocumentSQLColumn",
+    "DocumentSQLColumnType",
     "DocumentSubfieldMapping",
     "DocumentSubfieldMappingMissingNullPolicy",
     "DropExtensionRequest",
@@ -5062,6 +5067,7 @@ __all__ = (
     "SqlSettingValueType2",
     "SQLTemporalKind",
     "SQLTransactionStatus",
+    "SQLViewIndexRequirement",
     "SSEError",
     "SSEErrorReason",
     "SSEEvent",

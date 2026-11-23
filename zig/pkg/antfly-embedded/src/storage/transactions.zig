@@ -37,6 +37,7 @@ const tracing = @import("../tracing/antfly_trace_writer.zig");
 const stderr_writer = @import("../tracing/stderr_writer.zig");
 const ttl = @import("ttl.zig");
 const retained_effects = @import("retained_effects.zig");
+const document_revision_reservation = @import("document_revision_reservation.zig");
 pub const topology_debt = @import("transaction_debt.zig");
 pub const ExternalDecisionOwner = @import("transaction_decision_owner.zig").External;
 pub const NativePhysicalPin = @import("../common/relation_persistence.zig").PhysicalPin;
@@ -338,6 +339,7 @@ pub const WriteIntent = struct {
 };
 
 pub const IntentValue = struct {
+    document_revision: ?u64 = null,
     prepared_graph_effects: ?[]const u8 = null,
     row_policy_requirement: @import("../usermgr/row_policy_authority.zig").MutationRequirement = .native,
     value: ?[]const u8,
@@ -376,8 +378,25 @@ pub const IntentValue = struct {
                 base.prepared_graph_effects = bytes[5..][0..length];
                 break :blk base;
             },
+            6 => blk: {
+                if (depth != 0 or bytes.len < 10) return error.InvalidTxnRecord;
+                var base = try decodeAt(bytes[9..], depth + 1);
+                base.document_revision = try document_revision_reservation.decodeVersion(bytes[1..9]);
+                break :blk base;
+            },
             else => error.InvalidTxnRecord,
         };
+    }
+
+    /// Only use the revision assigned by the accepting owner's native ledger.
+    fn withDocumentRevision(alloc: Allocator, base: []const u8, revision: u64) ![]u8 {
+        if (revision == 0 or revision > document_revision_reservation.max_version or
+            (try decode(base)).document_revision != null) return error.InvalidTxnRecord;
+        const bytes = try alloc.alloc(u8, 9 + base.len);
+        bytes[0] = 6;
+        std.mem.writeInt(u64, bytes[1..9], revision, .little);
+        @memcpy(bytes[9..], base);
+        return bytes;
     }
 
     pub fn encode(alloc: Allocator, intent: WriteIntent) ![]u8 {
@@ -439,24 +458,24 @@ fn isRawMetadataIntentKey(key: []const u8) bool {
         range_protection.indexCounterDigest(key) != null or
         std.mem.startsWith(u8, key, "\x00\x00__metadata__:relational_integrity:") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_activation") or
-        std.mem.eql(u8, key, @import("db/relational_integrity_activation_contract.zig").validation_key) or
-        std.mem.eql(u8, key, @import("db/relational_integrity_activation_contract.zig").validation_inputs_key) or
+        std.mem.eql(u8, key, @import("db/relational/integrity/activation_contract.zig").validation_key) or
+        std.mem.eql(u8, key, @import("db/relational/integrity/activation_contract.zig").validation_inputs_key) or
         std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_retirement") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_generation_retirement") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:restore_staging_owner") or
-        @import("db/relational_index_maintenance_contract.zig").isControlKey(key);
+        @import("db/relational/indexes/maintenance_contract.zig").isControlKey(key);
 }
 
 fn isRawMetadataPredicateKey(key: []const u8) bool {
     return isRawMetadataIntentKey(key) or
-        std.mem.eql(u8, key, @import("db/relational_index_catalog.zig").head_key) or
-        (key.len == @import("db/relational_index_jobs.zig").progress_prefix.len + range_protection.index_id_bytes and
-            std.mem.startsWith(u8, key, @import("db/relational_index_jobs.zig").progress_prefix));
+        std.mem.eql(u8, key, @import("db/relational/indexes/catalog.zig").head_key) or
+        (key.len == @import("db/relational/indexes/jobs.zig").progress_prefix.len + range_protection.index_id_bytes and
+            std.mem.startsWith(u8, key, @import("db/relational/indexes/jobs.zig").progress_prefix));
 }
 
 fn retainedIntentBytes(alloc: Allocator, intent: WriteIntent) !u64 {
-    if (@import("db/relational_integrity_contract.zig").isKey(intent.key)) {
-        _ = try @import("db/relational_integrity_contract.zig").parseKey(intent.key);
+    if (@import("db/relational/integrity/contract.zig").isKey(intent.key)) {
+        _ = try @import("db/relational/integrity/contract.zig").parseKey(intent.key);
         return std.math.add(u64, 16 + intent.key.len, if (intent.value) |value| value.len else 0) catch error.TransactionTooLarge;
     }
     if (isRawMetadataIntentKey(intent.key)) return 0;
@@ -491,7 +510,7 @@ fn retainedIntentBytesForLanguage(alloc: Allocator, intent: WriteIntent, sources
     // the full source slot before voting yes; deletes and relational rows do
     // not encode this slot. The retained language cannot change with intents.
     if (sources and bytes != 0 and intent.value != null and intent.prepared_row == null and
-        !@import("db/relational_integrity_contract.zig").isKey(intent.key))
+        !@import("db/relational/integrity/contract.zig").isKey(intent.key))
         return std.math.add(u64, bytes, 16) catch error.TransactionTooLarge;
     return bytes;
 }
@@ -521,6 +540,7 @@ pub const VersionPredicate = struct {
     key: []const u8,
     expected_version: u64 = 0, // 0 = key must not exist
     expected_content_digest: ?[32]u8 = null,
+    expected_mutation_revision: ?u64 = null,
     /// A server-authored INSERT identity constraint, rather than an observed read.
     unique_absence: bool = false,
     /// Internal integrity records are raw metadata, not timestamped primary
@@ -533,7 +553,7 @@ pub const VersionPredicate = struct {
 };
 
 fn validReadMember(bytes: []const u8) bool {
-    return bytes.len == 8 or (bytes.len == 33 and (bytes[0] == 2 or bytes[0] == 3 or bytes[0] == 4));
+    return bytes.len == 8 or (bytes.len == 33 and (bytes[0] == 2 or bytes[0] == 3 or bytes[0] == 4 or bytes[0] == 5));
 }
 
 fn readPredicateIdentity(predicate: VersionPredicate, out: *[33]u8) []const u8 {
@@ -545,7 +565,12 @@ fn readPredicateIdentity(predicate: VersionPredicate, out: *[33]u8) []const u8 {
                 var hash = std.crypto.hash.sha2.Sha256.init(.{});
                 hash.update(&version);
                 hash.update(&digest);
-                out[0] = 4;
+                out[0] = if (predicate.expected_mutation_revision) |revision| tagged: {
+                    var bytes: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &bytes, revision, .little);
+                    hash.update(&bytes);
+                    break :tagged 5;
+                } else 4;
                 hash.final(out[1..33]);
                 return out;
             }
@@ -566,7 +591,9 @@ pub fn hasAnyTransactionStateInView(read: anytype) !bool {
     return try readHasPrefix(read, records_prefix) or try readHasPrefix(read, intents_prefix) or
         try readHasPrefix(read, intent_locks_prefix) or try readHasPrefix(read, read_guards_prefix) or
         try readHasPrefix(read, read_members_prefix) or try readHasPrefix(read, hot_standby_batch_outbox_prefix) or
-        try readHasPrefix(read, hot_standby_replay_outbox_prefix);
+        try readHasPrefix(read, hot_standby_replay_outbox_prefix) or
+        try readHasPrefix(read, document_revision_reservation.header_prefix) or
+        try readHasPrefix(read, document_revision_reservation.rows_prefix);
 }
 
 /// Compact native decision state for control journals that share this 2PC
@@ -586,6 +613,44 @@ pub fn externalParticipant(txn: anytype, id: TxnId) !?ExternalParticipant {
     };
     const record = try decodeRecord(bytes);
     return .{ .owner = record.external_decision_owner, .native_pin = record.native_pin, .status = record.status, .prepared = record.prepared, .commit_version = record.commit_version };
+}
+
+pub fn requireCollectedExternalParticipant(txn: anytype, id: TxnId, owner: ExternalDecisionOwner, expected: TxnStatus, decision_version: u64) !void {
+    if (expected == .pending) return error.ExternalTransactionDecisionChanged;
+    if (try externalParticipant(txn, id)) |record| {
+        const held = record.owner orelse return error.ExternalTransactionDecisionRequired;
+        if (!held.eql(owner) or record.status != expected or (expected == .committed and record.commit_version != decision_version)) return error.ExternalTransactionDecisionChanged;
+        try requireResolvedExternalLockControl(txn, id);
+    } else {
+        const raw = txn.get(external_expiry_floor_key) catch |err| return if (err == error.NotFound) error.ExternalTransactionDecisionChanged else err;
+        if (raw.len != 8 or std.mem.readInt(u64, raw[0..8], .little) < owner.expires_at_unix_ns) return error.ExternalTransactionDecisionChanged;
+    }
+    // A genuinely retired local record is possible after its retry window.
+    // Exact native decision permission still owns cleanup; independently prove
+    // that no physical intent of that transaction remains in this SAME cut.
+    var prefix: [intents_prefix.len + 17]u8 = undefined;
+    @memcpy(prefix[0..intents_prefix.len], intents_prefix);
+    @memcpy(prefix[intents_prefix.len..][0..16], &id);
+    prefix[prefix.len - 1] = ':';
+    if (try readHasPrefix(txn, &prefix)) return error.ExternalTransactionDecisionChanged;
+}
+
+/// A missing outbox becomes actionable only when the same read cut proves
+/// that the exact owner cannot subsequently prepare.
+pub fn publicationAbortFence(reader: anytype, id: TxnId, owner: ExternalDecisionOwner) !?@import("../system_catalog/logical_replication_capacity.zig").AbortFence {
+    const bytes = reader.get(&makeRecordKey(id)) catch |err| {
+        if (err != error.NotFound) return err;
+        const floor = try TxnManager.readExternalExpiryFloor(reader);
+        return if (floor >= owner.expires_at_unix_ns) .{ .expiry_floor = floor } else null;
+    };
+    const record = try decodeRecord(bytes);
+    if (!(record.external_decision_owner orelse return error.ExternalTransactionDecisionChanged).eql(owner))
+        return error.ExternalTransactionDecisionChanged;
+    if (record.publication_capture_required) return error.LogicalCaptureReceiptMissing;
+    if (record.status != .aborted or !record.intents_resolved_known or !record.intents_resolved) return null;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(bytes, &digest, .{});
+    return .{ .aborted_record = digest };
 }
 
 /// Phase-two lock cleanup under a topology fence must follow actual row
@@ -663,7 +728,16 @@ pub const TxnSummaryPage = struct {
     next_after: ?TxnId,
 };
 
+pub const ReplicationOrderedPhase = struct {
+    permit: source_apply.contract.Permit,
+    physical_root: u128,
+    position: @import("db/receipt_position.zig").Position,
+};
+
 pub const ResolutionExtraBatch = struct {
+    replication_resolution: ?ReplicationOrderedPhase = null,
+    publication_ordered_position: ?@FieldType(@import("db/receipt_position.zig").Position, "raft") = null,
+    publication_terminal_sink: ?@import("publication_prepare_sink.zig").TerminalSink = null,
     prepared_graph_effects_checked: bool = false,
     external_decision_owner: ?ExternalDecisionOwner = null,
     native_pin: ?NativePhysicalPin = null,
@@ -704,7 +778,30 @@ pub const ResolutionExtraBatch = struct {
 /// entry without a crash window between the transaction and its replay marker.
 const prepared_enrichments_prefix = "\x00\x00__txn_prepared_enrichments__:";
 
+const source_apply = @import("db/replication_source_apply_store.zig");
+
+pub const ReplicationPrepare = struct {
+    preparation: source_apply.Preparation,
+    position: @import("db/receipt_position.zig").Position,
+    catalog: @import("db/table_catalog.zig").Catalog,
+};
+
+pub const ReplicationAcknowledgement = struct {
+    completion: source_apply.contract.AckCompletion,
+    physical_root: u128,
+    position: @import("db/receipt_position.zig").Position,
+};
+
 pub const MutationExtraBatch = struct {
+    replication_ack: ?ReplicationAcknowledgement = null,
+    replication_activation: ?ReplicationOrderedPhase = null,
+    replication_prepare: ?ReplicationPrepare = null,
+    publication_capture: ?@import("db/logical_replication_outbox.zig").Preparation = null,
+    /// Private native owner hook. The sink journals the materialized first
+    /// PREPARE in the same backend batch, before the durability ticket exists.
+    publication_prepare_sink: ?@import("publication_prepare_sink.zig").Sink = null,
+    document_revision_scope: ?document_revision_reservation.Scope = null,
+    document_revision_references: []const document_revision_reservation.Reference = &.{},
     external_decision_owner: ?ExternalDecisionOwner = null,
     native_pin: ?NativePhysicalPin = null,
     prepared_enrichments_json: ?[]const u8 = null,
@@ -775,6 +872,7 @@ pub const ReplayAppend = struct {
 };
 
 pub const IntentBatch = struct {
+    document_revision_references: []document_revision_reservation.Reference = &.{},
     prepared_enrichments_json: ?[]u8 = null,
     document_revisions: bool = false,
     writes: []docstore.KVPair = &.{},
@@ -788,6 +886,7 @@ pub const IntentBatch = struct {
     owned_entries: ?[]backend_scan.OwnedKVPair = null,
 
     pub fn deinit(self: *IntentBatch, alloc: Allocator) void {
+        if (self.document_revision_references.len != 0) alloc.free(self.document_revision_references);
         if (self.prepared_enrichments_json) |bytes| alloc.free(bytes);
         if (self.prepared_rows.len != 0) alloc.free(self.prepared_rows);
         if (self.prepared_graph_effects.len != 0) alloc.free(self.prepared_graph_effects);
@@ -810,6 +909,8 @@ pub const IntentBatch = struct {
 };
 
 const TxnRecord = struct {
+    publication_capture_required: bool = false,
+    replication_source_required: bool = false,
     document_revisions: bool = false,
     status: TxnStatus,
     begin_timestamp: u64,
@@ -1016,12 +1117,91 @@ pub const TxnManager = struct {
     pub fn TopologySnapshotAudit(comptime Read: type) type {
         return @import("transaction_snapshot.zig").Audit(Read, SnapshotApi);
     }
+    pub fn validateDocumentRevisionSnapshot(alloc: Allocator, read: anytype, control: anytype) !void {
+        var points = try read.openReadScope(alloc);
+        defer points.close();
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        var row = try cursor.seekAtOrAfter(document_revision_reservation.header_prefix);
+        while (row) |entry| {
+            try control.check();
+            if (!std.mem.startsWith(u8, entry.key, document_revision_reservation.header_prefix)) break;
+            if (entry.key.len != document_revision_reservation.header_prefix.len + 16) return error.InvalidTxnRecord;
+            const id = entry.key[document_revision_reservation.header_prefix.len..][0..16].*;
+            const header = try document_revision_reservation.Header.decode(entry.value);
+            if (!std.mem.eql(u8, &header.scope.transaction_id, &id)) return error.InvalidTxnRecord;
+            try points.reset();
+            const record = try decodeRecord(try points.get(&makeRecordKey(id)));
+            if (!record.document_revisions or record.begin_timestamp != header.scope.begin_timestamp) return error.InvalidTxnRecord;
+            if (header.owner) |owner| {
+                if (!(record.external_decision_owner orelse return error.InvalidTxnRecord).eql(owner)) return error.InvalidTxnRecord;
+            } else if (record.external_decision_owner != null or record.prepared or record.intent_revision != 0 or record.status == .committed) return error.InvalidTxnRecord;
+            if (header.scope.native_pin) |pin| {
+                if (record.external_decision_owner != null and !(record.native_pin orelse return error.InvalidTxnRecord).eql(pin)) return error.InvalidTxnRecord;
+            } else if (record.native_pin != null) return error.InvalidTxnRecord;
+            const watermark_bytes = try points.get(ttl.document_version_watermark_key);
+            if (watermark_bytes.len != 8) return error.InvalidTimestamp;
+            const watermark = std.mem.readInt(u64, watermark_bytes[0..8], .little);
+            const catalog = try @import("db/table_catalog.zig").Catalog.decode(try points.get(@import("db/table_catalog.zig").key));
+            if (catalog.transaction_effect_format < 2) return error.InvalidTxnRecord;
+            var children = try read.openCursor();
+            defer children.close();
+            const prefix = document_revision_reservation.rowPrefix(id);
+            var child = try children.seekAtOrAfter(&prefix);
+            var count: usize = 0;
+            var key_bytes: usize = 0;
+            while (child) |item| {
+                try control.check();
+                if (!std.mem.startsWith(u8, item.key, &prefix)) break;
+                count += 1;
+                if (item.key.len == prefix.len or count > header.count) return error.InvalidTxnRecord;
+                key_bytes = std.math.add(usize, key_bytes, item.key.len - prefix.len) catch return error.InvalidTxnRecord;
+                if (key_bytes > header.key_bytes) return error.InvalidTxnRecord;
+                const version = try document_revision_reservation.rowVersion(item.value);
+                if (version > watermark) return error.InvalidTimestamp;
+                if (!record.intents_resolved_known or !record.intents_resolved) {
+                    try points.reset();
+                    const lock_key = try std.mem.concat(alloc, u8, &.{ intent_locks_prefix, item.key[prefix.len..] });
+                    defer alloc.free(lock_key);
+                    const held = try points.get(lock_key);
+                    if (held.len != 16 or !std.mem.eql(u8, held, &id)) return error.InvalidTxnRecord;
+                }
+                if (item.value.len >= 16 and catalog.transaction_effect_format < 3) return error.InvalidTxnRecord;
+                if (try document_revision_reservation.rowUsed(item.value)) {
+                    if (!record.prepared or record.intent_revision == 0) return error.InvalidTxnRecord;
+                    if (!record.intents_resolved_known or !record.intents_resolved) {
+                        try points.reset();
+                        const key = try std.mem.concat(alloc, u8, &.{ &makeSidecarKey(intents_prefix, id), ":", item.key[prefix.len..] });
+                        defer alloc.free(key);
+                        if ((try IntentValue.decode(try points.get(key))).document_revision != version) return error.InvalidTxnRecord;
+                    }
+                }
+                child = try children.next();
+            }
+            if (count != header.count or key_bytes != header.key_bytes) return error.InvalidTxnRecord;
+            row = try cursor.next();
+        }
+        // The reverse proof catches orphan rows even when every header above
+        // was valid. This pass retains one key and one fixed-size header only.
+        row = try cursor.seekAtOrAfter(document_revision_reservation.rows_prefix);
+        while (row) |entry| {
+            try control.check();
+            if (!std.mem.startsWith(u8, entry.key, document_revision_reservation.rows_prefix)) break;
+            if (entry.key.len <= document_revision_reservation.rows_prefix.len + 17 or entry.key[document_revision_reservation.rows_prefix.len + 16] != ':') return error.InvalidTxnRecord;
+            const id = entry.key[document_revision_reservation.rows_prefix.len..][0..16].*;
+            try points.reset();
+            _ = try document_revision_reservation.Header.decode(try points.get(&document_revision_reservation.headerKey(id)));
+            row = try cursor.next();
+        }
+    }
+
     pub fn validateTopologyDebtSnapshot(alloc: Allocator, read: anytype, expected: ?topology_debt.Scope, options: @import("../spill_sort.zig").Options) !topology_debt.SnapshotStats {
         var points = try read.openReadScope(alloc);
         defer points.close();
         const control = options.cancellation orelse @import("antfly_cancellation").CancellationToken.none;
         const stats = try topology_debt.validateSnapshot(read, &points, expected, control);
         try @import("transaction_snapshot.zig").validate(alloc, read, try topology_debt.load(&points), options, SnapshotApi);
+        try validateDocumentRevisionSnapshot(alloc, read, control);
         return stats;
     }
 
@@ -1143,37 +1323,80 @@ pub const TxnManager = struct {
             TxnError.TxnNotFound => null,
             else => return err,
         };
-        if (existing) |record| {
-            if (record.external_decision_owner) |held| {
-                const requested = extra_batch.external_decision_owner orelse return error.ExternalTransactionDecisionRequired;
-                if (!held.eql(requested)) return error.ExternalTransactionDecisionChanged;
-            } else if (extra_batch.external_decision_owner != null) return error.ExternalTransactionDecisionChanged;
-            if (record.status != .pending or record.begin_timestamp != timestamp) return TxnError.DecisionConflict;
-            if (record.coordinator_known and record.coordinator != coordinator) return TxnError.DecisionConflict;
-            if (record.retain_terminal_known and record.retain_terminal != retain_terminal) return TxnError.DecisionConflict;
-            const persisted = try self.getParticipants(self.alloc, txn_id);
-            defer freeParticipantList(self.alloc, persisted);
-            if (!participantListsEqual(persisted, participants)) return TxnError.DecisionConflict;
-            // An idempotent begin from a new binary is the authoritative point
-            // where a legacy record can safely learn its coordinator role.
-            // Persist the upgrade before prepare can rewrite the record as v4.
-            if (!record.coordinator_known or !record.retain_terminal_known) {
-                var upgraded = record;
-                upgraded.coordinator = coordinator;
-                upgraded.coordinator_known = true;
-                upgraded.retain_terminal = retain_terminal;
-                upgraded.retain_terminal_known = true;
-                const upgraded_value = try self.encodeRecord(upgraded);
-                defer self.alloc.free(upgraded_value);
-                var writes = std.ArrayListUnmanaged(docstore.KVPair).empty;
-                defer writes.deinit(self.alloc);
-                try writes.append(self.alloc, .{ .key = &key, .value = upgraded_value });
-                try writes.appendSlice(self.alloc, extra_batch.writes);
-                return try self.applyBatchStaged(writes.items, extra_batch.deletes, null, null, null);
+        if (extra_batch.document_revision_scope != null and existing == null) return error.InvalidTxnRecord;
+        existing_check: {
+            if (existing) |record| {
+                if (record.external_decision_owner == null and extra_batch.external_decision_owner != null and extra_batch.document_revision_scope != null) {
+                    const scope = extra_batch.document_revision_scope.?;
+                    try self.requireDocumentRevisionScope(txn_id, scope);
+                    var read = try self.store.beginProbe();
+                    defer read.abort();
+                    const reservation = (try document_revision_reservation.load(&read, txn_id)) orelse return error.ExternalTransactionDecisionChanged;
+                    const owner = extra_batch.external_decision_owner.?;
+                    try owner.requireFreshVoteAt(created_at);
+                    if (!std.mem.eql(u8, &owner.metadata_incarnation, &scope.metadata_incarnation)) return error.ExternalTransactionDecisionChanged;
+                    if (!reservation.scope.eql(scope) or scope.begin_timestamp != timestamp or reservation.owner != null or reservation.expires_at <= created_at or
+                        record.status != .pending or record.prepared or record.intent_revision != 0 or record.begin_timestamp != timestamp or
+                        !record.document_revisions or record.coordinator or record.retain_terminal) return error.ExternalTransactionDecisionChanged;
+                    const previous = try self.getParticipants(self.alloc, txn_id);
+                    defer freeParticipantList(self.alloc, previous);
+                    if (previous.len != 0) return error.ExternalTransactionDecisionChanged;
+                    break :existing_check;
+                }
+                if (extra_batch.document_revision_scope == null and record.external_decision_owner != null) {
+                    var read = try self.store.beginProbe();
+                    defer read.abort();
+                    if (try document_revision_reservation.load(&read, txn_id) != null) return error.ExternalTransactionDecisionRequired;
+                }
+                if (record.external_decision_owner) |held| {
+                    const requested = extra_batch.external_decision_owner orelse return error.ExternalTransactionDecisionRequired;
+                    if (!held.eql(requested)) return error.ExternalTransactionDecisionChanged;
+                } else if (extra_batch.external_decision_owner != null) return error.ExternalTransactionDecisionChanged;
+                if (extra_batch.document_revision_scope) |scope| {
+                    try self.requireDocumentRevisionScope(txn_id, scope);
+                    var read = try self.store.beginProbe();
+                    defer read.abort();
+                    const header = (try document_revision_reservation.load(&read, txn_id)) orelse return error.ExternalTransactionDecisionChanged;
+                    if (!header.scope.eql(scope) or !(header.owner orelse return error.ExternalTransactionDecisionRequired).eql(extra_batch.external_decision_owner orelse return error.ExternalTransactionDecisionRequired)) return error.ExternalTransactionDecisionChanged;
+                }
+                if (record.status != .pending or record.begin_timestamp != timestamp) return TxnError.DecisionConflict;
+                if (record.coordinator_known and record.coordinator != coordinator) return TxnError.DecisionConflict;
+                if (record.retain_terminal_known and record.retain_terminal != retain_terminal) return TxnError.DecisionConflict;
+                const persisted = try self.getParticipants(self.alloc, txn_id);
+                defer freeParticipantList(self.alloc, persisted);
+                if (!participantListsEqual(persisted, participants)) return TxnError.DecisionConflict;
+                // An idempotent begin from a new binary is the authoritative point
+                // where a legacy record can safely learn its coordinator role.
+                // Persist the upgrade before prepare can rewrite the record as v4.
+                if (!record.coordinator_known or !record.retain_terminal_known) {
+                    var upgraded = record;
+                    upgraded.coordinator = coordinator;
+                    upgraded.coordinator_known = true;
+                    upgraded.retain_terminal = retain_terminal;
+                    upgraded.retain_terminal_known = true;
+                    const upgraded_value = try self.encodeRecord(upgraded);
+                    defer self.alloc.free(upgraded_value);
+                    var writes = std.ArrayListUnmanaged(docstore.KVPair).empty;
+                    defer writes.deinit(self.alloc);
+                    try writes.append(self.alloc, .{ .key = &key, .value = upgraded_value });
+                    try writes.appendSlice(self.alloc, extra_batch.writes);
+                    return try self.applyBatchStaged(writes.items, extra_batch.deletes, null, null, null);
+                }
+                return try self.applyMutationExtraBatchStaged(extra_batch);
             }
-            return try self.applyMutationExtraBatchStaged(extra_batch);
+        }
+        var reservation_header: ?[document_revision_reservation.Header.encoded_len]u8 = null;
+        if (extra_batch.document_revision_scope) |scope| {
+            try self.requireDocumentRevisionScope(txn_id, scope);
+            var read = try self.store.beginProbe();
+            defer read.abort();
+            var held = (try document_revision_reservation.load(&read, txn_id)) orelse return error.ExternalTransactionDecisionChanged;
+            if (!held.scope.eql(scope) or held.owner != null) return error.ExternalTransactionDecisionChanged;
+            held.owner = extra_batch.external_decision_owner orelse return error.ExternalTransactionDecisionRequired;
+            reservation_header = try held.encode();
         }
         const record = TxnRecord{
+            .document_revisions = reservation_header != null,
             .external_decision_owner = extra_batch.external_decision_owner,
             .native_pin = if (extra_batch.external_decision_owner != null) extra_batch.native_pin orelse self.native_relation_pin else null,
             .status = .pending,
@@ -1193,6 +1416,8 @@ pub const TxnManager = struct {
         var writes = std.ArrayListUnmanaged(docstore.KVPair).empty;
         defer writes.deinit(self.alloc);
         try writes.append(self.alloc, .{ .key = &key, .value = record_value });
+        const revision_header_key = document_revision_reservation.headerKey(txn_id);
+        if (reservation_header) |*bytes| try writes.append(self.alloc, .{ .key = &revision_header_key, .value = bytes });
         if (participant_value) |value| {
             try writes.append(self.alloc, .{ .key = &participant_key, .value = value });
         }
@@ -1279,6 +1504,7 @@ pub const TxnManager = struct {
         extra_batch: MutationExtraBatch,
     ) !backend_erased.Ticket {
         try self.requireNativeMutationPin(extra_batch.native_pin);
+        if (extra_batch.document_revision_scope == null and extra_batch.document_revision_references.len != 0) return error.InvalidTxnRecord;
         if (extra_batch.index_span_digests.len > max_read_guards_per_transaction) return error.TransactionTooLarge;
         for (intents) |intent| {
             if (intent.prepared_graph_effects) |effects| {
@@ -1297,6 +1523,22 @@ pub const TxnManager = struct {
             if (owner.expires_at_unix_ns <= try self.externalExpiryFloor()) return error.ExternalTransactionAdmissionExpired;
         }
         const first_prepare = record.prepared_known and !record.prepared and record.intent_revision == 0;
+        if (record.publication_capture_required) return error.PreparedIntentRequiresMaterialization;
+        if (record.replication_source_required) return error.PreparedIntentRequiresMaterialization;
+        if (extra_batch.replication_prepare) |source| {
+            try source.preparation.validate();
+            try source.position.validate();
+            const permit = source.preparation.permit;
+            const owner = record.external_decision_owner orelse return error.ExternalTransactionDecisionRequired;
+            if (!first_prepare or record.native_pin != null or source.position != .raft or extra_batch.publication_prepare_sink != null or
+                !owner.eql(permit.decision_owner) or !std.mem.eql(u8, &txn_id, &permit.reference.txn_id)) return error.ReplicationCutoverAuthorityLost;
+        }
+        const capturing = extra_batch.publication_capture != null or extra_batch.publication_prepare_sink != null;
+        if (capturing and (!first_prepare or record.external_decision_owner == null or record.native_pin != null)) return error.InvalidCommitMetadata;
+        if (extra_batch.publication_capture) |capture| {
+            if (!record.external_decision_owner.?.eql(capture.demand.owner)) return error.ExternalTransactionDecisionChanged;
+            if ((capture.ordered == null) != (extra_batch.publication_prepare_sink != null)) return error.InvalidCommitMetadata;
+        } else if (extra_batch.publication_prepare_sink != null and !@import("builtin").is_test) return error.InvalidCommitMetadata;
         if (!first_prepare and extra_batch.prepared_enrichments_json == null) {
             if (try self.loadPreparedEnrichments(self.alloc, txn_id)) |packet| {
                 self.alloc.free(packet);
@@ -1338,6 +1580,51 @@ pub const TxnManager = struct {
         };
         try self.checkIntentConflicts(extra_batch.graph_sources, txn_id);
         try self.checkIndexSpanGuardConflicts(extra_batch.index_span_digests, txn_id);
+
+        var reservation_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer reservation_arena.deinit();
+        var reserved_versions = std.StringHashMap(u64).init(reservation_arena.allocator());
+        var reserved_children = std.StringHashMap(u64).init(reservation_arena.allocator());
+        if (record.document_revisions or extra_batch.document_revision_scope != null) {
+            var read = try self.store.beginProbe();
+            defer read.abort();
+            if (try document_revision_reservation.load(&read, txn_id)) |held| {
+                const scope = extra_batch.document_revision_scope orelse return error.ExternalTransactionDecisionRequired;
+                try self.requireDocumentRevisionScope(txn_id, scope);
+                const owner = record.external_decision_owner orelse return error.ExternalTransactionDecisionRequired;
+                if (!held.scope.eql(scope) or !(held.owner orelse return error.ExternalTransactionDecisionRequired).eql(owner) or !record.document_revisions or
+                    (extra_batch.document_revisions != null and !extra_batch.document_revisions.?)) return error.ExternalTransactionDecisionChanged;
+                const references = extra_batch.document_revision_references;
+                if (references.len > document_revision_reservation.max_rows) return error.TransactionTooLarge;
+                var demands = std.StringHashMap(u64).init(reservation_arena.allocator());
+                var key_bytes: usize = 0;
+                for (references, 0..) |reference, i| {
+                    if (reference.key.len == 0 or reference.version == 0 or reference.version > document_revision_reservation.max_version or
+                        (i != 0 and std.mem.order(u8, references[i - 1].key, reference.key) != .lt)) return error.InvalidTxnRecord;
+                    key_bytes = std.math.add(usize, key_bytes, reference.key.len) catch return error.TransactionTooLarge;
+                    if (key_bytes > document_revision_reservation.max_key_bytes) return error.TransactionTooLarge;
+                    try demands.put(reference.key, reference.version);
+                }
+                for (intents) |intent| {
+                    if (isRawMetadataIntentKey(intent.key)) continue;
+                    const demand = demands.get(intent.key) orelse return error.ExternalTransactionDecisionChanged;
+                    const key = try document_revision_reservation.rowKey(reservation_arena.allocator(), txn_id, intent.key);
+                    const value = read.get(key) catch |err| return if (err == error.NotFound) error.ExternalTransactionDecisionChanged else err;
+                    const assigned = try document_revision_reservation.rowVersion(value);
+                    if (assigned != demand) return error.VersionConflict;
+                    if (intent.prepared_row != null) return error.PreparedIntentRequiresMaterialization;
+                    const timestamp_key = try internal_keys.ttlKeyAlloc(reservation_arena.allocator(), intent.key);
+                    const current = read.get(timestamp_key) catch |err| switch (err) {
+                        error.NotFound => null,
+                        else => return err,
+                    };
+                    if (current) |bytes| if ((ttl.writeVersion(bytes) orelse return error.InvalidTimestamp) >= assigned) return error.VersionConflict;
+                    try reserved_versions.put(intent.key, assigned);
+                    try reserved_children.put(intent.key, try document_revision_reservation.rowSubtransaction(value));
+                }
+                if (reserved_versions.count() != references.len) return error.ExternalTransactionDecisionChanged;
+            } else if (extra_batch.document_revision_scope != null) return error.ExternalTransactionDecisionChanged;
+        }
 
         const source_language = blk: {
             var probe = try self.store.beginProbe();
@@ -1413,7 +1700,8 @@ pub const TxnManager = struct {
                 if (raw.len != 16 and raw.len != 24) return error.InvalidTxnRecord;
                 break :blk IntentCost{ .bytes = std.mem.readInt(u64, raw[0..8], .little), .retained = std.mem.readInt(u64, raw[8..16], .little), .retained_keys = if (raw.len == 24) std.mem.readInt(u64, raw[16..24], .little) else @intFromBool(std.mem.readInt(u64, raw[8..16], .little) != 0) };
             };
-            const cost = try intentAdmissionBytes(intent);
+            const envelope_bytes: u64 = if (reserved_versions.contains(intent.key)) 9 else 0;
+            const cost = std.math.add(u64, try intentAdmissionBytes(intent), envelope_bytes) catch return error.TransactionTooLarge;
             const retained = try retainedIntentBytesForLanguage(self.alloc, intent, source_language);
             const retained_keys = try retainedIntentKeys(intent, retained);
             if (prior) |old| {
@@ -1479,10 +1767,21 @@ pub const TxnManager = struct {
             // SQL provenance prefixes the existing immutable value envelope.
             // It is committed atomically with the prepare vote and survives
             // journal replay, restart and replacement of the same intent key.
-            const val = try IntentValue.encode(self.alloc, intent);
+            const base = try IntentValue.encode(self.alloc, intent);
+            const val = if (reserved_versions.get(intent.key)) |revision| blk: {
+                defer self.alloc.free(base);
+                break :blk try IntentValue.withDocumentRevision(self.alloc, base, revision);
+            } else base;
             try appendOwnedBytes(self.alloc, &write_vals, val);
 
             try writes.append(self.alloc, .{ .key = intent_key, .value = val });
+            if (reserved_versions.get(intent.key)) |revision| {
+                const receipt_key = try document_revision_reservation.rowKey(self.alloc, txn_id, intent.key);
+                try appendOwnedBytes(self.alloc, &write_keys, receipt_key);
+                const receipt_value = try document_revision_reservation.encodeRow(self.alloc, revision, reserved_children.get(intent.key).?, true);
+                try appendOwnedBytes(self.alloc, &write_vals, receipt_value);
+                try writes.append(self.alloc, .{ .key = receipt_key, .value = receipt_value });
+            }
 
             const lock_key = try self.makeIntentLockKey(intent.key);
             try appendOwnedBytes(self.alloc, &write_keys, lock_key);
@@ -1495,6 +1794,8 @@ pub const TxnManager = struct {
         // Recovery can therefore never observe intents without the durable
         // fencing bit that prevents presumed abort.
         record.prepared = true;
+        record.publication_capture_required = capturing;
+        record.replication_source_required = extra_batch.replication_prepare != null;
         // Pin the scheme with the first vote. A transaction may span a
         // rolling activation; later prepares preserve its durable contract.
         // Records predating the prepare bit remain conservatively legacy.
@@ -1551,7 +1852,12 @@ pub const TxnManager = struct {
         }
         try writes.appendSlice(self.alloc, extra_batch.writes);
 
-        const ticket = try self.applyBatchStaged(writes.items, extra_batch.deletes, null, .{ .previous = if (previous_admission) |old| old.reservation() else 0, .next = admission.reservation() }, null);
+        const ticket = try self.applyBatchStaged(writes.items, extra_batch.deletes, null, .{
+            .previous = if (previous_admission) |old| old.reservation() else 0,
+            .next = admission.reservation(),
+            .capture = if (extra_batch.publication_prepare_sink) |sink| .{ .id = txn_id, .sink = sink } else null,
+            .publication = .{ .source = extra_batch.replication_prepare, .input = extra_batch.publication_capture, .id = txn_id, .revision = record.intent_revision, .intents = intents },
+        }, null);
 
         self.traceWriteIntentSuccess(txn_id, intents, predicates);
         return ticket;
@@ -1565,11 +1871,27 @@ pub const TxnManager = struct {
         try self.requireNativeMutationPin(extra.native_pin);
         try owner.validate();
         var record = try self.loadTransactionRecord(txn_id);
+        if (record.replication_source_required != (extra.replication_activation != null)) return error.ReplicationCutoverAuthorityLost;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const activation = if (extra.replication_activation) |phase| blk: {
+            const permit = phase.permit;
+            var read = try self.store.beginRead();
+            defer read.abort();
+            const namespace = @import("db/online_source_contract.zig").namespaceBytes(permit.namespace);
+            _ = try @import("source_authority.zig").require(&read, .raft, namespace);
+            const prepared = (try source_apply.preparedForTransaction(arena.allocator(), &read, txn_id, owner, permit.namespace)) orelse return error.ReplicationCutoverAuthorityLost;
+            if (!std.meta.eql(prepared.receipt.permit, permit) or prepared.intent_revision != record.intent_revision)
+                return error.ReplicationCutoverAuthorityLost;
+            break :blk try source_apply.activationWrite(arena.allocator(), &read, prepared, phase.position, phase.physical_root);
+        } else null;
         const held = record.external_decision_owner orelse return error.ExternalTransactionDecisionRequired;
         if (!held.eql(owner)) return error.ExternalTransactionDecisionChanged;
         if (!record.prepared or record.status == .aborted) return error.DecisionConflict;
         var barrier_value: [8]u8 = undefined;
         const install_barrier = !record.external_commit_started;
+        if (extra.replication_activation != null and install_barrier != (activation != null))
+            return error.ReplicationCutoverAuthorityLost;
         if (install_barrier) {
             var read = try self.store.beginProbe();
             defer read.abort();
@@ -1584,6 +1906,7 @@ pub const TxnManager = struct {
         defer writes.deinit(self.alloc);
         try writes.append(self.alloc, .{ .key = &key, .value = encoded });
         if (install_barrier) try writes.append(self.alloc, .{ .key = external_read_barrier_count_key, .value = &barrier_value });
+        if (activation) |write| try writes.append(self.alloc, write);
         try writes.appendSlice(self.alloc, extra.writes);
         try self.applyBatch(writes.items, extra.deletes, null);
     }
@@ -1591,6 +1914,10 @@ pub const TxnManager = struct {
     fn externalExpiryFloor(self: *TxnManager) !u64 {
         var read = try self.store.beginProbe();
         defer read.abort();
+        return readExternalExpiryFloor(&read);
+    }
+
+    fn readExternalExpiryFloor(read: anytype) !u64 {
         const bytes = read.get(external_expiry_floor_key) catch |err| switch (err) {
             error.NotFound => return 0,
             else => return err,
@@ -1604,7 +1931,9 @@ pub const TxnManager = struct {
     fn fenceMissingExternalAbort(self: *TxnManager, id: TxnId, timestamp: u64, extra: ResolutionExtraBatch) !StagedResolutionOutcome {
         const owner = extra.external_decision_owner.?;
         try owner.validate();
-        if (try self.externalExpiryFloor() >= owner.expires_at_unix_ns) {
+        const source = extra.replication_resolution;
+        if (source) |input| try requireReplicationResolution(id, owner, input);
+        if (source == null and try self.externalExpiryFloor() >= owner.expires_at_unix_ns) {
             const ticket = if (extra.completion_writes.len != 0 or extra.completion_deletes.len != 0)
                 try self.applyBatchStaged(extra.completion_writes, extra.completion_deletes, null, null, null)
             else
@@ -1612,7 +1941,7 @@ pub const TxnManager = struct {
             return .{ .outcome = .{ .applied = false, .replay_sequence = 0 }, .ticket = ticket };
         }
         const key = makeRecordKey(id);
-        const record: TxnRecord = .{ .status = .aborted, .begin_timestamp = timestamp, .commit_version = 0, .created_at = timestamp, .finalized_at = timestamp, .retain_terminal = true, .intents_resolved = true, .intents_resolved_known = true, .external_decision_owner = owner, .native_pin = extra.native_pin orelse self.native_relation_pin };
+        const record: TxnRecord = .{ .status = .aborted, .begin_timestamp = timestamp, .commit_version = 0, .created_at = timestamp, .finalized_at = timestamp, .retain_terminal = true, .intents_resolved = true, .intents_resolved_known = true, .external_decision_owner = owner, .native_pin = extra.native_pin orelse self.native_relation_pin, .replication_source_required = source != null };
         const bytes = try self.encodeRecord(record);
         defer self.alloc.free(bytes);
         var writes: std.ArrayListUnmanaged(docstore.KVPair) = .empty;
@@ -1620,7 +1949,10 @@ pub const TxnManager = struct {
         try writes.append(self.alloc, .{ .key = &key, .value = bytes });
         const participant_key = makeSidecarKey(participants_prefix, id);
         const resolved_key = makeSidecarKey(resolved_participants_prefix, id);
-        const participants = if (extra.resolved_participant) |peer| try encodeParticipantList(self.alloc, &.{peer}) else null;
+        const participants = if (source == null and extra.resolved_participant != null)
+            try encodeParticipantList(self.alloc, &.{extra.resolved_participant.?})
+        else
+            null;
         defer if (participants) |value| self.alloc.free(value);
         if (participants) |value| {
             try writes.append(self.alloc, .{ .key = &participant_key, .value = value });
@@ -1628,11 +1960,91 @@ pub const TxnManager = struct {
             // handoff ACK. In particular ABORT may precede BEGIN and its reply
             // may be lost after admission expiry. Keep the actual local roster
             // unresolved until the existing explicit external ACK arrives.
-            if (record.native_pin == null)
+            if (record.native_pin == null and source == null)
                 try writes.append(self.alloc, .{ .key = &resolved_key, .value = value });
         }
         try writes.appendSlice(self.alloc, extra.completion_writes);
-        const ticket = try self.applyBatchStaged(writes.items, extra.completion_deletes, null, null, null);
+        const reservation: ?ReservationChange = if (source) |input| .{
+            .previous = 0,
+            .next = 0,
+            .source_resolution = .{ .input = input, .revision = 0, .status = .aborted },
+        } else null;
+        const ticket = try self.applyBatchStaged(writes.items, extra.completion_deletes, null, reservation, null);
+        return .{ .outcome = .{ .applied = false, .replay_sequence = 0 }, .ticket = ticket };
+    }
+
+    fn requireReplicationResolution(id: TxnId, owner: ExternalDecisionOwner, input: ReplicationOrderedPhase) !void {
+        try input.permit.validate();
+        try input.position.validate();
+        if (input.position != .raft or input.physical_root == 0 or !owner.eql(input.permit.decision_owner) or
+            !std.mem.eql(u8, &id, &input.permit.reference.txn_id)) return error.ReplicationCutoverAuthorityLost;
+    }
+
+    /// Cancel owner reservations when the coordinator aborts before BEGIN,
+    /// retaining the terminal decision for durable participant acknowledgement.
+    fn fenceReservedExternalAbort(self: *TxnManager, id: TxnId, timestamp: u64, previous: TxnRecord, extra: ResolutionExtraBatch) !StagedResolutionOutcome {
+        const owner = extra.external_decision_owner.?;
+        try owner.validate();
+        if (previous.status != .pending or previous.prepared or previous.intent_revision != 0 or previous.coordinator or previous.retain_terminal or previous.external_commit_started) return error.ExternalTransactionDecisionChanged;
+        // The apply fence makes tip probes and this prefix cursor one cut.
+        // Do not clone the entire mutable memtable merely to cancel own keys.
+        const View = struct {
+            probe: backend_erased.ProbeTxn,
+            scan: backend_erased.CurrentScanTxn,
+            pub fn get(view: *@This(), key: []const u8) ![]const u8 {
+                return view.probe.get(key);
+            }
+            pub fn getManySorted(view: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
+                return view.probe.getManySorted(keys, values);
+            }
+            pub fn openCursor(view: *@This()) !backend_erased.Cursor {
+                return view.scan.openCursor();
+            }
+        };
+        var probe = try self.store.beginProbe();
+        defer probe.abort();
+        var scan = try self.store.beginCurrentScan();
+        defer scan.abort();
+        var read: View = .{ .probe = probe, .scan = scan };
+        var header = (try document_revision_reservation.load(&read, id)) orelse return error.InvalidTxnRecord;
+        try self.requireDocumentRevisionScope(id, header.scope);
+        if (header.owner != null or !std.mem.eql(u8, &header.scope.metadata_incarnation, &owner.metadata_incarnation)) return error.ExternalTransactionDecisionChanged;
+        const peer = extra.resolved_participant orelse return error.InvalidParticipant;
+        const peers = try self.getParticipants(self.alloc, id);
+        defer freeParticipantList(self.alloc, peers);
+        if (peers.len != 0) return error.ExternalTransactionDecisionChanged;
+        var plan = (try self.prepareAbandonDocumentRevisions(&read, id, header.scope.principal_digest, timestamp)) orelse return error.ExternalTransactionDecisionChanged;
+        defer plan.deinit();
+        var record = previous;
+        record.status = .aborted;
+        record.finalized_at = timestamp;
+        record.retain_terminal = true;
+        record.retain_terminal_known = true;
+        record.external_decision_owner = owner;
+        record.native_pin = extra.native_pin orelse self.native_relation_pin;
+        record.intents_resolved = true;
+        record.intents_resolved_known = true;
+        const encoded = try self.encodeRecord(record);
+        defer self.alloc.free(encoded);
+        try plan.put(&makeRecordKey(id), encoded);
+        header.owner = owner;
+        header.count = 0;
+        header.key_bytes = 0;
+        try plan.put(&document_revision_reservation.headerKey(id), &try header.encode());
+        const roster = try encodeParticipantList(self.alloc, &.{peer});
+        defer self.alloc.free(roster);
+        try plan.put(&makeSidecarKey(participants_prefix, id), roster);
+        try plan.put(&makeParticipantIndexKey(participant_index_prefix, id, peer), peer);
+        var indexed: [17]u8 = undefined;
+        (ParticipantIndex{ .enlisted = 1, .resolved = if (record.native_pin == null) 1 else 0 }).encode(&indexed);
+        try plan.put(&makeSidecarKey(participant_index_prefix, id), &indexed);
+        if (record.native_pin == null) {
+            try plan.put(&makeSidecarKey(resolved_participants_prefix, id), roster);
+            try plan.put(&makeParticipantIndexKey(resolved_index_prefix, id, peer), peer);
+        }
+        for (extra.completion_writes) |write| try plan.put(write.key, write.value);
+        for (extra.completion_deletes) |key| try plan.erase(key);
+        const ticket = try self.applyBatchStaged(plan.writes.items, plan.deletes.items, null, null, extra.commit_participant);
         return .{ .outcome = .{ .applied = false, .replay_sequence = 0 }, .ticket = ticket };
     }
 
@@ -1640,6 +2052,39 @@ pub const TxnManager = struct {
     /// Conflicting terminal decisions return `TxnError.DecisionConflict`; callers
     /// should treat that as a protocol inconsistency / torn-state signal rather
     /// than a retryable OCC conflict.
+    fn validateReservedMaterialization(self: *TxnManager, a: Allocator, entries: []const backend_scan.OwnedKVPair, extra: ResolutionExtraBatch) !void {
+        const Expected = struct { version: u64, write: bool };
+        var expected = std.StringHashMap(Expected).init(a);
+        var highest: u64 = 0;
+        for (entries) |entry| {
+            const key = entry.key[intents_prefix.len + 17 ..];
+            if (isRawMetadataIntentKey(key)) continue;
+            const intent = try IntentValue.decode(entry.value);
+            const version = intent.document_revision orelse return error.InvalidTxnRecord;
+            highest = @max(highest, version);
+            const timestamp_key = try internal_keys.ttlKeyAlloc(a, key);
+            try expected.put(timestamp_key, .{ .version = version, .write = intent.value != null });
+        }
+        var read = try self.store.beginProbe();
+        defer read.abort();
+        const raw_floor = try read.get(ttl.document_version_watermark_key);
+        if (raw_floor.len != 8) return error.InvalidTimestamp;
+        const floor = std.mem.readInt(u64, raw_floor[0..8], .little);
+        if (floor < highest) return error.InvalidTimestamp;
+        inline for (.{ extra.writes, extra.completion_writes }) |writes| for (writes) |write| {
+            if (std.mem.eql(u8, write.key, ttl.document_version_watermark_key)) {
+                if (write.value.len != 8 or std.mem.readInt(u64, write.value[0..8], .little) < floor) return error.InvalidTimestamp;
+            } else if (internal_keys.isTtlKey(write.key)) {
+                const held = expected.get(write.key) orelse return error.InvalidTxnRecord;
+                if (!held.write or (ttl.writeVersion(write.value) orelse return error.InvalidTimestamp) != held.version) return error.InvalidTxnRecord;
+            }
+        };
+        inline for (.{ extra.deletes, extra.completion_deletes }) |deletes| for (deletes) |key| {
+            if (std.mem.eql(u8, key, ttl.document_version_watermark_key)) return error.InvalidTimestamp;
+            if (internal_keys.isTtlKey(key)) if (expected.get(key)) |held| if (held.write) return error.InvalidTxnRecord;
+        };
+    }
+
     pub fn resolveIntents(self: *TxnManager, txn_id: TxnId, status: TxnStatus, timestamp: u64) !void {
         _ = try self.resolveIntentsWithExtraBatch(txn_id, status, timestamp, .{});
     }
@@ -1686,11 +2131,62 @@ pub const TxnManager = struct {
         const rec_key = makeRecordKey(txn_id);
         const schema_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);
         var record = self.loadTransactionRecord(txn_id) catch |err| {
-            if (err == error.TxnNotFound and status == .aborted and extra_batch.external_decision_owner != null)
+            if (err == error.TxnNotFound and status == .aborted and extra_batch.external_decision_owner != null and extra_batch.publication_terminal_sink == null)
                 return self.fenceMissingExternalAbort(txn_id, timestamp, extra_batch);
             return err;
         };
-        const retain_metadata_ack = record.native_pin != null and record.external_decision_owner != null;
+        if (record.replication_source_required and extra_batch.replication_resolution == null) return error.ReplicationCutoverAuthorityLost;
+        if (extra_batch.publication_terminal_sink != null and !record.publication_capture_required)
+            return error.LogicalCaptureReceiptMissing;
+        var terminal_region: std.heap.ArenaAllocator = .init(self.alloc);
+        defer terminal_region.deinit();
+        const replication_prepared = if (extra_batch.replication_resolution) |resolution| prepared: {
+            const a = terminal_region.allocator();
+            const owner = record.external_decision_owner orelse return error.ExternalTransactionDecisionRequired;
+            try requireReplicationResolution(txn_id, owner, resolution);
+            if (!(extra_batch.external_decision_owner orelse return error.ExternalTransactionDecisionRequired).eql(owner))
+                return error.ExternalTransactionDecisionChanged;
+            var read = try self.store.beginRead();
+            defer read.abort();
+            if (!record.prepared) {
+                if (status != .aborted or record.intent_revision != 0 or record.native_pin != null) return error.ReplicationCutoverAuthorityLost;
+                if (record.status != .pending) {
+                    if (!record.replication_source_required or record.status != .aborted) return error.ReplicationCutoverAuthorityLost;
+                    const receipt = (try source_apply.readAborted(a, &read, resolution.permit)) orelse return error.ReplicationCutoverAuthorityLost;
+                    if (receipt.image.physical_root_incarnation != resolution.physical_root or
+                        (!std.meta.eql(receipt.position, resolution.position) and !resolution.position.strictlyAfter(receipt.position)))
+                        return error.ReplicationCutoverAuthorityLost;
+                }
+                record.replication_source_required = true;
+                break :prepared null;
+            }
+            if (!record.replication_source_required or status == .pending) return error.ReplicationCutoverAuthorityLost;
+            break :prepared try source_apply.requirePrepared(a, &read, resolution.permit, resolution.physical_root, record.intent_revision);
+        } else null;
+        var ordered_capture: @import("db/logical_replication_outbox.zig").OrderedResolution = undefined;
+        var publication_terminal_sink = extra_batch.publication_terminal_sink;
+        if (record.publication_capture_required and !record.intents_resolved and publication_terminal_sink == null) {
+            const position = extra_batch.publication_ordered_position orelse return error.LogicalCaptureReceiptMissing;
+            const owner = extra_batch.external_decision_owner orelse return error.ExternalTransactionDecisionRequired;
+            if (!owner.eql(record.external_decision_owner orelse return error.InvalidTxnRecord)) return error.ExternalTransactionDecisionChanged;
+            ordered_capture = .{
+                .alloc = terminal_region.allocator(),
+                .position = position,
+                .owner = owner,
+                .transaction_id = txn_id,
+                .intent_revision = record.intent_revision,
+                .status = switch (status) {
+                    .committed => .committed,
+                    .aborted => .aborted,
+                    .pending => return error.InvalidTxnRecord,
+                },
+                .commit_version = timestamp,
+            };
+            publication_terminal_sink = ordered_capture.sink();
+        }
+        if (status == .aborted and record.document_revisions and record.external_decision_owner == null and extra_batch.external_decision_owner != null)
+            return self.fenceReservedExternalAbort(txn_id, timestamp, record, extra_batch);
+        const retain_metadata_ack = (record.native_pin != null or record.publication_capture_required or record.replication_source_required) and record.external_decision_owner != null;
         var resolved_participant_key: [resolved_participants_prefix.len + 16]u8 = undefined;
         var resolved_participant_value: ?[]u8 = null;
         defer if (resolved_participant_value) |value| self.alloc.free(value);
@@ -1780,7 +2276,7 @@ pub const TxnManager = struct {
 
         if (extra_batch.captured_intents != null and extra_batch.expected_intent_revision == null) return error.InvalidArgument;
         const intent_entries = if (extra_batch.captured_intents) |entries| entries else if (extra_batch.known_intent_keys) |keys|
-            if (extra_batch.skip_all_intent_application and extra_batch.expected_intent_revision != null and extra_batch.prepared_graph_effects_checked)
+            if (!record.replication_source_required and extra_batch.skip_all_intent_application and extra_batch.expected_intent_revision != null and extra_batch.prepared_graph_effects_checked)
                 try intentRetirementEntries(self.alloc, scan_prefix, keys)
             else
                 try self.loadIntentEntriesByKeys(self.alloc, scan_prefix, keys)
@@ -1790,6 +2286,13 @@ pub const TxnManager = struct {
             try self.loadIntentEntries(self.alloc, txn_id, scan_prefix);
         defer if (extra_batch.captured_intents == null) backend_scan.freeResults(self.alloc, intent_entries);
 
+        if (status == .committed) if (replication_prepared) |prepared| {
+            const a = terminal_region.allocator();
+            const frozen = try a.alloc(source_apply.FrozenIntent, intent_entries.len);
+            for (intent_entries, frozen) |entry, *item|
+                item.* = .{ .key = entry.key[scan_prefix.len..], .encoded_value = entry.value };
+            try source_apply.validatePreparedIntents(a, prepared, frozen);
+        };
         const prepared_key = makeSidecarKey(prepared_enrichments_prefix, txn_id);
         const read_prefix = makeSidecarKey(read_members_prefix, txn_id);
         const read_admission = try self.loadReadAdmission(txn_id);
@@ -1905,7 +2408,47 @@ pub const TxnManager = struct {
         defer revision_arena.deinit();
         const revision_alloc = revision_arena.allocator();
         var resolved_version = timestamp;
-        if (status == .committed and record.document_revisions and !extra_batch.skip_all_intent_application) {
+        const reservation: ?document_revision_reservation.Header = if (record.document_revisions) blk: {
+            var read = try self.store.beginProbe();
+            defer read.abort();
+            break :blk try document_revision_reservation.load(&read, txn_id);
+        } else null;
+        if (reservation) |held| {
+            if (status == .committed and (extra_batch.skip_all_intent_application or extra_batch.skip_intent_keys.len != 0)) return error.PreparedIntentRequiresMaterialization;
+            if (record.external_decision_owner) |owner| {
+                if (!(held.owner orelse return error.ExternalTransactionDecisionRequired).eql(owner)) return error.InvalidTxnRecord;
+            } else if (held.owner != null or status != .aborted or record.prepared or record.intent_revision != 0) return error.ExternalTransactionDecisionRequired;
+            if (!record.document_revisions) return error.InvalidTxnRecord;
+            {
+                var scan = try self.store.beginCurrentScan();
+                defer scan.abort();
+                var members = try document_revision_reservation.prepareCleanup(revision_alloc, &scan, held);
+                defer members.deinit();
+                const prefix = document_revision_reservation.rowPrefix(txn_id);
+                var locks = try self.store.beginProbe();
+                defer locks.abort();
+                for (members.keys[1..]) |row_key| {
+                    const lock_key = try std.mem.concat(revision_alloc, u8, &.{ intent_locks_prefix, row_key[prefix.len..] });
+                    const lock_owner = try locks.get(lock_key);
+                    if (lock_owner.len != 16 or !std.mem.eql(u8, lock_owner, &txn_id)) return error.InvalidTxnRecord;
+                    try deletes.append(self.alloc, lock_key);
+                }
+            }
+            var read = try self.store.beginProbe();
+            defer read.abort();
+            // ABORT's revision-fenced fast path carries keys only; it never
+            // needs payloads or creates committed row receipts.
+            if (status == .committed) for (intent_entries) |entry| {
+                const key = entry.key[intents_prefix.len + 17 ..];
+                if (isRawMetadataIntentKey(key)) continue;
+                const assigned = (try IntentValue.decode(entry.value)).document_revision orelse return error.InvalidTxnRecord;
+                const receipt_key = try document_revision_reservation.rowKey(revision_alloc, txn_id, key);
+                const receipt = try read.get(receipt_key);
+                if (!try document_revision_reservation.rowUsed(receipt) or try document_revision_reservation.rowVersion(receipt) != assigned) return error.InvalidTxnRecord;
+            };
+            if (status == .committed) try self.validateReservedMaterialization(revision_alloc, intent_entries, extra_batch);
+        }
+        if (reservation == null and status == .committed and record.document_revisions and !extra_batch.skip_all_intent_application) {
             var revision_writes = std.ArrayList(docstore.KVPair).empty;
             var revision_deletes = std.ArrayList([]const u8).empty;
             for (intent_entries) |entry| {
@@ -1929,6 +2472,7 @@ pub const TxnManager = struct {
                 const user_key = entry.key[intents_prefix.len + 17 ..];
                 if (extra_batch.skip_all_intent_application and extra_batch.prepared_graph_effects_checked) continue;
                 const intent = try IntentValue.decode(entry.value);
+                if ((intent.document_revision != null) != (reservation != null and !isRawMetadataIntentKey(user_key))) return error.InvalidTxnRecord;
                 if (intent.prepared_graph_effects != null and !extra_batch.prepared_graph_effects_checked) return error.PreparedIntentRequiresMaterialization;
                 if (extra_batch.skip_all_intent_application or skipped_intent_keys.contains(user_key)) continue;
                 // The checked graph attachment has already been materialized
@@ -1964,7 +2508,7 @@ pub const TxnManager = struct {
                     // Write timestamp for the key
                     const ts_key = try internal_keys.ttlKeyAlloc(self.alloc, user_key);
                     try owned_apply_keys.append(self.alloc, ts_key);
-                    const ts_val = try ttl.encodeTimestampAlloc(revision_alloc, resolved_version, @as(i128, timestamp));
+                    const ts_val = try ttl.encodeTimestampAlloc(revision_alloc, intent.document_revision orelse resolved_version, @as(i128, timestamp));
                     try writes.append(self.alloc, .{ .key = ts_key, .value = ts_val });
                 }
             }
@@ -1988,7 +2532,16 @@ pub const TxnManager = struct {
         try deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
 
         const admission = try self.loadIntentAdmission(self.alloc, txn_id);
-        const ticket = try self.applyBatchStaged(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null);
+        const ticket = try self.applyBatchStaged(writes.items, deletes.items, extra_batch.replay, .{
+            .previous = if (admission) |value| value.reservation() else 0,
+            .next = 0,
+            .terminal = if (was_terminal) null else publication_terminal_sink,
+            .source_resolution = if (was_terminal or extra_batch.replication_resolution == null) null else .{
+                .input = extra_batch.replication_resolution.?,
+                .revision = record.intent_revision,
+                .status = status,
+            },
+        }, if (status == .committed) extra_batch.commit_participant else null);
 
         if (self.trace_writer) |tw| {
             tw.traceEvent(&.{
@@ -2043,12 +2596,15 @@ pub const TxnManager = struct {
         errdefer if (graph_effects.len != 0) alloc.free(graph_effects);
         const deletes = try alloc.alloc([]const u8, intent_entries.len - write_count);
         errdefer alloc.free(deletes);
+        var references: std.ArrayList(document_revision_reservation.Reference) = .empty;
+        errdefer references.deinit(alloc);
         var writes_initialized: usize = 0;
         var deletes_initialized: usize = 0;
 
         for (intent_entries) |entry| {
             const user_key = entry.key[intents_prefix.len + 17 ..];
             const intent = try IntentValue.decode(entry.value);
+            if (intent.document_revision) |version| try references.append(alloc, .{ .key = user_key, .version = version });
             if (intent.value == null) {
                 deletes[deletes_initialized] = user_key;
                 deletes_initialized += 1;
@@ -2059,7 +2615,7 @@ pub const TxnManager = struct {
                 writes_initialized += 1;
             }
         }
-        return .{ .prepared_enrichments_json = prepared_json, .writes = writes, .deletes = deletes, .prepared_rows = prepared_rows, .prepared_graph_effects = graph_effects, .revision = record.intent_revision, .schema_binding = schema_binding, .owned_entries = intent_entries, .document_revisions = record.document_revisions };
+        return .{ .document_revision_references = try references.toOwnedSlice(alloc), .prepared_enrichments_json = prepared_json, .writes = writes, .deletes = deletes, .prepared_rows = prepared_rows, .prepared_graph_effects = graph_effects, .revision = record.intent_revision, .schema_binding = schema_binding, .owned_entries = intent_entries, .document_revisions = record.document_revisions };
     }
 
     pub fn loadPreparedEnrichments(self: *TxnManager, alloc: Allocator, txn_id: TxnId) !?[]u8 {
@@ -2362,6 +2918,11 @@ pub const TxnManager = struct {
         return hasRowTransactionStateInView(self.alloc, &read, false);
     }
 
+    pub fn hasPublicationCaptureDebtInView(alloc: Allocator, read: anytype) !bool {
+        if (try readHasPrefix(read, schema_leases_prefix)) return true;
+        return hasRowTransactionStateInView(alloc, read, false);
+    }
+
     fn hasRowTransactionStateInView(alloc: Allocator, read: anytype, include_external_ack: bool) !bool {
         // Resolution normally removes intents and HA outboxes atomically before
         // a transaction becomes quiescent. Check the global prefixes once rather
@@ -2514,7 +3075,7 @@ pub const TxnManager = struct {
         // has already cleaned the transaction. Do not recreate an orphaned
         // resolved-participants sidecar in that case, and reject corrupt
         // acknowledgements for participants that were never enlisted.
-        _ = try self.loadTransactionRecord(txn_id);
+        if ((try self.loadTransactionRecord(txn_id)).replication_source_required) return error.ReplicationCutoverAuthorityLost;
         const participants = try self.getParticipants(self.alloc, txn_id);
         defer freeParticipantList(self.alloc, participants);
         var enlisted = false;
@@ -2562,6 +3123,17 @@ pub const TxnManager = struct {
         try self.requireNativeMutationPin(extra_batch.native_pin);
         if (acknowledgements.len == 0 or acknowledgements.len > 64) return error.InvalidParticipant;
         const record = try self.loadTransactionRecord(txn_id);
+        if (record.replication_source_required != (extra_batch.replication_ack != null)) return error.ReplicationCutoverAuthorityLost;
+        if (extra_batch.replication_ack) |ack| {
+            const completion = ack.completion;
+            const owner = record.external_decision_owner orelse return error.ExternalTransactionDecisionRequired;
+            if (!completion.permit.decision_owner.eql(owner) or !std.mem.eql(u8, &completion.permit.reference.txn_id, &txn_id) or
+                record.status == .pending or !record.intents_resolved or ack.position != .raft or
+                (completion.decision == .committed) != (record.status == .committed) or
+                (record.status == .committed and record.commit_version != completion.decision_version))
+                return error.ReplicationCutoverAuthorityLost;
+            try completion.requireAcknowledgementIds(acknowledgements);
+        }
         if (extra_batch.external_decision_owner) |expected| {
             const held = record.external_decision_owner orelse return error.ExternalTransactionDecisionChanged;
             if (!held.eql(expected)) return error.ExternalTransactionDecisionChanged;
@@ -2570,6 +3142,12 @@ pub const TxnManager = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const scratch = arena.allocator();
+        var recovered_roster = false;
+        if (extra_batch.replication_ack) |ack| {
+            const roster = try self.getParticipants(scratch, txn_id);
+            recovered_roster = roster.len == 0 and record.status == .aborted and !record.prepared;
+            try ack.completion.requireParticipants(if (recovered_roster) acknowledgements else roster);
+        }
         const index_key = makeSidecarKey(participant_index_prefix, txn_id);
         const raw = self.getAlloc(scratch, &index_key) catch |err| switch (err) {
             error.NotFound => null,
@@ -2579,8 +3157,13 @@ pub const TxnManager = struct {
         var writes: std.ArrayListUnmanaged(docstore.KVPair) = .empty;
         var deletes: std.ArrayListUnmanaged([]const u8) = .empty;
         var enlisted: std.StringHashMapUnmanaged(void) = .empty;
+        if (recovered_roster) {
+            if (raw != null) return error.InvalidTxnRecord;
+            const members_key = makeSidecarKey(participants_prefix, txn_id);
+            try writes.append(scratch, .{ .key = try scratch.dupe(u8, &members_key), .value = try encodeParticipantList(scratch, acknowledgements) });
+        }
         if (raw == null) {
-            const participants = try self.getParticipants(scratch, txn_id);
+            const participants = if (recovered_roster) acknowledgements else try self.getParticipants(scratch, txn_id);
             for (participants) |participant| {
                 const member = try enlisted.getOrPut(scratch, participant);
                 if (member.found_existing) continue;
@@ -2645,7 +3228,10 @@ pub const TxnManager = struct {
         try deletes.appendSlice(scratch, extra_batch.deletes);
         // Membership migration, resolution entries, count proof and the Raft
         // replay marker publish in one storage batch. No growing list rewrite.
-        try self.applyBatch(writes.items, deletes.items, null);
+        if (extra_batch.replication_ack) |ack| {
+            const ticket = try self.applyBatchStaged(writes.items, deletes.items, null, .{ .previous = 0, .next = 0, .source_ack = ack }, null);
+            try ticket.wait();
+        } else try self.applyBatch(writes.items, deletes.items, null);
     }
 
     /// Caller holds its DB apply fence across record and roster observation.
@@ -2866,6 +3452,10 @@ pub const TxnManager = struct {
     ) !void {
         var relational_primary: ?bool = null;
         for (predicates) |pred| {
+            if (pred.expected_mutation_revision) |revision| {
+                if (revision == 0 or pred.comparison != .document_version or pred.expected_version == 0 or pred.expected_content_digest == null)
+                    return error.InvalidArgument;
+            }
             if (pred.unique_absence and (pred.comparison != .document_version or pred.expected_version != 0)) return error.InvalidArgument;
             switch (pred.comparison) {
                 .document_version => {
@@ -2900,11 +3490,17 @@ pub const TxnManager = struct {
                         else
                             try internal_keys.documentKeyAlloc(self.alloc, pred.key);
                         defer self.alloc.free(primary_key);
-                        const current = self.getAlloc(self.alloc, primary_key) catch |err| switch (err) {
+                        var probe = try self.store.beginProbe();
+                        defer probe.abort();
+                        if (pred.expected_mutation_revision) |revision| {
+                            const revisions = @import("document_mutation_revision.zig");
+                            const revision_key = revisions.keyForPhysical(primary_key) orelse return error.InvalidArgument;
+                            if (try revisions.load(&probe, revision_key) != revision) return TxnError.VersionConflict;
+                        }
+                        const current = probe.get(primary_key) catch |err| switch (err) {
                             error.NotFound => return TxnError.VersionConflict,
                             else => return err,
                         };
-                        defer self.alloc.free(current);
                         var digest: [32]u8 = undefined;
                         std.crypto.hash.sha2.Sha256.hash(current, &digest, .{});
                         if (!std.mem.eql(u8, &digest, &expected)) return TxnError.VersionConflict;
@@ -3253,6 +3849,258 @@ pub const TxnManager = struct {
         return key;
     }
 
+    fn requireDocumentRevisionScope(self: *TxnManager, id: TxnId, scope: document_revision_reservation.Scope) !void {
+        try scope.validate();
+        if (!std.mem.eql(u8, &scope.transaction_id, &id)) return error.ExternalTransactionDecisionChanged;
+        try self.requireNativeMutationPin(scope.native_pin);
+        if (self.native_relation_pin != null and scope.native_pin == null) return error.ExternalTransactionDecisionChanged;
+    }
+
+    /// Ordered replay markers and the root's existing durable journal observer
+    /// commit with the allocation, locks, watermark and pending record.
+    pub const StagedDocumentRevisions = RevisionPlan;
+    const RevisionPlan = struct {
+        transaction_id: TxnId,
+        arena: std.heap.ArenaAllocator,
+        writes: std.ArrayList(docstore.KVPair) = .empty,
+        versions: []const u64 = &.{},
+        deletes: std.ArrayList([]const u8) = .empty,
+        released: usize = 0,
+        pub fn deinit(self: *@This()) void {
+            self.arena.deinit();
+        }
+        fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+            const a = self.arena.allocator();
+            try self.writes.append(a, .{ .key = try a.dupe(u8, key), .value = try a.dupe(u8, value) });
+        }
+        fn erase(self: *@This(), key: []const u8) !void {
+            try self.deletes.append(self.arena.allocator(), try self.arena.allocator().dupe(u8, key));
+        }
+        /// Retain this owner through caller commit OR abort, even when stage
+        /// fails after a partial put. The writer may borrow these buffers.
+        pub fn stage(self: *const @This(), writer: anytype) !void {
+            if (self.writes.items.len == 0 and self.deletes.items.len == 0) return;
+            for (self.deletes.items) |key| try writer.delete(key);
+            for (self.writes.items) |write| try writer.put(write.key, write.value);
+            if (try topology_debt.load(writer)) |loaded| {
+                var header = loaded;
+                if (header.phase != .retired) {
+                    try topology_debt.setMember(writer, &header, self.transaction_id, .blocked);
+                    try header.bump();
+                    try topology_debt.save(writer, header);
+                }
+            }
+        }
+    };
+
+    fn planDocumentRevisions(self: *TxnManager, read: anytype, scope: document_revision_reservation.Scope, keys: []const []const u8, now: u64, expires_at: u64, subtransaction: u64) !RevisionPlan {
+        try self.requireDocumentRevisionScope(scope.transaction_id, scope);
+        const record_key = makeRecordKey(scope.transaction_id);
+        const previous = try optionalTopologyValue(read, &record_key);
+        var record = if (previous) |bytes| try decodeRecord(bytes) else TxnRecord{ .status = .pending, .begin_timestamp = scope.begin_timestamp, .created_at = now, .finalized_at = 0, .commit_version = 0 };
+        if (record.status != .pending or record.prepared or record.intent_revision != 0 or record.external_decision_owner != null or
+            record.begin_timestamp != scope.begin_timestamp or record.coordinator or record.retain_terminal) return error.DecisionConflict;
+        if (try participantListCountInRead(read, &makeSidecarKey(participants_prefix, scope.transaction_id)) != 0) return error.DecisionConflict;
+        const allocation = try document_revision_reservation.prepareScoped(self.alloc, read, scope, keys, now, expires_at, subtransaction);
+        var result: RevisionPlan = .{ .transaction_id = scope.transaction_id, .arena = allocation.arena, .versions = allocation.versions };
+        errdefer result.deinit();
+        const a = result.arena.allocator();
+        const lock_keys = try a.alloc([]const u8, keys.len);
+        const owners = try a.alloc(?[]const u8, keys.len);
+        const fresh = try a.alloc(bool, keys.len);
+        @memset(fresh, false);
+        for (allocation.fresh_indices) |index| fresh[index] = true;
+        for (keys, lock_keys) |key, *lock| lock.* = try std.mem.concat(a, u8, &.{ intent_locks_prefix, key });
+        try read.getManySorted(lock_keys, owners);
+        for (owners, fresh) |held, is_new| {
+            if (held) |id| {
+                if (id.len != 16) return error.InvalidTxnRecord;
+                if (!std.mem.eql(u8, id, &scope.transaction_id)) return error.IntentConflict;
+                if (is_new) return error.InvalidTxnRecord;
+            } else if (!is_new) return error.InvalidTxnRecord;
+        }
+        try result.writes.appendSlice(a, allocation.writes);
+        for (allocation.fresh_indices) |index| try result.put(lock_keys[index], &scope.transaction_id);
+        record.document_revisions = true;
+        const encoded = try self.encodeRecord(record);
+        defer self.alloc.free(encoded);
+        try result.put(&record_key, encoded);
+        if (previous == null) {
+            const index_key = makeSidecarKey(participant_index_prefix, scope.transaction_id);
+            var index_value: [17]u8 = undefined;
+            (ParticipantIndex{}).encode(&index_value);
+            try result.put(&index_key, &index_value);
+        }
+        const table_catalog = @import("db/table_catalog.zig");
+        const previous_catalog = try optionalTopologyValue(read, table_catalog.key);
+        var catalog = if (previous_catalog) |bytes| try table_catalog.Catalog.decode(bytes) else table_catalog.Catalog{};
+        const effect_format: u8 = if (subtransaction == 0) 2 else 3;
+        if (catalog.transaction_effect_format < effect_format) {
+            catalog.transaction_effect_format = effect_format;
+            const bytes = try catalog.encodeDurable();
+            try result.put(table_catalog.key, bytes.slice());
+        }
+        return result;
+    }
+
+    /// Caller holds the primary apply fence and owns the accepting native
+    /// writer. Command admission, allocation, row locks, replay marker and
+    /// journal are staged in that SAME transaction. Abort it on every error.
+    pub fn prepareDocumentRevisionsAtSubtransaction(self: *TxnManager, read: anytype, scope: document_revision_reservation.Scope, keys: []const []const u8, now: u64, expires_at: u64, subtransaction: u64) !StagedDocumentRevisions {
+        return self.planDocumentRevisions(read, scope, keys, now, expires_at, subtransaction);
+    }
+
+    fn planDocumentRevisionRelease(self: *TxnManager, read: anytype, scope: document_revision_reservation.Scope, references: []const document_revision_reservation.Reference) !RevisionPlan {
+        try self.requireDocumentRevisionScope(scope.transaction_id, scope);
+        const bytes = (try optionalTopologyValue(read, &makeRecordKey(scope.transaction_id))) orelse return error.TxnNotFound;
+        const record = try decodeRecord(bytes);
+        if (record.status != .pending or record.prepared or record.intent_revision != 0 or record.external_decision_owner != null or record.begin_timestamp != scope.begin_timestamp) return error.DecisionConflict;
+        try (document_revision_reservation.Handoff{ .scope = scope, .references = references }).validate();
+        var result: RevisionPlan = .{ .transaction_id = scope.transaction_id, .arena = .init(self.alloc) };
+        errdefer result.deinit();
+        const a = result.arena.allocator();
+        const keys = try a.alloc([]const u8, references.len);
+        const lock_keys = try a.alloc([]const u8, references.len);
+        const values = try a.alloc(?[]const u8, references.len);
+        const owners = try a.alloc(?[]const u8, references.len);
+        for (references, 0..) |reference, index| {
+            keys[index] = try document_revision_reservation.rowKey(a, scope.transaction_id, reference.key);
+            lock_keys[index] = try std.mem.concat(a, u8, &.{ intent_locks_prefix, reference.key });
+        }
+        var header = (try document_revision_reservation.load(read, scope.transaction_id)) orelse return error.ExternalTransactionDecisionChanged;
+        if (!header.scope.eql(scope) or header.owner != null) return error.ExternalTransactionDecisionChanged;
+        try read.getManySorted(keys, values);
+        try read.getManySorted(lock_keys, owners);
+        for (references, values, owners, 0..) |reference, value, owner, index| {
+            if (value) |raw| {
+                if (try document_revision_reservation.rowUsed(raw) or try document_revision_reservation.rowVersion(raw) != reference.version) return error.ExternalTransactionDecisionChanged;
+                const actual = owner orelse return error.InvalidTxnRecord;
+                if (actual.len != 16 or !std.mem.eql(u8, actual, &scope.transaction_id)) return error.InvalidTxnRecord;
+                header.count = std.math.sub(u32, header.count, 1) catch return error.InvalidTxnRecord;
+                header.key_bytes = std.math.sub(u32, header.key_bytes, @intCast(reference.key.len)) catch return error.InvalidTxnRecord;
+                try result.erase(keys[index]);
+                try result.erase(lock_keys[index]);
+                result.released += 1;
+            } else if (owner) |actual| {
+                if (actual.len != 16 or std.mem.eql(u8, actual, &scope.transaction_id)) return error.InvalidTxnRecord;
+            }
+        }
+        if (result.released != 0) try result.put(&document_revision_reservation.headerKey(scope.transaction_id), &try header.encode());
+        return result;
+    }
+
+    pub fn prepareDocumentRevisionRelease(self: *TxnManager, read: anytype, scope: document_revision_reservation.Scope, references: []const document_revision_reservation.Reference) !StagedDocumentRevisions {
+        return self.planDocumentRevisionRelease(read, scope, references);
+    }
+
+    pub fn prepareDocumentRevisionRenewal(self: *TxnManager, writer: anytype, scope: document_revision_reservation.Scope, now: u64, expires_at: u64) !StagedDocumentRevisions {
+        // Empty release validates the same unadmitted record/header contract;
+        // renewal cannot create a reservation or revive an expired one.
+        var plan = try self.planDocumentRevisionRelease(writer, scope, &.{});
+        errdefer plan.deinit();
+        var header = (try document_revision_reservation.load(writer, scope.transaction_id)).?;
+        if (now == 0 or expires_at <= now or expires_at - now > document_revision_reservation.max_lease_ns or header.expires_at <= now) return error.ExternalTransactionAdmissionExpired;
+        if (header.expires_at < expires_at) {
+            header.expires_at = expires_at;
+            try plan.put(&document_revision_reservation.headerKey(scope.transaction_id), &try header.encode());
+        }
+        return plan;
+    }
+
+    /// The existing authenticated SQL source CLOSE retires only unadmitted
+    /// first touches. Actual P custody always waits for its external decision.
+    pub fn prepareAbandonDocumentRevisions(self: *TxnManager, writer: anytype, id: TxnId, principal: [32]u8, now: u64) !?StagedDocumentRevisions {
+        const header = (try document_revision_reservation.load(writer, id)) orelse return null;
+        if (!std.mem.eql(u8, &header.scope.principal_digest, &principal)) return error.LockOwnerChanged;
+        try self.requireDocumentRevisionScope(id, header.scope);
+        if (header.owner != null) return null;
+        const raw = (try optionalTopologyValue(writer, &makeRecordKey(id))) orelse return error.InvalidTxnRecord;
+        var record = try decodeRecord(raw);
+        if (record.status == .aborted and record.intents_resolved_known and record.intents_resolved) return null;
+        if (record.status != .pending or record.prepared or record.intent_revision != 0 or record.external_decision_owner != null or now == 0 or
+            !record.document_revisions or record.begin_timestamp != header.scope.begin_timestamp) return error.DecisionConflict;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var references: std.ArrayList(document_revision_reservation.Reference) = .empty;
+        {
+            var cursor = try writer.openCursor();
+            defer cursor.close();
+            const prefix = document_revision_reservation.rowPrefix(id);
+            var entry = try cursor.seekAtOrAfter(&prefix);
+            while (entry) |row| : (entry = try cursor.next()) {
+                if (!std.mem.startsWith(u8, row.key, &prefix)) break;
+                if (references.items.len >= header.count or references.items.len >= document_revision_reservation.max_rows or row.key.len == prefix.len) return error.InvalidTxnRecord;
+                try references.append(a, .{ .key = try a.dupe(u8, row.key[prefix.len..]), .version = try document_revision_reservation.rowVersion(row.value) });
+            }
+        }
+        if (references.items.len != header.count) return error.InvalidTxnRecord;
+        var plan = try self.planDocumentRevisionRelease(writer, header.scope, references.items);
+        errdefer plan.deinit();
+        record.status = .aborted;
+        record.finalized_at = now;
+        record.intents_resolved = true;
+        record.intents_resolved_known = true;
+        const encoded = try self.encodeRecord(record);
+        defer self.alloc.free(encoded);
+        try plan.put(&makeRecordKey(id), encoded);
+        return plan;
+    }
+
+    /// Existing source control delivery owns savepoint cleanup. The caller
+    /// stages this plan in the same accepting writer as its control receipt.
+    pub fn prepareDocumentRevisionSavepoint(self: *TxnManager, writer: anytype, id: TxnId, principal: [32]u8, action: @import("pessimistic_lock/ledger.zig").Control) !?StagedDocumentRevisions {
+        if (action != .rollback and action != .release_savepoint) return null;
+        const selected = switch (action) {
+            .rollback => |value| value.transaction,
+            .release_savepoint => |value| value.transaction,
+            else => unreachable,
+        };
+        if (!std.mem.eql(u8, &id, &selected)) return error.InvalidLockScope;
+        const header = (try document_revision_reservation.load(writer, id)) orelse return null;
+        if (!std.mem.eql(u8, &header.scope.principal_digest, &principal)) return error.LockOwnerChanged;
+        if (header.owner != null) return error.LockOwnerBusy;
+        var plan = try self.planDocumentRevisionRelease(writer, header.scope, &.{});
+        errdefer plan.deinit();
+        const a = plan.arena.allocator();
+        var references: std.ArrayList(document_revision_reservation.Reference) = .empty;
+        var cursor = try writer.openCursor();
+        defer cursor.close();
+        const prefix = document_revision_reservation.rowPrefix(id);
+        var entry = try cursor.seekAtOrAfter(&prefix);
+        var count: usize = 0;
+        var key_bytes: usize = 0;
+        while (entry) |row| : (entry = try cursor.next()) {
+            if (!std.mem.startsWith(u8, row.key, &prefix)) break;
+            count += 1;
+            if (row.key.len == prefix.len or count > header.count) return error.InvalidTxnRecord;
+            key_bytes = std.math.add(usize, key_bytes, row.key.len - prefix.len) catch return error.InvalidTxnRecord;
+            if (key_bytes > header.key_bytes) return error.InvalidTxnRecord;
+            if (try document_revision_reservation.rowUsed(row.value)) return error.LockOwnerBusy;
+            const child = try document_revision_reservation.rowSubtransaction(row.value);
+            switch (action) {
+                .rollback => |rollback| if (child >= rollback.first_aborted) {
+                    try references.append(a, .{ .key = try a.dupe(u8, row.key[prefix.len..]), .version = try document_revision_reservation.rowVersion(row.value) });
+                },
+                .release_savepoint => |release| {
+                    if (release.first_child == 0 or release.parent >= release.first_child) return error.InvalidLockScope;
+                    if (child >= release.first_child) {
+                        const value = try document_revision_reservation.encodeRow(a, try document_revision_reservation.rowVersion(row.value), release.parent, false);
+                        try plan.put(row.key, value);
+                    }
+                },
+                else => unreachable,
+            }
+        }
+        if (count != header.count or key_bytes != header.key_bytes) return error.InvalidTxnRecord;
+        if (action == .rollback and references.items.len != 0) {
+            const released = try self.planDocumentRevisionRelease(writer, header.scope, references.items);
+            plan.deinit();
+            return released;
+        }
+        return plan;
+    }
+
     fn requireNativeMutationPin(self: *const TxnManager, requested: ?NativePhysicalPin) !void {
         const pin = requested orelse return;
         try pin.validate();
@@ -3285,6 +4133,9 @@ pub const TxnManager = struct {
 
     fn encodeRecord(self: *TxnManager, record: TxnRecord) ![]u8 {
         if (record.native_pin != null and record.external_decision_owner == null) return error.InvalidTxnRecord;
+        if (record.replication_source_required and (record.external_decision_owner == null or record.native_pin != null or
+            (!record.prepared and record.status != .aborted))) return error.InvalidTxnRecord;
+        if (record.publication_capture_required and (record.external_decision_owner == null or record.native_pin != null or !record.prepared)) return error.InvalidTxnRecord;
         if (self.native_relation_pin) |actual| if (record.external_decision_owner != null) {
             const pin = record.native_pin orelse return error.ExternalTransactionDecisionChanged;
             if (!pin.eql(actual)) return error.ExternalTransactionDecisionChanged;
@@ -3302,7 +4153,7 @@ pub const TxnManager = struct {
         buf[50] = @intFromBool(record.coordinator);
         buf[51] = @intFromBool(record.retain_terminal);
         buf[52] = @intFromBool(record.intents_resolved);
-        if (record.document_revisions or record.external_decision_owner != null) buf[txn_record_v6_size] = @intFromBool(record.document_revisions);
+        if (record.document_revisions or record.external_decision_owner != null) buf[txn_record_v6_size] = @as(u8, @intFromBool(record.document_revisions)) | (@as(u8, @intFromBool(record.publication_capture_required)) << 2) | (@as(u8, @intFromBool(record.replication_source_required)) << 3);
         if (record.external_decision_owner) |owner| {
             if ((record.external_commit_started and !record.prepared) or !record.coordinator_known or
                 (record.status == .committed and !record.external_commit_started) or
@@ -3360,6 +4211,15 @@ pub const TxnManager = struct {
         if (!try self.nativeLockCleanupReady(txn_id)) {
             try self.applyMutationExtraBatch(extra_batch);
             return false;
+        }
+        if (record.replication_source_required and !record.prepared) {
+            var read = try self.store.beginProbe();
+            defer read.abort();
+            const key = makeSidecarKey(participants_prefix, txn_id);
+            if (try participantListCountInRead(&read, &key) == 0) {
+                try self.applyMutationExtraBatch(extra_batch);
+                return false;
+            }
         }
         const unresolved = try self.getUnresolvedParticipants(self.alloc, txn_id);
         defer freeParticipantList(self.alloc, unresolved);
@@ -3571,6 +4431,19 @@ pub const TxnManager = struct {
         defer backend_scan.freeResults(self.alloc, resolutions);
         for (members) |member| try deletes.append(self.alloc, member.key);
         for (resolutions) |resolution| try deletes.append(self.alloc, resolution.key);
+        const revision_header: ?document_revision_reservation.Header = if (record.document_revisions) blk: {
+            var probe = try self.store.beginProbe();
+            defer probe.abort();
+            break :blk try document_revision_reservation.load(&probe, txn_id);
+        } else null;
+        var revision_cleanup: ?document_revision_reservation.Cleanup = null;
+        defer if (revision_cleanup) |*cleanup| cleanup.deinit();
+        if (revision_header) |header| {
+            var scan = try self.store.beginCurrentScan();
+            defer scan.abort();
+            revision_cleanup = try document_revision_reservation.prepareCleanup(self.alloc, &scan, header);
+            try deletes.appendSlice(self.alloc, revision_cleanup.?.keys);
+        }
         var writes: std.ArrayListUnmanaged(docstore.KVPair) = .empty;
         defer writes.deinit(self.alloc);
         try writes.appendSlice(self.alloc, extra_batch.writes);
@@ -3655,7 +4528,41 @@ pub const TxnManager = struct {
         return self.applyBatchWithReservation(writes, deletes, replay, null);
     }
 
-    const ReservationChange = struct { previous: u64, next: u64 };
+    const Capture = struct { id: TxnId, sink: @import("publication_prepare_sink.zig").Sink };
+    const ReservationChange = struct {
+        previous: u64,
+        next: u64,
+        capture: ?Capture = null,
+        terminal: ?@import("publication_prepare_sink.zig").TerminalSink = null,
+        source_ack: ?ReplicationAcknowledgement = null,
+        source_resolution: ?struct { input: ReplicationOrderedPhase, revision: u64, status: TxnStatus } = null,
+        publication: ?struct {
+            source: ?ReplicationPrepare = null,
+            input: ?@import("db/logical_replication_outbox.zig").Preparation,
+            id: TxnId,
+            revision: u64,
+            intents: []const WriteIntent,
+        } = null,
+    };
+
+    fn stagePrepareRoster(a: Allocator, batch: anytype, id: TxnId) !void {
+        // BEGIN can predate capture admission. Emit the actual roster so a
+        // follower can install the complete PREPARE without replaying BEGIN.
+        const participants = makeSidecarKey(participants_prefix, id);
+        if (try optionalTopologyValue(batch, &participants)) |bytes| {
+            const members = try decodeParticipantList(a, bytes);
+            defer freeParticipantList(a, members);
+            try batch.put(&participants, bytes);
+            for (members) |member| {
+                const key = makeParticipantIndexKey(participant_index_prefix, id, member);
+                const held = (try optionalTopologyValue(batch, &key)) orelse return error.InvalidTxnRecord;
+                if (!std.mem.eql(u8, held, member)) return error.InvalidTxnRecord;
+                try batch.put(&key, held);
+            }
+        }
+        const index = makeSidecarKey(participant_index_prefix, id);
+        try batch.put(&index, (try optionalTopologyValue(batch, &index)) orelse return error.InvalidTxnRecord);
+    }
     fn applyBatchWithReservation(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange) !void {
         return self.applyBatchWithParticipant(writes, deletes, replay, reservation, null);
     }
@@ -3672,12 +4579,29 @@ pub const TxnManager = struct {
     /// the hosted LSM backend, returns an already-durable ticket from the
     /// ordinary blocking commit, so this never changes behavior there.
     fn applyBatchStaged(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant) !backend_erased.Ticket {
+        if (reservation) |change| if (change.capture) |capture| {
+            if (replay != null or participant != null) return error.InvalidCommitMetadata;
+            return self.applyBatchStagedWithCapture(true, writes, deletes, replay, reservation, participant, capture);
+        };
+        return self.applyBatchStagedWithCapture(false, writes, deletes, replay, reservation, participant, undefined);
+    }
+
+    fn applyBatchStagedWithCapture(self: *TxnManager, comptime recording: bool, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant, capture: Capture) !backend_erased.Ticket {
         // Transaction extras are not a directory initialization/repair API.
         for (writes) |kv| if (std.mem.startsWith(u8, kv.key, topology_debt.family_prefix)) return error.InvalidCommitMetadata;
         for (deletes) |key| if (std.mem.startsWith(u8, key, topology_debt.family_prefix)) return error.InvalidCommitMetadata;
-        var batch = try self.store.beginBatch();
-        errdefer batch.abort();
-        var directory = try topology_debt.load(&batch);
+        var raw_batch = try self.store.beginBatch();
+        errdefer raw_batch.abort();
+        var arena = if (recording) std.heap.ArenaAllocator.init(self.alloc) else {};
+        defer if (recording) arena.deinit();
+        var recorder = if (recording) @import("publication_prepare_sink.zig").Recording(@TypeOf(raw_batch)){
+            .inner = &raw_batch,
+            .alloc = arena.allocator(),
+            .maximum = capture.sink.max_bytes,
+        } else {};
+        const batch = if (recording) &recorder else &raw_batch;
+        if (recording) try stagePrepareRoster(arena.allocator(), batch, capture.id);
+        var directory = try topology_debt.load(batch);
         const CommitGuard = struct {
             original: @import("commit_participant.zig").Participant,
             protected: bool,
@@ -3689,22 +4613,22 @@ pub const TxnManager = struct {
                 const observer: *@This() = @ptrCast(@alignCast(ptr));
                 observer.original.observe(observer.original.ptr, key, value);
             }
+            const GuardedView = struct {
+                original: @import("commit_participant.zig").View,
+                fn get(raw: *anyopaque, key: []const u8) ![]const u8 {
+                    const guard: *@This() = @ptrCast(@alignCast(raw));
+                    return guard.original.get(key);
+                }
+                fn put(raw: *anyopaque, key: []const u8, value: []const u8) !void {
+                    const guard: *@This() = @ptrCast(@alignCast(raw));
+                    // Final callbacks cannot change transaction evidence
+                    // after its directory update or mint a ready marker.
+                    if (std.mem.startsWith(u8, key, "\x00\x00__txn_") or std.mem.startsWith(u8, key, topology_debt.family_prefix)) return error.InvalidCommitMetadata;
+                    try guard.original.put(key, value);
+                }
+            };
             fn stage(ptr: *anyopaque, view: @import("commit_participant.zig").View, position: []const u8) anyerror!void {
                 const observer: *@This() = @ptrCast(@alignCast(ptr));
-                const GuardedView = struct {
-                    original: @import("commit_participant.zig").View,
-                    fn get(raw: *anyopaque, key: []const u8) ![]const u8 {
-                        const guard: *@This() = @ptrCast(@alignCast(raw));
-                        return guard.original.get(key);
-                    }
-                    fn put(raw: *anyopaque, key: []const u8, value: []const u8) !void {
-                        const guard: *@This() = @ptrCast(@alignCast(raw));
-                        // Final callbacks cannot change transaction evidence
-                        // after its directory update or mint a ready marker.
-                        if (std.mem.startsWith(u8, key, "\x00\x00__txn_") or std.mem.startsWith(u8, key, topology_debt.family_prefix)) return error.InvalidCommitMetadata;
-                        try guard.original.put(key, value);
-                    }
-                };
                 if (!observer.protected) return observer.original.stage(observer.original.ptr, view, position);
                 var guarded: GuardedView = .{ .original = view };
                 try observer.original.stage(observer.original.ptr, .{ .ptr = &guarded, .get_fn = GuardedView.get, .put_fn = GuardedView.put }, position);
@@ -3713,9 +4637,20 @@ pub const TxnManager = struct {
         var commit_guard: CommitGuard = undefined;
         if (participant) |observer| {
             commit_guard = .{ .original = observer, .protected = directory != null and directory.?.phase != .retired };
-            try batch.setCommitParticipant(.{ .ptr = &commit_guard, .reset = CommitGuard.reset, .observe = CommitGuard.observe, .stage = CommitGuard.stage });
+            try batch.setCommitParticipant(.{ .ptr = &commit_guard, .stage_control_on_empty = observer.stage_control_on_empty, .reset = CommitGuard.reset, .observe = CommitGuard.observe, .stage = CommitGuard.stage });
         }
-        if (reservation) |change| try retained_effects.replaceReservation(&batch, change.previous, change.next);
+        var capture_scratch = if (recording) {} else std.heap.ArenaAllocator.init(self.alloc);
+        defer if (!recording) capture_scratch.deinit();
+        if (reservation) |change| {
+            if (change.source_ack == null) try retained_effects.replaceReservation(batch, change.previous, change.next);
+            if (change.publication) |publication| {
+                const outbox = @import("db/logical_replication_outbox.zig");
+                if (publication.input) |input| {
+                    const scratch = if (recording) arena.allocator() else capture_scratch.allocator();
+                    _ = try outbox.stage(scratch, batch, input, publication.id, publication.revision, publication.intents);
+                } else try outbox.requireUncapturedIntents(self.alloc, batch, publication.intents);
+            }
+        }
         for (deletes) |key| {
             batch.delete(key) catch |err| switch (err) {
                 error.NotFound => {},
@@ -3725,29 +4660,84 @@ pub const TxnManager = struct {
         for (writes) |kv| {
             try batch.put(kv.key, kv.value);
         }
+        if (reservation) |change| if (change.publication) |publication| if (publication.source) |source| {
+            const a = if (recording) arena.allocator() else capture_scratch.allocator();
+            const namespace = @import("db/online_source_contract.zig").namespaceBytes(source.preparation.physical.namespace);
+            const authority = (try @import("source_authority.zig").load(batch)) orelse return error.OnlineSourceScopeChanged;
+            if (authority.kind != .raft or !std.mem.eql(u8, &namespace, &authority.namespace)) return error.OnlineSourceScopeChanged;
+            if (publication.input) |outbound| {
+                if (outbound.physical_root_incarnation != source.preparation.physical.physical_root_incarnation or outbound.ordered == null or
+                    !std.meta.eql(outbound.ordered.?, source.position.raft)) return error.ReplicationCutoverAuthorityLost;
+            }
+            _ = try @import("db/replication_source_reader_floor.zig").stage(a, batch, source.catalog);
+            var frozen: std.ArrayList(source_apply.FrozenIntent) = .empty;
+            defer frozen.deinit(a);
+            for (writes) |kv| {
+                if (std.mem.startsWith(u8, kv.key, intents_prefix) and kv.key.len > intents_prefix.len + 17 and
+                    std.mem.eql(u8, kv.key[intents_prefix.len..][0..16], &publication.id) and kv.key[intents_prefix.len + 16] == ':')
+                    try frozen.append(a, .{ .key = kv.key[intents_prefix.len + 17 ..], .encoded_value = kv.value });
+            }
+            const admitted = try batch.get(&makeSidecarKey(intent_admission_prefix, publication.id));
+            if (admitted.len != 32 or std.mem.readInt(u64, admitted[0..8], .little) != frozen.items.len) return error.InvalidTxnRecord;
+            _ = try source_apply.stagePrepared(a, batch, source.preparation, source.position, publication.id, publication.revision, frozen.items);
+        };
         if (directory) |*header| if (header.phase != .retired) {
             var changed = false;
             for (deletes) |key| if (topologyDebtTxnId(key)) |id| {
-                try topology_debt.setMember(&batch, header, id, try TopologyDebtClassifier.fast(&batch, id));
+                try topology_debt.setMember(batch, header, id, try TopologyDebtClassifier.fast(batch, id));
                 changed = true;
             };
             for (writes) |kv| if (topologyDebtTxnId(kv.key)) |id| {
-                try topology_debt.setMember(&batch, header, id, try TopologyDebtClassifier.fast(&batch, id));
+                try topology_debt.setMember(batch, header, id, try TopologyDebtClassifier.fast(batch, id));
                 changed = true;
             };
             if (changed) {
-                if (header.phase == .dirty and header.pending == null and !try topology_debt.hasPrefix(&batch, &topology_debt.dirtyPrefix(header.scope.generation))) {
+                if (header.phase == .dirty and header.pending == null and !try topology_debt.hasPrefix(batch, &topology_debt.dirtyPrefix(header.scope.generation))) {
                     header.phase = .gc;
                     header.after = null;
                 }
-                if (header.phase == .gc and !try topology_debt.hasPrefix(&batch, &topology_debt.orphanPrefix(header.scope.generation)) and
-                    !try topology_debt.hasPrefix(&batch, &topology_debt.seenPrefix(header.scope.generation))) header.phase = .ready;
+                if (header.phase == .gc and !try topology_debt.hasPrefix(batch, &topology_debt.orphanPrefix(header.scope.generation)) and
+                    !try topology_debt.hasPrefix(batch, &topology_debt.seenPrefix(header.scope.generation))) header.phase = .ready;
                 try header.bump();
-                try topology_debt.save(&batch, header.*);
+                try topology_debt.save(batch, header.*);
             }
         };
         if (replay) |entry| try batch.setReplayOpaque(entry.sequence, entry.payload);
-        return try batch.commitStaged();
+        if (recording) {
+            const view = @import("commit_participant.zig").View.from(&raw_batch);
+            var journal: CommitGuard.GuardedView = .{ .original = view };
+            try recorder.finish(capture.sink, .{ .ptr = &journal, .get_fn = CommitGuard.GuardedView.get, .put_fn = CommitGuard.GuardedView.put });
+        }
+        if (reservation) |change| if (change.terminal) |sink| {
+            const view = @import("commit_participant.zig").View.from(&raw_batch);
+            var journal: CommitGuard.GuardedView = .{ .original = view };
+            try sink.stage(sink.ptr, .{ .ptr = &journal, .get_fn = CommitGuard.GuardedView.get, .put_fn = CommitGuard.GuardedView.put });
+        };
+        if (reservation) |change| if (change.source_resolution) |resolution| {
+            const a = if (recording) arena.allocator() else capture_scratch.allocator();
+            const input = resolution.input;
+            const namespace = @import("db/online_source_contract.zig").namespaceBytes(input.permit.namespace);
+            _ = try @import("source_authority.zig").require(batch, .raft, namespace);
+            switch (resolution.status) {
+                .committed => {
+                    const activated = (try source_apply.readActivated(a, batch, input.permit)) orelse return error.ReplicationCutoverAuthorityLost;
+                    if (activated.image.physical_root_incarnation != input.physical_root or !input.position.strictlyAfter(activated.position))
+                        return error.ReplicationCutoverAuthorityLost;
+                    _ = try source_apply.stageApplied(a, batch, input.permit, input.physical_root, resolution.revision, input.position);
+                },
+                .aborted => _ = try source_apply.stageAborted(a, batch, input.permit, input.physical_root, input.permit.namespace, input.position),
+                .pending => unreachable,
+            }
+        };
+        if (reservation) |change| if (change.source_ack) |ack| {
+            const a = if (recording) arena.allocator() else capture_scratch.allocator();
+            const namespace = @import("db/online_source_contract.zig").namespaceBytes(ack.completion.permit.namespace);
+            _ = try @import("source_authority.zig").require(batch, .raft, namespace);
+            if (try source_apply.readAcknowledged(a, batch, ack.completion)) |existing| {
+                if (existing.image.physical_root_incarnation != ack.physical_root) return error.ReplicationCutoverAuthorityLost;
+            } else _ = try source_apply.stageAcknowledged(a, batch, ack.completion, ack.physical_root, ack.position);
+        };
+        return try raw_batch.commitStaged();
     }
 
     fn traceWriteIntentSuccess(self: *TxnManager, txn_id: TxnId, intents: []const WriteIntent, predicates: []const VersionPredicate) void {
@@ -4128,13 +5118,19 @@ fn decodeRecord(raw: []const u8) !TxnRecord {
     if (raw.len == 0 or raw[0] > @backingInt(TxnStatus.aborted)) return TxnError.InvalidTxnRecord;
     if (raw.len == txn_record_v9_size) {
         var record = try decodeRecord(raw[0..txn_record_v8_size]);
+        if (record.publication_capture_required or record.replication_source_required) return error.InvalidTxnRecord;
         record.native_pin = NativePhysicalPin.decode(raw[txn_record_v8_size..]) catch return error.InvalidTxnRecord;
         return record;
     }
     if (raw.len == txn_record_v8_size) {
         var record = try decodeRecord(raw[0..txn_record_v6_size]);
-        if (raw[txn_record_v8_size - 1] > 1 or raw[txn_record_v6_size] > 1) return error.InvalidTxnRecord;
-        record.document_revisions = raw[txn_record_v6_size] == 1;
+        const flags = raw[txn_record_v6_size];
+        if (raw[txn_record_v8_size - 1] > 1 or flags & ~@as(u8, 13) != 0) return error.InvalidTxnRecord;
+        record.document_revisions = flags & 1 != 0;
+        record.publication_capture_required = flags & 4 != 0;
+        record.replication_source_required = flags & 8 != 0;
+        if (!record.prepared and (record.publication_capture_required or (record.replication_source_required and record.status != .aborted)))
+            return error.InvalidTxnRecord;
         record.external_decision_owner = ExternalDecisionOwner.decode(raw[txn_record_v7_size..][0..ExternalDecisionOwner.encoded_len]) catch return error.InvalidTxnRecord;
         record.external_commit_started = raw[txn_record_v8_size - 1] == 1;
         if ((record.external_commit_started and !record.prepared) or
@@ -4389,7 +5385,7 @@ test "retained transaction reservations survive LSM reopen and guarantee committ
     defer alloc.free(physical);
     const filler_key = try internal_keys.documentKeyAlloc(alloc, "filler");
     defer alloc.free(filler_key);
-    const integrity = @import("db/relational_integrity_contract.zig");
+    const integrity = @import("db/relational/integrity/contract.zig");
     const address = try integrity.Address.init(@splat(3), "parent");
     const claim_key = address.claimKey();
     const claim_value = try (integrity.Claim{ .tuple = "parent", .parent_table = "parents", .parent_key = "reserved", .schema_version = 1 }).encode(alloc, address);
@@ -4559,7 +5555,7 @@ test "retained transaction byte bounds count exact physical rows without parsing
     try std.testing.expectEqual(@as(u64, raw.value.?.len + 16 + 2 + internal_keys.encodedComponentLen(raw.key)), try retainedIntentBytes(fixed.allocator(), raw));
     const typed: WriteIntent = .{ .key = "row", .value = "sidecar", .prepared_row = "already encoded defaults and generated values" };
     try std.testing.expectEqual(@as(u64, typed.prepared_row.?.len + 23), try retainedIntentBytes(fixed.allocator(), typed));
-    const address = try @import("db/relational_integrity_contract.zig").Address.init(@splat(1), "parent");
+    const address = try @import("db/relational/integrity/contract.zig").Address.init(@splat(1), "parent");
     const claim_key = address.claimKey();
     // Physical integrity keys are already encoded; neither JSON parsing nor
     // primary-key escaping belongs in their exact prepared reservation.
@@ -4930,6 +5926,7 @@ test "transaction intent snapshot owns one payload copy and retirement reads onl
         .expected_intent_revision = revision,
         .known_intent_keys = &.{"row"},
         .skip_all_intent_application = true,
+        .prepared_graph_effects_checked = true,
         .writes = &.{.{ .key = "resolved", .value = "ok" }},
     });
     try std.testing.expect(!try mgr.hasSchemaLeases());
@@ -5151,6 +6148,28 @@ test "version predicate conflict" {
     });
     try std.testing.expectError(TxnError.VersionConflict, result2);
 
+    const physical = try internal_keys.documentKeyAlloc(alloc, "existing_key");
+    defer alloc.free(physical);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("value", &digest, .{});
+    const revision_key = @import("document_mutation_revision.zig").keyForPhysical(physical).?;
+    const revision = revision: {
+        var read = try store.beginProbeTxn();
+        defer read.abort();
+        break :revision try @import("document_mutation_revision.zig").load(&read, revision_key);
+    };
+    try std.testing.expect(revision != 0);
+    const exact: VersionPredicate = .{
+        .key = "existing_key",
+        .expected_version = 5000,
+        .expected_content_digest = digest,
+        .expected_mutation_revision = revision,
+    };
+    try mgr.checkVersionPredicates(&.{exact}, null);
+    try putVisibleDoc(&store, alloc, "existing_key", "value");
+    try mgr.checkVersionPredicates(&.{.{ .key = "existing_key", .expected_version = 5000, .expected_content_digest = digest }}, null);
+    try std.testing.expectError(TxnError.VersionConflict, mgr.checkVersionPredicates(&.{exact}, null));
+
     // Predicate: correct version — should succeed
     try mgr.writeIntents(txn_id, &.{
         .{ .key = "existing_key", .value = "new_value" },
@@ -5282,7 +6301,7 @@ test "transaction index span guards fence pending and later writers without bloc
     try internal_keys.appendDocumentPrefix(&component, alloc, "primary");
     var forward: std.ArrayList(u8) = .empty;
     defer forward.deinit(alloc);
-    const forward_prefix = try @import("db/relational_index_records.zig").forwardPrefix(.{ .generation = 7, .slot = 2 });
+    const forward_prefix = try @import("db/relational/indexes/records.zig").forwardPrefix(.{ .generation = 7, .slot = 2 });
     try forward.appendSlice(alloc, &forward_prefix);
     try forward.appendSlice(alloc, &.{ 0x80, 'x', 0, 0 });
     try forward.appendSlice(alloc, component.items[1..]);
@@ -7542,4 +8561,442 @@ test "time series record codec keeps main revision bytes and SQL owner native pi
             try std.testing.expectError(error.InvalidTxnRecord, decodeRecord(encoded));
         }
     };
+}
+
+test "document revision reservation stages the watermark and row custody atomically" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "txn-staged-revision-reservation");
+    defer a.free(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    var manager = try TxnManager.init(a, &store);
+    defer manager.deinit();
+    const scope: document_revision_reservation.Scope = .{
+        .metadata_incarnation = @splat('a'),
+        .transaction_id = @splat(1),
+        .principal_digest = @splat(2),
+        .begin_timestamp = 10,
+        .table_id = 3,
+        .shard_id = 4,
+        .range_id = 5,
+    };
+    var assigned: u64 = 0;
+    for (0..2) |attempt| {
+        var writer = try store.beginWriteTxn();
+        errdefer writer.abort();
+        try std.testing.expect((try document_revision_reservation.load(&writer, scope.transaction_id)) == null);
+        try std.testing.expectError(error.NotFound, writer.get(ttl.document_version_watermark_key));
+        var plan = try manager.prepareDocumentRevisionsAtSubtransaction(&writer, scope, &.{"row"}, 20, 100, 7);
+        defer plan.deinit();
+        assigned = plan.versions[0];
+        try plan.stage(&writer);
+        if (attempt == 0) writer.abort() else try writer.commit();
+    }
+    {
+        var read = try store.beginProbeTxn();
+        defer read.abort();
+        const key = try document_revision_reservation.rowKey(a, scope.transaction_id, "row");
+        defer a.free(key);
+        const bytes = try read.get(key);
+        try std.testing.expectEqual(assigned, try document_revision_reservation.rowVersion(bytes));
+        try std.testing.expectEqual(@as(u64, 7), try document_revision_reservation.rowSubtransaction(bytes));
+        try std.testing.expectEqual(assigned, std.mem.readInt(u64, (try read.get(ttl.document_version_watermark_key))[0..8], .little));
+    }
+    {
+        var writer = try store.beginWriteTxn();
+        errdefer writer.abort();
+        var release = try manager.prepareDocumentRevisionRelease(&writer, scope, &.{.{ .key = "row", .version = assigned }});
+        defer release.deinit();
+        try std.testing.expectEqual(@as(usize, 1), release.released);
+        try release.stage(&writer);
+        try writer.commit();
+    }
+    {
+        var writer = try store.beginWriteTxn();
+        errdefer writer.abort();
+        var next = try manager.prepareDocumentRevisionsAtSubtransaction(&writer, scope, &.{"row"}, 20, 100, 8);
+        defer next.deinit();
+        try std.testing.expect(next.versions[0] > assigned);
+        try next.stage(&writer);
+        try std.testing.expectError(error.ExternalTransactionDecisionChanged, manager.prepareDocumentRevisionRelease(&writer, scope, &.{.{ .key = "row", .version = assigned }}));
+        try writer.commit();
+    }
+    {
+        var reparent: ?TxnManager.StagedDocumentRevisions = null;
+        defer if (reparent) |*plan| plan.deinit();
+        var rollback: ?TxnManager.StagedDocumentRevisions = null;
+        defer if (rollback) |*plan| plan.deinit();
+        var writer = try store.beginWriteTxn();
+        defer writer.abort();
+        reparent = (try manager.prepareDocumentRevisionSavepoint(&writer, scope.transaction_id, scope.principal_digest, .{ .release_savepoint = .{ .transaction = scope.transaction_id, .first_child = 8, .parent = 7 } })).?;
+        try reparent.?.stage(&writer);
+        rollback = (try manager.prepareDocumentRevisionSavepoint(&writer, scope.transaction_id, scope.principal_digest, .{ .rollback = .{ .transaction = scope.transaction_id, .first_aborted = 8 } })).?;
+        try std.testing.expectEqual(@as(usize, 0), rollback.?.released);
+        rollback.?.deinit();
+        rollback = null;
+        rollback = (try manager.prepareDocumentRevisionSavepoint(&writer, scope.transaction_id, scope.principal_digest, .{ .rollback = .{ .transaction = scope.transaction_id, .first_aborted = 7 } })).?;
+        try std.testing.expectEqual(@as(usize, 1), rollback.?.released);
+        try rollback.?.stage(&writer);
+        try std.testing.expectError(error.NotFound, writer.get(intent_locks_prefix ++ "row"));
+        // Aborting this writer also aborts the savepoint metadata and release.
+    }
+    {
+        var writer = try store.beginWriteTxn();
+        errdefer writer.abort();
+        try std.testing.expectError(error.LockOwnerChanged, manager.prepareAbandonDocumentRevisions(&writer, scope.transaction_id, @splat(9), 30));
+        var close = (try manager.prepareAbandonDocumentRevisions(&writer, scope.transaction_id, scope.principal_digest, 30)).?;
+        defer close.deinit();
+        try std.testing.expectEqual(@as(usize, 1), close.released);
+        try close.stage(&writer);
+        try std.testing.expect((try manager.prepareAbandonDocumentRevisions(&writer, scope.transaction_id, scope.principal_digest, 30)) == null);
+        try std.testing.expectError(error.NotFound, writer.get(intent_locks_prefix ++ "row"));
+        try writer.commit();
+    }
+}
+
+test "document revision reservation adoption binds the header and exact native decision together" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "txn-adopted-revision-reservation");
+    defer a.free(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    var manager = try TxnManager.init(a, &store);
+    defer manager.deinit();
+    const scope: document_revision_reservation.Scope = .{
+        .metadata_incarnation = @splat('a'),
+        .transaction_id = @splat(1),
+        .principal_digest = @splat(2),
+        .begin_timestamp = 10,
+        .table_id = 3,
+        .shard_id = 4,
+        .range_id = 5,
+    };
+    {
+        var writer = try store.beginWriteTxn();
+        errdefer writer.abort();
+        var plan = try manager.prepareDocumentRevisionsAtSubtransaction(&writer, scope, &.{"row"}, 20, 100, 0);
+        defer plan.deinit();
+        try plan.stage(&writer);
+        try writer.commit();
+    }
+    const owner: ExternalDecisionOwner = .{ .metadata_incarnation = scope.metadata_incarnation, .operation_id = @splat(3), .admission_digest = @splat(4), .expires_at_unix_ns = 90 };
+    var other = owner;
+    other.metadata_incarnation = @splat('b');
+    try std.testing.expectError(error.ExternalTransactionDecisionChanged, manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(scope.transaction_id, 10, 30, &.{"owner"}, false, true, .{ .external_decision_owner = other, .document_revision_scope = scope }));
+    for (0..2) |_| {
+        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(scope.transaction_id, 10, 30, &.{"owner"}, false, true, .{ .external_decision_owner = owner, .document_revision_scope = scope });
+    }
+    const revision_key = try document_revision_reservation.rowKey(a, scope.transaction_id, "row");
+    defer a.free(revision_key);
+    const assigned = blk: {
+        var observation = try store.beginProbeTxn();
+        defer observation.abort();
+        break :blk try document_revision_reservation.rowVersion(try observation.get(revision_key));
+    };
+    const intents: []const WriteIntent = &.{.{ .key = "row", .value = "{}" }};
+    var extra: MutationExtraBatch = .{ .external_decision_owner = owner, .document_revision_scope = scope, .document_revision_references = &.{.{ .key = "row", .version = assigned + 1 }} };
+    try std.testing.expectError(error.VersionConflict, manager.writeIntentsExtraBatch(scope.transaction_id, intents, &.{}, extra));
+    extra.document_revision_references = &.{.{ .key = "row", .version = assigned }};
+    try manager.writeIntentsExtraBatch(scope.transaction_id, intents, &.{}, extra);
+    const intent_key = try manager.makeIntentKey(scope.transaction_id, "row");
+    defer a.free(intent_key);
+    {
+        var read = try store.beginProbeTxn();
+        defer read.abort();
+        const header = (try document_revision_reservation.load(&read, scope.transaction_id)).?;
+        const record = (try externalParticipant(&read, scope.transaction_id)).?;
+        try std.testing.expect(header.owner.?.eql(owner));
+        try std.testing.expect(record.owner.?.eql(owner));
+        try std.testing.expect(record.prepared);
+        try std.testing.expect(try document_revision_reservation.rowUsed(try read.get(revision_key)));
+        try std.testing.expectEqual(assigned, (try IntentValue.decode(try read.get(intent_key))).document_revision.?);
+    }
+    {
+        var image = try manager.store.beginRead();
+        defer image.abort();
+        try TxnManager.validateDocumentRevisionSnapshot(a, &image, @import("antfly_cancellation").CancellationToken.none);
+    }
+    try manager.activateExternalDecision(scope.transaction_id, owner, .{});
+    const committed = try manager.resolveIntentsWithExtraBatch(scope.transaction_id, .committed, 50, .{ .external_decision_owner = owner });
+    try std.testing.expect(committed.applied);
+    try std.testing.expectEqual(@as(?u64, assigned), try ttl.readTimestamp(&store, a, "row"));
+    try std.testing.expectEqual(@as(?i128, 50), try ttl.readSourceTimestamp(&store, a, "row"));
+    try manager.checkOrdinaryWriteConflicts(&.{"row"});
+    const retry = try manager.resolveIntentsWithExtraBatch(scope.transaction_id, .committed, 50, .{ .external_decision_owner = owner });
+    try std.testing.expect(!retry.applied);
+    {
+        var image = try manager.store.beginRead();
+        defer image.abort();
+        try TxnManager.validateDocumentRevisionSnapshot(a, &image, @import("antfly_cancellation").CancellationToken.none);
+    }
+}
+
+test "document revision reservation aborts before BEGIN without leaking the reserved row lock" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "txn-prebegin-aborted-revision-reservation");
+    defer a.free(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    var manager = try TxnManager.init(a, &store);
+    defer manager.deinit();
+    const scope: document_revision_reservation.Scope = .{
+        .metadata_incarnation = @splat('a'),
+        .transaction_id = @splat(1),
+        .principal_digest = @splat(2),
+        .begin_timestamp = 10,
+        .table_id = 3,
+        .shard_id = 4,
+        .range_id = 5,
+    };
+    {
+        var writer = try store.beginWriteTxn();
+        errdefer writer.abort();
+        var plan = try manager.prepareDocumentRevisionsAtSubtransaction(&writer, scope, &.{"row"}, 20, 100, 0);
+        defer plan.deinit();
+        try plan.stage(&writer);
+        try writer.commit();
+    }
+    const owner: ExternalDecisionOwner = .{ .metadata_incarnation = scope.metadata_incarnation, .operation_id = @splat(3), .admission_digest = @splat(4), .expires_at_unix_ns = 90 };
+    const extra: ResolutionExtraBatch = .{ .external_decision_owner = owner, .resolved_participant = "owner" };
+    for (0..2) |_| {
+        const outcome = try manager.resolveIntentsWithExtraBatch(scope.transaction_id, .aborted, 30, extra);
+        try std.testing.expect(!outcome.applied);
+    }
+    try manager.checkOrdinaryWriteConflicts(&.{"row"});
+    var image = try manager.store.beginRead();
+    defer image.abort();
+    const header = (try document_revision_reservation.load(&image, scope.transaction_id)).?;
+    const record = (try externalParticipant(&image, scope.transaction_id)).?;
+    try std.testing.expectEqual(TxnStatus.aborted, record.status);
+    try std.testing.expect(header.owner.?.eql(owner));
+    try std.testing.expectEqual(@as(u32, 0), header.count);
+    try TxnManager.validateDocumentRevisionSnapshot(a, &image, @import("antfly_cancellation").CancellationToken.none);
+}
+
+test "logical publication journals the actual transaction prepare and roster atomically" {
+    try checkPublicationPrepareTerminal(.aborted);
+    try checkPublicationPrepareTerminal(.committed);
+}
+
+fn checkPublicationPrepareTerminal(comptime status: TxnStatus) !void {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "logical-publication-" ++ @tagName(status));
+    defer a.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    const id: TxnId = @splat(5);
+    const owner: ExternalDecisionOwner = .{ .metadata_incarnation = @splat('1'), .operation_id = @splat(2), .admission_digest = @splat(3), .expires_at_unix_ns = 1000 };
+    const Check = struct {
+        reject: bool = true,
+        calls: usize = 0,
+        reject_terminal: bool = true,
+        terminal_calls: usize = 0,
+        row_key: []const u8,
+        const terminal_key = "\x00\x00publication-terminal-test-journal";
+        const journal_key = "\x00\x00publication-test-journal";
+        fn stage(raw: *anyopaque, view: @import("commit_participant.zig").View, changes: []const @import("publication_prepare_sink.zig").Change) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            const record_key = makeRecordKey(id);
+            const index_key = makeSidecarKey(participant_index_prefix, id);
+            const member_key = makeParticipantIndexKey(participant_index_prefix, id, "owner");
+            var record = false;
+            var roster = false;
+            var member = false;
+            for (changes) |change| {
+                if (std.mem.eql(u8, change.key, &record_key)) {
+                    const decoded = try decodeRecord(change.value.?);
+                    try std.testing.expect(decoded.prepared and decoded.publication_capture_required);
+                    record = true;
+                }
+                if (std.mem.eql(u8, change.key, &index_key)) roster = true;
+                if (std.mem.eql(u8, change.key, &member_key)) {
+                    try std.testing.expectEqualStrings("owner", change.value.?);
+                    member = true;
+                }
+            }
+            try std.testing.expect(record and roster and member);
+            try std.testing.expectError(error.InvalidCommitMetadata, view.put(&record_key, "corruption"));
+            try view.put(journal_key, "captured");
+            if (self.reject) return error.TestPublicationRejected;
+        }
+
+        fn terminal(raw: *anyopaque, view: @import("commit_participant.zig").View) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.terminal_calls += 1;
+            const record = try decodeRecord(try view.get(&makeRecordKey(id)));
+            try std.testing.expect(record.status == status and record.intents_resolved and record.publication_capture_required);
+            if (status == .committed)
+                try std.testing.expectEqualStrings("{}", try view.get(self.row_key))
+            else
+                try std.testing.expectError(error.NotFound, view.get(self.row_key));
+            try view.put(terminal_key, @tagName(status));
+            if (self.reject_terminal) return error.TestPublicationRejected;
+        }
+    };
+    const row_key = try internal_keys.documentKeyAlloc(a, "row");
+    defer a.free(row_key);
+    var check: Check = .{ .row_key = row_key };
+    const intents: []const WriteIntent = &.{.{ .key = "row", .value = "{}" }};
+    const extra: MutationExtraBatch = .{
+        .external_decision_owner = owner,
+        .publication_prepare_sink = .{ .ptr = &check, .max_bytes = 64 * 1024, .stage = Check.stage },
+    };
+    const terminal: ResolutionExtraBatch = .{
+        .external_decision_owner = owner,
+        .resolved_participant = "owner",
+        .publication_terminal_sink = .{ .ptr = &check, .stage = Check.terminal },
+    };
+    for (0..3) |pass| {
+        var store = try DocStore.open(a, path, .{});
+        defer store.close();
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        if (pass == 0) {
+            try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(id, 10, 30, &.{"owner"}, false, true, .{ .external_decision_owner = owner });
+            try std.testing.expectError(error.TestPublicationRejected, manager.writeIntentsExtraBatch(id, intents, &.{}, extra));
+            try std.testing.expect(!(try manager.loadTransactionRecord(id)).prepared);
+            try std.testing.expect(!(try manager.hasIntents(id)));
+            try std.testing.expectError(error.NotFound, manager.getAlloc(a, Check.journal_key));
+            check.reject = false;
+            try manager.writeIntentsExtraBatch(id, intents, &.{}, extra);
+        }
+        const journal = try manager.getAlloc(a, Check.journal_key);
+        defer a.free(journal);
+        try std.testing.expectEqualStrings("captured", journal);
+        const record = try manager.loadTransactionRecord(id);
+        try std.testing.expect(record.prepared and record.publication_capture_required);
+        try std.testing.expectEqual(@as(usize, 2), check.calls);
+        if (pass == 2) {
+            try std.testing.expectEqual(status, record.status);
+            try std.testing.expect(!(try manager.hasIntents(id)));
+            const terminal_frame = try manager.getAlloc(a, Check.terminal_key);
+            defer a.free(terminal_frame);
+            try std.testing.expectEqualStrings(@tagName(status), terminal_frame);
+            const retry = try manager.resolveIntentsWithExtraBatch(id, status, 50, terminal);
+            try std.testing.expect(!retry.applied);
+            try std.testing.expectEqual(@as(usize, 2), check.terminal_calls);
+            const pending_ack = try manager.getUnresolvedParticipants(a, id);
+            defer freeParticipantList(a, pending_ack);
+            try std.testing.expectEqual(@as(usize, 1), pending_ack.len);
+            try std.testing.expectEqualStrings("owner", pending_ack[0]);
+            continue;
+        }
+        try std.testing.expect(try manager.hasIntents(id));
+        try std.testing.expectError(error.LogicalCaptureReceiptMissing, manager.resolveIntentsWithExtraBatch(id, status, 50, .{ .external_decision_owner = owner }));
+        try std.testing.expectError(error.PreparedIntentRequiresMaterialization, manager.writeIntentsExtraBatch(id, intents, &.{}, .{ .external_decision_owner = owner }));
+        if (pass == 1) {
+            if (status == .committed) try manager.activateExternalDecision(id, owner, .{});
+            try std.testing.expectError(error.TestPublicationRejected, manager.resolveIntentsWithExtraBatch(id, status, 50, terminal));
+            try std.testing.expectEqual(TxnStatus.pending, (try manager.loadTransactionRecord(id)).status);
+            try std.testing.expect(try manager.hasIntents(id));
+            try std.testing.expectError(error.NotFound, manager.getAlloc(a, Check.terminal_key));
+            try std.testing.expectError(error.NotFound, manager.getAlloc(a, row_key));
+            check.reject_terminal = false;
+            const outcome = try manager.resolveIntentsWithExtraBatch(id, status, 50, terminal);
+            try std.testing.expect(outcome.applied);
+        }
+    }
+}
+
+test "Source physical transaction PREPARE atomically retains the exact frozen intents" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "source-frozen-prepare");
+    defer a.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    const input = source_apply.fixturePreparation();
+    const id = input.permit.reference.txn_id;
+    const owner = input.permit.decision_owner;
+    const realm = @import("db/online_source_contract.zig").namespaceBytes(input.permit.namespace);
+    const authority = @import("source_authority.zig");
+    const intents: []const WriteIntent = &.{.{ .key = "row", .value = "{\"value\":7}" }};
+    const extra: MutationExtraBatch = .{
+        .external_decision_owner = owner,
+        .replication_prepare = .{ .preparation = input, .position = .{ .raft = .{ .term = 2, .index = 3 } }, .catalog = .{} },
+    };
+    for (0..4) |pass| {
+        var store = try DocStore.open(a, path, .{});
+        defer store.close();
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        if (pass == 0) {
+            try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(id, 10, 30, &.{"owner"}, false, true, .{ .external_decision_owner = owner });
+            try std.testing.expectError(error.OnlineSourceScopeChanged, manager.writeIntentsExtraBatch(id, intents, &.{}, extra));
+            try std.testing.expect(!(try manager.hasIntents(id)));
+            {
+                var txn = try store.beginWriteTxn();
+                errdefer txn.abort();
+                try authority.bind(&txn, .raft, realm);
+                try txn.commit();
+            }
+            try manager.writeIntentsExtraBatch(id, intents, &.{}, extra);
+        }
+        const record = try manager.loadTransactionRecord(id);
+        try std.testing.expect(record.prepared and record.replication_source_required);
+        var arena: std.heap.ArenaAllocator = .init(a);
+        defer arena.deinit();
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        const prepared = (try source_apply.readPrepared(arena.allocator(), &read, input.permit)).?;
+        try std.testing.expectEqual(@as(u64, 1), prepared.intent_count);
+        try std.testing.expectEqual(record.intent_revision, prepared.intent_revision);
+        try std.testing.expectEqualDeep(extra.replication_prepare.?.position, prepared.receipt.position);
+        if (pass == 0) try std.testing.expectError(error.ReplicationCutoverAuthorityLost, manager.activateExternalDecision(id, owner, .{}));
+        if (pass == 1) {
+            try manager.activateExternalDecision(id, owner, .{ .replication_activation = .{
+                .permit = input.permit,
+                .physical_root = input.physical.physical_root_incarnation,
+                .position = .{ .raft = .{ .term = 2, .index = 4 } },
+            } });
+            const resolution: ResolutionExtraBatch = .{
+                .external_decision_owner = owner,
+                .replication_resolution = .{
+                    .permit = input.permit,
+                    .physical_root = input.physical.physical_root_incarnation,
+                    .position = .{ .raft = .{ .term = 2, .index = 5 } },
+                },
+            };
+            const outcome = try manager.resolveIntentsWithExtraBatch(id, .committed, 40, resolution);
+            try std.testing.expect(outcome.applied);
+        }
+        const ids: []const []const u8 = &.{"owner"};
+        const completion: source_apply.contract.AckCompletion = .{
+            .permit = input.permit,
+            .participant_count = 1,
+            .participant_ids_digest = try source_apply.contract.participantIdsDigest(ids),
+            .participant_id_digest = source_apply.contract.participantIdDigest(ids[0]),
+            .decision = .committed,
+            .decision_version = 40,
+            .terminal_receipts_digest = @splat(1),
+        };
+        if (pass == 2) {
+            var ack: MutationExtraBatch = .{ .external_decision_owner = owner, .replication_ack = .{
+                .completion = completion,
+                .physical_root = input.physical.physical_root_incarnation,
+                .position = .{ .raft = .{ .term = 2, .index = 5 } },
+            } };
+            try std.testing.expectError(error.ReplicationCutoverAuthorityLost, manager.markParticipantsResolvedExtraBatch(id, ids, ack));
+            const before = try manager.getResolvedParticipants(a, id);
+            defer freeParticipantList(a, before);
+            try std.testing.expectEqual(@as(usize, 0), before.len);
+            ack.replication_ack.?.position.raft.index += 1;
+            try manager.markParticipantsResolvedExtraBatch(id, ids, ack);
+            try manager.markParticipantsResolvedExtraBatch(id, ids, ack);
+        }
+        if (pass == 3) {
+            const applied = (try source_apply.readApplied(arena.allocator(), &read, input.permit)).?;
+            try std.testing.expectEqual(@as(u64, 5), applied.position.raft.index);
+            try std.testing.expectEqual(TxnStatus.committed, record.status);
+            const acked = (try source_apply.readAcknowledged(arena.allocator(), &read, completion)).?;
+            try std.testing.expectEqual(@as(u64, 6), acked.position.raft.index);
+            const resolved = try manager.getResolvedParticipants(a, id);
+            defer freeParticipantList(a, resolved);
+            try std.testing.expectEqualDeep(ids, resolved);
+            try std.testing.expect(!(try manager.hasIntents(id)));
+        }
+    }
 }

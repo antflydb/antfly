@@ -113,11 +113,11 @@ const row_policy_authority_mod = @import("../../usermgr/row_policy_authority.zig
 
 const schema_registry_mod = @import("schema_registry.zig");
 
-const relational_index_plans = @import("relational_index_plan.zig");
+const relational_index_plans = @import("relational/indexes/plan.zig");
 
 const transactions_mod = @import("../transactions.zig");
 
-const relational_store = @import("relational_store.zig");
+const relational_store = @import("relational/rows/store.zig");
 
 const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 
@@ -989,7 +989,7 @@ pub const PreparedRowEffects = struct {
 };
 
 pub const RelationalPriorMembership = struct {
-    const Source = @import("relational_index_predicate.zig").Source;
+    const Source = @import("relational/indexes/predicate.zig").Source;
     alloc: Allocator,
     members: []bool,
     sources: []?Source,
@@ -1216,7 +1216,7 @@ pub const BatchExecutionOptions = struct {
     /// `.attach` write, self-healing it (queuing its deletion in this
     /// same commit) instead of refusing the parent change forever. `null`
     /// preserves exact today's-behavior: any live Reference blocks.
-    relational_child_existence_check: ?@import("relational_integrity.zig").ChildExistenceCheck = null,
+    relational_child_existence_check: ?@import("relational/integrity/integrity.zig").ChildExistenceCheck = null,
     /// Borrowed by this synchronous call and consumed only after primary
     /// durability, while waiting for requested derived visibility.
     visibility_cancellation: types.CancellationToken = .none,
@@ -1227,6 +1227,8 @@ pub const BatchExecutionOptions = struct {
 pub const OrderedApplyReceipt = types.OrderedApplyReceipt;
 
 pub const TransactionResolution = struct {
+    replication_resolution: ?transactions_mod.ReplicationOrderedPhase = null,
+    document_revision_references: []const @import("../document_revision_reservation.zig").Reference = &.{},
     prepared_graph_effects_checked: bool = false,
     external_decision_owner: ?transactions_mod.ExternalDecisionOwner = null,
     txn_id: transactions_mod.TxnId,
@@ -1302,7 +1304,7 @@ pub const LocalExecutionState = struct {
     restore_staging_required: std.atomic.Value(bool) = .init(false),
     materialized_view_read_only: std.atomic.Value(bool) = .init(false),
     initial_child_hidden: std.atomic.Value(bool) = .init(false),
-    initial_child_bootstrap: ?@import("relational_initial_child_publication.zig").Bootstrap = null,
+    initial_child_bootstrap: ?@import("relational/integrity/initial_child_publication.zig").Bootstrap = null,
     vector_migration_reopen_required: std.atomic.Value(bool) = .init(false),
     graph_merge_import_recovery_pending: std.atomic.Value(bool) = .init(false),
     source_vectors: std.atomic.Value(?*vector_payload_store_mod.Store) = .init(null),
@@ -1329,7 +1331,7 @@ pub const LocalExecutionState = struct {
     /// reconciliation cost.
     schema_reconcile: @import("schema_reconcile_owner.zig").Owner = .{},
     relational_index_maintenance_cursor: std.atomic.Value(usize) = .init(0),
-    relational_index_maintenance_sweep: @import("relational_index_maintenance_sweep.zig").Sweep = .{},
+    relational_index_maintenance_sweep: @import("relational/indexes/maintenance_sweep.zig").Sweep = .{},
     relational_index_retry_after_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
     index_structural_mutation_mutex: std.atomic.Mutex = .unlocked,
     optional_runtime_workers_enabled: bool = false,
@@ -2159,7 +2161,7 @@ pub const PreparedEnrichments = struct {
         var output: std.Io.Writer.Allocating = .init(a);
         defer output.deinit();
         var stream: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
-        try @import("relational_integrity_json.zig").writeCompact(value, &stream);
+        try @import("relational/integrity/json.zig").writeCompact(value, &stream);
         const bytes = try output.toOwnedSlice();
         defer a.free(bytes);
         var digest: [32]u8 = undefined;
@@ -2177,7 +2179,7 @@ pub const PreparedEnrichments = struct {
     };
 
     pub fn jsonStringify(self: @This(), stream: anytype) !void {
-        return @import("relational_integrity_json.zig").writeCompact(self, stream);
+        return @import("relational/integrity/json.zig").writeCompact(self, stream);
     }
 };
 

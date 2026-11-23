@@ -22,7 +22,7 @@ const binding = @import("aggregate_binding.zig");
 const scalar = @import("scalar.zig");
 const spill = @import("spill.zig");
 const ordered = @import("ordered_aggregate.zig");
-const arrays = @import("array_value.zig");
+const arrays = @import("array/value.zig");
 const A = std.mem.Allocator;
 const Datum = scalar.Datum;
 
@@ -37,7 +37,7 @@ pub const Collector = struct {
     key_buffer: []Datum = &.{},
     prepared: bool = false,
     evaluation_limits: scalar.EvalLimits = .{},
-    function_work: ?@import("numeric_value.zig").Context = null,
+    function_work: ?@import("numeric/value.zig").Context = null,
 
     pub fn init(grouped: *operators.Grouped, bound: *const binding.Bound, manager: *spill.Manager, bytes: usize) !Collector {
         var self: Collector = .{ .grouped = grouped, .bound = bound, .manager = manager };

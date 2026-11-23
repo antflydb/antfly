@@ -91,7 +91,7 @@ pub const Prepared = struct {
     primary_key: ?[]const u8 = null,
 };
 
-pub fn canonicalElement(kind: @import("ast.zig").ColumnType, element: ?@import("array_value.zig").ElementType) ?@import("array_value.zig").ElementType {
+pub fn canonicalElement(kind: @import("ast.zig").ColumnType, element: ?@import("array/value.zig").ElementType) ?@import("array/value.zig").ElementType {
     return scalar.columnElementType(kind, element) orelse switch (kind) {
         .string => .text,
         .boolean => .boolean,
@@ -143,7 +143,7 @@ const Preparation = struct {
     primary_key: ?[]const u8 = null,
 
     fn limits(self: *@This()) scalar.EvalLimits {
-        return .{ .output_bytes = @import("../storage/db/relational_index_limits.zig").max_stored_key_bytes, .clock_values = self.state.control.clock_values, .checkpoint = State.poll, .checkpoint_context = &self.state, .regex_checkpoint = State.poll, .regex_context = &self.state };
+        return .{ .output_bytes = @import("../storage/db/relational/indexes/limits.zig").max_stored_key_bytes, .clock_values = self.state.control.clock_values, .checkpoint = State.poll, .checkpoint_context = &self.state, .regex_checkpoint = State.poll, .regex_context = &self.state };
     }
     fn rejectsNull(self: *@This(), a: Allocator, root: u32, key_root: u32) !bool {
         if (self.nullable.len == 0 or !self.nullable[key_root]) return true;
@@ -216,8 +216,8 @@ const Preparation = struct {
             return;
         };
         const wire = if (converted.numeric) |number| numeric: {
-            var work: @import("numeric_value.zig").Context = .{ .alloc = a, .max_output_bytes = self.limits().output_bytes, .checkpoint = State.poll, .ptr = &self.state };
-            break :numeric std.json.Value{ .string = @import("numeric_value.zig").format(&work, number.*) catch |err| {
+            var work: @import("numeric/value.zig").Context = .{ .alloc = a, .max_output_bytes = self.limits().output_bytes, .checkpoint = State.poll, .ptr = &self.state };
+            break :numeric std.json.Value{ .string = @import("numeric/value.zig").format(&work, number.*) catch |err| {
                 try self.state.optional(err, &budget);
                 return;
             } };

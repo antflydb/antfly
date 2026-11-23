@@ -50,6 +50,26 @@ pub fn schemaHasForeignKeys(alloc: std.mem.Allocator, schema_json: []const u8) !
     defer parsed.deinit();
     return if (parsed.value.foreign_keys) |foreign_keys| foreign_keys.len != 0 else false;
 }
+fn initialPartitionParent(alloc: std.mem.Allocator, child: records.TableRecord) !bool {
+    if (child.schema_json.len == 0) return false;
+    const local = @import("antfly_local_sources");
+    const Shape = struct { sql_partition: ?std.json.Value = null };
+    var shape = try std.json.parseFromSlice(Shape, alloc, child.schema_json, .{ .ignore_unknown_fields = true });
+    defer shape.deinit();
+    if (shape.value.sql_partition == null) return false;
+    var schema = try local.schema_mod.PreparedSchemaDefinition.init(alloc, child.schema_json);
+    defer schema.deinit(alloc);
+    const state = schema.public_schema.sql_partition.?.value;
+    if (state != .parent or state.parent.parent.table_id != child.table_id or state.parent.members.len != 0 or
+        state.parent.revision != 1 or state.parent.policy.enabled or
+        !std.meta.eql(child.schema_reader_requirements, @as(?local.common_schema_readers.ReaderRequirements, schema.readerRequirements()))) return error.InvalidGenerationPublication;
+    var identities = try @import("column_identity_definition.zig").initial(alloc, child);
+    defer identities.deinit();
+    for (identities.value.columns) |column| {
+        if (column.id == state.parent.key_attribute and std.mem.eql(u8, column.name, state.parent.key_name)) return true;
+    }
+    return error.InvalidGenerationPublication;
+}
 // A terminal witness is independent of the replaceable publication payload.
 // Keep it for the lifetime of the metadata owner; callers can hold receipts
 // across arbitrary schema changes and outages.
@@ -795,10 +815,13 @@ pub const InitialCreatePlan = struct {
     column_sequences: []const @import("antfly_local_sources").system_catalog_column_sequences.Creation = &.{},
     counter_effects: ?@import("initial_column_sequences.zig").Effects = null,
 
+    partition_parent: bool = false,
+    partition_birth: ?@import("initial_partition.zig").Intent = null,
+
     pub fn jsonStringify(self: InitialCreatePlan, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(InitialCreatePlan).@"struct".field_names) |field_name| {
-            const include = if (comptime std.mem.eql(u8, field_name, "expected_incarnation")) self.expected_incarnation != null else if (comptime std.mem.eql(u8, field_name, "support_schema_format")) self.support_schema_format != .legacy else if (comptime std.mem.eql(u8, field_name, "creation_copy")) self.creation_copy != null else if (comptime std.mem.eql(u8, field_name, "copy_effects")) self.copy_effects != null else if (comptime std.mem.eql(u8, field_name, "column_sequences")) self.column_sequences.len != 0 else if (comptime std.mem.eql(u8, field_name, "counter_effects")) self.counter_effects != null else if (comptime std.mem.eql(u8, field_name, "sql_owner")) self.sql_owner != null else if (comptime std.mem.eql(u8, field_name, "catalog_coverage")) self.catalog_coverage != .legacy else if (comptime std.mem.eql(u8, field_name, "constraint_name_admission")) self.constraint_name_admission != null else if (comptime std.mem.eql(u8, field_name, "historical_reference_coverage")) self.historical_reference_coverage else true;
+            const include = if (comptime std.mem.eql(u8, field_name, "partition_birth")) self.partition_birth != null else if (comptime std.mem.eql(u8, field_name, "partition_parent")) self.partition_parent else if (comptime std.mem.eql(u8, field_name, "expected_incarnation")) self.expected_incarnation != null else if (comptime std.mem.eql(u8, field_name, "support_schema_format")) self.support_schema_format != .legacy else if (comptime std.mem.eql(u8, field_name, "creation_copy")) self.creation_copy != null else if (comptime std.mem.eql(u8, field_name, "copy_effects")) self.copy_effects != null else if (comptime std.mem.eql(u8, field_name, "column_sequences")) self.column_sequences.len != 0 else if (comptime std.mem.eql(u8, field_name, "counter_effects")) self.counter_effects != null else if (comptime std.mem.eql(u8, field_name, "sql_owner")) self.sql_owner != null else if (comptime std.mem.eql(u8, field_name, "catalog_coverage")) self.catalog_coverage != .legacy else if (comptime std.mem.eql(u8, field_name, "constraint_name_admission")) self.constraint_name_admission != null else if (comptime std.mem.eql(u8, field_name, "historical_reference_coverage")) self.historical_reference_coverage else true;
             if (include) {
                 try writer.objectField(field_name);
                 try writer.write(@field(self, field_name));
@@ -825,11 +848,15 @@ pub const InitialCreatePlan = struct {
             if (admission.namespace_id != self.namespace_id) return error.InvalidGenerationPublication;
             try admission.validateSchema(alloc, self.child.schema_json);
         }
+        if (self.partition_birth) |birth| {
+            if (self.partition_parent) return error.InvalidGenerationPublication;
+            try birth.validate(alloc, self.child);
+        } else if ((try initialPartitionParent(alloc, self.child)) != self.partition_parent) return error.InvalidGenerationPublication;
         if (std.mem.allEqual(u8, &self.id, 0) or self.catalog_id < 3 or self.namespace_id == 0 or
             self.logical_name.len == 0 or self.logical_name.len > 256 or
             self.child.table_id == 0 or self.child.name.len == 0 or
             self.child_ranges.len == 0 or self.child_ranges.len > max_owners or
-            (self.parents.len == 0 and self.self_transitions.len == 0) or
+            (self.parents.len == 0 and self.self_transitions.len == 0 and !self.partition_parent and self.partition_birth == null) or
             self.parents.len > max_constraints or self.self_transitions.len > max_constraints) return error.InvalidGenerationPublication;
         const expected_physical_name = try std.fmt.allocPrint(alloc, "table:{d}", .{self.catalog_id});
         defer alloc.free(expected_physical_name);
@@ -842,7 +869,8 @@ pub const InitialCreatePlan = struct {
         if (parsed.storage_mode != .relational) return error.InvalidGenerationPublication;
         const fks = try parsed.relationalForeignKeyDefinitions(alloc);
         defer if (fks.len > 0) alloc.free(fks);
-        if (fks.len == 0 or fks.len > max_constraints) return error.InvalidGenerationPublication;
+        if (fks.len > max_constraints or (fks.len == 0 and !self.partition_parent and self.partition_birth == null))
+            return error.InvalidGenerationPublication;
         var validation_arena = std.heap.ArenaAllocator.init(alloc);
         defer validation_arena.deinit();
         const validation = try @import("antfly_local_sources").schema_relational_foreign_key_target.ChildTargets.init(validation_arena.allocator(), parsed, fks);
@@ -1154,7 +1182,7 @@ pub const InitialCommand = struct {
     plan_id: Id,
     child_table_id: u64,
     expected_revision: u64,
-    action: enum { begin, seal_support, child_provisioned, parent_staged, parent_activated, parent_acknowledged, child_released, publish_child, cancel, child_canceled, parent_canceled },
+    action: enum { begin, seal_support, child_provisioned, parent_staged, parent_activated, parent_acknowledged, child_released, publish_child, partition_reconcile, cancel, child_canceled, parent_canceled },
     plan: ?InitialCreatePlan = null,
     child_receipt: ?@import("../api/relational_fk_generation_publication.zig").InitialChildReceipt = null,
     parent_receipt: ?@import("../api/relational_fk_generation_publication.zig").Receipt = null,
@@ -1173,7 +1201,7 @@ pub const InitialCommand = struct {
                 !std.mem.eql(u8, &self.plan_id, &self.plan.?.id) or self.child_table_id != self.plan.?.child.table_id) return error.InvalidGenerationPublication,
             .child_provisioned, .child_released, .child_canceled => if (self.expected_revision == 0 or self.plan != null or self.child_receipt == null or self.parent_receipt != null) return error.InvalidGenerationPublication,
             .parent_staged, .parent_activated, .parent_acknowledged, .parent_canceled => if (self.expected_revision == 0 or self.plan != null or self.child_receipt != null or self.parent_receipt == null) return error.InvalidGenerationPublication,
-            .publish_child, .cancel => if (self.expected_revision == 0 or self.plan != null or self.child_receipt != null or self.parent_receipt != null) return error.InvalidGenerationPublication,
+            .publish_child, .partition_reconcile, .cancel => if (self.expected_revision == 0 or self.plan != null or self.child_receipt != null or self.parent_receipt != null) return error.InvalidGenerationPublication,
         }
     }
 };
@@ -1192,6 +1220,76 @@ pub const InitialPublication = struct {
     child_canceled: []const Receipt = &.{},
     parent_canceled: []const Receipt = &.{},
 
+    partition_journal: ?@import("schema_validation/read.zig").Lookup = null,
+    partition_ready: bool = false,
+
+    pub fn jsonStringify(self: InitialPublication, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(InitialPublication).@"struct".field_names) |field| {
+            const include = if (comptime std.mem.eql(u8, field, "partition_journal")) self.partition_journal != null else if (comptime std.mem.eql(u8, field, "partition_ready")) self.partition_ready else true;
+            if (include) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
+
+    pub fn partitionReference(self: InitialPublication) !@import("initial_partition.zig").Reference {
+        if (self.plan.partition_birth == null) return error.InvalidGenerationPublication;
+        const reference: @import("initial_partition.zig").Reference = .{
+            .initial_id = self.plan.id,
+            .child_table_id = self.plan.child.table_id,
+            .admission_digest = self.plan_digest,
+        };
+        try reference.validate();
+        return reference;
+    }
+
+    /// Persist this successor together with native journal admission.
+    pub fn linkPartitionJournal(self: InitialPublication, alloc: std.mem.Allocator, head: @import("schema_validation/publication.zig").Head) !InitialPublication {
+        const birth = self.plan.partition_birth orelse return error.InvalidGenerationPublication;
+        try head.validate();
+        if (self.phase != .provisioning_child or self.child_provisioned.len != self.plan.child_ranges.len or
+            self.partition_journal != null or head.phase != .validating or head.table_id != birth.parent_before.table_id or
+            std.mem.eql(u8, &head.id, &self.plan.id) or !std.meta.eql(head.initial_partition, @as(?@import("initial_partition.zig").Reference, try self.partitionReference())))
+            return error.GenerationPublicationChanged;
+        var next = self;
+        next.revision = std.math.add(u64, self.revision, 1) catch return error.GenerationPublicationChanged;
+        next.partition_journal = .fromHead(head);
+        try next.validateState(alloc);
+        return next;
+    }
+
+    /// The metadata writer loads the retained head to establish readiness.
+    pub fn markPartitionReady(self: InitialPublication, alloc: std.mem.Allocator, head: @import("schema_validation/publication.zig").Head) !InitialPublication {
+        const lookup = self.partition_journal orelse return error.InvalidGenerationPublication;
+        try lookup.require(head);
+        if (self.phase != .provisioning_child or self.partition_ready or head.phase != .installed or
+            head.publication_revision != 0 or !std.meta.eql(head.initial_partition, @as(?@import("initial_partition.zig").Reference, try self.partitionReference())))
+            return error.GenerationPublicationChanged;
+        var next = self;
+        next.revision = std.math.add(u64, self.revision, 1) catch return error.GenerationPublicationChanged;
+        next.partition_ready = true;
+        next.phase = if (self.plan.parents.len == 0) .published_hidden else .staging_parents;
+        try next.validateState(alloc);
+        return next;
+    }
+
+    /// Child retirement starts only after the parent owners confirm cancellation.
+    pub fn markPartitionCanceled(self: InitialPublication, alloc: std.mem.Allocator, head: @import("schema_validation/publication.zig").Head) !InitialPublication {
+        const lookup = self.partition_journal orelse return error.InvalidGenerationPublication;
+        try lookup.require(head);
+        if (self.phase != .provisioning_child or self.partition_ready or head.phase != .canceled or
+            !std.meta.eql(head.initial_partition, @as(?@import("initial_partition.zig").Reference, try self.partitionReference())))
+            return error.GenerationPublicationChanged;
+        var next = self;
+        next.revision = std.math.add(u64, self.revision, 1) catch return error.GenerationPublicationChanged;
+        next.phase = .canceling;
+        try next.validateState(alloc);
+        return next;
+    }
+
     pub fn apply(self: InitialPublication, alloc: std.mem.Allocator, command: InitialCommand) !InitialPublication {
         try command.validateShape();
         if (command.catalog_coverage != self.plan.catalog_coverage or command.action == .begin or command.child_table_id != self.plan.child.table_id or
@@ -1200,7 +1298,7 @@ pub const InitialPublication = struct {
         var next = self;
         next.revision = std.math.add(u64, self.revision, 1) catch return error.GenerationPublicationChanged;
         switch (command.action) {
-            .begin => unreachable,
+            .begin, .partition_reconcile => return error.InvalidGenerationPublication,
             .seal_support => {
                 if (self.phase != .preparing_support or !self.plan.support_pending) return error.GenerationPublicationChanged;
                 const sealed = command.plan.?;
@@ -1261,7 +1359,7 @@ pub const InitialPublication = struct {
                     .child_provisioned => {
                         if (self.phase != .provisioning_child) return error.GenerationPublicationChanged;
                         next.child_provisioned = try appendReceipt(alloc, self.child_provisioned, compact);
-                        if (next.child_provisioned.len == self.plan.child_ranges.len)
+                        if (next.child_provisioned.len == self.plan.child_ranges.len and self.plan.partition_birth == null)
                             next.phase = if (self.plan.parents.len == 0) .published_hidden else .staging_parents;
                     },
                     .child_released => {
@@ -1314,10 +1412,11 @@ pub const InitialPublication = struct {
                 }
             },
             .publish_child => {
-                if (self.phase != .publishing_child) return error.GenerationPublicationChanged;
+                if (self.phase != .publishing_child or (self.plan.partition_birth != null and !self.partition_ready)) return error.GenerationPublicationChanged;
                 next.phase = .published;
             },
             .cancel => {
+                if (self.partition_journal != null) return error.GenerationPublicationChanged;
                 if ((self.phase != .preparing_support and self.phase != .provisioning_child and self.phase != .staging_parents and self.phase != .activating_parents) or self.parent_activated.len != 0)
                     return error.GenerationPublicationChanged;
                 // No child owner has been touched while support is preparing.
@@ -1337,6 +1436,15 @@ pub const InitialPublication = struct {
 
     pub fn validateState(self: InitialPublication, alloc: std.mem.Allocator) !void {
         if (self.revision == 0 or std.mem.allEqual(u8, &self.plan_digest, 0)) return error.InvalidGenerationPublication;
+        if (self.partition_journal) |lookup| {
+            const birth = self.plan.partition_birth orelse return error.InvalidGenerationPublication;
+            if (lookup.table != birth.parent_before.table_id or self.child_provisioned.len != self.plan.child_ranges.len)
+                return error.InvalidGenerationPublication;
+        } else if (self.partition_ready) return error.InvalidGenerationPublication;
+        if (self.plan.partition_birth != null and !self.partition_ready) switch (self.phase) {
+            .preparing_support, .provisioning_child, .canceling, .canceled => {},
+            else => return error.InvalidGenerationPublication,
+        };
         const child_groups = try alloc.dupe(records.RangeRecord, self.plan.child_ranges);
         defer alloc.free(child_groups);
         std.mem.sort(records.RangeRecord, child_groups, {}, struct {
@@ -1387,7 +1495,10 @@ pub const InitialPublication = struct {
     pub fn nextWork(self: InitialPublication) !?InitialWork {
         const target: InitialWork.Target = switch (self.phase) {
             .preparing_support => .seal_support,
-            .provisioning_child => try self.nextChild(self.child_provisioned, .provision),
+            .provisioning_child => if (self.plan.partition_birth != null and self.child_provisioned.len == self.plan.child_ranges.len)
+                .{ .partition = if (self.partition_journal == null) .prepare else .reconcile }
+            else
+                try self.nextChild(self.child_provisioned, .provision),
             .staging_parents => self.nextParent(self.parent_staged, .stage) orelse return error.InvalidGenerationPublication,
             .activating_parents => self.nextParent(self.parent_activated, .activate) orelse return error.InvalidGenerationPublication,
             .acknowledging_parents => self.nextParent(self.parent_acknowledged, .acknowledge) orelse return error.InvalidGenerationPublication,
@@ -1437,6 +1548,7 @@ pub const InitialWork = struct {
 
     pub const Target = union(enum) {
         seal_support,
+        partition: enum { prepare, reconcile },
         child: struct { group_id: u64, action: @import("../api/relational_fk_generation_publication.zig").InitialChildAction },
         parent: struct { table_name: []const u8, table_id: u64, group_id: u64, action: @import("../api/relational_fk_generation_publication.zig").Action },
         publish_child,
@@ -1577,11 +1689,12 @@ pub fn deriveInitialTransitions(alloc: std.mem.Allocator, child_table_id: u64, c
     var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
     if (parsed.storage_mode != .relational) return error.InvalidGenerationPublication;
-    var compiled = try compileCatalog(alloc, parsed, child_table_id, null);
-    defer compiled.deinit();
     const fks = try parsed.relationalForeignKeyDefinitions(alloc);
     defer if (fks.len > 0) alloc.free(fks);
+    if (fks.len == 0 and parsed.sql_partition != null) return &.{};
     if (fks.len == 0 or fks.len > max_constraints) return error.InvalidGenerationPublication;
+    var compiled = try compileCatalog(alloc, parsed, child_table_id, null);
+    defer compiled.deinit();
     var result: std.ArrayList(DerivedTransition) = .empty;
     errdefer {
         for (result.items) |entry| {
@@ -2835,4 +2948,27 @@ test "SQL drop retirement command observations require exact durable owner recei
     command.plan_id[0] ^= 1;
     command.expected_revision = 2;
     try std.testing.expect(!state.commandObserved(command));
+}
+
+test "schema validation publication initial partition parent binds allocated identity and reader floor" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const source =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"created_at":{"type":"datetime"}},"additionalProperties":false}}}}
+    ;
+    var table: records.TableRecord = .{ .table_id = 7, .name = "partition_parent", .schema_json = source };
+    try std.testing.expect(!try initialPartitionParent(a, table));
+    var identities = try @import("column_identity_definition.zig").initial(a, table);
+    defer identities.deinit();
+    const attribute = identities.value.columns[0].id;
+    const parent = try local.schema_table_partitions.createParentSchema(a, table.table_id, attribute, source, .{ .key_name = "created_at" });
+    defer a.free(parent);
+    table.schema_json = parent;
+    table.schema_reader_requirements = try local.schema_mod.readerRequirementsForDefinitions(a, parent, "");
+    try std.testing.expect(try initialPartitionParent(a, table));
+    table.schema_reader_requirements.?.semantic_version -= 1;
+    try std.testing.expectError(error.InvalidGenerationPublication, initialPartitionParent(a, table));
+    table.schema_reader_requirements.?.semantic_version += 1;
+    table.table_id += 1;
+    try std.testing.expectError(error.InvalidGenerationPublication, initialPartitionParent(a, table));
 }

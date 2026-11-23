@@ -21,7 +21,7 @@ const catalog = local.sql_catalog;
 const preparation = catalog.trigger_preparation;
 const provider = @import("antfly_local_sources").api_operation;
 const Capture = @import("capture.zig");
-const execution = @import("../../sql_execution.zig");
+const execution = @import("../execution/execution.zig");
 const domain = local.system_catalog_domain;
 const Table = local.common_topology_records.TableRecord;
 const A = std.mem.Allocator;
@@ -48,7 +48,7 @@ const Entry = struct {
     begun: @FieldType(catalog.triggers.Entry, "events") = .{},
     update_names: []const []const u8 = &.{},
     update_ids: []const u64 = &.{},
-    check: ?*@import("../../sql_policy_evaluation.zig").Evaluation = null,
+    check: ?*@import("../execution/policy_evaluation.zig").Evaluation = null,
     no_policy: bool = false,
     after_generations: [4]u32 = @splat(0),
     closure_captured: bool = false,
@@ -448,7 +448,7 @@ pub const Broker = struct {
         }.less);
         return result.toOwnedSlice(a);
     }
-    fn policyCheck(self: *Broker, entry: *Entry) !?*@import("../../sql_policy_evaluation.zig").Evaluation {
+    fn policyCheck(self: *Broker, entry: *Entry) !?*@import("../execution/policy_evaluation.zig").Evaluation {
         if (entry.no_policy) return null;
         if (entry.check) |check| return check;
         const scope = entry.binding.scope orelse return invalidSnapshot("policy_scope");
@@ -460,7 +460,7 @@ pub const Broker = struct {
         const identity = self.root.identity.* orelse return error.RowPolicyAuthenticationRequired;
         var binding = entry.binding;
         binding.row_policy_purpose = .sql_write;
-        entry.check = try @import("../../sql_policy_evaluation.zig").Evaluation.initForWrite(self.a, self.root.server, self.root.context, binding, identity.username, token.?, self.root.setting_overlay);
+        entry.check = try @import("../execution/policy_evaluation.zig").Evaluation.initForWrite(self.a, self.root.server, self.root.context, binding, identity.username, token.?, self.root.setting_overlay);
         return entry.check;
     }
     fn updateIds(self: *Broker, entry: *const Entry, names: []const []const u8) ![]const u64 {

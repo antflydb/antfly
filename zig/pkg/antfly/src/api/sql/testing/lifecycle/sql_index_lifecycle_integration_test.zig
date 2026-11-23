@@ -1011,7 +1011,7 @@ fn nativeIndexLostAck(ctx: *fixture.Context, gin: bool) !void {
     const drop_sql = if (gin) "DROP INDEX lost_ack_gin" else "DROP INDEX lost_ack_fts";
     var parsed = try sources.sql_compiler.compile(ctx.alloc, create_sql, .{});
     defer parsed.deinit();
-    const outcome = try @import("../../../sql_catalog.zig").execute(&gateway, null, .{}, "default", "public", ctx.alloc, .{ .catalog_ddl = parsed.statement.catalog_ddl });
+    const outcome = try @import("../../catalog/catalog.zig").execute(&gateway, null, .{}, "default", "public", ctx.alloc, .{ .catalog_ddl = parsed.statement.catalog_ddl });
     const receipt = outcome.catalog_receipt orelse return error.MissingNativeIndexReceipt;
     defer receipt.deinit(ctx.alloc);
     try std.testing.expectEqual(.unknown, receipt.state);
@@ -1021,7 +1021,7 @@ fn nativeIndexLostAck(ctx: *fixture.Context, gin: bool) !void {
     try command(ctx, "public", drop_sql);
     try command(ctx, "public", create_sql);
     probe.hidden = false;
-    const recovered = try @import("../../../sql_catalog_recovery.zig").recover(&gateway, null, .{}, ctx.alloc, receipt.recovery_token);
+    const recovered = try @import("../../recovery/catalog_recovery.zig").recover(&gateway, null, .{}, ctx.alloc, receipt.recovery_token);
     defer recovered.deinit(ctx.alloc);
     try std.testing.expectEqual(.committed, recovered.state);
     try std.testing.expectEqual(.index, recovered.kind);

@@ -26558,6 +26558,9 @@ components:
         - query_source
         - view
         - extension
+        - collation
+        - publication
+        - subscription
       description: Catalog object affected by an exact recoverable operation.
     SQLCatalogOperationKind:
       type: string
@@ -46867,6 +46870,64 @@ components:
           graph: '#/components/schemas/CreateGraphIndexRequest'
           algebraic: '#/components/schemas/CreateAlgebraicIndexRequest'
           relational: '#/components/schemas/CreateRelationalIndexRequest'
+    DocumentSQLColumn:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - path
+        - type
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        path:
+          type: array
+          minItems: 1
+          maxItems: 16
+          items:
+            type: string
+            minLength: 1
+            maxLength: 128
+          description: Literal object keys, without wildcard or array traversal.
+        type:
+          type: string
+          enum:
+            - keyword
+            - text
+            - integer
+            - number
+            - boolean
+            - json
+          description: Existing strict SQL document scalar domain. Numeric/object values are never stringified
+            for keyword or text columns.
+    SQLViewIndexRequirement:
+      type: object
+      additionalProperties: false
+      required:
+        - view_name
+        - required_indexes
+      properties:
+        view_name:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Unqualified canonical view name in this document source's namespace. Does not create
+            a view or grant permissions.
+        required_indexes:
+          type: array
+          minItems: 1
+          maxItems: 16
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 128
+          description: Required full-text indexes. Canonical view admission captures their actual server-managed
+            incarnations. Dropping and recreating an index or changing its logical configuration invalidates
+            the captured dependency until the view is explicitly replaced. Maintenance and rebuilds of
+            the same logical index acquire a fresh ready publication for each retained read.
     SQLNamedEnumLabel:
       type: object
       additionalProperties: false
@@ -47910,6 +47971,27 @@ components:
       type: object
       description: Schema definition for a table with multiple document types
       properties:
+        document_sql_columns:
+          type: array
+          maxItems: 256
+          items:
+            $ref: '#/components/schemas/DocumentSQLColumn'
+          description: Read-only typed SQL aliases over literal document paths, independent of JSON Schema
+            write validation. SQL assignments reject these computed aliases; raw document ingress remains
+            unchanged. Missing paths produce SQL NULL; JSON null is retained for json columns and SQL
+            NULL for scalar columns. Scalar domain mismatches fail when the value is demanded instead
+            of converting to text. Untaken CASE and COALESCE branches do not evaluate a hidden typed failure.
+            Alias names cannot shadow existing schema columns or reserved document columns. Document storage
+            only.
+        sql_view_requirements:
+          type: array
+          maxItems: 64
+          items:
+            $ref: '#/components/schemas/SQLViewIndexRequirement'
+          description: Document-source dependency policies consumed by ordinary CREATE VIEW in the same
+            namespace. Typed paths use schema-owned document_sql_columns or existing document property
+            aliases; this field creates no second view catalog. Required index lifetimes and readiness
+            are checked once per retained physical read cut. Relational sources reject these policies.
         named_types:
           type: array
           readOnly: true

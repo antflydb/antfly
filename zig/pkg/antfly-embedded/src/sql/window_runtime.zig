@@ -27,8 +27,8 @@ const Datum = scalar.Datum;
 const Json = std.json.Value;
 const Allocator = std.mem.Allocator;
 
-const numeric = @import("numeric_value.zig");
-const numeric_aggregate = @import("numeric_aggregate.zig");
+const numeric = @import("numeric/value.zig");
+const numeric_aggregate = @import("numeric/aggregate.zig");
 const disk = @import("disk_rows.zig");
 const Cells = union(enum) {
     memory: []const []Datum,

@@ -21,7 +21,7 @@ const binding = @import("aggregate_binding.zig");
 const operators = @import("operators.zig");
 const scalar = @import("scalar.zig");
 const spill = @import("spill.zig");
-const arrays = @import("array_value.zig");
+const arrays = @import("array/value.zig");
 const A = std.mem.Allocator;
 const Datum = scalar.Datum;
 const Location = union(enum) { key: usize, value: usize };
@@ -85,7 +85,7 @@ pub const Stream = struct {
     locations: []Location,
     running: ?*UserState = null,
     evaluation_limits: scalar.EvalLimits = .{},
-    function_work: ?@import("numeric_value.zig").Context = null,
+    function_work: ?@import("numeric/value.zig").Context = null,
 
     fn reductionLimits(self: *Stream, original: scalar.EvalLimits) scalar.EvalLimits {
         var limits = original;

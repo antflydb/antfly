@@ -19,7 +19,7 @@
 const std = @import("std");
 const layout = @import("../common/sql_array_layout.zig");
 const json_order = @import("json_order.zig");
-const Context = @import("numeric_value.zig").Context;
+const Context = @import("numeric/value.zig").Context;
 
 /// A present typed JSON value, including JSON null. SQL NULL is represented by
 /// Value.null, never by this payload. Trees borrow a pinned ingress/schema/row
@@ -296,7 +296,7 @@ pub const Value = union(enum) {
     number: f64,
     numeric: []const u8,
     sql_array: Array,
-    range: @import("range_value.zig").Encoded,
+    range: @import("range/value.zig").Encoded,
     enumeration: *const @import("../common/sql_enum_value.zig").Value,
     /// A sparse owner allocates a JSON root only when actually referenced.
     /// Keep DOM container metadata out of every ordinary logical value slot.

@@ -492,7 +492,7 @@ test "SQL typed array rows survive scalar join and grouped relation adapters" {
                 if (self.emitted or limit == 0) return .{ .rows = &.{} };
                 self.emitted = true;
                 const rows = try a.alloc(catalog.Row, 1);
-                var array = try @import("array_value.zig").Value.init(.int64, &.{.{ .length = 2, .lower = -3 }}, &.{ Datum.json(.{ .integer = 9007199254740993 }), .{} }, .{});
+                var array = try @import("array/value.zig").Value.init(.int64, &.{.{ .length = 2, .lower = -3 }}, &.{ Datum.json(.{ .integer = 9007199254740993 }), .{} }, .{});
                 rows[0] = try catalog.Row.fromDatums(a, "row", try catalog.Row.TypedLayout.init(a, &.{"a"}), &.{Datum.typedArray(&array)});
                 return .{ .rows = rows };
             }
@@ -655,7 +655,7 @@ test "SQL typed blocking query boundaries unwind allocation failures" {
 }
 
 test "SQL public array results preserve descriptors through constant set window and scalar paths" {
-    const arrays = @import("array_value.zig");
+    const arrays = @import("array/value.zig");
     const Case = struct { sql: []const u8, kind: arrays.ElementType, expected: ?[]const u8 };
     const a = std.testing.allocator;
     for ([_]bool{ false, true }) |with_io| for ([_]Case{
@@ -683,9 +683,9 @@ test "SQL public array results preserve descriptors through constant set window 
         const flag = result.output.sql_nulls.?[0][0];
         if (entry.expected) |text| {
             try std.testing.expect(!flag);
-            var decoded = try @import("array_wire.zig").decode(a, entry.kind, cell, .{});
+            var decoded = try @import("array/wire.zig").decode(a, entry.kind, cell, .{});
             defer decoded.deinit();
-            var expected = try @import("array_text.zig").decode(a, entry.kind, text, .{});
+            var expected = try @import("array/text.zig").decode(a, entry.kind, text, .{});
             defer expected.deinit();
             var work: arrays.Budget = .{};
             try std.testing.expectEqual(std.math.Order.eq, try expected.value.compare(decoded.value, &work));
@@ -998,7 +998,7 @@ test "SQL set inference respects pairwise and derived type boundaries" {
     var numeric_result = try runtime.execute(std.testing.allocator, backend.backend(), &numeric_query, &.{.{ .integer = 1 }}, .{});
     defer numeric_result.deinit();
     try std.testing.expectEqual(@import("ast.zig").ColumnType.number, numeric_result.output.columns[0].type);
-    try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .numeric), numeric_result.output.columns[0].element_type);
+    try std.testing.expectEqual(@as(?@import("array/value.zig").ElementType, .numeric), numeric_result.output.columns[0].element_type);
     var predicate_query = try compiler.compile(std.testing.allocator, "SELECT $1 AS x WHERE $1=1 UNION ALL SELECT 1.5", .{});
     defer predicate_query.deinit();
     var predicate_result = try runtime.execute(std.testing.allocator, backend.backend(), &predicate_query, &.{.{ .integer = 1 }}, .{});
@@ -3145,10 +3145,8 @@ fn Engine(comptime Context: type) type {
                     if (self.probe) |*probe| {
                         while (try probe.next()) |match| {
                             try self.engine.checkpoint();
-                            // A join iterator owns its candidate scratch for its full
-                            // lifetime. Reuse retained pages across output rows;
-                            // returned cells still reference the stable probe/build
-                            // rows, not this transient candidate allocation.
+                            // Reuse the working set across this probe batch.
+                            // Only accepted rows transfer payload ownership to the caller.
                             if (!self.scratch.reset(.retain_capacity)) return error.OutOfMemory;
                             if (self.left_values == null) self.left_values = try self.probe_payload.row(self.probe_arena.allocator(), self.probe_index - 1);
                             const values = try self.combine(self.scratch.allocator(), self.left_values, try match.materializeValues(self.scratch.allocator()));
@@ -3160,18 +3158,34 @@ fn Engine(comptime Context: type) type {
                             }
                             self.left_matched = true;
                             try self.hash_join.?.markMatched(match.index);
-                            return try alloc.dupe(Datum, values);
+                            const owned = try alloc.alloc(Datum, values.len);
+                            for (values, owned) |value, *cell| cell.* = try operators.cloneDatum(alloc, value);
+                            return owned;
                         }
                         self.probe = null;
-                        if (!self.left_matched and (kind == .left or kind == .full)) return try self.combine(alloc, self.left_values orelse try self.probe_payload.row(self.probe_arena.allocator(), self.probe_index - 1), null);
+                        if (!self.left_matched and (kind == .left or kind == .full)) {
+                            const left = self.left_values orelse try self.probe_payload.row(self.probe_arena.allocator(), self.probe_index - 1);
+                            const row = try self.combine(alloc, left, null);
+                            for (@constCast(row)) |*cell| cell.* = try operators.cloneDatum(alloc, cell.*);
+                            return row;
+                        }
                     }
                     if (self.eof) {
                         if (kind == .right or kind == .full) {
-                            if (try self.hash_join.?.unmatched(&self.unmatched_index)) |match| return try self.combine(alloc, null, try match.materializeValues(alloc));
+                            if (try self.hash_join.?.unmatched(&self.unmatched_index)) |match| {
+                                if (!self.scratch.reset(.retain_capacity)) return error.OutOfMemory;
+                                const right = try match.materializeValues(self.scratch.allocator());
+                                const row = try self.combine(alloc, null, right);
+                                for (@constCast(row)) |*cell| cell.* = try operators.cloneDatum(alloc, cell.*);
+                                return row;
+                            }
                         }
                         return null;
                     }
                     if (self.probe_index == self.probe_payload.len()) {
+                        // Release exceptional scratch growth at batch boundaries,
+                        // where it cannot cause repeated allocation per candidate.
+                        if (!self.scratch.reset(.{ .retain_with_limit = 64 * 1024 })) return error.OutOfMemory;
                         if (!try self.fillProbes(if (self.flipped_join) join.right_keys else join.left_keys)) {
                             self.eof = true;
                             continue;
@@ -4523,7 +4537,7 @@ test "SQL prepared native batches avoid row matrices across memory and spill blo
             var source = std.heap.ArenaAllocator.init(a);
             defer source.deinit();
             const sa = source.allocator();
-            const array = try @import("array_value.zig").Value.init(.int64, &.{.{ .length = 2, .lower = -3 }}, &.{ Datum.json(.{ .integer = 9007199254740993 }), .{} }, .{});
+            const array = try @import("array/value.zig").Value.init(.int64, &.{.{ .length = 2, .lower = -3 }}, &.{ Datum.json(.{ .integer = 9007199254740993 }), .{} }, .{});
             const layout = try catalog.Row.TypedLayout.init(sa, &.{"a"});
             const rows = try sa.alloc(catalog.Row, row_count);
             for (rows) |*row| row.* = .{ .id = "row", .version = 0, .value = .null, .typed_cells = .{ .layout = layout, .values = &.{Datum.typedArray(&array)} } };
@@ -4771,6 +4785,47 @@ test "SQL encoded JSON join batches preserve residual outer rows flips and retai
         try Fixture.run(std.testing.allocator, flip, "FULL", pull, true, frozen_mode);
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{ true, @as([]const u8, "FULL"), @as(u32, 3), true, true });
+}
+
+test "SQL scalar hash join result owns variable-width cells across pulls and iterator close" {
+    const a = std.testing.allocator;
+    const Runtime = @import("runtime.zig");
+    var fixture: EncodedJoinFixture = .{ .allow_scalar = true };
+    var result_arena = std.heap.ArenaAllocator.init(a);
+    defer result_arena.deinit();
+    const result_alloc = result_arena.allocator();
+    const rows = blk: {
+        var work = std.heap.ArenaAllocator.init(a);
+        defer work.deinit();
+        var compiled = try @import("compiler.zig").compile(a, "SELECT l.j,r.j FROM left_docs l JOIN right_docs r ON l.k=r.k", .{});
+        defer compiled.deinit();
+        const bound = try describe.bind(work.allocator(), fixture.backend(), &compiled, &.{});
+        const owner = try Source(Runtime.Context).create(.{ .alloc = a, .arena = work.allocator(), .backend = fixture.backend(), .binding = bound, .parameters = &.{}, .limits = .{ .execution_batch_rows = 4 }, .typed_output = true });
+        defer owner.close();
+        const iterator = owner.iterator.?;
+        try std.testing.expect(iterator.node.operation == .join);
+        const first = (try iterator.next(result_alloc)).?;
+        const second = (try iterator.next(result_alloc)).?;
+        break :blk [2][]const Datum{ first, second };
+    };
+    var sides: u8 = 0;
+    for (rows) |row| {
+        var found_left = false;
+        var found_right = false;
+        for (row) |cell| {
+            if (cell.value != .object) continue;
+            const side = cell.value.object.get("side").?.string;
+            if (std.mem.eql(u8, side, "L0")) found_left = true else if (std.mem.eql(u8, side, "R0")) {
+                sides |= 1;
+                found_right = true;
+            } else if (std.mem.eql(u8, side, "R1")) {
+                sides |= 2;
+                found_right = true;
+            } else return error.TestUnexpectedResult;
+        }
+        try std.testing.expect(found_left and found_right);
+    }
+    try std.testing.expectEqual(@as(u8, 3), sides);
 }
 
 test "native projection refinements benchmark encoded join output" {

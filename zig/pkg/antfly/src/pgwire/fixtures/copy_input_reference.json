@@ -8928,5 +8928,107 @@
       ]
     }
   },
-  "rls_sqlstate": "0A000"
+  "rls_sqlstate": "0A000",
+  "freeze": {
+    "id": "sql-0372",
+    "sql": "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, HEADER true, FREEZE true, ON_ERROR ignore, REJECT_LIMIT 10, LOG_VERBOSITY verbose, FORCE_NOT_NULL (id, status), FORCE_NULL (status), DELIMITER ',', QUOTE '\"', ESCAPE '!', NULL '', DEFAULT 'n/a', ENCODING 'UTF8')",
+    "create": "CREATE TABLE usage_records(id bigint PRIMARY KEY,status text DEFAULT 'PENDING')",
+    "data": "id,status\n1,READY\nbad,ignored\n2,n/a\n",
+    "existing_sqlstate": "55000",
+    "open_cursor_sqlstate": "25000",
+    "after_select_tags": {
+      "READ COMMITTED": "COPY 2",
+      "REPEATABLE READ": "COPY 2"
+    },
+    "child_after_truncate_sqlstate": "55000",
+    "child_after_create_sqlstate": "55000",
+    "create_tag": "COPY 2",
+    "truncate_tag": "COPY 2",
+    "created_rows": [
+      [
+        1,
+        "READY"
+      ],
+      [
+        2,
+        "PENDING"
+      ]
+    ],
+    "truncated_rows": [
+      [
+        1,
+        "READY"
+      ],
+      [
+        2,
+        "PENDING"
+      ]
+    ],
+    "rows_after_rollback": [
+      [
+        1,
+        "READY"
+      ],
+      [
+        2,
+        "PENDING"
+      ]
+    ],
+    "older_snapshot_rows": {
+      "frozen": [
+        [
+          1,
+          "READY"
+        ],
+        [
+          2,
+          "PENDING"
+        ]
+      ],
+      "ordinary": []
+    },
+    "released_child_tag": "COPY 2",
+    "rolled_back_child_sqlstate": "55000",
+    "restored_parent_sqlstate": "55000",
+    "created_parent_tags_after_child_rollback": [
+      "COPY 2",
+      "COPY 2"
+    ],
+    "mixed_older_snapshot_rows": [
+      [
+        1,
+        "READY"
+      ],
+      [
+        2,
+        "PENDING"
+      ]
+    ],
+    "mixed_current_rows": [
+      [
+        1,
+        "updated"
+      ],
+      [
+        3,
+        "ordinary"
+      ]
+    ],
+    "repeated_older_snapshot_rows": [
+      [
+        7,
+        "first"
+      ],
+      [
+        7,
+        "second"
+      ]
+    ],
+    "repeated_current_rows": [
+      [
+        7,
+        "second"
+      ]
+    ]
+  }
 }

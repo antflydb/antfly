@@ -169,6 +169,8 @@ pub const RequestContext = struct {
         prepare_metadata: ?*const fn (*anyopaque, SQLCompletionOwner) anyerror!void = null,
         reject_metadata: ?*const fn (*anyopaque, SQLCompletionOwner) anyerror!void = null,
     } = null,
+    /// Borrowed socket-bound SELinux signer. Never forwarded or decoded.
+    sql_selinux_ingress: ?@import("../system_catalog/security_labels.zig").KernelRelabel.Ingress = null,
     /// Captured by the durable SQL command owner. Catalog adapters bind this
     /// into their existing mutation identities before any forwarding.
     sql_command_fence: ?*const @import("../storage/pessimistic_lock/authority.zig").CommandFence = null,

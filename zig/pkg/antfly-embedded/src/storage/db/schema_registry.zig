@@ -89,6 +89,9 @@ pub const Epoch = struct {
         if (owned_validator) |validator| if (validator.schema.sql_triggers != null) {
             requirements.semantic_version = @max(requirements.semantic_version, schema_api.table_trigger_semantic_version);
         };
+        if (owned_validator) |validator| if (validator.schema.hasDocumentSqlDeclarations()) {
+            requirements.semantic_version = @max(requirements.semantic_version, @import("../../common/schema_readers.zig").sql_view_index_semantic_version);
+        };
         var physical_layout = try row_codec.PhysicalLayout.init(alloc, owned_schema);
         errdefer physical_layout.deinit();
         const epoch = try alloc.create(Epoch);

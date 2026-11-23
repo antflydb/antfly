@@ -8153,7 +8153,7 @@ export interface components {
          * @description Catalog object affected by an exact recoverable operation.
          * @enum {string}
          */
-        SQLCatalogObjectKind: "sequence" | "function" | "procedure" | "operator" | "aggregate" | "cast" | "type" | "authorization" | "table" | "index" | "database" | "namespace" | "tablespace" | "query_source" | "view" | "extension";
+        SQLCatalogObjectKind: "sequence" | "function" | "procedure" | "operator" | "aggregate" | "cast" | "type" | "authorization" | "table" | "index" | "database" | "namespace" | "tablespace" | "query_source" | "view" | "extension" | "collation" | "publication" | "subscription";
         /** @enum {string} */
         SQLCatalogOperationKind: "create" | "alter" | "rename" | "drop";
         /**
@@ -19875,6 +19875,22 @@ export interface components {
         };
         /** @description Type-safe configuration for a new index. The index name is owned by the request path. */
         CreateIndexRequest: components["schemas"]["CreateFullTextIndexRequest"] | components["schemas"]["CreateEmbeddingsIndexRequest"] | components["schemas"]["CreateGraphIndexRequest"] | components["schemas"]["CreateAlgebraicIndexRequest"] | components["schemas"]["CreateRelationalIndexRequest"];
+        DocumentSQLColumn: {
+            name: string;
+            /** @description Literal object keys, without wildcard or array traversal. */
+            path: string[];
+            /**
+             * @description Existing strict SQL document scalar domain. Numeric/object values are never stringified for keyword or text columns.
+             * @enum {string}
+             */
+            type: "keyword" | "text" | "integer" | "number" | "boolean" | "json";
+        };
+        SQLViewIndexRequirement: {
+            /** @description Unqualified canonical view name in this document source's namespace. Does not create a view or grant permissions. */
+            view_name: string;
+            /** @description Required full-text indexes. Canonical view admission captures their actual server-managed incarnations. Dropping and recreating an index or changing its logical configuration invalidates the captured dependency until the view is explicitly replaced. Maintenance and rebuilds of the same logical index acquire a fresh ready publication for each retained read. */
+            required_indexes: string[];
+        };
         /** @description Immutable enum symbol. Symbol IDs are append-only; order keys are opaque stable ordering metadata. */
         SQLNamedEnumLabel: {
             /** Format: uint32 */
@@ -20390,6 +20406,10 @@ export interface components {
         };
         /** @description Schema definition for a table with multiple document types */
         TableSchema: {
+            /** @description Read-only typed SQL aliases over literal document paths, independent of JSON Schema write validation. SQL assignments reject these computed aliases; raw document ingress remains unchanged. Missing paths produce SQL NULL; JSON null is retained for json columns and SQL NULL for scalar columns. Scalar domain mismatches fail when the value is demanded instead of converting to text. Untaken CASE and COALESCE branches do not evaluate a hidden typed failure. Alias names cannot shadow existing schema columns or reserved document columns. Document storage only. */
+            document_sql_columns?: components["schemas"]["DocumentSQLColumn"][];
+            /** @description Document-source dependency policies consumed by ordinary CREATE VIEW in the same namespace. Typed paths use schema-owned document_sql_columns or existing document property aliases; this field creates no second view catalog. Required index lifetimes and readiness are checked once per retained physical read cut. Relational sources reject these policies. */
+            sql_view_requirements?: components["schemas"]["SQLViewIndexRequirement"][];
             /** @description Server-resolved immutable SQL type layouts, sorted by catalog ID. Clients reference types through x-antfly-sql-type-id; catalog admission verifies every layout against its active definition. Retained by backups and schema epochs for deterministic cold decoding. */
             readonly named_types?: components["schemas"]["SQLNamedTypeLayout"][];
             /**

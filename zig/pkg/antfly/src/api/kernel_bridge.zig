@@ -154,8 +154,8 @@ const OpaqueApiHttpServer = struct {
         try callError(self.functions.attach_replicated_restore_store(abi.abi_version, self.opaque_handle, &input));
     }
 
-    pub fn authorizeSqlLock(self: *OpaqueApiHttpServer, value: @import("sql_data_locks.zig").AuthorizationInput) !@import("antfly_local_sources").storage_pessimistic_lock_control.Command {
-        const Input = @import("sql_data_locks.zig").AuthorizationInput;
+    pub fn authorizeSqlLock(self: *OpaqueApiHttpServer, value: @import("sql/session/data_locks.zig").AuthorizationInput) !@import("antfly_local_sources").storage_pessimistic_lock_control.Command {
+        const Input = @import("sql/session/data_locks.zig").AuthorizationInput;
         const Output = @import("antfly_local_sources").storage_pessimistic_lock_control.Command;
         var result: Output = undefined;
         try callFallible(Input, Output, self.functions.authorize_sql_lock, self.opaque_handle, &value, &result);

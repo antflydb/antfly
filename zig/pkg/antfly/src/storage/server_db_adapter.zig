@@ -227,7 +227,25 @@ pub fn captureSnapshot(owner: anytype, group_id: u64, through_index: u64) !snaps
     var pin = try db.pinTransferablePrimarySnapshot();
     errdefer pin.primary.deinit();
     if (pin.receipt != null and pin.receipt.?.index > through_index) return error.InvalidSnapshot;
-    return .{ .alloc = pin.alloc, .io = pin.io, .primary = pin.primary, .identity = .{
+    const archive: ?snapshots.Capture.Frozen = if (pin.frozen_base) |binding| blk: {
+        const Archive = struct {
+            db: @TypeOf(db.*),
+            alloc: std.mem.Allocator,
+
+            fn release(raw: *anyopaque) void {
+                const retained: *@This() = @ptrCast(@alignCast(raw));
+                retained.db.close();
+                retained.alloc.destroy(retained);
+            }
+        };
+        const retained = try pin.alloc.create(Archive);
+        errdefer pin.alloc.destroy(retained);
+        retained.* = .{ .db = try db.openPublishedFrozenImage(binding, .none), .alloc = pin.alloc };
+        errdefer retained.db.close();
+        const frozen_pin = try retained.db.pinTransferablePrimarySnapshot();
+        break :blk .{ .primary = frozen_pin.primary, .owner = retained, .release = Archive.release };
+    } else null;
+    return .{ .alloc = pin.alloc, .io = pin.io, .primary = pin.primary, .archive = archive, .identity = .{
         .group_id = group_id,
         .namespace = pin.namespace,
         .through_index = through_index,
@@ -235,10 +253,24 @@ pub fn captureSnapshot(owner: anytype, group_id: u64, through_index: u64) !snaps
         .native_index = if (pin.receipt) |value| value.index else 0,
         .origin = pin.origin,
         .schema_header = pin.schema_header,
+        .frozen_base = pin.frozen_base,
     } };
 }
 
 pub fn verifySnapshot(owner: anytype, expected: snapshots.Identity) !void {
+    const db = physicalOwner(owner);
+    const bound = try db.transferableFrozenBase();
+    if (!std.meta.eql(bound, expected.frozen_base)) return error.InvalidSnapshot;
+    if (bound) |binding| {
+        const frozen = @import("antfly_local_sources").storage_db_relational_frozen_contract;
+        const installed = try frozen.installedPathAlloc(db.alloc, db.core.path, binding.scope);
+        defer db.alloc.free(installed);
+        const io = db.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+        var directory = try std.Io.Dir.cwd().openDir(io, installed, .{});
+        directory.close(io);
+        var archive = try db.openPublishedFrozenImage(binding, .none);
+        defer archive.close();
+    }
     const cut: ?types.OrderedApplyReceipt = if (expected.native_index == 0 and expected.native_term == 0) null else .{ .term = expected.native_term, .index = expected.native_index };
     if (expected.origin) |origin| {
         try physicalOwner(owner).verifyTransferablePrimarySnapshotWithOrigin(expected.namespace, cut, origin);

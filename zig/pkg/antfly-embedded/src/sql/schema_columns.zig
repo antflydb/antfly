@@ -62,7 +62,7 @@ pub fn column(name: []const u8, property: Json) !catalog.Column {
     if (identity) |builtin| if (kind != .array and kind != scalarType(builtin)) return error.InvalidSqlBackendResponse;
     const modifier = if (property.object.get("x-antfly-sql-numeric-modifier")) |value| blk: {
         if (identity != .numeric or (kind != .number and kind != .array)) return error.InvalidSqlBackendResponse;
-        break :blk @import("numeric_storage.zig").modifierFromJson(value) catch return error.InvalidSqlBackendResponse;
+        break :blk @import("numeric/storage.zig").modifierFromJson(value) catch return error.InvalidSqlBackendResponse;
     } else null;
     return .{ .name = name, .path = name, .type = kind, .element_type = identity, .numeric_modifier = modifier };
 }

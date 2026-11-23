@@ -16,6 +16,7 @@
 const std = @import("std");
 const storage_schema = @import("../storage/schema.zig");
 const impl = @import("table_schema_impl.zig");
+pub const sql_view_index_binding = @import("sql_view_index_binding.zig");
 pub const table_triggers = @import("table_triggers.zig");
 pub const table_trigger_semantic_version: u32 = 43;
 test {
@@ -72,6 +73,13 @@ pub fn namedTypeReaderRequirementsForDefinitions(alloc: std.mem.Allocator, write
     return try readerRequirementsForDefinitions(alloc, write, read);
 }
 
+pub fn creationReaderRequirementsForDefinitions(alloc: std.mem.Allocator, write: []const u8, read: []const u8) !?storage_schema.ReaderRequirements {
+    if ((write.len != 0 and try sql_view_index_binding.usesSchemaDeclaration(alloc, write)) or
+        (read.len != 0 and try sql_view_index_binding.usesSchemaDeclaration(alloc, read)))
+        return try readerRequirementsForDefinitions(alloc, write, read);
+    return namedTypeReaderRequirementsForDefinitions(alloc, write, read);
+}
+
 pub fn parseValidatedTableSchema(alloc: std.mem.Allocator, schema_json: []const u8) !ParsedTableSchema {
     return try impl.parseSchema(alloc, schema_json);
 }
@@ -99,7 +107,12 @@ pub const PreparedSchemaDefinition = struct {
     /// decoder identity must instead come from that actual frame's header.
     pub fn readerRequirements(self: *const PreparedSchemaDefinition) storage_schema.ReaderRequirements {
         return .{
-            .semantic_version = @max(storage_schema.requiredReaderVersion(self.runtime_schema), if (self.public_schema.sql_triggers != null) table_trigger_semantic_version else 0),
+            .semantic_version = @max(
+                storage_schema.requiredReaderVersion(self.runtime_schema),
+                if (self.public_schema.sql_triggers != null) table_trigger_semantic_version else 0,
+                if (self.public_schema.sql_partition != null) @import("table_partitions.zig").semantic_version else 0,
+                if (self.public_schema.hasDocumentSqlDeclarations()) @import("../common/schema_readers.zig").sql_view_index_semantic_version else 0,
+            ),
             .encoding_version = storage_schema.storage_format_version,
         };
     }
@@ -235,7 +248,7 @@ pub const CompiledTableValidator = struct {
         var schema = try parseValidatedTableSchema(alloc, schema_json);
         errdefer schema.deinit(alloc);
         var compiled = try takeParsed(alloc, schema);
-        compiled.source_digest = @import("../storage/db/relational_schema_owner_contract.zig").hash(schema_json);
+        compiled.source_digest = @import("../storage/db/relational/schema_change/schema_owner_contract.zig").hash(schema_json);
         return compiled;
     }
 
@@ -412,6 +425,7 @@ pub const CompiledTableValidator = struct {
     pub fn validateRelationalRestoreFieldsWithExecution(self: *const CompiledTableValidator, execution: *@import("relational_expression.zig").Execution, row: anytype) !void {
         std.debug.assert(!self.restore.full_root);
         try execution.charge(0);
+        if (self.schema.sql_partition) |state| try @import("table_partitions.zig").validateRow(state.value, row);
         if (self.execution.expressions) |expressions| try expressions.verifyRowWithExecution(execution, row);
         if (self.execution.checks) |checks| if (try checks.firstFailureRowWithExecution(execution, row)) |failure| return failure.reason;
         for (self.restore.properties) |index| {
@@ -1386,7 +1400,7 @@ fn requiresStringLengths(schema: ParsedTableSchema) bool {
 }
 
 fn numericFunctionName(name: []const u8) bool {
-    return std.meta.stringToEnum(@import("../sql/numeric_functions.zig").Function, name) != null;
+    return std.meta.stringToEnum(@import("../sql/numeric/functions.zig").Function, name) != null;
 }
 
 fn numericFunctionJson(expression: std.json.Value, depth: usize) bool {
@@ -1985,27 +1999,27 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         if (logical_keys) |adapter| {
             const keys = try arena.allocator().alloc(@import("../storage/relational_index.zig").RelationalIndexKey, adapter.key_columns.len);
             for (adapter.key_columns, keys) |column, *key| key.* = .{ .column = column };
-            var tuple = @import("../storage/db/relational_index_keys.zig").TuplePlan.init(alloc, index_schema, &layout, keys) catch |err| switch (err) {
+            var tuple = @import("../storage/db/relational/indexes/keys.zig").TuplePlan.init(alloc, index_schema, &layout, keys) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return error.InvalidSchemaUpdateRequest,
             };
             tuple.deinit();
         }
         for ((try schema.relationalIndexDefinitions(arena.allocator())) orelse &.{}) |definition| {
-            var tuple = @import("../storage/db/relational_index_keys.zig").TuplePlan.init(alloc, index_schema, &layout, definition.keys) catch |err| switch (err) {
+            var tuple = @import("../storage/db/relational/indexes/keys.zig").TuplePlan.init(alloc, index_schema, &layout, definition.keys) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return error.InvalidSchemaUpdateRequest,
             };
             tuple.deinit();
             if (definition.include_columns.len != 0) {
-                var cover = @import("../storage/db/relational_index_cover.zig").Plan.init(alloc, index_schema, &layout, definition.keys, definition.include_columns) catch |err| switch (err) {
+                var cover = @import("../storage/db/relational/indexes/cover.zig").Plan.init(alloc, index_schema, &layout, definition.keys, definition.include_columns) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => return error.InvalidSchemaUpdateRequest,
                 };
                 cover.deinit();
             }
             if (definition.where.len != 0) {
-                var condition = @import("../storage/db/relational_index_predicate.zig").Plan.init(alloc, index_schema, &layout, definition.where) catch |err| switch (err) {
+                var condition = @import("../storage/db/relational/indexes/predicate.zig").Plan.init(alloc, index_schema, &layout, definition.where) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => return error.InvalidSchemaUpdateRequest,
                 };
@@ -2020,6 +2034,7 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
     errdefer alloc.free(default_type);
     const ttl_field = try alloc.dupe(u8, schema.ttl_field);
     errdefer alloc.free(ttl_field);
+    try @import("table_partitions.zig").validateLayout(alloc, schema, expression_schema);
     const external = if (schema.external_base_source) |source| try @import("../serverless/external_source/schema_binding.zig").cloneAlloc(alloc, source) else null;
 
     var result = expression_schema;
@@ -2131,7 +2146,7 @@ fn rangeExpressionJson(expression: std.json.Value, depth: usize) bool {
     if (depth >= @import("relational_expression.zig").max_depth or expression != .object) return false;
     if (expression.object.get("type")) |kind| if (kind == .string) {
         const parsed = std.meta.stringToEnum(storage_schema.RelationalColumnType, kind.string);
-        if (parsed) |tag| if (@import("../sql/range_value.zig").kindFromType(tag) != null) return true;
+        if (parsed) |tag| if (@import("../sql/range/value.zig").kindFromType(tag) != null) return true;
     };
     if (expression.object.get("args")) |args| if (args == .array) for (args.array.items) |arg| {
         if (rangeExpressionJson(arg, depth + 1)) return true;
@@ -2141,7 +2156,7 @@ fn rangeExpressionJson(expression: std.json.Value, depth: usize) bool {
 
 fn rangeExpressionWire(expression: anytype, depth: usize) bool {
     if (depth >= @import("relational_expression.zig").max_depth) return false;
-    if (expression.type) |kind| if (@import("../sql/range_value.zig").kindFromType(kind) != null) return true;
+    if (expression.type) |kind| if (@import("../sql/range/value.zig").kindFromType(kind) != null) return true;
     if (expression.args) |args| for (args) |arg| if (rangeExpressionWire(arg, depth + 1)) return true;
     return false;
 }
@@ -2279,7 +2294,7 @@ pub fn runtimeRelationalColumnType(property: impl.DocumentProperty) ?storage_sch
     if (property.field_type) |field_type| {
         if (std.mem.eql(u8, field_type, "sql_array")) return .sql_array;
         if (std.mem.eql(u8, field_type, "sql_enum")) return .enumeration;
-        if (std.meta.stringToEnum(@import("../sql/range_value.zig").Kind, field_type)) |kind| return @import("../sql/range_value.zig").typeFromKind(storage_schema.RelationalColumnType, kind);
+        if (std.meta.stringToEnum(@import("../sql/range/value.zig").Kind, field_type)) |kind| return @import("../sql/range/value.zig").typeFromKind(storage_schema.RelationalColumnType, kind);
         if (property.sql_type == .numeric) return .numeric;
         if (std.mem.eql(u8, field_type, "embedding")) return .dense_vector;
         if (std.mem.eql(u8, field_type, "keyword") or
@@ -4727,4 +4742,33 @@ test "document generated SQL COPY candidates defer NOT NULL and CHECK while sele
         _ = try validator.prepareSelectedValueWithNulls(owned, &candidate, &.{});
         try std.testing.expect(!candidate.object.contains("n"));
     }
+}
+
+test "typed document paths advertise a semantic floor and leave write validation independent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const authored =
+        \\{"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"metadata":{}},"additionalProperties":true}}},"document_sql_columns":[{"name":"plan","path":["metadata","plan"],"type":"keyword"}],"sql_view_requirements":[{"view_name":"support_view","required_indexes":["support_fts"]}]}
+    ;
+    var prepared = try PreparedSchemaDefinition.init(a, authored);
+    defer prepared.deinit(a);
+    const readers = @import("../common/schema_readers.zig");
+    try std.testing.expectEqual(readers.sql_view_index_semantic_version, prepared.readerRequirements().semantic_version);
+    const columns = try @import("../sql/document_row.zig").deriveColumns(a, prepared.public_schema);
+    var found = false;
+    for (columns) |column| {
+        if (!std.mem.eql(u8, column.name, "plan")) continue;
+        found = true;
+        try std.testing.expect(column.generated);
+        try std.testing.expectEqual(@as(usize, 2), column.document_path.len);
+        try std.testing.expectEqualStrings("metadata", column.document_path[0]);
+        try std.testing.expectEqualStrings("plan", column.document_path[1]);
+    }
+    try std.testing.expect(found);
+    var validator = try CompiledTableValidator.initParsed(a, prepared.public_schema);
+    defer validator.deinit(a);
+    var body = try std.json.parseFromSlice(std.json.Value, a, "{\"metadata\":{\"plan\":17}}", .{});
+    defer body.deinit();
+    try validator.validateValue(a, &body.value);
 }

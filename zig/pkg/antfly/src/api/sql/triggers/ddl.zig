@@ -20,9 +20,9 @@ const local = @import("antfly_local_sources");
 const catalog = local.sql_catalog;
 const ast = local.sql_ast;
 const domain = local.system_catalog_domain;
-const calls = @import("../../sql_routine_execution.zig");
-const execution = @import("../../sql_execution.zig");
-const schemas = @import("../../sql_catalog.zig");
+const calls = @import("../execution/routine_execution.zig");
+const execution = @import("../execution/execution.zig");
+const schemas = @import("../catalog/catalog.zig");
 const topology = @import("../../../metadata/topology_protocol.zig");
 
 pub fn execute(root: *execution.Adapter, allocators: catalog.DdlAllocators, ddl: ast.CatalogDdl) !catalog.DdlOutcome {

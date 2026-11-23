@@ -95,7 +95,7 @@ fn tableState(ctx: *fixture.Context, name: []const u8) !std.json.Parsed(local.sq
 fn authorize(manager: *@import("../../../../usermgr/mod.zig").UserManager) !void {
     const users = @import("../../../../usermgr/mod.zig");
     try manager.removePermissionFromUser("pk-rewriter", "*", .table);
-    inline for (.{ "trigger_source", "restored_table", "touch_source", "touch_destination" }) |name| {
+    inline for (.{ "trigger_source", "independent_source", "restore_name_conflict", "restored_table", "touch_source", "touch_destination" }) |name| {
         var permission = try users.Permission.initOwned(manager.alloc, .table, name, .admin);
         defer permission.deinit(manager.alloc);
         try manager.addPermissionToUser("pk-rewriter", permission);
@@ -107,7 +107,7 @@ fn authorize(manager: *@import("../../../../usermgr/mod.zig").UserManager) !void
     }
 }
 fn backup(ctx: *fixture.Context, cluster: bool, location: []const u8) !void {
-    const path = if (cluster) "/db/v1/backup" else "/db/v1/tables/trigger_source/backup";
+    const path = if (cluster) "/db/v1/backup" else "/db/v1/tables/independent_source/backup";
     const body = if (cluster)
         try std.json.Stringify.valueAlloc(ctx.alloc, .{ .backup_id = "cohort", .location = location, .connection = "archive", .format = "native", .table_names = &.{"trigger_source"} }, .{})
     else
@@ -133,11 +133,11 @@ fn backup(ctx: *fixture.Context, cluster: bool, location: []const u8) !void {
         try std.testing.expectEqualStrings("successful", completed.value.backup);
     }
 }
-fn waitJob(ctx: *fixture.Context, id: []const u8, expected: []const u8) !void {
+fn waitJob(ctx: *fixture.Context, id: []const u8, expected: []const u8, cluster: bool) !void {
     const deadline = @import("antfly_platform").time.monotonicNs() +| 120 * std.time.ns_per_s;
     while (@import("antfly_platform").time.monotonicNs() < deadline) {
         try ctx.checkDrivers();
-        var response = try fixture.job(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.base, id);
+        var response = try fixture.job(ctx.alloc, ctx.transport, if (cluster) ctx.headers else ctx.admin_headers, ctx.base, id);
         defer response.deinit(ctx.alloc);
         try std.testing.expectEqual(@as(u16, 200), response.status);
         var body = try std.json.parseFromSlice(std.json.Value, ctx.alloc, response.body, .{});
@@ -160,6 +160,15 @@ fn restoreBody(a: A, source: SourceIdentity, destination: u64, cluster: bool, lo
     return std.json.Stringify.valueAlloc(a, .{ .backup_id = "independent", .location = location, .connection = "archive", .routine_mappings = &.{mapping} }, .{});
 }
 fn startRestore(ctx: *fixture.Context, body: []const u8, cluster: bool, key: []const u8) ![]u8 {
+    // The public cluster gate and the durable trigger actor have different
+    // authority requirements. Narrow the actor immediately after admission.
+    const manager = ctx.data.api_server_cfg.user_manager orelse return error.RestoreCampaignManagerAbsent;
+    if (cluster) {
+        var permission = try @import("../../../../usermgr/mod.zig").Permission.initOwned(manager.alloc, .@"*", "*", .admin);
+        defer permission.deinit(manager.alloc);
+        try manager.addPermissionToUser("pk-rewriter", permission);
+    }
+    defer if (cluster) manager.removePermissionFromUser("pk-rewriter", "*", .@"*") catch @panic("failed to release fixture cluster admission permission");
     const headers = try ctx.alloc.alloc(http.RequestHeader, ctx.admin_headers.len + 1);
     defer ctx.alloc.free(headers);
     @memcpy(headers[0..ctx.admin_headers.len], ctx.admin_headers);
@@ -203,7 +212,7 @@ const Producer = struct {
     }
     pub const configureAuth = authorize;
     pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
-        try command(ctx, "CREATE TABLE trigger_source (id UUID PRIMARY KEY, n BIGINT)");
+        try command(ctx, "CREATE TABLE trigger_source (id UUID CONSTRAINT restore_campaign_cluster_pk PRIMARY KEY, n BIGINT)");
         try command(ctx, "CREATE FUNCTION touch_source() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.n := NEW.n + 100; RAISE NOTICE 'source'; RETURN NEW; END $$");
         try command(ctx, "CREATE TRIGGER touch BEFORE UPDATE ON trigger_source FOR EACH ROW EXECUTE FUNCTION touch_source()");
         _ = try fixture.waitServingSchema(ctx, "trigger_source", 0);
@@ -212,6 +221,12 @@ const Producer = struct {
         var state = try tableState(ctx, "trigger_source");
         defer state.deinit();
         self.identity.* = .{ .realm = routine.realm, .routine = routine.id, .table = state.value.table_id };
+        // Both restores coexist in one destination namespace. Separate source
+        // relations give their schema-global primary indexes distinct names.
+        try command(ctx, "CREATE TABLE independent_source (id UUID PRIMARY KEY, n BIGINT)");
+        try command(ctx, "CREATE TRIGGER touch BEFORE UPDATE ON independent_source FOR EACH ROW EXECUTE FUNCTION touch_source()");
+        _ = try fixture.waitServingSchema(ctx, "independent_source", 0);
+        try command(ctx, "INSERT INTO independent_source (id,n) VALUES ('00000000-0000-0000-0000-000000000001',10)");
         try backup(ctx, false, self.location);
         try backup(ctx, true, self.location);
     }
@@ -221,26 +236,6 @@ const Producer = struct {
         try scalar(ctx, "SELECT n FROM trigger_source", 10);
     }
 };
-fn connected(ctx: *fixture.Context, connection: []const u8, statement: []const u8) !void {
-    var authorized = ctx.*;
-    authorized.headers = ctx.admin_headers;
-    var response = try client.executeConnectedParameters(&authorized, connection, statement, &.{}, .never);
-    defer response.deinit(ctx.alloc);
-    errdefer std.debug.print("restore lock SQL={s} status={d} body={s}\n", .{ statement, response.status, response.body });
-    try std.testing.expect(response.status == 200 or response.status == 202);
-}
-fn lockDestination(ctx: *fixture.Context) ![32]u8 {
-    var response = try send(ctx, "/db/v1/sql/connections", .POST, "{}");
-    defer response.deinit(ctx.alloc);
-    try std.testing.expectEqual(@as(u16, 200), response.status);
-    var parsed = try std.json.parseFromSlice(struct { connection_id: []const u8 }, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
-    defer parsed.deinit();
-    if (parsed.value.connection_id.len != 32) return error.RestoreCampaignConnectionIdentity;
-    const id = parsed.value.connection_id[0..32].*;
-    try connected(ctx, &id, "BEGIN");
-    try connected(ctx, &id, "LOCK TABLE trigger_source IN ACCESS EXCLUSIVE MODE");
-    return id;
-}
 fn nativeState(ctx: *fixture.Context, id: []const u8) !?std.json.Parsed(@import("../../../../metadata/restore_staging.zig").Job) {
     const native_id = try @import("../../../../metadata/restore_staging.zig").idForAttempt(try std.fmt.parseInt(u64, id, 10), 1);
     const source = @import("../../../http_server.zig").StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
@@ -257,8 +252,8 @@ fn waitNative(ctx: *fixture.Context, id: []const u8, wanted: @import("../../../.
         if (observed) |job| {
             if (job.value.state == wanted) {
                 if (wanted == .cutover) {
-                    // SQL participants block the final metadata publication,
-                    // after cancellable source fencing, not child validation.
+                    // Wait for the complete cancellable source fence before
+                    // changing the admission actor or requesting cancellation.
                     var owners: usize = 0;
                     for (job.value.plan.targets) |target| if (target.replace) |prior| {
                         owners += prior.ranges.len;
@@ -275,14 +270,21 @@ fn waitNative(ctx: *fixture.Context, id: []const u8, wanted: @import("../../../.
         }
         try ctx.io.sleep(.fromMilliseconds(20), .awake);
     }
+    var final = try nativeState(ctx, id);
+    defer if (final) |*job| job.deinit();
+    if (final) |job| {
+        std.debug.print("restore native deadline expected={s} observed={s} completed_owners={d} revision={d}\n", .{ @tagName(wanted), @tagName(job.value.state), job.value.completed_owners, job.value.revision });
+    } else std.debug.print("restore native deadline expected={s} plan absent\n", .{@tagName(wanted)});
     return error.RestoreCampaignNativeDeadline;
 }
 fn faultQualification(ctx: *fixture.Context, body: []const u8, destination: u64) !void {
-    // A real SQL transaction prevents final publication, while permitting
-    // import, validation and cancellable source fencing. No test flag is used.
-    const lock = try lockDestination(ctx);
-    var lock_live = true;
-    defer if (lock_live) connected(ctx, &lock, "ROLLBACK") catch {};
+    // A SQL participant held before admission blocks reservation itself.
+    // Pause only the final decision while the real owners and metadata
+    // journal complete the cancellable portion of the protocol.
+    const driver = @import("../../../http_server.zig").RestoreWorkerTestDriver;
+    const server = &ctx.data.http_server.?;
+    driver.pauseCutover(server, true);
+    defer driver.pauseCutover(server, false);
     const id = try startRestore(ctx, body, true, "cohort-revoked-before-cutover");
     defer ctx.alloc.free(id);
     try waitNative(ctx, id, .cutover);
@@ -300,10 +302,8 @@ fn faultQualification(ctx: *fixture.Context, body: []const u8, destination: u64)
     const manager = ctx.data.api_server_cfg.user_manager orelse return error.RestoreCampaignManagerAbsent;
     try manager.removePermissionFromUser("pk-rewriter", "touch_destination", .table);
     try manager.removePermissionFromUser("pk-rewriter", "*", .namespace);
-    try waitJob(ctx, id, "failed");
+    try waitJob(ctx, id, "failed", true);
     try waitNative(ctx, id, .canceled);
-    try connected(ctx, &lock, "ROLLBACK");
-    lock_live = false;
     try scalar(ctx, "SELECT n FROM trigger_source", 99);
     const users = @import("../../../../usermgr/mod.zig");
     inline for (.{ users.ResourceType.table, users.ResourceType.namespace }) |kind| {
@@ -311,21 +311,16 @@ fn faultQualification(ctx: *fixture.Context, body: []const u8, destination: u64)
         defer permission.deinit(manager.alloc);
         try manager.addPermissionToUser("pk-rewriter", permission);
     }
-    const second_lock = try lockDestination(ctx);
-    var second_live = true;
-    defer if (second_live) connected(ctx, &second_lock, "ROLLBACK") catch {};
     const canceled = try startRestore(ctx, body, true, "cohort-canceled-before-cutover");
     defer ctx.alloc.free(canceled);
     try waitNative(ctx, canceled, .cutover);
     const path = try std.fmt.allocPrint(ctx.alloc, "/db/v1/restore/jobs/{s}", .{canceled});
     defer ctx.alloc.free(path);
-    var cancellation = try send(ctx, path, .DELETE, null);
+    var cancellation = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, path, .DELETE, null, 30_000);
     defer cancellation.deinit(ctx.alloc);
     try std.testing.expect(cancellation.status == 200 or cancellation.status == 202);
-    try waitJob(ctx, canceled, "cancelled");
+    try waitJob(ctx, canceled, "cancelled", true);
     try waitNative(ctx, canceled, .canceled);
-    try connected(ctx, &second_lock, "ROLLBACK");
-    second_live = false;
     try scalar(ctx, "SELECT n FROM trigger_source", 99);
     // Confirmed cleanup releases the actual callable lease, not just a
     // public job flag. Replacement can now preserve its immutable routine ID.
@@ -333,6 +328,7 @@ fn faultQualification(ctx: *fixture.Context, body: []const u8, destination: u64)
     try std.testing.expectEqual(destination, (try function(ctx, "touch_destination")).id);
 }
 const Consumer = struct {
+    pub const native_restore_jobs = true;
     pub const native_auth = true;
     pub const native_sessions = true;
     pub const cold_catalog = true;
@@ -363,7 +359,7 @@ const Consumer = struct {
         const retried = try startRestore(ctx, body, false, "independent-cross-realm");
         defer ctx.alloc.free(retried);
         try std.testing.expectEqualStrings(id, retried);
-        try waitJob(ctx, id, "succeeded");
+        try waitJob(ctx, id, "succeeded", false);
         try scalar(ctx, "SELECT n FROM restored_table", 10);
         var restored = try tableState(ctx, "restored_table");
         defer restored.deinit();
@@ -380,10 +376,20 @@ const Consumer = struct {
         try command(ctx, "CREATE TABLE trigger_source (id UUID PRIMARY KEY, n BIGINT)");
         _ = try fixture.waitServingSchema(ctx, "trigger_source", 0);
         try command(ctx, "INSERT INTO trigger_source (id,n) VALUES ('00000000-0000-0000-0000-000000000002',99)");
+        try command(ctx, "CREATE TABLE restore_name_conflict (id UUID CONSTRAINT restore_campaign_cluster_pk PRIMARY KEY)");
+        const conflict_id = try startRestore(ctx, cluster, true, "cohort-occupied-index-name");
+        defer ctx.alloc.free(conflict_id);
+        try waitJob(ctx, conflict_id, "failed", true);
+        var conflict_job = try fixture.job(ctx.alloc, ctx.transport, ctx.headers, ctx.base, conflict_id);
+        defer conflict_job.deinit(ctx.alloc);
+        var conflict_body = try std.json.parseFromSlice(std.json.Value, ctx.alloc, conflict_job.body, .{});
+        defer conflict_body.deinit();
+        try std.testing.expectEqualStrings("RestoreNameConflict", (try fixture.field(conflict_body.value, "error")).string);
+        try command(ctx, "DROP TABLE restore_name_conflict");
         try faultQualification(ctx, cluster, destination.id);
         const cluster_id = try startRestore(ctx, cluster, true, "cohort-cross-realm");
         defer ctx.alloc.free(cluster_id);
-        try waitJob(ctx, cluster_id, "succeeded");
+        try waitJob(ctx, cluster_id, "succeeded", true);
         try scalar(ctx, "SELECT n FROM trigger_source", 10);
         try command(ctx, "UPDATE trigger_source SET n=n+1");
         try scalar(ctx, "SELECT n FROM trigger_source", 1011);

@@ -194,6 +194,10 @@ pub fn stageSourceCursor(txn: anytype, control: SourceControl, backend: local.st
 pub const Work = struct { head: Head, child: ?Child, source_after: ?local.storage_pessimistic_lock_contract.Backend = null };
 pub fn nextOwnerWork(reader: anytype, group: u64, after: u64) !?Work {
     const value = (try nextWork(reader, group, after)) orelse return null;
+    return try ownerWork(reader, value);
+}
+
+pub fn ownerWork(reader: anytype, value: Head) !Work {
     const selected = if (value.progress.completed_tables < value.lookup.reference.tables)
         (try child(reader, value.lookup, value.progress.completed_tables)) orelse return error.InvalidScopeRetirement
     else

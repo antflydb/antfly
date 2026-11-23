@@ -114,7 +114,7 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
     const io = parent_provider.context.io orelse return error.UnsupportedSqlExecution;
     try parent_source.ensureInventory(parent_provider.context);
     try parent_source.ensureCanonicalPlan(parent_provider.context);
-    var schemas = @import("sql_schema_cache.zig").Cache.init(a);
+    var schemas = @import("sql/execution/schema_cache.zig").Cache.init(a);
     defer schemas.deinit();
     const sql_table = try schemas.resolve(io, ca, table.schema_json, table.table_id, table.name);
     const contract = try ca.alloc(local.serverless_query_lake_schema.Column, sql_table.columns.len);

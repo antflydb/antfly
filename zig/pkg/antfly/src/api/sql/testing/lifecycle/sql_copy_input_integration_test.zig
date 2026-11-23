@@ -107,7 +107,7 @@ const Campaign = struct {
         var source = std.Io.Reader.fixed(input.written());
         var output: std.Io.Writer.Allocating = .init(a);
         defer output.deinit();
-        var adapter: @import("../../../sql_pgwire.zig").Adapter = .{ .server = api };
+        var adapter: @import("../../transport/pgwire.zig").Adapter = .{ .server = api };
         var session: protocol.Session = .{ .alloc = a, .io = ctx.io, .source = adapter.backend(), .reader = &source, .writer = &output.writer };
         defer session.deinit();
         try session.run();

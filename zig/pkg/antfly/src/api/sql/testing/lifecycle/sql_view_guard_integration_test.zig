@@ -20,6 +20,7 @@ const std = @import("std");
 const local = @import("antfly_local_sources");
 const fixture = @import("../owner_test_fixture.zig");
 const client = @import("../owner_test_client.zig");
+const compare = @import("../parity_reference.zig");
 const views = @import("../../../../system_catalog/views.zig");
 const domain = local.system_catalog_domain;
 const wire = @import("antfly_metadata_openapi").types;
@@ -378,4 +379,289 @@ test "mounted SQL document view guards reject forged epochs and source reincarna
     var state: State = .{};
     defer if (state.stale_definition) |value| std.testing.allocator.free(value);
     try fixture.runWithState(Campaign, .{ .state = &state });
+}
+
+fn requiredIndexQuery(ctx: *fixture.Context, statement: []const u8, admin: bool) !@import("../../../../raft/transport/http_common.zig").HttpResponse {
+    var authenticated = ctx.*;
+    authenticated.headers = if (admin) ctx.admin_headers else ctx.reader_headers;
+    authenticated.base = ctx.metadata_uri;
+    return client.execute(&authenticated, statement, .read);
+}
+
+const RequiredIndexViewCampaign = struct {
+    pub const native_auth = true;
+    pub const cold_catalog = true;
+    credentials: client.ApiKeyHeaders = .{},
+    pub fn configureAuth(manager: *@import("../../../../usermgr/mod.zig").UserManager) !void {
+        const users = @import("../../../../usermgr/mod.zig");
+        inline for (.{ users.ResourceType.database, users.ResourceType.namespace }) |kind| {
+            var permission = try users.Permission.initOwned(manager.alloc, kind, "*", .admin);
+            defer permission.deinit(manager.alloc);
+            try manager.addPermissionToUser("pk-rewriter", permission);
+        }
+    }
+    fn executeDdl(ctx: *fixture.Context, statement: []const u8) !void {
+        var authenticated = ctx.*;
+        authenticated.headers = ctx.admin_headers;
+        authenticated.base = ctx.metadata_uri;
+        var response = client.execute(&authenticated, statement, .write_admission) catch |err| {
+            reportIndexOwners(ctx) catch |diagnostic_error| std.debug.print("required-index owner diagnostics unavailable: {s}\n", .{@errorName(diagnostic_error)});
+            return err;
+        };
+        defer response.deinit(ctx.alloc);
+        if (response.status != 200) {
+            std.debug.print("required-index view command status={d} body={s}\n", .{ response.status, response.body });
+            reportIndexOwners(ctx) catch |err| std.debug.print("required-index owner diagnostics unavailable: {s}\n", .{@errorName(err)});
+        }
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+    }
+    fn reportIndexOwners(ctx: *fixture.Context) !void {
+        var arena = std.heap.ArenaAllocator.init(ctx.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const svc = ctx.metadata.server.svc;
+        const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+        const tables = try store.listTables(a, svc.metadata_group_id);
+        const ranges = try store.listRanges(a, svc.metadata_group_id);
+        const placements = try store.listPlacementIntents(a, svc.metadata_group_id);
+        for (tables) |table| {
+            if (std.mem.indexOf(u8, table.indexes_json, "\"support_fts\"") == null) continue;
+            for (ranges) |range| {
+                if (range.table_id != table.table_id) continue;
+                std.debug.print("required-index table={d} group={d} requirements={any}\n", .{ table.table_id, range.group_id, table.schema_reader_requirements });
+                for (placements) |placement| {
+                    if (placement.record.group_id != range.group_id) continue;
+                    std.debug.print("required-index placement store={d} node={d} state={s}\n", .{ placement.store_id, placement.record.local_node_id, @tagName(placement.serving_state) });
+                    const owner = (try store.readStore(a, svc.metadata_group_id, placement.store_id, true)) orelse continue;
+                    for (owner.runtime_statuses) |status| {
+                        if (status.group_id != range.group_id) continue;
+                        std.debug.print("required-index runtime store={d} schema={d} complete={} authority={any}\n", .{ owner.store_id, status.schema_epoch, status.target_observation_complete, status.source_authority });
+                        for (status.indexes) |item| {
+                            if (!std.mem.eql(u8, item.name, "support_fts")) continue;
+                            std.debug.print("required-index incarnation={d} config={d} identity={} snapshot={} backfill={} catch_up={} replay={d}/{d} load_error={any}\n", .{ item.coverage_generation, item.coverage_config_hash, item.coverage_identity_ready, item.serving_snapshot_ready, item.backfill_active, item.replay_catch_up_required, item.replay_applied_sequence, item.replay_target_sequence, item.load_error });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn reject(ctx: *fixture.Context, statement: []const u8, code: []const u8) !void {
+        var response = try requiredIndexQuery(ctx, statement, true);
+        defer response.deinit(ctx.alloc);
+        try std.testing.expect(response.status != 200);
+        var diagnostic = try std.json.parseFromSlice(struct { code: []const u8, transaction_id: ?[]const u8 = null, ddl_receipt: ?Json = null }, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
+        defer diagnostic.deinit();
+        try std.testing.expectEqualStrings(code, diagnostic.value.code);
+        try std.testing.expect(diagnostic.value.transaction_id == null and diagnostic.value.ddl_receipt == null);
+    }
+    fn original(a: std.mem.Allocator) !local.sql_parity_fixtures.Corpus {
+        var corpus = try local.sql_parity_fixtures.Corpus.init(a);
+        errdefer corpus.deinit();
+        try std.testing.expectEqualStrings("SELECT _id, plan FROM support_view WHERE plan = 'pro' LIMIT 10", (try corpus.get("sql-0854")).sql);
+        return corpus;
+    }
+    fn observe(ctx: *fixture.Context, count: usize) !void {
+        var corpus = try original(ctx.alloc);
+        defer corpus.deinit();
+        var response = try requiredIndexQuery(ctx, (try corpus.get("sql-0854")).sql, false);
+        defer response.deinit(ctx.alloc);
+        if (response.status != 200) std.debug.print("required-index original status={d} body={s}\n", .{ response.status, response.body });
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        var parsed = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("SELECT", parsed.value.command_tag);
+        try std.testing.expectEqual(@as(i64, 0), parsed.value.rows_affected);
+        try std.testing.expectEqual(count, parsed.value.rows.len);
+        try std.testing.expectEqual(@as(usize, 2), parsed.value.columns.len);
+        for (parsed.value.columns, [_][]const u8{ "_id", "plan" }) |column, name| {
+            try std.testing.expectEqualStrings(name, column.name);
+            try std.testing.expect(compare.postgresColumnMatches(column, 25));
+        }
+        if (parsed.value.sql_nulls) |nulls| {
+            try std.testing.expectEqual(count, nulls.len);
+            for (parsed.value.rows, nulls) |row, flags| {
+                try std.testing.expectEqual(@as(usize, 2), row.len);
+                try std.testing.expectEqual(@as(usize, 2), flags.len);
+                try std.testing.expect(!flags[0] and !flags[1]);
+            }
+        } else try std.testing.expectEqual(@as(usize, 0), count);
+        if (count != 0) {
+            try std.testing.expectEqualStrings("doc:a", parsed.value.rows[0][0].string);
+            try std.testing.expectEqualStrings("pro", parsed.value.rows[0][1].string);
+        }
+    }
+    fn replaceDocument(ctx: *fixture.Context, value: []const u8) !void {
+        const batch = try std.fmt.allocPrint(ctx.alloc, "{{\"inserts\":{{\"doc:a\":{s}}},\"sync_level\":\"full_text\"}}", .{value});
+        defer ctx.alloc.free(batch);
+        var response = try fixture.batch(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.base, "docs", batch);
+        defer response.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 201), response.status);
+    }
+    fn index(ctx: *fixture.Context, method: @import("../../../../raft/transport/http_common.zig").Method) !void {
+        var response = try fixture.request(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.base, "/db/v1/tables/docs/indexes/support_fts", method, if (method == .POST) "{\"name\":\"support_fts\",\"type\":\"full_text\"}" else null);
+        defer response.deinit(ctx.alloc);
+        try std.testing.expect(response.status == 200 or response.status == 201 or response.status == 202 or response.status == 204);
+        if (method == .POST) try waitIndex(ctx);
+    }
+    fn waitIndex(ctx: *fixture.Context) !void {
+        const platform = @import("antfly_platform");
+        const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
+        while (platform.time.monotonicNs() < deadline) {
+            try ctx.checkDrivers();
+            const remaining_ms = (deadline -| platform.time.monotonicNs()) / std.time.ns_per_ms;
+            if (remaining_ms == 0) break;
+            // This is a read-only readiness observation, not a mutation retry.
+            // Bound each attempt and wait by the original fifteen-second cut.
+            var response = fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.base, "/db/v1/tables/docs/indexes/support_fts", .GET, null, @intCast(@min(remaining_ms, 1_000))) catch |err| switch (err) {
+                error.Timeout, error.DeadlineExceeded, error.ConnectionTimedOut, error.ConnectionResetByPeer, error.ConnectionRefused, error.BrokenPipe, error.EndOfStream, error.ReadUnavailable, error.StorageReadTemporarilyUnavailable => {
+                    const remaining = deadline -| platform.time.monotonicNs();
+                    if (remaining != 0) try ctx.io.sleep(.fromNanoseconds(@min(remaining, 20 * std.time.ns_per_ms)), .awake);
+                    continue;
+                },
+                else => return err,
+            };
+            defer response.deinit(ctx.alloc);
+            if (response.status == 200) {
+                var value = try std.json.parseFromSlice(struct { status: ?struct { milestones: ?struct { complete: struct { reached: bool } } = null } = null }, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
+                defer value.deinit();
+                if (value.value.status) |status| if (status.milestones) |milestones| if (milestones.complete.reached) return;
+            } else if (response.status != 503) return error.RequiredViewIndexStatusFailed;
+            const remaining = deadline -| platform.time.monotonicNs();
+            if (remaining != 0) try ctx.io.sleep(.fromNanoseconds(@min(remaining, 20 * std.time.ns_per_ms)), .awake);
+        }
+        return error.RequiredViewIndexReadinessTimeout;
+    }
+    fn lazyDemand(ctx: *fixture.Context) !void {
+        for ([_]struct { statement: []const u8, free_rows: usize }{
+            .{ .statement = "SELECT CASE WHEN _id='doc:a' THEN 'kept' ELSE plan END FROM support_view", .free_rows = 1 },
+            .{ .statement = "SELECT COALESCE('kept',plan) FROM support_view", .free_rows = 0 },
+            .{ .statement = "WITH q AS (SELECT _id,plan FROM support_view) SELECT CASE WHEN _id='doc:a' THEN 'kept' ELSE plan END FROM q", .free_rows = 1 },
+            .{ .statement = "SELECT CASE WHEN a._id='doc:a' THEN 'kept' ELSE b.plan END FROM support_view a JOIN support_view b ON a._id=b._id", .free_rows = 1 },
+        }) |probe| {
+            var response = try requiredIndexQuery(ctx, probe.statement, false);
+            defer response.deinit(ctx.alloc);
+            try std.testing.expectEqual(@as(u16, 200), response.status);
+            var parsed = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(usize, 2), parsed.value.rows.len);
+            var kept: usize = 0;
+            var free: usize = 0;
+            for (parsed.value.rows) |row| {
+                try std.testing.expectEqual(@as(usize, 1), row.len);
+                if (std.mem.eql(u8, row[0].string, "kept")) kept += 1 else {
+                    try std.testing.expectEqualStrings("free", row[0].string);
+                    free += 1;
+                }
+            }
+            try std.testing.expectEqual(probe.free_rows, free);
+            try std.testing.expectEqual(2 - probe.free_rows, kept);
+        }
+        try reject(ctx, "SELECT CASE WHEN _id='never' THEN 'kept' ELSE plan END FROM support_view", "42804");
+        try reject(ctx, "SELECT COALESCE(CAST(NULL AS TEXT),plan) FROM support_view", "42804");
+    }
+    pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+        try self.credentials.activateWithCatalog(ctx, true);
+        const declaration =
+            \\{"schema":{"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"metadata":{}},"additionalProperties":true}}},"document_sql_columns":[{"name":"plan","path":["metadata","plan"],"type":"keyword"}],"sql_view_requirements":[{"view_name":"support_view","required_indexes":["support_fts"]}]}}
+        ;
+        var created = try fixture.request(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.base, "/db/v1/tables/docs", .POST, declaration);
+        defer created.deinit(ctx.alloc);
+        try std.testing.expect(created.status == 200 or created.status == 201);
+        var observed = try fixture.table(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.base, "docs");
+        defer observed.deinit(ctx.alloc);
+        var record = try std.json.parseFromSlice(Json, ctx.alloc, observed.body, .{});
+        defer record.deinit();
+        const id = try std.fmt.parseUnsigned(u64, (try fixture.field(record.value, "table_id")).string, 10);
+        try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, id);
+        _ = try fixture.waitServingSchema(ctx, "docs", 0);
+        try fixture.waitRelationPublication(ctx.alloc, ctx.io, ctx.metadata, "docs");
+        // Preserve both original source rows: the unchanged predicate must
+        // exclude the genuine nonmatching string through every later phase.
+        var seeded = try fixture.batch(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.base, "docs",
+            \\{"inserts":{"doc:a":{"title":"alpha","metadata":{"plan":"pro"}},"doc:b":{"title":"17","metadata":{"plan":"free"}}},"sync_level":"full_text"}
+        );
+        defer seeded.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 201), seeded.status);
+        try reject(ctx, "CREATE VIEW support_view WITH(security_invoker=true) AS SELECT _id,plan FROM docs", "42704");
+        try index(ctx, .POST);
+        try executeDdl(ctx, "CREATE VIEW support_view WITH(security_invoker=true) AS SELECT _id,plan FROM docs");
+        try observe(ctx, 1);
+        try reject(ctx, "UPDATE docs SET plan='pro'", "428C9");
+        try reject(ctx, "INSERT INTO docs(_id,plan) VALUES('alias-write','pro')", "428C9");
+        // Source ingress remains arbitrary JSON. Keyword typing belongs to
+        // this SQL projection and must not silently stringify wrong leaf types.
+        for ([_][]const u8{ "{}", "{\"metadata\":null}", "{\"metadata\":17}", "{\"metadata\":{\"plan\":null}}" }) |body| {
+            try replaceDocument(ctx, body);
+            try observe(ctx, 0);
+        }
+        for ([_][]const u8{ "{\"metadata\":{\"plan\":17}}", "{\"metadata\":{\"plan\":{}}}", "{\"metadata\":{\"plan\":[]}}", "{\"metadata\":{\"plan\":true}}" }) |body| {
+            try replaceDocument(ctx, body);
+            try lazyDemand(ctx);
+            try reject(ctx, "SELECT _id, plan FROM support_view WHERE plan = 'pro' LIMIT 10", "42804");
+            // Neither an undemanded view column nor LIMIT0 may decode the
+            // strict alias. The WHERE comparison above must demand it even
+            // when raw JSON/postings would reject this row as a non-match.
+            var id_only = try requiredIndexQuery(ctx, "SELECT _id FROM support_view", false);
+            defer id_only.deinit(ctx.alloc);
+            try std.testing.expectEqual(@as(u16, 200), id_only.status);
+            var zero = try requiredIndexQuery(ctx, "SELECT _id,plan FROM support_view WHERE plan='pro' LIMIT 0", false);
+            defer zero.deinit(ctx.alloc);
+            try std.testing.expectEqual(@as(u16, 200), zero.status);
+            var zero_rows = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, zero.body, .{});
+            defer zero_rows.deinit();
+            try std.testing.expectEqual(@as(usize, 0), zero_rows.value.rows.len);
+        }
+        try executeDdl(ctx, "CREATE VIEW hidden_plan WITH(security_invoker=true,security_barrier=true) AS SELECT _id,plan FROM docs WHERE _id<>'doc:a'");
+        {
+            var hidden = try requiredIndexQuery(ctx, "SELECT plan FROM hidden_plan WHERE plan='pro'", false);
+            defer hidden.deinit(ctx.alloc);
+            try std.testing.expectEqual(@as(u16, 200), hidden.status);
+            var rows = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, hidden.body, .{});
+            defer rows.deinit();
+            try std.testing.expectEqual(@as(usize, 0), rows.value.rows.len);
+        }
+        try executeDdl(ctx, "DROP VIEW hidden_plan");
+        {
+            const api = ctx.metadata.server.owned_public_http_server orelse return error.MissingMetadataPublicApi;
+            const manager = api.cfg.user_manager orelse return error.MissingUserManager;
+            try manager.setRowFilter("pk-reader", "docs", "{\"term\":{\"visible\":true}}");
+            defer manager.removeRowFilter("pk-reader", "docs") catch {};
+            try replaceDocument(ctx, "{\"visible\":false,\"metadata\":{\"plan\":17}}");
+            // The real mandatory credential filter precedes demanded typing:
+            // a hidden malformed leaf must not disclose a conversion error.
+            try observe(ctx, 0);
+            try reject(ctx, "SELECT _id, plan FROM support_view WHERE plan = 'pro' LIMIT 10", "42804");
+        }
+        try replaceDocument(ctx, "{\"metadata\":{\"plan\":\"pro\"},\"metadata.plan\":17}");
+        try observe(ctx, 1);
+        try index(ctx, .DELETE);
+        try reject(ctx, "SELECT _id, plan FROM support_view WHERE plan = 'pro' LIMIT 10", "42704");
+        try index(ctx, .POST);
+        try reject(ctx, "SELECT _id, plan FROM support_view WHERE plan = 'pro' LIMIT 10", "40001");
+        try executeDdl(ctx, "CREATE OR REPLACE VIEW support_view WITH(security_invoker=true) AS SELECT _id,plan FROM docs");
+        try observe(ctx, 1);
+        try replaceDocument(ctx, "{\"metadata\":{\"plan\":17}}");
+    }
+    pub fn afterRestart(_: *@This(), ctx: *fixture.Context) !void {
+        try lazyDemand(ctx);
+        try reject(ctx, "SELECT _id, plan FROM support_view WHERE plan='pro' LIMIT 10", "42804");
+        try replaceDocument(ctx, "{\"metadata\":{\"plan\":\"pro\"}}");
+        _ = try fixture.waitServingSchema(ctx, "docs", 0);
+        try waitIndex(ctx);
+        try observe(ctx, 1);
+        const previous = try fixture.waitServingSchema(ctx, "docs", 0);
+        var schema = try fixture.request(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.base, "/db/v1/tables/docs/schema", .PATCH, "{\"document_sql_columns\":[{\"name\":\"plan\",\"path\":[\"metadata\",\"plan\"],\"type\":\"text\"}]}");
+        defer schema.deinit(ctx.alloc);
+        try std.testing.expect(schema.status == 200 or schema.status == 202);
+        _ = try fixture.waitServingSchema(ctx, "docs", previous.version + 1);
+        try reject(ctx, "SELECT _id, plan FROM support_view WHERE plan = 'pro' LIMIT 10", "40001");
+        try executeDdl(ctx, "CREATE OR REPLACE VIEW support_view WITH(security_invoker=true) AS SELECT _id,plan FROM docs");
+        try observe(ctx, 1);
+    }
+};
+
+test "mounted SQL original required-index document view preserves typed paths logical rebuild and cold ownership" {
+    // sql-0854 retains the unchanged original SELECT and both original source rows.
+    try fixture.run(RequiredIndexViewCampaign);
 }

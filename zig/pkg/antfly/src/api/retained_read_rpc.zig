@@ -134,14 +134,15 @@ pub fn errorStatus(err: anyerror) u16 {
     return switch (err) {
         error.InvalidRetainedReadLease, error.InvalidRetainedReadToken, error.InvalidRetainedReadQuery, error.InvalidRetainedReadPageLimit => 400,
         error.RetainedReadAdmissionExceeded, error.RetainedReadBusy => 429,
-        error.RetainedReadNotFound, error.RetainedReadExpired, error.RetainedReadScopeChanged, error.RetainedReadSequenceMismatch, error.SqlRangeTrackingRequired => 409,
+        error.RetainedReadNotFound, error.RetainedReadExpired, error.RetainedReadScopeChanged, error.RetainedReadSequenceMismatch, error.SqlRangeTrackingRequired, error.VersionConflict => 409,
         else => 503,
     };
 }
 
 pub const Request = struct {
-    operation: enum { admit, capture, validate, snapshot, open, open_snapshot, next, normalize, range_proofs, close, cancel, renew_snapshot, graph_page, graph_snapshot, graph_invoke, admit_graph, graph_open },
+    operation: enum { admit, capture, validate, snapshot, open, open_snapshot, open_frozen, next, normalize, range_proofs, close, cancel, renew_snapshot, graph_page, graph_snapshot, graph_invoke, admit_graph, graph_open },
     schema_version: u32,
+    frozen: ?reads.FrozenBinding = null,
     graph_indexes: []const []const u8 = &.{},
     graph_page_request: ?GraphRequest = null,
     graph: ?@import("antfly_local_sources").storage_statement_read_fence.GraphInput = null,
@@ -162,6 +163,7 @@ pub const Request = struct {
     include_content_hashes: bool = false,
     include_range_proofs: bool = false,
     privacy_policy_version: ?[64]u8 = null,
+    required_sql_indexes: @FieldType(types.ScanOptions, "required_sql_indexes") = &.{},
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     writes: []const types.BatchWrite = &.{},
@@ -169,9 +171,10 @@ pub const Request = struct {
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |field| {
-            const omit = (comptime std.mem.eql(u8, field, "graph_indexes")) and self.graph_indexes.len == 0 or
+            const omit = ((comptime std.mem.eql(u8, field, "frozen")) and self.frozen == null) or (comptime std.mem.eql(u8, field, "graph_indexes")) and self.graph_indexes.len == 0 or
                 (comptime std.mem.eql(u8, field, "graph")) and self.graph == null or
-                (comptime std.mem.eql(u8, field, "graph_page_request")) and self.graph_page_request == null;
+                (comptime std.mem.eql(u8, field, "graph_page_request")) and self.graph_page_request == null or
+                (comptime std.mem.eql(u8, field, "required_sql_indexes")) and self.required_sql_indexes.len == 0;
             if (!omit) {
                 try writer.objectField(field);
                 try writer.write(@field(self, field));
@@ -196,6 +199,7 @@ const native_page = @import("retained_read_page.zig");
 pub const Response = struct {
     graph_page: ?GraphRead.Page = null,
     text_filter_digest: ?[32]u8 = null,
+    required_indexes_digest: ?[32]u8 = null,
     range_proofs: []const @import("antfly_local_sources").storage_range_protection.Proof = &.{},
     token: ?registry.Token = null,
     busy: bool = false,
@@ -207,7 +211,8 @@ pub const Response = struct {
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |field| {
-            const omit = (comptime std.mem.eql(u8, field, "graph_page")) and self.graph_page == null;
+            const omit = (comptime std.mem.eql(u8, field, "graph_page")) and self.graph_page == null or
+                (comptime std.mem.eql(u8, field, "required_indexes_digest")) and self.required_indexes_digest == null;
             if (!omit) {
                 try writer.objectField(field);
                 try writer.write(@field(self, field));
@@ -228,6 +233,8 @@ pub fn executeWithPageFormat(alloc: std.mem.Allocator, owner: owner_mod.Owner, s
     return executeWithCodec(alloc, owner, scope, table, input, if (native) .v1 else .json);
 }
 pub fn executeWithCodec(alloc: std.mem.Allocator, owner: owner_mod.Owner, scope: registry.Scope, table: []const u8, input: Request, format: native_page.Format) ![]u8 {
+    if ((input.operation == .open_frozen) != (input.frozen != null)) return error.InvalidRetainedReadQuery;
+    if (input.operation != .open and input.required_sql_indexes.len != 0) return error.InvalidRetainedReadQuery;
     if (input.schema_version != scope.schema_version) return error.RetainedReadScopeChanged;
     if (input.lease_ms == 0 or input.lease_ms > max_lease_ms) return error.InvalidRetainedReadLease;
     const deadline = time.monotonicNs() +| @as(u64, input.lease_ms) * std.time.ns_per_ms;
@@ -303,6 +310,7 @@ pub fn executeWithCodec(alloc: std.mem.Allocator, owner: owner_mod.Owner, scope:
         .graph_invoke => return owner.invokeGraph(scope, input.token orelse return error.InvalidRetainedReadToken, alloc, input.graph_body),
         .open => {
             const opened = try owner.openQualified(scope, input.token orelse return error.InvalidRetainedReadToken, input.connection, input.from, input.to, .{
+                .required_sql_indexes = input.required_sql_indexes,
                 .privacy_policy_version = input.privacy_policy_version,
                 .relational_query = input.query orelse return error.InvalidRetainedReadQuery,
                 .filter_query_json = input.filter_query_json,
@@ -315,8 +323,25 @@ pub fn executeWithCodec(alloc: std.mem.Allocator, owner: owner_mod.Owner, scope:
                 .row_policy_database = input.row_policy_database,
             }, deadline);
             errdefer owner.registry.close(opened.token, scope) catch {};
+            if (opened.required_indexes_digest) |digest| return encode(alloc, .{ .token = opened.token, .text_filter_digest = opened.text_filter_digest, .required_indexes_digest = digest });
             if (opened.text_filter_digest) |digest| return encode(alloc, .{ .token = opened.token, .text_filter_digest = digest });
             return encode(alloc, .{ .token = opened.token });
+        },
+        .open_frozen => {
+            if (input.token != null or input.sql_document_preimage) return error.InvalidRetainedReadQuery;
+            const token = try owner.openFrozen(scope, input.connection, table, input.frozen.?, input.from, input.to, .{
+                .relational_query = input.query orelse return error.InvalidRetainedReadQuery,
+                .filter_query_json = input.filter_query_json,
+                .inclusive_from = input.inclusive_from,
+                .exclusive_to = input.exclusive_to,
+                .include_content_hashes = input.include_content_hashes,
+                .include_range_proofs = input.include_range_proofs,
+                .privacy_policy_version = input.privacy_policy_version,
+                .row_policy_principal_proof = input.row_policy_principal_proof,
+                .row_policy_database = input.row_policy_database,
+            }, deadline);
+            errdefer owner.registry.close(token, scope) catch {};
+            return encode(alloc, .{ .token = token });
         },
         .open_snapshot => {
             const token = try owner.openSnapshot(scope, input.token orelse return error.InvalidRetainedReadToken, input.connection, input.from, input.to, .{
@@ -602,4 +627,30 @@ test "retained graph request keeps ordinary wire unchanged and explicitly select
     var graph_decoded = try std.json.parseFromSlice(Response, a, graph_response, .{});
     defer graph_decoded.deinit();
     try std.testing.expectEqual(@as(u64, 1), graph_decoded.value.graph_page.?.proof.source_sequence);
+}
+
+test "retained read index requirements preserve legacy wire and attest an exact incarnation" {
+    const a = std.testing.allocator;
+    var request: Request = .{ .operation = .open, .schema_version = 1 };
+    const legacy = try std.json.Stringify.valueAlloc(a, request, .{});
+    defer a.free(legacy);
+    try std.testing.expect(std.mem.indexOf(u8, legacy, "required_sql_indexes") == null);
+    request.required_sql_indexes = &.{.{ .name = "support_fts", .incarnation = 3, .config_hash = 7 }};
+    const bytes = try std.json.Stringify.valueAlloc(a, request, .{});
+    defer a.free(bytes);
+    var parsed = try std.json.parseFromSlice(Request, a, bytes, .{});
+    defer parsed.deinit();
+    const requirements = types.sql_view_index_requirements;
+    const digest = try requirements.digest(parsed.value.required_sql_indexes);
+    const legacy_reply = try encode(a, .{});
+    defer a.free(legacy_reply);
+    try std.testing.expect(std.mem.indexOf(u8, legacy_reply, "required_indexes_digest") == null);
+    const reply = try encode(a, .{ .required_indexes_digest = digest });
+    defer a.free(reply);
+    var decoded = try std.json.parseFromSlice(Response, a, reply, .{});
+    defer decoded.deinit();
+    try requirements.requireDigest(request.required_sql_indexes, decoded.value.required_indexes_digest);
+    var replaced = request.required_sql_indexes[0];
+    replaced.incarnation += 1;
+    try std.testing.expectError(error.UnsupportedSqlExecution, requirements.requireDigest(&.{replaced}, decoded.value.required_indexes_digest));
 }

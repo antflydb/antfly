@@ -13619,6 +13619,14 @@ pub const DocumentFieldMapping = struct {
     }
 };
 
+pub const DocumentSQLColumn = struct {
+    name: []const u8,
+    /// Literal object keys, without wildcard or array traversal.
+    path: []const []const u8,
+    /// Existing strict SQL document scalar domain. Numeric/object values are never stringified for keyword or text columns.
+    type: []const u8,
+};
+
 /// Defines the structure of a document type
 pub const DocumentSchema = struct {
     /// A description of the document type.
@@ -56148,6 +56156,8 @@ pub const SQLCatalogObjectKind = enum {
     query_source,
     view,
     extension,
+    collation,
+    subscription,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -56167,6 +56177,8 @@ pub const SQLCatalogObjectKind = enum {
             .query_source => "query_source",
             .view => "view",
             .extension => "extension",
+            .collation => "collation",
+            .subscription => "subscription",
         };
         try jw.write(s);
     }
@@ -56193,6 +56205,8 @@ pub const SQLCatalogObjectKind = enum {
             .{ "query_source", .query_source },
             .{ "view", .view },
             .{ "extension", .extension },
+            .{ "collation", .collation },
+            .{ "subscription", .subscription },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -57750,6 +57764,13 @@ pub const SQLTransactionStatus = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+pub const SQLViewIndexRequirement = struct {
+    /// Unqualified canonical view name in this document source's namespace. Does not create a view or grant permissions.
+    view_name: []const u8,
+    /// Required full-text indexes. Canonical view admission captures their actual server-managed incarnations. Dropping and recreating an index or changing its logical configuration invalidates the captured dependency until the view is explicitly replaced. Maintenance and rebuilds of the same logical index acquire a fresh ready publication for each retained read.
+    required_indexes: []const []const u8,
 };
 
 /// Terminal retrieval failure. Capacity events carry the complete InferenceCapacityError envelope, including message, reason, retryable and retry_after_ms; generic failures may carry only error.
@@ -60950,6 +60971,10 @@ pub const TableRestoreStatus = struct {
 
 /// Schema definition for a table with multiple document types
 pub const TableSchema = struct {
+    /// Read-only typed SQL aliases over literal document paths, independent of JSON Schema write validation. SQL assignments reject these computed aliases; raw document ingress remains unchanged. Missing paths produce SQL NULL; JSON null is retained for json columns and SQL NULL for scalar columns. Scalar domain mismatches fail when the value is demanded instead of converting to text. Untaken CASE and COALESCE branches do not evaluate a hidden typed failure. Alias names cannot shadow existing schema columns or reserved document columns. Document storage only.
+    document_sql_columns: ?[]const DocumentSQLColumn = null,
+    /// Document-source dependency policies consumed by ordinary CREATE VIEW in the same namespace. Typed paths use schema-owned document_sql_columns or existing document property aliases; this field creates no second view catalog. Required index lifetimes and readiness are checked once per retained physical read cut. Relational sources reject these policies.
+    sql_view_requirements: ?[]const SQLViewIndexRequirement = null,
     /// Server-resolved immutable SQL type layouts, sorted by catalog ID. Clients reference types through x-antfly-sql-type-id; catalog admission verifies every layout against its active definition. Retained by backups and schema epochs for deterministic cold decoding.
     named_types: ?[]const SQLNamedTypeLayout = null,
     /// Backend-managed schema generation used for migrations. Omit it from create and update requests.
@@ -60988,6 +61013,8 @@ pub const TableSchema = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "document_sql_columns", "document_sql_columns", true },
+        .{ "sql_view_requirements", "sql_view_requirements", true },
         .{ "named_types", "named_types", true },
         .{ "version", "version", true },
         .{ "index_sort", "index_sort", true },
@@ -61018,6 +61045,14 @@ pub const TableSchema = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.document_sql_columns) |value| {
+            try jw.objectField("document_sql_columns");
+            try jw.write(value);
+        }
+        if (self.sql_view_requirements) |value| {
+            try jw.objectField("sql_view_requirements");
+            try jw.write(value);
+        }
         if (self.named_types) |value| {
             try jw.objectField("named_types");
             try jw.write(value);

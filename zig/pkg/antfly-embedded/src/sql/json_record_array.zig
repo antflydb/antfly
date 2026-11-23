@@ -16,7 +16,7 @@
 //! Explicit JSON record conversion, not a JSONB-to-array SQL cast. Shared
 //! scalar input functions convert each leaf; JSON arrays remain JSON elsewhere.
 const std = @import("std");
-const arrays = @import("array_value.zig");
+const arrays = @import("array/value.zig");
 const Datum = @import("scalar.zig").Datum;
 const Json = std.json.Value;
 const A = std.mem.Allocator;

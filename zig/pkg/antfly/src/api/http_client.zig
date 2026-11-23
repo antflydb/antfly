@@ -4104,6 +4104,60 @@ pub const ApiHttpClient = struct {
         return fetchInternalPostEmptyWithCapabilities(self, base_uri, group_id, table_name, routes.Routes.txn_acknowledge_many_suffix, body, null, null, true);
     }
 
+    pub fn fetchGroupPublicationCapture(self: *ApiHttpClient, base_uri: []const u8, group: u64, table_name: []const u8, request: @import("logical_replication_capture_worker.zig").Capture.Request, timeout_ms: u32, cancellation: ?*const http_common.RequestCancellation) !@import("logical_replication_capture_worker.zig").Receipt {
+        const wire = @import("logical_replication_capture_worker.zig");
+        if (try wire.ownerGroup(request) != group) return error.InvalidLogicalCaptureControl;
+        return self.fetchGroupControlReceipt(wire.Receipt, base_uri, group, table_name, wire.suffix, wire.max_request_bytes, request, timeout_ms, cancellation);
+    }
+
+    pub fn fetchGroupControlReceipt(self: *ApiHttpClient, comptime Result: type, base_uri: []const u8, group: u64, table_name: []const u8, suffix: []const u8, maximum: usize, request: anytype, timeout_ms: u32, cancellation: ?*const http_common.RequestCancellation) !Result {
+        const table = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(table);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group, routes.Routes.tables_prefix, table, suffix });
+        defer self.alloc.free(path);
+        return self.fetchInternalControlReceipt(Result, base_uri, path, maximum, request, timeout_ms, cancellation);
+    }
+
+    pub fn fetchInternalControlReceipt(self: *ApiHttpClient, comptime Result: type, base_uri: []const u8, path: []const u8, maximum: usize, request: anytype, timeout_ms: u32, cancellation: ?*const http_common.RequestCancellation) !Result {
+        const wire = @import("logical_replication_capture_worker.zig");
+        if (timeout_ms == 0 or timeout_ms > wire.max_budget_ms) return error.InvalidLogicalCaptureControl;
+        var budget_buffer: [16]u8 = undefined;
+        const budget = try std.fmt.bufPrint(&budget_buffer, "{d}", .{timeout_ms});
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+        defer self.alloc.free(body);
+        if (body.len > maximum) return error.ResourceRequestTooLarge;
+        var response = try self.executeRequest(.{
+            .method = .POST,
+            .uri = uri,
+            .content_type = "application/json",
+            .body = body,
+            .headers = &.{.{ .name = wire.budget_header, .value = budget }},
+            .timeout_ms = timeout_ms,
+            .cancellation = cancellation,
+            .max_response_bytes = if (Result == []u8) request.max_bytes else wire.max_response_bytes,
+        });
+        defer response.deinit(self.alloc);
+        switch (response.status) {
+            200 => {},
+            400 => return error.InvalidLogicalCaptureControl,
+            401, 403 => return error.Forbidden,
+            409 => return error.LogicalCaptureControlChanged,
+            408 => return error.Canceled,
+            413 => return error.ResourceRequestTooLarge,
+            503 => return error.GroupLeaderUnavailable,
+            504 => return error.DeadlineExceeded,
+            else => return error.UnexpectedHttpStatus,
+        }
+        if (Result == []u8) return self.alloc.dupe(u8, response.body);
+        if (Result == wire.Proofs.CollectionReceipt)
+            return std.json.parseFromSliceLeaky(Result, self.alloc, response.body, .{ .allocate = .alloc_always });
+        const parsed = try std.json.parseFromSlice(Result, self.alloc, response.body, .{});
+        defer parsed.deinit();
+        return parsed.value;
+    }
+
     pub fn fetchGroupOnlineMergeIo(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("online_merge_io.zig").contract.Request, timeout_ms: u32, cancellation: ?*const http_common.RequestCancellation) !QueryResponse {
         const contract = @import("online_merge_io.zig").contract;
         const budget_ms = try contract.serverBudgetMs(timeout_ms);

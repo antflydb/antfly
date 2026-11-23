@@ -20,8 +20,8 @@ const local = @import("antfly_local_sources");
 const catalog = local.sql_catalog;
 const manifest = catalog.trigger_manifest;
 const routines = @import("../../../system_catalog/routines.zig");
-const routine_execution = @import("../../sql_routine_execution.zig");
-const execution = @import("../../sql_execution.zig");
+const routine_execution = @import("../execution/routine_execution.zig");
+const execution = @import("../execution/execution.zig");
 const A = std.mem.Allocator;
 
 const Capture = struct {

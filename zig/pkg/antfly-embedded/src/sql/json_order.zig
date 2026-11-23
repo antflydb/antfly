@@ -65,11 +65,11 @@ pub const Budget = struct {
     remaining: usize = @import("resource_limits.zig").default_memory_bytes,
     /// Optional shared row/program work and cancellation identity. Local JSON
     /// admission remains independently bounded, without restarting its owner.
-    shared: ?*@import("numeric_value.zig").Context = null,
+    shared: ?*@import("numeric/value.zig").Context = null,
     /// A numeric subkernel must not restart cancellation or spend work outside
     /// its enclosing row. The caller reconciles remaining on all exits.
-    pub fn numericContext(self: *Budget, alloc: std.mem.Allocator) @import("numeric_value.zig").Context {
-        var context: @import("numeric_value.zig").Context = .{
+    pub fn numericContext(self: *Budget, alloc: std.mem.Allocator) @import("numeric/value.zig").Context {
+        var context: @import("numeric/value.zig").Context = .{
             .alloc = alloc,
             .remaining = self.remaining,
             .parent = self.shared,
@@ -288,8 +288,8 @@ test "SQL JSONB domain matches PostgreSQL owned pinned scalar and array admissio
             const result: anyerror!Json = switch (mode) {
                 0 => parseTextLeaky(r, entry.input, &work),
                 1 => parsePinnedTextLeaky(r, entry.input, &work),
-                2 => if (@import("array_text.zig").decodeLeaky(r, .jsonb, text, .{ .values = .{ .bytes = 4096, .work = 4096 } })) |decoded| decoded.value.elements[0].value else |err| err,
-                3 => if (@import("array_binary.zig").decodeLeaky(r, .jsonb, binary, .{ .values = .{ .bytes = 4096, .work = 4096 } })) |decoded| decoded.value.elements[0].value else |err| err,
+                2 => if (@import("array/text.zig").decodeLeaky(r, .jsonb, text, .{ .values = .{ .bytes = 4096, .work = 4096 } })) |decoded| decoded.value.elements[0].value else |err| err,
+                3 => if (@import("array/binary.zig").decodeLeaky(r, .jsonb, binary, .{ .values = .{ .bytes = 4096, .work = 4096 } })) |decoded| decoded.value.elements[0].value else |err| err,
                 4 => value: {
                     frame = @import("parameter_frame.zig").Frame.prepare(a, &.{.{ .kind = .json, .element_type = .jsonb }}, &.{.{ .text = entry.input }}, .{ .bytes = 4096, .work = 4096 }) catch |err| break :value err;
                     try std.testing.expect(!frame.?.values[0].sql_null);
@@ -320,7 +320,7 @@ test "SQL JSONB domain matches PostgreSQL owned pinned scalar and array admissio
         var region: std.heap.ArenaAllocator = .init(a);
         defer region.deinit();
         var work: Budget = .{};
-        if (@import("array_binary.zig").decodeElementLeaky(region.allocator(), .jsonb, bytes, &work)) |_| return error.ExpectedPostgresRejection else |err| try std.testing.expectEqualStrings(entry.@"error", @import("errors.zig").describe(err).code);
+        if (@import("array/binary.zig").decodeElementLeaky(region.allocator(), .jsonb, bytes, &work)) |_| return error.ExpectedPostgresRejection else |err| try std.testing.expectEqualStrings(entry.@"error", @import("errors.zig").describe(err).code);
     }
 }
 
@@ -414,7 +414,7 @@ test "SQL JSONB domain cancellation is sticky through lexical and DOM phases" {
     try encoded.writer.writeByte(']');
     for ([_]bool{ false, true }) |pinned| {
         var counter: Counter = .{};
-        var owner: @import("numeric_value.zig").Context = .{ .alloc = a, .checkpoint = Counter.poll, .ptr = &counter };
+        var owner: @import("numeric/value.zig").Context = .{ .alloc = a, .checkpoint = Counter.poll, .ptr = &counter };
         var work: Budget = .{ .shared = &owner };
         var region = std.heap.ArenaAllocator.init(a);
         defer region.deinit();
@@ -433,11 +433,11 @@ test "SQL JSONB domain cancellation is sticky through lexical and DOM phases" {
             try std.testing.expectEqual(remaining, owner.remaining);
         }
     }
-    var limited: @import("numeric_value.zig").Context = .{ .alloc = std.mem.Allocator.failing, .remaining = 1 };
+    var limited: @import("numeric/value.zig").Context = .{ .alloc = std.mem.Allocator.failing, .remaining = 1 };
     var work: Budget = .{ .shared = &limited };
     try std.testing.expectError(error.SqlProgramLimitExceeded, parseTextLeaky(std.mem.Allocator.failing, "1.20", &work));
     try std.testing.expect(limited.failure.? == error.SqlProgramLimitExceeded);
-    var genuine: @import("numeric_value.zig").Context = .{ .alloc = std.mem.Allocator.failing };
+    var genuine: @import("numeric/value.zig").Context = .{ .alloc = std.mem.Allocator.failing };
     work = .{ .shared = &genuine };
     try std.testing.expectError(error.OutOfMemory, parseTextLeaky(std.mem.Allocator.failing, "[1]", &work));
     try std.testing.expect(genuine.failure == null);
@@ -876,7 +876,7 @@ test "SQL JSONB display equality matches PostgreSQL without changing logical has
 }
 
 test "SQL JSONB display equality retains exact shared quota and every cancellation cut" {
-    const Context = @import("numeric_value.zig").Context;
+    const Context = @import("numeric/value.zig").Context;
     const Control = struct {
         polls: usize = 0,
         fail_at: usize = 0,

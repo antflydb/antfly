@@ -254,7 +254,7 @@ const provider = @This();
 const Adapters = struct {
     fn documentMetadata(h: contract.Handle) Outcome(contract.DocumentMetadata) {
         const owner = h.resolve(.document, Document) catch |err| return failure(contract.DocumentMetadata, err);
-        return .{ .value = .{ .text_filter_digest = if (owner.text) |text| text.query_digest else null } };
+        return .{ .value = .{ .text_filter_digest = owner.textFilterDigest(), .required_indexes_digest = owner.requiredIndexesDigest() } };
     }
 
     fn nullability_page(h: contract.Handle, a: std.mem.Allocator, io: ?contract.IoBorrow, budget: Rows.Budget, plan: *const ReaderValues.nullability.Plan, control: ReaderValues.nullability.Control) Outcome(ReaderValues.NullabilityPage) {

@@ -25,7 +25,7 @@ from generate_sql_postgres_reference import ROOT, FIXTURES, postgres
 def main():
     from psycopg.pq import DiagnosticField, ExecStatus
 
-    source = (ROOT / "zig/pkg/antfly/src/api/sql_document_root_test.zig").read_text()
+    source = (ROOT / "zig/pkg/antfly/src/api/sql/testing/document_root_test.zig").read_text()
     anchor = 'test "httpx SQL original PostgreSQL invalid grammar rejects before catalog access"'
     section = source.split(anchor, 1)[1].split("\ntest ", 1)[0]
     ids = re.findall(r'"(sql-\d{4})"', section)

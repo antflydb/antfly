@@ -3803,7 +3803,19 @@ test "relation mutation admission projects naming capability without materializi
 
 /// Allocation failure aborts admission instead of selecting another floor.
 pub fn transitionRequiredCoordinatedDecoderVersion(a: std.mem.Allocator, command: metadata_storage.TransitionCommand) std.mem.Allocator.Error!u16 {
-    var required = (try transitionBaseDecoderVersion(a, command));
+    const wire = @import("schema_reader_wire.zig");
+    const index_proof_envelope = switch (command) {
+        .apply_system_catalog, .apply_restore_staging, .apply_fk_initial_create, .apply_fk_generation_publication, .begin_relational_index_publication, .apply_schema_validation => |bytes| bytes,
+        .create_restore_job_with_staging => |request| request.plan_json,
+        else => null,
+    };
+    const index_proof_version = if (index_proof_envelope) |bytes|
+        if (wire.requiresSqlViewIndexProofs(bytes) or wire.requiresSqlDocumentViewReaders(bytes)) metadata_topology_protocol.sql_document_view_indexes_version else 0
+    else
+        0;
+    if (command == .apply_restore_staging and wire.requiresRestoreReservationOutcome(command.apply_restore_staging))
+        return @max(index_proof_version, metadata_topology_protocol.restore_reservation_outcome_version);
+    var required = @max(index_proof_version, try transitionBaseDecoderVersion(a, command));
     switch (command) {
         .apply_system_catalog => |bytes| {
             const Header = struct { mutation: struct { kind: @import("antfly_local_sources").system_catalog_domain.Kind, expected_incarnation: ?[16]u8 = null, expected_resource_id: ?u64 = null, expected_parent_id: ?u64 = null, expected_tablespace_id: ?u64 = null } };
@@ -3894,6 +3906,12 @@ fn tableDecoderVersion(a: std.mem.Allocator, table: metadata_table_manager.Table
     if (metadata_topology_protocol.usesPrivacy(table.indexes_json)) required = @max(required, metadata_topology_protocol.privacy_version);
     if (metadata_topology_protocol.usesResolverRecords(table.indexes_json)) required = @max(required, metadata_topology_protocol.resolver_records_version);
     if (metadata_topology_protocol.usesResolverNamespaces(table.indexes_json)) required = @max(required, metadata_topology_protocol.resolver_namespaces_version);
+    const local = @import("antfly_local_sources");
+    if (table.schema_reader_requirements) |readers| {
+        if (readers.semantic_version >= local.common_schema_readers.sql_view_index_semantic_version)
+            required = @max(required, metadata_topology_protocol.sql_document_view_indexes_version);
+    }
+
     return required;
 }
 
@@ -4191,6 +4209,9 @@ fn resolverRequiredCoordinatedDecoderVersion(a: std.mem.Allocator, command: meta
 }
 
 fn baseRequiredCoordinatedDecoderVersion(a: std.mem.Allocator, command: metadata_storage.TransitionCommand) std.mem.Allocator.Error!u16 {
+    if (command == .update_sql_selinux_authority) return metadata_topology_protocol.sql_selinux_approval_version;
+    if (command == .accept_sql_catalog_progress) return metadata_topology_protocol.sql_catalog_progress_version;
+    if (command == .reserve_sql_catalog_restore) return metadata_topology_protocol.sql_catalog_reservation_version;
     if (command == .apply_transaction_sessions) {
         const frame = command.apply_transaction_sessions;
         if (frame.len == 0) return metadata_topology_protocol.current_version;
@@ -4211,12 +4232,34 @@ fn baseRequiredCoordinatedDecoderVersion(a: std.mem.Allocator, command: metadata
     }
 
     if (command == .apply_scope_retirement or (command == .apply_fk_generation_publication and @import("schema_reader_wire.zig").requiresScopeRetirementAuthority(command.apply_fk_generation_publication)) or (command == .apply_sql_lock_scope and @import("schema_reader_wire.zig").requiresScopeRetirementAuthority(command.apply_sql_lock_scope)) or (command == .apply_table_retirement and @import("schema_reader_wire.zig").requiresScopeRetirementAuthority(command.apply_table_retirement))) return metadata_topology_protocol.sql_scope_retirement_version;
+    if (command == .apply_sql_prepared_transaction and @import("schema_reader_wire.zig").requiresSqlPreparedCatalogAtomicAdmission(command.apply_sql_prepared_transaction)) return metadata_topology_protocol.sql_catalog_atomic_admission_version;
+    if (command == .apply_sql_prepared_transaction and @import("schema_reader_wire.zig").requiresSqlPreparedCatalogCompletion(command.apply_sql_prepared_transaction)) return metadata_topology_protocol.sql_catalog_completion_version;
+    if (command == .apply_sql_prepared_transaction and @import("schema_reader_wire.zig").requiresSqlPreparedPublicationAbortFence(command.apply_sql_prepared_transaction)) return metadata_topology_protocol.sql_publication_abort_fence_version;
+    if (command == .apply_sql_prepared_transaction and @import("schema_reader_wire.zig").requiresSqlPreparedPublicationDecisionJournal(command.apply_sql_prepared_transaction)) return metadata_topology_protocol.sql_publication_slot_version;
+    if (command == .apply_sql_prepared_transaction and @import("schema_reader_wire.zig").requiresSqlPreparedPublicationTerminal(command.apply_sql_prepared_transaction)) return metadata_topology_protocol.sql_publication_terminal_version;
+    if (command == .apply_sql_prepared_transaction and @import("schema_reader_wire.zig").requiresSqlPreparedPublicationCapture(command.apply_sql_prepared_transaction)) return metadata_topology_protocol.sql_publication_capture_version;
     const notifications = switch (command) {
         .apply_sql_lock_scope, .apply_sql_prepared_transaction => |bytes| @import("schema_reader_wire.zig").requiresSqlNotifications(bytes),
         else => false,
     };
     if (notifications) return metadata_topology_protocol.sql_notifications_version;
-    if (command == .apply_system_catalog and @import("schema_reader_wire.zig").requiresSqlCatalogJournal(command.apply_system_catalog)) return metadata_topology_protocol.sql_catalog_journal_version;
+    if (command == .apply_system_catalog) {
+        const markers = @import("schema_reader_wire.zig").catalogMarkers(command.apply_system_catalog) orelse return metadata_topology_protocol.current_version;
+        if (markers.contains(.sql_subscription_ddl)) {
+            return if (markers.contains(.subscription_apply)) metadata_topology_protocol.sql_subscription_apply_version else metadata_topology_protocol.sql_replication_catalog_version;
+        }
+        if (markers.contains(.sql_publication_slot_control)) {
+            const completion = markers.contains(.finish_subscription_disable) or markers.contains(.finish_subscription_drop) or
+                markers.contains(.bind_subscription_export) or markers.contains(.transition_subscription_export) or markers.contains(.provider_preflight_identity);
+            return if (completion) metadata_topology_protocol.sql_subscription_apply_version else metadata_topology_protocol.sql_publication_slot_control_version;
+        }
+        if (markers.contains(.sql_publication_collection_ack)) return metadata_topology_protocol.sql_publication_collection_version;
+        if (markers.contains(.sql_publication_ddl) or markers.contains(.sql_publication_advance)) return metadata_topology_protocol.sql_publication_capture_version;
+        if (markers.contains(.sql_collation_ddl)) return metadata_topology_protocol.sql_collation_catalog_version;
+        if (markers.contains(.sql_security_label) and markers.contains(.selinux_approval)) return metadata_topology_protocol.sql_selinux_approval_version;
+        if (markers.contains(.sql_security_label) or markers.contains(.sql_security_labels)) return metadata_topology_protocol.sql_security_labels_version;
+        if (markers.contains(.sql_catalog_admission)) return metadata_topology_protocol.sql_catalog_journal_version;
+    }
     // This native home participant has a newer decoder than command fences.
     if (command == .apply_sql_prepared_transaction) return metadata_topology_protocol.sql_prepared_lock_handoff_version;
     const command_fence = switch (command) {
@@ -4288,6 +4331,9 @@ fn baseRequiredCoordinatedDecoderVersion(a: std.mem.Allocator, command: metadata
     if (command == .apply_sql_settings and @import("schema_reader_wire.zig").requiresDatabaseDefaults(command.apply_sql_settings)) return metadata_topology_protocol.sql_database_defaults_version;
     if (command == .apply_sql_settings and @import("schema_reader_wire.zig").requiresRoleDefaults(command.apply_sql_settings)) return metadata_topology_protocol.sql_role_defaults_version;
     if (command == .apply_schema_validation) return @import("schema_validation/ledger.zig").requiredDecoderVersion(command.apply_schema_validation);
+    if (command == .apply_fk_initial_create and @import("schema_reader_wire.zig").requiresPartitionMembership(command.apply_fk_initial_create))
+        return metadata_topology_protocol.sql_partition_membership_version;
+
     const bound_text = switch (command) {
         .upsert_table => |table| table.full_text_read_index != null,
         .compare_and_replace_table => |cas| cas.expected.full_text_read_index != null or cas.replacement.full_text_read_index != null,
@@ -4447,6 +4493,7 @@ fn baseRequiredCoordinatedDecoderVersion(a: std.mem.Allocator, command: metadata
 
 test "system catalog schema reader publication rejects invalid facts before readiness or encoding" {
     const Fake = struct {
+        alloc: std.mem.Allocator = std.testing.allocator,
         calls: usize = 0,
         pub fn cachedCoordinatedDecoderReadiness(self: *@This(), required: u16) !TableTopologyProtocolReadiness {
             self.calls += 1;
@@ -4479,7 +4526,7 @@ test "schema validation publication text binding requires its coordinated decode
         .{ .compare_and_replace_table = .{ .expected = bound, .replacement = plain } },
         .{ .compare_and_replace_table = .{ .expected = plain, .replacement = bound } },
         .{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{bound} } },
-        .{ .apply_system_catalog = "{\"table\":{\"full_text_read_index\":\"named_text\"}}" },
+        .{ .apply_system_catalog = "{\"mutation\":{\"kind\":\"table\"},\"table\":{\"full_text_read_index\":\"named_text\"}}" },
         .{ .apply_fk_generation_publication = "{\"plan\":{\"after\":{\"full_text_read_index\":\"named_text\"}}}" },
         .{ .apply_restore_staging = "{\"targets\":[{\"table\":{\"full_text_read_index\":\"named_text\"}}]}" },
         .{ .create_restore_job_with_staging = .{ .key = "job", .value = "{}", .plan_json = "{\"full_text_read_index\":\"named_text\"}" } },
@@ -4569,7 +4616,7 @@ test "system catalog USING rewrite decoder barrier precedes lower schema reader 
     try std.testing.expectEqual(metadata_topology_protocol.sql_column_transform_version, (try transitionRequiredCoordinatedDecoderVersion(std.heap.page_allocator, .{ .apply_restore_staging = bytes })));
     // A malformed envelope must retain the strongest possible requirement,
     // not let a weaker transform projection bypass text-generation binding.
-    try std.testing.expectEqual(metadata_topology_protocol.current_version, (try transitionRequiredCoordinatedDecoderVersion(std.heap.page_allocator, .{ .apply_restore_staging = "{" })));
+    try std.testing.expectEqual(metadata_topology_protocol.restore_reservation_outcome_version, (try transitionRequiredCoordinatedDecoderVersion(std.heap.page_allocator, .{ .apply_restore_staging = "{" })));
 }
 
 test "system catalog CHECK identity decoder barrier covers admission and planless owner ACKs" {
@@ -4672,6 +4719,7 @@ test "system catalog schema reader publication durable activation guards ordinar
     const publication_version = metadata_topology_protocol.schema_reader_publication_version;
     const head_version = metadata_topology_protocol.index_publication_head_version;
     const Fake = struct {
+        alloc: std.mem.Allocator = std.testing.allocator,
         metadata_group_id: u64 = 21,
         source: Source = .{},
         members: []const u16 = &.{ publication_version, publication_version - 1, publication_version },
@@ -4785,12 +4833,76 @@ pub fn ensureQueryPopulationDecoderWithContext(service: anytype, bytes: []const 
     if (required != 0) try ensureDurableDecoderActivation(service, context, required);
 }
 
+pub fn ensureSqlReplicationCatalogCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
+    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_replication_catalog_version);
+}
+
+pub fn ensureSqlPublicationSlotControlCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
+    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_publication_slot_control_version);
+}
+
+pub fn ensureSqlPublicationCollectionCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
+    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_publication_collection_version);
+}
+
+pub fn ensureSqlPublicationCaptureCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
+    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_publication_capture_version);
+}
+
+pub fn ensureSqlCollationCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
+    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_collation_catalog_version);
+}
+
+pub fn ensureSqlSecurityLabelCapabilityWithContext(service: anytype, context: api_operation.RequestContext, version: u16) !void {
+    try ensureDurableDecoderActivation(service, context, version);
+}
+
+/// Trusted deployment code supplies verifier updates. Only the public key
+/// and policy identity cross Raft. Confirm the epoch after the exact receipt.
+pub fn submitSqlSelinuxAuthority(service: anytype, context: api_operation.RequestContext, update: @import("../system_catalog/storage.zig").SelinuxAuthorityUpdate) !@import("../system_catalog/storage.zig").SelinuxAuthorityState {
+    if (!context.setting_admin) return error.Forbidden;
+    try update.validate();
+    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_selinux_approval_version);
+    try context.ensureActive();
+    const a = std.heap.page_allocator;
+    const bytes = try std.json.Stringify.valueAlloc(a, update, .{});
+    defer a.free(bytes);
+    const receipt = try service.proposeTransitionCommandWithReceipt(.{ .update_sql_selinux_authority = bytes });
+    try service.waitForTransitionAppliedWithContext(receipt, context);
+    try service.ensureLinearizableReadWithContext(context);
+    const store = service.projectedStore() orelse return error.MissingMetadataStore;
+    const state = try store.sqlSelinuxAuthority(service.metadata_group_id);
+    var expected = update.active;
+    if (expected) |*active| active.epoch = update.expected_epoch + 1;
+    if (state.epoch != update.expected_epoch + 1 or !std.meta.eql(state.active, expected))
+        return error.CatalogGenerationChanged;
+    return state;
+}
+
 pub fn ensureSqlCatalogCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
     try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_catalog_journal_version);
 }
 
-pub fn ensureSqlPreparedCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
-    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_prepared_lock_handoff_version);
+pub fn ensureSqlPreparedPublicationCapabilityWithContext(service: anytype, context: api_operation.RequestContext, request: @import("../system_catalog/prepared_transactions.zig").Mutation) !u16 {
+    const minimum = metadata_topology_protocol.sql_prepared_lock_handoff_version;
+    const publisher = metadata_topology_protocol.sql_publication_slot_version;
+    const required = switch (request.operation) {
+        .replication_admit, .replication_advance, .replication_ack_publish, .replication_checkpoint => metadata_topology_protocol.sql_subscription_apply_version,
+        .admit => |admission| version: {
+            for (admission.participants) |participant| if (participant.publication_capture != null) break :version @max(publisher, admission.identity.minimumDecoderVersion());
+            break :version @max(minimum, admission.identity.minimumDecoderVersion());
+        },
+        .cancel_admission => |canceled| @max(minimum, canceled.original.identity.minimumDecoderVersion()),
+        .advance => |advance| switch (advance.action) {
+            .catalog_complete => metadata_topology_protocol.sql_catalog_completion_version,
+            .publication_capacity, .publication_vote, .publication_terminal, .publication_abort_fence => publisher,
+            .commit => |decision| if (decision.commit_time_unix_us != null) publisher else minimum,
+            else => minimum,
+        },
+        else => minimum,
+    };
+    try ensureDurableDecoderActivation(service, context, required);
+    return required;
 }
 
 pub fn ensureSqlAuthorizationCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
@@ -4843,6 +4955,28 @@ pub fn ensureMaterializedViewCapabilityWithContext(service: anytype, context: ap
 
 pub fn ensureQueryPopulationCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
     try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_population_version);
+}
+
+pub fn ensureRestoreStagingDecoderWithContext(service: anytype, command_json: []const u8, context: api_operation.RequestContext) !void {
+    const command: metadata_storage.TransitionCommand = .{ .apply_restore_staging = command_json };
+    if (!@import("schema_reader_wire.zig").requiresRestoreReservationOutcome(command_json))
+        return ensureCoordinatedDecoderWithContext(service, command, context);
+    try context.ensureActive();
+    try metadata_storage.raft_apply_store.validateTransitionCommandSchemaReaderRequirements(command);
+    // Receipt-bearing restore commands check the committed barrier during
+    // apply. A successful decoder probe alone cannot authorize an append.
+    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.restore_reservation_outcome_version);
+}
+
+pub fn ensureCatalogAtomicAdmissionDecoderWithContext(service: anytype, context: api_operation.RequestContext) !void {
+    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_catalog_atomic_admission_version);
+}
+
+pub fn ensureCatalogRestoreDecoderWithContext(service: anytype, context: api_operation.RequestContext, progress: bool) !void {
+    return ensureDurableDecoderActivation(service, context, if (progress)
+        metadata_topology_protocol.sql_catalog_progress_version
+    else
+        metadata_topology_protocol.sql_catalog_reservation_version);
 }
 
 /// Capability observation alone does not install the apply-side barrier. Own
@@ -25405,6 +25539,7 @@ test "SQL table trigger decoder preserves ordinary schema-free CREATE preflight 
     ordinary.schema_json = "{}";
     try std.testing.expectEqual(@as(u16, 0), tableTriggersRequiredDecoderVersion(.{ .upsert_table = ordinary }));
     const Peer = struct {
+        alloc: std.mem.Allocator = std.testing.allocator,
         requested: u16 = 0,
         pub fn ensureTableTopologyProtocolReadyWithContext(self: *@This(), _: api_operation.RequestContext, version: u16) !bool {
             self.requested = version;
@@ -25686,4 +25821,19 @@ test "index alias lifecycle decoder floor distinguishes legacy and restored enve
     const envelope = try std.json.Stringify.valueAlloc(a, .{ .table = after }, .{});
     defer a.free(envelope);
     try std.testing.expectEqual(@as(u16, 91), try transitionRequiredCoordinatedDecoderVersion(a, .{ .apply_restore_staging = envelope }));
+}
+
+test "SQL document view dependencies require the coordinated index-proof decoder" {
+    const protocol = metadata_topology_protocol;
+    const a = std.testing.allocator;
+    const base = "{\"mutation\":{\"kind\":\"view\"},\"sql_view\":{\"operation\":{\"publish\":{\"definition\":{\"sources\":[";
+    const suffix = "]}}}}}";
+    try std.testing.expectEqual(protocol.sql_document_view_indexes_version, try transitionRequiredCoordinatedDecoderVersion(a, .{ .apply_system_catalog = base ++ "{\"required_indexes\":[{}]}" ++ suffix }));
+    try std.testing.expect((try transitionRequiredCoordinatedDecoderVersion(a, .{ .apply_system_catalog = base ++ "{\"description\":\"required_indexes\"}" ++ suffix })) < protocol.sql_document_view_indexes_version);
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .schema_reader_requirements = .{ .semantic_version = @import("antfly_local_sources").common_schema_readers.sql_view_index_semantic_version, .encoding_version = 42 },
+    };
+    try std.testing.expectEqual(protocol.sql_document_view_indexes_version, try transitionRequiredCoordinatedDecoderVersion(a, .{ .upsert_table = table }));
 }

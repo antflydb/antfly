@@ -424,7 +424,7 @@ const Campaign = struct {
 };
 
 test "mounted SQL original native TEMP and UNLOGGED lifetimes preserve owner isolation population rollback and clean restart" {
-    // sql-0360/0361/0362/0363/0367/0368/0568/0569 execute unchanged.
+    // sql-0360, sql-0361, sql-0362, sql-0363, sql-0367, sql-0368, sql-0568, and sql-0569 execute unchanged.
     try fixture.run(Campaign);
 }
 

@@ -37,6 +37,7 @@ pub const Limits = struct {
 pub const Error = std.mem.Allocator.Error || error{
     InvalidSqlSyntax,
     UnsupportedSqlShape,
+    SqlPartitionUniqueKeyMissing,
     SqlLimitExceeded,
     InvalidSqlParameter,
     InvalidSqlNumber,
@@ -318,7 +319,6 @@ test "SQL routine declaration admission consumes grammar before missing-body dia
     // and SUPPORT names require authoritative catalog resolution, not guesses.
     for ([_][]const u8{
         "CREATE FUNCTION f() RETURNS trigger LANGUAGE unknown_language",
-        "CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql SUPPORT missing_support",
     }) |sql| try std.testing.expectError(error.UnsupportedSqlShape, compile(a, sql, .{}));
 }
 
@@ -927,7 +927,7 @@ const Parser = struct {
         } else if (self.peek(.identifier) and !self.tokens[self.pos].owned and (std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "timestamptz") or std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "interval") or std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "date") or std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "timestamp") or std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "time") or std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "timetz")) and self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .string) {
             // Typed literals use the same validating/canonicalizing cast as
             // CAST(text AS timestamptz), including offset normalization.
-            const temporal_kind: ?@import("temporal_value.zig").Kind = if (std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "interval")) .interval else if (std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "date")) .date else if (std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "timestamp")) .timestamp else if (std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "time")) .time else if (std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "timetz")) .time_tz else null;
+            const temporal_kind: ?@import("temporal/value.zig").Kind = if (std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "interval")) .interval else if (std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "date")) .date else if (std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "timestamp")) .timestamp else if (std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "time")) .time else if (std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "timetz")) .time_tz else null;
             self.pos += 1;
             const literal = try self.scalarNode(.{ .literal = try self.value() });
             left = try self.scalarNode(.{ .cast = .{ .operand = literal, .type = .datetime, .temporal_kind = temporal_kind } });
@@ -1311,7 +1311,7 @@ const Parser = struct {
                             left = try self.patternArray(left, input, every, op == .ilike, false);
                             continue;
                         }
-                        const comparison_value: @import("array_value.zig").Comparison = switch (op) {
+                        const comparison_value: @import("array/value.zig").Comparison = switch (op) {
                             .eq => .eq,
                             .neq => .ne,
                             .lt => .lt,
@@ -1865,8 +1865,8 @@ const Parser = struct {
             try aliases.append(self.alloc, alias);
             try self.expect(.rparen);
         }
-        if (types.items.len == 0) return self.fail(error.InvalidSqlSyntax, "MATCH requires an edge pattern");
-        try self.expectKeyword(.with);
+        if (types.items.len == 0) return self.fail(error.UnsupportedSqlShape, "MATCH requires a supported directed edge pattern");
+        if (!self.keyword(.with)) return self.fail(error.UnsupportedSqlShape, "MATCH requires a WITH GRAPH source");
         if (!self.ddlWord("GRAPH")) return self.fail(error.InvalidSqlSyntax, "MATCH requires WITH GRAPH");
         const index = try self.identifier();
         try self.expectKeyword(.on);
@@ -2599,7 +2599,7 @@ const Parser = struct {
         return self.scalarNode(.{ .call = .{ .name = "$array_pattern_quantified", .args = try self.alloc.dupe(*const ast.Scalar, &.{ operand, input, all_node, insensitive_node, negated_node }) } });
     }
 
-    const CastType = struct { named_type: ?ast.Name = null, type: ast.ColumnType, temporal_kind: ?@import("temporal_value.zig").Kind = null, element_type: ?@import("array_value.zig").ElementType = null, numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null };
+    const CastType = struct { named_type: ?ast.Name = null, type: ast.ColumnType, temporal_kind: ?@import("temporal/value.zig").Kind = null, element_type: ?@import("array/value.zig").ElementType = null, numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null };
 
     fn numericModifier(self: *Parser) Error!?@import("../common/sql_builtin_type.zig").NumericModifier {
         if (!self.take(.lparen)) return null;
@@ -2655,26 +2655,26 @@ const Parser = struct {
         if (std.ascii.eqlIgnoreCase(name_value, "date")) return .{ .type = .datetime, .temporal_kind = .date };
         if (std.ascii.eqlIgnoreCase(name_value, "timestamp")) return .{ .type = .datetime, .temporal_kind = .timestamp };
         const pairs = .{
-            .{ "text", @import("array_value.zig").ElementType.text },
-            .{ "uuid", @import("array_value.zig").ElementType.uuid },
-            .{ "smallint", @import("array_value.zig").ElementType.int16 },
-            .{ "int2", @import("array_value.zig").ElementType.int16 },
-            .{ "int", @import("array_value.zig").ElementType.int32 },
-            .{ "integer", @import("array_value.zig").ElementType.int32 },
-            .{ "int4", @import("array_value.zig").ElementType.int32 },
-            .{ "bigint", @import("array_value.zig").ElementType.int64 },
-            .{ "int8", @import("array_value.zig").ElementType.int64 },
-            .{ "real", @import("array_value.zig").ElementType.float32 },
-            .{ "float4", @import("array_value.zig").ElementType.float32 },
-            .{ "float8", @import("array_value.zig").ElementType.float64 },
-            .{ "double", @import("array_value.zig").ElementType.float64 },
-            .{ "bool", @import("array_value.zig").ElementType.boolean },
-            .{ "boolean", @import("array_value.zig").ElementType.boolean },
-            .{ "jsonb", @import("array_value.zig").ElementType.jsonb },
-            .{ "numeric", @import("array_value.zig").ElementType.numeric },
-            .{ "decimal", @import("array_value.zig").ElementType.numeric },
+            .{ "text", @import("array/value.zig").ElementType.text },
+            .{ "uuid", @import("array/value.zig").ElementType.uuid },
+            .{ "smallint", @import("array/value.zig").ElementType.int16 },
+            .{ "int2", @import("array/value.zig").ElementType.int16 },
+            .{ "int", @import("array/value.zig").ElementType.int32 },
+            .{ "integer", @import("array/value.zig").ElementType.int32 },
+            .{ "int4", @import("array/value.zig").ElementType.int32 },
+            .{ "bigint", @import("array/value.zig").ElementType.int64 },
+            .{ "int8", @import("array/value.zig").ElementType.int64 },
+            .{ "real", @import("array/value.zig").ElementType.float32 },
+            .{ "float4", @import("array/value.zig").ElementType.float32 },
+            .{ "float8", @import("array/value.zig").ElementType.float64 },
+            .{ "double", @import("array/value.zig").ElementType.float64 },
+            .{ "bool", @import("array/value.zig").ElementType.boolean },
+            .{ "boolean", @import("array/value.zig").ElementType.boolean },
+            .{ "jsonb", @import("array/value.zig").ElementType.jsonb },
+            .{ "numeric", @import("array/value.zig").ElementType.numeric },
+            .{ "decimal", @import("array/value.zig").ElementType.numeric },
         };
-        var element: ?@import("array_value.zig").ElementType = null;
+        var element: ?@import("array/value.zig").ElementType = null;
         inline for (pairs) |pair| if (std.ascii.eqlIgnoreCase(name_value, pair[0])) {
             element = pair[1];
         };
@@ -2786,6 +2786,11 @@ const Parser = struct {
             try self.expectKeyword(.exists);
         }
         const table = try self.name();
+        if (self.keyword(.partition)) {
+            if (!self.ddlWord("OF")) return self.fail(error.InvalidSqlSyntax, "expected PARTITION OF");
+            const parent = try self.name();
+            return .{ .table = table, .columns = &.{}, .if_not_exists = if_not_exists, .partition_of = .{ .parent = parent, .bounds = try self.partitionRange() } };
+        }
         try self.expect(.lparen);
         var columns = std.ArrayList(ast.Column).empty;
         var constraints = std.ArrayList(ast.SchemaChange).empty;
@@ -2877,6 +2882,22 @@ const Parser = struct {
             }
         }
         try self.expect(.rparen);
+        const partition_by: ?ast.PartitionBy = if (self.keyword(.partition)) blk: {
+            try self.expectKeyword(.by);
+            if (!self.keyword(.range)) return self.fail(error.UnsupportedSqlShape, "only RANGE partitioning is supported");
+            break :blk .{ .columns = try self.ddlColumnList() };
+        } else null;
+        if (partition_by) |partition| {
+            for (partition.columns) |key| {
+                if (!seen.contains(key) and like_tables.items.len == 0)
+                    return self.fail(error.InvalidSqlSyntax, "partition key references an unknown column");
+            }
+            for (constraints.items) |constraint| {
+                if (constraint != .add_unique) continue;
+                @import("../system_catalog/table_partitions.zig").requireUniqueKey(partition.columns, constraint.add_unique.columns) catch
+                    return self.fail(error.SqlPartitionUniqueKeyMissing, "unique constraint on partitioned table must include all partitioning columns");
+            }
+        }
         const document = try self.documentTableOptions(columns.items.len, constraints.items.len);
         const on_commit = try self.onCommitClause();
         const tablespace = if (self.keyword(.tablespace)) try self.identifier() else null;
@@ -2896,7 +2917,23 @@ const Parser = struct {
         };
         try self.normalizeUniqueConstraints(&constraints);
         try self.disambiguateGeneratedConstraintLabels(constraints.items);
-        return .{ .table = table, .columns = try columns.toOwnedSlice(self.alloc), .constraints = try constraints.toOwnedSlice(self.alloc), .like_tables = try like_tables.toOwnedSlice(self.alloc), .if_not_exists = if_not_exists, .tablespace = tablespace, .document = document_definition, .on_commit = on_commit };
+        return .{ .partition_by = partition_by, .table = table, .columns = try columns.toOwnedSlice(self.alloc), .constraints = try constraints.toOwnedSlice(self.alloc), .like_tables = try like_tables.toOwnedSlice(self.alloc), .if_not_exists = if_not_exists, .tablespace = tablespace, .document = document_definition, .on_commit = on_commit };
+    }
+
+    fn partitionBound(self: *Parser) Error!ast.PartitionBound {
+        try self.expect(.lparen);
+        const bound: ast.PartitionBound = if (self.ddlWord("MINVALUE")) .minvalue else if (self.ddlWord("MAXVALUE")) .maxvalue else .{ .expression = try self.scalar(0, 0) };
+        if (self.peek(.comma)) return self.fail(error.UnsupportedSqlShape, "multi-column partition bounds require a matching native key comparator");
+        try self.expect(.rparen);
+        return bound;
+    }
+    fn partitionRange(self: *Parser) Error!ast.PartitionRange {
+        try self.expectKeyword(.@"for");
+        try self.expectKeyword(.values);
+        try self.expectKeyword(.from);
+        const lower = try self.partitionBound();
+        if (!self.ddlWord("TO")) return self.fail(error.InvalidSqlSyntax, "expected partition upper bound TO");
+        return .{ .lower = lower, .upper = try self.partitionBound() };
     }
 
     const DocumentOptions = struct { enabled: bool = false, default_type: ?[]const u8 = null, enforce_types: bool = false };
@@ -3405,10 +3442,143 @@ const Parser = struct {
         return ddl;
     }
 
+    fn replicationOptions(self: *Parser) Error![]const @import("replication_ddl.zig").Option {
+        const R = @import("replication_ddl.zig");
+        try self.expect(.lparen);
+        var options: std.ArrayList(R.Option) = .empty;
+        while (true) {
+            try self.node();
+            if (options.items.len == R.max_options) return self.fail(error.SqlLimitExceeded, "replication option budget exceeded");
+            if (!self.peek(.identifier)) return self.fail(error.InvalidSqlSyntax, "expected replication option");
+            const item = self.tokens[self.pos];
+            self.pos += 1;
+            const name_ = try self.alloc.dupe(u8, item.text);
+            if (!item.owned) _ = std.ascii.lowerString(name_, name_);
+            for (options.items) |prior| if (std.mem.eql(u8, prior.name, name_)) return self.fail(error.SqlInvalidParameterValue, "duplicate replication option");
+            var value_: R.Value = .{ .boolean = true };
+            if (self.take(.eq)) {
+                value_ = if (self.peek(.string)) .{ .text = (try self.value()).string } else if (self.ddlWord("TRUE")) .{ .boolean = true } else if (self.ddlWord("FALSE")) .{ .boolean = false } else if (self.ddlWord("NONE")) .none else if (self.ddlWord("ON")) .{ .text = "on" } else if (self.ddlWord("OFF")) .{ .text = "off" } else if (self.peek(.number)) number: {
+                    const literal = try self.value();
+                    if (literal != .integer) return self.fail(error.SqlInvalidParameterValue, "expected replication option value");
+                    break :number .{ .text = try std.fmt.allocPrint(self.alloc, "{d}", .{literal.integer}) };
+                } else .{ .text = try self.identifier() };
+            }
+            try options.append(self.alloc, .{ .name = name_, .value = value_ });
+            if (!self.take(.comma)) break;
+        }
+        try self.expect(.rparen);
+        return options.toOwnedSlice(self.alloc);
+    }
+
+    fn publicationTables(self: *Parser) Error![]const ast.Name {
+        var tables: std.ArrayList(ast.Name) = .empty;
+        while (true) {
+            try self.node();
+            if (tables.items.len == @import("replication_ddl.zig").max_members) return self.fail(error.SqlLimitExceeded, "publication relation budget exceeded");
+            try tables.append(self.alloc, try self.tableReferenceName());
+            if (!self.take(.comma)) break;
+        }
+        return tables.toOwnedSlice(self.alloc);
+    }
+
+    fn subscriptionPublications(self: *Parser) Error![]const []const u8 {
+        var names: std.ArrayList([]const u8) = .empty;
+        while (true) {
+            try self.node();
+            if (names.items.len == @import("replication_ddl.zig").max_members) return self.fail(error.SqlLimitExceeded, "subscription publication budget exceeded");
+            const name_ = try self.identifier();
+            for (names.items) |prior| if (std.mem.eql(u8, prior, name_)) return self.fail(error.SqlInvalidParameterValue, "duplicate subscription publication");
+            try names.append(self.alloc, name_);
+            if (!self.take(.comma)) break;
+        }
+        return names.toOwnedSlice(self.alloc);
+    }
+
+    fn replicationDdl(self: *Parser, subscription: bool, action: @FieldType(ast.CatalogDdl, "action")) Error!ast.CatalogDdl {
+        const R = @import("replication_ddl.zig");
+        var ddl: ast.CatalogDdl = .{ .kind = if (subscription) .subscription else .publication, .action = action, .name = undefined };
+        if (action == .drop) {
+            ddl.conditional = self.keyword(.@"if");
+            if (ddl.conditional) try self.expectKeyword(.exists);
+        }
+        // Both names are database-wide objects, never schema-qualified.
+        ddl.name = .{ .table = try self.identifier() };
+        if (action == .drop) {
+            ddl.cascade = self.ddlWord("CASCADE");
+            if (!ddl.cascade) _ = self.ddlWord("RESTRICT");
+            ddl.replication = if (subscription) .drop_subscription else .drop_publication;
+            return ddl;
+        }
+        if (action == .create) {
+            if (subscription) {
+                if (!self.ddlWord("CONNECTION") or !self.peek(.string)) return self.fail(error.InvalidSqlSyntax, "subscription requires CONNECTION string");
+                const connection = (try self.value()).string;
+                if (!self.ddlWord("PUBLICATION")) return self.fail(error.InvalidSqlSyntax, "subscription requires PUBLICATION");
+                const publications = try self.subscriptionPublications();
+                const options = if (self.keyword(.with)) try self.replicationOptions() else &.{};
+                _ = R.subscriptionOptions(ddl.name.table, options) catch return self.fail(error.SqlInvalidParameterValue, "invalid subscription options");
+                ddl.replication = .{ .create_subscription = .{ .connection = connection, .publications = publications, .options = options } };
+            } else {
+                var create: R.PublicationCreate = .{};
+                if (self.keyword(.@"for")) {
+                    if (self.keyword(.all)) {
+                        if (!self.ddlWord("TABLES")) return self.fail(error.InvalidSqlSyntax, "FOR ALL requires TABLES");
+                        create.all_tables = true;
+                    } else {
+                        try self.expectKeyword(.table);
+                        create.tables = try self.publicationTables();
+                    }
+                }
+                if (self.keyword(.with)) create.options = try self.replicationOptions();
+                _ = R.publicationOptions(create.options, .{}) catch return self.fail(error.SqlInvalidParameterValue, "invalid publication options");
+                ddl.replication = .{ .create_publication = create };
+            }
+            return ddl;
+        }
+        if (subscription) {
+            if (self.ddlWord("ENABLE")) {
+                ddl.replication = .{ .set_subscription_enabled = true };
+            } else if (self.ddlWord("DISABLE")) {
+                ddl.replication = .{ .set_subscription_enabled = false };
+            } else if (self.ddlWord("REFRESH")) {
+                if (!self.ddlWord("PUBLICATION")) return self.fail(error.InvalidSqlSyntax, "REFRESH requires PUBLICATION");
+                const options = if (self.keyword(.with)) try self.replicationOptions() else &.{};
+                ddl.replication = .{ .refresh_subscription = @import("../system_catalog/logical_replication.zig").refreshOptions(options, false) catch return self.fail(error.SqlInvalidParameterValue, "invalid subscription refresh option") };
+            } else {
+                const Mode = @FieldType(@FieldType(R.Syntax, "change_subscription_publications"), "mode");
+                const mode: Mode = if (self.keyword(.set)) .set else if (self.keyword(.add)) .add else if (self.keyword(.drop)) .drop else return self.fail(error.UnsupportedSqlShape, "unsupported ALTER SUBSCRIPTION operation");
+                if (mode == .set and self.peek(.lparen)) {
+                    ddl.replication = .{ .alter_subscription_options = try self.replicationOptions() };
+                } else {
+                    if (!self.ddlWord("PUBLICATION")) return self.fail(error.InvalidSqlSyntax, "subscription membership requires PUBLICATION");
+                    const names = try self.subscriptionPublications();
+                    const options = if (self.keyword(.with)) try self.replicationOptions() else &.{};
+                    ddl.replication = .{ .change_subscription_publications = .{ .mode = mode, .names = names, .options = @import("../system_catalog/logical_replication.zig").refreshOptions(options, true) catch return self.fail(error.SqlInvalidParameterValue, "invalid subscription membership option") } };
+                }
+            }
+        } else {
+            const mode: enum { add, set, drop } = if (self.keyword(.add)) .add else if (self.keyword(.set)) .set else if (self.keyword(.drop)) .drop else return self.fail(error.UnsupportedSqlShape, "unsupported ALTER PUBLICATION operation");
+            if (mode == .set and self.peek(.lparen)) {
+                const options = try self.replicationOptions();
+                _ = R.publicationOptions(options, .{}) catch return self.fail(error.SqlInvalidParameterValue, "invalid publication options");
+                ddl.replication = .{ .alter_publication = .{ .options = options } };
+            } else {
+                try self.expectKeyword(.table);
+                const tables = try self.publicationTables();
+                ddl.replication = .{ .alter_publication = switch (mode) {
+                    .add => .{ .add_tables = tables },
+                    .set => .{ .set_tables = tables },
+                    .drop => .{ .drop_tables = tables },
+                } };
+            }
+        }
+        return ddl;
+    }
+
     fn catalogDdl(self: *Parser, action: @FieldType(ast.CatalogDdl, "action")) Error!ast.CatalogDdl {
         const kind: @FieldType(ast.CatalogDdl, "kind") = if (self.keyword(.database)) .database else if (self.keyword(.schema)) .namespace else if (self.keyword(.tablespace)) .tablespace else if (self.keyword(.table)) .table else return self.fail(error.UnsupportedSqlShape, "expected a table, database, schema, or tablespace");
         var conditional = false;
-        if (action == .create or action == .drop or (action == .rename and kind == .table)) {
+        if ((action == .create and kind != .tablespace) or action == .drop or (action == .rename and kind == .table)) {
             conditional = self.keyword(.@"if");
             if (conditional) {
                 if (action == .create) try self.expectKeyword(.not);
@@ -3423,6 +3593,19 @@ const Parser = struct {
         var ddl: ast.CatalogDdl = .{ .kind = kind, .action = action, .name = target_name, .conditional = conditional };
         if (action == .rename and kind == .database and (self.pos < self.tokens.len and ((self.tokens[self.pos].isKeyword(.set) and (self.pos + 1 >= self.tokens.len or !self.tokens[self.pos + 1].isKeyword(.tablespace))) or std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "RESET")))) return self.settingDefaultDdl(.database, target_name.table);
         if (action == .rename) {
+            if (kind == .table and self.ddlWord("ATTACH")) {
+                try self.expectKeyword(.partition);
+                const child = try self.name();
+                ddl.action = .alter_schema;
+                ddl.partition = .{ .attach = .{ .child = child, .bounds = try self.partitionRange() } };
+                return ddl;
+            }
+            if (kind == .table and self.ddlWord("DETACH")) {
+                try self.expectKeyword(.partition);
+                ddl.action = .alter_schema;
+                ddl.partition = .{ .detach = try self.name() };
+                return ddl;
+            }
             if (kind == .table and self.keyword(.add)) {
                 if (self.keyword(.constraint)) {
                     ddl.action = .alter_schema;
@@ -3533,11 +3716,10 @@ const Parser = struct {
                 ddl.tablespace = try self.identifier();
             } else return self.fail(error.UnsupportedSqlShape, "unsupported catalog ALTER operation");
         } else if (action == .create and kind == .tablespace) {
-            if (self.keyword(.location)) {
-                const location = try self.value();
-                if (location != .string) return self.fail(error.InvalidSqlSyntax, "tablespace location must be a string literal");
-                ddl.location = location.string;
-            }
+            try self.expectKeyword(.location);
+            const location = try self.value();
+            if (location != .string) return self.fail(error.InvalidSqlSyntax, "tablespace location must be a string literal");
+            ddl.location = location.string;
         } else if (action == .create and self.keyword(.tablespace)) ddl.tablespace = try self.identifier();
         if (action == .drop and kind == .database and self.keyword(.with)) {
             try self.expect(.lparen);
@@ -4072,6 +4254,53 @@ const Parser = struct {
         }
         return ddl;
     }
+    fn collationDdl(self: *Parser, action: @FieldType(ast.CatalogDdl, "action")) Error!ast.CatalogDdl {
+        const conditional = self.keyword(.@"if");
+        if (conditional) {
+            if (action == .create) try self.expectKeyword(.not);
+            try self.expectKeyword(.exists);
+        }
+        var ddl: ast.CatalogDdl = .{ .kind = .collation, .action = action, .name = try self.name(), .conditional = conditional };
+        if (action == .drop) {
+            ddl.cascade = self.ddlWord("CASCADE");
+            if (!ddl.cascade) _ = self.ddlWord("RESTRICT");
+            return ddl;
+        }
+        if (action == .rename) {
+            if (conditional or !self.keyword(.rename)) return self.fail(error.UnsupportedSqlShape, "ALTER COLLATION requires RENAME TO");
+            try self.expectKeyword(.to);
+            ddl.new_name = try self.identifier();
+            return ddl;
+        }
+        try self.expect(.lparen);
+        var locale: ?[]const u8 = null;
+        var provider: bool = false;
+        var deterministic_seen: bool = false;
+        while (true) {
+            const key = try self.identifier();
+            try self.expect(.eq);
+            if (std.ascii.eqlIgnoreCase(key, "provider")) {
+                if (provider) return self.fail(error.InvalidSqlSyntax, "duplicate collation provider");
+                if (!self.ddlWord("ICU")) return self.fail(error.UnsupportedSqlShape, "collation requires the native ICU provider");
+                provider = true;
+            } else if (std.ascii.eqlIgnoreCase(key, "locale")) {
+                if (locale != null or !self.peek(.string)) return self.fail(error.InvalidSqlSyntax, "collation requires one locale string");
+                locale = (try self.value()).string;
+            } else if (std.ascii.eqlIgnoreCase(key, "deterministic")) {
+                if (deterministic_seen) return self.fail(error.InvalidSqlSyntax, "duplicate collation determinism");
+                const deterministic = try self.value();
+                if (deterministic != .boolean) return self.fail(error.InvalidSqlSyntax, "collation determinism requires a boolean");
+                if (!deterministic.boolean) return self.fail(error.UnsupportedSqlShape, "nondeterministic SQL collation consumers require their native hashing and pattern contracts");
+                deterministic_seen = true;
+            } else return self.fail(error.UnsupportedSqlShape, "collation option requires a native provider contract");
+            if (!self.take(.comma)) break;
+        }
+        try self.expect(.rparen);
+        if (!provider or locale == null) return self.fail(error.InvalidSqlSyntax, "ICU collation requires provider and locale");
+        ddl.collation_definition = .{ .locale = locale.? };
+        return ddl;
+    }
+
     fn castDdl(self: *Parser, creating: bool) Error!ast.CatalogDdl {
         const conditional = !creating and self.keyword(.@"if");
         if (conditional) try self.expectKeyword(.exists);
@@ -4273,6 +4502,7 @@ const Parser = struct {
         }
         var language: ?[]const u8 = null;
         var body: ?[]const u8 = null;
+        var planner_support: ?ast.Name = null;
         var strict = false;
         var volatility: @FieldType(ast.RoutineDefinition, "volatility") = .@"volatile";
         var supported = procedure or result != null or returns_trigger;
@@ -4328,7 +4558,9 @@ const Parser = struct {
                 supported = false;
                 if (self.tokens[self.pos - 1].isKeyword(.not) and !self.ddlWord("LEAKPROOF")) return self.fail(error.InvalidSqlSyntax, "NOT requires LEAKPROOF");
             } else if (self.ddlWord("SUPPORT")) {
-                return self.fail(error.UnsupportedSqlShape, "SUPPORT requires catalog-bound routine lookup");
+                option = 10;
+                planner_support = try self.name();
+                if (procedure) return self.fail(error.SqlInvalidFunctionDefinition, "invalid attribute in procedure definition");
             } else if (self.ddlWord("TRANSFORM")) {
                 option = 11;
                 supported = false;
@@ -4359,15 +4591,15 @@ const Parser = struct {
         if (self.pos != self.tokens.len) return self.fail(error.InvalidSqlSyntax, "submit one routine definition");
         // Language lookup and validation must precede body validation. Only a
         // built-in supported language can produce this definitive diagnostic.
-        if (language) |name_| if (std.mem.eql(u8, name_, "plpgsql") or std.mem.eql(u8, name_, "sql")) {
+        if (planner_support == null) if (language) |name_| if (std.mem.eql(u8, name_, "plpgsql") or std.mem.eql(u8, name_, "sql")) {
             if (body == null) return self.fail(error.SqlInvalidFunctionDefinition, "no function body specified");
         };
-        if (returns_trigger and language != null) {
+        if (planner_support == null and returns_trigger and language != null) {
             if (std.mem.eql(u8, language.?, "sql")) return self.fail(error.SqlTriggerSqlLanguage, "SQL functions cannot return type trigger");
             if (std.mem.eql(u8, language.?, "plpgsql") and arguments.items.len != 0) return self.fail(error.SqlTriggerDeclaredArguments, "trigger functions cannot have declared arguments");
         }
-        if (supported and language != null and body != null and (std.mem.eql(u8, language.?, "sql") or ((procedure or returns_trigger) and std.mem.eql(u8, language.?, "plpgsql"))))
-            return .{ .catalog_ddl = .{ .kind = if (procedure) .procedure else .function, .action = .create, .name = name_value, .routine = .{ .arguments = try arguments.toOwnedSlice(self.alloc), .result = result, .returns_trigger = returns_trigger, .language = if (std.mem.eql(u8, language.?, "sql")) .sql else .plpgsql, .body = try self.alloc.dupe(u8, body.?), .replace = replace, .strict = strict, .volatility = volatility } } };
+        if (supported and language != null and (body != null or planner_support != null) and (std.mem.eql(u8, language.?, "sql") or ((procedure or returns_trigger) and std.mem.eql(u8, language.?, "plpgsql"))))
+            return .{ .catalog_ddl = .{ .kind = if (procedure) .procedure else .function, .action = .create, .name = name_value, .routine = .{ .arguments = try arguments.toOwnedSlice(self.alloc), .result = result, .returns_trigger = returns_trigger, .language = if (std.mem.eql(u8, language.?, "sql")) .sql else .plpgsql, .body = if (body) |text| try self.alloc.dupe(u8, text) else null, .planner_support = planner_support, .replace = replace, .strict = strict, .volatility = volatility } } };
         return self.fail(error.UnsupportedSqlShape, "routine language or execution options are not supported");
     }
 
@@ -4601,7 +4833,7 @@ const Parser = struct {
         const with_options = self.keyword(.with);
         if (with_options and !self.peek(.lparen)) return self.fail(error.InvalidSqlSyntax, "COPY WITH requires options");
         if (self.take(.lparen)) {
-            const Option = enum { format, delimiter, null, header, quote, escape, force_quote, encoding, force_null, force_not_null, default, on_error, reject_limit, log_verbosity, oids };
+            const Option = enum { format, delimiter, null, header, quote, escape, force_quote, encoding, force_null, force_not_null, default, on_error, reject_limit, log_verbosity, oids, freeze };
             var seen: u16 = 0;
             while (true) {
                 try self.node();
@@ -4635,6 +4867,24 @@ const Parser = struct {
                                 options.header_match = true;
                             } else if (std.ascii.eqlIgnoreCase(boolean, "true") or std.ascii.eqlIgnoreCase(boolean, "on") or std.mem.eql(u8, boolean, "1")) options.header = true else if (std.ascii.eqlIgnoreCase(boolean, "false") or std.ascii.eqlIgnoreCase(boolean, "off") or std.mem.eql(u8, boolean, "0")) options.header = false else return self.fail(error.SqlInvalidParameterValue, "COPY HEADER requires a boolean");
                         }
+                    },
+                    .freeze => {
+                        if (self.peek(.comma) or self.peek(.rparen)) {
+                            options.freeze = true;
+                        } else {
+                            if (self.pos == self.tokens.len) return self.fail(error.InvalidSqlSyntax, "expected COPY FREEZE boolean");
+                            const boolean_text = if (self.peek(.string)) try self.copyString() else text_value: {
+                                const text = self.tokens[self.pos].text;
+                                self.pos += 1;
+                                break :text_value text;
+                            };
+                            if (std.ascii.eqlIgnoreCase(boolean_text, "true") or std.ascii.eqlIgnoreCase(boolean_text, "on") or std.mem.eql(u8, boolean_text, "1")) {
+                                options.freeze = true;
+                            } else if (!std.ascii.eqlIgnoreCase(boolean_text, "false") and !std.ascii.eqlIgnoreCase(boolean_text, "off") and !std.mem.eql(u8, boolean_text, "0")) {
+                                return self.fail(error.SqlInvalidParameterValue, "COPY FREEZE requires a boolean");
+                            }
+                        }
+                        if (!input and options.freeze) return self.fail(error.SqlInvalidParameterValue, "COPY FREEZE is only valid for COPY FROM");
                     },
                     .encoding => {
                         const text = try self.copyString();
@@ -4705,7 +4955,13 @@ const Parser = struct {
         var intent: ast.Maintenance = .{ .operation = operation };
         var kind: @FieldType(ast.CatalogDdl, "kind") = .table;
         var concurrent = false;
-        if (operation == .vacuum) {
+        if (operation == .cluster) {
+            if (self.take(.lparen)) {
+                if (!self.ddlWord("VERBOSE")) return self.fail(error.UnsupportedSqlShape, "unsupported CLUSTER option");
+                intent.verbose = try self.explainBoolean();
+                try self.expect(.rparen);
+            } else intent.verbose = self.ddlWord("VERBOSE");
+        } else if (operation == .vacuum) {
             if (self.take(.lparen)) {
                 var seen: u8 = 0;
                 while (true) {
@@ -4734,6 +4990,7 @@ const Parser = struct {
             concurrent = self.ddlWord("CONCURRENTLY");
         }
         const target = try self.name();
+        if (operation == .cluster and self.ddlWord("USING")) intent.cluster_index = try self.identifier();
         if (operation == .analyze or intent.analyze) if (self.take(.lparen)) {
             var columns: std.ArrayList([]const u8) = .empty;
             while (true) {
@@ -4807,6 +5064,7 @@ const Parser = struct {
         if (self.ddlWord("COPY")) return self.copyTo();
         if (self.ddlWord("VACUUM")) return .{ .catalog_ddl = try self.maintenance(.vacuum) };
         if (self.ddlWord("ANALYZE")) return .{ .catalog_ddl = try self.maintenance(.analyze) };
+        if (self.ddlWord("CLUSTER")) return .{ .catalog_ddl = try self.maintenance(.cluster) };
         if (self.ddlWord("REINDEX")) return .{ .catalog_ddl = try self.maintenance(.reindex) };
         if (self.keyword(.explain)) {
             const inner = try self.alloc.create(ast.Statement);
@@ -5012,6 +5270,28 @@ const Parser = struct {
             return .{ .delete = try self.delete() };
         }
         if (self.keyword(.merge)) return .{ .merge = try self.merge() };
+        if (self.ddlWord("SECURITY")) {
+            if (!self.ddlWord("LABEL")) return self.fail(error.InvalidSqlSyntax, "SECURITY requires LABEL");
+            const provider = if (self.keyword(.@"for")) try self.identifier() else null;
+            try self.expectKeyword(.on);
+            var ddl: ast.CatalogDdl = undefined;
+            if (self.ddlWord("PROCEDURE")) {
+                ddl = try self.routineReference(true, true);
+            } else {
+                const kind: @FieldType(ast.CatalogDdl, "kind") = if (self.keyword(.table)) .table else if (self.keyword(.schema)) .namespace else return self.fail(error.UnsupportedSqlShape, "this SECURITY LABEL target is not implemented");
+                const target = try self.name();
+                if (kind == .namespace and (target.namespace != null or target.database != null))
+                    return self.fail(error.InvalidSqlSyntax, "schema security labels require a single identifier");
+                ddl = .{ .kind = kind, .action = .security_label, .name = target };
+            }
+            try self.expectKeyword(.is);
+            if (!self.peek(.string) and !(self.pos < self.tokens.len and self.tokens[self.pos].isKeyword(.null)))
+                return self.fail(error.InvalidSqlSyntax, "SECURITY LABEL requires a string literal or NULL");
+            const label = try self.value();
+            ddl.action = .security_label;
+            ddl.security_label = .{ .provider = provider, .label = if (label == .string) label.string else null };
+            return .{ .catalog_ddl = ddl };
+        }
         if (self.ddlWord("COMMENT")) {
             try self.expectKeyword(.on);
             if (self.ddlWord("FUNCTION") or self.ddlWord("PROCEDURE")) {
@@ -5055,6 +5335,9 @@ const Parser = struct {
             return .{ .catalog_ddl = .{ .kind = kind, .action = .comment, .name = target, .comment_value = if (text == .string) text.string else null, .comment_column = comment_column, .comment_object = if (constraint_name) |label| .{ .kind = .constraint, .name = label } else if (index_comment) .{ .kind = .index, .name = target.table } else null, .named_type_kind = if (domain_comment) .domain else .enumeration } };
         }
         if (self.keyword(.create)) {
+            if (self.ddlWord("PUBLICATION")) return .{ .catalog_ddl = try self.replicationDdl(false, .create) };
+            if (self.ddlWord("SUBSCRIPTION")) return .{ .catalog_ddl = try self.replicationDdl(true, .create) };
+            if (self.ddlWord("COLLATION")) return .{ .catalog_ddl = try self.collationDdl(.create) };
             if (self.ddlWord("EXTENSION")) return .{ .catalog_ddl = try self.extensionDdl(.create) };
             if (self.ddlWord("ROLE")) return .{ .catalog_ddl = try self.roleDdl(false) };
             if (self.ddlWord("TYPE")) return .{ .catalog_ddl = try self.enumDdl(.create) };
@@ -5110,6 +5393,9 @@ const Parser = struct {
             return .{ .catalog_ddl = (try self.populationDdl(.refresh_materialized_view, .permanent)).ddl() };
         }
         if (self.keyword(.drop)) {
+            if (self.ddlWord("PUBLICATION")) return .{ .catalog_ddl = try self.replicationDdl(false, .drop) };
+            if (self.ddlWord("SUBSCRIPTION")) return .{ .catalog_ddl = try self.replicationDdl(true, .drop) };
+            if (self.ddlWord("COLLATION")) return .{ .catalog_ddl = try self.collationDdl(.drop) };
             if (self.ddlWord("EXTENSION")) return .{ .catalog_ddl = try self.extensionDdl(.drop) };
             if (self.ddlWord("TRIGGER")) return .{ .catalog_ddl = try self.triggerDdl(false, false) };
             if (self.ddlWord("ROLE")) return .{ .catalog_ddl = try self.roleDdl(true) };
@@ -5139,6 +5425,9 @@ const Parser = struct {
             return .{ .drop_table = .{ .table = table, .if_exists = if_exists, .cascade = cascade } };
         }
         if (self.keyword(.alter)) {
+            if (self.ddlWord("PUBLICATION")) return .{ .catalog_ddl = try self.replicationDdl(false, .alter_schema) };
+            if (self.ddlWord("SUBSCRIPTION")) return .{ .catalog_ddl = try self.replicationDdl(true, .alter_schema) };
+            if (self.ddlWord("COLLATION")) return .{ .catalog_ddl = try self.collationDdl(.rename) };
             if (self.ddlWord("EXTENSION")) return .{ .catalog_ddl = try self.extensionDdl(.alter_schema) };
             if (self.ddlWord("DEFAULT")) {
                 if (!self.ddlWord("PRIVILEGES")) return self.fail(error.InvalidSqlSyntax, "ALTER DEFAULT requires PRIVILEGES");
@@ -5166,6 +5455,11 @@ const Parser = struct {
         }
         if (self.keyword(.set)) {
             if (self.keyword(.transaction)) {
+                if (self.ddlWord("SNAPSHOT")) {
+                    const snapshot = try self.value();
+                    if (snapshot != .string) return self.fail(error.InvalidSqlSyntax, "SET TRANSACTION SNAPSHOT requires a string identifier");
+                    return .{ .set_transaction = .{ .snapshot = snapshot.string } };
+                }
                 const options = try self.transactionOptions();
                 if (!options.isolation_specified and !options.mode_specified and options.deferrable == null) return self.fail(error.InvalidSqlSyntax, "SET TRANSACTION requires a characteristic");
                 return .{ .set_transaction = .{
@@ -6034,7 +6328,7 @@ test "compiler durable expression trees unwind every allocation fault" {
 }
 
 test "compiler array DDL retains PostgreSQL builtin element identity without dimension constraints" {
-    const Element = @import("array_value.zig").ElementType;
+    const Element = @import("array/value.zig").ElementType;
     const cases = .{
         .{ .declaration = "text[]", .element = Element.text, .oid = @as(u32, 1009) },
         .{ .declaration = "smallint[]", .element = Element.int16, .oid = @as(u32, 1005) },
@@ -6071,9 +6365,9 @@ test "compiler precise DDL descriptors retain scalar storage widths" {
     var compiled = try compile(std.testing.allocator, "CREATE TABLE widths (i integer, b bigint, f double precision, j json, a jsonb[])", .{});
     defer compiled.deinit();
     const columns = compiled.statement.create_table.columns;
-    try std.testing.expectEqual(@import("array_value.zig").ElementType.int32, columns[0].element_type.?);
-    try std.testing.expectEqual(@import("array_value.zig").ElementType.int64, columns[1].element_type.?);
-    try std.testing.expectEqual(@import("array_value.zig").ElementType.float64, columns[2].element_type.?);
+    try std.testing.expectEqual(@import("array/value.zig").ElementType.int32, columns[0].element_type.?);
+    try std.testing.expectEqual(@import("array/value.zig").ElementType.int64, columns[1].element_type.?);
+    try std.testing.expectEqual(@import("array/value.zig").ElementType.float64, columns[2].element_type.?);
     try std.testing.expectEqual(ast.ColumnType.json, columns[3].type);
     try std.testing.expect(columns[3].element_type == null);
     try std.testing.expectEqual(ast.ColumnType.array, columns[4].type);
@@ -6672,7 +6966,7 @@ test "SQL owned sequence defaults parse serial aliases and identity options as p
         const column = table.columns[0];
         try std.testing.expectEqualStrings("id", column.name);
         try std.testing.expect(!column.nullable);
-        try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .int64), column.element_type);
+        try std.testing.expectEqual(@as(?@import("array/value.zig").ElementType, .int64), column.element_type);
         const intent = column.sequence orelse return error.MissingOwnedSequenceIntent;
         try std.testing.expectEqual(([_]@import("../system_catalog/column_sequences.zig").Generation{ .serial, .by_default, .always })[index], intent.generation);
         try std.testing.expectEqual(.unchanged, intent.options.owned_by);
@@ -6819,7 +7113,7 @@ test "SQL routine original declarations retain typed signatures names bodies and
         try std.testing.expectEqual(.function, compiled.statement.catalog_ddl.kind);
         const definition = compiled.statement.catalog_ddl.routine.?;
         try std.testing.expect(definition.arguments.len > 0);
-        try std.testing.expect(std.mem.startsWith(u8, definition.body, "SELECT "));
+        try std.testing.expect(std.mem.startsWith(u8, definition.body orelse return error.TestUnexpectedResult, "SELECT "));
         try std.testing.expectEqual(@as(u32, 0), compiled.parameter_count);
         if (std.mem.eql(u8, id, "sql-0397")) try std.testing.expectEqual(.immutable, definition.volatility);
         if (std.mem.eql(u8, id, "sql-0404")) try std.testing.expectEqualStrings("status_text", definition.arguments[0].name.?);
@@ -7637,4 +7931,172 @@ test "SQL GRAPH_TABLE lowers native graph patterns into shared IR" {
     try std.testing.expectEqualStrings("Document", graph.query.clauses[0].operation.match.paths[0].nodes[0].labels[0]);
     try std.testing.expectEqualStrings("CITES", graph.query.clauses[0].operation.match.paths[0].edges[0].types[0]);
     try std.testing.expectEqualStrings("target_id", graph.query.clauses[1].operation.project.value.items[0].alias.?);
+}
+
+test "SQL tablespace original CREATE requires PostgreSQL LOCATION grammar" {
+    const a = std.testing.allocator;
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(a);
+    defer corpus.deinit();
+    var compiled = try compile(a, (try corpus.get("sql-0110")).sql, .{});
+    defer compiled.deinit();
+    try std.testing.expect(compiled.statement == .catalog_ddl);
+    try std.testing.expect(compiled.statement.catalog_ddl.kind == .tablespace);
+    try std.testing.expectEqualStrings("/var/lib/antfly/fastspace", compiled.statement.catalog_ddl.location.?);
+    for ([_][]const u8{
+        "CREATE TABLESPACE fastspace",
+        "CREATE TABLESPACE IF NOT EXISTS fastspace LOCATION '/var/lib/antfly/fastspace'",
+        "CREATE TABLESPACE fastspace LOCATION 1",
+        "CREATE TABLESPACE fastspace LOCATION $1",
+    }) |sql| try std.testing.expectError(error.InvalidSqlSyntax, compile(a, sql, .{}));
+    var unreserved = try compile(a, "CREATE TABLESPACE if LOCATION '/var/lib/antfly/fastspace'", .{});
+    defer unreserved.deinit();
+    try std.testing.expectEqualStrings("if", unreserved.statement.catalog_ddl.name.table);
+}
+
+test "SQL planner SUPPORT preserves unresolved names and body absence until catalog admission" {
+    const a = std.testing.allocator;
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(a);
+    defer corpus.deinit();
+    const original = try corpus.get("sql-0394");
+    var compiled = try compile(a, original.sql, .{});
+    defer compiled.deinit();
+    const intent = compiled.statement.catalog_ddl.routine.?;
+    try std.testing.expect(intent.body == null);
+    try std.testing.expectEqualStrings("audit_support", intent.planner_support.?.table);
+    try std.testing.expectError(error.UnsupportedSqlShape, @import("routine_definition.zig").definition(a, intent, .auth_disabled));
+    var body = try compile(a, "CREATE FUNCTION f() RETURNS text LANGUAGE sql SUPPORT helpers.audit_support AS $$SELECT 'ready'$$", .{});
+    defer body.deinit();
+    try std.testing.expectEqualStrings("helpers", body.statement.catalog_ddl.routine.?.planner_support.?.namespace.?);
+    try std.testing.expectEqualStrings("SELECT 'ready'", body.statement.catalog_ddl.routine.?.body.?);
+    try std.testing.expectError(error.UnsupportedSqlShape, @import("routine_definition.zig").definition(a, body.statement.catalog_ddl.routine.?, .auth_disabled));
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(a, "CREATE FUNCTION f() RETURNS text LANGUAGE sql SUPPORT a SUPPORT b AS 'SELECT 1'", .{}));
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(a, "CREATE FUNCTION f() RETURNS text LANGUAGE sql SUPPORT", .{}));
+    try std.testing.expectError(error.SqlInvalidFunctionDefinition, compile(a, "CREATE PROCEDURE f() LANGUAGE plpgsql SUPPORT missing_support", .{}));
+}
+
+test "compiler SECURITY LABEL retains provider typed target and NULL distinct from empty label" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { sql: []const u8, kind: @FieldType(ast.CatalogDdl, "kind"), provider: ?[]const u8, label: ?[]const u8 }{
+        .{ .sql = "SECURITY LABEL FOR selinux ON TABLE usage_records IS 'internal';", .kind = .table, .provider = "selinux", .label = "internal" },
+        .{ .sql = "SECURITY LABEL ON SCHEMA public IS 'internal';", .kind = .namespace, .provider = null, .label = "internal" },
+        .{ .sql = "SECURITY LABEL ON PROCEDURE rotate_usage() IS NULL;", .kind = .procedure, .provider = null, .label = null },
+        .{ .sql = "SECURITY LABEL FOR \"ExactProvider\" ON TABLE db.public.\"T Ω\" IS '';", .kind = .table, .provider = "ExactProvider", .label = "" },
+    };
+    for (cases) |case| {
+        var plan = try compile(a, case.sql, .{});
+        defer plan.deinit();
+        const ddl = plan.statement.catalog_ddl;
+        try std.testing.expectEqual(.security_label, ddl.action);
+        try std.testing.expectEqual(case.kind, ddl.kind);
+        const label = ddl.security_label.?;
+        if (case.provider) |value| try std.testing.expectEqualStrings(value, label.provider.?) else try std.testing.expect(label.provider == null);
+        if (case.label) |value| try std.testing.expectEqualStrings(value, label.label.?) else try std.testing.expect(label.label == null);
+        if (case.kind == .procedure) try std.testing.expectEqual(@as(usize, 0), ddl.routine_signature.?.len);
+        try std.testing.expect(ddl.comment_value == null);
+    }
+    for ([_][]const u8{
+        "SECURITY LABEL ON TABLE t IS 42",
+        "SECURITY LABEL ON TABLE t IS $1",
+        "SECURITY LABEL ON TABLE t IS lower('x')",
+        "SECURITY LABEL ON TABLE t 'x'",
+        "SECURITY LABEL ON SCHEMA db.public IS 'x'",
+        "SECURITY LABEL ON PROCEDURE p() CASCADE IS NULL",
+    }) |sql| try std.testing.expectError(error.InvalidSqlSyntax, compile(a, sql, .{}));
+}
+
+test "compiler ICU collation retains the four original catalog intents" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { sql: []const u8, action: @FieldType(ast.CatalogDdl, "action"), conditional: bool = false }{
+        .{ .sql = "CREATE COLLATION case_insensitive (provider = icu, locale = 'und-u-ks-level2')", .action = .create },
+        .{ .sql = "ALTER COLLATION case_insensitive RENAME TO ci_text", .action = .rename },
+        .{ .sql = "DROP COLLATION ci_text", .action = .drop },
+        .{ .sql = "DROP COLLATION IF EXISTS ci_text", .action = .drop, .conditional = true },
+    };
+    for (cases) |case| {
+        var compiled = try compile(a, case.sql, .{});
+        defer compiled.deinit();
+        const ddl = compiled.statement.catalog_ddl;
+        try std.testing.expectEqual(.collation, ddl.kind);
+        try std.testing.expectEqual(case.action, ddl.action);
+        try std.testing.expectEqual(case.conditional, ddl.conditional);
+        if (case.action == .create) try std.testing.expectEqualStrings("und-u-ks-level2", ddl.collation_definition.?.locale);
+        if (case.action == .rename) try std.testing.expectEqualStrings("ci_text", ddl.new_name.?);
+    }
+}
+
+test "SQL CLUSTER originals retain their exact index and verbose physical-maintenance intent" {
+    const a = std.testing.allocator;
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(a);
+    defer corpus.deinit();
+    for ([_][]const u8{ "sql-0078", "sql-0079" }, 0..) |id, ordinal| {
+        var compiled = try compile(a, (try corpus.get(id)).sql, .{});
+        defer compiled.deinit();
+        const ddl = compiled.statement.catalog_ddl;
+        try std.testing.expectEqual(.maintenance, ddl.action);
+        try std.testing.expectEqual(.table, ddl.kind);
+        try std.testing.expectEqualStrings("usage_records", ddl.name.table);
+        try std.testing.expectEqual(.cluster, ddl.maintenance.?.operation);
+        try std.testing.expectEqual(ordinal == 1, ddl.maintenance.?.verbose);
+        try std.testing.expectEqualStrings("usage_records_status_idx", ddl.maintenance.?.cluster_index.?);
+    }
+    var preferred = try compile(a, "CLUSTER usage_records", .{});
+    defer preferred.deinit();
+    try std.testing.expect(preferred.statement.catalog_ddl.maintenance.?.cluster_index == null);
+    var quiet = try compile(a, "CLUSTER (VERBOSE FALSE) usage_records USING usage_records_status_idx", .{});
+    defer quiet.deinit();
+    try std.testing.expect(!quiet.statement.catalog_ddl.maintenance.?.verbose);
+}
+
+test "compiler original logical publications and subscriptions preserve all twelve commands and disconnected options" {
+    const a = std.testing.allocator;
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(a);
+    defer corpus.deinit();
+    var id: [16]u8 = undefined;
+    for (114..126) |number| {
+        const key = try std.fmt.bufPrint(&id, "sql-{d:0>4}", .{number});
+        var compiled = try compile(a, (try corpus.get(key)).sql, .{});
+        defer compiled.deinit();
+        const ddl = compiled.statement.catalog_ddl;
+        const syntax = ddl.replication orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(number >= 119, ddl.kind == .subscription);
+        if (number == 115) try std.testing.expect(syntax.create_publication.all_tables);
+        if (number == 120) {
+            const effective = try @import("replication_ddl.zig").subscriptionOptions(ddl.name.table, syntax.create_subscription.options);
+            try std.testing.expect(!effective.enabled and !effective.copy_data and !effective.create_slot and !effective.connect);
+            try std.testing.expect(effective.binary and effective.failover and effective.run_as_owner and !effective.password_required);
+            try std.testing.expectEqual(.parallel, effective.streaming);
+            try std.testing.expectEqual(.remote_write, effective.synchronous_commit);
+            try std.testing.expectEqualStrings("usage_slot", effective.slot_name.name);
+        }
+        if (number == 121) try std.testing.expectEqual(@as(usize, 2), syntax.create_subscription.publications.len);
+        if (number == 122 or number == 123) try std.testing.expectEqual(number == 123, syntax.set_subscription_enabled);
+        if (number == 118 or number == 125) try std.testing.expect(ddl.conditional);
+    }
+}
+
+test "SQL partition original grammar and PostgreSQL unique key restriction" {
+    const a = std.testing.allocator;
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(a);
+    defer corpus.deinit();
+    try std.testing.expectError(error.SqlPartitionUniqueKeyMissing, compile(a, (try corpus.get("sql-0421")).sql, .{}));
+    var child = try compile(a, (try corpus.get("sql-0422")).sql, .{});
+    defer child.deinit();
+    try std.testing.expectEqualStrings("usage_events", child.statement.create_table.partition_of.?.parent.table);
+    var attach = try compile(a, (try corpus.get("sql-0423")).sql, .{});
+    defer attach.deinit();
+    try std.testing.expectEqualStrings("usage_events_2026", attach.statement.catalog_ddl.partition.?.attach.child.table);
+    var detach = try compile(a, (try corpus.get("sql-0424")).sql, .{});
+    defer detach.deinit();
+    try std.testing.expectEqualStrings("usage_events_2026", detach.statement.catalog_ddl.partition.?.detach.table);
+    var parent = try compile(a, "CREATE TABLE events(id uuid, at timestamptz, PRIMARY KEY(id,at)) PARTITION BY RANGE(at)", .{});
+    defer parent.deinit();
+    try std.testing.expectEqualStrings("at", parent.statement.create_table.partition_by.?.columns[0]);
+}
+
+test "SQL retained snapshot exports parse a literal snapshot identifier" {
+    const a = std.testing.allocator;
+    var imported = try compile(a, "SET TRANSACTION SNAPSHOT 'antfly-11223344556677889900112233445566'", .{});
+    defer imported.deinit();
+    try std.testing.expectEqualStrings("antfly-11223344556677889900112233445566", imported.statement.set_transaction.snapshot.?);
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(a, "SET TRANSACTION SNAPSHOT 42", .{}));
 }

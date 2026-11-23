@@ -19,10 +19,10 @@
 //! catalog. Physical claims retain canonical ranges and independently owned row
 //! identities; lower-bound keys support bounded predecessor/successor probes.
 const std = @import("std");
-const integrity = @import("relational_integrity_contract.zig");
-const ranges = @import("../../sql/range_value.zig");
-const binary = @import("../../sql/range_binary.zig");
-const keys = @import("../../sql/range_key.zig");
+const integrity = @import("relational/integrity/contract.zig");
+const ranges = @import("../../sql/range/value.zig");
+const binary = @import("../../sql/range/binary.zig");
+const keys = @import("../../sql/range/key.zig");
 const A = std.mem.Allocator;
 pub const max_key_bytes = integrity.key_len + integrity.max_record_bytes + 32;
 

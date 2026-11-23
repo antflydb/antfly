@@ -1484,7 +1484,7 @@ pub fn backupStorageKernelOwnerDb(
     return backupStorageKernelOwnerDbWithControl(alloc, db, db_path, group_id, backup_root, backup_id, format, null, null, .{ .deadline_ns = std.math.maxInt(u64) });
 }
 
-pub fn backupStorageKernelOwnerDbWithControl(alloc: std.mem.Allocator, db: *db_mod.DB, db_path: []const u8, group_id: u64, backup_root: []const u8, backup_id: []const u8, format: backups_api.BackupFormat, cohort: ?@import("db/relational_integrity_topology_contract.zig").Fence, sealed: ?@import("db/native_backup_seal_contract.zig").Handle, control: backups_api.BackupOperationControl) ![]backups_api.ShardSnapshot {
+pub fn backupStorageKernelOwnerDbWithControl(alloc: std.mem.Allocator, db: *db_mod.DB, db_path: []const u8, group_id: u64, backup_root: []const u8, backup_id: []const u8, format: backups_api.BackupFormat, cohort: ?@import("db/relational/integrity/topology_contract.zig").Fence, sealed: ?@import("db/native_backup_seal_contract.zig").Handle, control: backups_api.BackupOperationControl) ![]backups_api.ShardSnapshot {
     if (comptime storage_engine.enabled) return storage_engine.call("writeBackupStorageKernelOwnerDbWithControl", .{ alloc, db, db_path, group_id, backup_root, backup_id, format, cohort, sealed, control });
     try control.ensureActive();
     if (cohort) |fence| {
@@ -1870,11 +1870,11 @@ test "fenced owner reopen defers index deletion until exact cancellation" {
     try db.setSchemaJson(alloc, schema_json);
     try std.testing.expect(!(try configureStorageKernelOwnerDbAtOpen(alloc, &db, "rows", schema_json, old_indexes, null, null, null, null, .{}, null, 0)));
     try std.testing.expect(db.hasIndex("old"));
-    const catalog = try db.core.store.get(alloc, @import("db/relational_integrity_catalog.zig").key);
+    const catalog = try db.core.store.get(alloc, @import("db/relational/integrity/catalog.zig").key);
     defer alloc.free(catalog);
     var catalog_digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(catalog, &catalog_digest, .{});
-    const fence: @import("db/relational_integrity_topology.zig").Fence = .{
+    const fence: @import("db/relational/integrity/topology.zig").Fence = .{
         .transition_id = 1,
         .attempt = 1,
         .peer_group_id = 19,
@@ -1890,7 +1890,7 @@ test "fenced owner reopen defers index deletion until exact cancellation" {
     defer alloc.free(pinned_contract);
     try std.testing.expectEqualStrings(old_indexes, pinned_contract);
     try std.testing.expectEqual(contract.StorageKernelReconcileState.busy, (try reconcileStorageKernelOwnerDb(alloc, &db, "rows", schema_json, "{}", null, false, null, null, .{}, null)).state);
-    const transition: @import("db/relational_integrity_generation_admission.zig").Transition = .{
+    const transition: @import("db/relational/integrity/generation_admission.zig").Transition = .{
         .child_table_id = 17,
         .child_table_name = "rows",
         .constraint_name = "fk",

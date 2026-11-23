@@ -78,7 +78,7 @@ pub const Clock = struct {
     transaction_micros: i64,
     statement_micros: i64,
     pub fn validate(self: Clock) !void {
-        const Timestamp = @import("temporal_value.zig").Timestamp;
+        const Timestamp = @import("temporal/value.zig").Timestamp;
         const transaction = try Timestamp.init(self.transaction_micros);
         const statement = try Timestamp.init(self.statement_micros);
         if (transaction.infinity() != 0 or statement.infinity() != 0) return error.InvalidTransactionClock;
@@ -102,7 +102,7 @@ pub const Absence = struct {
     pub fn validate(self: Absence) !void {
         if (self.metadata_group_id == 0 or self.table_id == 0 or std.mem.allEqual(u8, &self.incarnation, 0) or std.mem.allEqual(u8, &self.schema_digest, 0)) return error.InvalidSqlTriggerManifest;
         if (!self.schema_present) {
-            const empty = @import("../storage/db/relational_schema_owner_contract.zig").hash("");
+            const empty = @import("../storage/db/relational/schema_change/schema_owner_contract.zig").hash("");
             if (self.schema_version != 0 or !std.mem.eql(u8, &self.schema_digest, &empty)) return error.InvalidSqlTriggerManifest;
         }
     }
@@ -122,7 +122,7 @@ pub const Absence = struct {
     }
     pub fn requireNoSchema(self: Absence) !void {
         try self.validate();
-        const empty = @import("../storage/db/relational_schema_owner_contract.zig").hash("");
+        const empty = @import("../storage/db/relational/schema_change/schema_owner_contract.zig").hash("");
         if (self.schema_present or self.schema_version != 0 or !std.mem.eql(u8, &self.schema_digest, &empty)) return error.CatalogGenerationChanged;
     }
     pub fn requireView(self: Absence, view: anytype) !void {

@@ -210,7 +210,7 @@ test "hosted CTE MERGE retries only proven precommit read unavailability" {
     try std.testing.expect(!pgwirePrecommitReadUnavailable("SERROR\x00C40003\x00Mwrite outcome unknown\x00", 1, 0, 0));
 }
 fn runHostedPgwirePreparedOnce(alloc: std.mem.Allocator, io: std.Io, api: *http_server.ApiHttpServer, original: []const u8, execute: []const u8, select: []const u8, completion_tag: []const u8, expected_row: []const []const u8) !enum { committed, retry_read, committed_read_unavailable } {
-    var pg_adapter: @import("sql_pgwire.zig").Adapter = .{ .server = api };
+    var pg_adapter: @import("sql/transport/pgwire.zig").Adapter = .{ .server = api };
     var input = std.Io.Writer.Allocating.init(alloc);
     defer input.deinit();
     try pgwirePreparedInput(alloc, &input.writer, original, execute, select);
@@ -273,7 +273,7 @@ fn awaitHostedReadBack(alloc: std.mem.Allocator, io: std.Io, transport: http.Req
     }
 }
 fn runHostedPgwireRecursiveReadOnce(alloc: std.mem.Allocator, io: std.Io, api: *http_server.ApiHttpServer, original: []const u8) !enum { complete, retry_read } {
-    var pg_adapter: @import("sql_pgwire.zig").Adapter = .{ .server = api };
+    var pg_adapter: @import("sql/transport/pgwire.zig").Adapter = .{ .server = api };
     var input = std.Io.Writer.Allocating.init(alloc);
     defer input.deinit();
     try pgwirePreparedInput(alloc, &input.writer, original, "EXECUTE recursive_usage_read_plan", null);

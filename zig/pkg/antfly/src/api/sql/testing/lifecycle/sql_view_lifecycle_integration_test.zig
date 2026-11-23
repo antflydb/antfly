@@ -119,7 +119,7 @@ const Campaign = struct {
         try command(ctx, "ALTER VIEW durable_view RENAME TO renamed_view");
         try command(ctx, "CREATE VIEW durable_view AS SELECT 99 AS id");
         try rows(ctx, "SELECT id FROM nested_view", "id", &.{2});
-        try @import("../../../sql_view_security_campaign.zig").beforeRestart(ctx);
+        try @import("../../execution/view_security_campaign.zig").beforeRestart(ctx);
     }
 
     pub fn afterRestart(_: *@This(), ctx: *fixture.Context) !void {
@@ -127,7 +127,7 @@ const Campaign = struct {
         try rows(ctx, "SELECT id FROM nested_view", "id", &.{2});
         try rows(ctx, "SELECT id FROM renamed_view", "id", &.{2});
         try rows(ctx, "SELECT id FROM durable_view", "id", &.{99});
-        try @import("../../../sql_view_security_campaign.zig").afterRestart(ctx);
+        try @import("../../execution/view_security_campaign.zig").afterRestart(ctx);
         try command(ctx, "DROP VIEW renamed_view CASCADE");
         try rejected(ctx, "SELECT id FROM nested_view", "42P01");
         try rows(ctx, "SELECT id FROM durable_view", "id", &.{99});

@@ -16,8 +16,8 @@
 //! Source-compatible request and ranked-batch values. No physical Reader state.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const tuples = @import("db/relational_index_keys.zig");
-const predicates = @import("db/relational_predicate.zig");
+const tuples = @import("db/relational/indexes/keys.zig");
+const predicates = @import("db/relational/indexes/predicate.zig");
 const codec = @import("db/algebraic/relational_row_codec.zig");
 pub const ExpressionKeyIdentity = @import("relational_index.zig").ExpressionKeyIdentity;
 
@@ -111,9 +111,9 @@ pub const ForeignKeyReplayBoundary = struct {
 
 /// A bounded replay assertion, never proof of coverage by itself. The reader
 /// independently visits the prefix and compares every field before advancing.
-pub const NullabilityReplayBoundary = @import("db/relational_schema_owner_contract.zig").NullabilityReplayBoundary;
+pub const NullabilityReplayBoundary = @import("db/relational/schema_change/schema_owner_contract.zig").NullabilityReplayBoundary;
 
-pub const nullability = @import("db/relational_nullability.zig");
+pub const nullability = @import("db/relational/schema_change/nullability.zig");
 pub const foreign_validation = @import("db/foreign_key_validation.zig");
 pub const domain_row = @import("../schema/domain_row.zig");
 pub const domain_handoff = @import("../schema/domain_handoff.zig");

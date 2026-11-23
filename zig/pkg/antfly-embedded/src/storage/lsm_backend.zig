@@ -2361,13 +2361,19 @@ pub const Backend = struct {
     pub fn pinNativeCheckpoint(self: *Backend) !NativeCheckpoint {
         const root_dir = self.root_dir orelse return error.Unsupported;
         const storage = self.storage orelse return error.Unsupported;
-        if (self.options.backend.read_only) return error.ReadOnly;
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
 
-        try self.flushCheckpointCutLocked();
-        if (self.manifest_dirty or self.obsolete_manifest_dirty or self.manifest_backing == null) {
-            try self.writeManifestSnapshotLocked(root_dir, self.writeStatsNowNs());
+        if (self.options.backend.read_only) {
+            // An installed immutable checkpoint has no journal suffix. A
+            // read-only recovery that replayed writes cannot export its run
+            // set alone without silently losing the recovered memtables.
+            if (self.mutable.entryCount() != 0 or self.activeImmutableMemtableCount() != 0) return error.ReadOnly;
+        } else {
+            try self.flushCheckpointCutLocked();
+            if (self.manifest_dirty or self.obsolete_manifest_dirty or self.manifest_backing == null) {
+                try self.writeManifestSnapshotLocked(root_dir, self.writeStatsNowNs());
+            }
         }
         // Export only the pinned generation, not a live edit stream or its
         // obsolete-file history. Restores need no journal suffix or old SSTs.

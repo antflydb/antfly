@@ -94,7 +94,7 @@ pub const Coordinator = struct {
         const decision: ledger.Decision = .{ .lookup = .fromHead(head), .revision = head.revision };
         const command: ledger.Command = switch (head.phase) {
             .validated => .{ .install = decision },
-            .installed => .{ .publish = decision },
+            .installed => if (head.initial_partition == null) .{ .publish = decision } else return page.value.next != null,
             else => return page.value.next != null,
         };
         const next = if (command == .install) try head.decideInstall(head.revision) else try head.publish(head.revision);

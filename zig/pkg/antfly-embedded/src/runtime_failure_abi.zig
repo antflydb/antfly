@@ -1045,6 +1045,12 @@ pub const Status = enum(u32) {
     unknown_shape_reference = 1088,
     unsupported_manifest_api_version = 1089,
     unsupported_package_kind = 1090,
+    sql_invalid_parameter_value = 1091,
+    sql_wrong_object_type = 1092,
+    sql_ambiguous_function = 1093,
+    sql_undefined_procedure = 1094,
+    catalog_source_untracked = 1095,
+    schema_reader_upgrade_required = 1096,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

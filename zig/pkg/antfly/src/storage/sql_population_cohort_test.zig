@@ -21,7 +21,7 @@ const staging = local.storage_db_restore_staging_contract;
 const catalog = local.sql_catalog;
 const operation = local.api_operation;
 const owner = @import("restore_owner.zig");
-const delivery = @import("../api/sql_population_delivery.zig");
+const delivery = @import("../api/sql/execution/population_delivery.zig");
 
 const Backend = struct {
     fn resolve(_: *anyopaque, _: std.mem.Allocator, _: local.sql_ast.Name, _: catalog.Action) !catalog.Table {

@@ -177,6 +177,9 @@ pub const Guard = struct {
 pub fn readLease(a: A, io: std.Io, db_path: []const u8, id: []const u8, cancellation: Cancellation) !Guard {
     const path = try std.fmt.allocPrint(a, "{s}.query-pins/{s}.lease", .{ db_path, id });
     defer a.free(path);
+    return readLeasePath(io, path, cancellation);
+}
+fn readLeasePath(io: std.Io, path: []const u8, cancellation: Cancellation) !Guard {
     const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false });
     errdefer file.close(io);
     while (!try file.tryLock(io, .shared)) {
@@ -198,9 +201,17 @@ const ReadLeaseOwner = struct {
 };
 pub fn readLeaseOwned(a: A, io: std.Io, db_path: []const u8, id: []const u8, cancellation: Cancellation) !@import("native_query_cut_contract.zig").ReadLease {
     var guard = try readLease(a, io, db_path, id, cancellation);
+    return ownReadLease(a, &guard);
+}
+/// Shared reader exclusion for a durable generation outside query-cache GC.
+pub fn readLeaseAtPathOwned(a: A, io: std.Io, path: []const u8, cancellation: Cancellation) !@import("native_query_cut_contract.zig").ReadLease {
+    var guard = try readLeasePath(io, path, cancellation);
+    return ownReadLease(a, &guard);
+}
+fn ownReadLease(a: A, guard: *Guard) !@import("native_query_cut_contract.zig").ReadLease {
     errdefer guard.deinit();
     const owner = try a.create(ReadLeaseOwner);
-    owner.* = .{ .allocator = a, .guard = guard };
+    owner.* = .{ .allocator = a, .guard = guard.* };
     return .{ .context = owner, .release = ReadLeaseOwner.release };
 }
 

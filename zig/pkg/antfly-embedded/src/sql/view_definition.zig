@@ -40,10 +40,10 @@ pub const SourceKind = enum(u8) { table = 1, view = 2 };
 pub const Output = struct {
     name: []const u8,
     type: ast.ColumnType,
-    element_type: ?@import("array_value.zig").ElementType = null,
+    element_type: ?@import("array/value.zig").ElementType = null,
     numeric_modifier: ?scalar.NumericModifier = null,
     /// null preserves the historical timestamptz descriptor and its digest.
-    temporal_kind: ?@import("temporal_value.zig").Kind = null,
+    temporal_kind: ?@import("temporal/value.zig").Kind = null,
 
     pub fn asColumn(self: Output) catalog.Column {
         return .{ .name = self.name, .path = self.name, .type = self.type, .element_type = self.element_type, .numeric_modifier = self.numeric_modifier, .temporal_kind = self.temporal_kind };
@@ -82,6 +82,18 @@ pub const Source = struct {
     schema_version: u32,
     schema_digest: [32]u8,
     columns: []const ColumnDependency = &.{},
+    required_indexes: []const catalog.view_index_requirements.Requirement = &.{},
+
+    pub fn jsonStringify(self: Source, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(Source).@"struct".field_names) |field| {
+            if (!std.mem.eql(u8, field, "required_indexes") or self.required_indexes.len != 0) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
 };
 pub const Definition = struct {
     format: u8,
@@ -95,6 +107,7 @@ pub const Definition = struct {
     sources: []const Source,
 
     pub fn requiredFormat(self: Definition) u8 {
+        for (self.sources) |source| if (source.required_indexes.len != 0) return 3;
         for (self.columns) |column| if (column.temporal_kind != null) return 2;
         return 1;
     }
@@ -180,6 +193,9 @@ fn cloneSource(a: A, source: Source) !Source {
     const columns = try a.dupe(ColumnDependency, source.columns);
     for (columns) |*column| column.name = try a.dupe(u8, column.name);
     result.columns = columns;
+    const requirements = try a.dupe(catalog.view_index_requirements.Requirement, source.required_indexes);
+    for (requirements) |*requirement| requirement.name = try a.dupe(u8, requirement.name);
+    result.required_indexes = requirements;
     return result;
 }
 fn lessSource(_: void, left: Source, right: Source) bool {
@@ -225,7 +241,7 @@ const Preparation = struct {
                 !std.mem.eql(u8, prior.namespace, scope.namespace) or
                 !std.mem.eql(u8, prior.name, scope.name)) return error.InvalidSqlBackendResponse;
         };
-        try self.sources.append(a, .{ .kind = resolved.kind, .reference = try cloneName(a, name), .database = try a.dupe(u8, scope.database), .namespace = try a.dupe(u8, scope.namespace), .name = try a.dupe(u8, scope.name), .physical_name = try a.dupe(u8, table.physical_name), .table_id = table.id, .schema_version = table.schema_version, .schema_digest = resolved.schema_digest });
+        try self.sources.append(a, .{ .kind = resolved.kind, .reference = try cloneName(a, name), .database = try a.dupe(u8, scope.database), .namespace = try a.dupe(u8, scope.namespace), .name = try a.dupe(u8, scope.name), .physical_name = try a.dupe(u8, table.physical_name), .table_id = table.id, .schema_version = table.schema_version, .schema_digest = resolved.schema_digest, .required_indexes = table.required_indexes });
         // Physical table IDs and logical view IDs occupy different durable
         // domains. Use private bind-local IDs, never a high-bit reservation or
         // a fabricated routing identity, for semantic dependency collection.
@@ -355,7 +371,9 @@ fn prepareValue(scratch_backing: A, output: A, resolver: Resolver, query: []cons
         temporal_domains = true;
         break;
     };
-    return .{ .format = if (temporal_domains) 2 else 1, .query = try output.dupe(u8, query), .owner = owner, .security = options.security, .security_barrier = options.security_barrier, .catalog_revision = preparation.revision, .setting_epoch = if (options.settings) |settings| settings.epoch else null, .columns = columns, .sources = sources };
+    return .{ .format = for (sources) |source| {
+        if (source.required_indexes.len != 0) break 3;
+    } else if (temporal_domains) 2 else 1, .query = try output.dupe(u8, query), .owner = owner, .security = options.security, .security_barrier = options.security_barrier, .catalog_revision = preparation.revision, .setting_epoch = if (options.settings) |settings| settings.epoch else null, .columns = columns, .sources = sources };
 }
 
 const TestResolver = struct {
@@ -646,7 +664,7 @@ test "SQL view temporal domains preserve exact output identity and legacy canoni
             var owned = try prepare(fault, resolver.resolver(), "SELECT id,DATE '2000-01-01' AS d,TIME '01:02:03' AS t,TIMETZ '01:02:03+02' AS z,TIMESTAMP '2000-01-01' AS s,TIMESTAMPTZ '2000-01-01' AS u,INTERVAL '1 day' AS i FROM things", .{ .owner = .auth_disabled });
             defer owned.deinit();
             try std.testing.expectEqual(@as(u8, 2), owned.value.format);
-            const kinds = [_]?@import("temporal_value.zig").Kind{ .date, .time, .time_tz, .timestamp, null, .interval };
+            const kinds = [_]?@import("temporal/value.zig").Kind{ .date, .time, .time_tz, .timestamp, null, .interval };
             for (owned.value.columns[1..], kinds) |column, kind| {
                 try std.testing.expectEqual(ast.ColumnType.datetime, column.type);
                 try std.testing.expectEqual(kind, column.temporal_kind);

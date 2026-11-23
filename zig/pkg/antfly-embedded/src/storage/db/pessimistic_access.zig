@@ -26,7 +26,7 @@ const store_mod = @import("../docstore.zig");
 const transactions = @import("../transactions.zig");
 const schemas = @import("schema_registry.zig");
 const rows = @import("algebraic/relational_row_codec.zig");
-const tuples = @import("relational_index_keys.zig");
+const tuples = @import("relational/indexes/keys.zig");
 const native = @import("../relational_index.zig");
 const A = std.mem.Allocator;
 
@@ -139,7 +139,7 @@ pub const Guard = struct {
         if (current == null or current.?.storageMode() != .relational) return self.row(key_value, .no_key_update);
         try self.preparePlans();
         if (self.key_plans.items.len == 0) return self.row(key_value, .no_key_update);
-        const store_key = try @import("relational_store.zig").keyAlloc(self.a, key_value);
+        const store_key = try @import("relational/rows/store.zig").keyAlloc(self.a, key_value);
         defer self.a.free(store_key);
         const previous = self.read.?.get(store_key) catch |err| switch (err) {
             error.NotFound => return self.row(key_value, .update),

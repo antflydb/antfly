@@ -196,7 +196,7 @@ const AdvisoryCampaign = struct {
         defer output.deinit();
         var reader: std.Io.Reader = .fixed(input.written());
         const api = if (ctx.data.http_server) |*value| value else return error.MissingDataApi;
-        var adapter: @import("../../../sql_pgwire.zig").Adapter = .{ .server = api };
+        var adapter: @import("../../transport/pgwire.zig").Adapter = .{ .server = api };
         var session: protocol.Session = .{ .alloc = ctx.alloc, .io = ctx.io, .source = adapter.backend(), .reader = &reader, .writer = &output.writer, .limits = .{ .statement_timeout_ms = 15_000 } };
         defer session.deinit();
         try session.run();

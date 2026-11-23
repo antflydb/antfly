@@ -49,43 +49,7 @@ pub const sha256_artifact_id_prefix = "sha256:";
 /// may reuse pages belonging to older attempts. Attempt identities must never
 /// be reused after loss of publication authority. Scoped object names are also
 /// the durable inventory: late uploads remain discoverable after a failed build.
-pub const UploadScope = struct {
-    domain: [32]u8,
-    attempt: [16]u8,
-
-    pub fn validate(self: UploadScope) !void {
-        if (std.mem.allEqual(u8, &self.domain, 0) or self.fencingToken() == 0 or std.mem.allEqual(u8, self.attempt[8..16], 0))
-            return error.InvalidArtifactUploadScope;
-    }
-
-    pub fn fencingToken(self: UploadScope) u64 {
-        return std.mem.readInt(u64, self.attempt[0..8], .big);
-    }
-
-    pub fn forPublication(domain: [32]u8, token: u64, io: std.Io) !UploadScope {
-        var scope = UploadScope{ .domain = domain, .attempt = undefined };
-        std.mem.writeInt(u64, scope.attempt[0..8], token, .big);
-        while (true) {
-            io.random(scope.attempt[8..16]);
-            if (!std.mem.allEqual(u8, scope.attempt[8..16], 0)) break;
-        }
-        try scope.validate();
-        return scope;
-    }
-
-    pub fn artifactId(self: UploadScope, checksum: []const u8) ![175]u8 {
-        try self.validate();
-        try validateSha256Checksum(checksum);
-        var id: [175]u8 = undefined;
-        @memcpy(id[0..7], "sha256:");
-        @memcpy(id[7..71], checksum);
-        @memcpy(id[71..78], ":graph:");
-        @memcpy(id[78..142], &std.fmt.bytesToHex(&self.domain, .lower));
-        id[142] = ':';
-        @memcpy(id[143..175], &std.fmt.bytesToHex(&self.attempt, .lower));
-        return id;
-    }
-};
+pub const UploadScope = @import("antfly_local_sources").storage_artifact_identity.UploadScope;
 
 pub fn uploadScopeFromArtifactId(id: []const u8) !?UploadScope {
     if ((id.len != 71 and id.len != 175) or !std.mem.startsWith(u8, id, "sha256:")) return error.InvalidArtifactId;

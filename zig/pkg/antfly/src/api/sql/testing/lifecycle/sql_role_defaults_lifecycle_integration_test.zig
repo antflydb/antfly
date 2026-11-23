@@ -89,7 +89,7 @@ fn expectValue(ctx: *fixture.Context, headers: []const transport.RequestHeader, 
         // disabling that budget or requiring a wall-clock timing accident.
         const api = ctx.metadata.server.owned_public_http_server orelse return error.MissingCatalogApi;
         const store = api.txn_sessions.durable orelse return error.MissingSqlStore;
-        var connection = try @import("../../../sql_connections.zig").load(store, ctx.alloc, id.*, "app_writer", api.localSessionNodeId(), @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
+        var connection = try @import("../../session/connections.zig").load(store, ctx.alloc, id.*, "app_writer", api.localSessionNodeId(), @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
         defer connection.deinit();
         try std.testing.expectEqual(@as(u32, if (std.mem.eql(u8, expected.?, "0")) 0 else 1), connection.value.statement_timeout_ms orelse 0);
         return;
@@ -462,7 +462,7 @@ const DatabaseCampaign = struct {
         try command(ctx, "ALTER DATABASE tenant_ops SET statement_timeout TO '1000ms'", null);
         const timed = try openDatabase(ctx, &headers, "tenant_ops");
         const api = ctx.metadata.server.owned_public_http_server orelse return error.MissingCatalogApi;
-        var timed_record = try @import("../../../sql_connections.zig").load(api.txn_sessions.durable.?, ctx.alloc, timed, "app_writer", api.localSessionNodeId(), @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
+        var timed_record = try @import("../../session/connections.zig").load(api.txn_sessions.durable.?, ctx.alloc, timed, "app_writer", api.localSessionNodeId(), @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
         defer timed_record.deinit();
         try std.testing.expectEqual(@as(?u32, 1000), timed_record.value.statement_timeout_ms);
         try close(ctx, &headers, &timed);

@@ -19,7 +19,9 @@
 const std = @import("std");
 
 pub const minimum_semantic_version: u32 = 11;
-pub const current_semantic_version: u32 = 43;
+pub const sql_view_index_semantic_version: u32 = 44;
+pub const sql_partition_semantic_version: u32 = 45;
+pub const current_semantic_version: u32 = sql_partition_semantic_version;
 pub const current_encoding_version: u32 = 42;
 
 pub const ReaderCapabilities = struct {

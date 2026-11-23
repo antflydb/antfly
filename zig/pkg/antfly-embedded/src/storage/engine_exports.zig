@@ -282,7 +282,7 @@ fn snapshotNativeWithCancellation(self: *DB, id: []const u8, cancellation: types
     return .{ .value = self.snapshotNativeWithCancellation(id, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn snapshotRelationalCohort(self: *DB, id: []const u8, expected: @import("db/relational_integrity_topology.zig").Fence, cancellation: types.CancellationToken) engine.Outcome(u64) {
+fn snapshotRelationalCohort(self: *DB, id: []const u8, expected: @import("db/relational/integrity/topology.zig").Fence, cancellation: types.CancellationToken) engine.Outcome(u64) {
     return .{ .value = self.snapshotRelationalCohort(id, expected, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
@@ -392,7 +392,7 @@ fn constraintValidationStatus(self: *DB) engine.Outcome(DB.ConstraintValidationS
     return .{ .value = self.constraintValidationStatus() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn validateConstraintsStep(self: *DB, budget: @import("db/relational_constraint_jobs.zig").Budget) engine.Outcome(bool) {
+fn validateConstraintsStep(self: *DB, budget: @import("db/relational/integrity/constraint_jobs.zig").Budget) engine.Outcome(bool) {
     return .{ .value = self.validateConstraintsStep(budget) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
@@ -498,7 +498,7 @@ fn trySnapshotDenseSearch(self: *DB, alloc: std.mem.Allocator, req: types.Search
     return .{ .value = value };
 }
 
-fn snapshotInternal(self: *DB, id: []const u8, include_generated: bool, cancellation: types.CancellationToken, maintenance_deadline_ns: ?u64, expected_topology_fence: ?@import("db/relational_integrity_topology.zig").Fence, backup_seal_only: bool, query_cut: ?@import("db/native_query_cut_contract.zig").Request) engine.Outcome(u64) {
+fn snapshotInternal(self: *DB, id: []const u8, include_generated: bool, cancellation: types.CancellationToken, maintenance_deadline_ns: ?u64, expected_topology_fence: ?@import("db/relational/integrity/topology.zig").Fence, backup_seal_only: bool, query_cut: ?@import("db/native_query_cut_contract.zig").Request) engine.Outcome(u64) {
     return .{ .value = self.snapshotInternal(id, include_generated, cancellation, maintenance_deadline_ns, expected_topology_fence, backup_seal_only, query_cut) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
@@ -564,6 +564,17 @@ fn captureQueryCut(self: *DB, request: @import("db/native_query_cut_contract.zig
 
 fn openQueryCut(self: *DB, request: @import("db/native_query_cut_contract.zig").Request, cancellation: types.CancellationToken) engine.Outcome(DB) {
     return .{ .value = self.openQueryCut(request, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn captureFrozenImage(self: *DB, binding: @import("db/relational/rows/frozen_image.zig").Binding, cancellation: types.CancellationToken, deadline_ns: u64) engine.Outcome(@import("db/relational/rows/frozen_image.zig").Handle) {
+    return .{ .value = self.captureFrozenImage(binding, cancellation, deadline_ns) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn openFrozenImage(self: *DB, handle: @import("db/relational/rows/frozen_image.zig").Handle, cancellation: types.CancellationToken) engine.Outcome(DB) {
+    return .{ .value = self.openFrozenImage(handle, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn openPublishedFrozenImage(self: *DB, binding: @import("db/relational/rows/frozen_image.zig").Binding, cancellation: types.CancellationToken) engine.Outcome(DB) {
+    return .{ .value = self.openPublishedFrozenImage(binding, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn runSourcePinCleanupStep(self: *DB) engine.Outcome(bool) {
@@ -983,11 +994,11 @@ fn verifyTransferablePrimarySnapshotWithOrigin(self: *DB, namespace: [24]u8, rec
     return .{ .value = self.verifyTransferablePrimarySnapshotWithOrigin(namespace, receipt, origin) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn prepareSchemaOwnerProposalBytes(self: *DB, output: Allocator, command_descriptor: @import("db/relational_schema_owner_contract.zig").CommandDescriptor, budget: @import("read_session_types").types.values.Budget, context: @import("../api/operation.zig").RequestContext) engine.Outcome(?[]u8) {
+fn prepareSchemaOwnerProposalBytes(self: *DB, output: Allocator, command_descriptor: @import("db/relational/schema_change/schema_owner_contract.zig").CommandDescriptor, budget: @import("read_session_types").types.values.Budget, context: @import("../api/operation.zig").RequestContext) engine.Outcome(?[]u8) {
     return .{ .value = self.prepareSchemaOwnerProposalBytes(output, command_descriptor, budget, context) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn executeNativeSchemaOwnerControl(self: *DB, command: @import("db/relational_schema_owner_contract.zig").Command, budget: @import("read_session_types").types.values.Budget, context: @import("../api/operation.zig").RequestContext) engine.Outcome(@import("db/relational_schema_owner_contract.zig").NativeOutcome) {
+fn executeNativeSchemaOwnerControl(self: *DB, command: @import("db/relational/schema_change/schema_owner_contract.zig").Command, budget: @import("read_session_types").types.values.Budget, context: @import("../api/operation.zig").RequestContext) engine.Outcome(@import("db/relational/schema_change/schema_owner_contract.zig").NativeOutcome) {
     return .{ .value = self.executeNativeSchemaOwnerControl(command, budget, context) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
@@ -999,15 +1010,67 @@ fn sqlMaintenanceJson(self: *DB, alloc: Allocator, bytes: []const u8) engine.Out
     return .{ .value = self.sqlMaintenanceJson(alloc, bytes) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+const PublicationCapture = @import("../system_catalog/logical_replication_capture.zig");
+const PublicationRef = @import("../system_catalog/logical_replication_publisher.zig").CaptureRef;
+const PublicationCapacity = @import("../system_catalog/logical_replication_capacity.zig");
+
+const PublisherCollection = @import("../system_catalog/logical_replication_publisher.zig");
+fn readPublicationOutboxPage(self: *DB, alloc: Allocator, request: @import("db/logical_replication_outbox_contract.zig").PageRequest) engine.Outcome([]u8) {
+    return .{ .value = self.readPublicationOutboxPage(alloc, request) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn observePublicationCollection(self: *DB, permission: PublisherCollection.GcPermission) engine.Outcome(?PublisherCollection.GcObservation) {
+    return .{ .value = self.observePublicationCollection(permission) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn applyPublicationCollection(self: *DB, permission: PublisherCollection.GcPermission, ordered: @import("db/db.zig").OrderedApplyReceipt, context: @import("../api/operation.zig").RequestContext) engine.Outcome(?PublisherCollection.GcObservation) {
+    return .{ .value = self.applyPublicationCollection(permission, ordered, context) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn observeReplicationSource(self: *DB, request: @import("db/replication_source_apply_store.zig").ObservationRequest) engine.Outcome(?@import("db/replication_source_apply_store.zig").Observation) {
+    return .{ .value = self.observeReplicationSource(request) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn observePublicationTerminal(self: *DB, demand: PublicationCapacity.Observation) engine.Outcome(?PublicationCapacity.TerminalObservation) {
+    return .{ .value = self.observePublicationTerminal(demand) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn observePublicationOutbox(self: *DB, demand: PublicationCapacity.Observation) engine.Outcome(?PublicationRef) {
+    return .{ .value = self.observePublicationOutbox(demand) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn observePublicationCapacity(self: *DB, request: PublicationCapacity.Request, context: @import("../api/operation.zig").RequestContext) engine.Outcome(PublicationCapacity.Observation) {
+    return .{ .value = self.observePublicationCapacity(request, context) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn observePublicationCaptureControl(self: *DB, control: PublicationCapture.Control, context: @import("../api/operation.zig").RequestContext) engine.Outcome(?PublicationCapture.Receipt) {
+    return .{ .value = self.observePublicationCaptureControl(control, context) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn observePublicationCaptureOwner(self: *DB, request: PublicationCapture.ObservationRequest, context: @import("../api/operation.zig").RequestContext) engine.Outcome(PublicationCapture.OwnerObservation) {
+    return .{ .value = self.observePublicationCaptureOwner(request, context) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn observeNativePublicationCaptureOwner(self: *DB, request: PublicationCapture.ObservationRequest, context: @import("../api/operation.zig").RequestContext) engine.Outcome(PublicationCapture.OwnerObservation) {
+    return .{ .value = self.observeNativePublicationCaptureOwner(request, context) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn applyPublicationCaptureControl(self: *DB, control: PublicationCapture.Control, ordered: db.OrderedApplyReceipt, context: @import("../api/operation.zig").RequestContext) engine.Outcome(?PublicationCapture.Receipt) {
+    return .{ .value = self.applyPublicationCaptureControl(control, ordered, context) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn executeNativePublicationCaptureControl(self: *DB, control: PublicationCapture.Control, context: @import("../api/operation.zig").RequestContext) engine.Outcome(PublicationCapture.NativeOutcome) {
+    return .{ .value = self.executeNativePublicationCaptureControl(control, context) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn applyReplicatedSchemaOwnerControl(self: *DB, record: @import("db/replication_record.zig").RecordView) engine.Outcome(void) {
     return .{ .value = self.applyReplicatedSchemaOwnerControl(record) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn applyRaftSchemaOwnerCommand(self: *DB, command: @import("db/relational_schema_owner_contract.zig").Command, owner_group: u64, entry: db.OrderedApplyReceipt, context: @import("../api/operation.zig").RequestContext) engine.Outcome(void) {
+fn applyRaftSchemaOwnerCommand(self: *DB, command: @import("db/relational/schema_change/schema_owner_contract.zig").Command, owner_group: u64, entry: db.OrderedApplyReceipt, context: @import("../api/operation.zig").RequestContext) engine.Outcome(void) {
     return .{ .value = self.applyRaftSchemaOwnerCommand(command, owner_group, entry, context) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn stepSchemaOwnerRowAudit(self: *DB, owner_group: u64, binding: @import("db/relational_schema_owner_contract.zig").Binding, inputs: []const u8, budget: @import("read_session_types").types.values.Budget, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../api/operation.zig").RequestContext) engine.Outcome(@import("db/relational_schema_audit_checkpoint.zig").Result) {
+fn stepSchemaOwnerRowAudit(self: *DB, owner_group: u64, binding: @import("db/relational/schema_change/schema_owner_contract.zig").Binding, inputs: []const u8, budget: @import("read_session_types").types.values.Budget, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../api/operation.zig").RequestContext) engine.Outcome(@import("db/relational/schema_change/schema_audit_checkpoint.zig").Result) {
     return .{ .value = self.stepSchemaOwnerRowAudit(owner_group, binding, inputs, budget, signing_root_dir, signing_root_incarnation, context) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
@@ -1083,7 +1146,7 @@ fn drainSnapshotMaintenance(self: *DB, deadline_ns: u64) engine.Outcome(void) {
     return .{ .value = self.drainSnapshotMaintenance(deadline_ns) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn sealBackupCohort(self: *DB, id: []const u8, expected: @import("db/relational_integrity_topology.zig").Fence, cancellation: types.CancellationToken) engine.Outcome(@import("db/native_backup_seal.zig").Handle) {
+fn sealBackupCohort(self: *DB, id: []const u8, expected: @import("db/relational/integrity/topology.zig").Fence, cancellation: types.CancellationToken) engine.Outcome(@import("db/native_backup_seal.zig").Handle) {
     return .{ .value = self.sealBackupCohort(id, expected, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
@@ -1200,11 +1263,11 @@ fn relationalTopologyIdentity(self: *DB) engine.Outcome(DB.RelationalTopologyIde
     return .{ .value = self.relationalTopologyIdentity() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn relationalHandoffManifest(self: *DB, alloc: std.mem.Allocator, source: @import("db/relational_integrity_topology.zig").Fence, destination: @import("db/relational_integrity_topology.zig").Fence, lower: []const u8, upper: []const u8, primary_sequence: u64) engine.Outcome(@import("db/relational_integrity_handoff.zig").Manifest) {
+fn relationalHandoffManifest(self: *DB, alloc: std.mem.Allocator, source: @import("db/relational/integrity/topology.zig").Fence, destination: @import("db/relational/integrity/topology.zig").Fence, lower: []const u8, upper: []const u8, primary_sequence: u64) engine.Outcome(@import("db/relational/integrity/handoff.zig").Manifest) {
     return .{ .value = self.relationalHandoffManifest(alloc, source, destination, lower, upper, primary_sequence) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn relationalHandoffPage(self: *DB, alloc: std.mem.Allocator, manifest: @import("db/relational_integrity_handoff.zig").Manifest, progress: @import("db/relational_integrity_handoff.zig").Progress) engine.Outcome(@import("db/relational_integrity_handoff.zig").Page) {
+fn relationalHandoffPage(self: *DB, alloc: std.mem.Allocator, manifest: @import("db/relational/integrity/handoff.zig").Manifest, progress: @import("db/relational/integrity/handoff.zig").Progress) engine.Outcome(@import("db/relational/integrity/handoff.zig").Page) {
     return .{ .value = self.relationalHandoffPage(alloc, manifest, progress) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
@@ -1236,8 +1299,8 @@ fn markReplicatedTransactionParticipantResolvedAtOrderedReceipt(self: *DB, txn_i
     return .{ .value = self.markReplicatedTransactionParticipantResolvedAtOrderedReceipt(txn_id, participant, identity) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(self: *DB, txn_id: @import("transactions.zig").TxnId, participants: []const []const u8, identity: db.OrderedApplyReceipt) engine.Outcome(void) {
-    return .{ .value = self.markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(txn_id, participants, identity) catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(self: *DB, txn_id: @import("transactions.zig").TxnId, participants: []const []const u8, identity: db.OrderedApplyReceipt, completion: ?@import("../api/replication_source_apply.zig").AckCompletion) engine.Outcome(void) {
+    return .{ .value = self.markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(txn_id, participants, identity, completion) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn cleanupReplicatedTransactionAtOrderedReceipt(self: *DB, txn_id: @import("transactions.zig").TxnId, cutoff_timestamp: u64, retained_cutoff_timestamp: u64, identity: db.OrderedApplyReceipt) engine.Outcome(bool) {
@@ -1364,7 +1427,7 @@ fn readRestoreStagingBootstrap(self: *DB, alloc: std.mem.Allocator) engine.Outco
     return .{ .value = self.readRestoreStagingBootstrap(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn cancelColdInitialChildForRetirement(self: *DB, expected: @import("db/relational_initial_child_publication.zig").Record, cancel_revision: u64) engine.Outcome(void) {
+fn cancelColdInitialChildForRetirement(self: *DB, expected: @import("db/relational/integrity/initial_child_publication.zig").Record, cancel_revision: u64) engine.Outcome(void) {
     return .{ .value = self.cancelColdInitialChildForRetirement(expected, cancel_revision) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
@@ -1701,7 +1764,7 @@ fn validateRestoreStagingScope(self: *DB, alloc: std.mem.Allocator, scope: [32]u
     return .{ .value = self.validateRestoreStagingScope(alloc, scope) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn readInitialChildPublicationRecord(self: *DB) engine.Outcome(?@import("db/relational_initial_child_publication.zig").Record) {
+fn readInitialChildPublicationRecord(self: *DB) engine.Outcome(?@import("db/relational/integrity/initial_child_publication.zig").Record) {
     return .{ .value = self.readInitialChildPublicationRecord() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
@@ -1709,7 +1772,7 @@ fn prepareRestoreStagingPage(self: *DB, alloc: std.mem.Allocator, scope: @import
     return .{ .value = self.prepareRestoreStagingPage(alloc, scope, source, max_rows, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn prepareRewriteStagingPage(self: *DB, alloc: std.mem.Allocator, scope: @import("db/restore_staging.zig").Scope, source: *DB, max_rows: usize, cancellation: types.CancellationToken, program: *const @import("db/relational_rewrite_staging.zig").ProgramSet) engine.Outcome(@import("db/restore_staging.zig").PreparedPage) {
+fn prepareRewriteStagingPage(self: *DB, alloc: std.mem.Allocator, scope: @import("db/restore_staging.zig").Scope, source: *DB, max_rows: usize, cancellation: types.CancellationToken, program: *const @import("db/relational/schema_change/rewrite_staging.zig").ProgramSet) engine.Outcome(@import("db/restore_staging.zig").PreparedPage) {
     return .{ .value = self.prepareRewriteStagingPage(alloc, scope, source, max_rows, cancellation, program) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
@@ -1782,7 +1845,7 @@ fn resolveTransactionIntents(self: *DB, txn_id: @import("transactions.zig").TxnI
     return .{ .value = self.resolveTransactionIntents(txn_id, status, commit_version) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn applyRelationalTopologyControl(self: *DB, command: @import("db/relational_integrity_topology.zig").Command, ordered_receipt: ?db.OrderedApplyReceipt) engine.Outcome(void) {
+fn applyRelationalTopologyControl(self: *DB, command: @import("db/relational/integrity/topology.zig").Command, ordered_receipt: ?db.OrderedApplyReceipt) engine.Outcome(void) {
     return .{ .value = self.applyRelationalTopologyControl(command, ordered_receipt) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
@@ -1926,10 +1989,10 @@ fn portableDecoderStep(alloc: Allocator, io: native.IoBorrow, file: std.Io.File,
 fn portableDecoderBindRange(alloc: Allocator, store: *@import("docstore.zig").DocStore, range: types.ByteRange) engine.Outcome(void) {
     return .{ .value = @import("portable_decoder.zig").bindRange(alloc, store, range) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
-fn requireRewriteSourceManifest(self: *DB, alloc: Allocator, program: *const @import("db/relational_rewrite_program.zig").ProgramSet, cancellation: types.CancellationToken) engine.Outcome(void) {
+fn requireRewriteSourceManifest(self: *DB, alloc: Allocator, program: *const @import("db/relational/schema_change/rewrite_program.zig").ProgramSet, cancellation: types.CancellationToken) engine.Outcome(void) {
     return .{ .value = self.requireRewriteSourceManifest(alloc, program, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
-fn verifyColdInitialChildSeed(self: *DB, expected: @import("db/relational_initial_child_publication.zig").Bootstrap) engine.Outcome(void) {
+fn verifyColdInitialChildSeed(self: *DB, expected: @import("db/relational/integrity/initial_child_publication.zig").Bootstrap) engine.Outcome(void) {
     return .{ .value = self.verifyColdInitialChildSeed(expected) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 fn syncPrimaryStore(self: *DB) engine.Outcome(void) {
@@ -1984,7 +2047,7 @@ fn writeBackupStorageKernelOwnerDb(alloc: std.mem.Allocator, database: *@import(
     return .{ .value = @import("write.zig").backupStorageKernelOwnerDb(alloc, database, db_path, group_id, backup_root, backup_id, format) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn writeBackupStorageKernelOwnerDbWithControl(alloc: std.mem.Allocator, database: *@import("db/mod.zig").DB, db_path: []const u8, group_id: u64, backup_root: []const u8, backup_id: []const u8, format: @import("../api/backups.zig").BackupFormat, cohort: ?@import("db/relational_integrity_topology_contract.zig").Fence, sealed: ?@import("db/native_backup_seal_contract.zig").Handle, control: @import("../api/backups.zig").BackupOperationControl) engine.Outcome([]@import("../api/backups.zig").ShardSnapshot) {
+fn writeBackupStorageKernelOwnerDbWithControl(alloc: std.mem.Allocator, database: *@import("db/mod.zig").DB, db_path: []const u8, group_id: u64, backup_root: []const u8, backup_id: []const u8, format: @import("../api/backups.zig").BackupFormat, cohort: ?@import("db/relational/integrity/topology_contract.zig").Fence, sealed: ?@import("db/native_backup_seal_contract.zig").Handle, control: @import("../api/backups.zig").BackupOperationControl) engine.Outcome([]@import("../api/backups.zig").ShardSnapshot) {
     return .{ .value = @import("write.zig").backupStorageKernelOwnerDbWithControl(alloc, database, db_path, group_id, backup_root, backup_id, format, cohort, sealed, control) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 

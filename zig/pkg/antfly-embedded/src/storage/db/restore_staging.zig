@@ -22,8 +22,8 @@ const builtin = @import("builtin");
 const replication_ingress = @import("replication_ingress.zig");
 const std = @import("std");
 const identity = @import("doc_identity.zig");
-const activation = @import("relational_integrity_activation.zig");
-const catalog_mod = @import("relational_integrity_catalog.zig");
+const activation = @import("relational/integrity/activation.zig");
+const catalog_mod = @import("relational/integrity/catalog.zig");
 const Allocator = std.mem.Allocator;
 pub const key = @import("restore_staging_contract.zig").key;
 pub const bootstrap_key = @import("restore_staging_contract.zig").bootstrap_key;
@@ -76,7 +76,7 @@ test "restore empty generation proves pristine owner and rejects source import" 
             try std.testing.expectEqual(Phase.reserved, state.value.phase);
         }
         try target.core.store.putBatch(&.{}, &.{count_key});
-        const orphan = @import("relational_index_records.zig").forward_namespace ++ "orphan";
+        const orphan = @import("relational/indexes/records.zig").forward_namespace ++ "orphan";
         try target.core.store.putBatch(&.{.{ .key = orphan, .value = "" }}, &.{});
         try std.testing.expectError(error.RestoreStagingTargetNotEmpty, target.beginRestoreStaging(alloc, scope));
         try target.core.store.putBatch(&.{}, &.{orphan});
@@ -179,7 +179,7 @@ pub fn requireMutableScope(alloc: Allocator, txn: anytype, expected: ?Digest) !v
 }
 
 /// Internal PreparedRow import admission, consumed under the DB apply fence.
-pub const BatchAdmission = struct { expected: Digest, next: []const u8, scope: Digest, rewrite: bool = false, source_effects: u32 = 0, artifact_page: bool = false, projection_page: bool = false, source_generation_proof_page: bool = false, population: ?@import("relational_population_contract.zig").Delivery = null };
+pub const BatchAdmission = struct { expected: Digest, next: []const u8, scope: Digest, rewrite: bool = false, source_effects: u32 = 0, artifact_page: bool = false, projection_page: bool = false, source_generation_proof_page: bool = false, population: ?@import("relational/schema_change/population_contract.zig").Delivery = null };
 pub fn validateImport(alloc: Allocator, txn: anytype, admission: BatchAdmission, row_count: usize, delete_count: usize, original_writes: []const @import("types.zig").BatchWrite) !void {
     const raw = (try optional(txn)) orelse return error.RestoreStagingScopeChanged;
     if (!std.mem.eql(u8, &digest(raw), &admission.expected)) return error.RestoreStagingProgressChanged;
@@ -201,7 +201,7 @@ pub fn validateImport(alloc: Allocator, txn: anytype, admission: BatchAdmission,
     if (admission.population) |delivery| {
         if (admission.rewrite or admission.artifact_page or admission.projection_page or admission.source_generation_proof_page or
             admission.source_effects != 0 or row_count != original_writes.len) return error.InvalidRestoreStagingCommand;
-        try @import("relational_population_staging.zig").validate(before.value, after.value, delivery, original_writes, delete_count);
+        try @import("relational/schema_change/population_staging.zig").validate(before.value, after.value, delivery, original_writes, delete_count);
         return;
     }
     if (admission.rewrite != (before.value.scope.rewrite != null)) return error.InvalidRestoreStagingCommand;
@@ -290,7 +290,7 @@ pub fn initialCoverage(alloc: Allocator, txn: anytype, catalog: catalog_mod.Cata
     progress.cursor = "";
     progress.rows_scanned = 0;
     progress.failure = "";
-    progress.phase = @import("relational_integrity_activation_contract.zig").firstPhase(catalog);
+    progress.phase = @import("relational/integrity/activation_contract.zig").firstPhase(catalog);
     return try progress.encode(alloc);
 }
 

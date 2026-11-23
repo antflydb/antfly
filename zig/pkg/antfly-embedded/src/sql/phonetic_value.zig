@@ -16,7 +16,7 @@
 //! PostgreSQL fuzzystrmatch-compatible ASCII Soundex. UTF-8 bytes outside the
 //! ASCII alphabet are separators, not transliterations or locale-dependent text.
 const std = @import("std");
-const Context = @import("numeric_value.zig").Context;
+const Context = @import("numeric/value.zig").Context;
 pub const Code = struct {
     bytes: [4]u8 = .{ '0', '0', '0', '0' },
     len: u3 = 0,

@@ -16,8 +16,8 @@
 //! Notifications are owned SQL intents, never a request-side delivery effect.
 const std = @import("std");
 const local = @import("antfly_local_sources");
-const execution = @import("../../sql_execution.zig");
-const producer = @import("../../sql_command_producer.zig");
+const execution = @import("../execution/execution.zig");
+const producer = @import("../session/command_producer.zig");
 const authority = @import("../../../system_catalog/lock_authority.zig");
 /// A native PID lease is shared across API nodes. Wire backends reserve their
 /// advertised identity at startup; HTTP identities can retry collisions before
@@ -35,7 +35,7 @@ pub fn bindIdentity(root: *execution.Adapter, a: std.mem.Allocator) !?i32 {
     defer cut.deinit();
     if (!cut.value.notification_capable) return null;
     if (cut.value.group != frame.fence.group or !std.mem.eql(u8, &cut.value.incarnation, &frame.fence.backend.incarnation) or cut.value.standalone != frame.fence.standalone) return error.CatalogGenerationChanged;
-    var connection = try @import("../../sql_connections.zig").loadWithCommand(frame.source, a, frame.connection, frame.principal, root.server.localSessionNodeId(), now, root.context.sql_command_fence);
+    var connection = try @import("../session/connections.zig").loadWithCommand(frame.source, a, frame.connection, frame.principal, root.server.localSessionNodeId(), now, root.context.sql_command_fence);
     defer connection.deinit();
     var pid: ?i32 = null;
     if (cut.value.notification_binding) |binding| {
@@ -56,7 +56,7 @@ pub fn bindIdentity(root: *execution.Adapter, a: std.mem.Allocator) !?i32 {
     }
     const accepted = pid orelse return error.SqlBackendPidInUse;
     if (root.backend_pid > 0 and accepted != root.backend_pid) return error.SqlBackendPidInUse;
-    _ = try @import("../../sql_connections.zig").mutateWithCommand(frame.source, .{ .notification_identity = .{ .id = frame.connection, .generation = connection.value.generation, .sender_pid = accepted } }, frame.principal, root.server.localSessionNodeId(), now, root.context.sql_command_fence);
+    _ = try @import("../session/connections.zig").mutateWithCommand(frame.source, .{ .notification_identity = .{ .id = frame.connection, .generation = connection.value.generation, .sender_pid = accepted } }, frame.principal, root.server.localSessionNodeId(), now, root.context.sql_command_fence);
     return accepted;
 }
 pub fn stage(raw: *anyopaque, a: std.mem.Allocator, command: local.sql_ast.notifications.Command) anyerror!void {
@@ -65,7 +65,7 @@ pub fn stage(raw: *anyopaque, a: std.mem.Allocator, command: local.sql_ast.notif
     if (try bindIdentity(root, a) == null) return error.TableTopologyProtocolUpgradeRequired;
     const frame = try root.lockingFrame();
     if (command == .unlisten or command == .unlisten_all) {
-        var connection = try @import("../../sql_connections.zig").loadWithCommand(frame.source, a, frame.connection, frame.principal, root.server.localSessionNodeId(), @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, root.context.sql_command_fence);
+        var connection = try @import("../session/connections.zig").loadWithCommand(frame.source, a, frame.connection, frame.principal, root.server.localSessionNodeId(), @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, root.context.sql_command_fence);
         defer connection.deinit();
         if (!connection.value.notification_listen_seen) {
             var has_registration = false;

@@ -97,7 +97,7 @@ pub const Cell = struct {
     sql_array_element_type: ?@import("../../../common/sql_builtin_type.zig").Type = null,
     /// Range identity is pinned by the immutable column layout; payload bytes
     /// never infer their subtype or become a JSON string by accident.
-    sql_range_kind: ?@import("../../../sql/range_value.zig").Kind = null,
+    sql_range_kind: ?@import("../../../sql/range/value.zig").Kind = null,
     /// Distinguishes an explicitly stored JSON null from an absent column.
     /// `value_type` retains the declared physical type; `value` is ignored.
     is_null: bool = false,
@@ -438,7 +438,7 @@ fn serializeOrdinalInternal(
             cell.is_dense_vector != (column.column_type == .dense_vector) or
             cell.is_numeric != (column.column_type == .numeric) or
             cell.sql_array_element_type != (if (column.column_type == .sql_array) column.sql_element_type else null) or
-            cell.sql_range_kind != @import("../../../sql/range_value.zig").kindFromType(column.column_type))
+            cell.sql_range_kind != @import("../../../sql/range/value.zig").kindFromType(column.column_type))
             return error.InvalidRelationalRow;
         var physical_column = column;
         if (cell.enum_record) |record| if (layout) |compiled| {
@@ -1006,11 +1006,11 @@ fn jsonValueFromCellAlloc(
         },
         .sql_array => blk: {
             const kind = column.sql_element_type orelse return error.InvalidRelationalRow;
-            const decoded = try @import("../../../sql/array_storage.zig").decodeLeaky(alloc, kind, cell.value.bytes_val, .{});
-            break :blk try @import("../../../sql/array_wire.zig").toJsonLeaky(alloc, decoded.value, .{});
+            const decoded = try @import("../../../sql/array/storage.zig").decodeLeaky(alloc, kind, cell.value.bytes_val, .{});
+            break :blk try @import("../../../sql/array/wire.zig").toJsonLeaky(alloc, decoded.value, .{});
         },
-        .numeric => try @import("../../../sql/numeric_storage.zig").jsonValueAlloc(alloc, cell.value.bytes_val),
-        .numrange, .daterange, .tsrange, .tstzrange => try @import("../../../sql/range_storage.zig").jsonValueAlloc(alloc, @import("../../../sql/range_value.zig").kindFromType(column.column_type).?, cell.value.bytes_val),
+        .numeric => try @import("../../../sql/numeric/storage.zig").jsonValueAlloc(alloc, cell.value.bytes_val),
+        .numrange, .daterange, .tsrange, .tstzrange => try @import("../../../sql/range/storage.zig").jsonValueAlloc(alloc, @import("../../../sql/range/value.zig").kindFromType(column.column_type).?, cell.value.bytes_val),
         .datetime => if (cell.value.u64_val <= std.math.maxInt(i64))
             .{ .integer = @intCast(cell.value.u64_val) }
         else
@@ -1631,21 +1631,21 @@ pub const OrdinalRowView = struct {
         return switch (column.column_type) {
             .enumeration => Datum.typedEnum(try (self.layout.enumView(ordinal) orelse return error.InvalidRelationalRow).bySymbol(std.math.cast(u32, cell.value.i64_val) orelse return error.InvalidSqlEnumSymbol)),
             .sql_array => blk: {
-                const array = try alloc.create(@import("../../../sql/array_value.zig").Value);
-                array.* = try @import("../../../sql/array_storage.zig").viewLeaky(alloc, column.sql_element_type orelse return error.InvalidRelationalRow, cell.value.bytes_val, .{});
+                const array = try alloc.create(@import("../../../sql/array/value.zig").Value);
+                array.* = try @import("../../../sql/array/storage.zig").viewLeaky(alloc, column.sql_element_type orelse return error.InvalidRelationalRow, cell.value.bytes_val, .{});
                 break :blk Datum.typedArray(array);
             },
             .numrange, .daterange, .tsrange, .tstzrange => blk: {
-                const ranges = @import("../../../sql/range_value.zig");
+                const ranges = @import("../../../sql/range/value.zig");
                 var context: ranges.Context = .{ .alloc = alloc };
                 const range = try alloc.create(ranges.Value);
                 range.* = try ranges.decodeCanonicalLeaky(&context, ranges.kindFromType(column.column_type).?, cell.value.bytes_val);
                 break :blk Datum.typedRange(range);
             },
             .numeric => blk: {
-                const numeric = @import("../../../sql/numeric_value.zig");
+                const numeric = @import("../../../sql/numeric/value.zig");
                 var context: numeric.Context = .{ .alloc = alloc };
-                var decoded = try @import("../../../sql/numeric_binary.zig").decodeCanonical(&context, cell.value.bytes_val);
+                var decoded = try @import("../../../sql/numeric/binary.zig").decodeCanonical(&context, cell.value.bytes_val);
                 errdefer decoded.deinit();
                 const number = try alloc.create(numeric.Value);
                 number.* = decoded.value;
@@ -2087,7 +2087,7 @@ fn ordinalCellFromPayloadWithValidation(
         .is_numeric = column.column_type == .numeric,
         .enum_record = record,
         .sql_array_element_type = if (column.column_type == .sql_array) column.sql_element_type else null,
-        .sql_range_kind = @import("../../../sql/range_value.zig").kindFromType(column.column_type),
+        .sql_range_kind = @import("../../../sql/range/value.zig").kindFromType(column.column_type),
         .is_null = is_null,
         .value = typed_value,
     };
@@ -2103,11 +2103,11 @@ fn ordinalCellFromPayloadWithValidation(
             // Constrained NUMERIC arrays already passed complete canonical
             // framing/limb admission before modifier traversal above.
             if (column.numeric_modifier == null)
-                _ = try @import("../../../sql/array_storage.zig").validateCanonical(std.heap.page_allocator, column.sql_element_type orelse return error.InvalidRelationalRow, cell.value.bytes_val, .{});
+                _ = try @import("../../../sql/array/storage.zig").validateCanonical(std.heap.page_allocator, column.sql_element_type orelse return error.InvalidRelationalRow, cell.value.bytes_val, .{});
         } else if (column.column_type == .numeric) {
             _ = try @import("../../../common/sql_numeric_layout.zig").View.open(cell.value.bytes_val, .{});
-        } else if (@import("../../../sql/range_value.zig").kindFromType(column.column_type)) |kind| {
-            try @import("../../../sql/range_storage.zig").validateCanonical(std.heap.page_allocator, kind, cell.value.bytes_val);
+        } else if (@import("../../../sql/range/value.zig").kindFromType(column.column_type)) |kind| {
+            try @import("../../../sql/range/storage.zig").validateCanonical(std.heap.page_allocator, kind, cell.value.bytes_val);
         } else if (column.column_type == .dense_vector) {
             try validateDenseVectorBytes(cell.value.bytes_val);
         } else if (column.is_json) {
@@ -2539,7 +2539,7 @@ test "relational index system NUMERIC modifiers reject unconstrained rows despit
     const table: runtime_schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_numeric_modifiers = true, .relational_columns = &.{constrained} };
     var layout = try PhysicalLayout.init(a, table);
     defer layout.deinit();
-    const storage = @import("../../../sql/numeric_storage.zig");
+    const storage = @import("../../../sql/numeric/storage.zig");
     for ([_][]const u8{ "1.234", "123.45", "0" }) |text| {
         const payload = try storage.encodeJsonAlloc(a, .{ .string = text });
         defer a.free(payload);
@@ -2553,9 +2553,9 @@ test "relational index system NUMERIC modifiers reject unconstrained rows despit
 
 test "relational index system NUMERIC modifiers validate array elements while retaining nulls and bounds" {
     const a = std.testing.allocator;
-    const arrays = @import("../../../sql/array_value.zig");
-    const numeric = @import("../../../sql/numeric_value.zig");
-    const storage = @import("../../../sql/array_storage.zig");
+    const arrays = @import("../../../sql/array/value.zig");
+    const numeric = @import("../../../sql/numeric/value.zig");
+    const storage = @import("../../../sql/array/storage.zig");
     const plain: runtime_schema.RelationalColumn = .{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = .numeric };
     var constrained = plain;
     constrained.numeric_modifier = .{ .precision = 4, .scale = 2 };
@@ -2645,8 +2645,8 @@ test "relational index system NUMERIC array restore rejects malformed coefficien
 
 test "relational index system SQL array trusted projection addresses maximum arrays without materializing cells" {
     const alloc = std.testing.allocator;
-    const arrays = @import("../../../sql/array_value.zig");
-    const storage = @import("../../../sql/array_storage.zig");
+    const arrays = @import("../../../sql/array/value.zig");
+    const storage = @import("../../../sql/array/storage.zig");
     const column: runtime_schema.RelationalColumn = .{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = .int64 };
     const table: runtime_schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{column} };
     var layout = try PhysicalLayout.init(alloc, table);
@@ -2750,7 +2750,7 @@ fn validateCell(alloc: Allocator, cell: Cell) !void {
             _ = try @import("../../../common/sql_numeric_layout.zig").View.open(cell.value.bytes_val, .{});
         } else if (cell.sql_array_element_type) |kind| {
             if (cell.is_json or cell.is_dense_vector) return error.InvalidRelationalRow;
-            _ = try @import("../../../sql/array_storage.zig").validateCanonical(alloc, kind, cell.value.bytes_val, .{});
+            _ = try @import("../../../sql/array/storage.zig").validateCanonical(alloc, kind, cell.value.bytes_val, .{});
         } else if (cell.is_dense_vector) {
             try validateDenseVectorBytes(cell.value.bytes_val);
         } else if (cell.is_json) {
@@ -2883,7 +2883,7 @@ pub fn writeCellValue(scratch: Allocator, writer: *std.Io.Writer, cell: Cell, mo
     }
     if (cell.sql_range_kind) |kind| {
         if (cell.value_type != .bytes_val) return error.InvalidRelationalRow;
-        const value = try @import("../../../sql/range_storage.zig").jsonValueAlloc(scratch, kind, cell.value.bytes_val);
+        const value = try @import("../../../sql/range/storage.zig").jsonValueAlloc(scratch, kind, cell.value.bytes_val);
         defer scratch.free(value.string);
         return std.json.Stringify.value(value, .{}, writer);
     }
@@ -2907,7 +2907,7 @@ pub fn writeCellValue(scratch: Allocator, writer: *std.Io.Writer, cell: Cell, mo
         },
         .bytes_val => {
             if (cell.is_numeric) {
-                var value = try @import("../../../sql/numeric_storage.zig").jsonValueAlloc(scratch, cell.value.bytes_val);
+                var value = try @import("../../../sql/numeric/storage.zig").jsonValueAlloc(scratch, cell.value.bytes_val);
                 defer @import("../types.zig").deinitJsonValue(scratch, &value);
                 try std.json.Stringify.value(value, .{}, writer);
             } else if (cell.sql_array_element_type) |kind| {
@@ -3573,8 +3573,8 @@ test "ordinal rows store dense vectors as canonical binary values" {
 
 test "public graph metric borrowed wire native SQL array writer matches logical envelopes across PostgreSQL goldens" {
     const a = std.testing.allocator;
-    const arrays = @import("../../../sql/array_value.zig");
-    const storage = @import("../../../sql/array_storage.zig");
+    const arrays = @import("../../../sql/array/value.zig");
+    const storage = @import("../../../sql/array/storage.zig");
     const Fixture = struct { entries: []const struct { element_type: arrays.ElementType, binary: []const u8 } };
     const fixture = try std.json.parseFromSlice(Fixture, a, @embedFile("../../../sql/fixtures/sql_array_binary_reference.json"), .{ .ignore_unknown_fields = true });
     defer fixture.deinit();
@@ -3582,7 +3582,7 @@ test "public graph metric borrowed wire native SQL array writer matches logical 
         const binary = try a.alloc(u8, entry.binary.len / 2);
         defer a.free(binary);
         _ = try std.fmt.hexToBytes(binary, entry.binary);
-        var original = try @import("../../../sql/array_binary.zig").decode(a, entry.element_type, binary, .{});
+        var original = try @import("../../../sql/array/binary.zig").decode(a, entry.element_type, binary, .{});
         defer original.deinit();
         const bytes = try storage.encodeAlloc(a, original.value, .{});
         defer a.free(bytes);
@@ -3615,11 +3615,11 @@ test "ordinal native SQL projection owns arrays numeric and missing cells across
     const schema: runtime_schema.TableSchema = .{ .version = 2, .storage_mode = .relational, .relational_columns = &columns };
     var layout = try PhysicalLayout.init(a, schema);
     defer layout.deinit();
-    var array = try @import("../../../sql/array_text.zig").decode(a, .int64, "[0:2]={9007199254740993,NULL,-7}", .{});
+    var array = try @import("../../../sql/array/text.zig").decode(a, .int64, "[0:2]={9007199254740993,NULL,-7}", .{});
     defer array.deinit();
-    const payload = try @import("../../../sql/array_storage.zig").encodeAlloc(a, array.value, .{});
+    const payload = try @import("../../../sql/array/storage.zig").encodeAlloc(a, array.value, .{});
     defer a.free(payload);
-    const number = try @import("../../../sql/numeric_storage.zig").encodeJsonAlloc(a, .{ .string = "9007199254740993.1200" });
+    const number = try @import("../../../sql/numeric/storage.zig").encodeJsonAlloc(a, .{ .string = "9007199254740993.1200" });
     defer a.free(number);
     const cells = [_]Cell{
         .{ .ordinal = 0, .path = "a", .value_type = .bytes_val, .sql_array_element_type = .int64, .value = .{ .bytes_val = payload } },
@@ -3640,8 +3640,8 @@ test "ordinal native SQL projection owns arrays numeric and missing cells across
     try std.testing.expectEqual(@as(i64, 9007199254740993), projection.values[0].array.?.flatCell(0).value.integer);
     try std.testing.expectEqual(@as(i32, 0), projection.values[0].array.?.dimensions[0].lower);
     try std.testing.expect(projection.values[0].array.?.flatCell(1).sql_null);
-    var context: @import("../../../sql/numeric_value.zig").Context = .{ .alloc = a };
-    const text = try @import("../../../sql/numeric_value.zig").format(&context, projection.values[1].numeric.?.*);
+    var context: @import("../../../sql/numeric/value.zig").Context = .{ .alloc = a };
+    const text = try @import("../../../sql/numeric/value.zig").format(&context, projection.values[1].numeric.?.*);
     defer a.free(text);
     try std.testing.expectEqualStrings("9007199254740993.1200", text);
     try std.testing.expectEqualStrings("retained", projection.values[2].value.string);
@@ -3652,8 +3652,8 @@ test "ordinal native SQL projection owns arrays numeric and missing cells across
 
 test "ordinal native SQL projection avoids public array envelope allocations" {
     const a = std.testing.allocator;
-    const arrays = @import("../../../sql/array_value.zig");
-    const storage = @import("../../../sql/array_storage.zig");
+    const arrays = @import("../../../sql/array/value.zig");
+    const storage = @import("../../../sql/array/storage.zig");
     const test_alloc = @import("../../lite/test_allocator.zig");
     const elements = try a.alloc(arrays.Element, 32768);
     defer a.free(elements);

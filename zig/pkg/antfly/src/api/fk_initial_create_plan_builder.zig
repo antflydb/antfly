@@ -192,6 +192,24 @@ pub fn buildWithCreationCopyAndScratch(
     creation_copy: ?@import("../metadata/initial_creation_copy.zig").Input,
     expected_namespace_id: ?u64,
 ) !publication.InitialCreatePlan {
+    return buildWithPartitionAndScratch(server, alloc, scratch, context, identity, target, request, generated_constraint_names, column_sequences, creation_copy, expected_namespace_id, null, null);
+}
+
+pub fn buildWithPartitionAndScratch(
+    server: *server_mod.ApiHttpServer,
+    alloc: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    context: operation.RequestContext,
+    identity: ?server_mod.AuthenticatedIdentity,
+    target: domain.Target,
+    request: tables.CreateTableRequest,
+    generated_constraint_names: []const []const u8,
+    column_sequences: []const @import("antfly_local_sources").system_catalog_column_sequences.Creation,
+    creation_copy: ?@import("../metadata/initial_creation_copy.zig").Input,
+    expected_namespace_id: ?u64,
+    partition_by: ?@import("antfly_local_sources").system_catalog_table_partitions.Create,
+    partition_of: ?@import("../metadata/initial_partition.zig").Request,
+) !publication.InitialCreatePlan {
     try context.ensureActive();
     const logical_child = try target.resourceNameAlloc(alloc);
     defer alloc.free(logical_child);
@@ -216,25 +234,26 @@ pub fn buildWithCreationCopyAndScratch(
         .candidate = candidate,
         .generated_constraint_names = generated_constraint_names,
         .creation_copy = creation_copy,
+        .partition_by = partition_by,
+        .partition_of = partition_of,
         .column_sequences = column_sequences,
     } });
     const prepared = try std.json.parseFromSliceLeaky(publication.InitialCreatePrepare, alloc, prepare_bytes, .{ .allocate = .alloc_always });
     try context.checkMetadataIncarnation(prepared.metadata_incarnation);
     var child = prepared.child;
-    child.schema_json = try @import("../metadata/relation_create.zig").bindReservedSelf(alloc, child.schema_json, target.table, child.name);
+    if (prepared.partition_birth == null) child.schema_json = try @import("../metadata/relation_create.zig").bindReservedSelf(alloc, child.schema_json, target.table, child.name);
     const routing_derived = try publication.deriveInitialTransitions(alloc, child.table_id, child.name, child.schema_json);
-    if (routing_derived.len == 0) return error.InvalidGenerationPublication;
-    var snapshot = try settledParentSnapshot(server, context, child.name, routing_derived);
-    defer server.source.freeAdminSnapshot(&snapshot);
-    try context.checkMetadataIncarnation(snapshot.status.metadata_incarnation);
-    // Calculate support definitions against this settled read cut, but do
-    // not publish any parent here. Begin owns each exact before/after pair in
-    // one metadata transaction with the hidden child/name reservation.
-    var witness = try @import("relational_witness_ddl.zig").prepare(scratch, snapshot.tables, child.name, child.schema_json, "");
-    defer witness.deinit();
-    child.schema_json = try alloc.dupe(u8, witness.schema_json);
-    const derived = try publication.deriveInitialTransitions(alloc, child.table_id, child.name, child.schema_json);
-    const support_pending = witness.parents.len != 0;
+    if (routing_derived.len == 0 and partition_by == null and prepared.partition_birth == null) return error.InvalidGenerationPublication;
+    var snapshot = if (routing_derived.len != 0) try settledParentSnapshot(server, context, child.name, routing_derived) else null;
+    defer if (snapshot) |*settled| server.source.freeAdminSnapshot(settled);
+    if (snapshot) |settled| try context.checkMetadataIncarnation(settled.status.metadata_incarnation);
+    // Only FK parents need shape reconciliation. Partition birth already
+    // captured its exact parent and owner cover in the reservation cut.
+    var witness = if (snapshot) |settled| try @import("relational_witness_ddl.zig").prepare(scratch, settled.tables, child.name, child.schema_json, "") else null;
+    defer if (witness) |*owned| owned.deinit();
+    if (witness) |owned| child.schema_json = try alloc.dupe(u8, owned.schema_json);
+    const derived = if (witness != null) try publication.deriveInitialTransitions(alloc, child.table_id, child.name, child.schema_json) else routing_derived;
+    const support_pending = if (witness) |owned| owned.parents.len != 0 else false;
     var id: publication.Id = undefined;
     const io = server.restore_job_store.io orelse return error.AsyncRestoreUnavailable;
     while (true) {
@@ -244,7 +263,7 @@ pub fn buildWithCreationCopyAndScratch(
     var self_transitions: []const publication.Transition = &.{};
     var parents: std.ArrayList(publication.Parent) = .empty;
     var groups: existing.ParentGroups = .{ .entries = derived };
-    var by_name = try existing.parentsByName(scratch, snapshot.tables, derived);
+    var by_name = try existing.parentsByName(scratch, if (snapshot) |settled| settled.tables else &.{}, derived);
     defer by_name.deinit(scratch);
     _ = by_name.remove(child.name);
     var work = std.heap.ArenaAllocator.init(scratch);
@@ -252,9 +271,9 @@ pub fn buildWithCreationCopyAndScratch(
     const temporary = work.allocator();
     var index: existing.RangeIndex = .{};
     try existing.authorizeParents(server, temporary, context, identity, &by_name, &index);
-    try index.collect(temporary, snapshot.ranges);
+    if (snapshot) |settled| try index.collect(temporary, settled.ranges);
     var support: std.AutoHashMapUnmanaged(u64, *const records.TableRecord) = .empty;
-    for (witness.parents) |*parent| try support.put(temporary, parent.before.table_id, &parent.after);
+    if (witness) |owned| for (owned.parents) |*parent| try support.put(temporary, parent.before.table_id, &parent.after);
     while (groups.next()) |group| {
         const name = group[0].parent_table_name;
         if (std.mem.eql(u8, name, child.name)) {
@@ -283,11 +302,13 @@ pub fn buildWithCreationCopyAndScratch(
         }
     }.less);
     const plan: publication.InitialCreatePlan = .{
-        .sql_owner = try @import("sql_authorization_recovery.zig").creator(server, identity),
+        .partition_parent = partition_by != null,
+        .partition_birth = prepared.partition_birth,
+        .sql_owner = try @import("sql/recovery/authorization_recovery.zig").creator(server, identity),
         .historical_reference_coverage = try publication.schemaHasUnvalidatedForeignKeys(alloc, child.schema_json),
         .id = id,
         .catalog_coverage = .checks_v1,
-        .expected_incarnation = context.expectedMetadataIncarnation(),
+        .expected_incarnation = context.expectedMetadataIncarnation() orelse if (partition_by != null or partition_of != null) prepared.metadata_incarnation else null,
         .retirement_scope = retirementScopeForDeployment(server.cfg.deployment_mode),
         .column_sequences = column_sequences,
         .creation_copy = creation_copy,
