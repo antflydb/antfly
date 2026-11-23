@@ -151,6 +151,12 @@ pub const ListBackupsParams = struct {
     cursor: ?[]const u8 = null,
 };
 
+pub const PullChangefeedParams = struct {
+    after: []const u8,
+    limit: ?[]const u8 = null,
+    max_bytes: ?[]const u8 = null,
+};
+
 pub const ListConnectionsParams = struct {
     /// Comma-separated list of connection kinds to include (e.g. "inference,external_io,cdc"). Defaults to all kinds. This filters by the response "kind" field.
     types: ?[]const u8 = null,
@@ -1893,6 +1899,110 @@ pub const Client = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.MultiBatchResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Create or resume enrollment for a durable changefeed
+    /// POST /db/v1/changefeeds
+    pub fn createChangefeed(self: *@This(), body: types.ChangefeedCreate, idempotency_key: []const u8) !ApiResponse(types.ChangefeedCreated) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/changefeeds", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        try request_headers.append(self.allocator, .{ "Idempotency-Key", idempotency_key });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
+        return ApiResponse(types.ChangefeedCreated).fromResponse(self.allocator, &resp);
+    }
+
+    /// Inspect a changefeed's lease and acknowledged progress
+    /// GET /db/v1/changefeeds/{feed_id}
+    pub fn inspectChangefeed(self: *@This(), feed_id: []const u8) !ApiResponse(types.ChangefeedProgress) {
+        const encoded_feed_id = try httpx.PercentEncoding.encode(self.allocator, feed_id);
+        defer self.allocator.free(encoded_feed_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/changefeeds/{s}", .{ self.base_url, encoded_feed_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ChangefeedProgress).fromResponse(self.allocator, &resp);
+    }
+
+    /// Close a feed and release its retention grants
+    /// DELETE /db/v1/changefeeds/{feed_id}
+    pub fn closeChangefeed(self: *@This(), feed_id: []const u8) !ApiResponse(std.json.Value) {
+        const encoded_feed_id = try httpx.PercentEncoding.encode(self.allocator, feed_id);
+        defer self.allocator.free(encoded_feed_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/changefeeds/{s}", .{ self.base_url, encoded_feed_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+    }
+
+    /// Acknowledge a successfully applied page
+    /// POST /db/v1/changefeeds/{feed_id}/ack
+    pub fn acknowledgeChangefeed(self: *@This(), feed_id: []const u8, body: types.ChangefeedCheckpoint) !ApiResponse(types.ChangefeedCheckpoint) {
+        const encoded_feed_id = try httpx.PercentEncoding.encode(self.allocator, feed_id);
+        defer self.allocator.free(encoded_feed_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/changefeeds/{s}/ack", .{ self.base_url, encoded_feed_id });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.ChangefeedCheckpoint).fromResponse(self.allocator, &resp);
+    }
+
+    /// Read or replay a bounded changefeed page
+    /// GET /db/v1/changefeeds/{feed_id}/events
+    pub fn pullChangefeed(self: *@This(), feed_id: []const u8, params: PullChangefeedParams) !ApiResponse(types.ChangefeedPage) {
+        const encoded_feed_id = try httpx.PercentEncoding.encode(self.allocator, feed_id);
+        defer self.allocator.free(encoded_feed_id);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/changefeeds/{s}/events", .{ self.base_url, encoded_feed_id });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        const encoded_query_value_after = try httpx.PercentEncoding.encode(self.allocator, params.after);
+        defer self.allocator.free(encoded_query_value_after);
+        try query_buf.appendSlice(self.allocator, &.{sep});
+        try query_buf.appendSlice(self.allocator, "after=");
+        try query_buf.appendSlice(self.allocator, encoded_query_value_after);
+        sep = '&';
+        if (params.limit) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "limit=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.max_bytes) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "max_bytes=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ChangefeedPage).fromResponse(self.allocator, &resp);
+    }
+
+    /// Extend the retention lease for a streaming feed
+    /// POST /db/v1/changefeeds/{feed_id}/renew
+    pub fn renewChangefeed(self: *@This(), feed_id: []const u8, body: types.ChangefeedLease) !ApiResponse(types.ChangefeedLease) {
+        const encoded_feed_id = try httpx.PercentEncoding.encode(self.allocator, feed_id);
+        defer self.allocator.free(encoded_feed_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/changefeeds/{s}/renew", .{ self.base_url, encoded_feed_id });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.ChangefeedLease).fromResponse(self.allocator, &resp);
     }
 
     /// Get cluster topology
@@ -5405,6 +5515,30 @@ pub const Client = struct {
         if (if_match) |value| try request_headers.append(self.allocator, .{ "If-Match", value });
         var resp = try self.http.patch(url, .{ .json = json_body, .headers = request_headers.items });
         return ApiResponse(PatchSchemaResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Read managed-source configuration, progress, and destination capabilities
+    /// GET /db/v1/tables/{tableName}/sources/managed
+    pub fn getManagedSources(self: *@This(), table_name: []const u8) !ApiResponse(types.ManagedSourceStatus) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/sources/managed", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ManagedSourceStatus).fromResponse(self.allocator, &resp);
+    }
+
+    /// Replace managed-source configuration using the current table ID and source hash
+    /// POST /db/v1/tables/{tableName}/sources/managed
+    pub fn replaceManagedSources(self: *@This(), table_name: []const u8, body: types.ManagedSourceReplacement) !ApiResponse(types.ManagedSourceConfigured) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/sources/managed", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.ManagedSourceConfigured).fromResponse(self.allocator, &resp);
     }
 
     /// Create or resume a table storage migration job

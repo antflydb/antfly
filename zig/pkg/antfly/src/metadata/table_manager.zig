@@ -1370,6 +1370,8 @@ pub const ReplicationSourceStatusRecord = struct {
     snapshot_offset: u64 = 0,
     prepared_checkpoint: []const u8 = "",
     stream_checkpoint: []const u8 = "",
+    /// Durable destination acceptance, projected from the scoped actor or recorded after Iceberg WAL admission.
+    accepted_stream_checkpoint: ?[]const u8 = null,
     last_error: []const u8 = "",
     failure_class: []const u8 = "",
     lag_records: u64 = 0,
@@ -1399,6 +1401,39 @@ pub const ReplicationSourceStatusRecord = struct {
     retired_slot_name: []const u8 = "",
     retired_publication_name: []const u8 = "",
     updated_at_ms: u64 = 0,
+    /// Published before the page can reach the destination transaction path.
+    pending_snapshot_page: ?SnapshotPage = null,
+    snapshot_cleanup_job: []const u8 = "",
+    snapshot_page_attempt: u32 = 0,
+    native_bootstrap_catalog_digest: [32]u8 = @splat(0),
+    pub const SnapshotPage = struct {
+        end_offset: u64,
+        checkpoint: []const u8,
+        payload_digest: [32]u8,
+        final: bool = false,
+        managed_dispatch: bool = false,
+        recovery_job: []const u8 = "",
+
+        pub fn eql(left: ?SnapshotPage, right: ?SnapshotPage) bool {
+            const a = left orelse return right == null;
+            const b = right orelse return false;
+            return a.end_offset == b.end_offset and a.final == b.final and a.managed_dispatch == b.managed_dispatch and std.mem.eql(u8, a.checkpoint, b.checkpoint) and
+                std.mem.eql(u8, &a.payload_digest, &b.payload_digest) and
+                std.mem.eql(u8, a.recovery_job, b.recovery_job);
+        }
+    };
+};
+
+pub const CapturedNativeSnapshotPage = struct {
+    page: ReplicationSourceStatusRecord.SnapshotPage,
+    rows: []const u8,
+    sealed: bool = false,
+
+    pub fn deinit(self: CapturedNativeSnapshotPage, a: std.mem.Allocator) void {
+        a.free(self.page.checkpoint);
+        a.free(self.page.recovery_job);
+        a.free(self.rows);
+    }
 };
 
 pub const ShuffleJoinLeaseRecord = struct {
@@ -2307,6 +2342,10 @@ pub fn cloneRoutingTable(alloc: std.mem.Allocator, record: TableRecord) !TableRe
     const restore_location = try alloc.dupe(u8, "");
     errdefer alloc.free(restore_location);
     return .{
+        .storage = record.storage,
+        .object_storage_generation = record.object_storage_generation,
+        .object_storage_identity = record.object_storage_identity,
+        .routing_storage_binding = @import("antfly_local_sources").common_topology_records.tableStorageBinding(record),
         .table_id = record.table_id,
         .name = name,
         .description = description,
@@ -2320,6 +2359,14 @@ pub fn cloneRoutingTable(alloc: std.mem.Allocator, record: TableRecord) !TableRe
         .desired_replica_count = 0,
         .min_ranges = 0,
     };
+}
+
+/// Re-cloning a compact wire snapshot must not manufacture a complete binding
+/// from fields omitted by an older producer. Preserve an absent proof as absent.
+pub fn cloneCompactRoutingTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
+    var result = try cloneRoutingTable(alloc, record);
+    result.routing_storage_binding = record.routing_storage_binding;
+    return result;
 }
 
 pub const freeTable = @import("antfly_local_sources").metadata_local_catalog.freeTable;
@@ -2428,12 +2475,33 @@ test "routing clones exclude operational and schema payloads" {
     const table = try cloneRoutingTable(std.testing.allocator, .{
         .table_id = 7,
         .name = "docs",
+        .storage = .{ .engine = .object },
+        .object_storage_generation = 5,
+        .object_storage_identity = @splat(6),
         .schema_json = "large schema",
         .indexes_json = "large indexes",
         .restore_location = "s3://private/restore",
     });
     defer freeTable(std.testing.allocator, table);
     try std.testing.expectEqualStrings("docs", table.name);
+    try std.testing.expectEqual(.object, table.storage.engine);
+    try std.testing.expectEqual(@as(u64, 5), table.object_storage_generation);
+    try std.testing.expectEqual(@as([32]u8, @splat(6)), table.object_storage_identity);
+    try std.testing.expect(table.routing_storage_binding != null);
+    const compact = try cloneCompactRoutingTable(std.testing.allocator, table);
+    defer freeTable(std.testing.allocator, compact);
+    try std.testing.expectEqual(table.routing_storage_binding, compact.routing_storage_binding);
+    var legacy = table;
+    legacy.routing_storage_binding = null;
+    const legacy_compact = try cloneCompactRoutingTable(std.testing.allocator, legacy);
+    defer freeTable(std.testing.allocator, legacy_compact);
+    try std.testing.expect(legacy_compact.routing_storage_binding == null);
+    const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, table, .{});
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "s3://private/restore") == null);
+    const ordinary = try std.json.Stringify.valueAlloc(std.testing.allocator, TableRecord{ .table_id = 7, .name = "docs" }, .{});
+    defer std.testing.allocator.free(ordinary);
+    try std.testing.expect(std.mem.indexOf(u8, ordinary, "routing_storage_binding") == null);
     try std.testing.expectEqual(@as(usize, 0), table.schema_json.len);
     try std.testing.expectEqual(@as(usize, 0), table.indexes_json.len);
     try std.testing.expectEqual(@as(usize, 0), table.restore_location.len);
@@ -2520,6 +2588,8 @@ pub fn cloneReplicationSourceStatus(alloc: std.mem.Allocator, record: Replicatio
     errdefer alloc.free(prepared_checkpoint);
     const stream_checkpoint = try alloc.dupe(u8, record.stream_checkpoint);
     errdefer alloc.free(stream_checkpoint);
+    const accepted_stream_checkpoint = if (record.accepted_stream_checkpoint) |checkpoint_value| try alloc.dupe(u8, checkpoint_value) else null;
+    errdefer if (accepted_stream_checkpoint) |checkpoint_value| alloc.free(checkpoint_value);
     const last_error = try alloc.dupe(u8, record.last_error);
     errdefer alloc.free(last_error);
     const failure_class = try alloc.dupe(u8, record.failure_class);
@@ -2528,6 +2598,20 @@ pub fn cloneReplicationSourceStatus(alloc: std.mem.Allocator, record: Replicatio
     errdefer alloc.free(retired_slot_name);
     const retired_publication_name = try alloc.dupe(u8, record.retired_publication_name);
     errdefer alloc.free(retired_publication_name);
+    const cleanup = try alloc.dupe(u8, record.snapshot_cleanup_job);
+    errdefer alloc.free(cleanup);
+    const pending = if (record.pending_snapshot_page) |page| blk: {
+        const checkpoint_copy = try alloc.dupe(u8, page.checkpoint);
+        errdefer alloc.free(checkpoint_copy);
+        break :blk ReplicationSourceStatusRecord.SnapshotPage{
+            .end_offset = page.end_offset,
+            .payload_digest = page.payload_digest,
+            .final = page.final,
+            .managed_dispatch = page.managed_dispatch,
+            .checkpoint = checkpoint_copy,
+            .recovery_job = try alloc.dupe(u8, page.recovery_job),
+        };
+    } else null;
     return .{
         .table_id = record.table_id,
         .source_ordinal = record.source_ordinal,
@@ -2541,6 +2625,7 @@ pub fn cloneReplicationSourceStatus(alloc: std.mem.Allocator, record: Replicatio
         .snapshot_offset = record.snapshot_offset,
         .prepared_checkpoint = prepared_checkpoint,
         .stream_checkpoint = stream_checkpoint,
+        .accepted_stream_checkpoint = accepted_stream_checkpoint,
         .last_error = last_error,
         .failure_class = failure_class,
         .lag_records = record.lag_records,
@@ -2556,11 +2641,20 @@ pub fn cloneReplicationSourceStatus(alloc: std.mem.Allocator, record: Replicatio
         .retired_cutover_authority_id = record.retired_cutover_authority_id,
         .retired_slot_name = retired_slot_name,
         .retired_publication_name = retired_publication_name,
+        .native_bootstrap_catalog_digest = record.native_bootstrap_catalog_digest,
+        .snapshot_page_attempt = record.snapshot_page_attempt,
+        .snapshot_cleanup_job = cleanup,
+        .pending_snapshot_page = pending,
         .updated_at_ms = record.updated_at_ms,
     };
 }
 
 pub fn freeReplicationSourceStatus(alloc: std.mem.Allocator, record: ReplicationSourceStatusRecord) void {
+    if (record.pending_snapshot_page) |page| {
+        alloc.free(page.checkpoint);
+        alloc.free(page.recovery_job);
+    }
+    alloc.free(record.snapshot_cleanup_job);
     alloc.free(record.source_kind);
     alloc.free(record.external_table);
     alloc.free(record.cutover_mode);
@@ -2570,6 +2664,7 @@ pub fn freeReplicationSourceStatus(alloc: std.mem.Allocator, record: Replication
     alloc.free(record.checkpoint);
     alloc.free(record.prepared_checkpoint);
     alloc.free(record.stream_checkpoint);
+    if (record.accepted_stream_checkpoint) |checkpoint| alloc.free(checkpoint);
     alloc.free(record.last_error);
     alloc.free(record.failure_class);
     alloc.free(record.retired_slot_name);

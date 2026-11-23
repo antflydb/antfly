@@ -903,11 +903,11 @@ pub const Executor = struct {
         try exact_cutover_intent.check();
         try self.ensurePublicationAlloc(
             alloc,
-            dsn,
             sql_conn,
             publication_name,
             params.table,
             params.filter_query_json,
+            true,
             execution_deadline_ns,
         );
         if (slot_exists) {
@@ -1004,7 +1004,8 @@ pub const Executor = struct {
             .executor = self,
             .conn = sql_conn,
         };
-        const checkpoint = try alloc.dupe(u8, exported.checkpoint);
+        const binding = try self.publicationBinding(alloc, sql_conn, publication_name, params.table, params.filter_query_json != null, execution_deadline_ns);
+        const checkpoint = try binding.checkpoint(alloc, exported.checkpoint);
         self.pqfinish(repl_conn);
         repl_conn = null;
         self.releaseGlobalConnections(1);
@@ -2300,50 +2301,182 @@ pub const Executor = struct {
         };
     }
 
+    fn logicalLsn(text: []const u8) !u64 {
+        const slash = std.mem.indexOfScalar(u8, text, '/') orelse return error.InvalidReplicationTransaction;
+        const high = std.fmt.parseInt(u32, text[0..slash], 16) catch return error.InvalidReplicationTransaction;
+        const low = std.fmt.parseInt(u32, text[slash + 1 ..], 16) catch return error.InvalidReplicationTransaction;
+        return (@as(u64, high) << 32) | low;
+    }
+
+    const PublicationBinding = struct {
+        relation: u32,
+        fingerprint: [32]u8,
+
+        fn checkpoint(self: PublicationBinding, a: Allocator, position: []const u8) ![]u8 {
+            if (position.len == 0) return a.dupe(u8, position);
+            _ = try logicalLsn(position);
+            return std.fmt.allocPrint(a, "pg1:{s}:{s}", .{ std.fmt.bytesToHex(self.fingerprint, .lower), position });
+        }
+
+        fn lsn(self: PublicationBinding, value: []const u8) ![]const u8 {
+            const prefix = "pg1:";
+            if (!std.mem.startsWith(u8, value, prefix)) {
+                _ = try logicalLsn(value);
+                return value;
+            }
+            const hash_end = prefix.len + self.fingerprint.len * 2;
+            if (value.len <= hash_end or value[hash_end] != ':') return error.InvalidReplicationCheckpoint;
+            const expected = std.fmt.bytesToHex(self.fingerprint, .lower);
+            if (!std.mem.eql(u8, value[prefix.len..hash_end], &expected)) return error.ReplicationPublicationBindingChanged;
+            const position = value[hash_end + 1 ..];
+            _ = try logicalLsn(position);
+            return position;
+        }
+    };
+
+    fn publicationBinding(
+        self: *@This(),
+        alloc: Allocator,
+        conn: ?*PGconn,
+        publication: []const u8,
+        table: []const u8,
+        allow_row_filter: bool,
+        deadline_ns: ?u64,
+    ) !PublicationBinding {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const quoted_table = try sql.postgresDialect().quote_relation(a, table);
+        const args = try a.alloc(sql.ParameterValue, 3);
+        args[0] = .{ .string = try a.dupe(u8, publication) };
+        args[1] = .{ .string = quoted_table };
+        args[2] = .{ .bool = allow_row_filter };
+        var prepared = sql.PreparedQuery{
+            .sql_text = try a.dupe(u8,
+                \\SELECT CASE WHEN c.oid = pg_catalog.to_regclass($2::text)
+                \\             AND ($3::boolean OR (pg_catalog.to_jsonb(t) ->> 'rowfilter') IS NULL)
+                \\            THEN c.oid::text END,
+                \\       pg_catalog.to_jsonb(t) ->> 'rowfilter',
+                \\       p.pubviaroot::text
+                \\  FROM pg_catalog.pg_publication p
+                \\  JOIN pg_catalog.pg_publication_tables t ON t.pubname = p.pubname
+                \\  JOIN pg_catalog.pg_namespace n ON n.nspname = t.schemaname
+                \\  JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = t.tablename
+                \\ WHERE p.pubname = $1 AND p.pubinsert AND p.pubupdate AND p.pubdelete
+                \\   AND NOT p.puballtables
+                \\   AND NOT EXISTS (
+                \\       SELECT 1 FROM pg_catalog.pg_publication_rel r
+                \\        WHERE r.prpubid = p.oid AND (pg_catalog.to_jsonb(r) ->> 'prattrs') IS NOT NULL
+                \\   )
+                \\ LIMIT 2
+            ),
+            .args = args,
+        };
+        defer prepared.deinit(a);
+        // Compare the entire membership before advancing the slot. Filtering
+        // the catalog query to the configured table would hide extra members.
+        const result = try self.execPreparedWithDeadline(conn, alloc, prepared, deadline_ns, null);
+        defer self.pqclear(result);
+        if (self.pqntuples(result) != 1 or self.pqgetisnull(result, 0, 0) != 0)
+            return error.ReplicationPublicationBindingChanged;
+        const actual = self.pqgetvalue(result, 0, 0)[0..@intCast(self.pqgetlength(result, 0, 0))];
+        const oid = std.fmt.parseInt(u32, actual, 10) catch return error.ReplicationPublicationBindingChanged;
+        // Bind the deparsed expression to durable progress. Recreating a
+        // publication with the same relation, projection and expression keeps
+        // this identity. Changing the row filter or table incarnation does not.
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly:postgres-publication-binding:v1");
+        var encoded: [4]u8 = undefined;
+        std.mem.writeInt(u32, &encoded, oid, .big);
+        hash.update(&encoded);
+        for (1..3) |column| {
+            const col: c_int = @intCast(column);
+            if (self.pqgetisnull(result, 0, col) != 0) {
+                hash.update(&.{0});
+                continue;
+            }
+            hash.update(&.{1});
+            const cell = self.pqgetvalue(result, 0, col)[0..@intCast(self.pqgetlength(result, 0, col))];
+            std.mem.writeInt(u32, &encoded, @intCast(cell.len), .big);
+            hash.update(&encoded);
+            hash.update(cell);
+        }
+        return .{ .relation = oid, .fingerprint = hash.finalResult() };
+    }
+
     fn pollChangesAlloc(self: *@This(), alloc: Allocator, dsn: []const u8, params: foreign_source.ReplicationPollParams) !foreign_source.ReplicationPollResult {
         const slot_name = params.slot_name orelse return error.InvalidQueryRequest;
         const publication_name = params.publication_name orelse return error.InvalidQueryRequest;
         std.log.info("postgres libpq poll begin table={s} slot={s}", .{ params.table, slot_name });
-        const conn = try self.connectCountedFresh(alloc, dsn, params.execution_deadline_ns);
-        defer self.closeCountedConnection(conn);
+        const verify_provider = params.expected_provider_identity != null;
+        const deadline_ns = params.execution_deadline_ns orelse if (verify_provider) platform_time.monotonicNs() +| 5 * std.time.ns_per_s else null;
+        // A qualified poll needs both SQL and replication sockets for identity
+        // verification. Reserve both together to keep the connection budget.
+        const permits: usize = if (verify_provider) 2 else 1;
+        try self.acquireGlobalConnectionPermits(permits, deadline_ns, null);
+        defer self.releaseGlobalConnections(permits);
+        const conn = if (deadline_ns != null)
+            try self.connectFreshWithDeadline(dsn, deadline_ns, null)
+        else
+            (try self.connectFresh(alloc, dsn)) orelse return error.ForeignConnectionFailed;
+        defer self.pqfinish(conn);
         std.log.info("postgres libpq poll connected table={s} slot={s}", .{ params.table, slot_name });
+        if (params.expected_provider_identity) |expected| {
+            const deadline = deadline_ns.?;
+            const replication = try self.connectReplicationFreshWithDeadline(alloc, dsn, deadline);
+            defer self.pqfinish(replication);
+            const actual = try self.identifyExactCutoverProvider(alloc, conn, replication, deadline);
+            if (!std.meta.eql(expected, actual)) return error.ReplicationCutoverAuthorityLost;
+        }
         var observed_checkpoint: ?[]u8 = null;
         errdefer if (observed_checkpoint) |value| alloc.free(value);
         try self.ensurePublicationAlloc(
             alloc,
-            dsn,
             conn,
             publication_name,
             params.table,
             params.filter_query_json,
-            params.execution_deadline_ns,
+            if (params.checkpoint) |saved| !std.mem.startsWith(u8, saved, "pg1:") else true,
+            deadline_ns,
         );
-        if (params.checkpoint) |checkpoint| {
-            if (checkpoint.len > 0 and !try self.logicalReplicationSlotExistsAlloc(
-                alloc,
-                conn,
-                slot_name,
-                params.execution_deadline_ns,
-            )) {
-                return error.ForeignReplicationSlotMissing;
-            }
-            if (checkpoint.len > 0) {
-                const advanced_checkpoint = try self.advanceLogicalReplicationSlotCheckpointAlloc(
-                    alloc,
-                    conn,
-                    slot_name,
-                    checkpoint,
-                    params.execution_deadline_ns,
-                );
-                observed_checkpoint = advanced_checkpoint;
+        const binding = try self.publicationBinding(alloc, conn, publication_name, params.table, params.filter_query_json != null, deadline_ns);
+        if (params.checkpoint) |saved| {
+            if (saved.len > 0) {
+                const checkpoint = try binding.lsn(saved);
+                const confirmed = try self.loadLogicalReplicationSlotCheckpointAlloc(alloc, conn, slot_name, deadline_ns);
+                defer alloc.free(confirmed);
+                if (confirmed.len == 0) return error.ForeignReplicationSlotMissing;
+                const durable_lsn = try logicalLsn(checkpoint);
+                const confirmed_lsn = try logicalLsn(confirmed);
+                if (confirmed_lsn > durable_lsn) return error.ReplicationCutoverAuthorityLost;
+                const advanced_checkpoint = if (confirmed_lsn == durable_lsn)
+                    confirmed
+                else
+                    try self.advanceLogicalReplicationSlotCheckpointAlloc(
+                        alloc,
+                        conn,
+                        slot_name,
+                        checkpoint,
+                        deadline_ns,
+                    );
+                defer if (confirmed_lsn != durable_lsn) alloc.free(advanced_checkpoint);
+                observed_checkpoint = try binding.checkpoint(alloc, advanced_checkpoint);
+                if (try logicalLsn(checkpoint) != try logicalLsn(advanced_checkpoint))
+                    return error.ReplicationCutoverAuthorityLost;
             }
         } else {
             _ = try self.ensureLogicalReplicationSlotAlloc(
                 alloc,
                 conn,
                 slot_name,
-                params.execution_deadline_ns,
+                deadline_ns,
             );
+        }
+
+        if (params.checkpoint == null) {
+            const confirmed = try self.loadLogicalReplicationSlotCheckpointAlloc(alloc, conn, slot_name, deadline_ns);
+            defer alloc.free(confirmed);
+            if (confirmed.len == 0) return error.ForeignReplicationSlotMissing;
         }
 
         const quoted_slot_name = try quoteSqlStringLiteralAlloc(alloc, slot_name);
@@ -2351,11 +2484,27 @@ pub const Executor = struct {
         const quoted_publication_name = try quoteSqlStringLiteralAlloc(alloc, publication_name);
         defer alloc.free(quoted_publication_name);
 
+        // PostgreSQL's change-count hint can return an entire large
+        // transaction. Bound the result before libpq materializes it. A NULL
+        // payload marks overflow. Only the complete prefix may advance.
+        const max_capture_bytes = 32 * 1024 * 1024;
+        const max_capture_messages = 65536;
         var prepared = sql.PreparedQuery{
             .sql_text = try std.fmt.allocPrint(
                 alloc,
-                "SELECT lsn::text, data FROM pg_logical_slot_peek_binary_changes({s}, NULL, {d}, 'proto_version', '2', 'publication_names', {s})",
-                .{ quoted_slot_name, params.limit orelse 256, quoted_publication_name },
+                \\WITH changes AS (
+                \\    SELECT lsn, data, ordinal, octet_length(data) AS bytes,
+                \\           sum(octet_length(data)) OVER (ORDER BY ordinal ROWS UNBOUNDED PRECEDING) AS used
+                \\      FROM pg_catalog.pg_logical_slot_peek_binary_changes({s}, NULL, {d},
+                \\                 'proto_version', '2', 'publication_names', {s})
+                \\           WITH ORDINALITY AS messages(lsn, xid, data, ordinal)
+                \\)
+                \\SELECT lsn::text, CASE WHEN used <= {d} AND ordinal <= {d} THEN data END
+                \\  FROM changes
+                \\ WHERE used - bytes <= {d} AND ordinal <= {d}
+                \\ ORDER BY ordinal
+            ,
+                .{ quoted_slot_name, params.limit orelse 256, quoted_publication_name, max_capture_bytes, max_capture_messages, max_capture_bytes, max_capture_messages + 1 },
             ),
         };
         defer prepared.deinit(alloc);
@@ -2364,7 +2513,7 @@ pub const Executor = struct {
             conn,
             alloc,
             prepared,
-            params.execution_deadline_ns,
+            deadline_ns,
             null,
         );
         defer self.pqclear(result);
@@ -2378,26 +2527,47 @@ pub const Executor = struct {
             changes.deinit(alloc);
         }
         var current_txn_first_change_idx: ?usize = null;
+        var completed_transaction = false;
         var lag_millis: u64 = 0;
         const poll_now_ms: i64 = @intCast(currentRealtimeMillis());
 
         const rows_len: usize = @intCast(self.pqntuples(result));
         for (0..rows_len) |row_idx| {
             const row: c_int = @intCast(row_idx);
-            if (self.pqgetisnull(result, row, 0) != 0 or self.pqgetisnull(result, row, 1) != 0) continue;
+            if (self.pqgetisnull(result, row, 1) != 0) {
+                if (!completed_transaction) return error.ReplicationCaptureLimitExceeded;
+                if (current_txn_first_change_idx) |start| {
+                    for (changes.items[start..]) |*change| change.deinit(alloc);
+                    changes.shrinkRetainingCapacity(start);
+                    current_txn_first_change_idx = null;
+                }
+                break;
+            }
+            if (self.pqgetisnull(result, row, 0) != 0) return error.InvalidReplicationCheckpoint;
             const lsn = try copyCellAlloc(alloc, self.pqgetvalue(result, row, 0), @intCast(self.pqgetlength(result, row, 0)));
-            if (observed_checkpoint) |value| alloc.free(value);
-            observed_checkpoint = lsn;
+            defer alloc.free(lsn);
             const data_hex = self.pqgetvalue(result, row, 1)[0..@intCast(self.pqgetlength(result, row, 1))];
             const data = try decodeByteaHexAlloc(alloc, data_hex);
             defer alloc.free(data);
 
+            // A concurrent publication change can invalidate the catalog
+            // check. Check the relation carried by every decoded row as well.
+            if (data.len != 0 and std.mem.indexOfScalar(u8, "IUD", data[0]) != null) {
+                var relation_offset: usize = 1;
+                if (try readU32(data, &relation_offset) != binding.relation)
+                    return error.ReplicationPublicationBindingChanged;
+            }
             switch (try parsePgoutputMessageAlloc(alloc, data, &relation_cache)) {
                 .none => {},
                 .begin => {
+                    if (current_txn_first_change_idx != null) return error.InvalidReplicationTransaction;
                     current_txn_first_change_idx = changes.items.len;
                 },
                 .commit => |commit_timestamp_ms| {
+                    if (current_txn_first_change_idx == null) return error.InvalidReplicationTransaction;
+                    const committed_checkpoint = try binding.checkpoint(alloc, lsn);
+                    if (observed_checkpoint) |value| alloc.free(value);
+                    observed_checkpoint = committed_checkpoint;
                     if (current_txn_first_change_idx) |start_idx| {
                         const computed_lag_ms: u64 = if (commit_timestamp_ms > 0 and poll_now_ms > 0)
                             @intCast(@max(@as(i64, 0), poll_now_ms - @as(i64, @intCast(commit_timestamp_ms))))
@@ -2405,23 +2575,29 @@ pub const Executor = struct {
                             0;
                         for (changes.items[start_idx..]) |*change| {
                             change.commit_timestamp_ms = commit_timestamp_ms;
+                            const change_checkpoint = try alloc.dupe(u8, committed_checkpoint);
                             alloc.free(change.checkpoint);
-                            change.checkpoint = try alloc.dupe(u8, lsn);
+                            change.checkpoint = change_checkpoint;
                         }
                         lag_millis = @max(lag_millis, computed_lag_ms);
                     }
                     current_txn_first_change_idx = null;
+                    completed_transaction = true;
                 },
                 .change => |parsed_change| {
                     var change_without_checkpoint = parsed_change;
                     errdefer change_without_checkpoint.deinit(alloc);
-                    alloc.free(change_without_checkpoint.checkpoint);
-                    change_without_checkpoint.checkpoint = try alloc.dupe(u8, lsn);
+                    if (current_txn_first_change_idx == null) return error.InvalidReplicationTransaction;
                     change_without_checkpoint.lag_records = 0;
                     try changes.append(alloc, change_without_checkpoint);
                 },
             }
         }
+        // A source position may only acknowledge complete transactions. Never
+        // publish a BEGIN/row LSN if a provider response ends before COMMIT.
+        if (current_txn_first_change_idx != null) return error.IncompleteReplicationTransaction;
+        const observed_binding = try self.publicationBinding(alloc, conn, publication_name, params.table, params.filter_query_json != null, deadline_ns);
+        if (!std.meta.eql(binding, observed_binding)) return error.ReplicationPublicationBindingChanged;
 
         if (rows_len > 0 or changes.items.len > 0) {
             std.log.info(
@@ -2446,26 +2622,24 @@ pub const Executor = struct {
         defer self.closeCountedConnection(conn);
         try self.ensurePublicationAlloc(
             alloc,
-            dsn,
             conn,
             publication_name,
             params.table,
             params.filter_query_json,
+            true,
             params.execution_deadline_ns,
         );
+        const binding = try self.publicationBinding(alloc, conn, publication_name, params.table, params.filter_query_json != null, params.execution_deadline_ns);
         const slot_existed = try self.ensureLogicalReplicationSlotAlloc(
             alloc,
             conn,
             slot_name,
             params.execution_deadline_ns,
         );
+        const position = try self.loadLogicalReplicationSlotCheckpointAlloc(alloc, conn, slot_name, params.execution_deadline_ns);
+        defer alloc.free(position);
         return .{
-            .checkpoint = try self.loadLogicalReplicationSlotCheckpointAlloc(
-                alloc,
-                conn,
-                slot_name,
-                params.execution_deadline_ns,
-            ),
+            .checkpoint = try binding.checkpoint(alloc, position),
             .slot_existed = slot_existed,
         };
     }
@@ -2500,11 +2674,11 @@ pub const Executor = struct {
     fn ensurePublicationAlloc(
         self: *@This(),
         alloc: Allocator,
-        dsn: []const u8,
         conn: ?*PGconn,
         publication_name: []const u8,
         table: []const u8,
         filter_query_json: ?[]const u8,
+        verify_filter: bool,
         execution_deadline_ns: ?u64,
     ) !void {
         const check_args = try alloc.alloc(sql.ParameterValue, 1);
@@ -2522,51 +2696,46 @@ pub const Executor = struct {
             null,
         );
         defer self.pqclear(check_result);
-        if (@as(usize, @intCast(self.pqntuples(check_result))) > 0) return;
+        const exists = self.pqntuples(check_result) != 0;
+        if (exists and (!verify_filter or filter_query_json == null)) return;
 
-        const quoted_publication = try sql.postgresDialect().quote_identifier(alloc, publication_name);
-        defer alloc.free(quoted_publication);
-        const quoted_table = try sql.postgresDialect().quote_relation(alloc, table);
-        defer alloc.free(quoted_table);
-        var create_sql = std.ArrayListUnmanaged(u8).empty;
-        defer create_sql.deinit(alloc);
-        const create_prefix = try std.fmt.allocPrint(alloc, "CREATE PUBLICATION {s} FOR TABLE {s}", .{ quoted_publication, quoted_table });
-        defer alloc.free(create_prefix);
-        try create_sql.appendSlice(alloc, create_prefix);
-
-        var translated_filter: ?filter.Translation = null;
-        defer if (translated_filter) |*value| value.deinit(alloc);
-        if (filter_query_json) |query_json| {
-            const columns = try self.discoverColumnsAllocWithDeadline(
-                alloc,
-                dsn,
-                table,
-                execution_deadline_ns,
-            );
-            defer freeColumns(alloc, columns);
-            translated_filter = try filter.translateAlloc(alloc, sql.postgresDialect(), query_json, columns);
-            if (translated_filter.?.where_sql.len > 0) {
-                const where_suffix = try std.fmt.allocPrint(alloc, " WHERE ({s})", .{translated_filter.?.where_sql});
-                defer alloc.free(where_suffix);
-                try create_sql.appendSlice(alloc, where_suffix);
-            }
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const predicate = if (filter_query_json) |json| try filter.postgresPublicationPredicateAlloc(a, json, &.{}) else "";
+        if (!exists) return self.createPublication(a, conn, publication_name, table, predicate, execution_deadline_ns);
+        if (predicate.len == 0) {
+            _ = try self.publicationBinding(a, conn, publication_name, table, false, execution_deadline_ns);
+            return;
         }
 
-        var create_prepared = sql.PreparedQuery{
-            .sql_text = try create_sql.toOwnedSlice(alloc),
-            .args = if (translated_filter) |value| try cloneParameterValuesAlloc(alloc, value.args) else &.{},
-        };
-        defer create_prepared.deinit(alloc);
-        const create_result = if (execution_deadline_ns) |deadline_ns|
-            try self.execPreparedAllowCommandWithDeadline(
-                conn,
-                alloc,
-                create_prepared,
-                deadline_ns,
-            )
+        // Use PostgreSQL's own parser and catalog deparser for both expressions.
+        // The comparison publication is visible only within this transaction.
+        const deadline = execution_deadline_ns orelse platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
+        self.pqclear(try self.execSimpleWithDeadline(conn, a, "BEGIN", deadline, true));
+        errdefer {
+            if (self.execSimpleWithDeadline(conn, a, "ROLLBACK", deadline, true)) |result| self.pqclear(result) else |_| {}
+        }
+        const probe = try std.fmt.allocPrint(a, "antfly_filter_{x}_{x}", .{ @intFromPtr(conn), platform_time.monotonicNs() });
+        try self.createPublication(a, conn, probe, table, predicate, deadline);
+        const expected = try self.publicationBinding(a, conn, probe, table, true, deadline);
+        const actual = try self.publicationBinding(a, conn, publication_name, table, true, deadline);
+        if (!std.meta.eql(expected, actual)) return error.ReplicationPublicationBindingChanged;
+        self.pqclear(try self.execSimpleWithDeadline(conn, a, "ROLLBACK", deadline, true));
+    }
+
+    fn createPublication(self: *@This(), a: Allocator, conn: ?*PGconn, name: []const u8, table: []const u8, predicate: []const u8, deadline: ?u64) !void {
+        const quoted_name = try sql.postgresDialect().quote_identifier(a, name);
+        defer a.free(quoted_name);
+        const quoted_table = try sql.postgresDialect().quote_relation(a, table);
+        defer a.free(quoted_table);
+        const statement = if (predicate.len == 0)
+            try std.fmt.allocPrint(a, "CREATE PUBLICATION {s} FOR TABLE {s}", .{ quoted_name, quoted_table })
         else
-            try self.execPreparedAllowCommand(conn, alloc, create_prepared);
-        defer self.pqclear(create_result);
+            try std.fmt.allocPrint(a, "CREATE PUBLICATION {s} FOR TABLE {s} WHERE ({s})", .{ quoted_name, quoted_table, predicate });
+        defer a.free(statement);
+        const bounded = deadline orelse platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
+        self.pqclear(try self.execSimpleWithDeadline(conn, a, statement, bounded, true));
     }
 
     fn ensureLogicalReplicationSlotAlloc(
@@ -2621,7 +2790,13 @@ pub const Executor = struct {
         const args = try alloc.alloc(sql.ParameterValue, 1);
         args[0] = .{ .string = try alloc.dupe(u8, slot_name) };
         var prepared = sql.PreparedQuery{
-            .sql_text = try alloc.dupe(u8, "SELECT COALESCE(confirmed_flush_lsn::text, restart_lsn::text, '') FROM pg_replication_slots WHERE slot_name = $1"),
+            .sql_text = try alloc.dupe(u8,
+                \\SELECT CASE WHEN slot_type = 'logical' AND plugin = 'pgoutput'
+                \\                  AND database = current_database() AND restart_lsn IS NOT NULL
+                \\                  AND (to_jsonb(s) ->> 'invalidation_reason') IS NULL
+                \\            THEN confirmed_flush_lsn::text END
+                \\  FROM pg_catalog.pg_replication_slots s WHERE slot_name = $1
+            ),
             .args = args,
         };
         defer prepared.deinit(alloc);
@@ -2633,7 +2808,8 @@ pub const Executor = struct {
             null,
         );
         defer self.pqclear(result);
-        if (self.pqntuples(result) == 0 or self.pqgetisnull(result, 0, 0) != 0) return try alloc.dupe(u8, "");
+        if (self.pqntuples(result) == 0) return try alloc.dupe(u8, "");
+        if (self.pqgetisnull(result, 0, 0) != 0) return error.ReplicationCutoverAuthorityLost;
         return try copyCellAlloc(alloc, self.pqgetvalue(result, 0, 0), @intCast(self.pqgetlength(result, 0, 0)));
     }
 
@@ -2649,7 +2825,17 @@ pub const Executor = struct {
         args[0] = .{ .string = try alloc.dupe(u8, slot_name) };
         args[1] = .{ .string = try alloc.dupe(u8, checkpoint) };
         var prepared = sql.PreparedQuery{
-            .sql_text = try alloc.dupe(u8, "SELECT COALESCE(end_lsn::text, '') FROM pg_replication_slot_advance($1, $2::pg_lsn)"),
+            .sql_text = try alloc.dupe(u8,
+                \\WITH eligible AS MATERIALIZED (
+                \\    SELECT slot_name FROM pg_catalog.pg_replication_slots s
+                \\    WHERE slot_name = $1 AND slot_type = 'logical' AND plugin = 'pgoutput'
+                \\      AND database = current_database() AND restart_lsn IS NOT NULL
+                \\      AND (to_jsonb(s) ->> 'invalidation_reason') IS NULL
+                \\      AND confirmed_flush_lsn <= $2::pg_lsn
+                \\)
+                \\SELECT advanced.end_lsn::text FROM eligible
+                \\CROSS JOIN LATERAL pg_catalog.pg_replication_slot_advance(eligible.slot_name, $2::pg_lsn) advanced
+            ),
             .args = args,
         };
         defer prepared.deinit(alloc);
@@ -2661,7 +2847,7 @@ pub const Executor = struct {
             null,
         );
         defer self.pqclear(result);
-        if (self.pqntuples(result) == 0 or self.pqgetisnull(result, 0, 0) != 0) return try alloc.dupe(u8, checkpoint);
+        if (self.pqntuples(result) != 1 or self.pqgetisnull(result, 0, 0) != 0) return error.ReplicationCutoverAuthorityLost;
         return try copyCellAlloc(alloc, self.pqgetvalue(result, 0, 0), @intCast(self.pqgetlength(result, 0, 0)));
     }
 
@@ -4258,6 +4444,7 @@ fn cloneParameterValuesAlloc(alloc: Allocator, args: []const sql.ParameterValue)
 const PgoutputColumn = struct {
     name: []u8,
     data_type: Oid,
+    is_key: bool,
 };
 
 const PgoutputRelation = struct {
@@ -4310,14 +4497,15 @@ fn parsePgoutputMessageAlloc(
         'O' => return .none,
         'Y' => return .none,
         'M' => return .none,
-        'T' => return .none,
+        'T' => return error.UnsupportedReplicationTruncate,
         'R' => {
             const relation_id = try readU32(data, &pos);
             const namespace = try readCStringAlloc(alloc, data, &pos);
             errdefer alloc.free(namespace);
             const relation_name = try readCStringAlloc(alloc, data, &pos);
             errdefer alloc.free(relation_name);
-            _ = try readByte(data, &pos); // replica identity
+            const replica_identity = try readByte(data, &pos);
+            if (replica_identity != 'd' and replica_identity != 'n' and replica_identity != 'f' and replica_identity != 'i') return error.InvalidReplicationSourceRow;
             const column_count = try readU16(data, &pos);
             const columns = try alloc.alloc(PgoutputColumn, column_count);
             var initialized: usize = 0;
@@ -4326,8 +4514,10 @@ fn parsePgoutputMessageAlloc(
                 alloc.free(columns);
             }
             for (0..column_count) |i| {
-                _ = try readByte(data, &pos); // flags
+                const flags = try readByte(data, &pos);
+                if (flags & ~@as(u8, 1) != 0) return error.InvalidReplicationSourceRow;
                 columns[i] = .{
+                    .is_key = flags & 1 != 0,
                     .name = try readCStringAlloc(alloc, data, &pos),
                     .data_type = try readU32(data, &pos),
                 };
@@ -4355,48 +4545,98 @@ fn parsePgoutputMessageAlloc(
         },
         'I' => {
             const relation = relation_cache.get(try readU32(data, &pos)) orelse return error.InvalidReplicationSourceRow;
-            const tuple_tag = try readByte(data, &pos);
-            if (tuple_tag != 'N') return error.InvalidReplicationSourceRow;
-            const row = try parsePgoutputTupleAlloc(alloc, data, &pos, relation);
+            if (try readByte(data, &pos) != 'N') return error.InvalidReplicationSourceRow;
+            var row = try parsePgoutputTupleAlloc(alloc, data, &pos, relation);
+            errdefer foreign_source.deinitJsonValue(alloc, &row);
+            if (pos != data.len) return error.InvalidReplicationSourceRow;
             return .{ .change = .{
                 .op = .insert,
                 .checkpoint = try alloc.alloc(u8, 0),
                 .row = row,
+                .row_complete = row.object.count() == relation.columns.len,
             } };
         },
         'U' => {
             const relation = relation_cache.get(try readU32(data, &pos)) orelse return error.InvalidReplicationSourceRow;
             var marker = try readByte(data, &pos);
+            var before: ?std.json.Value = null;
+            errdefer if (before) |*value| foreign_source.deinitJsonValue(alloc, value);
+            var before_kind: foreign_source.ReplicationBeforeKind = .none;
             if (marker == 'K' or marker == 'O') {
-                var old_row = try parsePgoutputTupleAlloc(alloc, data, &pos, relation);
-                foreign_source.deinitJsonValue(alloc, &old_row);
+                before_kind = if (marker == 'K') .key else .full;
+                before = try parsePgoutputTupleAlloc(alloc, data, &pos, relation);
+                if (marker == 'K') retainPgoutputKeyColumns(alloc, &before.?, relation);
                 marker = try readByte(data, &pos);
             }
             if (marker != 'N') return error.InvalidReplicationSourceRow;
-            const row = try parsePgoutputTupleAlloc(alloc, data, &pos, relation);
+            var row = try parsePgoutputTupleAlloc(alloc, data, &pos, relation);
+            errdefer foreign_source.deinitJsonValue(alloc, &row);
+            if (pos != data.len) return error.InvalidReplicationSourceRow;
+            if (before == null) {
+                // In pgoutput an UPDATE omits the old key when the replica
+                // identity columns did not change. Only those columns can
+                // be taken from the new tuple as historical key evidence.
+                var identity: std.json.Value = .{ .object = .empty };
+                errdefer foreign_source.deinitJsonValue(alloc, &identity);
+                for (relation.columns) |column| {
+                    if (!column.is_key) continue;
+                    const value = row.object.get(column.name) orelse continue;
+                    const name = try alloc.dupe(u8, column.name);
+                    errdefer alloc.free(name);
+                    var copy = try cloneJsonValueAlloc(alloc, value);
+                    errdefer foreign_source.deinitJsonValue(alloc, &copy);
+                    try identity.object.put(alloc, name, copy);
+                }
+                before = identity;
+                before_kind = .key;
+            }
             return .{ .change = .{
                 .op = .update,
                 .checkpoint = try alloc.alloc(u8, 0),
                 .row = row,
+                .before = before,
+                .before_kind = before_kind,
+                .row_complete = row.object.count() == relation.columns.len,
+                .before_complete = before_kind == .full and before.?.object.count() == relation.columns.len,
             } };
         },
         'D' => {
             const relation = relation_cache.get(try readU32(data, &pos)) orelse return error.InvalidReplicationSourceRow;
             const marker = try readByte(data, &pos);
             if (marker != 'K' and marker != 'O') return error.InvalidReplicationSourceRow;
-            const row = try parsePgoutputTupleAlloc(alloc, data, &pos, relation);
+            var row = try parsePgoutputTupleAlloc(alloc, data, &pos, relation);
+            errdefer foreign_source.deinitJsonValue(alloc, &row);
+            if (marker == 'K') retainPgoutputKeyColumns(alloc, &row, relation);
+            if (pos != data.len) return error.InvalidReplicationSourceRow;
+            const complete = marker == 'O' and row.object.count() == relation.columns.len;
             return .{ .change = .{
                 .op = .delete,
                 .checkpoint = try alloc.alloc(u8, 0),
                 .row = row,
+                .before_kind = if (marker == 'K') .key else .full,
+                .row_complete = complete,
+                .before_complete = complete,
             } };
         },
-        else => return .none,
+        else => return error.UnsupportedReplicationMessage,
+    }
+}
+
+/// Key-tuple NULL placeholders are not historical values of non-key fields.
+fn retainPgoutputKeyColumns(alloc: Allocator, row: *std.json.Value, relation: PgoutputRelation) void {
+    for (relation.columns) |column| {
+        if (column.is_key) continue;
+        if (row.object.fetchOrderedRemove(column.name)) |removed| {
+            alloc.free(@constCast(removed.key));
+            var value = removed.value;
+            foreign_source.deinitJsonValue(alloc, &value);
+        }
     }
 }
 
 fn parsePgoutputTupleAlloc(alloc: Allocator, data: []const u8, pos: *usize, relation: PgoutputRelation) !std.json.Value {
     const column_count = try readU16(data, pos);
+    if (column_count != relation.columns.len) return error.InvalidReplicationSourceRow;
     var object = std.json.ObjectMap.empty;
     errdefer {
         var it = object.iterator();
@@ -4412,7 +4652,10 @@ fn parsePgoutputTupleAlloc(alloc: Allocator, data: []const u8, pos: *usize, rela
         const kind = try readByte(data, pos);
         switch (kind) {
             'n' => {
-                try object.put(alloc, try alloc.dupe(u8, relation.columns[idx].name), .null);
+                const name = try alloc.dupe(u8, relation.columns[idx].name);
+                errdefer alloc.free(name);
+                if (object.contains(name)) return error.InvalidReplicationSourceRow;
+                try object.put(alloc, name, .null);
             },
             'u' => {},
             't', 'b' => {
@@ -4420,24 +4663,12 @@ fn parsePgoutputTupleAlloc(alloc: Allocator, data: []const u8, pos: *usize, rela
                 if (len < 0 or pos.* + @as(usize, @intCast(len)) > data.len) return error.InvalidReplicationSourceRow;
                 const raw = data[pos.* .. pos.* + @as(usize, @intCast(len))];
                 pos.* += @as(usize, @intCast(len));
-                try object.put(
-                    alloc,
-                    try alloc.dupe(u8, relation.columns[idx].name),
-                    try parseLogicalValueAlloc(alloc, relation.columns[idx].data_type, raw, kind == 'b'),
-                );
-            },
-            else => return error.InvalidReplicationSourceRow,
-        }
-    }
-
-    while (idx < column_count) : (idx += 1) {
-        const kind = try readByte(data, pos);
-        switch (kind) {
-            'n', 'u' => {},
-            't', 'b' => {
-                const len = try readI32(data, pos);
-                if (len < 0 or pos.* + @as(usize, @intCast(len)) > data.len) return error.InvalidReplicationSourceRow;
-                pos.* += @as(usize, @intCast(len));
+                var value = try parseLogicalValueAlloc(alloc, relation.columns[idx].data_type, raw, kind == 'b');
+                errdefer foreign_source.deinitJsonValue(alloc, &value);
+                const name = try alloc.dupe(u8, relation.columns[idx].name);
+                errdefer alloc.free(name);
+                if (object.contains(name)) return error.InvalidReplicationSourceRow;
+                try object.put(alloc, name, value);
             },
             else => return error.InvalidReplicationSourceRow,
         }
@@ -5910,6 +6141,14 @@ test "postgres libpq created replication snapshot cloning is allocation-failure 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
+test "postgres libpq parser rejects truncate and unknown effects rather than acknowledging lost mutations" {
+    const alloc = std.testing.allocator;
+    var relations = std.AutoHashMapUnmanaged(u32, PgoutputRelation).empty;
+    defer deinitPgoutputRelationCache(alloc, &relations);
+    try std.testing.expectError(error.UnsupportedReplicationTruncate, parsePgoutputMessageAlloc(alloc, "T", &relations));
+    try std.testing.expectError(error.UnsupportedReplicationMessage, parsePgoutputMessageAlloc(alloc, "?", &relations));
+}
+
 test "postgres libpq parser decodes pgoutput relation and row changes" {
     const alloc = std.testing.allocator;
 
@@ -5967,8 +6206,8 @@ test "postgres libpq parser decodes pgoutput relation and row changes" {
     try Builder.appendCString(&relation_bytes, alloc, "users");
     try relation_bytes.append(alloc, 'd');
     try Builder.appendU16(&relation_bytes, alloc, 3);
-    inline for (.{ .{ "id", TypeOid.int8 }, .{ "name", TypeOid.json }, .{ "tier", TypeOid.boolean } }) |column| {
-        try relation_bytes.append(alloc, 0);
+    inline for (.{ .{ "id", TypeOid.int8 }, .{ "name", TypeOid.json }, .{ "tier", TypeOid.boolean } }, 0..) |column, index| {
+        try relation_bytes.append(alloc, @intFromBool(index == 0));
         try Builder.appendCString(&relation_bytes, alloc, column.@"0");
         try Builder.appendU32(&relation_bytes, alloc, column.@"1");
         try Builder.appendU32(&relation_bytes, alloc, 0);
@@ -6020,8 +6259,51 @@ test "postgres libpq parser decodes pgoutput relation and row changes" {
     };
     defer update.deinit(alloc);
     try std.testing.expectEqual(foreign_source.ReplicationOp.update, update.op);
+    try std.testing.expectEqual(foreign_source.ReplicationBeforeKind.key, update.before_kind);
+    try std.testing.expectEqual(@as(usize, 1), update.beforeImage().?.object.count());
+    try std.testing.expectEqual(update.row.?.object.get("id").?.integer, update.beforeImage().?.object.get("id").?.integer);
     try std.testing.expectEqualStrings("la", update.row.?.object.get("name").?.object.get("city").?.string);
     try std.testing.expect(!update.row.?.object.get("tier").?.bool);
+
+    var key_update_bytes = std.ArrayListUnmanaged(u8).empty;
+    defer key_update_bytes.deinit(alloc);
+    try key_update_bytes.append(alloc, 'U');
+    try Builder.appendU32(&key_update_bytes, alloc, 42);
+    try key_update_bytes.append(alloc, 'K');
+    try Builder.appendU16(&key_update_bytes, alloc, 3);
+    try Builder.appendTextTupleValue(&key_update_bytes, alloc, "7");
+    try key_update_bytes.appendSlice(alloc, "nn");
+    try key_update_bytes.append(alloc, 'N');
+    try Builder.appendU16(&key_update_bytes, alloc, 3);
+    try Builder.appendTextTupleValue(&key_update_bytes, alloc, "8");
+    try key_update_bytes.appendSlice(alloc, "un");
+    var key_update = (try parsePgoutputMessageAlloc(alloc, key_update_bytes.items, &relation_cache)).change;
+    defer key_update.deinit(alloc);
+    try std.testing.expectEqual(foreign_source.ReplicationBeforeKind.key, key_update.before_kind);
+    try std.testing.expect(!key_update.before_complete and !key_update.row_complete);
+    try std.testing.expectEqual(@as(i64, 7), key_update.beforeImage().?.object.get("id").?.integer);
+    try std.testing.expectEqual(@as(usize, 1), key_update.beforeImage().?.object.count());
+    try std.testing.expectEqual(@as(i64, 8), key_update.row.?.object.get("id").?.integer);
+    try std.testing.expect(key_update.row.?.object.get("name") == null);
+    try std.testing.expect(key_update.row.?.object.get("tier").? == .null);
+    var full_update_bytes = std.ArrayListUnmanaged(u8).empty;
+    defer full_update_bytes.deinit(alloc);
+    try full_update_bytes.append(alloc, 'U');
+    try Builder.appendU32(&full_update_bytes, alloc, 42);
+    try full_update_bytes.append(alloc, 'O');
+    try Builder.appendU16(&full_update_bytes, alloc, 3);
+    try Builder.appendTextTupleValue(&full_update_bytes, alloc, "7");
+    try Builder.appendTextTupleValue(&full_update_bytes, alloc, "{\"city\":\"la\"}");
+    try full_update_bytes.append(alloc, 'n');
+    try full_update_bytes.appendSlice(alloc, update_bytes.items[5..]);
+    var full_update = (try parsePgoutputMessageAlloc(alloc, full_update_bytes.items, &relation_cache)).change;
+    defer full_update.deinit(alloc);
+    try std.testing.expectEqual(foreign_source.ReplicationBeforeKind.full, full_update.before_kind);
+    try std.testing.expect(full_update.before_complete and full_update.row_complete);
+    try std.testing.expect(full_update.beforeImage().?.object.get("tier").? == .null);
+    try std.testing.expectEqualStrings("la", full_update.beforeImage().?.object.get("name").?.object.get("city").?.string);
+    const malformed_tuple = [_]u8{ 'I', 0, 0, 0, 42, 'N', 0, 2 };
+    try std.testing.expectError(error.InvalidReplicationSourceRow, parsePgoutputMessageAlloc(alloc, &malformed_tuple, &relation_cache));
 
     var delete_bytes = std.ArrayListUnmanaged(u8).empty;
     defer delete_bytes.deinit(alloc);
@@ -6039,6 +6321,8 @@ test "postgres libpq parser decodes pgoutput relation and row changes" {
     };
     defer delete.deinit(alloc);
     try std.testing.expectEqual(foreign_source.ReplicationOp.delete, delete.op);
+    try std.testing.expectEqual(foreign_source.ReplicationBeforeKind.full, delete.before_kind);
+    try std.testing.expect(delete.before_complete);
     try std.testing.expectEqual(@as(i64, 7), delete.row.?.object.get("id").?.integer);
 
     var commit_bytes = std.ArrayListUnmanaged(u8).empty;
@@ -6986,6 +7270,62 @@ test "postgres libpq poll resumes from durable checkpoint across multiple transa
         .limit = 16,
     };
     defer second_poll_params.deinit(alloc);
+    const deadline = platform_time.monotonicNs() +| 10 * std.time.ns_per_s;
+    const replication = try executor.connectReplicationFreshWithDeadline(alloc, dsn, deadline);
+    defer executor.pqfinish(replication);
+    const identity = try executor.identifyExactCutoverProvider(alloc, conn, replication, deadline);
+    var wrong_identity = identity;
+    wrong_identity[0] ^= 1;
+    const before_rejection = try executor.loadLogicalReplicationSlotCheckpointAlloc(alloc, conn, slot_name, deadline);
+    defer alloc.free(before_rejection);
+    second_poll_params.expected_provider_identity = wrong_identity;
+    try std.testing.expectError(error.ReplicationCutoverAuthorityLost, executor.pollChangesAlloc(alloc, dsn, second_poll_params));
+    const after_rejection = try executor.loadLogicalReplicationSlotCheckpointAlloc(alloc, conn, slot_name, deadline);
+    defer alloc.free(after_rejection);
+    try std.testing.expectEqualStrings(before_rejection, after_rejection);
+    second_poll_params.expected_provider_identity = identity;
+
+    const extra_table = try std.fmt.allocPrint(alloc, "{s}_other", .{table_name});
+    defer alloc.free(extra_table);
+    const create_extra = try std.fmt.allocPrint(alloc, "CREATE TABLE {s} (LIKE {s} INCLUDING ALL)", .{ extra_table, table_name });
+    defer alloc.free(create_extra);
+    const drop_extra = try std.fmt.allocPrint(alloc, "DROP TABLE IF EXISTS {s}", .{extra_table});
+    defer alloc.free(drop_extra);
+    try execCommandForTest(&executor, conn, alloc, create_extra);
+    defer execCommandForTest(&executor, conn, alloc, drop_extra) catch {};
+    const add_extra = try std.fmt.allocPrint(alloc, "ALTER PUBLICATION {s} ADD TABLE {s}", .{ publication_name, extra_table });
+    defer alloc.free(add_extra);
+    try execCommandForTest(&executor, conn, alloc, add_extra);
+    try std.testing.expectError(error.ReplicationPublicationBindingChanged, executor.pollChangesAlloc(alloc, dsn, second_poll_params));
+
+    const drift_filter = try std.fmt.allocPrint(alloc, "ALTER PUBLICATION {s} SET TABLE {s} WHERE (id <> 'u1')", .{ publication_name, table_name });
+    defer alloc.free(drift_filter);
+    try execCommandForTest(&executor, conn, alloc, drift_filter);
+    {
+        var configured = prepare_params;
+        configured.filter_query_json = try alloc.dupe(u8, "{\"term\":\"u1\",\"field\":\"id\"}");
+        defer alloc.free(configured.filter_query_json.?);
+        try std.testing.expectError(error.ReplicationPublicationBindingChanged, executor.prepareReplicationAlloc(alloc, dsn, configured));
+        const matching = try std.fmt.allocPrint(alloc, "ALTER PUBLICATION {s} SET TABLE {s} WHERE (id = 'u1')", .{ publication_name, table_name });
+        defer alloc.free(matching);
+        try execCommandForTest(&executor, conn, alloc, matching);
+        var prepared = try executor.prepareReplicationAlloc(alloc, dsn, configured);
+        defer prepared.deinit(alloc);
+        try std.testing.expect(prepared.slot_existed);
+    }
+    {
+        var filtered = second_poll_params;
+        filtered.filter_query_json = try alloc.dupe(u8, "{}");
+        defer alloc.free(filtered.filter_query_json.?);
+        try std.testing.expectError(error.ReplicationPublicationBindingChanged, executor.pollChangesAlloc(alloc, dsn, filtered));
+    }
+    const restore_publication = try std.fmt.allocPrint(alloc, "ALTER PUBLICATION {s} SET TABLE {s}", .{ publication_name, table_name });
+    defer alloc.free(restore_publication);
+    try execCommandForTest(&executor, conn, alloc, restore_publication);
+    const after_drift = try executor.loadLogicalReplicationSlotCheckpointAlloc(alloc, conn, slot_name, deadline);
+    defer alloc.free(after_drift);
+    try std.testing.expectEqualStrings(before_rejection, after_drift);
+
     var second_poll = try executor.pollChangesAlloc(alloc, dsn, second_poll_params);
     defer second_poll.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), second_poll.changes.len);
@@ -6994,6 +7334,8 @@ test "postgres libpq poll resumes from durable checkpoint across multiple transa
     try std.testing.expectEqualStrings("platinum", second_poll.changes[0].row.?.object.get("tier").?.string);
     try std.testing.expect(second_poll.checkpoint.len > 0);
     try std.testing.expectEqualStrings(second_poll.changes[0].checkpoint, second_poll.checkpoint);
+    first_poll_params.expected_provider_identity = identity;
+    try std.testing.expectError(error.ReplicationCutoverAuthorityLost, executor.pollChangesAlloc(alloc, dsn, first_poll_params));
 }
 
 test "postgres libpq module compiles" {

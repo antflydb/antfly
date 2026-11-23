@@ -15,6 +15,8 @@
 
 pub const physical_local_write = if (@import("storage_source_options").control_only) struct {} else @import("antfly_source_root").antfly_sources.local_write;
 pub const std = @import("std");
+pub const source_admission = @import("../storage/source_admission.zig");
+pub const source_effects = @import("../storage/source_effects.zig");
 pub const storage_source_options = @import("storage_source_options");
 pub const control_only_storage_sources = storage_source_options.control_only;
 pub const backups_api = @import("backups.zig");
@@ -100,7 +102,16 @@ pub const BoundTableWriteSource = struct {
     pub fn source(self: *BoundTableWriteSource) TableWriteSource {
         return .{
             .ptr = self,
+            .supports_transaction_producers = true,
+            .supports_transaction_producer_phases = true,
             .vtable = &.{
+                .retire_source_attempt = retireSourceAttempt,
+                .native_history_consumer_control = nativeHistoryConsumerControl,
+                .native_history_page = nativeHistoryPage,
+                .admit_source_transaction = admitSourceTransaction,
+                .native_source_admission_namespace = nativeSourceAdmissionNamespace,
+                .resolve_source_admission = resolveSourceAdmissionCallback,
+                .release_source_admission = releaseSourceAdmissionCallback,
                 .create_table = createTable,
                 .update_schema = updateSchema,
                 .create_index = createIndex,
@@ -724,24 +735,19 @@ pub const BoundTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
-        if (tables.len == 1 and tables[0].predicates.len == 0 and tables[0].relational_index_maintenance == null) {
+        _ = try @import("distributed_txn_contract.zig").transactionProducer(tables);
+        if (tables.len == 1) if (boundFastBatchRequest(tables[0], sync_level)) |req| {
             const table = tables[0];
             const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
             if (!std.mem.eql(u8, self.table_name, table.table_name)) return null;
             const db = try self.activeDb();
-            const req: db_mod.types.BatchRequest = .{
-                .writes = transactionWritesAsBatchWrites(table.writes),
-                .deletes = table.deletes,
-                .transforms = table.transforms,
-                .sync_level = sync_level,
-            };
             try validateTableBatchAgainstLocalSchema(alloc, db, req.writes, req.deletes, req.transforms);
             db.batchWithVisibilityCancellation(req, cancellation) catch |err| switch (err) {
                 error.IntentConflict, error.VersionConflict => return .{ .conflict = boundConflict(table, err) },
                 else => return err,
             };
             return .{ .committed = .{ .participant_count = 1 } };
-        }
+        };
         const txn_source: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         const txn_io: ?Io = txn_source.db.backend_runtime.io();
         const txn_id = nextTxnId(txn_io);
@@ -786,6 +792,101 @@ pub const BoundTableWriteSource = struct {
         return {};
     }
 
+    fn admitSourceTransaction(ptr: *anyopaque, alloc: std.mem.Allocator, table: distributed_txn.TableCommitRequest, cancellation: db_mod.types.CancellationToken) !distributed_txn.CommitOutcome {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        const db = try self.activeDb();
+        _ = try db.nativeSourceAdmissionNamespace();
+        const command = table.source_admission orelse return error.InvalidSourceAdmission;
+        _ = try db.sourceAdmissionStatus(command);
+        var original = self.*;
+        original.table_name = table.table_name;
+        return (try commitBoundTransaction(&original, alloc, command.transactionId(), command.accepted_at_ns, &.{table}, .write, true, cancellation)) orelse error.SourceOutcomeUnresolved;
+    }
+
+    fn retireSourceAttempt(ptr: *anyopaque, command: source_admission.Command) ![source_admission.fence_size]u8 {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        return (try self.activeDb()).retireSourceAttempt(command);
+    }
+
+    fn nativeHistoryConsumerControl(ptr: *anyopaque, command: table_write_source.history_consumer.Command) !table_write_source.history_consumer.Result {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        return (try self.activeDb()).nativeHistoryConsumerControl(command);
+    }
+
+    fn nativeHistoryPage(ptr: *anyopaque, allocator: std.mem.Allocator, request: table_write_source.history_page.Request) !table_write_source.history_page.Page {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        return (try self.activeDb()).nativeHistoryPage(allocator, request);
+    }
+
+    fn nativeSourceAdmissionNamespace(ptr: *anyopaque) ![24]u8 {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        return (try self.activeDb()).nativeSourceAdmissionNamespace();
+    }
+
+    fn resolveSourceAdmissionCallback(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, command: source_admission.Command, sync: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) !?distributed_txn.CommitOutcome {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        return self.resolveSourceAdmission(alloc, name, command, sync, cancellation);
+    }
+
+    fn releaseSourceAdmissionCallback(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, command: source_admission.Command) !void {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        return self.releaseSourceAdmission(alloc, name, command);
+    }
+
+    /// Resolve only an authenticated durable source reservation. A prepared
+    /// vote already contains the final row effects, so recovery must never
+    /// expand the original transforms against today's documents or schema.
+    /// The original name locates the retained coordinator; table ID authority
+    /// is checked by sourceAdmissionStatus before that locator is used.
+    pub fn resolveSourceAdmission(
+        self: *BoundTableWriteSource,
+        alloc: std.mem.Allocator,
+        original_table_name: []const u8,
+        command: source_admission.Command,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?distributed_txn.CommitOutcome {
+        const db = try self.activeDb();
+        _ = try db.nativeSourceAdmissionNamespace();
+        switch (try db.sourceAdmissionStatus(command)) {
+            .absent => return null,
+            .committed => return try sourceCommittedOutcome(db, command.transactionId(), original_table_name, sync_level, true, cancellation),
+            .prepared => {},
+        }
+        var original = self.*;
+        original.table_name = original_table_name;
+        const outcome = try commitBoundTransactionInner(&original, alloc, command.transactionId(), command.accepted_at_ns, &.{.{
+            .table_name = original_table_name,
+            .source_admission = command,
+        }}, sync_level, true, cancellation, true);
+        if (outcome) |value| if (value == .committed) {
+            if (try db.sourceAdmissionReceipt(command) == null) return error.SourceOutcomeUnresolved;
+        };
+        return outcome;
+    }
+
+    /// Release coordinator retention only after the caller has durably recorded
+    /// destination acceptance. The independent source receipt survives release,
+    /// making retries safe even after the native transaction record is gone.
+    pub fn releaseSourceAdmission(
+        self: *BoundTableWriteSource,
+        alloc: std.mem.Allocator,
+        original_table_name: []const u8,
+        command: source_admission.Command,
+    ) !void {
+        const db = try self.activeDb();
+        _ = try db.nativeSourceAdmissionNamespace();
+        if (try db.sourceAdmissionReceipt(command) == null) return error.SourceOutcomeUnresolved;
+        const status = db.getTransactionStatus(command.transactionId()) catch |err| switch (err) {
+            error.TxnNotFound => return,
+            else => return err,
+        };
+        if (status != .committed) return error.SourceOutcomeUnresolved;
+        const participant = try distributed_txn.participantIdForGroup(alloc, original_table_name, 0);
+        defer alloc.free(participant);
+        try db.markTransactionParticipantResolved(command.transactionId(), participant);
+    }
+
     pub fn commitBoundTransaction(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -796,6 +897,110 @@ pub const BoundTableWriteSource = struct {
         retain_terminal: bool,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
+        const producer = try @import("distributed_txn_contract.zig").transactionProducer(tables);
+        if (producer != .unlabelled) for (tables) |table| if (table.source_admission != null) return error.SourceTransactionIdentityConflict;
+        const admission = @import("../storage/source_admission.zig");
+        if (tables.len != 1 or tables[0].source_admission == null)
+            return commitBoundTransactionInner(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, retain_terminal, cancellation, false);
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        const table = tables[0];
+        if (!std.mem.eql(u8, self.table_name, table.table_name)) return null;
+        const command = table.source_admission.?;
+        if (!retain_terminal) return error.InvalidSourceAdmission;
+        try command.validate();
+        if (command.accepted_at_ns != begin_timestamp or !std.mem.eql(u8, &txn_id, &command.transactionId())) return error.SourceTransactionIdentityConflict;
+        if (!std.mem.eql(u8, &command.participant_digest, &admission.operationsDigest(table))) return error.SourcePayloadConflict;
+        const db = try self.activeDb();
+        // Resolve acknowledged source retries before validating against a newer
+        // schema or expanding transforms against a later row image.
+        const source_status = try db.sourceAdmissionStatus(command);
+        if (source_status == .committed)
+            return try sourceCommittedOutcome(db, txn_id, table.table_name, sync_level, retain_terminal, cancellation);
+        const outcome = commitBoundTransactionInner(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, retain_terminal, cancellation, source_status == .prepared) catch |err| {
+            if (err == error.SourceAlreadyCommitted and try db.sourceAdmissionReceipt(command) != null)
+                return try sourceCommittedOutcome(db, txn_id, table.table_name, sync_level, retain_terminal, cancellation);
+            return err;
+        };
+        if (outcome) |value| if (value == .committed) {
+            if (try db.sourceAdmissionReceipt(command) == null) return error.SourceOutcomeUnresolved;
+        };
+        return outcome;
+    }
+
+    fn sourceCommittedOutcome(
+        db: *db_mod.DB,
+        txn_id: db_mod.types.TxnId,
+        table_name: []const u8,
+        sync_level: db_mod.types.SyncLevel,
+        retain_terminal: bool,
+        cancellation: db_mod.types.CancellationToken,
+    ) !distributed_txn.CommitOutcome {
+        const retained = if (retain_terminal) blk: {
+            const status = db.getTransactionStatus(txn_id) catch |err| if (err == error.TxnNotFound) break :blk false else return err;
+            break :blk status == .committed;
+        } else false;
+        var result: @FieldType(distributed_txn.CommitOutcome, "committed") = .{
+            .participant_count = 1,
+            .coordinator_group_id = if (retained) 0 else null,
+            .coordinator_table_name = if (retained) table_name else null,
+        };
+        db.waitForCurrentSyncLevelWithCancellation(sync_level, cancellation) catch |err| {
+            result.visibility_pending = true;
+            result.visibility_retry_pending = err != error.EnrichmentWorkerFailed;
+            result.visibility_repair_required = err == error.EnrichmentWorkerFailed;
+        };
+        return .{ .committed = result };
+    }
+
+    fn resolveBoundTransaction(db: *db_mod.DB, command: ?source_admission.Command, txn_id: db_mod.types.TxnId, status: transactions_mod.TxnStatus, version: u64, sync_level: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) !void {
+        if (command) |source_command| return db.resolveSourceTransaction(source_command, status, sync_level, cancellation);
+        return db.resolveTransactionIntentsWithSyncLevelAndCancellation(txn_id, status, version, sync_level, cancellation);
+    }
+
+    fn prepareBoundTransaction(alloc: std.mem.Allocator, db: *db_mod.DB, txn_id: db_mod.types.TxnId, table: distributed_txn.TableCommitRequest) !void {
+        // Producer BEGIN checked the original identity/decision before schema
+        // validation. New validation failures still enter the existing ABORT path.
+        if (table.source_producer != .unlabelled) try validateTransactionAgainstLocalSchema(alloc, db, txn_id, table.writes, table.deletes, table.transforms);
+        try db.writeTransaction(txn_id, .{
+            .completion_ordinary_producer = table.source_producer == .ordinary,
+            .completion_legacy_producer = table.source_producer == .legacy_cdc,
+
+            .source_admission = table.source_admission,
+            .row_policy_principal_proof = table.row_policy_principal_proof,
+            .row_policy_database = table.row_policy_database,
+            .row_policy_admitted_at_seconds = table.row_policy_admitted_at_seconds,
+            .normalized_graph_rows = table.normalized_graph_rows,
+            .writes = table.writes,
+            .deletes = table.deletes,
+            .transforms = table.transforms,
+            .graph_writes = table.graph_writes,
+            .graph_deletes = table.graph_deletes,
+            .predicates = table.predicates,
+            .integrity = table.integrity,
+            .integrity_commands = table.integrity_commands,
+            .relational_activation = table.relational_activation,
+            .relational_retirement = table.relational_retirement,
+            .relational_index_maintenance = table.relational_index_maintenance,
+            .schema_version = table.schema_version,
+            .relational_schema_version = table.relational_schema_version,
+            .relational_integrity_generation_set = table.relational_integrity_generation_set,
+            .restore_staging_scope = table.restore_staging_scope,
+            .restore_staging_plan_id = table.restore_staging_plan_id,
+            .relational_repair = table.relational_repair,
+        });
+    }
+
+    fn commitBoundTransactionInner(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        retain_terminal: bool,
+        cancellation: db_mod.types.CancellationToken,
+        source_prepared: bool,
+    ) !?distributed_txn.CommitOutcome {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (tables.len != 1) return error.UnsupportedOperation;
         const table = tables[0];
@@ -804,23 +1009,28 @@ pub const BoundTableWriteSource = struct {
         if (table.relational_index_maintenance) |command| if (command.owner_group_id != (self.owner_group_id orelse return error.UnsupportedOperation)) return error.PreparedGenerationChanged;
         const db = try self.activeDb();
         if (table.range_guards.len != 0) return error.SqlStatementSnapshotRequired;
-        try validateTransactionAgainstLocalSchema(alloc, db, txn_id, table.writes, table.deletes, table.transforms);
+        if (!source_prepared and table.source_producer == .unlabelled) try validateTransactionAgainstLocalSchema(alloc, db, txn_id, table.writes, table.deletes, table.transforms);
         const commit_version = begin_timestamp + 1;
         const local_participant = try distributed_txn.participantIdForGroup(alloc, table.table_name, 0);
         defer alloc.free(local_participant);
         const participants = [_][]const u8{local_participant};
 
-        _ = db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
-            txn_id,
-            begin_timestamp,
-            nextTxnTimestamp(db.backend_runtime.io()),
-            &participants,
-            true,
-            retain_terminal,
-        ) catch |err| switch (err) {
+        _ = (if (table.source_admission) |command|
+            db.beginSourceTransaction(command, nextTxnTimestamp(db.backend_runtime.io()), &participants)
+        else if (table.source_producer != .unlabelled)
+            db.beginProducerTransactionScoped(txn_id, begin_timestamp, nextTxnTimestamp(db.backend_runtime.io()), &participants, true, retain_terminal, table.restore_staging_scope, table.source_producer)
+        else
+            db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
+                txn_id,
+                begin_timestamp,
+                nextTxnTimestamp(db.backend_runtime.io()),
+                &participants,
+                true,
+                retain_terminal,
+            )) catch |err| switch (err) {
             error.DecisionConflict => switch (try db.getTransactionStatus(txn_id)) {
                 .committed => {
-                    db.resolveTransactionIntentsWithSyncLevelAndCancellation(txn_id, .committed, commit_version, sync_level, cancellation) catch |barrier_err| {
+                    resolveBoundTransaction(db, table.source_admission, txn_id, .committed, commit_version, sync_level, cancellation) catch |barrier_err| {
                         const durable_status = db.getTransactionStatus(txn_id) catch return barrier_err;
                         if (durable_status != .committed) return barrier_err;
                         var propagation_pending = false;
@@ -865,28 +1075,24 @@ pub const BoundTableWriteSource = struct {
             },
             else => return err,
         };
-        db.writeTransaction(txn_id, .{
-            .writes = table.writes,
-            .deletes = table.deletes,
-            .transforms = table.transforms,
-            .predicates = table.predicates,
-            .integrity = table.integrity,
-            .integrity_commands = table.integrity_commands,
-            .relational_activation = table.relational_activation,
-            .relational_retirement = table.relational_retirement,
-            .relational_index_maintenance = table.relational_index_maintenance,
-            .schema_version = table.schema_version,
-            .relational_schema_version = table.relational_schema_version,
-            .relational_integrity_generation_set = table.relational_integrity_generation_set,
-            .restore_staging_scope = table.restore_staging_scope,
-            .restore_staging_plan_id = table.restore_staging_plan_id,
-            .relational_repair = table.relational_repair,
-        }) catch |err| {
+        // A durable source receipt intent proves the original effects were
+        // atomically prepared. Resume that vote without re-expanding transforms
+        // or validating an old request against a newer schema. BEGIN above still
+        // fences participant/coordinator/retention identity before resolution.
+        if (!source_prepared) prepareBoundTransaction(alloc, db, txn_id, table) catch |err| {
+            if (table.source_admission != null) switch (err) {
+                // Another exact attempt can finish after our receipt lookup.
+                error.SourceAlreadyCommitted => return try sourceCommittedOutcome(db, txn_id, table.table_name, sync_level, retain_terminal, cancellation),
+                // A different payload under the same identity cannot abort the
+                // original attempt whose durable receipt owns that identity.
+                error.SourcePayloadConflict, error.SourceTransactionIdentityConflict => return err,
+                else => {},
+            };
             // A begun local transaction must reach a terminal state on every
             // rejected write. In particular, graph transform validation is
             // performed by DB.writeTransaction after begin, so returning the
             // validation error without aborting would strand its transaction.
-            db.resolveTransactionIntents(txn_id, .aborted, commit_version) catch |abort_err| {
+            resolveBoundTransaction(db, table.source_admission, txn_id, .aborted, commit_version, .propose, .none) catch |abort_err| {
                 std.log.err("failed to abort rejected bound transaction write_err={s} abort_err={s}", .{
                     @errorName(err),
                     @errorName(abort_err),
@@ -911,7 +1117,7 @@ pub const BoundTableWriteSource = struct {
                 else => return err,
             }
         };
-        db.resolveTransactionIntentsWithSyncLevelAndCancellation(txn_id, .committed, commit_version, sync_level, cancellation) catch |err| {
+        resolveBoundTransaction(db, table.source_admission, txn_id, .committed, commit_version, sync_level, cancellation) catch |err| {
             const durable_status = db.getTransactionStatus(txn_id) catch return err;
             if (durable_status == .committed) {
                 std.log.warn("bound transaction acknowledged after durable commit barrier failure txn_id={x} err={s}", .{
@@ -1082,8 +1288,8 @@ pub const BoundTableWriteSource = struct {
 
     pub fn txnBeginGroupLocalWithPreDecisionContext(
         ptr: *anyopaque,
-        _: std.mem.Allocator,
-        _: u64,
+        alloc: std.mem.Allocator,
+        group_id: u64,
         table_name: []const u8,
         txn_id: db_mod.types.TxnId,
         begin_timestamp: u64,
@@ -1095,6 +1301,26 @@ pub const BoundTableWriteSource = struct {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         try ensurePreDecisionContextActive(context);
+        if (context.source_producer != .unlabelled) {
+            if (self.owner_group_id) |bound_group| if (bound_group != group_id) return null;
+            const local_participant = try distributed_txn.participantIdForGroupScoped(alloc, table_name, group_id, context.restore_staging_scope, context.restore_staging_plan_id);
+            defer alloc.free(local_participant);
+            if (participants.len == 0) return error.InvalidParticipant;
+            var seen = std.StringHashMapUnmanaged(void).empty;
+            defer seen.deinit(alloc);
+            var local_present = false;
+            for (participants) |participant| {
+                if (distributed_txn.parseParticipantRef(participant) == null) return error.InvalidParticipant;
+                const slot = try seen.getOrPut(alloc, participant);
+                if (slot.found_existing) return error.InvalidParticipant;
+                if (std.mem.eql(u8, participant, local_participant)) local_present = true;
+            }
+            if (!local_present) return error.InvalidParticipant;
+            const coordinator = std.mem.eql(u8, participants[0], local_participant);
+            const local_only = [_][]const u8{local_participant};
+            _ = try (try self.activeDb()).beginProducerTransactionScoped(txn_id, begin_timestamp, nextTxnTimestamp(self.db.backend_runtime.io()), if (coordinator) participants else &local_only, coordinator, retain_terminal, context.restore_staging_scope, context.source_producer);
+            return {};
+        }
         _ = try (try self.activeDb()).beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
             txn_id,
             begin_timestamp,
@@ -1224,6 +1450,41 @@ pub fn nextTxnId(io: ?Io) db_mod.types.TxnId {
     std.mem.writeInt(u64, txn_id[0..8], nextTxnTimestamp(null), .big);
     std.mem.writeInt(u64, txn_id[8..16], nonce, .big);
     return txn_id;
+}
+
+pub fn boundFastBatchRequest(table: distributed_txn.TableCommitRequest, sync_level: db_mod.types.SyncLevel) ?db_mod.types.BatchRequest {
+    const defaults: distributed_txn.TableCommitRequest = .{ .table_name = table.table_name };
+    inline for (comptime std.meta.fieldNames(distributed_txn.TableCommitRequest)) |name| {
+        if (comptime std.mem.eql(u8, name, "table_name") or std.mem.eql(u8, name, "source_producer") or
+            std.mem.eql(u8, name, "row_policy_principal_proof") or std.mem.eql(u8, name, "row_policy_database") or
+            std.mem.eql(u8, name, "row_policy_admitted_at_seconds") or std.mem.eql(u8, name, "normalized_graph_rows") or
+            std.mem.eql(u8, name, "schema_version") or std.mem.eql(u8, name, "relational_schema_version") or
+            std.mem.eql(u8, name, "relational_integrity_generation_set") or std.mem.eql(u8, name, "restore_staging_scope") or
+            std.mem.eql(u8, name, "restore_staging_plan_id") or std.mem.eql(u8, name, "writes") or std.mem.eql(u8, name, "deletes") or
+            std.mem.eql(u8, name, "transforms") or std.mem.eql(u8, name, "graph_writes") or std.mem.eql(u8, name, "graph_deletes")) continue;
+        const value = @field(table, name);
+        if (comptime @typeInfo(@TypeOf(value)) == .pointer and @typeInfo(@TypeOf(value)).pointer.size == .slice) {
+            if (value.len != 0) return null;
+        } else if (!std.meta.eql(value, @field(defaults, name))) return null;
+    }
+    return .{
+        .source_producer = table.source_producer,
+        .row_policy_principal_proof = table.row_policy_principal_proof,
+        .row_policy_database = table.row_policy_database,
+        .row_policy_admitted_at_seconds = table.row_policy_admitted_at_seconds,
+        .normalized_graph_rows = table.normalized_graph_rows,
+        .schema_version = table.schema_version,
+        .relational_schema_version = table.relational_schema_version,
+        .relational_integrity_generation_set = table.relational_integrity_generation_set,
+        .restore_staging_scope = table.restore_staging_scope,
+        .restore_staging_plan_id = table.restore_staging_plan_id,
+        .writes = transactionWritesAsBatchWrites(table.writes),
+        .deletes = table.deletes,
+        .transforms = table.transforms,
+        .graph_writes = table.graph_writes,
+        .graph_deletes = table.graph_deletes,
+        .sync_level = sync_level,
+    };
 }
 
 pub fn boundConflict(table: distributed_txn.TableCommitRequest, err: anyerror) distributed_txn.CommitConflict {

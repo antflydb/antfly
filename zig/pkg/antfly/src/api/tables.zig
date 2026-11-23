@@ -1094,10 +1094,23 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !Crea
     return parseCreateTableRequestWithOptions(alloc, body, false);
 }
 
+pub const external_table_replication_sources_error_message = "external tables with local storage do not accept replication sources";
+
 pub fn validateObjectCreateDefinition(alloc: std.mem.Allocator, req: CreateTableRequest) !void {
     const storage = req.storage orelse @import("antfly_local_sources").common_table_storage.Settings{};
-    if (storage.engine != .object) return;
-    try storage.validateCreate(req.num_shards, if (req.replication_sources_json) |sources| !std.mem.eql(u8, sources, "[]") else false);
+    const has_replication_sources = if (req.replication_sources_json) |sources| !std.mem.eql(u8, sources, "[]") else false;
+    if (storage.engine != .object) {
+        if (has_replication_sources and req.schema_json != null) {
+            const bindings = @import("antfly_local_sources").serverless_external_source_schema_binding;
+            if (try bindings.externalBindingFromSchemaJsonAlloc(alloc, req.schema_json.?)) |external| {
+                var binding = external;
+                binding.deinit(alloc);
+                return error.ExternalTableReplicationSourcesUnsupported;
+            }
+        }
+        return;
+    }
+    try storage.validateCreate(req.num_shards, has_replication_sources);
     const validated = try @import("antfly_local_sources").schema_table_schema_impl.parseCreateSchemaRequest(alloc, effectiveSchemaJson(req.schema_json));
     defer alloc.free(validated);
     var schema = try std.json.parseFromSlice(std.json.Value, alloc, validated, .{});

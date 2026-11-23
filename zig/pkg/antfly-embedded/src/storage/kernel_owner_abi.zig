@@ -23,11 +23,35 @@ const failure_abi = @import("runtime_failure_abi");
 // Older owners must reject their operation identifiers before dispatch.
 // Version 90 also fences certified graph document-key descriptor domains.
 // Version 91 fences selected-role merge-readiness projection responses.
-// Version 92 requires native batch decoders to preserve commit prerequisites.
-// Version 93 adds capture-only direct preparation and immutable effect replay.
-// Version 95 adds ranged reads on retained metadata session snapshots.
-// Version 96 counts a prefix on a retained metadata session snapshot.
-pub const abi_version: u32 = 96;
+// Version 92 adds ordered history control and its stable retention failures.
+// Version 93 adds bounded binary retained-history pages at an ordered read cut.
+// Version 94 adds read-only exact retained-history outcome recovery.
+// Version 95 adds request-bound read-only retained grant observations.
+// Version 96 adds cut-bound immutable participant resolution reads.
+// Version 105 fences source-checkpoint failure statuses across owner calls.
+// Version 106 adds source checkpoint receipt-window mutation layouts.
+// Version 107 adds qualified checkpoint receipt observations.
+// Version 109 adds qualified source-scope registry observations.
+// Version 110 adds ordered source-scope controls and exact outcome recovery.
+// Version 111 adds ordered source retirement and exact outcome recovery.
+// Version 112 fences explicit ordinary completion transaction phases.
+// Version 113 fences private row batch producer envelopes.
+// Version 114 fences legacy completion transaction producer layouts.
+// Version 115 fences explicit table transaction origin contracts.
+// Version 116 fences native/ordered non-history producer admission.
+// Version 117 fences native producer pre-decision context layouts.
+// Version 118 adds apply-only physical producer closure.
+// Version 119 adds read-only producer closure snapshots.
+// Version 120 adds apply-only original terminal legacy resolution.
+// Version 121 returns durable original-terminal recovery outcomes.
+// Version 122 adds read-only original-terminal outcome observations.
+// Version 125 includes immutable direct preparation and retained history.
+// Version 127 includes retained metadata session snapshot ranges and counts.
+// Version 128 adds source recovery scope lookup to the metadata owner.
+// Version 129 supports first source binding after an ordered native drain check.
+// Version 130 decodes native PostgreSQL bootstrap certification in metadata apply.
+// Version 131 exposes the private retained native snapshot page read.
+pub const abi_version: u32 = 131;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -494,6 +518,10 @@ pub const MetadataProjectionKind = enum(u32) {
     /// Nonwaiting observation/reconciliation of the shared durable HA outbox.
     poll_ha_outbox = 76,
     catalog_table_projection = 77,
+    native_snapshot_rows = 78,
+    native_snapshot_capture = 79,
+    native_root_producer_cohort = 80,
+    native_root_producer_cohort_sealed = 81,
     /// Opaque binary AFSC bytes (empty = absent), unlike JSON projections.
     secret_collection = 42,
 };
@@ -836,6 +864,8 @@ pub const TransactionRecoveryCleanupFn = *const fn (
 
 /// Distributed control callbacks retained by a live owner for transaction
 /// recovery. Callback byte slices are borrowed only for each synchronous call.
+pub const TransactionRecoveryCompletionFn = *const fn (?*anyopaque, BorrowedBytes) callconv(.c) Status;
+
 pub const TransactionRecoveryConfig = extern struct {
     enabled: u8 = 0,
     lease_owned: u8 = 0,
@@ -851,6 +881,7 @@ pub const TransactionRecoveryConfig = extern struct {
     acknowledge_participant_fn: ?TransactionRecoveryAcknowledgeFn = null,
     acknowledge_participants_fn: ?TransactionRecoveryAcknowledgeManyFn = null,
     cleanup_transaction_fn: ?TransactionRecoveryCleanupFn = null,
+    enqueue_completion_fn: ?TransactionRecoveryCompletionFn = null,
 };
 
 /// One candidate entity borrowed for a synchronous resolution callback.
@@ -1095,6 +1126,13 @@ pub const ReplicatedBatchAtRaftEntryRequest = extern struct {
     raft_term: u64 = 0,
     raft_index: u64 = 0,
 };
+
+pub const TimestampedBatchAtRaftEntryRequest = extern struct {
+    entry: ReplicatedBatchAtRaftEntryRequest = .{},
+    committed_at_ns: i64 = 0,
+};
+
+pub extern fn antfly_storage_owner_timestamped_batch_at_raft_entry(owner: ?*anyopaque, request: *const TimestampedBatchAtRaftEntryRequest) callconv(.c) Status;
 
 /// Metadata-authorized hidden-child control on a native owner. This is a
 /// local operation receipt, never a data-Raft entry or source watermark.
@@ -1994,6 +2032,105 @@ pub extern fn antfly_storage_owner_replicated_batch_json(
 pub extern fn antfly_storage_owner_replicated_batch_at_raft_entry_json(
     owner: ?*anyopaque,
     request: *const ReplicatedBatchAtRaftEntryRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+/// Additive source-plan operations reuse the stable JSON headers. Only trusted
+/// native-owner callers may invoke them after qualifying the physical root.
+pub extern fn antfly_storage_owner_native_source_plan_control(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;
+pub extern fn antfly_storage_owner_ordered_source_plan_control(owner: ?*anyopaque, request: *const ReplicatedBatchAtRaftEntryRequest, out_response: *OwnedBytes) callconv(.c) Status;
+pub extern fn antfly_storage_owner_ordered_source_scope_control(owner: ?*anyopaque, request: *const ReplicatedBatchAtRaftEntryRequest, out_response: *OwnedBytes) callconv(.c) Status;
+pub extern fn antfly_storage_owner_ordered_source_scope_outcome(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;
+pub extern fn antfly_storage_owner_ordered_legacy_terminal_resolution(owner: ?*anyopaque, request: *const ReplicatedBatchAtRaftEntryRequest, out_response: *OwnedBytes) callconv(.c) Status;
+pub extern fn antfly_storage_owner_ordered_source_producer_closure(owner: ?*anyopaque, request: *const ReplicatedBatchAtRaftEntryRequest, out_response: *OwnedBytes) callconv(.c) Status;
+pub extern fn antfly_storage_owner_ordered_source_retirement(owner: ?*anyopaque, request: *const ReplicatedBatchAtRaftEntryRequest, out_response: *OwnedBytes) callconv(.c) Status;
+pub extern fn antfly_storage_owner_source_retirement_outcome(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;
+pub extern fn antfly_storage_owner_legacy_recovery_inventory(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;
+pub extern fn antfly_storage_owner_legacy_terminal_outcome(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;
+pub extern fn antfly_storage_owner_source_producer_closure_observation(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;
+pub extern fn antfly_storage_owner_source_scope_observation(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;
+pub extern fn antfly_storage_owner_source_checkpoint_observation(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;
+pub extern fn antfly_storage_owner_source_plan_observation(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;
+pub extern fn antfly_storage_owner_source_plan_chunk(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;
+pub extern fn antfly_storage_owner_ordered_source_plan_outcome(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;
+
+/// Private committed retention command. Uses the same immutable entry identity
+/// header; its request/response JSON are typed history command/outcome values.
+pub extern fn antfly_storage_owner_ordered_history_control_json(
+    owner: ?*anyopaque,
+    request: *const ReplicatedBatchAtRaftEntryRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+/// Read-only exact outcome lookup; request and response are bounded typed JSON.
+pub extern fn antfly_storage_owner_ordered_history_outcome(
+    owner: ?*anyopaque,
+    request: *const JsonOperationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+/// Read-only native/ordered lease observation, bound to the exact request.
+pub extern fn antfly_storage_owner_history_grant(
+    owner: ?*anyopaque,
+    request: *const JsonOperationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+/// Coherent retained coordinator record/admission read; owned bounded JSON.
+pub extern fn antfly_storage_owner_history_decision(
+    owner: ?*anyopaque,
+    request: *const JsonOperationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+/// Read-only native completion admission preconditions at the actual root.
+pub extern fn antfly_storage_owner_history_admission(
+    owner: ?*anyopaque,
+    request: *const JsonOperationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_history_publication(
+    owner: ?*anyopaque,
+    request: *const JsonOperationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_history_resolution(
+    owner: ?*anyopaque,
+    request: *const JsonOperationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+/// Private page request JSON contains the retained position and required cut;
+/// the response is the bounded HPG1 binary page envelope, not JSON.
+pub extern fn antfly_storage_owner_artifact_publication_history(
+    owner: ?*anyopaque,
+    request: *const JsonOperationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+pub extern fn antfly_storage_owner_split_history_policy(
+    owner: ?*anyopaque,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+pub extern fn antfly_storage_owner_split_history_cut(
+    owner: ?*anyopaque,
+    request: *const JsonOperationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+pub extern fn antfly_storage_owner_merge_history_cut(
+    owner: ?*anyopaque,
+    request: *const JsonOperationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+pub extern fn antfly_storage_owner_ordered_history_page(
+    owner: ?*anyopaque,
+    request: *const JsonOperationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+pub extern fn antfly_storage_owner_ordered_history_bootstrap_page(
+    owner: ?*anyopaque,
+    request: *const JsonOperationRequest,
     out_response: *OwnedBytes,
 ) callconv(.c) Status;
 

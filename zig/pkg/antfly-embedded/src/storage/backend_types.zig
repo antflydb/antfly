@@ -154,6 +154,9 @@ pub threadlocal var commit_progress: ?*CommitProgress = null;
 pub const BatchOptions = struct {
     mode: BatchMode = .default,
     defer_commit_flush: bool = false,
+    /// Topology copy materializes rows whose logical mutations were already
+    /// captured at the original owner. Keep native controls and receipts.
+    capture_committed_rows: bool = true,
     // Read-throughs performed by a write batch (for example, loading exact
     // vectors while building a derived index) may be one-pass scans. Keep the
     // default reusable, but let those callers avoid filling the shared block

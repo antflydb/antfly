@@ -285,7 +285,9 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const projectedBatchLsmAdmissionBytes = preparation.projectedBatchLsmAdmissionBytes;
         pub const rememberBulkIngestAllNewIdentityUpserts = commit.rememberBulkIngestAllNewIdentityUpserts;
         pub const replicationMutationBarrier = commit.replicationMutationBarrier;
+        pub const resolveClosedLegacyTerminalInternal = commit.resolveClosedLegacyTerminalInternal;
         pub const resolveTransactionIntentsInternal = commit.resolveTransactionIntentsInternal;
+        pub const resolveTransactionIntentsInternalScoped = commit.resolveTransactionIntentsInternalScoped;
         pub const resolveTransactionIntentsPrepared = commit.resolveTransactionIntentsPrepared;
         pub const restoreStagingStatus = commit.restoreStagingStatus;
         pub const shouldApplySplitReplicationLocked = commit.shouldApplySplitReplicationLocked;
@@ -859,7 +861,9 @@ pub fn ImplementationFor(comptime D: type) type {
             pub const prepareMergeArtifactEffects = Implementation.prepareMergeArtifactEffects;
             pub const rememberBulkIngestAllNewIdentityUpserts = Implementation.rememberBulkIngestAllNewIdentityUpserts;
             pub const replicationMutationBarrier = Implementation.replicationMutationBarrier;
+            pub const resolveClosedLegacyTerminalInternal = Implementation.resolveClosedLegacyTerminalInternal;
             pub const resolveTransactionIntentsInternal = Implementation.resolveTransactionIntentsInternal;
+            pub const resolveTransactionIntentsInternalScoped = Implementation.resolveTransactionIntentsInternalScoped;
             pub const resolveTransactionIntentsPrepared = Implementation.resolveTransactionIntentsPrepared;
             pub const restoreStagingStatus = Implementation.restoreStagingStatus;
             pub const shouldApplySplitReplicationLocked = Implementation.shouldApplySplitReplicationLocked;
@@ -1017,7 +1021,9 @@ pub fn ImplementationFor(comptime D: type) type {
             pub const prepareMergeArtifactEffects = Implementation.prepareMergeArtifactEffects;
             pub const rememberBulkIngestAllNewIdentityUpserts = Implementation.rememberBulkIngestAllNewIdentityUpserts;
             pub const replicationMutationBarrier = Implementation.replicationMutationBarrier;
+            pub const resolveClosedLegacyTerminalInternal = Implementation.resolveClosedLegacyTerminalInternal;
             pub const resolveTransactionIntentsInternal = Implementation.resolveTransactionIntentsInternal;
+            pub const resolveTransactionIntentsInternalScoped = Implementation.resolveTransactionIntentsInternalScoped;
             pub const resolveTransactionIntentsPrepared = Implementation.resolveTransactionIntentsPrepared;
             pub const restoreStagingStatus = Implementation.restoreStagingStatus;
             pub const shouldApplySplitReplicationLocked = Implementation.shouldApplySplitReplicationLocked;
@@ -1034,7 +1040,7 @@ pub fn ImplementationFor(comptime D: type) type {
             pub fn scheduleDurableReplicationOutboxRecovery(_: *@This()) void {}
 
             pub fn resolveTransaction(self: *@This(), txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, commit_version: u64) !void {
-                try self.resolveTransactionIntentsInternal(txn_id, status, commit_version, .propose, .none, null, null);
+                try self.resolveTransactionIntentsInternal(txn_id, status, commit_version, .propose, .none, null, null, null, null);
             }
 
             pub fn waitForResolvedTransactionSyncWithCancellation(self: *@This(), sync_level: types.SyncLevel, _: u64, _: types.CancellationToken) !void {

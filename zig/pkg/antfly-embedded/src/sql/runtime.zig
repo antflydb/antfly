@@ -186,8 +186,8 @@ fn executeInner(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *c
     var statement_backend = backend;
     if (limits.error_context) |context| statement_backend.error_context = context;
     if (parameters.len > 1024) return error.InvalidSqlParameters;
-    if (backend.setting_capture) |capture| {
-        pinned_settings = try @import("setting_catalog.zig").View.capture(alloc, capture.owner, capture.scope, capture.overlay);
+    if (try backend.captureSettings(alloc)) |captured| {
+        pinned_settings = captured;
         statement_backend.settings_view = &pinned_settings.?;
     }
     const memory = try limits.workingMemory();
@@ -1628,6 +1628,16 @@ pub const Context = struct {
             if (literal.parameter == 0) return error.InvalidSqlParameters;
             return describe.coerceDatum(self.arena, try self.parameterDatum(literal.parameter - 1), column.type, column.element_type);
         }
+        if (column.type == .number and column.element_type == .numeric) {
+            const raw: Json = switch (literal) {
+                .null => .null,
+                .integer => |integer| .{ .integer = integer },
+                .numeric => |text| .{ .number_string = text },
+                .string => |text| .{ .string = text },
+                else => return error.SqlTypeMismatch,
+            };
+            return describe.coerceDatum(self.arena, Datum.fromJson(raw), column.type, column.element_type);
+        }
         const result = try self.value(literal, column);
         return .{ .value = result, .sql_null = result == .null and !(column.type == .json and literal == .string) };
     }
@@ -2183,6 +2193,77 @@ test "SQL NUMERIC executes exact scalar projections through public result metada
         try std.testing.expectEqual(ast.ColumnType.number, column.type);
         try std.testing.expectEqual(@import("array_value.zig").ElementType.numeric, column.element_type.?);
     }
+}
+
+test "SQL version advertises PostgreSQL compatibility and the actual engine" {
+    const alloc = std.testing.allocator;
+    var fixture: TestBackend = .{};
+    var compiled = try compiler.compile(alloc, "SELECT VERSION()", .{});
+    defer compiled.deinit();
+    var result = try execute(alloc, fixture.iface(), &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(ast.ColumnType.string, result.output.columns[0].type);
+    try std.testing.expectEqualStrings("PostgreSQL " ++ @import("scalar.zig").postgres_compat_version ++ " compatibility (Antfly)", result.output.rows[0][0].string);
+}
+
+test "SQL catalog identity uses the authorized statement scope" {
+    const settings = @import("setting_catalog.zig");
+    const Owner = struct {
+        fn load(_: *anyopaque, _: std.mem.Allocator, scope: settings.Scope) !settings.RawSnapshot {
+            return .{ .scope = scope, .epoch = 1, .definitions = &.{} };
+        }
+    };
+    const alloc = std.testing.allocator;
+    var fixture: TestBackend = .{};
+    var backend = fixture.iface();
+    backend.setting_capture = .{ .owner = .{ .ptr = &fixture, .load = Owner.load }, .scope = .{ .database = "analytics", .principal = "replicator" } };
+    var compiled = try compiler.compile(alloc, "SELECT current_user, current_database(), current_catalog", .{});
+    defer compiled.deinit();
+    try std.testing.expect(compiled.uses_current_setting);
+    var result = try execute(alloc, backend, &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqualStrings("current_user", result.output.columns[0].name);
+    try std.testing.expectEqualStrings("current_database", result.output.columns[1].name);
+    try std.testing.expectEqualStrings("current_catalog", result.output.columns[2].name);
+    const cells = result.output.rows[0];
+    try std.testing.expectEqualStrings("replicator", cells[0].string);
+    try std.testing.expectEqualStrings("analytics", cells[1].string);
+    try std.testing.expectEqualStrings("analytics", cells[2].string);
+
+    const membership_query = try std.fmt.allocPrint(alloc, "SELECT pg_has_role(current_user, {d}, 'MEMBER'), pg_has_role('other', 'replicator', 'USAGE'), pg_has_role(current_user, NULL, 'MEMBER')", .{@import("scalar.zig").postgresRoleOid("replicator")});
+    defer alloc.free(membership_query);
+    var membership = try compiler.compile(alloc, membership_query, .{});
+    defer membership.deinit();
+    try std.testing.expect(membership.uses_current_setting);
+    var memberships = try execute(alloc, backend, &membership, &.{}, .{});
+    defer memberships.deinit();
+    try std.testing.expectEqualDeep(@as([]const std.json.Value, &.{ .{ .bool = true }, .{ .bool = false }, .null }), memberships.output.rows[0]);
+}
+
+test "SQL NUMERIC insert literals preserve decimals at the mutation boundary" {
+    const Fixture = struct {
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
+            return .{ .id = 1, .physical_name = "docs", .schema_version = 1, .columns = &.{.{ .name = "n", .path = "n", .type = .number, .element_type = .numeric }} };
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
+            return error.UnexpectedScan;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+            try std.testing.expectEqual(@as(usize, 2), mutations.len);
+            try std.testing.expectEqualStrings("12345678901234567890.12345678", mutations[0].row.?.object.get("n").?.string);
+            try std.testing.expectEqualStrings("3", mutations[1].row.?.object.get("n").?.string);
+            return .committed;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var context: u8 = 0;
+    const backend: catalog.Backend = .{ .ptr = &context, .vtable = &.{ .resolve = Fixture.resolve, .scan = Fixture.scan, .mutate = Fixture.mutate, .checkpoint = Fixture.checkpoint } };
+    var compiled = try compiler.compile(alloc, "INSERT INTO docs (_id, n) VALUES ('a', 12345678901234567890.12345678), ('b', 3)", .{});
+    defer compiled.deinit();
+    var result = try execute(alloc, backend, &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u64, 2), result.output.rows_affected);
 }
 
 test "SQL NUMERIC predicates preserve inferred and explicit parameters for reads and mutations" {
@@ -3432,6 +3513,43 @@ test "SQL joins use one coordinated cut and preserve typed outer nulls across pa
     try std.testing.expectEqual(@as(usize, 1), backend.statement_opens);
     try std.testing.expectEqual(@as(usize, 1), backend.statement_closes);
     try std.testing.expectError(error.SqlStatementSnapshotRequired, execute(std.testing.allocator, backend.iface(), &compiled, &.{}, .{}));
+}
+
+test "SQL Boolean array positions preserve correlated subquery windows and absent NULLs" {
+    const a = std.testing.allocator;
+    var backend: TestBackend = .{ .row_count = 3 };
+    var compiled = try compiler.compile(a,
+        \\SELECT r._id,
+        \\       CAST(array_position(ARRAY(SELECT b._id FROM things b WHERE b._id = r._id), '1') AS BOOL),
+        \\       CAST(array_position(ARRAY(SELECT b._id FROM things b ORDER BY b._id LIMIT 1 OFFSET 1), '1') AS BOOL)
+        \\FROM things r ORDER BY r._id
+    , .{});
+    defer compiled.deinit();
+    var description = try @import("describe.zig").describe(a, backend.coordinated(), &compiled, &.{});
+    defer description.deinit();
+    try std.testing.expectEqual(@as(usize, 3), description.binding.columns.len);
+    var result = try execute(a, backend.coordinated(), &compiled, &.{}, .{ .page_rows = 1 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 3), result.output.rows.len);
+    try std.testing.expect(result.output.sql_nulls.?[0][1]);
+    try std.testing.expectEqual(std.json.Value{ .bool = true }, result.output.rows[1][1]);
+    try std.testing.expect(result.output.sql_nulls.?[2][1]);
+    for (result.output.rows) |row| try std.testing.expectEqual(std.json.Value{ .bool = true }, row[2]);
+}
+
+test "SQL DISTINCT ON chooses ordered representatives before pagination" {
+    const a = std.testing.allocator;
+    var backend: TestBackend = .{};
+    const source = " FROM (VALUES ('a', 1), ('a', 6), ('b', 2), ('b', 7), ('c', 3)) t(k,v) ";
+    var compiled = try compiler.compile(a, "SELECT DISTINCT ON (k) k AS item, v" ++ source ++ "ORDER BY item, v DESC LIMIT 1 OFFSET 1", .{});
+    defer compiled.deinit();
+    var result = try execute(a, backend.coordinated(), &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqualStrings("item", result.output.columns[0].name);
+    try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+    try std.testing.expectEqualStrings("b", result.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("7", result.output.rows[0][1].string);
+    try std.testing.expectError(error.InvalidSqlSyntax, compiler.compile(a, "SELECT DISTINCT ON (k) k, v" ++ source ++ "ORDER BY v, k", .{}));
 }
 
 test "SQL CTE aliases feed hash joins and grouped projection without stringifying rows" {
