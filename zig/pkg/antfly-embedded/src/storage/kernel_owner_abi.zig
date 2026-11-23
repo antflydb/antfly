@@ -20,7 +20,8 @@ const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
 // Includes main v89 aggregation budgets, checked DB borrows and policy fences.
-// Main owns published job projections 72..74. Schema preflight appends at 75.
+// The schema-validation preflight projection appends after the existing
+// job, retained-history, and native snapshot projections.
 // v116 also versions JSON semantics: v115 accepts the existing receipt-v3
 // wrapper but can ignore its new graph_preparation root. Engine descriptors
 // stay inside the provider and cannot protect this opaque JSON boundary.
@@ -562,9 +563,6 @@ pub const MetadataProjectionKind = enum(u32) {
     job_owner_count = 74,
     /// Compact lake authority, including an explicit unowned-source record.
     lake_source_owner = 75,
-    /// Raw binary schema-publication command; read-only preflight returns JSON
-    /// acceptance intent. No ASVI frame is escaped into a JSON envelope.
-    schema_validation_preflight = 82,
     /// Nonwaiting observation/reconciliation of the shared durable HA outbox.
     poll_ha_outbox = 76,
     catalog_table_projection = 77,
@@ -572,6 +570,9 @@ pub const MetadataProjectionKind = enum(u32) {
     native_snapshot_capture = 79,
     native_root_producer_cohort = 80,
     native_root_producer_cohort_sealed = 81,
+    /// Raw binary schema-publication command; read-only preflight returns JSON
+    /// acceptance intent. No ASVI frame is escaped into a JSON envelope.
+    schema_validation_preflight = 82,
 };
 
 pub const MetadataHABindRequest = extern struct {
@@ -2903,8 +2904,13 @@ pub extern fn antfly_storage_wal_append_idempotent(
 /// Snapshot JSON uses an independent version so cache/budget ABI layouts do not change.
 pub extern fn antfly_storage_context_pipeline_metrics_json(context: ?*anyopaque, version: u32, out_json: *OwnedBytes) callconv(.c) Status;
 
-test "published metadata outbox polling ordinal remains stable" {
+test "metadata schema preflight appends after published projection ordinals" {
     const std = @import("std");
     try std.testing.expectEqual(@as(u32, 76), @backingInt(MetadataProjectionKind.poll_ha_outbox));
-    try std.testing.expectEqual(@as(u32, 78), @backingInt(MetadataProjectionKind.schema_validation_preflight));
+    try std.testing.expectEqual(@as(u32, 77), @backingInt(MetadataProjectionKind.catalog_table_projection));
+    try std.testing.expectEqual(@as(u32, 78), @backingInt(MetadataProjectionKind.native_snapshot_rows));
+    try std.testing.expectEqual(@as(u32, 79), @backingInt(MetadataProjectionKind.native_snapshot_capture));
+    try std.testing.expectEqual(@as(u32, 80), @backingInt(MetadataProjectionKind.native_root_producer_cohort));
+    try std.testing.expectEqual(@as(u32, 81), @backingInt(MetadataProjectionKind.native_root_producer_cohort_sealed));
+    try std.testing.expectEqual(@as(u32, 82), @backingInt(MetadataProjectionKind.schema_validation_preflight));
 }

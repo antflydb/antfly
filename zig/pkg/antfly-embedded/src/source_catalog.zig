@@ -1070,7 +1070,6 @@ pub const storage_db_row_policy_schema_pair_test = @import("storage/db/row_polic
 pub const storage_db_temporal_integrity_contract = @import("storage/db/temporal_integrity_contract.zig");
 pub const storage_document_revision_control = @import("storage/document_revision_control.zig");
 pub const storage_graph_read_snapshot = @import("storage/graph_read_snapshot.zig");
-pub const storage_kernel_owner_abi = @import("storage/kernel_owner_abi.zig");
 pub const storage_pessimistic_lock_native_test = @import("storage/pessimistic_lock/native_test.zig");
 pub const storage_raw_graph_read_lease = @import("storage/raw_graph_read_lease.zig");
 pub const storage_row_heap = @import("storage/row_heap.zig");

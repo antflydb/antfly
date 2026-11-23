@@ -2659,7 +2659,7 @@ an unavailable oracle fail the test rather than skip it. PostgreSQL 19beta4
 is the currently available local oracle, not final-release certification.
 
 The native regression belongs to `zig build public-api-parity-test` in `zig/`.
-Runtime selection of the exact `api.sql_catalog.test.SQL index DDL drops the
+Runtime selection of the exact `api.sql.catalog.catalog.test.SQL index DDL drops the
 exact qualified owner without a catalog snapshot` test is useful for development
 but does not constitute a passing full public API or distributed release gate.
 

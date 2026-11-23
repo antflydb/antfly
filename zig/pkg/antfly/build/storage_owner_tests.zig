@@ -88,8 +88,7 @@ pub fn add(
                 else if (index == 0)
                     &.{
                         b.fmt("storage.{s}.", .{std.fs.path.stem(test_sources[index])}),
-                        "opaque graph decoder ABI rejects ABI115 context and batch ingress before effects",
-                        "opaque privacy decoder ABI rejects ABI117 ABI118 and ABI119 context and lookup before effects",
+                        "storage.kernel_owner_trigger_test.",
                     }
                 else
                     &.{b.fmt("storage.{s}.", .{std.fs.path.stem(test_sources[index])})},

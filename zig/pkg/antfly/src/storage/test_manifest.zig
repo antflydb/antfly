@@ -675,7 +675,6 @@ test {
     _ = @import("antfly_local_sources").storage_document_revision_control;
     _ = @import("antfly_local_sources").storage_document_revision_reservation;
     _ = @import("antfly_local_sources").storage_graph_read_snapshot;
-    _ = @import("antfly_local_sources").storage_kernel_owner_abi;
     _ = @import("antfly_local_sources").storage_pessimistic_lock_authority;
     _ = @import("antfly_local_sources").storage_pessimistic_lock_contract;
     _ = @import("antfly_local_sources").storage_pessimistic_lock_control;

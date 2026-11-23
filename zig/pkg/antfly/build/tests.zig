@@ -7757,6 +7757,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&run_local_query_contract_tests.step);
     unit_test_step.dependOn(&run_local_query_contract_tests.step);
 
+    const kernel_owner_abi_tests = b.addTest(.{
+        .name = "storage-kernel-owner-abi-tests",
+        .root_module = antfly_imports.storage_boundary.owner,
+    });
+    const run_kernel_owner_abi_tests = addFilteredTestRunArtifact(b, kernel_owner_abi_tests);
+    b.step("storage-kernel-owner-abi-test", "Validate wire ordinals through the storage owner ABI module")
+        .dependOn(&run_kernel_owner_abi_tests.step);
+    unit_test_step.dependOn(&run_kernel_owner_abi_tests.step);
+
     const opaque_read_session_step = b.step("opaque-read-session-test", "Run source and independently compiled statement and read-session lifetime regressions");
     if (b.top_level_steps.get("opaque-read-session-abi-integration-test")) |integration|
         opaque_read_session_step.dependOn(&integration.step);
@@ -8346,6 +8355,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-protected-backfill-test", "Verify protected model migration batching without model inference")
         .dependOn(&addFilteredTestRunArtifact(b, protected_backfill_tests).step);
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
+    db_test_step.dependOn(&run_kernel_owner_abi_tests.step);
     const index_publication_progress_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("pkg/antfly-embedded/src/relational_index_publication_progress_test_root.zig"),
@@ -9293,7 +9303,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.document_revision_control.",
             "storage.document_revision_reservation.",
             "storage.graph_read_snapshot.",
-            "storage.kernel_owner_abi.",
             "storage.pessimistic_lock.",
             "storage.publication_prepare_sink.",
             "storage.raw_graph_read_lease.",
@@ -9457,6 +9466,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "Run the storage portion of the default antfly-unit-test target in bounded codegen shards",
     );
     unit_storage_sharded_test_step.dependOn(&run_unit_server_db_tests.step);
+    unit_storage_sharded_test_step.dependOn(&run_kernel_owner_abi_tests.step);
     // Ordinals are a separately configured module; importing their sources in
     // the storage manifest would give each file two module owners.
     unit_storage_sharded_test_step.dependOn(&b.top_level_steps.get("storage-ordinal-core-test").?.step);
@@ -9491,7 +9501,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // wiring the storage test roots do not (both benchmarks open their DB
     // through the real capi.openLiteHandleWithRuntime seam, same reason as
     // the crash sweep).
-    for ([_][]const u8{ "ordinals/root.zig", "ordinals/operations.zig", "lite/crash_consistency_capi_test.zig", "lite/write_amplification_bench_test.zig", "lite/write_amplification_cpu_bench_test.zig", "local_query_abi.zig" }) |source| {
+    for ([_][]const u8{ "ordinals/root.zig", "ordinals/operations.zig", "lite/crash_consistency_capi_test.zig", "lite/write_amplification_bench_test.zig", "lite/write_amplification_cpu_bench_test.zig", "local_query_abi.zig", "kernel_owner_abi.zig" }) |source| {
         unit_storage_shard_audit.addArg("--local-dedicated");
         unit_storage_shard_audit.addFileArg2(b.path(b.fmt("pkg/antfly-embedded/src/storage/{s}", .{source})), .{ .make_absolute = true });
     }
