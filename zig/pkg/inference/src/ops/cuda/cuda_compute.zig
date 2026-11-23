@@ -25311,14 +25311,20 @@ fn linearNoBiasWithPolicy(ctx: *anyopaque, input: CT, weight: CT, rows: usize, i
 }
 
 fn linearNoBiasWithDestination(self: *CudaCompute, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize, primitive_training: bool, destination: ?buffer_mod.DeviceBuffer) !CT {
-    try validateProjectionOperands(tensorFromCt(input), tensorFromCt(weight), null, rows, in_dim, out_dim);
+    const input_tensor = tensorFromCt(input);
+    const weight_tensor = tensorFromCt(weight);
+    try validateProjectionOperands(input_tensor, weight_tensor, null, rows, in_dim, out_dim);
     const out_count = try checkedMul(rows, out_dim);
-    const output_bytes = try lightOnLinearOutputBytes(self, tensorFromCt(weight), rows, out_dim);
+    const output_bytes = try lightOnLinearOutputBytes(self, weight_tensor, rows, out_dim);
+    if (destination) |assigned| {
+        const sources = [3]buffer_mod.DeviceBuffer{ input_tensor.buffer, weight_tensor.buffer, assigned };
+        try buffer_mod.validateRegions(3, sources, .{ sources[0].len, sources[1].len, output_bytes }, .{ @alignOf(f32), 1, @alignOf(f32) }, 2);
+    }
     var output = try OwnedF32Output.fromOwnedShapeDestination(self, try allocShape2(self.allocator, rows, out_dim), out_count, output_bytes, destination);
     defer output.deinit();
-    errdefer if (strictSeq2seqMatmul(self) or isF16Weight(tensorFromCt(weight))) self.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
+    errdefer if (strictSeq2seqMatmul(self) or isF16Weight(weight_tensor)) self.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
     const device = output.buffer;
-    try linearNoBiasInto(self, device, tensorFromCt(input), tensorFromCt(weight), rows, in_dim, out_dim, primitive_training);
+    try linearNoBiasInto(self, device, input_tensor, weight_tensor, rows, in_dim, out_dim, primitive_training);
     const result = output.intoTensor();
     if (destination != null) tensorFromCt(result).owns_buffer = false;
     return result;
@@ -45063,6 +45069,7 @@ test "LightOnOCR3 CUDA wide graph head projection writes its assigned buffer" {
     defer claim.deinit();
     var observation = @import("../../execution/runtime_observation.zig").Scope.init();
     defer observation.deinit();
+    try std.testing.expectError(error.InvalidShape, linearNoBiasWithDestination(&compute, input, weight, 2, 2, 2, false, tensorFromCt(input).buffer));
     const projected = try claim.projectHead(&cb, input, weight);
     const entries = observation.snapshot().backend_entries;
     for (entries.records[0..entries.count]) |entry| {
