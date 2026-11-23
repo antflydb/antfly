@@ -746,6 +746,15 @@ pub const Backend = struct {
             self.inner.publishMirror();
         }
 
+        pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
+            for (keys, values) |key, *value| {
+                value.* = self.get(key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+            }
+        }
+
         pub fn containsManySorted(self: *@This(), keys: []const []const u8, present: []bool) !void {
             for (keys, present) |key, *exists| {
                 exists.* = if (self.get(key)) |_| true else |err| switch (err) {

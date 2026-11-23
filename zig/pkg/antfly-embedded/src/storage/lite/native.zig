@@ -42661,6 +42661,7 @@ test "lite header format fence reopens after uncertain migration publication" {
         var writer = try NativeFile.createWithIo(alloc, io, path, .{});
         defer writer.close();
         try writer.putDocument("doc", "retained");
+        @import("antfly_test_error_logs").expectErrorLogs(1);
         writer.failNextGenerationDirectorySyncForTest();
         try std.testing.expectError(error.OutcomeUnknown, writer.requireVersionedTextFormat());
     }
