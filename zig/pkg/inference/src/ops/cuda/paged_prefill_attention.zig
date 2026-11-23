@@ -162,6 +162,20 @@ pub const Module = struct {
         };
     }
 
+    pub fn reserveForExecution(self: *Module, ctx: *context.CudaContext) !void {
+        if (ctx.video_cache_budget.admission) |policy| {
+            if (self.failed or self.closing) return error.LightOnAttentionExecutionFailed;
+            if (self.quota != .prepared or self.device.ptr == 0 or self.host.ptr == null) return error.RecurrentPrefillColdPreparationRequired;
+            const owned = self.quota.peek() orelse return error.RecurrentPrefillColdPreparationRequired;
+            if (owned.controller != policy.controller or !std.meta.eql(owned.amounts, memory.AdmissionAmounts{
+                .backend_scratch_bytes = device_bytes,
+                .host_scratch_bytes = host_bytes + host_plan_bytes,
+            })) return error.PreparedCacheAmountChanged;
+            return;
+        }
+        return self.reserve(ctx);
+    }
+
     pub fn reserve(self: *Module, ctx: *context.CudaContext) !void {
         // External quota callbacks precede publication locking. Recheck after
         // reservation; a reentrant cold observer must never see a partial owner.

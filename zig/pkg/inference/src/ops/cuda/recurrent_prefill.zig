@@ -147,6 +147,22 @@ pub const Module = struct {
         return self.scratch;
     }
 
+    /// Numerical execution can reuse exact funded storage. A cold admitted
+    /// request must go through the prefill phase before acquiring this lane.
+    pub fn reserveForExecution(self: *Module, ctx: *context.CudaContext, bytes: usize) !buffer.DeviceBuffer {
+        if (self.closing) return error.RecurrentPrefillClosing;
+        if (self.failed) return error.LightOnPrefillExecutionFailed;
+        if (self.managed_decline) return error.RecurrentPrefillColdPreparationRequired;
+        if (bytes == 0) return .{};
+        if (ctx.video_cache_budget.admission) |policy| {
+            if (self.quota != .prepared or self.scratch.ptr == 0 or self.scratch.len < bytes) return error.RecurrentPrefillColdPreparationRequired;
+            const owned = self.quota.peek() orelse return error.RecurrentPrefillColdPreparationRequired;
+            if (owned.controller != policy.controller or owned.amounts.backend_scratch_bytes != self.scratch.len) return error.PreparedCacheAmountChanged;
+            return self.scratch;
+        }
+        return self.reserve(ctx, bytes);
+    }
+
     /// Legacy explicit-outside entry. Suppliers and quota discharge remain
     /// outside the metadata lock; exact publication is revalidated afterward.
     pub fn reserve(self: *Module, ctx: *context.CudaContext, bytes: usize) !buffer.DeviceBuffer {

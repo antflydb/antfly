@@ -5496,13 +5496,14 @@ pub const CudaCompute = struct {
         }
         var workspace_bytes: usize = 0;
         if (!only_decode) {
-            if (self.managed_external_prefill_publication and !self.lighton_recurrent.bf16_prefill_configured) {
+            const admitted_prefill = self.managed_external_prefill_publication or self.ctx.video_cache_budget.admission != null;
+            if (admitted_prefill and !self.lighton_recurrent.bf16_prefill_configured) {
                 // Managed entry cannot dlopen a new opaque runtime beneath
                 // numerical ownership. The actual unpublished ctor resolves it.
                 self.external_prefill_declines += 1;
             } else try self.lighton_recurrent.configureBf16Prefill(&self.ctx, platform.env.getenv("ANTFLY_CUDA_LIGHTON_PREFILL_LIBRARY"));
             if (self.lighton_recurrent.bf16_prefill) |*prefill| {
-                if (self.managed_external_prefill_publication) prefill.managed = true;
+                if (admitted_prefill) prefill.managed = true;
                 if (!fused_decode) return error.LightOnPrefillRequiresFusedDecode;
                 for (packets[0..packet_count], 0..) |*params, index| {
                     packet_scratch[index] = prefill.workspaceBytes(params) catch |err| {
@@ -5520,7 +5521,7 @@ pub const CudaCompute = struct {
         // stream-ordered buffer serves both packets and survives GPU consumers.
         // Admission/ABI/shape failures above have not consumed any page state.
         const workspace = if (workspace_bytes != 0)
-            self.lighton_recurrent.bf16_prefill.?.reserve(&self.ctx, workspace_bytes) catch |err| decline: {
+            self.lighton_recurrent.bf16_prefill.?.reserveForExecution(&self.ctx, workspace_bytes) catch |err| decline: {
                 if (err != error.RecurrentPrefillColdPreparationRequired) return err;
                 self.external_prefill_declines += 1;
                 workspace_bytes = 0;
@@ -31788,13 +31789,13 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
         !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active)
     {
         if (self.lighton_recurrent.bf16_prefill) |*prefill| if (prefill.attention) |*fast| fast_library: {
-            if (self.managed_external_prefill_publication) fast.managed = true;
-            if (self.managed_external_prefill_publication) self.prepareExternalAttentionFromBoundFunding() catch |err| {
+            const admitted_prefill = self.managed_external_prefill_publication or self.ctx.video_cache_budget.admission != null;
+            if (admitted_prefill) fast.managed = true;
+            if (admitted_prefill) self.prepareExternalAttentionFromBoundFunding() catch |err| {
                 if (err != error.RecurrentPrefillColdPreparationRequired) return err;
-                // The original reserve below declines before any DSO state
-                // mutation; its existing generic attention fallback runs once.
+                // A missing workspace declines before any DSO state mutation.
             };
-            fast.reserve(&self.ctx) catch |err| {
+            fast.reserveForExecution(&self.ctx) catch |err| {
                 if (err != error.RecurrentPrefillColdPreparationRequired) return err;
                 self.external_prefill_declines += 1;
                 break :fast_library;
@@ -45068,6 +45069,8 @@ test "LightOnOCR3 CUDA optional BF16 prefill scratch preserves admission across 
     var controller = memory.AdmissionController{};
     compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{ .backend_limit_bytes = 1023, .scratch_limit_bytes = 1023 }, .check_live_memory = false };
     const before = compute.ctx.device_allocations.snapshot().live;
+    try std.testing.expectError(error.RecurrentPrefillColdPreparationRequired, prefill.reserveForExecution(&compute.ctx, 1024));
+    if (prefill.attention) |*attention| try std.testing.expectError(error.RecurrentPrefillColdPreparationRequired, attention.reserveForExecution(&compute.ctx));
     try std.testing.expectError(error.ResourceLimitExceeded, prefill.reserve(&compute.ctx, 1024));
     try std.testing.expectEqual(before, compute.ctx.device_allocations.snapshot().live);
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
@@ -45076,6 +45079,7 @@ test "LightOnOCR3 CUDA optional BF16 prefill scratch preserves admission across 
     compute.ctx.video_cache_budget.admission.?.limits.scratch_limit_bytes = 1024;
     const full = try prefill.reserve(&compute.ctx, 1024);
     const reused = try prefill.reserve(&compute.ctx, 512);
+    try std.testing.expectError(error.RecurrentPrefillColdPreparationRequired, prefill.reserveForExecution(&compute.ctx, 512));
     try std.testing.expectEqual(full.ptr, reused.ptr);
     try std.testing.expectEqual(@as(usize, 1024), controller.snapshot().backend_scratch_bytes);
     try std.testing.expectEqual(before + 1024, compute.ctx.device_allocations.snapshot().live);
@@ -57439,6 +57443,8 @@ test "CUDA optional recurrent prefill actual DSO cold geometry funds real retain
         defer if (held) gate.unlock();
         try std.testing.expectEqual(CudaCompute.ExternalPrefillDecision.ready, try CudaCompute.inspectExternalPrefillPhase(&cb, &warm, .{ .boundary = &b }));
         try std.testing.expect(warm.cold == null);
+        try std.testing.expectEqual(owner.scratch.ptr, (try owner.reserveForExecution(&compute.ctx, actual_bytes)).ptr);
+        if (owner.attention) |*attention| try attention.reserveForExecution(&compute.ctx);
         try std.testing.expectEqualDeep(device_after, compute.ctx.device_allocations.snapshot());
         try std.testing.expectEqualDeep(paid, domain.controller.snapshot());
         try std.testing.expect(compute.ctx.driver.fns.cuStreamIsCapturing != null);
