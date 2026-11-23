@@ -845,14 +845,22 @@ pub const Pool = struct {
         self.immutable_bindings = try prepared_routes.ImmutableBindings.createSource(self.allocator, immutable_inputs);
         const operation = @import("backend_operation.zig");
         var metadata: operation.Scope = .{};
+        const metal_enabled = @import("build_options").enable_metal;
+        var pause: if (metal_enabled) @import("../ops/metal_compute.zig").MetalCompute.ColdEnginePause else struct {} = .{};
+        defer if (comptime metal_enabled) pause.reopen() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        // Metadata must leave the provider before restoring its numerical gate.
         defer metadata.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
-        if (metal) {
+        if (comptime metal_enabled) if (metal) {
+            pause = try @TypeOf(pause).begin(&backend);
             try operation.enterInto(&backend, graph, null, .metadata, &metadata);
             if (metadata.token() == null) return null;
-        }
+        };
         const selected = (try finishPreparedVariant(self, inputs, if (metal) .select_regions else .compatibility_regions, .unknown, metadata.token())) orelse return null;
         self.private_decoder_program = true;
         owner.* = null;
+        errdefer selected.release();
+        try metadata.finish();
+        if (comptime metal_enabled) try pause.reopen();
         return selected;
     }
 

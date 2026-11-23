@@ -1179,6 +1179,39 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         try lease.begin(.{ .implementation = lease.implementation, .program = null, .mode = .managed });
         self.engine_operation = lease;
     }
+    /// Cold planning holds the request's provider lease, but needs a separate
+    /// metadata operation to acquire the slot index. Reopen the numerical
+    /// operation before returning to the same request with its pinned slots.
+    pub const ColdEnginePause = struct {
+        compute: ?*MetalCompute = null,
+
+        pub fn begin(cb: *const ops.ComputeBackend) !ColdEnginePause {
+            if (!operationAccepts(cb.vtable)) return error.UnsupportedDenseSchedule;
+            const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+            if (self.engine_borrowed_operation != null or self.engine_cleanup_finish != null or self.audio_capture != null)
+                return error.UnsupportedDenseSchedule;
+            var owned = self.engine_operation orelse return .{};
+            if (!self.owned_native_provider and self.shared_provider_lease_io == null) return error.UnsupportedDenseSchedule;
+            const token = owned.borrow() orelse return error.UnsupportedDenseSchedule;
+            if (try token.retainCleanupEpoch()) |epoch| {
+                var held = epoch;
+                held.release();
+                return error.UnsupportedDenseSchedule;
+            }
+            const runtime = self.provider_impl.raw_decode_runtime;
+            if (metal_runtime.hasActiveFrame(runtime) or metal_runtime.hasSubmittedFrame(runtime)) return error.UnsupportedDenseSchedule;
+            self.engine_operation = null;
+            try owned.finish();
+            return .{ .compute = self };
+        }
+
+        pub fn reopen(self: *ColdEnginePause) !void {
+            const compute = self.compute orelse return;
+            self.compute = null;
+            try compute.beginEngineOperation();
+        }
+    };
+
     pub fn adoptEngineOperation(self: *MetalCompute, lease: operation_mod.Lease) !void {
         if (self.engine_operation != null or self.engine_borrowed_operation != null) return error.BackendOperationConsumed;
         const backend = self.computeBackend();
@@ -56040,6 +56073,13 @@ const PreparedDenseRegionFixture = struct {
                 private_pool.?.coverage_reachable = analysis.reachable;
                 private_pool.?.coverage_backend = cb;
                 private_pool.?.metal_frame_dispatch = true;
+                const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+                try compute.beginEngineOperation();
+                defer {
+                    compute.quiesceEngineOperation() catch unreachable;
+                    compute.finishEngineOperation();
+                }
+                const prior_engine = cb.operationToken() orelse return error.ExpectedExplicitEngineOperation;
                 const private = (try physical.Pool.preparePrivateDecoderSourcesConsuming(&private_pool, .{ .slice = bindings[1..parameter_count] }, .{ .slice = &.{activation} })) orelse return error.MissingPreparedRoutes;
                 defer private.release();
                 try std.testing.expect(private_pool == null);
@@ -56048,7 +56088,9 @@ const PreparedDenseRegionFixture = struct {
                 const operation = @import("../execution/backend_operation.zig");
                 var scope: operation.Scope = .{};
                 defer scope.deinitChecked() catch unreachable;
-                try operation.enterInto(&cb, graph, null, .managed, &scope);
+                const engine = cb.operationToken() orelse return error.ExpectedExplicitEngineOperation;
+                try std.testing.expect(prior_engine.context != engine.context or prior_engine.nonce != engine.nonce);
+                try operation.enterInto(&cb, graph, engine, .managed, &scope);
                 const cleanup = @import("../execution/cleanup_context.zig").Context{ .operation = scope.token() };
                 const frame = (try private.pool.acquirePrivateDecoderFrame(null, scope.token())) orelse return error.MissingPhysicalPool;
                 defer _ = frame.finishWithCleanup(cleanup) catch unreachable;
