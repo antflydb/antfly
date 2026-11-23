@@ -49,13 +49,14 @@ pub const Plan = struct {
                 if (attrs.runtime_shape or !attrs.new_shape.eq(output) or input.numElements() != output.numElements()) return null;
             },
             .slice => |attrs| {
-                if ((backend != .native and backend != .metal) or attrs.runtime_starts or attrs.runtime_limits or attrs.num_axes != input.rank() or output.rank() != input.rank()) return null;
+                if ((backend != .native and backend != .metal and backend != .cuda) or attrs.runtime_starts or attrs.runtime_limits or attrs.num_axes != input.rank() or output.rank() != input.rank()) return null;
                 const dims = output.dims[0..output.rank()];
                 const slice = @import("../ops/slice_plan.zig").Plan.init(input.dims[0..input.rank()], attrs.starts[0..attrs.num_axes], attrs.limits[0..attrs.num_axes], attrs.strides[0..attrs.num_axes], dims) catch return null;
                 if (!slice.contiguous() or !std.mem.eql(i64, slice.shape[0..slice.rank], dims)) return null;
                 if (slice.base == 0 and input.eq(output)) {
+                    if (backend == .cuda) return null;
                     result.kind = .full_slice;
-                } else if (backend == .metal) {
+                } else if (backend == .metal or backend == .cuda) {
                     result.kind = .contiguous_slice;
                     const base = std.math.cast(usize, slice.base) orelse return null;
                     result.byte_offset = std.math.mul(usize, base, @sizeOf(f32)) catch return null;
@@ -97,7 +98,7 @@ pub const Plan = struct {
         if (source.role != .primary or !desc.shape.eq(self.input) or desc.quant_format != null or desc.attention_storage != null or desc.attention_kv_format != null) return null;
         switch (desc.current_backend orelse return null) {
             .native => if (desc.storage != .host_f32 and desc.storage != .metadata_view) return null,
-            .cuda => if (desc.storage != .cuda_buffer or self.kind != .reshape) return null,
+            .cuda => if (desc.storage != .cuda_buffer or (self.kind != .reshape and self.kind != .contiguous_slice)) return null,
             .metal => if (desc.storage != .metal_buffer or (self.kind != .reshape and self.kind != .full_slice and self.kind != .contiguous_slice)) return null,
             else => return null,
         }
@@ -222,6 +223,19 @@ pub fn fullSpanRequest(value: *const Request, actual_shape: []const i64, availab
     const bytes = logicalBytes(value.input.shape) orelse return false;
     return value.byte_offset == 0 and value.input.shape.rank() == actual_shape.len and std.mem.eql(i64, value.input.shape.dims[0..value.input.shape.rank()], actual_shape) and logicalBytes(value.output.shape) == bytes and value.input.readable_bytes == bytes and value.output.readable_bytes == bytes and bytes <= available_bytes and dense(value.input.shape, value.input.strides) and dense(value.output.shape, value.output.strides);
 }
+/// Validate a dense view against the size of its immediate source, never
+/// against the larger physical bank or the allocation's padded capacity.
+pub fn contiguousRange(value: *const Request, actual_shape: []const i64, available_bytes: usize) ?usize {
+    const input_bytes = logicalBytes(value.input.shape) orelse return null;
+    const output_bytes = logicalBytes(value.output.shape) orelse return null;
+    if (!std.mem.eql(i64, actual_shape, value.input.shape.dims[0..value.input.shape.rank()]) or
+        !dense(value.input.shape, value.input.strides) or !dense(value.output.shape, value.output.strides) or
+        value.input.readable_bytes != input_bytes or value.output.readable_bytes != output_bytes or
+        input_bytes != available_bytes or value.byte_offset % @sizeOf(f32) != 0 or
+        value.byte_offset > input_bytes or output_bytes > input_bytes - value.byte_offset) return null;
+    return output_bytes;
+}
+
 /// Follow the existing planner's alias/root lifetime, never inventing a new
 /// root or recoloring a live source. External inputs/constants remain opaque.
 pub fn fullSpanRoot(plan: *const @import("../graph/buffer_plan.zig").BufferPlan, node: ml.graph.NodeId, backend: contracts.BackendKind) ?@import("../graph/buffer_plan.zig").LogicalSlot {

@@ -22870,10 +22870,18 @@ fn createMetadataAliasOp(ctx: *anyopaque, input: CT, request: *const @import("..
             source.buffer.ptr != root.buffer.ptr or source.buffer.len != root.buffer.len) return null;
     }
     for (source.auxiliary_leases) |extra| if (extra != null) return null;
-    if (!@import("../../execution/metadata_alias.zig").fullSpanRequest(request, source.shape, source.buffer.len)) return null;
-    // The existing retained reshape body owns its shape header and pins this
-    // exact physical Lease. It submits no work or independent buffer copy.
-    return try reshapeOp(ctx, input, request.output.shape.dims[0..request.output.shape.rank()]);
+    const metadata = @import("../../execution/metadata_alias.zig");
+    const output_shape = request.output.shape.dims[0..request.output.shape.rank()];
+    if (metadata.fullSpanRequest(request, source.shape, source.buffer.len)) {
+        return try reshapeOp(ctx, input, output_shape);
+    }
+    if (source.physical_lease == null) return null;
+    const output_bytes = metadata.contiguousRange(request, source.shape, source.buffer.len) orelse return null;
+    const ptr = try std.math.add(u64, source.buffer.ptr, request.byte_offset);
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const shape = try self.allocator.dupe(i64, output_shape);
+    errdefer self.allocator.free(shape);
+    return makeRetainedTensorView(self, source, .{ .ptr = ptr, .len = output_bytes, .borrowed = true }, shape, output_bytes / @sizeOf(f32));
 }
 
 fn reshapeOp(ctx: *anyopaque, input: CT, new_shape: []const i64) anyerror!CT {
@@ -53404,6 +53412,51 @@ test "CUDA prepared F32 vendor metadata preserves qualified workspace policy and
             try generic.validate(.{ .inputs = inputs, .output = slot });
         }
     };
+}
+
+test "CUDA bounded activation slice retains the exact planned source range" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const shared = @import("../../backends/compute_context.zig").SharedBackendContext.init(a, .cuda, null) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer shared.release();
+    const cb = shared.computeBackend();
+    const ml = @import("ml");
+    const Shape = ml.graph.Shape;
+    const Tensor = @import("../../backends/tensor.zig").Tensor;
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("x", Shape.init(.f32, &.{ 3, 2 }));
+    const activation = try builder.absOp(input);
+    const slice = try graph.addNode(.{
+        .op = .{ .slice = .{ .starts = .{ 1, 0, 0, 0, 0, 0, 0, 0 }, .limits = .{ 3, 2, 0, 0, 0, 0, 0, 0 }, .num_axes = 2 } },
+        .output_shape = Shape.init(.f32, &.{ 2, 2 }),
+        .inputs = .{ activation, ml.graph.null_node, ml.graph.null_node, ml.graph.null_node },
+        .num_inputs = 1,
+    });
+    const output = try builder.reshape(slice, Shape.init(.f32, &.{4}));
+    try graph.markOutput(output);
+    var program = try @import("../../execution/program.zig").ModelProgram.init(a, &graph, &.{ .{ .name = "x", .node_id = input, .kind = .input }, .{ .name = "out", .node_id = output, .kind = .output } });
+    defer program.deinit();
+    var executable = try @import("../../execution/executable.zig").prepare(a, &program, &cb, .partitioned);
+    defer executable.deinit();
+    const node = program.id_map[input];
+    const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    const selected = (try pool.prepareRoutes(&.{.{ .node_id = node, .value = .{ .imported_host = .{ .logical = program.graph.node(node).output_shape, .target = .cuda, .owned_ingress = true } } }})) orelse return error.MissingPreparedKernelRoute;
+    defer selected.release();
+    const coverage = selected.pool.completeOwnedPayload() orelse return error.MissingActivationAliasCoverage;
+    try std.testing.expectEqual(@as(usize, 2), coverage.aliases);
+    var host = try Tensor.initFloat32(a, "x", &.{ 3, 2 }, &.{ -1, 2, -3, 4, -5, 6 });
+    defer host.deinit();
+    const ingress = [_]@import("../../execution/host_ingress.zig").Input{.{ .node_id = node, .value = &host }};
+    var result = try executable.run(a, .{ .host_inputs = &ingress, .prepared_routes = selected });
+    defer result.deinit(&executable.runtime);
+    const actual = try cb.toFloat32(result.outputs[0], a);
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 3, 4, 5, 6 }, actual);
 }
 
 test "complete CUDA activation aliases retain full spans under exact caps held output and capture" {

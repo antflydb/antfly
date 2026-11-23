@@ -14262,13 +14262,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (metadata.fullSpanRequest(request, shape, tensor.deviceByteLen())) {
             return primReshapeOp(ctx, input, request.output.shape.dims[0..request.output.shape.rank()]);
         }
-        const input_bytes = metadata.logicalBytes(request.input.shape) orelse return null;
-        const output_bytes = metadata.logicalBytes(request.output.shape) orelse return null;
-        if (!std.mem.eql(i64, shape, request.input.shape.dims[0..request.input.shape.rank()]) or
-            !metadata.dense(request.input.shape, request.input.strides) or !metadata.dense(request.output.shape, request.output.strides) or
-            request.input.readable_bytes != input_bytes or request.output.readable_bytes != output_bytes or
-            input_bytes != tensor.deviceByteLen() or request.byte_offset % @sizeOf(f32) != 0 or
-            request.byte_offset > input_bytes or output_bytes > input_bytes - request.byte_offset) return null;
+        const output_bytes = metadata.contiguousRange(request, shape, tensor.deviceByteLen()) orelse return null;
         var dims: [metal_tensor_mod.max_dims]i32 = undefined;
         const rank = request.output.shape.rank();
         if (rank > dims.len) return null;

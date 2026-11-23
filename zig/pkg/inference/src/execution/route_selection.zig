@@ -445,6 +445,10 @@ pub const Selection = struct {
             const source = self.retainedInput(pool, alias.source);
             const incoming = source.value;
             const root = @import("metadata_alias.zig").fullSpanRoot(&pool.plan, alias.source, slot.backend);
+            if (alias.kind == .contiguous_slice and (root == null or root.?.kind != .allocation)) {
+                self.alias_enabled[alias_index] = false;
+                break :alias_candidate;
+            }
             const device_input = if (slot.backend == .cuda and root != null and root.?.kind == .runtime_input)
                 self.inputs.find(root.?.node_id)
             else

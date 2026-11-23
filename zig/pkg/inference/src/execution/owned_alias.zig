@@ -14,7 +14,7 @@
 // limitations under the License.
 
 //! Exact dense aliases of selected activation banks, including bounded
-//! contiguous Metal slices of allocations.
+//! contiguous device slices of allocations.
 const std = @import("std");
 const physical = @import("physical_buffers.zig");
 const buffers = @import("../graph/buffer_plan.zig");
@@ -79,7 +79,7 @@ pub fn denseActivation(pool: *const physical.Pool, slot: buffers.LogicalSlot, ta
         for (pool.metadata_aliases, 0..) |alias, index| {
             if (index >= selected.alias_enabled.len) return false;
             if (alias.node != current.node_id or alias.source != parent.node_id or !selected.alias_enabled[index]) continue;
-            if (alias.kind != .reshape and alias.kind != .full_slice and !(target.kind() == .metal and root.kind == .allocation and alias.kind == .contiguous_slice)) return false;
+            if (alias.kind != .reshape and alias.kind != .full_slice and !(root.kind == .allocation and alias.kind == .contiguous_slice)) return false;
             if (!alias.input.eq(parent.desc.shape) or !alias.output.eq(current.desc.shape)) return false;
             expected = alias.apply(selected.planes[parent.node_id][0]) orelse return false;
             break;

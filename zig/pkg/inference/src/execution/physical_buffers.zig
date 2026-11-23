@@ -3331,7 +3331,7 @@ pub const Frame = struct {
             const view = if (node.op == .constant)
                 (try self.materializeLiteral(cb, @intCast(index))) orelse return error.IncompleteNativeProgram
             else create: {
-                if (slot.kind == .view and cb.kind() == .metal and self.hasPreparedMetadataAlias(@intCast(index))) {
+                if (slot.kind == .view and (cb.kind() == .metal or cb.kind() == .cuda) and self.hasPreparedMetadataAlias(@intCast(index))) {
                     break :create (try self.executeMetadataAlias(cb, values, @intCast(index))) orelse return error.IncompleteNativeProgram;
                 }
                 if (self.pool.kernels[index] == null and (node.op != .reshape or slot.kind != .view)) return error.IncompleteNativeProgram;
