@@ -7869,7 +7869,7 @@ pub const GraphIndex = struct {
         }
     }
 
-    fn clearPrivateEdgeStateInBatch(self: *GraphIndex, batch: *backend_erased.Batch, source: []const u8, edge_type: []const u8, target: []const u8, edge_id: []const u8, owner_document: []const u8) !void {
+    fn clearPrivateEdgeStateInBatch(self: *GraphIndex, batch: anytype, source: []const u8, edge_type: []const u8, target: []const u8, edge_id: []const u8, owner_document: []const u8) !void {
         var read = try self.beginReadReverseTxn();
         defer read.abort();
         if (edge_id.len == 0) {
@@ -8053,6 +8053,15 @@ pub const GraphIndex = struct {
         // member-row puts/deletes are appended to the reverse batch after it
         // opens, so membership and edge rows commit atomically.
 
+        const inject_split = builtin.is_test and (test_abort_doc_clear_after_forward_commit or test_abort_prune_after_forward_commit);
+        if (!inject_split and self.outgoing_owner == .native_catalog and self.reverse_owner == .native_catalog) {
+            const outgoing = self.outgoing_owner.native_catalog;
+            const reverse = self.reverse_owner.native_catalog;
+            if (outgoing.canCommitTogether(reverse)) {
+                return self.applyNativeMutationPage(outgoing, reverse, writes, deletes, suppressed, coalesced, completed_intent);
+            }
+        }
+
         // The outgoing store commits first. Persist the identities of document
         // clears in the reverse store before touching outgoing rows, so replay
         // can find even an edge with no TTL contribution or owner member row.
@@ -8119,6 +8128,68 @@ pub const GraphIndex = struct {
 
         var reverse_batch = try self.beginWriteReverseBatch();
         errdefer reverse_batch.abort();
+        const counters = try self.stageMutationPage(&main_batch, &reverse_batch, writes, deletes, suppressed, coalesced, completed_intent);
+        {
+            const wal_trace_scope = wal_trace.scope(.graph_forward_commit);
+            defer wal_trace_scope.end();
+            try main_batch.commit();
+        }
+        main_active = false;
+        // A durable reverse-store completion must never retire its recovery
+        // intent while the outgoing deletion can still be lost on power loss.
+        if (completed_intent != null or clears_private_state or clears_producer) try self.outgoing_owner.sync(true);
+        if (builtin.is_test and completed_intent == null and test_abort_doc_clear_after_forward_commit) {
+            for (deletes) |delete| {
+                if (delete.clear_all_private_state or delete.producer_clear) return error.TestInjectedGraphClearFailure;
+            }
+        }
+        if (builtin.is_test and completed_intent != null and test_abort_prune_after_forward_commit) return error.TestInjectedBackfillFailure;
+        {
+            const wal_trace_scope = wal_trace.scope(.graph_reverse_commit);
+            defer wal_trace_scope.end();
+            try reverse_batch.commit();
+        }
+        self.publishCounters(counters);
+    }
+
+    fn applyNativeMutationPage(
+        self: *GraphIndex,
+        outgoing: *native_catalog_backend.Backend,
+        reverse: *native_catalog_backend.Backend,
+        writes: []const BatchWrite,
+        deletes: []const BatchDelete,
+        suppressed: []const bool,
+        comptime coalesced: bool,
+        completed_intent: ?[]const u8,
+    ) !void {
+        const synchronization = @import("antfly_platform").sync;
+        synchronization.lockYielding(&outgoing.serialized_write_mutex);
+        defer outgoing.serialized_write_mutex.unlock();
+        synchronization.lockYielding(&reverse.serialized_write_mutex);
+        defer reverse.serialized_write_mutex.unlock();
+        var main_batch = try outgoing.boundWrite(.{});
+        errdefer main_batch.abort();
+        var reverse_batch = try reverse.boundWrite(.{});
+        errdefer reverse_batch.abort();
+        const counters = try self.stageMutationPage(&main_batch, &reverse_batch, writes, deletes, suppressed, coalesced, completed_intent);
+        try native_catalog_backend.Backend.submitTogether(&main_batch, &reverse_batch);
+        synchronization.lockYielding(&self.ownership_mutex);
+        main_batch.publishDurable();
+        reverse_batch.publishDurable();
+        self.publishCountersLocked(counters);
+        self.ownership_mutex.unlock();
+    }
+
+    fn stageMutationPage(
+        self: *GraphIndex,
+        main_batch: anytype,
+        reverse_batch: anytype,
+        writes: []const BatchWrite,
+        deletes: []const BatchDelete,
+        suppressed: []const bool,
+        comptime coalesced: bool,
+        completed_intent: ?[]const u8,
+    ) !Stats {
         var topology_changes = std.StringHashMapUnmanaged(TopologyMutation).empty;
         defer {
             var keys = topology_changes.keyIterator();
@@ -8128,7 +8199,7 @@ pub const GraphIndex = struct {
         const typed_demand = for (self.metric_configs) |cfg| {
             if (cfg.edge_filter.mode == .types) break true;
         } else false;
-        const typed_state = try typed_edges.maintenanceState(&reverse_batch, typed_demand);
+        const typed_state = try typed_edges.maintenanceState(reverse_batch, typed_demand);
         // Compare original and final identity sets, not intermediate delete /
         // insert operations. Replacing attributes or replaying an identical
         // batch must not retire immutable topology or restart numerical jobs.
@@ -8138,14 +8209,14 @@ pub const GraphIndex = struct {
             try self.rememberTopologyMutation(&topology_changes, item.source, item.target, item.edge_type, item.edge_id, item.owner_document, false);
         }
         for (writes) |item| try self.rememberTopologyMutation(&topology_changes, item.source, item.target, item.edge_type, item.edge_id, item.owner_document, true);
-        try self.resolveTopologyMutationPresence(&reverse_batch, &topology_changes, coalesced);
+        try self.resolveTopologyMutationPresence(reverse_batch, &topology_changes, coalesced);
         var changed_types = std.StringHashMapUnmanaged(void).empty;
         defer changed_types.deinit(self.alloc);
         var changes = topology_changes.iterator();
         while (changes.next()) |entry| {
             if (entry.value_ptr.before != entry.value_ptr.after) try changed_types.put(self.alloc, entry.value_ptr.kind, {});
         }
-        var counters = try graphCountersInTxn(&reverse_batch);
+        var counters = try graphCountersInTxn(reverse_batch);
         for (writes) |write| if (write.edge_id.len > 0) {
             counters.has_relationship_ids = true;
         };
@@ -8188,9 +8259,9 @@ pub const GraphIndex = struct {
 
             const rev_key = try relationshipKeyAlloc(self.alloc, delete.target, self.index_name, delete.edge_type, delete.source, delete.edge_id, delete.owner_document);
             defer self.alloc.free(rev_key);
-            try self.replaceProjectedExpirationInBatch(&reverse_batch, rev_key, null);
+            try self.replaceProjectedExpirationInBatch(reverse_batch, rev_key, null);
             if (delete.clear_all_private_state)
-                try self.clearPrivateEdgeStateInBatch(&reverse_batch, delete.source, delete.edge_type, delete.target, delete.edge_id, delete.owner_document);
+                try self.clearPrivateEdgeStateInBatch(reverse_batch, delete.source, delete.edge_type, delete.target, delete.edge_id, delete.owner_document);
             if (delete.clear_all_private_state) {
                 const intent_key = try relationshipClearIntentKeyAlloc(self.alloc, delete.source, delete.edge_type, delete.target, delete.edge_id, delete.owner_document);
                 defer self.alloc.free(intent_key);
@@ -8199,7 +8270,7 @@ pub const GraphIndex = struct {
                     else => return err,
                 };
             }
-            if (!coalesced) try self.accountReverseDelete(&reverse_batch, &counters, delete.source, delete.target, rev_key);
+            if (!coalesced) try self.accountReverseDelete(reverse_batch, &counters, delete.source, delete.target, rev_key);
             reverse_batch.delete(rev_key) catch |err| switch (err) {
                 error.NotFound => {},
                 else => return err,
@@ -8231,8 +8302,8 @@ pub const GraphIndex = struct {
 
             const rev_key = try relationshipKeyAlloc(self.alloc, write.target, self.index_name, write.edge_type, write.source, write.edge_id, write.owner_document);
             defer self.alloc.free(rev_key);
-            try self.replaceProjectedExpirationInBatch(&reverse_batch, rev_key, edge_val);
-            if (!coalesced) try self.accountReverseInsert(&reverse_batch, &counters, write.source, write.target, rev_key);
+            try self.replaceProjectedExpirationInBatch(reverse_batch, rev_key, edge_val);
+            if (!coalesced) try self.accountReverseInsert(reverse_batch, &counters, write.source, write.target, rev_key);
             try reverse_batch.put(rev_key, edge_val);
 
             if (write.owner.len > 0) {
@@ -8247,7 +8318,7 @@ pub const GraphIndex = struct {
             }
         }
 
-        if (coalesced) try self.accountTopologyMutations(&reverse_batch, &counters, &topology_changes);
+        if (coalesced) try self.accountTopologyMutations(reverse_batch, &counters, &topology_changes);
         var typed_updates = typed_edges.Updates.init(self.alloc);
         defer typed_updates.deinit();
         changes = topology_changes.iterator();
@@ -8255,27 +8326,27 @@ pub const GraphIndex = struct {
             if (!typed_state.active) break;
             if (entry.value_ptr.before == entry.value_ptr.after) continue;
             const mutation = entry.value_ptr.*;
-            try typed_updates.stageKnown(&reverse_batch, mutation.kind, entry.key_ptr.*, mutation.source, mutation.target, mutation.after, if (typed_state.ready) mutation.before else null);
+            try typed_updates.stageKnown(reverse_batch, mutation.kind, entry.key_ptr.*, mutation.source, mutation.target, mutation.after, if (typed_state.ready) mutation.before else null);
         }
-        try typed_updates.flush(&reverse_batch);
+        try typed_updates.flush(reverse_batch);
         if (typed_state.active and prev_edge_count == 0) try reverse_batch.put(typed_edges.ready_key, "1");
         if (changed_types.count() > 0) {
             counters.edge_generation = std.math.add(u64, counters.edge_generation, 1) catch return error.InvalidGraphMetricBuildManifest;
             // A migration floor gives previously indexed types a conservative
             // dependency epoch without an unbounded writer-side backfill.
             if (reverse_batch.get(graph_metric_type_epoch_floor_key)) |_| {} else |err| switch (err) {
-                error.NotFound => try putU64(&reverse_batch, graph_metric_type_epoch_floor_key, prev_edge_generation),
+                error.NotFound => try putU64(reverse_batch, graph_metric_type_epoch_floor_key, prev_edge_generation),
                 else => return err,
             }
             var kinds = changed_types.keyIterator();
             while (kinds.next()) |kind| {
                 const key = try self.graphMetricTypeEpochKeyAlloc(kind.*);
                 defer self.alloc.free(key);
-                try putU64(&reverse_batch, key, counters.edge_generation);
+                try putU64(reverse_batch, key, counters.edge_generation);
             }
-            try self.markMetricDirty(&reverse_batch, &changed_types, counters.edge_generation);
+            try self.markMetricDirty(reverse_batch, &changed_types, counters.edge_generation);
         }
-        try persistCounters(&reverse_batch, counters);
+        try persistCounters(reverse_batch, counters);
         if (completed_intent) |key| {
             // Advance the whole-range cursor atomically with reverse
             // accounting and intent retirement. Reopen never rescans the
@@ -8302,32 +8373,12 @@ pub const GraphIndex = struct {
         // contributor changes advance their own epoch, not the forward marker.
         const read_generation_key = try outgoingReadGenerationKeyAlloc(self.alloc, self.index_name);
         defer self.alloc.free(read_generation_key);
-        const next_read_generation = std.math.add(u64, try readU64OrZero(&reverse_batch, graph_read_generation_key), 1) catch return error.InvalidGraphMetricBuildManifest;
-        try putU64(&main_batch, read_generation_key, next_read_generation);
-        try putU64(&reverse_batch, graph_read_generation_key, next_read_generation);
-        try bumpReverseReadGeneration(&reverse_batch);
+        const next_read_generation = std.math.add(u64, try readU64OrZero(reverse_batch, graph_read_generation_key), 1) catch return error.InvalidGraphMetricBuildManifest;
+        try putU64(main_batch, read_generation_key, next_read_generation);
+        try putU64(reverse_batch, graph_read_generation_key, next_read_generation);
+        try bumpReverseReadGeneration(reverse_batch);
         if (builtin.is_test) if (test_counter_publication_hook) |hook| try hook(self, counters);
-        {
-            const wal_trace_scope = wal_trace.scope(.graph_forward_commit);
-            defer wal_trace_scope.end();
-            try main_batch.commit();
-        }
-        main_active = false;
-        // A durable reverse-store completion must never retire its recovery
-        // intent while the outgoing deletion can still be lost on power loss.
-        if (completed_intent != null or clears_private_state or clears_producer) try self.outgoing_owner.sync(true);
-        if (builtin.is_test and completed_intent == null and test_abort_doc_clear_after_forward_commit) {
-            for (deletes) |delete| {
-                if (delete.clear_all_private_state or delete.producer_clear) return error.TestInjectedGraphClearFailure;
-            }
-        }
-        if (builtin.is_test and completed_intent != null and test_abort_prune_after_forward_commit) return error.TestInjectedBackfillFailure;
-        {
-            const wal_trace_scope = wal_trace.scope(.graph_reverse_commit);
-            defer wal_trace_scope.end();
-            try reverse_batch.commit();
-        }
-        self.publishCounters(counters);
+        return counters;
     }
 
     // ------------------------------------------------------------------

@@ -251,6 +251,7 @@ pub const Sink = struct {
         return .{
             .ptr = self,
             .submit = submit,
+            .submitTogether = submitTogether,
             .loadAllAlloc = loadAllAlloc,
             .loadOneAlloc = loadOneAlloc,
             .loadMany = loadMany,
@@ -274,6 +275,24 @@ pub const Sink = struct {
     fn resumeMaintenance(ptr: *anyopaque) void {
         const self: *Sink = @ptrCast(@alignCast(ptr));
         self.store.endMultiCommitSequence();
+    }
+
+    fn submitTogether(ptr: *anyopaque, batches: *const [2]native_catalog_backend.ScopedMutations) anyerror!void {
+        const self: *Sink = @ptrCast(@alignCast(ptr));
+        const Context = struct {
+            allocator: Allocator,
+            batches: *const [2]native_catalog_backend.ScopedMutations,
+
+            fn apply(raw: *anyopaque, file: *native.NativeFile) anyerror!void {
+                const context: *@This() = @ptrCast(@alignCast(raw));
+                for (context.batches) |batch| {
+                    try applyMutations(context.allocator, file, batch.scope, batch.mutations);
+                }
+            }
+        };
+        const scopes = [_][]const u8{ batches[0].scope, batches[1].scope };
+        var context: Context = .{ .allocator = self.allocator, .batches = batches };
+        try self.store.submitIndexMutationForScopes(&scopes, &context, Context.apply);
     }
 
     fn submit(ptr: *anyopaque, scope: []const u8, mutations: []const native_catalog_backend.Mutation, durable: bool) anyerror!void {
@@ -497,6 +516,43 @@ test "native catalog sink key encoding disambiguates scopes that share a prefix"
             a.free(decoded.value);
         }
         return error.TestUnexpectedResult;
+    }
+}
+
+test "native catalog sink commits scoped graph records as one member" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/ncat-pair.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try docstore.Store.createWithOptions(a, path, .{ .use_redo_log = true, .io = std.testing.io });
+    defer store.close();
+
+    var sink: Sink = .{ .store = &store, .allocator = a };
+    const forward = native_catalog_backend.ScopedMutations{
+        .scope = "/graph/outgoing",
+        .mutations = &.{.{ .namespace = null, .key = "edge", .value = "target" }},
+    };
+    const invalid = native_catalog_backend.ScopedMutations{
+        .scope = "/graph/reverse",
+        .mutations = &.{.{ .namespace = native_catalog_backend.resolve_namespace, .key = "resolver", .value = "" }},
+    };
+    try std.testing.expectError(error.InvalidResolver, sink.sink().submitTogether.?(&sink, &.{ forward, invalid }));
+    const leaked = try Sink.loadOneAlloc(&sink, a, forward.scope, null, "edge");
+    defer if (leaked) |bytes| a.free(bytes);
+    try std.testing.expect(leaked == null);
+
+    const reverse = native_catalog_backend.ScopedMutations{
+        .scope = invalid.scope,
+        .mutations = &.{.{ .namespace = null, .key = "edge", .value = "source" }},
+    };
+    const before = store.file.committedSequence();
+    try sink.sink().submitTogether.?(&sink, &.{ forward, reverse });
+    try std.testing.expectEqual(before + 1, store.file.committedSequence());
+    for ([_]native_catalog_backend.ScopedMutations{ forward, reverse }) |batch| {
+        const value = (try Sink.loadOneAlloc(&sink, a, batch.scope, null, "edge")) orelse return error.MissingEdge;
+        defer a.free(value);
+        try std.testing.expectEqualStrings(batch.mutations[0].value, value);
     }
 }
 

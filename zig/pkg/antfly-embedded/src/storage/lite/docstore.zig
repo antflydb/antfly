@@ -6659,29 +6659,35 @@ pub const Store = struct {
         return self.submitIndexPlanForScope(scope, .{ .context = context, .apply = apply, .durable = durable, .index_only = true });
     }
 
+    pub fn submitIndexMutationForScopes(self: *Store, scopes: []const []const u8, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void) !void {
+        return self.submitIndexPlanForScopes(scopes, .{ .context = context, .apply = apply, .index_only = true });
+    }
+
     fn submitIndexPlanForScope(self: *Store, scope: []const u8, plan: MutationPlan) !void {
+        return self.submitIndexPlanForScopes(&.{scope}, plan);
+    }
+
+    fn submitIndexPlanForScopes(self: *Store, scopes: []const []const u8, plan: MutationPlan) !void {
         if (self.write_target == null) return self.submitScopedMutation(plan);
         const admission = self.writer_admission orelse return self.submitScopedMutation(plan);
         try admission.enter(admission.ptr, .index);
         defer admission.leave(admission.ptr);
         const io = self.file.runtime();
-        // A physical catalog change admission found under this scope
-        // (`markChangedIndexScopes`), in every redo mode: a file without a
-        // redo log publishes every index commit that way.
-        if (self.indexScopeStale(scope)) {
-            self.index_fence_refused.store(true, .release);
-            return error.EnrichmentWaitCanceled;
+        const shared = if (self.file.redo) |*redo| redo.shared else null;
+        // Both physical and redo-only catalog changes fence stale mirrors.
+        for (scopes) |scope| {
+            if (self.indexScopeStale(scope) or
+                (shared != null and shared.?.scopeLatestSequence(io, scope) > self.indexScopeFence(scope)))
+            {
+                self.index_fence_refused.store(true, .release);
+                return error.EnrichmentWaitCanceled;
+            }
         }
-        const shared = if (self.file.redo) |*redo| redo.shared else return self.submitScopedMutation(plan);
-        if (shared.scopeLatestSequence(io, scope) > self.indexScopeFence(scope)) {
-            self.index_fence_refused.store(true, .release);
-            return error.EnrichmentWaitCanceled;
-        }
-        // Reserved before publishing: recording the commit afterwards must
-        // not fail once storage has changed.
-        try self.reserveIndexScope(scope);
+        // Reserve before publication so updating the fences cannot fail
+        // once the storage transaction has committed.
+        if (shared != null) for (scopes) |scope| try self.reserveIndexScope(scope);
         try self.submitScopedMutation(plan);
-        self.noteIndexScopeCommit(scope, shared.scopeLatestSequence(io, scope));
+        if (shared) |overlay| for (scopes) |scope| self.noteIndexScopeCommit(scope, overlay.scopeLatestSequence(io, scope));
     }
 
     fn indexScopeStale(self: *Store, scope: []const u8) bool {

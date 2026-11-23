@@ -4483,24 +4483,30 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
             const queued_index_publication = inline_graph_publication != null or inline_sparse_publication != null or inline_dense_publication != null;
-            const BacklogCompletion = struct {
+            const QueuedCommitCompletion = struct {
                 executor: *derived_executor_mod.Executor,
                 admission: *derived_executor_mod.BacklogAdmission,
                 sequence: u64,
+                primary_committed: ?*bool,
+                disposition: ?*execution_resources.PreparedCommitDisposition,
 
                 fn run(ptr: *anyopaque, outcome: anyerror!u64) void {
                     const context: *@This() = @ptrCast(@alignCast(ptr));
                     _ = outcome catch return;
                     context.executor.commitBacklogAdmission(context.sequence, context.admission);
+                    if (context.primary_committed) |committed| committed.* = true;
+                    if (context.disposition) |disposition| disposition.markPrimaryCommitted();
                 }
             };
-            var backlog_completion: BacklogCompletion = .{
+            var queued_commit_completion: QueuedCommitCompletion = .{
                 .executor = S.ownerField(self, "executor").*,
                 .admission = &backlog_admission,
                 .sequence = sequence,
+                .primary_committed = opts.primary_committed,
+                .disposition = opts.prepared_commit_disposition,
             };
-            if (queued_index_publication and append_derived_replay)
-                commit_participants.completion = .{ .ptr = &backlog_completion, .run = BacklogCompletion.run };
+            if (queued_index_publication)
+                commit_participants.completion = .{ .ptr = &queued_commit_completion, .run = QueuedCommitCompletion.run };
             const combined_commit_participant: ?@import("../commit_participant.zig").Participant =
                 if (commit_participants.len != 0) commit_participants.participant() else null;
             const commit_participant = if (generated_acceptance) |*acceptance| acceptance.participant() else if (authored_acceptance.vectors.len != 0) authored_acceptance.participant() else null;
@@ -4613,8 +4619,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (inline_sparse_publication) |prepared| prepared.markEnqueued();
             if (inline_dense_publication) |prepared| prepared.markEnqueued();
             local_coverage_guard.release();
-            if (opts.primary_committed) |committed| committed.* = true;
-            if (opts.prepared_commit_disposition) |disposition| disposition.markPrimaryCommitted();
+            if (!queued_index_publication) {
+                if (opts.primary_committed) |committed| committed.* = true;
+                if (opts.prepared_commit_disposition) |disposition| disposition.markPrimaryCommitted();
+            }
             if (graph_publication) |*lease| lease.release();
             if (comptime @import("builtin").is_test) if (test_fail_after_primary_commit) |err| {
                 test_fail_after_primary_commit = null;

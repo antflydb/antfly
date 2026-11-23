@@ -93,6 +93,11 @@ pub const Pending = struct {
 /// `scope` disambiguates which index's records a call addresses, so the
 /// sink's own durable keys never collide across indexes sharing one `.aflite`
 /// file's native index-catalog root.
+pub const ScopedMutations = struct {
+    scope: []const u8,
+    mutations: []const Mutation,
+};
+
 pub const Sink = struct {
     ptr: *anyopaque,
     /// Apply every mutation in `mutations`, in order, as ONE native
@@ -101,6 +106,8 @@ pub const Sink = struct {
     /// `NamespaceTxn.setDurable`), or none of them on failure. `mutations`
     /// is only valid for the duration of the call.
     submit: *const fn (ptr: *anyopaque, scope: []const u8, mutations: []const Mutation, durable: bool) anyerror!void,
+    /// Commits every supplied scope in one durable transaction.
+    submitTogether: ?*const fn (*anyopaque, *const [2]ScopedMutations) anyerror!void = null,
     /// Loads every entry currently committed under this sink's scope, to
     /// seed the in-memory mirror on open. Called once, synchronously, from
     /// `Backend.init`. The returned slice and every entry's bytes are
@@ -642,6 +649,27 @@ pub const Backend = struct {
         return try backend_erased.storeFrom(allocator, BoundStore{ .backend = self, .namespace = namespace });
     }
 
+    pub fn canCommitTogether(self: *const Backend, other: *const Backend) bool {
+        return self != other and !self.open_options.read_only and !other.open_options.read_only and
+            self.sink.ptr == other.sink.ptr and self.sink.submitTogether != null and
+            self.sink.submitTogether == other.sink.submitTogether;
+    }
+
+    /// The caller holds both write admissions and publishes both mirrors
+    /// under its reader barrier after the durable submission succeeds.
+    pub fn submitTogether(first: *BoundTxn, second: *BoundTxn) !void {
+        const a = &first.inner;
+        const b = &second.inner;
+        std.debug.assert(a.backend.canCommitTogether(b.backend));
+        std.debug.assert(!a.closed and !b.closed and !a.read_only and !b.read_only);
+        if (a.hasResolver() or b.hasResolver()) return error.UnsupportedOperation;
+        try a.backend.sink.submitTogether.?(a.backend.sink.ptr, &.{
+            .{ .scope = a.backend.scope, .mutations = a.pending.items },
+            .{ .scope = b.backend.scope, .mutations = b.pending.items },
+        });
+        wal_trace.recordCommit();
+    }
+
     /// Like `runtimeStore(...).beginWrite()`, but returns the concrete
     /// (unerased) write handle instead of `backend_erased.WriteTxn`. For a
     /// caller that needs to inspect this transaction's own staged
@@ -650,8 +678,7 @@ pub const Backend = struct {
     /// transaction -- see `graph/graph.zig`'s `prepareInlineEdgePublication`,
     /// mirroring `persistent.zig`'s `prepareInlineSegmentPublication`),
     /// `backend_erased.Batch`'s vtable has no such accessor, so this bypasses
-    /// erasure entirely. The caller must `abort()` (never `commit()`) once
-    /// it has harvested what it needs -- this never talks to `sink`.
+    /// erasure entirely. The caller owns the transaction and must close it.
     pub fn boundWrite(self: *Backend, namespace: backend_types.Namespace) !BoundTxn {
         return .{ .inner = try NamespaceTxn.open(self, false), .namespace = namespace };
     }
@@ -696,7 +723,7 @@ pub const Backend = struct {
 
     /// Namespace-bound write/read handle, composing `NamespaceTxn`. Backs
     /// `BoundStore`'s `backend_erased.Store`/`Batch` erasure.
-    const BoundTxn = struct {
+    pub const BoundTxn = struct {
         inner: NamespaceTxn,
         namespace: backend_types.Namespace,
 
@@ -713,6 +740,19 @@ pub const Backend = struct {
 
         pub fn commit(self: *@This()) !void {
             try self.inner.commit();
+        }
+
+        pub fn publishDurable(self: *@This()) void {
+            self.inner.publishMirror();
+        }
+
+        pub fn containsManySorted(self: *@This(), keys: []const []const u8, present: []bool) !void {
+            for (keys, present) |key, *exists| {
+                exists.* = if (self.get(key)) |_| true else |err| switch (err) {
+                    error.NotFound => false,
+                    else => return err,
+                };
+            }
         }
 
         /// See `NamespaceTxn.setDurable`'s WS2/§3.2a ride-along note.
@@ -1020,7 +1060,7 @@ pub const Backend = struct {
         pub fn commit(self: *NamespaceTxn) !void {
             if (self.closed) return error.ReadOnly;
             if (self.read_only) return error.ReadOnly;
-            const rc = self.rc orelse return error.ReadOnly;
+            if (self.rc == null) return error.ReadOnly;
 
             // Durable-first (when durable): readers (via the backend-state
             // swap below) must never observe a mutation this backend has not
@@ -1088,6 +1128,11 @@ pub const Backend = struct {
                 try self.mirrorResolved(try resolverOf(m));
             };
 
+            self.publishMirror();
+        }
+
+        fn publishMirror(self: *NamespaceTxn) void {
+            const rc = self.rc.?;
             lockBackend(self.backend);
             const old = self.backend.state;
             self.backend.state = rc;
