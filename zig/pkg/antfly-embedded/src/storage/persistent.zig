@@ -6545,6 +6545,8 @@ const InlinePublicationTestSink = struct {
     entries: std.ArrayListUnmanaged(native_catalog_backend.Entry) = .empty,
     allocator: Allocator,
 
+    full_loads: usize = 0,
+
     fn findIndex(self: *@This(), namespace: ?[]const u8, key: []const u8) ?usize {
         for (self.entries.items, 0..) |e, i| {
             const ns_match = (e.namespace == null and namespace == null) or
@@ -6585,6 +6587,7 @@ const InlinePublicationTestSink = struct {
     fn loadAllAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]native_catalog_backend.Entry {
         _ = scope;
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.full_loads += 1;
         const out = try allocator.alloc(native_catalog_backend.Entry, self.entries.items.len);
         for (self.entries.items, out) |e, *copy| copy.* = .{
             .namespace = if (e.namespace) |n| try allocator.dupe(u8, n) else null,
@@ -9542,6 +9545,10 @@ test "persistent index applies peer level-0, merge and rebuild deltas" {
     var index = try openVersionedTestIndex(alloc, &sink, path);
     defer index.close();
 
+    // Serving readers must follow the same incremental path.
+    index.read_only = true;
+    const initial_loads = sink.full_loads;
+
     const older = try DocVersion.of(1, 0);
     const newer = try DocVersion.of(2, 0);
     const old_key = l0Key(l0SegmentId(older));
@@ -9600,6 +9607,8 @@ test "persistent index applies peer level-0, merge and rebuild deltas" {
         try std.testing.expectEqual(@as(u32, 1), snapshot.liveDocCount());
     }
 
+    try std.testing.expectEqual(initial_loads, sink.full_loads);
+
     var peer_path_buf: [256]u8 = undefined;
     const peer_path = persistTmpPath(&peer_path_buf);
     defer cleanupPersistDir(peer_path);
@@ -9614,6 +9623,7 @@ test "persistent index applies peer level-0, merge and rebuild deltas" {
     try std.testing.expectEqual(@as(usize, 1), rebuilt.segments.len);
     const rebuilt_id = rebuilt.segments[0].id;
     try std.testing.expect(rebuilt_id != merged_id);
+    const loads_before_rebuild_delta = sink.full_loads;
     const rebuilt_key = std.mem.toBytes(std.mem.nativeToBig(u64, rebuilt_id));
     const rebuilt_active = activeSegmentMetaKey(rebuilt_id);
     try index.refreshChangedFromTip(&.{
@@ -9626,6 +9636,7 @@ test "persistent index applies peer level-0, merge and rebuild deltas" {
         .{ .namespace = native_catalog_backend.tip_namespace, .key = "doc:a" },
         .{ .namespace = native_catalog_backend.tip_namespace, .key = "doc:b" },
     });
+    try std.testing.expectEqual(loads_before_rebuild_delta, sink.full_loads);
     const snapshot = index.writer.acquireSnapshot();
     defer snapshot.release();
     try std.testing.expectEqual(@as(usize, 1), snapshot.segments.len);
