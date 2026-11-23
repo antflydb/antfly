@@ -4479,7 +4479,7 @@ fn stepLinear(cb: *const ComputeBackend, assigned: ?*@import("../execution/dense
     return cb.linear(x, w, b, rows, width, out);
 }
 fn stepTriple(cb: *const ComputeBackend, assigned: ?*@import("../execution/dense_decoder_schedule.zig").Schedule, x: CT, q: LinearWeights, k: LinearWeights, v: LinearWeights, rows: usize, width: usize) !ops.LinearTripleResult {
-    if (assigned) |schedule| return .{ .first = try schedule.execute(&.{ x, q.weight, q.bias }, null), .second = try schedule.execute(&.{ x, k.weight, k.bias }, null), .third = try schedule.execute(&.{ x, v.weight, v.bias }, null) };
+    if (assigned) |schedule| return schedule.executeQkv(.{ &.{ x, q.weight, q.bias }, &.{ x, k.weight, k.bias }, &.{ x, v.weight, v.bias } });
     return cb.linearTriple(x, q.weight, q.bias, k.weight, k.bias, v.weight, v.bias, rows, width, width);
 }
 fn stepEmbedding(cb: *const ComputeBackend, assigned: ?*@import("../execution/dense_decoder_schedule.zig").Schedule, weight: CT, ids: []const i64, rows: usize, width: usize) !CT {

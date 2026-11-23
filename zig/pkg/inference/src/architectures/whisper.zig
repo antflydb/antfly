@@ -2069,6 +2069,13 @@ const Projections = struct {
 };
 
 fn projectQkv(cb: *const ComputeBackend, w: *const LayerWeights, normed: CT, rows: usize, d_model: usize, profile: *StepProfile) !Projections {
+    if (profile.assigned) |schedule| {
+        const q = [3]CT{ normed, w.q.w, w.q.b orelse w.q.w };
+        const k = [3]CT{ normed, w.k.w, w.k.b orelse w.k.w };
+        const v = [3]CT{ normed, w.v.w, w.v.b orelse w.v.w };
+        const projected = try schedule.executeQkv(.{ q[0..if (w.q.b == null) 2 else 3], k[0..if (w.k.b == null) 2 else 3], v[0..if (w.v.b == null) 2 else 3] });
+        return .{ .q = projected.first, .k = projected.second, .v = projected.third };
+    }
     if (w.qkv_slots) |slots| {
         if (try cb.decoderRuntimeApplyLinearQkv(&.{
             .q_slot = slots[0],

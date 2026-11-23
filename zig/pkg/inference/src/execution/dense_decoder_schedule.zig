@@ -893,9 +893,31 @@ pub const Schedule = struct {
         return if (self.descriptors[try self.nextNodeId()]) |*descriptor| descriptor else error.DenseScheduleOrderChanged;
     }
     pub fn execute(self: *Schedule, inputs: []const CT, attention: ?*const ops.AttentionContext) !CT {
-        const id = try self.nextNodeId();
-        const node = self.graph.node(id);
+        const node = self.graph.node(try self.nextNodeId());
         if (inputs.len != node.num_inputs) return error.DenseScheduleOrderChanged;
+        return self.executeStep(node, inputs, attention);
+    }
+    /// Consume a semantic projection group with one cursor contract. Validate
+    /// all member operands before submitting the first numerical operation.
+    pub fn executeQkv(self: *Schedule, inputs: [3][]const CT) !ops.LinearTripleResult {
+        if (self.cursor > self.steps.len or self.steps.len - self.cursor < inputs.len) return error.DenseScheduleOrderChanged;
+        const members = self.steps[self.cursor..][0..inputs.len];
+        const activation = self.graph.node(members[0]).inputs[0];
+        for (members, inputs) |id, operands| {
+            const descriptor = self.descriptors[id] orelse return error.DenseScheduleOrderChanged;
+            const node = self.graph.node(id);
+            if (descriptor.operation != .linear or operands.len < 2 or operands.len != descriptor.input_count or
+                node.num_inputs != operands.len or node.inputs[0] != activation or operands[0] != inputs[0][0])
+                return error.DenseScheduleOrderChanged;
+        }
+        return .{
+            .first = try self.executeStep(self.graph.node(members[0]), inputs[0], null),
+            .second = try self.executeStep(self.graph.node(members[1]), inputs[1], null),
+            .third = try self.executeStep(self.graph.node(members[2]), inputs[2], null),
+        };
+    }
+    fn executeStep(self: *Schedule, node: *const ml.graph.Node, inputs: []const CT, attention: ?*const ops.AttentionContext) !CT {
+        const id = self.steps[self.cursor];
         for (node.getInputs(), inputs) |source, value| self.values[source] = value;
         const frame = self.frame orelse return error.DenseScheduleNotEntered;
         const result = try frame.executePreparedProgram(&self.backend, self.values, id, null, attention orelse &.{ .total_sequence_len = 0, .query_sequence_len = 0, .kv_sequence_len = 0 });
