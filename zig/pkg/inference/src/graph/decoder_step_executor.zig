@@ -977,7 +977,7 @@ pub const Executor = struct {
             if (verified.max_future != max_future or verified.attention_count != attention_count or (!verified_key.same or verified_key.len != key.len) or !std.mem.eql(u32, position_snapshot[0..positions.len], current_positions)) return self.declineLightOnGraph(7);
         }
         // The callback may have parked/restored; read the actual owner NOW.
-        const prepared = (try C.beginBoundedDecodeGraph(self.context.cb, .{ .boundary = self.context.cleanupEpoch(), .operation = self.context.cb.operationToken() }, &funding_phase, self.lighton_cuda_execution_id, key.words[0..key.len], position_snapshot[0..positions.len], claimed.len, self.context.gpt_config.hidden_size, self.context.gpt_config.vocab_size, max_future, attention_count, self.context.gpt_config.num_hidden_layers - attention_count)) orelse return self.declineLightOnGraph(7);
+        const prepared = (try C.beginBoundedDecodeGraph(self.context.cb, .{ .boundary = self.context.cleanupEpoch(), .operation = self.context.cb.operationToken() }, &funding_phase, descriptor)) orelse return self.declineLightOnGraph(7);
         // All graph tokens are consumed/published. Pure metadata can now retire
         // at this B even if later scalar/host reads park and rotate it again.
         try funding_phase.close(.{ .boundary = self.context.cleanupEpoch() });

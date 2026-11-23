@@ -3741,14 +3741,9 @@ pub const CudaCompute = struct {
         if (epoch == 0) return;
         if (current.outside_execution) {
             if (current.boundary != null or current.operation != null) return error.ConflictingCleanupAuthority;
-            var pending: @import("../../execution/resource_retirement.zig").SynchronousOutsideRawLeases = .{};
             var local = try @import("../../execution/cleanup_owner.zig").Owner.beginOutsideCleanup();
-            defer {
-                const registered = pending.boundary_context != null;
-                local.finishAfterUnlock();
-                if (registered) std.debug.assert(pending.finished);
-            }
-            const scoped = try local.synchronousOutsideContext(&pending);
+            defer local.finishAfterUnlock();
+            const scoped: CacheCleanup = .{ .boundary = try local.outsideCleanupEpoch() };
             return endLightOnDecodeGraphEpochWithCleanup(cb, epoch, scoped);
         }
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
@@ -3981,14 +3976,9 @@ pub const CudaCompute = struct {
         if (!self.lighton_decode_graph_enabled and self.bounded_decode_graph.metadata.ptr == 0 and self.bounded_decode_graph.arena.ptr == 0 and self.bounded_decode_graph.head.ptr == 0 and self.bounded_decode_graph.graph == null and self.bounded_decode_graph.pending_graph == null) return;
         if (current.outside_execution) {
             if (current.boundary != null or current.operation != null) return error.ConflictingCleanupAuthority;
-            var pending: @import("../../execution/resource_retirement.zig").SynchronousOutsideRawLeases = .{};
             var local = try @import("../../execution/cleanup_owner.zig").Owner.beginOutsideCleanup();
-            defer {
-                const registered = pending.boundary_context != null;
-                local.finishAfterUnlock();
-                if (registered) std.debug.assert(pending.finished);
-            }
-            const scoped = try local.synchronousOutsideContext(&pending);
+            defer local.finishAfterUnlock();
+            const scoped: CacheCleanup = .{ .boundary = try local.outsideCleanupEpoch() };
             return invalidateLightOnDecodeGraphWithCleanup(cb, scoped);
         }
         if (!self.bounded_decode_graph.mutex.tryLock()) return error.ReaderEpochBackendBusy;
@@ -4196,11 +4186,6 @@ pub const CudaCompute = struct {
         phase.expected_compute = @intFromPtr(self);
         phase.admission = self.ctx.video_cache_budget.admission;
         phase.old = owner.snapshot();
-        if (phase.old.hasRaw()) {
-            if (try self.ctx.streamCaptureActive()) return .unsupported;
-            phase.mode = .upgrade;
-            return .outside;
-        }
         if (owner.epoch_id != descriptor.epoch or !owner.matches(descriptor.key, descriptor.positions)) {
             if (try self.ctx.streamCaptureActive()) return .unsupported;
             // Exact invalid graph dies under the ACTUAL B before outside
@@ -4223,7 +4208,7 @@ pub const CudaCompute = struct {
     }
     /// Reader restored its SAME graph/workspace under actual owner lanes.
     /// Revalidate the full concrete snapshot and policy, never a weak hash.
-    pub fn bindCapturedGraphPhase(cb: *const ops.ComputeBackend, phase: *@import("bounded_decode_graph.zig").GraphPhase, current: CacheCleanup) !bool {
+    pub fn bindCapturedGraphPhase(cb: *const ops.ComputeBackend, phase: *@import("bounded_decode_graph.zig").GraphPhase, current: CacheCleanup) !void {
         if (!acceptsPhysicalImplementation(cb.vtable) or @intFromPtr(cb.ptr) != phase.expected_compute) return error.UnsupportedReaderEpochBackend;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (current.outside_execution or current.boundary == null or try current.boundary.?.isSealed()) return error.MissingCurrentCleanupEpoch;
@@ -4233,34 +4218,31 @@ pub const CudaCompute = struct {
         if (!owner.mutex.tryLock()) return error.ReaderEpochBackendBusy;
         defer owner.mutex.unlock();
         if (!std.meta.eql(owner.snapshot(), phase.old)) return error.PreparedCachePlanChanged;
-        if (phase.mode == .upgrade) {
-            const cold = phase.cold orelse return error.InvalidPreparedCacheState;
-            const quotas = [_]*CacheQuota{ &owner.metadata_quota, &owner.arena_quota, &owner.head_quota };
-            for (quotas, 0..) |quota, index| if (cold.upgrades[index]) |*upgrade| {
-                _ = try upgrade.install(quota);
-            };
-            return false; // close pure upgrade node under NOW B, inspect again
-        }
         if (phase.mode == .arena and (owner.epoch_id != phase.descriptor.epoch or !owner.matches(phase.descriptor.key, phase.descriptor.positions))) return error.PreparedCachePlanChanged;
         try phase.bind(current);
-        return true;
     }
     pub fn clearCapturedGraphWithCleanup(self: *CudaCompute, current: CacheCleanup) !void {
         try self.bounded_decode_graph.clearWithCleanup(&self.ctx, current);
         if (self.captured_cache_roots) |roots| roots.releaseRoots(self, current);
     }
 
-    pub fn beginBoundedDecodeGraph(cb: *const ops.ComputeBackend, current: @import("../../execution/cleanup_context.zig").Context, graph_phase: ?*@import("bounded_decode_graph.zig").GraphPhase, epoch: u64, key: []const u64, positions: []const u32, rows: usize, hidden: usize, vocab: usize, future_tokens: usize, attention_layers: usize, recurrent_layers: usize) !?BoundedDecodeClaim {
+    pub fn beginBoundedDecodeGraph(cb: *const ops.ComputeBackend, current: CacheCleanup, graph_phase: *@import("bounded_decode_graph.zig").GraphPhase, expected: @import("bounded_decode_graph.zig").Descriptor) !?BoundedDecodeClaim {
         if (!acceptsPhysicalImplementation(cb.vtable)) return error.UnsupportedReaderEpochBackend;
+        if (current.outside_execution or current.boundary == null or try current.boundary.?.isSealed()) return error.MissingCurrentCleanupEpoch;
+        const epoch = expected.epoch;
+        const key = expected.key;
+        const positions = expected.positions;
+        const rows = expected.rows;
+        const hidden = expected.hidden;
+        const vocab = expected.vocab;
+        const future_tokens = expected.future_tokens;
         if (!lightOnDecodeGraphEnabled(cb) or epoch == 0 or rows < 2 or rows > (if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL128")) @as(usize, 128) else 64) or vocab == 0 or future_tokens == 0 or future_tokens > @import("paged_attention_bf16.zig").max_native_context_tokens or positions.len != rows * 3 or (hidden != 1024 and hidden != 2560)) return null;
         if (rows > 64 and rows % 64 == 1) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (rows > 64 and !self.lighton_ragged_recurrent_enabled) return null;
         if (self.execution_scope != null or try self.ctx.streamCaptureActive()) return null;
-        if (graph_phase) |prepared_phase| {
-            const descriptor = prepared_phase.descriptor;
-            if (prepared_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or descriptor.attention_layers != attention_layers or descriptor.recurrent_layers != recurrent_layers or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions)) return error.PreparedCachePlanChanged;
-        }
+        const descriptor = graph_phase.descriptor;
+        if (graph_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or descriptor.attention_layers != expected.attention_layers or descriptor.recurrent_layers != expected.recurrent_layers or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions)) return error.PreparedCachePlanChanged;
         const owner = &self.bounded_decode_graph;
         while (!owner.mutex.tryLock()) std.atomic.spinLoopHint();
         var claimed = false;
@@ -4276,12 +4258,8 @@ pub const CudaCompute = struct {
                 });
                 owner.resets_logged += 1;
             }
-            const reset_result = if (graph_phase) |prepared_phase| owner.resetPrepared(&self.ctx, prepared_phase) else raw: {
-                if (!current.outside_execution) return error.UnpreparedCapturedGraphAdmission;
-                break :raw owner.reset(&self.ctx, key, positions, rows, hidden, vocab);
-            };
-            reset_result catch |err| switch (err) {
-                error.OutOfMemory, error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.CudaMemoryLimitExceeded => {
+            owner.resetPrepared(&self.ctx, graph_phase) catch |err| switch (err) {
+                error.CudaMemoryLimitExceeded => {
                     owner.admission_denials += 1;
                     return null;
                 },
@@ -4292,12 +4270,8 @@ pub const CudaCompute = struct {
         if (owner.phase == .disabled) return null;
         if (self.captured_cache_roots) |roots| try roots.beginGeneration(self, current);
         if (owner.phase == .capture) arena: {
-            const result = if (graph_phase) |prepared_phase| owner.reserveArenaPrepared(&self.ctx, prepared_phase) else raw: {
-                if (!current.outside_execution) return error.UnpreparedCapturedGraphAdmission;
-                break :raw owner.reserveArena(&self.ctx);
-            };
-            result catch |err| switch (err) {
-                error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.CudaMemoryLimitExceeded => {
+            owner.reserveArenaPrepared(&self.ctx, graph_phase) catch |err| switch (err) {
+                error.CudaMemoryLimitExceeded => {
                     owner.admission_denials += 1;
                     owner.phase = .disabled;
                     return null;
@@ -4321,8 +4295,8 @@ pub const CudaCompute = struct {
             _ = try blas.reserveTensorCorePlanSlots(&self.ctx, 64);
         };
         owner.future_tokens = future_tokens;
-        owner.expected_attention_calls = try checkedMul(try checkedMul(2, attention_layers), (rows + 63) / 64);
-        owner.expected_ragged_packets = if (rows > 64) try checkedMul(try checkedMul(2, recurrent_layers), (rows + 63) / 64) else 0;
+        owner.expected_attention_calls = try checkedMul(try checkedMul(2, expected.attention_layers), (rows + 63) / 64);
+        owner.expected_ragged_packets = if (rows > 64) try checkedMul(try checkedMul(2, expected.recurrent_layers), (rows + 63) / 64) else 0;
         claimed = true;
         return .{ .compute = self, .future_tokens = future_tokens };
     }
@@ -45117,108 +45091,6 @@ test "LightOnOCR3 CUDA optional BF16 prefill scratch preserves admission across 
     try std.testing.expectEqual(@as(usize, 0), prefill.calls);
 }
 
-test "LightOnOCR3 CUDA decoder graph arena admission rejects partial allocations and releases every reservation" {
-    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
-    const memory = @import("../../runtime/tier/memory.zig");
-    var compute = try CudaCompute.testing.init(std.testing.allocator);
-    defer compute.deinit();
-    var controller = memory.AdmissionController{};
-    var owner = @import("bounded_decode_graph.zig").Module{};
-    defer owner.clear(&compute.ctx) catch {};
-    const positions = [_]u32{ 10, 20, 30, 40, 50, 60 };
-    const key = [_]u64{ 1, 2, 3 };
-    const bytes = 8960;
-    compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{
-        .backend_limit_bytes = bytes - 1,
-        .host_limit_bytes = 16 * 1024 * 1024,
-        .scratch_limit_bytes = 16 * 1024 * 1024,
-    }, .check_live_memory = false };
-    const baseline = compute.ctx.device_allocations.snapshot().live;
-    try std.testing.expectError(error.ResourceLimitExceeded, owner.reset(&compute.ctx, &key, &positions, 2, 1024, 8));
-    try std.testing.expectEqual(baseline, compute.ctx.device_allocations.snapshot().live);
-    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
-    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
-    compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = bytes;
-    try owner.reset(&compute.ctx, &key, &positions, 2, 1024, 8);
-    try std.testing.expectEqual(@as(usize, bytes), controller.snapshot().backend_scratch_bytes);
-    try std.testing.expect(owner.matches(&key, &positions));
-    owner.plan.?.allocate(1024, 0x1000);
-    owner.plan.?.release(0x1000);
-    try std.testing.expect(owner.plan.?.finishNoOutput());
-    compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = bytes + 1023;
-    // The arena fits on its own; the retained metadata lease occupies the
-    // missing byte, so this is a temporary denial rather than an oversized request.
-    try std.testing.expectError(error.ResourceTemporarilyUnavailable, owner.reserveArena(&compute.ctx));
-    try std.testing.expectEqual(@as(usize, 0), owner.arena.ptr);
-    try std.testing.expectEqual(baseline + bytes, compute.ctx.device_allocations.snapshot().live);
-    compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = bytes + 1024;
-    try owner.reserveArena(&compute.ctx);
-    const arena_pointer = owner.arena.ptr;
-    try owner.reserveArena(&compute.ctx);
-    try std.testing.expectEqual(arena_pointer, owner.arena.ptr);
-    try std.testing.expectEqual(@as(usize, bytes + 1024), controller.snapshot().backend_scratch_bytes);
-    try owner.notePair();
-    try std.testing.expect(!owner.matches(&key, &positions));
-    try owner.clear(&compute.ctx);
-    try std.testing.expectEqual(baseline, compute.ctx.device_allocations.snapshot().live);
-    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
-    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
-    try std.testing.expectEqual(@as(usize, 0), owner.key.len);
-}
-
-test "LightOnOCR3 CUDA wide graph head has independent admission and never enters the temporary cache" {
-    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
-    const memory = @import("../../runtime/tier/memory.zig");
-    var compute = try CudaCompute.testing.init(std.testing.allocator);
-    defer compute.deinit();
-    var controller = memory.AdmissionController{};
-    var owner = @import("bounded_decode_graph.zig").Module{};
-    defer owner.clear(&compute.ctx) catch {};
-    const positions: [384]u32 = @splat(10);
-    const key = [_]u64{ 1, 2, 3 };
-    const metadata_bytes = 527104;
-    const head_bytes = 128 * 8 * 4;
-    const total = metadata_bytes + head_bytes;
-    compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{
-        .backend_limit_bytes = total - 1,
-        .host_limit_bytes = 16 * 1024 * 1024,
-        .scratch_limit_bytes = 16 * 1024 * 1024,
-    }, .check_live_memory = false };
-    const baseline = compute.ctx.device_allocations.snapshot().live;
-    // The second lease is denied; the preceding metadata allocation and both
-    // host reservations must be rolled back before conservative execution.
-    try std.testing.expectError(error.ResourceTemporarilyUnavailable, owner.reset(&compute.ctx, &key, &positions, 128, 1024, 8));
-    try std.testing.expectEqual(baseline, compute.ctx.device_allocations.snapshot().live);
-    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
-    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
-    try std.testing.expectEqual(@as(usize, 0), owner.head.ptr);
-    compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = total;
-    try owner.reset(&compute.ctx, &key, &positions, 128, 1024, 8);
-    try std.testing.expectEqual(@as(usize, head_bytes), owner.head.len);
-    try std.testing.expectEqual(@as(usize, metadata_bytes), owner.metadata.len);
-    try std.testing.expectEqual(@as(usize, total), controller.snapshot().backend_scratch_bytes);
-    const head_pointer = owner.head.ptr;
-    const cached = compute.temp_buffers.buffers.items.len;
-    for ([_]usize{ 0, 0x1000 }) |base| {
-        var scope = @import("../../execution/stream_workspace.zig").Scope{ .plan = owner.plan.?, .base = base };
-        compute.execution_scope = &scope;
-        defer compute.execution_scope = null;
-        var output = try OwnedF32Output.fromOwnedShapeDestination(&compute, try allocShape2(compute.allocator, 8, 128), 8 * 128, head_bytes, owner.head);
-        defer output.deinit();
-        try std.testing.expect(output.buffer.borrowed);
-        try std.testing.expectEqual(head_pointer, output.buffer.ptr);
-        try std.testing.expectError(error.InvalidExecutionPlan, OwnedF32Output.fromOwnedShapeDestination(&compute, try allocShape2(compute.allocator, 8, 128), 8 * 128, head_bytes - 4, owner.head));
-        try std.testing.expectEqual(head_pointer, owner.head.ptr);
-        try std.testing.expectEqual(cached, compute.temp_buffers.buffers.items.len);
-        try std.testing.expectEqual(@as(usize, 0), owner.plan.?.event_count);
-        try std.testing.expectEqual(baseline + total, compute.ctx.device_allocations.snapshot().live);
-    }
-    try owner.clear(&compute.ctx);
-    try std.testing.expectEqual(baseline, compute.ctx.device_allocations.snapshot().live);
-    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
-    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
-}
-
 test "LightOnOCR3 CUDA wide graph head projection writes its assigned buffer" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -55949,7 +55821,7 @@ test "captured graph funding rejects copied backend tables before invalid contex
     const backend = ops.ComputeBackend{ .ptr = @ptrFromInt(1), .vtable = &copied };
     try std.testing.expectError(error.UnsupportedReaderEpochBackend, CudaCompute.inspectCapturedGraphPhase(&backend, &phase, .{}));
     try std.testing.expectError(error.UnsupportedReaderEpochBackend, CudaCompute.bindCapturedGraphPhase(&backend, &phase, .{}));
-    try std.testing.expectError(error.UnsupportedReaderEpochBackend, CudaCompute.beginBoundedDecodeGraph(&backend, .{}, &phase, 1, &key, &positions, 2, 1024, 8, 16, 1, 1));
+    try std.testing.expectError(error.UnsupportedReaderEpochBackend, CudaCompute.beginBoundedDecodeGraph(&backend, .{}, &phase, phase.descriptor));
 }
 
 test "captured graph prefunded nonempty program and learned workspace replay after exact reader custody park and peer request" {
@@ -56370,61 +56242,6 @@ test "CUDA NativeState teardown publishes KV retirement and preserves host owner
     // Fully consumed typed teardown is harmless; no retired sequence/list is
     // revisited, unlike the partial-failure retry above.
     try state.deinitWithCleanup(.{ .boundary = &epoch });
-}
-
-test "CUDA legacy three raw graph quotas preserve explicit outside invalidate and end without supplier callbacks under graph mutex" {
-    if (comptime !cuda_enabled) return error.SkipZigTest;
-    const Memory = @import("../../runtime/tier/memory.zig");
-    var compute = try CudaCompute.testing.init(std.testing.allocator);
-    defer compute.deinit();
-    var controller = Memory.AdmissionController{};
-    const Probe = struct {
-        compute: *CudaCompute,
-        held: bool = false,
-        releases: usize = 0,
-        fn check(self: *@This()) void {
-            if (!self.compute.bounded_decode_graph.mutex.tryLock()) self.held = true else self.compute.bounded_decode_graph.mutex.unlock();
-        }
-        fn reserve(raw: *anyopaque, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!usize {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.check();
-            return 1;
-        }
-        fn retain(raw: *anyopaque, _: usize, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.check();
-        }
-        fn release(raw: *anyopaque, _: usize) void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.check();
-            self.releases += 1;
-        }
-    };
-    var probe = Probe{ .compute = &compute };
-    try controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
-    compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{}, .check_live_memory = false };
-    defer compute.ctx.video_cache_budget.admission = null;
-    compute.lighton_decode_graph_enabled = true;
-    const backend = compute.computeBackend();
-    const key = [_]u64{ 1, 2, 3 };
-    const positions: [384]u32 = @splat(1);
-    for (0..2) |method| {
-        const graph = &compute.bounded_decode_graph;
-        try graph.reset(&compute.ctx, &key, &positions, 128, 1024, 8);
-        graph.epoch_id = method + 1;
-        graph.plan.?.allocate(512, 0x1000);
-        graph.plan.?.release(0x1000);
-        try std.testing.expect(graph.plan.?.finishNoOutput());
-        try graph.reserveArena(&compute.ctx);
-        try std.testing.expect(graph.metadata_quota == .raw and graph.arena_quota == .raw and graph.head_quota == .raw);
-        const before = controller.snapshot();
-        const frees = probe.releases;
-        if (method == 0) try CudaCompute.invalidateLightOnDecodeGraphWithCleanup(&backend, .{ .outside_execution = true }) else try CudaCompute.endLightOnDecodeGraphEpochWithCleanup(&backend, method + 1, .{ .outside_execution = true });
-        try std.testing.expect(!probe.held and probe.releases > frees);
-        try std.testing.expect(before.backend_scratch_bytes > 0 and before.host_scratch_bytes > 0);
-        try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, controller.snapshot());
-        try std.testing.expect(graph.metadata.ptr == 0 and graph.arena.ptr == 0 and graph.head.ptr == 0);
-    }
 }
 
 test "CUDA persistent host-capable cache with actual raw recurrent producer keeps explicit outside NativeState cleanup available" {

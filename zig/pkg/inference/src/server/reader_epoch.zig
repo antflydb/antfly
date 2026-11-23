@@ -1356,18 +1356,13 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                 parked.restoreKeepingStep() catch platform.inference_process_supervisor.restartWorker();
                 // NEVER use the pre-pause current variable for bind/retirement.
                 const now = @import("../execution/cleanup_context.zig").Context{ .boundary = ctx.cleanup_owner.epoch(), .operation = cb.operationToken() };
-                const bound = Cuda.bindCapturedGraphPhase(cb, phase, now) catch |err| {
+                Cuda.bindCapturedGraphPhase(cb, phase, now) catch |err| {
                     try phase.close(now); // process-owned node, not this stack
                     if (err != error.PreparedCachePlanChanged) return err;
                     try phase.initInto(descriptor);
                     continue;
                 };
-                if (bound) return true;
-                // Legacy raw metadata upgrade consumed no graph math. Retire
-                // its inert process phase under NOW B, then inspect again;
-                // the next park seals B before any new graph funding supplier.
-                try phase.close(now);
-                try phase.initInto(descriptor);
+                return true;
             }
             return error.PreparedCachePlanChanged;
         }

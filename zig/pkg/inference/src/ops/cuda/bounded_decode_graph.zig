@@ -134,10 +134,6 @@ pub const Snapshot = struct {
     events: usize,
     metadata_quota: quota_mod.Quota,
     arena_quota: quota_mod.Quota,
-    head_quota: quota_mod.Quota,
-    pub fn hasRaw(self: Snapshot) bool {
-        return self.metadata_quota == .raw or self.arena_quota == .raw or self.head_quota == .raw;
-    }
 };
 
 /// Pure heap metadata retired by the CURRENT caller's unsealed B. It never
@@ -150,10 +146,8 @@ const ColdPhase = struct {
     funding: ?*funding_mod.Funding = null,
     key: []u64 = &.{},
     plan: ?*plan_mod.Plan = null,
-    upgrades: [3]?quota_mod.RawUpgrade = @splat(null),
     fn destroyOutside(self: *ColdPhase) void {
         if (self.funding) |value| value.finishOutsideExecution();
-        for (&self.upgrades) |*slot| if (slot.*) |*upgrade| upgrade.deinitOutsideExecution();
         if (self.plan) |value| self.allocator.destroy(value);
         if (self.key.len != 0) self.allocator.free(self.key);
         self.allocator.destroy(self);
@@ -166,7 +160,7 @@ const ColdPhase = struct {
 
 pub const GraphPhase = struct {
     descriptor: Descriptor,
-    mode: enum { none, upgrade, storage, arena } = .none,
+    mode: enum { none, storage, arena } = .none,
     expected_compute: usize = 0,
     old: Snapshot = undefined,
     admission: ?@import("video_cache_budget.zig").Admission = null,
@@ -175,9 +169,6 @@ pub const GraphPhase = struct {
     pub fn initInto(self: *GraphPhase, descriptor: Descriptor) !void {
         _ = try descriptor.layout();
         self.* = .{ .descriptor = descriptor };
-    }
-    pub fn needsOutside(self: *const GraphPhase) bool {
-        return self.mode != .none;
     }
     /// Caller has dropped EVERY model/provider/reader lane but retains the
     /// exact model lifetime and SAME worker step. All callback-capable quota,
@@ -190,44 +181,33 @@ pub const GraphPhase = struct {
         const cold = try allocator.create(ColdPhase);
         cold.* = .{ .allocator = allocator };
         errdefer cold.destroyOutside();
-        if (self.mode == .upgrade) {
-            const previous = [_]quota_mod.Quota{ self.old.metadata_quota, self.old.arena_quota, self.old.head_quota };
-            for (previous, 0..) |quota, index| if (quota == .raw) {
-                const lease = quota.raw;
-                const controller = lease.controller orelse return error.MissingResourceRetirementLease;
-                const pin = model.retainAdmissionDomain(controller) orelse return error.MissingCacheRetirementDomain;
-                defer pin.release();
-                cold.upgrades[index] = try quota_mod.RawUpgrade.prepare(lease, &pin);
-            };
-        } else {
-            const request = if (self.mode == .storage) try self.descriptor.storageRequest() else funding_mod.Request{ .captured_arena = .{ .epoch = self.descriptor.epoch, .key_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(self.descriptor.key)), .bytes = self.old.peak, .events = self.old.events } };
-            const amounts = switch (request) {
-                .captured_storage => |value| try value.amounts(),
-                .captured_arena => |value| value.amounts(),
-                else => unreachable,
-            };
-            const funding = try funding_mod.Funding.createWithAllocator(allocator, .{ .requests = &.{request} });
-            cold.funding = funding;
-            try funding.noteMiss(0, amounts, 0);
-            funding.admission = self.admission;
-            funding.compute_identity = self.expected_compute;
-            funding.state = .snapped;
-            var pin: ?@import("../../runtime/tier/admission_domain.zig").Pin = null;
-            if (self.admission) |policy| pin = model.retainAdmissionDomain(policy.controller) orelse return error.MissingCacheRetirementDomain;
-            defer if (pin) |value| value.release();
-            try funding.fundOutsideExecution(if (pin) |*value| value else null);
-            if (self.mode == .storage) {
-                cold.key = try allocator.dupe(u64, self.descriptor.key);
-                cold.plan = try allocator.create(plan_mod.Plan);
-                cold.plan.?.* = .{};
-            }
+        const request = if (self.mode == .storage) try self.descriptor.storageRequest() else funding_mod.Request{ .captured_arena = .{ .epoch = self.descriptor.epoch, .key_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(self.descriptor.key)), .bytes = self.old.peak, .events = self.old.events } };
+        const amounts = switch (request) {
+            .captured_storage => |value| try value.amounts(),
+            .captured_arena => |value| value.amounts(),
+            else => unreachable,
+        };
+        const funding = try funding_mod.Funding.createWithAllocator(allocator, .{ .requests = &.{request} });
+        cold.funding = funding;
+        try funding.noteMiss(0, amounts, 0);
+        funding.admission = self.admission;
+        funding.compute_identity = self.expected_compute;
+        funding.state = .snapped;
+        var pin: ?@import("../../runtime/tier/admission_domain.zig").Pin = null;
+        if (self.admission) |policy| pin = model.retainAdmissionDomain(policy.controller) orelse return error.MissingCacheRetirementDomain;
+        defer if (pin) |value| value.release();
+        try funding.fundOutsideExecution(if (pin) |*value| value else null);
+        if (self.mode == .storage) {
+            cold.key = try allocator.dupe(u64, self.descriptor.key);
+            cold.plan = try allocator.create(plan_mod.Plan);
+            cold.plan.?.* = .{};
         }
         self.cold = cold;
     }
     /// Metadata-only. Concrete CUDA owner validates full table/context,
     /// geometry/key/policy/snapshot before exposing this funding to reset.
     pub fn bind(self: *GraphPhase, current: Cleanup) !void {
-        if (self.bound or self.mode == .upgrade) return error.InvalidPreparedCacheState;
+        if (self.bound or self.mode == .none) return error.InvalidPreparedCacheState;
         const epoch = current.boundary orelse return error.MissingCurrentCleanupEpoch;
         if (current.outside_execution or try epoch.isSealed()) return error.InvalidPreparedCacheState;
         const cold = self.cold orelse return error.InvalidPreparedCacheState;
@@ -280,7 +260,6 @@ pub const Module = struct {
     // Wide logits live outside the bounded temporary arena. Both dependent
     // steps reuse this independently admitted output after their argmax.
     head: buffer.DeviceBuffer = .{},
-    head_quota: quota_mod.Quota = .none,
     future_tokens: usize = 0,
     expected_attention_calls: usize = 0,
     expected_ragged_packets: usize = 0,
@@ -307,25 +286,13 @@ pub const Module = struct {
     pub fn clear(self: *Module, ctx: *context.CudaContext) !void {
         try self.metadata_quota.validateLegacyRaw();
         try self.arena_quota.validateLegacyRaw();
-        try self.head_quota.validateLegacyRaw();
         return self.clearWithCleanup(ctx, .{ .outside_execution = true });
     }
     pub fn validateCleanup(self: *const Module, current: Cleanup) !void {
         try self.metadata_quota.validateCleanup(current);
         try self.arena_quota.validateCleanup(current);
-        try self.head_quota.validateCleanup(current);
     }
     pub fn clearWithCleanup(self: *Module, ctx: *context.CudaContext, current: Cleanup) !void {
-        if (current.synchronous_outside_raw) |pending| {
-            const epoch = current.boundary orelse return error.MissingCurrentCleanupEpoch;
-            // Exact metadata/arena/head provenance and capacity are certified
-            // together before ANY checked SDK destruction can begin.
-            try pending.bindGraph(@intFromPtr(self), .{
-                if (self.metadata_quota == .raw) &self.metadata_quota.raw else null,
-                if (self.arena_quota == .raw) &self.arena_quota.raw else null,
-                if (self.head_quota == .raw) &self.head_quota.raw else null,
-            }, epoch);
-        }
         try self.validateCleanup(current);
         if (self.active) return error.CapturedGraphActive;
         const live = self.head.ptr != 0 or self.metadata.ptr != 0 or self.arena.ptr != 0 or self.graph != null or self.pending_graph != null;
@@ -345,7 +312,6 @@ pub const Module = struct {
         self.plan = null;
         if (self.key.len != 0) self.host_allocator.free(self.key);
         self.key = &.{};
-        try self.head_quota.releaseAfterSdkDeath(current);
         try self.arena_quota.releaseAfterSdkDeath(current);
         try self.metadata_quota.releaseAfterSdkDeath(current);
         self.captured_roots_identity = 0;
@@ -356,7 +322,7 @@ pub const Module = struct {
         self.invalidations += 1;
     }
     pub fn snapshot(self: *const Module) Snapshot {
-        return .{ .invalidations = self.invalidations, .epoch = self.epoch_id, .phase = self.phase, .metadata = self.metadata.ptr, .arena = self.arena.ptr, .head = self.head.ptr, .graph = if (self.graph) |value| @intFromPtr(value) else 0, .pending_graph = if (self.pending_graph) |value| @intFromPtr(value) else 0, .plan = if (self.plan) |value| @intFromPtr(value) else 0, .peak = if (self.plan) |value| value.peak else 0, .events = if (self.plan) |value| value.event_count else 0, .metadata_quota = self.metadata_quota, .arena_quota = self.arena_quota, .head_quota = self.head_quota };
+        return .{ .invalidations = self.invalidations, .epoch = self.epoch_id, .phase = self.phase, .metadata = self.metadata.ptr, .arena = self.arena.ptr, .head = self.head.ptr, .graph = if (self.graph) |value| @intFromPtr(value) else 0, .pending_graph = if (self.pending_graph) |value| @intFromPtr(value) else 0, .plan = if (self.plan) |value| @intFromPtr(value) else 0, .peak = if (self.plan) |value| value.peak else 0, .events = if (self.plan) |value| value.event_count else 0, .metadata_quota = self.metadata_quota, .arena_quota = self.arena_quota };
     }
     pub fn invalidate(self: *Module, ctx: *context.CudaContext) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
@@ -368,27 +334,6 @@ pub const Module = struct {
             host_positions.len == 3 * self.rows and
             std.mem.eql(u32, self.next_positions[0..host_positions.len], host_positions);
     }
-    /// Explicit legacy raw producer. Managed execution uses resetPrepared.
-    pub fn reset(self: *Module, ctx: *context.CudaContext, key: []const u64, host_positions: []const u32, rows: usize, hidden: usize, vocab: usize) !void {
-        const layout = try StorageLayout.init(rows, hidden, vocab, key.len);
-        if (host_positions.len != rows * 3) return error.InvalidShape;
-        try self.clear(ctx);
-        errdefer self.clear(ctx) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
-        if (ctx.video_cache_budget.admission) |policy|
-            self.metadata_quota = quota_mod.Quota.fromRawAdmission(try policy.controller.tryAcquire(.gpu, policy.limits, .{ .backend_scratch_bytes = layout.metadata_bytes, .host_scratch_bytes = layout.host_bytes }, policy.check_live_memory));
-        self.host_allocator = std.heap.c_allocator;
-        self.key = try std.heap.c_allocator.dupe(u64, key);
-        self.plan = try std.heap.c_allocator.create(plan_mod.Plan);
-        self.plan.?.* = .{};
-        self.metadata = try buffer.DeviceBuffer.alloc(ctx, layout.metadata_bytes);
-        if (layout.head_bytes != 0) {
-            if (ctx.video_cache_budget.admission) |policy|
-                self.head_quota = quota_mod.Quota.fromRawAdmission(try policy.controller.tryAcquire(.gpu, policy.limits, .{ .backend_scratch_bytes = layout.head_bytes }, policy.check_live_memory));
-            self.head = try buffer.DeviceBuffer.alloc(ctx, layout.head_bytes);
-        }
-        self.installStorageGeometry(layout, rows, hidden, vocab, host_positions);
-    }
-
     fn installStorageGeometry(self: *Module, layout: StorageLayout, rows: usize, hidden: usize, vocab: usize, positions_: []const u32) void {
         self.rows = rows;
         self.hidden = hidden;
@@ -408,18 +353,6 @@ pub const Module = struct {
         return layout;
     }
 
-    pub fn reserveArena(self: *Module, ctx: *context.CudaContext) !void {
-        if (self.arena.ptr != 0) return;
-        const layout = try self.arenaLayout();
-        var lease: ?memory.AdmissionLease = null;
-        if (ctx.video_cache_budget.admission) |policy|
-            lease = try policy.controller.tryAcquire(.gpu, policy.limits, .{
-                .backend_scratch_bytes = layout.bytes,
-            }, policy.check_live_memory);
-        errdefer if (lease) |*value| value.release();
-        self.arena = try buffer.DeviceBuffer.alloc(ctx, layout.bytes);
-        self.arena_quota = quota_mod.Quota.fromRawAdmission(lease);
-    }
     pub fn resetPrepared(self: *Module, ctx: *context.CudaContext, phase: *GraphPhase) !void {
         const descriptor = phase.descriptor;
         const layout = try descriptor.layout();
@@ -491,20 +424,12 @@ test "captured sequence storage layout preserves existing narrow wide and aligne
         try std.testing.expectEqual(value.head, actual.head_bytes);
         try std.testing.expectEqual(@sizeOf(plan_mod.Plan) + 196608, actual.host_bytes);
     }
-}
-
-test "captured sequence malformed replacement refuses before old graph or SDK mutation" {
-    // Negative-only sentinels prove no context access or destruction. There
-    // is no SDK/GPU endpoint and this does not qualify a numerical replay.
-    var ctx: context.CudaContext = undefined;
-    var owner = Module{ .phase = .replay, .graph = @ptrFromInt(1), .metadata = .{ .ptr = 256, .len = 256 } };
-    try std.testing.expectError(error.InvalidShape, owner.reset(&ctx, &.{1}, &.{}, 1, 1024, 8));
-    try std.testing.expectError(error.InvalidShape, owner.reset(&ctx, &.{1}, &.{}, 2, 1024, 8));
-    try std.testing.expectError(error.Overflow, owner.reset(&ctx, &.{1}, &.{}, 128, std.math.maxInt(usize), 8));
-    try std.testing.expectError(error.Overflow, owner.reset(&ctx, &.{1}, &.{}, 128, 1024, std.math.maxInt(usize)));
-    try std.testing.expectError(error.InvalidShape, owner.reset(&ctx, &.{1}, &.{}, 128, 1024, 262145));
-    try std.testing.expect(owner.phase == .replay and owner.graph == @as(driver.CUgraphExec, @ptrFromInt(1)));
-    try std.testing.expectEqual(@as(u64, 256), owner.metadata.ptr);
+    try std.testing.expectError(error.InvalidShape, StorageLayout.init(1, 1024, 8, 1));
+    try std.testing.expectError(error.Overflow, StorageLayout.init(128, std.math.maxInt(usize), 8, 1));
+    try std.testing.expectError(error.Overflow, StorageLayout.init(128, 1024, std.math.maxInt(usize), 1));
+    try std.testing.expectError(error.InvalidShape, StorageLayout.init(128, 1024, 262145, 1));
+    const malformed = Descriptor{ .epoch = 1, .key = &.{1}, .positions = &.{}, .rows = 2, .hidden = 1024, .vocab = 8, .future_tokens = 1, .attention_layers = 1, .recurrent_layers = 0 };
+    try std.testing.expectError(error.InvalidShape, malformed.layout());
 }
 
 const GraphTestDriver = struct {
@@ -807,6 +732,13 @@ test "captured graph wide head and learned arena consume separate exact prefunde
     arena.expected_compute = 1;
     arena.old = owner.snapshot();
     arena.admission = storage.admission;
+    const total = try exact.merge(.{ .backend_scratch_bytes = owner.plan.?.peak });
+    arena.admission.?.limits.backend_limit_bytes = total.backend_scratch_bytes - 1;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, arena.prepareOutside(&model));
+    try std.testing.expect(arena.cold == null and owner.arena.ptr == 0);
+    try std.testing.expectEqual(@as(usize, 2), GraphTestDriver.allocations);
+    try std.testing.expectEqualDeep(exact, domain.controller.snapshot());
+    arena.admission.?.limits.backend_limit_bytes = total.backend_scratch_bytes;
     try arena.prepareOutside(&model);
     defer arena.destroyOutside();
     var current = try sink.enter();
@@ -820,7 +752,6 @@ test "captured graph wide head and learned arena consume separate exact prefunde
     try std.testing.expectEqual(pointer, owner.arena.ptr);
     try std.testing.expectEqual(@as(usize, 3), GraphTestDriver.allocations);
     try arena.close(.{ .boundary = &b });
-    const total = try exact.merge(.{ .backend_scratch_bytes = owner.plan.?.peak });
     try std.testing.expectEqualDeep(total, domain.controller.snapshot());
     try owner.clearWithCleanup(&ctx, .{ .boundary = &b });
     try std.testing.expectEqual(@as(usize, 3), GraphTestDriver.frees);
