@@ -268,7 +268,12 @@ pub const Track = struct {
         const identity = @import("media_index_cache.zig").Cache.aacKey(source, max_packets, max_bytes);
         const audio_identity = @import("media_index_cache.zig").Cache.audioKey(source, .embedded, max_packets, max_bytes);
         if (self.bindCached(source, identity, audio_identity)) return self;
-        const flight = if (admission != null) if (audio_identity orelse identity) |key| if (cache) |retained| try retained.acquireBuild(key, control) else null else null else null;
+        const flight = if (admission != null) if (audio_identity orelse identity) |key| if (cache) |retained| lease: {
+            if (!source.optional_range) break :lease try retained.acquireBuild(key, control);
+            if (try retained.tryAcquireBuild(key, control)) |acquired| break :lease acquired;
+            if (self.bindCached(source, identity, audio_identity)) return self;
+            return error.OptionalAudioBudgetExceeded;
+        } else null else null else null;
         defer if (flight) |lease| lease.deinit();
         if (flight != null and self.bindCached(source, identity, audio_identity)) return self;
         if (source.length() < 4) return error.UnsupportedAudioFormat;
