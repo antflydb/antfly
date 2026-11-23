@@ -271,7 +271,7 @@ def test_cross_table_context_sources_follow_source_changes(
     assert plain["freshness"]["state"] == "current"
     assert "current" not in plain
     assert plain["sources"] == [
-        {"name": "peers", "kind": "query", "tracking": "live", "ranked": False}
+        {"name": "peers", "kind": "query", "tracking": "live", "ranked": False, "traversal": False}
     ], plain
 
     # Reverse lineage: the source row's dependents across tables.
