@@ -33353,11 +33353,9 @@ pub const RaftApplyStore = struct {
             const ledger = state.artifact_control orelse return;
             const token = std.math.add(u64, ledger.next_token, 1) catch return;
             const sequence = std.math.add(u64, state.accepted.sequence, 1) catch return;
+            const expected = (try @import("../source_scope_binding.zig").reference(state, sequence, token)) orelse return;
             if (!authority.sameAuthority(manifest.value.checkpoint_authority) or
-                !std.meta.eql(scope.identity(), manifest.value.source_scope.binding) or
-                manifest.value.source_scope.generation != scope.generation or
-                manifest.value.source_scope.token != token or
-                manifest.value.source_scope.sequence != sequence or
+                !std.meta.eql(manifest.value.source_scope, expected) or
                 reference.upload.fencingToken() != revision) return;
         }
         const new_authority = switch (write.mutation) {
