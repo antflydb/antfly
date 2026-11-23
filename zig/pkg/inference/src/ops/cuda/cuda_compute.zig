@@ -20604,6 +20604,10 @@ fn audioBufferView(buffer: buffer_mod.DeviceBuffer, offset: usize, bytes: usize)
     if (offset > buffer.len or bytes > buffer.len - offset) return error.InvalidShape;
     return .{ .ptr = buffer.ptr + offset, .len = bytes, .borrowed = true };
 }
+fn audioOutputMatches(input: *const CudaTensor, output: *const CudaTensor, bytes: usize) bool {
+    return output.dtype == .f32 and output.elem_count == input.elem_count and output.buffer.len >= bytes;
+}
+
 fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (self.capability_profile != .embedding_gemma2 or !self.embedding_gemma2_policy.audio_graph or self.audio_execution_active or self.execution_scope != null or inputs.len == 0 or inputs.len > 20 or try self.ctx.streamCaptureActive()) return null;
@@ -20621,6 +20625,8 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     for (inputs, spans) |ct, span| {
         if (span.bytes > tensorFromCt(ct).buffer.len) return error.InvalidShape;
     }
+    const first_input = tensorFromCt(inputs[0]);
+    const output_bytes = spans[0].bytes;
     const input_bytes = cache_base.input_bytes;
     if (input_bytes > 128 * 1024 * 1024) return null;
     const base_key = cache_base.key;
@@ -20668,14 +20674,15 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
             return err;
         };
         self.execution_scope = null;
-        if (!plan.finish(tensorFromCt(out).buffer.ptr) or self.stats.h2d_bytes != h2d_before or self.stats.d2h_bytes != d2h_before) entry.disabled = true;
+        const result = tensorFromCt(out);
+        if (!audioOutputMatches(first_input, result, output_bytes) or
+            self.stats.h2d_bytes != h2d_before or self.stats.d2h_bytes != d2h_before or
+            !plan.finish(result.buffer.ptr)) entry.disabled = true;
         return out;
     }
     const plan = &entry.owner.?.plan;
     const storage = plan.layout(input_bytes) catch return null;
     const output = storage.output orelse return null;
-    const first_input = tensorFromCt(inputs[0]);
-    const output_bytes = spans[0].bytes;
     if (output_bytes == 0 or output_bytes > output.bytes) return null;
     // The same complete event ABI drives preflight and actual arena lookup.
     const cache_request = self.audioArenaRequestFromPlan(cache_base, plan, storage);
@@ -20760,7 +20767,8 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         self.execution_scope = null;
         const result_tensor = tensorFromCt(result);
         const expected_output = if (published_directly) tensorFromCt(out).buffer.ptr else arena.buffers[0].ptr + output.offset;
-        const matches = self.stats.h2d_bytes == h2d_before and self.stats.d2h_bytes == d2h_before and scope.complete() and result_tensor.buffer.ptr == expected_output;
+        const matches = self.stats.h2d_bytes == h2d_before and self.stats.d2h_bytes == d2h_before and
+            scope.complete() and result_tensor.buffer.ptr == expected_output and audioOutputMatches(first_input, result_tensor, output_bytes);
         if (!matches and capture) graph_mod.discardRecording(&self.ctx);
         if (scope.owns(result_tensor.buffer.ptr)) result_tensor.owns_buffer = false;
         freeTensor(self, result);
