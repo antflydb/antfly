@@ -15163,33 +15163,24 @@ pub fn pipelinedDecodeFrameDeviceDefault() bool {
     return termite_metal_pipelined_decode_frame_device_default() != 0;
 }
 
-/// Single home for the pipelined-decode-frame policy shared by the pipeline
-/// and the executor: the disable flag always wins, then an explicit enable,
-/// then the device-qualified default. Env reads are cached (decode-loop hot
-/// path).
-pub fn pipelinedDecodeFrameEnabledForFlags(
-    enable_requested: bool,
-    disable_requested: bool,
-    device_default: bool,
-) bool {
+fn pipelinedDecodeFrameOverride(enable_requested: bool, disable_requested: bool) ?bool {
     if (disable_requested) return false;
-    return enable_requested or device_default;
+    if (enable_requested) return true;
+    return null;
 }
 
 pub fn pipelinedDecodeFrameEnabled() bool {
-    return pipelinedDecodeFrameEnabledForFlags(
+    return pipelinedDecodeFrameOverride(
         getenvFlagEnabled("TERMITE_METAL_ENABLE_PIPELINED_DECODE_FRAME"),
         getenvFlagEnabled("TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME"),
-        pipelinedDecodeFrameDeviceDefault(),
-    );
+    ) orelse pipelinedDecodeFrameDeviceDefault();
 }
 
-test "pipelined decode frames follow flags with device default" {
-    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(false, false, false));
-    try std.testing.expect(pipelinedDecodeFrameEnabledForFlags(false, false, true));
-    try std.testing.expect(pipelinedDecodeFrameEnabledForFlags(true, false, false));
-    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(false, true, true));
-    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(true, true, true));
+test "pipelined decode frames defer the device default unless explicitly overridden" {
+    try std.testing.expectEqual(@as(?bool, null), pipelinedDecodeFrameOverride(false, false));
+    try std.testing.expectEqual(@as(?bool, true), pipelinedDecodeFrameOverride(true, false));
+    try std.testing.expectEqual(@as(?bool, false), pipelinedDecodeFrameOverride(false, true));
+    try std.testing.expectEqual(@as(?bool, false), pipelinedDecodeFrameOverride(true, true));
 }
 pub extern fn termite_metal_generated_pipeline_create(
     source: [*]const u8,

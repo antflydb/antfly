@@ -3062,10 +3062,6 @@ test "metal executor only enables split KV policy for mixed local and global Gem
     try std.testing.expect(!config.supportsSplitSwaGlobalKvRing());
 }
 
-test "metal executor pipelined decode frames delegate to the shared policy" {
-    try std.testing.expect(metal_runtime.pipelinedDecodeFrameEnabledForFlags(false, false, true));
-}
-
 test "metal executor keeps speculative decode frames opt in" {
     try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(false, false, false, true, true));
     try std.testing.expect(pipelinedDecodeFrameEnabledForFlags(true, false, false, false, false));

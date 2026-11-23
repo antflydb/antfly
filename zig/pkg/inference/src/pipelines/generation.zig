@@ -12488,12 +12488,6 @@ test "Metal pipelined greedy EOS policy honors ignore_eos" {
     try std.testing.expect(!pipeline.shouldStopOnEos(.{}, 6, false));
 }
 
-test "Gemma4 pipelined Metal decode frames delegate to the shared policy" {
-    // Policy precedence (disable > enable > device default) is owned and
-    // tested by metal_runtime.pipelinedDecodeFrameEnabledForFlags.
-    try std.testing.expect(!metal_runtime.pipelinedDecodeFrameEnabledForFlags(false, true, true));
-}
-
 test "gemma4 mtp adaptive k starts with probe and ramps on accepted windows" {
     var policy = MtpAdaptiveKPolicy.initFromValues(8, 750, 4, true, 1);
 
