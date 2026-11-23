@@ -64465,20 +64465,35 @@ static int termite_metal_encode_paged_quantized_kv_seed_on_encoder(
         const size_t block_end = block_start + page_size;
         if (block_end > capacity_tokens) capacity_tokens = block_end;
     }
-    if (capacity_tokens == 0) return failure_code;
-    const size_t encoded_bytes = capacity_tokens * key_row_bytes;
-    const size_t v_element_bytes = f16_kv ? sizeof(uint16_t) : sizeof(float);
-    const size_t v_bytes = capacity_tokens * v_row_stride * v_element_bytes;
-    if (termite_metal_decode_runtime_ensure_attention_span_slot_buffers(runtime, slot, encoded_bytes, v_bytes) != 0) return failure_code;
-
+    if (capacity_tokens == 0 || capacity_tokens - 1u > UINT32_MAX) return failure_code;
     const size_t values_per_row = num_kv_heads * head_dim;
-    if (values_per_row == 0 || values_per_row > UINT32_MAX || v_row_stride > UINT32_MAX) return failure_code;
+    if (values_per_row > UINT32_MAX || v_row_stride > UINT32_MAX) return failure_code;
     const size_t suffix_start = total_tokens - suffix_tokens;
     const size_t raw_source_row_bytes = values_per_row * sizeof(float);
     const size_t raw_v_source_row_bytes = v_row_stride * sizeof(float);
-    if (k_offset > k_buffer.length || suffix_tokens * raw_source_row_bytes > k_buffer.length - k_offset) return failure_code;
-    if (v_offset > v_buffer.length || suffix_tokens * raw_v_source_row_bytes > v_buffer.length - v_offset) return failure_code;
-    if (block_count > SIZE_MAX / sizeof(uint32_t)) return failure_code;
+    if (k_offset > k_buffer.length || suffix_tokens > (k_buffer.length - k_offset) / raw_source_row_bytes ||
+        v_offset > v_buffer.length || suffix_tokens > (v_buffer.length - v_offset) / raw_v_source_row_bytes ||
+        block_count > SIZE_MAX / sizeof(uint32_t)) return failure_code;
+
+    const size_t value_element_bytes = f16_kv ? sizeof(uint16_t) : sizeof(float);
+    const size_t value_row_bytes = v_row_stride * value_element_bytes;
+    const size_t key_row_halfs = key_row_bytes / sizeof(uint16_t);
+    const size_t max_indexed_elements = (size_t)UINT32_MAX + 1u;
+    if (capacity_tokens > SIZE_MAX / key_row_bytes || capacity_tokens > SIZE_MAX / value_row_bytes ||
+        capacity_tokens > max_indexed_elements / v_row_stride || suffix_tokens > UINT32_MAX / v_row_stride)
+        return failure_code;
+    if (f16_kv && (key_row_halfs < values_per_row || v_row_stride < values_per_row ||
+        capacity_tokens > max_indexed_elements / key_row_halfs || suffix_tokens > UINT32_MAX / values_per_row))
+        return failure_code;
+    const size_t residual_bytes = num_kv_heads * 4u;
+    const size_t work_per_row = format == 4u ? num_kv_heads : base_key_row_bytes + (format == 1u ? residual_bytes : 0u);
+    if (!f16_kv && (work_per_row > UINT32_MAX / suffix_tokens ||
+        (format == 4u ? head_dim > 256u || num_kv_heads * (head_dim + 4u) > key_row_bytes : work_per_row > key_row_bytes)))
+        return failure_code;
+
+    const size_t encoded_bytes = capacity_tokens * key_row_bytes;
+    const size_t v_bytes = capacity_tokens * value_row_bytes;
+    if (termite_metal_decode_runtime_ensure_attention_span_slot_buffers(runtime, slot, encoded_bytes, v_bytes) != 0) return failure_code;
     const size_t block_table_bytes = block_count * sizeof(uint32_t);
     id<MTLBuffer> block_table_buffer = nil;
     termite_metal_planned_encoder_range accesses[4];
@@ -64492,8 +64507,6 @@ static int termite_metal_encode_paged_quantized_kv_seed_on_encoder(
     }
 
     if (f16_kv) {
-        const size_t key_row_halfs = key_row_bytes / sizeof(uint16_t);
-        if (key_row_halfs < values_per_row || key_row_halfs > UINT32_MAX || v_row_stride < values_per_row) return failure_code;
         termite_metal_paged_f32_kv_seed_params params = {
             .total_tokens = (uint32_t)total_tokens,
             .suffix_tokens = (uint32_t)suffix_tokens,
@@ -64517,12 +64530,8 @@ static int termite_metal_encode_paged_quantized_kv_seed_on_encoder(
         antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->paged_f16_kv_seed_pipeline, total), 1, 1));
     } else {
 
-        const size_t residual_bytes = num_kv_heads * 4u;
-        const size_t work_per_row = format == 4u ? num_kv_heads : base_key_row_bytes + (format == 1u ? residual_bytes : 0u);
-        if (work_per_row > UINT32_MAX / suffix_tokens) return failure_code;
         size_t int8_group = 1u;
         while (int8_group < head_dim && int8_group < 256u) int8_group <<= 1u;
-        if (format == 4u && int8_group < head_dim) return failure_code;
         const termite_metal_encode_key_params key_params = {
             .rows = (uint32_t)suffix_tokens,
             .num_kv_heads = (uint32_t)num_kv_heads,

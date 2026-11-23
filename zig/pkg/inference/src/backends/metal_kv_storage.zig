@@ -2338,6 +2338,35 @@ test "Metal compressed cyclic append writes only the newest physical rows" {
     const binding = owner.slot_map.get(.{ .sequence_id = sequence, .layer_index = 0 }).?;
     try std.testing.expectEqual(@as(usize, 2), binding.ring_page_count);
     const info = try owner.slotInfo(binding.slot);
+    // Reject an out-of-range source before the next page could grow either backing.
+    const pages = [_]u32{ 0, 2, 4, 6 };
+    const invalid = metal_runtime.termite_metal_decode_runtime_update_attention_paged_from_f32_key_device_slot(
+        metal,
+        binding.slot,
+        @backingInt(owner.format),
+        input,
+        @sizeOf(@TypeOf(rows)),
+        input,
+        0,
+        tokens + 1,
+        1,
+        1,
+        width,
+        info.key_row_bytes,
+        info.key_row_bytes,
+        width,
+        0,
+        &pages,
+        pages.len,
+        2,
+    );
+    try std.testing.expect(invalid != 0);
+    const unchanged = try owner.slotInfo(binding.slot);
+    try std.testing.expectEqual(info.encoded_key_handle, unchanged.encoded_key_handle);
+    try std.testing.expectEqual(info.v_handle, unchanged.v_handle);
+    try std.testing.expectEqual(info.encoded_key_capacity, unchanged.encoded_key_capacity);
+    try std.testing.expectEqual(info.v_capacity, unchanged.v_capacity);
+
     var physical_values: [ring_tokens][width]f32 = undefined;
     try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_download(metal, info.v_handle, 0, &physical_values, @sizeOf(@TypeOf(physical_values))));
     var physical_keys: [ring_tokens][width + @sizeOf(f32)]u8 = undefined;
