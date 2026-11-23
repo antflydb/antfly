@@ -5379,7 +5379,41 @@ test "Metal to Native partition transfer preserves a held download" {
     defer metal_context.deinit(allocator);
     const host = host_context.computeBackend();
     const metal = metal_context.computeBackend();
+    try checkHeldPartitionTransfer(&metal, &host);
+}
 
+test "CUDA partition transfers preserve held upload and download outputs" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const contexts = @import("../backends/compute_context.zig");
+    var cuda_context = contexts.BackendContext.init(allocator, .cuda, std.testing.io) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer cuda_context.deinit(allocator);
+    var host_context = try contexts.BackendContext.init(allocator, .native, std.testing.io);
+    defer host_context.deinit(allocator);
+    const host = host_context.computeBackend();
+    const cuda = cuda_context.computeBackend();
+    try checkHeldPartitionTransfer(&host, &cuda);
+    try checkHeldPartitionTransfer(&cuda, &host);
+}
+
+fn physicalTransferTestSource(backend: *const ops.ComputeBackend, values: []const f32) !CT {
+    const temporary = try backend.fromFloat32Shape(values, &.{@intCast(values.len)});
+    if (comptime @import("build_options").enable_metal) {
+        if (backend.kind() == .metal) {
+            errdefer backend.free(temporary);
+            const resident = (try @import("../ops/metal_compute.zig").MetalCompute.makeDeviceResident(backend, temporary)) orelse return error.MissingPhysicalTransfer;
+            if (resident != temporary) backend.free(temporary);
+            return resident;
+        }
+    }
+    return temporary;
+}
+
+fn checkHeldPartitionTransfer(from: *const ops.ComputeBackend, to: *const ops.ComputeBackend) !void {
+    const allocator = std.testing.allocator;
     var graph = Graph.init(allocator);
     defer graph.deinit();
     var builder = ml.graph.Builder.init(&graph);
@@ -5394,39 +5428,38 @@ test "Metal to Native partition transfer preserves a held download" {
         }
     }.supports;
     var partitions = try partitioning.partition(allocator, &graph, &.{
-        .{ .backend = .native, .priority = 10, .supports = &onlyGelu },
-        .{ .backend = .metal, .priority = 0, .supports = &partitioning.supportsAll },
+        .{ .backend = to.kind(), .priority = 10, .supports = &onlyGelu },
+        .{ .backend = from.kind(), .priority = 0, .supports = &partitioning.supportsAll },
     });
     defer partitions.deinit();
     var plan = try buffers.build(allocator, &graph, &partitions, .{});
     defer plan.deinit();
-    const pool = (try Pool.create(allocator, &graph, &plan, &.{ &host, &metal }, &.{ null, null, null })) orelse return error.MissingPhysicalTransfer;
+    const pool = (try Pool.create(allocator, &graph, &plan, &.{ from, to }, &.{ null, null, null })) orelse return error.MissingPhysicalTransfer;
     defer pool.deinit();
     const frame = try Frame.create(pool);
     defer frame.deinit();
 
     const original = [_]f32{ -2, 3, -5, 7 };
     const replacement = [_]f32{ 1, 2, 3, 4 };
-    const MetalCompute = @import("../ops/metal_compute.zig").MetalCompute;
-    const first_host = try metal.fromFloat32Shape(&original, &.{4});
-    defer metal.free(first_host);
-    const first = (try MetalCompute.makeDeviceResident(&metal, first_host)) orelse return error.MissingPhysicalTransfer;
-    defer if (first != first_host) metal.free(first);
-    const second_host = try metal.fromFloat32Shape(&replacement, &.{4});
-    defer metal.free(second_host);
-    const second = (try MetalCompute.makeDeviceResident(&metal, second_host)) orelse return error.MissingPhysicalTransfer;
-    defer if (second != second_host) metal.free(second);
+    const first = try physicalTransferTestSource(from, &original);
+    defer from.free(first);
+    const second = try physicalTransferTestSource(from, &replacement);
+    defer from.free(second);
 
     const partition = partitions.node_assignment[output];
     {
-        const held = (try frame.transfer(&metal, &host, first, boundary, partition)) orelse return error.MissingPhysicalTransfer;
-        defer host.free(held);
-        try std.testing.expect((try frame.transfer(&metal, &host, second, boundary, partition)) == null);
-        try std.testing.expectEqualSlices(f32, &original, (try host.hostFloat32Read(held)).?);
+        const held = (try frame.transfer(from, to, first, boundary, partition)) orelse return error.MissingPhysicalTransfer;
+        defer to.free(held);
+        try std.testing.expect((try frame.transfer(from, to, second, boundary, partition)) == null);
+        const observed = try to.toFloat32(held, allocator);
+        defer allocator.free(observed);
+        try std.testing.expectEqualSlices(f32, &original, observed);
         try std.testing.expectEqual(@as(u64, 1), frame.stats.transfers);
     }
-    const reused = (try frame.transfer(&metal, &host, second, boundary, partition)) orelse return error.MissingPhysicalTransfer;
-    defer host.free(reused);
-    try std.testing.expectEqualSlices(f32, &replacement, (try host.hostFloat32Read(reused)).?);
+    const reused = (try frame.transfer(from, to, second, boundary, partition)) orelse return error.MissingPhysicalTransfer;
+    defer to.free(reused);
+    const observed = try to.toFloat32(reused, allocator);
+    defer allocator.free(observed);
+    try std.testing.expectEqualSlices(f32, &replacement, observed);
     try std.testing.expectEqual(@as(u64, 2), frame.stats.transfers);
 }
