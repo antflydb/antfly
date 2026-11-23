@@ -8526,7 +8526,7 @@ pub const AntflyApiHandler = struct {
                 self.adapter.context = try self.adapter.context.platformDeadline();
                 self.adapter.context.deadline_ns = connection.statementDeadline(self.statement_start_ns, self.adapter.context.deadline_ns);
                 try self.adapter.context.ensureActive();
-                if (connection.state == .beginning or connection.state == .uncertain) return error.SqlConnectionBusy;
+                if (connection.state == .beginning) return error.SqlConnectionBusy;
                 if ((!self.adapter.inherit_session_database and !std.mem.eql(u8, self.adapter.database, connection.database)) or
                     (!self.adapter.inherit_session_namespace and !std.mem.eql(u8, self.adapter.namespace, connection.namespace))) return error.SqlConnectionChanged;
                 self.adapter.database = connection.database;
