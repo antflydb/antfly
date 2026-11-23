@@ -797,7 +797,23 @@ pub fn retireSettledObservations(server: *server_mod.ApiHttpServer, alloc: std.m
 
 pub fn recoverUnpublished(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, limit: usize) !void {
     if (server.txn_sessions.durable == null) return;
-    const context = try settlementContext(.{});
+    const recovering_legacy = !server.sql_completion_cold_scan_done;
+    const slice_ns = if (recovering_legacy) std.time.ns_per_s else 2 * std.time.ns_per_s;
+    const live = recoverLivePublications(server, alloc, limit, recoveryContext(slice_ns));
+    // A failing live owner or an exhausted slice must leave the cold pass a
+    // chance to reclaim unrelated registrations written by older binaries.
+    const cold = if (recovering_legacy)
+        recoverLegacyPublications(server, alloc, limit, recoveryContext(slice_ns))
+    else {};
+    try live;
+    try cold;
+}
+
+fn recoveryContext(slice_ns: u64) operation.RequestContext {
+    return .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() +| slice_ns };
+}
+
+fn recoverLivePublications(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, limit: usize, context: operation.RequestContext) !void {
     const store = try registrationStoreControlled(server, context);
     const pending = try store.pendingRegistrationPage(alloc, server.sql_completion_pending_after, limit, context);
     defer alloc.free(pending.entries);
@@ -811,9 +827,10 @@ pub fn recoverUnpublished(server: *server_mod.ApiHttpServer, alloc: std.mem.Allo
     }
     server.sql_completion_pending_after = pending.next;
     if (live_failure) |err| return err;
+}
 
-    // Keep the cold scan for prepared registrations created by older writers.
-    if (server.sql_completion_cold_scan_done) return;
+fn recoverLegacyPublications(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, limit: usize, context: operation.RequestContext) !void {
+    const store = try registrationStoreControlled(server, context);
     const page = try store.registrationRecoveryPage(alloc, server.sql_completion_recovery_after, limit);
     defer alloc.free(page.references);
     var failure: ?anyerror = null;
