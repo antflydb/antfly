@@ -156,7 +156,7 @@ pub fn recover(
             admission.admitDelivery(a, current, fence, context) catch |err| switch (err) {
                 // A participant can move while the checkpoint owner's
                 // routing epoch stays unchanged. Settle on the coordinator.
-                error.TopologyChanged => return settleOriginalAttempt(svc, admission, a, current, catalog_digest, manifest, context),
+                error.TopologyChanged, error.DecisionConflict => return settleOriginalAttempt(svc, admission, a, current, catalog_digest, manifest, context),
                 else => return err,
             };
         defer a.free(acceptance.receipt);
@@ -254,10 +254,12 @@ fn settleOriginalAttempt(
     }
     if (!pending.retain_payload) return error.SourceOutcomeUnresolved;
     const proof = admission.fenceUnadmittedAttempt(a, state, manifest, fence, context) catch |err| switch (err) {
-        error.SourcePendingWork, error.SourceOutcomeUnresolved => {
+        error.SourcePendingWork, error.SourceOutcomeUnresolved => recovered: {
+            if (try admission.retireDisplacedDelivery(svc, a, manifest, fence, context))
+                break :recovered try admission.fenceUnadmittedAttempt(a, state, manifest, fence, context);
             if (state.checkpoint_transfer_target == null) return err;
-            // On a planned cutover the original lease is still published.
-            // A previously ordered BEGIN must finish under that same plan.
+            // The original leases are still published. Finish the enlisted
+            // attempt under its immutable plan before the planned cutover.
             const accepted = try admission.resumeEnlistedDelivery(a, state, fence, context);
             defer a.free(accepted.receipt);
             return mutate(svc, a, binding, catalog_digest, state, .{ .accept = .{

@@ -34,6 +34,7 @@ pub const independent_completion_stall_protocol_version: u16 = 253;
 pub const qualified_completion_stall_protocol_version: u16 = 254;
 pub const retained_payload_protocol_version: u16 = 255;
 pub const payload_prewrite_protocol_version: u16 = 258;
+pub const epoch_attempt_retirement_protocol_version: u16 = 259;
 pub const max_payload_cleanup_cursor_bytes = 2048;
 pub const completion_wait_timeout_ms = 30 * std.time.ms_per_s;
 pub const completion_wait_error = "SourceOutcomeUnresolved";

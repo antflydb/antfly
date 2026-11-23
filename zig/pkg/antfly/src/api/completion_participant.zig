@@ -137,7 +137,7 @@ pub const Port = struct {
         const coordinator = try admission.coordinatorMember();
         const locator = local.api_local_transaction_contract.parseParticipantRef(coordinator.locator) orelse return error.InvalidParticipant;
         var routed = owner;
-        if (decision.record.status == .committed and decision.record.source_scope != null)
+        if (decision.record.source_scope != null)
             routed.topology_epoch = fence.topology_epoch;
         try validateParticipantFence(routed, locator.group_id, fence);
         var pending: [64][]const u8 = undefined;
@@ -168,6 +168,33 @@ pub const Port = struct {
 
     fn acknowledgeParticipants(self: Port, a: A, owner: completion.RoutedOwner, fence: metadata.CatalogRouteFence, table: []const u8, txn_id: types.TxnId, participants: []const []const u8, context: operation.RequestContext, deadline_ns: u64) !void {
         return self.writeRequest(a, fence, owner, table, .{ .sync_level = .write, .transaction = .{ .acknowledge_many = .{ .txn_id = txn_id, .participants = participants } } }, context, deadline_ns);
+    }
+
+    /// The caller has qualified all original physical participants and
+    /// observed this exact coordinator admission under the refreshed lease.
+    pub fn abortDisplacedSource(self: Port, a: A, lookup: @import("history_decision_operations.zig").wire.Query, observation: @import("history_decision_operations.zig").wire.Reply, fence: metadata.CatalogRouteFence, timestamp_ns: u64, original: operation.RequestContext) !void {
+        try observation.validate(lookup);
+        const decision = observation.decision orelse return error.SourceOutcomeUnresolved;
+        const reference = decision.record.source_scope orelse return error.InvalidSourceAdmission;
+        const purpose = decision.record.source_purpose orelse return error.InvalidSourceAdmission;
+        if (decision.record.status != .pending or timestamp_ns <= decision.record.begin_timestamp) return error.SourceOutcomeUnresolved;
+        const admission = decision.admission.admission;
+        const member = try admission.coordinatorMember();
+        const owner = try admission.coordinatorOwner();
+        const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
+        var routed = owner;
+        routed.topology_epoch = fence.topology_epoch;
+        try validateParticipantFence(routed, locator.group_id, fence);
+        var lease = try @import("history_publication_operations.zig").Scope.init(fence, original);
+        const request: types.BatchRequest = .{ .sync_level = .write, .transaction = .{ .resolve = .{
+            .completion_owner = owner,
+            .source_purpose = purpose,
+            .source_scope = reference,
+            .txn_id = admission.transaction_id,
+            .status = .aborted,
+            .commit_version = timestamp_ns,
+        } } };
+        try self.writeRequest(a, fence, owner, locator.table_name, request, lease.context(), lease.deadline_ns);
     }
 
     /// Only the original coordinator can win the first terminal decision.

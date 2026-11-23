@@ -33,6 +33,12 @@ directory synchronization. The metadata worker writes the frozen delivery
 before it reserves the destination upload. A successor can then inspect the
 original attempt and recover without rereading provider rows.
 
+If a catalog epoch changes while a retained transaction is enlisted, the
+source can recover across refreshed routes to the same physical owners. It
+checks the coordinator’s durable decision first. If the attempt is still
+pending, it orders an abort, retires the followers, and fences the old attempt
+before rebuilding the delivery from the retained payload.
+
 ## Outbound PostgreSQL logical replication
 
 A native data node can serve a configured Antfly publication over pgwire. The

@@ -356,6 +356,7 @@ test "data raft ordered history completion recovery retains guard checkpoints an
         admin_frees: usize = 0,
         omit_admin_ranges: bool = false,
         source_recovery_mode: bool = false,
+        epoch_retirement: bool = false,
         begins: usize = 0,
         first_begin_group: ?u64 = null,
         prepares: usize = 0,
@@ -368,7 +369,7 @@ test "data raft ordered history completion recovery retains guard checkpoints an
             const index: usize = @intCast(input_fence.route.group_id - 9);
             if (self.unsupported_owners[index]) return error.ChangefeedCapabilityUnsupported;
             var owner = self.admission.participants[index].routed_owner.?;
-            owner.topology_epoch += self.capture_epoch_delta;
+            owner.topology_epoch = if (self.epoch_retirement) input_fence.topology_epoch else owner.topology_epoch + self.capture_epoch_delta;
             return .{ .owner = owner, .observation = try @import("history_owner_operations.zig").wire.Reply.init(.{ .owner = owner }, .{ .term = 1, .index = 8 }, self.retention_limit_bytes) };
         }
         fn acquire(ptr: *anyopaque, budget: catalog_api.RoutingBudget, authoritative: bool) !*catalog_api.RoutingGeneration {
@@ -460,7 +461,12 @@ test "data raft ordered history completion recovery retains guard checkpoints an
                     }
                     try std.testing.expectEqualDeep(self.state.source_purpose, terminal.source_purpose);
                     try std.testing.expectEqual(@as(local.storage_db_selected_root.db.types.TxnStatus, if (self.state.status == .committed) .committed else .aborted), terminal.status);
-                    try std.testing.expectEqual(@as(u64, if (self.state.status == .committed) 20 else 30), terminal.commit_version);
+                    if (self.epoch_retirement) {
+                        try std.testing.expectEqual(.aborted, terminal.status);
+                        try std.testing.expectEqualDeep(self.state.source_scope, terminal.source_scope);
+                        try std.testing.expectEqualDeep(try self.admission.coordinatorOwner(), terminal.completion_owner.?);
+                        try std.testing.expect(terminal.commit_version > self.state.begin_timestamp);
+                    } else try std.testing.expectEqual(@as(u64, if (self.state.status == .committed) 20 else 30), terminal.commit_version);
                     if (self.state.status == .pending and terminal.status == .aborted) {
                         self.state.status = .aborted;
                         self.state.commit_version = 0;
@@ -478,6 +484,7 @@ test "data raft ordered history completion recovery retains guard checkpoints an
                         try std.testing.expect(self.state.status == .aborted and self.resolved[0] and self.resolved[1]);
                     }
                     try std.testing.expectEqualSlices(u8, &self.admission.transaction_id, &value.txn_id);
+                    if (self.epoch_retirement) self.state.acknowledgments_pending = false;
                     const coordinator = self.admission.coordinator_namespace;
                     if (self.expect_coordinator_release) {
                         try std.testing.expectEqual(@as(usize, 1), value.participants.len);
@@ -506,6 +513,30 @@ test "data raft ordered history completion recovery retains guard checkpoints an
                 else => return error.TestUnexpectedResult,
             }
             return {};
+        }
+        const retirement_wire = @import("source_retirement_operations.zig").wire;
+
+        fn retire(ptr: *anyopaque, alloc: A, route: metadata.CatalogRouteFence, _: []const u8, request: retirement_wire.Request, _: Context) !retirement_wire.OwnedReply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.epoch_retirement and self.state.intents_resolved and self.state.acknowledgments_pending);
+            try std.testing.expectEqual(@as(u64, 9), route.route.group_id);
+            const intent = request.intent.?;
+            try std.testing.expect(route.topology_epoch != intent.owner.topology_epoch);
+            const cut: local.storage_source_scope.Cut = .{ .term = 1, .index = 9 };
+            const response: retirement_wire.Reply = .{
+                .request_digest = try request.digest(alloc),
+                .command = .{ .version = 1, .intent = intent, .observation = .{
+                    .request_digest = intent.coordinator.digest(),
+                    .cut = .{ .term = 1, .index = 8 },
+                    .decision = .{ .record = self.state, .admission = .{ .admission = self.admission, .digest = self.admission.digest() } },
+                } },
+                .receipt = cut,
+                .outcome = .{ .applied = .{ .version = 1, .request_digest = intent.digest(), .coordinator_record_digest = self.state.digest, .cut = cut, .closed_through_token = intent.reference.token, .disposition = .fenced } },
+            };
+            self.resolved[0] = true;
+            const bytes = try std.json.Stringify.valueAlloc(alloc, response, .{});
+            defer alloc.free(bytes);
+            return std.json.parseFromSlice(retirement_wire.Reply, alloc, bytes, .{ .allocate = .alloc_always });
         }
     };
     var fake: Fake = .{ .generation = generation, .admission = admission };
@@ -953,6 +984,7 @@ test "data raft ordered history completion recovery retains guard checkpoints an
         state: source_control.State,
         metadata_group_id: u64 = 1,
         lose_reply: bool = true,
+        lose_reply_at: ?u64 = null,
 
         pub fn ensureLinearizableReadWithContext(_: *@This(), _: Context) !void {}
         pub fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: Context, _: u16) error{TableTopologyProtocolUpgradeRequired}!void {}
@@ -974,8 +1006,8 @@ test "data raft ordered history completion recovery retains guard checkpoints an
             self.state = saved.value;
             return self.state.revision;
         }
-        pub fn waitForTransitionAppliedWithContext(self: *@This(), _: u64, _: Context) !void {
-            if (!self.lose_reply) return;
+        pub fn waitForTransitionAppliedWithContext(self: *@This(), revision: u64, _: Context) !void {
+            if (!self.lose_reply or (self.lose_reply_at != null and self.lose_reply_at.? != revision)) return;
             self.lose_reply = false;
             return error.TestLostMetadataReply;
         }
@@ -1041,8 +1073,12 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     journal.lose_reply = true;
     const source_input: @import("../metadata/source_delivery.zig").Input = .{ .batch_id = "batch", .checkpoint = "lsn:1", .payload_digest = @splat(40), .accepted_at_ns = 50 };
     const effects: []const @import("distributed_txn.zig").TableCommitRequest = &.{.{ .table_name = "docs", .deletes = &.{"z"} }};
-    try std.testing.expectError(error.SourcePayloadStorageUnavailable, source_completion.stage(&journal, reclaim_admission, a, actor_scope, @splat(32), source_input, effects, null, .{}));
-    try std.testing.expect(journal.state.pending == null);
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, source_completion.stage(&journal, reclaim_admission, a, actor_scope, @splat(32), source_input, effects, null, .{}));
+    try std.testing.expect(!journal.state.pending.?.retain_payload);
+    try std.testing.expect(journal.state.payload_prewrite == null);
+    journal.state = initialized_actor;
+    journal.lose_reply = true;
+    journal.lose_reply_at = initialized_actor.revision + 2;
     var spool_root = std.testing.tmpDir(.{});
     defer spool_root.cleanup();
     const spool_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/cdc-reservation", .{spool_root.sub_path});
@@ -1086,4 +1122,49 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     try std.testing.expectEqual(writes_before_aborted_source, fake.resolves);
     try std.testing.expectError(error.UnsupportedOperation, coordinator.commitSourcePrepared(a, &ordinary_prepared, 20, .{}));
     try std.testing.expectEqual(@as(usize, 4), fake.begins);
+
+    const readiness = struct {
+        pub fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: Context, required: u16) !void {
+            try std.testing.expectEqual(source_control.epoch_attempt_retirement_protocol_version, required);
+        }
+    };
+    var service: readiness = .{};
+    reclaim_admission.retirements = .{ .ptr = &fake, .execute_fn = Fake.retire };
+    fake.state = committed_record;
+    fake.state.status = .pending;
+    fake.state.commit_version = 0;
+    fake.state.finalized_at_ns = 0;
+    fake.state.intents_resolved = false;
+    fake.state.retain_terminal = true;
+    fake.state.acknowledgments_pending = true;
+    fake.resolved = .{ false, false };
+    fake.epoch_retirement = true;
+    const manifest = retained_source.manifest;
+    try std.testing.expect(!try reclaim_admission.retireDisplacedDelivery(&service, a, manifest, source_fence, .{}));
+    var changed_ranges = ranges;
+    changed_ranges[0].end_key = "n";
+    changed_ranges[1].start_key = "n";
+    const refreshed = try catalog_api.RoutingGeneration.create(a, .{
+        .metadata_group_id = 1,
+        .metadata_incarnation = owners[0].metadata_incarnation,
+        .catalog_revision = 11,
+        .tables = &records,
+        .ranges = &changed_ranges,
+    }, .{});
+    defer refreshed.release();
+    fake.generation = refreshed;
+    const changed_view = try refreshed.indexed.tableRoutingView("docs", .{});
+    var changed_fence = source_fence;
+    changed_fence.topology_epoch = changed_view.topology_epoch;
+    changed_fence.catalog_revision = 11;
+    try std.testing.expect(changed_fence.topology_epoch != source_fence.topology_epoch);
+
+    try std.testing.expectError(error.SourcePendingWork, reclaim_admission.retireDisplacedDelivery(&service, a, manifest, changed_fence, .{}));
+    try std.testing.expectEqual(.aborted, fake.state.status);
+    try std.testing.expect(!fake.resolved[0] and fake.resolved[1] and fake.state.acknowledgments_pending);
+    try std.testing.expectError(error.SourcePendingWork, reclaim_admission.retireDisplacedDelivery(&service, a, manifest, changed_fence, .{}));
+    try std.testing.expect(fake.resolved[0] and !fake.state.acknowledgments_pending);
+    try std.testing.expect(try reclaim_admission.retireDisplacedDelivery(&service, a, manifest, changed_fence, .{}));
+    try std.testing.expectEqual(original_begins, fake.begins);
+    try std.testing.expectEqual(original_prepares, fake.prepares);
 }

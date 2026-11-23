@@ -2657,7 +2657,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             if (request.operation != .recover) return error.InvalidSourcePlanWire;
         } else try request.validate();
         var expected = if (kind == .scope or kind == .producer_closure or kind == .legacy_terminal or kind == .legacy_inventory) request.owner else if (kind == .scope_outcome or kind == .retirement_outcome) request.command.intent.owner else request.source_owner;
-        if (comptime kind == .checkpoint) {
+        if (comptime kind == .checkpoint or kind == .retirement_outcome) {
             expected.topology_epoch = fence.topology_epoch;
         }
         const group = fence.route.group_id;

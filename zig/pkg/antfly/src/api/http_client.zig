@@ -3869,7 +3869,9 @@ pub const ApiHttpClient = struct {
         try context.ensureActive();
         if (self.internal_service == null) return error.Unauthorized;
         try input.validate();
-        try @import("source_owner_scope.zig").requireFence(input.owner(), fence);
+        var owner = input.owner();
+        owner.topology_epoch = fence.topology_epoch;
+        try @import("source_owner_scope.zig").requireFence(owner, fence);
         if (group_id == 0 or group_id != fence.route.group_id or table_name.len == 0 or table_name.len > 1024) return error.InvalidCatalogRouteFence;
         const table = try percentEncodePathComponent(self.alloc, table_name);
         defer self.alloc.free(table);

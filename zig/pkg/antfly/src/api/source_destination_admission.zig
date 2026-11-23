@@ -68,6 +68,7 @@ pub const Admission = struct {
     retained_payload_store: ?destination.payload_retention.Store = null,
     checkpoints: checkpoints.Port,
     scope_reads: ?@import("source_scope_operations.zig").Port = null,
+    retirements: ?@import("source_retirement_operations.zig").Port = null,
     scope_controls: ?@import("source_scope_control_operations.zig").Port = null,
 
     producer_reads: ?@import("source_producer_closure_operations.zig").Port = null,
@@ -295,6 +296,100 @@ pub const Admission = struct {
         try context.ensureActive();
         return result;
     }
+    /// Retire an exact enlisted attempt after the catalog revoked one of its
+    /// routes. No frozen writes are replayed under the refreshed leases.
+    pub fn retireDisplacedDelivery(self: Admission, svc: anytype, a: A, manifest: destination.Manifest, fence: metadata.CatalogRouteFence, context: Context) !bool {
+        const recovery = self.coordinator.recovery;
+        const request: @import("history_decision_operations.zig").Request = .{
+            .version = 1,
+            .owner = manifest.owner,
+            .transaction_id = manifest.transaction_id,
+            .minimum_applied_index = 1,
+        };
+        var observed = try recovery.decisions.read(a, fence, manifest.checkpoint_authority.table_name, request, context);
+        defer observed.deinit();
+        try observed.value.validate(request.binding());
+        const decision = observed.value.decision orelse return false;
+        if (!std.meta.eql(decision.admission.digest, manifest.admission_digest) or
+            !std.meta.eql(decision.record.source_scope, @as(?local.storage_source_scope.Reference, manifest.source_scope)) or
+            !std.meta.eql(decision.record.source_purpose, @as(?source.Digest, manifest.checkpoint.purpose)) or
+            decision.record.begin_timestamp != manifest.begin_timestamp)
+            return error.SourceTransactionIdentityConflict;
+        if (decision.record.status == .committed) return error.SourcePendingWork;
+
+        const admission = decision.admission.admission;
+        const coordinator = try admission.coordinatorMember();
+        const catalog = @import("table_catalog.zig");
+        var budget = recovery.catalog.budget(null);
+        budget.deadline_ns = budget.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io });
+        budget.cancellation = context.cancellation;
+        var session = try catalog.RoutingSession.initWithBudget(a, recovery.catalog, budget);
+        defer session.deinit();
+        const routes = try a.alloc(metadata.CatalogRouteFence, admission.participants.len);
+        defer a.free(routes);
+        var displaced = false;
+        for (admission.participants, routes) |member, *route| {
+            const owner = member.routed_owner orelse return error.InvalidSourceAdmission;
+            route.* = try @import("completion_recovery.zig").routeRetainedOwnerForCleanup(&session, owner, member.locator, budget, context);
+            displaced = displaced or route.topology_epoch != owner.topology_epoch;
+        }
+        if (decision.record.status == .pending and !displaced) return false;
+        const retirement_port = if (admission.participants.len > 1)
+            self.retirements orelse return error.ChangefeedCapabilityUnsupported
+        else
+            null;
+        _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, source.epoch_attempt_retirement_protocol_version);
+        if (decision.record.status == .pending) {
+            for (admission.participants, routes) |member, route| {
+                var owner = member.routed_owner.?;
+                owner.topology_epoch = route.topology_epoch;
+                const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
+                const qualified = try self.coordinator.owners.read(a, route, locator.table_name, .{ .version = 1, .expected_table_binding = owner.table_binding }, context);
+                if (!std.meta.eql(qualified.owner, owner)) return error.TopologyChanged;
+            }
+            const now = @import("antfly_platform").time.realtimeNs();
+            const timestamp = @max(now, std.math.add(u64, manifest.begin_timestamp, 1) catch return error.InvalidTxnRecord);
+            try recovery.participants.abortDisplacedSource(a, request.binding(), observed.value, fence, timestamp, context);
+            return error.SourcePendingWork;
+        }
+        if (!decision.record.intents_resolved) return error.SourcePendingWork;
+        if (!decision.record.acknowledgments_pending) return true;
+
+        // Retirement proves both the enlisted and never-enlisted cases at
+        // each follower before the coordinator may acknowledge its cleanup.
+        for (admission.participants, routes) |member, route| {
+            if (std.meta.eql(member.owner_fence, admission.coordinator_fence)) continue;
+            try context.ensureActive();
+            const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
+            const wire = @import("source_retirement_operations.zig").wire;
+            const retirement: wire.Request = .{
+                .version = 1,
+                .request_id = try requestNonce(a),
+                .operation = .submit,
+                .intent = .{
+                    .version = 1,
+                    .owner = member.routed_owner.?,
+                    .coordinator = request.binding(),
+                    .reference = manifest.source_scope,
+                    .source_purpose = manifest.checkpoint.purpose,
+                    .admission_digest = manifest.admission_digest,
+                },
+                .coordinator_locator = coordinator.locator,
+            };
+            var reply = try retirement_port.?.execute(a, route, locator.table_name, retirement, context);
+            defer reply.deinit();
+            try reply.value.validate(a, retirement);
+            if (!reply.value.confirmed()) return error.SourceOutcomeUnresolved;
+            switch (reply.value.outcome.?) {
+                .applied => {},
+                .rejected => |reason| return reason.asError(),
+                .superseded => return error.SourceOutcomeUnresolved,
+            }
+        }
+        try recovery.participants.acknowledgeResolved(a, request.binding(), observed.value, fence, context);
+        return error.SourcePendingWork;
+    }
+
     pub fn resumeEnlistedDelivery(self: Admission, a: A, state: source.State, fence: metadata.CatalogRouteFence, context: Context) !@import("../metadata/source_delivery.zig").Acceptance {
         var grant = try grantFromState(a, state);
         defer grant.deinit();

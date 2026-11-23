@@ -16848,7 +16848,7 @@ pub const DataServer = struct {
             const source_owner = if (kind == .legacy_inventory_observe) input.query.owner else if ((kind == .source_scope_observe or kind == .source_producer_closure_observe or kind == .source_producer_control or kind == .legacy_terminal_control)) input.owner else if ((kind == .source_scope_control or kind == .source_retirement_control)) input.owner() else input.source_owner;
             if (source_owner.group_id != original_fence.route.group_id or
                 source_owner.metadata_group_id != original_fence.metadata_group_id or
-                source_owner.topology_epoch != original_fence.topology_epoch or
+                (kind != .source_retirement_control and source_owner.topology_epoch != original_fence.topology_epoch) or
                 !std.mem.eql(u8, &source_owner.metadata_incarnation, &incarnation) or
                 !std.mem.eql(u8, &source_owner.namespace, &namespace)) return error.InvalidCatalogRouteFence;
         }
@@ -17568,7 +17568,11 @@ pub const DataServer = struct {
         if (comptime kind == .source_plan) try @import("../api/completion_owner_admission.zig").require(alloc, owner.catalog, table_name, fence, descriptor.view(), try command.routedOwner(fence.topology_epoch), context);
         if (comptime kind == .producer_closure) try @import("../api/completion_owner_admission.zig").require(alloc, owner.catalog, table_name, fence, descriptor.view(), command, context);
         if (comptime kind == .legacy_terminal) try @import("../api/completion_owner_admission.zig").require(alloc, owner.catalog, table_name, fence, descriptor.view(), command.owner, context);
-        if (comptime kind == .source_scope or kind == .source_retirement) try @import("../api/completion_owner_admission.zig").require(alloc, owner.catalog, table_name, fence, descriptor.view(), command.intent.owner, context);
+        if (comptime kind == .source_scope or kind == .source_retirement) {
+            var routed = command.intent.owner;
+            if (comptime kind == .source_retirement) routed.topology_epoch = fence.topology_epoch;
+            try @import("../api/completion_owner_admission.zig").require(alloc, owner.catalog, table_name, fence, descriptor.view(), routed, context);
+        }
         const encoded = switch (kind) {
             .history => try @import("history_control_entry.zig").encode(alloc, .{ .table = table_name, .protocol = required, .storage_owner = descriptor.view(), .history_control = .{ .command = command } }, required),
             .source_plan => try @import("source_plan_entry.zig").encode(alloc, .{ .table = table_name, .protocol = required, .storage_owner = descriptor.view(), .source_owner = command.source_owner, .source_plan = command.command }, required),
@@ -18098,10 +18102,11 @@ pub const DataServer = struct {
                     .publish_completion => |publication| publication.completion_owner,
                     else => return error.InvalidBatchRequest,
                 };
-                // A certificate is independently validated at apply against
-                // original retained resolution evidence. Rebind only the
-                // live route check and keep its original owner in the command.
-                if (req.transaction.? == .publish_completion)
+                // Publication and scoped ABORT are validated against the
+                // original retained transaction at apply. Refresh only the
+                // route, preserving the transaction's immutable owner.
+                if (req.transaction.? == .publish_completion or
+                    (req.transaction.? == .resolve and req.transaction.?.resolve.status == .aborted and req.transaction.?.resolve.source_scope != null))
                     owner.topology_epoch = route.write_route_fence.?.topology_epoch;
                 const admission_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
                 try @import("../api/completion_owner_admission.zig").require(alloc, admission_source.catalog, table_name, route.write_route_fence.?, storage_owner_descriptor.?.view(), owner, completion_context);

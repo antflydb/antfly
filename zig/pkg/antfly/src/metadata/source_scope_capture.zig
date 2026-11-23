@@ -56,13 +56,14 @@ pub const Snapshot = struct {
     native_bootstrap_certified: bool = false,
     pending_fenceable: bool = false,
     checkpoint_transfer: bool = false,
+    settled_attempt_fence: bool = false,
     checkpoint_adopted: bool = false,
     checkpoint_donor_close_ready: bool = false,
     prepared_install: ?PreparedInstall = null,
     pub fn jsonStringify(self: Snapshot, stream: anytype) @TypeOf(stream.*).Error!void {
         try stream.beginObject();
         inline for (@typeInfo(Snapshot).@"struct".field_names) |name| {
-            const boolean_flag = comptime std.mem.eql(u8, name, "native_bootstrap_certified") or std.mem.eql(u8, name, "pending_fenceable") or std.mem.eql(u8, name, "checkpoint_transfer") or std.mem.eql(u8, name, "checkpoint_adopted") or std.mem.eql(u8, name, "checkpoint_donor_close_ready");
+            const boolean_flag = comptime std.mem.eql(u8, name, "native_bootstrap_certified") or std.mem.eql(u8, name, "pending_fenceable") or std.mem.eql(u8, name, "settled_attempt_fence") or std.mem.eql(u8, name, "checkpoint_transfer") or std.mem.eql(u8, name, "checkpoint_adopted") or std.mem.eql(u8, name, "checkpoint_donor_close_ready");
             const include = if (comptime boolean_flag)
                 @field(self, name)
             else if (comptime std.mem.eql(u8, name, "prepared_install"))
@@ -107,7 +108,7 @@ pub const Snapshot = struct {
         const result: native_control.Command = .{
             .version = switch (intent.action) {
                 .install_checkpoint, .close_checkpoint => 4,
-                .fence_attempt => if (self.checkpoint_transfer) 4 else 3,
+                .fence_attempt => if (self.checkpoint_transfer or self.settled_attempt_fence) 4 else 3,
                 .bind => if (self.checkpoint_adopted) 4 else if (self.native_bootstrap_certified) 2 else 1,
                 else => 1,
             },
@@ -167,7 +168,7 @@ pub fn capture(a: A, query: Query, applied_index: u64, incarnation: [32]u8, deco
         if (decoder_version < control.checkpoint_authority.successor_protocol_version) return error.TableTopologyProtocolUpgradeRequired;
         break :blk .{ .owner = prepared.successor.owner, .transfer = prepared.transfer };
     } else null;
-    return .{ .cut = .{ .group_id = query.metadata_group_id, .incarnation = incarnation, .index = applied_index }, .spec = spec, .phase = if (state.retired) .retired else if (state.closing) .closing else .active, .actor_revision = state.revision, .live_definition = if (definition) |value| std.meta.eql(value, source.definition) else false, .checkpoint_table = try a.dupe(u8, authority.table_name), .pending = pending, .native_bootstrap_certified = state.native_bootstrap_checkpoint != null, .pending_fenceable = pending_fenceable, .checkpoint_transfer = checkpoint_transfer, .checkpoint_adopted = state.checkpoint_install_receipt != null, .checkpoint_donor_close_ready = checkpoint_transfer and state.checkpointTransferDrained(), .prepared_install = prepared_install };
+    return .{ .cut = .{ .group_id = query.metadata_group_id, .incarnation = incarnation, .index = applied_index }, .spec = spec, .phase = if (state.retired) .retired else if (state.closing) .closing else .active, .actor_revision = state.revision, .live_definition = if (definition) |value| std.meta.eql(value, source.definition) else false, .checkpoint_table = try a.dupe(u8, authority.table_name), .pending = pending, .native_bootstrap_certified = state.native_bootstrap_checkpoint != null, .pending_fenceable = pending_fenceable, .checkpoint_transfer = checkpoint_transfer, .settled_attempt_fence = pending_fenceable and decoder_version >= control.epoch_attempt_retirement_protocol_version, .checkpoint_adopted = state.checkpoint_install_receipt != null, .checkpoint_donor_close_ready = checkpoint_transfer and state.checkpointTransferDrained(), .prepared_install = prepared_install };
 }
 
 pub fn readOnService(svc: anytype, a: A, query: Query, request: anytype) !Snapshot {
