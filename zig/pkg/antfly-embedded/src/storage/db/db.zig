@@ -7600,6 +7600,14 @@ pub const DB = struct {
 
     pub fn runLsmMaintenanceStepBestEffort(self: *DB) !bool {
         if (comptime storage_engine.enabled) return storage_engine.call("runLsmMaintenanceStepBestEffort", .{self});
+        // Use the same debt and due-work signals as the admitted path. Idle
+        // polls must not advance the replay revision seen by hybrid readers.
+        const primary = &self.core.primary_store_owner;
+        if (!self.source_pin_cleanup.due(monotonicTimeNs()) and
+            primary.lsmMaintenanceDebtHint() == 0 and
+            primary.nextLsmMaintenanceWakeDelayNsBestEffort() != @as(?u64, 0) and
+            !self.core.index_manager.mayHaveLsmMaintenanceWork()) return false;
+
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         var snapshot_replay = try self.acquireSnapshotReplayMutation();
@@ -7667,6 +7675,11 @@ pub const DB = struct {
 
     pub fn runPrimaryLsmMaintenanceStepBestEffort(self: *DB) !bool {
         if (comptime storage_engine.enabled) return storage_engine.call("runPrimaryLsmMaintenanceStepBestEffort", .{self});
+        const primary = &self.core.primary_store_owner;
+        if (primary.lsmMaintenanceDebtHint() == 0 and
+            primary.nextLsmMaintenanceWakeDelayNsBestEffort() != @as(?u64, 0) and
+            primary.lsmMaintenanceScoreBestEffort() == @as(?u64, 0)) return false;
+
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         var snapshot_replay = try self.acquireSnapshotReplayMutation();
@@ -7712,6 +7725,23 @@ pub const DB = struct {
             }
         }
         return steps;
+    }
+
+    test "db lsm maintenance idle best-effort polls preserve the replay revision" {
+        const alloc = std.testing.allocator;
+        var directory = try TestDirectory.init("idle-lsm-maintenance");
+        defer directory.cleanup();
+        var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false });
+        defer db.close();
+
+        // The fixture owns no source pins. Retire the initial cleanup probe
+        // before sampling the revision that hybrid search would observe.
+        _ = try db.runSourcePinCleanupStep();
+        try std.testing.expect(!db.source_pin_cleanup.due(monotonicTimeNs()));
+        const revision = db.core.snapshot_replay_admission.quietRevision().?;
+        try std.testing.expect(!try db.runLsmMaintenanceStepBestEffort());
+        try std.testing.expect(!try db.runPrimaryLsmMaintenanceStepBestEffort());
+        try std.testing.expectEqual(@as(?u64, revision), db.core.snapshot_replay_admission.quietRevision());
     }
 
     test "db lsm maintenance reclaims due index obsolete paths before primary compaction" {
@@ -52623,19 +52653,21 @@ pub const DB = struct {
             HybridComponents.ownerAllocatorCanOverlap(self.alloc) and
             (HybridComponents.Budget.reusableHeadroom(alloc) orelse 0) >= HybridComponents.workspace_bytes;
         const io = if (can_overlap and reusable) exec_ctx.io orelse self.backend_runtime.io() else null;
-        const revisions = if (io != null) HybridComponents.quietRevisions(self) else null;
+        const revisions = if (io != null) HybridComponents.quietRevisions(self, null) else null;
         const probe = if (builtin.is_test) test_hybrid_probe else null;
         const sources = if (revisions != null) HybridComponents.resolveSources(self, alloc, req, probe) else null;
+        const profile_hybrid = has_text and has_dense and benchQueryProfileEnabled();
         var hybrid: HybridComponents = .{
             .db = self,
             .io = if (sources != null) io else null,
             .sources = sources orelse .{},
             .probe = probe,
+            .profile = profile_hybrid,
             .component_alloc = .{ .backing = alloc },
         };
-        if (sources != null) hybrid.cut = hybrid.readCutFrom(revisions.?);
+        if (sources != null) hybrid.cut = hybrid.readCutFrom(revisions.?, null);
         hybrid.lexical_budget = .{ .backing = hybrid.component_alloc.allocator(), .limit = if (probe) |test_probe| test_probe.workspace_bytes else HybridComponents.workspace_bytes };
-        defer if (has_text and has_dense and benchQueryProfileEnabled()) {
+        defer if (profile_hybrid) {
             std.log.info("antfly_bench_hybrid launched={} accepted={} replay={s}", .{
                 hybrid.launched,                                            hybrid.accepted_batch and hybrid.retry_reason == null,
                 if (hybrid.retry_reason) |err| @errorName(err) else "none",
@@ -52664,7 +52696,7 @@ pub const DB = struct {
             .attach_graph_results = attachGraphResultsCallback,
         };
         var attempt = db_query_search.searchComposed(alloc, req, executor);
-        if (hybrid.accepted_batch and !std.meta.eql(hybrid.cut, hybrid.readCut())) {
+        if (hybrid.accepted_batch and !hybrid.cutMatches("fusion")) {
             if (attempt) |value| {
                 var abandoned = value;
                 abandoned.deinit();
@@ -52726,6 +52758,14 @@ pub const DB = struct {
         const scheduler = @import("../../sql/parallel_scheduler.zig");
         const Budget = @import("../../sql/memory_budget.zig");
         const workspace_bytes = 16 * 1024 * 1024;
+        const CutFailure = enum {
+            changed,
+            primary_unquiet,
+            replay_unquiet,
+            dense_publishing,
+            replay_bracket,
+            primary_bracket,
+        };
         const Revisions = struct { primary: u64, replay: u64 };
         const Cut = struct {
             primary: u64,
@@ -52746,6 +52786,7 @@ pub const DB = struct {
         io: ?Io,
         cut: ?Cut = null,
         sources: Sources,
+        profile: bool,
         probe: ?*HybridTestProbe,
         component_alloc: scheduler.LockedAllocator,
         launched: bool = false,
@@ -52791,25 +52832,35 @@ pub const DB = struct {
             return (entry orelse return null).persistent.writer.snapshotEpoch();
         }
 
-        fn quietRevisions(db: *DB) ?Revisions {
+        fn unavailable(failure: ?*CutFailure, reason: CutFailure) @TypeOf(null) {
+            if (failure) |out| out.* = reason;
+            return null;
+        }
+
+        fn quietRevisions(db: *DB, failure: ?*CutFailure) ?Revisions {
             return .{
-                .primary = db.core.snapshot_admission.quietRevision() orelse return null,
-                .replay = db.core.snapshot_replay_admission.quietRevision() orelse return null,
+                .primary = db.core.snapshot_admission.quietRevision() orelse return unavailable(failure, .primary_unquiet),
+                .replay = db.core.snapshot_replay_admission.quietRevision() orelse return unavailable(failure, .replay_unquiet),
             };
         }
 
-        fn readCut(self: *HybridComponents) ?Cut {
-            return self.readCutFrom(quietRevisions(self.db) orelse return null);
+        fn cutMatches(self: *HybridComponents, comptime phase: []const u8) bool {
+            var reason: CutFailure = .changed;
+            const failure = if (self.profile) &reason else null;
+            const current = if (quietRevisions(self.db, failure)) |revisions| self.readCutFrom(revisions, failure) else null;
+            if (std.meta.eql(self.cut, current)) return true;
+            if (self.profile) std.log.info("antfly_bench_hybrid_cut phase={s} reason={s} old={any} new={any}", .{ phase, @tagName(reason), self.cut, current });
+            return false;
         }
 
-        fn readCutFrom(self: *HybridComponents, revisions: Revisions) ?Cut {
+        fn readCutFrom(self: *HybridComponents, revisions: Revisions, failure: ?*CutFailure) ?Cut {
             if (builtin.is_test) {
                 if (self.probe) |probe| probe.read_cut_samples += 1;
             }
             const db = self.db;
             const generation = if (self.sources.dense) |entry| entry.index.publishedGeneration() else null;
             const mutation = if (self.sources.dense) |entry| entry.index.publishedMutationEpoch() else null;
-            if (((generation orelse 0) | (mutation orelse 0)) & 1 != 0) return null;
+            if (((generation orelse 0) | (mutation orelse 0)) & 1 != 0) return unavailable(failure, .dense_publishing);
             const cut: Cut = .{
                 .primary = revisions.primary,
                 .replay = revisions.replay,
@@ -52821,8 +52872,8 @@ pub const DB = struct {
             };
             // Bracket source sampling in reverse order so both mutation
             // domains were quiet over a common interval.
-            if (db.core.snapshot_replay_admission.quietRevision() != @as(?u64, revisions.replay) or
-                db.core.snapshot_admission.quietRevision() != @as(?u64, revisions.primary)) return null;
+            if (db.core.snapshot_replay_admission.quietRevision() != @as(?u64, revisions.replay)) return unavailable(failure, .replay_bracket);
+            if (db.core.snapshot_admission.quietRevision() != @as(?u64, revisions.primary)) return unavailable(failure, .primary_bracket);
             return cut;
         }
 
@@ -52921,7 +52972,7 @@ pub const DB = struct {
             var text_owned = text_outcome catch null;
             errdefer if (text_owned) |*result| result.deinit();
 
-            if (!std.meta.eql(self.cut, self.readCut())) return error.HybridReadCutChanged;
+            if (!self.cutMatches("retrieval")) return error.HybridReadCutChanged;
             if (text_outcome) |_| {} else |err| {
                 if (err == error.OutOfMemory and self.lexical_budget.isExhausted())
                     return error.HybridSerialRetry;
