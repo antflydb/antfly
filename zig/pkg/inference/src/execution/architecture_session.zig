@@ -5791,8 +5791,11 @@ fn buildColdNativeWhisper(self: *ColdNativeWhisper, session: Session, allocator:
     const shared_lookup = domain != null and schedule.sharedBackingSupported(arch.allocator);
     var preparation = try selectDensePreparationForSpec(if (shared_lookup) &arch.dense_decoder_definitions else null, &header, &source, domain, current);
     defer preparation.deinit(current);
+    // Short Metal prompts can write directly into the planned Q/K/V
+    // destinations with their existing slots. The schedule still has to
+    // prove every route before it can replace the ordinary prefill.
     const scheduled_initial_rows = if (initial_rows) |rows|
-        if (cb.kind() != .metal or rows == 1 or try self.weights.?.hasPackedInitialProjections(cb, config)) rows else null
+        if (cb.kind() != .metal or rows < 128 or try self.weights.?.hasPackedInitialProjections(cb, config)) rows else null
     else
         null;
     var initial_preparation = schedule.Preparation{ .key = @splat(0) };
@@ -11670,7 +11673,7 @@ test "native incremental actual Metal owned provider preserves source lease and 
             return error.ExpectedPreparedResidentWhisper;
         }
         try std.testing.expectEqual(.prepared, observation.program.outcome);
-        try std.testing.expectEqual(initial_rows == 1, decoder.cache.native_program.?.initial != null);
+        try std.testing.expect(decoder.cache.native_program.?.initial != null);
         const templates = observation.templates orelse return error.MissingDefinitionLifetimeStatistics;
         try std.testing.expectEqual(.decode_prefix, templates.phase);
         try std.testing.expectEqual(.sampled, templates.availability);

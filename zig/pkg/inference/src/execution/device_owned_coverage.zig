@@ -302,7 +302,7 @@ pub fn assess(pool: *const physical.Pool, target: ops.ComputeBackend, metadata: 
                 result.literals += 1;
             },
             .view => {
-                if (!@import("owned_alias.zig").fullSpanActivation(pool, slot, target)) {
+                if (!@import("owned_alias.zig").denseActivation(pool, slot, target)) {
                     if (@import("antfly_platform").env.getenvBool("TERMITE_GRAPH_PARTITION_REPORT")) {
                         const root = @import("metadata_alias.zig").fullSpanRoot(&pool.plan, slot.node_id, slot.backend);
                         std.debug.print("graph-partition-report alias rejected node={d} op={s} shape={any} root={s}\n", .{

@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Exact full-span aliases of selected activation banks. Model/runtime inputs,
-//! literals, affine/partial views and opaque roots retain compatibility floors.
+//! Exact dense aliases of selected activation banks, including bounded
+//! contiguous Metal slices of allocations.
 const std = @import("std");
 const physical = @import("physical_buffers.zig");
 const buffers = @import("../graph/buffer_plan.zig");
@@ -22,7 +22,7 @@ const metadata = @import("metadata_alias.zig");
 const ops = @import("../ops/ops.zig");
 const ml = @import("ml");
 
-pub fn fullSpanActivation(pool: *const physical.Pool, slot: buffers.LogicalSlot, target: ops.ComputeBackend) bool {
+pub fn denseActivation(pool: *const physical.Pool, slot: buffers.LogicalSlot, target: ops.ComputeBackend) bool {
     if (target.kind() != .cuda and target.kind() != .metal) return false;
     const functions = target.vtable.kernels orelse return false;
     if (!functions.accepts(target.vtable) or functions.createMetadataAlias == null) return false;
@@ -79,8 +79,8 @@ pub fn fullSpanActivation(pool: *const physical.Pool, slot: buffers.LogicalSlot,
         for (pool.metadata_aliases, 0..) |alias, index| {
             if (index >= selected.alias_enabled.len) return false;
             if (alias.node != current.node_id or alias.source != parent.node_id or !selected.alias_enabled[index]) continue;
-            if (alias.kind != .reshape and alias.kind != .full_slice) return false;
-            if (!alias.input.eq(parent.desc.shape) or !alias.output.eq(current.desc.shape) or metadata.logicalBytes(alias.input) != metadata.logicalBytes(alias.output)) return false;
+            if (alias.kind != .reshape and alias.kind != .full_slice and !(target.kind() == .metal and root.kind == .allocation and alias.kind == .contiguous_slice)) return false;
+            if (!alias.input.eq(parent.desc.shape) or !alias.output.eq(current.desc.shape)) return false;
             expected = alias.apply(selected.planes[parent.node_id][0]) orelse return false;
             break;
         }
@@ -94,6 +94,8 @@ pub fn fullSpanActivation(pool: *const physical.Pool, slot: buffers.LogicalSlot,
         };
         if (!std.meta.eql(plane.backing, planned.backing) or plane.byte_offset != planned.byte_offset) return false;
         if (plane.role != .primary or plane.descriptor.current_backend != target.kind() or plane.descriptor.storage != storage or plane.descriptor.quant_format != null or plane.descriptor.attention_storage != null or plane.descriptor.attention_kv_format != null or !plane.descriptor.shape.eq(current.desc.shape) or plane.descriptor.view_source != parent.node_id or !metadata.dense(current.desc.shape, plane.descriptor.strides) or plane.logical_bytes != bytes or plane.readable_bytes != bytes or plane.writable != null or plane.layout_key != null or plane.storage_epoch != selected.epoch or backing_bytes < bytes) return false;
+        const offset = std.math.sub(usize, plane.byte_offset, selected.planes[root.node_id][0].byte_offset) catch return false;
+        if (offset > backing_bytes or bytes > backing_bytes - offset) return false;
         current = parent;
     }
     return current.id == root.id;

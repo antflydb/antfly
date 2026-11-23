@@ -58460,6 +58460,7 @@ test "Native typed slice source output and metadata unwind every allocation fail
 }
 
 fn createMetadataAliasOp(ctx: *anyopaque, input: CT, request: *const @import("../execution/metadata_alias.zig").Request) anyerror!?CT {
+    if (request.byte_offset != 0) return null;
     const affine = @import("../execution/metadata_alias.zig");
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const source = toBuf(input);
