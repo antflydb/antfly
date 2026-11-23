@@ -20667,15 +20667,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     // The same complete event ABI drives preflight and actual arena lookup.
     const cache_request = self.audioArenaRequestFromPlan(cache_base, plan, storage);
     const arena = (try self.embedding_gemma2_execution.audioArena(&self.ctx, @intCast(cache_request.arena.grid_x), storage.bytes)) orelse return null;
-    // Collect only completed events, with no new stream/device wait.
-    if (arena.timing_replay) |replay| if (arena.timing) |pair| {
-        var ms: f32 = 0;
-        if (self.ctx.driver.fns.cuEventElapsedTime(&ms, pair.start, pair.end) == 0) {
-            if (ms > 0) arena.recordCompleted(replay, @intFromFloat(@as(f64, ms) * 1000000));
-            arena.timing_replay = null;
-        }
-    };
-    const capture_sample = arena.graph == null;
+    arena.pollTiming(&self.ctx);
     // The sealed allocation plan above is the audio route's capture proof.
     const action = arena.graphAction(true);
     const capture = action == .capture;
@@ -20696,10 +20688,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     if (published_directly) try execution_scope.?.bindPublishedOutput(tensorFromCt(out).buffer.ptr, output_bytes);
     const input_bank = if (replay or capture) try audioBufferView(arena.buffers[0], 0, storage.scratch_offset) else buffer_mod.DeviceBuffer{};
     defer arena.noteUse(&self.ctx);
-    if (!capture_sample) {
-        if (arena.timing == null) arena.timing = self.ctx.createProfileEventPair() catch null;
-        if (arena.timing_replay == null) if (arena.timing) |pair| try self.ctx.recordProfileStart(pair);
-    }
+    const timing = try arena.beginTiming(&self.ctx);
     if (!replay) {
         // Eager execution borrows the same logical input spans from the caller.
         // Recording binds them to the cache's fixed addresses.
@@ -20774,10 +20763,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     }
     // Include the publication copy in replay samples. The direct ordinary
     // route already publishes its result as part of the measured work.
-    if (!capture_sample and arena.timing_replay == null) if (arena.timing) |pair| {
-        try self.ctx.recordProfileEnd(pair);
-        arena.timing_replay = replay;
-    };
+    if (timing) |pair| try arena.endTiming(&self.ctx, pair, replay);
     const observation = @import("../../execution/runtime_observation.zig");
     if (capture) {
         observation.cudaAudioResult(.recorded_and_launched);

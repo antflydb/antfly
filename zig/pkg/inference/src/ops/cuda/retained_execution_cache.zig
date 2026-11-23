@@ -210,7 +210,34 @@ pub fn Program(comptime Recipe: type) type {
                 samples.* +|= 1;
                 self.timed_uses +%= 1;
             }
+            /// Collect only completed device samples without waiting on the stream.
+            pub fn pollTiming(self: *Arena, ctx: *Context) void {
+                const replay = self.timing_replay orelse return;
+                const pair = self.timing orelse return;
+                var ms: f32 = 0;
+                const status = ctx.driver.fns.cuEventElapsedTime(&ms, pair.start, pair.end);
+                if (status != driver.CUDA_ERROR_NOT_READY) self.timing_replay = null;
+                const ns = @as(f64, ms) * std.time.ns_per_ms;
+                if (status == driver.CUDA_SUCCESS and ns > 0 and ns < @as(f64, @floatFromInt(std.math.maxInt(u64)))) {
+                    self.recordCompleted(replay, @intFromFloat(ns));
+                }
+            }
+
+            pub fn beginTiming(self: *Arena, ctx: *Context) !?@import("context.zig").ProfileEventPair {
+                if (self.graph == null or self.timing_replay != null) return null;
+                if (self.timing == null) self.timing = ctx.createProfileEventPair() catch return null;
+                const pair = self.timing.?;
+                try ctx.recordProfileStart(pair);
+                return pair;
+            }
+
+            pub fn endTiming(self: *Arena, ctx: *Context, pair: @import("context.zig").ProfileEventPair, replay: bool) !void {
+                try ctx.recordProfileEnd(pair);
+                self.timing_replay = replay;
+            }
+
             pub fn resetTiming(self: *Arena) void {
+                self.timing_replay = null;
                 self.eager_samples = 0;
                 self.replay_samples = 0;
                 self.eager_ns = 0;
@@ -605,8 +632,10 @@ test "retained CUDA execution accepts an independent typed recipe without model 
     arena.noteAttentionSource(.{ .sequence = 4, .all_valid = true }, .{ .generation = 1 });
     try arena.prepareAttentionSource(&context, .{ .sequence = 5, .all_valid = true }, .{ .generation = 1 });
     try std.testing.expect(arena.warm);
+    arena.timing_replay = true;
     try arena.prepareAttentionSource(&context, .{ .sequence = 5, .all_valid = true }, .{ .generation = 2 });
     try std.testing.expect(!arena.warm and arena.attention_source == null);
+    try std.testing.expect(arena.timing_replay == null);
 
     try std.testing.expectEqual(P.Arena.GraphAction.eager, arena.graphAction(false));
     try std.testing.expectEqual(P.Arena.GraphAction.capture, arena.graphAction(true));
