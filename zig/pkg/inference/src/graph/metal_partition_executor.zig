@@ -2245,7 +2245,7 @@ pub const MetalPartitionExecutor = struct {
             // on a consumer fusing it — which writes the consumer's slot,
             // not this one.
             const node_elision_protected = i < elision_protected_nodes.len and elision_protected_nodes[i];
-            const defer_allowed = deferredProducerConsumerStaysInFrameChunk(
+            const defer_allowed = !owned_frame and deferredProducerConsumerStaysInFrameChunk(
                 node_ids,
                 node_pos,
                 node_id,
@@ -2308,10 +2308,12 @@ pub const MetalPartitionExecutor = struct {
             const op_plan = partition_plan.operatorPlanForNode(node_id);
             var execution_kind: ?MetalExecutionKind = null;
             if (trace_node_progress) std.debug.print("metal_partition_progress: phase=planned_region_begin partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
-            const runtime_region = runtime_region_plan.regionAt(node_pos, node_id, node_ids);
+            // Attestation excludes region schedules and deferred producers.
+            // Keep complete frames on assigned dispatch after admission.
+            const runtime_region: RuntimeRegion = if (owned_frame) .{ .none = {} } else runtime_region_plan.regionAt(node_pos, node_id, node_ids);
             const region_start_ns = if (collect_op_stats) metalPartitionNowNs() else 0;
             const planned_region_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
-            if (try tryExecutePlannedRuntimeRegion(
+            if (!owned_frame and try tryExecutePlannedRuntimeRegion(
                 runtime_region,
                 runtime_region_plan.preparedPtrAt(node_pos, node_id, node_ids),
                 runtime_region_plan.sourceStateAt(node_pos),
@@ -2347,7 +2349,7 @@ pub const MetalPartitionExecutor = struct {
                 if (trace_node_progress) std.debug.print("metal_partition_progress: phase=planned_region_miss partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
                 if (trace_node_progress) std.debug.print("metal_partition_progress: phase=fused_pattern_begin partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
                 const fused_pattern_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
-                if (try tryExecuteFusedMetalGraphPattern(
+                if (!owned_frame and try tryExecuteFusedMetalGraphPattern(
                     allocator,
                     graph,
                     cb,
