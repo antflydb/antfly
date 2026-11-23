@@ -12079,7 +12079,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const req = owned.requirements;
         if (req.workspace.host_byte_size != 0 or req.probe_workspace.byte_size != 0 or req.probe_workspace.host_byte_size != 0 or req.auxiliaries.count != 0) return false;
         if (owned.vtable == &PreparedDenseLinear.vtable) return req.workspace.byte_size == 0 and PreparedDenseLinear.belongs(@ptrCast(@alignCast(ctx)), owned);
-        return @import("../execution/assigned_kernel_route.zig").belongsToProgram(owned, .{ .ptr = ctx, .vtable = @ptrCast(@alignCast(owned.implementation.table)) }, directRouteSupported);
+        const direct = if (owned.vtable == &PreparedCachedGather.vtable) gather: {
+            const prepared: *const PreparedCachedGather = @ptrCast(@alignCast(owned.context));
+            break :gather &prepared.direct;
+        } else owned;
+        return @import("../execution/assigned_kernel_route.zig").belongsToProgram(direct, .{ .ptr = ctx, .vtable = @ptrCast(@alignCast(owned.implementation.table)) }, directRouteSupported);
     }
 
     fn directRouteSupported(ctx: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
@@ -12139,7 +12143,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const table: *const ops.ComputeBackend.VTable = @ptrCast(@alignCast(implementation.table));
         const direct = @import("../execution/assigned_kernel_route.zig");
         const backend = ops.ComputeBackend{ .ptr = self, .vtable = table };
-        if (request.descriptor.operation == .gather) return direct.prepareHostGather(backend, request, directRouteSupported);
+        if (request.descriptor.operation == .gather) {
+            if (try direct.prepareHostGather(backend, request, directRouteSupported)) |owned| return owned;
+            if (!self.ownsMetadataIndex() or !DenseProjectionProfile.noFrame(self)) return null;
+            return PreparedCachedGather.prepare(self, backend, request);
+        }
         if (request.descriptor.operation == .linear) {
             // Only the genuine cold metadata scope can acquire a new pin.
             // A missing slot retains the original allocating route.
@@ -12148,6 +12156,71 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         return direct.prepare(backend, request, directRouteSupported);
     }
+
+    const PreparedCachedGather = struct {
+        const route = @import("../execution/kernel_route.zig");
+        const direct_route = @import("../execution/assigned_kernel_route.zig");
+        allocator: std.mem.Allocator,
+        source: CT,
+        plane: @import("../execution/storage_ownership.zig").Plane,
+        table: MetalTensor,
+        direct: route.Owned,
+        output: route.OutputSlot,
+
+        fn prepare(compute: *MetalCompute, backend: ops.ComputeBackend, request: route.Prepare) !?route.Owned {
+            if (request.inputs.len != 2 or request.inputs[0] != .tensor or request.descriptor.operation.gather.axis != 0) return null;
+            const source = request.inputs[0].tensor;
+            if (source.implementation.context != backend.ptr or source.implementation.table != @as(*const anyopaque, backend.vtable)) return null;
+            const plane = denseDecoderHeldWeight(compute, compute.data, source.value, null) catch return null;
+            const shape = request.descriptor.input_shapes[0];
+            if (!shape.eq(plane.descriptor.shape) or shape.rank() != 2 or shape.dim(0) <= 0 or shape.dim(1) <= 0 or plane.descriptor.resident_backend != .native) return null;
+            const key = embeddingTableIdentity(toBuf(source.value)) orelse return null;
+            const runtime = compute.provider_impl.raw_decode_runtime orelse return null;
+            var table = (try metal_runtime.retainPreparedEmbeddingF32(runtime, key, @intCast(shape.dim(0)), @intCast(shape.dim(1)))) orelse return null;
+            var committed = false;
+            defer if (!committed) table.deinit();
+            const facts = [_]route.Binding{ .{ .resident = .{ .implementation = source.implementation, .logical = shape, .planes = &.{plane} } }, request.inputs[1] };
+            var checked = request;
+            checked.inputs = &facts;
+            var direct = (try direct_route.prepareHostGather(backend, checked, directRouteSupported)) orelse return null;
+            defer if (!committed) direct.deinit();
+            const owner = try request.allocator.create(PreparedCachedGather);
+            var output = request.output;
+            output.writable_bytes = direct.requirements.primary_bytes;
+            owner.* = .{ .allocator = request.allocator, .source = source.value, .plane = plane, .table = table, .direct = direct, .output = output };
+            committed = true;
+            return .{ .context = owner, .implementation = direct.implementation, .key = direct.key, .requirements = direct.requirements, .output_plane_metadata = .assigned_dense, .vtable = &vtable };
+        }
+
+        fn pinnedInput(raw: *anyopaque, index: usize, binding: route.Binding) bool {
+            const self: *const PreparedCachedGather = @ptrCast(@alignCast(raw));
+            return index == 0 and binding == .tensor and binding.tensor.value == self.source and
+                binding.tensor.implementation.context == self.direct.implementation.context and
+                binding.tensor.implementation.table == self.direct.implementation.table;
+        }
+        fn matches(raw: *anyopaque, request: route.Validate) bool {
+            const self: *const PreparedCachedGather = @ptrCast(@alignCast(raw));
+            if (request.inputs.len != 2 or !pinnedInput(raw, 0, request.inputs[0])) return false;
+            const facts = [_]route.Binding{ .{ .resident = .{ .implementation = self.direct.implementation, .logical = self.plane.descriptor.shape, .planes = &.{self.plane} } }, request.inputs[1] };
+            var checked = request;
+            checked.inputs = &facts;
+            return self.direct.vtable.matches(self.direct.context, checked);
+        }
+        fn validate(raw: *anyopaque, request: route.Validate) !void {
+            if (!matches(raw, request)) return error.PreparedKernelBindingChanged;
+        }
+        fn indexConstraint(raw: *anyopaque, operand: usize) ?@import("../execution/host_ingress.zig").IndexBounds {
+            const self: *const PreparedCachedGather = @ptrCast(@alignCast(raw));
+            return self.direct.vtable.host_input_constraint.?(self.direct.context, operand);
+        }
+        fn deinit(raw: *anyopaque) void {
+            const self: *PreparedCachedGather = @ptrCast(@alignCast(raw));
+            self.direct.deinit();
+            self.table.deinit();
+            self.allocator.destroy(self);
+        }
+        const vtable: route.Owned.VTable = .{ .pinned_input = pinnedInput, .host_input_constraint = indexConstraint, .matches = matches, .validate = validate, .deinit = @This().deinit };
+    };
 
     /// The generic direct owner proves dense bindings and output geometry;
     /// this owner adds the actual prepared payload/declaration lifetime. It
@@ -13291,11 +13364,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         if (request.inputs.len != descriptor.input_count) return error.InvalidTensorShape;
         const typed_gather = descriptor.operation == .gather and descriptor.input_shapes[1].dtype != .f32;
+        const cached_gather: ?*const PreparedCachedGather = if (typed_gather and request.prepared_route != null and request.prepared_route.?.vtable == &PreparedCachedGather.vtable) cached: {
+            const route = request.prepared_route.?;
+            if (route.implementation.context != ctx or !acceptsPhysicalImplementation(route.implementation.table)) return error.PreparedKernelBindingChanged;
+            const owner: *const PreparedCachedGather = @ptrCast(@alignCast(route.context));
+            if (owner.source != request.inputs[0]) return error.PreparedKernelBindingChanged;
+            break :cached owner;
+        } else null;
         for (request.inputs, 0..) |input, index| {
             const buf = toBuf(input);
             const typed_index = typed_gather and index == 1;
             if (buf.integer_storage != typed_index or hasHostView(buf) or buf.lazy_multiply != null or bufHasAnyQuantizedStorage(buf)) return false;
-            const tensor = buf.metal_tensor orelse {
+            const tensor = (if (index == 0 and cached_gather != null) cached_gather.?.table else buf.metal_tensor) orelse {
                 const prepared = request.prepared_route orelse return false;
                 if (descriptor.operation != .linear or index == 0 or prepared.vtable != &PreparedDenseLinear.vtable) return false;
                 const source = denseDecoderHeldWeight(ctx, self.data, input, null) catch return false;
@@ -13310,7 +13390,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
         }
         if (typed_gather) {
-            const route = request.prepared_route orelse return false;
+            const route = if (cached_gather) |owner| &owner.direct else request.prepared_route orelse return false;
             const direct = @import("../execution/assigned_kernel_route.zig");
             if (!acceptsPhysicalImplementation(route.implementation.table) or
                 !direct.belongsToProgram(route, .{ .ptr = ctx, .vtable = @ptrCast(@alignCast(route.implementation.table)) }, directRouteSupported) or
@@ -13362,16 +13442,23 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 assigned.slot.writable_bytes != planned.writable_bytes or !assigned.slot.logical.eq(planned.logical)) return error.InvalidPhysicalStorageAuthority;
             try self.validateProjectionOutput(out_tensor, assigned.*);
         }
+        if (cached_gather) |gather| {
+            const assigned = request.assigned_output orelse return error.InvalidPhysicalStorageAuthority;
+            const planned = gather.output;
+            if (assigned.slot.node != planned.node or assigned.slot.epoch != planned.epoch or assigned.slot.allocation != planned.allocation or
+                assigned.slot.writable_bytes != planned.writable_bytes or !assigned.slot.logical.eq(planned.logical)) return error.InvalidPhysicalStorageAuthority;
+            try self.validateProjectionOutput(out_tensor, assigned.*);
+        }
         if (descriptor.operation == .add_mul_scalar or descriptor.operation == .concat or descriptor.operation == .slice or descriptor.operation == .gather or descriptor.operation == .norm or descriptor.operation == .linear or descriptor.operation == .dot or descriptor.operation == .rope or dense_attention) {
-            for (request.inputs) |source| {
-                const tensor = toBuf(source).metal_tensor orelse continue;
+            for (request.inputs, 0..) |source, index| {
+                const tensor = (if (index == 0 and cached_gather != null) cached_gather.?.table else toBuf(source).metal_tensor) orelse continue;
                 if (tensor.deviceHandle() == out_tensor.deviceHandle() and kernel_geometry.byteRangesOverlap(@intCast(tensor.deviceByteOffset()), tensor.deviceByteLen(), @intCast(out_tensor.deviceByteOffset()), out_tensor.deviceByteLen())) return error.InvalidAssignedAlias;
             }
         }
         // Inputs and output are already admitted device views. Borrow them for
         // synchronous encoding instead of retaining/materializing each through
         // the general CT adapters; the command/frame layer retains GPU resources.
-        const input = toBuf(request.inputs[0]).metal_tensor.?;
+        const input = if (cached_gather) |owner| owner.table else toBuf(request.inputs[0]).metal_tensor.?;
         const written: bool = switch (descriptor.operation) {
             .paged_attention => return false,
             .dense_attention_rows, .dense_attention_prefix => blk: {
@@ -56658,6 +56745,87 @@ const PreparedDenseRegionFixture = struct {
 
 test "Metal prepared dense row projections install pair QKV owners and preserve original values lifetimes and failure bounds" {
     try @import("media_residency_test.zig").onMetal(AssignedPackedFixture.populate, PreparedDenseRegionFixture.check);
+}
+
+test "Metal prepared typed gather retains a named cached embedding table" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const Fixture = struct {
+        fn check(cb: ops.ComputeBackend, reference: ops.ComputeBackend) !void {
+            const a = std.testing.allocator;
+            const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+            const source = try cb.getWeight("q");
+            defer cb.free(source);
+            const key = MetalCompute.embeddingTableIdentity(MetalCompute.toBuf(source)) orelse return error.MissingSemanticEmbedding;
+            const runtime = compute.provider_impl.raw_decode_runtime.?;
+            try std.testing.expectEqual(@as(c_int, 0), metal_runtime_mod.termite_metal_decode_runtime_prepare_embedding_table_value(runtime, MetalCompute.toBuf(source).data.ptr, 64, 64, key.value, key.revision));
+
+            var graph = ml.graph.Graph.init(a);
+            defer graph.deinit();
+            var builder = ml.graph.Builder.init(&graph);
+            const table_node = try builder.parameter("q", ml.graph.Shape.init(.f32, &.{ 64, 64 }));
+            const index_shape = ml.graph.Shape.init(.i64, &.{1});
+            const index_node = try builder.parameter("index", index_shape);
+            const output = try builder.gather(table_node, index_node, ml.graph.Shape.init(.f32, &.{ 1, 64 }));
+            try graph.markOutput(output);
+            var analysis = try @import("../graph/interpreter.zig").CachedAnalysis.compute(a, &graph);
+            defer analysis.deinit(a);
+            var layout = try @import("../graph/runtime.zig").PhysicalLayout.create(a, &graph, &.{&cb}, .{}, false);
+            defer layout.deinit();
+            const physical = @import("../execution/physical_buffers.zig");
+            var private: ?*physical.Pool = (try layout.createPool(a, &graph, &.{&cb}, null)) orelse return error.MissingPhysicalPool;
+            defer if (private) |pool| pool.deinit();
+            private.?.coverage_graph = &graph;
+            private.?.coverage_reachable = analysis.reachable;
+            private.?.coverage_backend = cb;
+            private.?.metal_frame_dispatch = true;
+            const selected = (try physical.Pool.preparePrivateDecoderSourcesConsuming(&private, .{ .slice = &.{.{
+                .node_id = table_node,
+                .value = .{ .tensor = .{ .implementation = .{ .context = cb.ptr, .table = cb.vtable }, .value = source } },
+            }} }, .{ .slice = &.{.{
+                .node_id = index_node,
+                .value = .{ .imported_host = .{ .logical = index_shape, .target = .metal, .owned_ingress = true } },
+            }} })) orelse return error.MissingPreparedRoutes;
+            defer selected.release();
+            _ = selected.pool.completeOwnedPayload() orelse return error.MissingOwnedPayloadWitness;
+            const route = selected.pool.preparedKernelRoute(output) orelse return error.MissingPreparedRoutes;
+            try std.testing.expect(route.vtable == &MetalCompute.PreparedCachedGather.vtable);
+
+            var scope = try @import("../execution/backend_operation.zig").enter(cb, &graph, null, .managed);
+            defer scope.deinitChecked() catch unreachable;
+            const cleanup = @import("../execution/cleanup_context.zig").Context{ .operation = scope.token() };
+            const frame = (try selected.pool.acquirePrivateDecoderFrame(null, scope.token())) orelse return error.MissingPhysicalPool;
+            defer _ = frame.finishWithCleanup(cleanup) catch unreachable;
+            try frame.beginWithCleanup(cleanup);
+            try frame.beginProgramPreparation();
+            var index: i64 = 7;
+            const Tensor = @import("../backends/tensor.zig").Tensor;
+            const indices = Tensor{ .allocator = a, .name = "index", .dtype = .i64, .shape = &.{1}, .data = std.mem.asBytes(&index), .owns_data = false, .owns_shape = false };
+            const ingress = [_]@import("../execution/host_ingress.zig").Input{.{ .node_id = index_node, .value = &indices }};
+            const token = scope.token().?;
+            const first = (try frame.bindHostInputsWithOperation(&ingress, null, &token))[0].value;
+            var values: [3]?CT = @splat(null);
+            values[table_node] = source;
+            values[index_node] = first;
+            try frame.prepareProgramViews(&cb, &graph, &values, cleanup);
+            try frame.sealProgramStorage();
+            const ref_table = try reference.getWeight("q");
+            defer reference.free(ref_table);
+            const expected = try reference.toFloat32(ref_table, a);
+            defer a.free(expected);
+            const attention = ops.AttentionContext{ .total_sequence_len = 0, .query_sequence_len = 0, .kv_sequence_len = 0 };
+            for ([_]i64{ 7, 13 }) |row| {
+                index = row;
+                const bound = (try frame.rebindProgramHostInputs(&ingress))[0].value;
+                try std.testing.expectEqual(first, bound);
+                values[index_node] = bound;
+                const result = try frame.executePreparedProgram(&cb, &values, output, null, &attention);
+                const actual = try cb.toFloat32(result, a);
+                defer a.free(actual);
+                try std.testing.expectEqualSlices(f32, expected[@as(usize, @intCast(row)) * 64 ..][0..64], actual);
+            }
+        }
+    };
+    try @import("media_residency_test.zig").onMetal(AssignedPackedFixture.populate, Fixture.check);
 }
 
 test "Metal prepared pair and QKV dispatch mixed bias operands without readback" {
