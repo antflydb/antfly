@@ -52608,7 +52608,8 @@ pub const DB = struct {
         const can_overlap = !req.count_only and req.limit != 0 and
             has_text and has_dense and req.full_text_queries.len <= 1 and
             req.dense_queries.len <= 1 and req.sparse == null and req.sparse_queries.len == 0 and
-            dense_profile_sink == null and req.native_key_predicate == null and req.native_text_tie_rank == null and
+            req.graph_queries.len == 0 and dense_profile_sink == null and
+            req.native_key_predicate == null and req.native_text_tie_rank == null and
             req.text_pattern_programs == null and req.text_pattern_membership == null and
             !requestHasLogicalValues(req) and !openModeRequiresReadOnlyBackends(self.open_mode) and
             db_query_search.resolvedSearchEffort(req.search_effort) < 1 and
