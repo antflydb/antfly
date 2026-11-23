@@ -1391,7 +1391,7 @@ pub const BackendRuntime = struct {
         if (self.borrowed_receivers) |*borrowed| {
             if (borrowed.request_forward == null) return error.BackendRuntimeUnavailable;
         } else if (self.backend == .manual) return error.BackendRuntimeUnavailable;
-        return self.acquireRequestForwardWorkers(threaded_io_limits.request_forward_workers_per_request + 1);
+        return self.acquireRequestForwardWorkers(threaded_io_limits.sql_request_forward_workers_per_request);
     }
 
     pub fn acquireRequestForwardLane(self: *BackendRuntime) !RequestForwardLaneLease {
@@ -3488,7 +3488,7 @@ test "backend runtime forwarding admission includes retiring executor tasks" {
 
     var allocator: PausedAllocator = .{};
     var handle = try BackendRuntimeHandle.init(allocator.allocator(), .{
-        .lane_limits = .{ .request_forward = 6 },
+        .lane_limits = .{ .request_forward = threaded_io_limits.sql_request_forward_workers_per_request },
     });
     defer handle.deinit();
     const runtime = handle.ptr();
@@ -3548,7 +3548,7 @@ test "backend runtime honors reduced per-lane limits under the aggregate ceiling
         .api = 5,
         .raft_inbound = 2,
         .raft_outbound = 2,
-        .request_forward = 6,
+        .request_forward = threaded_io_limits.sql_request_forward_workers_per_request,
         .inference = 4,
         .control = 1,
         .pdf_render = 1,

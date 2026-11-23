@@ -61199,7 +61199,7 @@ fn implementationTests() type {
                 const io = virtual_io.io();
                 var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
                     .backend = .manual,
-                    .lane_limits = .{ .request_forward = @import("antfly_runtime_fs").threaded_io_limits.request_forward_workers_per_request },
+                    .lane_limits = .{ .request_forward = @import("antfly_runtime_fs").threaded_io_limits.sql_request_forward_workers_per_request },
                     .borrowed_io = .{ .general = io, .control = io, .request_forward = io },
                 });
                 defer runtime.deinit();

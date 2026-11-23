@@ -14447,6 +14447,9 @@ pub const ApiHttpServer = struct {
         needs_adoption: bool = false,
     };
 
+    pub const sql_peer_hop_header = "X-Antfly-SQL-Resource-Hop";
+    pub const sql_peer_hop_value = "forwarded";
+
     pub const SessionForwardRequest = struct {
         method: contextual_operations.Method,
         target: []const u8,
@@ -14477,12 +14480,17 @@ pub const ApiHttpServer = struct {
         txn_id: db_mod.types.TxnId,
         request: SessionForwardRequest,
     ) !?contextual_operations.OwnedResponse {
-        var trusted_header_storage: [2]http_common.RequestHeader = undefined;
+        var trusted_header_storage: [3]http_common.RequestHeader = undefined;
         const trusted_headers = sessionForwardHeaders(
             request.trusted_principal,
             request.sql_fence,
-            &trusted_header_storage,
+            trusted_header_storage[0..2],
         );
+        var header_count = trusted_headers.len;
+        if (request.sql != null) {
+            trusted_header_storage[header_count] = .{ .name = sql_peer_hop_header, .value = sql_peer_hop_value };
+            header_count += 1;
+        }
         var response = (try self.forwardSessionRequest(txn_id, .{
             .method = switch (request.method) {
                 .get => .GET,
@@ -14491,7 +14499,7 @@ pub const ApiHttpServer = struct {
                 .delete => .DELETE,
             },
             .uri = request.target,
-            .headers = trusted_headers,
+            .headers = trusted_header_storage[0..header_count],
             .authorization = request.authorization,
             .content_type = request.content_type,
             .body = request.body,
@@ -14536,11 +14544,11 @@ pub const ApiHttpServer = struct {
         const executor = (if (control) |value| value.executor else null) orelse self.cfg.session_executor orelse return error.HttpExecutorUnavailable;
         const base = (try router.nodeBaseUri(self.alloc, owner)) orelse return null;
         defer self.alloc.free(base);
-        for (request.headers) |header| if (std.ascii.eqlIgnoreCase(header.name, "X-Antfly-SQL-Resource-Hop") and std.mem.eql(u8, header.value, "forwarded")) return error.SqlConnectionWrongOwner;
+        for (request.headers) |header| if (std.ascii.eqlIgnoreCase(header.name, sql_peer_hop_header) and std.mem.eql(u8, header.value, sql_peer_hop_value)) return error.SqlConnectionWrongOwner;
         var headers: std.ArrayList(http_common.RequestHeader) = .empty;
         defer headers.deinit(self.alloc);
         try headers.appendSlice(self.alloc, request.headers);
-        try headers.append(self.alloc, .{ .name = "X-Antfly-SQL-Resource-Hop", .value = "forwarded" });
+        try headers.append(self.alloc, .{ .name = sql_peer_hop_header, .value = sql_peer_hop_value });
         const uri = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ base, request.uri });
         defer self.alloc.free(uri);
         var outgoing = request;
@@ -14568,8 +14576,13 @@ pub const ApiHttpServer = struct {
                 outgoing.timeout_ms = budget_ms;
             }
         } else outgoing.timeout_ms = sql_forward_max_timeout_ms;
+        var delivery: http_common.RequestDeliveryTracker = .{};
+        outgoing.delivery_tracker = &delivery;
         forwarded.* = true;
-        var response = try executor.execute(self.alloc, outgoing);
+        var response = executor.execute(self.alloc, outgoing) catch |err| {
+            forwarded.* = delivery.load() != .not_sent;
+            return err;
+        };
         defer response.deinit(self.alloc);
         return try self.cloneForwardedResponse(response);
     }
@@ -64141,7 +64154,7 @@ test "SQL pgwire native HTTP resources forward once with original authority and 
     try std.testing.expectEqualStrings("X-Antfly-SQL-Completion", response.headers[0].name);
     try std.testing.expectEqualStrings("owner-witness", response.headers[0].value);
     var loop = req;
-    loop.headers = &.{.{ .name = "X-Antfly-SQL-Resource-Hop", .value = "forwarded" }};
+    loop.headers = &.{.{ .name = ApiHttpServer.sql_peer_hop_header, .value = ApiHttpServer.sql_peer_hop_value }};
     try std.testing.expectError(error.SqlConnectionWrongOwner, server.forwardSQLResourceOperation(&handle, .connection, loop, &forwarded));
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     var close_request = req;
