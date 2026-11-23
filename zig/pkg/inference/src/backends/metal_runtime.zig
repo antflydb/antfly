@@ -51033,7 +51033,8 @@ pub extern fn antfly_metal_bind_packed_use_service(runtime: ?*RawMetalDecodeRunt
 pub extern fn antfly_metal_unbind_packed_use_service(runtime: ?*RawMetalDecodeRuntime, context: *anyopaque, nonce: u64) c_int;
 pub extern fn antfly_metal_packed_projection_publish(runtime: ?*RawMetalDecodeRuntime, entry: *anyopaque, owner: *anyopaque) c_int;
 pub extern fn antfly_metal_packed_projection_forget(runtime: ?*RawMetalDecodeRuntime, entry: *anyopaque) c_int;
-pub extern fn antfly_metal_projection_pack_begin(runtime: *RawMetalDecodeRuntime) ?*anyopaque;
+pub extern fn antfly_metal_projection_pack_begin(runtime: *RawMetalDecodeRuntime, encoder: *?*anyopaque) ?*anyopaque;
+pub extern fn antfly_metal_projection_pack_end_encoding(encoder: ?*anyopaque) void;
 pub extern fn antfly_metal_projection_pack_finish(recording: *anyopaque) c_int;
 pub extern fn antfly_metal_projection_pack_release(recording: *anyopaque) void;
 pub extern fn antfly_metal_packed_projection_create(runtime: *RawMetalDecodeRuntime, recording: *anyopaque, count: usize, slots: [*]const usize, generations: [*]const u64, declarations: [*]const u64, width: usize, widths: [*]const usize, weight: ?*anyopaque, bias: ?*anyopaque, entry: *?*anyopaque) c_int;

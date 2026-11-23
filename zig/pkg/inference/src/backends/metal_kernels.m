@@ -21243,12 +21243,12 @@ static void antfly_metal_publish_projection_pack(termite_metal_decode_runtime *r
 
 // One packing order serves compatibility caches and independently owned
 // immutable entries: all weight slabs, then all F32 bias slabs.
-static int antfly_metal_encode_projection_pack(
-    termite_metal_decode_runtime *runtime, id<MTLCommandBuffer> command_buffer,
+static int antfly_metal_encode_projection_pack_blit(
+    termite_metal_decode_runtime *runtime, id<MTLBlitCommandEncoder> blit,
     size_t count, const size_t *slots, size_t width, const size_t *widths,
     size_t element_bytes, id<MTLBuffer> packed, id<MTLBuffer> bias
 ) {
-    if (!runtime || command_buffer == nil || !slots || !widths || count < 2 || count > 3 ||
+    if (!runtime || blit == nil || !slots || !widths || count < 2 || count > 3 ||
         (element_bytes != 2 && element_bytes != 4) || !width) return -1;
     size_t weights[3], biases[3], weight_offsets[3], bias_offsets[3];
     size_t weight_bytes = 0, bias_bytes = 0;
@@ -21268,14 +21268,24 @@ static int antfly_metal_encode_projection_pack(
         if (packed == runtime->linear_weight_buffers[slots[i]] || packed == runtime->linear_bias_buffers[slots[i]] ||
             bias == runtime->linear_weight_buffers[slots[i]] || bias == runtime->linear_bias_buffers[slots[i]]) return -1;
     }
-    id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder(command_buffer);
-    if (blit == nil) return -3;
     for (size_t i = 0; i < count; ++i)
         [blit copyFromBuffer:runtime->linear_weight_buffers[slots[i]] sourceOffset:0 toBuffer:packed destinationOffset:weight_offsets[i] size:weights[i]];
     for (size_t i = 0; i < count; ++i)
         [blit copyFromBuffer:runtime->linear_bias_buffers[slots[i]] sourceOffset:0 toBuffer:bias destinationOffset:bias_offsets[i] size:biases[i]];
-    [blit endEncoding];
     return 0;
+}
+
+static int antfly_metal_encode_projection_pack(
+    termite_metal_decode_runtime *runtime, id<MTLCommandBuffer> command_buffer,
+    size_t count, const size_t *slots, size_t width, const size_t *widths,
+    size_t element_bytes, id<MTLBuffer> packed, id<MTLBuffer> bias
+) {
+    if (command_buffer == nil) return -1;
+    id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder(command_buffer);
+    if (blit == nil) return -3;
+    const int status = antfly_metal_encode_projection_pack_blit(runtime, blit, count, slots, width, widths, element_bytes, packed, bias);
+    [blit endEncoding];
+    return status;
 }
 
 typedef struct {
@@ -21407,10 +21417,22 @@ int antfly_metal_packed_projection_is_cached(termite_metal_decode_runtime *runti
 // The caller owns independent funding for BOTH supplied roots. This function
 // never allocates SDK payload. After terminal packing the compatibility cache
 // retains these same funded roots, rather than creating another physical pack.
-void *antfly_metal_projection_pack_begin(termite_metal_decode_runtime *runtime) {
+void *antfly_metal_projection_pack_begin(termite_metal_decode_runtime *runtime, void **encoder) {
+    if (!encoder) return NULL;
+    *encoder = NULL;
     if (!runtime || runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil) return NULL;
     id<MTLCommandBuffer> cb = termite_metal_new_command_buffer(runtime->queue, "prepared_projection_pack");
-    return cb == nil ? NULL : (void *)CFBridgingRetain(cb);
+    if (cb == nil) return NULL;
+    id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder(cb);
+    if (blit == nil) return NULL;
+    *encoder = (void *)CFBridgingRetain(blit);
+    return (void *)CFBridgingRetain(cb);
+}
+
+void antfly_metal_projection_pack_end_encoding(void *encoder) {
+    if (!encoder) return;
+    id<MTLBlitCommandEncoder> blit = CFBridgingRelease(encoder);
+    [blit endEncoding];
 }
 
 int antfly_metal_projection_pack_finish(void *recording) {
@@ -21455,8 +21477,8 @@ int antfly_metal_packed_projection_create(
         }
         if ((count == 2 && widths[0] != widths[1]) || (count == 3 && widths[1] != widths[2]) ||
             !antfly_metal_packed_projection_matches(runtime, entry)) return -1;
-        id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)recording;
-        const int encoded = antfly_metal_encode_projection_pack(runtime, cb, count, slots, width, widths, sizeof(float), (__bridge id<MTLBuffer>)entry->weight, (__bridge id<MTLBuffer>)entry->bias);
+        id<MTLBlitCommandEncoder> blit = (__bridge id<MTLBlitCommandEncoder>)recording;
+        const int encoded = antfly_metal_encode_projection_pack_blit(runtime, blit, count, slots, width, widths, sizeof(float), (__bridge id<MTLBuffer>)entry->weight, (__bridge id<MTLBuffer>)entry->bias);
         if (encoded != 0) return encoded;
         *result = entry;
         entry = NULL;

@@ -13339,8 +13339,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         const cache = self.projectionPackCache();
         var recording: ?*anyopaque = null;
+        var encoder: ?*anyopaque = null;
         defer for (pending) |entry| if (entry.encoded) |encoded| antfly_metal_packed_projection_release_owner(encoded.handle);
         defer if (recording) |command| metal_runtime.antfly_metal_projection_pack_release(command);
+        defer metal_runtime.antfly_metal_projection_pack_end_encoding(encoder);
         for (requests, pending) |request, *entry| {
             const funded = if (entry.funded) |*value| value else continue;
             // Another cold caller can publish while supplier work runs.
@@ -13349,10 +13351,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             cache.mutex.unlock();
             if (exists) continue;
             if (funded.published or funded.data != self.data or funded.provider != self.provider_impl or !std.meta.eql(funded.layout, try request.layout())) return error.PreparedPackedProjectionChanged;
-            if (recording == null) recording = metal_runtime.antfly_metal_projection_pack_begin(raw_runtime) orelse return error.PackedProjectionPreparationFailed;
-            entry.encoded = try metal_runtime.PackedProjectionEntry.encode(raw_runtime, recording.?, request, funded.roots);
+            if (recording == null) recording = metal_runtime.antfly_metal_projection_pack_begin(raw_runtime, &encoder) orelse return error.PackedProjectionPreparationFailed;
+            entry.encoded = try metal_runtime.PackedProjectionEntry.encode(raw_runtime, encoder.?, request, funded.roots);
         }
         const command = recording orelse return;
+        metal_runtime.antfly_metal_projection_pack_end_encoding(encoder);
+        encoder = null;
         if (metal_runtime.antfly_metal_projection_pack_finish(command) != 0) return error.PackedProjectionPreparationFailed;
         for (pending) |*entry| if (entry.encoded) |encoded| {
             try publishFundedProjectionPack(cache, encoded, &entry.funded.?);
