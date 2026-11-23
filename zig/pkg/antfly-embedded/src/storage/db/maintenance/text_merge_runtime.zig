@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const write_stage_profile = @import("../../write_stage_profile.zig");
 const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -612,6 +613,8 @@ const PlatformTextMergeRuntime = struct {
     }
 
     fn runOnceTask(self: *TextMergeRuntime) !bool {
+        const profile_span = write_stage_profile.begin(.merge);
+        defer profile_span.end();
         const previous_runtime = merge_runtime;
         const previous_borrow = merge_borrowed_from;
         merge_runtime = self;

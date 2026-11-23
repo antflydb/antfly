@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const storage_engine = @import("../engine_dispatch.zig").implementation;
+const write_stage_profile = @import("../write_stage_profile.zig");
 const snapshot_staging = @import("snapshot_staging.zig");
 const execution_resources = @import("execution_resources.zig");
 const read_projection = @import("read_projection.zig");
@@ -9267,6 +9268,8 @@ pub const DB = struct {
     /// turning one request into unbounded CPU/provider work.
     pub fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
         if (comptime storage_engine.enabled) return storage_engine.call("batchInternal", .{ self, req, profile, opts });
+        const profile_span = write_stage_profile.begin(.write);
+        defer profile_span.end();
         var committed = false;
         var tracked = opts;
         tracked.primary_committed = opts.primary_committed orelse &committed;

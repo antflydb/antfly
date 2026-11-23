@@ -17,6 +17,7 @@
 //! Receivers borrow local resources; lifetime and scheduling remain with DB.
 
 const DurableReplicationOutboxKind = @import("durable_outbox.zig").Kind;
+const write_stage_profile = @import("../write_stage_profile.zig");
 pub const IndexTargetVisibility = @import("query_visibility.zig").IndexTargetVisibility;
 pub const QueryVisibilityEvent = @import("query_visibility.zig").QueryVisibilityEvent;
 const apply_state = @import("derived/apply_state.zig");
@@ -3671,6 +3672,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         if (worker_applied == 0 or worker_applied + 1 != sequence) continue;
                     }
                     const index_ref: index_manager_mod.ManagedIndexRef = .{ .name = target_name, .kind = .full_text };
+                    const prepare_span = write_stage_profile.begin(.inline_text_prepare);
                     const prepared = prepareInlineTextPublication(
                         S.ownerField(self, "alloc").*,
                         S.ownerField(self, "core").*.store,
@@ -3681,7 +3683,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             (if (runtime.config.enabled) runtime.config.max_pending_segments else 0)
                         else
                             0,
-                    ) catch continue;
+                    ) catch {
+                        prepare_span.end();
+                        continue;
+                    };
+                    prepare_span.end();
                     // Own a copy of the name now: `target_name` aliases
                     // `sync_targets.full_text_indexes`, whose "filter once"
                     // block below frees exactly this entry (it is now
@@ -4405,6 +4411,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             } else blk: {
                 if (durable_replication_batch_outbox_key != null or durable_replication_replay_outbox_key != null)
                     S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.store(true, .release);
+                const stage_span = write_stage_profile.begin(.primary_stage);
                 primary_ticket = try S.ownerField(self, "core").*.store.putBatchWithHistoryTimeStaged(
                     S.ownerField(self, "backend_runtime").*.io(),
                     write_buffers.store_writes.items,
@@ -4417,6 +4424,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     else
                         opts.ordered_history_commit_time_ns,
                 );
+                stage_span.end();
                 schedule_replication_recovery_on_exit = durable_replication_batch_outbox_key != null or durable_replication_replay_outbox_key != null;
                 break :blk transactions_mod.ResolutionOutcome{ .applied = true, .replay_sequence = sequence };
             };
@@ -4563,6 +4571,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // share a group with whatever other writers staged while this
             // one ran its own apply-lock-protected bookkeeping above.
             if (primary_ticket) |ticket| {
+                const ticket_span = write_stage_profile.begin(.ticket_wait);
+                defer ticket_span.end();
                 // Clear before waiting, not after: `wait` must run at most
                 // once. If it fails, the `errdefer` registered above this
                 // would otherwise see `primary_ticket` still set and call
@@ -4626,6 +4636,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // slot out so the top-of-function `defer` no longer aborts
             // it; from here, a later failure in this function must not
             // undo an already-durable, already-installed publication.
+            const install_span = write_stage_profile.begin(.inline_install);
             for (inline_text_publications[0..inline_text_publication_count], 0..) |maybe_prepared, i| {
                 if (maybe_prepared) |prepared| {
                     prepared.install();
@@ -4643,6 +4654,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     }
                 }
             }
+            install_span.end();
             // `install()` above may have just flipped `compaction_pending`
             // on (see `IndexManager.noteInlineTextPublicationSegments`).
             // Wake the merge worker the same way
@@ -4781,7 +4793,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         completion.enrichment_fully_precomputed = enrichment_fully_precomputed;
                         completion.targets = sync_targets;
                         sync_targets = .{};
-                    } else try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation, enrichment_fully_precomputed);
+                    } else {
+                        const sync_span = write_stage_profile.begin(.wait_sync_level);
+                        defer sync_span.end();
+                        try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation, enrichment_fully_precomputed);
+                    }
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
                 }
             } else if (append_derived_replay) {
@@ -4852,7 +4868,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         completion.enrichment_fully_precomputed = enrichment_fully_precomputed;
                         completion.targets = sync_targets;
                         sync_targets = .{};
-                    } else try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation, enrichment_fully_precomputed);
+                    } else {
+                        const sync_span = write_stage_profile.begin(.wait_sync_level);
+                        defer sync_span.end();
+                        try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation, enrichment_fully_precomputed);
+                    }
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
                 }
             }

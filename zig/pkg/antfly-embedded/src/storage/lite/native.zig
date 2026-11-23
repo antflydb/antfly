@@ -19,6 +19,7 @@
 //! format, checkpoint publication, ownership retirement, and physical page reuse.
 
 const std = @import("std");
+const write_stage_profile = @import("../write_stage_profile.zig");
 const builtin = @import("builtin");
 const Crc32 = @import("antfly_hash").Crc32;
 const antfly_platform = @import("antfly_platform");
@@ -23024,7 +23025,13 @@ pub const NativeFile = struct {
                         if (hooks) |h| h.release(h.context);
                         defer if (hooks) |h| h.reacquire(h.context);
                         self.applyTestSyncDelay();
-                        self.syncRedoData() catch |err| break :blk err;
+                        {
+                            const sync_span = write_stage_profile.begin(.redo_sync);
+                            defer sync_span.end();
+                            self.syncRedoData() catch |err| break :blk err;
+                        }
+                        const frontier_span = write_stage_profile.begin(.frontier_sync);
+                        defer frontier_span.end();
                         if (self.header.protected_redo and !self.no_sync) self.persistRedoFrontier(&redo.writer) catch |err| {
                             frontier_failed = true;
                             break :blk err;
@@ -23250,7 +23257,13 @@ pub const NativeFile = struct {
                     if (hooks) |h| h.release(h.context);
                     defer if (hooks) |h| h.reacquire(h.context);
                     self.applyTestSyncDelay();
-                    self.syncRedoData() catch |err| break :blk err;
+                    {
+                        const sync_span = write_stage_profile.begin(.redo_sync);
+                        defer sync_span.end();
+                        self.syncRedoData() catch |err| break :blk err;
+                    }
+                    const frontier_span = write_stage_profile.begin(.frontier_sync);
+                    defer frontier_span.end();
                     if (self.header.protected_redo and !self.no_sync) self.persistRedoFrontier(&redo.writer) catch |err| {
                         frontier_failed = true;
                         break :blk err;

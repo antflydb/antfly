@@ -19,6 +19,7 @@ comptime {
     _ = @import("cypher.zig");
 }
 const handles = @import("handles.zig");
+const write_stage_profile = @import("../storage/write_stage_profile.zig");
 pub const testMaintenanceCaptureAdmission = @import("lite_connection.zig").testMaintenanceCaptureAdmission;
 pub const testPathReplacementAdmission = @import("lite_connection.zig").testPathReplacementAdmission;
 pub const std = handles.std;
@@ -1357,6 +1358,8 @@ fn enterCapturedHandle(entry: HandleEntry, access: HandleAccess, intent: Storage
 }
 
 fn enterCapturedHandleWithDeadline(entry: HandleEntry, access: HandleAccess, intent: StorageIntent, pinned: bool, deadline: ?i96, active_ns: ?*u64) HandleGuard {
+    const profile_span = write_stage_profile.begin(.entry);
+    defer profile_span.end();
     const handle = entry.handle;
     const slot = entry.slot;
     const lock_handle = entry.lock_handle;

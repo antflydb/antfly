@@ -19,6 +19,7 @@
 //! External publications reopen that owner; SQL streams retain their pinned
 //! generations, and sessions and cursor IDs remain connection-local.
 const h = @import("handles.zig");
+const write_stage_profile = @import("../storage/write_stage_profile.zig");
 const api = @import("db.zig");
 const std = h.std;
 const native = h.lite_backend.native;
@@ -2560,6 +2561,8 @@ pub const Owner = struct {
     }
 
     fn refreshImpl(self: *Owner, fast_only: bool) !?*h.Handle {
+        const profile_span = write_stage_profile.begin(.refresh);
+        defer profile_span.end();
         wal_trace.recordOp(.serving_runtime_refresh);
         if (comptime h.builtin.is_test) _ = self.test_refresh_count.fetchAdd(1, .release);
         var known_maintenance: ?*h.Handle = null;
@@ -3349,13 +3352,16 @@ pub const Owner = struct {
         const started = std.Io.Clock.awake.now(io).nanoseconds;
         const default_budget = 5 * std.time.ns_per_s;
         const budget = if (h.builtin.is_test) self.test_maintenance_wait_ns orelse default_budget else default_budget;
+        const lease_span = write_stage_profile.begin(.merge_lease_wait);
         var borrowed = self.writer_lane.borrowLease(self, &self.gate.mutex, started + budget, false, null) catch |err| {
+            lease_span.end();
             if (err == error.FileBusy) {
                 self.publication_stats.maintenance_queue_timeouts +|= 1;
                 stats.recordBusy(@intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
             }
             return err;
         };
+        lease_span.end();
         errdefer borrowed.lease.close();
         stats.recordAcquired(switch (borrowed.source) {
             .handoff => .handoff,

@@ -16,6 +16,7 @@
 //! Runtime document-store adapter over native `.aflite` document pages.
 
 const std = @import("std");
+const write_stage_profile = @import("../write_stage_profile.zig");
 const antfly_platform = @import("antfly_platform");
 const platform_sync = antfly_platform.sync;
 const backend_adapter = @import("../backend_adapter.zig");
@@ -6822,6 +6823,8 @@ pub const Store = struct {
     /// `force_durable` makes this group durable regardless of any member's
     /// own `durable` flag; see `driveMutationCoordinator`.
     fn applyMutationGroup(self: *Store, head: *MutationRequest, force_durable: bool) !void {
+        const profile_span = write_stage_profile.begin(.group_apply);
+        defer profile_span.end();
         // §9.4 (revised, step 4): start the background idle/threshold
         // checkpoint turn (`rideAlongFlushLoop`, extended to also drive
         // `maybeCheckpointRedoLogOnIdleTurn`) the first time this file
