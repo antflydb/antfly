@@ -42,15 +42,22 @@ pub const Pool = struct {
 
     pub const HostReclaimer = struct {
         callback: Reclaimer,
-        bytes: u64,
+        bytes: u64 = 0,
+        measure: ?*const fn (*anyopaque) u64 = null,
     };
 
     /// The callback may shrink existing reservations. Clearing it waits
     /// for any running transaction before the caller retires its context.
     pub fn setReclaimer(self: *Pool, value: ?HostReclaimer) void {
+        _ = self.swapReclaimer(value);
+    }
+
+    pub fn swapReclaimer(self: *Pool, value: ?HostReclaimer) ?HostReclaimer {
         self.lockReclaim();
         defer self.reclaim_lock.unlock();
+        const previous = self.reclaimer;
         self.reclaimer = value;
+        return previous;
     }
 
     fn lockReclaim(self: *Pool) void {
@@ -100,8 +107,9 @@ pub const Pool = struct {
             self.unlock();
             return error.SharedAdmissionExceeded;
         };
+        const reclaimable = if (reclaimer.measure) |measure| measure(reclaimer.callback.context) else reclaimer.bytes;
         if (requested.device_bytes > capacity.device_bytes or requested.commands > capacity.commands or
-            requested.host_bytes -| capacity.host_bytes > reclaimer.bytes)
+            requested.host_bytes -| capacity.host_bytes > reclaimable)
         {
             self.unlock();
             return error.SharedAdmissionExceeded;

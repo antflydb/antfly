@@ -596,6 +596,7 @@ pub const Directory = struct {
 pub const DirectoryBuilder = struct {
     allocator: std.mem.Allocator,
     limits: Webm.Limits,
+    pool: ?*@import("admission.zig").Pool = null,
     track: ?TrackInfo = null,
     packets: std.ArrayList(Packet) = .empty,
     padding: std.ArrayList(BlockPadding) = .empty,
@@ -607,7 +608,10 @@ pub const DirectoryBuilder = struct {
 
     fn tracks(context: *anyopaque, bytes: []const u8) void {
         const self: *DirectoryBuilder = @ptrCast(@alignCast(context));
-        if (self.failure == null) self.collectTracks(bytes) catch |err| self.fail(err);
+        if (self.failure != null) return;
+        const suspended = if (self.pool) |pool| pool.swapReclaimer(null) else null;
+        defer if (self.pool) |pool| pool.setReclaimer(suspended);
+        self.collectTracks(bytes) catch |err| self.fail(err);
     }
 
     fn collectTracks(self: *DirectoryBuilder, bytes: []const u8) !void {
@@ -623,6 +627,8 @@ pub const DirectoryBuilder = struct {
     fn block(context: *anyopaque, input: *Source, elem: Webm.Element, discard: ?Webm.Element, prefix: []const u8, ticks: u64, scale: u64) void {
         const self: *DirectoryBuilder = @ptrCast(@alignCast(context));
         if (self.failure != null) return;
+        const suspended = if (self.pool) |pool| pool.swapReclaimer(null) else null;
+        defer if (self.pool) |pool| pool.setReclaimer(suspended);
         self.collectBlock(input, elem, discard, prefix, ticks, scale) catch |err| self.fail(err);
     }
 

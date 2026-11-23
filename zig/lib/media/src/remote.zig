@@ -98,10 +98,13 @@ pub const ObjectRange = struct {
         self.charged_bytes += out.len;
         const reply = try self.transport.get(self.transport.context, .{ .object = self.object, .version = self.version, .version_kind = self.version_kind, .offset = offset }, out, control);
         self.transferred_bytes += @min(out.len, reply.bytes_written);
-        try control.check();
         if (reply.status != 206 or reply.offset != offset or reply.total_length != self.length or reply.bytes_written > out.len or reply.bytes_written == 0 or reply.range_length != reply.bytes_written) return error.InvalidRemoteRange;
         if (!std.mem.eql(u8, reply.version, self.version)) return error.SourceVersionChanged;
         self.charged_bytes -= out.len - reply.bytes_written;
+        control.check() catch |err| {
+            if (control.failed_prefix) |prefix| prefix.* = reply.bytes_written;
+            return err;
+        };
         return reply.bytes_written;
     }
 };
@@ -840,4 +843,35 @@ test "a later required fetch failure preserves the completed prefix in source ac
     try std.testing.expectEqual(@as(u64, 4), root.total_bytes);
     try std.testing.expectEqual(@as(usize, 0), root.retained_bytes);
     try std.testing.expectEqual(@as(usize, 1), root.reads);
+}
+
+test "object cancellation after validated transfer settles the completed prefix" {
+    const Fake = struct {
+        cancelled: bool = false,
+        fn check(raw: ?*const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            if (self.cancelled) return error.Cancelled;
+        }
+        fn get(raw: *anyopaque, request: Request, out: []u8, _: source.Control) !Response {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memset(out, 1);
+            self.cancelled = true;
+            return .{ .status = 206, .offset = request.offset, .total_length = 8, .bytes_written = out.len, .range_length = out.len, .version = request.version };
+        }
+    };
+    for ([_]bool{ false, true }) |wrapped| {
+        var fake = Fake{};
+        var object = ObjectRange{ .transport = .{ .context = &fake, .get = Fake.get }, .object = "bucket/key", .version = "v1", .length = 8, .version_kind = .s3_version_id };
+        const upstream = try object.range();
+        var cache = ReadAhead{ .allocator = std.testing.allocator, .upstream = upstream, .window_bytes = 4 };
+        defer cache.deinit();
+        var root = source.Source{ .allocator = std.testing.allocator, .identity = "cancelled-object", .storage = .{ .range = if (wrapped) cache.range() else upstream } };
+        var view = root.view(std.testing.allocator, null, .{ .context = &fake, .check_fn = Fake.check });
+        try std.testing.expectError(error.Cancelled, view.readSparse(0, 4));
+        try std.testing.expectEqual(@as(u64, 4), object.transferred_bytes);
+        try std.testing.expectEqual(@as(u64, 4), root.total_bytes);
+        try std.testing.expectEqual(@as(u64, 4), view.total_bytes);
+        try std.testing.expectEqual(@as(usize, 0), root.retained_bytes);
+        if (wrapped) try std.testing.expectEqual(@as(u64, 4), cache.transferred_bytes);
+    }
 }

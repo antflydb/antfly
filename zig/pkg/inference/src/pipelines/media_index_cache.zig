@@ -38,6 +38,9 @@ pub const Cache = struct {
     pub fn acquireBuild(self: *Cache, identity: [32]u8, control: @import("../execution_control.zig").InferenceExecutionControl) !@import("media_speaker_flights.zig").Registry.Lease {
         return self.builds.acquire(std.heap.smp_allocator, identity, control);
     }
+    pub fn tryAcquireBuild(self: *Cache, identity: [32]u8, control: @import("../execution_control.zig").InferenceExecutionControl) !?@import("media_speaker_flights.zig").Registry.Lease {
+        return self.builds.tryAcquire(std.heap.smp_allocator, identity, control);
+    }
     pub const Admission = struct {
         context: *anyopaque,
         acquire: *const fn (*anyopaque, usize) anyerror!@import("../runtime/tier/memory.zig").AdmissionLease,

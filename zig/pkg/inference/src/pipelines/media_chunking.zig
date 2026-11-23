@@ -992,6 +992,13 @@ pub const Runner = struct {
         return false;
     }
 
+    fn reclaimableVideoAudio(raw: *anyopaque) u64 {
+        const builder: *media.webm_audio.DirectoryBuilder = @ptrCast(@alignCast(raw));
+        return builder.packets.capacity * @sizeOf(media.webm_audio.Packet) +
+            builder.padding.capacity * @sizeOf(media.webm_audio.BlockPadding) +
+            (if (builder.track) |track| track.codec_private.len else 0);
+    }
+
     fn reclaimVideoAudio(raw: *anyopaque) bool {
         const builder: *media.webm_audio.DirectoryBuilder = @ptrCast(@alignCast(raw));
         if (builder.failure != null) return false;
@@ -1128,23 +1135,23 @@ pub const Runner = struct {
         if (webm and source.storage == .range and self.pageNeedsAudio()) {
             const audio_key = Cache.audioKey(source, count, self.request.max_working_bytes);
             audio_owner.warm = if (audio_key) |key| if (self.request.index_cache) |cache| cache.get(key) else null else null;
-            if (audio_owner.warm == null and self.request.index_cache_admission != null) if (audio_key) |key| if (self.request.index_cache) |cache| {
-                audio_owner.flight = cache.acquireBuild(key, self.control) catch |err| switch (err) {
-                    error.ResourceTemporarilyUnavailable => null,
-                    else => return err,
-                };
+            var collect_audio = audio_owner.warm == null;
+            if (collect_audio and self.request.index_cache_admission != null) if (audio_key) |key| if (self.request.index_cache) |cache| {
+                audio_owner.flight = try cache.tryAcquireBuild(key, self.control);
+                collect_audio = audio_owner.flight != null;
                 audio_owner.warm = cache.get(key);
                 if (audio_owner.warm != null) {
                     if (audio_owner.flight) |lease| lease.deinit();
                     audio_owner.flight = null;
                 }
             };
-            if (audio_owner.warm == null) {
+            if (audio_owner.warm == null and collect_audio) {
                 var memory = media.admission.TrackedAllocator{ .backing = self.allocator, .reservation = try self.pool.acquire(.{}), .limit = self.request.max_working_bytes };
                 defer memory.reservation.deinit();
                 const read_limit = @min(source.limits.max_read_bytes, source.limits.max_retained_bytes);
                 var builder = media.webm_audio.DirectoryBuilder{
                     .allocator = memory.allocator(),
+                    .pool = &self.pool,
                     .limits = .{ .max_packets = count, .max_metadata_bytes = @min(self.request.max_working_bytes, read_limit), .max_index_bytes = self.request.max_working_bytes, .max_packet_bytes = read_limit },
                 };
                 audio_owner.observed = .{ .builder = &builder, .memory = &memory };
@@ -1152,9 +1159,8 @@ pub const Runner = struct {
                     builder.deinit();
                     audio_owner.observed = null;
                 };
-                const previous_reclaimer = source.reclaimer;
-                source.reclaimer = .{ .context = &builder, .release = reclaimVideoAudio };
-                defer source.reclaimer = previous_reclaimer;
+                self.pool.setReclaimer(.{ .callback = .{ .context = &builder, .release = reclaimVideoAudio }, .measure = reclaimableVideoAudio });
+                defer self.pool.setReclaimer(null);
                 var reader = try media.webm.Reader.initObserved(self.allocator, source, .{ .max_packets = count, .max_index_bytes = self.request.max_working_bytes }, builder.observer());
                 defer reader.deinit();
                 if (builder.failure) |err| {
@@ -1202,11 +1208,6 @@ pub const Runner = struct {
         if (identity) |key| if (self.request.index_cache) |cache| if (self.request.index_cache_admission) |admission| cache.rememberPlanned(std.heap.smp_allocator, key, .{ .webm = reader.* }, admission, .{ .webm = snapshot });
         if (build.*) |lease| lease.deinit();
         build.* = null;
-        const reclaimer = reader.input.reclaimer;
-        reader.input.reclaimer = null;
-        const reclaimable = if (self.video_audio) |owner| if (owner.observed) |observed| observed.memory.live else 0 else 0;
-        self.pool.setReclaimer(if (reclaimer) |callback| .{ .callback = callback, .bytes = reclaimable } else null);
-        defer self.pool.setReclaimer(null);
         try self.webmWindowsSnapshot(reader, &snapshot);
     }
     fn webmWindowsSnapshot(self: *Runner, reader: *media.webm.Reader, snapshot: *const @import("media_index_cache.zig").Cache.WebmSnapshot) !void {
