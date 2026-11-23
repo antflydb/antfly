@@ -13894,7 +13894,7 @@ pub const RawRuntimeMemoryStats = extern struct {
     q4_k_activation_rhs_reduce: u64 = 0,
     florence_q4_k_mm_matrix_dispatches: u64 = 0,
     florence_q4_k_mm_nr4_dispatches: u64 = 0,
-    florence_attention_1x_dispatches: u64 = 0,
+    attention_1x_hd64_dispatches: u64 = 0,
     florence_window_sdpa_dispatches: u64 = 0,
     qwen3vl_vision_flash_q32_dispatches: u64 = 0,
     dense_causal_hd128_dispatches: u64 = 0,
@@ -44880,7 +44880,7 @@ test "metal native decoder runtime florence decode 1x attention matches generic 
     defer specialized.deinit();
     const specialized_values = try specialized.toHostSlice();
     const after = runtimeMemorySnapshot(runtime);
-    try std.testing.expectEqual(before.florence_attention_1x_dispatches + 1, after.florence_attention_1x_dispatches);
+    try std.testing.expectEqual(before.attention_1x_hd64_dispatches + 1, after.attention_1x_hd64_dispatches);
     try std.testing.expectEqual(generic_values.len, specialized_values.len);
     for (generic_values, specialized_values) |expected, actual| {
         try std.testing.expectApproxEqAbs(expected, actual, 1e-4);

@@ -55093,6 +55093,46 @@ test "Metal cross attention with arbitrary key masks keeps activations resident"
     try std.testing.expectEqualSlices(f32, &.{ 3, 4, 3, 4, 0, 0, 0, 0 }, values);
 }
 
+test "Metal short-query cross attention uses tuned kernels with masked keys" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, std.testing.io);
+    defer context.deinit(a);
+    const compute = context.metal_hosted.compute;
+    const cb = compute.ownedComputeBackend();
+    const runtime = compute.provider_impl.raw_decode_runtime;
+    const dim = 64;
+    const q_values: [dim]f32 = @splat(0);
+    const q = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&q_values, &.{ 1, dim }));
+    defer cb.free(q);
+    for ([_]usize{ 63, 512 }) |keys| {
+        const mask = try a.alloc(i64, keys);
+        defer a.free(mask);
+        @memset(mask, 0);
+        mask[1] = 1;
+        mask[keys - 1] = 1;
+        const payload = try a.alloc(f32, keys * dim);
+        defer a.free(payload);
+        @memset(payload, 0);
+        const k = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(payload, &.{ @intCast(keys), dim }));
+        defer cb.free(k);
+        @memset(payload, std.math.nan(f32));
+        @memset(payload[dim..][0..dim], 2);
+        @memset(payload[(keys - 1) * dim ..][0..dim], 4);
+        const v = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(payload, &.{ @intCast(keys), dim }));
+        defer cb.free(v);
+        const before = metal_runtime_mod.runtimeMemorySnapshot(runtime);
+        const output = try cb.crossAttention(q, k, v, mask, 1, 1, keys, 1, dim);
+        defer cb.free(output);
+        const after = metal_runtime_mod.runtimeMemorySnapshot(runtime);
+        try std.testing.expectEqual(before.attention_1x_hd64_dispatches + 1, after.attention_1x_hd64_dispatches);
+        const values = try cb.toFloat32(output, a);
+        defer a.free(values);
+        for (values) |value| try std.testing.expectApproxEqAbs(@as(f32, 3), value, 1e-5);
+    }
+}
+
 test "Metal assigned suffix attention preserves causal positions and sliding window" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;

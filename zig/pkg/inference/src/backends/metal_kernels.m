@@ -2521,7 +2521,7 @@ typedef struct termite_metal_decode_runtime {
     uint8_t florence_q4_k_mm_enabled;
     // Set by Florence's device window pack, then used to scope the cooperative
     // decode-1x cross-attention kernel to Florence runtimes.
-    uint8_t florence_attention_1x_enabled;
+    uint8_t attention_1x_hd64_enabled;
     uint8_t florence_window_sdpa_enabled;
     uint64_t prepared_frame_fast_path_calls;
     uint64_t prepared_frame_fallback_calls;
@@ -2714,7 +2714,7 @@ typedef struct termite_metal_decode_runtime {
     uint64_t q4_k_activation_rhs_reduce;
     uint64_t florence_q4_k_mm_matrix_dispatches;
     uint64_t florence_q4_k_mm_nr4_dispatches;
-    uint64_t florence_attention_1x_dispatches;
+    uint64_t attention_1x_hd64_dispatches;
     uint64_t florence_window_sdpa_dispatches;
     uint64_t qwen3vl_vision_flash_q32_dispatches;
     uint64_t dense_causal_hd128_dispatches;
@@ -3774,7 +3774,7 @@ typedef struct termite_metal_decode_runtime_memory_stats {
     uint64_t q4_k_activation_rhs_reduce;
     uint64_t florence_q4_k_mm_matrix_dispatches;
     uint64_t florence_q4_k_mm_nr4_dispatches;
-    uint64_t florence_attention_1x_dispatches;
+    uint64_t attention_1x_hd64_dispatches;
     uint64_t florence_window_sdpa_dispatches;
     uint64_t qwen3vl_vision_flash_q32_dispatches;
     uint64_t dense_causal_hd128_dispatches;
@@ -16812,6 +16812,7 @@ static NSString *termite_metal_shader_source(void) {
            "    float local_best = neg_inf;\n"
            "    for (uint ki = uint(sgitg); ki < p.kv_len; ki += NSG) {\n"
            "        const uint key_pos = p.kv_position_offset + ki; bool allowed = key_pos <= query_pos; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window;\n"
+           "        if (p.reserved0 != 0u) allowed = mask[b * p.kv_len + ki] != 0u;\n"
            "        float dot = 0.0f; if (allowed) { const uint k_base = kv_batch_base + ki * kv_stride + kv_head_off; dot = q[q_base + uint(lane)] * k[k_base + uint(lane)] + q[q_base + 32u + uint(lane)] * k[k_base + 32u + uint(lane)]; }\n"
            "        dot = simd_sum(dot);\n"
            "        if (lane == 0u) { const float score = allowed ? dot * scale : neg_inf; scores[ki] = score; local_best = max(local_best, score); }\n"
@@ -16825,12 +16826,12 @@ static NSString *termite_metal_shader_source(void) {
            "    const float denom = partials[0] + partials[1]; const float inv_sum = denom > 0.0f ? 1.0f / denom : 0.0f;\n"
            "    for (uint ki = uint(sgitg) * 32u + uint(lane); ki < p.kv_len; ki += NSG * 32u) scores[ki] *= inv_sum; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    const uint d = uint(sgitg) * 32u + uint(lane); float value = 0.0f;\n"
-           "    for (uint ki = 0u; ki < p.kv_len; ++ki) { const uint v_base = kv_batch_base + ki * kv_stride + kv_head_off; value += scores[ki] * v[v_base + d]; }\n"
+           "    for (uint ki = 0u; ki < p.kv_len; ++ki) { if (p.reserved0 != 0u && scores[ki] == 0.0f) continue; const uint v_base = kv_batch_base + ki * kv_stride + kv_head_off; value += scores[ki] * v[v_base + d]; }\n"
            "    output[out_base + d] = value;\n"
            "}\n"
            // tile-codegen:end attention.direct.22 family
            // tile-codegen:begin attention.direct.23 family (do not edit; run: zig build tile-kernel-codegen -- --write)
-           "kernel void termite_attention_f32_decode_1x_hd64_split_stage(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device float *partials [[buffer(3)]], constant termite_metal_attention_f32_params &p [[buffer(4)]], constant uint &chunk [[buffer(5)]], threadgroup float *shmem [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           "kernel void termite_attention_f32_decode_1x_hd64_split_stage(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device float *partials [[buffer(3)]], constant termite_metal_attention_f32_params &p [[buffer(4)]], constant uint &chunk [[buffer(5)]], device const uchar *mask [[buffer(6)]], threadgroup float *shmem [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
            "    const uint NSG = 4u;\n"
            "    const uint h = tg.x; const uint s = tg.y; const uint b = tg.z;\n"
            "    if (h >= p.num_heads || b >= p.batch || p.q_len != 1u || p.head_dim != 64u || chunk == 0u) return;\n"
@@ -16852,6 +16853,7 @@ static NSString *termite_metal_shader_source(void) {
            "    float local_best = neg_inf;\n"
            "    for (uint ki = start + uint(sgitg); ki < end; ki += NSG) {\n"
            "        const uint key_pos = p.kv_position_offset + ki; bool allowed = key_pos <= query_pos; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window;\n"
+           "        if (p.reserved0 != 0u) allowed = mask[b * p.kv_len + ki] != 0u;\n"
            "        float dot = 0.0f; if (allowed) { const uint k_base = kv_batch_base + ki * kv_stride + kv_head_off; dot = q0 * k[k_base + uint(lane)] + q1 * k[k_base + 32u + uint(lane)]; }\n"
            "        dot = simd_sum(dot);\n"
            "        if (lane == 0u) { const float score = allowed ? dot * scale : neg_inf; scores[ki - start] = score; local_best = max(local_best, score); }\n"
@@ -16864,7 +16866,7 @@ static NSString *termite_metal_shader_source(void) {
            "    local_sum = simd_sum(local_sum); if (lane == 0u) part[uint(sgitg)] = local_sum; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    const float denom = part[0] + part[1] + part[2] + part[3];\n"
            "    float value = 0.0f;\n"
-           "    for (uint i = parity; i < count; i += 2u) { const uint v_base = kv_batch_base + (start + i) * kv_stride + kv_head_off; value += scores[i] * v[v_base + d]; }\n"
+           "    for (uint i = parity; i < count; i += 2u) { if (p.reserved0 != 0u && scores[i] == 0.0f) continue; const uint v_base = kv_batch_base + (start + i) * kv_stride + kv_head_off; value += scores[i] * v[v_base + d]; }\n"
            "    if (parity == 1u) acc[d] = value; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    if (parity == 0u) partials[part_base + 2u + d] = value + acc[d];\n"
            "    if (sgitg == 0u && lane == 0u) { partials[part_base] = shared_best; partials[part_base + 1u] = denom; }\n"
@@ -32417,7 +32419,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create_for_quant_form
         // at 1500 keys; the decode kernel does it in well under a
         // millisecond. Enabled for every caller; Florence's own gate below
         // keeps its kill switch.
-        runtime->florence_attention_1x_enabled =
+        runtime->attention_1x_hd64_enabled =
             runtime->attention_f32_decode_1x_hd64_pipeline != nil &&
             !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_ATTENTION_1X"));
         // Split-K form of the same kernel for long K/V: each threadgroup
@@ -36960,6 +36962,18 @@ int antfly_metal_dense_attention_planned(termite_metal_decode_runtime *runtime,
         out, oo, true, workspace, workspace_offset, workspace_bytes);
 }
 
+static void antfly_metal_bind_attention_key_mask(id<MTLComputeCommandEncoder> encoder, NSUInteger slot,
+    id<MTLBuffer> buffer, const uint8_t *bytes, size_t count) {
+    if (buffer != nil) {
+        [encoder setBuffer:buffer offset:0 atIndex:slot];
+    } else if (bytes != NULL) {
+        [encoder setBytes:bytes length:count atIndex:slot];
+    } else {
+        const uint8_t none = 0;
+        [encoder setBytes:&none length:sizeof(none) atIndex:slot];
+    }
+}
+
 static int antfly_metal_apply_attention_f32_device_batched(
     termite_metal_decode_runtime *runtime,
     void *q_handle,
@@ -37027,7 +37041,6 @@ static int antfly_metal_apply_attention_f32_device_batched(
         } else if (key_mask_bytes != 0) return -7;
 
         const float zero_bias = 0.0f;
-        const uint8_t zero_mask = 0;
         termite_metal_attention_f32_params params = {
             .q_len = (uint32_t)q_len,
             .kv_len = (uint32_t)kv_len,
@@ -37056,7 +37069,7 @@ static int antfly_metal_apply_attention_f32_device_batched(
         const BOOL planned_encoder = (encoder != nil);
         if (!planned_encoder) encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION);
         if (encoder == nil) return -9;
-        const BOOL use_decode_1x_hd64 = key_mask == NULL && runtime->florence_attention_1x_enabled != 0 &&
+        const BOOL use_decode_1x_hd64 = runtime->attention_1x_hd64_enabled != 0 &&
             runtime->attention_f32_decode_1x_hd64_pipeline != nil &&
             q_len == 1u && head_dim == 64u && kv_len <= 2048u;
         const size_t split_chunk = 128u;
@@ -37078,8 +37091,8 @@ static int antfly_metal_apply_attention_f32_device_batched(
         // resident K/V: run the split-K single-query kernel once per query
         // row, each with its own partials region. The generic kernel would
         // walk every key serially per query row.
-        const BOOL use_split_multi = key_mask == NULL && !use_decode_1x_hd64 && batch == 1u &&
-            runtime->florence_attention_1x_enabled != 0 && runtime->attention_1x_split_enabled != 0 &&
+        const BOOL use_split_multi = !use_decode_1x_hd64 && batch == 1u &&
+            runtime->attention_1x_hd64_enabled != 0 && runtime->attention_1x_split_enabled != 0 &&
             runtime->attention_f32_decode_1x_hd64_split_stage_pipeline != nil &&
             runtime->attention_f32_decode_1x_hd64_split_reduce_pipeline != nil &&
             q_len > 1u && q_len <= 32u && head_dim == 64u && kv_len >= 256u && kv_len <= 2048u;
@@ -37103,6 +37116,7 @@ static int antfly_metal_apply_attention_f32_device_batched(
                 antfly_metal_set_compute_pipeline(encoder, (runtime->attention_f32_decode_1x_hd64_split_stage_pipeline));
                 termite_metal_bind_four_buffers(encoder, q_buffer, q_offset + qi * row_bytes, k_buffer, k_offset, v_buffer, v_offset, runtime->attention_split_partials_buffer, part_offset, &qparams, sizeof(qparams));
                 [encoder setBytes:&chunk32 length:sizeof(chunk32) atIndex:5];
+                antfly_metal_bind_attention_key_mask(encoder, 6u, key_mask_buffer, key_mask, key_mask_bytes);
                 [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16((split_chunk + 8u + 64u) * sizeof(float)) atIndex:0];
                 antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(num_heads, split_count, 1), MTLSizeMake(128u, 1, 1));
                 [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -37112,7 +37126,7 @@ static int antfly_metal_apply_attention_f32_device_batched(
                 antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(num_heads, 1, 1), MTLSizeMake(64u, 1, 1));
                 if (qi + 1u < q_len) [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             }
-            runtime->florence_attention_1x_dispatches += 1;
+            runtime->attention_1x_hd64_dispatches += 1;
             if (!planned_encoder) [encoder endEncoding];
             if (frame_owned) {
                 antfly_metal_commit(command_buffer);
@@ -37121,13 +37135,14 @@ static int antfly_metal_apply_attention_f32_device_batched(
             }
             return 0;
         }
-        if (use_decode_1x_hd64) runtime->florence_attention_1x_dispatches += 1;
+        if (use_decode_1x_hd64) runtime->attention_1x_hd64_dispatches += 1;
         if (use_split) {
             const uint32_t chunk32 = (uint32_t)split_chunk;
             const uint32_t splits32 = (uint32_t)split_count;
             antfly_metal_set_compute_pipeline(encoder, (runtime->attention_f32_decode_1x_hd64_split_stage_pipeline));
             termite_metal_bind_four_buffers(encoder, q_buffer, q_offset, k_buffer, k_offset, v_buffer, v_offset, runtime->attention_split_partials_buffer, 0, &params, sizeof(params));
             [encoder setBytes:&chunk32 length:sizeof(chunk32) atIndex:5];
+            antfly_metal_bind_attention_key_mask(encoder, 6u, key_mask_buffer, key_mask, key_mask_bytes);
             [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16((split_chunk + 8u + 64u) * sizeof(float)) atIndex:0];
             antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(num_heads, split_count, batch), MTLSizeMake(128u, 1, 1));
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -37148,13 +37163,7 @@ static int antfly_metal_apply_attention_f32_device_batched(
             : runtime->attention_f32_pipeline;
         antfly_metal_set_compute_pipeline(encoder, (pipeline));
         termite_metal_bind_four_buffers(encoder, q_buffer, q_offset, k_buffer, k_offset, v_buffer, v_offset, output_buffer, output_offset, &zero_bias, sizeof(zero_bias));
-        if (key_mask_buffer != nil) {
-            [encoder setBuffer:key_mask_buffer offset:0 atIndex:5];
-        } else if (key_mask != NULL) {
-            [encoder setBytes:key_mask length:key_mask_bytes atIndex:5];
-        } else {
-            [encoder setBytes:&zero_mask length:sizeof(zero_mask) atIndex:5];
-        }
+        antfly_metal_bind_attention_key_mask(encoder, 5u, key_mask_buffer, key_mask, key_mask_bytes);
         [encoder setBytes:&params length:sizeof(params) atIndex:6];
         if (use_decode_1x_hd64) {
             [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16((kv_len + 4u) * sizeof(float)) atIndex:0];
@@ -37278,7 +37287,7 @@ int termite_metal_decode_runtime_florence_window_pack_f32_device(
         if (finish_rc == 0) {
             runtime->florence_q4_k_mm_enabled =
                 !termite_metal_env_flag_enabled(getenv("TERMITE_FLORENCE2_METAL_DISABLE_Q4_K_MM"));
-            runtime->florence_attention_1x_enabled =
+            runtime->attention_1x_hd64_enabled =
                 !termite_metal_env_flag_enabled(getenv("TERMITE_FLORENCE2_METAL_DISABLE_CROSS_ATTN_1X"));
             runtime->florence_window_sdpa_enabled =
                 !termite_metal_env_flag_enabled(getenv("TERMITE_FLORENCE2_METAL_DISABLE_WINDOW_SDPA_1SG"));
@@ -70559,7 +70568,7 @@ int termite_metal_decode_runtime_memory_snapshot(
     snapshot->q4_k_activation_rhs_reduce = runtime->q4_k_activation_rhs_reduce;
     snapshot->florence_q4_k_mm_matrix_dispatches = runtime->florence_q4_k_mm_matrix_dispatches;
     snapshot->florence_q4_k_mm_nr4_dispatches = runtime->florence_q4_k_mm_nr4_dispatches;
-    snapshot->florence_attention_1x_dispatches = runtime->florence_attention_1x_dispatches;
+    snapshot->attention_1x_hd64_dispatches = runtime->attention_1x_hd64_dispatches;
     snapshot->florence_window_sdpa_dispatches = runtime->florence_window_sdpa_dispatches;
     snapshot->qwen3vl_vision_flash_q32_dispatches = runtime->qwen3vl_vision_flash_q32_dispatches;
     snapshot->dense_causal_hd128_dispatches = runtime->dense_causal_hd128_dispatches;
