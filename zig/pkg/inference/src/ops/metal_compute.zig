@@ -23040,9 +23040,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         plan.arena_recipe = recipe;
         // Preserve the previous output-bank eligibility and admission fallback.
         // Optional clamp scratch must not evict an otherwise fitting bank.
-        if (recipe.outputs_bytes <= audio_schedule_bank_limit) {
-            var workspace_bytes = recipe.workspaceBytes(plan.workspaces.len, plan.count, audio_schedule_bank_limit);
-            var bytes = if (workspace_bytes != 0) recipe.total_bytes else recipe.outputs_bytes;
+        if (recipe.initialBank(plan.workspaces.len, plan.count, audio_schedule_bank_limit)) |request| {
+            var workspace_bytes = request.workspace_bytes;
+            var bytes = request.bytes;
             var bank: ?MetalTensor = if (bytes != 0) try self.audioPlanBuffer(plan, bytes, false) else null;
             if (bank == null and workspace_bytes != 0) {
                 workspace_bytes = 0;

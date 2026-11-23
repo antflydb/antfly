@@ -279,6 +279,14 @@ pub const Plan = struct {
             return self.input_workspace_bytes;
         }
 
+        pub const BankRequest = struct { bytes: usize, workspace_bytes: usize };
+
+        pub fn initialBank(self: ArenaLayout, available_views: usize, count: usize, limit: usize) ?BankRequest {
+            if (self.outputs_bytes > limit) return null;
+            const scratch = self.workspaceBytes(available_views, count, limit);
+            return .{ .bytes = if (scratch != 0) self.total_bytes else self.outputs_bytes, .workspace_bytes = scratch };
+        }
+
         pub const View = struct { offset: usize, bytes: usize, shape: [2]i32 };
 
         fn view(offset: usize, bound: usize, rows: usize, width: usize) !View {
@@ -829,6 +837,9 @@ test "audio arena recipe funds one disjoint maximum clipped projection workspace
     try std.testing.expectEqual(@as(usize, 16384), recipe.total_bytes);
     try std.testing.expectEqual(recipe.input_workspace_bytes, recipe.workspaceBytes(nodes.len, nodes.len, 8192));
     try std.testing.expectEqual(@as(usize, 0), recipe.workspaceBytes(nodes.len, nodes.len, 4096));
+    try std.testing.expectEqual(Plan.ArenaLayout.BankRequest{ .bytes = 16384, .workspace_bytes = 8192 }, recipe.initialBank(nodes.len, nodes.len, 8192).?);
+    try std.testing.expectEqual(Plan.ArenaLayout.BankRequest{ .bytes = 8192, .workspace_bytes = 0 }, recipe.initialBank(0, nodes.len, 8192).?);
+    try std.testing.expect(recipe.initialBank(nodes.len, nodes.len, 4096) == null);
     const output = (try recipe.outputView(&nodes[1])).?;
     const combined = (try recipe.workspaceView(&nodes[1], .combined)).?;
     const separate = (try recipe.workspaceView(&nodes[1], .separate)).?;
