@@ -141,6 +141,32 @@ pub fn audioFramePlan(rows: usize, hidden: usize, intermediate: usize) AudioFram
     return if (group == 0) .{} else .{ .layers = group, .in_flight = 2 };
 }
 
+/// Identifies a learned schedule from logical geometry and alias relationships.
+/// Tensor addresses are compared for aliasing and never enter the cache key.
+pub const ScheduleKey = struct {
+    hash: std.hash.Wyhash,
+
+    pub fn init(base: u64, policy: u8, input_count: usize) ScheduleKey {
+        var hash = std.hash.Wyhash.init(base);
+        hash.update(std.mem.asBytes(&policy));
+        hash.update(std.mem.asBytes(&input_count));
+        return .{ .hash = hash };
+    }
+
+    pub fn addInput(self: *ScheduleKey, shape: []const i32, value: CT, prior: []const CT) void {
+        self.hash.update(std.mem.asBytes(&shape.len));
+        self.hash.update(std.mem.sliceAsBytes(shape));
+        for (prior) |previous| {
+            const same = previous == value;
+            self.hash.update(std.mem.asBytes(&same));
+        }
+    }
+
+    pub fn finish(self: *ScheduleKey) u64 {
+        return self.hash.final();
+    }
+};
+
 pub const capacity = 2048;
 pub const instruction_capacity = 1024;
 pub const Constant = struct { id: u16, model: bool, name: [256]u8, len: u16, required: bool = true, bound: ?CT = null };
@@ -154,20 +180,17 @@ pub const Plan = struct {
     eager_ns: u64 = 0,
     replay_ns: u64 = 0,
     selection: Selection = .{},
-    host_bytes: usize = @sizeOf(Plan),
+    storage: @import("prepared_tensor_storage.zig").Storage = .{ .host_bytes = @sizeOf(Plan) },
     metadata_bytes: usize = @sizeOf(Plan),
     metadata_owned: bool = false,
     retry_after: u64 = 0,
     retry_delay: u8 = 1,
-    outputs: []?CT = &.{},
     workspaces: []?CT = &.{},
-    backend_bytes: usize = 0,
     arena: ?CT = null,
     arena_size: usize = 0,
     input_workspace_bytes: usize = 0,
     arena_recipe: ArenaLayout = .{},
     input_workspace_bank: ?CT = null,
-    drop_ct: ?*const fn (CT) void = null,
     prepared: bool = false,
     linear_only: bool = false,
     nodes: []Node = &.{},
@@ -182,20 +205,17 @@ pub const Plan = struct {
         if (self.metadata_owned) {
             std.heap.c_allocator.free(self.nodes);
             std.heap.c_allocator.free(self.constants);
-            std.heap.c_allocator.free(self.outputs);
+            std.heap.c_allocator.free(self.storage.outputs);
             std.heap.c_allocator.free(self.workspaces);
         }
     }
     pub fn dropPrepared(self: *Plan) void {
-        if (self.drop_ct) |drop| {
+        if (self.storage.drop_ct) |drop| {
             for (self.constants[0..self.constant_count]) |*c| if (c.bound) |ct| {
                 drop(ct);
                 c.bound = null;
             };
-            for (self.outputs) |*output| if (output.*) |ct| {
-                drop(ct);
-                output.* = null;
-            };
+            self.storage.deinit();
             for (self.workspaces) |*workspace| if (workspace.*) |ct| {
                 drop(ct);
                 workspace.* = null;
@@ -356,8 +376,8 @@ pub const Plan = struct {
         }
         for (self.nodes[0..self.count], 0..) |*node, i| {
             try cb.checkExecutionControl();
-            const persistent = self.outputs.len > i and self.outputs[i] != null;
-            var hint: ?CT = if (persistent) self.outputs[i] else null;
+            const persistent = self.storage.outputs.len > i and self.storage.outputs[i] != null;
+            var hint: ?CT = if (persistent) self.storage.outputs[i] else null;
             if (!persistent) if (self.arena) |arena| if (try self.arena_recipe.outputView(node)) |region| {
                 if (cb.vtable.audioArenaView) |view| hint = try view(cb.ptr, arena, region.offset, region.bytes, region.shape);
             };
@@ -874,4 +894,32 @@ test "Metal audio frame groups bound two live groups and avoid overflow" {
         if (plan.in_flight == 2) try std.testing.expect(rows * (1024 * 12 + 4096 * 4) * 4 * plan.layers * 2 <= 384 * 1024 * 1024);
     }
     try std.testing.expectEqual(AudioFramePlan{}, audioFramePlan(std.math.maxInt(usize), 1024, 4096));
+}
+
+test "audio schedule keys track geometry and aliasing across different input owners" {
+    const Probe = struct {
+        fn key(inputs: [2]CT, second_shape: []const i32) u64 {
+            var builder = ScheduleKey.init(42, 7, inputs.len);
+            builder.addInput(&.{ 2, 4 }, inputs[0], &.{});
+            builder.addInput(second_shape, inputs[1], inputs[0..1]);
+            return builder.finish();
+        }
+    };
+    const a: CT = @ptrFromInt(16);
+    const b: CT = @ptrFromInt(32);
+    const c: CT = @ptrFromInt(48);
+    const d: CT = @ptrFromInt(64);
+    const baseline = Probe.key(.{ a, b }, &.{ 2, 4 });
+    var previous = std.hash.Wyhash.init(42);
+    previous.update(&.{7});
+    previous.update(std.mem.asBytes(&@as(usize, 2)));
+    for (0..2) |_| {
+        previous.update(std.mem.asBytes(&@as(usize, 2)));
+        previous.update(std.mem.sliceAsBytes(&[_]i32{ 2, 4 }));
+    }
+    previous.update(std.mem.asBytes(&false));
+    try std.testing.expectEqual(previous.final(), baseline);
+    try std.testing.expectEqual(baseline, Probe.key(.{ c, d }, &.{ 2, 4 }));
+    try std.testing.expect(baseline != Probe.key(.{ a, a }, &.{ 2, 4 }));
+    try std.testing.expect(baseline != Probe.key(.{ a, b }, &.{ 4, 2 }));
 }

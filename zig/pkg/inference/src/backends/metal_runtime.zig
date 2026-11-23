@@ -50669,7 +50669,6 @@ pub extern fn antfly_metal_host_input_shared_supported(runtime: ?*RawMetalDecode
 pub extern fn antfly_metal_host_input_allocation_bytes(runtime: ?*RawMetalDecodeRuntime, bytes: usize) usize;
 pub extern fn antfly_metal_buffer_is_shared(handle: ?*anyopaque) bool;
 pub extern fn antfly_metal_physical_allocation_bytes(runtime: ?*RawMetalDecodeRuntime, bytes: usize) usize;
-pub extern fn antfly_metal_audio_buffer_bytes(buffer: ?*anyopaque) usize;
 pub extern fn antfly_metal_norm_residual_weight(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, weight: ?*anyopaque, weight_offset: usize, residual: ?*anyopaque, residual_offset: usize, rows: usize, dim: usize, eps: f32, norm_scale: f32, output_scale: f32, out: ?*anyopaque, out_offset: usize) c_int;
 
 pub fn decoderRuntimeAudioClampInto(self: anytype, input: MetalTensor, output: MetalTensor, flags: u32, lo: f32, hi: f32, silu: bool) bool {

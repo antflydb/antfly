@@ -67,15 +67,11 @@ fn copyImpl(
     defer if (owned_shape_i64) |shape| allocator.free(shape);
     const shape_i64 = owned_shape_i64 orelse known_shape.?;
     if (trace) std.debug.print("graph_executor_transfer_stage: shape_i64={any}\n", .{shape_i64});
-    var inline_dimensions: [ml.graph.shape.max_rank]i32 = undefined;
-    const shape_i32 = try tensorShapeI32(allocator, shape_i64, &inline_dimensions);
-    defer if (shape_i64.len > inline_dimensions.len) allocator.free(shape_i32);
-    if (trace) std.debug.print("graph_executor_transfer_stage: shape_i32={any}\n", .{shape_i32});
     const dtype = if (allow_untyped_float32 and from.vtable.tensorDType == null) .f32 else try from.tensorDType(value);
     switch (dtype) {
         inline .i8, .i16, .i32, .i64, .u8, .bool_, .f16, .bf16, .f64 => |tag| {
             const borrowed: ?[]const u8 = if (comptime build_options.enable_native)
-                @import("../ops/native_compute.zig").borrowDenseIntegerTransferBytes(from, value, dtype, shape_i64)
+                @import("../ops/native_compute.zig").borrowDenseTransferBytes(from, value, dtype, shape_i64)
             else
                 null;
             var owned: ?[]u8 = null;
@@ -96,6 +92,9 @@ fn copyImpl(
             };
             if (try to.fromConstantBytes(bytes, @field(ml.graph.DType, @tagName(tag)), shape_i64)) |exact| return exact;
             if (dtype != .i32 or bytes.len % 4 != 0) return error.UnsupportedTensorType;
+            var inline_dimensions: [ml.graph.shape.max_rank]i32 = undefined;
+            const shape_i32 = try tensorShapeI32(allocator, shape_i64, &inline_dimensions);
+            defer if (shape_i64.len > inline_dimensions.len) allocator.free(shape_i32);
             const integers = try allocator.alloc(i32, bytes.len / 4);
             defer allocator.free(integers);
             for (integers, 0..) |*integer, i| integer.* = std.mem.readInt(i32, bytes[i * 4 ..][0..4], .little);
@@ -103,6 +102,10 @@ fn copyImpl(
         },
         else => {},
     }
+    var inline_dimensions: [ml.graph.shape.max_rank]i32 = undefined;
+    const shape_i32 = try tensorShapeI32(allocator, shape_i64, &inline_dimensions);
+    defer if (shape_i64.len > inline_dimensions.len) allocator.free(shape_i32);
+    if (trace) std.debug.print("graph_executor_transfer_stage: shape_i32={any}\n", .{shape_i32});
     const transferred = try copyFloat32(allocator, value, from, to, shape_i32);
     errdefer to.free(transferred);
     if (trace) std.debug.print("graph_executor_transfer_stage: from_float32_shape_done\n", .{});
@@ -201,4 +204,26 @@ test "exact Native integer transfer borrows bytes without allocating temporary s
     const float_output = try target.toFloat32(float_copy, allocator);
     defer allocator.free(float_output);
     try std.testing.expectEqualSlices(f32, &floats, float_output);
+
+    const reduced_bits: [4]u8 = .{ 0x01, 0x80, 0x55, 0x7e };
+    inline for (.{ .f16, .bf16 }) |dtype| {
+        const reduced_copy = imported: {
+            const reduced = (try source.fromConstantBytes(&reduced_bits, dtype, shape)).?;
+            defer source.free(reduced);
+            break :imported try copyWithKnownShape(failing.allocator(), reduced, &source, &target, shape);
+        };
+        defer target.free(reduced_copy);
+        const reduced_data = (try target.exportTensorData(reduced_copy, allocator)).?;
+        defer allocator.free(reduced_data.payload.bytes);
+        try std.testing.expectEqual(dtype, reduced_data.dtype);
+        try std.testing.expectEqualSlices(u8, &reduced_bits, reduced_data.payload.bytes);
+    }
+    try std.testing.expect(!failing.has_induced_failure);
+
+    const wide_empty_shape = &[_]i64{ 0, 1 << 31 };
+    const empty = (try source.fromConstantBytes(&.{}, .i64, wide_empty_shape)).?;
+    defer source.free(empty);
+    const empty_copy = try copyWithKnownShape(failing.allocator(), empty, &source, &target, wide_empty_shape);
+    defer target.free(empty_copy);
+    try std.testing.expect((try target.tensorShapeMatches(empty_copy, wide_empty_shape)).?);
 }

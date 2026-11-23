@@ -48,6 +48,7 @@ pub const Stats = struct {
     transfers: u64 = 0,
     output_copies: u64 = 0,
     transfer_bytes: u64 = 0,
+    transfer_declines: @import("stats.zig").AssignedTransferDeclines = .{},
     allocations: u64 = 0,
     allocated_bytes: u64 = 0,
     reused_allocations: u64 = 0,
@@ -101,7 +102,9 @@ const ReplayOutput = struct { node: NodeId, allocation: buffers.AllocationId, sh
 const ReplayBindingState = struct { weight: ?CT = null, supplied: bool = false, host_direct: bool = false };
 
 const TransferPlan = struct {
+    source_backend_index: usize,
     shape: ml.graph.Shape,
+    element_count: usize,
     backend_index: usize,
     allocation: buffers.AllocationId,
     usage: storage.Usage = .ordinary,
@@ -309,9 +312,22 @@ pub const Pool = struct {
             const download = edge.target_backend == .native and edge.source_backend != .native;
             const upload = edge.source_backend == .native and (edge.target_backend == .cuda or edge.target_backend == .metal);
             if (!download and !upload) continue;
+            const source_index = for (backends, 0..) |backend, index| {
+                if (backend.kind() == edge.source_backend) break index;
+            } else continue;
+            const source = backends[source_index];
+            if (source.vtable.tensorDType == null or source.vtable.tensorShapeMatches == null) continue;
+            if (download) {
+                const functions = source.vtable.kernels orelse continue;
+                if (functions.readFloat32Into == null) continue;
+            } else if (source.vtable.hostFloat32Read == null) continue;
             const shape = graph.node(edge.source_node).output_shape;
             const elements = shape.numElements() orelse continue;
             if (shape.dtype != .f32 or elements <= 0 or elements > std.math.maxInt(i32)) continue;
+            const element_count: usize = @intCast(elements);
+            const bytes = std.math.mul(usize, element_count, @sizeOf(f32)) catch continue;
+            const allocation = plan.allocationById(edge.allocation) orelse return error.InvalidPhysicalAllocation;
+            if (allocation.kind != .transfer or allocation.backend != edge.target_backend or allocation.byte_size < bytes or edge.byte_size != bytes) return error.InvalidPhysicalAllocation;
             for (backends, 0..) |backend, index| {
                 if (backend.kind() != edge.target_backend) continue;
                 const functions = backend.vtable.kernels orelse continue;
@@ -322,10 +338,10 @@ pub const Pool = struct {
                     if (!functions.accepts(backend.vtable)) continue;
                     const requirements = functions.hostInputRequirements orelse continue;
                     const ingress_plan = (try requirements(backend.ptr, shape)) orelse continue;
-                    if (ingress_plan.bytes != edge.byte_size or ingress_plan.host_bytes != 0 or ingress_plan.host_backing_bytes != 0) continue;
+                    if (ingress_plan.bytes != bytes or ingress_plan.host_bytes != 0 or ingress_plan.host_backing_bytes != 0) continue;
                     break :shared .host_input;
                 } else .ordinary;
-                transfers[edge_index] = .{ .shape = shape, .backend_index = index, .allocation = edge.allocation, .usage = usage };
+                transfers[edge_index] = .{ .source_backend_index = source_index, .shape = shape, .element_count = element_count, .backend_index = index, .allocation = edge.allocation, .usage = usage };
                 count += 1;
                 break;
             }
@@ -3293,37 +3309,41 @@ pub const Frame = struct {
         return (try target.vtable.kernels.?.physicalTensorView.?(target.ptr, .{ .storage = allocation, .shape = shape[0..logical.rank()], .dtype = logical.dtype, .byte_offset = byte_offset })) orelse error.UnsupportedPhysicalTensorView;
     }
 
+    fn declineTransfer(self: *Frame, comptime reason: []const u8) ?CT {
+        @field(self.stats.transfer_declines, reason) +|= 1;
+        return null;
+    }
+
     pub fn transfer(self: *Frame, source: *const ops.ComputeBackend, target: *const ops.ComputeBackend, value: CT, node: NodeId, partition: u32) !?CT {
-        const index = self.pool.plan.transfer_index.get(buffers.transferKey(node, partition)) orelse return null;
-        const binding = self.pool.transfers[index] orelse return null;
+        const index = self.pool.plan.transfer_index.get(buffers.transferKey(node, partition)) orelse return self.declineTransfer("not_assigned");
+        const binding = self.pool.transfers[index] orelse return self.declineTransfer("not_assigned");
         const selected = self.pool.backends[binding.backend_index];
-        if (selected.ptr != target.ptr or selected.vtable != target.vtable) return null;
-        if (source.kind() != self.pool.plan.transfers[index].source_backend) return null;
-        if (source.vtable.tensorDType == null or try source.tensorDType(value) != .f32) return null;
+        if (selected.ptr != target.ptr or selected.vtable != target.vtable) return self.declineTransfer("provider_mismatch");
+        const selected_source = self.pool.backends[binding.source_backend_index];
+        if (selected_source.ptr != source.ptr or selected_source.vtable != source.vtable) return self.declineTransfer("provider_mismatch");
+        if (try source.tensorDType(value) != .f32) return self.declineTransfer("representation");
         const dimensions = binding.shape.dims[0..binding.shape.rank()];
-        if (!(try source.tensorShapeMatches(value, dimensions) orelse false)) return null;
-        const count: usize = @intCast(binding.shape.numElements().?);
+        if (!(try source.tensorShapeMatches(value, dimensions) orelse false)) return self.declineTransfer("representation");
+        const count = binding.element_count;
         const result = if (target.kind() == .cuda or target.kind() == .metal) upload: {
-            const host = (try source.hostFloat32Read(value)) orelse return null;
+            const host = (try source.hostFloat32Read(value)) orelse return self.declineTransfer("representation");
             if (host.len != count) return error.InvalidPhysicalTransferSize;
-            const allocation = (try self.storageForUsage(target, binding.backend_index, binding.allocation, binding.usage)) orelse return null;
+            const allocation = (try self.storageForUsage(target, binding.backend_index, binding.allocation, binding.usage)) orelse return self.declineTransfer("destination_unavailable");
             // A retained view owns the previous payload in this allocation.
             // The ordinary transfer can allocate a separate destination.
-            if (!allocation.unique()) return null;
+            if (!allocation.unique()) return self.declineTransfer("destination_held");
             self.invalidateManagedTerminalEvidence();
             const output = try self.viewForShape(target, allocation, binding.shape);
             errdefer target.free(output);
             try target.vtable.kernels.?.writePhysicalFloat32.?(target.ptr, output, host);
             break :upload output;
         } else download: {
-            const functions = source.vtable.kernels orelse return null;
-            if (functions.readFloat32Into == null) return null;
-            const allocation = (try self.storageFor(target, binding.backend_index, binding.allocation)) orelse return null;
-            if (!allocation.unique()) return null;
-            const host = (try target.hostFloat32Write(allocation.tensor)) orelse return null;
+            const allocation = (try self.storageFor(target, binding.backend_index, binding.allocation)) orelse return self.declineTransfer("destination_unavailable");
+            if (!allocation.unique()) return self.declineTransfer("destination_held");
+            const host = (try target.hostFloat32Write(allocation.tensor)) orelse return self.declineTransfer("destination_unavailable");
             if (host.len < count) return error.InvalidPhysicalTransferSize;
             self.invalidateManagedTerminalEvidence();
-            if (!try source.readFloat32Into(value, host[0..count])) return null;
+            if (!try source.readFloat32Into(value, host[0..count])) return self.declineTransfer("representation");
             break :download try self.viewForShape(target, allocation, binding.shape);
         };
         self.stats.transfers += 1;
@@ -5308,16 +5328,35 @@ test "Native to Metal partition transfer uses its assigned Shared destination" {
     defer pool.deinit();
     const binding = pool.transfers[index] orelse return error.MissingPhysicalTransfer;
     try std.testing.expectEqual(storage.Usage.host_input, binding.usage);
+    const amounts = try pool.storageRequirement();
+    const planned_allocation = pool.plan.allocationById(binding.allocation).?;
+    const shared_bound = try ops.physical_storage.reservationBytes(metal, .{
+        .byte_size = @intCast(planned_allocation.byte_size),
+        .usage = .host_input,
+        .admitted = true,
+    });
+    try std.testing.expectEqual(shared_bound, pool.storage_requirement_bounds[binding.allocation]);
+    try std.testing.expect(amounts.backend_scratch_bytes >= shared_bound);
 
     const frame = try Frame.create(pool);
     defer frame.deinit();
     const values = [_]f32{ -2, 3, -5, 7 };
     const source = try host.fromFloat32Shape(&values, &.{4});
     defer host.free(source);
+    var other_context = try contexts.BackendContext.init(allocator, .native, std.testing.io);
+    defer other_context.deinit(allocator);
+    const other_host = other_context.computeBackend();
+    const other_value = try other_host.fromFloat32Shape(&values, &.{4});
+    defer other_host.free(other_value);
+    try std.testing.expect((try frame.transfer(&other_host, &metal, other_value, boundary, target_partition)) == null);
+    try std.testing.expectEqual(@as(u64, 1), frame.stats.transfer_declines.provider_mismatch);
+    try std.testing.expect(frame.storages[binding.allocation] == null);
+
     const reshaped_source = try host.fromFloat32Shape(&values, &.{ 2, 2 });
     defer host.free(reshaped_source);
     try std.testing.expect((try frame.transfer(&host, &metal, reshaped_source, boundary, target_partition)) == null);
     try std.testing.expect(frame.storages[binding.allocation] == null);
+    try std.testing.expectEqual(@as(u64, 1), frame.stats.transfer_declines.representation);
     var observed = @import("runtime_observation.zig").Scope.init();
     defer observed.deinit();
     const result = (try frame.transfer(&host, &metal, source, boundary, target_partition)) orelse return error.MissingPhysicalTransfer;
@@ -5457,10 +5496,12 @@ fn checkHeldPartitionTransfer(from: *const ops.ComputeBackend, to: *const ops.Co
     defer to.free(unplanned_source);
     try std.testing.expect((try frame.transfer(to, to, unplanned_source, boundary, partition)) == null);
     try std.testing.expectEqual(@as(u64, 0), frame.stats.transfers);
+    try std.testing.expectEqual(@as(u64, 1), frame.stats.transfer_declines.provider_mismatch);
     {
         const held = (try frame.transfer(from, to, first, boundary, partition)) orelse return error.MissingPhysicalTransfer;
         defer to.free(held);
         try std.testing.expect((try frame.transfer(from, to, second, boundary, partition)) == null);
+        try std.testing.expectEqual(@as(u64, 1), frame.stats.transfer_declines.destination_held);
         const observed = try to.toFloat32(held, allocator);
         defer allocator.free(observed);
         try std.testing.expectEqualSlices(f32, &original, observed);

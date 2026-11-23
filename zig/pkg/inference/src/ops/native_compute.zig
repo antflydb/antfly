@@ -39036,8 +39036,8 @@ fn integerTensorCount(tensor: *const tensor_mod.Tensor) !usize {
 fn typedShapeNumel(shape: []const i64) ?usize {
     var count: usize = 1;
     for (shape) |dim| {
-        if (dim < 0) return null;
-        count = std.math.mul(usize, count, @intCast(dim)) catch return null;
+        const extent = std.math.cast(usize, dim) orelse return null;
+        count = std.math.mul(usize, count, extent) catch return null;
     }
     return count;
 }
@@ -40675,11 +40675,7 @@ fn exportDenseTensorBytes(
 }
 
 fn tensorExpectedDenseByteLen(tensor: *const tensor_mod.Tensor) ?usize {
-    var element_count: usize = 1;
-    for (tensor.shape) |dim| {
-        if (dim < 0) return null;
-        element_count = std.math.mul(usize, element_count, @intCast(dim)) catch return null;
-    }
+    const element_count = typedShapeNumel(tensor.shape) orelse return null;
     return tensor.dtype.byteCount(element_count) catch null;
 }
 
@@ -40703,9 +40699,9 @@ fn exportDenseTensorDType(tensor: *const tensor_mod.Tensor) tensor_mod.DType {
     return tensor.dtype;
 }
 
-/// Borrow exact, contiguous integer bytes only for the synchronous transfer.
-pub fn borrowDenseIntegerTransferBytes(backend: *const ComputeBackend, tensor: CT, dtype: tensor_mod.DType, shape: []const i64) ?[]const u8 {
-    if (!isCanonicalVTable(backend.vtable) or (dtype != .i32 and dtype != .i64)) return null;
+/// Borrow exact, contiguous stored bytes only for the synchronous transfer.
+pub fn borrowDenseTransferBytes(backend: *const ComputeBackend, tensor: CT, dtype: tensor_mod.DType, shape: []const i64) ?[]const u8 {
+    if (!isCanonicalVTable(backend.vtable)) return null;
     const buf = toBuf(tensor);
     if (buf.whole_named_weight and weightOrigin(buf) != null) return null;
     if (buf.view_strides != null or buf.view_base_offset != 0 or buf.quantized_storage != null) return null;

@@ -184,6 +184,7 @@ pub const Report = struct {
             if (program.physical_frame_observed) report.assigned_frame_copies = .{
                 .partition_transfers = program.physical_transfer_dispatches,
                 .partition_transfer_bytes = program.physical_transfer_bytes,
+                .partition_transfer_declines = program.physical_transfer_declines,
                 .bound_input_copies = program.physical_input_copies,
                 .bound_input_copy_bytes = program.physical_input_copy_bytes,
             };
@@ -238,6 +239,7 @@ pub const AssignedFrameCopies = struct {
     scope: enum { corresponding_program_physical_frame_publication } = .corresponding_program_physical_frame_publication,
     partition_transfers: u64,
     partition_transfer_bytes: u64,
+    partition_transfer_declines: @import("stats.zig").AssignedTransferDeclines = .{},
     bound_input_copies: u64,
     bound_input_copy_bytes: u64,
 };
@@ -465,12 +467,14 @@ test "program transfers retain audited device copy counts and distinguish unavai
 
     program.physical_transfer_dispatches = 2;
     program.physical_transfer_bytes = 40;
+    program.physical_transfer_declines.destination_held = 1;
     program.physical_input_copies = 1;
     program.physical_input_copy_bytes = 16;
     diagnostics.publish(.{ .execution = program });
     const counts = diagnostics.snapshot().?.report.?.assigned_frame_copies.?;
     try std.testing.expectEqual(@as(u64, 2), counts.partition_transfers);
     try std.testing.expectEqual(@as(u64, 40), counts.partition_transfer_bytes);
+    try std.testing.expectEqual(@as(u64, 1), counts.partition_transfer_declines.destination_held);
     try std.testing.expectEqual(@as(u64, 1), counts.bound_input_copies);
     try std.testing.expectEqual(@as(u64, 16), counts.bound_input_copy_bytes);
 }

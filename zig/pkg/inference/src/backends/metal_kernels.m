@@ -74087,9 +74087,6 @@ void *antfly_metal_standalone_buffer_alloc(void *device_handle, size_t bytes) {
         return buffer ? (__bridge_retained void *)buffer : NULL;
     }
 }
-size_t antfly_metal_audio_buffer_bytes(void *handle) {
-    return handle ? antfly_audio_buffer_charge((__bridge id<MTLBuffer>)handle) : 0;
-}
 int antfly_metal_norm_residual_weight(termite_metal_decode_runtime *r,void *input,size_t io,void *weight,size_t wo,void *residual,size_t ro,size_t rows,size_t dim,float eps,float norm_scale,float output_scale,void *out,size_t oo) {
     if(!r || !r->precise_library_safe || !rows || !dim || rows>UINT32_MAX || dim>UINT32_MAX)return -1;
     size_t bytes;

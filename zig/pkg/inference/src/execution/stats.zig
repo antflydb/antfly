@@ -43,6 +43,19 @@ pub const AssignedRegions = struct {
     covered_callback_nodes: u64,
 };
 
+pub const AssignedTransferDeclines = struct {
+    not_assigned: u64 = 0,
+    provider_mismatch: u64 = 0,
+    representation: u64 = 0,
+    destination_unavailable: u64 = 0,
+    destination_held: u64 = 0,
+
+    pub fn merge(self: *@This(), other: @This()) void {
+        inline for (@typeInfo(@This()).@"struct".fields) |field|
+            @field(self.*, field.name) +|= @field(other, field.name);
+    }
+};
+
 pub const ExecutionStats = struct {
     assigned_regions: ?AssignedRegions = null,
     /// Last successfully finished Frame's cold admission coverage metadata.
@@ -62,6 +75,7 @@ pub const ExecutionStats = struct {
     physical_input_copy_bytes: u64 = 0,
     physical_transfer_dispatches: u64 = 0,
     physical_transfer_bytes: u64 = 0,
+    physical_transfer_declines: AssignedTransferDeclines = .{},
     assigned_kernel_dispatches: u64 = 0,
     physical_storage_allocations: u64 = 0,
     physical_storage_bytes: u64 = 0,

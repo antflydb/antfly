@@ -442,6 +442,7 @@ pub const Runtime = struct {
         stats.assigned_kernel_dispatches += physical.dispatches;
         stats.physical_transfer_dispatches += physical.transfers;
         stats.physical_transfer_bytes += physical.transfer_bytes;
+        stats.physical_transfer_declines.merge(physical.transfer_declines);
         stats.physical_storage_allocations += physical.allocations;
         stats.physical_storage_bytes += physical.allocated_bytes;
         stats.physical_storage_reuses += physical.reused_allocations;

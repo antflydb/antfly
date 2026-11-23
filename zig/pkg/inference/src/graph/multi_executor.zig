@@ -341,13 +341,15 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
                 }
                 const runtime_input = rt_map.contains(ext_in.node_id);
                 if (runtime_input) try owned_runtime_transfers.ensureUnusedCapacity(allocator, 1);
-                var static_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
-                const static_shape = try graphShapeDims(graph.node(ext_in.node_id).output_shape, &static_shape_buf);
                 const planned_transfer = if (options.physical_frame) |frame|
                     try frame.transfer(src_entry.backend, cb, src_val, ext_in.node_id, @intCast(part_idx))
                 else
                     null;
-                const transferred = planned_transfer orelse try tensor_transfer.copyWithKnownShape(allocator, src_val, src_entry.backend, cb, static_shape);
+                const transferred = planned_transfer orelse fallback: {
+                    var static_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
+                    const static_shape = try graphShapeDims(graph.node(ext_in.node_id).output_shape, &static_shape_buf);
+                    break :fallback try tensor_transfer.copyWithKnownShape(allocator, src_val, src_entry.backend, cb, static_shape);
+                };
                 if (collect_stats) exec_stats.cross_device_transfers += 1;
                 if (collect_stats and cb.kind() == .metal and metal_partition_executor.isMetalDeviceResident(cb, transferred)) {
                     exec_stats.device_resident_transfers += 1;

@@ -407,8 +407,7 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
             bytes += entry.owner.host_bytes + entry.owner.backend_bytes;
             entry.owner.deinit();
             if (self.embeddinggemma2_cache_admission) |cache| {
-                cache.noteRelease(.host, entry.owner.host_bytes);
-                cache.noteRelease(.backend, entry.owner.backend_bytes);
+                entry.owner.refundLocked(cache);
             }
             std.heap.c_allocator.destroy(entry);
             slot.* = null;
@@ -421,8 +420,7 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
             bytes += workspace.owner.host_bytes + workspace.owner.backend_bytes;
             workspace.owner.deinit();
             if (self.embeddinggemma2_cache_admission) |cache| {
-                cache.noteRelease(.host, workspace.owner.host_bytes);
-                cache.noteRelease(.backend, workspace.owner.backend_bytes);
+                workspace.owner.refundLocked(cache);
             }
             std.heap.c_allocator.destroy(workspace);
             entry.* = null;
@@ -431,8 +429,7 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
             bytes += coefficients.owner.host_bytes + coefficients.owner.backend_bytes;
             coefficients.owner.deinit();
             if (self.embeddinggemma2_cache_admission) |cache| {
-                cache.noteRelease(.host, coefficients.owner.host_bytes);
-                cache.noteRelease(.backend, coefficients.owner.backend_bytes);
+                coefficients.owner.refundLocked(cache);
             }
             std.heap.c_allocator.destroy(coefficients);
             self.embedding_vision_coefficients = null;
@@ -454,8 +451,7 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
         const bytes = state.owner.host_bytes + state.owner.backend_bytes;
         state.deinit();
         if (self.embeddinggemma2_cache_admission) |cache| {
-            cache.noteRelease(.host, state.owner.host_bytes);
-            cache.noteRelease(.backend, state.owner.backend_bytes);
+            state.owner.refundLocked(cache);
         }
         std.heap.c_allocator.destroy(state);
         self.embedding_bindings = null;
@@ -466,11 +462,10 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     pub fn dropAudioSchedule(self: *MetalNativeProvider, index: usize) usize {
         const entry = &self.audio_schedules[index];
         const plan = entry.* orelse return 0;
-        const bytes = plan.host_bytes + plan.backend_bytes;
+        const bytes = plan.storage.host_bytes + plan.storage.backend_bytes;
         plan.deinit();
         if (self.embeddinggemma2_cache_admission) |cache| {
-            cache.noteRelease(.host, plan.host_bytes);
-            cache.noteRelease(.backend, plan.backend_bytes);
+            plan.storage.refundLocked(cache);
         }
         std.heap.c_allocator.destroy(plan);
         entry.* = null;
