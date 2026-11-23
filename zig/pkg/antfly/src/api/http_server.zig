@@ -40637,7 +40637,10 @@ test "distributed txn public commit preparation signs physical participants and 
                         try std.testing.expectEqualStrings("docs", name);
                         logical.* = "docs";
                     }
-                    return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = 4, .tables = &.{}, .logical_names = resolved }, .{});
+                    const bindings = try alloc.alloc(?system_catalog.ResolvedTable, if (request.include_storage_bindings) resolved.len else 0);
+                    defer alloc.free(bindings);
+                    for (bindings) |*binding| binding.* = .{ .table_id = 7, .name = "docs" };
+                    return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = 4, .tables = &.{}, .logical_names = resolved, .storage_tables = bindings }, .{});
                 },
                 .policy_publication_status => |table_id| {
                     try std.testing.expect(context.row_policy_install_authority);
