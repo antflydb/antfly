@@ -276,8 +276,19 @@ pub const View = struct {
     }
 };
 
+/// Callbacks borrowed by a queued native transaction through ticket
+/// completion. Rejection runs while applying the group, before the next
+/// member can consume any state derived from the rejected member.
+pub const Queued = struct {
+    ptr: *anyopaque,
+    validate: *const fn (*anyopaque) anyerror!void,
+    reject: *const fn (*anyopaque) void,
+    complete: *const fn (*anyopaque, anyerror!u64) void,
+};
+
 pub const Participant = struct {
     ptr: *anyopaque,
+    queued: ?Queued = null,
     /// Fallible accounting covers physical mutations, including stamps staged
     /// by the host and private metadata staged by this participant.
     charge: ?*const fn (*anyopaque, []const u8, ?[]const u8) anyerror!void = null,
@@ -340,11 +351,35 @@ pub const List = struct {
         for (self.items[0..self.len]) |p| try p.stage(p.ptr, view, encoded_position);
     }
 
+    fn validateQueued(ptr: *anyopaque) anyerror!void {
+        const self: *List = @ptrCast(@alignCast(ptr));
+        for (self.items[0..self.len]) |p| if (p.queued) |queued| try queued.validate(queued.ptr);
+    }
+
+    fn rejectQueued(ptr: *anyopaque) void {
+        const self: *List = @ptrCast(@alignCast(ptr));
+        for (self.items[0..self.len]) |p| if (p.queued) |queued| queued.reject(queued.ptr);
+    }
+
+    fn completeQueued(ptr: *anyopaque, outcome: anyerror!u64) void {
+        const self: *List = @ptrCast(@alignCast(ptr));
+        for (self.items[0..self.len]) |p| if (p.queued) |queued| queued.complete(queued.ptr, outcome);
+    }
+
     /// Borrowed only for as long as `self` itself is: the returned
     /// `Participant` keeps a pointer back into `self.items`, exactly like
     /// every other `Participant` implementation in this tree keeps a
     /// pointer back into its own owning value.
     pub fn participant(self: *List) Participant {
+        for (self.items[0..self.len]) |p| {
+            if (p.queued != null) return .{
+                .ptr = self,
+                .reset = reset,
+                .observe = observe,
+                .stage = stage,
+                .queued = .{ .ptr = self, .validate = validateQueued, .reject = rejectQueued, .complete = completeQueued },
+            };
+        }
         return .{ .ptr = self, .reset = reset, .observe = observe, .stage = stage };
     }
 };

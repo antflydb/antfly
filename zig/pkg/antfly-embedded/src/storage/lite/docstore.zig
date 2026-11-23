@@ -7517,6 +7517,7 @@ const PendingMutation = struct {
 };
 
 pub const Txn = struct {
+    queued_participant: ?@import("../commit_participant.zig").Queued = null,
     allocator: Allocator,
     store: ?*Store = null,
     pending: std.ArrayListUnmanaged(PendingMutation) = .empty,
@@ -7784,6 +7785,14 @@ pub const Txn = struct {
         // `Txn.putIndexCatalogBatch`.
         index_catalog_mutations: []const native.CatalogMutation = &.{},
         index_catalog_delete_prefix: ?[]const u8 = null,
+        queued: ?@import("../commit_participant.zig").Queued = null,
+
+        fn complete(ptr: *anyopaque, outcome: anyerror!u64) void {
+            const context: *@This() = @ptrCast(@alignCast(ptr));
+            const queued = context.queued.?;
+            queued.complete(queued.ptr, outcome);
+        }
+
         fn scopeDeleteRedoBytes(ptr: *anyopaque, file: *const native.NativeFile) usize {
             const context: *const @This() = @ptrCast(@alignCast(ptr));
             return file.indexScopeCompanionRedoBytes(context.mutations, context.index_catalog_mutations);
@@ -7791,6 +7800,8 @@ pub const Txn = struct {
 
         fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
             const context: *@This() = @ptrCast(@alignCast(ptr));
+            errdefer if (context.queued) |queued| queued.reject(queued.ptr);
+            if (context.queued) |queued| try queued.validate(queued.ptr);
             try file.putDocumentBatch(context.mutations);
             for (context.index_resolvers) |scoped| try @import("native_catalog_sink.zig").applyResolver(context.allocator, file, scoped.scope, scoped.resolver);
             if (context.index_catalog_mutations.len != 0) try file.putIndexCatalogBatch(context.index_catalog_mutations);
@@ -7891,7 +7902,7 @@ pub const Txn = struct {
         // Metadata probes may use a write transaction without staging changes.
         // Release their admission and snapshot directly: entering publication
         // would unnecessarily run retirement pressure and allocator proof work.
-        if (self.pending_count == 0 and self.index_catalog_pending.items.len == 0 and self.index_catalog_resolvers.items.len == 0 and self.index_catalog_delete_prefix == null) {
+        if (self.pending_count == 0 and self.index_catalog_pending.items.len == 0 and self.index_catalog_resolvers.items.len == 0 and self.index_catalog_delete_prefix == null and self.queued_participant == null) {
             self.abort();
             return .{};
         }
@@ -7931,7 +7942,7 @@ pub const Txn = struct {
         // `StagedCommit.wait()`/`abort()`, both of which run after the
         // group's `apply` callback has already consumed it, mirroring how
         // `mutations` above borrows `self.pending`'s own buffers.
-        context.* = .{ .mutations = mutations, .index_catalog_mutations = self.index_catalog_pending.items, .allocator = allocator, .index_resolvers = self.index_catalog_resolvers.items, .index_catalog_delete_prefix = self.index_catalog_delete_prefix };
+        context.* = .{ .mutations = mutations, .index_catalog_mutations = self.index_catalog_pending.items, .allocator = allocator, .index_resolvers = self.index_catalog_resolvers.items, .index_catalog_delete_prefix = self.index_catalog_delete_prefix, .queued = self.queued_participant };
         errdefer {
             if (self.writer_reserved) {
                 store.releaseWriterSlot();
@@ -7975,6 +7986,7 @@ pub const Txn = struct {
         const plan = Store.MutationPlan{
             .context = context,
             .apply = PrimaryCommitContext.apply,
+            .complete = if (context.queued != null) PrimaryCommitContext.complete else null,
             .estimated_bytes = estimated_bytes,
             .scope_delete_redo_bytes = if (self.index_catalog_delete_prefix != null) PrimaryCommitContext.scopeDeleteRedoBytes else null,
             .scope_delete_prefix = self.index_catalog_delete_prefix,
@@ -8741,6 +8753,11 @@ pub const Txn = struct {
     /// `Sink.submit` normally takes. This is what lets a synchronous
     /// `full_text` write publish its segment/range/active-set records in
     /// the same commit as the documents it indexes.
+    pub fn setQueuedParticipant(self: *Txn, queued: @import("../commit_participant.zig").Queued) !void {
+        if (self.read_only or self.queued_participant != null) return error.InvalidTransactionState;
+        self.queued_participant = queued;
+    }
+
     pub fn putIndexCatalogBatch(self: *Txn, scope: []const u8, mutations: []const @import("../native_catalog_backend.zig").Mutation) !void {
         if (self.read_only) return error.ReadOnly;
         if (mutations.len == 0) return;
@@ -20153,4 +20170,58 @@ test "lite group commit completes members in queue order before tickets resolve"
     try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, &recorder.calls);
     try std.testing.expectEqual(sequence, recorder.sequence);
     try std.testing.expect(recorder.saw_failure);
+}
+
+test "lite group commit rejects primary writes that depend on a rejected member" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "rejected-dependency.aflite");
+    defer alloc.free(path);
+    var store = try Store.create(alloc, path, true);
+    defer store.close();
+
+    const State = struct { rejected: bool = false, completions: usize = 0 };
+    const Member = struct {
+        state: *State,
+        fail: bool,
+
+        fn validate(ptr: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.fail) return error.InjectedMemberFailure;
+            if (self.state.rejected) return error.QueuedDependencyRejected;
+        }
+
+        fn reject(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.state.rejected = true;
+        }
+
+        fn complete(ptr: *anyopaque, outcome: anyerror!u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (outcome) |_| unreachable else |_| self.state.completions += 1;
+        }
+
+        fn participant(self: *@This()) @import("../commit_participant.zig").Queued {
+            return .{ .ptr = self, .validate = validate, .reject = reject, .complete = complete };
+        }
+    };
+    var shared: State = .{};
+    var first: Member = .{ .state = &shared, .fail = true };
+    var second: Member = .{ .state = &shared, .fail = false };
+    var first_txn = try store.beginWrite();
+    try first_txn.put("first", "value");
+    try first_txn.setQueuedParticipant(first.participant());
+    const first_staged = try first_txn.commitStaged();
+    var second_txn = try store.beginWrite();
+    try second_txn.put("second", "value");
+    try second_txn.setQueuedParticipant(second.participant());
+    const second_staged = try second_txn.commitStaged();
+    try std.testing.expectError(error.InjectedMemberFailure, first_staged.wait());
+    try std.testing.expectError(error.QueuedDependencyRejected, second_staged.wait());
+    try std.testing.expectEqual(@as(usize, 2), shared.completions);
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectError(error.NotFound, read.get("first"));
+    try std.testing.expectError(error.NotFound, read.get("second"));
 }

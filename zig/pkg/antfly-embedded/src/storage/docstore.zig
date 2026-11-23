@@ -1335,6 +1335,11 @@ pub const DocStore = struct {
         source_certificate_released: bool = false,
 
         pub fn setCommitParticipant(self: *Batch, participant: @import("commit_participant.zig").Participant) !void {
+            if (participant.queued) |queued| {
+                if (self.runtime) |*runtime| {
+                    try runtime.setQueuedParticipant(queued);
+                } else return error.Unsupported;
+            }
             try self.artifact_inputs.attach(participant);
         }
 
