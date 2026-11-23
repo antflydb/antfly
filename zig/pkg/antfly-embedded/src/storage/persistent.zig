@@ -2212,7 +2212,7 @@ pub const PersistentIndex = struct {
             if (!std.mem.eql(u8, namespace, dead_namespace) and
                 !std.mem.eql(u8, namespace, l0_namespace) and
                 !std.mem.eql(u8, namespace, runtimeNamespace(.segments).name.?) and
-                !(std.mem.eql(u8, namespace, runtimeNamespace(.meta).name.?) and !std.mem.eql(u8, key.key, meta_text_storage_format)))
+                !std.mem.eql(u8, namespace, runtimeNamespace(.meta).name.?))
                 return self.refreshFromTip();
             try keys.append(alloc, key);
         }
@@ -2221,6 +2221,10 @@ pub const PersistentIndex = struct {
         const values = try alloc.alloc(?[]const u8, keys.items.len);
         try backend.loadCommittedValues(alloc, keys.items, values);
         for (keys.items, values) |*key, value| {
+            if (std.mem.eql(u8, key.namespace.?, runtimeNamespace(.meta).name.?) and std.mem.eql(u8, key.key, meta_text_storage_format)) {
+                const bytes = value orelse return error.UnsupportedRefresh;
+                if (bytes.len != 4 or std.mem.readInt(u32, bytes[0..4], .little) != text_storage_format_versions) return error.UnsupportedRefresh;
+            }
             key.is_delete = value == null;
             key.value = value orelse "";
         }
@@ -9481,7 +9485,7 @@ test "persistent index refreshes another writer's segments, rewrites and merges 
     try std.testing.expectEqual(@as(u32, 1), snap.liveDocCount());
 }
 
-test "persistent index applies peer level-0, merge and retirement deltas" {
+test "persistent index applies peer level-0, merge and rebuild deltas" {
     const alloc = std.testing.allocator;
     var sink = InlinePublicationTestSink{ .allocator = alloc };
     defer sink.deinit(alloc);
@@ -9532,6 +9536,7 @@ test "persistent index applies peer level-0, merge and retirement deltas" {
     try sink.foreignDelete(dead_namespace, &dead_key);
     try sink.foreignPut("segments", &merged_key, second);
     try sink.foreignPut("meta", &active_key, "");
+    try sink.foreignPut("meta", meta_next_seg_id, &PersistentIndex.nextSegmentIdValue(merged_id, 1));
     try index.refreshChangedFromTip(&.{
         .{ .namespace = l0_namespace, .key = &old_key },
         .{ .namespace = l0_namespace, .key = &new_key },
@@ -9547,15 +9552,35 @@ test "persistent index applies peer level-0, merge and retirement deltas" {
         try std.testing.expectEqual(@as(u32, 1), snapshot.liveDocCount());
     }
 
-    try sink.foreignDelete("segments", &merged_key);
-    try sink.foreignDelete("meta", &active_key);
-    try sink.foreignDelete(native_catalog_backend.tip_namespace, "doc:a");
+    var peer_path_buf: [256]u8 = undefined;
+    const peer_path = persistTmpPath(&peer_path_buf);
+    defer cleanupPersistDir(peer_path);
+    var peer = try openVersionedTestIndex(alloc, &sink, peer_path);
+    defer peer.close();
+    try peer.resetAllForRebuild();
+    const rebuilt_copy = try buildVersionedSegment(alloc, &.{.{ .doc_id = "doc:b", .term = "rebuilt", .version = try DocVersion.of(3, 0) }});
+    defer alloc.free(rebuilt_copy);
+    try peer.indexSegment(rebuilt_copy);
+    const rebuilt = peer.writer.acquireSnapshot();
+    defer rebuilt.release();
+    try std.testing.expectEqual(@as(usize, 1), rebuilt.segments.len);
+    const rebuilt_id = rebuilt.segments[0].id;
+    try std.testing.expect(rebuilt_id != merged_id);
+    const rebuilt_key = std.mem.toBytes(std.mem.nativeToBig(u64, rebuilt_id));
+    const rebuilt_active = activeSegmentMetaKey(rebuilt_id);
     try index.refreshChangedFromTip(&.{
         .{ .namespace = "segments", .key = &merged_key },
         .{ .namespace = "meta", .key = &active_key },
+        .{ .namespace = "segments", .key = &rebuilt_key },
+        .{ .namespace = "meta", .key = &rebuilt_active },
+        .{ .namespace = "meta", .key = meta_text_storage_format },
+        .{ .namespace = "meta", .key = meta_next_seg_id },
         .{ .namespace = native_catalog_backend.tip_namespace, .key = "doc:a" },
+        .{ .namespace = native_catalog_backend.tip_namespace, .key = "doc:b" },
     });
     const snapshot = index.writer.acquireSnapshot();
     defer snapshot.release();
-    try std.testing.expectEqual(@as(usize, 0), snapshot.segments.len);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.segments.len);
+    try std.testing.expectEqual(rebuilt_id, snapshot.segments[0].id);
+    try std.testing.expectEqual(@as(u32, 1), snapshot.liveDocCount());
 }
