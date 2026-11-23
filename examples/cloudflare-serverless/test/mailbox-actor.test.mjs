@@ -33,6 +33,7 @@ class Store {
       const rows = structuredClone(this.rows),
         result = await fn({
           get: async (k) => structuredClone(rows.get(k)),
+          getMany: async (keys) => keys.map((key) => structuredClone(rows.get(key))),
           put: (k, v) => rows.set(k, structuredClone(v)),
           delete: (k) => rows.delete(k),
           list: async ({ prefix, startAfter = "", limit }) =>
@@ -89,8 +90,13 @@ function engine() {
       }
       if (input.op === "lookup") return docs.has(input.doc_id) ? { body: docs.get(input.doc_id) } : {};
       if (input.op === "publish") return { has_more: false };
-      if (input.op === "search")
-        return { hits: [...docs].filter(([, body]) => body.includes(input.text)).map(([doc_id]) => ({ doc_id })) };
+      if (input.op === "search") {
+        const matches = [...docs].filter(([, body]) => body.includes(input.text));
+        const offset = Number(input.cursor ?? 0);
+        const hits = matches.slice(offset, offset + input.limit).map(([doc_id]) => ({ doc_id }));
+        const next = offset + hits.length;
+        return { hits, cursor: next < matches.length ? String(next) : null };
+      }
       throw Error("unexpected op " + input.op);
     },
   };
@@ -181,12 +187,15 @@ test("a purge that fails part-way is completed by a retry", async () => {
 test("a delete racing an ingest never resurrects the message or orphans objects", async () => {
   const m = mailbox();
   const doomed = await deliver(m, "Racing");
-  // The user deletes while the ingest is about to upsert the search document:
-  // the delete's purge runs first, then the ingest's upsert lands.
+  // The delete marks the receipt immediately and waits for ingest before
+  // performing any irreversible cleanup.
   m.search.hooks.beforeMutate = async (input) => {
     if (input.operation_id !== "mail/ingest/" + doomed) return;
     m.search.hooks.beforeMutate = null;
     await m.actor.delete(m.id, doomed);
+    assert.equal(await m.actor.message(m.id, doomed), null);
+    assert.deepEqual(await m.actor.purge(m.id, doomed), { deferred: true });
+    assert.deepEqual((await m.actor.pending(m.id)).purge, [doomed]);
   };
   const result = await m.actor.ingest(m.id, doomed);
   assert.deepEqual(result, { done: true, purge: true }, "the ingest re-arms the purge");
@@ -238,6 +247,9 @@ test("Trash hides a message from the inbox, search and devices, keeps it openabl
   assert.deepEqual((await m.actor.trashList(m.id)).messages, []);
   const resynced = await m.actor.sync(m.id, afterTrash);
   assert.deepEqual(resynced.messages.map((x) => x.id), [message], "devices fetch and embed it again");
+  const coalesced = await m.actor.sync(m.id, "");
+  assert.deepEqual(coalesced.messages.map((x) => x.id), [keep, message]);
+  assert.deepEqual(coalesced.deleted, [], "the Restore replaces the earlier tombstone");
   // A message restored then trashed again before a device syncs is not re-sent.
   await m.actor.trash(m.id, message);
   const replay = await m.actor.sync(m.id, afterTrash);
@@ -272,4 +284,93 @@ test("retention deletes Trash older than the period forever; Empty Trash deletes
   assert.deepEqual((await m.actor.trashList(m.id)).messages, []);
   assert.equal(await m.actor.message(m.id, recent), null);
   assert.equal(m.search.docs.size, 0, "only the never-indexed delivery remains, unindexed");
+});
+
+test("a restore that commits before the retention transaction preserves the message", async () => {
+  const m = mailbox();
+  const id = await deliver(m, "Restored");
+  await m.actor.ingest(m.id, id);
+  await m.actor.trash(m.id, id);
+  m.clock.now += 31 * DAY_MS;
+  assert.deepEqual(await m.actor.trashBin.expired(), [id]);
+  await m.actor.restore(m.id, id);
+  assert.deepEqual(await m.actor.expire(m.id), { deleted: 0, done: true });
+  assert.ok(await m.actor.message(m.id, id));
+  await m.actor.trash(m.id, id);
+  assert.deepEqual(await m.actor.expire(m.id), { deleted: 0, done: true });
+  assert.ok(await m.actor.message(m.id, id));
+});
+
+test("an older purge cannot clear a re-armed generation", async () => {
+  const m = mailbox();
+  const id = await deliver(m, "In flight");
+  await m.actor.ingest(m.id, id);
+  const remove = m.objects.delete;
+  m.objects.delete = async (keys) => {
+    await m.store.transaction((tx) => m.actor.deletion.requirePurge(tx, id));
+    return remove(keys);
+  };
+  await m.actor.delete(m.id, id);
+  assert.deepEqual((await m.actor.pending(m.id)).purge, [id]);
+  m.objects.delete = remove;
+  await m.actor.purge(m.id, id);
+  assert.deepEqual((await m.actor.pending(m.id)).purge, []);
+});
+
+test("purge owns attachment bytes even when ingest fails partway through its writes", async () => {
+  const m = mailbox();
+  const id = await deliver(m, "Interrupted");
+  const put = m.objects.put;
+  m.objects.put = async (key, ...args) => {
+    const result = await put(key, ...args);
+    if (key.startsWith(m.prefix + "attachments/")) {
+      await m.actor.delete(m.id, id);
+      throw Error("Put response lost");
+    }
+    return result;
+  };
+  await assert.rejects(m.actor.ingest(m.id, id), /Put response lost/);
+  assert.deepEqual((await m.actor.pending(m.id)).purge, [id]);
+  assert.equal(keysOf(m, id).length, 2);
+  await m.actor.purge(m.id, id);
+  assert.deepEqual(keysOf(m, id), []);
+  assert.deepEqual((await m.actor.pending(m.id)).purge, []);
+});
+
+test("search fills its ranked result page past an entire page of Trash", async () => {
+  const m = mailbox();
+  const matches = [];
+  for (let i = 0; i < 33; i++) {
+    const id = await deliver(m, "Trash match " + i);
+    await m.actor.ingest(m.id, id);
+    await m.actor.trash(m.id, id);
+  }
+  for (let i = 0; i < 11; i++) {
+    const id = await deliver(m, "Inbox match " + i);
+    await m.actor.ingest(m.id, id);
+    matches.push(id);
+  }
+  assert.deepEqual((await m.actor.search(m.id, "needleword")).messages.map((message) => message.id), matches.slice(0, 10));
+});
+
+test("Empty Trash resumes after a failed purge and keeps later Trash entries", async () => {
+  const m = mailbox();
+  const ids = [];
+  for (let i = 0; i < 27; i++) {
+    const id = await deliver(m, "Original Trash " + i);
+    await m.actor.ingest(m.id, id);
+    if (i < 26) await m.actor.trash(m.id, id);
+    ids.push(id);
+  }
+  const remove = m.objects.delete;
+  m.objects.delete = async () => { throw Error("R2 unavailable"); };
+  await assert.rejects(m.actor.emptyTrash(m.id), /R2 unavailable/);
+  assert.equal((await m.actor.pending(m.id)).empty, true);
+  m.objects.delete = remove;
+  m.clock.now++;
+  const later = ids.at(-1);
+  await m.actor.trash(m.id, later);
+  assert.deepEqual(await m.actor.emptyTrash(m.id, { continuation: true }), { deleted: 1, done: true });
+  assert.deepEqual((await m.actor.trashList(m.id)).messages.map((message) => message.id), [later]);
+  assert.equal((await m.actor.pending(m.id)).empty, undefined);
 });

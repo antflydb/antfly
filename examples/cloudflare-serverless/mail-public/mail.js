@@ -163,8 +163,8 @@ async function openMessage(id) {
   try {
     message = await api("/mail/messages/" + encodeURIComponent(id));
   } catch (error) {
-    // Offline: read the on-device copy when there is one.
-    message = local ? await local.message(id) : null;
+    // Fall back only when the server could not be reached.
+    message = error instanceof TypeError && local ? await local.message(id) : null;
     if (!message) throw error;
     message.offline = true;
   }
@@ -399,14 +399,17 @@ function startLocal(confirmDownload) {
   return localOpening;
 }
 async function syncLocal() {
-  if (!local) return;
+  const index = local;
+  if (!index) return;
   localStatus("Indexing new messages on this device…", {});
-  const state = await local.sync({
+  const state = await index.sync({
     onStatus: (s) => {
-      if (s.stage === "synced") localReady(local.state);
+      if (local !== index) return;
+      if (s.stage === "synced") localReady(index.state);
       localStatus("Indexing new messages on this device… " + (s.loaded ?? 0) + " so far", {});
     },
   });
+  if (local !== index) return;
   localReady(state);
   localStatus("Up to date. " + megabytes(state.bytes ?? 0) + " stored on this device.");
 }

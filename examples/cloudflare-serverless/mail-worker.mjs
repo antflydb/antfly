@@ -192,7 +192,7 @@ export default {
       // DELETE is "delete forever" (from Trash or directly), like Gmail's API.
       if (match && !match[2] && request.method === "DELETE") {
         const result = await takeRpcData(stub.delete(mailbox.id, match[1]));
-        // The purge ran inline; a hint covers a failure part-way through it.
+        // The durable purge may still be waiting for in-flight ingest.
         await hint(env, mailbox.id, "purge", match[1]);
         return reply(result);
       }
@@ -273,10 +273,8 @@ export default {
       message.setReject("Message too large");
       return;
     }
-    // Each SMTP invocation receives a receipt. Content hashes deduplicate bytes,
-    // never distinct deliveries; a repeated Message-ID cannot erase a message.
-    // Raw MIME is stored per delivery (not by content hash) so that deleting
-    // one message can remove its bytes without affecting identical deliveries.
+    // Raw MIME is owned by one receipt, even for identical deliveries.
+    // A content digest checks integrity, and Message-ID is used for threading.
     const raw = await boundedBytes(message.raw),
       checksum = await digest(raw),
       id = crypto.randomUUID(),
@@ -311,8 +309,12 @@ export default {
                   : body.kind === "expire"
                     ? await takeRpcData(stub.expire(body.mailbox))
                     : body.kind === "empty"
-                      ? await takeRpcData(stub.emptyTrash(body.mailbox))
+                      ? await takeRpcData(stub.emptyTrash(body.mailbox, { continuation: true }))
                       : await takeRpcData(stub.publish(body.mailbox));
+        if (result.deferred) {
+          message.retry({ delaySeconds: 60 });
+          continue;
+        }
         if (result.purge) await hint(env, body.mailbox, "purge", body.id);
         // Bounded Trash work continues as its own kind; publishing as publish.
         if (result.done === false)
@@ -333,6 +335,7 @@ export default {
         for (const id of pending.purge ?? []) await hint(env, mailbox, "purge", id);
         // Retention: Trash older than MAIL_TRASH_DAYS (default 30) is deleted forever.
         if (pending.expire) await hint(env, mailbox, "expire");
+        if (pending.empty) await hint(env, mailbox, "empty");
         if (pending.publish) await hint(env, mailbox, "publish");
       } catch (error) {
         failures.push(error);

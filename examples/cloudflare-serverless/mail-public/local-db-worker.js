@@ -57,10 +57,13 @@ function close() {
     /* The instance is discarded either way. */
   }
   // Releasing the handles lets another tab (or a later open) take the pool.
-  pool?.close();
-  api = null;
-  pool = null;
-  mailbox = null;
+  try {
+    pool?.close();
+  } finally {
+    api = null;
+    pool = null;
+    mailbox = null;
+  }
 }
 
 // Database calls are synchronous and can create many files; keep the OPFS

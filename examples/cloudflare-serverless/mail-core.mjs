@@ -345,14 +345,17 @@ export class MailSyncLog {
         startAfter: after ? this.entryKey(after) : "",
         limit,
       });
-      const ids = [];
-      const deleted = [];
+      const latest = new Map();
       let last = after;
       for (const [key, entry] of page) {
-        if (typeof entry === "string") ids.push(entry);
-        else if (entry?.deleted && uuid(entry.id)) deleted.push(entry.id);
+        const id = typeof entry === "string" ? entry : entry.id;
+        latest.delete(id);
+        latest.set(id, typeof entry !== "string");
         last = Number(key.slice(this.prefix.length + 4));
       }
+      const ids = [];
+      const deleted = [];
+      for (const [id, isDeleted] of latest) (isDeleted ? deleted : ids).push(id);
       return { ids, deleted, cursor: String(last), head, more: last < head };
     });
   }
@@ -452,12 +455,6 @@ export class MailTrash {
       return true;
     });
   }
-  /** Trashed-at time, or null if the message is not in Trash. */
-  async trashedAt(id) {
-    if (!uuid(id)) return null;
-    const receipt = await this.store.transaction((tx) => tx.get(this.receiptKey(id)));
-    return receipt?.state !== "deleted" && Number.isFinite(receipt?.trashed_at) ? receipt.trashed_at : null;
-  }
   expiresAt(trashedAt) {
     return trashedAt + this.retentionMs;
   }
@@ -479,12 +476,6 @@ export class MailTrash {
       return [...page].filter(([key]) => Number(key.split("/")[3]) <= cutoff).map(([, id]) => id);
     });
   }
-  /** Any trashed ids (oldest first), for emptying Trash in bounded steps. */
-  async all(limit = 25) {
-    return this.store.transaction(async (tx) => [
-      ...(await tx.list({ prefix: this.prefix + "trash-expiry/", limit })).values(),
-    ]);
-  }
 }
 
 // Deleting a message is a transactional mark followed by an idempotent purge.
@@ -503,25 +494,52 @@ export class MailDeletion {
     if (!uuid(id)) throw Error("InvalidMessageIdentity");
     return this.prefix + "receipt/" + id;
   }
-  /** Returns the receipt (with object keys) to purge, or null if already deleted. */
+  async markReceipt(tx, receipt) {
+    const { id } = receipt;
+    if (Number.isFinite(receipt.received_at)) await tx.delete(orderKey(receipt));
+    if (Number.isFinite(receipt.trashed_at)) for (const key of trashKeys(receipt)) await tx.delete(key);
+    await tx.delete(this.prefix + "pending/" + id);
+    await tx.put(this.receiptKey(id), { ...receipt, state: "deleted", deleted_at: this.clock() });
+    await tx.put(this.prefix + "purge/" + id, id);
+    await this.syncLog.recordDelete(tx, id);
+  }
+  /** Mark a message and return whether it needs purging. */
   async mark(id) {
     return this.store.transaction(async (tx) => {
       const receipt = await tx.get(this.receiptKey(id));
       if (!receipt) throw Error("UnknownMessage");
-      if (receipt.state === "deleted") return null;
-      if (Number.isFinite(receipt.received_at)) await tx.delete(orderKey(receipt));
-      if (Number.isFinite(receipt.trashed_at)) for (const key of trashKeys(receipt)) await tx.delete(key);
-      await tx.delete(this.prefix + "pending/" + id);
-      await tx.put(this.receiptKey(id), { ...receipt, state: "deleted", deleted_at: this.clock() });
-      await tx.put(this.prefix + "purge/" + id, id);
-      await this.syncLog.recordDelete(tx, id);
-      return receipt;
+      if (receipt.state === "deleted") return !!(await tx.get(this.prefix + "purge/" + id));
+      await this.markReceipt(tx, receipt);
+      return true;
     });
   }
-  async isDeleted(id) {
-    if (!uuid(id)) return true;
-    const receipt = await this.store.transaction((tx) => tx.get(this.receiptKey(id)));
-    return receipt?.state === "deleted";
+  /** Select and mark one batch under the same transaction as Restore. */
+  async markTrash(limit, cutoff, empty = false) {
+    return this.store.transaction(async (tx) => {
+      const job = this.prefix + "empty-trash";
+      const before = cutoff ?? (empty ? await tx.get(job) : null);
+      if (before == null) return { ids: [], done: true };
+      const page = await tx.list({ prefix: this.prefix + "trash-expiry/", limit });
+      const candidates = await tx.getMany([...page.values()].map((id) => this.receiptKey(id)));
+      const ids = [];
+      for (const receipt of candidates) {
+        if (receipt?.state !== "indexed" || !Number.isFinite(receipt.trashed_at)) continue;
+        if (receipt.trashed_at > before) break;
+        await this.markReceipt(tx, receipt);
+        ids.push(receipt.id);
+      }
+      const done = ids.length < limit;
+      if (empty) {
+        // Persist the original cutoff across continuations. A later request
+        // can explicitly extend it to include items trashed in the meantime.
+        if (done) await tx.delete(job);
+        else await tx.put(job, before);
+      }
+      return { ids, done };
+    });
+  }
+  async emptyTrashPending() {
+    return this.store.transaction(async (tx) => (await tx.get(this.prefix + "empty-trash")) != null);
   }
   /** Receipt still holding object keys, while its purge is outstanding. */
   async purging(id) {
@@ -546,17 +564,18 @@ export class MailDeletion {
     ]);
   }
   /** Drop the marker and keep only a small tombstone receipt. */
-  async finish(id) {
+  async finish(id, attempt) {
     return this.store.transaction(async (tx) => {
       const receipt = await tx.get(this.receiptKey(id));
+      if (!receipt || (receipt.purge_attempt ?? 0) !== attempt) return false;
       await tx.delete(this.prefix + "purge/" + id);
-      if (receipt)
-        await tx.put(this.receiptKey(id), {
-          id,
-          state: "deleted",
-          deleted_at: receipt.deleted_at,
-          purge_attempt: receipt.purge_attempt ?? 0,
-        });
+      await tx.put(this.receiptKey(id), {
+        id,
+        state: "deleted",
+        deleted_at: receipt.deleted_at,
+        purge_attempt: attempt,
+      });
+      return true;
     });
   }
 }

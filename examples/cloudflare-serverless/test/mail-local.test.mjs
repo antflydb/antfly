@@ -125,11 +125,10 @@ test("deletion hides a message at once, tombstones it for replicas and purges wh
   assert.deepEqual(before.ids, [id, other]);
 
   const marked = await deletion.mark(id);
-  assert.equal(marked.key, receipt.key, "mark returns the receipt to purge");
-  assert.equal(await deletion.isDeleted(id), true);
-  assert.equal(await deletion.isDeleted(other), false);
+  assert.equal(marked, true, "mark schedules the purge");
+  assert.equal((await store.transaction((tx) => tx.get("mail/v1/receipt/" + id))).state, "deleted");
   assert.equal(await store.transaction((tx) => tx.get(order)), undefined, "gone from the listing at once");
-  assert.equal(await deletion.mark(id), null, "deleting twice is a no-op");
+  assert.equal(await deletion.mark(id), true, "a repeated delete can retry a pending purge");
   await assert.rejects(deletion.mark(crypto.randomUUID()), /UnknownMessage/);
 
   // Replicas get exactly one tombstone after the earlier upsert entries.
@@ -147,7 +146,8 @@ test("deletion hides a message at once, tombstones it for replicas and purges wh
   assert.deepEqual(ownedObjects("mail/other/", receipt), [], "never another mailbox's objects");
   assert.deepEqual(await deletion.pending(), [id]);
 
-  await deletion.finish(id);
+  assert.equal(await deletion.finish(id, 0), true);
+  assert.equal(await deletion.mark(id), false, "deleting after the purge is a no-op");
   assert.equal(await deletion.purging(id), null);
   assert.deepEqual(await deletion.pending(), []);
   const tombstone = await store.transaction((tx) => tx.get("mail/v1/receipt/" + id));
@@ -157,7 +157,10 @@ test("deletion hides a message at once, tombstones it for replicas and purges wh
   // attempt number, since purge mutations are idempotent by operation id.
   await store.transaction((tx) => deletion.requirePurge(tx, id));
   assert.equal((await deletion.purging(id)).purge_attempt, 1);
-  await deletion.finish(id);
+  assert.equal(await deletion.finish(id, 0), false);
+  assert.deepEqual(await deletion.pending(), [id]);
+  assert.equal(await deletion.finish(id, 1), true);
+  assert.equal(await deletion.mark(id), false, "deleting after the purge is a no-op");
   await store.transaction((tx) => deletion.requirePurge(tx, id));
   assert.equal((await deletion.purging(id)).purge_attempt, 2, "attempts never repeat");
 });
@@ -831,4 +834,40 @@ test("Delete moves to Trash with Undo; Trash offers Restore, Delete forever and 
   } finally {
     window.close();
   }
+});
+
+test("a sync page already being embedded cannot reinsert a locally forgotten message", async (t) => {
+  const source = await readFile(new URL("../mail-public/local-index.js", import.meta.url), "utf8");
+  const schema = new URL("../mail-public/local-schema.js", import.meta.url);
+  const url = "data:text/javascript;base64," + Buffer.from(source.replace('"/local-schema.js"', JSON.stringify(schema.href))).toString("base64");
+  const { LocalMailIndex } = await import(url);
+  const id = crypto.randomUUID();
+  const embedding = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  let requests = 0;
+  t.mock.method(globalThis, "fetch", async () => Response.json(++requests === 1
+    ? { messages: [{ id, subject: "Stale", text: "Body" }], cursor: "1", more: false }
+    : { messages: [], deleted: [id], cursor: "2", more: false }));
+  const calls = [];
+  const index = new LocalMailIndex(id, {
+    async embed() {
+      embedding.resolve();
+      await release.promise;
+      return { value: { embeddings: [[0]] } };
+    },
+  }, {
+    async call(op, args) {
+      calls.push([op, args]);
+      return { cursor: op === "apply" ? args.cursor : "", messages: 0 };
+    },
+  }, { embedding: { dimensions: 1, max_tokens: 64 } }, { cursor: "", messages: 0 }, {});
+  const syncing = index.sync();
+  await embedding.promise;
+  await index.forget([id]);
+  release.resolve();
+  assert.equal((await syncing).cursor, "2");
+  assert.deepEqual(calls, [
+    ["forget", { ids: [id] }],
+    ["apply", { messages: [], vectors: [], deleted: [id], cursor: "2" }],
+  ]);
 });

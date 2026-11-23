@@ -183,6 +183,8 @@ export class LocalMailIndex {
     // The inference runtime runs one operation at a time: sync and search share it.
     this.queue = Promise.resolve();
     this.syncing = null;
+    this.forgetEpoch = 0;
+    this.forgetting = Promise.resolve();
   }
 
   serial(fn) {
@@ -208,13 +210,16 @@ export class LocalMailIndex {
         let more = true;
         let rebuilt = false;
         while (more) {
+          await this.forgetting;
           signal?.throwIfAborted();
+          const epoch = this.forgetEpoch;
           const response = await fetch("/mail/sync?cursor=" + encodeURIComponent(this.state.cursor ?? ""), {
             signal,
           });
           if (response.status === 401) throw Error("Sign in again to continue syncing");
           if (!response.ok) throw Error("Sync is temporarily unavailable");
           const page = await response.json();
+          if (epoch !== this.forgetEpoch) continue;
           if (page.reset) {
             onStatus({ stage: "reset" });
             this.state = await this.database.call("reset");
@@ -233,8 +238,13 @@ export class LocalMailIndex {
                 )
               ))
             );
+            if (epoch !== this.forgetEpoch) break;
             onStatus({ stage: "embedding", loaded: (this.state.messages ?? 0) + vectors.length });
           }
+          // A page fetched before a local removal can still contain that
+          // message. Refetch from the last committed cursor after removal.
+          if (epoch !== this.forgetEpoch) continue;
+          signal?.throwIfAborted();
           try {
             this.state = await this.database.call("apply", {
               messages: page.messages,
@@ -269,9 +279,14 @@ export class LocalMailIndex {
   }
 
   /** Remove messages deleted on the server from this device right away. */
-  async forget(ids) {
-    this.state = await this.database.call("forget", { ids });
-    return this.state;
+  forget(ids) {
+    this.forgetEpoch++;
+    const removed = this.forgetting.then(async () => {
+      this.state = await this.database.call("forget", { ids });
+      return this.state;
+    });
+    this.forgetting = removed.catch(() => {});
+    return removed;
   }
 
   /** The locally stored message, for reading offline. */

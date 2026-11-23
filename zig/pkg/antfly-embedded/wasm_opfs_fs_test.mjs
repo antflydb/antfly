@@ -20,7 +20,7 @@ import { openOpfsFileSystem, destroyOpfsFileSystem, status, withCapacity, OpfsPo
 
 const notFound = () => Object.assign(new Error("missing"), { name: "NotFoundError" });
 
-const faults = { quota: false };
+const faults = { quota: false, writeLimit: Infinity, writeAllowance: Infinity };
 class FakeFile {
     constructor(bytes = new Uint8Array(0)) {
         this.durable = bytes.slice();
@@ -52,9 +52,11 @@ function syncHandle(file) {
         write(bytes, { at = file.current.length } = {}) {
             live();
             if (faults.quota) throw Object.assign(new Error("quota"), { name: "QuotaExceededError" });
-            file.current = grow(file.current, at + bytes.length);
-            file.current.set(bytes, at);
-            return bytes.length;
+            const count = Math.min(bytes.length, faults.writeLimit, faults.writeAllowance);
+            faults.writeAllowance -= Number.isFinite(faults.writeAllowance) ? count : 0;
+            file.current = grow(file.current, at + count);
+            file.current.set(bytes.subarray(0, count), at);
+            return count;
         },
         truncate(size) {
             live();
@@ -105,6 +107,39 @@ function readAll(fs, path) {
     const out = new Uint8Array(size);
     assert.equal(fs.read(path, 0, out), size);
     return new TextDecoder().decode(out);
+}
+
+// The access handle can return a partial byte count, including zero.
+{
+    const dir = directory();
+    const fs = await openOpfsFileSystem(dir, { initialSlots: 4, reserve: 2 });
+    faults.writeLimit = 7;
+    assert.equal(fs.write("/db/source", bytes("source payload"), false), 0);
+    assert.equal(fs.write("/db/destination", bytes("destination payload"), false), 0);
+    assert.equal(fs.write("/db/source", bytes(" and append"), true), 0);
+    assert.equal(fs.sync("/db/source"), 0);
+    assert.equal(readAll(fs, "/db/source"), "source payload and append");
+
+    faults.writeAllowance = 7;
+    assert.equal(fs.rename("/db/source", "/db/destination"), status.io);
+    assert.equal(readAll(fs, "/db/source"), "source payload and append");
+    assert.equal(readAll(fs, "/db/destination"), "destination payload");
+    assert.equal(fs.write("/db/empty", bytes("cannot write"), false), status.io);
+    assert.equal(fs.size("/db/empty"), status.notFound);
+
+    faults.writeAllowance = Infinity;
+    const recoveredDir = crashed(dir);
+    const reopened = await openOpfsFileSystem(recoveredDir, { initialSlots: 4, reserve: 2 });
+    assert.equal(readAll(reopened, "/db/source"), "source payload and append");
+    assert.equal(readAll(reopened, "/db/destination"), "destination payload");
+    assert.equal(reopened.rename("/db/source", "/db/destination"), 0);
+    const renamed = await openOpfsFileSystem(crashed(recoveredDir), { initialSlots: 4, reserve: 2 });
+    assert.equal(readAll(renamed, "/db/destination"), "source payload and append");
+    assert.equal(renamed.size("/db/source"), status.notFound);
+    fs.close();
+    reopened.close();
+    renamed.close();
+    faults.writeLimit = Infinity;
 }
 
 // Contract: the same semantics as the in-memory storage.

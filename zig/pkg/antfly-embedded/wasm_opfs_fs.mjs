@@ -109,6 +109,15 @@ class FsError extends Error {
     }
 }
 
+function writeAll(handle, bytes, offset) {
+    let written = 0;
+    while (written < bytes.length) {
+        const count = handle.write(bytes.subarray(written), { at: offset + written });
+        if (count <= 0) throw new FsError(status.io, "OPFS write made no progress");
+        written += count;
+    }
+}
+
 /**
  * Open (or create) a slot pool in `directory`, a FileSystemDirectoryHandle in
  * a dedicated worker. Throws `OpfsBusy` if another tab holds the pool.
@@ -146,7 +155,13 @@ export async function openOpfsFileSystem(directory, { initialSlots = 512, reserv
     function readRecords(slot) {
         const header = new Uint8Array(HEADER);
         const size = slot.handle.getSize();
-        if (size > 0) slot.handle.read(header, { at: 0 });
+        const length = Math.min(size, HEADER);
+        let read = 0;
+        while (read < length) {
+            const count = slot.handle.read(header.subarray(read, length), { at: read });
+            if (count <= 0) throw new FsError(status.io, "OPFS header read made no progress");
+            read += count;
+        }
         const records = [decodeRecord(header.subarray(0, RECORD)), decodeRecord(header.subarray(RECORD, HEADER))];
         const index = !records[1] || (records[0] && records[0].generation >= records[1].generation) ? 0 : 1;
         const current = records[index];
@@ -160,7 +175,7 @@ export async function openOpfsFileSystem(directory, { initialSlots = 512, reserv
         const target = slot.record === 0 ? 1 : 0;
         const record = encodeRecord(++generation, path ?? "");
         if (slot.handle.getSize() < HEADER) slot.handle.truncate(HEADER);
-        slot.handle.write(record, { at: target * RECORD });
+        writeAll(slot.handle, record, target * RECORD);
         slot.handle.flush();
         slot.record = target;
         slot.generation = generation;
@@ -169,6 +184,9 @@ export async function openOpfsFileSystem(directory, { initialSlots = 512, reserv
 
     function release(slot) {
         writeRecord(slot, null);
+    }
+
+    function reclaim(slot) {
         slot.handle.truncate(HEADER);
         slot.handle.flush();
         free.push(slot);
@@ -181,55 +199,61 @@ export async function openOpfsFileSystem(directory, { initialSlots = 512, reserv
         if (match && handle.kind !== "directory") names.push([name, Number(match[1])]);
     }
     names.sort((a, b) => a[1] - b[1]);
-    try {
-        for (const [name, number] of names) slots.push(await openSlot(name, number));
-    } catch (error) {
-        for (const slot of slots) slot.handle.close();
-        throw error;
+    function adoptSlots() {
+        for (const slot of slots) {
+            readRecords(slot);
+            generation = Math.max(generation, slot.generation);
+        }
+        const loser = [];
+        for (const slot of slots) {
+            if (!slot.path) continue;
+            const holder = byPath.get(slot.path);
+            if (!holder) byPath.set(slot.path, slot);
+            else if (holder.generation < slot.generation) {
+                // A rename moved this path here; the older holder was being replaced.
+                loser.push(holder);
+                byPath.set(slot.path, slot);
+            } else loser.push(slot);
+        }
+        for (const slot of slots) if (!slot.path) free.push(slot);
+        for (const slot of free) if (slot.handle.getSize() > HEADER) slot.handle.truncate(HEADER);
+        for (const slot of loser) {
+            release(slot);
+            reclaim(slot);
+        }
     }
-    for (const slot of slots) {
-        readRecords(slot);
-        generation = Math.max(generation, slot.generation);
-    }
-    const loser = [];
-    for (const slot of slots) {
-        if (!slot.path) continue;
-        const holder = byPath.get(slot.path);
-        if (!holder) byPath.set(slot.path, slot);
-        else if (holder.generation < slot.generation) {
-            // A rename moved this path here; the older holder was being replaced.
-            loser.push(holder);
-            byPath.set(slot.path, slot);
-        } else loser.push(slot);
-    }
-    for (const slot of slots) if (!slot.path) free.push(slot);
-    for (const slot of loser) release(slot);
-    for (const slot of free) if (slot.handle.getSize() > HEADER) slot.handle.truncate(HEADER);
 
     async function grow(minimum) {
+        if (free.length >= minimum) return;
         let next = slots.reduce((max, slot) => Math.max(max, slot.number), 0) + 1;
         while (free.length < minimum) {
             if (next > 999999) throw new FsError(status.noSpace, "OPFS pool limit reached");
             const slot = await openSlot(`slot-${String(next).padStart(6, "0")}.afs`, next);
             next++;
-            slot.handle.truncate(0);
+            try {
+                slot.handle.truncate(0);
+            } catch (error) {
+                slot.handle.close();
+                throw error;
+            }
+            slots.push(slot);
             slot.record = 1;
             slot.generation = 0;
             slot.path = null;
-            slots.push(slot);
             free.push(slot);
         }
     }
 
     function claim(path) {
         if (encoder.encode(path).length > MAX_PATH) throw new FsError(status.io, "path too long");
-        const slot = free.pop();
+        const slot = free.at(-1);
         if (!slot) {
             exhausted = true;
             throw new FsError(status.noSpace, "OPFS pool exhausted; call ensureCapacity");
         }
-        lowestFree = Math.min(lowestFree, free.length);
         slot.handle.truncate(HEADER);
+        free.pop();
+        lowestFree = Math.min(lowestFree, free.length);
         return slot;
     }
     function lookup(path) {
@@ -269,24 +293,20 @@ export async function openOpfsFileSystem(directory, { initialSlots = 512, reserv
                 if (slot) {
                     if (!append) slot.handle.truncate(HEADER);
                     const at = slot.handle.getSize();
-                    if (bytes.length) slot.handle.write(bytes, { at });
+                    writeAll(slot.handle, bytes, at);
                     return 0;
                 }
                 slot = claim(path);
+                // Reuse the slot after a failed payload write. Once a header
+                // write starts, its durability is uncertain on error; leave
+                // that slot for recovery on the next open.
                 try {
-                    if (bytes.length) slot.handle.write(bytes, { at: HEADER });
-                    // Data first, then the name; writeRecord flushes both.
-                    writeRecord(slot, path);
+                    writeAll(slot.handle, bytes, HEADER);
                 } catch (error) {
-                    // The name never became durable: return the slot to the pool.
-                    try {
-                        slot.handle.truncate(HEADER);
-                    } catch {
-                        /* Reclaimed on the next open. */
-                    }
                     free.push(slot);
                     throw error;
                 }
+                writeRecord(slot, path);
                 byPath.set(path, slot);
                 return 0;
             }),
@@ -306,21 +326,26 @@ export async function openOpfsFileSystem(directory, { initialSlots = 512, reserv
                 writeRecord(slot, newPath);
                 byPath.delete(oldPath);
                 byPath.set(newPath, slot);
-                if (replaced) release(replaced);
+                if (replaced) {
+                    release(replaced);
+                    reclaim(replaced);
+                }
                 return 0;
             }),
         remove: (path, tree) =>
             guard(() => {
                 if (!tree) {
                     const slot = lookup(path);
-                    byPath.delete(path);
                     release(slot);
+                    byPath.delete(path);
+                    reclaim(slot);
                     return 0;
                 }
                 for (const [candidate, slot] of [...byPath]) {
                     if (!contains(path, candidate)) continue;
-                    byPath.delete(candidate);
                     release(slot);
+                    byPath.delete(candidate);
+                    reclaim(slot);
                 }
                 return 0;
             }),
@@ -377,18 +402,37 @@ export async function openOpfsFileSystem(directory, { initialSlots = 512, reserv
         close() {
             if (closed) return;
             closed = true;
+            let failure;
             for (const slot of slots) {
                 try {
-                    slot.handle.flush();
-                } finally {
-                    slot.handle.close();
+                    try {
+                        slot.handle.flush();
+                    } finally {
+                        slot.handle.close();
+                    }
+                } catch (error) {
+                    failure ??= error;
                 }
             }
+            if (failure) throw failure;
         },
     };
     // At least `initialSlots` in total and `reserve` free.
-    await fs.ensureCapacity(Math.max(reserve, initialSlots - (slots.length - free.length)));
-    return fs;
+    try {
+        for (const [name, number] of names) slots.push(await openSlot(name, number));
+        adoptSlots();
+        await fs.ensureCapacity(Math.max(reserve, initialSlots - (slots.length - free.length)));
+        return fs;
+    } catch (error) {
+        for (const slot of slots) {
+            try {
+                slot.handle.close();
+            } catch {
+                // Preserve the opening error and release the other handles.
+            }
+        }
+        throw error;
+    }
 }
 
 export class OpfsPoolExhausted extends Error {
