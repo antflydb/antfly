@@ -394,16 +394,20 @@ fn writePlannedExport(
     if (target_projector_path) |target| {
         var destinations = try ExportDestinations.open(io, output_path, target);
         defer destinations.close(io);
+        try validateProjectorDestination(io, &destinations, planned);
         var decoder = try destinations.decoder_dir.createFileAtomic(io, destinations.decoder_name, .{ .replace = true });
         defer decoder.deinit(io);
         var layout = try buildPlanLayout(allocator, &planned.plan);
         defer layout.deinit(allocator);
-        try writeExportContents(allocator, decoder.file, layout, access, planned.plan.tensors);
+        try validateDecoderDestination(io, allocator, &decoder, planned);
 
         const scratch = try allocator.alloc(u8, 256 * 1024);
         defer allocator.free(scratch);
         if (planned.pinned_projector) |*projector| {
-            try publishProjector(io, &destinations, projector.openFile(), projector.region.data.len, scratch);
+            const checked = try openMatchingProjector(io, destinations.projector_dir, destinations.projector_name, projector.openFile(), projector.region.data.len, scratch);
+            defer if (checked) |match| match.file.close(io);
+            try writePlannedContents(allocator, decoder.file, layout, access, planned.plan.tensors, planned, scratch);
+            try publishProjector(io, &destinations, projector.openFile(), projector.region.data.len, scratch, checked);
         } else if (planned.projector_plan) |*projector_plan| {
             var stage = try ExportScratchDir.init(io, destinations.projector_dir);
             defer stage.deinit(io);
@@ -411,18 +415,31 @@ fn writePlannedExport(
             defer payload.close(io);
             var projector_layout = try buildPlanLayout(allocator, projector_plan);
             defer projector_layout.deinit(allocator);
-            try writeExportContents(allocator, payload, projector_layout, access, projector_plan.tensors);
+            try writePlannedContents(allocator, payload, projector_layout, access, projector_plan.tensors, planned, scratch);
             const len = (try payload.stat(io)).size;
-            if (!try checkPublishedProjector(io, destinations.projector_dir, destinations.projector_name, payload, len, scratch)) {
+            const checked = try openMatchingProjector(io, destinations.projector_dir, destinations.projector_name, payload, len, scratch);
+            defer if (checked) |match| match.file.close(io);
+            try writePlannedContents(allocator, decoder.file, layout, access, planned.plan.tensors, planned, scratch);
+            const lock = try lockExportDirectory(io, destinations.projector_dir);
+            defer lock.close(io);
+            if (!try verifyProjectorDestination(io, &destinations, payload, len, scratch, checked)) {
                 stage.dir.renamePreserve("projector", destinations.projector_dir, destinations.projector_name, io) catch |err| switch (err) {
                     error.PathAlreadyExists => try confirmPublishedProjector(io, &destinations, payload, len, scratch),
                     else => return err,
                 };
             }
         } else unreachable;
-        try decoder.replace(io);
+        try commitDecoder(io, allocator, &decoder, planned);
     } else {
-        try writeSinglePlanExport(allocator, output_path, access, &planned.plan);
+        var decoder = try stageDecoder(io, output_path);
+        defer decoder.deinit(io);
+        try validateDecoderDestination(io, allocator, &decoder, planned);
+        var layout = try buildPlanLayout(allocator, &planned.plan);
+        defer layout.deinit(allocator);
+        const scratch: []u8 = if (planned.pinned_decoder != null) try allocator.alloc(u8, 256 * 1024) else &.{};
+        defer if (scratch.len > 0) allocator.free(scratch);
+        try writePlannedContents(allocator, decoder.file, layout, access, planned.plan.tensors, planned, scratch);
+        try commitDecoder(io, allocator, &decoder, planned);
     }
 
     if (isColqwenBundleExportManifest(manifest)) {
@@ -597,34 +614,122 @@ const ExportDestinations = struct {
 
 // A published projector is immutable. Installing it with no-replace makes
 // concurrent publishers agree on one projector before any decoder commits.
-fn publishProjector(io: std.Io, destinations: *const ExportDestinations, source: std.Io.File, len: u64, scratch: []u8) !void {
+fn stageDecoder(io: std.Io, path: []const u8) !std.Io.File.Atomic {
+    const dir = try std.Io.Dir.cwd().createDirPathOpen(io, std.fs.path.dirname(path) orelse ".", .{});
+    errdefer dir.close(io);
+    var staged = try dir.createFileAtomic(io, std.fs.path.basename(path), .{ .replace = true });
+    staged.close_dir_on_deinit = true;
+    return staged;
+}
+
+fn lockExportDirectory(io: std.Io, dir: std.Io.Dir) !std.Io.Dir {
+    // Linux path-only directory handles cannot be flocked. Reopen the same
+    // directory with a readable descriptor, independent of its pathname.
+    const locked_dir = try dir.openDir(io, ".", .{ .iterate = true });
+    errdefer locked_dir.close(io);
+    const file: std.Io.File = .{ .handle = locked_dir.handle, .flags = .{ .nonblocking = false } };
+    try file.lock(io, .exclusive);
+    return locked_dir;
+}
+
+fn openExportDestination(io: std.Io, dir: std.Io.Dir, name: []const u8) !?std.Io.File {
+    return dir.openFile(io, name, .{}) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+}
+
+fn validateProjectorDestination(io: std.Io, paths: *const ExportDestinations, planned: *const PlannedExport) !void {
+    const source = if (planned.pinned_decoder) |*decoder| decoder else return;
+    const existing = try openExportDestination(io, paths.projector_dir, paths.projector_name) orelse return;
+    defer existing.close(io);
+    if (try c_file.sameOpenFile(existing.handle, source.region.fd)) return error.ConflictingExportPaths;
+}
+
+fn validateDecoderDestination(io: std.Io, allocator: std.mem.Allocator, output: *const std.Io.File.Atomic, planned: ?*const PlannedExport) !void {
+    const existing = try openExportDestination(io, output.dir, output.dest_sub_path) orelse return;
+    defer existing.close(io);
+    if (planned) |plan| {
+        if (plan.pinned_decoder) |source| {
+            if (try c_file.sameOpenFile(existing.handle, source.region.fd)) return error.ConflictingExportPaths;
+        }
+        if (plan.pinned_projector) |source| {
+            if (try c_file.sameOpenFile(existing.handle, source.region.fd)) return error.ConflictingExportPaths;
+        }
+    }
+    var signature: [4]u8 = undefined;
+    if (try existing.readPositionalAll(io, &signature, 0) != 4 or !std.mem.eql(u8, &signature, "GGUF")) return;
+    var region = try c_file.MmapRegion.initFromFile(existing, std.math.maxInt(usize));
+    defer region.deinit();
+    var parsed = try gguf_mod.format.parseStructure(allocator, region.data);
+    defer parsed.deinit(allocator);
+    const metadata = gguf_mod.metadata.View.init(&parsed);
+    const architecture = metadata.getString("general.architecture") orelse "";
+    const kind = metadata.getString("general.type") orelse "";
+    if (std.mem.eql(u8, architecture, "antfly-projector") or std.mem.eql(u8, kind, "mmproj") or
+        projector_format_mod.detectFile(&parsed) != .unknown)
+        return error.ProjectorPublicationConflict;
+}
+
+fn commitDecoder(io: std.Io, allocator: std.mem.Allocator, output: *std.Io.File.Atomic, planned: ?*const PlannedExport) !void {
+    const lock = try lockExportDirectory(io, output.dir);
+    defer lock.close(io);
+    try validateDecoderDestination(io, allocator, output, planned);
+    try output.replace(io);
+}
+
+fn publishProjector(io: std.Io, destinations: *const ExportDestinations, source: std.Io.File, len: u64, scratch: []u8, checked: ?MatchedProjector) !void {
     const dir = destinations.projector_dir;
     const name = destinations.projector_name;
-    if (try checkPublishedProjector(io, dir, name, source, len, scratch)) return;
+    {
+        const lock = try lockExportDirectory(io, dir);
+        defer lock.close(io);
+        if (try verifyProjectorDestination(io, destinations, source, len, scratch, checked)) return;
+    }
     var staged = try dir.createFileAtomic(io, name, .{});
     defer staged.deinit(io);
     try copyFileRange(io, staged.file, source, 0, len, scratch);
+    const lock = try lockExportDirectory(io, dir);
+    defer lock.close(io);
     staged.link(io) catch |err| switch (err) {
         error.PathAlreadyExists => try confirmPublishedProjector(io, destinations, source, len, scratch),
         else => return err,
     };
 }
 
+fn verifyProjectorDestination(io: std.Io, paths: *const ExportDestinations, source: std.Io.File, len: u64, scratch: []u8, checked: ?MatchedProjector) !bool {
+    if (checked) |previous| {
+        if (try openExportDestination(io, paths.projector_dir, paths.projector_name)) |current| {
+            defer current.close(io);
+            if (try c_file.sameOpenFile(current.handle, previous.file.handle)) {
+                const stat = try current.stat(io);
+                if (stat.size != previous.stat.size or stat.mtime.nanoseconds != previous.stat.mtime.nanoseconds or
+                    stat.ctime.nanoseconds != previous.stat.ctime.nanoseconds) return error.ProjectorPublicationConflict;
+                return true;
+            }
+        }
+    }
+    const existing = try openMatchingProjector(io, paths.projector_dir, paths.projector_name, source, len, scratch) orelse return false;
+    existing.file.close(io);
+    return true;
+}
+
 fn confirmPublishedProjector(io: std.Io, destinations: *const ExportDestinations, source: std.Io.File, len: u64, scratch: []u8) !void {
-    if (!try checkPublishedProjector(io, destinations.projector_dir, destinations.projector_name, source, len, scratch))
+    if (!try verifyProjectorDestination(io, destinations, source, len, scratch, null))
         return error.ProjectorPublicationConflict;
 }
 
-fn checkPublishedProjector(io: std.Io, dir: std.Io.Dir, name: []const u8, source: std.Io.File, len: u64, scratch: []u8) !bool {
-    const existing = dir.openFile(io, name, .{}) catch |err| switch (err) {
-        error.FileNotFound => return false,
-        else => return err,
-    };
-    defer existing.close(io);
-    if (try c_file.sameOpenFile(existing.handle, source.handle)) return true;
+const MatchedProjector = struct {
+    file: std.Io.File,
+    stat: std.Io.File.Stat,
+};
+
+fn openMatchingProjector(io: std.Io, dir: std.Io.Dir, name: []const u8, source: std.Io.File, len: u64, scratch: []u8) !?MatchedProjector {
+    const existing = try openExportDestination(io, dir, name) orelse return null;
+    errdefer existing.close(io);
     const stat = try existing.stat(io);
     if (stat.kind != .file or stat.size != len) return error.ProjectorPublicationConflict;
-
+    if (try c_file.sameOpenFile(existing.handle, source.handle)) return .{ .file = existing, .stat = stat };
     const half = scratch.len / 2;
     var offset: u64 = 0;
     while (offset < len) {
@@ -636,7 +741,7 @@ fn checkPublishedProjector(io: std.Io, dir: std.Io.Dir, name: []const u8, source
         if (!std.mem.eql(u8, expected, actual)) return error.ProjectorPublicationConflict;
         offset += count;
     }
-    return true;
+    return .{ .file = existing, .stat = stat };
 }
 
 fn writePinnedGgufExport(
@@ -647,7 +752,6 @@ fn writePinnedGgufExport(
     planned: *const PlannedExport,
 ) !void {
     const io = io_compat();
-    const cwd = std.Io.Dir.cwd();
     var layout = try buildPlanLayout(allocator, &planned.plan);
     defer layout.deinit(allocator);
     const scratch = try allocator.alloc(u8, 256 * 1024);
@@ -656,19 +760,24 @@ fn writePinnedGgufExport(
     if (projector_output_path) |target| {
         var destinations = try ExportDestinations.open(io, output_path, target);
         defer destinations.close(io);
+        try validateProjectorDestination(io, &destinations, planned);
         const projector = &planned.pinned_projector.?;
         const projector_file = projector.openFile();
         const projector_len = projector.region.data.len;
         var decoder = try destinations.decoder_dir.createFileAtomic(io, destinations.decoder_name, .{ .replace = true });
         defer decoder.deinit(io);
+        try validateDecoderDestination(io, allocator, &decoder, planned);
+        const checked = try openMatchingProjector(io, destinations.projector_dir, destinations.projector_name, projector_file, projector_len, scratch);
+        defer if (checked) |match| match.file.close(io);
         try writePinnedGgufDecoder(io, decoder.file, source, layout, planned.plan.tensors, scratch);
-        try publishProjector(io, &destinations, projector_file, projector_len, scratch);
-        try decoder.replace(io);
+        try publishProjector(io, &destinations, projector_file, projector_len, scratch, checked);
+        try commitDecoder(io, allocator, &decoder, planned);
     } else {
-        var decoder = try cwd.createFileAtomic(io, output_path, .{ .replace = true, .make_path = true });
+        var decoder = try stageDecoder(io, output_path);
         defer decoder.deinit(io);
+        try validateDecoderDestination(io, allocator, &decoder, planned);
         try writePinnedGgufDecoder(io, decoder.file, source, layout, planned.plan.tensors, scratch);
-        try decoder.replace(io);
+        try commitDecoder(io, allocator, &decoder, planned);
     }
 }
 
@@ -688,7 +797,11 @@ fn writePinnedGgufDecoder(
     for (tensors, layout.offsets) |tensor, target_offset| {
         if (target_offset < current_offset) return error.InvalidTensorOffset;
         try writeZeroPadding(io, &file, @intCast(target_offset - current_offset));
-        const original = source.parsed.tensors[tensor.source_tensor_index.?];
+        if (tensor.transform != .none or tensor.source_byte_range != null) return error.UnsupportedTensorType;
+        const original = if (tensor.source_tensor_index) |index|
+            source.parsed.tensors[index]
+        else
+            (gguf_mod.tensor_catalog.Catalog.init(&source.parsed).find(tensor.source_name) orelse return error.TensorNotFound).*;
         const bytes = gguf_mod.tensor_types.byteLen(original.tensor_type, original.dimensions) orelse return error.UnsupportedTensorType;
         const end = try std.math.add(u64, original.data_offset, bytes);
         if (end > source.region.data.len) return error.RegionOutOfBounds;
@@ -2307,7 +2420,8 @@ const SourceGguf = struct {
         return .{ .handle = self.region.fd, .flags = .{ .nonblocking = false } };
     }
 
-    // The plan owns the mapping; records borrow its immutable tensor spans.
+    // Generic GGUF planning uses descriptors only. Writing reads the pinned
+    // file in bounded chunks so a truncated payload produces a read error.
     fn tensorAccess(self: *const SourceGguf) tensor_access_mod.TensorAccess {
         return .{ .ptr = @constCast(self), .vtable = &.{
             .getRecord = @ptrCast(&getRecord),
@@ -2331,7 +2445,7 @@ const SourceGguf = struct {
                 .byte_len = @intCast(bytes),
                 .quantized = tensor.tensor_type.isQuantized(),
             },
-            .raw_bytes = self.region.data[@intCast(tensor.data_offset)..][0..@intCast(bytes)],
+            .raw_bytes = &.{},
             .allocator = allocator,
             .owns_shape = true,
         };
@@ -5822,14 +5936,25 @@ fn writeExportFile(
     tensors: []const TensorPlan,
 ) !void {
     const io = io_compat();
-    if (std.fs.path.dirname(output_path)) |parent| {
-        if (parent.len > 0) try std.Io.Dir.cwd().createDirPath(io, parent);
-    }
-
-    var atomic_file = try std.Io.Dir.cwd().createFileAtomic(io, output_path, .{ .replace = true });
+    var atomic_file = try stageDecoder(io, output_path);
     defer atomic_file.deinit(io);
     try writeExportContents(allocator, atomic_file.file, layout, access, tensors);
-    try atomic_file.replace(io);
+    try commitDecoder(io, allocator, &atomic_file, null);
+}
+
+fn writePlannedContents(
+    allocator: std.mem.Allocator,
+    file: std.Io.File,
+    layout: gguf_mod.writer.Layout,
+    access: tensor_access_mod.TensorAccess,
+    tensors: []const TensorPlan,
+    planned: *const PlannedExport,
+    scratch: []u8,
+) !void {
+    if (planned.pinned_decoder) |*source| {
+        return writePinnedGgufDecoder(io_compat(), file, source, layout, tensors, scratch);
+    }
+    return writeExportContents(allocator, file, layout, access, tensors);
 }
 
 fn writeExportContents(
@@ -6341,6 +6466,8 @@ test "gguf passthrough preserves quantized tensor type and metadata" {
 
     const out_path = try std.fs.path.join(allocator, &.{ dir_path, "copy.gguf" });
     defer allocator.free(out_path);
+    const editable_original = try std.Io.Dir.cwd().openFile(compat.testingIo(), source_path, .{ .mode = .read_write });
+    defer editable_original.close(compat.testingIo());
     var plan = try buildPlannedExport(allocator, dir_path, .none, .auto, .{});
     defer plan.deinit(allocator);
     const original = try c_file.readFile(allocator, source_path);
@@ -6365,6 +6492,11 @@ test "gguf passthrough preserves quantized tensor type and metadata" {
     const view = gguf_mod.metadata.View.init(&parsed);
     try std.testing.expectEqualStrings("llama", view.getString("general.architecture").?);
     try std.testing.expectEqual(original[original.len - 1], raw[@intCast(tensor.data_offset + 33)]);
+    try editable_original.setLength(io, tensor.data_offset);
+    try std.testing.expectError(error.IncompleteRead, writePlannedExport(allocator, dir_path, out_path, null, &plan));
+    const retained = try c_file.readFile(allocator, out_path);
+    defer allocator.free(retained);
+    try std.testing.expectEqualSlices(u8, raw, retained);
 }
 
 test "dense export emits standalone hf tokenizer metadata arrays" {
@@ -6800,6 +6932,16 @@ test "Qwen35 GGUF export quantizes dense matrices and preserves projector and hy
     defer allocator.free(aliased_output);
     try std.testing.expectError(error.ConflictingExportPaths, writePlannedExport(allocator, dir_path, output, aliased_output, &plan));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "out/model.gguf", .{}));
+
+    // A decoder-only publication must leave an unrelated published projector intact.
+    var wrong_role = try stageDecoder(io, q8_projector_path);
+    defer wrong_role.deinit(io);
+    try std.testing.expectError(error.ProjectorPublicationConflict, commitDecoder(io, allocator, &wrong_role, null));
+
+    try tmp.dir.hardLink("model.gguf", tmp.dir, "out/source-alias.gguf", io, .{});
+    const source_alias = try std.fs.path.join(allocator, &.{ dir_path, "out", "source-alias.gguf" });
+    defer allocator.free(source_alias);
+    try std.testing.expectError(error.ConflictingExportPaths, writePlannedExport(allocator, dir_path, source_alias, output_projector, &plan));
 
     const existing_projector = try tmp.dir.openFile(io, "mmproj.gguf", .{});
     defer existing_projector.close(io);

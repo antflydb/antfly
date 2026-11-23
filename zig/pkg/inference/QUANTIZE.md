@@ -255,7 +255,8 @@ antfly inference export ./lighton-bf16 --target gguf --format q4_k \
 ```
 
 The decoder is published only after its projector is available. An existing
-projector is reused when it has identical bytes. To export with a different
+projector is reused when it has identical bytes. Decoder publication preserves
+projector destinations. To export with a different
 projector, select a new destination directory or projector filename. If
 decoder publication fails, any newly installed projector remains available
 for a retry.
