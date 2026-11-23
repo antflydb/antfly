@@ -2309,18 +2309,31 @@ test "Metal compressed cyclic append writes only the newest physical rows" {
     defer metal_runtime.termite_metal_buffer_release(input);
     try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_upload(metal, input, 0, &rows, @sizeOf(@TypeOf(rows))));
     const ref = storage_runtime.DeviceKvRef{ .handle = input, .byte_offset = 0, .byte_len = @sizeOf(@TypeOf(rows)) };
-    try runtime.writeLayerKvSuffixDevice(.{
-        .sequence_id = sequence,
-        .layer_index = 0,
-        .total_token_count = tokens,
-        .suffix_token_count = tokens,
-        .position_offset = 0,
-        .num_kv_heads = 1,
-        .head_dim = width,
-        .sliding_window = 2,
-        .max_inflight_tokens = 1,
-        .allow_swa_ring = true,
-    }, ref, ref);
+    {
+        const observation = @import("../execution/runtime_observation.zig");
+        var observed_calls = observation.Scope.init();
+        defer observed_calls.deinit();
+        var dispatch = observation.KernelScope{};
+        dispatch.begin();
+        defer _ = dispatch.finish();
+        try runtime.writeLayerKvSuffixDevice(.{
+            .sequence_id = sequence,
+            .layer_index = 0,
+            .total_token_count = tokens,
+            .suffix_token_count = tokens,
+            .position_offset = 0,
+            .num_kv_heads = 1,
+            .head_dim = width,
+            .sliding_window = 2,
+            .max_inflight_tokens = 1,
+            .allow_swa_ring = true,
+        }, ref, ref);
+        try std.testing.expectEqual(@as(u64, 2), dispatch.metal.total_messages);
+        try std.testing.expectEqual(@as(u64, 0), dispatch.metal.unknown_pipeline_messages);
+        try std.testing.expectEqual(@as(u8, 2), dispatch.metal.count);
+        try std.testing.expectEqual([3]u64{ width, ring_tokens, 1 }, dispatch.metal.records[0].grid);
+        try std.testing.expectEqual([3]u64{ width * ring_tokens, 1, 1 }, dispatch.metal.records[1].grid);
+    }
 
     const binding = owner.slot_map.get(.{ .sequence_id = sequence, .layer_index = 0 }).?;
     try std.testing.expectEqual(@as(usize, 2), binding.ring_page_count);
