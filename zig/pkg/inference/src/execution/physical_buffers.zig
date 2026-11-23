@@ -97,7 +97,7 @@ const HostInputPlan = struct {
 const HostInputStorage = struct { resource: host_ingress.Upload, admission: ?*admission.Reservation, retirement_owner: ?*@import("backing_retirement.zig").BackingOwner = null, private_view: ?CT = null };
 
 const ReplayInput = struct { node: NodeId, shape: ml.graph.Shape, allocation: ?buffers.AllocationId = null, constant_index: ?usize = null };
-const ReplayOutput = struct { node: NodeId, allocation: buffers.AllocationId, shape: ml.graph.Shape };
+const ReplayOutput = struct { node: NodeId, allocation: buffers.AllocationId, shape: ml.graph.Shape, byte_offset: usize = 0 };
 const ReplayBindingState = struct { weight: ?CT = null, supplied: bool = false, host_direct: bool = false };
 
 const TransferPlan = struct { shape: ml.graph.Shape, backend_index: usize, allocation: buffers.AllocationId };
@@ -465,6 +465,7 @@ pub const Pool = struct {
                 if (installed.owner.entry_node == id) count += 1;
                 continue;
             }
+            if (node.op == .slice and self.replaySlice(plan, @intCast(id)) != null) continue;
             if (node.op == .reshape and self.backends[index].vtable.kernels.?.physicalReplayReshapeViews) {
                 const slot = plan.slotForNode(@intCast(id)) orelse return;
                 if (slot.backend != .cuda or node.num_inputs != 1 or node.output_shape.dtype != .f32 or
@@ -490,7 +491,7 @@ pub const Pool = struct {
             return;
         }
         for (graph.outputs.items) |id| {
-            const source = replayOutputSource(graph, id) orelse return;
+            const source = (self.replayOutputSource(graph, plan, id) orelse return).node;
             if (self.kernels[source] != null or self.regionForNode(source) != null or graph.node(source).op == .constant) continue;
             var mutable = false;
             for (bindings) |binding| if (binding.node_id == source and (binding.kind == .input or binding.kind == .state_input)) {
@@ -518,7 +519,9 @@ pub const Pool = struct {
             }
             for (graph.outputs.items, self.replay_outputs) |id, *output| {
                 if (output.node != id or !output.shape.eq(graph.node(id).output_shape)) return error.InvalidReplayTemplate;
-                const source = replayOutputSource(graph, id).?;
+                const resolved = self.replayOutputSource(graph, plan, id).?;
+                const source = resolved.node;
+                output.byte_offset = resolved.byte_offset;
                 output.allocation = if (emptyReplayLiteral(graph.node(source)))
                     buffers.invalid_allocation
                 else if (self.regionForNode(source) != null)
@@ -565,7 +568,8 @@ pub const Pool = struct {
             };
         }
         for (graph.outputs.items, outputs) |id, *output| {
-            const source = replayOutputSource(graph, id).?;
+            const resolved = self.replayOutputSource(graph, plan, id).?;
+            const source = resolved.node;
             const allocation = if (emptyReplayLiteral(graph.node(source)))
                 buffers.invalid_allocation
             else if (self.regionForNode(source) != null)
@@ -574,7 +578,7 @@ pub const Pool = struct {
                 kernel.output_allocation
             else
                 inputs[input_indices[source]].allocation orelse return error.InvalidShape;
-            output.* = .{ .node = id, .allocation = allocation, .shape = graph.node(id).output_shape };
+            output.* = .{ .node = id, .allocation = allocation, .shape = graph.node(id).output_shape, .byte_offset = resolved.byte_offset };
         }
         self.replay_inputs = inputs;
         self.replay_input_indices = input_indices;
@@ -589,15 +593,51 @@ pub const Pool = struct {
             node.op.constant.data_len == 0 and node.output_shape.numElements() == 0;
     }
 
-    fn replayOutputSource(graph: *const Graph, node_id: NodeId) ?NodeId {
+    fn replaySlice(self: *const Pool, plan: *const buffers.BufferPlan, id: NodeId) ?@import("metadata_alias.zig").Plan {
+        for (self.metadata_aliases, 0..) |alias, index| {
+            if (alias.node != id or alias.kind != .contiguous_slice) continue;
+            if (self.selection) |selection| {
+                if (index >= selection.alias_enabled.len or !selection.alias_enabled[index]) return null;
+            }
+            const slot = plan.slotForNode(id) orelse return null;
+            if (slot.backend != .cuda or slot.kind != .view) return null;
+            const root = @import("metadata_alias.zig").fullSpanRoot(plan, id, .cuda) orelse return null;
+            if (root.kind != .allocation or root.allocation != slot.allocation) return null;
+            return alias;
+        }
+        return null;
+    }
+
+    const ReplayOutputRange = struct { node: NodeId, byte_offset: usize };
+
+    fn replayOutputSource(self: *const Pool, graph: *const Graph, plan: *const buffers.BufferPlan, node_id: NodeId) ?ReplayOutputRange {
         var id = node_id;
+        var byte_offset: usize = 0;
         for (0..graph.nodeCount()) |_| {
             const node = graph.node(id);
-            if (node.op != .reshape) return id;
+            if (self.regionForNode(id)) |installed| {
+                for (installed.outputs) |output| {
+                    if (output.slot.node == id) return replayOutputRange(graph, node_id, id, byte_offset);
+                }
+            }
+            if (node.op == .slice) {
+                const alias = self.replaySlice(plan, id) orelse return replayOutputRange(graph, node_id, id, byte_offset);
+                byte_offset = std.math.add(usize, byte_offset, alias.byte_offset) catch return null;
+            } else if (node.op != .reshape) return replayOutputRange(graph, node_id, id, byte_offset);
             if (node.num_inputs != 1 or node.inputs[0] >= graph.nodeCount()) return null;
             id = node.inputs[0];
         }
         return null;
+    }
+
+    fn replayOutputRange(graph: *const Graph, node: NodeId, allocation_node: NodeId, byte_offset: usize) ?ReplayOutputRange {
+        if (byte_offset != 0) {
+            const metadata = @import("metadata_alias.zig");
+            const bytes = metadata.logicalBytes(graph.node(node).output_shape) orelse return null;
+            const source_bytes = metadata.logicalBytes(graph.node(allocation_node).output_shape) orelse return null;
+            if (byte_offset > source_bytes or bytes > source_bytes - byte_offset) return null;
+        }
+        return .{ .node = allocation_node, .byte_offset = byte_offset };
     }
 
     /// Collect only unowned spans from the frozen actual plan. The warm frame
@@ -1692,6 +1732,17 @@ pub const Pool = struct {
         var capture_supported = true;
         for (self.regions) |installed| capture_supported = capture_supported and installed.owner.requirements.capture == .supported;
         const selected = if (self.selection) |*value| value else return capture_supported;
+        for (self.metadata_aliases, 0..) |alias, index| {
+            if (alias.kind != .contiguous_slice or self.regionForNode(alias.node) != null) continue;
+            const slot = self.plan.slotForNode(alias.node) orelse continue;
+            if (slot.backend != .cuda) continue;
+            if (self.coverage_reachable) |reachable| if (!reachable[alias.node]) continue;
+            if (index >= selected.alias_enabled.len or !selected.alias_enabled[index]) {
+                capture_supported = false;
+                self.replay_backend = null;
+                self.replay_decision = .unsupported_representation;
+            }
+        }
         // Existing independently qualified compatibility routes retain their
         // original storage. Selected exact routes replace their own scratch,
         // never silently selecting a new profile after admission.
@@ -2916,7 +2967,7 @@ pub const Frame = struct {
                 continue;
             }
             const allocation = self.storages[binding.allocation] orelse return error.InvalidShape;
-            output.* = try self.viewForShape(cb, allocation, binding.shape);
+            output.* = try self.viewForShapeAt(cb, allocation, binding.shape, binding.byte_offset);
             initialized += 1;
             if (try self.publishLiteralOutput(cb, binding.node, output.*)) |independent| {
                 cb.free(output.*);
@@ -3210,10 +3261,14 @@ pub const Frame = struct {
         return result;
     }
 
-    fn viewForShape(_: *Frame, target: *const ops.ComputeBackend, allocation: *storage.Lease, logical: ml.graph.Shape) !CT {
+    fn viewForShape(self: *Frame, target: *const ops.ComputeBackend, allocation: *storage.Lease, logical: ml.graph.Shape) !CT {
+        return self.viewForShapeAt(target, allocation, logical, 0);
+    }
+
+    fn viewForShapeAt(_: *Frame, target: *const ops.ComputeBackend, allocation: *storage.Lease, logical: ml.graph.Shape, byte_offset: usize) !CT {
         var shape: [ml.graph.shape.max_rank]i32 = undefined;
         for (logical.dims[0..logical.rank()], 0..) |dim, axis| shape[axis] = @intCast(dim);
-        return (try target.vtable.kernels.?.physicalTensorView.?(target.ptr, .{ .storage = allocation, .shape = shape[0..logical.rank()], .dtype = logical.dtype })) orelse error.UnsupportedPhysicalTensorView;
+        return (try target.vtable.kernels.?.physicalTensorView.?(target.ptr, .{ .storage = allocation, .shape = shape[0..logical.rank()], .dtype = logical.dtype, .byte_offset = byte_offset })) orelse error.UnsupportedPhysicalTensorView;
     }
 
     pub fn transfer(self: *Frame, source: *const ops.ComputeBackend, target: *const ops.ComputeBackend, value: CT, node: NodeId, partition: u32) !?CT {

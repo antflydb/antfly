@@ -53033,6 +53033,7 @@ fn denseStorageOwnership(comptime capture: bool, tensor: CT, view: *const Buf, r
 }
 
 fn physicalTensorViewOp(ctx: *anyopaque, request: ops.physical_storage.View) anyerror!?CT {
+    if (request.byte_offset != 0) return null;
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     if (request.dtype != .f32) return typedPhysicalTensorView(self, request);
     const source = toBuf(request.storage.tensor);

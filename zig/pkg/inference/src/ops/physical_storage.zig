@@ -333,6 +333,7 @@ pub const CapturedLeases = struct {
 pub const View = struct {
     storage: *Lease,
     shape: []const i32,
+    byte_offset: usize = 0,
     dtype: ops.GraphDType = .f32,
     /// Clone only logical/view metadata over new owned backing. Used by
     /// planned independent publication; never aliases the source's data.

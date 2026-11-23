@@ -39485,6 +39485,7 @@ fn physicalTensorViewOp(ctx: *anyopaque, request: ops.physical_storage.View) any
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const source = tensorFromCt(request.storage.tensor);
     if (request.layout_source) |prototype| {
+        if (request.byte_offset != 0) return null;
         const original = tensorFromCt(prototype);
         const dtype: tensor_mod.DType = switch (request.dtype) {
             .f32 => .f32,
@@ -39512,12 +39513,14 @@ fn physicalTensorViewOp(ctx: *anyopaque, request: ops.physical_storage.View) any
         target.* = dim;
     }
     const bytes = try checkedMul(count, request.dtype.byteSize());
-    if (bytes > source.buffer.len) return error.InvalidShape;
+    if (request.byte_offset % request.dtype.byteSize() != 0 or
+        request.byte_offset > source.buffer.len or bytes > source.buffer.len - request.byte_offset) return error.InvalidShape;
+    const offset_ptr = try std.math.add(u64, source.buffer.ptr, request.byte_offset);
     if (self.debug_cuda_graph_capture_active) try self.capturing_physical_storage.retain(self.allocator, request.storage);
     const dtype: tensor_mod.DType = switch (request.dtype) {
         inline else => |tag| @field(tensor_mod.DType, @tagName(tag)),
     };
-    const tensor = try createTensorWithDType(self, .{ .ptr = source.buffer.ptr, .len = bytes }, shape, count, dtype);
+    const tensor = try createTensorWithDType(self, .{ .ptr = offset_ptr, .len = bytes }, shape, count, dtype);
     tensorFromCt(tensor).owns_buffer = false;
     request.storage.retain();
     tensorFromCt(tensor).physical_lease = request.storage;
@@ -53448,7 +53451,8 @@ test "CUDA bounded activation slice retains the exact planned source range" {
     defer graph.deinit();
     var builder = ml.graph.Builder.init(&graph);
     const input = try builder.parameter("x", Shape.init(.f32, &.{ 3, 2 }));
-    const activation = try builder.absOp(input);
+    var activation = try builder.absOp(input);
+    for (0..8) |_| activation = try builder.add(activation, input);
     const slice = try graph.addNode(.{
         .op = .{ .slice = .{ .starts = .{ 1, 0, 0, 0, 0, 0, 0, 0 }, .limits = .{ 3, 2, 0, 0, 0, 0, 0, 0 }, .num_axes = 2 } },
         .output_shape = Shape.init(.f32, &.{ 2, 2 }),
@@ -53459,7 +53463,7 @@ test "CUDA bounded activation slice retains the exact planned source range" {
     try graph.markOutput(output);
     var program = try @import("../../execution/program.zig").ModelProgram.init(a, &graph, &.{ .{ .name = "x", .node_id = input, .kind = .input }, .{ .name = "out", .node_id = output, .kind = .output } });
     defer program.deinit();
-    var executable = try @import("../../execution/executable.zig").prepare(a, &program, &cb, .partitioned);
+    var executable = try @import("../../execution/executable.zig").prepare(a, &program, &cb, .compiled_required);
     defer executable.deinit();
     const node = program.id_map[input];
     const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
@@ -53470,11 +53474,37 @@ test "CUDA bounded activation slice retains the exact planned source range" {
     var host = try Tensor.initFloat32(a, "x", &.{ 3, 2 }, &.{ -1, 2, -3, 4, -5, 6 });
     defer host.deinit();
     const ingress = [_]@import("../../execution/host_ingress.zig").Input{.{ .node_id = node, .value = &host }};
-    var result = try executable.run(a, .{ .host_inputs = &ingress, .prepared_routes = selected });
-    defer result.deinit(&executable.runtime);
-    const actual = try cb.toFloat32(result.outputs[0], a);
-    defer a.free(actual);
-    try std.testing.expectEqualSlices(f32, &.{ 3, 4, 5, 6 }, actual);
+    var held: ?@import("../../graph/runtime.zig").Result = null;
+    defer if (held) |*result| result.deinit(&executable.runtime);
+    var captures: u64 = 0;
+    var replays: u64 = 0;
+    for (0..5) |iteration| {
+        const last: f32 = @floatFromInt(6 + iteration);
+        host.asFloat32Mut()[5] = last;
+        var result = try executable.run(a, .{ .host_inputs = &ingress, .prepared_routes = selected });
+        var live = true;
+        defer if (live) result.deinit(&executable.runtime);
+        captures += result.stats.physical_graph_captures;
+        replays += result.stats.physical_graph_replays;
+        const actual = try cb.toFloat32(result.outputs[0], a);
+        defer a.free(actual);
+        try std.testing.expectEqualSlices(f32, &.{ -21, 36, -35, 9 * last }, actual);
+        if (iteration == 4) {
+            held = result;
+            live = false;
+        }
+    }
+    try std.testing.expectEqual(@as(u64, 1), captures);
+    try std.testing.expect(replays >= 2);
+    host.asFloat32Mut()[5] = 50;
+    var next = try executable.run(a, .{ .host_inputs = &ingress, .prepared_routes = selected });
+    defer next.deinit(&executable.runtime);
+    const next_values = try cb.toFloat32(next.outputs[0], a);
+    defer a.free(next_values);
+    try std.testing.expectEqualSlices(f32, &.{ -21, 36, -35, 450 }, next_values);
+    const held_values = try cb.toFloat32(held.?.outputs[0], a);
+    defer a.free(held_values);
+    try std.testing.expectEqualSlices(f32, &.{ -21, 36, -35, 90 }, held_values);
     const source = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{ 3, 2 });
     var source_live = true;
     defer if (source_live) cb.free(source);

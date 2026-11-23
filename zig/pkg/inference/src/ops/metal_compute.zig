@@ -11775,6 +11775,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn physicalTensorViewOp(ctx: *anyopaque, request: ops.physical_storage.View) anyerror!?CT {
+        if (request.byte_offset != 0) return null;
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const dtype = hostInputMetalDType(request.dtype) orelse return null;
         if (dtype != .f32 and (request.storage.usage != .host_input or request.layout_source != null)) return null;
