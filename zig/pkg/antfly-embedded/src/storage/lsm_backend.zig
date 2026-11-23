@@ -3330,6 +3330,19 @@ pub const Backend = struct {
         return try self.runMaintenanceStepLocked(false);
     }
 
+    /// Keep the readiness recheck, attempt, and any stale-debt refresh in
+    /// the same lock acquisition. Contention never falls through to scoring.
+    pub fn runReadyMaintenanceStepBestEffort(self: *Backend) !bool {
+        if (!self.mu.tryLock()) return false;
+        defer self.unlockWithReclamation();
+        if (!self.maintenanceWorkReadyLocked()) return false;
+        const progressed = try self.runMaintenanceStepLocked(false);
+        if (!progressed and self.maintenanceDebtHint() != 0) {
+            _ = self.refreshCachedMaintenanceHintLocked();
+        }
+        return progressed;
+    }
+
     pub fn makeWalCheckpointRetryDueForTest(self: *Backend) void {
         if (!builtin.is_test) return;
         const locked = runtime_mod.lockBackend(Backend, self);
@@ -8926,12 +8939,13 @@ pub const Backend = struct {
         return self.nextMaintenanceWakeDelayNsLocked();
     }
 
-    /// Cached debt and scheduled work are the admission signals used by the
-    /// maintenance runner. A busy backend cannot prove it is idle.
-    pub fn mayHaveMaintenanceWork(self: *Backend) bool {
-        if (self.maintenanceDebtHint() != 0) return true;
-        if (!self.mu.tryLock()) return true;
+    pub fn hasReadyMaintenanceWorkBestEffort(self: *Backend) bool {
+        if (!self.mu.tryLock()) return false;
         defer self.mu.unlock();
+        return self.maintenanceWorkReadyLocked();
+    }
+
+    fn maintenanceWorkReadyLocked(self: *Backend) bool {
         return self.maintenanceDebtHint() != 0 or self.nextMaintenanceWakeDelayNsLocked() == @as(?u64, 0);
     }
 

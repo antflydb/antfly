@@ -7604,8 +7604,8 @@ pub const DB = struct {
         // polls must not advance the replay revision seen by hybrid readers.
         const primary = &self.core.primary_store_owner;
         if (!self.source_pin_cleanup.due(monotonicTimeNs()) and
-            !primary.mayHaveLsmMaintenanceWork() and
-            !self.core.index_manager.mayHaveLsmMaintenanceWork()) return false;
+            !primary.hasReadyLsmMaintenanceWorkBestEffort() and
+            !self.core.index_manager.hasReadyLsmMaintenanceWorkBestEffort()) return false;
 
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
@@ -7613,19 +7613,8 @@ pub const DB = struct {
         defer snapshot_replay.release();
         if (self.source_pin_cleanup.takeTurn() and try self.runSourcePinCleanupStep()) return true;
         if (try self.core.index_manager.runLsmObsoleteReclaimDueBestEffort()) return true;
-        const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
-        if (primary_reclaim_due) {
-            if (try self.core.primary_store_owner.runLsmMaintenanceStepBestEffort()) return true;
-        }
-
-        const primary_score = self.core.primary_store_owner.lsmMaintenanceDebtHint();
-        if (primary_score > 0) {
-            if (try self.core.primary_store_owner.runLsmMaintenanceStepBestEffort()) return true;
-        }
+        if (try primary.runReadyLsmMaintenanceStepBestEffort()) return true;
         if (try self.core.index_manager.runLsmMaintenanceStepBestEffort()) return true;
-        if (primary_score > 0) {
-            self.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
-        }
         return try self.runSourcePinCleanupStep();
     }
 
@@ -7675,16 +7664,13 @@ pub const DB = struct {
     pub fn runPrimaryLsmMaintenanceStepBestEffort(self: *DB) !bool {
         if (comptime storage_engine.enabled) return storage_engine.call("runPrimaryLsmMaintenanceStepBestEffort", .{self});
         const primary = &self.core.primary_store_owner;
-        if (!primary.mayHaveLsmMaintenanceWork()) return false;
+        if (!primary.hasReadyLsmMaintenanceWorkBestEffort()) return false;
 
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         var snapshot_replay = try self.acquireSnapshotReplayMutation();
         defer snapshot_replay.release();
-        if (!primary.mayHaveLsmMaintenanceWork()) return false;
-        if (try primary.runLsmMaintenanceStepBestEffort()) return true;
-        primary.refreshLsmMaintenanceDebtHint();
-        return false;
+        return try primary.runReadyLsmMaintenanceStepBestEffort();
     }
 
     pub fn hasActiveDenseBulkWork(self: *const DB) bool {
@@ -7741,12 +7727,42 @@ pub const DB = struct {
         _ = try db.runLsmMaintenanceUntilIdle();
         db.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
         try std.testing.expect(!db.source_pin_cleanup.due(monotonicTimeNs()));
-        try std.testing.expect(!backend.mayHaveMaintenanceWork());
+        try std.testing.expect(!backend.hasReadyMaintenanceWorkBestEffort());
 
         const revision = db.core.snapshot_replay_admission.quietRevision().?;
         try std.testing.expect(!try db.runLsmMaintenanceStepBestEffort());
         try std.testing.expect(!try db.runPrimaryLsmMaintenanceStepBestEffort());
         try std.testing.expectEqual(@as(?u64, revision), db.core.snapshot_replay_admission.quietRevision());
+
+        // Keep the backend mutex held until both best-effort polls return.
+        // The timeout releases the mutex before joining if either poll blocks.
+        {
+            const Poll = struct {
+                db: *DB,
+                done: Io.Event = .unset,
+                result: anyerror!bool = false,
+
+                fn run(self: *@This()) void {
+                    self.result = self.poll();
+                    self.done.set(std.testing.io);
+                }
+
+                fn poll(self: *@This()) !bool {
+                    const primary = try self.db.runPrimaryLsmMaintenanceStepBestEffort();
+                    const combined = try self.db.runLsmMaintenanceStepBestEffort();
+                    return primary or combined;
+                }
+            };
+            var poll: Poll = .{ .db = &db };
+            var worker: ?std.Thread = null;
+            defer if (worker) |thread| thread.join();
+            try std.testing.expect(backend.mu.tryLock());
+            defer backend.mu.unlock();
+            worker = try std.Thread.spawn(.{}, Poll.run, .{&poll});
+            try poll.done.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+            try std.testing.expect(!try poll.result);
+            try std.testing.expectEqual(@as(?u64, revision), db.core.snapshot_replay_admission.quietRevision());
+        }
 
         for ([_]bool{ true, false }, 0..) |primary_only, i| {
             const obsolete = try lsm_backend_mod.repository.runPath(alloc, root, 999_999 + i);

@@ -10149,9 +10149,8 @@ pub const IndexManager = struct {
         return delay_ns;
     }
 
-    /// A busy catalog cannot prove that every index is idle.
-    pub fn mayHaveLsmMaintenanceWork(self: *IndexManager) bool {
-        if (!self.catalog_mutex.tryLockShared()) return true;
+    pub fn hasReadyLsmMaintenanceWorkBestEffort(self: *IndexManager) bool {
+        if (!self.catalog_mutex.tryLockShared()) return false;
         defer self.catalog_mutex.unlockShared();
         for (self.text_indexes.items) |*entry| {
             if (entry.persistent.lsmMaintenanceDebtHint() != 0 or

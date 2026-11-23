@@ -2487,7 +2487,7 @@ pub const PersistentIndex = struct {
     }
 
     pub fn runLsmMaintenanceStepBestEffort(self: *PersistentIndex) !bool {
-        self.lockStorage();
+        if (!self.storage_mu.tryLock()) return false;
         defer self.unlockStorage();
         return try self.main_store_owner.runLsmMaintenanceStepBestEffort();
     }
