@@ -12688,14 +12688,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return self.compute.audio_capture == null and metal_runtime.hasActiveFrame(self.compute.provider_impl.raw_decode_runtime);
         }
         fn encodeInFrame(self: *const @This(), request: ProjectionPack.Request, input: MetalTensor, rows: usize, outputs: []const MetalTensor, scratch: MetalTensor) !void {
-            platform.sync.lockYielding(&self.compute.packed_projection_mutex);
-            defer self.compute.packed_projection_mutex.unlock();
-            const pack = self.compute.packedProjection(request) orelse return error.PreparedRegionBindingChanged;
-            const runtime = self.compute.provider_impl.raw_decode_runtime.?;
-            const recording = try metal_runtime.DenseFrameRecording.retainActive(runtime);
-            defer recording.release();
-            const entry = metal_runtime.PackedProjectionEntry{ .runtime = runtime, .handle = pack.entry, .request = request };
-            try entry.encodeAssigned(recording, input, rows, outputs, scratch);
+            for ([_]?*MetalCompute{ self.compute, self.compute.borrowedProjectionPackSource() }) |owner_candidate| {
+                const cache_owner = owner_candidate orelse continue;
+                platform.sync.lockYielding(&cache_owner.packed_projection_mutex);
+                defer cache_owner.packed_projection_mutex.unlock();
+                const pack = cache_owner.packedProjection(request) orelse continue;
+                const runtime = self.compute.provider_impl.raw_decode_runtime.?;
+                const recording = try metal_runtime.DenseFrameRecording.retainActive(runtime);
+                defer recording.release();
+                const entry = metal_runtime.PackedProjectionEntry{ .runtime = runtime, .handle = pack.entry, .request = request };
+                return entry.encodeAssigned(recording, input, rows, outputs, scratch);
+            }
+            return error.PreparedRegionBindingChanged;
         }
         fn matches(raw: *anyopaque, request: region.Validate) bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -13405,11 +13409,26 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         residency_locked = false;
     }
 
+    fn borrowedProjectionPackSource(self: *MetalCompute) ?*MetalCompute {
+        const token = self.engine_borrowed_operation orelse return null;
+        if (token.vtable != &operation_vtable) return null;
+        const current = currentEngineOperation(self) orelse return null;
+        const record = operationRecord(current.context, current.nonce) catch return null;
+        if (!acceptsPhysicalImplementation(record.source.table)) return null;
+        const source: *MetalCompute = @ptrCast(@alignCast(record.source.context));
+        if (source == self or source.data != self.data or source.provider_impl != self.provider_impl) return null;
+        return source;
+    }
+
     fn hasInstalledProjectionPack(self: *MetalCompute, request: ProjectionPack.Request) bool {
         if (request.count == 3 and platform.env.getenvBool("TERMITE_METAL_DISABLE_DENSE_QKV_PACKED")) return false;
-        platform.sync.lockYielding(&self.packed_projection_mutex);
-        defer self.packed_projection_mutex.unlock();
-        return self.packedProjection(request) != null;
+        for ([_]?*MetalCompute{ self, self.borrowedProjectionPackSource() }) |candidate| {
+            const cache_owner = candidate orelse continue;
+            platform.sync.lockYielding(&cache_owner.packed_projection_mutex);
+            defer cache_owner.packed_projection_mutex.unlock();
+            if (cache_owner.packedProjection(request) != null) return true;
+        }
+        return false;
     }
 
     fn packedProjection(self: *MetalCompute, request: ProjectionPack.Request) ?*ProjectionPack.Owner {
@@ -58332,6 +58351,7 @@ test "Metal private borrowed engine authority survives backend copies but cannot
     var nested = try MetalCompute.initBorrowingSharedProvider(a, owner.data, null, .{});
     defer nested.deinit();
     try nested.adoptEngineBorrowedOperation(token);
+    try std.testing.expectEqual(owner, nested.borrowedProjectionPackSource().?);
     try std.testing.expectError(error.BackendOperationConsumed, nested.adoptEngineBorrowedOperation(token));
     var copied = nested.computeBackend();
     const input = try auditDeviceTensor(owner, &backend, &.{ 3, 5 }, &.{2});
@@ -58353,6 +58373,7 @@ test "Metal private borrowed engine authority survives backend copies but cannot
     try std.testing.expectError(error.BackendOperationInactive, token.validate(.{ .implementation = .{ .context = &nested, .table = copied.vtable }, .program = null, .mode = .managed }));
     nested.embedding_stage_suspended = false;
     try std.testing.expect(copied.operationToken() == null);
+    try std.testing.expect(nested.borrowedProjectionPackSource() == null);
     try std.testing.expect(backend.operationToken() == null);
     nested.finishEngineOperation();
     try std.testing.expect(nested.engine_borrowed_operation == null);
