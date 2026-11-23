@@ -53380,7 +53380,7 @@ const MediaOutputExecution = struct {
             var vector_revisions: [16][64]u8 = undefined;
             var vector_count: usize = 0;
             defer for (vectors[0..vector_count]) |vector| if (vector) |owned| scratch.free(owned);
-            var order: [16]usize = undefined;
+            var order: [16]struct { index: usize, needed: bool } = undefined;
             var count: usize = 0;
             for ([_]bool{ true, false }) |primary| {
                 for (self.speaker_states, 0..) |candidate, i| {
@@ -53389,15 +53389,18 @@ const MediaOutputExecution = struct {
                     const through = if (work) |video_work| video_work.through[i] else end;
                     const needed = eligible[i] and !self.enough(state, start, through.?, stop_at_turn);
                     if (needed != primary or (!needed and !sharing[i])) continue;
-                    order[count] = i;
+                    order[count] = .{ .index = i, .needed = needed };
                     count += 1;
                 }
             }
-            for (order[0..count]) |i| {
+            // An earlier recipe can close the boundary turn while applying
+            // this hop. Keep the work selected before any recipe commits so
+            // another recipe at the same grid point can use its embedding.
+            for (order[0..count]) |scheduled| {
+                const i = scheduled.index;
                 const target = self.config.targets[i];
                 const state = self.speaker_states[i] orelse continue;
-                const goal = if (work) |video_work| video_work.through[i] else end;
-                const needed = eligible[i] and !self.enough(state, start, goal.?, stop_at_turn);
+                const needed = scheduled.needed;
                 const shared_goal = if (sharing[i]) work.?.piggyback.?[i] else null;
                 if (!needed and (shared_goal == null or self.enough(state, start, shared_goal.?, stop_at_turn))) continue;
                 var failure_work = work;
