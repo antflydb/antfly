@@ -2048,7 +2048,13 @@ const RaftTableApplyStateMachine = struct {
         else
             protocol.withExactEnvelopeFloor(try protocol.completionProtocolVersion(self.alloc, req), exact_prepare);
         if (required_protocol) |required| {
-            if (comptime !linked_storage) return error.StorageKernelOwnerUnavailable;
+            if (comptime !linked_storage) {
+                // The direct owner handles an ordinary producer with the
+                // standard ordered batch path. Retained controls and history
+                // clock entries still require their linked native owner.
+                if (history_commit_time_ns != null or exact_prepare or req.transaction != null or req.source_producer != .ordinary)
+                    return error.StorageKernelOwnerUnavailable;
+            }
             const projection = self.topology_apply_store orelse return error.StorageKernelOwnerUnavailable;
             const floor = projection.raftBatchProtocolVersionForRequest(group_id) catch |err| switch (err) {
                 error.SplitSourceProjectionNotReady, error.StorageBusy => return error.RaftApplyWriterUnavailable,
@@ -39618,6 +39624,53 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                     .policy_version = try @import("antfly_local_sources").privacy_catalog.policyBinding(response_alloc, table.indexes_json),
                 }, .{}) };
             }
+            if (std.mem.endsWith(u8, request.uri, antfly.metadata_http_routes.Routes.internal_decision_admission)) {
+                const catalog_api = antfly.public_api.table_catalog;
+                const parsed = try std.json.parseFromSlice(antfly.metadata_api.DecisionAdmissionRequest, response_alloc, request.body, .{});
+                defer parsed.deinit();
+                const input = parsed.value;
+                const generation = try catalog_api.RoutingGeneration.createFromFullRecords(response_alloc, .{
+                    .metadata_group_id = snapshot.status.metadata_group_id,
+                    .metadata_incarnation = snapshot.status.metadata_incarnation,
+                    .catalog_revision = snapshot.status.metadata_epoch,
+                    .tables = snapshot.tables,
+                    .ranges = snapshot.ranges,
+                }, .{});
+                defer generation.release();
+                const Validation = struct {
+                    fn tableMatches(cut: *const antfly.metadata_api.AdminSnapshot, gen: *catalog_api.RoutingGeneration, id: u64, name: []const u8, epoch: ?u64) bool {
+                        const table = antfly.public_api.tables.findTableByName(cut, name) orelse return false;
+                        if (id != table.table_id) return false;
+                        catalog_api.validateTransactionTopologyStableSnapshot(cut, table.*) catch return false;
+                        if (epoch) |expected| {
+                            const view = gen.indexed.tableRoutingView(name, .{}) catch return false;
+                            if (view.topology_epoch != expected) return false;
+                        }
+                        return true;
+                    }
+                };
+                var result: antfly.metadata_api.DecisionAdmission = .{
+                    .metadata_group_id = snapshot.status.metadata_group_id,
+                    .metadata_incarnation = snapshot.status.metadata_incarnation,
+                    .catalog_revision = snapshot.status.metadata_epoch,
+                    .stable = Validation.tableMatches(snapshot, generation, input.table_id, input.table_name, null),
+                };
+                if (input.route_check) |check| {
+                    result.route_checked = true;
+                    const current = catalog_api.generationDecisionRoute(generation, input.table_name, check.route.group_id, .{}) catch null;
+                    result.stable = result.stable and current != null and current.?.topology_epoch == check.topology_epoch and std.meta.eql(current.?.route, check.route);
+                }
+                if (input.table_batch) |batch| {
+                    result.tables_checked = true;
+                    for (batch.tables) |table| {
+                        if (Validation.tableMatches(snapshot, generation, table.table_id, table.table_name, table.topology_epoch)) continue;
+                        result.stable = false;
+                        result.rejected_table_id = table.table_id;
+                        break;
+                    }
+                }
+                return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(response_alloc, result, .{}) };
+            }
             // This fixture owns metadata directly. Serve the same compact
             // read contract as production instead of relying on data caches
             // to stand in for the catalog authority.
@@ -68275,6 +68328,8 @@ fn implementationTests() type {
             try std.testing.expectEqual(.finalized, observation.receiver.phase);
             try std.testing.expect(observation.receiver.cutover_ready);
 
+            // Reopen the receiver from disk after stopping both Raft tasks.
+            try server.data_raft_apply.?.write_source.clearWriteCache();
             var receiver = try antfly.db.DB.open(alloc, receiver_path, .{
                 .identity_namespace = .{
                     .table_id = contract.table_id,
