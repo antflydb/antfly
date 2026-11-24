@@ -24,6 +24,7 @@ const ctc_decode = @import("ctc_decode.zig");
 const connected_components = @import("connected_components.zig");
 const vision_reader = @import("../readers/vision_reader.zig");
 const model_manager_mod = @import("../server/model_manager.zig");
+const ocria_nano = @import("ocria_nano.zig");
 
 pub const TextRegion = struct {
     bbox: [4]f64,
@@ -536,6 +537,9 @@ pub const MultiStageOCRPipeline = struct {
     recognition_crop_orientation: crop.Orientation = .preserve,
     layout: ?backends.Session = null,
     order: ?backends.Session = null,
+    /// OCRia-nano router and script recognizers; `detector` is its line
+    /// detector. When set, the generic detection/recognition path is unused.
+    ocria: ?ocria_nano.Stages = null,
 
     /// Borrow immutable models and dictionaries for one synchronous execution.
     /// Only transient buffers/results use work; teardown belongs to the loader.
@@ -553,6 +557,10 @@ pub const MultiStageOCRPipeline = struct {
     }
 
     pub fn deinit(self: *MultiStageOCRPipeline) void {
+        if (self.ocria) |*stages| {
+            stages.deinit(self.allocator);
+            self.ocria = null;
+        }
         if (self.recognizer) |*recognizer| {
             recognizer.deinit();
             self.recognizer = null;
@@ -600,6 +608,7 @@ pub const MultiStageOCRPipeline = struct {
     }
 
     fn runDecodedPrepared(self: *MultiStageOCRPipeline, img: image.Image, control: ?InferenceExecutionControl, retained: *Preparation) !MultiStageOCRResult {
+        if (self.ocria) |*stages| return self.runOcria(stages, img, control, retained);
         const result_allocator = try retained.allocator();
         const regions = try self.detect(img, control, retained);
         defer if (regions.len > 0) result_allocator.free(regions);
@@ -684,6 +693,46 @@ pub const MultiStageOCRPipeline = struct {
             .full_text = full_text,
             .regions = try recognized.toOwnedSlice(result_allocator),
             .layout = layout_regions,
+        };
+    }
+
+    fn runOcria(self: *MultiStageOCRPipeline, stages: *const ocria_nano.Stages, img: image.Image, control: ?InferenceExecutionControl, retained: *Preparation) !MultiStageOCRResult {
+        const result_allocator = try retained.allocator();
+        const tab = try result_allocator.create(ocria_nano.BicubicTable);
+        defer result_allocator.destroy(tab);
+        tab.init();
+        const env = ocria_nano.Env{
+            .backing = self.allocator,
+            .work = result_allocator,
+            .retained = retained,
+            .control = control,
+            .tab = tab,
+        };
+        const lines = try ocria_nano.runPage(&env, self.detector, stages, img);
+        defer result_allocator.free(lines);
+        var transferred: usize = 0;
+        errdefer for (lines[transferred..]) |line| result_allocator.free(line.text);
+        const regions = try result_allocator.alloc(RecognizedRegion, lines.len);
+        errdefer {
+            for (regions[0..transferred]) |*region| region.deinit(result_allocator);
+            result_allocator.free(regions);
+        }
+        for (lines, regions) |line, *region| {
+            region.* = .{
+                .bbox = ocria_nano.quadBBox(line.quad),
+                .confidence = line.confidence,
+                .text = line.text,
+                .rec_confidence = line.confidence,
+            };
+            transferred += 1;
+        }
+        sortRegionsByReadingOrder(RecognizedRegion, regions);
+        const full_text = try assembleFullText(result_allocator, regions);
+        try retained.trim();
+        return .{
+            .allocator = result_allocator,
+            .full_text = full_text,
+            .regions = regions,
         };
     }
 

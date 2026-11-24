@@ -348,6 +348,41 @@ Verified in this pass:
 - `zig build` still passes after the shared Vision2Seq refactor and multistage `vision2seq` recognizer wiring
 - the existing model-backed `monkt/paddleocr-onnx` `/api/read` e2e still passes after adding the new recognizer type, confirming the CTC path still works
 
+## OCRia-nano-1 Reader
+
+[llamaindex/OCRia-nano-1](https://huggingface.co/llamaindex/OCRia-nano-1) is an
+8.1M-parameter CPU OCR pipeline: a line detector (`det.onnx`), a script router
+(`router.onnx`) and four CTC line recognizers (`rec_{latin,cjk,rtl,world}.onnx`
+with `rec_<script>.charset.json`). All of them run on the native ONNX importer;
+the recognizers decode CTC in-graph (`ids`, `conf` outputs), which needed the
+`ReduceLogSumExp` converter in `zig/lib/onnx`.
+
+```sh
+antfly inference pull hf:llamaindex/OCRia-nano-1 --models-dir models/readers
+antfly-inference read models/readers/llamaindex/OCRia-nano-1 page.png
+```
+
+- Pull recognizes the raw repo layout, downloads the OCR stack (plus `LICENSE`,
+  skipping LayoutNet's `tablenet.*`) and synthesizes `antfly_metadata.json` with
+  `model_type: "ocria_nano"`: stages `detection`, `router`, `recognition`
+  (Latin) and the optional `recognition_cjk`, `recognition_rtl`,
+  `recognition_world` (`type: "ocria_ctc"`). A missing script recognizer falls
+  back to Latin. Stage `meta_file` sidecars carry `det.meta.json` thresholds and
+  `rec_rtl.meta.json` `visual_rtl`.
+- `src/pipelines/ocria_nano.zig` ports LiteParse's `ocr/ocria` module
+  (Apache-2.0), the reference the models were qualified with: OpenCV-exact
+  area/linear resizes and bicubic perspective crops, connected-component line
+  quads, collinear merging, column-gutter splits, sideways-page retry, page-level
+  script routing with flip detection and low-confidence rescue, homoglyph
+  folding and the junk filter. `/api/read` returns `text` plus line `regions`.
+- Not ported: LayoutNet (`tablenet.onnx`: tables and layout classes over the
+  PDF text layer and OCR tokens), faint-token recovery, and the adaptive second
+  detection pass. RTL readings use a reduced bidi reorder rather than the full
+  Unicode bidi algorithm.
+- License: the weights use the OCRia-nano-1 Model License (RAIL-M based), not
+  Apache-2.0. Commercial use above LlamaIndex's revenue/funding thresholds, or
+  in a product competing with LlamaParse, needs a license from LlamaIndex.
+
 ## Moondream Reader
 
 Moondream2 (`vikhyatk/moondream2@2024-03-04`, `model_type: "moondream1"`)

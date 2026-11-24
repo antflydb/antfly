@@ -236,6 +236,19 @@ const SyntheticMetadataPlan = union(enum) {
         recognition_model: []const u8,
         char_dict_file: []const u8,
     },
+    ocria_nano: OcriaNanoPlan,
+};
+
+/// llamaindex/OCRia-nano-1 ships its pipeline as loose files at the repo
+/// root (det.onnx, router.onnx, rec_<script>.onnx + charset); the metadata
+/// that wires them together is synthesized at pull time.
+const ocria_scripts = [_][]const u8{ "latin", "cjk", "rtl", "world" };
+const ocria_stage_names = [_][]const u8{ "recognition", "recognition_cjk", "recognition_rtl", "recognition_world" };
+
+const OcriaNanoPlan = struct {
+    has_detector_meta: bool = false,
+    scripts: [ocria_scripts.len]bool = @splat(false),
+    script_meta: [ocria_scripts.len]bool = @splat(false),
 };
 
 /// Files needed per model type, in priority order.
@@ -1081,6 +1094,65 @@ fn appendMultiStageArtifacts(
     return found_stage_payload;
 }
 
+fn appendOcriaNanoArtifacts(
+    allocator: std.mem.Allocator,
+    to_download: *std.ArrayListUnmanaged(HubFile),
+    files: []const HubFile,
+) !SyntheticMetadataPlan {
+    if (hasFile(files, "antfly_metadata.json")) return .none;
+    for ([_][]const u8{ "det.onnx", "router.onnx", "rec_latin.onnx", "rec_latin.charset.json" }) |required| {
+        if (!hasFile(files, required)) return .none;
+    }
+    var plan = OcriaNanoPlan{};
+    _ = try appendMatchingFileIfMissing(allocator, to_download, files, "det.onnx");
+    _ = try appendMatchingFileIfMissing(allocator, to_download, files, "router.onnx");
+    plan.has_detector_meta = try appendMatchingFileIfMissing(allocator, to_download, files, "det.meta.json");
+    for (ocria_scripts, 0..) |script, i| {
+        var model_buf: [64]u8 = undefined;
+        var charset_buf: [64]u8 = undefined;
+        var meta_buf: [64]u8 = undefined;
+        const model = try std.fmt.bufPrint(&model_buf, "rec_{s}.onnx", .{script});
+        const charset = try std.fmt.bufPrint(&charset_buf, "rec_{s}.charset.json", .{script});
+        const meta = try std.fmt.bufPrint(&meta_buf, "rec_{s}.meta.json", .{script});
+        if (!hasFile(files, model) or !hasFile(files, charset)) continue;
+        _ = try appendMatchingFileIfMissing(allocator, to_download, files, model);
+        _ = try appendMatchingFileIfMissing(allocator, to_download, files, charset);
+        plan.script_meta[i] = try appendMatchingFileIfMissing(allocator, to_download, files, meta);
+        plan.scripts[i] = true;
+    }
+    // The weights carry their own license terms; keep them with the model.
+    _ = try appendMatchingFileIfMissing(allocator, to_download, files, "LICENSE");
+    return .{ .ocria_nano = plan };
+}
+
+fn ocriaNanoMetadataAlloc(allocator: std.mem.Allocator, plan: OcriaNanoPlan) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator,
+        \\{
+        \\  "model_type": "ocria_nano",
+        \\  "pipeline_type": "multistage_ocr",
+        \\  "stages": {
+        \\    "detection": {"model_file": "det.onnx", "post_processor": "ocria"
+    );
+    if (plan.has_detector_meta) try out.appendSlice(allocator, ", \"meta_file\": \"det.meta.json\"");
+    try out.appendSlice(allocator, "},\n    \"router\": {\"model_file\": \"router.onnx\"}");
+    for (ocria_scripts, ocria_stage_names, 0..) |script, stage, i| {
+        if (!plan.scripts[i]) continue;
+        const entry = try std.fmt.allocPrint(allocator, ",\n    \"{s}\": {{\"type\": \"ocria_ctc\", \"model_file\": \"rec_{s}.onnx\", \"char_dict_file\": \"rec_{s}.charset.json\"", .{ stage, script, script });
+        defer allocator.free(entry);
+        try out.appendSlice(allocator, entry);
+        if (plan.script_meta[i]) {
+            const meta = try std.fmt.allocPrint(allocator, ", \"meta_file\": \"rec_{s}.meta.json\"", .{script});
+            defer allocator.free(meta);
+            try out.appendSlice(allocator, meta);
+        }
+        try out.append(allocator, '}');
+    }
+    try out.appendSlice(allocator, "\n  }\n}\n");
+    return out.toOwnedSlice(allocator);
+}
+
 fn appendPreexportedPaddleOCRArtifacts(
     allocator: std.mem.Allocator,
     to_download: *std.ArrayListUnmanaged(HubFile),
@@ -1147,6 +1219,17 @@ fn writeSyntheticMetadata(
                 , .{ payload.detection_model, payload.recognition_model, payload.char_dict_file });
             defer allocator.free(metadata);
 
+            const metadata_path = try std.fmt.allocPrint(allocator, "{s}/antfly_metadata.json", .{dest_dir});
+            defer allocator.free(metadata_path);
+            try writeFileAtomically(allocator, io, metadata_path, metadata);
+            return .{
+                .path = "antfly_metadata.json",
+                .size = metadata.len,
+            };
+        },
+        .ocria_nano => |plan| {
+            const metadata = try ocriaNanoMetadataAlloc(allocator, plan);
+            defer allocator.free(metadata);
             const metadata_path = try std.fmt.allocPrint(allocator, "{s}/antfly_metadata.json", .{dest_dir});
             defer allocator.free(metadata_path);
             try writeFileAtomically(allocator, io, metadata_path, metadata);
@@ -2286,6 +2369,9 @@ pub fn downloadModel(
             const found_decoder_only_vlm_vision = try appendPreferredOnnxPayload(allocator, &to_download, files, &decoder_only_vlm_vision_candidates);
             const found_decoder_only_vlm = found_decoder_only_vlm_decoder or found_decoder_only_vlm_embed or found_decoder_only_vlm_vision;
             const found_multistage = try appendMultiStageArtifacts(allocator, &to_download, files);
+            if (!found_multistage and synthetic_metadata == .none) {
+                synthetic_metadata = try appendOcriaNanoArtifacts(allocator, &to_download, files);
+            }
             if (!found_multistage and synthetic_metadata == .none) {
                 synthetic_metadata = try appendPreexportedPaddleOCRArtifacts(allocator, &to_download, files);
             }
@@ -3696,6 +3782,54 @@ test "appendPreexportedPaddleOCRArtifacts selects nested raw PaddleOCR assets" {
     try std.testing.expectEqualStrings("languages/english/dict.txt", to_download.items[2].name);
     try std.testing.expectEqualStrings("detection/v3/config.json", to_download.items[3].name);
     try std.testing.expectEqualStrings("languages/english/config.json", to_download.items[4].name);
+}
+
+test "appendOcriaNanoArtifacts selects the OCR stack and synthesizes metadata" {
+    const allocator = std.testing.allocator;
+
+    const files = [_]HubFile{
+        .{ .name = "README.md" },
+        .{ .name = "LICENSE" },
+        .{ .name = "det.meta.json" },
+        .{ .name = "det.onnx" },
+        .{ .name = "rec_cjk.charset.json" },
+        .{ .name = "rec_cjk.onnx" },
+        .{ .name = "rec_latin.charset.json" },
+        .{ .name = "rec_latin.onnx" },
+        .{ .name = "rec_rtl.charset.json" },
+        .{ .name = "rec_rtl.meta.json" },
+        .{ .name = "rec_rtl.onnx" },
+        .{ .name = "rec_world.onnx" },
+        .{ .name = "router.onnx" },
+        .{ .name = "tablenet.onnx" },
+        .{ .name = "tablenet.bin" },
+    };
+
+    var to_download = std.ArrayListUnmanaged(HubFile).empty;
+    defer to_download.deinit(allocator);
+
+    const plan = try appendOcriaNanoArtifacts(allocator, &to_download, &files);
+    try std.testing.expect(plan == .ocria_nano);
+    // det, router, det.meta, latin (2), cjk (2), rtl (3), LICENSE; world has no charset.
+    try std.testing.expectEqual(@as(usize, 11), to_download.items.len);
+    for (to_download.items) |file| {
+        try std.testing.expect(!std.mem.startsWith(u8, file.name, "tablenet"));
+        try std.testing.expect(!std.mem.eql(u8, file.name, "rec_world.onnx"));
+    }
+
+    const metadata = try ocriaNanoMetadataAlloc(allocator, plan.ocria_nano);
+    defer allocator.free(metadata);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, metadata, .{});
+    defer parsed.deinit();
+    const stages = parsed.value.object.get("stages").?.object;
+    try std.testing.expectEqual(@as(usize, 5), stages.count());
+    try std.testing.expectEqualStrings("det.meta.json", stages.get("detection").?.object.get("meta_file").?.string);
+    try std.testing.expectEqualStrings("rec_rtl.meta.json", stages.get("recognition_rtl").?.object.get("meta_file").?.string);
+    try std.testing.expect(stages.get("recognition_world") == null);
+
+    var paddle = std.ArrayListUnmanaged(HubFile).empty;
+    defer paddle.deinit(allocator);
+    try std.testing.expect(try appendPreexportedPaddleOCRArtifacts(allocator, &paddle, &files) == .none);
 }
 
 test "gguf selection skips projector and appends it as companion artifact" {

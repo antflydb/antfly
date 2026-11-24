@@ -187,6 +187,7 @@ pub fn convertNodeWithScope(
         .ReduceMin => convertReduceMinMax(builder, .min, node, inputs),
         .ReduceProd => convertReduceProd(builder, node, inputs),
         .ReduceL2 => convertReduceL2(builder, node, inputs),
+        .ReduceLogSumExp => convertReduceLogSumExp(builder, node, inputs),
 
         // Data movement
         .Gather => convertGather(builder, node, inputs),
@@ -320,6 +321,7 @@ const OpType = enum {
     ReduceMin,
     ReduceProd,
     ReduceL2,
+    ReduceLogSumExp,
     // Data movement
     Gather,
     Concat,
@@ -437,6 +439,7 @@ const OpType = enum {
             .{ "ReduceMin", .ReduceMin },
             .{ "ReduceProd", .ReduceProd },
             .{ "ReduceL2", .ReduceL2 },
+            .{ "ReduceLogSumExp", .ReduceLogSumExp },
             .{ "Gather", .Gather },
             .{ "Concat", .Concat },
             .{ "Slice", .Slice },
@@ -2734,6 +2737,29 @@ fn convertReduceL2(builder: *Builder, node: *const NodeProto, inputs: []const No
     const squared = try builder.mul(inputs[0], inputs[0]);
     const reduced = try convertReduce(builder, .reduce_sum, node, &.{squared});
     return builder.sqrt(reduced);
+}
+
+fn convertReduceLogSumExp(builder: *Builder, node: *const NodeProto, inputs: []const NodeId) ConvertError!NodeId {
+    if (inputs.len < 1) return error.MissingInput;
+    // Stable form: max + log(sum(exp(x - max))). The shifted max keeps the
+    // reduced axes so it broadcasts against x; the outer max follows the
+    // node's own keepdims, as the sum does.
+    var keep_attrs: [17]AttributeProto = undefined;
+    if (node.attributes.len + 1 > keep_attrs.len) return error.InvalidAttribute;
+    keep_attrs[0] = .{ .name = "keepdims", .i = 1, .attr_type = .int };
+    for (node.attributes, 1..) |attr, i| keep_attrs[i] = attr;
+    var keep_node = node.*;
+    keep_node.attributes = keep_attrs[0 .. node.attributes.len + 1];
+    const shift = try convertReduce(builder, .reduce_max, &keep_node, inputs);
+    const centered = try builder.sub(inputs[0], shift);
+    const exps = try builder.expOp(centered);
+    var sum_inputs_buf: [2]NodeId = .{ exps, null_node };
+    if (inputs.len >= 2) sum_inputs_buf[1] = inputs[1];
+    const sum_inputs = sum_inputs_buf[0..@min(inputs.len, 2)];
+    const summed = try convertReduce(builder, .reduce_sum, node, sum_inputs);
+    const logs = try builder.logOp(summed);
+    const max = try convertReduce(builder, .reduce_max, node, inputs);
+    return builder.add(logs, max);
 }
 
 // ── Phase 2: ScatterND ──────────────────────────────────────────────
@@ -7293,6 +7319,27 @@ test "convertNode ReduceSum" {
     const node = NodeProto{ .op_type = "ReduceSum", .attributes = &attrs };
     const result = try convertNode(allocator, &b, &node, &.{x}, null);
     try std.testing.expect(std.meta.activeTag(g.node(result).op) == .reduce_sum);
+}
+
+test "convertNode ReduceLogSumExp keeps the requested output rank" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const x = try b.parameter("x", Shape.init(.f32, &.{ 2, 5, 7 }));
+    var axes = [_]i64{1};
+    var attrs = [_]AttributeProto{
+        .{ .name = "axes", .ints = &axes },
+        .{ .name = "keepdims", .i = 0, .attr_type = .int },
+    };
+    const node = NodeProto{ .op_type = "ReduceLogSumExp", .attributes = &attrs };
+    const result = try convertNode(allocator, &b, &node, &.{x}, null);
+    const shape = g.node(result).output_shape;
+    try std.testing.expectEqual(@as(u8, 2), shape.rank());
+    try std.testing.expectEqual(@as(i64, 2), shape.dim(0));
+    try std.testing.expectEqual(@as(i64, 7), shape.dim(1));
+    try std.testing.expect(std.meta.activeTag(g.node(result).op) == .add);
 }
 
 test "convertNode ReduceMean" {

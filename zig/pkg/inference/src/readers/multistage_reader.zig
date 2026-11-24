@@ -21,6 +21,7 @@ const reader_types = @import("types.zig");
 const multistage_ocr = @import("../pipelines/multistage_ocr.zig");
 const ctc_decode = @import("../pipelines/ctc_decode.zig");
 const image = @import("../pipelines/image.zig");
+const ocria_nano = @import("../pipelines/ocria_nano.zig");
 const model_manager_mod = @import("../server/model_manager.zig");
 const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
@@ -269,6 +270,15 @@ pub const LoadedMultiStageReader = struct {
         errdefer pipeline.deinit();
         detector_owned = false;
 
+        if (preflight.ocria) |*assets| {
+            try loadOcriaStages(allocator, asset_resolver, metadata, component_loader, &managed_sessions, assets, &pipeline, control);
+            return .{
+                .allocator = allocator,
+                .pipeline = pipeline,
+                .managed_sessions = managed_sessions,
+            };
+        }
+
         // Load optional graph-only stages before transferring preflight-owned
         // tokenizer/dictionary state. A backend failure can then retry without
         // reparsing or cloning permanent sidecars.
@@ -357,6 +367,57 @@ pub const LoadedMultiStageReader = struct {
         };
     }
 
+    /// OCRia-nano: the router and one CTC recognizer per script group. Groups
+    /// without a stage fall back to the Latin recognizer at run time.
+    fn loadOcriaStages(
+        allocator: std.mem.Allocator,
+        asset_resolver: *AssetResolver,
+        metadata: *const metadata_mod.MultiStageMetadata,
+        component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
+        managed_sessions: *std.ArrayListUnmanaged(model_manager_mod.ManagedSession),
+        assets: *const OcriaAssets,
+        pipeline: *multistage_ocr.MultiStageOCRPipeline,
+        control: ?InferenceExecutionControl,
+    ) !void {
+        const router_stage = metadata.stages.get("router") orelse return error.InvalidMetadata;
+        const router_path = try asset_resolver.resolve(router_stage.model_file orelse return error.InvalidMetadata);
+        defer allocator.free(router_path);
+        var router_managed = try loadComponent(component_loader, router_path, control);
+        errdefer router_managed.deinit();
+        const router = router_managed.disownSession();
+        var router_owned = true;
+        errdefer if (router_owned) router.close();
+        try managed_sessions.append(allocator, router_managed);
+        router_managed.resource_lease = null;
+
+        var options = ocria_nano.Options{};
+        if (assets.detector.thresh) |value| options.det_thresh = value;
+        if (assets.detector.merge) |value| options.det_merge = value;
+        pipeline.ocria = .{ .router = router, .recognizers = @splat(null), .options = options };
+        router_owned = false;
+
+        for (ocria_stage_names, 0..) |stage_name, group| {
+            const stage = metadata.stages.get(stage_name) orelse continue;
+            const charset = assets.charsets[group] orelse return error.InvalidMetadata;
+            const rec_path = try asset_resolver.resolve(stage.model_file orelse return error.InvalidMetadata);
+            defer allocator.free(rec_path);
+            var rec_managed = try loadComponent(component_loader, rec_path, control);
+            errdefer rec_managed.deinit();
+            const rec_session = rec_managed.disownSession();
+            var rec_owned = true;
+            errdefer if (rec_owned) rec_session.close();
+            try managed_sessions.append(allocator, rec_managed);
+            rec_managed.resource_lease = null;
+            pipeline.ocria.?.recognizers[group] = .{
+                .session = rec_session,
+                .charset = try dupeCharset(allocator, charset),
+                .visual_rtl = assets.visual_rtl[group],
+            };
+            rec_owned = false;
+        }
+        if (pipeline.ocria.?.recognizers[0] == null) return error.InvalidMetadata;
+    }
+
     fn loadComponent(
         component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
         model_path: []const u8,
@@ -410,6 +471,7 @@ const PreflightAssets = struct {
     post_processor: multistage_ocr.DetectionPostProcessor,
     char_dict: ?[][]u8 = null,
     vision_tokenizer: ?model_manager_mod.ManagedHfTokenizer = null,
+    ocria: ?OcriaAssets = null,
 
     fn load(
         allocator: std.mem.Allocator,
@@ -420,6 +482,16 @@ const PreflightAssets = struct {
         const detection = metadata.stages.get("detection") orelse
             return error.InvalidMetadata;
         _ = detection.model_file orelse return error.InvalidMetadata;
+        if (std.mem.eql(u8, metadata.model_type orelse "", ocria_nano.model_type)) {
+            // The OCRia detector has its own post-processing; this one is unused.
+            var result = PreflightAssets{
+                .allocator = allocator,
+                .post_processor = .{ .heatmap = .{ .threshold = 0.5, .min_area = 50 } },
+            };
+            errdefer result.deinit();
+            result.ocria = try OcriaAssets.load(allocator, asset_resolver, metadata, &detection);
+            return result;
+        }
         var result = PreflightAssets{
             .allocator = allocator,
             .post_processor = try loadPostProcessor(detection),
@@ -474,10 +546,91 @@ const PreflightAssets = struct {
     pub fn deinit(self: *PreflightAssets) void {
         if (self.char_dict) |dict| ctc_decode.freeCharDict(self.allocator, dict);
         if (self.vision_tokenizer) |*managed| managed.deinit();
+        if (self.ocria) |*assets| assets.deinit(self.allocator);
+        self.ocria = null;
         self.char_dict = null;
         self.vision_tokenizer = null;
     }
 };
+
+/// Recognition stage names in OCRia script-group order.
+const ocria_stage_names = [_][]const u8{ "recognition", "recognition_cjk", "recognition_rtl", "recognition_world" };
+const max_ocria_sidecar_bytes = 4 * 1024 * 1024;
+
+/// OCRia-nano charsets and threshold sidecars, read once before backend
+/// fallback.
+const OcriaAssets = struct {
+    charsets: [ocria_nano.group_count]?[][]u8 = @splat(null),
+    visual_rtl: [ocria_nano.group_count]bool = @splat(false),
+    detector: ocria_nano.DetectorMeta = .{},
+
+    fn load(
+        allocator: std.mem.Allocator,
+        asset_resolver: *AssetResolver,
+        metadata: *const metadata_mod.MultiStageMetadata,
+        detection: *const metadata_mod.StageMetadata,
+    ) !OcriaAssets {
+        var result = OcriaAssets{};
+        errdefer result.deinit(allocator);
+        if (metadata.stages.get("router") == null) return error.InvalidMetadata;
+        if (metadata.stages.get("recognition") == null) return error.InvalidMetadata;
+        if (detection.meta_file) |relative| {
+            if (try readOptionalAsset(allocator, asset_resolver, relative)) |bytes| {
+                defer allocator.free(bytes);
+                result.detector = ocria_nano.parseDetectorMeta(allocator, bytes);
+            }
+        }
+        for (ocria_stage_names, 0..) |stage_name, group| {
+            const stage = metadata.stages.get(stage_name) orelse continue;
+            const stage_type = stage.stage_type orelse return error.InvalidMetadata;
+            if (!std.mem.eql(u8, stage_type, "ocria_ctc")) return error.InvalidMetadata;
+            _ = stage.model_file orelse return error.InvalidMetadata;
+            const charset_rel = stage.char_dict_file orelse return error.InvalidMetadata;
+            const charset_path = try asset_resolver.resolve(charset_rel);
+            defer allocator.free(charset_path);
+            const bytes = try c_file.readFileMax(allocator, charset_path, max_ocria_sidecar_bytes);
+            defer allocator.free(bytes);
+            result.charsets[group] = try ocria_nano.parseCharset(allocator, bytes);
+            if (stage.meta_file) |relative| {
+                if (try readOptionalAsset(allocator, asset_resolver, relative)) |meta| {
+                    defer allocator.free(meta);
+                    result.visual_rtl[group] = ocria_nano.parseVisualRtl(allocator, meta);
+                }
+            }
+        }
+        return result;
+    }
+
+    fn deinit(self: *OcriaAssets, allocator: std.mem.Allocator) void {
+        for (&self.charsets) |*maybe| if (maybe.*) |charset| {
+            ocria_nano.freeCharset(allocator, charset);
+            maybe.* = null;
+        };
+    }
+};
+
+fn readOptionalAsset(allocator: std.mem.Allocator, asset_resolver: *AssetResolver, relative: []const u8) !?[]u8 {
+    const path = asset_resolver.resolve(relative) catch |err| switch (err) {
+        error.InvalidMetadata, error.ModelAssetOutsideRoot => return err,
+        else => return null,
+    };
+    defer allocator.free(path);
+    return try c_file.readFileMax(allocator, path, max_ocria_sidecar_bytes);
+}
+
+fn dupeCharset(allocator: std.mem.Allocator, charset: []const []u8) ![][]u8 {
+    const out = try allocator.alloc([]u8, charset.len);
+    var filled: usize = 0;
+    errdefer {
+        for (out[0..filled]) |entry| allocator.free(entry);
+        allocator.free(out);
+    }
+    for (charset) |entry| {
+        out[filled] = try allocator.dupe(u8, entry);
+        filled += 1;
+    }
+    return out;
+}
 
 fn validateStageProcessorPath(
     allocator: std.mem.Allocator,
