@@ -1624,7 +1624,6 @@ pub const MetalPartitionExecutor = struct {
                 if (initializer.staging.byte_size != bytes or initializer.staging.usage != .host_input or initializer.staging.admitted) return false;
                 continue;
             }
-            if (node.output_shape.dtype != .f32) return false;
             // The region and elision checks below guard composite schedules
             // that use a different owner than a standalone destination kernel.
             // Regular RoPE descriptors derive positions in the shared kernel;
@@ -1632,6 +1631,10 @@ pub const MetalPartitionExecutor = struct {
             // Projection selection likewise pins the concrete slot and
             // validates its schedule before assigning any destination.
             const descriptor = ops_mod.kernel_descriptor.lower(graph, id);
+            if (node.output_shape.dtype != .f32) {
+                const value = descriptor orelse return false;
+                if (!metal_compute_mod.supportsAssignedDescriptor(&value)) return false;
+            }
             if (descriptor) |value| switch (value.operation) {
                 .gather => {
                     // The selected route requires checked host or immutable indices. Keep

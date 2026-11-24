@@ -7756,12 +7756,36 @@ extern fn termite_metal_decode_runtime_gliner_boundary_device(
 ) c_int;
 
 pub fn decoderRuntimeConcatLastDimF32_2DDevice(self: anytype, a: MetalTensor, b: MetalTensor, rows: usize, dim_a: usize, dim_b: usize, output_shape: []const i32) !?MetalTensor {
-    return decoderRuntimeConcatLastDimF32_2DDeviceImpl(self, a, b, rows, dim_a, dim_b, output_shape, null);
+    return decoderRuntimeConcatLastDimF32_2DDeviceImpl(self, a, b, rows, dim_a, dim_b, output_shape);
 }
-pub fn decoderRuntimeConcatLastDimF32_2DDeviceInto(self: anytype, a: MetalTensor, b: MetalTensor, rows: usize, dim_a: usize, dim_b: usize, output_shape: []const i32, output_override: MetalTensor) !?MetalTensor {
-    return decoderRuntimeConcatLastDimF32_2DDeviceImpl(self, a, b, rows, dim_a, dim_b, output_shape, output_override);
+pub fn decoderRuntimeConcatWordsInto(self: anytype, a: MetalTensor, b: MetalTensor, rows: usize, dim_a: usize, dim_b: usize, output: MetalTensor) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (!a.isDevice() or !b.isDevice() or !output.isDevice() or a.dtype != output.dtype or b.dtype != output.dtype) return false;
+    const words: usize = switch (output.dtype) {
+        .f32, .i32 => 1,
+        .i64 => 2,
+        else => return false,
+    };
+    if (rows == 0 or dim_a == 0 or dim_b == 0) return false;
+    const a_words = try std.math.mul(usize, dim_a, words);
+    const b_words = try std.math.mul(usize, dim_b, words);
+    const output_count = try std.math.mul(usize, rows, try std.math.add(usize, dim_a, dim_b));
+    if (output_count > std.math.maxInt(u32) / words or output.elemCount() != output_count or
+        a.elemCount() != try std.math.mul(usize, rows, dim_a) or b.elemCount() != try std.math.mul(usize, rows, dim_b)) return false;
+    return termite_metal_decode_runtime_concat_lastdim_f32_2d_device(
+        runtime,
+        a.deviceHandle(),
+        a.deviceByteOffset(),
+        b.deviceHandle(),
+        b.deviceByteOffset(),
+        rows,
+        a_words,
+        b_words,
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    ) == 0;
 }
-inline fn decoderRuntimeConcatLastDimF32_2DDeviceImpl(self: anytype, a: MetalTensor, b: MetalTensor, rows: usize, dim_a: usize, dim_b: usize, output_shape: []const i32, output_override: ?MetalTensor) !?MetalTensor {
+inline fn decoderRuntimeConcatLastDimF32_2DDeviceImpl(self: anytype, a: MetalTensor, b: MetalTensor, rows: usize, dim_a: usize, dim_b: usize, output_shape: []const i32) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (!a.isDevice() or !b.isDevice()) return null;
@@ -7770,28 +7794,11 @@ inline fn decoderRuntimeConcatLastDimF32_2DDeviceImpl(self: anytype, a: MetalTen
     if (b.elemCount() != try std.math.mul(usize, rows, dim_b)) return null;
     const out_dim = try std.math.add(usize, dim_a, dim_b);
     const output_elems = try std.math.mul(usize, rows, out_dim);
-    if (output_override) |override| if (!override.isDevice() or override.dtype != .f32 or override.elemCount() != output_elems) return null;
-    var output_device = output_override orelse try MetalTensor.deviceAllocate(runtime, output_elems * @sizeOf(f32), .private, output_shape);
-    errdefer if (output_override == null) output_device.deinit();
-    const rc = termite_metal_decode_runtime_concat_lastdim_f32_2d_device(
-        runtime,
-        a.deviceHandle(),
-        a.deviceByteOffset(),
-        b.deviceHandle(),
-        b.deviceByteOffset(),
-        rows,
-        dim_a,
-        dim_b,
-        output_device.deviceHandle(),
-        output_device.deviceByteOffset(),
-    );
-    if (rc != 0) {
-        // return null is not an error return, so the errdefer above
-        // does not run; release the fresh device buffer explicitly.
-        if (output_override == null) output_device.deinit();
-        return null;
-    }
-    return output_device;
+    var output = try MetalTensor.deviceAllocate(runtime, try std.math.mul(usize, output_elems, @sizeOf(f32)), .private, output_shape);
+    errdefer output.deinit();
+    if (try decoderRuntimeConcatWordsInto(self, a, b, rows, dim_a, dim_b, output)) return output;
+    output.deinit();
+    return null;
 }
 
 pub fn decoderRuntimeGlinerGruCombineF32Device(

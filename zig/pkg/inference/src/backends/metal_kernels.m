@@ -13914,7 +13914,7 @@ static NSString *termite_metal_shader_source(void) {
            "}\n"
            // tile-codegen:end tensor.layout.direct.11 family
            // tile-codegen:begin tensor.layout.direct.12 family (do not edit; run: zig build tile-kernel-codegen -- --write)
-           "kernel void termite_concat_lastdim_f32_2d(device const float *a [[buffer(0)]], device const float *b [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_concat_lastdim_f32_2d_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
+           "kernel void termite_concat_lastdim_f32_2d(device const uint *a [[buffer(0)]], device const uint *b [[buffer(1)]], device uint *output [[buffer(2)]], constant termite_metal_concat_lastdim_f32_2d_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint out_dim = p.dim_a + p.dim_b;\n"
            "    uint count = p.rows * out_dim;\n"
            "    if (gid >= count) return;\n"

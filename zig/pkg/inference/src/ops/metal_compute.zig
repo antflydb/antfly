@@ -30,7 +30,11 @@ const kernel_geometry = @import("kernel_geometry.zig");
 /// Static target legality is shared by preparation and direct invocation.
 /// Tensor residency remains a runtime property checked by the invocation hook.
 pub fn supportsAssignedDescriptor(descriptor: *const ops.kernel_descriptor.Descriptor) bool {
-    if (descriptor.output_shape.dtype != .f32) return false;
+    switch (descriptor.output_shape.dtype) {
+        .f32 => {},
+        .i32, .i64 => if (descriptor.operation != .concat and descriptor.operation != .slice) return false,
+        else => return false,
+    }
     if (descriptor.output_shape.rank() == 0) return false;
     switch (descriptor.operation) {
         .paged_attention => return false,
@@ -89,11 +93,15 @@ pub fn supportsAssignedDescriptor(descriptor: *const ops.kernel_descriptor.Descr
                 _ = kernel_geometry.ReductionAxis.init(geometry) catch return false;
             }
         },
+        .concat => |geometry| {
+            if (geometry.outer == 0 or geometry.a_axis == 0 or geometry.b_axis == 0 or geometry.inner == 0) return false;
+            if (descriptor.output_shape.dtype != .f32 and descriptor.elements() > std.math.maxInt(u32) / (descriptor.output_shape.dtype.byteSize() / @sizeOf(u32))) return false;
+        },
         .slice => |map| {
             const plan = map.plan(descriptor.input_shapes[0], descriptor.output_shape) catch return false;
             // Preserve the existing zero-copy slice route rather than assigning
             // a separate result buffer to an operation that can remain a view.
-            if (plan.contiguous()) return false;
+            if (plan.contiguous() or plan.count > std.math.maxInt(u32)) return false;
         },
         .gather => |gather| switch (descriptor.input_shapes[1].dtype) {
             .f32 => if (gather.axis != 0 or descriptor.input_shapes[0].rank() != 2) return false,
@@ -11827,7 +11835,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (request.byte_offset != 0) return null;
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const dtype = hostInputMetalDType(request.dtype) orelse return null;
-        if (dtype != .f32 and request.storage.usage != .host_input and !request.storage.isReadOnly() and request.layout_source == null) return null;
         if (request.storage.backend.ptr != ctx or request.storage.backend.kind() != .metal) return error.InvalidPhysicalStorageBackend;
         const storage = toBuf(request.storage.tensor);
         if (request.layout_source) |prototype| {
@@ -13696,8 +13703,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         } else null;
         for (request.inputs, 0..) |input, index| {
             const buf = toBuf(input);
-            const typed_index = typed_gather and index == 1;
-            if (buf.integer_storage != typed_index or hasHostView(buf) or buf.lazy_multiply != null or bufHasAnyQuantizedStorage(buf)) return false;
+            const dtype = hostInputMetalDType(descriptor.input_shapes[index].dtype) orelse return false;
+            if (buf.integer_storage != (dtype != .f32) or hasHostView(buf) or buf.lazy_multiply != null or bufHasAnyQuantizedStorage(buf)) return false;
             const tensor = PreparedCachedOperands.deviceInput(cached_operands, input, index) orelse {
                 const prepared = request.prepared_route orelse return false;
                 if (descriptor.operation != .linear or index == 0 or prepared.vtable != &PreparedDenseLinear.vtable) return false;
@@ -13705,7 +13712,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (!source.descriptor.shape.eq(descriptor.input_shapes[index])) return false;
                 continue;
             };
-            if (!tensor.isDevice() or tensor.dtype != (if (typed_index) hostInputMetalDType(descriptor.input_shapes[index].dtype).? else .f32) or tensor.elemCount() != descriptor.input_shapes[index].numElements().?) return false;
+            if (!tensor.isDevice() or tensor.dtype != dtype or tensor.elemCount() != descriptor.input_shapes[index].numElements().?) return false;
             if (typed_gather) {
                 const shape = descriptor.input_shapes[index];
                 if (tensor.ndim() != shape.rank()) return false;
@@ -13763,9 +13770,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const output = request.output orelse return true;
         const out_buf = toBuf(output);
         if (out_buf.metal_tensor) |*tensor| if (tensor.isReadOnlyPhysical()) return error.ReadOnlyPhysicalStorage;
-        if (out_buf.integer_storage or hasHostView(out_buf) or out_buf.lazy_multiply != null or bufHasAnyQuantizedStorage(out_buf)) return error.InvalidTensorShape;
+        const output_dtype = hostInputMetalDType(descriptor.output_shape.dtype) orelse return false;
+        if (out_buf.integer_storage != (output_dtype != .f32) or hasHostView(out_buf) or out_buf.lazy_multiply != null or bufHasAnyQuantizedStorage(out_buf)) return error.InvalidTensorShape;
         const out_tensor = out_buf.metal_tensor orelse return error.InvalidTensorShape;
-        if (!out_tensor.isDevice() or out_tensor.dtype != .f32 or out_tensor.elemCount() != descriptor.elements()) return error.InvalidTensorShape;
+        if (!out_tensor.isDevice() or out_tensor.dtype != output_dtype or out_tensor.elemCount() != descriptor.elements()) return error.InvalidTensorShape;
         if (descriptor.operation == .linear and request.prepared_route != null) {
             const prepared: *const PreparedDenseLinear = @ptrCast(@alignCast(request.prepared_route.?.context));
             const assigned = request.assigned_output orelse return error.InvalidPhysicalStorageAuthority;
@@ -13891,8 +13899,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             ),
             .concat => |geometry| blk: {
                 const rhs = toBuf(request.inputs[1]).metal_tensor.?;
-                const shape = ops.kernel_descriptor.nativeDimensions(i32, descriptor.output_shape);
-                if (geometry.inner == 1) break :blk (try metal_runtime.decoderRuntimeConcatLastDimF32_2DDeviceInto(self.provider_impl, input, rhs, geometry.outer, geometry.a_axis, geometry.b_axis, shape[0..descriptor.output_shape.rank()], out_tensor)) != null;
+                if (input.dtype != .f32 or geometry.inner == 1) {
+                    const a_chunk = try std.math.mul(usize, geometry.a_axis, geometry.inner);
+                    const b_chunk = try std.math.mul(usize, geometry.b_axis, geometry.inner);
+                    break :blk try metal_runtime.decoderRuntimeConcatWordsInto(self.provider_impl, input, rhs, geometry.outer, a_chunk, b_chunk, out_tensor);
+                }
                 var destination = out_tensor;
                 try concatDeviceInto(input, rhs, &destination, geometry);
                 break :blk true;
@@ -41952,7 +41963,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return (descriptor.operation == .slice or descriptor.operation == .broadcast) and supportsAssignedDescriptor(descriptor);
     }
 
-    const kernel_backend_impl: ops.KernelBackend = .{ .denseDecoder = &dense_decoder_services, .ownedPayloadServices = &owned_payload_services, .retainImmutableTensor = retainImmutableTensorOp, .standaloneOutputBytes = standaloneOutputBytesOp, .pooledOutputStorage = pooledOutputStorageOp, .gatherDeviceRows = gatherDeviceRowsOp, .regionPolicyKey = denseRegionPolicyKey, .claimRegionExecutionProfile = claimDenseProjectionProfile, .prepareRegionRoutes = prepareDenseProjectionRegions, .regionRoutesInOrdinaryFrame = true, .hostInputRequirements = hostInputRequirementsOp, .createHostInput = createHostInputOp, .hostInputViewExclusive = hostInputViewExclusiveOp, .createMetadataAlias = createMetadataAliasOp, .materializesOutput = materializesOutputOp, .physicalReplayReshapeViews = true, .implementation_table = &vtable_impl, .acceptsImplementation = acceptsPhysicalImplementation, .storageOwnership = storageOwnershipOp, .physicalLiteralBindingSupported = physicalLiteralBindingSupportedOp, .writePhysicalFloat32 = writePhysicalFloat32Op, .physicalLiteralInitializer = physicalLiteralInitializerOp, .copyPhysicalInput = copyPhysicalInputOp, .copyPhysicalIndexInput = copyPhysicalIndexInputOp, .validatePhysicalIndexInput = validatePhysicalIndexInputOp, .readFloat32Into = readFloat32IntoOp, .physical_storage_policy = &physical_storage_policy, .physicalTensorView = physicalTensorViewOp, .runAssignedKernel = runAssignedKernelOp, .assignedKernelWorkspace = assignedKernelWorkspaceOp, .prepareKernelRoute = prepareKernelRouteOp };
+    fn assignedKernelSupportedOp(_: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
+        return supportsAssignedDescriptor(descriptor);
+    }
+
+    const kernel_backend_impl: ops.KernelBackend = .{ .denseDecoder = &dense_decoder_services, .ownedPayloadServices = &owned_payload_services, .retainImmutableTensor = retainImmutableTensorOp, .standaloneOutputBytes = standaloneOutputBytesOp, .pooledOutputStorage = pooledOutputStorageOp, .gatherDeviceRows = gatherDeviceRowsOp, .regionPolicyKey = denseRegionPolicyKey, .claimRegionExecutionProfile = claimDenseProjectionProfile, .prepareRegionRoutes = prepareDenseProjectionRegions, .regionRoutesInOrdinaryFrame = true, .hostInputRequirements = hostInputRequirementsOp, .createHostInput = createHostInputOp, .hostInputViewExclusive = hostInputViewExclusiveOp, .createMetadataAlias = createMetadataAliasOp, .materializesOutput = materializesOutputOp, .physicalReplayReshapeViews = true, .implementation_table = &vtable_impl, .acceptsImplementation = acceptsPhysicalImplementation, .storageOwnership = storageOwnershipOp, .physicalLiteralBindingSupported = physicalLiteralBindingSupportedOp, .writePhysicalFloat32 = writePhysicalFloat32Op, .physicalLiteralInitializer = physicalLiteralInitializerOp, .copyPhysicalInput = copyPhysicalInputOp, .copyPhysicalIndexInput = copyPhysicalIndexInputOp, .validatePhysicalIndexInput = validatePhysicalIndexInputOp, .readFloat32Into = readFloat32IntoOp, .physical_storage_policy = &physical_storage_policy, .physicalTensorView = physicalTensorViewOp, .assignedKernelSupported = assignedKernelSupportedOp, .runAssignedKernel = runAssignedKernelOp, .assignedKernelWorkspace = assignedKernelWorkspaceOp, .prepareKernelRoute = prepareKernelRouteOp };
 
     const vtable_impl: ops.ComputeBackend.VTable = blk: {
         var vt = native_compute_mod.vtable_impl;
