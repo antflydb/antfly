@@ -58,15 +58,20 @@ pub const SharedLiteralStore = struct {
     /// executable/route invocation. Materialized device owners retain no IR.
     pub fn create(allocator: std.mem.Allocator, graph: *const ml.graph.Graph, plan: *buffers.BufferPlan, backends: []const ops.ComputeBackend) !?*SharedLiteralStore {
         var count: usize = 0;
-        for (graph.nodes.items, 0..) |_, node| if (eligible(graph, plan, backends, @intCast(node)) != null) {
+        var selected: ?[]u32 = null;
+        errdefer if (selected) |values| allocator.free(values);
+        for (graph.nodes.items, 0..) |_, node| if (eligible(graph, plan, backends, @intCast(node))) |backend| {
+            if (backend >= ml.graph.null_node) return error.InvalidPhysicalStorageBackend;
+            if (selected == null) {
+                selected = try allocator.alloc(u32, graph.nodeCount());
+                @memset(selected.?, ml.graph.null_node);
+            }
+            selected.?[node] = @intCast(backend);
             count += 1;
         };
-        if (count == 0) return null;
+        const indices = selected orelse return null;
         const literals = try allocator.alloc(Literal, count);
         errdefer allocator.free(literals);
-        const indices = try allocator.alloc(u32, graph.nodeCount());
-        errdefer allocator.free(indices);
-        @memset(indices, ml.graph.null_node);
         const owners = try allocator.alloc(Owner, count);
         errdefer allocator.free(owners);
         @memset(owners, .{});
@@ -80,8 +85,9 @@ pub const SharedLiteralStore = struct {
         errdefer allocator.free(completions);
         @memset(completions, null);
         var index: usize = 0;
-        for (graph.nodes.items, 0..) |node, node_id| {
-            const backend = eligible(graph, plan, backends, @intCast(node_id)) orelse continue;
+        for (graph.nodes.items, indices, 0..) |node, *selected_index, node_id| {
+            const backend = selected_index.*;
+            if (backend == ml.graph.null_node) continue;
             const attrs = node.op.constant;
             const bytes = try std.math.mul(usize, attrs.data_len, node.output_shape.dtype.byteSize());
             const bound = try ops.physical_storage.reservationBytes(backends[backend], .{ .byte_size = bytes });
@@ -94,7 +100,7 @@ pub const SharedLiteralStore = struct {
                 staging_bound = try ops.physical_storage.reservationBytes(backends[backend], initializer.staging);
             };
             literals[index] = .{ .node = @intCast(node_id), .shape = node.output_shape, .data = @alignCast(graph.constant_pool.items[attrs.data_offset..][0..bytes]), .allocation = try plan.addConstantBinding(backends[backend].kind(), bytes), .backend_index = backend, .cold_bound = bound, .staging_bound = staging_bound };
-            indices[node_id] = @intCast(index);
+            selected_index.* = @intCast(index);
             index += 1;
         }
         const roots = try allocator.alloc(u32, plan.slots.len);
