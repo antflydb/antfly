@@ -1600,10 +1600,12 @@ pub const MetalPartitionExecutor = struct {
     /// Cold canonical-executor proof. The caller owns the actual provider's
     /// metadata operation before touching the cached region plan. This reuses
     /// the plan and reachability authority already used by real execution.
-    pub fn ownedFrameDispatchDecline(actual: *const PartitionExecutor, graph: *const Graph, backend: *const ComputeBackend, nodes: []const NodeId, reachable: []const bool, last_use: []const u32, required_products: ?*std.array_list.Managed(region_schedule.DeferredProducer)) !?@import("../execution/owned_coverage.zig").Reason {
+    pub fn ownedFrameDispatchDecline(actual: *const PartitionExecutor, graph: *const Graph, backend: *const ComputeBackend, nodes: []const NodeId, reachable: []const bool, last_use: []const u32, required_deferrals: ?*std.array_list.Managed(region_schedule.DeferredProducer)) !?@import("../execution/owned_coverage.zig").Reason {
         if (!ownsPartition(actual, graph, backend) or reachable.len != graph.nodeCount() or last_use.len != graph.nodeCount()) return .execution_path;
         const self: *MetalPartitionExecutor = @ptrCast(@alignCast(actual.ptr));
         var saw_dot = false;
+        var transposes: ?std.DynamicBitSetUnmanaged = null;
+        defer if (transposes) |*seen| seen.deinit(self.allocator);
         for (nodes) |id| {
             if (id >= reachable.len) return .execution_path;
             if (!reachable[id]) continue;
@@ -1646,6 +1648,7 @@ pub const MetalPartitionExecutor = struct {
                     if (graph.node(node.inputs[0]).op == .add) return .backend_region;
                 },
                 .dot => {
+                    if (transposes) |seen| if (seen.isSet(node.inputs[1])) continue;
                     // A terminal standalone dot cannot be subsumed by a
                     // neighboring projection or grouped head schedule.
                     if (saw_dot or std.mem.indexOfScalar(NodeId, graph.outputs.items, id) == null) return .backend_region;
@@ -1658,17 +1661,38 @@ pub const MetalPartitionExecutor = struct {
             } else if (@import("../execution/metadata_alias.zig").Plan.lower(graph, id, .metal) == null) return .operation;
             // These exact heuristics run ahead of the physical branch. Even
             // a supported descriptor cannot claim a producer they defer.
-            if (shouldDeferScaleMulForAdd(graph, id, reachable, last_use, null) or
-                shouldDeferTransposeForLinearDot(graph, id, reachable, last_use)) return .deferred_producer;
+            if (shouldDeferScaleMulForAdd(graph, id, reachable, last_use, null)) return .deferred_producer;
+            if (shouldDeferTransposeForLinearDot(graph, id, reachable, last_use)) {
+                const pending = required_deferrals orelse return .deferred_producer;
+                if (std.mem.indexOfScalar(NodeId, graph.outputs.items, id) != null) return .deferred_producer;
+                for (graph.nodes.items, reachable, 0..) |consumer, active, consumer_id| {
+                    if (!active or std.mem.indexOfScalar(NodeId, consumer.getInputs(), id) == null) continue;
+                    const consumer_node: NodeId = @intCast(consumer_id);
+                    const matched = ops_mod.kernel_descriptor.TransposedRightDot.match(graph, consumer_node) orelse return .deferred_producer;
+                    if (matched.transpose != id) return .deferred_producer;
+                    try pending.append(.{ .producer = id, .consumer = consumer_node });
+                }
+                if (transposes == null) transposes = try std.DynamicBitSetUnmanaged.initEmpty(self.allocator, graph.nodeCount());
+                transposes.?.set(id);
+            }
             if (shouldDeferElementwiseMulForAdd(graph, id, reachable, last_use, null)) {
-                const pending = required_products orelse return .deferred_producer;
+                const pending = required_deferrals orelse return .deferred_producer;
                 try pending.append(.{ .producer = id, .consumer = last_use[id] });
             }
         }
         var transient: ?RuntimeRegionPlan = null;
         defer if (transient) |*plan| plan.deinit(self.allocator);
         const plan = try self.runtimeRegionPlan(self.allocator, graph, nodes, graph.nodeCount(), reachable, last_use, null, &transient);
-        if (!plan.matches(nodes, graph.nodeCount()) or plan.region_count != 0 or plan.covered_node_count != 0 or plan.elided_node_count != 0 or plan.pre_skipped_node_count != 0) return .backend_region;
+        if (!plan.matches(nodes, graph.nodeCount()) or plan.elided_node_count != 0 or plan.pre_skipped_node_count != 0) return .backend_region;
+        for (plan.regions_by_pos) |region| switch (region) {
+            .none => {},
+            .raw_linear_dot => |dot| {
+                // A planned transpose group must replace this exact edge.
+                const needed = transposes orelse return .backend_region;
+                if (!needed.isSet(dot.transpose_id)) return .backend_region;
+            },
+            else => return .backend_region,
+        };
         for (nodes, 0..) |id, position| {
             if (!reachable[id] or graph.node(id).op == .parameter or graph.node(id).op == .constant) continue;
             if (plan.descriptorAt(position) == null and @import("../execution/metadata_alias.zig").Plan.lower(graph, id, .metal) == null) return .operation;
@@ -2025,9 +2049,11 @@ pub const MetalPartitionExecutor = struct {
         if (traceRuntimeRegionsEnabled()) printRuntimeRegionPlanSummary(graph, runtime_region_plan, partition_index);
         if (metalPartitionOpRunsEnabled()) printMetalPartitionOpRuns(graph, node_ids, reachable, last_use, partition_index);
         if (exec_ctx.stats) |stats| {
-            stats.runtime_region_plan_active_regions += runtime_region_plan.region_count;
-            stats.runtime_region_plan_covered_nodes += runtime_region_plan.covered_node_count;
-            stats.runtime_region_plan_elided_nodes += runtime_region_plan.elided_node_count;
+            if (!owned_frame) {
+                stats.runtime_region_plan_active_regions += runtime_region_plan.region_count;
+                stats.runtime_region_plan_covered_nodes += runtime_region_plan.covered_node_count;
+                stats.runtime_region_plan_elided_nodes += runtime_region_plan.elided_node_count;
+            }
             stats.runtime_region_pre_skip_declined_external_consumers += runtime_region_plan.pre_skip_declined_external_consumer_count;
             const frame_eligibility = analyzeRuntimeFrameEligibility(graph, runtime_region_plan);
             recordRuntimeFrameEligibilityStats(stats, frame_eligibility);
@@ -2136,25 +2162,27 @@ pub const MetalPartitionExecutor = struct {
             }
         }
 
-        try prepareRuntimeRegionPlan(
-            graph,
-            cb,
-            values,
-            value_device,
-            device_id,
-            runtime_region_plan,
-            preparation_scope,
-            exec_ctx.stats,
-        );
+        if (!owned_frame) {
+            try prepareRuntimeRegionPlan(
+                graph,
+                cb,
+                values,
+                value_device,
+                device_id,
+                runtime_region_plan,
+                preparation_scope,
+                exec_ctx.stats,
+            );
 
-        applyRuntimeRegionPreSkippedNodes(
-            graph,
-            runtime_region_plan,
-            skipped_nodes,
-            elision_protected_nodes,
-            rt_map,
-            exec_ctx.stats,
-        );
+            applyRuntimeRegionPreSkippedNodes(
+                graph,
+                runtime_region_plan,
+                skipped_nodes,
+                elision_protected_nodes,
+                rt_map,
+                exec_ctx.stats,
+            );
+        }
 
         // Precompute per-node consumer counts (capped at 2) once so the mul-for-add
         // deferral checks in the loop below are O(1) instead of an O(nodes) scan

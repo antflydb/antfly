@@ -9022,7 +9022,8 @@ fn decoderRuntimeDotGeneral2DF32DeviceImpl(
             override.deviceHandle(),
             override.deviceByteOffset(),
         );
-        if (rc != 0) return null;
+        if (rc == -2) return null;
+        if (rc != 0) return error.CommandBufferFailed;
         return override;
     }
     var output_device = if (allocator) |owner|

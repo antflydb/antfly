@@ -256,9 +256,9 @@ pub fn assess(pool: *const physical.Pool, target: ops.ComputeBackend, metadata: 
         else => false,
     }) or reachable.len != graph.nodeCount() or pool.plan.node_slots.len != graph.nodeCount() or graph.outputs.items.len == 0) return .{ .compatibility = .execution_path };
     if (target.kind() == .metal) {
-        for ((pool.root_pool orelse pool).metal_required_products) |required| {
+        for ((pool.root_pool orelse pool).metal_required_deferrals) |required| {
             const installed = pool.regionForNode(required.producer) orelse return .{ .compatibility = .deferred_producer };
-            if (installed.owner.entry_node != required.consumer or pool.regionForNode(required.consumer) != installed)
+            if (pool.regionForNode(required.consumer) != installed)
                 return .{ .compatibility = .deferred_producer };
         }
     }

@@ -70,12 +70,14 @@ pub fn retireRegionInternals(pool: anytype, owners: []const *const @import("regi
         }
         for (owner.covered_nodes) |node| {
             const slot = pool.plan.slotForNode(node) orelse return error.InvalidBufferPlan;
-            if (retained.isSet(slot.id) or slot.kind != .allocation or slot.roles.graph_output or
+            if (retained.isSet(slot.id) or (slot.kind != .allocation and slot.kind != .view) or slot.roles.graph_output or
                 slot.roles.partition_output or slot.roles.transfer_source or slot.roles.transfer_target) continue;
             const internal = &pool.plan.slots[slot.id];
             internal.kind = .region_internal;
             internal.allocation = buffers.invalid_allocation;
+            internal.source_slot = null;
             internal.reusable = false;
+            internal.roles.view = false;
             pool.kernels[node] = null;
         }
     }

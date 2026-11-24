@@ -202,7 +202,7 @@ pub const Pool = struct {
     /// synchronous region. The root grants no primitive Frame credit.
     metal_projection_region_candidate: bool = false,
     coverage_backend: ?ops.ComputeBackend = null,
-    metal_required_products: []const @import("region_schedule.zig").DeferredProducer = &.{},
+    metal_required_deferrals: []const @import("region_schedule.zig").DeferredProducer = &.{},
     cold_coverage_decline: ?@import("owned_coverage.zig").Reason = null,
     payload_coverage: @import("owned_coverage.zig").Coverage = .{ .compatibility = .no_selected_routes },
     route_owner: ?*prepared_routes.PreparedRoutes = null,
@@ -771,7 +771,7 @@ pub const Pool = struct {
             cache.deinitWithCleanup(cleanup);
             self.allocator.destroy(cache);
         }
-        self.allocator.free(self.metal_required_products);
+        self.allocator.free(self.metal_required_deferrals);
         for (self.frames.items) |frame| frame.deinitWithCleanup(cleanup);
         self.deinitRegions();
         if (self.selection) |*selected| selected.deinitWithCleanup(cleanup);

@@ -11946,6 +11946,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn ownedPayloadRegion(ctx: *anyopaque, owned: *const @import("../execution/region_route.zig").Owned) bool {
         if (owned.implementation.context != ctx or !acceptsPhysicalImplementation(owned.implementation.table)) return false;
         if (owned.vtable == &ElementwiseProductAddRegion.table) return ElementwiseProductAddRegion.attests(ctx, owned);
+        if (owned.vtable == &TransposedRightDotRegion.table) return TransposedRightDotRegion.attests(ctx, owned);
         if (owned.vtable != &DenseProjectionRegion.table) return false;
         const self: *const DenseProjectionRegion = @ptrCast(@alignCast(owned.context));
         if (@as(*anyopaque, @ptrCast(self.compute)) != ctx or self.count < 2 or self.count > 3 or
@@ -13053,6 +13054,30 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return .{ .allocator = request.allocator, .items = items };
     }
 
+    fn acceptsDenseRegionInput(compute: *MetalCompute, binding: @import("../execution/kernel_route.zig").Binding, implementation: @import("../execution/kernel_route.zig").Implementation, logical: ml.graph.Shape, readable_bytes: usize) bool {
+        switch (binding) {
+            .imported_host => |source| return source.target == .metal and source.owned_ingress and source.logical.eq(logical),
+            .imported_device => |source| return source.implementation.context == implementation.context and source.implementation.table == implementation.table and source.logical.eq(logical),
+            .resident => return ownedPayloadInput(compute, binding, logical) catch false,
+            .planned => |planned| {
+                if (!planned.logical.eq(logical)) return false;
+                for (planned.planes) |plane| {
+                    if (plane.role == .primary and plane.descriptor.shape.eq(logical) and plane.readable_bytes >= readable_bytes and
+                        std.meta.eql(plane.descriptor.strides, @import("../graph/backend_contracts.zig").TensorStrides.dense(logical))) return true;
+                }
+                return false;
+            },
+            .tensor => |source| {
+                if (source.implementation.context != implementation.context or source.implementation.table != implementation.table) return false;
+                const tensor = denseDeviceF32(source.value) orelse return false;
+                const runtime = compute.provider_impl.raw_decode_runtime orelse return false;
+                if (tensor.device.?.ref.runtime != @as(*anyopaque, @ptrCast(runtime))) return false;
+                return (tensorShapeMatchesOp(compute, source.value, logical.dims[0..logical.rank()]) catch return false) orelse false;
+            },
+            .unknown => return false,
+        }
+    }
+
     const ElementwiseProductAddRegion = struct {
         const region = @import("../execution/region_route.zig");
         const route = @import("../execution/kernel_route.zig");
@@ -13069,28 +13094,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         elements: usize,
 
         fn accepts(self: *const @This(), binding: route.Binding, implementation: route.Implementation) bool {
-            const logical = self.outputs[0].logical;
-            switch (binding) {
-                .imported_host => |source| return source.target == .metal and source.owned_ingress and source.logical.eq(logical),
-                .imported_device => |source| return source.implementation.context == implementation.context and source.implementation.table == implementation.table and source.logical.eq(logical),
-                .resident => return ownedPayloadInput(self.compute, binding, logical) catch false,
-                .planned => |planned| {
-                    if (!planned.logical.eq(logical)) return false;
-                    for (planned.planes) |plane| {
-                        if (plane.role == .primary and plane.descriptor.shape.eq(logical) and plane.readable_bytes >= self.outputs[0].bytes and
-                            std.meta.eql(plane.descriptor.strides, @import("../graph/backend_contracts.zig").TensorStrides.dense(logical))) return true;
-                    }
-                    return false;
-                },
-                .tensor => |source| {
-                    if (source.implementation.context != implementation.context or source.implementation.table != implementation.table) return false;
-                    const tensor = denseDeviceF32(source.value) orelse return false;
-                    const runtime = self.compute.provider_impl.raw_decode_runtime orelse return false;
-                    if (tensor.device.?.ref.runtime != @as(*anyopaque, @ptrCast(runtime))) return false;
-                    return (tensorShapeMatchesOp(self.compute, source.value, logical.dims[0..logical.rank()]) catch return false) orelse false;
-                },
-                .unknown => return false,
-            }
+            const output = self.outputs[0];
+            return acceptsDenseRegionInput(self.compute, binding, implementation, output.logical, output.bytes);
         }
 
         fn attests(ctx: *anyopaque, owned: *const region.Owned) bool {
@@ -13220,6 +13225,179 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
     };
 
+    const TransposedRightDotRegion = struct {
+        const region = @import("../execution/region_route.zig");
+        const route = @import("../execution/kernel_route.zig");
+        const descriptor = ops.kernel_descriptor;
+        const NodeId = ml.graph.NodeId;
+        const limit = @import("../execution/region_binding.zig").max_outputs;
+
+        allocator: std.mem.Allocator,
+        compute: *MetalCompute,
+        outputs: [limit]region.Output = undefined,
+        nodes: [limit + 1]NodeId = undefined,
+        input_nodes: [limit + 1]NodeId = undefined,
+        input_shapes: [limit + 1]ml.graph.Shape = undefined,
+        input_bytes: [limit + 1]usize = undefined,
+        lhs_indices: [limit]usize = undefined,
+        descriptors: [limit]descriptor.Descriptor = undefined,
+        count: usize = 0,
+        input_count: usize = 0,
+        observed_uses: usize = 0,
+        next: ?*@This() = null,
+
+        fn shapeBytes(shape: ml.graph.Shape) ?usize {
+            const elements = std.math.cast(usize, shape.numElements() orelse return null) orelse return null;
+            return std.math.mul(usize, elements, @sizeOf(f32)) catch null;
+        }
+
+        fn matches(raw: *anyopaque, request: region.Validate) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (request.inputs.len != self.input_count) return false;
+            for (request.inputs, self.input_shapes[0..self.input_count], self.input_bytes[0..self.input_count]) |input, shape, bytes| {
+                if (!acceptsDenseRegionInput(self.compute, input, request.implementation, shape, bytes)) return false;
+            }
+            return true;
+        }
+
+        fn validate(_: *anyopaque, _: region.Validate) !void {}
+
+        fn dispatch(raw: *anyopaque, request: region.Invocation) !region.Outcome {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            // Binding and destination checks finish before any dot can write.
+            for (self.descriptors[0..self.count], self.lhs_indices[0..self.count], request.outputs) |*dot, lhs_index, output| {
+                if (!try runAssignedKernelOp(self.compute, .{
+                    .descriptor = dot,
+                    .inputs = &.{ request.inputs[lhs_index], request.inputs[0] },
+                })) return error.PreparedRegionBindingChanged;
+                const destination = denseDeviceF32(output.tensor) orelse return error.PreparedRegionOutputMismatch;
+                try self.compute.validateProjectionOutput(destination, output.authority orelse return error.InvalidPhysicalStorageAuthority);
+            }
+            const scope = self.compute.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
+            defer self.compute.endActivePlannedComputeScope(scope);
+            for (self.descriptors[0..self.count], self.lhs_indices[0..self.count], request.outputs) |*dot, lhs_index, output| {
+                if (!try runAssignedKernelOp(self.compute, .{
+                    .descriptor = dot,
+                    .inputs = &.{ request.inputs[lhs_index], request.inputs[0] },
+                    .output = output.tensor,
+                })) return error.PreparedRegionBindingChanged;
+            }
+            return .completed;
+        }
+
+        fn attests(ctx: *anyopaque, owned: *const region.Owned) bool {
+            const self: *const @This() = @ptrCast(@alignCast(owned.context));
+            const need = owned.requirements;
+            if (@as(*anyopaque, @ptrCast(self.compute)) != ctx or self.count == 0 or
+                owned.policy_key != 1 or owned.entry_node != self.nodes[1] or
+                owned.covered_nodes.ptr != &self.nodes or owned.covered_nodes.len != self.count + 1 or
+                owned.input_nodes.ptr != &self.input_nodes or owned.input_nodes.len != self.input_count or
+                need.outputs.ptr != &self.outputs or need.outputs.len != self.count or
+                need.requires_execution_profile or !std.meta.eql(need.dispatch_workspace, descriptor.WorkspaceRequirement{}) or
+                !std.meta.eql(need.preparation_workspace, descriptor.WorkspaceRequirement{})) return false;
+            for (self.descriptors[0..self.count]) |*dot| if (!directRouteSupported(ctx, dot)) return false;
+            return true;
+        }
+
+        fn append(compute: *MetalCompute, request: region.Prepare, positions: []const u32, result: *std.ArrayList(region.Owned)) !void {
+            const graph = request.graph;
+            const allocator = request.allocator;
+            var groups: std.AutoHashMapUnmanaged(NodeId, *@This()) = .empty;
+            var first: ?*@This() = null;
+            var tail = &first;
+            defer {
+                var remaining = groups.valueIterator();
+                while (remaining.next()) |value| allocator.destroy(value.*);
+                groups.deinit(allocator);
+            }
+            for (request.partition_nodes) |node| {
+                const dot = descriptor.TransposedRightDot.match(graph, node) orelse continue;
+                if (!ElementwiseProductAddRegion.isPartitionMember(dot.transpose, request.partition_nodes, positions)) continue;
+                if (!directRouteSupported(compute, &dot.descriptor)) continue;
+                const lhs_shape = dot.descriptor.input_shapes[0];
+                const rhs_shape = dot.descriptor.input_shapes[1];
+                const lhs_bytes = shapeBytes(lhs_shape) orelse continue;
+                const rhs_bytes = shapeBytes(rhs_shape) orelse continue;
+                const output_bytes = shapeBytes(dot.descriptor.output_shape) orelse continue;
+                if (!acceptsDenseRegionInput(compute, request.node_facts[dot.inputs[0]], request.implementation, lhs_shape, lhs_bytes) or
+                    !acceptsDenseRegionInput(compute, request.node_facts[dot.inputs[1]], request.implementation, rhs_shape, rhs_bytes)) continue;
+                const lookup = try groups.getOrPut(allocator, dot.transpose);
+                if (!lookup.found_existing) {
+                    const group = allocator.create(@This()) catch |err| {
+                        _ = groups.remove(dot.transpose);
+                        return err;
+                    };
+                    group.* = .{ .allocator = allocator, .compute = compute, .input_count = 1 };
+                    group.input_nodes[0] = dot.inputs[1];
+                    group.input_shapes[0] = rhs_shape;
+                    group.input_bytes[0] = rhs_bytes;
+                    group.nodes[0] = dot.transpose;
+                    lookup.value_ptr.* = group;
+                    tail.* = group;
+                    tail = &group.next;
+                }
+                const group = lookup.value_ptr.*;
+                if (group.count == limit) continue;
+                const slot = group.count;
+                const known = std.mem.indexOfScalar(NodeId, group.input_nodes[0..group.input_count], dot.inputs[0]);
+                const lhs_index = known orelse group.input_count;
+                if (known == null) {
+                    group.input_nodes[lhs_index] = dot.inputs[0];
+                    group.input_shapes[lhs_index] = lhs_shape;
+                    group.input_bytes[lhs_index] = lhs_bytes;
+                    group.input_count += 1;
+                }
+                group.nodes[slot + 1] = node;
+                group.outputs[slot] = .{ .node = node, .logical = dot.descriptor.output_shape, .bytes = output_bytes };
+                group.descriptors[slot] = dot.descriptor;
+                group.lhs_indices[slot] = lhs_index;
+                group.count += 1;
+            }
+            if (groups.count() == 0) return;
+            for (graph.nodes.items, request.reachable) |node, reachable| {
+                if (!reachable) continue;
+                for (node.getInputs()) |input| if (groups.get(input)) |group| {
+                    group.observed_uses += 1;
+                };
+            }
+            for (graph.outputs.items) |output| if (groups.get(output)) |group| {
+                group.observed_uses += 1;
+            };
+            // Groups retain the order of their first scheduled consumer.
+            var next_group = first;
+            while (next_group) |group| {
+                next_group = group.next;
+                if (group.count != group.observed_uses) continue;
+                const node = group.nodes[1];
+                const entry = positions[node];
+                for (group.input_nodes[0..group.input_count]) |input| {
+                    if (positions[input] < entry) continue;
+                    if (graph.node(input).op != .parameter or request.node_facts[input] != .tensor) break;
+                } else {
+                    try result.append(allocator, .{
+                        .context = group,
+                        .implementation = request.implementation,
+                        .key = node,
+                        .policy_key = request.policy_key,
+                        .covered_nodes = group.nodes[0 .. group.count + 1],
+                        .input_nodes = group.input_nodes[0..group.input_count],
+                        .entry_node = node,
+                        .requirements = .{ .outputs = group.outputs[0..group.count], .requires_execution_profile = false, .uncovered = .{} },
+                        .vtable = &table,
+                    });
+                    _ = groups.remove(group.nodes[0]);
+                }
+            }
+        }
+
+        fn destroyRegion(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.allocator.destroy(self);
+        }
+
+        const table: region.Owned.VTable = .{ .matches = matches, .validate = validate, .dispatch = dispatch, .deinit = destroyRegion };
+    };
+
     fn prepareDenseProjectionRegions(ctx: *anyopaque, request: @import("../execution/region_route.zig").Prepare) !?@import("../execution/region_route.zig").OwnedList {
         const region = @import("../execution/region_route.zig");
         const route = @import("../execution/kernel_route.zig");
@@ -13244,7 +13422,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var result: std.ArrayList(region.Owned) = .empty;
         defer result.deinit(request.allocator);
         errdefer for (result.items) |*owner| owner.deinit();
-        if (ordinary) try ElementwiseProductAddRegion.append(self, request, positions, &result);
+        if (ordinary) {
+            try ElementwiseProductAddRegion.append(self, request, positions, &result);
+            try TransposedRightDotRegion.append(self, request, positions, &result);
+        }
         var watched: std.ArrayList(DenseRegionReadiness.Entry) = .empty;
         defer watched.deinit(request.allocator);
         var packs: std.ArrayList(DenseRegionReadiness.Pack) = .empty;

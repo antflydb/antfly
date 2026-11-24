@@ -2901,8 +2901,8 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
     pool.cuda_frame_dispatch = false;
     pool.metal_frame_dispatch = false;
     pool.metal_projection_region_candidate = false;
-    pool.allocator.free(pool.metal_required_products);
-    pool.metal_required_products = &.{};
+    pool.allocator.free(pool.metal_required_deferrals);
+    pool.metal_required_deferrals = &.{};
     pool.cold_coverage_decline = null;
     pool.coverage_backend = .{ .ptr = executable.runtime.default_backend.ptr, .vtable = executable.runtime.default_backend.vtable };
     if (comptime @import("build_options").enable_metal) {
@@ -2929,8 +2929,8 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
                 };
                 if (metadata.token() == null) return;
             }
-            var required_products = std.array_list.Managed(@import("region_schedule.zig").DeferredProducer).init(pool.allocator);
-            defer required_products.deinit();
+            var required_deferrals = std.array_list.Managed(@import("region_schedule.zig").DeferredProducer).init(pool.allocator);
+            defer required_deferrals.deinit();
             var active_partitions: usize = 0;
             var native_partitions: usize = 0;
             for (plan.base.partitions, 0..) |part, index| {
@@ -2962,7 +2962,7 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
                 if (!owned) return;
                 if (projection_head) {
                     if (active_partitions != 1 or !Executor.ownsPartition(actual, graph, executable.runtime.default_backend)) return;
-                } else if (try Executor.ownedFrameDispatchDecline(actual, graph, executable.runtime.default_backend, part.node_ids, analysis.reachable, analysis.last_use, &required_products)) |reason| {
+                } else if (try Executor.ownedFrameDispatchDecline(actual, graph, executable.runtime.default_backend, part.node_ids, analysis.reachable, analysis.last_use, &required_deferrals)) |reason| {
                     pool.cold_coverage_decline = reason;
                     return;
                 }
@@ -2970,7 +2970,7 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
             if (active_partitions == 0 or (pool.plan.transfers.len != 0 and native_partitions == 0)) return;
             pool.mixed_frame_dispatch = native_partitions != 0;
             pool.metal_projection_region_candidate = projection_head and active_partitions == 1;
-            pool.metal_required_products = try required_products.toOwnedSlice();
+            pool.metal_required_deferrals = try required_deferrals.toOwnedSlice();
             pool.metal_frame_dispatch = !projection_head;
             return;
         }
@@ -3540,7 +3540,7 @@ test "planned Metal elementwise product-add publishes into the assigned region o
         const routes = (try pool.prepareRoutes(facts[0..count])) orelse return error.MissingPreparedKernelRoute;
         defer routes.release();
         if (routes.pool.completeOwnedPayload() == null) {
-            std.debug.print("Metal product-add coverage {any}, required products {any}, regions {d}\n", .{ routes.pool.payload_coverage, pool.metal_required_products, routes.pool.regions.len });
+            std.debug.print("Metal product-add coverage {any}, required products {any}, regions {d}\n", .{ routes.pool.payload_coverage, pool.metal_required_deferrals, routes.pool.regions.len });
             return error.MissingProductAddCoverage;
         }
         try std.testing.expectEqual(@as(usize, 1), routes.pool.regions.len);
@@ -4492,4 +4492,111 @@ test "Metal Frame cold metadata publication unwinds every allocation failure wit
     const before = @import("../backends/metal_tensor.zig").memoryStatsSnapshot();
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Case.run, .{ &graph, analysis, &backend });
     try std.testing.expectEqual(before.device_owned_buffers_created, @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_buffers_created);
+}
+
+test "planned Metal shared transpose publishes two assigned dot outputs" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    const metal = @import("../backends/metal_runtime.zig");
+    if (!metal.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    const Tensor = @import("../backends/tensor.zig").Tensor;
+    const Context = @import("../backends/compute_context.zig").SharedBackendContext;
+    const context = try Context.init(a, .metal, std.testing.io);
+    defer context.release();
+    const cb = context.computeBackend();
+    if (!metal.antfly_metal_host_input_shared_supported(context.ctx.metal_hosted.compute.provider_impl.raw_decode_runtime)) return error.SkipZigTest;
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const names = [_][]const u8{ "first", "second", "shared" };
+    const dims = [_][2]i64{ .{ 4, 7 }, .{ 5, 7 }, .{ 13, 7 } };
+    var nodes: [3]ml.graph.NodeId = undefined;
+    var bindings: [3]@import("program.zig").Binding = undefined;
+    for (names, &dims, &nodes, &bindings) |name, *shape, *node, *binding| {
+        node.* = try builder.parameter(name, ml.graph.Shape.init(.f32, shape));
+        binding.* = .{ .name = name, .node_id = node.*, .kind = .input };
+    }
+    const transpose = try builder.transpose(nodes[2], &.{ 1, 0 });
+    const first = try builder.matmul(nodes[0], transpose);
+    const second = try builder.matmul(nodes[1], transpose);
+    try graph.markOutput(first);
+    try graph.markOutput(second);
+    var program = try ModelProgram.initWithPipeline(a, &graph, &bindings, .cleanup);
+    defer program.deinit();
+    var executable = try prepare(a, &program, &cb, .partitioned);
+    defer executable.deinit();
+    const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    var facts: [3]@import("kernel_route.zig").InputBinding = undefined;
+    var values: [3]Tensor = undefined;
+    var inputs: [3]@import("host_ingress.zig").Input = undefined;
+    var initialized: usize = 0;
+    defer for (values[0..initialized]) |*value| value.deinit();
+    var rows: [3][91]f32 = undefined;
+    for (nodes, names, &dims, &facts, &values, &inputs, &rows, 0..) |node, name, *shape, *fact, *value, *input, *data, index| {
+        const id = program.id_map[node];
+        fact.* = .{ .node_id = id, .value = .{ .imported_host = .{ .target = .metal, .logical = ml.graph.Shape.init(.f32, shape), .owned_ingress = true } } };
+        const len: usize = @intCast(shape[0] * shape[1]);
+        for (data[0..len], 0..) |*element, i| element.* = @floatFromInt((i + index * 3) % 11);
+        value.* = try Tensor.initFloat32(a, name, shape, data[0..len]);
+        initialized += 1;
+        input.* = .{ .node_id = id, .value = value };
+    }
+    const routes = (try pool.prepareRoutes(&facts)) orelse return error.MissingPreparedKernelRoute;
+    defer routes.release();
+    if (routes.pool.completeOwnedPayload() == null) {
+        std.debug.print("Metal transpose coverage {any}, cold decline {any}, required deferrals {any}, regions {d}\n", .{ routes.pool.payload_coverage, pool.cold_coverage_decline, pool.metal_required_deferrals, routes.pool.regions.len });
+        return error.MissingTransposeCoverage;
+    }
+    try std.testing.expectEqual(@as(usize, 1), routes.pool.regions.len);
+    const slot = routes.pool.plan.slotForNode(program.id_map[transpose]) orelse return error.InvalidBufferPlan;
+    try std.testing.expectEqual(.region_internal, slot.kind);
+    try std.testing.expect(routes.pool.plan.allocationForSlot(slot.id) == null);
+    try routes.pool.plan.validate(executable.graph, &executable.runtime.plan.?.base);
+    var claims = switch (try routes.claimRegions(a, null, &facts)) {
+        .ready => |owned| owned,
+        .no_regions, .reprepare => return error.MissingPreparedRegionClaims,
+    };
+    defer claims.releaseUnsubmitted();
+    var assigned = executable.run(a, .{ .host_inputs = &inputs, .prepared_routes = routes, .region_claims = &claims, .output_placement = .producer, .collect_partition_stats = true, .activation_readbacks = .forbidden }) catch |err| {
+        std.debug.print("Metal assigned transpose dispatch failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer assigned.deinit(&executable.runtime);
+    const dispatch = assigned.stats.assigned_regions orelse return error.MissingRegionDispatch;
+    try std.testing.expectEqual(@as(u64, 1), dispatch.accepted_callbacks);
+    try std.testing.expectEqual(@as(u64, 3), dispatch.covered_callback_nodes);
+
+    const compatibility = (try pool.prepareRoutesWithPolicy(&facts, .compatibility_regions)) orelse return error.MissingCompatibilityRoutes;
+    defer compatibility.release();
+    // Compare against the legacy route even when it materializes a view.
+    var ordinary = try executable.run(a, .{ .host_inputs = &inputs, .prepared_routes = compatibility, .output_placement = .producer });
+    defer ordinary.deinit(&executable.runtime);
+    for (assigned.outputs, ordinary.outputs, 0..) |selected, original, index| {
+        const result = try cb.toFloat32(selected, a);
+        defer a.free(result);
+        const reference = try cb.toFloat32(original, a);
+        defer a.free(reference);
+        try std.testing.expectEqualSlices(f32, reference, result);
+        for (result, 0..) |element, j| {
+            var expected: f32 = 0;
+            for (0..7) |k| expected += rows[index][(j / 13) * 7 + k] * rows[2][(j % 13) * 7 + k];
+            try std.testing.expectEqual(expected, element);
+        }
+    }
+    try graph.markOutput(transpose);
+    var published_program = try ModelProgram.initWithPipeline(a, &graph, &bindings, .cleanup);
+    defer published_program.deinit();
+    var published = try prepare(a, &published_program, &cb, .partitioned);
+    defer published.deinit();
+    const published_pool = published.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    const published_slot = published_pool.plan.slotForNode(published_program.id_map[transpose]) orelse return error.InvalidBufferPlan;
+    try std.testing.expect(published_slot.roles.graph_output);
+    try std.testing.expect(published_slot.kind != .region_internal);
+    if (published_slot.kind == .view) {
+        try std.testing.expect(published_slot.source_slot != null);
+    } else {
+        try std.testing.expect(published_pool.plan.allocationForSlot(published_slot.id) != null);
+    }
+    try std.testing.expectEqual(@as(?@import("owned_coverage.zig").Reason, .deferred_producer), published_pool.cold_coverage_decline);
 }

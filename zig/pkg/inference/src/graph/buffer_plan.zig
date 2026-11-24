@@ -452,7 +452,7 @@ pub const BufferPlan = struct {
             } else if (slot.kind == .region_internal) {
                 if (self.execution_reachable == null or slot.allocation != invalid_allocation or slot.reusable or
                     slot.source_slot != null or slot.roles.graph_output or slot.roles.partition_output or
-                    slot.roles.transfer_source or slot.roles.transfer_target) return error.InvalidBufferPlan;
+                    slot.roles.transfer_source or slot.roles.transfer_target or slot.roles.view) return error.InvalidBufferPlan;
             } else if (slot.allocation != invalid_allocation) {
                 return error.InvalidBufferPlan;
             }

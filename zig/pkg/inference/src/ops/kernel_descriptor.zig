@@ -740,6 +740,40 @@ pub const Descriptor = struct {
         return @intCast(self.output_shape.numElements().?);
     }
 };
+
+/// Canonical dense matrix product with a logical right-hand transpose.
+/// Keep the original weight as a region input and contract its last axis.
+pub const TransposedRightDot = struct {
+    transpose: ml.graph.NodeId,
+    inputs: [2]ml.graph.NodeId,
+    descriptor: Descriptor,
+
+    pub fn match(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?TransposedRightDot {
+        if (id >= graph.nodeCount()) return null;
+        const node = graph.node(id);
+        if (node.op != .dot_general or node.num_inputs != 2) return null;
+        const attrs = node.op.dot_general;
+        if (attrs.num_batch != 0 or attrs.num_contracting != 1 or attrs.lhs_contracting[0] != 1 or attrs.rhs_contracting[0] != 0) return null;
+        const transpose_id = node.inputs[1];
+        if (transpose_id >= graph.nodeCount() or node.inputs[0] >= graph.nodeCount()) return null;
+        const transpose = graph.node(transpose_id);
+        if (transpose.op != .transpose or transpose.num_inputs != 1 or transpose.inputs[0] >= graph.nodeCount()) return null;
+        const lhs = graph.node(node.inputs[0]).output_shape;
+        const source = graph.node(transpose.inputs[0]).output_shape;
+        if (lhs.dtype != .f32 or source.dtype != .f32 or lhs.rank() != 2 or source.rank() != 2) return null;
+        if (transpose.op.transpose.num_axes != 0 and transpose.op.transpose.num_axes != 2) return null;
+        var permutation: [ml.graph.shape.max_rank]u8 = undefined;
+        const perm = @import("../graph/transpose_utils.zig").effectivePerm(transpose.op.transpose, 2, &permutation);
+        if (!std.mem.eql(u8, perm, &.{ 1, 0 })) return null;
+        const transposed = transpose.output_shape;
+        if (transposed.dtype != .f32 or transposed.rank() != 2 or
+            transposed.dim(0) != source.dim(1) or transposed.dim(1) != source.dim(0)) return null;
+        var descriptor = lower(graph, id) orelse return null;
+        descriptor.operation.dot.rhs_contract_last = true;
+        descriptor.input_shapes[1] = source;
+        return .{ .transpose = transpose_id, .inputs = .{ node.inputs[0], transpose.inputs[0] }, .descriptor = descriptor };
+    }
+};
 /// Per-invocation scratch. Targets expose their own layout inside this region;
 /// its physical owner and reuse lifetime belong to the executable plan.
 pub const WorkspaceRequirement = struct {
@@ -1380,4 +1414,24 @@ test "Metal row projection head preserves optional bias operands" {
     try std.testing.expect(!head.linears[1].operation.linear.bias);
     graph.nodeMut(bias).output_shape.dtype = .bf16;
     try std.testing.expect(!metalRowProjectionHead(&graph));
+}
+
+test "dense right transpose contracts the original weight axis and retains output geometry" {
+    var graph = ml.graph.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const lhs = try builder.parameter("activation", ml.graph.Shape.init(.f32, &.{ 4, 7 }));
+    const weights = try builder.parameter("weight", ml.graph.Shape.init(.f32, &.{ 9, 7 }));
+    const transpose = try builder.transpose(weights, &.{ 1, 0 });
+    const dot = try builder.matmul(lhs, transpose);
+    const selected = TransposedRightDot.match(&graph, dot) orelse return error.MissingDotDescriptor;
+    try std.testing.expectEqual(transpose, selected.transpose);
+    try std.testing.expectEqualSlices(ml.graph.NodeId, &.{ lhs, weights }, &selected.inputs);
+    const geometry = selected.descriptor.operation.dot;
+    try std.testing.expect(geometry.rhs_contract_last);
+    try std.testing.expectEqual(@as(usize, 4), geometry.m);
+    try std.testing.expectEqual(@as(usize, 9), geometry.n);
+    try std.testing.expectEqual(@as(usize, 7), geometry.k);
+    const direct = try builder.parameter("direct", ml.graph.Shape.init(.f32, &.{ 7, 9 }));
+    try std.testing.expect(TransposedRightDot.match(&graph, try builder.matmul(lhs, direct)) == null);
 }
