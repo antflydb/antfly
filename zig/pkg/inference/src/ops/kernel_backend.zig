@@ -107,7 +107,7 @@ pub const VTable = struct {
     createHostInput: ?*const fn (*anyopaque, @import("../execution/host_ingress.zig").Create) anyerror!?@import("../execution/host_ingress.zig").Upload = null,
     /// Exact optional host staging and synchronous initialization, before literal
     /// publication. Null retains the original compatibility workspace floor.
-    physicalLiteralInitializer: ?*const fn (*anyopaque, usize) anyerror!?physical_storage.LiteralInitializer = null,
+    physicalLiteralInitializer: ?*const fn (*anyopaque, @import("ml").graph.DType, usize) anyerror!?physical_storage.LiteralInitializer = null,
     validatePhysicalIndexInput: ?*const fn (ctx: *anyopaque, source: CT, extent: usize) anyerror!void = null,
     copyPhysicalIndexInput: ?*const fn (ctx: *anyopaque, destination: CT, source: CT) anyerror!void = null,
     copyPhysicalInput: ?*const fn (ctx: *anyopaque, destination: CT, source: CT) anyerror!void = null,

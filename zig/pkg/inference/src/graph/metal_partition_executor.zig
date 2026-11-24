@@ -1609,23 +1609,22 @@ pub const MetalPartitionExecutor = struct {
                 if (!@import("../execution/host_ingress.zig").rawDType(node.output_shape.dtype)) return false;
                 continue;
             }
-            if (node.output_shape.dtype != .f32) return false;
             if (node.op == .constant) {
-                // The ORIGINAL executor materializes constants before beginFrame.
-                // Only the declared F32 Shared-stage/Private-bank constructor is
-                // eligible; no new kernel or legacy staging credit is implied.
+                // The executor materializes declared constants before beginFrame.
+                // Their typed Shared staging and Private storage are proved here.
                 const count = node.output_shape.numElements() orelse return false;
                 if (count <= 0 or count > std.math.maxInt(i32) or count != node.op.constant.data_len) return false;
-                const bytes = std.math.mul(usize, @intCast(count), @sizeOf(f32)) catch return false;
+                const bytes = std.math.mul(usize, @intCast(count), node.output_shape.dtype.byteSize()) catch return false;
                 const functions = backend.vtable.kernels orelse return false;
                 if (!functions.accepts(backend.vtable)) return false;
                 const eligible = functions.physicalLiteralBindingSupported orelse return false;
                 if (!eligible(backend.ptr)) return false;
                 const query = functions.physicalLiteralInitializer orelse return false;
-                const initializer = (try query(backend.ptr, bytes)) orelse return false;
+                const initializer = (try query(backend.ptr, node.output_shape.dtype, bytes)) orelse return false;
                 if (initializer.staging.byte_size != bytes or initializer.staging.usage != .host_input or initializer.staging.admitted) return false;
                 continue;
             }
+            if (node.output_shape.dtype != .f32) return false;
             // The region and elision checks below guard composite schedules
             // that use a different owner than a standalone destination kernel.
             // Regular RoPE descriptors derive positions in the shared kernel;
@@ -1635,7 +1634,7 @@ pub const MetalPartitionExecutor = struct {
             const descriptor = ops_mod.kernel_descriptor.lower(graph, id);
             if (descriptor) |value| switch (value.operation) {
                 .gather => {
-                    // The selected route requires checked host indices. Keep
+                    // The selected route requires checked host or immutable indices. Keep
                     // the tuned gather-after-bias owner for composite graphs.
                     if (value.input_shapes[1].dtype == .f32 or graph.node(node.inputs[0]).op == .add) return false;
                 },

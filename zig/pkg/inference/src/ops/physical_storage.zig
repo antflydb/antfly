@@ -33,7 +33,7 @@ pub const Request = struct {
 /// returns. Ordinary published copies retain their read-only checks.
 pub const LiteralInitializer = struct {
     staging: Request,
-    initialize: *const fn (*anyopaque, *Lease, *Lease, []const f32) anyerror!void,
+    initialize: *const fn (*anyopaque, *Lease, *Lease, []const u8) anyerror!void,
 };
 /// One canonical allocation policy. KernelBackend.accepts must be checked
 /// before invoking any callback, including metadata-only reservation queries.
@@ -77,6 +77,12 @@ pub const Lease = struct {
     references: std.atomic.Value(usize) = .init(1),
     slot_authority: ?@import("../execution/slot_authority.zig").Slot = null,
     host_index_certificate: ?IndexCertificate = null,
+    /// Bounds and encoding from the bytes used to initialize an immutable literal.
+    literal_index_proof: ?LiteralIndexProof = null,
+    pub const LiteralIndexProof = struct {
+        dtype: @import("ml").graph.DType,
+        bounds: @import("index_metadata.zig").Bounds,
+    };
     /// A by-value certificate owns no resource and borrows no Frame/Upload.
     /// Its token belongs to this retained Lease's immutable slot authority.
     const IndexCertificate = struct {

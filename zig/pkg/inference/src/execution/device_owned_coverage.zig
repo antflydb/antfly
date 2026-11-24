@@ -110,7 +110,7 @@ fn literal(pool: *const physical.Pool, slot: buffers.LogicalSlot, target: ops.Co
         const eligible = functions.physicalLiteralBindingSupported orelse return null;
         if (!eligible(target.ptr)) return null;
         const query = functions.physicalLiteralInitializer orelse return null;
-        const initializer = (query(target.ptr, size) catch return null) orelse return null;
+        const initializer = (query(target.ptr, value.shape.dtype, size) catch return null) orelse return null;
         if (initializer.staging.byte_size != size or initializer.staging.usage != .host_input or initializer.staging.admitted) return null;
         const bound = ops.physical_storage.reservationBytes(target, initializer.staging) catch return null;
         if (bound != value.staging_bound) return null;

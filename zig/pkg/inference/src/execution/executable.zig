@@ -3235,6 +3235,94 @@ test "Native planned concat slice gather execute only declared banks across warm
     try std.testing.expectEqualSlices(f32, &.{ 5, 6, 4, 2, 3, 1 }, values);
 }
 
+test "Metal immutable literal plans and publishes exact typed graph outputs" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, std.testing.io);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    const data = [_]i64{ 9_007_199_254_740_993, -9_007_199_254_740_993 };
+    const bytes = std.mem.asBytes(&data);
+    const query = cb.vtable.kernels.?.physicalLiteralInitializer.?;
+    const initializer = (try query(cb.ptr, .i64, bytes.len)) orelse return error.SkipZigTest;
+    for ([_]bool{ false, true }) |invalid| {
+        var graph = ml.graph.Graph.init(a);
+        defer graph.deinit();
+        var b = ml.graph.Builder.init(&graph);
+        const literal = try b.tensorConstBytes(bytes, ml.graph.Shape.init(.i64, &.{2}));
+        try graph.markOutput(literal);
+        const table = try b.parameter("table", ml.graph.Shape.init(.f32, &.{ 2, 3 }));
+        const index_values = [_]i64{ -1, if (invalid) data[0] else 0 };
+        const indices = try b.tensorConstBytes(std.mem.asBytes(&index_values), ml.graph.Shape.init(.i64, &.{2}));
+        const gathered = try b.gather(table, indices, ml.graph.Shape.init(.f32, &.{ 2, 3 }));
+        try graph.markOutput(gathered);
+        var program = try ModelProgram.init(a, &graph, &.{.{ .name = "table", .node_id = table, .kind = .input }});
+        defer program.deinit();
+        var executable = try prepare(a, &program, &cb, .partitioned);
+        defer executable.deinit();
+        const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+        const store = pool.literal_store orelse return error.MissingLiteralStore;
+        const node = program.id_map[literal];
+        const index = store.node_indices[node];
+        try std.testing.expect(index != ml.graph.null_node);
+        try std.testing.expectEqual(try @import("../ops/physical_storage.zig").reservationBytes(cb, initializer.staging), store.literals[index].staging_bound);
+        try std.testing.expect(store.publications[node] != null);
+        const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{ 2, 3 }));
+        defer cb.free(input);
+        const ownership = @import("storage_ownership.zig");
+        const PlaneProbe = struct {
+            primary: ?ownership.Plane = null,
+            fn visit(raw: *anyopaque, report: ownership.Report) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (report == .plane and report.plane.role == .primary) self.primary = report.plane;
+            }
+        };
+        var probe = PlaneProbe{};
+        try std.testing.expectEqual(.complete, try cb.vtable.kernels.?.storageOwnership.?(cb.ptr, input, .{ .context = &probe, .visit = PlaneProbe.visit }));
+        const table_id = program.id_map[table];
+        const routes = (try pool.prepareRoutes(&.{.{
+            .node_id = table_id,
+            .value = .{ .resident = .{
+                .logical = program.graph.node(table_id).output_shape,
+                .planes = &.{probe.primary orelse return error.MissingResidentInputPlane},
+                .implementation = .{ .context = cb.ptr, .table = cb.vtable },
+            } },
+        }})) orelse return error.MissingPreparedLiteralRoute;
+        defer routes.release();
+        try std.testing.expect(routes.pool.completeOwnedPayload() != null);
+        var inputs = [_]interpreter.RuntimeInput{.{ .node_id = table, .value = input, .source_backend = &cb }};
+        const options = interpreter.ExecuteOptions{
+            .prepared_routes = routes,
+            .runtime_inputs = try program.remapInputs(&inputs),
+            .output_placement = .producer,
+            .collect_partition_stats = true,
+            .activation_readbacks = .forbidden,
+        };
+        if (invalid) {
+            try std.testing.expectError(error.IndexOutOfBounds, executable.run(a, options));
+            continue;
+        }
+        var result = try executable.run(a, options);
+        defer result.deinit(&executable.runtime);
+        const output = (try cb.exportTensorData(result.outputs[0], a)) orelse return error.MissingTypedLiteralExport;
+        defer a.free(output.payload.bytes);
+        try std.testing.expectEqual(.i64, output.dtype);
+        try std.testing.expectEqualSlices(u8, bytes, output.payload.bytes);
+        const owner = store.owners[index].lease orelse return error.MissingPhysicalLiteral;
+        const functions = cb.vtable.kernels.?;
+        const retagged = (try functions.physicalTensorView.?(cb.ptr, .{ .storage = owner, .shape = &.{4} })).?;
+        defer cb.free(retagged);
+        try std.testing.expectError(error.ReadOnlyPhysicalStorage, functions.writePhysicalFloat32.?(cb.ptr, retagged, &.{ 0, 0, 0, 0 }));
+        try std.testing.expectEqual(@as(u64, 1), result.stats.assigned_kernel_dispatches);
+        try std.testing.expectEqual(@as(u64, 0), result.stats.index_metadata_host_access_bytes);
+        const selected = try cb.toFloat32(result.outputs[1], a);
+        defer a.free(selected);
+        try std.testing.expectEqualSlices(f32, &.{ 4, 5, 6, 1, 2, 3 }, selected);
+    }
+}
+
 test "Native planned integer concat slice and gather use assigned buffers and preserve full width" {
     if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
     const a = std.testing.allocator;

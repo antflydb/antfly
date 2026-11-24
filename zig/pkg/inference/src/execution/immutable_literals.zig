@@ -87,14 +87,12 @@ pub const SharedLiteralStore = struct {
             const bound = try ops.physical_storage.reservationBytes(backends[backend], .{ .byte_size = bytes });
             if (bound < bytes) return error.InvalidPhysicalStorageReservation;
             var staging_bound: usize = 0;
-            if (backends[backend].kind() == .metal) {
-                const functions = backends[backend].vtable.kernels.?;
-                if (functions.physicalLiteralInitializer) |query| if (try query(backends[backend].ptr, bytes)) |initializer| {
-                    if (initializer.staging.byte_size != bytes or initializer.staging.usage != .host_input or initializer.staging.admitted)
-                        return error.InvalidPhysicalLiteralInitialization;
-                    staging_bound = try ops.physical_storage.reservationBytes(backends[backend], initializer.staging);
-                };
-            }
+            const functions = backends[backend].vtable.kernels.?;
+            if (functions.physicalLiteralInitializer) |query| if (try query(backends[backend].ptr, node.output_shape.dtype, bytes)) |initializer| {
+                if (initializer.staging.byte_size != bytes or initializer.staging.usage != .host_input or initializer.staging.admitted)
+                    return error.InvalidPhysicalLiteralInitialization;
+                staging_bound = try ops.physical_storage.reservationBytes(backends[backend], initializer.staging);
+            };
             literals[index] = .{ .node = @intCast(node_id), .shape = node.output_shape, .data = @alignCast(graph.constant_pool.items[attrs.data_offset..][0..bytes]), .allocation = try plan.addConstantBinding(backends[backend].kind(), bytes), .backend_index = backend, .cold_bound = bound, .staging_bound = staging_bound };
             indices[node_id] = @intCast(index);
             index += 1;
@@ -186,7 +184,12 @@ pub const SharedLiteralStore = struct {
             if (functions.physicalTensorView == null or functions.copyPhysicalInput == null) continue;
             switch (node.output_shape.dtype) {
                 .f32 => if (functions.writePhysicalFloat32 != null) return index,
-                .i32, .i64 => if (functions.writePhysicalIntegerLiteral != null) return index,
+                .i32, .i64 => {
+                    if (functions.writePhysicalIntegerLiteral != null) return index;
+                    const query = functions.physicalLiteralInitializer orelse continue;
+                    const bytes = std.math.mul(usize, @intCast(elements), node.output_shape.dtype.byteSize()) catch continue;
+                    if ((query(backend.ptr, node.output_shape.dtype, bytes) catch continue) != null) return index;
+                },
                 else => {},
             }
         }
@@ -428,12 +431,18 @@ pub const SharedLiteralStore = struct {
             const binding_supported = functions.physicalLiteralBindingSupported orelse return error.UnsupportedPhysicalLiteralInitialization;
             if (!binding_supported(cb.ptr)) return error.UnsupportedPhysicalLiteralInitialization;
             const query = functions.physicalLiteralInitializer orelse return error.UnsupportedPhysicalLiteralInitialization;
-            const current = (try query(cb.ptr, literal_bytes)) orelse return error.UnsupportedPhysicalLiteralInitialization;
+            const current = (try query(cb.ptr, literal.shape.dtype, literal_bytes)) orelse return error.UnsupportedPhysicalLiteralInitialization;
             if (current.staging.byte_size != literal_bytes or current.staging.usage != .host_input or current.staging.admitted or
                 try ops.physical_storage.reservationBytes(cb, current.staging) != literal.staging_bound)
                 return error.InvalidPhysicalLiteralInitialization;
             break :blk current;
         } else null;
+        const dtype = literal.shape.dtype;
+        const metadata = @import("../ops/index_metadata.zig");
+        const literal_bounds = if (initializer != null and (dtype == .i32 or dtype == .i64))
+            try metadata.Bounds.read(try metadata.Reader.init(if (dtype == .i64) .i64 else .i32, literal.data))
+        else
+            null;
         if (self.completions[literal.backend_index] == null) {
             if (functions.createPhysicalCompletion) |make| self.completions[literal.backend_index] = try make(cb.ptr);
         }
@@ -449,7 +458,7 @@ pub const SharedLiteralStore = struct {
         if (initializer) |initialize| {
             const stage = (try ops.physical_storage.Lease.createAdmittedWithUsage(self.allocator, cb, initialize.staging.byte_size, ledger, .activation, capability, .host_input)) orelse return error.PhysicalStorageAllocationDeclined;
             defer stage.releaseWithCleanup(construction_cleanup);
-            initialize.initialize(cb.ptr, lease, stage, std.mem.bytesAsSlice(f32, literal.data)) catch |err| {
+            initialize.initialize(cb.ptr, lease, stage, literal.data) catch |err| {
                 failure = err;
             };
         } else if (literal.shape.dtype == .f32) {
@@ -457,7 +466,8 @@ pub const SharedLiteralStore = struct {
                 failure = err;
             };
         } else {
-            functions.writePhysicalIntegerLiteral.?(cb.ptr, tensor, literal.data) catch |err| {
+            const write = functions.writePhysicalIntegerLiteral orelse return error.UnsupportedPhysicalLiteralInitialization;
+            write(cb.ptr, tensor, literal.data) catch |err| {
                 failure = err;
             };
         }
@@ -468,6 +478,9 @@ pub const SharedLiteralStore = struct {
         };
         @import("antfly_platform").sync.lockYielding(&self.mutex);
         self.epoch = next_epoch;
+        if (failure == null) if (literal_bounds) |bounds| {
+            lease.literal_index_proof = .{ .dtype = dtype, .bounds = bounds };
+        };
         owner.* = .{ .lease = lease, .value = tensor, .failure = failure, .published_epoch = self.epoch };
         if (lease.retirement_owner != null) self.prepared_backings.store(true, .release);
         self.cached_claim = null;
@@ -881,7 +894,9 @@ fn preparedLiteralMetalAttachmentRollbackCase(comptime partial_payload: bool, co
     var owners = [_]Owner{.{}};
     const data = [_]f32{ 0.5, 1, -3, 7 };
     const upper = try ops.physical_storage.reservationBytes(backend, .{ .byte_size = 16 });
-    var literals = [_]Literal{.{ .node = 0, .shape = ml.graph.Shape.init(.f32, &.{4}), .data = std.mem.sliceAsBytes(&data), .allocation = 0, .backend_index = 0, .cold_bound = upper }};
+    const stage = (try kernels.physicalLiteralInitializer.?(backend.ptr, .f32, 16)) orelse return error.SkipZigTest;
+    const stage_bound = try ops.physical_storage.reservationBytes(backend, stage.staging);
+    var literals = [_]Literal{.{ .node = 0, .shape = ml.graph.Shape.init(.f32, &.{4}), .data = std.mem.sliceAsBytes(&data), .allocation = 0, .backend_index = 0, .cold_bound = upper, .staging_bound = stage_bound }};
     var backends = [_]ops.ComputeBackend{backend};
     var completions = [_]?ops.physical_storage.Completion{null};
     var store = SharedLiteralStore{ .allocator = a, .literals = &literals, .node_indices = &.{}, .publications = &.{}, .consumers = &.{}, .owners = &owners, .backends = &backends, .completions = &completions };
@@ -1031,7 +1046,7 @@ test "Metal literal Shared staging keeps Private bank immutable and warm credit 
     const cb = context.computeBackend();
     const functions = cb.vtable.kernels.?;
     const query = functions.physicalLiteralInitializer orelse return error.MissingLiteralInitializer;
-    const initializer = (try query(cb.ptr, 16)) orelse return error.SkipZigTest;
+    const initializer = (try query(cb.ptr, .f32, 16)) orelse return error.SkipZigTest;
     const bound = try ops.physical_storage.reservationBytes(cb, .{ .byte_size = 16 });
     const stage_bound = try ops.physical_storage.reservationBytes(cb, initializer.staging);
     const total = try std.math.add(usize, bound, stage_bound);
@@ -1107,14 +1122,14 @@ test "Metal literal Shared staging keeps Private bank immutable and warm credit 
     const refused_stage = (try ops.physical_storage.Lease.createAdmittedWithUsage(a, cb, 16, null, .activation, null, .host_input)).?;
     defer refused_stage.release();
     const before_foreign = @import("../backends/metal_tensor.zig").memoryStatsSnapshot();
-    try std.testing.expectError(error.InvalidPhysicalLiteralInitialization, initializer.initialize(cb.ptr, first.lease, refused_stage, &data));
+    try std.testing.expectError(error.InvalidPhysicalLiteralInitialization, initializer.initialize(cb.ptr, first.lease, refused_stage, std.mem.asBytes(&data)));
     try std.testing.expectEqual(before_foreign.device_owned_buffers_created, @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_buffers_created);
     try std.testing.expect(try cb.decoderRuntimeBeginFrame());
     var frame_live = true;
     defer if (frame_live) cb.decoderRuntimeCancelFrame() catch @panic("literal frame cancel");
-    try std.testing.expect((try query(cb.ptr, 16)) != null);
+    try std.testing.expect((try query(cb.ptr, .f32, 16)) != null);
     try std.testing.expect(!functions.physicalLiteralBindingSupported.?(cb.ptr));
-    try std.testing.expectError(error.UnsupportedPhysicalLiteralInitialization, initializer.initialize(cb.ptr, refused_destination, refused_stage, &data));
+    try std.testing.expectError(error.UnsupportedPhysicalLiteralInitialization, initializer.initialize(cb.ptr, refused_destination, refused_stage, std.mem.asBytes(&data)));
     try std.testing.expect(cb.decoderRuntimeHasActiveFrame());
     try cb.decoderRuntimeCancelFrame();
     frame_live = false;
@@ -1135,9 +1150,9 @@ test "Metal literal Shared staging keeps Private bank immutable and warm credit 
     var submitted_live = true;
     defer if (submitted_live) cb.decoderRuntimeWaitSubmittedFrame() catch @panic("literal submitted wait");
     try std.testing.expect(cb.decoderRuntimeHasSubmittedFrame() and !cb.decoderRuntimeHasActiveFrame());
-    try std.testing.expect((try query(cb.ptr, 16)) != null);
+    try std.testing.expect((try query(cb.ptr, .f32, 16)) != null);
     try std.testing.expect(!functions.physicalLiteralBindingSupported.?(cb.ptr));
-    try std.testing.expectError(error.UnsupportedPhysicalLiteralInitialization, initializer.initialize(cb.ptr, refused_destination, refused_stage, &data));
+    try std.testing.expectError(error.UnsupportedPhysicalLiteralInitialization, initializer.initialize(cb.ptr, refused_destination, refused_stage, std.mem.asBytes(&data)));
     try std.testing.expect(cb.decoderRuntimeHasSubmittedFrame());
     try cb.decoderRuntimeWaitSubmittedFrame();
     submitted_live = false;
@@ -1178,14 +1193,14 @@ test "Metal literal completed copy error releases transient stage and quarantine
     const Fault = struct {
         var original: *const ops.ComputeBackend.VTable = undefined;
         var calls: usize = 0;
-        fn query(raw: *anyopaque, bytes: usize) !?ops.physical_storage.LiteralInitializer {
-            var value = (try original.kernels.?.physicalLiteralInitializer.?(raw, bytes)) orelse return null;
+        fn query(raw: *anyopaque, dtype: ml.graph.DType, bytes: usize) !?ops.physical_storage.LiteralInitializer {
+            var value = (try original.kernels.?.physicalLiteralInitializer.?(raw, dtype, bytes)) orelse return null;
             value.initialize = initialize;
             return value;
         }
-        fn initialize(raw: *anyopaque, destination: *ops.physical_storage.Lease, stage: *ops.physical_storage.Lease, values: []const f32) !void {
+        fn initialize(raw: *anyopaque, destination: *ops.physical_storage.Lease, stage: *ops.physical_storage.Lease, values: []const u8) !void {
             calls += 1;
-            const actual = (try original.kernels.?.physicalLiteralInitializer.?(raw, destination.byte_size)).?;
+            const actual = (try original.kernels.?.physicalLiteralInitializer.?(raw, .f32, destination.byte_size)).?;
             try actual.initialize(raw, destination, stage, values);
             // Fault AFTER the original owned blit has returned from its wait.
             // This exercises failure custody; it does not simulate a GPU crash.
@@ -1201,7 +1216,7 @@ test "Metal literal completed copy error releases transient stage and quarantine
     var table = canonical.vtable.*;
     table.kernels = &kernels;
     const backend = ops.ComputeBackend{ .ptr = canonical.ptr, .vtable = &table };
-    const descriptor = (try Fault.query(backend.ptr, 16)) orelse return error.SkipZigTest;
+    const descriptor = (try Fault.query(backend.ptr, .f32, 16)) orelse return error.SkipZigTest;
     var owners = [_]Owner{.{}};
     const data = [_]f32{ 1, 3, 5, 7 };
     var literals = [_]Literal{.{ .node = 0, .shape = ml.graph.Shape.init(.f32, &.{4}), .data = std.mem.sliceAsBytes(&data), .allocation = 0, .backend_index = 0, .cold_bound = try ops.physical_storage.reservationBytes(backend, .{ .byte_size = 16 }), .staging_bound = try ops.physical_storage.reservationBytes(backend, descriptor.staging) }};
