@@ -37214,10 +37214,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 request.token_embedding_scale,
                 fuse_token_embedding_scale,
             )) orelse return null;
-        var hidden = hidden_raw;
-        errdefer self.retireTemporaryWorkspaceValue(&hidden);
+        var result = DecodeBatchInitialTensors{ .hidden = hidden_raw };
+        var transferred = false;
+        defer if (!transferred) self.retireTemporaryWorkspaceValue(&result);
 
-        var ple_token_embedding: ?MetalTensor = null;
         if (request.ple_hidden_size != 0 and request.layer_count != 0) {
             const ple_scope = try self.beginPlannedGraphScopeForSelf(.ple);
             defer self.endPlannedGraphScopeForSelf(ple_scope) catch {};
@@ -37242,19 +37242,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     @sqrt(@as(f32, @floatFromInt(request.ple_hidden_size))),
                     true,
                 )) orelse return null;
-            var ple = ple_raw;
-            errdefer self.retireTemporaryWorkspaceValue(&ple);
-            ple_token_embedding = ple;
+            result.ple_token_embedding = ple_raw;
         }
 
-        var result = DecodeBatchInitialTensors{
-            .hidden = hidden,
-            .ple_token_embedding = ple_token_embedding,
-        };
-        errdefer self.retireTemporaryWorkspaceValue(&result);
         if (result.ple_token_embedding != null) {
             result.ple_vectors = (try computeDecodePleVectors(self, request, &result)) orelse return null;
         }
+        transferred = true;
         return result;
     }
 
