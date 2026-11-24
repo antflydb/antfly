@@ -23979,6 +23979,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     break :blk owned_scratch.?;
                 };
                 if (!metal_runtime.decoderRuntimeAudioClampInto(self.provider_impl, x, target, p.flags & 3, p.input_min, p.input_max, false)) return error.MetalKernelFailed;
+                const observation = @import("../execution/runtime_observation.zig");
+                if (observation.kernelObservationActive()) observation.metalAudioClampScratch(bytes, owned_scratch == null);
                 operand = target;
             };
             if (!try metal_runtime.decoderRuntimeApplyAudioLinearInto(self.provider_impl, slot, operand, rows, in_dim, out_dim, mt)) return error.AudioSchedulePreparedSlotMissing;
@@ -63022,6 +63024,11 @@ test "metal mapped F32 weight borrowing unwinds source metadata and every pin al
 test "Metal prepared audio projection consumes disjoint clamp workspace after fused decline without tensor allocation" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    var observation: @import("../execution/runtime_observation.zig").KernelScope = .{};
+    observation.begin();
+    defer if (observation.attached) {
+        _ = observation.finish();
+    };
     const a = std.testing.allocator;
     var store = testMetalWeightStoreInit(a);
     defer store.lazy_weights.deinit(a);
@@ -63094,6 +63101,12 @@ test "Metal prepared audio projection consumes disjoint clamp workspace after fu
             try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(actual));
         }
     }
+    _ = observation.finish();
+    const measured = observation.metal_serial_workspace orelse return error.MissingMetalAudioScratchObservation;
+    try std.testing.expectEqual(@as(u64, 8), measured.planned_clamp_bindings);
+    try std.testing.expectEqual(@as(u64, 8 * bytes), measured.planned_clamp_bytes);
+    try std.testing.expectEqual(@as(u64, 1), measured.temporary_clamp_bindings);
+    try std.testing.expectEqual(@as(u64, bytes), measured.temporary_clamp_bytes);
     request.output = destination;
     request.input_workspace = input;
     try std.testing.expectError(error.InvalidPreparedProjectionWorkspace, MetalCompute.audioPreparedLinearOp(&compute, &request));

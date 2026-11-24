@@ -284,6 +284,12 @@ pub const SerialWorkspaceObservation = struct {
     callbacks_with_pending_frame: u64 = 0,
     /// Decision counts include declined routes whose caller owns the eager callback.
     decisions: Decisions = .{},
+    /// Sum of logical scratch spans bound to clamp dispatches. These are
+    /// usage totals, not physical backing sizes or simultaneous peaks.
+    planned_clamp_bindings: u64 = 0,
+    planned_clamp_bytes: u64 = 0,
+    temporary_clamp_bindings: u64 = 0,
+    temporary_clamp_bytes: u64 = 0,
     /// Gauges for the latest successful ready-plan callback.
     latest: ?Banks = null,
 
@@ -333,6 +339,21 @@ pub noinline fn metalSerialWorkspace(replayed: bool, pending_frame: bool, banks:
         value.latest = banks;
         if (replayed) value.successful_replays +|= 1 else value.successful_eager_calls +|= 1;
         if (pending_frame) value.callbacks_with_pending_frame +|= 1;
+    }
+}
+
+pub noinline fn metalAudioClampScratch(bytes: usize, planned: bool) void {
+    var active = active_kernels;
+    while (active) |scope| : (active = scope.previous) {
+        if (scope.metal_serial_workspace == null) scope.metal_serial_workspace = .{};
+        const value = &scope.metal_serial_workspace.?;
+        if (planned) {
+            value.planned_clamp_bindings +|= 1;
+            value.planned_clamp_bytes +|= bytes;
+        } else {
+            value.temporary_clamp_bindings +|= 1;
+            value.temporary_clamp_bytes +|= bytes;
+        }
     }
 }
 
