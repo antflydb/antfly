@@ -42442,6 +42442,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn decoderRuntimeApplyScaledAddScaleOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyScaledAddScaleRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (request.rhs_scale != null and (request.output_scale != 1 or denseDeviceF32(request.lhs) == null or denseDeviceF32(request.rhs) == null)) return null;
         if (request.output) |output| if (!self.assignedDecoderOutputLegal(output, &.{ request.lhs, request.rhs }, request.dim)) return null;
         var lhs = try self.ownedMetalTensorFromCt(request.lhs);
         defer self.retireTemporaryWorkspaceValue(&lhs);
@@ -42453,6 +42454,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .rhs = rhs,
             .dim = request.dim,
             .lhs_scale = request.lhs_scale,
+            .rhs_scale = request.rhs_scale,
             .output_scale = request.output_scale,
         }, &self.timing_stats)) orelse return null;
         if (request.output) |output| {

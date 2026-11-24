@@ -3595,11 +3595,15 @@ test "planned Metal elementwise product-add publishes into the assigned region o
         try std.testing.expectEqual(@as(usize, width), output.len);
         for (output, 0..) |element, index| try std.testing.expectEqual(@as(f32, if (pair) 14 else if (dual_scaled) if (index == 0) 0 else 5 else if (scaled) 2.5 else 5), element);
 
+        const compute = context.ctx.metal_hosted.compute;
+        const before_ordinary = compute.timing_stats.decoder_runtime_apply_add_calls;
+        if (dual_scaled) inputs[count - 1].value = &values[count - 1];
         var ordinary = try executable.run(a, .{ .host_inputs = inputs[0..count], .prepared_routes = compatibility, .output_placement = .producer, .activation_readbacks = .forbidden });
         defer ordinary.deinit(&executable.runtime);
         const ordinary_values = try cb.toFloat32(ordinary.outputs[0], a);
         defer a.free(ordinary_values);
-        try std.testing.expectEqualSlices(f32, next_values, ordinary_values);
+        try std.testing.expectEqualSlices(f32, if (dual_scaled) output else next_values, ordinary_values);
+        if (dual_scaled) try std.testing.expectEqual(before_ordinary + 1, compute.timing_stats.decoder_runtime_apply_add_calls);
     }
 }
 

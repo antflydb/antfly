@@ -34598,7 +34598,7 @@ fn decoderRuntimeApplyLinearQkvOp(ctx: *anyopaque, request: *const ops.DecoderRu
 }
 
 fn decoderRuntimeApplyScaledAddScaleOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyScaledAddScaleRequest) anyerror!?CT {
-    if (request.output != null) return null;
+    if (request.output != null or request.rhs_scale != null) return null;
     const lhs_tensor = tensorFromCt(request.lhs);
     const rhs_tensor = tensorFromCt(request.rhs);
     if (request.dim == 0 or lhs_tensor.elem_count != request.dim or rhs_tensor.elem_count != request.dim) return error.InvalidShape;

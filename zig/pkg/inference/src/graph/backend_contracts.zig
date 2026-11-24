@@ -930,6 +930,9 @@ pub const DecoderRuntimeApplyScaledAddScaleRequest = struct {
     dim: usize,
     lhs_scale: f32,
     output_scale: f32,
+    /// When present, round both scaled operands before addition. Requires a
+    /// unit output scale. Providers without this route decline before work.
+    rhs_scale: ?f32 = null,
 };
 
 pub const DecoderRuntimeApplyMultiplyAddRequest = struct {

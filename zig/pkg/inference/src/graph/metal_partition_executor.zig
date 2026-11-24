@@ -16006,6 +16006,18 @@ fn executeRuntimeScaledAddFromDeferredMul(
     const rhs_pending = pendingDeferredScaleMul(graph, values, inputs[1], output_shape);
     if (lhs_pending) |lhs_scaled| {
         if (rhs_pending) |rhs_scaled| {
+            const lhs_input = valueFor(values, lhs_scaled.source_id) orelse return null;
+            const rhs_input = valueFor(values, rhs_scaled.source_id) orelse return null;
+            const fused = try executeDecoderWithOutputHint(cb, ComputeBackend.decoderRuntimeApplyScaledAddScale, ops_mod.DecoderRuntimeApplyScaledAddScaleRequest{
+                .output = output_hint,
+                .lhs = lhs_input,
+                .rhs = rhs_input,
+                .dim = dim,
+                .lhs_scale = lhs_scaled.scale,
+                .rhs_scale = rhs_scaled.scale,
+                .output_scale = 1,
+            });
+            if (try promoteMetalOutputIfNeeded(cb, fused, output_hint)) |result| return result;
             const lhs = (try executeDeferredScaleMulValue(cb, values, lhs_scaled)) orelse return null;
             defer cb.free(lhs);
             const rhs = (try executeDeferredScaleMulValue(cb, values, rhs_scaled)) orelse return null;
