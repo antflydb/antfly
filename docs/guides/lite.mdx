@@ -18,7 +18,7 @@ order: 5
 - Does Antfly Lite need an inference runtime?
 </Questions>
 
-Antfly Lite is Antfly in one file. Documents, schemas, indexes, enrichments, and query-visible artifacts live in a local `.aflite` database that an application opens directly, with no server process. Choose Lite for development, desktop apps, edge workers, tests, and single-user deployments. Choose a normal instance when you need replication, shard placement, multi-node scaling, or cluster metadata. Everything else, from the index model to the query API, is the same code.
+Antfly Lite is Antfly in one file. Documents, schemas, indexes, enrichments, and query-visible artifacts live in a local `.aflite` database that an application opens directly, with no server process. Choose Lite for development, desktop apps, edge workers, tests, and managed databases in Antfly Cloud. Choose a normal instance when you need replication, shard placement, multi-node scaling, or cluster metadata. Everything else, from the index model to the query API, is the same code.
 
 Embedded storage query execution rejects non-null `evaluate`; use the
 [supported embedded API surface](https://github.com/antflydb/antfly/blob/main/zig/pkg/antfly-embedded/WASM.md#hosted-entry-points)
@@ -577,7 +577,17 @@ Lite builds embed the local inference runtime, and status advertises it by defau
 
 `zig build wasm` builds and installs the embedded database and inference WASM bundle, and `zig build wasm-test` runs its Node smoke test. `zig build lite-test` runs the Lite backend, CLI, C ABI, Go binding, embedded example, and packaging checks in one pass.
 
+### Embedded library lifetime
+
+Keep a dynamically loaded `libantfly` loaded until the host process exits. Closing the last database handle or timing out can leave a descriptor recovery worker finishing a filesystem call.
+
+## Upgrading Lite
+
+When upgrading to a build that uses lock-region format v6, stop every Lite process that has the database open before starting the upgraded processes. This includes read-only clients. A rolling restart can leave new readers waiting on an older writer's live lock region. The first upgraded opener rebuilds the coordination sidecar once the old processes have closed it. Keep the database and its sidecars in place during the restart.
+
 ## Maintenance
+
+Close every process using the database before moving or renaming an `.aflite` file with filesystem tools. Lite's writer lease follows the pathname, so moving an open database can allow another writer to acquire a separate lease. Use a Lite snapshot or backup when the database must stay online.
 
 ```bash
 antfly lite check app.aflite      # integrity
@@ -600,6 +610,7 @@ Then prompt it with the outcome, for example "Embed Antfly Lite in my Go applica
 
 ## Next Steps
 
-- [Quickstart](/docs/guides/quickstart): the same queries against a normal standalone instance
+- [Quickstart](/docs/guides/quickstart): search Wikipedia locally, with optional AI steps
+- [Move a database to Antfly Cloud](/docs/guides/cloud-migration): import and export a complete Lite database
 - [Document Engine](/docs/guides/document-engine): how mappings, full-text, vector, and graph indexes compose under one query, in Lite and everywhere else
 - [Backup and Restore](/docs/api/data-operations): the `.afb` format and restore options on a normal instance

@@ -16,6 +16,7 @@
     },
     {
       "name": "receipt",
+      "min_grounding_boxes": 3,
       "image": "receipt.png",
       "expected": "ANTFLY MARKET\nReceipt 40872\nDate: 2026-10-21\n\nCoffee             USD 4.50\nNotebook           USD 7.25\n\nSubtotal          USD 11.75\nTax                USD 0.94\nTotal             USD 12.69",
       "required": [

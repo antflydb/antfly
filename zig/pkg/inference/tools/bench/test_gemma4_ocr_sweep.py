@@ -94,15 +94,14 @@ class SweepTests(unittest.TestCase):
             self.assertEqual(flags["ANTFLY_GEMMA4_METAL_OCR_TRACE_CHOICES"], "1")
             self.assertNotIn("ANTFLY_GEMMA4_METAL_OCR_DIFFERENTIAL_STEP", flags)
 
-    def test_shared_fused_reuse_controls_and_sampled_profile(self):
-        for variant in ["share", "fused", "reuse", "optimized", "optimizedprofile"]:
+    def test_fused_reuse_controls_and_sampled_profile(self):
+        for variant in ["fused", "reuse", "optimized", "optimizedprofile"]:
             flags, batch, _ = sweep.flags_for("cohort4w8" + variant)
             self.assertEqual(batch, 8)
-            self.assertEqual(flags["TERMITE_METAL_Q4_0_BATCH_SHARED"], "1")
+            self.assertNotIn("TERMITE_METAL_Q4_0_BATCH_SHARED", flags)
             self.assertEqual(flags["TERMITE_METAL_Q4_0_BATCH_INVARIANT"], "1")
-            if variant != "share":
-                self.assertEqual(flags["TERMITE_METAL_Q4_0_BATCH_FUSED_TAILS"], "1")
-                self.assertEqual(flags["ANTFLY_GEMMA4_METAL_OCR_BATCH_QKV"], "1")
+            self.assertEqual(flags["TERMITE_METAL_Q4_0_BATCH_FUSED_TAILS"], "1")
+            self.assertEqual(flags["ANTFLY_GEMMA4_METAL_OCR_BATCH_QKV"], "1")
             if variant in {"reuse", "optimized", "optimizedprofile"}:
                 self.assertEqual(flags["ANTFLY_GEMMA4_METAL_OCR_REUSE_CARRIERS"], "1")
         for variant in ["tails", "pool"]:

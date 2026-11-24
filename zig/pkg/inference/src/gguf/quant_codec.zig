@@ -16,6 +16,7 @@
 const std = @import("std");
 const Tensor = @import("../backends/tensor.zig").Tensor;
 const tensor_types = @import("tensor_types.zig");
+const quant_recipe = @import("../graph/quant_recipe.zig");
 
 // SIMD width / vector aliases.  The matmul-shaped decoder kernels below
 // (`dotXBlock` and `accumulateXBlock`) are AVX2-friendly at 8 lanes; we
@@ -1182,60 +1183,139 @@ pub fn quantizeQ4_KFromF32(allocator: std.mem.Allocator, input: []const f32) ![]
 }
 
 pub fn quantizeQ4_KBlock(input: []const f32, output: []u8) void {
+    encodeQ4KBlock(input, output, true);
+}
+
+/// Range fit for latency-sensitive model loading.
+pub fn quantizeQ4_KBlockFast(input: []const f32, output: []u8) void {
+    encodeQ4KBlock(input, output, false);
+}
+
+fn encodeQ4KBlock(input: []const f32, output: []u8, comptime weighted_fit: bool) void {
     std.debug.assert(input.len == tensor_types.valuesPerBlock(.{ .known = .Q4_K }).?);
     std.debug.assert(output.len == tensor_types.bytesPerBlock(.{ .known = .Q4_K }).?);
 
-    @memset(output, 0);
-    var sub_scales: [8]f32 = undefined;
-    var sub_mins: [8]f32 = undefined;
-    var scs: [8]u8 = undefined;
-    var mins: [8]u8 = undefined;
-    var max_scale: f32 = 0.0;
-    var max_min: f32 = 0.0;
-
-    for (0..8) |sub| {
-        const start = sub * 32;
-        const sub_input = input[start .. start + 32];
-        var min_v = sub_input[0];
-        var max_v = sub_input[0];
-        for (sub_input[1..]) |value| {
-            min_v = @min(min_v, value);
-            max_v = @max(max_v, value);
-        }
-        const min_mag = @max(-min_v, 0.0);
-        const scale = if (max_v + min_mag == 0.0) @as(f32, 1.0) else (max_v + min_mag) / 15.0;
-        sub_scales[sub] = scale;
-        sub_mins[sub] = min_mag;
-        max_scale = @max(max_scale, scale);
-        max_min = @max(max_min, min_mag);
+    var fits: [8]Q4KFit = undefined;
+    var max_scale: f32 = 0;
+    var max_offset: f32 = 0;
+    for (&fits, 0..) |*fit, sub| {
+        fit.* = fitQ4KGroup(input[sub * 32 ..][0..32], weighted_fit);
+        max_scale = @max(max_scale, fit.scale);
+        max_offset = @max(max_offset, -fit.minimum);
     }
 
-    const d = if (max_scale == 0.0) @as(f32, 1.0) else max_scale / 63.0;
-    const dmin = if (max_min == 0.0) @as(f32, 1.0) else max_min / 63.0;
-    writeF16Le(output[0..2], d);
-    writeF16Le(output[2..4], dmin);
+    const scale_factor = if (max_scale > 0) 63.0 / max_scale else 0;
+    const offset_factor = if (max_offset > 0) 63.0 / max_offset else 0;
+    writeF16Le(output[0..2], max_scale / 63.0);
+    writeF16Le(output[2..4], max_offset / 63.0);
 
-    for (0..8) |sub| {
-        scs[sub] = if (max_scale == 0.0) 0 else @intFromFloat(@min(@max(std.math.round(sub_scales[sub] / d), 0.0), 63.0));
-        mins[sub] = if (max_min == 0.0) 0 else @intFromFloat(@min(@max(std.math.round(sub_mins[sub] / dmin), 0.0), 63.0));
+    var scales: [8]u8 = undefined;
+    var offsets: [8]u8 = undefined;
+    for (fits, &scales, &offsets) |fit, *scale, *offset| {
+        scale.* = roundQ4KCode(fit.scale * scale_factor, 63);
+        offset.* = roundQ4KCode(-fit.minimum * offset_factor, 63);
     }
-    packQ4KScaleMins(output[4..16], scs, mins);
+    packQ4KScaleMins(output[4..16], scales, offsets);
 
-    for (0..4) |chunk| {
-        const sub0 = chunk * 2;
-        const sub1 = sub0 + 1;
-        const scale0 = if (sub_scales[sub0] == 0.0) @as(f32, 1.0) else sub_scales[sub0];
-        const scale1 = if (sub_scales[sub1] == 0.0) @as(f32, 1.0) else sub_scales[sub1];
-        const inv0 = if (sub_scales[sub0] == 0.0) 0.0 else 1.0 / scale0;
-        const inv1 = if (sub_scales[sub1] == 0.0) 0.0 else 1.0 / scale1;
-        const q_off = 16 + chunk * 32;
-
-        for (0..32) |i| {
-            const q0 = quantizeUnsigned(input[sub0 * 32 + i] + sub_mins[sub0], inv0, 15);
-            const q1 = quantizeUnsigned(input[sub1 * 32 + i] + sub_mins[sub1], inv1, 15);
-            output[q_off + i] = q0 | (q1 << 4);
+    // Use the same rounded scales as the decoder when assigning the nibbles.
+    const block_scale = decodeFp16Le(output[0], output[1]);
+    const block_offset = decodeFp16Le(output[2], output[3]);
+    for (0..4) |pair| {
+        const low = pair * 2;
+        const high = low + 1;
+        const low_scale = block_scale * @as(f32, @floatFromInt(scales[low]));
+        const high_scale = block_scale * @as(f32, @floatFromInt(scales[high]));
+        const low_offset = block_offset * @as(f32, @floatFromInt(offsets[low]));
+        const high_offset = block_offset * @as(f32, @floatFromInt(offsets[high]));
+        const low_inverse = if (low_scale > 0) 1.0 / low_scale else 0;
+        const high_inverse = if (high_scale > 0) 1.0 / high_scale else 0;
+        for (output[16 + pair * 32 ..][0..32], 0..) |*byte, i| {
+            const low_value = input[low * 32 + i] + low_offset;
+            const high_value = input[high * 32 + i] + high_offset;
+            const lo = if (weighted_fit and low_scale > 0) low_value / low_scale else low_value * low_inverse;
+            const hi = if (weighted_fit and high_scale > 0) high_value / high_scale else high_value * high_inverse;
+            byte.* = roundQ4KCode(lo, 15) | (roundQ4KCode(hi, 15) << 4);
         }
     }
+}
+
+const Q4KFit = struct {
+    scale: f32,
+    minimum: f32,
+};
+
+fn roundQ4KCode(value: f32, comptime limit: u8) u8 {
+    // Adding 2^23 + 2^22 rounds a small nonnegative f32 to an even integer.
+    const bounded = @min(@max(value, 0), @as(f32, @floatFromInt(limit)));
+    return @intFromFloat((bounded + 12582912.0) - 12582912.0);
+}
+
+// Use the unweighted-quantization reference strategy from ggml: weight each
+// sample by its magnitude plus the group's RMS, then fit legal affine grids.
+fn fitQ4KGroup(input: *const [32]f32, comptime weighted_fit: bool) Q4KFit {
+    var squared_sum: f32 = 0;
+    var minimum = input[0];
+    var maximum = input[0];
+    for (input) |value| {
+        if (weighted_fit) squared_sum += value * value;
+        minimum = @min(minimum, value);
+        maximum = @max(maximum, value);
+    }
+    minimum = @min(minimum, 0);
+    const range = maximum - minimum;
+    if (!weighted_fit or range == 0) return .{ .scale = range / 15.0, .minimum = minimum };
+
+    const rms = @sqrt(squared_sum / 32.0);
+    var weights: [32]f32 = undefined;
+    var weight_sum: f32 = 0;
+    var weighted_input: f32 = 0;
+    for (input, &weights) |value, *weight| {
+        weight.* = rms + @abs(value);
+        weight_sum += weight.*;
+        weighted_input += weight.* * value;
+    }
+
+    const initial_inverse = 15.0 / range;
+    var best: Q4KFit = .{ .scale = 1.0 / initial_inverse, .minimum = minimum };
+    var best_error: f32 = 0;
+    for (input, weights) |value, weight| {
+        const code: f32 = @floatFromInt(roundQ4KCode(initial_inverse * (value - minimum), 15));
+        const residual = best.scale * code + minimum - value;
+        best_error += weight * (residual * residual);
+    }
+
+    for (0..21) |step| {
+        const inverse = (14.0 + 0.1 * @as(f32, @floatFromInt(step))) / range;
+        var codes: [32]f32 = undefined;
+        var weighted_code: f32 = 0;
+        var weighted_code_squared: f32 = 0;
+        var weighted_cross: f32 = 0;
+        for (input, weights, &codes) |value, weight, *code| {
+            code.* = @floatFromInt(roundQ4KCode(inverse * (value - best.minimum), 15));
+            const weighted = weight * code.*;
+            weighted_code += weighted;
+            weighted_code_squared += weighted * code.*;
+            weighted_cross += weighted * value;
+        }
+        const determinant = weight_sum * weighted_code_squared - weighted_code * weighted_code;
+        if (determinant <= 0) continue;
+        var fit: Q4KFit = .{
+            .scale = (weight_sum * weighted_cross - weighted_input * weighted_code) / determinant,
+            .minimum = (weighted_code_squared * weighted_input - weighted_code * weighted_cross) / determinant,
+        };
+        if (fit.minimum > 0) fit = .{ .scale = weighted_cross / weighted_code_squared, .minimum = 0 };
+        if (fit.scale <= 0) continue;
+        var candidate_error: f32 = 0;
+        for (input, weights, codes) |value, weight, code| {
+            const residual = fit.scale * code + fit.minimum - value;
+            candidate_error += weight * (residual * residual);
+        }
+        if (candidate_error < best_error) {
+            best = fit;
+            best_error = candidate_error;
+        }
+    }
+    return best;
 }
 
 fn maxAbs(input: []const f32) f32 {
@@ -1744,18 +1824,18 @@ pub fn dequantizeToFloat32(tensor_type: tensor_types.TensorType, raw_bytes: []co
             .Q1_0 => try dequantizeQ1_0(raw_bytes, output),
             .I2_S => try dequantizeI2S(raw_bytes, output),
             .I8_S => try dequantizeI8S(raw_bytes, output),
-            .Q4_0 => try dequantizeQ4_0(raw_bytes, output),
-            .Q4_1 => try dequantizeQ4_1(raw_bytes, output),
-            .Q5_0 => try dequantizeQ5_0(raw_bytes, output),
-            .Q5_1 => try dequantizeQ5_1(raw_bytes, output),
-            .Q8_0 => try dequantizeQ8_0(raw_bytes, output),
-            .Q8_1 => try dequantizeQ8_1(raw_bytes, output),
-            .Q2_K => try dequantizeQ2K(raw_bytes, output),
-            .Q3_K => try dequantizeQ3K(raw_bytes, output),
-            .Q4_K => try dequantizeQ4K(raw_bytes, output),
-            .Q5_K => try dequantizeQ5K(raw_bytes, output),
-            .Q6_K => try dequantizeQ6K(raw_bytes, output),
-            .Q8_K => try dequantizeQ8K(raw_bytes, output),
+            .Q4_0 => try quant_recipe.decode(.q4_0, raw_bytes, output),
+            .Q4_1 => try quant_recipe.decode(.q4_1, raw_bytes, output),
+            .Q5_0 => try quant_recipe.decode(.q5_0, raw_bytes, output),
+            .Q5_1 => try quant_recipe.decode(.q5_1, raw_bytes, output),
+            .Q8_0 => try quant_recipe.decode(.q8_0, raw_bytes, output),
+            .Q8_1 => try quant_recipe.decode(.q8_1, raw_bytes, output),
+            .Q2_K => try quant_recipe.decode(.q2_k, raw_bytes, output),
+            .Q3_K => try quant_recipe.decode(.q3_k, raw_bytes, output),
+            .Q4_K => try quant_recipe.decode(.q4_k, raw_bytes, output),
+            .Q5_K => try quant_recipe.decode(.q5_k, raw_bytes, output),
+            .Q6_K => try quant_recipe.decode(.q6_k, raw_bytes, output),
+            .Q8_K => try quant_recipe.decode(.q8_k, raw_bytes, output),
             .TQ1_0 => try dequantizeTQ1_0(raw_bytes, output),
             .TQ2_0 => try dequantizeTQ2_0(raw_bytes, output),
             .IQ2_XXS => try dequantizeIQ2XXS(raw_bytes, output),
@@ -1777,41 +1857,7 @@ pub fn dequantizeToFloat32(tensor_type: tensor_types.TensorType, raw_bytes: []co
 }
 
 fn dequantizeBlockToFloat32(tensor_type: tensor_types.TensorType, block: []const u8, output: []f32) !void {
-    switch (tensor_type) {
-        .known => |known| switch (known) {
-            .Q1_0 => try dequantizeQ1_0(block, output),
-            .I2_S => try dequantizeI2S(block, output),
-            .I8_S => try dequantizeI8S(block, output),
-            .Q4_0 => try dequantizeQ4_0(block, output),
-            .Q4_1 => try dequantizeQ4_1(block, output),
-            .Q5_0 => try dequantizeQ5_0(block, output),
-            .Q5_1 => try dequantizeQ5_1(block, output),
-            .Q8_0 => try dequantizeQ8_0(block, output),
-            .Q8_1 => try dequantizeQ8_1(block, output),
-            .Q2_K => try dequantizeQ2K(block, output),
-            .Q3_K => try dequantizeQ3K(block, output),
-            .Q4_K => try dequantizeQ4K(block, output),
-            .Q5_K => try dequantizeQ5K(block, output),
-            .Q6_K => try dequantizeQ6K(block, output),
-            .Q8_K => try dequantizeQ8K(block, output),
-            .TQ1_0 => try dequantizeTQ1_0(block, output),
-            .TQ2_0 => try dequantizeTQ2_0(block, output),
-            .IQ2_XXS => try dequantizeIQ2XXS(block, output),
-            .IQ2_XS => try dequantizeIQ2XS(block, output),
-            .IQ2_S => try dequantizeIQ2S(block, output),
-            .IQ3_XXS => try dequantizeIQ3XXS(block, output),
-            .IQ3_S => try dequantizeIQ3S(block, output),
-            .IQ1_S => try dequantizeIQ1S(block, output),
-            .IQ1_M => try dequantizeIQ1M(block, output),
-            .IQ4_NL => try dequantizeIQ4NL(block, output),
-            .IQ4_XS => try dequantizeIQ4XS(block, output),
-            .MXFP4 => try dequantizeMXFP4(block, output),
-            .NVFP4 => try dequantizeNVFP4(block, output),
-            else => return error.UnsupportedTensorType,
-        },
-        .bitnet_tl2 => return error.UnsupportedTensorType,
-        .unknown => return error.UnsupportedTensorType,
-    }
+    return dequantizeToFloat32(tensor_type, block, output);
 }
 
 fn dequantizeQ1_0(data: []const u8, output: []f32) !void {
@@ -1872,184 +1918,6 @@ fn dequantizeI8S(data: []const u8, output: []f32) !void {
     for (output, 0..) |*dst, i| {
         const value: i8 = @bitCast(data[i]);
         dst.* = @floatFromInt(value);
-    }
-}
-
-fn dequantizeQ8_0(data: []const u8, output: []f32) !void {
-    const block_size = tensor_types.bytesPerBlock(.{ .known = .Q8_0 }).?;
-    const values_per_block = tensor_types.valuesPerBlock(.{ .known = .Q8_0 }).?;
-    if (data.len % block_size != 0) return error.InvalidQuantizedDataSize;
-    if (output.len > (data.len / block_size) * values_per_block) return error.InvalidQuantizedOutputSize;
-
-    var out_off: usize = 0;
-    var block_index: usize = 0;
-    while (block_index * block_size < data.len and out_off < output.len) : (block_index += 1) {
-        const block = data[block_index * block_size .. (block_index + 1) * block_size];
-        const d = decodeFp16Le(block[0], block[1]);
-        for (0..32) |i| {
-            if (out_off >= output.len) return;
-            const value: i8 = @bitCast(block[2 + i]);
-            output[out_off] = d * @as(f32, @floatFromInt(value));
-            out_off += 1;
-        }
-    }
-}
-
-fn dequantizeQ8_1(data: []const u8, output: []f32) !void {
-    const block_size = tensor_types.bytesPerBlock(.{ .known = .Q8_1 }).?;
-    const values_per_block = tensor_types.valuesPerBlock(.{ .known = .Q8_1 }).?;
-    if (data.len % block_size != 0) return error.InvalidQuantizedDataSize;
-    if (output.len > (data.len / block_size) * values_per_block) return error.InvalidQuantizedOutputSize;
-
-    var out_off: usize = 0;
-    var block_index: usize = 0;
-    while (block_index * block_size < data.len and out_off < output.len) : (block_index += 1) {
-        const block = data[block_index * block_size .. (block_index + 1) * block_size];
-        const d = decodeFp16Le(block[0], block[1]);
-        // block[2..4] stores d * sum(qs) for optimized dot products.
-        for (0..32) |i| {
-            if (out_off >= output.len) return;
-            const value: i8 = @bitCast(block[4 + i]);
-            output[out_off] = d * @as(f32, @floatFromInt(value));
-            out_off += 1;
-        }
-    }
-}
-
-fn dequantizeQ4_0(data: []const u8, output: []f32) !void {
-    const block_size = tensor_types.bytesPerBlock(.{ .known = .Q4_0 }).?;
-    const values_per_block = tensor_types.valuesPerBlock(.{ .known = .Q4_0 }).?;
-    if (data.len % block_size != 0) return error.InvalidQuantizedDataSize;
-    if (output.len > (data.len / block_size) * values_per_block) return error.InvalidQuantizedOutputSize;
-
-    var out_off: usize = 0;
-    var block_index: usize = 0;
-    while (block_index * block_size < data.len and out_off < output.len) : (block_index += 1) {
-        const block = data[block_index * block_size .. (block_index + 1) * block_size];
-        const d = decodeFp16Le(block[0], block[1]);
-        const qs = block[2..18];
-
-        for (qs) |packed_byte| {
-            if (out_off >= output.len) return;
-            output[out_off] = d * @as(f32, @floatFromInt(@as(i32, packed_byte & 0x0F) - 8));
-            out_off += 1;
-        }
-        for (qs) |packed_byte| {
-            if (out_off >= output.len) return;
-            output[out_off] = d * @as(f32, @floatFromInt(@as(i32, packed_byte >> 4) - 8));
-            out_off += 1;
-        }
-    }
-}
-
-fn dequantizeQ4_1(data: []const u8, output: []f32) !void {
-    const block_size = tensor_types.bytesPerBlock(.{ .known = .Q4_1 }).?;
-    const values_per_block = tensor_types.valuesPerBlock(.{ .known = .Q4_1 }).?;
-    if (data.len % block_size != 0) return error.InvalidQuantizedDataSize;
-    if (output.len > (data.len / block_size) * values_per_block) return error.InvalidQuantizedOutputSize;
-
-    var out_off: usize = 0;
-    var block_index: usize = 0;
-    while (block_index * block_size < data.len and out_off < output.len) : (block_index += 1) {
-        const block = data[block_index * block_size .. (block_index + 1) * block_size];
-        const d = decodeFp16Le(block[0], block[1]);
-        const m = decodeFp16Le(block[2], block[3]);
-        const qs = block[4..20];
-
-        for (qs) |packed_byte| {
-            if (out_off >= output.len) return;
-            output[out_off] = d * @as(f32, @floatFromInt(packed_byte & 0x0F)) + m;
-            out_off += 1;
-        }
-        for (qs) |packed_byte| {
-            if (out_off >= output.len) return;
-            output[out_off] = d * @as(f32, @floatFromInt(packed_byte >> 4)) + m;
-            out_off += 1;
-        }
-    }
-}
-
-fn dequantizeQ5_0(data: []const u8, output: []f32) !void {
-    const block_size = tensor_types.bytesPerBlock(.{ .known = .Q5_0 }).?;
-    const values_per_block = tensor_types.valuesPerBlock(.{ .known = .Q5_0 }).?;
-    if (data.len % block_size != 0) return error.InvalidQuantizedDataSize;
-    if (output.len > (data.len / block_size) * values_per_block) return error.InvalidQuantizedOutputSize;
-
-    var out_off: usize = 0;
-    var block_index: usize = 0;
-    while (block_index * block_size < data.len and out_off < output.len) : (block_index += 1) {
-        const block = data[block_index * block_size .. (block_index + 1) * block_size];
-        const d = decodeFp16Le(block[0], block[1]);
-        const qh = std.mem.readInt(u32, block[2..6], .little);
-        const qs = block[6..22];
-
-        for (0..16) |i| {
-            if (out_off >= output.len) return;
-            const lo4: i32 = qs[i] & 0x0F;
-            const hi1: i32 = @intCast((qh >> @intCast(i)) & 1);
-            output[out_off] = d * @as(f32, @floatFromInt((lo4 | (hi1 << 4)) - 16));
-            out_off += 1;
-        }
-        for (0..16) |i| {
-            if (out_off >= output.len) return;
-            const lo4: i32 = qs[i] >> 4;
-            const hi1: i32 = @intCast((qh >> @intCast(i + 16)) & 1);
-            output[out_off] = d * @as(f32, @floatFromInt((lo4 | (hi1 << 4)) - 16));
-            out_off += 1;
-        }
-    }
-}
-
-fn dequantizeQ5_1(data: []const u8, output: []f32) !void {
-    const block_size = tensor_types.bytesPerBlock(.{ .known = .Q5_1 }).?;
-    const values_per_block = tensor_types.valuesPerBlock(.{ .known = .Q5_1 }).?;
-    if (data.len % block_size != 0) return error.InvalidQuantizedDataSize;
-    if (output.len > (data.len / block_size) * values_per_block) return error.InvalidQuantizedOutputSize;
-
-    var out_off: usize = 0;
-    var block_index: usize = 0;
-    while (block_index * block_size < data.len and out_off < output.len) : (block_index += 1) {
-        const block = data[block_index * block_size .. (block_index + 1) * block_size];
-        const d = decodeFp16Le(block[0], block[1]);
-        const m = decodeFp16Le(block[2], block[3]);
-        const qh = std.mem.readInt(u32, block[4..8], .little);
-        const qs = block[8..24];
-
-        for (0..16) |i| {
-            if (out_off >= output.len) return;
-            const lo4: i32 = qs[i] & 0x0F;
-            const hi1: i32 = @intCast((qh >> @intCast(i)) & 1);
-            output[out_off] = d * @as(f32, @floatFromInt(lo4 | (hi1 << 4))) + m;
-            out_off += 1;
-        }
-        for (0..16) |i| {
-            if (out_off >= output.len) return;
-            const lo4: i32 = qs[i] >> 4;
-            const hi1: i32 = @intCast((qh >> @intCast(i + 16)) & 1);
-            output[out_off] = d * @as(f32, @floatFromInt(lo4 | (hi1 << 4))) + m;
-            out_off += 1;
-        }
-    }
-}
-
-fn dequantizeQ8K(data: []const u8, output: []f32) !void {
-    const block_size = tensor_types.bytesPerBlock(.{ .known = .Q8_K }).?;
-    const values_per_block = tensor_types.valuesPerBlock(.{ .known = .Q8_K }).?;
-    if (data.len % block_size != 0) return error.InvalidQuantizedDataSize;
-    if (output.len > (data.len / block_size) * values_per_block) return error.InvalidQuantizedOutputSize;
-
-    var out_off: usize = 0;
-    var block_index: usize = 0;
-    while (block_index * block_size < data.len and out_off < output.len) : (block_index += 1) {
-        const block = data[block_index * block_size .. (block_index + 1) * block_size];
-        const d = decodeF32Le(block[0], block[1], block[2], block[3]);
-        const qs = block[4 .. 4 + 256];
-        for (0..256) |i| {
-            if (out_off >= output.len) return;
-            const value: i8 = @bitCast(qs[i]);
-            output[out_off] = d * @as(f32, @floatFromInt(value));
-            out_off += 1;
-        }
     }
 }
 
@@ -2542,240 +2410,6 @@ fn dequantizeNVFP4(data: []const u8, output: []f32) !void {
     }
 }
 
-fn dequantizeQ2K(data: []const u8, output: []f32) !void {
-    const block_size = tensor_types.bytesPerBlock(.{ .known = .Q2_K }).?;
-    const values_per_block = tensor_types.valuesPerBlock(.{ .known = .Q2_K }).?;
-    if (data.len % block_size != 0) return error.InvalidQuantizedDataSize;
-    if (output.len > (data.len / block_size) * values_per_block) return error.InvalidQuantizedOutputSize;
-
-    var out_off: usize = 0;
-    var block_index: usize = 0;
-    while (block_index * block_size < data.len and out_off < output.len) : (block_index += 1) {
-        const block = data[block_index * block_size .. (block_index + 1) * block_size];
-        const scales_raw = block[0..16];
-        const d = decodeFp16Le(block[16], block[17]);
-        const dmin = decodeFp16Le(block[18], block[19]);
-        const qs = block[20..84];
-
-        for (0..16) |sub| {
-            const sc = @as(f32, @floatFromInt(scales_raw[sub] & 0x0F));
-            const m = @as(f32, @floatFromInt(scales_raw[sub] >> 4));
-            const dsc = d * sc;
-            const dmn = dmin * m;
-            const chunk = sub / 8;
-            const group = (sub % 8) / 2;
-            const l_base = (sub % 2) * 16;
-            const q_base = chunk * 32;
-            const shift: u3 = @intCast(group * 2);
-
-            for (0..16) |i| {
-                if (out_off >= output.len) return;
-                const q = (qs[q_base + l_base + i] >> shift) & 0x03;
-                output[out_off] = dsc * @as(f32, @floatFromInt(q)) - dmn;
-                out_off += 1;
-            }
-        }
-    }
-}
-
-fn dequantizeQ3K(data: []const u8, output: []f32) !void {
-    const block_size = tensor_types.bytesPerBlock(.{ .known = .Q3_K }).?;
-    const values_per_block = tensor_types.valuesPerBlock(.{ .known = .Q3_K }).?;
-    if (data.len % block_size != 0) return error.InvalidQuantizedDataSize;
-    if (output.len > (data.len / block_size) * values_per_block) return error.InvalidQuantizedOutputSize;
-
-    var out_off: usize = 0;
-    var block_index: usize = 0;
-    while (block_index * block_size < data.len and out_off < output.len) : (block_index += 1) {
-        const block = data[block_index * block_size .. (block_index + 1) * block_size];
-        const hmask = block[0..32];
-        const qs = block[32..96];
-        const scale_data = block[96..108];
-        const d = decodeFp16Le(block[108], block[109]);
-
-        var raw_scales: [16]i32 = undefined;
-        for (0..4) |i| {
-            raw_scales[i] = @as(i32, scale_data[i] & 0x0F) | (@as(i32, scale_data[8 + i] & 0x03) << 4);
-            raw_scales[i + 4] = @as(i32, scale_data[4 + i] & 0x0F) | (@as(i32, (scale_data[8 + i] >> 2) & 0x03) << 4);
-            raw_scales[i + 8] = @as(i32, (scale_data[i] >> 4) & 0x0F) | (@as(i32, (scale_data[8 + i] >> 4) & 0x03) << 4);
-            raw_scales[i + 12] = @as(i32, (scale_data[4 + i] >> 4) & 0x0F) | (@as(i32, (scale_data[8 + i] >> 6) & 0x03) << 4);
-        }
-
-        for (0..16) |sub| {
-            const scale = d * @as(f32, @floatFromInt(raw_scales[sub] - 32));
-            const chunk = sub / 8;
-            const group = (sub % 8) / 2;
-            const l_base = (sub % 2) * 16;
-            const q_base = chunk * 32;
-            const shift: u3 = @intCast(group * 2);
-            const hm_bit: u3 = @intCast(chunk * 4 + group);
-
-            for (0..16) |i| {
-                if (out_off >= output.len) return;
-                const l = l_base + i;
-                const low2 = @as(i32, (qs[q_base + l] >> shift) & 0x03);
-                const high1 = @as(i32, (hmask[l] >> hm_bit) & 0x01);
-                output[out_off] = scale * @as(f32, @floatFromInt(low2 + high1 * 4 - 4));
-                out_off += 1;
-            }
-        }
-    }
-}
-
-fn dequantizeQ4K(data: []const u8, output: []f32) !void {
-    const block_size = tensor_types.bytesPerBlock(.{ .known = .Q4_K }).?;
-    const values_per_block = tensor_types.valuesPerBlock(.{ .known = .Q4_K }).?;
-    if (data.len % block_size != 0) return error.InvalidQuantizedDataSize;
-    if (output.len > (data.len / block_size) * values_per_block) return error.InvalidQuantizedOutputSize;
-
-    var out_off: usize = 0;
-    var block_index: usize = 0;
-    while (block_index * block_size < data.len and out_off < output.len) : (block_index += 1) {
-        const block = data[block_index * block_size .. (block_index + 1) * block_size];
-        const d = decodeFp16Le(block[0], block[1]);
-        const dmin = decodeFp16Le(block[2], block[3]);
-        const scales = block[4..16];
-        const qs = block[16..144];
-
-        var scs: [8]f32 = undefined;
-        var mins: [8]f32 = undefined;
-        unpackQ4KScaleMins(scales, &scs, &mins);
-
-        var q_off: usize = 0;
-        for (0..4) |chunk| {
-            const sub = chunk * 2;
-            const dsc0 = d * scs[sub];
-            const dmn0 = dmin * mins[sub];
-            const dsc1 = d * scs[sub + 1];
-            const dmn1 = dmin * mins[sub + 1];
-
-            for (0..32) |i| {
-                if (out_off >= output.len) return;
-                output[out_off] = dsc0 * @as(f32, @floatFromInt(qs[q_off + i] & 0x0F)) - dmn0;
-                out_off += 1;
-            }
-            for (0..32) |i| {
-                if (out_off >= output.len) return;
-                output[out_off] = dsc1 * @as(f32, @floatFromInt(qs[q_off + i] >> 4)) - dmn1;
-                out_off += 1;
-            }
-            q_off += 32;
-        }
-    }
-}
-
-fn dequantizeQ6K(data: []const u8, output: []f32) !void {
-    const block_size = tensor_types.bytesPerBlock(.{ .known = .Q6_K }).?;
-    const values_per_block = tensor_types.valuesPerBlock(.{ .known = .Q6_K }).?;
-    if (data.len % block_size != 0) return error.InvalidQuantizedDataSize;
-    if (output.len > (data.len / block_size) * values_per_block) return error.InvalidQuantizedOutputSize;
-
-    var out_off: usize = 0;
-    var block_index: usize = 0;
-    while (block_index * block_size < data.len and out_off < output.len) : (block_index += 1) {
-        const block = data[block_index * block_size .. (block_index + 1) * block_size];
-        const ql = block[0..128];
-        const qh = block[128..192];
-        const scales = block[192..208];
-        const d = decodeFp16Le(block[208], block[209]);
-
-        for (0..16) |sub| {
-            const scale = d * @as(f32, @floatFromInt(@as(i8, @bitCast(scales[sub]))));
-            const half = sub / 8;
-            const group = (sub % 8) / 2;
-            const l_base = (sub % 2) * 16;
-            const ql_off = half * 64 + (group & 1) * 32;
-            const qh_off = half * 32;
-            const qh_shift: u3 = @intCast(group * 2);
-            const nibble_shift: u3 = @intCast((group / 2) * 4);
-
-            for (0..16) |i| {
-                if (out_off >= output.len) return;
-                const l = l_base + i;
-                const low4 = @as(i32, (ql[ql_off + l] >> nibble_shift) & 0x0F);
-                const high2 = @as(i32, (qh[qh_off + l] >> qh_shift) & 0x03);
-                output[out_off] = scale * @as(f32, @floatFromInt((low4 | (high2 << 4)) - 32));
-                out_off += 1;
-            }
-        }
-    }
-}
-
-fn dequantizeQ5K(data: []const u8, output: []f32) !void {
-    const block_size = tensor_types.bytesPerBlock(.{ .known = .Q5_K }).?;
-    const values_per_block = tensor_types.valuesPerBlock(.{ .known = .Q5_K }).?;
-    if (data.len % block_size != 0) return error.InvalidQuantizedDataSize;
-    if (output.len > (data.len / block_size) * values_per_block) return error.InvalidQuantizedOutputSize;
-
-    var out_off: usize = 0;
-    var block_index: usize = 0;
-    while (block_index * block_size < data.len and out_off < output.len) : (block_index += 1) {
-        const block = data[block_index * block_size .. (block_index + 1) * block_size];
-        const d = decodeFp16Le(block[0], block[1]);
-        const dmin = decodeFp16Le(block[2], block[3]);
-        const scales = block[4..16];
-        const qh = block[16..48];
-        const ql = block[48..176];
-
-        var scs: [8]f32 = undefined;
-        var mins: [8]f32 = undefined;
-        unpackQ4KScaleMins(scales, &scs, &mins);
-
-        for (0..8) |sub| {
-            const dsc = d * scs[sub];
-            const dmn = dmin * mins[sub];
-            const chunk = sub / 2;
-            const is_high = sub % 2 == 1;
-            const ql_off = chunk * 32;
-            const hb_shift: u3 = @intCast(sub);
-
-            for (0..32) |i| {
-                if (out_off >= output.len) return;
-                const low = if (is_high) ql[ql_off + i] >> 4 else ql[ql_off + i] & 0x0F;
-                const q = @as(i32, low) + @as(i32, (qh[i] >> hb_shift) & 1) * 16;
-                output[out_off] = dsc * @as(f32, @floatFromInt(q)) - dmn;
-                out_off += 1;
-            }
-        }
-    }
-}
-
-fn unpackQ4KScaleMins(scales: []const u8, scs: *[8]f32, mins: *[8]f32) void {
-    for (0..4) |j| {
-        scs[j] = @floatFromInt(scales[j] & 63);
-        mins[j] = @floatFromInt(scales[j + 4] & 63);
-    }
-    for (4..8) |j| {
-        scs[j] = @floatFromInt((scales[j + 4] & 0x0F) | ((scales[j - 4] >> 6) << 4));
-        mins[j] = @floatFromInt((scales[j + 4] >> 4) | ((scales[j] >> 6) << 4));
-    }
-}
-
-fn packedExpertMatrixShape(
-    allocator: std.mem.Allocator,
-    full_shape: []const i64,
-    expert_axis: usize,
-    expert_index: u32,
-    row_count_override: ?usize,
-) ![]i64 {
-    if (full_shape.len != 3) return error.InvalidPackedExpertTensor;
-    if (expert_axis >= full_shape.len - 1) return error.InvalidPackedExpertTensor;
-    if (expert_index >= @as(u32, @intCast(full_shape[expert_axis]))) return error.InvalidPackedExpertTensor;
-
-    const matrix_shape = try allocator.alloc(i64, 2);
-    var dst: usize = 0;
-    for (full_shape, 0..) |dim, axis| {
-        if (axis == expert_axis) continue;
-        matrix_shape[dst] = if (dst == 0 and row_count_override != null)
-            @intCast(row_count_override.?)
-        else
-            dim;
-        dst += 1;
-    }
-    if (dst != 2) return error.InvalidPackedExpertTensor;
-    return matrix_shape;
-}
-
 fn packedExpertRowBlockBase(
     full_shape: []const i64,
     expert_axis: usize,
@@ -2953,6 +2587,30 @@ test "quantize q4_k block packs exact header and representative qs bytes" {
     try std.testing.expectEqualSlices(u8, &expected_qs, raw[48..80]);
     try std.testing.expectEqualSlices(u8, &expected_qs, raw[80..112]);
     try std.testing.expectEqualSlices(u8, &expected_qs, raw[112..144]);
+}
+
+test "quantize q4_k fits skewed groups using the stored scales" {
+    var input: [256]f32 = undefined;
+    for (&input, 0..) |*value, index| {
+        const sample = @as(i32, @intCast(index * 37 % 113)) - 56;
+        const group_scale: i32 = @intCast(1 + index / 32);
+        const outlier_scale: i32 = if (index % 32 == 0) 4 else 1;
+        value.* = @as(f32, @floatFromInt(sample * group_scale * outlier_scale)) / 64.0;
+    }
+
+    var raw: [144]u8 = undefined;
+    quantizeQ4_KBlock(&input, &raw);
+    var decoded: [256]f32 = undefined;
+    try dequantizeToFloat32(.{ .known = .Q4_K }, &raw, &decoded);
+
+    var squared_error: f32 = 0;
+    for (input, decoded) |reference, actual| {
+        const residual = reference - actual;
+        squared_error += residual * residual;
+    }
+    // The ggml reference scores 16.38 on this block; the old min/max fit
+    // and pre-packing nibble assignment scored 17.64.
+    try std.testing.expect(squared_error <= 16.5);
 }
 
 test "quantize q4_k rejects non-block-sized input" {

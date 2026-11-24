@@ -45,6 +45,7 @@ pub const canDecodeWithOptions = generic.canDecodeWithOptions;
 pub const downmixToMono = generic.downmixToMono;
 pub const resample = generic.resample;
 pub const copyOrResample = generic.copyOrResample;
+pub const copyOrResampleParts = generic.copyOrResampleParts;
 pub const logMelSpectrogramWithConfig = generic.logMelSpectrogramWithConfig;
 
 /// Only exact decoded zero establishes silence; quiet nonzero samples must

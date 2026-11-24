@@ -343,6 +343,7 @@ def wait_for_server(
     allow_unauthorized: bool = False,
     processes: list[tuple[str, subprocess.Popen[Any]]] | None = None,
     listener_ready: Callable[[], bool] | None = None,
+    required_successes: int = 2,
 ) -> bool:
     deadline = time.monotonic() + timeout
     consecutive_successes = 0
@@ -359,11 +360,11 @@ def wait_for_server(
                 return False
             if resp.ok:
                 consecutive_successes += 1
-                if consecutive_successes >= 2:
+                if consecutive_successes >= required_successes:
                     return True
             elif allow_unauthorized and resp.status_code == 401:
                 consecutive_successes += 1
-                if consecutive_successes >= 2:
+                if consecutive_successes >= required_successes:
                     return True
             else:
                 consecutive_successes = 0
@@ -1264,6 +1265,7 @@ class StatefulAntflyServer:
         *,
         auth_enabled: bool = False,
         data_config: dict | None = None,
+        metadata_config: dict | None = None,
     ):
         self.binary = binary
         self.host = host
@@ -1283,6 +1285,12 @@ class StatefulAntflyServer:
             )
             setup.callback(self.tempdir.cleanup)
             self.root = Path(self.tempdir.name)
+            self.metadata_config_path = None
+            if metadata_config is not None:
+                self.metadata_config_path = self.root / "metadata-config.json"
+                self.metadata_config_path.write_text(
+                    json.dumps(metadata_config), encoding="utf-8"
+                )
             self.data_config_path = None
             if data_config is not None:
                 self.data_config_path = self.root / "data-config.json"
@@ -1325,6 +1333,8 @@ class StatefulAntflyServer:
             admin_port=self.metadata_admin_port,
             root=self.root,
         )
+        if self.metadata_config_path is not None:
+            metadata_command.extend(["--config", str(self.metadata_config_path)])
         self.metadata_proc = self.port_reservations.handoff_to(
             (self.metadata_port, self.metadata_admin_port),
             lambda: subprocess.Popen(
@@ -1400,21 +1410,20 @@ class StatefulAntflyServer:
         data_out = _read_log_tail(self.data_log_path)
         return f"[metadata]\n{metadata_out}\n[data]\n{data_out}"
 
-    def _stop_processes(self) -> None:
-        if self.data_proc is not None and self.data_proc.poll() is None:
-            self.data_proc.send_signal(signal.SIGTERM)
+    def _stop_processes(self, *, crash: bool = False) -> None:
+        for proc in (self.data_proc, self.metadata_proc):
+            if proc is None or proc.poll() is not None:
+                continue
+            if crash:
+                proc.kill()
+                proc.wait(timeout=10)
+                continue
+            proc.send_signal(signal.SIGTERM)
             try:
-                self.data_proc.wait(timeout=10)
+                proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                self.data_proc.kill()
-                self.data_proc.wait()
-        if self.metadata_proc is not None and self.metadata_proc.poll() is None:
-            self.metadata_proc.send_signal(signal.SIGTERM)
-            try:
-                self.metadata_proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.metadata_proc.kill()
-                self.metadata_proc.wait()
+                proc.kill()
+                proc.wait()
         self.data_proc = None
         self.metadata_proc = None
 
@@ -1426,8 +1435,8 @@ class StatefulAntflyServer:
         self.data_log_file = self.data_log_path.open("a")
         self._start_processes(truncate_logs=False)
 
-    def pause(self) -> None:
-        self._stop_processes()
+    def pause(self, *, crash: bool = False) -> None:
+        self._stop_processes(crash=crash)
         self.port_reservations.ensure_reserved(
             self.metadata_port,
             self.metadata_admin_port,
@@ -1481,6 +1490,7 @@ class StandaloneAntflyServer:
         config_path: Path | None = None,
         storage_engine: str | None = None,
         inference_host_budget_mb: int | None = None,
+        on_first_ready: Callable[["StandaloneAntflyServer"], None] | None = None,
         on_process_started: Callable[[subprocess.Popen], None] | None = None,
         on_startup_failed: Callable[["StandaloneAntflyServer"], None] | None = None,
     ):
@@ -1489,6 +1499,7 @@ class StandaloneAntflyServer:
         self.config_path = config_path
         self.storage_engine = storage_engine
         self.inference_host_budget_mb = inference_host_budget_mb
+        self.on_first_ready = on_first_ready
         self.on_process_started = on_process_started
         self.on_startup_failed = on_startup_failed
         with ExitStack() as setup:
@@ -1584,7 +1595,10 @@ class StandaloneAntflyServer:
             self.api_url,
             allow_unauthorized=self.pgwire_port is not None,
             processes=[("server", self.proc)],
-            listener_ready=lambda: _log_contains_since(
+            required_successes=1 if self.on_first_ready else 2,
+            listener_ready=None
+            if self.on_first_ready
+            else lambda: _log_contains_since(
                 self.log_path,
                 log_start,
                 f"standalone public api listening on {self.url}",
@@ -1594,6 +1608,8 @@ class StandaloneAntflyServer:
             raise RuntimeError(
                 f"Standalone API server failed to start at {self.api_url}\n{out}"
             )
+        if self.on_first_ready:
+            self.on_first_ready(self)
         self.metadata_admin_url = self._poll_metadata_admin_url()
 
     def _poll_metadata_admin_url(self) -> str:

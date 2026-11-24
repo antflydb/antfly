@@ -17,6 +17,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const common_config = @import("antfly_local_sources").common_config;
+const common_secrets = @import("antfly_local_sources").common_secrets;
 const preload_model_spec = @import("../common/preload_model_spec.zig");
 const process_memory_budget = @import("antfly_local_sources").common_process_memory_budget;
 const runtime_lifecycle = @import("../common/runtime_lifecycle.zig");
@@ -342,7 +343,17 @@ fn resolveRunMaxConcurrentRequests(cli: ?u32, cfg: ?*const common_config.Config)
 }
 
 // Standalone serving uses the same resources and inference sections as the DB.
+fn isNamedGeneratedExtractor(value: std.json.Value) bool {
+    if (value != .object) return false;
+    const method = value.object.get("method") orelse return false;
+    return method == .string and std.mem.eql(u8, method.string, "generated");
+}
+
 fn parseRunConfig(alloc: std.mem.Allocator, raw: []const u8) !common_config.Config {
+    return parseRunConfigWithSecrets(alloc, raw, null);
+}
+
+fn parseRunConfigWithSecrets(alloc: std.mem.Allocator, raw: []const u8, store: ?*common_secrets.FileStore) !common_config.Config {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const scratch = arena.allocator();
@@ -350,6 +361,20 @@ fn parseRunConfig(alloc: std.mem.Allocator, raw: []const u8) !common_config.Conf
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidConfig;
     var root = &parsed.value.object;
+    // The common runtime bindings are a separate configuration contract.
+    // Named generated extractors are owned by the inference listener.
+    if (root.getPtr("extractors")) |extractors| {
+        if (extractors.* == .object) {
+            var index: usize = 0;
+            while (index < extractors.object.count()) {
+                if (isNamedGeneratedExtractor(extractors.object.values()[index])) {
+                    _ = extractors.object.swapRemove(extractors.object.keys()[index]);
+                } else {
+                    index += 1;
+                }
+            }
+        }
+    }
     var model_config = if (root.get("inference")) |value| switch (value) {
         .object => value.object,
         else => return error.InvalidConfig,
@@ -364,7 +389,7 @@ fn parseRunConfig(alloc: std.mem.Allocator, raw: []const u8) !common_config.Conf
         try root.put(scratch, "inference", .{ .object = model_config });
     }
     const normalized = try std.json.Stringify.valueAlloc(scratch, parsed.value, .{});
-    var config = try common_config.Config.parseFromSlice(alloc, normalized);
+    var config = try common_config.Config.parseFromSliceWithSecrets(alloc, normalized, store);
     errdefer config.deinit();
     if (preload_value) |entry| {
         var preload_object = std.json.ObjectMap{};
@@ -606,10 +631,43 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         }
     }
 
+    var extractor_arena = std.heap.ArenaAllocator.init(alloc);
+    defer extractor_arena.deinit();
+    const extractor_alloc = extractor_arena.allocator();
+    var generated_extractors: std.ArrayList(inference.server.NamedGeneratedExtractor) = .empty;
+    var secret_store: ?common_secrets.FileStore = null;
+    defer if (secret_store) |*store| store.deinit();
     var loaded_config: ?common_config.Config = if (config_path) |path| blk: {
         const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(16 * 1024 * 1024));
         defer alloc.free(raw);
-        break :blk parseRunConfig(alloc, raw) catch |err| {
+        const tree = try std.json.parseFromSliceLeaky(std.json.Value, extractor_alloc, raw, .{ .allocate = .alloc_always });
+        if (tree == .object) if (tree.object.get("secrets")) |value| {
+            var settings = try common_secrets.parseConfig(alloc, value);
+            defer settings.deinit();
+            secret_store = try common_secrets.FileStore.initConfiguredWithIo(alloc, io, settings.value);
+        };
+        const store = if (secret_store) |*value| value else null;
+        if (tree == .object) if (tree.object.get("extractors")) |entries| {
+            if (entries != .object) return error.InvalidConfig;
+            for (entries.object.keys(), entries.object.values()) |name, value| {
+                if (!isNamedGeneratedExtractor(value)) continue;
+                // Resolve the explicit endpoint before the shared parser normalizes
+                // url/api_url and hosted registration checks the scheme.
+                var resolved = value;
+                if (resolved.object.getPtr("generator")) |generator| {
+                    if (inference.server.NamedGeneratedExtractor.explicitEndpointField(generator.*)) |name_of_field| {
+                        const field = generator.object.getPtr(name_of_field).?;
+                        if (field.* == .string and common_secrets.parseSecretReference(field.string) != null)
+                            field.string = try common_secrets.resolveReferenceOwned(extractor_alloc, store, field.string);
+                    }
+                }
+                var entry = try inference.server.NamedGeneratedExtractor.parse(extractor_alloc, name, resolved);
+                if (entry.config.generator.api_key) |key|
+                    entry.config.generator.api_key = try common_secrets.resolveReferenceOwned(extractor_alloc, store, key);
+                try generated_extractors.append(extractor_alloc, entry);
+            }
+        };
+        break :blk parseRunConfigWithSecrets(alloc, raw, store) catch |err| {
             platform.inference_settings.diagnoseInvalidConfig(alloc, raw);
             return err;
         };
@@ -671,8 +729,22 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
 
     const audio_readers = if (loaded_config) |*config| try config.transcribers.hostedReaders(alloc) else &.{};
     defer alloc.free(audio_readers);
+    var image_readers: std.ArrayList(inference.server.NamedImageReader) = .empty;
+    defer image_readers.deinit(alloc);
+    if (loaded_config) |*config| {
+        var entries = config.readers.configs.iterator();
+        while (entries.next()) |entry| {
+            const reader = entry.value_ptr.*;
+            if (reader.provider != .openai) continue;
+            const endpoint = reader.base_url orelse reader.resolvedUrl() orelse continue;
+            if (!inference.server.isHostedInferenceEndpoint(endpoint)) return error.InvalidReaderConfig;
+            try image_readers.append(alloc, .{ .name = entry.key_ptr.*, .config = reader });
+        }
+    }
     var node = try InferenceNode.init(alloc, .{
         .audio_readers = audio_readers,
+        .image_readers = image_readers.items,
+        .generated_extractors = generated_extractors.items,
         .models_dir = models_dir,
         .ml_dir = ml_dir,
         .max_loaded_models = model_settings.max_loaded_models,
@@ -682,6 +754,8 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         .generation_batching = inference.server.GenerationBatchingConfig.fromSettings(if (loaded_config) |cfg| cfg.inference.generation_batching else .{}),
         .max_work_units = resource_policy.inference.admission.workCapacity(),
         .request_limits = resource_policy.inference.request_limits,
+        .content_security = if (loaded_config) |cfg| cfg.inference.content_security else null,
+        .s3_credentials = if (loaded_config) |cfg| cfg.inference.s3_credentials else null,
         .http_max_body_bytes = try inference.server.httpBodyLimitBytesFromMib(if (loaded_config) |cfg| cfg.inference.http_max_body_mb else 10),
         .pool_size = if (loaded_config) |cfg| cfg.inference.pool_size else 2,
         .process_memory_limit_bytes = process_memory_resolution.limit_bytes,

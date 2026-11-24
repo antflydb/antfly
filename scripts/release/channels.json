@@ -50,6 +50,40 @@
       "github_release": "none",
       "recovery_sources": ["object-storage"],
       "retention": {"mode": "age-and-count", "days": 30, "minimum_count": 10}
+    },
+    "v0-3": {
+      "tag_kind": "stable",
+      "ordering": "semver",
+      "journal_key": "antfly/channels/v0-3.json",
+      "bootstrap_sources": ["npm", "object-storage"],
+      "npm_tag": "v0-3",
+      "publish_npm": true,
+      "publish_pypi": false,
+      "publish_homebrew": false,
+      "container_alias": "v0-3",
+      "object_alias": "v0-3",
+      "object_static_files": {},
+      "github_release": "release",
+      "recovery_sources": ["github-release", "object-storage"],
+      "retention": {"mode": "forever"},
+      "release_line": "0.3"
+    },
+    "v0-3-next": {
+      "tag_kind": "prerelease",
+      "ordering": "semver",
+      "journal_key": "antfly/channels/v0-3-next.json",
+      "bootstrap_sources": ["object-storage"],
+      "npm_tag": null,
+      "publish_npm": false,
+      "publish_pypi": false,
+      "publish_homebrew": false,
+      "container_alias": "v0-3-next",
+      "object_alias": "v0-3-next",
+      "object_static_files": {},
+      "github_release": "prerelease",
+      "recovery_sources": ["github-release", "object-storage"],
+      "retention": {"mode": "after-stable", "grace_days": 90},
+      "release_line": "0.3"
     }
   }
 }

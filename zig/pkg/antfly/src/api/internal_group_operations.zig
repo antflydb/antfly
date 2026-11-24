@@ -49,9 +49,14 @@ fn logUnknownTransitionFailure(group_id: u64, action: metadata_mod.TransitionAct
     std.log.warn("private transition failed group_id={} action={s} err={s}", .{ group_id, @tagName(action), @errorName(err) });
 }
 
-pub const Error = operation.ApiError || @import("relational_integrity_errors.zig").Error || @import("relational_row_errors.zig").Error || error{
+pub const Error = @import("external_transaction_errors.zig").Error || @import("source_transaction_errors.zig").Error || operation.ApiError || @import("relational_integrity_errors.zig").Error || @import("relational_row_errors.zig").Error || error{
+    SqlRelationOwnerChanged,
+    SqlTemporaryRelationNotOwned,
+    SqlRelationRecoveryIncomplete,
+    InvalidSqlRelationPersistence,
     ResourceBudgetExceeded,
     RetainedEffectsFull,
+    HistoryFull,
     AuthoritativeLookupMissing,
     TopologyChanged,
     IdentityReadGenerationChanged,
@@ -69,11 +74,17 @@ pub const Error = operation.ApiError || @import("relational_integrity_errors.zig
     GraphExploredEdgesBudgetExceeded,
     GraphExploredEdgeBytesBudgetExceeded,
     GroupLeaderUnavailable,
+    TransitionOperationBusy,
+    TransactionTopologyBusy,
+    SplitSourceProjectionNotReady,
+    SplitSourceProjectionAdvanced,
+    DurableRootIncarnationUnavailable,
     PreDecisionDeadlineExceeded,
     TransactionPreDecisionOutcomeUnknown,
     RaftBatchWriteOutcomeUnknown,
     OnlineMergeArtifactCatalogUncoordinated,
     DecisionConflict,
+    DecisionNotProposed,
     TransactionConflict,
     TransactionTooLarge,
     EnrichmentWaitCanceled,
@@ -206,8 +217,8 @@ fn validateHandoffReceiptLookup(input: LookupInput, request: operation.RequestCo
         (!hidden_scoped and (!published_routed or identity)) or
         input.key.len != 0 or input.consistency != .read_index or
         input.options.generation_handoff_install_read_index_certified or
-        input.options.include_primary_digest or input.options.relational_integrity_catalog or input.options.relational_integrity_action or
-        input.options.relational_integrity_jobs_json.len != 0 or input.options.group_source_query_json.len != 0 or input.options.relational_index_status_json.len != 0 or
+        input.options.include_primary_digest or input.options.include_json_null_fields or input.options.relational_integrity_catalog or input.options.relational_integrity_action or
+        input.options.relational_integrity_jobs_json.len != 0 or input.options.sql_lock_query_json.len != 0 or input.options.group_source_query_json.len != 0 or input.options.relational_index_status_json.len != 0 or
         input.options.relational_activation_json.len != 0 or input.options.fields.len != 0)
         return error.InvalidArgument;
 }
@@ -281,6 +292,10 @@ pub const Operations = struct {
     txn_validator: ?TxnValidator = null,
     repair_cancellation_lookup: ?RepairCancellationLookup = null,
     routed_raft_batch_writer: ?RoutedRaftBatchWriter = null,
+    sql_lock_validator: ?struct {
+        ptr: *anyopaque,
+        check: *const fn (*anyopaque, std.mem.Allocator, operation.RequestContext, u64, []const u8, @import("antfly_local_sources").storage_pessimistic_lock_control.Command) anyerror!@import("antfly_local_sources").storage_pessimistic_lock_control.Command,
+    } = null,
 
     fn routedReads(
         self: Operations,
@@ -293,11 +308,20 @@ pub const Operations = struct {
             error.UnsupportedCatalogRouteFence => return error.Unsupported,
             else => return error.InvalidArgument,
         };
-        if (reads.route_fence) |*fence| fence.admission_deadline_io = request.deadline_io;
+        if (reads.route_fence) |*fence| {
+            fence.admission_deadline_io = request.deadline_io;
+            // Only trusted ingress can set this field after verifying the
+            // body-bound native read grant; route JSON always omits it.
+            if (fence.route.execution == .native_local) if (request.sql_relation_owner) |owner| {
+                fence.route.execution.native_local.requireConnectionOwner(owner) catch return error.SqlTemporaryRelationNotOwned;
+                fence.admission_sql_relation_owner = owner;
+            };
+        }
         return reads;
     }
 
     fn mapCommonReadError(err: anyerror) ?Error {
+        if (@import("external_transaction_errors.zig").classify(err)) |reason| return reason;
         if (storage_descriptor_errors.isPressure(err)) return error.StorageReadTemporarilyUnavailable;
         if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
         if (@import("relational_integrity_errors.zig").classify(err)) |reason| return reason;
@@ -420,24 +444,33 @@ pub const Operations = struct {
             error.TopologyChanged => return error.TopologyChanged,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.UnsupportedOperation => return error.Unsupported,
-            error.LeaderUnavailable,
-            error.GroupLeaderUnavailable,
-            error.MetadataSnapshotUnavailable,
+            error.TransitionOperationBusy,
+            error.TransactionTopologyBusy,
             error.SplitSourceProjectionNotReady,
             error.SplitSourceProjectionAdvanced,
             error.DurableRootIncarnationUnavailable,
+            => |retry| return retry,
+            error.LeaderUnavailable,
+            error.GroupLeaderUnavailable,
+            error.MetadataSnapshotUnavailable,
             error.AutoBulkIngestBusy,
             error.ApplyStoreGroupRetired,
             error.ApplyStoreShuttingDown,
             error.BackgroundOwnerClosing,
             error.BackgroundOwnerClosed,
-            error.TransitionOperationBusy,
             error.MergeTransitionNotReady,
             error.MergeReceiverProjectionNotReady,
             error.MergeSourceProjectionNotReady,
             error.MergeSourceProjectionAdvanced,
             error.StorageBusy,
-            => return error.GroupLeaderUnavailable,
+            => {
+                std.log.debug("transition temporarily unavailable group_id={} action={s} err={s}", .{
+                    group_id,
+                    @tagName(action),
+                    @errorName(err),
+                });
+                return error.GroupLeaderUnavailable;
+            },
             else => {
                 logUnknownTransitionFailure(group_id, action, err);
                 return error.Internal;
@@ -453,17 +486,48 @@ pub const Operations = struct {
         table_name: []const u8,
         input: db_mod.types.BatchRequest,
     ) Error!batch_api.BatchResult {
+        return self.batchWithRoute(alloc, request, group_id, table_name, input, null);
+    }
+
+    pub fn nativeAtomicBatch(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: db_mod.types.BatchRequest, fence: metadata_api.CatalogRouteFence) Error!batch_api.BatchResult {
+        if (fence.route.execution != .native_local or fence.route.group_id != group_id) return error.InvalidArgument;
+        if (input.activate_range_tracking) {
+            // A native marker is a strict control-only request. It consumes
+            // the same verified route/OwnerGrant and never accepts row work.
+            @import("antfly_local_sources").storage_range_protection.validateRequest(input) catch return error.InvalidArgument;
+        } else input.requireAtomicIntentShape() catch return error.InvalidArgument;
+        var checked = request;
+        // Native ingress has already verified the body-bound OwnerGrant and
+        // attached this process-local field. Validation and owner execution
+        // must use that same authenticated connection, not the empty HTTP
+        // request context. This field is never accepted from route JSON.
+        if (fence.admission_sql_relation_owner) |owner| {
+            if (request.sql_relation_owner) |captured| if (!captured.eql(owner)) return error.SqlTemporaryRelationNotOwned;
+            checked.sql_relation_owner = owner;
+        }
+        return self.batchWithRoute(alloc, checked, group_id, table_name, input, fence);
+    }
+
+    fn batchWithRoute(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: db_mod.types.BatchRequest, fence: ?metadata_api.CatalogRouteFence) Error!batch_api.BatchResult {
         try request.ensureActive();
-        if (self.reject_unrouted_batch) return error.Unsupported;
+        if (self.reject_unrouted_batch and fence == null) return error.Unsupported;
+        var admitted = input;
+        if (input.sql_lock) |command| {
+            @import("antfly_local_sources").storage_pessimistic_lock_control.validateBatch(input) catch return error.InvalidArgument;
+            const validator = self.sql_lock_validator orelse return error.Unavailable;
+            admitted.sql_lock = validator.check(validator.ptr, alloc, request, group_id, table_name, command) catch return error.Unavailable;
+        }
         const writes = self.writes orelse return error.NotFound;
         const validator = self.batch_validator orelse return error.Unavailable;
         validator.validate(request, table_name, input.writes) catch |err| switch (err) {
-            error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
+            error.InvalidBatchRequest => return error.InvalidArgument,
+            error.RelationalCheckViolation => return error.RelationalCheckViolation,
             error.TableNotFound => return error.NotFound,
             error.ResourceTemporarilyUnavailable, error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired => return error.Unavailable,
             error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return error.DeadlineExceeded,
             error.Canceled, error.Cancelled => return error.Canceled,
             else => {
+                if (@import("external_transaction_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
                 std.log.err("group-local Raft batch validation failed group_id={} table={s} err={s}", .{
                     group_id,
@@ -473,11 +537,17 @@ pub const Operations = struct {
                 return error.Internal;
             },
         };
-        _ = (writes.batchGroupLocal(alloc, group_id, table_name, input) catch |err| switch (err) {
+        _ = ((if (fence) |captured| writes.batchGroupLocalRouted(alloc, group_id, table_name, admitted, captured) else writes.batchGroupLocal(alloc, group_id, table_name, admitted)) catch |err| switch (err) {
+            error.SqlRelationOwnerChanged => return error.SqlRelationOwnerChanged,
+            error.SqlTemporaryRelationNotOwned => return error.SqlTemporaryRelationNotOwned,
+            error.SqlRelationRecoveryIncomplete => return error.SqlRelationRecoveryIncomplete,
+            error.InvalidSqlRelationPersistence => return error.InvalidSqlRelationPersistence,
             error.OnlineMergeArtifactCatalogUncoordinated => return error.OnlineMergeArtifactCatalogUncoordinated,
             error.OnlineSourcePinPending => return error.RaftBatchWriteOutcomeUnknown,
             error.RetainedEffectsFull => return retainedBatchPressure(input),
-            error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
+            error.HistoryFull => return if (input.transaction == null) error.HistoryFull else retainedBatchPressure(input),
+            error.InvalidBatchRequest => return error.InvalidArgument,
+            error.RelationalCheckViolation => return error.RelationalCheckViolation,
             error.InvalidIntegrityTopologyFence => return error.InvalidArgument,
             error.IntegrityTopologyBusy, error.TransactionTopologyBusy, error.ConstraintRetirementInProgress => return error.Unavailable,
             error.IntegrityTopologyChanged, error.IntegrityTopologyCompleted, error.IntegrityTopologyFenceMissing, error.IntegrityCatalogChanged => return error.TopologyChanged,
@@ -489,6 +559,7 @@ pub const Operations = struct {
             error.EnrichmentWorkerFailed => return error.EnrichmentWorkerFailed,
             error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable, error.Unavailable => return error.GroupLeaderUnavailable,
             else => {
+                if (@import("external_transaction_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_integrity_errors.zig").classify(err)) |reason| return reason;
                 std.log.err("group-local Raft batch failed group_id={} table={s} err={s}", .{
@@ -518,7 +589,8 @@ pub const Operations = struct {
         try request.ensureActive();
         const validator = self.batch_validator orelse return error.Unavailable;
         validator.validate(request, table_name, input.writes) catch |err| switch (err) {
-            error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
+            error.InvalidBatchRequest => return error.InvalidArgument,
+            error.RelationalCheckViolation => return error.RelationalCheckViolation,
             // The sender's catalog can lead this replica's projection during
             // provisioning/restart. Validation has not called the writer, so
             // preserve the explicit not-proposed availability response.
@@ -529,6 +601,7 @@ pub const Operations = struct {
             error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return error.DeadlineExceeded,
             error.Canceled, error.Cancelled => return error.Canceled,
             else => {
+                if (@import("external_transaction_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
                 std.log.err("routed Raft batch validation failed group_id={} table={s} err={s}", .{
                     group_id,
@@ -550,11 +623,17 @@ pub const Operations = struct {
                 .{ .ignore_unknown_fields = false },
             ) catch return error.InvalidArgument;
             parsed_fence.?.value.validate() catch return error.InvalidArgument;
+            if (parsed_fence.?.value.protocol == metadata_api.CatalogRouteFence.decision_protocol and
+                (input.transaction == null or input.transaction.? != .resolve)) return error.InvalidArgument;
             if (parsed_fence.?.value.route.group_id != group_id) return error.InvalidArgument;
             parsed_fence.?.value.admission_deadline_ns = request.deadline_ns;
             parsed_fence.?.value.admission_deadline_io = request.deadline_io;
             parsed_fence.?.value.admission_cancellation = request.cancellation;
             break :fence .{ .catalog = parsed_fence.?.value };
+        } else if (input.sql_lock != null) lock: {
+            @import("antfly_local_sources").storage_pessimistic_lock_control.validateBatch(input) catch return error.InvalidArgument;
+            if (input.sql_lock.?.admission.binding.namespace.group != group_id) return error.InvalidArgument;
+            break :lock .transaction;
         } else if (input.merge_source_transition != null) rollback: {
             // Authenticated private cleanup only. The replicated donor state
             // remains responsible for matching this transition and receiver;
@@ -596,6 +675,7 @@ pub const Operations = struct {
                     if (ack.participants.len == 0 or ack.participants.len > 64) return error.InvalidArgument;
                     for (ack.participants) |participant| if (distributed_txn.parseParticipantRef(participant) == null) return error.InvalidArgument;
                 },
+                .publish_completion => |publication| if (publication.completion_owner.group_id != group_id) return error.InvalidArgument,
                 .cleanup => {},
             }
             break :transaction .transaction;
@@ -657,7 +737,10 @@ pub const Operations = struct {
             error.OnlineMergeArtifactCatalogUncoordinated => return error.OnlineMergeArtifactCatalogUncoordinated,
             error.OnlineSourcePinPending => return error.RaftBatchWriteOutcomeUnknown,
             error.RetainedEffectsFull => return retainedBatchPressure(input),
-            error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
+            error.InvalidBatchRequest => return error.InvalidArgument,
+            error.RelationalCheckViolation => return error.RelationalCheckViolation,
+            error.HistoryFull => return if (input.transaction == null) error.HistoryFull else retainedBatchPressure(input),
+            error.DecisionNotProposed => return error.DecisionNotProposed,
             error.InvalidIntegrityTopologyFence => return error.InvalidArgument,
             error.IntegrityTopologyBusy, error.TransactionTopologyBusy, error.ConstraintRetirementInProgress => return error.Unavailable,
             error.IntegrityTopologyChanged, error.IntegrityTopologyCompleted, error.IntegrityTopologyFenceMissing, error.IntegrityCatalogChanged => return error.TopologyChanged,
@@ -678,6 +761,8 @@ pub const Operations = struct {
             error.EnrichmentWorkerFailed => return error.EnrichmentWorkerFailed,
             error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable, error.Unavailable => return error.GroupLeaderUnavailable,
             else => {
+                if (@import("external_transaction_errors.zig").classify(err)) |reason| return reason;
+                if (@import("source_transaction_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_integrity_errors.zig").classify(err)) |reason| return reason;
                 std.log.err("routed Raft batch failed group_id={} table={s} err={s}", .{
@@ -697,19 +782,27 @@ pub const Operations = struct {
 
     pub fn txnBegin(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnBeginRequest) Error!void {
         try ensurePreDecisionRequestActive(request);
+        if (input.route_fence) |fence| {
+            if (fence.route.group_id != group_id or fence.topology_epoch != input.topology_epoch) return error.TopologyChanged;
+        }
         const writes = self.writes orelse return error.NotFound;
         const supports_pre_decision_context =
             writes.vtable.txn_begin_group_local_with_pre_decision_context != null;
         _ = (writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, input.txn_id, input.begin_timestamp, input.topology_epoch, input.retain_terminal, input.participants, .{
+            .external_decision_owner = input.external_decision_owner,
+            .sql_locks = input.sql_locks,
+            .route_fence = input.route_fence,
+            .source_producer = input.source_producer,
             .restore_staging_scope = input.restore_staging_scope,
             .restore_staging_plan_id = input.restore_staging_plan_id,
             .deadline_ns = request.deadline_ns,
             .deadline_io = request.deadline_io,
             .cancellation = request.cancellation,
         }) catch |err| switch (err) {
-            error.RetainedEffectsFull => return error.RetainedEffectsFull,
+            error.RetainedEffectsFull, error.HistoryFull => return error.RetainedEffectsFull,
             error.OnlineSourcePinPending => return error.TransactionPreDecisionOutcomeUnknown,
-            error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
+            error.InvalidBatchRequest => return error.InvalidArgument,
+            error.RelationalCheckViolation => return error.RelationalCheckViolation,
             error.Canceled, error.Cancelled => return error.Canceled,
             error.Timeout, error.DeadlineExceeded => return error.TransactionPreDecisionOutcomeUnknown,
             error.PreDecisionDeadlineExceeded => {
@@ -722,11 +815,28 @@ pub const Operations = struct {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.UnsupportedOperation => return error.Unsupported,
             error.UnknownGroup, error.TxnNotFound => return error.NotFound,
+            // All four are raised before any Raft proposal for this txn: a
+            // leader/term/incarnation check (NotLeader) or a stale/unavailable
+            // local catalog snapshot (CatalogRoutingSnapshotTimeout), same as
+            // the two below. Nothing was proposed, so GroupLeaderUnavailable's
+            // "definitely not proposed, safe to retry another candidate or
+            // wait" contract holds. Omitting NotLeader/CatalogRoutingSnapshotTimeout
+            // here previously fell through to the generic `error.Internal` ->
+            // HTTP 500 below, which a client cannot safely retry (a 500 does
+            // not prove nothing was applied) -- turning an ordinary transient
+            // "not currently the leader" or "catalog view not yet caught up"
+            // condition (e.g. right after a Raft leader election following a
+            // network partition) into a permanent failure for the whole
+            // cross-group transaction.
             error.LeaderUnavailable,
             error.GroupLeaderUnavailable,
             error.MetadataSnapshotUnavailable,
+            error.NotLeader,
+            error.CatalogRoutingSnapshotTimeout,
             => return error.GroupLeaderUnavailable,
             else => {
+                if (@import("external_transaction_errors.zig").classify(err)) |reason| return reason;
+                if (@import("source_transaction_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_integrity_errors.zig").classify(err)) |reason| return reason;
                 return error.Internal;
             },
@@ -745,15 +855,23 @@ pub const Operations = struct {
         // Hidden restore owners are absent from public schema metadata. The
         // writer validates the exact durable owner capability before admission;
         // native prepare still validates every command against its own catalog.
-        if (input.req.restore_staging_scope == null) {
+        // Phase-two activation cannot acquire new effects or user authority.
+        // The native transaction manager validates its already stored owner;
+        // a new schema/user-vote projection would incorrectly require a live
+        // TEMP connection after an immutable decision has been admitted.
+        if (input.req.restore_staging_scope == null and input.req.asBatch(input.txn_id, input.topology_epoch).externalActivationOwner() == null) {
             const validator = self.txn_validator orelse return error.Unavailable;
             validator.validate(request, table_name, input.req.writes) catch |err| switch (err) {
-                error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
+                error.InvalidBatchRequest => return error.InvalidArgument,
+                error.RelationalCheckViolation => return error.RelationalCheckViolation,
+                error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
                 error.TableNotFound => return error.NotFound,
                 error.ResourceTemporarilyUnavailable, error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired => return error.Unavailable,
                 error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return error.PreDecisionDeadlineExceeded,
                 error.Canceled, error.Cancelled => return error.Canceled,
                 else => {
+                    if (@import("external_transaction_errors.zig").classify(err)) |reason| return reason;
+                    if (@import("source_transaction_errors.zig").classify(err)) |reason| return reason;
                     if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
                     return error.Internal;
                 },
@@ -766,10 +884,12 @@ pub const Operations = struct {
             .deadline_io = request.deadline_io,
             .cancellation = request.cancellation,
         }) catch |err| switch (err) {
-            error.RetainedEffectsFull => return error.RetainedEffectsFull,
+            error.RetainedEffectsFull, error.HistoryFull => return error.RetainedEffectsFull,
             error.OnlineSourcePinPending => return error.TransactionPreDecisionOutcomeUnknown,
             error.TransactionTooLarge => return error.TransactionTooLarge,
-            error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
+            error.InvalidBatchRequest => return error.InvalidArgument,
+            error.RelationalCheckViolation => return error.RelationalCheckViolation,
+            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
             error.Canceled, error.Cancelled => return error.Canceled,
             error.Timeout, error.DeadlineExceeded => return error.TransactionPreDecisionOutcomeUnknown,
             error.PreDecisionDeadlineExceeded => {
@@ -782,15 +902,24 @@ pub const Operations = struct {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.UnsupportedOperation => return error.Unsupported,
             error.UnknownGroup, error.TxnNotFound => return error.NotFound,
+            // See the matching comment in txnBegin: NotLeader and
+            // CatalogRoutingSnapshotTimeout are both raised before this
+            // prepare is proposed and belong in the same "definitely not
+            // proposed" bucket as the three below.
             error.LeaderUnavailable,
             error.GroupLeaderUnavailable,
             error.MetadataSnapshotUnavailable,
+            error.NotLeader,
+            error.CatalogRoutingSnapshotTimeout,
             => return error.GroupLeaderUnavailable,
             else => {
+                if (@import("source_transaction_errors.zig").classify(err)) |reason| return reason;
                 // One registry drives Raft terminal results and participant
                 // transport; adding a lifecycle fence must not silently turn
                 // its recoverable typed rejection into an HTTP 500.
+                if (@import("external_transaction_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
+                if (@import("external_transaction_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_integrity_errors.zig").classify(err)) |reason| return reason;
                 return error.Internal;
             },
@@ -802,7 +931,8 @@ pub const Operations = struct {
         const writes = self.writes orelse return error.NotFound;
         _ = (distributed_txn.resolveGroupLocalWithRequest(writes, alloc, group_id, table_name, input, request.cancellation) catch |err| switch (err) {
             error.OnlineSourcePinPending => return error.EnrichmentRetryInProgress,
-            error.RetainedEffectsFull => return if (input.status == .committed) error.EnrichmentRetryInProgress else error.Unavailable,
+            error.RetainedEffectsFull, error.HistoryFull => return if (input.status == .committed) error.EnrichmentRetryInProgress else error.Unavailable,
+            error.DecisionNotProposed => return error.DecisionNotProposed,
             error.DecisionConflict => return error.DecisionConflict,
             error.TopologyChanged => return error.TopologyChanged,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
@@ -812,7 +942,10 @@ pub const Operations = struct {
             error.EnrichmentWorkerFailed => return error.EnrichmentWorkerFailed,
             error.UnsupportedOperation => return error.Unsupported,
             error.UnknownGroup, error.TxnNotFound => return error.NotFound,
-            else => return error.Internal,
+            else => {
+                if (@import("external_transaction_errors.zig").classify(err)) |reason| return reason;
+                return error.Internal;
+            },
         }) orelse return error.NotFound;
     }
 
@@ -823,7 +956,7 @@ pub const Operations = struct {
     pub fn txnStatusWithRequest(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnStatusRequest) Error!db_mod.types.TxnStatus {
         try request.ensureActive();
         const writes = self.writes orelse return error.NotFound;
-        const status = if (input.restore_staging_scope != null or input.restore_staging_plan_id != null)
+        const status = if (input.restore_staging_scope != null or input.restore_staging_plan_id != null or input.route_fence != null)
             writes.txnStatusGroupLocalWithRequest(alloc, group_id, table_name, input, request)
         else if (request.deadline_ns) |deadline_ns|
             writes.txnStatusGroupAuthoritativeLocalUntil(alloc, group_id, table_name, input.txn_id, deadline_ns)
@@ -1087,8 +1220,8 @@ pub const Operations = struct {
             };
             if (probe.value.transition_id != null) {
                 if (input.key.len != 0 or input.consistency != .read_index or input.options.restore_staging_scope != null or
-                    input.options.include_primary_digest or input.options.relational_integrity_catalog or input.options.relational_integrity_action or
-                    input.options.relational_integrity_jobs_json.len != 0 or input.options.group_source_query_json.len != 0 or input.options.relational_index_status_json.len != 0 or input.options.relational_activation_json.len != 0 or input.options.fields.len != 0) return error.InvalidArgument;
+                    input.options.include_primary_digest or input.options.include_json_null_fields or input.options.relational_integrity_catalog or input.options.relational_integrity_action or
+                    input.options.relational_integrity_jobs_json.len != 0 or input.options.sql_lock_query_json.len != 0 or input.options.group_source_query_json.len != 0 or input.options.relational_index_status_json.len != 0 or input.options.relational_activation_json.len != 0 or input.options.fields.len != 0) return error.InvalidArgument;
                 var scoped = std.json.parseFromSlice(@import("../raft/shard_ops.zig").TopologyReadRequest, alloc, input.options.relational_topology_json, .{}) catch return error.InvalidArgument;
                 defer scoped.deinit();
                 const ops = self.shard_ops orelse return error.NotFound;
@@ -1102,7 +1235,10 @@ pub const Operations = struct {
                 const deadline: Deadline = .{ .context = request };
                 const json = ops.topologyRead(alloc, input.group_id, input.table_name, scoped.value, .{ .ptr = &deadline, .is_cancelled_fn = Deadline.canceled }) catch |err| {
                     try request.ensureActive();
-                    const mapped = mapCommonReadError(err) orelse mapLookupError(err);
+                    const mapped = switch (err) {
+                        error.IntegrityTopologyBusy, error.TransactionTopologyBusy => error.StorageReadTemporarilyUnavailable,
+                        else => mapCommonReadError(err) orelse mapLookupError(err),
+                    };
                     if (mapped == error.Internal) {
                         const now = platform_time.monotonicNs();
                         const next = next_unknown_topology_read_log_ns.load(.monotonic);
@@ -1518,6 +1654,7 @@ fn consumerTests() type {
         test "distributed txn internal operations preserve every semantic participant rejection" {
             const Source = struct {
                 failure: anyerror,
+                validation_failure: ?anyerror = null,
                 fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
                     return error.UnexpectedTestCall;
                 }
@@ -1525,7 +1662,10 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     return self.failure;
                 }
-                pub fn validate(_: *anyopaque, _: operation.RequestContext, _: []const u8, _: []const db_mod.types.TransactionWrite) anyerror!void {}
+                pub fn validate(ptr: *anyopaque, _: operation.RequestContext, _: []const u8, _: []const db_mod.types.TransactionWrite) anyerror!void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (self.validation_failure) |failure| return failure;
+                }
             };
             var source = Source{ .failure = error.UnexpectedTestCall };
             const operations = Operations{
@@ -1539,11 +1679,15 @@ fn consumerTests() type {
                 source.failure = @field(errors.Error, field);
                 try std.testing.expectError(source.failure, operations.txnPrepare(std.testing.allocator, .{}, 7, "rows", .{ .txn_id = @splat(7), .req = .{} }));
             }
+            source.failure = error.StorageReadTemporarilyUnavailable;
+            try std.testing.expectError(source.failure, operations.txnPrepare(std.testing.allocator, .{}, 7, "rows", .{ .txn_id = @splat(7), .req = .{} }));
             const execution_errors = @import("antfly_local_sources").schema_relational_expression_errors.Error || @import("relational_row_errors.zig").PolicyError;
             inline for (@typeInfo(execution_errors).error_set.error_names.?) |field| {
                 source.failure = @field(execution_errors, field);
                 try std.testing.expectError(source.failure, operations.txnPrepare(std.testing.allocator, .{}, 7, "rows", .{ .txn_id = @splat(7), .req = .{} }));
             }
+            source.validation_failure = error.RelationalCheckViolation;
+            try std.testing.expectError(error.RelationalCheckViolation, operations.txnPrepare(std.testing.allocator, .{}, 7, "rows", .{ .txn_id = @splat(7), .req = .{} }));
         }
 
         test "internal transaction operations preserve pre-decision leader unavailability" {
@@ -1822,6 +1966,39 @@ fn consumerTests() type {
                 "docs",
                 .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
             ));
+
+            // NotLeader (a leader/term/incarnation check failing before any
+            // proposal) and CatalogRoutingSnapshotTimeout (a stale/unavailable
+            // local catalog snapshot, also checked before proposing) are both
+            // raised pre-decision, the same as LeaderUnavailable and
+            // MetadataSnapshotUnavailable above. A network partition that
+            // forces a Raft leader election, or otherwise disrupts catalog
+            // sync, routinely produces these on the node a client happens to
+            // have cached as "the leader." Regression for a prior gap where
+            // both fell through to the generic error.Internal (-> HTTP 500),
+            // which a client cannot safely retry against another candidate
+            // (a 500 does not prove nothing was applied) -- turning an
+            // ordinary transient condition into a permanent failure for the
+            // whole cross-group transaction instead of the "definitely not
+            // proposed, try the next candidate or wait" GroupLeaderUnavailable
+            // contract.
+            for ([_]anyerror{ error.NotLeader, error.CatalogRoutingSnapshotTimeout }) |failure| {
+                context_deadline_source.failure = failure;
+                try std.testing.expectError(error.GroupLeaderUnavailable, context_deadline_operations.txnBegin(
+                    std.testing.allocator,
+                    .{},
+                    7,
+                    "docs",
+                    .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
+                ));
+                try std.testing.expectError(error.GroupLeaderUnavailable, context_deadline_operations.txnPrepare(
+                    std.testing.allocator,
+                    .{},
+                    7,
+                    "docs",
+                    .{ .txn_id = txn_id, .req = .{} },
+                ));
+            }
         }
 
         test "typed routed batch preserves forwarding cancellation and identity conflicts" {

@@ -842,15 +842,18 @@ pub const View = struct {
     /// numeric index. Iterative traversal also handles deeply nested arrays
     /// without turning user data depth into native call-stack depth.
     pub fn collect(self: *View, path: []const []const u8, pointer: bool, out: *std.ArrayListUnmanaged(Value)) !void {
-        _ = try self.collectImpl(path, pointer, out, false);
+        _ = try self.collectImpl(path, pointer, out, false, false);
+    }
+    pub fn collectExactNumbers(self: *View, path: []const []const u8, pointer: bool, out: *std.ArrayListUnmanaged(Value)) !void {
+        _ = try self.collectImpl(path, pointer, out, false, true);
     }
     /// Presence observes a path, including explicit NULL, without decoding its
     /// payload. Preparation has already validated syntax and duplicate keys.
     pub fn hasPath(self: *View, path: []const []const u8, pointer: bool) !bool {
         var unused: std.ArrayListUnmanaged(Value) = .empty;
-        return self.collectImpl(path, pointer, &unused, true);
+        return self.collectImpl(path, pointer, &unused, true, false);
     }
-    fn collectImpl(self: *View, path: []const []const u8, pointer: bool, out: *std.ArrayListUnmanaged(Value), comptime presence: bool) !bool {
+    fn collectImpl(self: *View, path: []const []const u8, pointer: bool, out: *std.ArrayListUnmanaged(Value), comptime presence: bool, comptime exact_numbers: bool) !bool {
         const Work = struct { node: *Node, depth: usize };
         var pending = std.ArrayListUnmanaged(Work).empty;
         defer pending.deinit(self.alloc);
@@ -858,7 +861,11 @@ pub const View = struct {
         while (pending.pop()) |work| {
             if (work.depth == path.len) {
                 if (presence) return true;
-                try out.append(self.alloc, try self.materialize(work.node));
+                const value = if (exact_numbers)
+                    try std.json.parseFromSliceLeaky(Value, self.alloc, work.node.raw, .{ .parse_numbers = false })
+                else
+                    try self.materialize(work.node);
+                try out.append(self.alloc, value);
                 continue;
             }
             const part = path[work.depth];

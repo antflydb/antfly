@@ -96,7 +96,16 @@ def sync_detailed(
     """Register or replace an artifact enrichment
 
      Registers a table-level generated artifact definition. Reusing the same
-    artifact name replaces the existing mapping. Chunk or asset enrichments
+    artifact name replaces the existing mapping.
+    Omitting all producer fields (producer, producer_json and transcriber)
+    on an existing same-kind artifact retains its admitted producer. Supplying
+    any one of these fields explicitly replaces the producer; mutually
+    exclusive spellings cannot be combined. Execution-policy updates persist
+    separately from publication authority, without reading credentials,
+    reconstructing the recipe, or invalidating completed output.
+    Changing execution alone preserves completed artifacts; changing producer
+    semantics may invalidate them. Use explicit reprocessing for incomplete
+    or all existing work. Chunk or asset enrichments
     may set `full_text_index: true` to map generated text into the table's
     default full-text index.
 
@@ -138,7 +147,16 @@ def sync(
     """Register or replace an artifact enrichment
 
      Registers a table-level generated artifact definition. Reusing the same
-    artifact name replaces the existing mapping. Chunk or asset enrichments
+    artifact name replaces the existing mapping.
+    Omitting all producer fields (producer, producer_json and transcriber)
+    on an existing same-kind artifact retains its admitted producer. Supplying
+    any one of these fields explicitly replaces the producer; mutually
+    exclusive spellings cannot be combined. Execution-policy updates persist
+    separately from publication authority, without reading credentials,
+    reconstructing the recipe, or invalidating completed output.
+    Changing execution alone preserves completed artifacts; changing producer
+    semantics may invalidate them. Use explicit reprocessing for incomplete
+    or all existing work. Chunk or asset enrichments
     may set `full_text_index: true` to map generated text into the table's
     default full-text index.
 
@@ -175,7 +193,16 @@ async def asyncio_detailed(
     """Register or replace an artifact enrichment
 
      Registers a table-level generated artifact definition. Reusing the same
-    artifact name replaces the existing mapping. Chunk or asset enrichments
+    artifact name replaces the existing mapping.
+    Omitting all producer fields (producer, producer_json and transcriber)
+    on an existing same-kind artifact retains its admitted producer. Supplying
+    any one of these fields explicitly replaces the producer; mutually
+    exclusive spellings cannot be combined. Execution-policy updates persist
+    separately from publication authority, without reading credentials,
+    reconstructing the recipe, or invalidating completed output.
+    Changing execution alone preserves completed artifacts; changing producer
+    semantics may invalidate them. Use explicit reprocessing for incomplete
+    or all existing work. Chunk or asset enrichments
     may set `full_text_index: true` to map generated text into the table's
     default full-text index.
 
@@ -215,7 +242,16 @@ async def asyncio(
     """Register or replace an artifact enrichment
 
      Registers a table-level generated artifact definition. Reusing the same
-    artifact name replaces the existing mapping. Chunk or asset enrichments
+    artifact name replaces the existing mapping.
+    Omitting all producer fields (producer, producer_json and transcriber)
+    on an existing same-kind artifact retains its admitted producer. Supplying
+    any one of these fields explicitly replaces the producer; mutually
+    exclusive spellings cannot be combined. Execution-policy updates persist
+    separately from publication authority, without reading credentials,
+    reconstructing the recipe, or invalidating completed output.
+    Changing execution alone preserves completed artifacts; changing producer
+    semantics may invalidate them. Use explicit reprocessing for incomplete
+    or all existing work. Chunk or asset enrichments
     may set `full_text_index: true` to map generated text into the table's
     default full-text index.
 

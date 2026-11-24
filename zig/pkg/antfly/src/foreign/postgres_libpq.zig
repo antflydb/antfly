@@ -258,6 +258,10 @@ const CONNECTION_OK: ConnStatusType = 0;
 const PGRES_COMMAND_OK: ExecStatusType = 1;
 const PGRES_TUPLES_OK: ExecStatusType = 2;
 const PGRES_FATAL_ERROR: ExecStatusType = 7;
+const PGRES_SINGLE_TUPLE: ExecStatusType = 9;
+const replication_wire_chunk_bytes: usize = 32 * 1024;
+const replication_poll_bytes: usize = 32 * 1024 * 1024;
+const replication_poll_messages: usize = 65536;
 const PG_DIAG_SQLSTATE: c_int = 'C';
 
 const FnPQconnectdb = *const fn ([*:0]const u8) callconv(.c) ?*PGconn;
@@ -266,10 +270,23 @@ const FnPQconnectPoll = *const fn (?*PGconn) callconv(.c) c_uint;
 const FnPQexec = *const fn (?*PGconn, [*:0]const u8) callconv(.c) ?*PGresult;
 const FnPQsendQuery = *const fn (?*PGconn, [*:0]const u8) callconv(.c) c_int;
 const FnPQstatus = *const fn (?*PGconn) callconv(.c) ConnStatusType;
+const ConninfoOption = extern struct {
+    keyword: ?[*:0]const u8,
+    envvar: ?[*:0]const u8,
+    compiled: ?[*:0]const u8,
+    value: ?[*:0]const u8,
+    label: ?[*:0]const u8,
+    display: ?[*:0]const u8,
+    display_size: c_int,
+};
+const FnPQconninfoParse = *const fn ([*:0]const u8, ?*?[*:0]u8) callconv(.c) ?[*]ConninfoOption;
+const FnPQconninfoFree = *const fn ([*]ConninfoOption) callconv(.c) void;
+const FnPQconnectionUsedPassword = *const fn (?*PGconn) callconv(.c) c_int;
 const FnPQerrorMessage = *const fn (?*PGconn) callconv(.c) [*:0]const u8;
 const FnPQfinish = *const fn (?*PGconn) callconv(.c) void;
 const FnPQexecParams = *const fn (?*PGconn, [*:0]const u8, c_int, ?[*]const Oid, ?[*]const ?[*:0]const u8, ?[*]const c_int, ?[*]const c_int, c_int) callconv(.c) ?*PGresult;
 const FnPQsendQueryParams = *const fn (?*PGconn, [*:0]const u8, c_int, ?[*]const Oid, ?[*]const ?[*:0]const u8, ?[*]const c_int, ?[*]const c_int, c_int) callconv(.c) c_int;
+const FnPQsetSingleRowMode = *const fn (?*PGconn) callconv(.c) c_int;
 const FnPQsetnonblocking = *const fn (?*PGconn, c_int) callconv(.c) c_int;
 const FnPQflush = *const fn (?*PGconn) callconv(.c) c_int;
 const FnPQconsumeInput = *const fn (?*PGconn) callconv(.c) c_int;
@@ -461,7 +478,7 @@ pub const Executor = struct {
                 @min(deadline_ns orelse std.math.maxInt(u64), now_ns +| cancellation_poll_interval_ns)
             else
                 deadline_ns orelse unreachable;
-            return try self.executor.waitForSocketEvents(self.conn, events, wait_deadline_ns);
+            return try self.executor.waitForSocketEvents(self.conn, events, wait_deadline_ns, .query);
         }
 
         fn consumeInput(self: @This()) c_int {
@@ -547,10 +564,14 @@ pub const Executor = struct {
     pqexec: FnPQexec,
     pqsendQuery: FnPQsendQuery,
     pqstatus: FnPQstatus,
+    pqconninfoParse: ?FnPQconninfoParse = null,
+    pqconninfoFree: ?FnPQconninfoFree = null,
+    pqconnectionUsedPassword: ?FnPQconnectionUsedPassword = null,
     pqerrorMessage: FnPQerrorMessage,
     pqfinish: FnPQfinish,
     pqexecParams: FnPQexecParams,
     pqsendQueryParams: FnPQsendQueryParams,
+    pqsetSingleRowMode: ?FnPQsetSingleRowMode = null,
     pqsetnonblocking: FnPQsetnonblocking,
     pqflush: FnPQflush,
     pqconsumeInput: FnPQconsumeInput,
@@ -581,10 +602,14 @@ pub const Executor = struct {
             .pqexec = try lookupRequired(&lib, FnPQexec, "PQexec"),
             .pqsendQuery = try lookupRequired(&lib, FnPQsendQuery, "PQsendQuery"),
             .pqstatus = try lookupRequired(&lib, FnPQstatus, "PQstatus"),
+            .pqconninfoParse = try lookupRequired(&lib, FnPQconninfoParse, "PQconninfoParse"),
+            .pqconninfoFree = try lookupRequired(&lib, FnPQconninfoFree, "PQconninfoFree"),
+            .pqconnectionUsedPassword = try lookupRequired(&lib, FnPQconnectionUsedPassword, "PQconnectionUsedPassword"),
             .pqerrorMessage = try lookupRequired(&lib, FnPQerrorMessage, "PQerrorMessage"),
             .pqfinish = try lookupRequired(&lib, FnPQfinish, "PQfinish"),
             .pqexecParams = try lookupRequired(&lib, FnPQexecParams, "PQexecParams"),
             .pqsendQueryParams = try lookupRequired(&lib, FnPQsendQueryParams, "PQsendQueryParams"),
+            .pqsetSingleRowMode = try lookupRequired(&lib, FnPQsetSingleRowMode, "PQsetSingleRowMode"),
             .pqsetnonblocking = try lookupRequired(&lib, FnPQsetnonblocking, "PQsetnonblocking"),
             .pqflush = try lookupRequired(&lib, FnPQflush, "PQflush"),
             .pqconsumeInput = try lookupRequired(&lib, FnPQconsumeInput, "PQconsumeInput"),
@@ -692,6 +717,7 @@ pub const Executor = struct {
         return .{
             .ptr = self,
             .vtable = &.{
+                .transaction_envelopes = true,
                 .deinit = deinitQueryExecutor,
                 .query = Executor.query,
                 .statistics = Executor.statistics,
@@ -699,7 +725,11 @@ pub const Executor = struct {
                 .discover_columns = Executor.discoverColumns,
                 .refresh_columns = Executor.refreshColumns,
                 .begin_snapshot_query = Executor.beginSnapshotQuery,
+                .begin_replication_snapshot_query = Executor.beginReplicationSnapshotQuery,
                 .begin_prepared_replication_snapshot = Executor.beginPreparedReplicationSnapshot,
+                .begin_subscription_snapshot = Executor.beginSubscriptionSnapshot,
+                .poll_subscription = Executor.pollSubscription,
+                .acknowledge_subscription = Executor.acknowledgeSubscription,
                 .prepare_replication = Executor.prepareReplication,
                 .poll_changes = Executor.pollChanges,
                 .cleanup_replication = Executor.cleanupReplication,
@@ -741,23 +771,136 @@ pub const Executor = struct {
     const SnapshotQuery = struct {
         executor: *Executor,
         conn: ?*PGconn,
+        replication_identity_enabled: bool = false,
+        verified_provider_identity: ?foreign_source.ExactCutoverIntent.ProviderIdentity = null,
 
+        capture_digest: ?[32]u8 = null,
+        capture_complete: bool = false,
+        capture_relation_locked: bool = false,
+        capture_relation_id: ?u32 = null,
+        multi_relation: bool = false,
+        created_slot: ?struct { name: []u8, checkpoint: []const u8 } = null,
         fn asSnapshotQuery(self: *@This()) postgres_source.QueryExecutor.SnapshotQuery {
-            return .{
-                .ptr = self,
-                .vtable = &.{
-                    .deinit = SnapshotQuery.destroy,
-                    .query = SnapshotQuery.query,
-                },
+            const ordinary: postgres_source.QueryExecutor.SnapshotQuery.VTable = .{
+                .deinit = SnapshotQuery.destroy,
+                .query = SnapshotQuery.query,
             };
+            const replication: postgres_source.QueryExecutor.SnapshotQuery.VTable = .{
+                .deinit = SnapshotQuery.destroy,
+                .query = SnapshotQuery.query,
+                .abort_subscription = SnapshotQuery.abortSubscription,
+                .capture_query = SnapshotQuery.capture,
+                .capture_query_control = SnapshotQuery.captureControlled,
+                .replication_identity_control = SnapshotQuery.replicationIdentityControlled,
+                .replication_identity = SnapshotQuery.replicationIdentity,
+            };
+            return .{ .ptr = self, .vtable = if (self.replication_identity_enabled) &replication else &ordinary };
+        }
+
+        fn replicationIdentity(ptr: *anyopaque, a: Allocator, table: []const u8, deadline: ?u64) !foreign_source.ReplicationIdentity {
+            return replicationIdentityWithControl(ptr, a, table, deadline, null);
+        }
+        fn replicationIdentityControlled(ptr: *anyopaque, a: Allocator, table: []const u8, deadline: ?u64, cancellation: CancellationToken) !foreign_source.ReplicationIdentity {
+            return replicationIdentityWithControl(ptr, a, table, deadline, cancellation);
+        }
+        fn replicationIdentityWithControl(ptr: *anyopaque, a: Allocator, table: []const u8, deadline: ?u64, cancellation: ?CancellationToken) !foreign_source.ReplicationIdentity {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const conn = self.conn orelse return error.ForeignConnectionFailed;
+            const until = deadline orelse platform_time.monotonicNs() +| 30 * std.time.ns_per_s;
+            // Keep the source relation's actual identity stable through every
+            // page on this reader. Resolving regclass before its first SELECT
+            // would otherwise leave a DROP/recreate gap in the origin anchor.
+            const quoted_table = try sql.quotePostgresRelationAlloc(a, table);
+            defer a.free(quoted_table);
+            const lock_sql = try std.fmt.allocPrint(a, "LOCK TABLE {s} IN ACCESS SHARE MODE", .{quoted_table});
+            defer a.free(lock_sql);
+            const locked = self.executor.execSimpleWithControl(conn, a, lock_sql, until, true, cancellation) catch |err| {
+                self.executor.closeCountedConnection(conn);
+                self.conn = null;
+                return err;
+            };
+            self.executor.pqclear(locked);
+            const origin = self.executor.sqlReplicationIdentityWithControl(a, conn, table, until, cancellation) catch |err| {
+                self.executor.closeCountedConnection(conn);
+                self.conn = null;
+                return err;
+            };
+            if (self.verified_provider_identity) |expected| {
+                if (!std.mem.eql(u8, &expected, &origin.provider_identity)) {
+                    self.executor.closeCountedConnection(conn);
+                    self.conn = null;
+                    return error.ForeignProviderIdentityMismatch;
+                }
+            }
+            if (self.capture_relation_id) |prior| if (prior != origin.relation_id) {
+                if (!self.multi_relation or !self.capture_complete) return error.InvalidReplicationSnapshotCursor;
+                const closed = try self.executor.execSimpleWithControl(conn, a, "CLOSE antfly_replication_capture", until, true, cancellation);
+                self.executor.pqclear(closed);
+                self.capture_digest = null;
+                self.capture_complete = false;
+            };
+            self.capture_relation_id = origin.relation_id;
+            self.capture_relation_locked = true;
+            return origin;
+        }
+
+        fn capture(ptr: *anyopaque, a: Allocator, prepared: sql.PreparedQuery, page_rows: usize, deadline: ?u64) !foreign_source.QueryResult {
+            return captureWithControl(ptr, a, prepared, page_rows, deadline, null);
+        }
+        fn captureControlled(ptr: *anyopaque, a: Allocator, prepared: sql.PreparedQuery, page_rows: usize, deadline: ?u64, cancellation: CancellationToken) !foreign_source.QueryResult {
+            return captureWithControl(ptr, a, prepared, page_rows, deadline, cancellation);
+        }
+        fn captureWithControl(ptr: *anyopaque, a: Allocator, prepared: sql.PreparedQuery, page_rows: usize, deadline: ?u64, cancellation: ?CancellationToken) !foreign_source.QueryResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var owned = prepared;
+            defer owned.deinit(a);
+            if (!self.replication_identity_enabled or !self.capture_relation_locked or page_rows == 0 or page_rows > 4096) return error.InvalidReplicationSnapshotCursor;
+            const conn = self.conn orelse return error.ForeignConnectionFailed;
+            const until = deadline orelse platform_time.monotonicNs() +| 30 * std.time.ns_per_s;
+            // One declared cursor, not separate OFFSET plans, owns the exact
+            // source row sequence until complete capture has been retained.
+            var hashing = std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256).initHasher(std.crypto.hash.sha2.Sha256.init(.{}), &.{});
+            try std.json.Stringify.value(prepared, .{}, &hashing.writer);
+            var digest: [32]u8 = undefined;
+            hashing.hasher.final(&digest);
+            errdefer {
+                self.executor.closeCountedConnection(conn);
+                self.conn = null;
+            }
+            if (self.capture_digest) |expected| {
+                if (!std.mem.eql(u8, &expected, &digest)) return error.InvalidReplicationSnapshotCursor;
+            } else {
+                const declaration = try std.fmt.allocPrint(a, "DECLARE antfly_replication_capture NO SCROLL CURSOR FOR {s}", .{prepared.sql_text});
+                defer a.free(declaration);
+                const result = try self.executor.execPreparedWithDeadlineInternal(conn, a, .{ .sql_text = declaration, .args = prepared.args }, until, true, cancellation);
+                self.executor.pqclear(result);
+                self.capture_digest = digest;
+            }
+            if (self.capture_complete) return .{};
+            const fetch = try std.fmt.allocPrint(a, "FETCH FORWARD {d} FROM antfly_replication_capture", .{page_rows});
+            defer a.free(fetch);
+            const result = try self.executor.execSimpleWithControl(conn, a, fetch, until, false, cancellation);
+            defer self.executor.pqclear(result);
+            const rows = try self.executor.readQueryResultWithProvenance(a, result, until, cancellation, true);
+            if (rows.rows.len == 0) self.capture_complete = true;
+            return rows;
+        }
+
+        fn abortSubscription(ptr: *anyopaque, a: Allocator) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const created = self.created_slot orelse return error.UnsupportedReplicationCleanup;
+            const conn = self.conn orelse return error.ForeignConnectionFailed;
+            defer {
+                self.executor.closeCountedConnection(conn);
+                self.conn = null;
+            }
+            try self.executor.abortSubscriptionExport(a, conn, created.name, created.checkpoint, true);
         }
 
         fn destroy(ptr: *anyopaque, alloc: Allocator) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (self.conn) |conn| {
-                _ = self.executor.execSimpleAllowCommand(conn, alloc, "ROLLBACK") catch {};
-                self.executor.closeCountedConnection(conn);
-            }
+            if (self.conn) |conn| self.executor.closeCountedConnection(conn);
+            if (self.created_slot) |created| alloc.free(created.name);
             alloc.destroy(self);
         }
 
@@ -782,7 +925,7 @@ pub const Executor = struct {
                 return err;
             };
             defer self.executor.pqclear(result);
-            return try self.executor.readQueryResultAllocWithDeadline(alloc, result, execution_deadline_ns, null);
+            return try self.executor.readQueryResultWithProvenance(alloc, result, execution_deadline_ns, null, self.replication_identity_enabled);
         }
     };
 
@@ -802,6 +945,18 @@ pub const Executor = struct {
         return snapshot_query.asSnapshotQuery();
     }
 
+    fn beginReplicationSnapshotQuery(ptr: *anyopaque, a: Allocator, dsn: []const u8) !postgres_source.QueryExecutor.SnapshotQuery {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const deadline = platform_time.monotonicNs() +| 30 * std.time.ns_per_s;
+        const conn = try self.connectCountedFresh(a, dsn, deadline);
+        errdefer self.closeCountedConnection(conn);
+        const begun = try self.execSimpleWithDeadline(conn, a, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY", deadline, true);
+        self.pqclear(begun);
+        const snapshot_query = try a.create(SnapshotQuery);
+        snapshot_query.* = .{ .executor = self, .conn = conn, .replication_identity_enabled = true };
+        return snapshot_query.asSnapshotQuery();
+    }
+
     fn beginPreparedReplicationSnapshot(
         ptr: *anyopaque,
         alloc: Allocator,
@@ -815,8 +970,7 @@ pub const Executor = struct {
         const publication_name = params.publication_name orelse return error.InvalidQueryRequest;
         const cutover_lock_name = params.cutover_lock_name orelse
             return error.InvalidQueryRequest;
-        const exact_cutover_intent = params.exact_cutover_intent orelse
-            return error.InvalidQueryRequest;
+        const custody = try params.snapshotCustody();
         if ((params.retired_slot_name == null) !=
             (params.retired_publication_name == null))
             return error.InvalidQueryRequest;
@@ -869,13 +1023,16 @@ pub const Executor = struct {
         // after losing leadership. Credentials are deliberately absent from
         // provider_identity, so rotating them cannot invalidate ownership.
         try ensureDeadline(execution_deadline_ns);
-        try exact_cutover_intent.persist(provider_identity);
-        try exact_cutover_intent.check();
+        const source_relation_id = try self.pollRelationIdentityAlloc(alloc, sql_conn, params.table, execution_deadline_ns);
+        const actual_origin: foreign_source.ReplicationIdentity = .{ .provider_identity = provider_identity, .relation_id = source_relation_id };
+        try params.checkOrigin(actual_origin);
+        try custody.bindOrigin(actual_origin);
+        try custody.check();
         try ensureDeadline(execution_deadline_ns);
 
         if (params.retired_slot_name) |retired_slot_name| {
             const retired_publication_name = params.retired_publication_name.?;
-            try exact_cutover_intent.check();
+            try custody.check();
             try self.dropInactiveLogicalReplicationSlotIfExistsAlloc(
                 alloc,
                 sql_conn,
@@ -888,30 +1045,30 @@ pub const Executor = struct {
                 retired_slot_name,
                 execution_deadline_ns,
             )) return error.ExactCutoverCleanupPending;
-            try exact_cutover_intent.check();
+            try custody.check();
             try self.dropPublicationIfExistsAlloc(
                 alloc,
                 sql_conn,
                 retired_publication_name,
                 execution_deadline_ns,
             );
-            try exact_cutover_intent.check();
-            try exact_cutover_intent.retirementComplete();
-            try exact_cutover_intent.check();
+            try custody.check();
+            try custody.retirementComplete();
+            try custody.check();
         }
 
-        try exact_cutover_intent.check();
+        try custody.check();
         try self.ensurePublicationAlloc(
             alloc,
-            dsn,
             sql_conn,
             publication_name,
             params.table,
             params.filter_query_json,
+            true,
             execution_deadline_ns,
         );
         if (slot_exists) {
-            try exact_cutover_intent.check();
+            try custody.check();
             try self.dropInactiveLogicalReplicationSlotIfExistsAlloc(
                 alloc,
                 sql_conn,
@@ -926,7 +1083,7 @@ pub const Executor = struct {
             )) return error.ExactCutoverCleanupPending;
         }
 
-        try exact_cutover_intent.check();
+        try custody.check();
         var slot_created = false;
         errdefer if (slot_created) {
             // Clean up only a slot whose successful create response this
@@ -1003,15 +1160,24 @@ pub const Executor = struct {
         snapshot_query.* = .{
             .executor = self,
             .conn = sql_conn,
+            .replication_identity_enabled = true,
+            .verified_provider_identity = provider_identity,
         };
-        const checkpoint = try alloc.dupe(u8, exported.checkpoint);
+        const binding = try self.publicationBinding(alloc, sql_conn, publication_name, params.table, params.filter_query_json != null, execution_deadline_ns);
+        if (binding.relation != source_relation_id) return error.ReplicationPublicationBindingChanged;
+        const checkpoint = try binding.checkpoint(alloc, exported.checkpoint);
+        errdefer alloc.free(checkpoint);
+        const snapshot_token = try alloc.dupe(u8, exported.snapshot_name);
+        errdefer alloc.free(snapshot_token);
         self.pqfinish(repl_conn);
         repl_conn = null;
         self.releaseGlobalConnections(1);
         release_reserved_permits = false;
         slot_created = false;
         return .{
+            .origin = .{ .provider_identity = provider_identity, .relation_id = source_relation_id },
             .checkpoint = checkpoint,
+            .snapshot_token = snapshot_token,
             .snapshot_query = snapshot_query.asSnapshotQuery(),
         };
     }
@@ -1042,6 +1208,7 @@ pub const Executor = struct {
 
     fn cleanupReplication(ptr: *anyopaque, alloc: Allocator, dsn: []const u8, params: foreign_source.ReplicationCleanupParams) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        try params.check();
         const execution_deadline_ns = params.execution_deadline_ns orelse
             platform_time.monotonicNs() +| 30 * std.time.ns_per_s;
         const pool = try self.getOrCreateConnectionPool(
@@ -1983,7 +2150,7 @@ pub const Executor = struct {
         self.pqfinish(conn);
     }
 
-    fn waitForSocketEvents(self: *@This(), conn: ?*PGconn, events: i16, deadline_ns: u64) !i16 {
+    fn waitForSocketEvents(self: *@This(), conn: ?*PGconn, events: i16, deadline_ns: u64, mode: enum { connect, query }) !i16 {
         const socket = self.pqsocket(conn);
         if (socket < 0) return error.ForeignConnectionFailed;
         const now_ns = platform_time.monotonicNs();
@@ -1997,13 +2164,17 @@ pub const Executor = struct {
             .revents = 0,
         }};
         if (try std.posix.poll(&poll_fds, timeout_ms) == 0) return error.Timeout;
-        if (poll_fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0)
+        const revents = poll_fds[0].revents;
+        if (revents & std.posix.POLL.NVAL != 0) return error.ForeignConnectionFailed;
+        // During connection setup libpq handles socket failures itself.
+        // Poll it again so it can try the next address or configured host.
+        if (mode == .query and revents & (std.posix.POLL.ERR | std.posix.POLL.HUP) != 0)
             return error.ForeignConnectionFailed;
         return poll_fds[0].revents;
     }
 
     fn waitForSocket(self: *@This(), conn: ?*PGconn, events: i16, deadline_ns: u64) !void {
-        _ = try self.waitForSocketEvents(conn, events, deadline_ns);
+        _ = try self.waitForSocketEvents(conn, events, deadline_ns, .query);
     }
 
     fn waitForSocketCancellable(
@@ -2019,7 +2190,7 @@ pub const Executor = struct {
                 execution_deadline_ns,
                 cancellation,
             ) orelse unreachable;
-            _ = self.waitForSocketEvents(conn, events, wait_deadline_ns) catch |err| {
+            _ = self.waitForSocketEvents(conn, events, wait_deadline_ns, .connect) catch |err| {
                 if (err != error.Timeout) return err;
                 try ensureNotCancelled(cancellation);
                 if (execution_deadline_ns) |deadline_ns| try ensureDeadline(deadline_ns);
@@ -2208,6 +2379,10 @@ pub const Executor = struct {
         execution_deadline_ns: u64,
         allow_command_ok: bool,
     ) !?*PGresult {
+        return self.execSimpleWithControl(conn, alloc, sql_text, execution_deadline_ns, allow_command_ok, null);
+    }
+    fn execSimpleWithControl(self: *@This(), conn: ?*PGconn, alloc: Allocator, sql_text: []const u8, execution_deadline_ns: u64, allow_command_ok: bool, cancellation: ?CancellationToken) !?*PGresult {
+        if (cancellation) |token| try token.check();
         try ensureDeadline(execution_deadline_ns);
         const sql_text_z = try alloc.dupeSentinel(u8, sql_text, 0);
         defer alloc.free(sql_text_z);
@@ -2218,7 +2393,7 @@ pub const Executor = struct {
             conn,
             execution_deadline_ns,
             allow_command_ok,
-            null,
+            cancellation,
         );
     }
 
@@ -2246,6 +2421,17 @@ pub const Executor = struct {
         execution_deadline_ns: ?u64,
         cancellation: ?CancellationToken,
     ) !foreign_source.QueryResult {
+        return self.readQueryResultWithProvenance(alloc, result, execution_deadline_ns, cancellation, false);
+    }
+
+    fn readQueryResultWithProvenance(
+        self: *@This(),
+        alloc: Allocator,
+        result: ?*PGresult,
+        execution_deadline_ns: ?u64,
+        cancellation: ?CancellationToken,
+        capture_json_nulls: bool,
+    ) !foreign_source.QueryResult {
         try ensureNotCancelled(cancellation);
         const rows_len: usize = @intCast(self.pqntuples(result));
         const cols_len: usize = @intCast(self.pqnfields(result));
@@ -2256,10 +2442,24 @@ pub const Executor = struct {
         errdefer {
             for (rows[0..row_idx]) |*row| foreign_source.deinitJsonValue(alloc, row);
         }
+        const provenance: [][]const []const u8 = if (capture_json_nulls) try alloc.alloc([]const []const u8, rows_len) else &.{};
+        var provenance_len: usize = 0;
+        errdefer if (capture_json_nulls) {
+            for (provenance[0..provenance_len]) |fields| {
+                for (fields) |field| alloc.free(field);
+                alloc.free(fields);
+            }
+            alloc.free(provenance);
+        };
         var cells_until_deadline_check: u8 = 1;
         while (row_idx < rows_len) : (row_idx += 1) {
             try ensureNotCancelled(cancellation);
             if (execution_deadline_ns) |deadline_ns| try ensureDeadline(deadline_ns);
+            var nulls: std.ArrayListUnmanaged([]const u8) = .empty;
+            errdefer {
+                for (nulls.items) |field| alloc.free(field);
+                nulls.deinit(alloc);
+            }
             var object = std.json.ObjectMap.empty;
             errdefer {
                 var it = object.iterator();
@@ -2289,228 +2489,817 @@ pub const Executor = struct {
                         @intCast(self.pqgetlength(result, @intCast(row_idx), col)),
                     );
                 errdefer foreign_source.deinitJsonValue(alloc, &value);
+                if (capture_json_nulls and value == .null and self.pqgetisnull(result, @intCast(row_idx), col) == 0) {
+                    const oid = self.pqftype(result, col);
+                    if (oid == TypeOid.json or oid == TypeOid.jsonb) {
+                        const field = try alloc.dupe(u8, key);
+                        errdefer alloc.free(field);
+                        try nulls.append(alloc, field);
+                    }
+                }
                 try object.put(alloc, key, value);
+            }
+            if (capture_json_nulls) {
+                provenance[row_idx] = try nulls.toOwnedSlice(alloc);
+                provenance_len += 1;
             }
             rows[row_idx] = .{ .object = object };
         }
 
         return .{
             .rows = rows,
+            .json_null_fields = provenance,
             .total = rows_len,
         };
+    }
+
+    const VerifiedReplicationConnection = struct {
+        executor: *Executor,
+        conn: *PGconn,
+        origin: foreign_source.ReplicationIdentity,
+        fn deinit(self: *VerifiedReplicationConnection) void {
+            self.executor.closeCountedConnection(self.conn);
+        }
+    };
+
+    fn openVerifiedReplicationConnection(self: *@This(), a: Allocator, dsn: []const u8, table: []const u8, deadline: u64) !VerifiedReplicationConnection {
+        const conn = try self.connectCountedFresh(a, dsn, deadline);
+        errdefer self.closeCountedConnection(conn);
+        return .{ .executor = self, .conn = conn, .origin = try self.sqlReplicationIdentityAlloc(a, conn, table, deadline) };
+    }
+
+    fn sqlProviderIdentityAlloc(self: *@This(), a: Allocator, conn: ?*PGconn, deadline: u64) ![32]u8 {
+        return self.sqlProviderIdentityWithControl(a, conn, deadline, null);
+    }
+    fn sqlProviderIdentityWithControl(self: *@This(), a: Allocator, conn: ?*PGconn, deadline: u64, cancellation: ?CancellationToken) ![32]u8 {
+        // Read identity on the exact SQL session that owns this operation.
+        // Missing operator permission to inspect the real cluster identity fails
+        // before snapshot/apply effects; no DSN or endpoint hash substitutes.
+        const result = try self.execSimpleWithControl(conn, a,
+            \\SELECT (pg_catalog.pg_control_system()).system_identifier::text,
+            \\       pg_catalog.current_database(), oid::text
+            \\FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database()
+        , deadline, false, cancellation);
+        defer self.pqclear(result);
+        if (self.pqntuples(result) != 1 or self.pqnfields(result) != 3) return error.ForeignProviderIdentityMismatch;
+        for (0..3) |i| if (self.pqgetisnull(result, 0, @intCast(i)) != 0) return error.ForeignProviderIdentityMismatch;
+        const system_id = self.pqgetvalue(result, 0, 0)[0..@intCast(self.pqgetlength(result, 0, 0))];
+        const database = self.pqgetvalue(result, 0, 1)[0..@intCast(self.pqgetlength(result, 0, 1))];
+        const database_oid = self.pqgetvalue(result, 0, 2)[0..@intCast(self.pqgetlength(result, 0, 2))];
+        if (system_id.len == 0 or database.len == 0 or database_oid.len == 0) return error.ForeignProviderIdentityMismatch;
+        return exactCutoverProviderIdentity(system_id, database, database_oid);
+    }
+
+    fn sqlReplicationIdentityAlloc(self: *@This(), a: Allocator, conn: ?*PGconn, table: []const u8, deadline: u64) !foreign_source.ReplicationIdentity {
+        return .{ .provider_identity = try self.sqlProviderIdentityAlloc(a, conn, deadline), .relation_id = try self.pollRelationIdentityAlloc(a, conn, table, deadline) };
+    }
+    fn sqlReplicationIdentityWithControl(self: *@This(), a: Allocator, conn: ?*PGconn, table: []const u8, deadline: u64, cancellation: ?CancellationToken) !foreign_source.ReplicationIdentity {
+        return .{ .provider_identity = try self.sqlProviderIdentityWithControl(a, conn, deadline, cancellation), .relation_id = try self.pollRelationIdentityWithControl(a, conn, table, deadline, cancellation) };
+    }
+
+    fn pollRelationIdentityAlloc(self: *@This(), a: Allocator, conn: ?*PGconn, table: []const u8, deadline: u64) !u32 {
+        return self.pollRelationIdentityWithControl(a, conn, table, deadline, null);
+    }
+    fn pollRelationIdentityWithControl(self: *@This(), a: Allocator, conn: ?*PGconn, table: []const u8, deadline: u64, cancellation: ?CancellationToken) !u32 {
+        const args = try a.alloc(sql.ParameterValue, 1);
+        args[0] = .{ .string = try sql.quotePostgresRelationAlloc(a, table) };
+        var request: sql.PreparedQuery = .{ .sql_text = try a.dupe(u8, "SELECT $1::pg_catalog.regclass::oid::text"), .args = args };
+        defer request.deinit(a);
+        const result = try self.execPreparedWithDeadline(conn, a, request, deadline, cancellation);
+        defer self.pqclear(result);
+        if (self.pqntuples(result) != 1 or self.pqnfields(result) != 1 or self.pqgetisnull(result, 0, 0) != 0) return error.ForeignTableNotFound;
+        const bytes = self.pqgetvalue(result, 0, 0)[0..@intCast(self.pqgetlength(result, 0, 0))];
+        const id = std.fmt.parseInt(u32, bytes, 10) catch return error.ForeignTableNotFound;
+        if (id == 0) return error.ForeignTableNotFound;
+        return id;
+    }
+
+    fn logicalLsn(text: []const u8) !u64 {
+        const slash = std.mem.indexOfScalar(u8, text, '/') orelse return error.InvalidReplicationTransaction;
+        const high = std.fmt.parseInt(u32, text[0..slash], 16) catch return error.InvalidReplicationTransaction;
+        const low = std.fmt.parseInt(u32, text[slash + 1 ..], 16) catch return error.InvalidReplicationTransaction;
+        return (@as(u64, high) << 32) | low;
+    }
+
+    const PublicationBinding = struct {
+        relation: u32,
+        fingerprint: [32]u8,
+
+        fn checkpoint(self: PublicationBinding, a: Allocator, position: []const u8) ![]u8 {
+            if (position.len == 0) return a.dupe(u8, position);
+            _ = try logicalLsn(position);
+            return std.fmt.allocPrint(a, "pg1:{s}:{s}", .{ std.fmt.bytesToHex(self.fingerprint, .lower), position });
+        }
+
+        fn lsn(self: PublicationBinding, value: []const u8) ![]const u8 {
+            const prefix = "pg1:";
+            if (!std.mem.startsWith(u8, value, prefix)) {
+                _ = try logicalLsn(value);
+                return value;
+            }
+            const hash_end = prefix.len + self.fingerprint.len * 2;
+            if (value.len <= hash_end or value[hash_end] != ':') return error.InvalidReplicationCheckpoint;
+            const expected = std.fmt.bytesToHex(self.fingerprint, .lower);
+            if (!std.mem.eql(u8, value[prefix.len..hash_end], &expected)) return error.ReplicationPublicationBindingChanged;
+            const position = value[hash_end + 1 ..];
+            _ = try logicalLsn(position);
+            return position;
+        }
+    };
+
+    fn publicationBinding(
+        self: *@This(),
+        alloc: Allocator,
+        conn: ?*PGconn,
+        publication: []const u8,
+        table: []const u8,
+        allow_row_filter: bool,
+        deadline_ns: ?u64,
+    ) !PublicationBinding {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const quoted_table = try sql.postgresDialect().quote_relation(a, table);
+        const args = try a.alloc(sql.ParameterValue, 3);
+        args[0] = .{ .string = try a.dupe(u8, publication) };
+        args[1] = .{ .string = quoted_table };
+        args[2] = .{ .bool = allow_row_filter };
+        var prepared = sql.PreparedQuery{
+            .sql_text = try a.dupe(u8,
+                \\SELECT CASE WHEN c.oid = pg_catalog.to_regclass($2::text)
+                \\             AND ($3::boolean OR (pg_catalog.to_jsonb(t) ->> 'rowfilter') IS NULL)
+                \\            THEN c.oid::text END,
+                \\       pg_catalog.to_jsonb(t) ->> 'rowfilter',
+                \\       p.pubviaroot::text
+                \\  FROM pg_catalog.pg_publication p
+                \\  JOIN pg_catalog.pg_publication_tables t ON t.pubname = p.pubname
+                \\  JOIN pg_catalog.pg_namespace n ON n.nspname = t.schemaname
+                \\  JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = t.tablename
+                \\ WHERE p.pubname = $1 AND p.pubinsert AND p.pubupdate AND p.pubdelete
+                \\   AND NOT p.puballtables
+                \\   AND NOT EXISTS (
+                \\       SELECT 1 FROM pg_catalog.pg_publication_rel r
+                \\        WHERE r.prpubid = p.oid AND (pg_catalog.to_jsonb(r) ->> 'prattrs') IS NOT NULL
+                \\   )
+                \\ LIMIT 2
+            ),
+            .args = args,
+        };
+        defer prepared.deinit(a);
+        // Compare the entire membership before advancing the slot. Filtering
+        // the catalog query to the configured table would hide extra members.
+        const result = try self.execPreparedWithDeadline(conn, alloc, prepared, deadline_ns, null);
+        defer self.pqclear(result);
+        if (self.pqntuples(result) != 1 or self.pqgetisnull(result, 0, 0) != 0)
+            return error.ReplicationPublicationBindingChanged;
+        const actual = self.pqgetvalue(result, 0, 0)[0..@intCast(self.pqgetlength(result, 0, 0))];
+        const oid = std.fmt.parseInt(u32, actual, 10) catch return error.ReplicationPublicationBindingChanged;
+        // Bind the deparsed expression to durable progress. Recreating a
+        // publication with the same relation, projection and expression keeps
+        // this identity. Changing the row filter or table incarnation does not.
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly:postgres-publication-binding:v1");
+        var encoded: [4]u8 = undefined;
+        std.mem.writeInt(u32, &encoded, oid, .big);
+        hash.update(&encoded);
+        for (1..3) |column| {
+            const col: c_int = @intCast(column);
+            if (self.pqgetisnull(result, 0, col) != 0) {
+                hash.update(&.{0});
+                continue;
+            }
+            hash.update(&.{1});
+            const cell = self.pqgetvalue(result, 0, col)[0..@intCast(self.pqgetlength(result, 0, col))];
+            std.mem.writeInt(u32, &encoded, @intCast(cell.len), .big);
+            hash.update(&encoded);
+            hash.update(cell);
+        }
+        return .{ .relation = oid, .fingerprint = hash.finalResult() };
     }
 
     fn pollChangesAlloc(self: *@This(), alloc: Allocator, dsn: []const u8, params: foreign_source.ReplicationPollParams) !foreign_source.ReplicationPollResult {
         const slot_name = params.slot_name orelse return error.InvalidQueryRequest;
         const publication_name = params.publication_name orelse return error.InvalidQueryRequest;
         std.log.info("postgres libpq poll begin table={s} slot={s}", .{ params.table, slot_name });
-        const conn = try self.connectCountedFresh(alloc, dsn, params.execution_deadline_ns);
-        defer self.closeCountedConnection(conn);
+        const deadline = params.execution_deadline_ns orelse platform_time.monotonicNs() +| 30 * std.time.ns_per_s;
+        var verified = try self.openVerifiedReplicationConnection(alloc, dsn, params.table, deadline);
+        defer verified.deinit();
+        const conn = verified.conn;
+        try params.observeInitializationOrigin(verified.origin);
+        const provider_identity = verified.origin.provider_identity;
+        const source_relation_id = verified.origin.relation_id;
         std.log.info("postgres libpq poll connected table={s} slot={s}", .{ params.table, slot_name });
+        if (params.expected_provider_identity) |expected| {
+            if (!std.meta.eql(expected, provider_identity)) return error.ReplicationCutoverAuthorityLost;
+        }
         var observed_checkpoint: ?[]u8 = null;
         errdefer if (observed_checkpoint) |value| alloc.free(value);
         try self.ensurePublicationAlloc(
             alloc,
-            dsn,
             conn,
             publication_name,
             params.table,
             params.filter_query_json,
-            params.execution_deadline_ns,
+            if (params.checkpoint) |saved| !std.mem.startsWith(u8, saved, "pg1:") else true,
+            deadline,
         );
-        if (params.checkpoint) |checkpoint| {
-            if (checkpoint.len > 0 and !try self.logicalReplicationSlotExistsAlloc(
-                alloc,
-                conn,
-                slot_name,
-                params.execution_deadline_ns,
-            )) {
-                return error.ForeignReplicationSlotMissing;
-            }
-            if (checkpoint.len > 0) {
-                const advanced_checkpoint = try self.advanceLogicalReplicationSlotCheckpointAlloc(
-                    alloc,
-                    conn,
-                    slot_name,
-                    checkpoint,
-                    params.execution_deadline_ns,
-                );
-                observed_checkpoint = advanced_checkpoint;
+        const binding = try self.publicationBinding(alloc, conn, publication_name, params.table, params.filter_query_json != null, deadline);
+        if (binding.relation != source_relation_id) return error.ReplicationPublicationBindingChanged;
+        if (params.checkpoint) |saved| {
+            if (saved.len > 0) {
+                const checkpoint = try binding.lsn(saved);
+                const confirmed = try self.loadLogicalReplicationSlotCheckpointAlloc(alloc, conn, slot_name, deadline);
+                defer alloc.free(confirmed);
+                if (confirmed.len == 0) return error.ForeignReplicationSlotMissing;
+                const durable_lsn = try logicalLsn(checkpoint);
+                const confirmed_lsn = try logicalLsn(confirmed);
+                if (confirmed_lsn > durable_lsn) return error.ReplicationCutoverAuthorityLost;
+                const advanced_checkpoint = if (confirmed_lsn == durable_lsn)
+                    confirmed
+                else
+                    try self.advanceLogicalReplicationSlotCheckpointAlloc(
+                        alloc,
+                        conn,
+                        slot_name,
+                        checkpoint,
+                        deadline,
+                    );
+                defer if (confirmed_lsn != durable_lsn) alloc.free(advanced_checkpoint);
+                observed_checkpoint = try binding.checkpoint(alloc, advanced_checkpoint);
+                if (try logicalLsn(checkpoint) != try logicalLsn(advanced_checkpoint))
+                    return error.ReplicationCutoverAuthorityLost;
             }
         } else {
             _ = try self.ensureLogicalReplicationSlotAlloc(
                 alloc,
                 conn,
                 slot_name,
-                params.execution_deadline_ns,
+                deadline,
             );
         }
 
+        if (params.checkpoint == null) {
+            const confirmed = try self.loadLogicalReplicationSlotCheckpointAlloc(alloc, conn, slot_name, deadline);
+            defer alloc.free(confirmed);
+            if (confirmed.len == 0) return error.ForeignReplicationSlotMissing;
+        }
+        var poll = try self.pollLogicalSlotAlloc(alloc, conn, slot_name, publication_name, params.limit orelse 256, deadline, null, binding);
+        errdefer poll.deinit(alloc);
+        const observed_binding = try self.publicationBinding(alloc, conn, publication_name, params.table, params.filter_query_json != null, deadline);
+        if (!std.meta.eql(binding, observed_binding)) return error.ReplicationPublicationBindingChanged;
+        if (poll.checkpoint.len == 0) if (observed_checkpoint) |checkpoint| {
+            alloc.free(poll.checkpoint);
+            poll.checkpoint = checkpoint;
+            observed_checkpoint = null;
+        };
+        if (observed_checkpoint) |checkpoint| alloc.free(checkpoint);
+        poll.provider_identity = provider_identity;
+        poll.source_relation_id = source_relation_id;
+        return poll;
+    }
+
+    fn subscriptionPublicationNames(a: Allocator, names: []const []const u8, sql_literals: bool) ![]u8 {
+        var result: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer result.deinit(a);
+        for (names, 0..) |name, i| {
+            const quoted = if (sql_literals) try quoteSqlStringLiteralAlloc(a, name) else try sql.postgresDialect().quote_identifier(a, name);
+            defer a.free(quoted);
+            if (i != 0) try result.append(a, ',');
+            try result.appendSlice(a, quoted);
+        }
+        return result.toOwnedSlice(a);
+    }
+
+    fn subscriptionOriginAlloc(self: *@This(), a: Allocator, conn: ?*PGconn, request: foreign_source.SubscriptionRequest) !foreign_source.SubscriptionOrigin.Observation {
+        const names = try subscriptionPublicationNames(a, request.publications, true);
+        defer a.free(names);
+        const text = try std.fmt.allocPrint(a,
+            \\WITH members AS MATERIALIZED (
+            \\ SELECT c.oid, n.nspname, c.relname, c.relreplident, pt.attnames, pt.rowfilter
+            \\ FROM pg_catalog.pg_publication_tables pt
+            \\ JOIN pg_catalog.pg_namespace n ON n.nspname=pt.schemaname
+            \\ JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid AND c.relname=pt.tablename
+            \\ WHERE pt.pubname IN ({s})
+            \\), relation_groups AS (
+            \\ SELECT oid,nspname,relname,relreplident,pg_catalog.min(attnames::text)::pg_catalog.name[] AS attnames,
+            \\ CASE WHEN pg_catalog.bool_or(rowfilter IS NULL) THEN NULL ELSE pg_catalog.string_agg(DISTINCT '('||rowfilter||')',' OR ' ORDER BY '('||rowfilter||')') END AS row_filter,
+            \\ pg_catalog.count(DISTINCT attnames::text)=1 AS same_columns
+            \\ FROM members GROUP BY oid,nspname,relname,relreplident
+            \\), relation_rows AS (
+            \\ SELECT m.oid, pg_catalog.jsonb_build_object(
+            \\ 'id',m.oid::bigint,'namespace',m.nspname,'name',m.relname,
+            \\ 'replica_identity',CASE m.relreplident WHEN 'd' THEN 'default' WHEN 'n' THEN 'nothing' WHEN 'f' THEN 'full' WHEN 'i' THEN 'index' END,
+            \\ 'row_filter',m.row_filter,
+            \\ 'columns',(SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+            \\   'name',a.attname,'type_oid',a.atttypid::bigint,'type_modifier',a.atttypmod,
+            \\   'key',(m.relreplident='f' OR EXISTS(SELECT 1 FROM pg_catalog.pg_index i WHERE i.indrelid=m.oid AND ((m.relreplident='i' AND i.indisreplident) OR (m.relreplident='d' AND i.indisprimary)) AND a.attnum=ANY((i.indkey::smallint[])[0:i.indnkeyatts-1])))) ORDER BY a.attnum)
+            \\   FROM pg_catalog.pg_attribute a WHERE a.attrelid=m.oid AND a.attnum>0 AND NOT a.attisdropped AND a.attname=ANY(m.attnames))
+            \\ ) AS body,m.same_columns
+            \\ FROM relation_groups m
+            \\), packed AS (
+            \\ SELECT COALESCE(pg_catalog.jsonb_agg(body ORDER BY oid),'[]'::jsonb)::text AS body, COALESCE(pg_catalog.bool_and(same_columns),true) AS compatible FROM relation_rows
+            \\)
+            \\SELECT (SELECT pg_catalog.count(*) FROM pg_catalog.pg_publication WHERE pubname IN ({s}))::text,
+            \\ CASE WHEN compatible AND pg_catalog.octet_length(body)<={d} THEN body ELSE NULL END FROM packed
+        , .{ names, names, foreign_source.SubscriptionOrigin.max_encoded_bytes });
+        defer a.free(text);
+        const result = try self.execSimpleWithDeadline(conn, a, text, request.execution_deadline_ns, false);
+        defer self.pqclear(result);
+        if (self.pqntuples(result) != 1 or self.pqnfields(result) != 2 or self.pqgetisnull(result, 0, 0) != 0 or self.pqgetisnull(result, 0, 1) != 0) return error.InvalidLogicalReplicationOrigin;
+        const count = std.fmt.parseInt(usize, self.pqgetvalue(result, 0, 0)[0..@intCast(self.pqgetlength(result, 0, 0))], 10) catch return error.InvalidLogicalReplicationOrigin;
+        if (count != request.publications.len) return error.ForeignPublicationNotFound;
+        const bytes = self.pqgetvalue(result, 0, 1)[0..@intCast(self.pqgetlength(result, 0, 1))];
+        if (bytes.len > foreign_source.SubscriptionOrigin.max_encoded_bytes) return error.ProgramLimitExceeded;
+        const parsed = try std.json.parseFromSlice([]const foreign_source.SubscriptionOrigin.Relation, a, bytes, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        const observed: foreign_source.SubscriptionOrigin.Observation = .{ .provider_identity = try self.sqlProviderIdentityAlloc(a, conn, request.execution_deadline_ns), .relations = parsed.value };
+        return observed.clone(a);
+    }
+
+    fn requireExplicitSubscriptionPassword(self: *@This(), a: Allocator, dsn: []const u8) !void {
+        const parse = self.pqconninfoParse orelse return error.ForeignAuthFailed;
+        const free = self.pqconninfoFree orelse return error.ForeignAuthFailed;
+        if (std.mem.indexOfScalar(u8, dsn, 0) != null) return error.ForeignAuthFailed;
+        const text = try a.dupeSentinel(u8, dsn, 0);
+        defer a.free(text);
+        const options = parse(text.ptr, null) orelse return error.ForeignAuthFailed;
+        defer free(options);
+        var index: usize = 0;
+        while (options[index].keyword) |keyword| : (index += 1) {
+            if (!std.mem.eql(u8, std.mem.span(keyword), "password")) continue;
+            const password = options[index].value orelse return error.ForeignAuthFailed;
+            if (password[0] != 0) return;
+            break;
+        }
+        return error.ForeignAuthFailed;
+    }
+
+    fn requireSubscriptionPasswordUsed(self: *@This(), conn: ?*PGconn) !void {
+        const used = self.pqconnectionUsedPassword orelse return error.ForeignAuthFailed;
+        if (used(conn) != 1) return error.ForeignAuthFailed;
+    }
+
+    fn pollSubscription(ptr: *anyopaque, a: Allocator, dsn: []const u8, request: foreign_source.SubscriptionRequest) !foreign_source.SubscriptionPollResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try request.validate(a);
+        if (request.password_required) try self.requireExplicitSubscriptionPassword(a, dsn);
+        if (request.expected == null) return error.ForeignProviderIdentityMismatch;
+        if (request.advance_durable_checkpoint) {
+            try request.authority.acknowledged(request.checkpoint orelse return error.InvalidQueryRequest);
+        } else {
+            try request.authority.check();
+        }
+        const conn = try self.connectCountedFresh(a, dsn, request.execution_deadline_ns);
+        defer self.closeCountedConnection(conn);
+        if (request.password_required) try self.requireSubscriptionPasswordUsed(conn);
+        try self.setCutoverAdvisoryLockAlloc(a, conn, request.lock_name, true, request.execution_deadline_ns);
+        var origin = try self.subscriptionOriginAlloc(a, conn, request);
+        errdefer origin.deinit(a);
+        try request.observe(a, origin);
+        const confirmed = try self.requireSubscriptionSlotAlloc(a, conn, request.slot_name, request.execution_deadline_ns);
+        // A recreated/externally advanced slot cannot silently skip a gap.
+        const durable = try foreign_source.requireSubscriptionCheckpoint(confirmed, request.checkpoint);
+        if (request.advance_durable_checkpoint and confirmed < durable) {
+            const checkpoint = request.checkpoint.?;
+            try request.authority.acknowledged(checkpoint);
+            const actual = try self.advanceLogicalReplicationSlotCheckpointAlloc(a, conn, request.slot_name, checkpoint, request.execution_deadline_ns);
+            defer a.free(actual);
+            if (!std.mem.eql(u8, actual, checkpoint)) return error.ForeignProviderIdentityMismatch;
+        }
+        const publications = try subscriptionPublicationNames(a, request.publications, false);
+        defer a.free(publications);
+        var poll = try self.pollLogicalSlotAlloc(a, conn, request.slot_name, publications, request.limit, request.execution_deadline_ns, origin, null);
+        errdefer poll.deinit(a);
+        // The decoder owns transaction framing; provider identity belongs to
+        // the verified connection/roster above, including empty polls. Keep
+        // source_relation_id unset because one subscription spans relations.
+        poll.provider_identity = origin.provider_identity;
+        try request.authority.check();
+        try ensureDeadline(request.execution_deadline_ns);
+        return .{ .origin = origin, .poll = poll };
+    }
+
+    fn acknowledgeSubscription(ptr: *anyopaque, a: Allocator, dsn: []const u8, request: foreign_source.SubscriptionRequest) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try request.validate(a);
+        if (request.password_required) try self.requireExplicitSubscriptionPassword(a, dsn);
+        if (request.expected == null) return error.ForeignProviderIdentityMismatch;
+        const checkpoint = request.checkpoint orelse return error.InvalidQueryRequest;
+        try request.authority.acknowledged(checkpoint);
+        const conn = try self.connectCountedFresh(a, dsn, request.execution_deadline_ns);
+        defer self.closeCountedConnection(conn);
+        if (request.password_required) try self.requireSubscriptionPasswordUsed(conn);
+        try self.setCutoverAdvisoryLockAlloc(a, conn, request.lock_name, true, request.execution_deadline_ns);
+        var origin = try self.subscriptionOriginAlloc(a, conn, request);
+        defer origin.deinit(a);
+        try request.observe(a, origin);
+        // Rejoin the actual native checkpoint AFTER acquiring the same slot
+        // lock, before the sole upstream acknowledgement effect.
+        try request.authority.acknowledged(checkpoint);
+        const confirmed = try self.requireSubscriptionSlotAlloc(a, conn, request.slot_name, request.execution_deadline_ns);
+        // A recreated/externally advanced slot cannot silently skip a gap.
+        _ = try foreign_source.requireSubscriptionCheckpoint(confirmed, request.checkpoint);
+        const actual = try self.advanceLogicalReplicationSlotCheckpointAlloc(a, conn, request.slot_name, checkpoint, request.execution_deadline_ns);
+        defer a.free(actual);
+        if (!std.mem.eql(u8, actual, checkpoint)) return error.ForeignProviderIdentityMismatch;
+        try request.authority.check();
+        try ensureDeadline(request.execution_deadline_ns);
+    }
+
+    fn beginSubscriptionSnapshot(ptr: *anyopaque, a: Allocator, dsn: []const u8, request: foreign_source.SubscriptionRequest) !postgres_source.QueryExecutor.PreparedSubscriptionSnapshot {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try request.validate(a);
+        if (request.password_required) try self.requireExplicitSubscriptionPassword(a, dsn);
+        if (request.checkpoint != null) return error.InvalidQueryRequest;
+        try request.authority.check();
+        // One exported slot snapshot for the entire roster. Reserve both
+        // connections before opening either, as the ordinary cutover does.
+        try self.acquireGlobalConnectionPermits(2, request.execution_deadline_ns, null);
+        var owned_permits: usize = 2;
+        errdefer self.releaseGlobalConnections(owned_permits);
+        var sql_conn: ?*PGconn = try self.connectFreshWithDeadline(dsn, request.execution_deadline_ns, null);
+        errdefer if (sql_conn) |conn| self.pqfinish(conn);
+        if (request.password_required) try self.requireSubscriptionPasswordUsed(sql_conn);
+        try self.setCutoverAdvisoryLockAlloc(a, sql_conn, request.lock_name, true, request.execution_deadline_ns);
+        var repl_conn: ?*PGconn = try self.connectReplicationFreshWithDeadline(a, dsn, request.execution_deadline_ns);
+        errdefer if (repl_conn) |conn| self.pqfinish(conn);
+        if (request.password_required) try self.requireSubscriptionPasswordUsed(repl_conn);
+        const provider = try self.identifyExactCutoverProvider(a, sql_conn, repl_conn, request.execution_deadline_ns);
+        try self.lockSubscriptionSlotCreation(a, repl_conn, request.slot_name, request.execution_deadline_ns);
+        var before = try self.subscriptionOriginAlloc(a, sql_conn, request);
+        defer before.deinit(a);
+        if (!std.mem.eql(u8, &provider, &before.provider_identity)) return error.ForeignProviderIdentityMismatch;
+        // Do not publish native slot ownership until this invocation actually
+        // creates the slot. A pre-existing pgoutput slot is not our artifact.
+        // Existing slots cannot reproduce an already-lost exported snapshot.
+        // Native recovery must retain/resume its actual captured pages or
+        // explicitly retire the old birth before proposing another one.
+        if (try self.logicalReplicationSlotExistsAlloc(a, sql_conn, request.slot_name, request.execution_deadline_ns)) return error.UnsupportedExactCutover;
+        const exported = try self.createLogicalReplicationSlotExportResult(a, repl_conn, request.slot_name, request.execution_deadline_ns, .{ .authority = request.authority, .locked_observer = sql_conn, .provider_identity = provider });
+        defer self.pqclear(exported);
+        const checkpoint = self.pqgetvalue(exported, 0, 1)[0..@intCast(self.pqgetlength(exported, 0, 1))];
+        const snapshot_name = self.pqgetvalue(exported, 0, 2)[0..@intCast(self.pqgetlength(exported, 0, 2))];
+        var imported_transaction = false;
+        errdefer {
+            // Keep the exact cut available for cleanup despite allocation failure.
+            if (repl_conn) |conn| {
+                self.pqfinish(conn);
+                repl_conn = null;
+            }
+            self.abortSubscriptionExport(self.alloc, sql_conn, request.slot_name, checkpoint, imported_transaction) catch {};
+        }
+        // CREATE succeeded on our retained replication connection. Only now
+        // may observation bind this slot to the durable native preparation.
+        try request.observe(a, before);
+        try request.authority.exported(provider, try foreign_source.parseReplicationCheckpoint(checkpoint));
+        const begin = try self.execSimpleWithDeadline(sql_conn, a, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY", request.execution_deadline_ns, true);
+        self.pqclear(begin);
+        imported_transaction = true;
+        const quoted = try quoteSqlStringLiteralAlloc(a, snapshot_name);
+        defer a.free(quoted);
+        const import_sql = try std.fmt.allocPrint(a, "SET TRANSACTION SNAPSHOT {s}", .{quoted});
+        defer a.free(import_sql);
+        const imported = try self.execSimpleWithDeadline(sql_conn, a, import_sql, request.execution_deadline_ns, true);
+        self.pqclear(imported);
+        // Pin EVERY roster relation before returning the cut. Locking each
+        // table only on its first page would allow ALTER/DROP of a later
+        // relation after READY's immutable roster had already been captured.
+        // Sorted provider OIDs give all subscription readers one lock order.
+        for (before.relations) |relation| {
+            const namespace = try sql.postgresDialect().quote_identifier(a, relation.namespace);
+            defer a.free(namespace);
+            const name = try sql.postgresDialect().quote_identifier(a, relation.name);
+            defer a.free(name);
+            const table = try std.fmt.allocPrint(a, "{s}.{s}", .{ namespace, name });
+            defer a.free(table);
+            const lock_sql = try std.fmt.allocPrint(a, "LOCK TABLE {s} IN ACCESS SHARE MODE", .{table});
+            defer a.free(lock_sql);
+            const locked = try self.execSimpleWithDeadline(sql_conn, a, lock_sql, request.execution_deadline_ns, true);
+            self.pqclear(locked);
+            if (try self.pollRelationIdentityAlloc(a, sql_conn, table, request.execution_deadline_ns) != relation.id)
+                return error.ForeignProviderIdentityMismatch;
+            try request.authority.check();
+        }
+        // The imported SQL transaction sees its exported MVCC cut. Rejoin
+        // CURRENT catalog facts on the still-owned logical replication
+        // connection after ALL locks are held, otherwise a pre-lock ALTER
+        // could be hidden by that older catalog snapshot. Logical replication
+        // mode supports simple SQL; the exported token is no longer needed
+        // after successful import, so consuming it here does not reopen a cut.
+        var origin = try self.subscriptionOriginAlloc(a, repl_conn, request);
+        errdefer origin.deinit(a);
+        if (!std.mem.eql(u8, &try before.digest(a), &try origin.digest(a))) return error.ForeignProviderIdentityMismatch;
+        try request.observe(a, origin);
+        try ensureDeadline(request.execution_deadline_ns);
+        const reader = try a.create(SnapshotQuery);
+        errdefer a.destroy(reader);
+        const owned_checkpoint = try a.dupe(u8, checkpoint);
+        errdefer a.free(owned_checkpoint);
+        const token = try a.dupe(u8, snapshot_name);
+        errdefer a.free(token);
+        const owned_slot = try a.dupe(u8, request.slot_name);
+        reader.* = .{ .executor = self, .conn = sql_conn, .replication_identity_enabled = true, .verified_provider_identity = provider, .multi_relation = true, .created_slot = .{ .name = owned_slot, .checkpoint = owned_checkpoint } };
+        self.pqfinish(repl_conn);
+        repl_conn = null;
+        self.releaseGlobalConnections(1);
+        owned_permits = 0;
+        sql_conn = null;
+        return .{ .origin = origin, .checkpoint = owned_checkpoint, .snapshot_token = token, .snapshot_query = reader.asSnapshotQuery() };
+    }
+
+    fn abortSubscriptionExport(self: *@This(), a: Allocator, conn: ?*PGconn, slot_name: []const u8, checkpoint: []const u8, imported_transaction: bool) !void {
+        _ = try foreign_source.parseReplicationCheckpoint(checkpoint);
+        // This connection still owns the slot lock and has the exact export
+        // result. A canceled or revoked attempt must still undo its own slot.
+        const deadline = platform_time.monotonicNs() +| 2 * std.time.ns_per_s;
+        // Release the imported transaction while retaining the session lock.
+        if (imported_transaction) {
+            const rolled_back = try self.execSimpleWithDeadline(conn, a, "ROLLBACK", deadline, true);
+            self.pqclear(rolled_back);
+        }
+        try self.dropSubscriptionSlotAtCheckpoint(a, conn, slot_name, checkpoint, deadline);
+    }
+
+    fn dropSubscriptionSlotAtCheckpoint(self: *@This(), a: Allocator, conn: ?*PGconn, slot_name: []const u8, checkpoint: []const u8, deadline: u64) !void {
+        const statement =
+            "SELECT pg_catalog.pg_drop_replication_slot(slot_name) " ++
+            "FROM pg_catalog.pg_replication_slots WHERE slot_name = $1 " ++
+            "AND database = pg_catalog.current_database() AND slot_type = 'logical' " ++
+            "AND plugin = 'pgoutput' AND NOT temporary AND NOT active " ++
+            "AND confirmed_flush_lsn = $2::pg_catalog.pg_lsn";
+        const prepared: sql.PreparedQuery = .{
+            .sql_text = @constCast(statement),
+            .args = @constCast(&[_]sql.ParameterValue{ .{ .string = @constCast(slot_name) }, .{ .string = @constCast(checkpoint) } }),
+        };
+        const dropped = try self.execPreparedWithDeadline(conn, a, prepared, deadline, null);
+        self.pqclear(dropped);
+    }
+
+    fn pollLogicalSlotAlloc(self: *@This(), alloc: Allocator, conn: ?*PGconn, slot_name: []const u8, publications: []const u8, limit: usize, deadline: u64, expected: ?foreign_source.SubscriptionOrigin.Observation, binding: ?PublicationBinding) !foreign_source.ReplicationPollResult {
         const quoted_slot_name = try quoteSqlStringLiteralAlloc(alloc, slot_name);
         defer alloc.free(quoted_slot_name);
-        const quoted_publication_name = try quoteSqlStringLiteralAlloc(alloc, publication_name);
-        defer alloc.free(quoted_publication_name);
-
-        var prepared = sql.PreparedQuery{
-            .sql_text = try std.fmt.allocPrint(
-                alloc,
-                "SELECT lsn::text, data FROM pg_logical_slot_peek_binary_changes({s}, NULL, {d}, 'proto_version', '2', 'publication_names', {s})",
-                .{ quoted_slot_name, params.limit orelse 256, quoted_publication_name },
-            ),
-        };
-        defer prepared.deinit(alloc);
-
-        const result = try self.execPreparedWithDeadline(
-            conn,
-            alloc,
-            prepared,
-            params.execution_deadline_ns,
-            null,
-        );
-        defer self.pqclear(result);
+        const quoted_publications = try quoteSqlStringLiteralAlloc(alloc, publications);
+        defer alloc.free(quoted_publications);
+        // SQL projects a bounded bytea slice BEFORE libpq sees a DataRow.
+        // PQ single-row mode alone still buffers one arbitrarily large bytea.
+        // Ordinal+offset carry physical framing only; source commit boundaries
+        // remain the pgoutput B/C envelope and are never acknowledged here.
+        const request = try std.fmt.allocPrint(alloc,
+            \\WITH messages AS MATERIALIZED (
+            \\ SELECT lsn::text AS lsn, data, ordinality AS ordinal,
+            \\        pg_catalog.octet_length(data) AS bytes
+            \\ FROM pg_catalog.pg_logical_slot_peek_binary_changes({s}, NULL, {d}, 'proto_version', '2', 'publication_names', {s}) WITH ORDINALITY
+            \\), measured AS (
+            \\ SELECT *, pg_catalog.sum(bytes) OVER (ORDER BY ordinal ROWS UNBOUNDED PRECEDING) AS used
+            \\ FROM messages
+            \\), page AS (
+            \\ SELECT *, used <= {d} AND ordinal <= {d} AS admitted
+            \\ FROM measured WHERE used - bytes <= {d} AND ordinal <= {d}
+            \\)
+            \\SELECT lsn, ordinal::text, bytes::text, offsets.chunk_offset::text,
+            \\       CASE WHEN admitted THEN pg_catalog.substring(data, offsets.chunk_offset + 1, {d}) END
+            \\FROM page CROSS JOIN LATERAL pg_catalog.generate_series(0, CASE WHEN admitted THEN GREATEST(bytes - 1, 0) ELSE 0 END, {d}) AS offsets(chunk_offset)
+            \\ORDER BY ordinal, offsets.chunk_offset
+        , .{ quoted_slot_name, limit, quoted_publications, replication_poll_bytes, replication_poll_messages, replication_poll_bytes, replication_poll_messages + 1, replication_wire_chunk_bytes, replication_wire_chunk_bytes });
+        defer alloc.free(request);
+        try self.startReplicationChunkQuery(alloc, conn, request, deadline);
 
         var relation_cache = std.AutoHashMapUnmanaged(u32, PgoutputRelation).empty;
         defer deinitPgoutputRelationCache(alloc, &relation_cache);
 
-        var changes = std.ArrayListUnmanaged(foreign_source.ReplicationChange).empty;
-        errdefer {
-            for (changes.items) |*change| change.deinit(alloc);
-            changes.deinit(alloc);
-        }
-        var current_txn_first_change_idx: ?usize = null;
+        var decoded: PgoutputTransactions = .{ .binding = binding };
+        defer decoded.deinit(alloc);
         var lag_millis: u64 = 0;
         const poll_now_ms: i64 = @intCast(currentRealtimeMillis());
 
-        const rows_len: usize = @intCast(self.pqntuples(result));
-        for (0..rows_len) |row_idx| {
-            const row: c_int = @intCast(row_idx);
-            if (self.pqgetisnull(result, row, 0) != 0 or self.pqgetisnull(result, row, 1) != 0) continue;
-            const lsn = try copyCellAlloc(alloc, self.pqgetvalue(result, row, 0), @intCast(self.pqgetlength(result, row, 0)));
-            if (observed_checkpoint) |value| alloc.free(value);
-            observed_checkpoint = lsn;
-            const data_hex = self.pqgetvalue(result, row, 1)[0..@intCast(self.pqgetlength(result, row, 1))];
-            const data = try decodeByteaHexAlloc(alloc, data_hex);
-            defer alloc.free(data);
-
-            switch (try parsePgoutputMessageAlloc(alloc, data, &relation_cache)) {
-                .none => {},
-                .begin => {
-                    current_txn_first_change_idx = changes.items.len;
-                },
-                .commit => |commit_timestamp_ms| {
-                    if (current_txn_first_change_idx) |start_idx| {
-                        const computed_lag_ms: u64 = if (commit_timestamp_ms > 0 and poll_now_ms > 0)
-                            @intCast(@max(@as(i64, 0), poll_now_ms - @as(i64, @intCast(commit_timestamp_ms))))
-                        else
-                            0;
-                        for (changes.items[start_idx..]) |*change| {
-                            change.commit_timestamp_ms = commit_timestamp_ms;
-                            alloc.free(change.checkpoint);
-                            change.checkpoint = try alloc.dupe(u8, lsn);
-                        }
-                        lag_millis = @max(lag_millis, computed_lag_ms);
-                    }
-                    current_txn_first_change_idx = null;
-                },
-                .change => |parsed_change| {
-                    var change_without_checkpoint = parsed_change;
-                    errdefer change_without_checkpoint.deinit(alloc);
-                    alloc.free(change_without_checkpoint.checkpoint);
-                    change_without_checkpoint.checkpoint = try alloc.dupe(u8, lsn);
-                    change_without_checkpoint.lag_records = 0;
-                    try changes.append(alloc, change_without_checkpoint);
-                },
+        var framing: ReplicationChunkFraming = .{};
+        var message_bytes: std.ArrayListUnmanaged(u8) = .empty;
+        defer message_bytes.deinit(alloc);
+        var message_lsn: std.ArrayListUnmanaged(u8) = .empty;
+        defer message_lsn.deinit(alloc);
+        var completed_result = false;
+        var truncated = false;
+        while (try self.nextReplicationChunkResult(conn, deadline)) |result| {
+            defer self.pqclear(result);
+            const status = self.pqresultStatus(result);
+            if (status == PGRES_TUPLES_OK) {
+                if (completed_result or self.pqntuples(result) != 0 or self.pqnfields(result) != 5) return error.ForeignQueryFailed;
+                completed_result = true;
+                continue;
+            }
+            if (status != PGRES_SINGLE_TUPLE) return mapResultError(self.pqresultErrorField(result, PG_DIAG_SQLSTATE), self.pqresultErrorMessage(result));
+            if (completed_result or truncated or self.pqntuples(result) != 1 or self.pqnfields(result) != 5) return error.ForeignQueryFailed;
+            for (0..4) |column| if (self.pqgetisnull(result, 0, @intCast(column)) != 0) return error.InvalidReplicationSourceRow;
+            const lsn = self.pqgetvalue(result, 0, 0)[0..@intCast(self.pqgetlength(result, 0, 0))];
+            const ordinal = try self.replicationChunkInteger(result, 1);
+            const total = try self.replicationChunkInteger(result, 2);
+            const offset = try self.replicationChunkInteger(result, 3);
+            if (self.pqgetisnull(result, 0, 4) != 0) {
+                // SQL emits one sentinel at the first message that crosses
+                // the page budget. Only an already complete prefix may escape.
+                if (framing.in_message or ordinal != framing.next_ordinal or offset != 0) return error.InvalidReplicationSourceRow;
+                if (decoded.transactions.items.len == 0) return error.ReplicationCaptureLimitExceeded;
+                truncated = true;
+                continue;
+            }
+            const chunk_len: usize = @intCast(self.pqgetlength(result, 0, 4));
+            if (lsn.len == 0 or lsn.len > 32 or chunk_len > replication_wire_chunk_bytes) return error.InvalidReplicationSourceRow;
+            const chunk = self.pqgetvalue(result, 0, 4)[0..chunk_len];
+            try framing.accept(ordinal, total, offset, chunk.len);
+            if (offset == 0) {
+                message_lsn.clearRetainingCapacity();
+                try message_lsn.appendSlice(alloc, lsn);
+            } else if (!std.mem.eql(u8, message_lsn.items, lsn)) return error.InvalidReplicationSourceRow;
+            try message_bytes.appendSlice(alloc, chunk);
+            if (!framing.in_message) {
+                if (binding) |identity| try requirePublicationMessageRelation(message_bytes.items, identity.relation);
+                const message = try parsePgoutputMessageAlloc(alloc, message_bytes.items, &relation_cache);
+                if (expected) |origin| if (message_bytes.items[0] == 'R') try requirePgoutputOrigin(message_bytes.items, &relation_cache, origin);
+                try decoded.accept(alloc, message, message_lsn.items);
+                if (message == .commit) {
+                    const timestamp = message.commit.timestamp_ms;
+                    if (timestamp > 0 and poll_now_ms > 0) lag_millis = @max(lag_millis, @as(u64, @intCast(@max(@as(i64, 0), poll_now_ms - @as(i64, @intCast(timestamp))))));
+                }
+                message_bytes.clearRetainingCapacity();
             }
         }
+        if (!completed_result or framing.in_message) return error.InvalidReplicationSourceRow;
+        if (self.pqsetnonblocking(conn, 0) != 0) return error.ForeignQueryFailed;
+        // A provider page ending inside a transaction cannot expose any of
+        // that transaction's rows or advance its slot. The next peek retries
+        // from the last complete commit and retains ordinary relation frames.
+        decoded.discardIncomplete(alloc);
 
-        if (rows_len > 0 or changes.items.len > 0) {
-            std.log.info(
-                "postgres libpq logical poll table={s} slot={s} rows={d} changes={d}",
-                .{ params.table, slot_name, rows_len, changes.items.len },
-            );
+        return decoded.finish(alloc, lag_millis);
+    }
+
+    fn startReplicationChunkQuery(self: *@This(), a: Allocator, conn: ?*PGconn, request: []const u8, deadline: u64) !void {
+        try ensureDeadline(deadline);
+        const single_row = self.pqsetSingleRowMode orelse return error.ForeignQueryFailed;
+        const text = try a.dupeSentinel(u8, request, 0);
+        defer a.free(text);
+        if (self.pqsetnonblocking(conn, 1) != 0 or self.pqsendQueryParams(conn, text.ptr, 0, null, null, null, null, 1) != 1 or single_row(conn) != 1) return error.ForeignQueryFailed;
+        const driver: AsyncResultDriver = .{ .executor = self, .conn = conn };
+        while (true) {
+            try ensureDeadline(deadline);
+            const flushed = driver.flush();
+            if (flushed == 0) return;
+            if (flushed < 0) return error.ForeignQueryFailed;
+            const events = driver.wait(std.posix.POLL.IN | std.posix.POLL.OUT, deadline, null) catch |err| switch (err) {
+                error.Timeout => continue,
+                else => return err,
+            };
+            if (events & std.posix.POLL.IN != 0 and driver.consumeInput() != 1) return error.ForeignQueryFailed;
         }
+    }
 
-        return .{
-            .changes = try changes.toOwnedSlice(alloc),
-            .checkpoint = if (observed_checkpoint) |value| value else &.{},
-            .lag_records = 0,
-            .lag_millis = lag_millis,
-        };
+    fn nextReplicationChunkResult(self: *@This(), conn: ?*PGconn, deadline: u64) !?*PGresult {
+        const driver: AsyncResultDriver = .{ .executor = self, .conn = conn };
+        while (driver.isBusy() != 0) {
+            try ensureDeadline(deadline);
+            const events = driver.wait(std.posix.POLL.IN, deadline, null) catch |err| switch (err) {
+                error.Timeout => continue,
+                else => return err,
+            };
+            if (events & std.posix.POLL.IN != 0 and driver.consumeInput() != 1) return error.ForeignQueryFailed;
+        }
+        try ensureDeadline(deadline);
+        return driver.getResult();
+    }
+
+    fn replicationChunkInteger(self: *@This(), result: ?*PGresult, column: c_int) !u64 {
+        const length = self.pqgetlength(result, 0, column);
+        if (length <= 0 or length > 20) return error.InvalidReplicationSourceRow;
+        return std.fmt.parseInt(u64, self.pqgetvalue(result, 0, column)[0..@intCast(length)], 10) catch error.InvalidReplicationSourceRow;
+    }
+
+    fn lockInitialization(self: *@This(), a: Allocator, conn: ?*PGconn, params: foreign_source.ReplicationPollParams, deadline: u64) !bool {
+        const owner = params.initialization_origin orelse return false;
+        // Cleanup takes this same birth-specific advisory lock and rechecks
+        // native retirement after acquiring it. A late creator must recheck
+        // its claim after the lock too, so it cannot resurrect retired state.
+        const name = params.cutover_lock_name orelse return error.InvalidQueryRequest;
+        _ = try params.snapshotCustody();
+        try self.setCutoverAdvisoryLockAlloc(a, conn, name, true, deadline);
+        errdefer self.setCutoverAdvisoryLockAlloc(a, conn, name, false, deadline) catch {};
+        try owner.check();
+        return true;
+    }
+    fn unlockInitialization(self: *@This(), a: Allocator, conn: ?*PGconn, params: foreign_source.ReplicationPollParams, deadline: u64) void {
+        self.setCutoverAdvisoryLockAlloc(a, conn, params.cutover_lock_name.?, false, deadline) catch {};
     }
 
     fn prepareReplicationAlloc(self: *@This(), alloc: Allocator, dsn: []const u8, params: foreign_source.ReplicationPollParams) !foreign_source.ReplicationPrepareResult {
         const slot_name = params.slot_name orelse return error.InvalidQueryRequest;
         const publication_name = params.publication_name orelse return error.InvalidQueryRequest;
         std.log.info("postgres libpq prepare replication table={s} slot={s}", .{ params.table, slot_name });
-        const conn = try self.connectCountedFresh(alloc, dsn, params.execution_deadline_ns);
-        defer self.closeCountedConnection(conn);
+        const deadline = params.execution_deadline_ns orelse platform_time.monotonicNs() +| 30 * std.time.ns_per_s;
+        var verified = try self.openVerifiedReplicationConnection(alloc, dsn, params.table, deadline);
+        defer verified.deinit();
+        const conn = verified.conn;
+        const initialization_locked = try self.lockInitialization(alloc, conn, params, deadline);
+        defer if (initialization_locked) self.unlockInitialization(alloc, conn, params, deadline);
+        // Identity is sampled again after waiting for attempt ownership.
+        const origin = if (initialization_locked) try self.sqlReplicationIdentityAlloc(alloc, conn, params.table, deadline) else verified.origin;
+        try params.observeInitializationOrigin(origin);
         try self.ensurePublicationAlloc(
             alloc,
-            dsn,
             conn,
             publication_name,
             params.table,
             params.filter_query_json,
+            true,
             params.execution_deadline_ns,
         );
+        const binding = try self.publicationBinding(alloc, conn, publication_name, params.table, params.filter_query_json != null, params.execution_deadline_ns);
+        if (params.initialization_origin) |owner| try owner.check();
         const slot_existed = try self.ensureLogicalReplicationSlotAlloc(
             alloc,
             conn,
             slot_name,
             params.execution_deadline_ns,
         );
+        const position = try self.loadLogicalReplicationSlotCheckpointAlloc(alloc, conn, slot_name, params.execution_deadline_ns);
+        defer alloc.free(position);
         return .{
-            .checkpoint = try self.loadLogicalReplicationSlotCheckpointAlloc(
-                alloc,
-                conn,
-                slot_name,
-                params.execution_deadline_ns,
-            ),
+            .origin = origin,
+            .checkpoint = try binding.checkpoint(alloc, position),
             .slot_existed = slot_existed,
         };
     }
 
     fn cleanupReplicationAlloc(self: *@This(), alloc: Allocator, dsn: []const u8, params: foreign_source.ReplicationCleanupParams) !void {
-        std.log.info("postgres libpq cleanup replication slot={s} publication={s}", .{ params.slot_name, params.publication_name });
-        const execution_deadline_ns = params.execution_deadline_ns orelse
-            platform_time.monotonicNs() +| 30 * std.time.ns_per_s;
+        try params.check();
+        if (params.password_required) try self.requireExplicitSubscriptionPassword(alloc, dsn);
+        const execution_deadline_ns = params.execution_deadline_ns orelse platform_time.monotonicNs() +| 30 * std.time.ns_per_s;
         const conn = try self.connectCountedFresh(alloc, dsn, execution_deadline_ns);
         defer self.closeCountedConnection(conn);
+        if (params.password_required) try self.requireSubscriptionPasswordUsed(conn);
+        if (params.native_source) |native| {
+            const actual = try self.sqlProviderIdentityAlloc(alloc, conn, execution_deadline_ns);
+            if (!std.mem.eql(u8, &actual, &native.provider_identity)) return error.ForeignProviderIdentityMismatch;
+            try self.setCutoverAdvisoryLockAlloc(alloc, conn, native.lock_name, true, execution_deadline_ns);
+            try self.lockSubscriptionSlotCreation(alloc, conn, params.slot_name, execution_deadline_ns);
+            // Rejoin native drain/custody AFTER the shared provider lock. A
+            // stale worker cannot recreate or acknowledge a retired slot.
+            try native.authority.check();
+            if (!native.require_absent) if (try self.requireSubscriptionCleanupSlotAlloc(alloc, conn, params.slot_name, native.snapshot_checkpoint, native.durable_checkpoint, execution_deadline_ns)) |point| {
+                const checkpoint = try std.fmt.allocPrint(alloc, "{X}/{X}", .{ @as(u32, @intCast(point >> 32)), @as(u32, @truncate(point)) });
+                defer alloc.free(checkpoint);
+                try params.check();
+                try self.dropSubscriptionSlotAtCheckpoint(alloc, conn, params.slot_name, checkpoint, execution_deadline_ns);
+            };
+        } else {
+            try self.dropInactiveLogicalReplicationSlotIfExistsAlloc(alloc, conn, params.slot_name, execution_deadline_ns);
+        }
+        if (try self.logicalReplicationSlotExistsAlloc(alloc, conn, params.slot_name, execution_deadline_ns)) return error.ExactCutoverCleanupPending;
+        if (params.publication_name) |publication| {
+            try params.check();
+            try self.dropPublicationIfExistsAlloc(alloc, conn, publication, execution_deadline_ns);
+        }
+        try params.check();
+        try ensureDeadline(execution_deadline_ns);
+    }
 
-        try self.dropInactiveLogicalReplicationSlotIfExistsAlloc(
-            alloc,
-            conn,
-            params.slot_name,
-            execution_deadline_ns,
+    /// Cleanup accepts a genuinely absent slot or lost WAL, but never another
+    /// database/plugin/temporary slot. An active consumer is retryable debt.
+    fn requireSubscriptionCleanupSlotAlloc(self: *@This(), a: Allocator, conn: ?*PGconn, slot_name: []const u8, snapshot: u64, durable: u64, deadline: u64) !?u64 {
+        var prepared = try tableNamePreparedQueryAlloc(
+            a,
+            "SELECT (slot_type = 'logical' AND plugin = 'pgoutput' AND database = current_database() AND NOT temporary)::text, active::text, confirmed_flush_lsn::text FROM pg_catalog.pg_replication_slots WHERE slot_name = $1",
+            slot_name,
         );
-        if (try self.logicalReplicationSlotExistsAlloc(
-            alloc,
-            conn,
-            params.slot_name,
-            execution_deadline_ns,
-        )) return error.ExactCutoverCleanupPending;
-        try self.dropPublicationIfExistsAlloc(
-            alloc,
-            conn,
-            params.publication_name,
-            execution_deadline_ns,
-        );
+        defer prepared.deinit(a);
+        const result = try self.execPreparedWithDeadline(conn, a, prepared, deadline, null);
+        defer self.pqclear(result);
+        if (self.pqntuples(result) == 0) return null;
+        if (self.pqntuples(result) != 1 or self.pqnfields(result) != 3 or self.pqgetisnull(result, 0, 0) != 0 or self.pqgetisnull(result, 0, 1) != 0) return error.ForeignProviderIdentityMismatch;
+        const valid = self.pqgetvalue(result, 0, 0)[0..@intCast(self.pqgetlength(result, 0, 0))];
+        const active = self.pqgetvalue(result, 0, 1)[0..@intCast(self.pqgetlength(result, 0, 1))];
+        if (!std.mem.eql(u8, valid, "true")) return error.ForeignProviderIdentityMismatch;
+        if (!std.mem.eql(u8, active, "false")) return error.ExactCutoverCleanupPending;
+        if (self.pqgetisnull(result, 0, 2) != 0) return error.ForeignProviderIdentityMismatch;
+        const checkpoint = self.pqgetvalue(result, 0, 2)[0..@intCast(self.pqgetlength(result, 0, 2))];
+        const point = foreign_source.parseReplicationCheckpoint(checkpoint) catch return error.ForeignProviderIdentityMismatch;
+        if (point < snapshot or point > durable) return error.ForeignProviderIdentityMismatch;
+        return point;
     }
 
     fn ensurePublicationAlloc(
         self: *@This(),
         alloc: Allocator,
-        dsn: []const u8,
         conn: ?*PGconn,
         publication_name: []const u8,
         table: []const u8,
         filter_query_json: ?[]const u8,
+        verify_filter: bool,
         execution_deadline_ns: ?u64,
     ) !void {
-        const check_args = try alloc.alloc(sql.ParameterValue, 1);
+        const check_args = try alloc.alloc(sql.ParameterValue, 2);
         check_args[0] = .{ .string = try alloc.dupe(u8, publication_name) };
+        check_args[1] = .{ .string = try alloc.dupe(u8, table) };
         var check_prepared = sql.PreparedQuery{
-            .sql_text = try alloc.dupe(u8, "SELECT 1 FROM pg_publication WHERE pubname = $1"),
+            .sql_text = try alloc.dupe(u8, "SELECT p.pubviaroot, c.relkind, EXISTS (SELECT 1 FROM pg_catalog.pg_publication_tables pt JOIN pg_catalog.pg_namespace n ON n.nspname = pt.schemaname JOIN pg_catalog.pg_class published ON published.relnamespace = n.oid AND published.relname = pt.tablename WHERE pt.pubname = p.pubname AND published.oid = c.oid) FROM pg_catalog.pg_publication p JOIN pg_catalog.pg_class c ON c.oid = $2::regclass WHERE p.pubname = $1"),
             .args = check_args,
         };
         defer check_prepared.deinit(alloc);
@@ -2522,51 +3311,57 @@ pub const Executor = struct {
             null,
         );
         defer self.pqclear(check_result);
-        if (@as(usize, @intCast(self.pqntuples(check_result))) > 0) return;
-
-        const quoted_publication = try sql.postgresDialect().quote_identifier(alloc, publication_name);
-        defer alloc.free(quoted_publication);
-        const quoted_table = try sql.postgresDialect().quote_relation(alloc, table);
-        defer alloc.free(quoted_table);
-        var create_sql = std.ArrayListUnmanaged(u8).empty;
-        defer create_sql.deinit(alloc);
-        const create_prefix = try std.fmt.allocPrint(alloc, "CREATE PUBLICATION {s} FOR TABLE {s}", .{ quoted_publication, quoted_table });
-        defer alloc.free(create_prefix);
-        try create_sql.appendSlice(alloc, create_prefix);
-
-        var translated_filter: ?filter.Translation = null;
-        defer if (translated_filter) |*value| value.deinit(alloc);
-        if (filter_query_json) |query_json| {
-            const columns = try self.discoverColumnsAllocWithDeadline(
-                alloc,
-                dsn,
-                table,
-                execution_deadline_ns,
-            );
-            defer freeColumns(alloc, columns);
-            translated_filter = try filter.translateAlloc(alloc, sql.postgresDialect(), query_json, columns);
-            if (translated_filter.?.where_sql.len > 0) {
-                const where_suffix = try std.fmt.allocPrint(alloc, " WHERE ({s})", .{translated_filter.?.where_sql});
-                defer alloc.free(where_suffix);
-                try create_sql.appendSlice(alloc, where_suffix);
-            }
+        const exists = self.pqntuples(check_result) != 0;
+        var publish_via_root = true;
+        if (exists) {
+            if (self.pqntuples(check_result) != 1 or self.pqnfields(check_result) != 3) return error.InvalidReplicationSourceConfig;
+            for (0..3) |column| if (self.pqgetisnull(check_result, 0, @intCast(column)) != 0) return error.InvalidReplicationSourceConfig;
+            const via_root = self.pqgetvalue(check_result, 0, 0)[0..@intCast(self.pqgetlength(check_result, 0, 0))];
+            const relation_kind = self.pqgetvalue(check_result, 0, 1)[0..@intCast(self.pqgetlength(check_result, 0, 1))];
+            const member = self.pqgetvalue(check_result, 0, 2)[0..@intCast(self.pqgetlength(check_result, 0, 2))];
+            try requirePublicationSourceIdentity(via_root, relation_kind, member);
+            publish_via_root = std.mem.eql(u8, via_root, "t");
+            if (!verify_filter or filter_query_json == null) return;
         }
 
-        var create_prepared = sql.PreparedQuery{
-            .sql_text = try create_sql.toOwnedSlice(alloc),
-            .args = if (translated_filter) |value| try cloneParameterValuesAlloc(alloc, value.args) else &.{},
-        };
-        defer create_prepared.deinit(alloc);
-        const create_result = if (execution_deadline_ns) |deadline_ns|
-            try self.execPreparedAllowCommandWithDeadline(
-                conn,
-                alloc,
-                create_prepared,
-                deadline_ns,
-            )
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const predicate = if (filter_query_json) |json| try filter.postgresPublicationPredicateAlloc(a, json, &.{}) else "";
+        if (!exists) return self.createPublication(a, conn, publication_name, table, predicate, publish_via_root, execution_deadline_ns);
+        if (predicate.len == 0) {
+            _ = try self.publicationBinding(a, conn, publication_name, table, false, execution_deadline_ns);
+            return;
+        }
+
+        // Use PostgreSQL's own parser and catalog deparser for both expressions.
+        // The comparison publication is visible only within this transaction.
+        const deadline = execution_deadline_ns orelse platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
+        self.pqclear(try self.execSimpleWithDeadline(conn, a, "BEGIN", deadline, true));
+        errdefer {
+            if (self.execSimpleWithDeadline(conn, a, "ROLLBACK", deadline, true)) |result| self.pqclear(result) else |_| {}
+        }
+        const probe = try std.fmt.allocPrint(a, "antfly_filter_{x}_{x}", .{ @intFromPtr(conn), platform_time.monotonicNs() });
+        try self.createPublication(a, conn, probe, table, predicate, publish_via_root, deadline);
+        const expected = try self.publicationBinding(a, conn, probe, table, true, deadline);
+        const actual = try self.publicationBinding(a, conn, publication_name, table, true, deadline);
+        if (!std.meta.eql(expected, actual)) return error.ReplicationPublicationBindingChanged;
+        self.pqclear(try self.execSimpleWithDeadline(conn, a, "ROLLBACK", deadline, true));
+    }
+
+    fn createPublication(self: *@This(), a: Allocator, conn: ?*PGconn, name: []const u8, table: []const u8, predicate: []const u8, publish_via_root: bool, deadline: ?u64) !void {
+        const quoted_name = try sql.postgresDialect().quote_identifier(a, name);
+        defer a.free(quoted_name);
+        const quoted_table = try sql.postgresDialect().quote_relation(a, table);
+        defer a.free(quoted_table);
+        const options = if (publish_via_root) " WITH (publish_via_partition_root = true)" else "";
+        const statement = if (predicate.len == 0)
+            try std.fmt.allocPrint(a, "CREATE PUBLICATION {s} FOR TABLE {s}{s}", .{ quoted_name, quoted_table, options })
         else
-            try self.execPreparedAllowCommand(conn, alloc, create_prepared);
-        defer self.pqclear(create_result);
+            try std.fmt.allocPrint(a, "CREATE PUBLICATION {s} FOR TABLE {s} WHERE ({s}){s}", .{ quoted_name, quoted_table, predicate, options });
+        defer a.free(statement);
+        const bounded = deadline orelse platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
+        self.pqclear(try self.execSimpleWithDeadline(conn, a, statement, bounded, true));
     }
 
     fn ensureLogicalReplicationSlotAlloc(
@@ -2621,7 +3416,13 @@ pub const Executor = struct {
         const args = try alloc.alloc(sql.ParameterValue, 1);
         args[0] = .{ .string = try alloc.dupe(u8, slot_name) };
         var prepared = sql.PreparedQuery{
-            .sql_text = try alloc.dupe(u8, "SELECT COALESCE(confirmed_flush_lsn::text, restart_lsn::text, '') FROM pg_replication_slots WHERE slot_name = $1"),
+            .sql_text = try alloc.dupe(u8,
+                \\SELECT CASE WHEN slot_type = 'logical' AND plugin = 'pgoutput'
+                \\                  AND database = current_database() AND restart_lsn IS NOT NULL
+                \\                  AND (to_jsonb(s) ->> 'invalidation_reason') IS NULL
+                \\            THEN confirmed_flush_lsn::text END
+                \\  FROM pg_catalog.pg_replication_slots s WHERE slot_name = $1
+            ),
             .args = args,
         };
         defer prepared.deinit(alloc);
@@ -2633,7 +3434,8 @@ pub const Executor = struct {
             null,
         );
         defer self.pqclear(result);
-        if (self.pqntuples(result) == 0 or self.pqgetisnull(result, 0, 0) != 0) return try alloc.dupe(u8, "");
+        if (self.pqntuples(result) == 0) return try alloc.dupe(u8, "");
+        if (self.pqgetisnull(result, 0, 0) != 0) return error.ReplicationCutoverAuthorityLost;
         return try copyCellAlloc(alloc, self.pqgetvalue(result, 0, 0), @intCast(self.pqgetlength(result, 0, 0)));
     }
 
@@ -2649,7 +3451,17 @@ pub const Executor = struct {
         args[0] = .{ .string = try alloc.dupe(u8, slot_name) };
         args[1] = .{ .string = try alloc.dupe(u8, checkpoint) };
         var prepared = sql.PreparedQuery{
-            .sql_text = try alloc.dupe(u8, "SELECT COALESCE(end_lsn::text, '') FROM pg_replication_slot_advance($1, $2::pg_lsn)"),
+            .sql_text = try alloc.dupe(u8,
+                \\WITH eligible AS MATERIALIZED (
+                \\    SELECT slot_name FROM pg_catalog.pg_replication_slots s
+                \\    WHERE slot_name = $1 AND slot_type = 'logical' AND plugin = 'pgoutput'
+                \\      AND database = current_database() AND restart_lsn IS NOT NULL
+                \\      AND (to_jsonb(s) ->> 'invalidation_reason') IS NULL
+                \\      AND confirmed_flush_lsn <= $2::pg_lsn
+                \\)
+                \\SELECT advanced.end_lsn::text FROM eligible
+                \\CROSS JOIN LATERAL pg_catalog.pg_replication_slot_advance(eligible.slot_name, $2::pg_lsn) advanced
+            ),
             .args = args,
         };
         defer prepared.deinit(alloc);
@@ -2661,7 +3473,7 @@ pub const Executor = struct {
             null,
         );
         defer self.pqclear(result);
-        if (self.pqntuples(result) == 0 or self.pqgetisnull(result, 0, 0) != 0) return try alloc.dupe(u8, checkpoint);
+        if (self.pqntuples(result) != 1 or self.pqgetisnull(result, 0, 0) != 0) return error.ReplicationCutoverAuthorityLost;
         return try copyCellAlloc(alloc, self.pqgetvalue(result, 0, 0), @intCast(self.pqgetlength(result, 0, 0)));
     }
 
@@ -2675,6 +3487,30 @@ pub const Executor = struct {
             self.* = undefined;
         }
     };
+
+    // A birth-specific name alone does not prove the retained provider slot.
+    // Check the actual provider/database/plugin before either peek or ACK.
+    fn requireSubscriptionSlotAlloc(self: *@This(), a: Allocator, conn: ?*PGconn, slot_name: []const u8, deadline: u64) !u64 {
+        var slot_query: sql.PreparedQuery = blk: {
+            const args = try a.alloc(sql.ParameterValue, 1);
+            errdefer a.free(args);
+            args[0] = .{ .string = try a.dupe(u8, slot_name) };
+            errdefer a.free(args[0].string);
+            break :blk .{
+                .sql_text = try a.dupe(u8, "SELECT (slot_type = 'logical' AND plugin = 'pgoutput' AND database = current_database() AND NOT temporary AND NOT active AND wal_status IS DISTINCT FROM 'lost')::text, confirmed_flush_lsn::text FROM pg_catalog.pg_replication_slots WHERE slot_name = $1"),
+                .args = args,
+            };
+        };
+        defer slot_query.deinit(a);
+        const result = try self.execPreparedWithDeadline(conn, a, slot_query, deadline, null);
+        defer self.pqclear(result);
+        if (self.pqntuples(result) == 0) return error.ForeignReplicationSlotMissing;
+        if (self.pqntuples(result) != 1 or self.pqgetisnull(result, 0, 0) != 0) return error.ForeignProviderIdentityMismatch;
+        const valid = self.pqgetvalue(result, 0, 0)[0..@intCast(self.pqgetlength(result, 0, 0))];
+        if (!std.mem.eql(u8, valid, "true") or self.pqgetisnull(result, 0, 1) != 0) return error.ForeignProviderIdentityMismatch;
+        const confirmed = self.pqgetvalue(result, 0, 1)[0..@intCast(self.pqgetlength(result, 0, 1))];
+        return foreign_source.parseReplicationCheckpoint(confirmed) catch error.ForeignProviderIdentityMismatch;
+    }
 
     fn logicalReplicationSlotExistsAlloc(
         self: *@This(),
@@ -2736,11 +3572,11 @@ pub const Executor = struct {
         const sql_identity_result = try self.execSimpleWithDeadline(
             sql_conn,
             alloc,
-            \\SELECT (pg_control_system()).system_identifier::text,
-            \\       current_database(),
+            \\SELECT (pg_catalog.pg_control_system()).system_identifier::text,
+            \\       pg_catalog.current_database(),
             \\       oid::text
-            \\  FROM pg_database
-            \\ WHERE datname = current_database()
+            \\  FROM pg_catalog.pg_database
+            \\ WHERE datname = pg_catalog.current_database()
         ,
             execution_deadline_ns,
             false,
@@ -2798,30 +3634,55 @@ pub const Executor = struct {
         execution_deadline_ns: u64,
         slot_created: *bool,
     ) !ExportedReplicationSnapshot {
-        const quoted_slot = try sql.postgresDialect().quote_identifier(alloc, slot_name);
-        defer alloc.free(quoted_slot);
-        const create_sql = try std.fmt.allocPrint(
-            alloc,
-            "CREATE_REPLICATION_SLOT {s} LOGICAL pgoutput EXPORT_SNAPSHOT",
-            .{quoted_slot},
-        );
-        defer alloc.free(create_sql);
-        const result = try self.execSimpleWithDeadline(
-            conn,
-            alloc,
-            create_sql,
-            execution_deadline_ns,
-            false,
-        );
+        const result = try self.createLogicalReplicationSlotExportResult(alloc, conn, slot_name, execution_deadline_ns, null);
         defer self.pqclear(result);
-        if (self.pqntuples(result) == 0 or self.pqnfields(result) < 3) return error.ForeignQueryFailed;
-        if (self.pqgetisnull(result, 0, 1) != 0 or self.pqgetisnull(result, 0, 2) != 0) return error.ForeignQueryFailed;
         return try cloneCreatedReplicationSnapshotAlloc(
             alloc,
             slot_created,
             self.pqgetvalue(result, 0, 1)[0..@intCast(self.pqgetlength(result, 0, 1))],
             self.pqgetvalue(result, 0, 2)[0..@intCast(self.pqgetlength(result, 0, 2))],
         );
+    }
+
+    fn createLogicalReplicationSlotExportResult(
+        self: *@This(),
+        alloc: Allocator,
+        conn: ?*PGconn,
+        slot_name: []const u8,
+        execution_deadline_ns: u64,
+        capture: ?struct { authority: foreign_source.SubscriptionAuthority, locked_observer: ?*PGconn, provider_identity: [32]u8 },
+    ) !?*PGresult {
+        const quoted_slot = try sql.postgresDialect().quote_identifier(alloc, slot_name);
+        defer alloc.free(quoted_slot);
+        const command = try std.fmt.allocPrintSentinel(alloc, "CREATE_REPLICATION_SLOT {s} LOGICAL pgoutput EXPORT_SNAPSHOT", .{quoted_slot}, 0);
+        defer alloc.free(command);
+        try ensureDeadline(execution_deadline_ns);
+        if (self.pqsetnonblocking(conn, 1) != 0) return error.ForeignQueryFailed;
+        if (capture) |attempt| try attempt.authority.start(attempt.provider_identity);
+        ensureDeadline(execution_deadline_ns) catch |err| {
+            if (capture) |attempt| attempt.authority.refused() catch {};
+            return err;
+        };
+        if (self.pqsendQuery(conn, command.ptr) != 1) return error.ForeignQueryFailed;
+        const result = try readSingleAsyncResultWithDeadline(AsyncResultDriver{ .executor = self, .conn = conn }, execution_deadline_ns, null);
+        errdefer self.pqclear(result);
+        const status = self.pqresultStatus(result);
+        if (status != PGRES_TUPLES_OK) {
+            const state = self.pqresultErrorField(result, PG_DIAG_SQLSTATE);
+            // A complete server refusal plus confirmed absence under the
+            // publisher lock can retire this attempt. Transport errors and
+            // uncertain observations leave custody for later recovery.
+            if (capture) |attempt| {
+                if (status == PGRES_FATAL_ERROR and state != null and self.pqstatus(conn) == CONNECTION_OK) {
+                    const exists = self.logicalReplicationSlotExistsAlloc(alloc, attempt.locked_observer, slot_name, execution_deadline_ns) catch true;
+                    if (!exists) attempt.authority.refused() catch {};
+                }
+            }
+            return mapResultError(state, self.pqresultErrorMessage(result));
+        }
+        if (self.pqntuples(result) != 1 or self.pqnfields(result) < 3) return error.ForeignQueryFailed;
+        if (self.pqgetisnull(result, 0, 1) != 0 or self.pqgetisnull(result, 0, 2) != 0) return error.ForeignQueryFailed;
+        return result;
     }
 
     fn dropInactiveLogicalReplicationSlotIfExistsAlloc(
@@ -2874,6 +3735,18 @@ pub const Executor = struct {
             prepared,
             execution_deadline_ns,
         );
+        self.pqclear(result);
+    }
+
+    /// Keep a server-side fence on the connection that runs CREATE. If the
+    /// process dies, its SQL connection can lose the outer lock before the
+    /// replication backend has finished the outstanding command.
+    fn lockSubscriptionSlotCreation(self: *@This(), a: Allocator, conn: ?*PGconn, name: []const u8, deadline: u64) !void {
+        const quoted = try quoteSqlStringLiteralAlloc(a, name);
+        defer a.free(quoted);
+        const statement = try std.fmt.allocPrint(a, "SELECT pg_catalog.pg_advisory_lock(pg_catalog.hashtextextended({s}, 1))", .{quoted});
+        defer a.free(statement);
+        const result = try self.execSimpleWithDeadline(conn, a, statement, deadline, false);
         self.pqclear(result);
     }
 
@@ -4098,6 +4971,8 @@ const LazyExecutor = struct {
         return .{
             .ptr = self,
             .vtable = &.{
+                .transaction_envelopes = true,
+                .begin_replication_snapshot_query = beginReplicationSnapshotQuery,
                 .deinit = deinitQueryExecutor,
                 .query = query,
                 .statistics = statistics,
@@ -4106,6 +4981,9 @@ const LazyExecutor = struct {
                 .refresh_columns = refreshColumns,
                 .begin_snapshot_query = beginSnapshotQuery,
                 .begin_prepared_replication_snapshot = beginPreparedReplicationSnapshot,
+                .begin_subscription_snapshot = beginSubscriptionSnapshot,
+                .poll_subscription = pollSubscription,
+                .acknowledge_subscription = acknowledgeSubscription,
                 .prepare_replication = prepareReplication,
                 .poll_changes = pollChanges,
                 .cleanup_replication = cleanupReplication,
@@ -4175,6 +5053,12 @@ const LazyExecutor = struct {
         return try executor.asQueryExecutor().beginSnapshotQuery(alloc, dsn);
     }
 
+    fn beginReplicationSnapshotQuery(ptr: *anyopaque, alloc: Allocator, dsn: []const u8) !postgres_source.QueryExecutor.SnapshotQuery {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const executor = try self.ensureExecutor(null);
+        return try executor.asQueryExecutor().beginReplicationSnapshotQuery(alloc, dsn);
+    }
+
     fn beginPreparedReplicationSnapshot(
         ptr: *anyopaque,
         alloc: Allocator,
@@ -4214,6 +5098,22 @@ const LazyExecutor = struct {
         return try executor.asQueryExecutor().pollChanges(alloc, dsn, params);
     }
 
+    fn beginSubscriptionSnapshot(ptr: *anyopaque, a: Allocator, dsn: []const u8, request: foreign_source.SubscriptionRequest) !postgres_source.QueryExecutor.PreparedSubscriptionSnapshot {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const executor = try self.ensureExecutor(request.execution_deadline_ns);
+        return executor.asQueryExecutor().beginSubscriptionSnapshot(a, dsn, request);
+    }
+    fn pollSubscription(ptr: *anyopaque, a: Allocator, dsn: []const u8, request: foreign_source.SubscriptionRequest) !foreign_source.SubscriptionPollResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const executor = try self.ensureExecutor(request.execution_deadline_ns);
+        return executor.asQueryExecutor().pollSubscription(a, dsn, request);
+    }
+    fn acknowledgeSubscription(ptr: *anyopaque, a: Allocator, dsn: []const u8, request: foreign_source.SubscriptionRequest) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const executor = try self.ensureExecutor(request.execution_deadline_ns);
+        return executor.asQueryExecutor().acknowledgeSubscription(a, dsn, request);
+    }
+
     fn cleanupReplication(
         ptr: *anyopaque,
         alloc: Allocator,
@@ -4227,11 +5127,32 @@ const LazyExecutor = struct {
 };
 
 fn appendReplicationModeAlloc(alloc: Allocator, dsn: []const u8) ![]u8 {
-    if (std.mem.indexOf(u8, dsn, "replication=") != null) return try alloc.dupe(u8, dsn);
-    if (std.mem.indexOfScalar(u8, dsn, '?') != null) {
-        return try std.fmt.allocPrint(alloc, "{s}&replication=database", .{dsn});
+    // libpq accepts both URI and keyword/value conninfo. A question mark in a
+    // quoted keyword value is data, not a URI query delimiter. The final real
+    // parameter must also override an explicit replication=false/true value:
+    // this socket always needs database-scoped logical replication protocol.
+    if (std.mem.startsWith(u8, dsn, "postgresql://") or std.mem.startsWith(u8, dsn, "postgres://")) {
+        const separator: u8 = if (std.mem.indexOfScalar(u8, dsn, '?') != null) '&' else '?';
+        return std.fmt.allocPrint(alloc, "{s}{c}replication=database", .{ dsn, separator });
     }
-    return try std.fmt.allocPrint(alloc, "{s}?replication=database", .{dsn});
+    return std.fmt.allocPrint(alloc, "{s} replication=database", .{dsn});
+}
+
+test "postgres libpq replication connection mode handles both conninfo syntaxes and overrides protocol downgrade" {
+    const a = std.testing.allocator;
+    const cases = .{
+        .{ "host=localhost dbname=postgres", "host=localhost dbname=postgres replication=database" },
+        .{ "host=localhost password='literal?replication=false' replication = false", "host=localhost password='literal?replication=false' replication = false replication=database" },
+        .{ "", " replication=database" },
+        .{ "postgres://localhost/postgres", "postgres://localhost/postgres?replication=database" },
+        .{ "postgresql://localhost/postgres?replication=false", "postgresql://localhost/postgres?replication=false&replication=database" },
+        .{ "postgres://localhost/postgres?application_name=replication%3Ddatabase", "postgres://localhost/postgres?application_name=replication%3Ddatabase&replication=database" },
+    };
+    inline for (cases) |case| {
+        const actual = try appendReplicationModeAlloc(a, case[0]);
+        defer a.free(actual);
+        try std.testing.expectEqualStrings(case[1], actual);
+    }
 }
 
 fn cloneParameterValuesAlloc(alloc: Allocator, args: []const sql.ParameterValue) ![]sql.ParameterValue {
@@ -4258,12 +5179,15 @@ fn cloneParameterValuesAlloc(alloc: Allocator, args: []const sql.ParameterValue)
 const PgoutputColumn = struct {
     name: []u8,
     data_type: Oid,
+    type_modifier: i32 = -1,
+    key: bool = false,
 };
 
 const PgoutputRelation = struct {
     namespace: []u8,
     relation_name: []u8,
     columns: []PgoutputColumn,
+    replica_identity: u8 = 'd',
 };
 
 fn deinitPgoutputRelationCache(alloc: Allocator, cache: *std.AutoHashMapUnmanaged(u32, PgoutputRelation)) void {
@@ -4279,10 +5203,135 @@ fn deinitPgoutputRelationCache(alloc: Allocator, cache: *std.AutoHashMapUnmanage
 
 const ParsedPgoutputMessage = union(enum) {
     none,
-    begin,
-    commit: u64,
+    begin: struct { final_lsn: u64, timestamp_ms: u64, xid: u32 },
+    commit: struct { commit_lsn: u64, end_lsn: u64, timestamp_ms: u64 },
     change: foreign_source.ReplicationChange,
 };
+
+fn clonePgoutputRelationIdentity(a: Allocator, id: u32, relation: PgoutputRelation) !foreign_source.ReplicationRelation {
+    const namespace = try a.dupe(u8, relation.namespace);
+    errdefer a.free(namespace);
+    return .{ .id = id, .namespace = namespace, .name = try a.dupe(u8, relation.relation_name) };
+}
+
+const PgoutputTransactions = struct {
+    binding: ?Executor.PublicationBinding = null,
+    changes: std.ArrayListUnmanaged(foreign_source.ReplicationChange) = .empty,
+    transactions: std.ArrayListUnmanaged(foreign_source.ReplicationTransaction) = .empty,
+    pending: ?struct { first: usize, final_lsn: u64, timestamp_ms: u64, xid: u32 } = null,
+
+    fn deinit(self: *PgoutputTransactions, a: Allocator) void {
+        for (self.changes.items) |*change| change.deinit(a);
+        self.changes.deinit(a);
+        for (self.transactions.items) |*transaction| transaction.deinit(a);
+        self.transactions.deinit(a);
+    }
+
+    /// Consumes a row message even on error; B/C carry no owned memory.
+    fn accept(self: *PgoutputTransactions, a: Allocator, message: ParsedPgoutputMessage, checkpoint: []const u8) !void {
+        switch (message) {
+            .none => {},
+            .begin => |begin| {
+                if (self.pending != null) return error.InvalidReplicationTransaction;
+                self.pending = .{ .first = self.changes.items.len, .final_lsn = begin.final_lsn, .timestamp_ms = begin.timestamp_ms, .xid = begin.xid };
+            },
+            .change => |value| {
+                var change = value;
+                errdefer change.deinit(a);
+                if (self.pending == null) return error.InvalidReplicationTransaction;
+                try self.changes.append(a, change);
+            },
+            .commit => |commit| {
+                const pending = self.pending orelse return error.InvalidReplicationTransaction;
+                if (pending.final_lsn != commit.commit_lsn or pending.timestamp_ms != commit.timestamp_ms or checkpoint.len == 0)
+                    return error.InvalidReplicationTransaction;
+                if (self.transactions.getLastOrNull()) |previous| if (commit.end_lsn <= previous.end_lsn or commit.commit_lsn < previous.end_lsn) return error.InvalidReplicationTransaction;
+                // Reserve and copy everything before changing owned row fields.
+                try self.transactions.ensureUnusedCapacity(a, 1);
+                // The decoded COMMIT end_lsn is the complete transaction
+                // boundary. Never advance from an intermediate SQL output-row
+                // location or from a row inside this transaction.
+                var position_buffer: [17]u8 = undefined;
+                const position = std.fmt.bufPrint(&position_buffer, "{X}/{X}", .{ @as(u32, @truncate(commit.end_lsn >> 32)), @as(u32, @truncate(commit.end_lsn)) }) catch unreachable;
+                const owned_checkpoint = if (self.binding) |binding| try binding.checkpoint(a, position) else try a.dupe(u8, position);
+                errdefer a.free(owned_checkpoint);
+                for (self.changes.items[pending.first..]) |*change| {
+                    const next = try a.dupe(u8, owned_checkpoint);
+                    a.free(change.checkpoint);
+                    change.checkpoint = next;
+                    change.commit_timestamp_ms = commit.timestamp_ms;
+                }
+                self.transactions.appendAssumeCapacity(.{ .xid = pending.xid, .final_lsn = pending.final_lsn, .commit_lsn = commit.commit_lsn, .end_lsn = commit.end_lsn, .commit_timestamp_ms = commit.timestamp_ms, .first_change = pending.first, .change_count = self.changes.items.len - pending.first, .checkpoint = owned_checkpoint });
+                self.pending = null;
+            },
+        }
+    }
+
+    fn discardIncomplete(self: *PgoutputTransactions, a: Allocator) void {
+        const pending = self.pending orelse return;
+        for (self.changes.items[pending.first..]) |*change| change.deinit(a);
+        self.changes.shrinkRetainingCapacity(pending.first);
+        self.pending = null;
+    }
+
+    fn finish(self: *PgoutputTransactions, a: Allocator, lag_millis: u64) !foreign_source.ReplicationPollResult {
+        self.discardIncomplete(a);
+        const checkpoint = if (self.transactions.getLastOrNull()) |last| try a.dupe(u8, last.checkpoint) else try a.alloc(u8, 0);
+        errdefer a.free(checkpoint);
+        const changes = try self.changes.toOwnedSlice(a);
+        errdefer {
+            for (changes) |*change| change.deinit(a);
+            a.free(changes);
+        }
+        const transactions = try self.transactions.toOwnedSlice(a);
+        return .{ .changes = changes, .transactions = transactions, .checkpoint = checkpoint, .lag_millis = lag_millis };
+    }
+};
+
+/// Bounded physical transport framing, independent of logical transaction
+/// commit. No omitted/duplicated/reordered source bytes can enter the decoder.
+const ReplicationChunkFraming = struct {
+    next_ordinal: u64 = 1,
+    total: u64 = 0,
+    offset: u64 = 0,
+    in_message: bool = false,
+
+    fn accept(self: *@This(), ordinal: u64, total: u64, offset: u64, bytes: usize) !void {
+        if (ordinal != self.next_ordinal or bytes == 0 or bytes > replication_wire_chunk_bytes or total == 0 or offset != self.offset or bytes > total or offset > total - bytes) return error.InvalidReplicationSourceRow;
+        if (!self.in_message) {
+            if (offset != 0) return error.InvalidReplicationSourceRow;
+            self.total = total;
+            self.in_message = true;
+        } else if (total != self.total) return error.InvalidReplicationSourceRow;
+        const next = offset + bytes;
+        if (next < total and bytes != replication_wire_chunk_bytes) return error.InvalidReplicationSourceRow;
+        self.offset = next;
+        if (next == total) {
+            self.next_ordinal = std.math.add(u64, self.next_ordinal, 1) catch return error.InvalidReplicationSourceRow;
+            self.offset = 0;
+            self.total = 0;
+            self.in_message = false;
+        }
+    }
+};
+
+fn requirePgoutputOrigin(bytes: []const u8, cache: *const std.AutoHashMapUnmanaged(u32, PgoutputRelation), origin: foreign_source.SubscriptionOrigin.Observation) !void {
+    if (bytes.len < 5 or bytes[0] != 'R') return error.InvalidReplicationSourceRow;
+    const id = std.mem.readInt(u32, bytes[1..5], .big);
+    const expected = origin.find(id) orelse return error.ForeignProviderIdentityMismatch;
+    const actual = cache.get(id) orelse return error.InvalidReplicationSourceRow;
+    const replica_identity: u8 = switch (expected.replica_identity) {
+        .default => 'd',
+        .nothing => 'n',
+        .full => 'f',
+        .index => 'i',
+    };
+    if (actual.replica_identity != replica_identity or !std.mem.eql(u8, actual.namespace, expected.namespace) or
+        !std.mem.eql(u8, actual.relation_name, expected.name) or actual.columns.len != expected.columns.len) return error.ForeignProviderIdentityMismatch;
+    for (actual.columns, expected.columns) |column, frozen| {
+        if (!std.mem.eql(u8, column.name, frozen.name) or column.data_type != frozen.type_oid or column.type_modifier != frozen.type_modifier or column.key != frozen.key) return error.ForeignProviderIdentityMismatch;
+    }
+}
 
 fn parsePgoutputMessageAlloc(
     alloc: Allocator,
@@ -4295,29 +5344,35 @@ fn parsePgoutputMessageAlloc(
     pos += 1;
     switch (tag) {
         'B' => {
-            _ = try readU64(data, &pos); // final lsn
-            _ = try readI64(data, &pos); // commit timestamp
-            _ = try readU32(data, &pos); // xid
-            return .begin;
+            const final_lsn = try readU64(data, &pos);
+            const timestamp = try readI64(data, &pos);
+            const xid = try readU32(data, &pos);
+            if (pos != data.len or final_lsn == 0 or xid == 0) return error.InvalidReplicationTransaction;
+            return .{ .begin = .{ .final_lsn = final_lsn, .timestamp_ms = postgresEpochMicrosToUnixMillis(timestamp), .xid = xid } };
         },
         'C' => {
-            _ = try readByte(data, &pos); // flags
-            _ = try readU64(data, &pos); // commit lsn
-            _ = try readU64(data, &pos); // end lsn
+            if (try readByte(data, &pos) != 0) return error.InvalidReplicationTransaction;
+            const commit_lsn = try readU64(data, &pos);
+            const end_lsn = try readU64(data, &pos);
             const commit_ts = try readI64(data, &pos);
-            return .{ .commit = postgresEpochMicrosToUnixMillis(commit_ts) };
+            if (pos != data.len or commit_lsn == 0 or end_lsn <= commit_lsn) return error.InvalidReplicationTransaction;
+            return .{ .commit = .{ .commit_lsn = commit_lsn, .end_lsn = end_lsn, .timestamp_ms = postgresEpochMicrosToUnixMillis(commit_ts) } };
         },
         'O' => return .none,
         'Y' => return .none,
         'M' => return .none,
-        'T' => return .none,
+        // Never acknowledge TRUNCATE or streamed/prepared transactions as
+        // ignored metadata. They require explicit transaction-aware apply.
+        'S', 'E', 'c', 'A', 'b', 'P', 'p', 'K', 'r' => return error.UnsupportedReplicationStreaming,
+        'T' => return error.UnsupportedReplicationTruncate,
         'R' => {
             const relation_id = try readU32(data, &pos);
             const namespace = try readCStringAlloc(alloc, data, &pos);
             errdefer alloc.free(namespace);
             const relation_name = try readCStringAlloc(alloc, data, &pos);
             errdefer alloc.free(relation_name);
-            _ = try readByte(data, &pos); // replica identity
+            const replica_identity = try readByte(data, &pos);
+            if (replica_identity != 'd' and replica_identity != 'n' and replica_identity != 'f' and replica_identity != 'i') return error.InvalidReplicationSourceRow;
             const column_count = try readU16(data, &pos);
             const columns = try alloc.alloc(PgoutputColumn, column_count);
             var initialized: usize = 0;
@@ -4326,14 +5381,17 @@ fn parsePgoutputMessageAlloc(
                 alloc.free(columns);
             }
             for (0..column_count) |i| {
-                _ = try readByte(data, &pos); // flags
+                const flags = try readByte(data, &pos);
+                if (flags & ~@as(u8, 1) != 0) return error.InvalidReplicationSourceRow;
                 columns[i] = .{
                     .name = try readCStringAlloc(alloc, data, &pos),
                     .data_type = try readU32(data, &pos),
+                    .key = flags & 1 != 0,
                 };
                 initialized += 1;
-                _ = try readU32(data, &pos); // type modifier
+                columns[i].type_modifier = @bitCast(try readU32(data, &pos));
             }
+            if (pos != data.len) return error.InvalidReplicationSourceRow;
             if (relation_cache.getPtr(relation_id)) |existing| {
                 alloc.free(existing.namespace);
                 alloc.free(existing.relation_name);
@@ -4343,60 +5401,186 @@ fn parsePgoutputMessageAlloc(
                     .namespace = namespace,
                     .relation_name = relation_name,
                     .columns = columns,
+                    .replica_identity = replica_identity,
                 };
             } else {
                 try relation_cache.put(alloc, relation_id, .{
                     .namespace = namespace,
                     .relation_name = relation_name,
                     .columns = columns,
+                    .replica_identity = replica_identity,
                 });
             }
             return .none;
         },
         'I' => {
-            const relation = relation_cache.get(try readU32(data, &pos)) orelse return error.InvalidReplicationSourceRow;
+            const relation_id = try readU32(data, &pos);
+            const relation = relation_cache.get(relation_id) orelse return error.InvalidReplicationSourceRow;
             const tuple_tag = try readByte(data, &pos);
             if (tuple_tag != 'N') return error.InvalidReplicationSourceRow;
-            const row = try parsePgoutputTupleAlloc(alloc, data, &pos, relation);
+            var json_nulls: std.ArrayListUnmanaged([]const u8) = .empty;
+            errdefer {
+                for (json_nulls.items) |field| alloc.free(field);
+                json_nulls.deinit(alloc);
+            }
+            var row = try parsePgoutputTupleWithNullsAlloc(alloc, data, &pos, relation, &json_nulls);
+            errdefer foreign_source.deinitJsonValue(alloc, &row);
+            if (pos != data.len) return error.InvalidReplicationSourceRow;
+            var identity = try clonePgoutputRelationIdentity(alloc, relation_id, relation);
+            errdefer identity.deinit(alloc);
             return .{ .change = .{
                 .op = .insert,
-                .checkpoint = try alloc.alloc(u8, 0),
+                .checkpoint = &.{},
+                .relation = identity,
+                .json_null_fields = try json_nulls.toOwnedSlice(alloc),
                 .row = row,
+                .row_complete = row.object.count() == relation.columns.len,
             } };
         },
         'U' => {
-            const relation = relation_cache.get(try readU32(data, &pos)) orelse return error.InvalidReplicationSourceRow;
+            const relation_id = try readU32(data, &pos);
+            const relation = relation_cache.get(relation_id) orelse return error.InvalidReplicationSourceRow;
             var marker = try readByte(data, &pos);
+            var old_row: ?std.json.Value = null;
+            errdefer if (old_row) |*old| foreign_source.deinitJsonValue(alloc, old);
+            var old_json_nulls: std.ArrayListUnmanaged([]const u8) = .empty;
+            errdefer {
+                for (old_json_nulls.items) |field| alloc.free(field);
+                old_json_nulls.deinit(alloc);
+            }
+            var before_kind: foreign_source.ReplicationBeforeKind = .none;
             if (marker == 'K' or marker == 'O') {
-                var old_row = try parsePgoutputTupleAlloc(alloc, data, &pos, relation);
-                foreign_source.deinitJsonValue(alloc, &old_row);
+                before_kind = if (marker == 'K') .key else .full;
+                old_row = try parsePgoutputTupleWithNullsAlloc(alloc, data, &pos, relation, &old_json_nulls);
+                if (marker == 'K') retainPgoutputKeyColumns(alloc, &old_row.?, relation, &old_json_nulls);
                 marker = try readByte(data, &pos);
             }
             if (marker != 'N') return error.InvalidReplicationSourceRow;
-            const row = try parsePgoutputTupleAlloc(alloc, data, &pos, relation);
+            var json_nulls: std.ArrayListUnmanaged([]const u8) = .empty;
+            errdefer {
+                for (json_nulls.items) |field| alloc.free(field);
+                json_nulls.deinit(alloc);
+            }
+            var row = try parsePgoutputTupleWithNullsAlloc(alloc, data, &pos, relation, &json_nulls);
+            errdefer foreign_source.deinitJsonValue(alloc, &row);
+            if (pos != data.len) return error.InvalidReplicationSourceRow;
+            if (old_row == null) {
+                old_row = try clonePgoutputKeyTuple(alloc, row, relation, json_nulls.items, &old_json_nulls);
+                if (old_row.?.object.count() != 0) {
+                    before_kind = .key;
+                } else {
+                    foreign_source.deinitJsonValue(alloc, &old_row.?);
+                    old_row = null;
+                }
+            }
+            var identity = try clonePgoutputRelationIdentity(alloc, relation_id, relation);
+            errdefer identity.deinit(alloc);
+            const old_fields = try old_json_nulls.toOwnedSlice(alloc);
+            errdefer {
+                for (old_fields) |field| alloc.free(field);
+                alloc.free(old_fields);
+            }
+            const new_fields = try json_nulls.toOwnedSlice(alloc);
             return .{ .change = .{
                 .op = .update,
-                .checkpoint = try alloc.alloc(u8, 0),
+                .checkpoint = &.{},
+                .relation = identity,
+                .json_null_fields = new_fields,
                 .row = row,
+                .before = old_row,
+                .before_kind = before_kind,
+                .row_complete = row.object.count() == relation.columns.len,
+                .before_complete = before_kind == .full and old_row.?.object.count() == relation.columns.len,
+                .before_json_null_fields = old_fields,
             } };
         },
         'D' => {
-            const relation = relation_cache.get(try readU32(data, &pos)) orelse return error.InvalidReplicationSourceRow;
+            const relation_id = try readU32(data, &pos);
+            const relation = relation_cache.get(relation_id) orelse return error.InvalidReplicationSourceRow;
             const marker = try readByte(data, &pos);
             if (marker != 'K' and marker != 'O') return error.InvalidReplicationSourceRow;
-            const row = try parsePgoutputTupleAlloc(alloc, data, &pos, relation);
+            var json_nulls: std.ArrayListUnmanaged([]const u8) = .empty;
+            errdefer {
+                for (json_nulls.items) |field| alloc.free(field);
+                json_nulls.deinit(alloc);
+            }
+            var row = try parsePgoutputTupleWithNullsAlloc(alloc, data, &pos, relation, &json_nulls);
+            errdefer foreign_source.deinitJsonValue(alloc, &row);
+            if (pos != data.len) return error.InvalidReplicationSourceRow;
+            if (marker == 'K') retainPgoutputKeyColumns(alloc, &row, relation, &json_nulls);
+            const complete = marker == 'O' and row.object.count() == relation.columns.len;
+            var identity = try clonePgoutputRelationIdentity(alloc, relation_id, relation);
+            errdefer identity.deinit(alloc);
             return .{ .change = .{
                 .op = .delete,
-                .checkpoint = try alloc.alloc(u8, 0),
+                .checkpoint = &.{},
+                .relation = identity,
+                .json_null_fields = try json_nulls.toOwnedSlice(alloc),
                 .row = row,
+                .before_kind = if (marker == 'K') .key else .full,
+                .row_complete = complete,
+                .before_complete = complete,
             } };
         },
-        else => return .none,
+        else => return error.UnsupportedReplicationMessage,
+    }
+}
+
+/// Key-tuple NULL placeholders are not historical values of non-key fields.
+fn requirePublicationMessageRelation(message: []const u8, relation_id: u32) !void {
+    if (message.len == 0) return error.InvalidReplicationSourceRow;
+    if (std.mem.indexOfScalar(u8, "RIUD", message[0]) == null) return;
+    var position: usize = 1;
+    if (try readU32(message, &position) != relation_id) return error.ReplicationPublicationBindingChanged;
+}
+
+fn clonePgoutputKeyTuple(alloc: Allocator, row: std.json.Value, relation: PgoutputRelation, json_nulls: []const []const u8, key_nulls: *std.ArrayListUnmanaged([]const u8)) !std.json.Value {
+    var key: std.json.Value = .{ .object = .empty };
+    errdefer foreign_source.deinitJsonValue(alloc, &key);
+    for (relation.columns) |column| {
+        if (!column.key) continue;
+        const value = row.object.get(column.name) orelse continue;
+        {
+            const name = try alloc.dupe(u8, column.name);
+            errdefer alloc.free(name);
+            var copy = try cloneJsonValueAlloc(alloc, value);
+            errdefer foreign_source.deinitJsonValue(alloc, &copy);
+            try key.object.put(alloc, name, copy);
+        }
+        for (json_nulls) |field| {
+            if (!std.mem.eql(u8, field, column.name)) continue;
+            const owned = try alloc.dupe(u8, field);
+            errdefer alloc.free(owned);
+            try key_nulls.append(alloc, owned);
+            break;
+        }
+    }
+    return key;
+}
+
+fn retainPgoutputKeyColumns(alloc: Allocator, row: *std.json.Value, relation: PgoutputRelation, json_nulls: *std.ArrayListUnmanaged([]const u8)) void {
+    for (relation.columns) |column| {
+        if (column.key) continue;
+        for (json_nulls.items, 0..) |field, i| {
+            if (!std.mem.eql(u8, field, column.name)) continue;
+            alloc.free(json_nulls.orderedRemove(i));
+            break;
+        }
+        if (row.object.fetchOrderedRemove(column.name)) |removed| {
+            alloc.free(@constCast(removed.key));
+            var value = removed.value;
+            foreign_source.deinitJsonValue(alloc, &value);
+        }
     }
 }
 
 fn parsePgoutputTupleAlloc(alloc: Allocator, data: []const u8, pos: *usize, relation: PgoutputRelation) !std.json.Value {
+    return parsePgoutputTupleWithNullsAlloc(alloc, data, pos, relation, null);
+}
+
+fn parsePgoutputTupleWithNullsAlloc(alloc: Allocator, data: []const u8, pos: *usize, relation: PgoutputRelation, json_nulls: ?*std.ArrayListUnmanaged([]const u8)) !std.json.Value {
     const column_count = try readU16(data, pos);
+    if (column_count != relation.columns.len) return error.InvalidReplicationSourceRow;
     var object = std.json.ObjectMap.empty;
     errdefer {
         var it = object.iterator();
@@ -4412,7 +5596,10 @@ fn parsePgoutputTupleAlloc(alloc: Allocator, data: []const u8, pos: *usize, rela
         const kind = try readByte(data, pos);
         switch (kind) {
             'n' => {
-                try object.put(alloc, try alloc.dupe(u8, relation.columns[idx].name), .null);
+                const name = try alloc.dupe(u8, relation.columns[idx].name);
+                errdefer alloc.free(name);
+                if (object.contains(name)) return error.InvalidReplicationSourceRow;
+                try object.put(alloc, name, .null);
             },
             'u' => {},
             't', 'b' => {
@@ -4420,24 +5607,17 @@ fn parsePgoutputTupleAlloc(alloc: Allocator, data: []const u8, pos: *usize, rela
                 if (len < 0 or pos.* + @as(usize, @intCast(len)) > data.len) return error.InvalidReplicationSourceRow;
                 const raw = data[pos.* .. pos.* + @as(usize, @intCast(len))];
                 pos.* += @as(usize, @intCast(len));
-                try object.put(
-                    alloc,
-                    try alloc.dupe(u8, relation.columns[idx].name),
-                    try parseLogicalValueAlloc(alloc, relation.columns[idx].data_type, raw, kind == 'b'),
-                );
-            },
-            else => return error.InvalidReplicationSourceRow,
-        }
-    }
-
-    while (idx < column_count) : (idx += 1) {
-        const kind = try readByte(data, pos);
-        switch (kind) {
-            'n', 'u' => {},
-            't', 'b' => {
-                const len = try readI32(data, pos);
-                if (len < 0 or pos.* + @as(usize, @intCast(len)) > data.len) return error.InvalidReplicationSourceRow;
-                pos.* += @as(usize, @intCast(len));
+                var decoded = try parseLogicalValueAlloc(alloc, relation.columns[idx].data_type, raw, kind == 'b');
+                errdefer foreign_source.deinitJsonValue(alloc, &decoded);
+                if (json_nulls) |fields| if ((relation.columns[idx].data_type == TypeOid.json or relation.columns[idx].data_type == TypeOid.jsonb) and decoded == .null) {
+                    const name = try alloc.dupe(u8, relation.columns[idx].name);
+                    errdefer alloc.free(name);
+                    try fields.append(alloc, name);
+                };
+                const name = try alloc.dupe(u8, relation.columns[idx].name);
+                errdefer alloc.free(name);
+                if (object.contains(name)) return error.InvalidReplicationSourceRow;
+                try object.put(alloc, name, decoded);
             },
             else => return error.InvalidReplicationSourceRow,
         }
@@ -4447,7 +5627,7 @@ fn parsePgoutputTupleAlloc(alloc: Allocator, data: []const u8, pos: *usize, rela
 }
 
 fn parseLogicalValueAlloc(alloc: Allocator, oid: Oid, raw: []const u8, binary: bool) !std.json.Value {
-    if (binary) return .{ .string = try alloc.dupe(u8, raw) };
+    if (binary) return parseLogicalBinaryValueAlloc(alloc, oid, raw);
     return switch (oid) {
         TypeOid.boolean => .{ .bool = parseBoolCell(raw) },
         TypeOid.int2, TypeOid.int4, TypeOid.int8 => .{ .integer = try std.fmt.parseInt(i64, raw, 10) },
@@ -4460,6 +5640,72 @@ fn parseLogicalValueAlloc(alloc: Allocator, oid: Oid, raw: []const u8, binary: b
         },
         else => .{ .string = try alloc.dupe(u8, raw) },
     };
+}
+
+/// Binary tuple cells use the PostgreSQL type's send representation. Unknown
+/// OIDs must fail before admission, never become arbitrary UTF-8 strings.
+fn parseLogicalBinaryValueAlloc(a: Allocator, oid: Oid, raw: []const u8) !std.json.Value {
+    return switch (oid) {
+        TypeOid.boolean => blk: {
+            if (raw.len != 1 or raw[0] > 1) return error.InvalidReplicationSourceRow;
+            break :blk .{ .bool = raw[0] == 1 };
+        },
+        TypeOid.int2 => if (raw.len == 2) .{ .integer = std.mem.readInt(i16, raw[0..2], .big) } else error.InvalidReplicationSourceRow,
+        TypeOid.int4 => if (raw.len == 4) .{ .integer = std.mem.readInt(i32, raw[0..4], .big) } else error.InvalidReplicationSourceRow,
+        TypeOid.int8 => if (raw.len == 8) .{ .integer = std.mem.readInt(i64, raw[0..8], .big) } else error.InvalidReplicationSourceRow,
+        26 => if (raw.len == 4) .{ .integer = std.mem.readInt(u32, raw[0..4], .big) } else error.InvalidReplicationSourceRow,
+        TypeOid.float4 => blk: {
+            if (raw.len != 4) return error.InvalidReplicationSourceRow;
+            const value: f32 = @bitCast(std.mem.readInt(u32, raw[0..4], .big));
+            if (!std.math.isFinite(value)) return error.UnsupportedReplicationType;
+            break :blk .{ .float = value };
+        },
+        TypeOid.float8 => blk: {
+            if (raw.len != 8) return error.InvalidReplicationSourceRow;
+            const value: f64 = @bitCast(std.mem.readInt(u64, raw[0..8], .big));
+            if (!std.math.isFinite(value)) return error.UnsupportedReplicationType;
+            break :blk .{ .float = value };
+        },
+        TypeOid.numeric => blk: {
+            const native = @import("antfly_local_sources");
+            var context: native.sql_numeric_value.Context = .{ .alloc = a };
+            var number = try native.sql_numeric_binary.decode(&context, raw, .{});
+            defer number.deinit();
+            if (number.value.kind != .finite) return error.UnsupportedReplicationType;
+            break :blk .{ .number_string = try native.sql_numeric_value.format(&context, number.value) };
+        },
+        TypeOid.json, TypeOid.jsonb => blk: {
+            const bytes = if (oid == TypeOid.jsonb) body: {
+                if (raw.len == 0 or raw[0] != 1) return error.InvalidReplicationSourceRow;
+                break :body raw[1..];
+            } else raw;
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+            defer parsed.deinit();
+            break :blk try cloneJsonValueAlloc(a, parsed.value);
+        },
+        18, 19, 25, 1042, 1043 => blk: {
+            if (!std.unicode.utf8ValidateSlice(raw) or std.mem.indexOfScalar(u8, raw, 0) != null) return error.InvalidReplicationSourceRow;
+            break :blk .{ .string = try a.dupe(u8, raw) };
+        },
+        else => error.UnsupportedReplicationType,
+    };
+}
+
+test "postgres logical binary tuples decode actual type OIDs and refuse opaque or malformed cells" {
+    var region = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer region.deinit();
+    const a = region.allocator();
+    try std.testing.expectEqual(@as(i64, -2), (try parseLogicalValueAlloc(a, TypeOid.int8, &.{ 255, 255, 255, 255, 255, 255, 255, 254 }, true)).integer);
+    try std.testing.expectEqual(@as(i64, 17), (try parseLogicalValueAlloc(a, TypeOid.int4, &.{ 0, 0, 0, 17 }, true)).integer);
+    try std.testing.expect((try parseLogicalValueAlloc(a, TypeOid.boolean, &.{1}, true)).bool);
+    try std.testing.expectEqualStrings("plan", (try parseLogicalValueAlloc(a, 25, "plan", true)).string);
+    const json = try parseLogicalValueAlloc(a, TypeOid.jsonb, "\x01{\"n\":17,\"v\":null}", true);
+    try std.testing.expectEqual(@as(i64, 17), json.object.get("n").?.integer);
+    try std.testing.expect(json.object.get("v").? == .null);
+    try std.testing.expectError(error.InvalidReplicationSourceRow, parseLogicalValueAlloc(a, TypeOid.int4, &.{ 0, 17 }, true));
+    try std.testing.expectError(error.InvalidReplicationSourceRow, parseLogicalValueAlloc(a, TypeOid.boolean, &.{2}, true));
+    try std.testing.expectError(error.InvalidReplicationSourceRow, parseLogicalValueAlloc(a, TypeOid.jsonb, "\x02{}", true));
+    try std.testing.expectError(error.UnsupportedReplicationType, parseLogicalValueAlloc(a, 99999, "no-type-proof", true));
 }
 
 fn decodeByteaHexAlloc(alloc: Allocator, encoded: []const u8) ![]u8 {
@@ -5910,6 +7156,37 @@ test "postgres libpq created replication snapshot cloning is allocation-failure 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
+test "Source tuple DELETE retains full old image markers and rejects changed tuple widths" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var cache: std.AutoHashMapUnmanaged(u32, PgoutputRelation) = .empty;
+    const columns = try scratch.alloc(PgoutputColumn, 1);
+    columns[0] = .{ .name = try scratch.dupe(u8, "payload"), .data_type = TypeOid.jsonb, .key = true };
+    try cache.put(scratch, 42, .{ .namespace = try scratch.dupe(u8, "public"), .relation_name = try scratch.dupe(u8, "rows"), .columns = columns, .replica_identity = 'f' });
+    for ([_]u8{ 'O', 'K' }) |marker| {
+        var bytes = [_]u8{ 'D', 0, 0, 0, 42, marker, 0, 1, 't', 0, 0, 0, 4, 'n', 'u', 'l', 'l' };
+        var change = (try parsePgoutputMessageAlloc(a, &bytes, &cache)).change;
+        defer change.deinit(a);
+        try std.testing.expectEqual(marker == 'O', (change.before_kind == .full));
+        try std.testing.expect(change.row.?.object.get("payload").? == .null);
+        try std.testing.expectEqualStrings("payload", change.json_null_fields[0]);
+        bytes[7] = 0;
+        try std.testing.expectError(error.InvalidReplicationSourceRow, parsePgoutputMessageAlloc(a, &bytes, &cache));
+        bytes[7] = 2;
+        try std.testing.expectError(error.InvalidReplicationSourceRow, parsePgoutputMessageAlloc(a, &bytes, &cache));
+    }
+}
+
+test "postgres libpq parser rejects truncate and unknown effects rather than acknowledging lost mutations" {
+    const alloc = std.testing.allocator;
+    var relations = std.AutoHashMapUnmanaged(u32, PgoutputRelation).empty;
+    defer deinitPgoutputRelationCache(alloc, &relations);
+    try std.testing.expectError(error.UnsupportedReplicationTruncate, parsePgoutputMessageAlloc(alloc, "T", &relations));
+    try std.testing.expectError(error.UnsupportedReplicationMessage, parsePgoutputMessageAlloc(alloc, "?", &relations));
+}
+
 test "postgres libpq parser decodes pgoutput relation and row changes" {
     const alloc = std.testing.allocator;
 
@@ -5967,8 +7244,8 @@ test "postgres libpq parser decodes pgoutput relation and row changes" {
     try Builder.appendCString(&relation_bytes, alloc, "users");
     try relation_bytes.append(alloc, 'd');
     try Builder.appendU16(&relation_bytes, alloc, 3);
-    inline for (.{ .{ "id", TypeOid.int8 }, .{ "name", TypeOid.json }, .{ "tier", TypeOid.boolean } }) |column| {
-        try relation_bytes.append(alloc, 0);
+    inline for (.{ .{ "id", TypeOid.int8 }, .{ "name", TypeOid.json }, .{ "tier", TypeOid.boolean } }, 0..) |column, index| {
+        try relation_bytes.append(alloc, @intFromBool(index == 0));
         try Builder.appendCString(&relation_bytes, alloc, column.@"0");
         try Builder.appendU32(&relation_bytes, alloc, column.@"1");
         try Builder.appendU32(&relation_bytes, alloc, 0);
@@ -5981,7 +7258,10 @@ test "postgres libpq parser decodes pgoutput relation and row changes" {
     try Builder.appendU64(&begin_bytes, alloc, 1);
     try Builder.appendI64(&begin_bytes, alloc, 0);
     try Builder.appendU32(&begin_bytes, alloc, 9);
-    try std.testing.expectEqual(ParsedPgoutputMessage.begin, try parsePgoutputMessageAlloc(alloc, begin_bytes.items, &relation_cache));
+    const parsed_begin = try parsePgoutputMessageAlloc(alloc, begin_bytes.items, &relation_cache);
+    try std.testing.expect(parsed_begin == .begin);
+    try std.testing.expectEqual(@as(u32, 9), parsed_begin.begin.xid);
+    try std.testing.expectEqual(@as(u64, 1), parsed_begin.begin.final_lsn);
 
     var insert_bytes = std.ArrayListUnmanaged(u8).empty;
     defer insert_bytes.deinit(alloc);
@@ -6020,8 +7300,98 @@ test "postgres libpq parser decodes pgoutput relation and row changes" {
     };
     defer update.deinit(alloc);
     try std.testing.expectEqual(foreign_source.ReplicationOp.update, update.op);
+    try std.testing.expectEqual(foreign_source.ReplicationBeforeKind.key, update.before_kind);
+    try std.testing.expectEqual(@as(usize, 1), update.beforeImage().?.object.count());
+    try std.testing.expectEqual(update.row.?.object.get("id").?.integer, update.beforeImage().?.object.get("id").?.integer);
     try std.testing.expectEqualStrings("la", update.row.?.object.get("name").?.object.get("city").?.string);
     try std.testing.expect(!update.row.?.object.get("tier").?.bool);
+
+    // UPDATE K retains the old replica identity; otherwise a source primary
+    // key move could create the new document and leave the old one behind.
+    var moved_bytes = std.ArrayListUnmanaged(u8).empty;
+    defer moved_bytes.deinit(alloc);
+    try moved_bytes.append(alloc, 'U');
+    try Builder.appendU32(&moved_bytes, alloc, 42);
+    try moved_bytes.append(alloc, 'K');
+    try Builder.appendU16(&moved_bytes, alloc, 3);
+    try Builder.appendTextTupleValue(&moved_bytes, alloc, "7");
+    try moved_bytes.appendSlice(alloc, "nn");
+    try moved_bytes.appendSlice(alloc, update_bytes.items[5..]);
+    var moved = switch (try parsePgoutputMessageAlloc(alloc, moved_bytes.items, &relation_cache)) {
+        .change => |change| change,
+        else => return error.TestUnexpectedResult,
+    };
+    defer moved.deinit(alloc);
+    try std.testing.expectEqual(@as(i64, 7), moved.before.?.object.get("id").?.integer);
+    try std.testing.expect(!(moved.before_kind == .full));
+    moved_bytes.items[5] = 'O';
+    var full_old = switch (try parsePgoutputMessageAlloc(alloc, moved_bytes.items, &relation_cache)) {
+        .change => |change| change,
+        else => return error.TestUnexpectedResult,
+    };
+    defer full_old.deinit(alloc);
+    try std.testing.expect((full_old.before_kind == .full));
+    for ([_]bool{ true, false }) |old_is_json_null| {
+        var old_null_bytes = std.ArrayListUnmanaged(u8).empty;
+        defer old_null_bytes.deinit(alloc);
+        try old_null_bytes.append(alloc, 'U');
+        try Builder.appendU32(&old_null_bytes, alloc, 42);
+        try old_null_bytes.append(alloc, 'O');
+        try Builder.appendU16(&old_null_bytes, alloc, 3);
+        try Builder.appendTextTupleValue(&old_null_bytes, alloc, "7");
+        if (old_is_json_null) try Builder.appendTextTupleValue(&old_null_bytes, alloc, "null") else try old_null_bytes.append(alloc, 'n');
+        try old_null_bytes.append(alloc, 'n');
+        try old_null_bytes.appendSlice(alloc, update_bytes.items[5..]);
+        var old_null = switch (try parsePgoutputMessageAlloc(alloc, old_null_bytes.items, &relation_cache)) {
+            .change => |change| change,
+            else => return error.TestUnexpectedResult,
+        };
+        defer old_null.deinit(alloc);
+        try std.testing.expect(old_null.before.?.object.get("name").? == .null);
+        try std.testing.expectEqual(@as(usize, if (old_is_json_null) 1 else 0), old_null.before_json_null_fields.len);
+        if (old_is_json_null) try std.testing.expectEqualStrings("name", old_null.before_json_null_fields[0]);
+        try std.testing.expectEqual(@as(usize, 0), old_null.json_null_fields.len);
+    }
+
+    var key_update_bytes = std.ArrayListUnmanaged(u8).empty;
+    defer key_update_bytes.deinit(alloc);
+    try key_update_bytes.append(alloc, 'U');
+    try Builder.appendU32(&key_update_bytes, alloc, 42);
+    try key_update_bytes.append(alloc, 'K');
+    try Builder.appendU16(&key_update_bytes, alloc, 3);
+    try Builder.appendTextTupleValue(&key_update_bytes, alloc, "7");
+    try key_update_bytes.appendSlice(alloc, "nn");
+    try key_update_bytes.append(alloc, 'N');
+    try Builder.appendU16(&key_update_bytes, alloc, 3);
+    try Builder.appendTextTupleValue(&key_update_bytes, alloc, "8");
+    try key_update_bytes.appendSlice(alloc, "un");
+    var key_update = (try parsePgoutputMessageAlloc(alloc, key_update_bytes.items, &relation_cache)).change;
+    defer key_update.deinit(alloc);
+    try std.testing.expectEqual(foreign_source.ReplicationBeforeKind.key, key_update.before_kind);
+    try std.testing.expect(!key_update.before_complete and !key_update.row_complete);
+    try std.testing.expectEqual(@as(i64, 7), key_update.beforeImage().?.object.get("id").?.integer);
+    try std.testing.expectEqual(@as(usize, 1), key_update.beforeImage().?.object.count());
+    try std.testing.expectEqual(@as(i64, 8), key_update.row.?.object.get("id").?.integer);
+    try std.testing.expect(key_update.row.?.object.get("name") == null);
+    try std.testing.expect(key_update.row.?.object.get("tier").? == .null);
+    var full_update_bytes = std.ArrayListUnmanaged(u8).empty;
+    defer full_update_bytes.deinit(alloc);
+    try full_update_bytes.append(alloc, 'U');
+    try Builder.appendU32(&full_update_bytes, alloc, 42);
+    try full_update_bytes.append(alloc, 'O');
+    try Builder.appendU16(&full_update_bytes, alloc, 3);
+    try Builder.appendTextTupleValue(&full_update_bytes, alloc, "7");
+    try Builder.appendTextTupleValue(&full_update_bytes, alloc, "{\"city\":\"la\"}");
+    try full_update_bytes.append(alloc, 'n');
+    try full_update_bytes.appendSlice(alloc, update_bytes.items[5..]);
+    var full_update = (try parsePgoutputMessageAlloc(alloc, full_update_bytes.items, &relation_cache)).change;
+    defer full_update.deinit(alloc);
+    try std.testing.expectEqual(foreign_source.ReplicationBeforeKind.full, full_update.before_kind);
+    try std.testing.expect(full_update.before_complete and full_update.row_complete);
+    try std.testing.expect(full_update.beforeImage().?.object.get("tier").? == .null);
+    try std.testing.expectEqualStrings("la", full_update.beforeImage().?.object.get("name").?.object.get("city").?.string);
+    const malformed_tuple = [_]u8{ 'I', 0, 0, 0, 42, 'N', 0, 2 };
+    try std.testing.expectError(error.InvalidReplicationSourceRow, parsePgoutputMessageAlloc(alloc, &malformed_tuple, &relation_cache));
 
     var delete_bytes = std.ArrayListUnmanaged(u8).empty;
     defer delete_bytes.deinit(alloc);
@@ -6039,6 +7409,8 @@ test "postgres libpq parser decodes pgoutput relation and row changes" {
     };
     defer delete.deinit(alloc);
     try std.testing.expectEqual(foreign_source.ReplicationOp.delete, delete.op);
+    try std.testing.expectEqual(foreign_source.ReplicationBeforeKind.full, delete.before_kind);
+    try std.testing.expect(delete.before_complete);
     try std.testing.expectEqual(@as(i64, 7), delete.row.?.object.get("id").?.integer);
 
     var commit_bytes = std.ArrayListUnmanaged(u8).empty;
@@ -6046,11 +7418,11 @@ test "postgres libpq parser decodes pgoutput relation and row changes" {
     try commit_bytes.append(alloc, 'C');
     try commit_bytes.append(alloc, 0);
     try Builder.appendU64(&commit_bytes, alloc, 1);
-    try Builder.appendU64(&commit_bytes, alloc, 1);
+    try Builder.appendU64(&commit_bytes, alloc, 2);
     try Builder.appendI64(&commit_bytes, alloc, 1_000_000);
     const parsed_commit = try parsePgoutputMessageAlloc(alloc, commit_bytes.items, &relation_cache);
     try std.testing.expect(parsed_commit == .commit);
-    try std.testing.expect(parsed_commit.commit > 946_684_800_000);
+    try std.testing.expect(parsed_commit.commit.timestamp_ms > 946_684_800_000);
 }
 
 test "postgres libpq decodes bytea hex text" {
@@ -6986,6 +8358,62 @@ test "postgres libpq poll resumes from durable checkpoint across multiple transa
         .limit = 16,
     };
     defer second_poll_params.deinit(alloc);
+    const deadline = platform_time.monotonicNs() +| 10 * std.time.ns_per_s;
+    const replication = try executor.connectReplicationFreshWithDeadline(alloc, dsn, deadline);
+    defer executor.pqfinish(replication);
+    const identity = try executor.identifyExactCutoverProvider(alloc, conn, replication, deadline);
+    var wrong_identity = identity;
+    wrong_identity[0] ^= 1;
+    const before_rejection = try executor.loadLogicalReplicationSlotCheckpointAlloc(alloc, conn, slot_name, deadline);
+    defer alloc.free(before_rejection);
+    second_poll_params.expected_provider_identity = wrong_identity;
+    try std.testing.expectError(error.ReplicationCutoverAuthorityLost, executor.pollChangesAlloc(alloc, dsn, second_poll_params));
+    const after_rejection = try executor.loadLogicalReplicationSlotCheckpointAlloc(alloc, conn, slot_name, deadline);
+    defer alloc.free(after_rejection);
+    try std.testing.expectEqualStrings(before_rejection, after_rejection);
+    second_poll_params.expected_provider_identity = identity;
+
+    const extra_table = try std.fmt.allocPrint(alloc, "{s}_other", .{table_name});
+    defer alloc.free(extra_table);
+    const create_extra = try std.fmt.allocPrint(alloc, "CREATE TABLE {s} (LIKE {s} INCLUDING ALL)", .{ extra_table, table_name });
+    defer alloc.free(create_extra);
+    const drop_extra = try std.fmt.allocPrint(alloc, "DROP TABLE IF EXISTS {s}", .{extra_table});
+    defer alloc.free(drop_extra);
+    try execCommandForTest(&executor, conn, alloc, create_extra);
+    defer execCommandForTest(&executor, conn, alloc, drop_extra) catch {};
+    const add_extra = try std.fmt.allocPrint(alloc, "ALTER PUBLICATION {s} ADD TABLE {s}", .{ publication_name, extra_table });
+    defer alloc.free(add_extra);
+    try execCommandForTest(&executor, conn, alloc, add_extra);
+    try std.testing.expectError(error.ReplicationPublicationBindingChanged, executor.pollChangesAlloc(alloc, dsn, second_poll_params));
+
+    const drift_filter = try std.fmt.allocPrint(alloc, "ALTER PUBLICATION {s} SET TABLE {s} WHERE (id <> 'u1')", .{ publication_name, table_name });
+    defer alloc.free(drift_filter);
+    try execCommandForTest(&executor, conn, alloc, drift_filter);
+    {
+        var configured = prepare_params;
+        configured.filter_query_json = try alloc.dupe(u8, "{\"term\":\"u1\",\"field\":\"id\"}");
+        defer alloc.free(configured.filter_query_json.?);
+        try std.testing.expectError(error.ReplicationPublicationBindingChanged, executor.prepareReplicationAlloc(alloc, dsn, configured));
+        const matching = try std.fmt.allocPrint(alloc, "ALTER PUBLICATION {s} SET TABLE {s} WHERE (id = 'u1')", .{ publication_name, table_name });
+        defer alloc.free(matching);
+        try execCommandForTest(&executor, conn, alloc, matching);
+        var prepared = try executor.prepareReplicationAlloc(alloc, dsn, configured);
+        defer prepared.deinit(alloc);
+        try std.testing.expect(prepared.slot_existed);
+    }
+    {
+        var filtered = second_poll_params;
+        filtered.filter_query_json = try alloc.dupe(u8, "{}");
+        defer alloc.free(filtered.filter_query_json.?);
+        try std.testing.expectError(error.ReplicationPublicationBindingChanged, executor.pollChangesAlloc(alloc, dsn, filtered));
+    }
+    const restore_publication = try std.fmt.allocPrint(alloc, "ALTER PUBLICATION {s} SET TABLE {s}", .{ publication_name, table_name });
+    defer alloc.free(restore_publication);
+    try execCommandForTest(&executor, conn, alloc, restore_publication);
+    const after_drift = try executor.loadLogicalReplicationSlotCheckpointAlloc(alloc, conn, slot_name, deadline);
+    defer alloc.free(after_drift);
+    try std.testing.expectEqualStrings(before_rejection, after_drift);
+
     var second_poll = try executor.pollChangesAlloc(alloc, dsn, second_poll_params);
     defer second_poll.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), second_poll.changes.len);
@@ -6994,6 +8422,8 @@ test "postgres libpq poll resumes from durable checkpoint across multiple transa
     try std.testing.expectEqualStrings("platinum", second_poll.changes[0].row.?.object.get("tier").?.string);
     try std.testing.expect(second_poll.checkpoint.len > 0);
     try std.testing.expectEqualStrings(second_poll.changes[0].checkpoint, second_poll.checkpoint);
+    first_poll_params.expected_provider_identity = identity;
+    try std.testing.expectError(error.ReplicationCutoverAuthorityLost, executor.pollChangesAlloc(alloc, dsn, first_poll_params));
 }
 
 test "postgres libpq module compiles" {
@@ -7020,4 +8450,733 @@ fn execCommandForTest(executor: *Executor, conn: ?*PGconn, alloc: Allocator, sql
     defer prepared.deinit(alloc);
     const result = try executor.execPreparedAllowCommand(conn, alloc, prepared);
     executor.pqclear(result);
+}
+
+test "postgres libpq subscription cleanup verifies provider checkpoint and authority and preserves publications" {
+    // This provider integration gate requires an explicit disposable oracle.
+    // Its dedicated build target uses --require-no-skips.
+    if (std.c.getenv("ANTFLY_TEST_PG_DSN") == null and std.c.getenv("PG_DSN") == null) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const dsn = try testPgDsnAlloc(a);
+    defer a.free(dsn);
+    var executor = try Executor.init(a);
+    defer executor.deinit();
+    const conn = try executor.connect(dsn);
+    const suffix = platform_time.monotonicNs();
+    const slot = try std.fmt.allocPrint(a, "antfly_source_cleanup_{d}", .{suffix});
+    defer a.free(slot);
+    const publication = try std.fmt.allocPrint(a, "antfly_source_pub_{d}", .{suffix});
+    defer a.free(publication);
+    const provider_lock_name = try std.fmt.allocPrint(a, "antfly/source-cleanup/{d}", .{suffix});
+    defer a.free(provider_lock_name);
+    const deadline = platform_time.monotonicNs() +| 30 * std.time.ns_per_s;
+    const create_pub = try std.fmt.allocPrint(a, "CREATE PUBLICATION {s}", .{publication});
+    defer a.free(create_pub);
+    const drop_pub = try std.fmt.allocPrint(a, "DROP PUBLICATION IF EXISTS {s}", .{publication});
+    defer a.free(drop_pub);
+    const create_slot = try std.fmt.allocPrint(a, "SELECT * FROM pg_create_logical_replication_slot('{s}', 'pgoutput')", .{slot});
+    defer a.free(create_slot);
+    try execCommandForTest(&executor, conn, a, create_pub);
+    defer execCommandForTest(&executor, conn, a, drop_pub) catch {};
+    try execCommandForTest(&executor, conn, a, create_slot);
+    defer executor.dropInactiveLogicalReplicationSlotIfExistsAlloc(a, conn, slot, deadline) catch {};
+    try std.testing.expectError(error.ForeignAuthFailed, executor.requireExplicitSubscriptionPassword(a, "host=localhost passfile=/tmp/password"));
+    try std.testing.expectError(error.ForeignAuthFailed, executor.requireExplicitSubscriptionPassword(a, "host=localhost password="));
+    try executor.requireExplicitSubscriptionPassword(a, "postgresql://account:fixture@localhost/database");
+    const authenticated = std.c.getenv("ANTFLY_TEST_PG_REQUIRE_PASSWORD") != null;
+    if (authenticated) {
+        try executor.requireExplicitSubscriptionPassword(a, dsn);
+        try executor.requireSubscriptionPasswordUsed(conn);
+    } else if (executor.pqconnectionUsedPassword.?(conn) == 0) {
+        try std.testing.expectError(error.ForeignAuthFailed, executor.requireSubscriptionPasswordUsed(conn));
+    }
+    const provider = try executor.sqlProviderIdentityAlloc(a, conn, deadline);
+    const Scope = struct {
+        denied: bool = false,
+        checks: usize = 0,
+        starts: usize = 0,
+        refuse_start: bool = false,
+        refusals: usize = 0,
+        observations: usize = 0,
+        fn refused(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refusals += 1;
+        }
+        fn start(raw: *anyopaque, identity: [32]u8) !void {
+            try std.testing.expect(!std.mem.allEqual(u8, &identity, 0));
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.starts += 1;
+            if (self.refuse_start) return error.ReplicationCutoverAuthorityLost;
+        }
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.denied) return error.ReplicationCutoverAuthorityLost;
+        }
+        fn observe(raw: *anyopaque, _: foreign_source.SubscriptionOrigin.Observation) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observations += 1;
+            self.denied = true;
+            return error.ReplicationCutoverAuthorityLost;
+        }
+        fn acknowledged(_: *anyopaque, _: []const u8) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var scope: Scope = .{};
+    {
+        // A disconnected worker's SQL lock can be gone while the backend
+        // running CREATE is still alive. Cleanup must honor that backend.
+        const replication = try executor.connectReplicationFreshWithDeadline(a, dsn, deadline);
+        defer executor.pqfinish(replication);
+        try executor.lockSubscriptionSlotCreation(a, replication, slot, deadline);
+        var blocked: foreign_source.ReplicationCleanupParams = .{
+            .slot_name = slot,
+            .native_source = .{ .provider_identity = provider, .snapshot_checkpoint = 1, .durable_checkpoint = 1, .lock_name = provider_lock_name, .authority = .{ .ptr = &scope, .check_fn = Scope.check, .observe_fn = Scope.observe, .acknowledged_fn = Scope.acknowledged } },
+            .password_required = authenticated,
+        };
+        blocked.execution_deadline_ns = platform_time.monotonicNs() +| 250 * std.time.ns_per_ms;
+        if (executor.asQueryExecutor().cleanupReplication(a, dsn, blocked)) |_| {
+            return error.TestUnexpectedResult;
+        } else |err| switch (err) {
+            error.Timeout, error.DeadlineExceeded => {},
+            else => return err,
+        }
+        try std.testing.expect(try executor.logicalReplicationSlotExistsAlloc(a, conn, slot, deadline));
+    }
+    const checkpoint = try executor.requireSubscriptionSlotAlloc(a, conn, slot, deadline);
+    var params: foreign_source.ReplicationCleanupParams = .{
+        .slot_name = slot,
+        .native_source = .{ .provider_identity = provider, .snapshot_checkpoint = checkpoint, .durable_checkpoint = checkpoint, .lock_name = provider_lock_name, .authority = .{ .ptr = &scope, .check_fn = Scope.check, .observe_fn = Scope.observe, .acknowledged_fn = Scope.acknowledged } },
+        .execution_deadline_ns = deadline,
+        .password_required = authenticated,
+    };
+    // A native preparation is not evidence that it created a slot. Refusing
+    // an existing foreign slot must precede the callback that binds ownership;
+    // otherwise later recovery could classify that foreign slot as ours.
+    var capture_authority = params.native_source.?.authority;
+    capture_authority.start_fn = Scope.start;
+    capture_authority.refused_fn = Scope.refused;
+    {
+        // An invalid slot identifier is refused by PostgreSQL after send.
+        const observer = try executor.connectFreshWithDeadline(dsn, deadline, null);
+        defer executor.pqfinish(observer);
+        try executor.setCutoverAdvisoryLockAlloc(a, observer, provider_lock_name, true, deadline);
+        const replication = try executor.connectReplicationFreshWithDeadline(a, dsn, deadline);
+        defer executor.pqfinish(replication);
+        try std.testing.expectError(error.ForeignQueryFailed, executor.createLogicalReplicationSlotExportResult(a, replication, "InvalidSlot", deadline, .{
+            .authority = capture_authority,
+            .locked_observer = observer,
+            .provider_identity = provider,
+        }));
+        try std.testing.expectEqual(@as(usize, 1), scope.refusals);
+        scope.starts = 0;
+    }
+    try std.testing.expectError(error.UnsupportedExactCutover, Executor.beginSubscriptionSnapshot(&executor, a, dsn, .{
+        .publications = &.{publication},
+        .slot_name = slot,
+        .lock_name = provider_lock_name,
+        .expected = null,
+        .authority = capture_authority,
+        .execution_deadline_ns = deadline,
+        .password_required = authenticated,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), scope.observations);
+    try std.testing.expectEqual(@as(usize, 0), scope.starts);
+    try std.testing.expect(try executor.logicalReplicationSlotExistsAlloc(a, conn, slot, deadline));
+    // Endpoint/credential changes cannot retarget cleanup to a different
+    // physical PostgreSQL database, even if its slot names happen to match.
+    const aborted = try std.fmt.allocPrint(a, "antfly_aborted_export_{d}", .{suffix});
+    defer a.free(aborted);
+    const capture_request: foreign_source.SubscriptionRequest = .{
+        .publications = &.{publication},
+        .slot_name = aborted,
+        .lock_name = provider_lock_name,
+        .expected = null,
+        .authority = capture_authority,
+        .execution_deadline_ns = deadline,
+        .password_required = authenticated,
+    };
+    scope.refuse_start = true;
+    try std.testing.expectError(error.ReplicationCutoverAuthorityLost, Executor.beginSubscriptionSnapshot(&executor, a, dsn, capture_request));
+    try std.testing.expectEqual(@as(usize, 1), scope.starts);
+    try std.testing.expectEqual(@as(usize, 0), scope.observations);
+    try std.testing.expect(!try executor.logicalReplicationSlotExistsAlloc(a, conn, aborted, deadline));
+    scope.refuse_start = false;
+    try std.testing.expectError(error.ReplicationCutoverAuthorityLost, Executor.beginSubscriptionSnapshot(&executor, a, dsn, capture_request));
+    try std.testing.expectEqual(@as(usize, 2), scope.starts);
+    try std.testing.expectEqual(@as(usize, 1), scope.observations);
+    try std.testing.expect(!try executor.logicalReplicationSlotExistsAlloc(a, conn, aborted, deadline));
+    scope.denied = false;
+    var absence = params;
+    absence.native_source.?.snapshot_checkpoint = 0;
+    absence.native_source.?.durable_checkpoint = 0;
+    absence.native_source.?.require_absent = true;
+    try std.testing.expectError(error.ExactCutoverCleanupPending, executor.asQueryExecutor().cleanupReplication(a, dsn, absence));
+    try std.testing.expect(try executor.logicalReplicationSlotExistsAlloc(a, conn, slot, deadline));
+    absence.slot_name = aborted;
+    try executor.asQueryExecutor().cleanupReplication(a, dsn, absence);
+    absence.native_source.?.provider_identity[0] ^= 1;
+    try std.testing.expectError(error.ForeignProviderIdentityMismatch, executor.asQueryExecutor().cleanupReplication(a, dsn, absence));
+    params.native_source.?.provider_identity[0] ^= 1;
+    try std.testing.expectError(error.ForeignProviderIdentityMismatch, executor.asQueryExecutor().cleanupReplication(a, dsn, params));
+    try std.testing.expect(try executor.logicalReplicationSlotExistsAlloc(a, conn, slot, deadline));
+    params.native_source.?.provider_identity = provider;
+    scope.denied = true;
+    try std.testing.expectError(error.ReplicationCutoverAuthorityLost, executor.asQueryExecutor().cleanupReplication(a, dsn, params));
+    try std.testing.expect(try executor.logicalReplicationSlotExistsAlloc(a, conn, slot, deadline));
+    scope.denied = false;
+    params.native_source.?.snapshot_checkpoint = checkpoint + 1;
+    params.native_source.?.durable_checkpoint = checkpoint + 1;
+    try std.testing.expectError(error.ForeignProviderIdentityMismatch, executor.asQueryExecutor().cleanupReplication(a, dsn, params));
+    try std.testing.expect(try executor.logicalReplicationSlotExistsAlloc(a, conn, slot, deadline));
+    params.native_source.?.snapshot_checkpoint = checkpoint;
+    params.native_source.?.durable_checkpoint = checkpoint;
+    try executor.asQueryExecutor().cleanupReplication(a, dsn, params);
+    try std.testing.expect(!try executor.logicalReplicationSlotExistsAlloc(a, conn, slot, deadline));
+    // A repeated actual provider observation is idempotent. No provider ACK,
+    // Source checkpoint advance or publication mutation is manufactured.
+    try executor.asQueryExecutor().cleanupReplication(a, dsn, params);
+    var query = try tableNamePreparedQueryAlloc(a, "SELECT count(*)::text FROM pg_publication WHERE pubname=$1", publication);
+    defer query.deinit(a);
+    const result = try executor.execPreparedWithDeadline(conn, a, query, deadline, null);
+    defer executor.pqclear(result);
+    try std.testing.expectEqual(@as(c_int, 1), executor.pqntuples(result));
+    try std.testing.expectEqualStrings("1", executor.pqgetvalue(result, 0, 0)[0..@intCast(executor.pqgetlength(result, 0, 0))]);
+    // The shared existing path still removes an explicitly owned publication.
+    try execCommandForTest(&executor, conn, a, create_slot);
+    params.native_source = null;
+    params.publication_name = publication;
+    try executor.asQueryExecutor().cleanupReplication(a, dsn, params);
+    const missing = try executor.execPreparedWithDeadline(conn, a, query, deadline, null);
+    defer executor.pqclear(missing);
+    try std.testing.expectEqualStrings("0", executor.pqgetvalue(missing, 0, 0)[0..@intCast(executor.pqgetlength(missing, 0, 0))]);
+}
+
+test "postgres pgoutput transaction envelopes discard incomplete suffix and retain exact commit evidence" {
+    const a = std.testing.allocator;
+    var decoded: PgoutputTransactions = .{};
+    defer decoded.deinit(a);
+    try decoded.accept(a, .{ .begin = .{ .xid = 9, .final_lsn = 16, .timestamp_ms = 7 } }, "0/01");
+    for (0..2) |_| try decoded.accept(a, .{ .change = .{ .op = .insert, .checkpoint = try a.alloc(u8, 0) } }, "0/02");
+    try decoded.accept(a, .{ .commit = .{ .commit_lsn = 16, .end_lsn = 24, .timestamp_ms = 7 } }, "0/18");
+    try decoded.accept(a, .{ .begin = .{ .xid = 10, .final_lsn = 32, .timestamp_ms = 8 } }, "0/20");
+    try decoded.accept(a, .{ .change = .{ .op = .delete, .checkpoint = try a.alloc(u8, 0) } }, "0/21");
+    var result = try decoded.finish(a, 0);
+    defer result.deinit(a);
+    try result.validateTransactions();
+    try std.testing.expectEqual(@as(usize, 2), result.changes.len);
+    try std.testing.expectEqual(@as(usize, 1), result.transactions.?.len);
+    try std.testing.expectEqual(@as(u32, 9), result.transactions.?[0].xid);
+    try std.testing.expectEqual(@as(u64, 24), result.transactions.?[0].end_lsn);
+    try std.testing.expectEqualStrings("0/18", result.checkpoint);
+    try std.testing.expectEqualStrings("0/18", result.changes[0].checkpoint);
+    try std.testing.expectEqualStrings("0/18", result.changes[1].checkpoint);
+}
+
+test "postgres pgoutput transaction envelopes reject missing begin and conflicting commit before handoff" {
+    const a = std.testing.allocator;
+    var decoded: PgoutputTransactions = .{};
+    defer decoded.deinit(a);
+    try std.testing.expectError(error.InvalidReplicationTransaction, decoded.accept(a, .{ .change = .{ .op = .insert, .checkpoint = try a.alloc(u8, 0) } }, "0/02"));
+    try decoded.accept(a, .{ .begin = .{ .xid = 9, .final_lsn = 16, .timestamp_ms = 7 } }, "0/01");
+    try std.testing.expectError(error.InvalidReplicationTransaction, decoded.accept(a, .{ .begin = .{ .xid = 10, .final_lsn = 32, .timestamp_ms = 8 } }, "0/02"));
+    try std.testing.expectError(error.InvalidReplicationTransaction, decoded.accept(a, .{ .commit = .{ .commit_lsn = 15, .end_lsn = 24, .timestamp_ms = 7 } }, "0/18"));
+    var relation_cache = std.AutoHashMapUnmanaged(u32, PgoutputRelation).empty;
+    defer deinitPgoutputRelationCache(a, &relation_cache);
+    try std.testing.expectError(error.UnsupportedReplicationTruncate, parsePgoutputMessageAlloc(a, "T", &relation_cache));
+    try std.testing.expectError(error.UnsupportedReplicationStreaming, parsePgoutputMessageAlloc(a, "S", &relation_cache));
+}
+
+test "postgres pgoutput transaction envelope ownership survives every allocation failure" {
+    const Campaign = struct {
+        fn run(a: Allocator) !void {
+            var decoded: PgoutputTransactions = .{};
+            defer decoded.deinit(a);
+            try decoded.accept(a, .{ .begin = .{ .xid = 9, .final_lsn = 16, .timestamp_ms = 7 } }, "0/01");
+            for (0..3) |_| try decoded.accept(a, .{ .change = .{ .op = .insert, .checkpoint = try a.alloc(u8, 0) } }, "0/02");
+            try decoded.accept(a, .{ .commit = .{ .commit_lsn = 16, .end_lsn = 24, .timestamp_ms = 7 } }, "0/18");
+            var result = try decoded.finish(a, 0);
+            defer result.deinit(a);
+            try result.validateTransactions();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
+}
+
+test "postgres lazy registry retains native transaction and snapshot identity capabilities" {
+    var lazy: LazyExecutor = .{ .alloc = std.testing.allocator };
+    defer lazy.deinit();
+    const executor = lazy.asQueryExecutor();
+    try std.testing.expect(executor.vtable.transaction_envelopes);
+    try std.testing.expect(executor.vtable.begin_replication_snapshot_query != null);
+    var runtime: postgres_source.RuntimeSource = .{ .alloc = std.testing.allocator, .executor = executor, .dsn = try std.testing.allocator.dupe(u8, "host=unused dbname=unused") };
+    defer runtime.deinit();
+    const source = runtime.asSource();
+    try std.testing.expect(source.vtable.transaction_envelopes);
+    try std.testing.expect(source.vtable.begin_replication_snapshot_query != null);
+    try std.testing.expect(lazy.executor == null);
+}
+
+test "postgres replication wire chunks reject reordered missing duplicated and oversized source bytes" {
+    const size = replication_wire_chunk_bytes;
+    var frame: ReplicationChunkFraming = .{};
+    try frame.accept(1, size * 2 + 7, 0, size);
+    try std.testing.expect(frame.in_message);
+    try std.testing.expectError(error.InvalidReplicationSourceRow, frame.accept(1, size * 2 + 7, size + 1, size));
+    try std.testing.expectError(error.InvalidReplicationSourceRow, frame.accept(1, size * 2 + 8, size, size));
+    try std.testing.expectError(error.InvalidReplicationSourceRow, frame.accept(2, size * 2 + 7, size, size));
+    try frame.accept(1, size * 2 + 7, size, size);
+    try std.testing.expectError(error.InvalidReplicationSourceRow, frame.accept(1, size * 2 + 7, size, size));
+    try std.testing.expect(frame.in_message);
+    try frame.accept(1, size * 2 + 7, size * 2, 7);
+    try std.testing.expect(!frame.in_message);
+    try std.testing.expectEqual(@as(u64, 2), frame.next_ordinal);
+    try std.testing.expectError(error.InvalidReplicationSourceRow, frame.accept(2, size + 1, 0, size + 1));
+    try std.testing.expectError(error.InvalidReplicationSourceRow, frame.accept(2, size + 1, 0, size - 1));
+    frame = .{};
+    try std.testing.expectError(error.InvalidReplicationSourceRow, frame.accept(1, 0, 0, 0));
+    try std.testing.expectError(error.InvalidReplicationSourceRow, frame.accept(1, 2, 1, 1));
+}
+
+const SnapshotNullFixture = struct {
+    fn rows(_: ?*PGresult) callconv(.c) c_int {
+        return 1;
+    }
+    fn columns(_: ?*PGresult) callconv(.c) c_int {
+        return 3;
+    }
+    fn name(_: ?*PGresult, column: c_int) callconv(.c) ?[*:0]const u8 {
+        return switch (column) {
+            0 => "sql_null",
+            1 => "json_null",
+            else => "text_null",
+        };
+    }
+    fn oid(_: ?*PGresult, column: c_int) callconv(.c) Oid {
+        return if (column == 2) TypeOid.text else TypeOid.jsonb;
+    }
+    fn isNull(_: ?*PGresult, _: c_int, column: c_int) callconv(.c) c_int {
+        return if (column == 0) 1 else 0;
+    }
+    fn length(_: ?*PGresult, _: c_int, _: c_int) callconv(.c) c_int {
+        return 4;
+    }
+    fn value(_: ?*PGresult, _: c_int, _: c_int) callconv(.c) [*]const u8 {
+        return "null";
+    }
+    fn check(a: Allocator) !void {
+        var executor = Executor.initForPermitTests(a);
+        defer executor.deinit();
+        executor.pqntuples = rows;
+        executor.pqnfields = columns;
+        executor.pqfname = name;
+        executor.pqftype = oid;
+        executor.pqgetisnull = isNull;
+        executor.pqgetlength = length;
+        executor.pqgetvalue = value;
+        var replication = try executor.readQueryResultWithProvenance(a, null, null, null, true);
+        defer replication.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), replication.json_null_fields.len);
+        try std.testing.expectEqual(@as(usize, 1), replication.json_null_fields[0].len);
+        try std.testing.expectEqualStrings("json_null", replication.json_null_fields[0][0]);
+        try std.testing.expect(replication.rows[0].object.get("sql_null").? == .null);
+        try std.testing.expect(replication.rows[0].object.get("json_null").? == .null);
+        try std.testing.expectEqualStrings("null", replication.rows[0].object.get("text_null").?.string);
+        var ordinary = try executor.readQueryResultAllocWithDeadline(a, null, null, null);
+        defer ordinary.deinit(a);
+        try std.testing.expectEqual(@as(usize, 0), ordinary.json_null_fields.len);
+    }
+};
+test "postgres replication snapshot retains SQL null versus JSON null without changing ordinary queries" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, SnapshotNullFixture.check, .{});
+}
+
+/// Publication membership must expose exactly the configured source identity.
+/// A leaf published via an ancestor is not that identity, either. This check
+/// runs before slot peek/advance and cannot acknowledge a filtered-out prefix.
+fn requirePublicationSourceIdentity(via_root: []const u8, relation_kind: []const u8, member: []const u8) !void {
+    if (!std.mem.eql(u8, member, "t")) return error.InvalidReplicationSourceConfig;
+    if (std.mem.eql(u8, relation_kind, "p") and !std.mem.eql(u8, via_root, "t")) return error.InvalidReplicationSourceConfig;
+    if (!std.mem.eql(u8, relation_kind, "r") and !std.mem.eql(u8, relation_kind, "p")) return error.InvalidReplicationSourceConfig;
+}
+
+test "replication publication rejects partition identity loss before checkpoint advancement" {
+    try requirePublicationSourceIdentity("t", "p", "t");
+    try requirePublicationSourceIdentity("f", "r", "t");
+    try std.testing.expectError(error.InvalidReplicationSourceConfig, requirePublicationSourceIdentity("f", "p", "t"));
+    try std.testing.expectError(error.InvalidReplicationSourceConfig, requirePublicationSourceIdentity("t", "r", "f"));
+    try std.testing.expectError(error.InvalidReplicationSourceConfig, requirePublicationSourceIdentity("t", "v", "t"));
+}
+
+test "postgres libpq retained subscription snapshot renews quantum cutoff and cancels actual FETCH" {
+    if (std.c.getenv("ANTFLY_TEST_PG_DSN") == null and std.c.getenv("PG_DSN") == null) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dsn = try testPgDsnAlloc(a);
+    var executor = try Executor.init(a);
+    defer executor.deinit();
+    const conn = try executor.connect(dsn);
+    const suffix = platform_time.monotonicNs();
+    const table = try std.fmt.allocPrint(a, "antfly_quantum_rows_{d}", .{suffix});
+    const role = try std.fmt.allocPrint(a, "antfly_quantum_role_{d}", .{suffix});
+    const function = try std.fmt.allocPrint(a, "antfly_quantum_wait_{d}", .{suffix});
+    const pub1 = try std.fmt.allocPrint(a, "antfly_quantum_a_{d}", .{suffix});
+    const pub2 = try std.fmt.allocPrint(a, "antfly_quantum_b_{d}", .{suffix});
+    const slot = try std.fmt.allocPrint(a, "antfly_quantum_slot_{d}", .{suffix});
+    const provider_lock = try std.fmt.allocPrint(a, "antfly/quantum/{d}", .{suffix});
+    const wait_key = suffix & @as(u64, std.math.maxInt(i64));
+    try execCommandForTest(&executor, conn, a, try std.fmt.allocPrint(a, "CREATE ROLE {s} NOLOGIN", .{role}));
+    defer {
+        execCommandForTest(&executor, conn, a, std.fmt.allocPrint(a, "DROP OWNED BY {s}", .{role}) catch unreachable) catch {};
+        execCommandForTest(&executor, conn, a, std.fmt.allocPrint(a, "DROP ROLE {s}", .{role}) catch unreachable) catch {};
+    }
+    try execCommandForTest(&executor, conn, a, try std.fmt.allocPrint(a, "CREATE TABLE {s}(id bigint PRIMARY KEY, value text)", .{table}));
+    defer execCommandForTest(&executor, conn, a, std.fmt.allocPrint(a, "DROP TABLE IF EXISTS {s} CASCADE", .{table}) catch unreachable) catch {};
+    try execCommandForTest(&executor, conn, a, try std.fmt.allocPrint(a, "INSERT INTO {s} VALUES (1,'first'),(2,'second'),(3,'blocked')", .{table}));
+    try execCommandForTest(&executor, conn, a, try std.fmt.allocPrint(a, "CREATE FUNCTION {s}(wanted bigint) RETURNS bool LANGUAGE plpgsql VOLATILE AS $q$ BEGIN IF wanted=3 THEN PERFORM pg_catalog.pg_advisory_xact_lock({d}); END IF; RETURN true; END $q$", .{ function, wait_key }));
+    defer execCommandForTest(&executor, conn, a, std.fmt.allocPrint(a, "DROP FUNCTION IF EXISTS {s}(bigint) CASCADE", .{function}) catch unreachable) catch {};
+    try execCommandForTest(&executor, conn, a, try std.fmt.allocPrint(a, "ALTER TABLE {s} ENABLE ROW LEVEL SECURITY", .{table}));
+    try execCommandForTest(&executor, conn, a, try std.fmt.allocPrint(a, "CREATE POLICY quantum_read ON {s} FOR SELECT USING ({s}(id))", .{ table, function }));
+    try execCommandForTest(&executor, conn, a, try std.fmt.allocPrint(a, "GRANT SELECT ON {s} TO {s}", .{ table, role }));
+    try execCommandForTest(&executor, conn, a, try std.fmt.allocPrint(a, "GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system() TO {s}", .{role}));
+    for ([_][]const u8{ pub1, pub2 }) |publication| try execCommandForTest(&executor, conn, a, try std.fmt.allocPrint(a, "CREATE PUBLICATION {s} FOR TABLE {s}", .{ publication, table }));
+    defer for ([_][]const u8{ pub1, pub2 }) |publication| execCommandForTest(&executor, conn, a, std.fmt.allocPrint(a, "DROP PUBLICATION IF EXISTS {s}", .{publication}) catch unreachable) catch {};
+    const Scope = struct {
+        checks: usize = 0,
+        expired: bool = false,
+        watch: ?struct { executor: *Executor, conn: ?*PGconn, a: Allocator, query: []const u8 } = null,
+        observed_fetch: bool = false,
+        observed: ?[32]u8 = null,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.expired) return error.DeadlineExceeded;
+            if (self.watch) |watch| {
+                const result = try watch.executor.execSimpleWithDeadline(watch.conn, watch.a, watch.query, platform_time.monotonicNs() +| std.time.ns_per_s, false);
+                defer watch.executor.pqclear(result);
+                if (watch.executor.pqntuples(result) == 1) {
+                    self.observed_fetch = true;
+                    return error.Canceled;
+                }
+            }
+        }
+        fn checkToken(raw: *const anyopaque) !void {
+            return check(@constCast(raw));
+        }
+        fn observe(raw: *anyopaque, origin: foreign_source.SubscriptionOrigin.Observation) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (origin.relations.len != 1) return error.TestUnexpectedResult;
+            if (self.observed) |prior| if (!std.mem.eql(u8, &prior, &origin.provider_identity)) return error.ForeignProviderIdentityMismatch;
+            self.observed = origin.provider_identity;
+        }
+        fn acknowledged(_: *anyopaque, _: []const u8) !void {
+            return error.TestUnexpectedResult;
+        }
+        fn authority(self: *@This()) foreign_source.SubscriptionAuthority {
+            return .{ .ptr = self, .check_fn = check, .observe_fn = observe, .acknowledged_fn = acknowledged };
+        }
+        fn token(self: *@This()) CancellationToken {
+            return .{ .ptr = self, .check_fn = checkToken };
+        }
+    };
+    var initial: Scope = .{};
+    const old_cutoff = platform_time.monotonicNs() +| 3 * std.time.ns_per_s;
+    var snapshot = try executor.asQueryExecutor().beginSubscriptionSnapshot(a, dsn, .{ .publications = &.{ pub1, pub2 }, .slot_name = slot, .lock_name = provider_lock, .expected = null, .authority = initial.authority(), .execution_deadline_ns = old_cutoff });
+    defer executor.dropInactiveLogicalReplicationSlotIfExistsAlloc(a, conn, slot, platform_time.monotonicNs() +| 30 * std.time.ns_per_s) catch {};
+    defer snapshot.deinit(a);
+    const reader: *Executor.SnapshotQuery = @ptrCast(@alignCast(snapshot.snapshot_query.ptr));
+    const original_connection = reader.conn;
+    const original_token = try a.dupe(u8, snapshot.snapshot_token);
+    const as_reader = try executor.execSimpleWithDeadline(reader.conn, a, try std.fmt.allocPrint(a, "SET ROLE {s}", .{role}), old_cutoff, true);
+    executor.pqclear(as_reader);
+    var first = try snapshot.captureRelation(a, snapshot.origin.relations[0].id, 1, old_cutoff, initial.token());
+    defer first.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), first.rows.len);
+    const pid_result = try executor.execSimpleWithDeadline(reader.conn, a, "SELECT pg_catalog.pg_backend_pid()::text", old_cutoff, false);
+    defer executor.pqclear(pid_result);
+    const backend_pid = try std.fmt.parseInt(u32, executor.pqgetvalue(pid_result, 0, 0)[0..@intCast(executor.pqgetlength(pid_result, 0, 0))], 10);
+    const old_checks = initial.checks;
+    platform_time.sleepNs((old_cutoff -| platform_time.monotonicNs()) +| std.time.ns_per_ms);
+    initial.expired = true;
+    var current: Scope = .{};
+    const fresh_cutoff = platform_time.monotonicNs() +| 30 * std.time.ns_per_s;
+    var second = try snapshot.captureRelation(a, snapshot.origin.relations[0].id, 1, fresh_cutoff, current.token());
+    defer second.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), second.rows.len);
+    try std.testing.expectEqual(old_checks, initial.checks);
+    try std.testing.expectEqual(original_connection, reader.conn);
+    try std.testing.expectEqualStrings(original_token, snapshot.snapshot_token);
+    // The real third FETCH blocks in the selected role's RLS policy. Cancel
+    // through this quantum's checkpoint while libpq is waiting on its socket.
+    try execCommandForTest(&executor, conn, a, try std.fmt.allocPrint(a, "SELECT pg_catalog.pg_advisory_lock({d})", .{wait_key}));
+    defer execCommandForTest(&executor, conn, a, std.fmt.allocPrint(a, "SELECT pg_catalog.pg_advisory_unlock({d})", .{wait_key}) catch unreachable) catch {};
+    current.watch = .{ .executor = &executor, .conn = conn, .a = a, .query = try std.fmt.allocPrint(a, "SELECT 1 FROM pg_catalog.pg_stat_activity WHERE pid={d} AND wait_event_type='Lock' AND wait_event='advisory' AND query LIKE 'FETCH FORWARD%antfly_replication_capture%'", .{backend_pid}) };
+    try std.testing.expectError(error.Cancelled, snapshot.captureRelation(a, snapshot.origin.relations[0].id, 1, fresh_cutoff, current.token()));
+    try std.testing.expect(current.observed_fetch);
+    try std.testing.expect(reader.conn == null);
+    try std.testing.expectEqualStrings(original_token, snapshot.snapshot_token);
+}
+test "postgres libpq subscription continuity preserves whole transactions replay and ACK fences" {
+    if (std.c.getenv("ANTFLY_TEST_PG_DSN") == null and std.c.getenv("PG_DSN") == null) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dsn = try testPgDsnAlloc(a);
+    var executor = try Executor.init(a);
+    defer executor.deinit();
+    const conn = try executor.connect(dsn);
+    const suffix = platform_time.monotonicNs();
+    const table = try std.fmt.allocPrint(a, "antfly_stream_rows_{d}", .{suffix});
+    const publication = try std.fmt.allocPrint(a, "antfly_stream_pub_{d}", .{suffix});
+    const slot = try std.fmt.allocPrint(a, "antfly_stream_slot_{d}", .{suffix});
+    const deadline = platform_time.monotonicNs() +| 30 * std.time.ns_per_s;
+    try execCommandForTest(&executor, conn, a, try std.fmt.allocPrint(a, "CREATE TABLE {s}(id numeric, weight real, value text, PRIMARY KEY (id, weight))", .{table}));
+    defer execCommandForTest(&executor, conn, a, std.fmt.allocPrint(a, "DROP TABLE IF EXISTS {s} CASCADE", .{table}) catch unreachable) catch {};
+    try execCommandForTest(&executor, conn, a, try std.fmt.allocPrint(a, "CREATE PUBLICATION {s} FOR TABLE {s}", .{ publication, table }));
+    defer execCommandForTest(&executor, conn, a, std.fmt.allocPrint(a, "DROP PUBLICATION IF EXISTS {s}", .{publication}) catch unreachable) catch {};
+    try execCommandForTest(&executor, conn, a, try std.fmt.allocPrint(a, "SELECT * FROM pg_create_logical_replication_slot('{s}', 'pgoutput')", .{slot}));
+    defer executor.dropInactiveLogicalReplicationSlotIfExistsAlloc(a, conn, slot, platform_time.monotonicNs() +| 30 * std.time.ns_per_s) catch {};
+    // Controlled authority qualifies the actual provider boundary only. Native
+    // receipt custody has separate DocStore tests; this is not a physical ACK.
+    const Authority = struct {
+        allowed: bool = false,
+        checkpoint: []const u8 = "",
+        checks: usize = 0,
+        acknowledgements: usize = 0,
+        deny_at: ?usize = null,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+        }
+        fn observe(_: *anyopaque, _: foreign_source.SubscriptionOrigin.Observation) !void {}
+        fn acknowledged(raw: *anyopaque, checkpoint: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.acknowledgements += 1;
+            if (!self.allowed or !std.mem.eql(u8, checkpoint, self.checkpoint) or (self.deny_at != null and self.acknowledgements == self.deny_at.?)) return error.ReplicationCutoverAuthorityLost;
+        }
+        fn value(self: *@This()) foreign_source.SubscriptionAuthority {
+            return .{ .ptr = self, .check_fn = check, .observe_fn = observe, .acknowledged_fn = acknowledged };
+        }
+    };
+    var authority: Authority = .{};
+    const initial = try executor.loadLogicalReplicationSlotCheckpointAlloc(a, conn, slot, deadline);
+    var request: foreign_source.SubscriptionRequest = .{ .publications = &.{publication}, .slot_name = slot, .lock_name = try std.fmt.allocPrint(a, "antfly/stream/{s}", .{slot}), .expected = null, .authority = authority.value(), .checkpoint = initial, .limit = 1, .password_required = std.c.getenv("ANTFLY_TEST_PG_REQUIRE_PASSWORD") != null, .execution_deadline_ns = deadline };
+    var origin = try executor.subscriptionOriginAlloc(a, conn, request);
+    defer origin.deinit(a);
+    request.expected = origin;
+    var empty = try executor.asQueryExecutor().pollSubscription(a, dsn, request);
+    defer empty.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), empty.poll.transactions.?.len);
+    try std.testing.expectEqual(origin.provider_identity, empty.poll.provider_identity.?);
+    try std.testing.expect(empty.poll.source_relation_id == null);
+    // upto_nchanges is a soft bound: all three changes of this one real COMMIT
+    // must survive a limit of one without exposing an uncommitted prefix.
+    try execCommandForTest(&executor, conn, a, try std.fmt.allocPrint(a, "INSERT INTO {s} VALUES (1,0,'a'),(2,0.1,'b'),(3,0.2,'c')", .{table}));
+    var first = try executor.asQueryExecutor().pollSubscription(a, dsn, request);
+    defer first.deinit(a);
+    try first.poll.validateTransactions();
+    try std.testing.expectEqual(origin.provider_identity, first.poll.provider_identity.?);
+    try std.testing.expect(first.poll.source_relation_id == null);
+    try std.testing.expectEqual(@as(usize, 1), first.poll.transactions.?.len);
+    try std.testing.expectEqual(@as(usize, 3), first.poll.changes.len);
+    const transaction = first.poll.transactions.?[0];
+    try std.testing.expectEqual(@as(usize, 3), transaction.change_count);
+    var replay = try executor.asQueryExecutor().pollSubscription(a, dsn, request);
+    defer replay.deinit(a);
+    try std.testing.expectEqual(transaction.xid, replay.poll.transactions.?[0].xid);
+    try std.testing.expectEqual(transaction.end_lsn, replay.poll.transactions.?[0].end_lsn);
+    try std.testing.expectEqual(@as(usize, 3), replay.poll.changes.len);
+    const wal = @import("../api/replication_subscription_rows.zig");
+    const durable = try foreign_source.parseReplicationCheckpoint(initial);
+    const original_work = (try wal.nextWalTransaction(first.poll, durable)).?;
+    const replayed_work = (try wal.nextWalTransaction(replay.poll, durable)).?;
+    try std.testing.expectEqual(original_work.event, replayed_work.event);
+    try std.testing.expectEqual(@as(usize, 3), replayed_work.changes.len);
+    try std.testing.expect((try wal.nextWalTransaction(replay.poll, transaction.end_lsn)) == null);
+
+    try std.testing.expectEqualStrings(initial, try executor.loadLogicalReplicationSlotCheckpointAlloc(a, conn, slot, deadline));
+    request.checkpoint = transaction.checkpoint;
+    authority.checkpoint = transaction.checkpoint;
+    try std.testing.expectError(error.ReplicationCutoverAuthorityLost, executor.asQueryExecutor().acknowledgeSubscription(a, dsn, request));
+    try std.testing.expectEqualStrings(initial, try executor.loadLogicalReplicationSlotCheckpointAlloc(a, conn, slot, deadline));
+    authority.allowed = true;
+    authority.acknowledgements = 0;
+    authority.deny_at = 2;
+    // Revocation after acquiring the real slot lock must still precede the
+    // upstream effect. The second independent receipt check is mandatory.
+    try std.testing.expectError(error.ReplicationCutoverAuthorityLost, executor.asQueryExecutor().acknowledgeSubscription(a, dsn, request));
+    try std.testing.expectEqual(@as(usize, 2), authority.acknowledgements);
+    try std.testing.expectEqualStrings(initial, try executor.loadLogicalReplicationSlotCheckpointAlloc(a, conn, slot, deadline));
+    request.advance_durable_checkpoint = true;
+    authority.acknowledgements = 0;
+    try std.testing.expectError(error.ReplicationCutoverAuthorityLost, executor.asQueryExecutor().pollSubscription(a, dsn, request));
+    try std.testing.expectEqualStrings(initial, try executor.loadLogicalReplicationSlotCheckpointAlloc(a, conn, slot, deadline));
+    authority.acknowledgements = 0;
+    authority.deny_at = null;
+    var caught_up_inline = try executor.asQueryExecutor().pollSubscription(a, dsn, request);
+    defer caught_up_inline.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), caught_up_inline.poll.transactions.?.len);
+    request.advance_durable_checkpoint = false;
+    try std.testing.expectEqual(@as(usize, 2), authority.acknowledgements);
+    try std.testing.expectEqualStrings(transaction.checkpoint, try executor.loadLogicalReplicationSlotCheckpointAlloc(a, conn, slot, deadline));
+    // A cold provider instance must detect an externally advanced/replaced slot
+    // instead of starting above its caller's durable position and losing rows.
+    request.checkpoint = initial;
+    authority.checkpoint = initial;
+    var cold = try Executor.init(a);
+    defer cold.deinit();
+    try std.testing.expectError(error.ForeignProviderIdentityMismatch, cold.asQueryExecutor().pollSubscription(a, dsn, request));
+    try std.testing.expectError(error.ForeignProviderIdentityMismatch, cold.asQueryExecutor().acknowledgeSubscription(a, dsn, request));
+    try std.testing.expectEqualStrings(transaction.checkpoint, try executor.loadLogicalReplicationSlotCheckpointAlloc(a, conn, slot, deadline));
+    request.checkpoint = transaction.checkpoint;
+    authority.checkpoint = transaction.checkpoint;
+    var caught_up = try cold.asQueryExecutor().pollSubscription(a, dsn, request);
+    defer caught_up.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), caught_up.poll.transactions.?.len);
+    try execCommandForTest(&executor, conn, a, "BEGIN");
+    try execCommandForTest(&executor, conn, a, try std.fmt.allocPrint(a, "UPDATE {s} SET id=1.000, weight='-0'::real WHERE id=1", .{table}));
+    try execCommandForTest(&executor, conn, a, try std.fmt.allocPrint(a, "UPDATE {s} SET id=8 WHERE id=1", .{table}));
+    try execCommandForTest(&executor, conn, a, "COMMIT");
+    var moved = try cold.asQueryExecutor().pollSubscription(a, dsn, request);
+    defer moved.deinit(a);
+    const move = (try wal.nextWalTransaction(moved.poll, transaction.end_lsn)).?;
+    try std.testing.expectEqual(@as(usize, 2), move.changes.len);
+    const relation = moved.origin.relations[0];
+    const scaled = try wal.addressWalRow(a, origin.provider_identity, relation, move.changes[0]);
+    const addressed = try wal.addressWalRow(a, origin.provider_identity, relation, move.changes[1]);
+    const insert = try wal.addressWalRow(a, origin.provider_identity, relation, first.poll.changes[0]);
+    try std.testing.expectEqualStrings(insert.after_key.?, scaled.before_key.?);
+    try std.testing.expectEqualStrings(insert.after_key.?, scaled.after_key.?);
+    try std.testing.expectEqualStrings(insert.after_key.?, addressed.before_key.?);
+    try std.testing.expect(!std.mem.eql(u8, addressed.before_key.?, addressed.after_key.?));
+}
+
+test "postgres libpq subscription capture retains and replays a real exported snapshot" {
+    if (std.c.getenv("ANTFLY_TEST_PG_DSN") == null and std.c.getenv("PG_DSN") == null) return error.SkipZigTest;
+    const local = @import("antfly_local_sources");
+    const capture_mod = @import("../api/replication_subscription_capture.zig");
+    const codec = @import("../system_catalog/replication/snapshot_codec.zig");
+    const payload = @import("../system_catalog/replication/payload.zig");
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dsn = try testPgDsnAlloc(a);
+    var executor = try Executor.init(a);
+    defer executor.deinit();
+    const conn = try executor.connect(dsn);
+    const table = "antfly_capture_rows";
+    const publication = "antfly_capture_publication";
+    const slot = "antfly_capture_slot";
+    try execCommandForTest(&executor, conn, a, "CREATE TABLE " ++ table ++ "(id bigint, payload jsonb, PRIMARY KEY (id) INCLUDE (payload))");
+    defer execCommandForTest(&executor, conn, a, "DROP TABLE IF EXISTS " ++ table ++ " CASCADE") catch {};
+    try execCommandForTest(&executor, conn, a, "INSERT INTO " ++ table ++ " VALUES (1,'null'),(2,NULL)");
+    try execCommandForTest(&executor, conn, a, "CREATE PUBLICATION " ++ publication ++ " FOR TABLE " ++ table);
+    defer execCommandForTest(&executor, conn, a, "DROP PUBLICATION IF EXISTS " ++ publication) catch {};
+    const deadline = platform_time.monotonicNs() +| 30 * std.time.ns_per_s;
+    defer executor.dropInactiveLogicalReplicationSlotIfExistsAlloc(a, conn, slot, deadline) catch {};
+    const Authority = struct {
+        binding: ?[32]u8 = null,
+        fail_at: ?usize = 1,
+        observations: usize = 0,
+        export_checkpoint: ?u64 = null,
+        fn check(_: *anyopaque) !void {}
+        fn observe(raw: *anyopaque, observed: foreign_source.SubscriptionOrigin.Observation) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, 1), observed.relations.len);
+            self.observations += 1;
+            if (self.fail_at == self.observations) return error.TestInjectedObservationFailure;
+            self.binding = observed.provider_identity;
+        }
+        fn exported(raw: *anyopaque, provider: [32]u8, checkpoint: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.binding.?, provider);
+            try std.testing.expect(self.export_checkpoint == null);
+            self.export_checkpoint = checkpoint;
+        }
+        fn ack(_: *anyopaque, _: []const u8) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var owner: Authority = .{};
+    const authority: foreign_source.SubscriptionAuthority = .{ .ptr = &owner, .exported_fn = Authority.exported, .check_fn = Authority.check, .observe_fn = Authority.observe, .acknowledged_fn = Authority.ack };
+    var runtime: postgres_source.RuntimeSource = .{ .alloc = a, .executor = executor.asQueryExecutor(), .dsn = try a.dupe(u8, dsn) };
+    defer runtime.deinit();
+    const request: foreign_source.SubscriptionRequest = .{
+        .publications = &.{publication},
+        .slot_name = slot,
+        .lock_name = "antfly/capture/test",
+        .expected = null,
+        .authority = authority,
+        .password_required = std.c.getenv("ANTFLY_TEST_PG_REQUIRE_PASSWORD") != null,
+        .execution_deadline_ns = deadline,
+    };
+    try std.testing.expectError(error.TestInjectedObservationFailure, runtime.asSource().beginSubscriptionSnapshot(a, request));
+    try std.testing.expect(!try executor.logicalReplicationSlotExistsAlloc(a, conn, slot, deadline));
+    try std.testing.expect(owner.export_checkpoint == null);
+    owner.fail_at = 3;
+    try std.testing.expectError(error.TestInjectedObservationFailure, runtime.asSource().beginSubscriptionSnapshot(a, request));
+    try std.testing.expect(!try executor.logicalReplicationSlotExistsAlloc(a, conn, slot, deadline));
+    try std.testing.expect(owner.export_checkpoint != null);
+    owner.export_checkpoint = null;
+    owner.fail_at = null;
+    var snapshot = try runtime.asSource().beginSubscriptionSnapshot(a, request);
+    defer snapshot.deinit(a);
+    try std.testing.expectEqual(owner.export_checkpoint.?, try foreign_source.parseReplicationCheckpoint(snapshot.checkpoint));
+    try std.testing.expect(snapshot.origin.relations[0].columns[0].key);
+    try std.testing.expect(!snapshot.origin.relations[0].columns[1].key);
+    const identity: foreign_source.SubscriptionOrigin.Identity = .{
+        .owner = .{ .logical_subscription = .{ .database_id = 2, .subscription_id = 3 } },
+        .origin_generation = 1,
+        .provider_identity = owner.binding.?,
+        .recipe_digest = @splat(4),
+        .slot_name = slot,
+        .roster_digest = try snapshot.origin.digest(a),
+    };
+    const incarnation = "0123456789abcdef0123456789abcdef".*;
+    const held: local.api_replication_source_purpose.Purpose = .{
+        .metadata_group = 1,
+        .incarnation = incarnation,
+        .owner = identity.owner,
+        .birth = 1,
+        .source_digest = try @import("../metadata/replication_digest.zig").digest("antfly/source-origin/v3", .{ @as(u64, 1), incarnation, identity }, foreign_source.SubscriptionOrigin.max_encoded_bytes),
+        .recipe_digest = identity.recipe_digest,
+        .roster_digest = identity.roster_digest,
+        .upload = .{ .token = 2, .nonce = @splat(5), .expires_at_unix_ns = 100 },
+    };
+    var dir = try local.common_test_directory.TestDirectory.init("postgres-subscription-capture");
+    defer dir.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, dir.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    var capture = try capture_mod.Capture.init(a, &store, identity, held, &snapshot, true);
+    defer capture.deinit();
+    try execCommandForTest(&executor, conn, a, "INSERT INTO " ++ table ++ " VALUES (3,'{}')");
+    for (0..2) |_| try std.testing.expect(!try capture.step(1, deadline, authority));
+    try std.testing.expect(try capture.step(1, deadline, authority));
+    const context = try payload.retain(a, &store, capture.scope, "test execution context", .none);
+    const ready = try capture.finish(context, authority);
+    try std.testing.expectEqual(@as(u64, 2), ready.total_rows);
+    var replay = try codec.Snapshot.open(a, &store, identity, held, ready, snapshot.origin, .none);
+    defer replay.deinit();
+    var json_null_seen = false;
+    var sql_null_seen = false;
+    while (try replay.next(a, .none)) |page| {
+        defer page.deinit();
+        const row = page.value.rows[0];
+        const id = row.value.object.get("id").?.number_string;
+        try std.testing.expect(row.value.object.get("payload").? == .null);
+        if (std.mem.eql(u8, id, "1")) {
+            try std.testing.expectEqualStrings("payload", row.json_null_fields[0]);
+            json_null_seen = true;
+        } else {
+            try std.testing.expectEqualStrings("2", id);
+            try std.testing.expectEqual(@as(usize, 0), row.json_null_fields.len);
+            sql_null_seen = true;
+        }
+    }
+    try std.testing.expect(json_null_seen and sql_null_seen);
+    try snapshot.abort(a);
+    try std.testing.expect(!try executor.logicalReplicationSlotExistsAlloc(a, conn, slot, deadline));
 }

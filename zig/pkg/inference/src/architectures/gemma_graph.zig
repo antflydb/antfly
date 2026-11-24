@@ -188,7 +188,7 @@ const LayerOutput = struct {
 /// Build full PLE tensor [total, ple_total_dim] from input_ids and initial hidden state.
 /// Matches HF Gemma4TextModel:
 ///   token_path = embed_per_layer(input_ids) * sqrt(ple_dim)
-///   ctx_path = RMSNorm(per_layer_proj(hidden), per_layer_proj_norm)
+///   ctx_path = RMSNorm(per_layer_proj(hidden)/sqrt(hidden_size), per_layer_proj_norm)
 ///   combined = (token_path + ctx_path) * (1/sqrt(2))
 fn buildPleVectors(
     bld: *Builder,
@@ -232,7 +232,8 @@ fn buildPleVectors(
         Shape.init(.f32, &.{ple_dim_i}),
     );
     const proj_flat = try bld.reshape(model_proj, Shape.init(.f32, &.{ total_i * num_layers_i, ple_dim_i }));
-    const proj_normed_flat = try bld.rmsNorm(proj_flat, proj_norm_w, @intCast(config.ple_hidden_size), config.norm_eps);
+    // Fold 1/sqrt(hidden_size) into epsilon, matching the direct PLE path.
+    const proj_normed_flat = try bld.rmsNorm(proj_flat, proj_norm_w, @intCast(config.ple_hidden_size), config.pleProjectionNormEps());
     const proj_normed = try bld.reshape(proj_normed_flat, Shape.init(.f32, &.{ total_i, ple_total_i }));
 
     // Combine: (token_scaled + proj_normed) * (1/sqrt(2))

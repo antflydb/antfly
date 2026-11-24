@@ -1,0 +1,563 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Durable, immutable HTTP prepared resources. The bounded directory is one
+//! native atomic index, separate from transaction records and recovery. A
+//! successful load owns its copy: close/expiry prevents subsequent admission,
+//! but does not cancel an execution that already loaded the resource.
+const std = @import("std");
+const transactions = @import("../../transactions.zig");
+const catalog = @import("antfly_local_sources").sql_catalog;
+const ast = @import("antfly_local_sources").sql_ast;
+const Budget = @import("antfly_local_sources").sql_memory_budget;
+const connection_record = @import("connection_record.zig");
+
+const key = "\x00sql-prepared-v1";
+pub const max_resources = 128;
+pub const max_statement_bytes = 64 << 10;
+pub const max_record_bytes = 4 << 20;
+pub const max_resource_bytes = 512 << 10;
+pub const ttl_ms: u64 = 60 * 60 * 1000;
+
+pub const Binding = struct {
+    kind: enum { table, view, sequence, function, procedure, operator, aggregate, cast, named_type, graph } = .table,
+    /// A prepared cast retains identity independently of namespace spelling.
+    /// Executable enum generations are append-only, so additive generations
+    /// may advance while drop/recreate and catalog replacement remain fenced.
+    named_type: ?struct {
+        lookup: []const u8,
+        incarnation: [16]u8,
+        namespace_id: u64,
+        origin_id: [16]u8,
+    } = null,
+    cast_database_id: ?u64 = null,
+    cast_pair: ?@import("antfly_local_sources").sql_catalog.casts.Pair = null,
+    sequence_incarnation: ?[16]u8 = null,
+    routine_incarnation: ?[16]u8 = null,
+    routine_signature: ?[]const u8 = null,
+    routine_namespace_id: ?u64 = null,
+    /// Original normalized lookup spelling. Dependency-only identity witnesses
+    /// have no spelling and never participate in overload selection.
+    routine_lookup: ?[]const u8 = null,
+    definition_digest: ?[32]u8 = null,
+    graph_pattern_hash: u64 = 0,
+    database: []const u8,
+    namespace: []const u8,
+    name: []const u8,
+    physical_name: []const u8,
+    id: u64,
+    schema_version: u32,
+    revision: u64,
+    /// Binds an immutable native lifetime independently of schema-version reuse.
+    sql_persistence_fingerprint: ?[32]u8 = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |name| {
+            const emit = if (comptime std.mem.eql(u8, name, "sql_persistence_fingerprint")) self.sql_persistence_fingerprint != null else true;
+            if (emit) {
+                try jw.objectField(name);
+                try jw.write(@field(self, name));
+            }
+        }
+        try jw.endObject();
+    }
+
+    pub fn from(table: catalog.Table) !Binding {
+        const scope = table.scope orelse return error.InvalidSqlBackendResponse;
+        return .{ .kind = if (table.graph != null) .graph else .table, .graph_pattern_hash = if (table.graph) |graph| std.hash.Wyhash.hash(0x67726170685f7371, graph.definition.query.source) else 0, .database = scope.database, .namespace = scope.namespace, .name = scope.name, .physical_name = table.physical_name, .id = table.id, .schema_version = table.schema_version, .revision = scope.revision, .sql_persistence_fingerprint = if (table.sql_persistence) |descriptor| try descriptor.fingerprint() else null };
+    }
+
+    pub fn verify(bindings: []const Binding, table: catalog.Table) !void {
+        const current = try from(table);
+        for (bindings) |entry| {
+            if (entry.kind != current.kind or entry.graph_pattern_hash != current.graph_pattern_hash) continue;
+            if (!std.mem.eql(u8, entry.database, current.database) or !std.mem.eql(u8, entry.namespace, current.namespace) or !std.mem.eql(u8, entry.name, current.name)) continue;
+            if (entry.id != current.id or entry.schema_version != current.schema_version or entry.revision != current.revision or !std.meta.eql(entry.sql_persistence_fingerprint, current.sql_persistence_fingerprint) or !std.mem.eql(u8, entry.physical_name, current.physical_name)) return error.CatalogGenerationChanged;
+            return;
+        }
+        return error.CatalogGenerationChanged;
+    }
+
+    pub fn fromCast(a: std.mem.Allocator, database: []const u8, snapshot: @import("../../../system_catalog/casts.zig").Snapshot, pair: @import("antfly_local_sources").sql_catalog.casts.Pair) !Binding {
+        return .{ .kind = .cast, .database = database, .namespace = "", .name = try pair.keyAlloc(a), .physical_name = "", .id = if (snapshot.record) |record| record.id else 0, .schema_version = if (snapshot.record) |record| record.generation else 0, .revision = snapshot.revision, .routine_incarnation = snapshot.incarnation, .cast_database_id = snapshot.database_id orelse return error.DatabaseNotFound, .cast_pair = pair };
+    }
+    pub fn verifyCast(bindings: []const Binding, current: Binding) !void {
+        if (current.kind != .cast or current.cast_pair == null or current.cast_database_id == null or current.cast_database_id == 0 or current.routine_incarnation == null or ((current.id == 0) != (current.schema_version == 0))) return error.InvalidSqlBackendResponse;
+        if (std.mem.allEqual(u8, &current.routine_incarnation.?, 0)) return error.InvalidSqlBackendResponse;
+        current.cast_pair.?.validate() catch return error.InvalidSqlBackendResponse;
+        for (bindings) |entry| {
+            if (entry.kind != .cast or !std.meta.eql(entry.cast_pair, current.cast_pair) or entry.cast_database_id != current.cast_database_id) continue;
+            if (entry.id != current.id or entry.schema_version != current.schema_version or !std.meta.eql(entry.routine_incarnation, current.routine_incarnation)) return error.CatalogGenerationChanged;
+            return;
+        }
+        return error.CatalogGenerationChanged;
+    }
+
+    pub fn fromRoutine(a: std.mem.Allocator, target: @import("antfly_local_sources").system_catalog_domain.Target, record: @import("antfly_local_sources").sql_catalog.routines.records.Record, incarnation: [16]u8, revision: u64) !Binding {
+        return .{ .kind = std.meta.stringToEnum(@FieldType(Binding, "kind"), @tagName(record.kind)).?, .database = target.database, .namespace = target.namespace, .name = target.table, .physical_name = "", .id = record.id, .schema_version = record.generation, .revision = revision, .routine_incarnation = incarnation, .routine_signature = try record.definition.signatureAlloc(a) };
+    }
+    pub fn verifyRoutine(bindings: []const Binding, current: Binding) !void {
+        if ((current.kind != .function and current.kind != .procedure and current.kind != .operator and current.kind != .aggregate) or current.routine_incarnation == null or current.routine_signature == null or current.routine_namespace_id == null or current.routine_namespace_id == 0) return error.InvalidSqlBackendResponse;
+        for (bindings) |entry| {
+            if (entry.kind != current.kind or entry.id != current.id) continue;
+            if (entry.routine_namespace_id != current.routine_namespace_id or entry.schema_version != current.schema_version or !std.meta.eql(entry.routine_incarnation, current.routine_incarnation) or entry.routine_signature == null or !std.mem.eql(u8, entry.routine_signature.?, current.routine_signature.?)) return error.CatalogGenerationChanged;
+            return;
+        }
+        return error.CatalogGenerationChanged;
+    }
+
+    pub fn fromView(target: @import("antfly_local_sources").system_catalog_domain.Target, id: u64, generation: u32, digest: [32]u8, revision: u64) Binding {
+        return .{
+            .kind = .view,
+            .definition_digest = digest,
+            .database = target.database,
+            .namespace = target.namespace,
+            .name = target.table,
+            .physical_name = "",
+            .id = id,
+            .schema_version = generation,
+            .revision = revision,
+        };
+    }
+    pub fn verifyView(bindings: []const Binding, current: Binding) !void {
+        if (current.kind != .view or current.definition_digest == null) return error.InvalidSqlBackendResponse;
+        for (bindings) |entry| {
+            if (entry.kind != .view or entry.id != current.id) continue;
+            if (entry.schema_version != current.schema_version or entry.definition_digest == null or
+                !std.mem.eql(u8, &entry.definition_digest.?, &current.definition_digest.?)) return error.CatalogGenerationChanged;
+            // Compatible source changes and relation renames do not change a
+            // view definition. Every execution still pins a fresh catalog cut.
+            return;
+        }
+        return error.CatalogGenerationChanged;
+    }
+};
+
+test "SQL prepared view manifests preserve identity across source epochs and reject retargeted definitions" {
+    const target: @import("antfly_local_sources").system_catalog_domain.Target = .{ .table = "stored" };
+    const original = Binding.fromView(target, 7, 1, @splat(1), 3);
+    var current = original;
+    current.revision = 9;
+    current.name = "renamed";
+    try Binding.verifyView(&.{original}, current);
+    current.id = 8;
+    try std.testing.expectError(error.CatalogGenerationChanged, Binding.verifyView(&.{original}, current));
+    current = original;
+    current.definition_digest = @splat(2);
+    try std.testing.expectError(error.CatalogGenerationChanged, Binding.verifyView(&.{original}, current));
+    current = original;
+    current.schema_version = 2;
+    try std.testing.expectError(error.CatalogGenerationChanged, Binding.verifyView(&.{original}, current));
+    const table: catalog.Table = .{
+        .id = 7,
+        .physical_name = "",
+        .schema_version = 1,
+        .columns = &.{},
+        .scope = .{ .database = target.database, .namespace = target.namespace, .name = target.table, .revision = 3 },
+    };
+    try std.testing.expectError(error.CatalogGenerationChanged, Binding.verify(&.{original}, table));
+}
+
+pub const Resource = struct {
+    // Keep the routing fields first for bounded ownership reads.
+    id: [32]u8,
+    owner_node_id: u64,
+    principal: []const u8,
+    expires_at_ms: u64,
+    database: []const u8,
+    namespace: []const u8,
+    statement: []const u8,
+    /// A resource described against a durable SQL session cannot later be
+    /// executed against another session's (possibly policy-sensitive) values.
+    /// Null preserves the original session-independent resource contract.
+    session_id: ?[32]u8 = null,
+    /// Idle HTTP connection ownership is distinct from an active transaction.
+    /// The generation is fenced atomically with DISCARD ALL in the same store.
+    connection_id: ?[32]u8 = null,
+    connection_generation: ?u64 = null,
+    /// The described types depend on the scoped setting definitions, not on
+    /// the mutable session values. Execution re-reads values at its own cut.
+    setting_epoch: ?u64 = null,
+    lookup_path: ?@import("../../../pgwire/search_path.zig").Path = null,
+    parameter_types: []const ?ast.ColumnType,
+    parameter_descriptors: []const @import("antfly_local_sources").sql_scalar.Type = &.{},
+    bindings: []const Binding,
+
+    pub fn verifyExecutionSession(self: Resource, encoded: ?[]const u8) !void {
+        if (self.session_id) |attached| {
+            const supplied = @import("../../distributed_txn.zig").parseTxnIdHex(encoded orelse return error.SqlTransactionNotActive) catch return error.SqlTransactionNotActive;
+            const expected = @import("../../distributed_txn.zig").parseTxnIdHex(&attached) catch return error.SqlPreparedNotFound;
+            if (!std.mem.eql(u8, &expected, &supplied)) return error.SqlTransactionNotActive;
+        }
+    }
+};
+
+pub const Owned = struct {
+    alloc: std.mem.Allocator,
+    budget: *Budget,
+    parsed: std.json.Parsed(Resource),
+    value: Resource,
+
+    pub fn deinit(self: *Owned) void {
+        self.parsed.deinit();
+        self.alloc.destroy(self.budget);
+        self.* = undefined;
+    }
+};
+const Entry = struct { id: [32]u8, expires_at_ms: u64, bytes: usize };
+const Directory = struct { resources: []const Entry = &.{} };
+const Action = union(enum) { create: Resource, close: []const u8 };
+
+fn validateParameters(resource: Resource) !void {
+    if (resource.lookup_path) |path| try path.validate();
+    if (resource.parameter_types.len != resource.parameter_descriptors.len or resource.parameter_descriptors.len > 1024) return error.InvalidSqlParameters;
+    for (resource.parameter_types, resource.parameter_descriptors) |kind, descriptor| {
+        if (kind != descriptor.kind) return error.InvalidSqlParameters;
+        try @import("antfly_local_sources").sql_scalar.validateParameterDescriptorWire(descriptor);
+    }
+}
+
+pub fn create(store: *transactions.DurableSessionStore, resource: Resource, now_ms: u64) !void {
+    try validateParameters(resource);
+    if (resource.statement.len == 0 or resource.statement.len > max_statement_bytes or resource.bindings.len > 64 or resource.parameter_types.len > 1024 or resource.expires_at_ms <= now_ms or resource.expires_at_ms - now_ms > ttl_ms) return error.SqlProgramLimitExceeded;
+    try access(store, store.alloc, .{ .create = resource }, resource.principal, resource.owner_node_id, now_ms, resource.connection_id);
+}
+
+pub fn load(store: *transactions.DurableSessionStore, alloc: std.mem.Allocator, id: []const u8, principal: []const u8, owner_node_id: u64, now_ms: u64) !Owned {
+    return loadForConnection(store, alloc, id, principal, owner_node_id, now_ms, null);
+}
+
+pub fn loadForConnection(store: *transactions.DurableSessionStore, alloc: std.mem.Allocator, id: []const u8, principal: []const u8, owner_node_id: u64, now_ms: u64, connection_id: ?[32]u8) !Owned {
+    return switch (store.backend) {
+        .docstore => |backend| blk: {
+            var txn = try backend.beginReadTxn();
+            defer txn.abort();
+            break :blk try loadTxn(&txn, alloc, id, principal, owner_node_id, now_ms, connection_id);
+        },
+        .runtime => |backend| blk: {
+            var txn = try backend.beginRead();
+            defer txn.abort();
+            break :blk try loadTxn(&txn, alloc, id, principal, owner_node_id, now_ms, connection_id);
+        },
+    };
+}
+
+pub fn resourceKey(id: []const u8) ![key.len + 1 + 32]u8 {
+    if (id.len != 32) return error.SqlPreparedNotFound;
+    var result: [key.len + 1 + 32]u8 = undefined;
+    @memcpy(result[0..key.len], key);
+    result[key.len] = '/';
+    @memcpy(result[key.len + 1 ..], id);
+    return result;
+}
+
+fn loadTxn(txn: anytype, alloc: std.mem.Allocator, id: []const u8, principal: []const u8, owner_node_id: u64, now_ms: u64, connection_id: ?[32]u8) !Owned {
+    const resource_key = try resourceKey(id);
+    const raw = txn.get(&resource_key) catch |err| switch (err) {
+        error.NotFound => return error.SqlPreparedNotFound,
+        else => return err,
+    };
+    if (raw.len > max_resource_bytes) return error.SqlProgramLimitExceeded;
+    const budget = try alloc.create(Budget);
+    errdefer alloc.destroy(budget);
+    budget.* = .{ .backing = alloc, .limit = 8 << 20 };
+    var value = std.json.parseFromSlice(Resource, budget.allocator(), raw, .{ .allocate = .alloc_always }) catch |err| return if (budget.exhausted) error.SqlProgramLimitExceeded else err;
+    errdefer value.deinit();
+    if (value.value.statement.len > max_statement_bytes or value.value.bindings.len > 64 or value.value.parameter_types.len > 1024) return error.SqlProgramLimitExceeded;
+    validateParameters(value.value) catch return error.SqlPreparedNotFound;
+    if (value.value.expires_at_ms <= now_ms or !std.mem.eql(u8, value.value.principal, principal) or !std.mem.eql(u8, &value.value.id, id)) return error.SqlPreparedNotFound;
+    if (value.value.owner_node_id != owner_node_id) return error.SqlPreparedWrongOwner;
+    if (value.value.connection_id) |bound| {
+        const supplied = connection_id orelse return error.SqlPreparedNotFound;
+        if (!std.mem.eql(u8, &bound, &supplied)) return error.SqlPreparedNotFound;
+        var connection = try connection_record.loadTxn(txn, alloc, &bound);
+        defer connection.deinit();
+        try connection.value.requireOwner(&bound, principal, owner_node_id, now_ms);
+        if (value.value.connection_generation != connection.value.generation) return error.SqlPreparedNotFound;
+    } else if (connection_id != null or value.value.connection_generation != null) return error.SqlPreparedNotFound;
+    return .{ .alloc = alloc, .budget = budget, .parsed = value, .value = value.value };
+}
+
+pub fn close(store: *transactions.DurableSessionStore, id: []const u8, principal: []const u8, owner_node_id: u64, now_ms: u64) !void {
+    try access(store, store.alloc, .{ .close = id }, principal, owner_node_id, now_ms, null);
+}
+
+pub fn closeForConnection(store: *transactions.DurableSessionStore, id: []const u8, principal: []const u8, owner_node_id: u64, now_ms: u64, connection_id: [32]u8) !void {
+    try access(store, store.alloc, .{ .close = id }, principal, owner_node_id, now_ms, connection_id);
+}
+
+fn access(store: *transactions.DurableSessionStore, alloc: std.mem.Allocator, action: Action, principal: []const u8, owner_node_id: u64, now_ms: u64, connection_id: ?[32]u8) !void {
+    const mutation = store.mutationMutex();
+    @import("antfly_platform").sync.lockYielding(mutation);
+    defer mutation.unlock();
+    if (store.fail_writes_for_test) return error.InjectedSessionStoreFailure;
+    return switch (store.backend) {
+        .docstore => |backend| blk: {
+            var txn = try backend.beginWriteTxn();
+            errdefer txn.abort();
+            break :blk try accessTxn(&txn, alloc, action, principal, owner_node_id, now_ms, connection_id);
+        },
+        .runtime => |backend| blk: {
+            var txn = try backend.beginWrite();
+            errdefer txn.abort();
+            break :blk try accessTxn(&txn, alloc, action, principal, owner_node_id, now_ms, connection_id);
+        },
+    };
+}
+
+fn accessTxn(txn: anytype, alloc: std.mem.Allocator, action: Action, principal: []const u8, owner_node_id: u64, now_ms: u64, connection_id: ?[32]u8) !void {
+    const raw = txn.get(key) catch |err| switch (err) {
+        error.NotFound => "{}",
+        else => return err,
+    };
+    if (raw.len > 64 << 10) return error.SqlProgramLimitExceeded;
+    var budget: Budget = .{ .backing = alloc, .limit = 32 << 20 };
+    const scratch = budget.allocator();
+    var parsed = try std.json.parseFromSlice(Directory, scratch, raw, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    if (parsed.value.resources.len > max_resources) return error.SqlProgramLimitExceeded;
+    var retained: [max_resources]Entry = undefined;
+    var count: usize = 0;
+    var total_bytes: usize = 0;
+    var found = false;
+    const id: []const u8 = switch (action) {
+        .create => |*value| &value.id,
+        .close => |value| value,
+    };
+    if (action == .close) {
+        var owned = try loadTxn(txn, alloc, id, principal, owner_node_id, now_ms, connection_id);
+        owned.deinit();
+    }
+    for (parsed.value.resources) |resource| {
+        if (resource.expires_at_ms <= now_ms) {
+            const expired_key = try resourceKey(&resource.id);
+            try txn.delete(&expired_key);
+            try @import("../execution/resource_routing.zig").deleteOwnership(txn, .prepared, &resource.id);
+            continue;
+        }
+        if (std.mem.eql(u8, &resource.id, id)) {
+            if (action == .create) return error.SqlPreparedAlreadyExists;
+            const deleted_key = try resourceKey(id);
+            try txn.delete(&deleted_key);
+            try @import("../execution/resource_routing.zig").deleteOwnership(txn, .prepared, id);
+            found = true;
+            continue;
+        }
+        retained[count] = resource;
+        total_bytes = try std.math.add(usize, total_bytes, resource.bytes);
+        count += 1;
+    }
+    switch (action) {
+        .close => if (!found) return error.SqlPreparedNotFound,
+        .create => |resource| {
+            if (resource.connection_id) |bound| {
+                if (resource.connection_generation == null) return error.InvalidSqlConnection;
+                var connection = try connection_record.loadTxn(txn, alloc, &bound);
+                defer connection.deinit();
+                try connection.value.requireOwner(&bound, principal, owner_node_id, now_ms);
+                if (connection.value.generation != resource.connection_generation.?) return error.SqlConnectionChanged;
+                switch (connection.value.state) {
+                    .idle => if (resource.session_id != null) return error.SqlTransactionNotActive,
+                    .active => {
+                        const attached = resource.session_id orelse return error.SqlTransactionNotActive;
+                        const active_hex = std.fmt.bytesToHex(connection.value.active_txn.?, .lower);
+                        if (!std.mem.eql(u8, &attached, &active_hex)) return error.SqlTransactionNotActive;
+                    },
+                    .beginning, .uncertain => return error.SqlConnectionBusy,
+                }
+            } else if (resource.connection_generation != null) return error.InvalidSqlConnection;
+            if (count == max_resources) return error.SqlWriteCapacityUnavailable;
+            const encoded_resource = try std.json.Stringify.valueAlloc(scratch, resource, .{});
+            defer scratch.free(encoded_resource);
+            if (encoded_resource.len > max_resource_bytes or total_bytes > max_record_bytes -| encoded_resource.len) return error.SqlProgramLimitExceeded;
+            const created_key = try resourceKey(&resource.id);
+            try txn.put(&created_key, encoded_resource);
+            try @import("../execution/resource_routing.zig").putOwnership(txn, .prepared, &resource.id, resource.owner_node_id);
+            total_bytes += encoded_resource.len;
+            retained[count] = .{ .id = resource.id, .expires_at_ms = resource.expires_at_ms, .bytes = encoded_resource.len };
+            count += 1;
+        },
+    }
+    const encoded = try std.json.Stringify.valueAlloc(scratch, Directory{ .resources = retained[0..count] }, .{});
+    defer scratch.free(encoded);
+    if (encoded.len > 64 << 10) return error.SqlProgramLimitExceeded;
+    if (total_bytes > max_record_bytes -| encoded.len) return error.SqlProgramLimitExceeded;
+    try txn.put(key, encoded);
+    try txn.commit();
+}
+
+/// Called only from the connection's native write transaction. The caller
+/// bumps its generation and clears its setting overlay in that same commit.
+/// Other principals and other connections' resources are never inspected by
+/// identity alone, much less deleted.
+pub fn discardConnectionTxn(txn: anytype, alloc: std.mem.Allocator, connection_id: [32]u8) !usize {
+    const raw = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return 0,
+        else => return err,
+    };
+    if (raw.len > 64 << 10) return error.SqlProgramLimitExceeded;
+    var parsed = try std.json.parseFromSlice(Directory, alloc, raw, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    if (parsed.value.resources.len > max_resources) return error.SqlProgramLimitExceeded;
+    var retained: [max_resources]Entry = undefined;
+    var count: usize = 0;
+    var removed: usize = 0;
+    for (parsed.value.resources) |entry| {
+        const resource_key = try resourceKey(&entry.id);
+        const bytes = txn.get(&resource_key) catch |err| switch (err) {
+            error.NotFound => return error.InvalidSqlPreparedDirectory,
+            else => return err,
+        };
+        if (bytes.len > max_resource_bytes) return error.SqlProgramLimitExceeded;
+        var resource = try std.json.parseFromSlice(Resource, alloc, bytes, .{ .allocate = .alloc_always });
+        defer resource.deinit();
+        if (!std.mem.eql(u8, &resource.value.id, &entry.id)) return error.InvalidSqlPreparedDirectory;
+        if (resource.value.connection_id) |owner| {
+            if (std.mem.eql(u8, &owner, &connection_id)) {
+                try txn.delete(&resource_key);
+                try @import("../execution/resource_routing.zig").deleteOwnership(txn, .prepared, &entry.id);
+                removed += 1;
+                continue;
+            }
+        }
+        retained[count] = entry;
+        count += 1;
+    }
+    const encoded = try std.json.Stringify.valueAlloc(alloc, Directory{ .resources = retained[0..count] }, .{});
+    defer alloc.free(encoded);
+    try txn.put(key, encoded);
+    return removed;
+}
+
+test "SQL prepared durable directory preserves ownership expiry admission and loaded execution" {
+    const alloc = std.testing.allocator;
+    var backend = @import("antfly_local_sources").storage_mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var native = try backend.runtimeStore(alloc, .{ .name = "prepared-test" });
+    defer native.deinit();
+    var store = transactions.DurableSessionStore.initRuntime(alloc, &native);
+    const first: Resource = .{ .id = @splat('1'), .principal = "alice", .owner_node_id = 7, .expires_at_ms = 100, .database = "app", .namespace = "public", .statement = "SELECT $1::BIGINT", .parameter_types = &.{.integer}, .parameter_descriptors = &.{.{ .kind = .integer, .element_type = .int64 }}, .bindings = &.{} };
+    try create(&store, first, 1);
+    try std.testing.expectError(error.SqlPreparedNotFound, load(&store, alloc, &first.id, "bob", 7, 2));
+    try std.testing.expectError(error.SqlPreparedWrongOwner, load(&store, alloc, &first.id, "alice", 8, 2));
+    try std.testing.expectError(error.SqlPreparedNotFound, close(&store, &first.id, "bob", 7, 2));
+    try std.testing.expectError(error.SqlPreparedAlreadyExists, create(&store, first, 2));
+    var recreated = transactions.DurableSessionStore.initRuntime(alloc, &native);
+    var loaded = try load(&recreated, alloc, &first.id, "alice", 7, 2);
+    defer loaded.deinit();
+    try std.testing.expectEqualStrings(first.statement, loaded.value.statement);
+    try loaded.value.verifyExecutionSession(null);
+    try std.testing.expectEqual(ast.ColumnType.integer, loaded.value.parameter_types[0].?);
+    try std.testing.expectEqual(@as(?@import("antfly_local_sources").sql_array_value.ElementType, .int64), loaded.value.parameter_descriptors[0].element_type);
+    var invalid = first;
+    invalid.parameter_descriptors = &.{};
+    try std.testing.expectError(error.InvalidSqlParameters, create(&store, invalid, 2));
+    store.fail_writes_for_test = true;
+    var read_during_write_failure = try load(&store, alloc, &first.id, "alice", 7, 2);
+    read_during_write_failure.deinit();
+    try std.testing.expectError(error.InjectedSessionStoreFailure, close(&store, &first.id, "alice", 7, 2));
+    store.fail_writes_for_test = false;
+    try close(&store, &first.id, "alice", 7, 2);
+    try std.testing.expectError(error.SqlPreparedNotFound, load(&store, alloc, &first.id, "alice", 7, 2));
+    // A close does not invalidate a previously admitted request's owned copy.
+    try std.testing.expectEqualStrings(first.statement, loaded.value.statement);
+    for (0..max_resources) |index| {
+        var value = first;
+        value.id = std.fmt.bytesToHex(std.mem.toBytes(@as(u128, index)), .lower);
+        try create(&store, value, 1);
+    }
+    try std.testing.expectError(error.SqlWriteCapacityUnavailable, create(&store, first, 2));
+    try std.testing.expectError(error.SqlPreparedNotFound, load(&store, alloc, &first.id, "alice", 7, 100));
+    var fresh = first;
+    fresh.expires_at_ms = 200;
+    try create(&store, fresh, 100);
+    var after_expiry = try load(&store, alloc, &first.id, "alice", 7, 100);
+    defer after_expiry.deinit();
+}
+
+test "SQL prepared manifest rejects rebinding and preserves logical aliases" {
+    const table: catalog.Table = .{ .id = 9, .physical_name = "physical", .schema_version = 2, .columns = &.{}, .scope = .{ .database = "app", .namespace = "public", .name = "items", .revision = 5 } };
+    const binding = try Binding.from(table);
+    try Binding.verify(&.{binding}, table);
+    var changed = table;
+    changed.id += 1;
+    try std.testing.expectError(error.CatalogGenerationChanged, Binding.verify(&.{binding}, changed));
+    changed = table;
+    changed.schema_version += 1;
+    try std.testing.expectError(error.CatalogGenerationChanged, Binding.verify(&.{binding}, changed));
+    changed = table;
+    changed.scope.?.revision += 1;
+    try std.testing.expectError(error.CatalogGenerationChanged, Binding.verify(&.{binding}, changed));
+    changed = table;
+    changed.scope.?.name = "alias";
+    try std.testing.expectError(error.CatalogGenerationChanged, Binding.verify(&.{binding}, changed));
+    try Binding.verify(&.{ binding, try Binding.from(changed) }, changed);
+}
+
+test "SQL prepared resource survives native store restart and transaction cleanup" {
+    const alloc = std.testing.allocator;
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("sql-prepared-restart");
+    defer directory.cleanup();
+    var resource: Resource = .{ .id = @splat('a'), .principal = "alice", .owner_node_id = 7, .expires_at_ms = 1000, .database = "app", .namespace = "public", .statement = "SELECT 1", .setting_epoch = 9, .parameter_types = &.{}, .bindings = &.{} };
+    {
+        var opened = try transactions.OpenedSessionStore.open(alloc, directory.path());
+        defer opened.deinit();
+        var registry = transactions.SessionRegistry.init(opened.durableStore());
+        defer registry.deinit(alloc);
+        const attached = try registry.beginForPrincipal(alloc, .{ .sql = .{ .database = "app", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice");
+        resource.session_id = std.fmt.bytesToHex(attached.txn_id, .lower);
+        try create(opened.durableStore(), resource, 1);
+        const transaction = try registry.beginForPrincipal(alloc, .{}, 7, "alice");
+        try std.testing.expect(try registry.retireBeforeExecution(alloc, try registry.mutation(alloc, transaction.txn_id, transaction.version.owner), registry.getInfo(transaction.txn_id).?.version, false));
+    }
+    {
+        var reopened = try transactions.OpenedSessionStore.open(alloc, directory.path());
+        defer reopened.deinit();
+        var value = try load(reopened.durableStore(), alloc, &resource.id, "alice", 7, 2);
+        defer value.deinit();
+        var registry = transactions.SessionRegistry.init(reopened.durableStore());
+        defer registry.deinit(alloc);
+        const attached_session = resource.session_id.?;
+        const attached_id = try @import("../../distributed_txn.zig").parseTxnIdHex(&attached_session);
+        var state = (try registry.getSqlState(alloc, attached_id)).?;
+        defer state.deinit(alloc);
+        try std.testing.expectEqualStrings("app", state.metadata.database);
+        try std.testing.expectEqualStrings("SELECT 1", value.value.statement);
+        try std.testing.expectEqual(@as(?u64, 9), value.value.setting_epoch);
+        try value.value.verifyExecutionSession(&attached_session);
+        try std.testing.expectError(error.SqlTransactionNotActive, value.value.verifyExecutionSession(null));
+        try std.testing.expectError(error.SqlTransactionNotActive, value.value.verifyExecutionSession("22222222222222222222222222222222"));
+        try close(reopened.durableStore(), &resource.id, "alice", 7, 2);
+    }
+    var reopened = try transactions.OpenedSessionStore.open(alloc, directory.path());
+    defer reopened.deinit();
+    try std.testing.expectError(error.SqlPreparedNotFound, load(reopened.durableStore(), alloc, &resource.id, "alice", 7, 3));
+}
+
+test "SQL prepared routine manifests reject replaced generations signatures and cluster incarnations" {
+    const first: Binding = .{ .kind = .function, .database = "default", .namespace = "public", .name = "f", .physical_name = "", .id = 7, .schema_version = 1, .revision = 2, .routine_signature = "text", .routine_incarnation = @splat(1), .routine_namespace_id = 2 };
+    var current = first;
+    current.revision = 90;
+    try Binding.verifyRoutine(&.{first}, current);
+    current.schema_version = 2;
+    try std.testing.expectError(error.CatalogGenerationChanged, Binding.verifyRoutine(&.{first}, current));
+    current = first;
+    current.routine_signature = "int32";
+    try std.testing.expectError(error.CatalogGenerationChanged, Binding.verifyRoutine(&.{first}, current));
+    current = first;
+    current.routine_incarnation = @splat(2);
+    try std.testing.expectError(error.CatalogGenerationChanged, Binding.verifyRoutine(&.{first}, current));
+}

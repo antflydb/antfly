@@ -421,6 +421,34 @@ antfly_error_code antfly_db_batch_json(
     antfly_buffer *out
 );
 /*
+ * Binary counterpart to antfly_db_batch_json: request_buf is one length-
+ * prefixed buffer instead of a JSON object (format in capi/batch_wire.zig),
+ * carrying only writes, deletes, and the sync_level option -- no transforms
+ * or graph writes/deletes, which remain JSON-only. All integers are little-
+ * endian and fixed width:
+ *   u32 magic ("AFBW" = 0x41464257), u16 version (1),
+ *   u8 sync_level (0 propose, 1 write, 2 full_text, 3 enrichments,
+ *     4 full_index), u8 reserved (0),
+ *   u32 write_count, u32 delete_count,
+ *   write_count * { u32 key_len, key bytes, u32 value_len, value bytes },
+ *   delete_count * { u32 key_len, key bytes }.
+ * Decoding never copies key/value bytes out of request_buf, so, like every
+ * antfly_slice, it must stay valid for the duration of this call; out is an
+ * ordinary owned antfly_buffer the caller frees with antfly_buffer_free.
+ */
+antfly_error_code antfly_db_batch_wire(
+    antfly_db *db,
+    antfly_slice request_buf,
+    antfly_buffer *out
+);
+/* antfly_db_batch_wire with the same-call receipt, as antfly_db_batch_json_with_receipt below. */
+antfly_error_code antfly_db_batch_wire_with_receipt(
+    antfly_db *db,
+    antfly_slice request_buf,
+    antfly_buffer *out,
+    antfly_buffer *receipt_out
+);
+/*
  * Outcome receipts. When an autocommit SQL write or a batch export returns
  * ANTFLY_OUTCOME_UNKNOWN, antfly_last_error_outcome_receipt (same thread,
  * before another call) returns a receipt string; SQL error bodies also carry

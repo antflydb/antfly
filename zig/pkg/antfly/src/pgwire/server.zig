@@ -18,11 +18,23 @@ const protocol = @import("protocol.zig");
 const backend = @import("backend.zig");
 const Budget = @import("budget.zig").Budget;
 
+const linux_host = @import("builtin").os.tag == .linux;
+const LinuxPolicy = @import("antfly_local_sources").system_catalog_domain.selinux_linux.LinuxPolicy;
+
+/// The caller owns the policy and signing key until the server has drained.
+/// Linux abstract Unix sockets disappear when the listener closes.
+pub const SelinuxEndpoint = struct {
+    address: std.Io.net.UnixAddress,
+    policy: *LinuxPolicy,
+    key: *const std.crypto.sign.Ed25519.KeyPair,
+};
+
 pub const Config = struct {
     io: std.Io,
     backend: backend.Backend,
     bind_host: []const u8 = "127.0.0.1",
     bind_port: u16 = 5432,
+    selinux_endpoint: ?SelinuxEndpoint = null,
     max_connections: u16 = 32,
     limits: protocol.Limits = .{},
     // There is no built-in TLS termination yet. A remote bind must explicitly
@@ -60,7 +72,6 @@ const State = struct {
     tasks: std.Io.Group = .init,
     active: std.atomic.Value(u32) = .init(0),
     mutex: std.Io.Mutex = .init,
-    next_pid: u32 = 0,
     sessions: std.AutoHashMapUnmanaged(i32, *protocol.Session) = .empty,
 
     fn acceptLoop(self: *State) void {
@@ -94,18 +105,31 @@ const State = struct {
         try self.mutex.lock(self.config.io);
         defer self.mutex.unlock(self.config.io);
         if (self.sessions.count() >= self.config.max_connections) return error.TooManyConnections;
-        while (true) {
-            self.next_pid = (self.next_pid % std.math.maxInt(i32)) + 1;
-            const pid: i32 = @intCast(self.next_pid);
-            if (self.sessions.contains(pid)) continue;
+        const pid = try self.availablePid();
+        var secret_bytes: [4]u8 = undefined;
+        try self.config.io.randomSecure(&secret_bytes);
+        try self.sessions.put(self.alloc, pid, session);
+        session.backend_pid = pid;
+        session.cancel_key = std.mem.readInt(i32, &secret_bytes, .big);
+    }
+    fn availablePid(self: *State) !i32 {
+        for (0..128) |_| {
             var bytes: [4]u8 = undefined;
             try self.config.io.randomSecure(&bytes);
-            const secret = std.mem.readInt(i32, &bytes, .big);
-            try self.sessions.put(self.alloc, pid, session);
-            session.backend_pid = pid;
-            session.cancel_key = secret;
-            return;
+            const pid: i32 = @intCast(1 + std.mem.readInt(u32, &bytes, .big) % std.math.maxInt(i32));
+            if (!self.sessions.contains(pid)) return pid;
         }
+        return error.TooManyConnections;
+    }
+    fn rekey(raw: *anyopaque, session: *protocol.Session) !void {
+        const self: *State = @ptrCast(@alignCast(raw));
+        try self.mutex.lock(self.config.io);
+        defer self.mutex.unlock(self.config.io);
+        if (self.sessions.get(session.backend_pid) != session) return error.ProtocolViolation;
+        const next = try self.availablePid();
+        try self.sessions.put(self.alloc, next, session);
+        _ = self.sessions.remove(session.backend_pid);
+        session.backend_pid = next;
     }
 
     fn unregister(raw: *anyopaque, session: *protocol.Session) void {
@@ -135,11 +159,19 @@ pub fn start(alloc: std.mem.Allocator, config: Config) !Server {
         config.limits.startup_timeout_ms == 0 or config.limits.idle_timeout_ms == 0 or
         config.limits.statement_timeout_ms == 0 or config.limits.result_rows == 0)
         return error.InvalidPgwireConfig;
-    const address = try std.Io.net.IpAddress.resolve(config.io, config.bind_host, config.bind_port);
-    if (!config.allow_insecure_non_loopback and !isLoopback(address)) return error.PgwireRequiresProtectedTransport;
     const self = try alloc.create(State);
     errdefer alloc.destroy(self);
-    self.* = .{ .alloc = alloc, .config = config, .listener = try address.listen(config.io, .{ .reuse_address = true }) };
+    const listener = if (config.selinux_endpoint) |endpoint| unix: {
+        if (comptime !linux_host) return error.SelinuxUnavailable;
+        if (endpoint.address.path.len < 2 or !endpoint.address.isAbstract()) return error.InvalidPgwireConfig;
+        _ = try endpoint.policy.currentPolicy();
+        break :unix try endpoint.address.listen(config.io, .{});
+    } else tcp: {
+        const address = try std.Io.net.IpAddress.resolve(config.io, config.bind_host, config.bind_port);
+        if (!config.allow_insecure_non_loopback and !isLoopback(address)) return error.PgwireRequiresProtectedTransport;
+        break :tcp try address.listen(config.io, .{ .reuse_address = true });
+    };
+    self.* = .{ .alloc = alloc, .config = config, .listener = listener };
     errdefer self.listener.deinit(config.io);
     try self.tasks.concurrent(config.io, State.acceptLoop, .{self});
     return .{ .state = self };
@@ -161,14 +193,20 @@ fn serveConnection(state: *State, stream: std.Io.net.Stream) void {
     var write_buffer: [8192]u8 = undefined;
     var reader = stream.reader(io, &read_buffer);
     var writer = stream.writer(io, &write_buffer);
+    var selinux_connection: ?LinuxPolicy.Connection = if (comptime linux_host) if (state.config.selinux_endpoint) |endpoint| .{
+        .policy = endpoint.policy,
+        .socket = stream.socket.handle,
+        .key = endpoint.key,
+    } else null else null;
     var session = protocol.Session{
         .alloc = budget.allocator(),
         .io = io,
         .source = state.config.backend,
+        .selinux_ingress = if (selinux_connection) |*connection| connection.ingress() else null,
         .reader = &reader.interface,
         .writer = &writer.interface,
         .limits = state.config.limits,
-        .hooks = .{ .context = state, .register = State.register, .unregister = State.unregister, .cancel = State.cancel },
+        .hooks = .{ .context = state, .register = State.register, .rekey = State.rekey, .unregister = State.unregister, .cancel = State.cancel },
     };
     // A gateway must never infer completion from EOF, timeout or cancellation.
     // Emit the private receipt only after structured cancellation has joined

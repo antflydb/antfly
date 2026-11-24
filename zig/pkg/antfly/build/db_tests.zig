@@ -59,6 +59,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "relational cumulative prepares",
         "relational preparation budget",
         "relational transform preparation releases",
+        "trigger prepared DOM owns one row authority",
+        "SQL trigger document candidates share native null provenance for OLD NEW and selected writes",
+        "SQL trigger AFTER row dispatcher admits one captured attachment for ordered FK interleaving",
+        "distributed txn trigger coordinator prepares generated FK rows once and runs empty child statements",
+        "SQL relation lifetime native participant records pin actual images across every decision mutation",
+        "SQL relation lifetime integrity preparation retains trusted lookup minter and rejects owner substitution",
+        "native local frozen cut proves actual sequence and owner without inventing raft positions",
+        "internal batch owner",
         "db transaction recovery",
     };
     const row_preparation_tests = b.addTest(.{
@@ -74,14 +82,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "producer readiness",
         "derived coverage outcome transitions are exclusive and idempotent",
         "graph projection preserves numeric literals in enrichment metadata and templates",
+        "db control-only publication preserves empty catalog while real user mutations remain conservative across cold reopen",
     };
     const producer_receipt_tests = b.addTest(.{
+        .name = "producer-receipt-tests",
         .root_module = antfly_test_mod,
         .filters = &producer_receipt_filters,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        // The curated native macOS Debug closure measured 7 GiB. Retain
+        // headroom without changing other host/profile claims.
+        .max_rss = if (b.graph.host.result.os.tag == .macos and antfly_test_mod.optimize == .debug) 9 * 1024 * 1024 * 1024 else 0,
     });
+    const producer_receipt_run = addCuratedTestRunArtifact(b, producer_receipt_tests, &producer_receipt_filters);
+    producer_receipt_run.addArg("--require-no-skips");
     b.step("antfly-storage-producer-receipts-test", "Run primary revision receipt and cached graph publication regressions")
-        .dependOn(&addCuratedTestRunArtifact(b, producer_receipt_tests, &producer_receipt_filters).step);
+        .dependOn(&producer_receipt_run.step);
     const relationship_identity_filters = [_][]const u8{
         "db graph endpoint cleanup pages",
         "db graph endpoint cleanup transaction graph effects",
@@ -195,6 +210,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db public artifact reprocess accepts durable work despite unrelated provider retries",
         "db public extraction budget rejection publishes a failure manifest",
         "db document extraction manifest inspection and reprocess API",
+        "db execution policy retains legacy local asset publications",
         "db artifact manifest list",
         "db generic artifact repair queue",
         "db successful asset publication clears terminal debt",
@@ -228,6 +244,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db mixed extraction batches retain document checkpoint ownership in either order",
         "storage.db.db.test.db asset consuming asset validates upstream references at admission",
         "generic scalar chunks reject stale upstream and fence publication",
+        "grouped source upstream receipt narrows to the group unit, not the whole raw document",
         "asset preparation is lazy and byte bounded across retryable provider batches",
         "asset planning groups interleaved providers",
         "asset producer neighbor context samples local graph adjacency into the input and skip state",
@@ -332,6 +349,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "native text diagnostics distinguish extraction completion and semantic coverage",
         "native text neutral provenance owns nested JSON through allocation failure",
         "document extraction parses independent native text policy and quality",
+        "execution budgets preserve extraction fingerprints",
         "document extraction client clone owns native metadata arrays",
         "ordered artifact inventory typed unit payload",
         "public enrichment validation rejects invalid execution and producer config",
@@ -616,6 +634,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "native text diagnostics distinguish extraction completion and semantic coverage",
         "native text neutral provenance owns nested JSON through allocation failure",
         "document extraction parses independent native text policy and quality",
+        "execution budgets preserve extraction fingerprints",
         "document extraction client clone owns native metadata arrays",
         "ordered artifact inventory typed unit payload",
         "public enrichment validation rejects invalid execution and producer config",
@@ -689,6 +708,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db dense index consuming a chunk-then-embed source via plural sources config converges its target counter",
         "runUntilIdle no-progress guard fails fast with a named stuck-index diagnostic",
         "target advance stuck tracking records first-seen time and clears on success",
+        "WS5 hosted replay retirement is leader-gated: the leader bounds the journal, a non-leader never retires",
+        "WS5 runUntilIdle drains journal retirement to completion at credit capacity",
     });
     const lib_db_enrichment_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -699,6 +720,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_db_enrichment_step.dependOn(&run_lib_db_enrichment_tests.step);
 
     const lib_db_query_default_filters = [_][]const u8{
+        "optional numeric range",
         "(#1095)",
         "db query drops full text hits whose stored document row was deleted directly from the store",
         "db native document filters preserve paged totals across representations",
@@ -889,6 +911,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{
             "externalizeSearchResultArtifactIds",
             "native asset members hydrate source authority and revision identity",
+            "direct PDF member",
             "native unit ancestry uses its configured producer name",
             "native member logical filters use parent values and shared verification budgets",
             "missing modality producers and transcription failures remain incomplete",
@@ -941,7 +964,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_lib_db_result_shape_tests = addFilteredTestRunArtifact(b, lib_db_result_shape_tests);
     lib_db_query_step.dependOn(&run_lib_db_result_shape_tests.step);
-    const alias_provenance_run = addFilteredTestRunArtifactWithRuntimeFilters(b, lib_db_result_shape_tests, &.{"externalizeSearchResultArtifactIds"});
+    const alias_provenance_run = addFilteredTestRunArtifactWithRuntimeFilters(b, lib_db_result_shape_tests, &.{ "externalizeSearchResultArtifactIds", "direct PDF member" });
     b.step("antfly-index-alias-provenance-test", "Verify repeated member identity conversion and allocation cleanup")
         .dependOn(&alias_provenance_run.step);
 
@@ -983,6 +1006,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "coordinator recovery durably aborts a stale prepared transaction",
             "idempotent begin upgrades a legacy transaction coordinator role",
             "transaction participant batch",
+            "version predicate conflict",
             "transaction trace retains every key",
             "relational integrity ",
             "distributed txn deferred reference handoff",

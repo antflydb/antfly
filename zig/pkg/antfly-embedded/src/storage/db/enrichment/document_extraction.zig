@@ -1298,6 +1298,8 @@ fn isUtf8Boundary(text: []const u8, offset: usize) bool {
 }
 
 pub const Result = struct {
+    /// Borrowed policy snapshot, serialized before the request is released.
+    execution_json: []const u8 = "",
     content_type: []u8,
     route_type: []u8,
     unsupported_reason: []u8 = "",
@@ -1427,6 +1429,16 @@ pub const Config = struct {
         self.* = undefined;
     }
 };
+
+/// Budgets belong to execution, not the serialized recipe used by source
+/// fingerprints. Parsed OCR config owns its invocation JSON independently.
+pub fn applyExecutionPolicy(alloc: Allocator, config: *Config, execution_json: []const u8) !void {
+    if (!config.ocr_enabled) return;
+    if (try @import("enrichment_types.zig").withGenerationBudgetAlloc(alloc, config.ocr_config_json, execution_json)) |updated| {
+        if (config.ocr_config_json.len > 0) alloc.free(config.ocr_config_json);
+        config.ocr_config_json = updated;
+    }
+}
 
 test "document extraction parses explicit render resolution policy" {
     var default_config = try parseConfig(std.testing.allocator, "{}");
@@ -7259,4 +7271,25 @@ test "OCR sampling recipe identity changes even when config JSON is unchanged" {
     const second = (try metadataFingerprintLegacyAlloc(a, "https://example.test/page.pdf", "{}", changed)).?;
     defer a.free(second);
     try std.testing.expect(!std.mem.eql(u8, first, second));
+}
+
+test "execution budgets preserve extraction fingerprints while model changes invalidate" {
+    const a = std.testing.allocator;
+    const recipe = "{\"content_type\":\"application/pdf\",\"version\":\"v1\",\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"reader@revision\",\"max_tokens\":512}}}";
+    var config = try parseConfig(a, recipe);
+    defer config.deinit(a);
+    const before = (try metadataFingerprintAlloc(a, "https://example.test/source.pdf", recipe, config)).?;
+    defer a.free(before);
+    inline for (.{ "{\"max_output_tokens_per_item\":8192}", "{\"max_output_tokens_per_item\":64}" }) |policy| {
+        try applyExecutionPolicy(a, &config, policy);
+        const after = (try metadataFingerprintAlloc(a, "https://example.test/source.pdf", recipe, config)).?;
+        defer a.free(after);
+        try std.testing.expectEqualStrings(before, after);
+    }
+    const changed = "{\"content_type\":\"application/pdf\",\"version\":\"v1\",\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"reader@new-revision\",\"max_tokens\":512}}}";
+    var other = try parseConfig(a, changed);
+    defer other.deinit(a);
+    const fingerprint = (try metadataFingerprintAlloc(a, "https://example.test/source.pdf", changed, other)).?;
+    defer a.free(fingerprint);
+    try std.testing.expect(!std.mem.eql(u8, before, fingerprint));
 }

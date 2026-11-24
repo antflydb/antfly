@@ -170,6 +170,26 @@ def test_pgwire_scoped_filters_survive_mixed_qualified_bindings(
                 assert reader.execute(query, prepare=prepare).fetchall() == [
                     ("own-open",)
                 ]
+            with psycopg.ClientCursor(reader) as cursor:
+                cursor.execute("BEGIN")
+                cursor.execute(
+                    f"DECLARE held_rows CURSOR WITH HOLD FOR SELECT id FROM {relation}"
+                )
+                cursor.execute(
+                    f"DECLARE held_count CURSOR WITH HOLD FOR SELECT count(*) FROM {relation}"
+                )
+                cursor.execute("COMMIT")
+                # Both snapshots used the old filter. The table still exists and
+                # SELECT is still granted after this change.
+                requests.put(
+                    server.url + "/auth/v1/users/scoped_reader/row-filters/*",
+                    auth=("admin", harness.AUTH_BOOTSTRAP_PASSWORD),
+                    json={"term": {"tenant_id": "b"}},
+                    timeout=30,
+                ).raise_for_status()
+                for name in ("held_rows", "held_count"):
+                    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                        cursor.execute(f"FETCH ALL FROM {name}")
     finally:
         server.stop()
 

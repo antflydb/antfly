@@ -1625,8 +1625,8 @@ test "GLiNER graph batch public routes preserve distinct ragged rows and cancell
     var cb = compute.computeBackend();
     var vtable = cb.vtable.*;
     vtable.getWeight = BatchRouteProbe.weight;
-    vtable.debertaEmbeddings = BatchRouteProbe.encoder;
-    vtable.glinerWordEmbeddings = BatchRouteProbe.head;
+    vtable.regions.relative_encoder.embeddings = BatchRouteProbe.encoder;
+    vtable.regions.sequence_projection.firstWordRows = BatchRouteProbe.head;
     cb.vtable = &vtable;
     const config = Config{ .hidden_size = 2, .entity_token_id = 51, .classification_token_id = 52, .relation_token_id = 53 };
     const encoder_config = deberta_config.Config{ .hidden_size = 2, .num_attention_heads = 1, .num_hidden_layers = 0 };
@@ -1676,8 +1676,8 @@ test "GLiNER graph batch fallback keeps exact sparse spans and per sample sessio
     var cb = compute.computeBackend();
     var vtable = cb.vtable.*;
     vtable.getWeight = BatchRouteProbe.weight;
-    vtable.debertaEmbeddings = BatchRouteProbe.encoder;
-    vtable.debertaRelativeEmbeddings = BatchRouteProbe.relative;
+    vtable.regions.relative_encoder.embeddings = BatchRouteProbe.encoder;
+    vtable.regions.relative_encoder.relativeEmbeddings = BatchRouteProbe.relative;
     cb.vtable = &vtable;
     const config = Config{ .hidden_size = 2, .entity_token_id = 51 };
     const encoder_config = deberta_config.Config{ .hidden_size = 2, .num_attention_heads = 1, .num_hidden_layers = 0, .max_position_embeddings = 8, .position_buckets = 4 };

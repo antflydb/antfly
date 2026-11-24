@@ -39,6 +39,22 @@ pub const Connection = struct {
     }
 
     pub fn openWithOptions(allocator: Allocator, path: []const u8, open_mode: db_mod.OpenOptions.OpenMode, opts: Options) !Connection {
+        // A read-only open recovers the checkpoint on disk at that moment.
+        // A live writer's fold can publish a newer one and reclaim the
+        // overlay versions the recovered one depends on before the open's
+        // own catalog read, which then reports `error.ReadSnapshotReclaimed`.
+        // Reopening recovers the newer checkpoint.
+        const max_attempts = 8;
+        var attempt: usize = 1;
+        while (true) : (attempt += 1) {
+            return openWithOptionsOnce(allocator, path, open_mode, opts) catch |err| {
+                if (err == error.ReadSnapshotReclaimed and attempt < max_attempts and openModeRequiresReadOnlyBackends(open_mode)) continue;
+                return err;
+            };
+        }
+    }
+
+    fn openWithOptionsOnce(allocator: Allocator, path: []const u8, open_mode: db_mod.OpenOptions.OpenMode, opts: Options) !Connection {
         var lite_backend = try backend.Handle.open(allocator, path, .{
             .reclamation = opts.reclamation,
             .read_only = openModeRequiresReadOnlyBackends(open_mode),
@@ -99,7 +115,6 @@ pub const Connection = struct {
                 defer a.free(namespace);
                 var options: db_mod.OpenOptions = .{
                     .open_mode = .writer,
-                    .external_derived_checkpoints = false,
                     .identity_namespace = .{ .table_id = table.id, .shard_id = table.id, .range_id = table.id },
                     .prefer_existing_identity_namespace = false,
                     .online_source_authority = .native,
@@ -196,7 +211,6 @@ fn openWithBackend(
     const identity = identityOpenOptions(create);
     var opts = db_mod.OpenOptions{
         .open_mode = open_mode,
-        .external_derived_checkpoints = false,
         .identity_namespace = identity.identity_namespace,
         .prefer_existing_identity_namespace = identity.prefer_existing_identity_namespace,
     };
@@ -292,7 +306,6 @@ test "lite connection adopts a legacy file whose first write persisted the defau
         defer lite_backend.deinit();
         var opts = db_mod.OpenOptions{
             .open_mode = .writer,
-            .external_derived_checkpoints = false,
             .identity_namespace = null,
         };
         try lite_backend.configureDbOpenOptions(&opts);

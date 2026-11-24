@@ -1210,6 +1210,13 @@ fn quarantineBlocks(stats: types.TextMergeStats) bool {
         stats.quarantined_segments >= stats.pending_segments;
 }
 
+/// Backoff used when there is no full-text index at all. Far longer than
+/// `idle_interval_ms` (an in-progress-merge idle cadence) since there is
+/// nothing a demand-triggered wake (notify()) could not already deliver
+/// sooner; this is only a safety net for catalog changes that don't call
+/// notify().
+const no_text_index_interval_ms: u64 = 5_000;
+
 fn workerStep(runtime: *TextMergeRuntime) ?u64 {
     if (isShutdown(runtime)) return null;
     if (runtime.fd_retry_epoch) |epoch| {
@@ -1225,6 +1232,14 @@ fn workerStep(runtime: *TextMergeRuntime) ?u64 {
         };
         runtime.native_storage_pool.releaseDescriptorsForTest(io, 1);
     }
+    // Edge-triggered: zero full-text indexes means runOnceTask() could not
+    // possibly find anything, so skip the exclusive apply lock this tick
+    // would otherwise take. This check comes after the test-only descriptor-
+    // admission hook above, so that hook still fires regardless of index
+    // count (see "db text merge shutdown cancels a worker blocked on
+    // descriptor admission" in db.zig, which exercises it with zero text
+    // indexes configured).
+    if (runtime.index_manager.text_indexes.items.len == 0) return no_text_index_interval_ms;
     const ran = runtime.runOnceTask() catch |err| {
         if (index_manager_mod.IndexManager.isTextMergeCancellation(err)) {
             // A canceled wait is not necessarily a graceful shutdown: the

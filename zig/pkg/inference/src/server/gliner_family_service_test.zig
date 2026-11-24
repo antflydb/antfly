@@ -69,7 +69,17 @@ fn ownershipSnapshot(node: *Node) OwnershipSnapshot {
             const loaded = entry.*;
             if (loaded.resource_lease) |lease| result.model = result.model.merge(lease.amounts) catch result.model;
             if (loaded.tokenizer_resource_lease) |lease| result.tokenizer_load = result.tokenizer_load.merge(lease.amounts) catch result.tokenizer_load;
-            result.weight_cache = result.weight_cache.merge(factory.sharedCacheAdmissionAmounts(loaded.session)) catch result.weight_cache;
+            if (factory.sharedCacheAdmissionSnapshot(loaded.session)) |cache| cache_once: {
+                // load_lock keeps all actual Model/cache identities alive.
+                var prior_iterator = node.model_manager.loaded.valueIterator();
+                while (prior_iterator.next()) |prior| {
+                    if (prior == entry) break; // exact map slot, including aliased Model values
+                    if (factory.sharedCacheAdmissionSnapshot(prior.*.session)) |previous| {
+                        if (previous.identity == cache.identity) break :cache_once;
+                    }
+                }
+                result.weight_cache = result.weight_cache.merge(cache.amounts) catch result.weight_cache;
+            }
             result.workspace = result.workspace.merge(factory.glinerBoundaryWorkspaceAdmissionAmounts(loaded.session)) catch result.workspace;
         }
     }
@@ -272,7 +282,17 @@ fn expectIdle(node: *Node) !memory.AdmissionAmounts {
             try std.testing.expectEqual(@as(usize, 0), loaded.active_handles);
             if (loaded.resource_lease) |lease| retained = try retained.merge(lease.amounts);
             if (loaded.tokenizer_resource_lease) |lease| retained = try retained.merge(lease.amounts);
-            retained = try retained.merge(factory.sharedCacheAdmissionAmounts(loaded.session));
+            if (factory.sharedCacheAdmissionSnapshot(loaded.session)) |cache| cache_once: {
+                // load_lock keeps all actual Model/cache identities alive.
+                var prior_iterator = node.model_manager.loaded.valueIterator();
+                while (prior_iterator.next()) |prior| {
+                    if (prior == entry) break; // exact map slot, including aliased Model values
+                    if (factory.sharedCacheAdmissionSnapshot(prior.*.session)) |previous| {
+                        if (previous.identity == cache.identity) break :cache_once;
+                    }
+                }
+                retained = try retained.merge(cache.amounts);
+            }
             retained = try retained.merge(factory.glinerBoundaryWorkspaceAdmissionAmounts(loaded.session));
         }
     }
@@ -566,10 +586,7 @@ fn familyExtractionServiceParity(comptime backend: BackendType) !void {
     const runtime_cpu_thread_budget = if (perf_config != null) try runtimeCpuThreadBudget() else 1;
     const perf_source_head = if (perf_config != null) try perf.sourceHead() else "";
     const worker_memory_bytes = if (backend == .cuda) cuda_service_worker_memory_bytes else service_worker_memory_bytes;
-    // CUDA evidence here covers multi-v1. The distinct multi-Decide checkpoint
-    // retains its own backend qualification and must be exercised separately.
-    const selected_profiles = if (backend == .cuda) profiles[0..1] else &profiles;
-    for (selected_profiles) |profile| {
+    for (profiles) |profile| {
         if (perf_config) |config| if (!config.profileEnabled(profile.name)) continue;
         const requested = platform.env.getenv(profile.environment) orelse return error.SkipZigTest;
         const directory = try realDirectory(a, requested);
@@ -731,7 +748,7 @@ fn familyDecisionServiceParity(comptime backend: BackendType) !void {
         .max_concurrent_requests = 1,
         .keep_alive_ms = 30 * 60 * 1000,
         .process_termination_available = true,
-        .process_memory_limit_bytes = service_worker_memory_bytes,
+        .process_memory_limit_bytes = if (backend == .cuda) cuda_service_worker_memory_bytes else service_worker_memory_bytes,
         .process_memory_limit_provenance = .explicit,
         .generation_budget_overrides = .{ .host_limit_bytes = service_generation_memory_bytes, .backend_limit_bytes = service_generation_memory_bytes, .scratch_limit_bytes = service_generation_memory_bytes, .combined_limit_bytes = service_generation_memory_bytes, .kv_limit_bytes = service_generation_memory_bytes },
     });
@@ -760,7 +777,7 @@ fn familyDecisionServiceParity(comptime backend: BackendType) !void {
         if (cached == null) {
             cached = try expectCached(&node, directory, profiles[1].pins, backend);
             resident_weights = direct_idle;
-            if (backend == .metal)
+            if (backend == .metal or backend == .cuda)
                 try std.testing.expect(resident_weights.?.backend_weight_bytes >= profiles[1].pins.@"model.safetensors".size_bytes)
             else
                 try std.testing.expect(resident_weights.?.host_weight_bytes >= profiles[1].pins.@"model.safetensors".size_bytes);
@@ -840,4 +857,8 @@ test "GLiNER2.5 multilingual Decide pinned native direct and HTTP distributions"
 
 test "GLiNER2.5 multilingual Decide pinned Metal direct and HTTP distributions" {
     try familyDecisionServiceParity(.metal);
+}
+
+test "GLiNER2.5 multilingual Decide pinned CUDA direct and HTTP distributions" {
+    try familyDecisionServiceParity(.cuda);
 }

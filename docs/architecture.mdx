@@ -61,7 +61,7 @@ The per-request `sync_level` picks how far a write gets before the response retu
 | --- | --- |
 | `propose` (default) | Raft accepts the proposal |
 | `write` | The write is durably applied to the local store |
-| `full_text` | The full-text index WAL write |
+| `query` | The primary write is durable and visible to document full-text queries. `full_text` is a compatibility alias. |
 | `enrichments` | This write's enrichments have published |
 | `full_index` | Full-text, enrichment, and vector index writes all complete |
 

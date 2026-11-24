@@ -4851,7 +4851,7 @@ pub fn parse_tile_hdr(c: [*c]Dav1dContext, gb: [*c]GetBits) callconv(.c) void {
         c.*.tile[@bitCast(@as(isize, @intCast(c.*.n_tile_data)))].end = n_tiles - @as(c_int, 1);
     }
 }
-pub export fn antfly_av1_dav1d_parse_obus(c: [*c]Dav1dContext, in: [*c]Dav1dData) ptrdiff_t {
+pub fn antfly_av1_dav1d_parse_obus(c: [*c]Dav1dContext, in: [*c]Dav1dData) callconv(.c) ptrdiff_t {
     _ = &c;
     _ = &in;
     var afz_i_39: c_int = undefined;

@@ -209,7 +209,17 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     }
     const ensured_primary_assets_at = std.Io.Timestamp.now(io, .awake);
 
-    const text_embeddings = if (opts.texts.items.len > 0)
+    var owned_text: ?@import("backends/session.zig").OwnedHostVectors = null;
+    defer if (owned_text) |*rows| rows.deinitOutsideExecution();
+    const text_embeddings: [][]f32 = if (opts.texts.items.len > 0 and opts.image_paths.items.len == 0 and opts.audio_paths.items.len == 0 and pipeline.canEmbedOwned()) owned: {
+        // Pin selected Session owners while assets are protected. The CLI is
+        // a top-level cold entry; release the asset cohort before suppliers.
+        var retained = try model.retainTextPipelineAssets(&pipeline);
+        defer retained.deinitOutsideExecution();
+        asset_lease.release();
+        owned_text = try retained.pipeline.embedOwned(opts.texts.items, .{ .outside_execution = true });
+        break :owned &.{};
+    } else if (opts.texts.items.len > 0)
         try pipeline.embed(opts.texts.items)
     else
         try allocator.alloc([]f32, 0);
@@ -227,15 +237,11 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     defer freeEmbeddings(allocator, image_embeddings);
     asset_lease.release();
 
-    try writeResultJson(
-        allocator,
-        &stdout.interface,
-        opts.model_dir,
-        opts.order.items,
-        text_embeddings,
-        image_embeddings,
-        audio_embeddings,
-    );
+    if (owned_text) |rows| {
+        try writeResultJson(allocator, &stdout.interface, opts.model_dir, opts.order.items, rows, image_embeddings, audio_embeddings);
+    } else {
+        try writeResultJson(allocator, &stdout.interface, opts.model_dir, opts.order.items, text_embeddings, image_embeddings, audio_embeddings);
+    }
     const finished_at = std.Io.Timestamp.now(io, .awake);
     if (opts.print_timing) {
         print(
@@ -639,7 +645,7 @@ fn writeResultJson(
     writer: *std.Io.Writer,
     model_name: []const u8,
     order: []const InputRef,
-    text_embeddings: [][]f32,
+    text_embeddings: anytype,
     image_embeddings: [][]f32,
     audio_embeddings: [][]f32,
 ) !void {
@@ -663,7 +669,7 @@ fn writeResultJson(
     for (order, 0..) |item, i| {
         if (i > 0) try buf.append(allocator, ',');
         const emb = switch (item.modality) {
-            .text => text_embeddings[item.index],
+            .text => if (@TypeOf(text_embeddings) == @import("backends/session.zig").OwnedHostVectors) text_embeddings.values(item.index) else text_embeddings[item.index],
             .image => image_embeddings[item.index],
             .audio => audio_embeddings[item.index],
             .video => return error.UnsupportedVideoBackend,
@@ -957,7 +963,7 @@ test "embed result writers propagate output failures" {
         &output,
         "model",
         &.{},
-        &.{},
+        @as([][]f32, &.{}),
         &.{},
         &.{},
     ));
@@ -968,4 +974,42 @@ test "embed result writers propagate output failures" {
         &.{},
         &.{},
     ));
+}
+
+test "CLI owned final text output keeps original quota through exact ordered JSON serialization" {
+    const Session = @import("backends/session.zig");
+    const Domain = @import("runtime/tier/admission_domain.zig").Domain;
+    const a = std.testing.allocator;
+    const domain = try Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    var run = try domain.controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 16384 }, false);
+    defer run.release();
+    var producer = try Session.HostOutputProducer.prepare(&run, &pin, 2, 2);
+    defer {
+        producer.abortWithCleanup(.{ .outside_execution = true }) catch unreachable;
+        producer.finishOutsideExecution();
+    }
+    try producer.writeRow(0, &.{ 1, 2 });
+    try producer.writeRow(1, &.{ 3, 4 });
+    var owned = try producer.publish();
+    defer owned.deinitOutsideExecution();
+    producer.finishOutsideExecution();
+    run.release();
+    const retained = domain.controller.snapshot();
+    var raw_first = [_]f32{ 1, 2 };
+    var raw_second = [_]f32{ 3, 4 };
+    var raw_rows = [_][]f32{ &raw_first, &raw_second };
+    const order = [_]InputRef{ .{ .modality = .text, .index = 1 }, .{ .modality = .text, .index = 0 }, .{ .modality = .text, .index = 1 } };
+    var expected = std.Io.Writer.Allocating.init(a);
+    defer expected.deinit();
+    try writeResultJson(a, &expected.writer, "actual-model", &order, &raw_rows, &.{}, &.{});
+    var actual = std.Io.Writer.Allocating.init(a);
+    defer actual.deinit();
+    try writeResultJson(a, &actual.writer, "actual-model", &order, owned, &.{}, &.{});
+    try std.testing.expectEqualSlices(u8, expected.written(), actual.written());
+    try std.testing.expectEqualDeep(retained, domain.controller.snapshot());
+    owned.deinitOutsideExecution();
+    try std.testing.expectEqualDeep(@import("runtime/tier/memory.zig").AdmissionAmounts{}, domain.controller.snapshot());
 }

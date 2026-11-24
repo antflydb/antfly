@@ -115,33 +115,41 @@ pub fn prepare(alloc: Allocator, tables: []const records.TableRecord, child_name
     defer child.deinit(alloc);
     var child_json = try preserveOwned(owned, before, proposed);
     var parents = std.ArrayList(Parent).empty;
-    for (try child.relationalForeignKeyDefinitions(owned)) |fk| {
-        if (fk.match != .partial) continue;
-        if (std.mem.eql(u8, child_name, fk.parent_table)) {
-            if (try support.ensureCoverage(owned, child_json, fk.parent_columns)) |updated| child_json = updated;
-            continue;
-        }
-        const parent = for (tables) |table| {
-            if (std.mem.eql(u8, table.name, fk.parent_table)) break table;
-        } else return error.ForeignKeyParentTableNotFound;
-        if (parent.relational_retirement_json.len != 0 or parent.restore_backup_id.len != 0) return error.TableTransitionActive;
-        const position = for (parents.items, 0..) |item, i| {
-            if (item.before.table_id == parent.table_id) break i;
-        } else null;
-        const current = if (position) |i| parents.items[i].after.schema_json else parent.schema_json;
-        if (try support.ensureCoverage(owned, current, fk.parent_columns)) |updated| {
-            const replacement = try tables_api.applySchemaUpdateRecord(owned, &parent, updated);
-            if (position) |i| parents.items[i].after = replacement else try parents.append(owned, .{ .before = parent, .after = replacement });
+    const fks = try child.relationalForeignKeyDefinitions(owned);
+    if (fks.len == 0) return .{ .arena = arena, .schema_json = child_json, .parents = &.{} };
+    const validation = try @import("antfly_local_sources").schema_relational_foreign_key_target.ChildTargets.init(owned, child, fks);
+    const Target = struct { table: ?*const records.TableRecord = null, requirements: std.ArrayList(support.ColumnGroup) = .empty };
+    var targets: std.StringArrayHashMapUnmanaged(Target) = .empty;
+    for (fks) |fk| {
+        const entry = try targets.getOrPut(owned, fk.parent_table);
+        if (!entry.found_existing) entry.value_ptr.* = .{};
+        if (fk.match == .partial) try entry.value_ptr.requirements.append(owned, fk.parent_columns);
+    }
+    var remaining = targets.count() - @intFromBool(targets.contains(child_name));
+    for (tables) |*table| {
+        if (remaining == 0) break;
+        const target = targets.getPtr(table.name) orelse continue;
+        if (target.table == null and !std.mem.eql(u8, child_name, table.name)) {
+            target.table = table;
+            remaining -= 1;
         }
     }
-    // Validate every target before making the first external schema change.
-    for (try child.relationalForeignKeyDefinitions(owned)) |fk| {
-        const parent_json = if (std.mem.eql(u8, child_name, fk.parent_table)) child_json else blk: {
-            for (parents.items) |parent| if (std.mem.eql(u8, parent.before.name, fk.parent_table)) break :blk parent.after.schema_json;
-            for (tables) |table| if (std.mem.eql(u8, table.name, fk.parent_table)) break :blk table.schema_json;
-            return error.ForeignKeyParentTableNotFound;
+    if (targets.get(child_name)) |target| {
+        if (try support.ensureCoverageMany(owned, child_json, target.requirements.items)) |updated| child_json = updated;
+    }
+    // Target validation checks all the child's constraints naming this parent.
+    for (targets.keys(), targets.values()) |name, target| {
+        const parent_json = if (std.mem.eql(u8, child_name, name)) child_json else blk: {
+            const parent = target.table orelse return error.ForeignKeyParentTableNotFound;
+            if (target.requirements.items.len != 0 and (parent.relational_retirement_json.len != 0 or parent.restore_backup_id.len != 0)) return error.TableTransitionActive;
+            if (try support.ensureCoverageMany(owned, parent.schema_json, target.requirements.items)) |updated| {
+                const after = try tables_api.applySchemaUpdateRecord(owned, parent, updated);
+                try parents.append(owned, .{ .before = parent.*, .after = after });
+                break :blk after.schema_json;
+            }
+            break :blk parent.schema_json;
         };
-        try @import("antfly_local_sources").schema_relational_foreign_key_target.validate(alloc, child_json, fk.parent_table, parent_json);
+        try validation.validateParent(alloc, name, parent_json);
     }
     const owned_result_parents = try parents.toOwnedSlice(owned);
     return .{ .arena = arena, .schema_json = child_json, .parents = owned_result_parents };

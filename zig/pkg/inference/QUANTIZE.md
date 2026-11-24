@@ -240,6 +240,34 @@ antfly inference quantize ~/.antfly/inference/models/antflydb/clipclap --target 
 antfly inference quantize ~/.antfly/inference/models/antflydb/clipclap --target safetensors --dry-run
 ```
 
+### LightOnOCR-3
+
+Antfly can quantize the canonical Qwen3.5 decoder GGUF used by llama.cpp.
+First convert the LightOnOCR-3 checkpoint with llama.cpp's
+`convert_hf_to_gguf.py --outtype bf16`. Run the converter a second time with
+`--mmproj --outtype f16` to produce the vision projector. Put both files in
+a directory containing just that GGUF pair, with the projector named
+`mmproj.gguf` or prefixed with `mmproj-`.
+
+```bash
+antfly inference export ./lighton-bf16 --target gguf --format q4_k \
+  --output ./lighton-q4/model.gguf --projector-output ./lighton-q4/mmproj.gguf
+```
+
+The decoder is published only after its projector is available. An existing
+projector is reused when it has identical bytes. Decoder publication preserves
+projector destinations. To export with a different
+projector, select a new destination directory or projector filename. If
+decoder publication fails, any newly installed projector remains available
+for a retry.
+
+Use `--format q8_0` for an 8-bit comparison. Antfly applies the requested
+format to eligible decoder matrices, preserves hybrid-attention state tensors
+and existing quantized weights, and copies the projector byte for byte.
+Antfly's `q4_k` applies a single format to selected matrices. To compare
+against llama.cpp's mixed `Q4_K_M` preset, count the tensors of each type
+before attributing quality or throughput differences to the quantizer.
+
 Internally, GGUF and safetensors keep format-specific exporter modules because
 their file layouts and metadata rules differ. They are implementation details,
 not separate public commands. The public CLI should stay centered on

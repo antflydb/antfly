@@ -250,6 +250,41 @@ pub const ChunkPage = struct {
     start_ordinal: u64,
     covered_through_ordinal: u64,
     complete: bool,
+    /// A verified prefix with a terminal failure at its next ordinal.
+    terminal: ?Terminal = null,
+
+    pub const Terminal = enum {
+        coded_window_budget_exceeded,
+        empty_video_window,
+        dependency_window_budget_exceeded,
+        malformed_video_packet,
+
+        pub fn fromCode(code: []const u8) ?Terminal {
+            inline for (std.meta.tags(Terminal)) |reason| {
+                if (std.mem.eql(u8, code, @errorName(reason.failure()))) return reason;
+            }
+            return null;
+        }
+
+        pub fn fromError(err: anyerror) ?Terminal {
+            return switch (err) {
+                error.ChunkCodedWindowBudgetExceeded => .coded_window_budget_exceeded,
+                error.ChunkDependencyBudgetExceeded => .dependency_window_budget_exceeded,
+                error.EmptyVideoWindow => .empty_video_window,
+                error.MalformedVideoPacket => .malformed_video_packet,
+                else => null,
+            };
+        }
+
+        pub fn failure(self: Terminal) anyerror {
+            return switch (self) {
+                .coded_window_budget_exceeded => error.ChunkCodedWindowBudgetExceeded,
+                .empty_video_window => error.EmptyVideoWindow,
+                .dependency_window_budget_exceeded => error.ChunkDependencyBudgetExceeded,
+                .malformed_video_packet => error.MalformedVideoPacket,
+            };
+        }
+    };
 
     /// Legacy providers still return their first planned member for probes.
     pub fn observedMetadata(self: @This()) ?*ModelMetadata {

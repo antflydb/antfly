@@ -24,15 +24,53 @@
 #include <metal_stdlib>
 using namespace metal;
 
-inline float antfly_qk_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
 inline float antfly_qk_gelu(float x) { if (!isfinite(x)) return 0.0f; float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x); if (inner > 10.0f) return x; if (inner < -10.0f) return 0.0f; float y = 0.5f * x * (1.0f + tanh(inner)); return isfinite(y) ? y : 0.0f; }
+inline float antfly_qk_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
 inline float antfly_q2_k_dequant_lane_v2(device const uchar *block, int lane) {
-    uint sub = uint(lane) >> 4; uint i = uint(lane) & 15u; uchar scale_byte = block[sub]; float dsc = antfly_qk_half_le_to_float(block + 16) * float(scale_byte & 0x0fu); float dmn = antfly_qk_half_le_to_float(block + 18) * float(scale_byte >> 4);
-    uint chunk = sub >> 3; uint group = (sub & 7u) >> 1; uint l_base = (sub & 1u) << 4; uint q_base = chunk << 5; uint shift = group << 1; uint q = (uint(block[20u + q_base + l_base + i]) >> shift) & 0x03u;
-    return dsc * float(q) - dmn;
+    int v0 = lane;
+    int v1 = 4;
+    int v2 = int(uint(v0) >> v1);
+    int v3 = 3;
+    int v4 = int(uint(v2) >> v3);
+    int v5 = 7;
+    int v6 = v2 & v5;
+    int v7 = 1;
+    int v8 = int(uint(v6) >> v7);
+    int v9 = v2 & v7;
+    int v10 = int(uint(v9) << v1);
+    int v11 = 15;
+    int v12 = v0 & v11;
+    int v13 = v10 + v12;
+    int v14 = 5;
+    int v15 = int(uint(v4) << v14);
+    int v16 = v15 + v13;
+    int v17 = 20;
+    int v18 = v16 + v17;
+    int v19 = int(block[v18]);
+    int v20 = int(uint(v8) << v7);
+    int v21 = int(uint(v19) >> v20);
+    int v22 = v21 & v3;
+    int v23 = int(block[v2]);
+    int v24 = 16;
+    float v25 = antfly_qk_half_le_to_float(block + v24);
+    int v26 = v23 & v11;
+    float v27 = float(v26);
+    float v28 = v25 * v27;
+    float v29 = float(v22);
+    float v30 = v28 * v29;
+    int v31 = 18;
+    float v32 = antfly_qk_half_le_to_float(block + v31);
+    int v33 = int(uint(v23) >> v1);
+    float v34 = float(v33);
+    float v35 = v32 * v34;
+    float v36 = v30 - v35;
+    return v36;
 }
+struct antfly_projection_decode_q2_k {
+    enum : int { values = 256, bytes = 84, shift = 8 };
+    __attribute__((always_inline)) static float decode(device const uchar* block, int lane) { return antfly_q2_k_dequant_lane_v2(block, lane); }
+};
+#include "../../../graph/templates/metal_projection_native.metal"
 kernel void antfly_q2_k_small_batch_bias_gelu_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q2_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
-    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
-    for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q2_k + ((col * block_count + block_idx) * 84); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 32) acc += input[row * in_dim + base + lane] * antfly_q2_k_dequant_lane_v2(block, lane); }
-    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = antfly_qk_gelu(acc + bias[col]);
+    antfly_projection_column<antfly_projection_decode_q2_k, antfly_projection_bias_gelu, 32u, 0u>(input, weight_q2_k, bias, output, rows, in_dim, out_dim, thread_pos, group_pos, 0, 0, nullptr);
 }

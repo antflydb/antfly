@@ -16,6 +16,16 @@
 //! Nonblocking shared admission. Share one Pool across request-local readers and
 //! preparers. Tokens are move-only and release only after resource destruction.
 const std = @import("std");
+/// Synchronous, request-local eviction of optional storage. The evicted
+/// allocations must be independent of the allocation being retried.
+pub const Reclaimer = struct {
+    context: *anyopaque,
+    release: *const fn (*anyopaque) bool,
+    pub fn reclaim(self: ?Reclaimer) bool {
+        const owner = self orelse return false;
+        return owner.release(owner.context);
+    }
+};
 pub const Resources = struct {
     host_bytes: u64 = 0,
     device_bytes: u64 = 0,
@@ -26,6 +36,95 @@ pub const Pool = struct {
     used: Resources = .{},
     high_water: Resources = .{},
     locked: std.atomic.Value(bool) = .init(false),
+    reclaim_lock: std.atomic.Mutex = .unlocked,
+    reclaimer: ?HostReclaimer = null,
+    reclaiming: bool = false,
+
+    pub const HostReclaimer = struct {
+        callback: Reclaimer,
+        bytes: u64 = 0,
+        measure: ?*const fn (*anyopaque) u64 = null,
+    };
+
+    /// The callback may shrink existing reservations. Clearing it waits
+    /// for any running transaction before the caller retires its context.
+    pub fn setReclaimer(self: *Pool, value: ?HostReclaimer) void {
+        _ = self.swapReclaimer(value);
+    }
+
+    pub fn swapReclaimer(self: *Pool, value: ?HostReclaimer) ?HostReclaimer {
+        self.lockReclaim();
+        defer self.reclaim_lock.unlock();
+        const previous = self.reclaimer;
+        self.reclaimer = value;
+        return previous;
+    }
+
+    fn lockReclaim(self: *Pool) void {
+        while (!self.reclaim_lock.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn available(self: *Pool, existing: Resources) Resources {
+        return .{
+            .host_bytes = self.limits.host_bytes -| (self.used.host_bytes - existing.host_bytes),
+            .device_bytes = self.limits.device_bytes -| (self.used.device_bytes - existing.device_bytes),
+            .commands = self.limits.commands -| (self.used.commands - existing.commands),
+        };
+    }
+
+    fn fits(requested: Resources, capacity: Resources) bool {
+        return requested.host_bytes <= capacity.host_bytes and requested.device_bytes <= capacity.device_bytes and requested.commands <= capacity.commands;
+    }
+
+    fn commit(self: *Pool, existing: Resources, requested: Resources) void {
+        inline for (@typeInfo(Resources).@"struct".field_names) |name| {
+            @field(self.used, name) = @field(self.used, name) - @field(existing, name) + @field(requested, name);
+            @field(self.high_water, name) = @max(@field(self.high_water, name), @field(self.used, name));
+        }
+    }
+
+    fn replace(self: *Pool, existing: Resources, requested: Resources) !void {
+        self.lock();
+        // Releases must proceed during reclamation, including releases by
+        // the callback. Other growth goes through the transaction gate.
+        if ((!self.reclaiming or fits(requested, existing)) and fits(requested, self.available(existing))) {
+            self.commit(existing, requested);
+            self.unlock();
+            return;
+        }
+        self.unlock();
+
+        self.lockReclaim();
+        defer self.reclaim_lock.unlock();
+        self.lock();
+        const capacity = self.available(existing);
+        if (fits(requested, capacity)) {
+            self.commit(existing, requested);
+            self.unlock();
+            return;
+        }
+        const reclaimer = self.reclaimer orelse {
+            self.unlock();
+            return error.SharedAdmissionExceeded;
+        };
+        const reclaimable = if (reclaimer.measure) |measure| measure(reclaimer.callback.context) else reclaimer.bytes;
+        if (requested.device_bytes > capacity.device_bytes or requested.commands > capacity.commands or
+            requested.host_bytes -| capacity.host_bytes > reclaimable)
+        {
+            self.unlock();
+            return error.SharedAdmissionExceeded;
+        }
+        self.reclaiming = true;
+        self.unlock();
+
+        const released = reclaimer.callback.release(reclaimer.callback.context);
+        self.lock();
+        defer self.unlock();
+        self.reclaiming = false;
+        if (released) self.reclaimer = null;
+        if (!fits(requested, self.available(existing))) return error.SharedAdmissionExceeded;
+        self.commit(existing, requested);
+    }
     fn lock(self: *Pool) void {
         while (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
     }
@@ -35,15 +134,7 @@ pub const Pool = struct {
     /// Atomic across all dimensions; denial mutates no counters. The caller can
     /// retry through its scheduler, retaining its original cancellation deadline.
     pub fn acquire(self: *Pool, requested: Resources) !Token {
-        self.lock();
-        defer self.unlock();
-        inline for (@typeInfo(Resources).@"struct".field_names) |name| {
-            if (@field(requested, name) > @field(self.limits, name) -| @field(self.used, name)) return error.SharedAdmissionExceeded;
-        }
-        inline for (@typeInfo(Resources).@"struct".field_names) |name| {
-            @field(self.used, name) += @field(requested, name);
-            @field(self.high_water, name) = @max(@field(self.high_water, name), @field(self.used, name));
-        }
+        try self.replace(.{}, requested);
         return .{ .pool = self, .resources = requested };
     }
     pub fn snapshot(self: *Pool) Resources {
@@ -58,20 +149,7 @@ pub const Token = struct {
     /// Replace this reservation atomically. Growth denial retains the original
     /// token; shrinking releases only bytes whose owner has already freed them.
     pub fn resize(self: *Token, requested: Resources) !void {
-        const pool = self.pool orelse {
-            self.resources = requested;
-            return;
-        };
-        pool.lock();
-        defer pool.unlock();
-        inline for (@typeInfo(Resources).@"struct".field_names) |name| {
-            const others = @field(pool.used, name) - @field(self.resources, name);
-            if (@field(requested, name) > @field(pool.limits, name) -| others) return error.SharedAdmissionExceeded;
-        }
-        inline for (@typeInfo(Resources).@"struct".field_names) |name| {
-            @field(pool.used, name) = @field(pool.used, name) - @field(self.resources, name) + @field(requested, name);
-            @field(pool.high_water, name) = @max(@field(pool.high_water, name), @field(pool.used, name));
-        }
+        if (self.pool) |pool| try pool.replace(self.resources, requested);
         self.resources = requested;
     }
     pub fn deinit(self: *Token) void {
@@ -156,6 +234,7 @@ pub const TrackedAllocator = struct {
     limit: usize,
     live: usize = 0,
     denied: ?anyerror = null,
+    reclaimer: ?Reclaimer = null,
     pub fn allocator(self: *@This()) std.mem.Allocator {
         return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
     }
@@ -177,6 +256,9 @@ pub const TrackedAllocator = struct {
     }
     fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         const self: *@This() = @ptrCast(@alignCast(raw));
+        return self.allocate(len, alignment, ra) orelse if (Reclaimer.reclaim(self.reclaimer)) self.allocate(len, alignment, ra) else null;
+    }
+    fn allocate(self: *@This(), len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         const next = std.math.add(usize, self.live, len) catch {
             self.denied = error.ResourceLimitExceeded;
             return null;
@@ -240,3 +322,35 @@ pub const TrackedAllocator = struct {
         self.restore(self.live);
     }
 };
+
+test "host reclaim waits until device and command capacity are available" {
+    const Optional = struct {
+        token: Token,
+        calls: usize = 0,
+        fn release(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.token.deinit();
+            return true;
+        }
+    };
+    var pool = Pool{ .limits = .{ .host_bytes = 10, .device_bytes = 2, .commands = 2 } };
+    var optional = Optional{ .token = try pool.acquire(.{ .host_bytes = 8 }) };
+    defer optional.token.deinit();
+    var peer = try pool.acquire(.{ .device_bytes = 1, .commands = 1 });
+    defer peer.deinit();
+    var video = try pool.acquire(.{ .device_bytes = 1, .commands = 1 });
+    defer video.deinit();
+    pool.setReclaimer(.{ .callback = .{ .context = &optional, .release = Optional.release }, .bytes = optional.token.resources.host_bytes });
+    defer pool.setReclaimer(null);
+    var fixed = try pool.acquire(.{ .host_bytes = 2 });
+    defer fixed.deinit();
+    try std.testing.expectError(error.SharedAdmissionExceeded, pool.acquire(.{ .host_bytes = 9 }));
+    try std.testing.expectEqual(@as(usize, 0), optional.calls);
+    fixed.deinit();
+    try std.testing.expectError(error.SharedAdmissionExceeded, pool.acquire(.{ .host_bytes = 4, .commands = 1 }));
+    try std.testing.expectError(error.SharedAdmissionExceeded, video.resize(.{ .host_bytes = 4, .device_bytes = 2, .commands = 1 }));
+    try std.testing.expectEqual(@as(usize, 0), optional.calls);
+    try video.resize(.{ .host_bytes = 4, .device_bytes = 1, .commands = 1 });
+    try std.testing.expectEqual(@as(usize, 1), optional.calls);
+}

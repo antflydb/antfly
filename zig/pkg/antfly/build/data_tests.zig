@@ -36,10 +36,27 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const target = options.target;
     const data_runtime_test_mod = options.data_runtime_test_mod;
     const data_storage_test_mod = options.data_storage_test_mod;
+    const source_scope_storage_tests = b.addTest(.{ .root_module = data_storage_test_mod, .filters = compileFiltersWithAnchors(b, &.{"data storage module tests are reachable"}, &.{"db ordered source scope"}), .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("source-scope-native-control-test", "Verify physical source scope controls and atomic ordered recovery").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, source_scope_storage_tests, &.{"db ordered source scope"}).step);
+    const source_plan_apply_tests = @import("linked_tests.zig").add(b, .{ .name = "source-plan-apply-tests", .root_module = data_runtime_test_mod, .filters = &.{ "data raft source plan", "data raft source scope" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("source-plan-apply-test", "Verify activated frozen source plan native dispatch and lost-result recovery").dependOn(&source_plan_apply_tests.run(b).step);
+    const history_apply_tests = @import("linked_tests.zig").add(b, .{ .name = "ordered-history-apply-tests", .root_module = data_runtime_test_mod, .filters = &.{ "data raft ordered history", "source scope", "source producer closure", "source legacy terminal", "source legacy inventory", "source producer control" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("history-control-apply-test", "Verify native retention completion precedes shared Raft applied publication").dependOn(&history_apply_tests.run(b).step);
     const lib_data_runtime_default_filters = [_][]const u8{
+        "SQL drop retirement control retains ordered timestamps and requires every applying decoder",
+        "document retirement binds source definition and requires every data applying decoder",
+        "data raft ordered history",
+        "data raft source plan",
+        "data raft source scope",
         "data runtime commit requirements",
         "data runtime ordered artifact upload handoff",
+        "data runtime schema reader",
+        "data runtime schema recovery",
         "data runtime hosted FK retirement",
+        "pure policy control bypasses only ordinary dense repair writer preflight",
+        "native retirement preparation rejects untrusted and malformed requests before metadata or owner access",
+        "data runtime native restore phase two rejoins activating descriptor authority",
+        "data runtime native reset generation two births a real owner under the current recovering Boot",
         "pure topology control bypasses only ordinary dense repair writer preflight",
         "data ownership fallback requires a single store across all roles",
         "data relational maintenance yields to raft persistence and follows elections",
@@ -124,6 +141,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data raft document apply identity prevents non-idempotent restart replay",
         "data raft replica retirement removes only retired group apply state",
         "data raft apply records transaction conflicts without stopping replica progress",
+        "data raft rejected prepare snapshot preserves the native mutation gap",
         "data runtime structural changes preserve writer-published runtime status",
         "data runtime startup catch-up prefers cached admin snapshot",
         "data runtime startup catch-up clears dirty bit for terminal degraded index load",
@@ -131,6 +149,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
         "data runtime background maintenance is due for dense posting cadence without lsm debt",
         "remote metadata source pins one cluster incarnation across cache invalidation",
+        "remote metadata source provisioning pairs ignore unrelated shared cache heads and unbound public snapshots",
+        "provisioned root re-pairs a changed metadata head without publishing mixed snapshots",
+        "remote metadata changefeed port shares budgets and never fails over uncertain writes",
         "remote metadata source restore staging authority binds every owner read",
         "remote table descriptors prefer ordered peers before legacy fallback",
         "remote metadata mutation failover preserves ambiguous and deterministic outcomes",
@@ -140,8 +161,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "remote metadata mutation discovery preserves endpoint coverage and delivery time",
         "remote metadata source retains mutation authority across cache invalidation",
         "remote metadata observation accepts newer catalog from a peer with a lower lifecycle counter",
+        "remote metadata snapshot refresh cannot renew a borrowed head or hide schema publication",
         "remote metadata source installs fenced snapshot without comparing epoch domains",
         "remote metadata source rejects fenced snapshot across mutation invalidation",
+        "remote metadata source SQL control snapshots own retained promotion outcomes",
         "remote metadata source treats superseded concurrent fenced snapshot as success",
         "remote metadata source retries fenced snapshot generations until success",
         "remote metadata source bounds repeated fenced snapshot generations",
@@ -180,6 +203,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data server registered data raft uses wal state backend by default",
         "data raft read safety deadline and cancellation cover owner lock admission",
         "data raft read safety barrier completes only after matching ReadState apply",
+        "data raft immutable image prefix progresses under churn without weakening frozen reads",
         "data raft native snapshot requires an install completion receipt",
         "data runtime native FK retirement preserves source ownership and exact cold path",
         "data raft read safety barrier rejects pre-restart responses for both read paths",
@@ -188,12 +212,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "restore publication recovers a cold owner through Raft admission",
         "data raft stable placement refreshes changed peer transport endpoints",
         "raft batch round trips table batch payload",
+        "raft schema control log",
+        "data raft schema controls",
         "raft batch round trips guarded graph owner replay afterimages",
         "raft batch round trips deterministic transaction begin",
         "raft batch round trips deterministic storage owner descriptor",
         "raft batch round trips binary initial owner range",
         "raft protocol barrier is fail closed for legacy batch parsers",
         "raft protocol barrier rejects unsupported future versions",
+        "raft protocol barrier rejects noninteger and out of range tokens",
         "raft proposal materializes a default batch timestamp exactly once",
         "raft proposal preserves isolated catalog admission through document revision negotiation",
         "raft proposal preserves guarded graph cleanup through document revision negotiation",
@@ -202,15 +229,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "distributed online merge admission declines both owners and direct source proposals",
         "data raft raw topology rejection advances delegate with exact typed outcome",
         "raft batch protocol preflight fingerprint fences every applying replica set",
+        "raft index owner controls require their decoder but cannot bypass metadata admission",
+        "raft index owner observation crosses the compiled storage boundary",
+        "raft index owner scope binds actual leadership and leased roots",
         "raft batch protocol plan resolves only current group applying peers",
         "raft batch protocol cache reuses only short lived negative evidence",
         "raft batch protocol activation is reusable only in its accepted leader term",
         "raft batch protocol activation cleanup preserves in flight references",
         "time series document revision protocol dominates older envelope features",
-        // Zig 0.17 response files treat apostrophes as quote delimiters even
-        // inside double-quoted arguments. Keep the test name intact and select
-        // it with its unique quote-free prefix on both compiler and run paths.
-        "time series optional revision upgrade preserves a mixed group",
+        "time series optional revision upgrade",
         "data raft forwarding admission waits within the borrowed deadline and cancellation",
         "data raft apply completion notifications fence reuse deadlines and bounded ownership",
         "data raft retry clock and sleep borrow VoprIo",
@@ -228,6 +255,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "metadata http client shares deadline and cancellation across retries",
         "system catalog write validation cache follows revisions and bounds admission",
         "system catalog peer publication avoids schema copies workload",
+        "system catalog native owner endpoints use only compact exact-store peers and inherited budgets",
         "system catalog read peer refresh forwards cancellation and remaining transport budget",
         "system catalog read peer miss refresh shares publication and preserves budgets",
         "system catalog read peer miss refresh bounds retries and preserves warm routes on failure",
@@ -235,6 +263,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "system catalog read peer routing retains healthy relocation views across publication and invalidation",
         "system catalog remote reads survive elections without skipping peers or extending budgets",
         "system catalog remote reads spend one caller budget across bounded RPC attempts",
+        "system catalog remote recovery preserves plain fallback budget after selector rejection",
         "system catalog report failover preserves repair signals and stable peer order",
         "metadata capability client distinguishes advertised routing from N-1 absence",
         "data server wires configured HA executors into API server",
@@ -260,6 +289,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data server keeps upstream replication availability failures nonfatal",
         "data runtime records HA standby apply failures without stopping run round",
         "remote metadata deadline ",
+        "native index claims data receiver",
+        "boundary dispatcher preserves native index claim",
         "remote repair routing ",
     };
     const lib_data_runtime_tests = @import("linked_tests.zig").add(b, .{
@@ -296,18 +327,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const private_initial_owner_predicate_tests = b.addTest(.{
         .name = "data-private-initial-owner-predicate-tests",
         .root_module = options.data_implementation_module,
-        .filters = &.{"ordinary unpublished placement does not require a private initial FK owner snapshot"},
+        .filters = &.{ "ordinary unpublished placement does not require a private initial FK owner snapshot", "initial FK private owner" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-data-private-initial-owner-predicate-test", "Verify hidden initial-FK owner preflight excludes ordinary unpublished placements")
         .dependOn(&addFilteredTestRunArtifact(b, private_initial_owner_predicate_tests).step);
 
     const lib_data_storage_default_filters = [_][]const u8{
+        "db ordered source scope",
         "privacy data raft apply batches WAL-durable commands without one SST per entry",
         "privacy data raft apply compaction families are contiguous and separate hot metadata from history",
         "membership reducer",
         "FK retirement worker",
         "data raft online topology arbitration persists exact rejection and scopes release across reopen",
+        "data raft history control",
         // Regressions previously selected only by unit-test-progress.
         "split status decodes an omitted nullable source phase",
         "derive merge transition phases",
@@ -359,6 +392,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db split successor bootstrap atomically replaces stale destination generation",
         "data raft apply store applies delete operations into group state",
         "data raft protocol barrier persists and transfers in snapshots",
+        "data raft schema controls",
         "data raft protocol request observation never waits for generation preparation",
         "data raft apply store prepared snapshot retains its MVCC view across later writes",
         "data raft apply store orders independent groups through separate shards",
@@ -427,6 +461,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db merge coordinator rollback reapplies target namespace for persisted reassignment opt-in",
     };
     const lib_data_storage_runtime_filters = selectTestFilters(b, &lib_data_storage_default_filters);
+    const history_projection_filters = &.{ "data raft history control", "data raft protocol barrier persists and transfers in snapshots", "data raft merge pages projection cannot acknowledge native source retention controls", "data raft merge pages native source projection requires trusted delegate and retries before shared applied publication" };
+    const history_projection_tests = b.addTest(.{ .root_module = data_storage_test_mod, .filters = compileFiltersWithAnchors(b, &.{"data storage module tests are reachable"}, history_projection_filters), .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const run_history_projection_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, history_projection_tests, history_projection_filters);
+    b.step("history-control-projection-test", "Verify retention projection cannot advance without native ownership and activation").dependOn(&run_history_projection_tests.step);
     const lib_data_storage_tests = b.addTest(.{
         .root_module = data_storage_test_mod,
         .filters = compileFiltersWithAnchors(
@@ -453,7 +491,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // clients through shared runtime tests. Link the same production
         // provider archives as the consumer executable; keeping its physical
         // source selection does not itself satisfy those extern symbols.
-        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ lib_data_runtime_tests.executable, implementation_tests }) catch @panic("OOM"),
+        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ lib_data_runtime_tests.executable, implementation_tests, history_apply_tests.executable, source_plan_apply_tests.executable }) catch @panic("OOM"),
         .run_lib_data_runtime_tests = run_lib_data_runtime_tests,
         .run_lib_data_storage_tests = run_lib_data_storage_tests,
     };

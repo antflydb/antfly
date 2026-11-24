@@ -6,6 +6,214 @@ const httpx = @import("httpx");
 const types = @import("types.zig");
 
 /// --- Extractors (framework-agnostic) ---
+/// Parse the JSON request body for accessInternalChangefeedState.
+pub fn parseAccessInternalChangefeedStateBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.InternalChangefeedStateRequest) {
+    return std.json.parseFromSlice(types.InternalChangefeedStateRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for captureNativeSourceMetadataScope.
+pub fn parseCaptureNativeSourceMetadataScopeBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.NativeSourceMetadataCaptureRequest) {
+    return std.json.parseFromSlice(types.NativeSourceMetadataCaptureRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Submit a native retention control or recover its exact result
+pub const ControlNativeRetainedHistoryPathParams = struct {
+    group_id: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for controlNativeRetainedHistory.
+pub fn parseControlNativeRetainedHistoryBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.NativeHistoryControlRequest) {
+    return std.json.parseFromSlice(types.NativeHistoryControlRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Read the retained coordinator decision and original participant admission
+pub const ReadNativeHistoryCoordinatorDecisionPathParams = struct {
+    group_id: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for readNativeHistoryCoordinatorDecision.
+pub fn parseReadNativeHistoryCoordinatorDecisionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.NativeHistoryDecisionRequest) {
+    return std.json.parseFromSlice(types.NativeHistoryDecisionRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Observe retained consumer admission without proposing a command
+pub const ObserveNativeRetainedHistoryGrantPathParams = struct {
+    group_id: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for observeNativeRetainedHistoryGrant.
+pub fn parseObserveNativeRetainedHistoryGrantBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.NativeHistoryGrantRequest) {
+    return std.json.parseFromSlice(types.NativeHistoryGrantRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Qualify the current native history participant owner
+pub const CaptureNativeHistoryOwnerPathParams = struct {
+    group_id: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for captureNativeHistoryOwner.
+pub fn parseCaptureNativeHistoryOwnerBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.NativeHistoryOwnerRequest) {
+    return std.json.parseFromSlice(types.NativeHistoryOwnerRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Read one bounded retained native frame page
+pub const ReadNativeRetainedHistoryPagePathParams = struct {
+    group_id: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for readNativeRetainedHistoryPage.
+pub fn parseReadNativeRetainedHistoryPageBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.NativeHistoryPageRequest) {
+    return std.json.parseFromSlice(types.NativeHistoryPageRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Read retained complete-certificate publication at its original owner
+pub const ReadNativeTransactionCompletionPublicationPathParams = struct {
+    group_id: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for readNativeTransactionCompletionPublication.
+pub fn parseReadNativeTransactionCompletionPublicationBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.NativeHistoryPublicationRequest) {
+    return std.json.parseFromSlice(types.NativeHistoryPublicationRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Read an immutable participant completion receipt at a qualified cut
+pub const ReadNativeTransactionCompletionResolutionPathParams = struct {
+    group_id: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for readNativeTransactionCompletionResolution.
+pub fn parseReadNativeTransactionCompletionResolutionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.NativeHistoryResolutionRequest) {
+    return std.json.parseFromSlice(types.NativeHistoryResolutionRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Read bounded retained source checkpoint receipts at a qualified native cut
+pub const ObserveNativeSourceCheckpointPathParams = struct {
+    group_id: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for observeNativeSourceCheckpoint.
+pub fn parseObserveNativeSourceCheckpointBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.NativeSourceCheckpointReadRequest) {
+    return std.json.parseFromSlice(types.NativeSourceCheckpointReadRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Read one authenticated sealed source-plan chunk
+pub const ReadNativeSourcePlanChunkPathParams = struct {
+    group_id: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for readNativeSourcePlanChunk.
+pub fn parseReadNativeSourcePlanChunkBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.NativeSourcePlanChunkRequest) {
+    return std.json.parseFromSlice(types.NativeSourcePlanChunkRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Stage or retire a frozen source plan
+pub const ControlNativeSourcePlanPathParams = struct {
+    group_id: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for controlNativeSourcePlan.
+pub fn parseControlNativeSourcePlanBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.NativeSourcePlanControlRequest) {
+    return std.json.parseFromSlice(types.NativeSourcePlanControlRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Observe root quota and frozen upload status
+pub const ObserveNativeSourcePlanPathParams = struct {
+    group_id: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for observeNativeSourcePlan.
+pub fn parseObserveNativeSourcePlanBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.NativeSourcePlanObserveRequest) {
+    return std.json.parseFromSlice(types.NativeSourcePlanObserveRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Submit one owner-fenced cumulative producer intake closure
+pub const CloseNativeSourceProducersPathParams = struct {
+    group_id: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for closeNativeSourceProducers.
+pub fn parseCloseNativeSourceProducersBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.NativeSourceProducerCloseRequest) {
+    return std.json.parseFromSlice(types.NativeSourceProducerCloseRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Read bounded original legacy work at a qualified physical cut
+pub const ReadNativeLegacyInventoryPathParams = struct {
+    group_id: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for readNativeLegacyInventory.
+pub fn parseReadNativeLegacyInventoryBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.NativeLegacyInventoryRequest) {
+    return std.json.parseFromSlice(types.NativeLegacyInventoryRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Submit original terminal legacy recovery or read its exact outcome
+pub const ControlNativeLegacyTerminalPathParams = struct {
+    group_id: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for controlNativeLegacyTerminal.
+pub fn parseControlNativeLegacyTerminalBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.NativeLegacyTerminalRequest) {
+    return std.json.parseFromSlice(types.NativeLegacyTerminalRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Read physical producer intake closure at a qualified native cut
+pub const ObserveNativeSourceProducerClosurePathParams = struct {
+    group_id: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for observeNativeSourceProducerClosure.
+pub fn parseObserveNativeSourceProducerClosureBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.NativeSourceProducerClosureQuery) {
+    return std.json.parseFromSlice(types.NativeSourceProducerClosureQuery, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Submit coordinator-authorized source retirement intent or recover its exact receipt
+pub const ControlNativeSourceRetirementPathParams = struct {
+    group_id: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for controlNativeSourceRetirement.
+pub fn parseControlNativeSourceRetirementBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.NativeSourceRetirementRequest) {
+    return std.json.parseFromSlice(types.NativeSourceRetirementRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Submit a metadata-authorized lifecycle intent or recover its exact receipt
+pub const ControlNativeSourceScopePathParams = struct {
+    group_id: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for controlNativeSourceScope.
+pub fn parseControlNativeSourceScopeBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.NativeSourceScopeControlRequest) {
+    return std.json.parseFromSlice(types.NativeSourceScopeControlRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Read bounded source scope state at a qualified native cut
+pub const ObserveNativeSourceScopePathParams = struct {
+    group_id: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for observeNativeSourceScope.
+pub fn parseObserveNativeSourceScopeBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.NativeSourceScopeQuery) {
+    return std.json.parseFromSlice(types.NativeSourceScopeQuery, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Parse the JSON request body for createHAReplicationStreamingSlot.
 pub fn parseCreateHAReplicationStreamingSlotBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.StandbyCreateReplicationSlotRequest) {
     return std.json.parseFromSlice(types.StandbyCreateReplicationSlotRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -33,6 +241,26 @@ pub const Route = struct {
 };
 
 pub const routes = [_]Route{
+    .{ .method = "POST", .path = "/catalog/changefeed-state-v1", .operation_id = "accessInternalChangefeedState", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/catalog/source-scope-capture-v1", .operation_id = "captureNativeSourceMetadataScope", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/history/control-v1", .operation_id = "controlNativeRetainedHistory", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/history/decision-v1", .operation_id = "readNativeHistoryCoordinatorDecision", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/history/grant-v1", .operation_id = "observeNativeRetainedHistoryGrant", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/history/owner-v1", .operation_id = "captureNativeHistoryOwner", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/history/page-v1", .operation_id = "readNativeRetainedHistoryPage", .request_body = .buffered, .streaming_response = true },
+    .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/history/publication-v1", .operation_id = "readNativeTransactionCompletionPublication", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/history/resolution-v1", .operation_id = "readNativeTransactionCompletionResolution", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-checkpoint/observe-v1", .operation_id = "observeNativeSourceCheckpoint", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-plan/chunk-v1", .operation_id = "readNativeSourcePlanChunk", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-plan/control-v1", .operation_id = "controlNativeSourcePlan", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-plan/observe-v1", .operation_id = "observeNativeSourcePlan", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-producers/close-v1", .operation_id = "closeNativeSourceProducers", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-producers/legacy-inventory-v1", .operation_id = "readNativeLegacyInventory", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-producers/legacy-terminal-v1", .operation_id = "controlNativeLegacyTerminal", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-producers/observe-v1", .operation_id = "observeNativeSourceProducerClosure", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-retirement/control-v1", .operation_id = "controlNativeSourceRetirement", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-scope/control-v1", .operation_id = "controlNativeSourceScope", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-scope/observe-v1", .operation_id = "observeNativeSourceScope", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/standby/replication/identify", .operation_id = "identifyHAReplicationSystem", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/standby/replication/slots", .operation_id = "createHAReplicationStreamingSlot", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/standby/replication/start", .operation_id = "startHAReplication", .request_body = .buffered, .streaming_response = false },
@@ -50,6 +278,26 @@ pub const routes = [_]Route{
 ///   try router.register(&server);
 pub fn ServerRouter(comptime Impl: type) type {
     comptime {
+        if (!@hasDecl(Impl, "accessInternalChangefeedState")) @compileError("ServerRouter: Impl missing required method 'accessInternalChangefeedState'");
+        if (!@hasDecl(Impl, "captureNativeSourceMetadataScope")) @compileError("ServerRouter: Impl missing required method 'captureNativeSourceMetadataScope'");
+        if (!@hasDecl(Impl, "controlNativeRetainedHistory")) @compileError("ServerRouter: Impl missing required method 'controlNativeRetainedHistory'");
+        if (!@hasDecl(Impl, "readNativeHistoryCoordinatorDecision")) @compileError("ServerRouter: Impl missing required method 'readNativeHistoryCoordinatorDecision'");
+        if (!@hasDecl(Impl, "observeNativeRetainedHistoryGrant")) @compileError("ServerRouter: Impl missing required method 'observeNativeRetainedHistoryGrant'");
+        if (!@hasDecl(Impl, "captureNativeHistoryOwner")) @compileError("ServerRouter: Impl missing required method 'captureNativeHistoryOwner'");
+        if (!@hasDecl(Impl, "readNativeRetainedHistoryPage")) @compileError("ServerRouter: Impl missing required method 'readNativeRetainedHistoryPage'");
+        if (!@hasDecl(Impl, "readNativeTransactionCompletionPublication")) @compileError("ServerRouter: Impl missing required method 'readNativeTransactionCompletionPublication'");
+        if (!@hasDecl(Impl, "readNativeTransactionCompletionResolution")) @compileError("ServerRouter: Impl missing required method 'readNativeTransactionCompletionResolution'");
+        if (!@hasDecl(Impl, "observeNativeSourceCheckpoint")) @compileError("ServerRouter: Impl missing required method 'observeNativeSourceCheckpoint'");
+        if (!@hasDecl(Impl, "readNativeSourcePlanChunk")) @compileError("ServerRouter: Impl missing required method 'readNativeSourcePlanChunk'");
+        if (!@hasDecl(Impl, "controlNativeSourcePlan")) @compileError("ServerRouter: Impl missing required method 'controlNativeSourcePlan'");
+        if (!@hasDecl(Impl, "observeNativeSourcePlan")) @compileError("ServerRouter: Impl missing required method 'observeNativeSourcePlan'");
+        if (!@hasDecl(Impl, "closeNativeSourceProducers")) @compileError("ServerRouter: Impl missing required method 'closeNativeSourceProducers'");
+        if (!@hasDecl(Impl, "readNativeLegacyInventory")) @compileError("ServerRouter: Impl missing required method 'readNativeLegacyInventory'");
+        if (!@hasDecl(Impl, "controlNativeLegacyTerminal")) @compileError("ServerRouter: Impl missing required method 'controlNativeLegacyTerminal'");
+        if (!@hasDecl(Impl, "observeNativeSourceProducerClosure")) @compileError("ServerRouter: Impl missing required method 'observeNativeSourceProducerClosure'");
+        if (!@hasDecl(Impl, "controlNativeSourceRetirement")) @compileError("ServerRouter: Impl missing required method 'controlNativeSourceRetirement'");
+        if (!@hasDecl(Impl, "controlNativeSourceScope")) @compileError("ServerRouter: Impl missing required method 'controlNativeSourceScope'");
+        if (!@hasDecl(Impl, "observeNativeSourceScope")) @compileError("ServerRouter: Impl missing required method 'observeNativeSourceScope'");
         if (!@hasDecl(Impl, "identifyHAReplicationSystem")) @compileError("ServerRouter: Impl missing required method 'identifyHAReplicationSystem'");
         if (!@hasDecl(Impl, "createHAReplicationStreamingSlot")) @compileError("ServerRouter: Impl missing required method 'createHAReplicationStreamingSlot'");
         if (!@hasDecl(Impl, "startHAReplication")) @compileError("ServerRouter: Impl missing required method 'startHAReplication'");
@@ -65,10 +313,186 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Register all routes on the server with explicit instance context.
         pub fn register(self: *const @This(), server: anytype) !void {
+            try server.post("/catalog/changefeed-state-v1", httpx.Handler.bind(self.impl, accessInternalChangefeedState));
+            try server.post("/catalog/source-scope-capture-v1", httpx.Handler.bind(self.impl, captureNativeSourceMetadataScope));
+            try server.post("/groups/:group_id/tables/:table_name/history/control-v1", httpx.Handler.bind(self.impl, controlNativeRetainedHistory));
+            try server.post("/groups/:group_id/tables/:table_name/history/decision-v1", httpx.Handler.bind(self.impl, readNativeHistoryCoordinatorDecision));
+            try server.post("/groups/:group_id/tables/:table_name/history/grant-v1", httpx.Handler.bind(self.impl, observeNativeRetainedHistoryGrant));
+            try server.post("/groups/:group_id/tables/:table_name/history/owner-v1", httpx.Handler.bind(self.impl, captureNativeHistoryOwner));
+            try server.post("/groups/:group_id/tables/:table_name/history/page-v1", httpx.Handler.bind(self.impl, readNativeRetainedHistoryPage));
+            try server.post("/groups/:group_id/tables/:table_name/history/publication-v1", httpx.Handler.bind(self.impl, readNativeTransactionCompletionPublication));
+            try server.post("/groups/:group_id/tables/:table_name/history/resolution-v1", httpx.Handler.bind(self.impl, readNativeTransactionCompletionResolution));
+            try server.post("/groups/:group_id/tables/:table_name/source-checkpoint/observe-v1", httpx.Handler.bind(self.impl, observeNativeSourceCheckpoint));
+            try server.post("/groups/:group_id/tables/:table_name/source-plan/chunk-v1", httpx.Handler.bind(self.impl, readNativeSourcePlanChunk));
+            try server.post("/groups/:group_id/tables/:table_name/source-plan/control-v1", httpx.Handler.bind(self.impl, controlNativeSourcePlan));
+            try server.post("/groups/:group_id/tables/:table_name/source-plan/observe-v1", httpx.Handler.bind(self.impl, observeNativeSourcePlan));
+            try server.post("/groups/:group_id/tables/:table_name/source-producers/close-v1", httpx.Handler.bind(self.impl, closeNativeSourceProducers));
+            try server.post("/groups/:group_id/tables/:table_name/source-producers/legacy-inventory-v1", httpx.Handler.bind(self.impl, readNativeLegacyInventory));
+            try server.post("/groups/:group_id/tables/:table_name/source-producers/legacy-terminal-v1", httpx.Handler.bind(self.impl, controlNativeLegacyTerminal));
+            try server.post("/groups/:group_id/tables/:table_name/source-producers/observe-v1", httpx.Handler.bind(self.impl, observeNativeSourceProducerClosure));
+            try server.post("/groups/:group_id/tables/:table_name/source-retirement/control-v1", httpx.Handler.bind(self.impl, controlNativeSourceRetirement));
+            try server.post("/groups/:group_id/tables/:table_name/source-scope/control-v1", httpx.Handler.bind(self.impl, controlNativeSourceScope));
+            try server.post("/groups/:group_id/tables/:table_name/source-scope/observe-v1", httpx.Handler.bind(self.impl, observeNativeSourceScope));
             try server.get("/standby/replication/identify", httpx.Handler.bind(self.impl, identifyHAReplicationSystem));
             try server.post("/standby/replication/slots", httpx.Handler.bind(self.impl, createHAReplicationStreamingSlot));
             try server.post("/standby/replication/start", httpx.Handler.bind(self.impl, startHAReplication));
             try server.post("/standby/replication/status", httpx.Handler.bind(self.impl, updateHAStandbyStatus));
+        }
+
+        /// Read or mutate durable private changefeed ownership state
+        /// POST /catalog/changefeed-state-v1
+        fn accessInternalChangefeedState(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.accessInternalChangefeedState(ctx);
+        }
+
+        /// Capture a native source lifecycle through metadata ReadIndex
+        /// POST /catalog/source-scope-capture-v1
+        fn captureNativeSourceMetadataScope(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.captureNativeSourceMetadataScope(ctx);
+        }
+
+        /// Submit a native retention control or recover its exact result
+        /// POST /groups/{group_id}/tables/{table_name}/history/control-v1
+        fn controlNativeRetainedHistory(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const group_id = ctx.param("group_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: group_id" });
+            const table_name = ctx.param("table_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table_name" });
+            return impl.controlNativeRetainedHistory(ctx, group_id, table_name);
+        }
+
+        /// Read the retained coordinator decision and original participant admission
+        /// POST /groups/{group_id}/tables/{table_name}/history/decision-v1
+        fn readNativeHistoryCoordinatorDecision(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const group_id = ctx.param("group_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: group_id" });
+            const table_name = ctx.param("table_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table_name" });
+            return impl.readNativeHistoryCoordinatorDecision(ctx, group_id, table_name);
+        }
+
+        /// Observe retained consumer admission without proposing a command
+        /// POST /groups/{group_id}/tables/{table_name}/history/grant-v1
+        fn observeNativeRetainedHistoryGrant(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const group_id = ctx.param("group_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: group_id" });
+            const table_name = ctx.param("table_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table_name" });
+            return impl.observeNativeRetainedHistoryGrant(ctx, group_id, table_name);
+        }
+
+        /// Qualify the current native history participant owner
+        /// POST /groups/{group_id}/tables/{table_name}/history/owner-v1
+        fn captureNativeHistoryOwner(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const group_id = ctx.param("group_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: group_id" });
+            const table_name = ctx.param("table_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table_name" });
+            return impl.captureNativeHistoryOwner(ctx, group_id, table_name);
+        }
+
+        /// Read one bounded retained native frame page
+        /// POST /groups/{group_id}/tables/{table_name}/history/page-v1
+        fn readNativeRetainedHistoryPage(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const group_id = ctx.param("group_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: group_id" });
+            const table_name = ctx.param("table_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table_name" });
+            return impl.readNativeRetainedHistoryPage(ctx, group_id, table_name);
+        }
+
+        /// Read retained complete-certificate publication at its original owner
+        /// POST /groups/{group_id}/tables/{table_name}/history/publication-v1
+        fn readNativeTransactionCompletionPublication(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const group_id = ctx.param("group_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: group_id" });
+            const table_name = ctx.param("table_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table_name" });
+            return impl.readNativeTransactionCompletionPublication(ctx, group_id, table_name);
+        }
+
+        /// Read an immutable participant completion receipt at a qualified cut
+        /// POST /groups/{group_id}/tables/{table_name}/history/resolution-v1
+        fn readNativeTransactionCompletionResolution(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const group_id = ctx.param("group_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: group_id" });
+            const table_name = ctx.param("table_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table_name" });
+            return impl.readNativeTransactionCompletionResolution(ctx, group_id, table_name);
+        }
+
+        /// Read bounded retained source checkpoint receipts at a qualified native cut
+        /// POST /groups/{group_id}/tables/{table_name}/source-checkpoint/observe-v1
+        fn observeNativeSourceCheckpoint(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const group_id = ctx.param("group_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: group_id" });
+            const table_name = ctx.param("table_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table_name" });
+            return impl.observeNativeSourceCheckpoint(ctx, group_id, table_name);
+        }
+
+        /// Read one authenticated sealed source-plan chunk
+        /// POST /groups/{group_id}/tables/{table_name}/source-plan/chunk-v1
+        fn readNativeSourcePlanChunk(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const group_id = ctx.param("group_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: group_id" });
+            const table_name = ctx.param("table_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table_name" });
+            return impl.readNativeSourcePlanChunk(ctx, group_id, table_name);
+        }
+
+        /// Stage or retire a frozen source plan
+        /// POST /groups/{group_id}/tables/{table_name}/source-plan/control-v1
+        fn controlNativeSourcePlan(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const group_id = ctx.param("group_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: group_id" });
+            const table_name = ctx.param("table_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table_name" });
+            return impl.controlNativeSourcePlan(ctx, group_id, table_name);
+        }
+
+        /// Observe root quota and frozen upload status
+        /// POST /groups/{group_id}/tables/{table_name}/source-plan/observe-v1
+        fn observeNativeSourcePlan(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const group_id = ctx.param("group_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: group_id" });
+            const table_name = ctx.param("table_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table_name" });
+            return impl.observeNativeSourcePlan(ctx, group_id, table_name);
+        }
+
+        /// Submit one owner-fenced cumulative producer intake closure
+        /// POST /groups/{group_id}/tables/{table_name}/source-producers/close-v1
+        fn closeNativeSourceProducers(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const group_id = ctx.param("group_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: group_id" });
+            const table_name = ctx.param("table_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table_name" });
+            return impl.closeNativeSourceProducers(ctx, group_id, table_name);
+        }
+
+        /// Read bounded original legacy work at a qualified physical cut
+        /// POST /groups/{group_id}/tables/{table_name}/source-producers/legacy-inventory-v1
+        fn readNativeLegacyInventory(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const group_id = ctx.param("group_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: group_id" });
+            const table_name = ctx.param("table_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table_name" });
+            return impl.readNativeLegacyInventory(ctx, group_id, table_name);
+        }
+
+        /// Submit original terminal legacy recovery or read its exact outcome
+        /// POST /groups/{group_id}/tables/{table_name}/source-producers/legacy-terminal-v1
+        fn controlNativeLegacyTerminal(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const group_id = ctx.param("group_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: group_id" });
+            const table_name = ctx.param("table_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table_name" });
+            return impl.controlNativeLegacyTerminal(ctx, group_id, table_name);
+        }
+
+        /// Read physical producer intake closure at a qualified native cut
+        /// POST /groups/{group_id}/tables/{table_name}/source-producers/observe-v1
+        fn observeNativeSourceProducerClosure(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const group_id = ctx.param("group_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: group_id" });
+            const table_name = ctx.param("table_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table_name" });
+            return impl.observeNativeSourceProducerClosure(ctx, group_id, table_name);
+        }
+
+        /// Submit coordinator-authorized source retirement intent or recover its exact receipt
+        /// POST /groups/{group_id}/tables/{table_name}/source-retirement/control-v1
+        fn controlNativeSourceRetirement(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const group_id = ctx.param("group_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: group_id" });
+            const table_name = ctx.param("table_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table_name" });
+            return impl.controlNativeSourceRetirement(ctx, group_id, table_name);
+        }
+
+        /// Submit a metadata-authorized lifecycle intent or recover its exact receipt
+        /// POST /groups/{group_id}/tables/{table_name}/source-scope/control-v1
+        fn controlNativeSourceScope(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const group_id = ctx.param("group_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: group_id" });
+            const table_name = ctx.param("table_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table_name" });
+            return impl.controlNativeSourceScope(ctx, group_id, table_name);
+        }
+
+        /// Read bounded source scope state at a qualified native cut
+        /// POST /groups/{group_id}/tables/{table_name}/source-scope/observe-v1
+        fn observeNativeSourceScope(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const group_id = ctx.param("group_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: group_id" });
+            const table_name = ctx.param("table_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table_name" });
+            return impl.observeNativeSourceScope(ctx, group_id, table_name);
         }
 
         /// Identify this primary replication system
@@ -99,6 +523,26 @@ pub fn ServerRouter(comptime Impl: type) type {
 
 // Handler interface. Implement these methods on your Impl struct:
 //
+//   fn accessInternalChangefeedState(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn captureNativeSourceMetadataScope(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn controlNativeRetainedHistory(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
+//   fn readNativeHistoryCoordinatorDecision(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
+//   fn observeNativeRetainedHistoryGrant(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
+//   fn captureNativeHistoryOwner(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
+//   fn readNativeRetainedHistoryPage(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
+//   fn readNativeTransactionCompletionPublication(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
+//   fn readNativeTransactionCompletionResolution(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
+//   fn observeNativeSourceCheckpoint(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
+//   fn readNativeSourcePlanChunk(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
+//   fn controlNativeSourcePlan(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
+//   fn observeNativeSourcePlan(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
+//   fn closeNativeSourceProducers(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
+//   fn readNativeLegacyInventory(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
+//   fn controlNativeLegacyTerminal(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
+//   fn observeNativeSourceProducerClosure(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
+//   fn controlNativeSourceRetirement(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
+//   fn controlNativeSourceScope(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
+//   fn observeNativeSourceScope(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn identifyHAReplicationSystem(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn createHAReplicationStreamingSlot(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn startHAReplication(self: *Impl, ctx: *httpx.Context) !httpx.Response

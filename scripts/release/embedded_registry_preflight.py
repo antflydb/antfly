@@ -33,24 +33,32 @@ from release_channels import (
     compare_channel_tags,
     load_policy,
     python_version_from_release,
+    validate_channel_tag,
 )
 
 
 def preflight(snapshot: Path, version: str, commit: str, npm_tag: str) -> None:
     verify(snapshot, version, commit)
-    if npm_tag not in {"latest", "next"}:
-        raise ValueError("embedded publication requires latest or next")
-    channel = "stable" if npm_tag == "latest" else "next"
+    policy = load_policy()
+    matching = [
+        name
+        for name, settings in policy["channels"].items()
+        if settings["publish_npm"] and settings["npm_tag"] == npm_tag
+    ]
+    # Preserve the historical prerelease preflight used by manual callers.
+    if npm_tag == "next":
+        matching = ["next"]
+    if len(matching) != 1:
+        raise ValueError("embedded publication requires a policy-owned npm tag")
+    channel = matching[0]
+    validate_channel_tag("v" + version, channel, policy)
     for name, stem in NPM_PACKAGES.items():
         observed = dist_tag(name, npm_tag)
         # The initial name-claim version is not a functional release.
         if (
             observed
             and observed != "0.0.0"
-            and compare_channel_tags(
-                "v" + version, "v" + observed, channel, load_policy()
-            )
-            < 0
+            and compare_channel_tags("v" + version, "v" + observed, channel, policy) < 0
         ):
             raise ValueError(
                 f"refusing to move {name} {npm_tag} backward from {observed}"

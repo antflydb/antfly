@@ -17,10 +17,11 @@
 //! header. The dynamic fixture alone cannot catch a shared slot-number mistake.
 const std = @import("std");
 const c = @import("pjrt_c_types.zig");
-extern const antfly_pjrt_api_offsets: [26]usize;
-extern const antfly_pjrt_arg_layouts: [58]usize;
+extern const antfly_pjrt_api_offsets: [28]usize;
+extern const antfly_pjrt_arg_layouts: [69]usize;
 
 test "PJRT function slots match the upstream C header" {
+    @setEvalBranchQuota(2000);
     const Slot = struct { index: usize, name: []const u8 };
     const slots = [_]Slot{
         .{ .index = c.Api.FN_ERROR_DESTROY, .name = "PJRT_Error_Destroy" },
@@ -49,6 +50,8 @@ test "PJRT function slots match the upstream C header" {
         .{ .index = c.Api.FN_BUFFER_ON_DEVICE_SIZE, .name = "PJRT_Buffer_OnDeviceSizeInBytes" },
         .{ .index = c.Api.FN_BUFFER_TO_HOST, .name = "PJRT_Buffer_ToHostBuffer" },
         .{ .index = c.Api.FN_EXEC_COMPILED_MEMORY_STATS, .name = "PJRT_Executable_GetCompiledMemoryStats" },
+        .{ .index = c.Api.FN_DEVICE_GET_DESCRIPTION, .name = "PJRT_Device_GetDescription" },
+        .{ .index = c.Api.FN_DEVICE_DESCRIPTION_KIND, .name = "PJRT_DeviceDescription_Kind" },
     };
     // Adding another wrapper entry point must also add its upstream field here.
     inline for (comptime std.meta.declarations(c.Api)) |decl| {
@@ -126,6 +129,17 @@ test "PJRT executable ownership and arity argument layouts match upstream" {
         @offsetOf(c.BufferMemoryLayout, "layout_type"),
         @offsetOf(c.ExecuteOptions, "non_donatable_input_indices"),
         @offsetOf(c.ExecuteOptions, "num_non_donatable_input_indices"),
+        @sizeOf(c.DeviceGetDescriptionArgs),
+        @offsetOf(c.DeviceGetDescriptionArgs, "struct_size"),
+        @offsetOf(c.DeviceGetDescriptionArgs, "extension_start"),
+        @offsetOf(c.DeviceGetDescriptionArgs, "device"),
+        @offsetOf(c.DeviceGetDescriptionArgs, "device_description"),
+        @sizeOf(c.DeviceDescriptionKindArgs),
+        @offsetOf(c.DeviceDescriptionKindArgs, "struct_size"),
+        @offsetOf(c.DeviceDescriptionKindArgs, "extension_start"),
+        @offsetOf(c.DeviceDescriptionKindArgs, "device_description"),
+        @offsetOf(c.DeviceDescriptionKindArgs, "device_kind"),
+        @offsetOf(c.DeviceDescriptionKindArgs, "device_kind_size"),
     };
     try std.testing.expectEqualSlices(usize, &antfly_pjrt_arg_layouts, &layouts);
 }

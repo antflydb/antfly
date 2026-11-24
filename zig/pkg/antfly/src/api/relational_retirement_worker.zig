@@ -68,6 +68,8 @@ fn retainedSchemaEqual(alloc: Allocator, source: []const u8, target: []const u8)
             if (!std.mem.eql(u8, prior_json, current_json)) return false;
         }
     };
+    @import("tables.zig").removeBindingHistory(&before.value.object);
+    @import("tables.zig").removeBindingHistory(&after.value.object);
     _ = before.value.object.swapRemove("relational_indexes");
     _ = after.value.object.swapRemove("relational_indexes");
     for ([_][]const u8{ "version", "unique_constraints", "foreign_keys" }) |field| {

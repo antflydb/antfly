@@ -42,6 +42,7 @@ const collectSparseEmbeddingWritesForBatch = @import("replay_vector_collectors.z
 const collectSparseFieldWritesProfiled = @import("replay_vector_collectors.zig").collectSparseFieldWritesProfiled;
 const denseEmbeddingDocKeySet = @import("replay_vector_collectors.zig").denseEmbeddingDocKeySet;
 const derived_types = @import("derived/derived_types.zig");
+const doc_identity = @import("doc_identity.zig");
 const docstore_mod = @import("../docstore.zig");
 const document_child_range_effects = @import("document_child_range_effects.zig");
 const document_child_range_outbox = @import("document_child_range_outbox.zig");
@@ -63,9 +64,15 @@ const graph_state_name = @import("graph_state_name.zig");
 const hbc_mod = @import("../hbc_adapter.zig");
 const hierarchy_navigation = @import("../hierarchy_navigation.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
+const algebraic_index_mod = @import("algebraic/index.zig");
 const internal_keys = @import("../internal_keys.zig");
 const mapper = @import("document_mapper.zig");
-const relational_store = @import("relational_store.zig");
+const commit_participant = @import("../commit_participant.zig");
+const native_catalog_backend = @import("../native_catalog_backend.zig");
+const roaring = @import("../../encoding/roaring.zig");
+const persistent_mod = @import("../persistent.zig");
+const projection_seal = @import("../projection_seal.zig");
+const relational_store = @import("relational/rows/store.zig");
 const resolver_lib = @import("antfly_resolver");
 const resource_manager_mod = @import("../resource_manager.zig");
 const result_collectors = @import("result_collectors.zig");
@@ -91,6 +98,10 @@ const text_merge_runtime_mod = @import("maintenance/text_merge_runtime.zig");
 const transactions_mod = @import("../transactions.zig");
 const transform_mod = @import("transform.zig");
 const types = @import("types.zig");
+/// `InlineDensePublication`'s staged-write type (lite-single-commit-write-
+/// path.md §3.3a): the same module `../hbc_adapter.zig` (imported above as
+/// `hbc_mod`) itself imports to return it from `HBCIndex.insertWithMetadataStaged`.
+const vectorindex_hbc_index = @import("antfly_vectorindex").hbc_index;
 
 fn requestContext(writes: anytype) ?@import("antfly_inference_execution_context").RequestContext {
     return if (@hasField(@TypeOf(writes.*), "context")) writes.context else null;
@@ -694,7 +705,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try self.lockApplyForPortableRuntime();
             defer S.ownerField(self, "core").*.unlockApply();
             const deletes = [_][]const u8{key};
-            try S.ownerField(self, "core").*.store.putBatch(&.{}, deletes[0..]);
+            // This removal only ever follows a successful `dispatcher.applyDispatch`
+            // (see `document_child_range_outbox.drain`). Losing it in a crash just
+            // means the next drain re-scans this same outbox entry and re-dispatches
+            // an idempotent child-range batch, so it rides along with the next
+            // foreground group's commit instead of paying its own fsync per entry
+            // (lite-single-commit-write-path.md §3.2a).
+            try S.ownerField(self, "core").*.store.putBatchWithReplayWithOptions(null, &.{}, deletes[0..], null, .{ .durability = .ride_along });
         }
 
         pub fn denseArtifactCounterBootstrapKeyAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
@@ -1474,6 +1491,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             error_code: []const u8,
             error_message: []const u8,
             error_stage: []const u8,
+            execution_json: []const u8,
             artifact_writes: anytype,
         ) !void {
             var previous_state = DocumentExtractionPreviousState{};
@@ -1495,6 +1513,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 error_code,
                 error_message,
                 error_stage,
+                execution_json,
             );
             defer alloc.free(manifest);
             try appendPreparedArtifactCopy(alloc, artifact_writes, manifest_key, manifest);
@@ -3300,7 +3319,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         .alloc = ctx.alloc,
                         .io = ctx.io,
                         .store = ctx.store,
-                        .applied_sequence_checkpoint_path = ctx.applied_sequence_checkpoint_path,
                         .index_manager = ctx.index_manager,
                         .apply_mutex = ctx.apply_mutex,
                         .snapshot_replay_admission = ctx.snapshot_replay_admission,
@@ -3322,7 +3340,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
             const applied_sequence_start_ns = monotonicTimeNs();
-            try saveAppliedSequencesBatchContext(ctx, updates.items);
+            // Reached from a synchronous-ack caller when no background
+            // workers are running (DB.open with start_index_workers=false),
+            // as well as from the executor's own worker threads. Keep this
+            // commit durable rather than guess which call stack got here;
+            // only the unambiguously background entry points (replay
+            // catch-up, the applied-sequence coalescer's non-forced flush)
+            // defer their flush.
+            try saveAppliedSequencesBatchContext(ctx, updates.items, false);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.applied_sequence_save_ns, applied_sequence_start_ns);
             const truncate_start_ns = monotonicTimeNs();
             try truncateReplayJournalIfSafeContext(ctx);
@@ -3336,6 +3361,1224 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 runtime.notify();
             }
             if (S.ownerField(self, "sparse_compaction_runtime").*) |runtime| runtime.notify();
+        }
+
+        /// WS4 phase 2: a prepared full_text inline publication, built by
+        /// `prepareInlineTextPublication` and attached as a
+        /// `commit_participant.Participant` so its segment, seal and
+        /// delete-tracking mutations land in the SAME native transaction as
+        /// the write's own primary rows. Holds `index_ref`'s apply guard
+        /// from prepare through `install`/`abort` -- the whole window is
+        /// serialized against every other writer of this index (the one
+        /// deliberate concurrency trade of this fast path: see the WS4
+        /// phase 2 design note).
+        pub const InlineTextPublication = struct {
+            pub const max_segments = 4;
+
+            alloc: Allocator,
+            index_manager: *index_manager_mod.IndexManager,
+            index_ref: index_manager_mod.ManagedIndexRef,
+            entry: *index_manager_mod.IndexManager.TextIndex,
+            /// Held from prepare to the end of `stage` only: decisions run in
+            /// the group apply (`resolution`), so nothing here is held across
+            /// the commit or its fsync.
+            /// The catalog stays shared from prepare to `finish`, so the
+            /// index and `entry` stay put; the index's own mutex is held only
+            /// from prepare to the end of `stage` and again for `install`
+            /// (`index_locked`).
+            apply_guard: index_manager_mod.IndexManager.ManagedIndexApplyGuard,
+            index_locked: bool = true,
+            segments: [max_segments]persistent_mod.PersistentIndex.InlineSegmentPublication = undefined,
+            segment_count: usize = 0,
+            seal: ?persistent_mod.PersistentIndex.SealPublication = null,
+            /// This write's copies and deletes, decided at the commit's tip
+            /// in the group apply, last writer wins by version.
+            resolution: persistent_mod.PersistentIndex.VersionResolution,
+            progress: apply_state.Progress,
+
+            fn mutationsAlloc(self: *InlineTextPublication, alloc: Allocator) ![]native_catalog_backend.Mutation {
+                var out = std.ArrayListUnmanaged(native_catalog_backend.Mutation).empty;
+                errdefer out.deinit(alloc);
+                for (self.segments[0..self.segment_count]) |*seg| try out.appendSlice(alloc, &seg.mutations());
+                if (self.seal) |*seal| try out.append(alloc, seal.mutation());
+                return try out.toOwnedSlice(alloc);
+            }
+
+            fn reset(_: *anyopaque) void {}
+            fn observe(_: *anyopaque, _: []const u8, _: ?[]const u8) void {}
+            fn stage(ptr: *anyopaque, view: commit_participant.View, _: []const u8) anyerror!void {
+                const self: *InlineTextPublication = @ptrCast(@alignCast(ptr));
+                const scope = self.entry.persistent.nativeCatalogScope() orelse return error.NotNativeCatalogBackend;
+                const resolution_bytes = native_catalog_backend.resolution(self.resolution.resolverForStaging());
+                try view.putIndexCatalog(scope, &.{.{ .namespace = native_catalog_backend.resolve_namespace, .key = "resolver", .value = &resolution_bytes }});
+                const mutations = try self.mutationsAlloc(self.alloc);
+                defer self.alloc.free(mutations);
+                if (mutations.len != 0) try view.putIndexCatalog(scope, mutations);
+                _ = try apply_state.contributeProgressTxn(view, self.progress);
+                // Nothing staged depends on another writer of this index:
+                // other writes may prepare and join the same group commit.
+                self.releaseGuard();
+            }
+
+            /// `commit_participant.Participant.stage` is called BEFORE the
+            /// host's native commit, so by the time it returns, `self`'s
+            /// mutations are staged into the SAME transaction as the
+            /// write's primary rows -- but not yet durable. Call `install`
+            /// only once that transaction's commit has actually returned
+            /// successfully (e.g. after `Ticket.wait()`), never from
+            /// inside `stage` itself.
+            pub fn participant(self: *InlineTextPublication) commit_participant.Participant {
+                return .{ .ptr = self, .reset = reset, .observe = observe, .stage = stage };
+            }
+
+            /// Runs only after this publication is durable: syncs the
+            /// `.native_catalog` backend's in-memory mirror (it never saw the
+            /// records, written into the native transaction directly), adds
+            /// the level-0 segments to the writer snapshot and marks the
+            /// versions this write made dead. Takes the index's apply guard
+            /// for just this, not across the commit.
+            pub fn install(self: *InlineTextPublication) !void {
+                defer self.finish();
+                errdefer self.index_manager.index_publication_reopen_required.store(true, .release);
+                if (!self.index_locked) {
+                    self.apply_guard.relockIndex();
+                    self.index_locked = true;
+                }
+
+                const mutations = try self.mutationsAlloc(self.alloc);
+                defer self.alloc.free(mutations);
+                try self.entry.persistent.applyExternallyCommittedMutationsIfNativeCatalog(mutations);
+                try self.entry.persistent.reconcileInlineCommittedMutations(self.resolution.decidedMutations());
+                // Consume every segment, including after a failed install.
+                var install_error: ?anyerror = null;
+                for (self.segments[0..self.segment_count]) |*seg| {
+                    self.entry.persistent.installInlineSegmentPublication(seg) catch |err| {
+                        if (install_error == null) install_error = err;
+                    };
+                }
+                self.segment_count = 0;
+                try self.resolution.installChecked();
+                try self.index_manager.noteInlineTextPublicationSegments(self.entry);
+                if (install_error) |err| return err;
+            }
+
+            /// The mutations were never committed (preparation succeeded but
+            /// the caller fell back, or the primary write failed before
+            /// committing): nothing becomes visible.
+            pub fn abort(self: *InlineTextPublication) void {
+                for (self.segments[0..self.segment_count]) |*seg| seg.abort(self.alloc);
+                self.segment_count = 0;
+                self.finish();
+            }
+
+            fn releaseGuard(self: *InlineTextPublication) void {
+                if (self.index_locked) self.apply_guard.unlockIndex();
+                self.index_locked = false;
+            }
+
+            fn finish(self: *InlineTextPublication) void {
+                _ = self.entry.persistent.inline_in_flight.fetchSub(1, .acq_rel);
+                // Segments neither installed nor aborted (an install that
+                // could not retake the guard) are released here.
+                for (self.segments[0..self.segment_count]) |*seg| seg.abort(self.alloc);
+                self.segment_count = 0;
+                self.releaseGuard();
+                self.apply_guard.unlockCatalog();
+                self.resolution.deinit();
+                self.alloc.destroy(self);
+            }
+        };
+
+        fn buildInlineProjectionSeal(
+            index_manager: *index_manager_mod.IndexManager,
+            store: *docstore_mod.DocStore,
+            entry: *index_manager_mod.IndexManager.TextIndex,
+            sequence: u64,
+        ) !?projection_seal.Seal {
+            if (index_manager.artifact_projection_root == 0) return null;
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            const selected = (try @import("artifact_publication.zig").authority(&read)) orelse return null;
+            return .{
+                .root = index_manager.artifact_projection_root,
+                .namespace = selected.namespace,
+                .generation = entry.config.coverage_generation,
+                .config_hash = types.indexConfigHash(entry.config),
+                .applied_sequence = sequence,
+            };
+        }
+
+        /// WS4 phase 2 fast path: prepares one managed full_text index's
+        /// segment, seal and delete-tracking mutations for publication in
+        /// the same native transaction as the write's own primary rows,
+        /// instead of each going through its own commit via
+        /// `applyPreparedTextMapperPublicationByNameWithOptions`/
+        /// `indexSegmentOwned`/`publishProjectionSeal`.
+        ///
+        /// Returns `error.InlineTextPublicationUnsupported` for every case
+        /// outside the simple, single-chunk, non-reprojected,
+        /// `.native_catalog` case -- a multi-chunk plan, a projection
+        /// change mid-build, an observed-analyzer update, or a
+        /// non-`.native_catalog` index -- so the caller falls back to
+        /// `applyDerivedBatchToIndexContextProfiled`, which remains
+        /// correct (and is not changed by any of this) for all of them.
+        pub fn prepareInlineTextPublication(
+            alloc: Allocator,
+            store: *docstore_mod.DocStore,
+            index_manager: *index_manager_mod.IndexManager,
+            batch: derived_types.DerivedBatch,
+            index_ref: index_manager_mod.ManagedIndexRef,
+        ) !*InlineTextPublication {
+            if (index_ref.kind != .full_text) return error.InlineTextPublicationUnsupported;
+
+            // Cheap precheck before any tokenization: bail out immediately
+            // for anything but a `.native_catalog` index, so a hosted/
+            // LSM-backed full_text write never pays for
+            // `prepareTextMapperDocsPublication`'s real tokenization work
+            // here just to discard it and redo it in the existing
+            // post-commit path below.
+            {
+                index_manager.catalog_mutex.lockShared();
+                defer index_manager.catalog_mutex.unlockShared();
+                const precheck_entry = index_manager.textIndexEntry(index_ref.name) orelse return error.InlineTextPublicationUnsupported;
+                if (precheck_entry.persistent.main_backend != .native_catalog) return error.InlineTextPublicationUnsupported;
+            }
+
+            var publication_context = try index_manager.acquireTextPublicationContext(alloc, index_ref.name);
+            defer publication_context.deinit();
+
+            var collected = try collectTextDocumentWritesForIndex(
+                alloc,
+                store,
+                index_manager,
+                batch.documents,
+                index_ref.name,
+                publication_context.chunk_backed,
+                index_manager.byte_range,
+                .{ .prefer_inline_when_store_tip_matches_sequence = batch.sequence },
+            );
+            defer collected.deinit();
+            if (collected.missing_required != 0 or collected.docs.items.len == 0) return error.InlineTextPublicationUnsupported;
+            // Each copy's version: this write's sequence, then its position.
+            for (collected.docs.items, 0..) |*doc, position| doc.doc_version = try persistent_mod.DocVersion.of(batch.sequence, position);
+
+            var publication_plan = try index_manager.planTextMapperDocsPublication(
+                index_ref.name,
+                &publication_context,
+                collected.docs.items,
+                std.math.maxInt(usize),
+            );
+            defer publication_plan.deinit();
+            if (publication_plan.chunks.len != 1) return error.InlineTextPublicationUnsupported;
+
+            var prepared_publication = index_manager.prepareTextMapperDocsPublication(
+                alloc,
+                store,
+                index_ref.name,
+                &publication_context,
+                collected.docs.items,
+            ) catch |err| switch (err) {
+                error.TextProjectionChanged => return error.InlineTextPublicationUnsupported,
+                else => return err,
+            };
+            defer prepared_publication.deinit();
+            if (prepared_publication.observed_field_analyzers.len != 0) return error.InlineTextPublicationUnsupported;
+            if (prepared_publication.segments.len > InlineTextPublication.max_segments) return error.InlineTextPublicationUnsupported;
+
+            var apply_guard = try index_manager.lockManagedIndexApply(index_ref);
+            errdefer apply_guard.unlock();
+
+            if ((try index_manager.refreshTextPublicationContextAssumeCatalogLocked(index_ref.name, &publication_context)) == .projection_changed)
+                return error.InlineTextPublicationUnsupported;
+
+            const entry = index_manager.textIndexEntry(index_ref.name) orelse return error.InlineTextPublicationUnsupported;
+            if (entry.persistent.main_backend != .native_catalog) return error.InlineTextPublicationUnsupported;
+
+            if (!entry.persistent.versioned) return error.InlineTextPublicationUnsupported;
+
+            const delete_keys = try collectTextReplayDeleteKeys(alloc, index_manager, batch, index_ref.name, publication_context);
+            defer if (delete_keys.len > 0) alloc.free(delete_keys);
+
+            var prepared_segments: [InlineTextPublication.max_segments]persistent_mod.PersistentIndex.InlineSegmentPublication = undefined;
+            var prepared_segment_count: usize = 0;
+            errdefer for (prepared_segments[0..prepared_segment_count]) |*seg| seg.abort(alloc);
+            for (prepared_publication.segments) |*segment| {
+                if (segment.len == 0) continue;
+                const owned = segment.*;
+                segment.* = &.{};
+                prepared_segments[prepared_segment_count] = entry.persistent.prepareInlineSegmentPublication(owned) catch |err| {
+                    alloc.free(owned);
+                    return err;
+                };
+                prepared_segment_count += 1;
+            }
+
+            const seal_value = try buildInlineProjectionSeal(index_manager, store, entry, batch.sequence);
+            const prepared_seal = if (seal_value) |seal| try entry.persistent.prepareInlineProjectionSealMutation(seal) else null;
+
+            // A key this write indexes again needs no delete: its new copy
+            // supersedes the old one. The rest are deleted at versions after
+            // every copy's.
+            var indexed = std.StringHashMapUnmanaged(void).empty;
+            defer indexed.deinit(alloc);
+            for (collected.docs.items) |doc| try indexed.put(alloc, doc.key, {});
+            var resolution = persistent_mod.PersistentIndex.VersionResolution.init(&entry.persistent);
+            errdefer resolution.deinit();
+            for (prepared_segments[0..prepared_segment_count]) |*seg| try resolution.addCopies(seg.copies);
+            var delete_position = collected.docs.items.len;
+            for (delete_keys) |key| {
+                if (indexed.contains(key)) continue;
+                try resolution.addDelete(key, try persistent_mod.DocVersion.of(batch.sequence, delete_position));
+                delete_position += 1;
+            }
+
+            const result = try alloc.create(InlineTextPublication);
+            // Under the apply guard, which `refreshFromTip` also takes.
+            _ = entry.persistent.inline_in_flight.fetchAdd(1, .acq_rel);
+            result.* = .{
+                .alloc = alloc,
+                .index_manager = index_manager,
+                .index_ref = index_ref,
+                .entry = entry,
+                .apply_guard = apply_guard,
+                .segments = prepared_segments,
+                .segment_count = prepared_segment_count,
+                .seal = prepared_seal,
+                .resolution = resolution,
+                .progress = .{
+                    .consumer = index_ref.name,
+                    .sequence = batch.sequence,
+                    .generation = entry.config.coverage_generation,
+                    .config_hash = types.indexConfigHash(entry.config),
+                },
+            };
+            return result;
+        }
+
+        /// lite-single-commit-write-path.md §3.3a's graph extension of WS4
+        /// phase 2: a prepared single-edge inline publication, mirroring
+        /// `InlineTextPublication` but wrapping
+        /// `graph_mod.GraphIndex.InlineEdgePublication` (already built and
+        /// unit-tested in graph.zig) instead of building its own staged
+        /// mutations. Holds this graph index's apply guard from prepare
+        /// through `install`/`abort`, serializing against every other
+        /// writer of this index for the whole window -- same deliberate
+        /// concurrency trade as text's apply guard.
+        ///
+        /// Deliberately does NOT also take `IndexManager.
+        /// beginGraphSourceReplay`/`beginGraphPrimaryMutation`'s shared
+        /// `graph_primary_publication` lease the way
+        /// `applyDerivedBatchToIndexContextProfiled`'s own `.graph` branch
+        /// does: `prepareInlineGraphPublication`'s only caller
+        /// (`mutation_commit.zig`'s `batchInternalPreparedOwned`) already
+        /// runs inside that SAME function's own EXCLUSIVE
+        /// `beginGraphPrimaryMutation` lease at the point it calls
+        /// `prepareInlineGraphPublication` (acquired near the top of that
+        /// function, released only after the primary write is staged --
+        /// well after this type's own `prepare`, but before its `install`/
+        /// `abort`). A second, shared acquisition from the SAME thread
+        /// while that exclusive one is still held would deadlock (`std.
+        /// atomic.Mutex`-backed RW locks are not reentrant); the window
+        /// after that release, through `install`/`abort`, is covered by
+        /// `apply_guard` alone, exactly like `InlineTextPublication`, which
+        /// has no equivalent broader lease at all.
+        pub const InlineGraphPublication = struct {
+            alloc: Allocator,
+            entry: *index_manager_mod.IndexManager.GraphIndex,
+            apply_guard: index_manager_mod.IndexManager.ManagedIndexApplyGuard,
+            publication: graph_mod.GraphIndex.InlineEdgePublication,
+            forward_scope: []const u8,
+            reverse_scope: []const u8,
+            progress: apply_state.Progress,
+            enqueued: bool = false,
+            install_error: ?anyerror = null,
+
+            fn reset(_: *anyopaque) void {}
+            fn observe(_: *anyopaque, _: []const u8, _: ?[]const u8) void {}
+            fn stage(ptr: *anyopaque, view: commit_participant.View, _: []const u8) anyerror!void {
+                const self: *InlineGraphPublication = @ptrCast(@alignCast(ptr));
+                const forward_mutations = self.publication.forwardMutations();
+                if (forward_mutations.len != 0) try view.putIndexCatalog(self.forward_scope, forward_mutations);
+                const reverse_mutations = self.publication.reverseMutations();
+                if (reverse_mutations.len != 0) try view.putIndexCatalog(self.reverse_scope, reverse_mutations);
+                _ = try apply_state.contributeProgressTxn(view, self.progress);
+            }
+
+            fn validate(ptr: *anyopaque) anyerror!void {
+                const self: *InlineGraphPublication = @ptrCast(@alignCast(ptr));
+                try self.entry.inline_writer.validate();
+            }
+
+            fn reject(ptr: *anyopaque) void {
+                const self: *InlineGraphPublication = @ptrCast(@alignCast(ptr));
+                self.entry.inline_writer.reject();
+            }
+
+            fn complete(ptr: *anyopaque, outcome: anyerror!u64) void {
+                const self: *InlineGraphPublication = @ptrCast(@alignCast(ptr));
+                self.apply_guard.relockIndex();
+                defer self.apply_guard.unlockIndex();
+                if (outcome) |_| {
+                    self.entry.index.applyInlinePublicationToServing(&self.publication) catch |err| {
+                        self.install_error = err;
+                        self.apply_guard.manager.index_publication_reopen_required.store(true, .release);
+                        self.entry.inline_writer.reject();
+                    };
+                    self.entry.invalidateNeighborSource();
+                } else |_| {}
+                self.entry.inline_writer.completed(outcome);
+            }
+
+            pub fn participant(self: *InlineGraphPublication) commit_participant.Participant {
+                return .{
+                    .ptr = self,
+                    .reset = reset,
+                    .observe = observe,
+                    .stage = stage,
+                    .queued = .{ .ptr = self, .validate = validate, .reject = reject, .complete = complete },
+                };
+            }
+
+            /// Called immediately after the primary ticket is returned. The
+            /// completion callback can only advance the serving state after
+            /// acquiring the index guard that is released here.
+            pub fn markEnqueued(self: *InlineGraphPublication) void {
+                const queue = &self.entry.inline_writer;
+                queue.enqueued();
+                self.enqueued = true;
+                queue.view.?.advance(&self.publication) catch queue.reject();
+                self.apply_guard.unlockIndex();
+            }
+
+            pub fn install(self: *InlineGraphPublication) !void {
+                std.debug.assert(self.enqueued);
+                const install_error = self.install_error;
+                self.abort();
+                if (install_error) |err| return err;
+            }
+
+            pub fn abort(self: *InlineGraphPublication) void {
+                self.publication.abort();
+                if (self.enqueued) {
+                    self.apply_guard.unlockCatalog();
+                } else {
+                    self.entry.inline_writer.discardIdle();
+                    self.apply_guard.unlock();
+                }
+                self.alloc.destroy(self);
+            }
+        };
+
+        /// WS4-for-graph fast path: prepares one managed graph index's
+        /// single-edge inline publication. Returns
+        /// `error.InlineGraphPublicationUnsupported` for every case outside
+        /// `graph_mod.GraphIndex.prepareInlineEdgePublication`'s own narrow
+        /// scope (owner/owner_document set, TTL, metrics, non-
+        /// `.native_catalog` stores) AND for every case needing
+        /// `IndexManager`-layer bookkeeping that fast path cannot replicate
+        /// (shard range, contributor snapshots -- see
+        /// `IndexManager.graphEdgeWriteEligibleForInlinePublication`'s own
+        /// doc comment), so the caller falls back to
+        /// `applyGraphMutationsByName`, which remains correct (and is not
+        /// changed by any of this) for all of them.
+        pub fn prepareInlineGraphPublication(
+            alloc: Allocator,
+            index_manager: *index_manager_mod.IndexManager,
+            write: types.GraphEdgeWrite,
+            index_ref: index_manager_mod.ManagedIndexRef,
+            sequence: u64,
+        ) !*InlineGraphPublication {
+            if (index_ref.kind != .graph) return error.InlineGraphPublicationUnsupported;
+            const entry = index_manager.graphIndex(index_ref.name) orelse return error.InlineGraphPublicationUnsupported;
+            if (!index_manager.graphEdgeWriteEligibleForInlinePublication(entry, write)) return error.InlineGraphPublicationUnsupported;
+
+            const forward_scope = entry.index.forwardCatalogScope() orelse return error.InlineGraphPublicationUnsupported;
+            const reverse_scope = entry.index.reverseCatalogScope() orelse return error.InlineGraphPublicationUnsupported;
+
+            var apply_guard = try index_manager.lockManagedIndexApply(index_ref);
+            errdefer apply_guard.unlock();
+
+            const queue = &entry.inline_writer;
+            try queue.validate();
+            if (queue.view == null) queue.start(try entry.index.forkInlineWriter());
+            errdefer queue.discardIdle();
+            var publication = entry.index.prepareInlineEdgePublicationFrom(&queue.view.?, .{
+                .source = write.source,
+                .target = write.target,
+                .edge_type = write.edge_type,
+                .edge_id = write.edge_id,
+                .owner_document = write.owner_document,
+                .weight = write.weight,
+                .created_at = write.created_at,
+                .updated_at = write.updated_at,
+                .ttl_created_ns = write.ttl_created_ns,
+                .metadata_json = write.metadata_json,
+                .owner = write.owner,
+            }) catch |err| switch (err) {
+                error.InlineEdgePublicationUnsupported => return error.InlineGraphPublicationUnsupported,
+                else => return err,
+            };
+
+            errdefer publication.abort();
+            const result = try alloc.create(InlineGraphPublication);
+            result.* = .{
+                .alloc = alloc,
+                .entry = entry,
+                .apply_guard = apply_guard,
+                .publication = publication,
+                .forward_scope = forward_scope,
+                .reverse_scope = reverse_scope,
+                .progress = .{
+                    .consumer = index_ref.name,
+                    .sequence = sequence,
+                    .generation = entry.config.coverage_generation,
+                    .config_hash = types.indexConfigHash(entry.config),
+                },
+            };
+            return result;
+        }
+
+        /// WS4 phase 2 (coverage ride-along, lite-single-commit-write-
+        /// path.md §3.3a): the exact derived-coverage marker+counter delta
+        /// `setDerivedCoverageOutcomes` would write for ONE doc_key's
+        /// `.produced` transition -- the only outcome an eligible inline
+        /// dense/sparse publication ever represents (external index,
+        /// caller-supplied vector/indices, never a delete; see
+        /// `accountDenseCoverageWithPlan`/`accountSparseCoverageWithPlan`'s
+        /// own `else` branch for generated/external indexes). Applied by
+        /// `InlineDensePublication`/`InlineSparsePublication.stage()` via
+        /// `commit_participant.View.putReplay`, inside the SAME native
+        /// transaction as the primary write, instead of
+        /// `setDerivedCoverageOutcomes`'s own separate `store.putBatch`.
+        const InlineCoveragePlan = struct {
+            marker_key: []u8,
+            produced_counter_key: []u8,
+            produced_count_at_prepare: u64,
+            previous_counter: ?struct { outcome: DerivedCoverageOutcome, key: []u8, count_at_prepare: u64 } = null,
+
+            fn deinit(self: *const InlineCoveragePlan, alloc: Allocator) void {
+                alloc.free(self.marker_key);
+                alloc.free(self.produced_counter_key);
+                if (self.previous_counter) |pc| alloc.free(pc.key);
+            }
+
+            fn countAtTip(view: commit_participant.View, key: []const u8, fallback: u64) !u64 {
+                const bytes = view.get(key) catch |err| switch (err) {
+                    error.NotFound => return fallback,
+                    else => return err,
+                };
+                return internal_keys.decodeDerivedCoverageOutcomeCount(bytes);
+            }
+
+            fn stage(self: *const InlineCoveragePlan, view: commit_participant.View) !void {
+                const marker = view.get(self.marker_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                if (marker) |value| {
+                    const previous = std.meta.stringToEnum(DerivedCoverageOutcome, value) orelse return error.InvalidDerivedCoverageOutcome;
+                    if (previous == .produced) return;
+                    const counter = self.previous_counter orelse return error.QueuedDependencyRejected;
+                    if (counter.outcome != previous) return error.QueuedDependencyRejected;
+                    const count = try countAtTip(view, counter.key, counter.count_at_prepare);
+                    if (count == 0) return error.InvalidDerivedCoverageCounter;
+                    var stored: [8]u8 = undefined;
+                    _ = internal_keys.encodeDerivedCoverageOutcomeCount(&stored, count - 1);
+                    try view.putReplay(counter.key, &stored);
+                }
+                const count = try countAtTip(view, self.produced_counter_key, self.produced_count_at_prepare);
+                var stored: [8]u8 = undefined;
+                _ = internal_keys.encodeDerivedCoverageOutcomeCount(&stored, count +| 1);
+                try view.putReplay(self.produced_counter_key, &stored);
+                try view.putReplay(self.marker_key, @tagName(DerivedCoverageOutcome.produced));
+            }
+        };
+
+        /// Prepare-time equivalent of `setDerivedCoverageOutcomes` for
+        /// exactly one write's `.produced` outcome transition. Reads
+        /// through `store` (point reads/legacy-scan fallback, identical to
+        /// `setDerivedCoverageOutcomes`'s own): the SAME per-index
+        /// `lockManagedIndexApply` guard an inline publication already
+        /// holds across prepare -> stage -> install excludes the slow
+        /// path's own concurrent accounting of this index (see
+        /// `applyDerivedBatchToIndexContextProfiled`'s own
+        /// `lockManagedIndexApplyWithPlan`), so this snapshot cannot go
+        /// stale before `stage()` applies it.
+        ///
+        /// Returns `null` for nothing to do: coverage tracking inactive
+        /// (`orderedCoverageActive`), no coverage generation configured for
+        /// this index, or the doc_key's marker is already `.produced` (an
+        /// idempotent re-publication, e.g. a worker replay racing an
+        /// already-applied inline write).
+        fn prepareInlineCoveragePlan(
+            alloc: Allocator,
+            store: *docstore_mod.DocStore,
+            index_manager: *index_manager_mod.IndexManager,
+            index_name: []const u8,
+            doc_key: []const u8,
+        ) !?InlineCoveragePlan {
+            if (try orderedCoverageActive(store)) return null;
+            const generation = index_manager.coverageGenerationForIndex(index_name) orelse return null;
+
+            const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, index_name, generation, doc_key);
+            errdefer alloc.free(marker_key);
+
+            var existing_outcome: ?DerivedCoverageOutcome = null;
+            {
+                var probe = try store.beginProbeTxnWithBlockCacheAdmission(.transient);
+                defer probe.abort();
+                const existing = probe.get(marker_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                if (existing) |value| {
+                    existing_outcome = std.meta.stringToEnum(DerivedCoverageOutcome, value) orelse return error.InvalidDerivedCoverageOutcome;
+                }
+            }
+            const produced_key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, index_name, generation, @tagName(DerivedCoverageOutcome.produced));
+            errdefer alloc.free(produced_key);
+            var previous_key: ?[]u8 = null;
+            errdefer if (previous_key) |k| alloc.free(k);
+            if (existing_outcome != null and existing_outcome.? != .produced) {
+                const prev = existing_outcome.?;
+                previous_key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, index_name, generation, @tagName(prev));
+            }
+
+            var produced_missing = false;
+            var produced_count: u64 = 0;
+            var previous_missing = false;
+            var previous_count: u64 = 0;
+            {
+                var probe = try store.beginProbeTxnWithBlockCacheAdmission(.transient);
+                defer probe.abort();
+                const raw_produced = probe.get(produced_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                if (raw_produced) |v| produced_count = try internal_keys.decodeDerivedCoverageOutcomeCount(v) else produced_missing = true;
+                if (previous_key) |pk| {
+                    const raw_prev = probe.get(pk) catch |err| switch (err) {
+                        error.NotFound => null,
+                        else => return err,
+                    };
+                    if (raw_prev) |v| previous_count = try internal_keys.decodeDerivedCoverageOutcomeCount(v) else previous_missing = true;
+                }
+            }
+            // Mirrors `setDerivedCoverageOutcomes`'s own ordering: the
+            // legacy-migration scan runs only after the point-read probe
+            // transaction above has closed (LMDB does not universally
+            // permit nested read transactions on one thread).
+            if (produced_missing) produced_count = try scanDerivedCoverageOutcomeFromStore(alloc, store, index_name, generation, @tagName(DerivedCoverageOutcome.produced));
+            if (previous_key != null and previous_missing) {
+                previous_count = try scanDerivedCoverageOutcomeFromStore(alloc, store, index_name, generation, @tagName(existing_outcome.?));
+            }
+
+            var plan: InlineCoveragePlan = .{
+                .marker_key = marker_key,
+                .produced_counter_key = produced_key,
+                .produced_count_at_prepare = produced_count,
+            };
+            if (previous_key) |pk| {
+                plan.previous_counter = .{ .outcome = existing_outcome.?, .key = pk, .count_at_prepare = previous_count };
+            }
+            return plan;
+        }
+
+        /// WS4 phase 2 (repair-issue ride-along): whether `artifact_key`
+        /// has an outstanding embedding-artifact repair issue recorded
+        /// against `index_name`. An inline write that supersedes such an
+        /// issue must clear it the way `clearPublishedEmbeddingArtifact
+        /// RepairIssuesContext` would -- that function's full logic (asset-
+        /// kind manifest validation, the `enrichment_failed`-reason branch
+        /// that depends on a just-settled derived-coverage marker,
+        /// terminal-failure-marker and repair-summary prefix scans) is not
+        /// expressible through `commit_participant.View`'s point get/put
+        /// surface without a much larger write surface, so an inline write
+        /// with an outstanding issue on its artifact_key simply is not
+        /// eligible: the caller falls back to the slow path, which clears
+        /// it correctly as it always has.
+        fn inlineWriteHasPendingEmbeddingRepairIssue(
+            alloc: Allocator,
+            store: *docstore_mod.DocStore,
+            index_name: []const u8,
+            artifact_key: ?[]const u8,
+        ) !bool {
+            const key = artifact_key orelse return false;
+            const hex = try bytesToHexAlloc(alloc, key);
+            defer alloc.free(hex);
+            const issue_key = try internal_keys.artifactRepairIssueKeyAlloc(alloc, index_name, "embedding", hex);
+            defer alloc.free(issue_key);
+            var probe = try store.beginProbeTxnWithBlockCacheAdmission(.transient);
+            defer probe.abort();
+            _ = probe.get(issue_key) catch |err| switch (err) {
+                error.NotFound => return false,
+                else => return err,
+            };
+            return true;
+        }
+
+        /// lite-single-commit-write-path.md §3.3a's sparse extension of
+        /// WS4 phase 2: a prepared single-batch inline publication,
+        /// mirroring `InlineGraphPublication` but wrapping
+        /// `sparse_mod.SparseIndex.InlineSparsePublication` (already
+        /// built and unit-tested in sparse.zig) instead of building its
+        /// own staged mutations. Holds this sparse index's apply guard
+        /// from prepare through `install`/`abort`, serializing against
+        /// every other writer of this index for the whole window -- same
+        /// deliberate concurrency trade as text's and graph's own apply
+        /// guards.
+        pub const InlineSparsePublication = struct {
+            alloc: Allocator,
+            entry: *index_manager_mod.IndexManager.SparseIndex,
+            apply_guard: index_manager_mod.IndexManager.ManagedIndexApplyGuard,
+            publication: sparse_mod.SparseIndex.InlineSparsePublication,
+            scope: []const u8,
+            progress: apply_state.Progress,
+            coverage_plan: ?InlineCoveragePlan = null,
+            enqueued: bool = false,
+            install_error: ?anyerror = null,
+
+            fn reset(_: *anyopaque) void {}
+            fn observe(_: *anyopaque, _: []const u8, _: ?[]const u8) void {}
+            fn stage(ptr: *anyopaque, view: commit_participant.View, _: []const u8) anyerror!void {
+                const self: *InlineSparsePublication = @ptrCast(@alignCast(ptr));
+                const mutations = self.publication.pendingMutations();
+                if (mutations.len != 0) try view.putIndexCatalog(self.scope, mutations);
+                _ = try apply_state.contributeProgressTxn(view, self.progress);
+            }
+
+            fn applyQueued(ptr: *anyopaque, view: commit_participant.View) anyerror!void {
+                const self: *InlineSparsePublication = @ptrCast(@alignCast(ptr));
+                if (self.coverage_plan) |*plan| try plan.stage(view);
+            }
+
+            fn validate(ptr: *anyopaque) anyerror!void {
+                const self: *InlineSparsePublication = @ptrCast(@alignCast(ptr));
+                try self.entry.inline_writer.validate();
+            }
+
+            fn reject(ptr: *anyopaque) void {
+                const self: *InlineSparsePublication = @ptrCast(@alignCast(ptr));
+                self.entry.inline_writer.reject();
+            }
+
+            fn complete(ptr: *anyopaque, outcome: anyerror!u64) void {
+                const self: *InlineSparsePublication = @ptrCast(@alignCast(ptr));
+                self.apply_guard.relockIndex();
+                defer self.apply_guard.unlockIndex();
+                if (outcome) |_| {
+                    self.entry.index.applyInlinePublicationToView(&self.publication) catch |err| {
+                        self.install_error = err;
+                        self.apply_guard.manager.index_publication_reopen_required.store(true, .release);
+                        self.entry.inline_writer.reject();
+                    };
+                } else |_| {}
+                self.entry.inline_writer.completed(outcome);
+            }
+
+            pub fn participant(self: *InlineSparsePublication) commit_participant.Participant {
+                return .{
+                    .ptr = self,
+                    .reset = reset,
+                    .observe = observe,
+                    .stage = stage,
+                    .queued = .{ .ptr = self, .validate = validate, .apply = applyQueued, .reject = reject, .complete = complete },
+                };
+            }
+
+            /// Called immediately after the primary ticket is returned. The
+            /// completion callback can only advance the serving state after
+            /// acquiring the index guard that is released here.
+            pub fn markEnqueued(self: *InlineSparsePublication) void {
+                const queue = &self.entry.inline_writer;
+                queue.enqueued();
+                self.enqueued = true;
+                queue.view.?.applyInlinePublicationToView(&self.publication) catch queue.reject();
+                self.apply_guard.unlockIndex();
+            }
+
+            pub fn install(self: *InlineSparsePublication) !void {
+                std.debug.assert(self.enqueued);
+                const install_error = self.install_error;
+                self.abort();
+                if (install_error) |err| return err;
+            }
+
+            pub fn abort(self: *InlineSparsePublication) void {
+                self.publication.abort();
+                if (self.coverage_plan) |*plan| plan.deinit(self.alloc);
+                if (self.enqueued) {
+                    self.apply_guard.unlockCatalog();
+                } else {
+                    self.entry.inline_writer.discardIdle();
+                    self.apply_guard.unlock();
+                }
+                self.alloc.destroy(self);
+            }
+        };
+
+        /// WS4-for-vectors fast path: prepares one managed sparse index's
+        /// single-batch inline publication. Returns `error.
+        /// InlineSparsePublicationUnsupported` for every case outside
+        /// `sparse_mod.SparseIndex.prepareInlineSparsePublication`'s own
+        /// narrow scope (non-`.native_catalog` stores) AND for every case
+        /// needing `IndexManager`-layer bookkeeping that fast path cannot
+        /// replicate (document-field-derived vectors, chunked/named-
+        /// embedding indexes, shard range -- see `IndexManager.
+        /// sparseEmbeddingWriteEligibleForInlinePublication`'s own doc
+        /// comment), so the caller falls back to `applySparseEmbedding
+        /// WritesByNameWithOptions`, which remains correct (and is not
+        /// changed by any of this) for all of them.
+        pub fn prepareInlineSparsePublication(
+            alloc: Allocator,
+            store: *docstore_mod.DocStore,
+            index_manager: *index_manager_mod.IndexManager,
+            write: derived_types.DerivedSparseEmbeddingWrite,
+            index_ref: index_manager_mod.ManagedIndexRef,
+            sequence: u64,
+        ) !*InlineSparsePublication {
+            if (index_ref.kind != .sparse_vector) return error.InlineSparsePublicationUnsupported;
+            const entry = index_manager.sparseIndex(index_ref.name) orelse return error.InlineSparsePublicationUnsupported;
+            // Stub builds (no sparse engine) never publish inline.
+            if (comptime !@hasDecl(@TypeOf(entry.index), "prepareInlineSparsePublication")) return error.InlineSparsePublicationUnsupported;
+            if (!index_manager.sparseEmbeddingWriteEligibleForInlinePublication(entry, write)) return error.InlineSparsePublicationUnsupported;
+            // An outstanding embedding-artifact repair issue for this exact
+            // artifact must be cleared the way the slow path would (see
+            // `inlineWriteHasPendingEmbeddingRepairIssue`'s own doc
+            // comment); fall back rather than leave it stuck open forever.
+            if (try inlineWriteHasPendingEmbeddingRepairIssue(alloc, store, index_ref.name, write.artifact_key)) return error.InlineSparsePublicationUnsupported;
+
+            const scope = entry.index.nativeCatalogScope() orelse return error.InlineSparsePublicationUnsupported;
+
+            var apply_guard = try index_manager.lockManagedIndexApply(index_ref);
+            errdefer apply_guard.unlock();
+
+            const coverage_plan = try prepareInlineCoveragePlan(alloc, store, index_manager, index_ref.name, write.doc_key);
+            errdefer if (coverage_plan) |plan| plan.deinit(alloc);
+
+            // Mirrors `IndexManager.assignSparseWriteDocNumsFromIdentity`:
+            // this index's eligibility (checked above) already guarantees
+            // `entry.chunk_name == null and entry.embedding_names.len ==
+            // 0`, the exact condition under which that function looks up
+            // the primary document's stable ordinal instead of letting
+            // `SparseIndex.processInsert` auto-assign a fresh one -- the
+            // fast path must do the same lookup, or this write's doc_num
+            // would drift from what the slow path would have assigned
+            // for the identical write.
+            var probe_txn = try store.beginProbeTxn();
+            defer probe_txn.abort();
+            const doc_num = try doc_identity.lookupOrdinalTxn(alloc, &probe_txn, write.doc_key);
+
+            const sparse_write: sparse_mod.SparseWrite = .{
+                .doc_id = write.doc_key,
+                .vec = .{ .indices = write.indices, .values = write.values },
+                .doc_num = doc_num,
+            };
+
+            const queue = &entry.inline_writer;
+            try queue.validate();
+            if (queue.view == null) queue.start(try entry.index.forkInlineWriter());
+            errdefer queue.discardIdle();
+            var publication = queue.view.?.prepareInlineSparsePublication(&.{sparse_write}, &.{}) catch |err| switch (err) {
+                error.InlineSparsePublicationUnsupported => return error.InlineSparsePublicationUnsupported,
+                else => return err,
+            };
+
+            errdefer publication.abort();
+            const result = try alloc.create(InlineSparsePublication);
+            result.* = .{
+                .alloc = alloc,
+                .entry = entry,
+                .apply_guard = apply_guard,
+                .publication = publication,
+                .scope = scope,
+                .coverage_plan = coverage_plan,
+                .progress = .{
+                    .consumer = index_ref.name,
+                    .sequence = sequence,
+                    .generation = entry.config.coverage_generation,
+                    .config_hash = types.indexConfigHash(entry.config),
+                },
+            };
+            return result;
+        }
+
+        /// lite-single-commit-write-path.md §3.3a's dense extension of WS4
+        /// phase 2, mirroring `InlineGraphPublication`/`InlineSparsePublication`
+        /// but wrapping `hbc_mod.HBCIndex.insertWithMetadataStaged` (the
+        /// library's own stage-without-commit single-vector insert; see its
+        /// doc comment for the full stage/install/abort contract) instead of
+        /// a graph/sparse-specific staged-publication type. Holds this dense
+        /// index's apply guard from prepare through `install`/`abort`,
+        /// serializing against every other writer of this index for the
+        /// whole window -- same deliberate concurrency trade as text's,
+        /// graph's and sparse's own apply guards.
+        ///
+        /// Side effects `applyDenseEmbeddingWritesEntry`'s slow path
+        /// performs for an eligible (caller-supplied-vector, external,
+        /// non-chunked, single-write) batch that this type deliberately does
+        /// NOT replicate, and why that is still correct:
+        /// - The "_embeddings" artifact write (`writeDenseEmbeddingArtifactTxn`)
+        ///   is already staged into this SAME primary transaction by the
+        ///   ordinary document-write path, well before this type ever runs
+        ///   (`mutation_commit.zig`'s `write_buffers.explicit_embedding_
+        ///   artifact_writes`, merged into `write_buffers.store_writes`
+        ///   before any inline publication is prepared). The slow path's own
+        ///   second write of the identical bytes is itself a no-op there
+        ///   (the `existing` equality check in `writeDenseEmbeddingArtifactTxn`).
+        /// - The posting-sidecar capture lease, the local HBC streaming
+        ///   session and the exact-vector-mutation capture it feeds are
+        ///   derived-batch/bulk-replay machinery with no single-write
+        ///   equivalent; `denseEmbeddingWriteEligibleForInlinePublication`
+        ///   also excludes the one case (`experimentalPostingWalAuthoritative`)
+        ///   where the capture lease would not already be a no-op.
+        /// - Derived-coverage accounting (`accountDenseCoverageWithPlan`) and
+        ///   embedding-artifact repair-issue bookkeeping
+        ///   (`clearPublishedEmbeddingArtifactRepairIssuesContext`) now ride
+        ///   along in the SAME transaction too: `coverage_plan` (see
+        ///   `prepareInlineCoveragePlan`) replicates the marker+counter
+        ///   delta `setDerivedCoverageOutcomes` would have written for this
+        ///   write's `.produced` outcome, applied via `commit_participant.
+        ///   View.putReplay`; `prepareInlineDensePublication` falls back to
+        ///   the slow path instead of inlining whenever this write's
+        ///   artifact_key has an outstanding repair issue, so clearing it
+        ///   still happens exactly as it always has (see
+        ///   `inlineWriteHasPendingEmbeddingRepairIssue`'s own doc comment
+        ///   for why that one gap is not replicated inline).
+        pub const InlineDensePublication = struct {
+            alloc: Allocator,
+            index_manager: *index_manager_mod.IndexManager,
+            entry: *index_manager_mod.IndexManager.DenseIndex,
+            apply_guard: index_manager_mod.IndexManager.ManagedIndexApplyGuard,
+            staged: vectorindex_hbc_index.StagedWrite,
+            scope: []const u8,
+            index_name: []const u8,
+            doc_key: []const u8,
+            vector_id: u64,
+            vector: []const f32,
+            progress: apply_state.Progress,
+            coverage_plan: ?InlineCoveragePlan = null,
+            enqueued: bool = false,
+            install_error: ?anyerror = null,
+
+            fn reset(_: *anyopaque) void {}
+            fn observe(_: *anyopaque, _: []const u8, _: ?[]const u8) void {}
+            fn stage(ptr: *anyopaque, view: commit_participant.View, _: []const u8) anyerror!void {
+                const self: *InlineDensePublication = @ptrCast(@alignCast(ptr));
+                if (self.staged.mutations.len != 0) {
+                    // `vectorindex`'s own generic `store.PendingMutation` (the
+                    // HBC library's stage-only harvest type) has the exact
+                    // same fields as `native_catalog_backend.Mutation` (what
+                    // `View.putIndexCatalog` requires) but is a distinct
+                    // nominal type -- graph's and sparse's own staged
+                    // publications are built to return the latter directly,
+                    // HBC's is not. Converted on a short-lived scratch
+                    // allocation; one vector insert touches a bounded number
+                    // of HBC namespace records (routing-tree nodes,
+                    // posting/vector payload, metadata), never a batch-sized
+                    // count.
+                    const converted = try self.alloc.alloc(native_catalog_backend.Mutation, self.staged.mutations.len);
+                    defer self.alloc.free(converted);
+                    for (self.staged.mutations, converted) |pending, *out| {
+                        out.* = .{ .namespace = pending.namespace, .key = pending.key, .value = pending.value, .is_delete = pending.is_delete };
+                    }
+                    try view.putIndexCatalog(self.scope, converted);
+                }
+                _ = try apply_state.contributeProgressTxn(view, self.progress);
+            }
+
+            fn applyQueued(ptr: *anyopaque, view: commit_participant.View) anyerror!void {
+                const self: *InlineDensePublication = @ptrCast(@alignCast(ptr));
+                try self.index_manager.writeDenseVectorMappingForInlinePublicationTxn(view, self.index_name, self.doc_key, self.vector_id, self.vector);
+                if (self.coverage_plan) |*plan| try plan.stage(view);
+            }
+
+            fn validate(ptr: *anyopaque) anyerror!void {
+                const self: *InlineDensePublication = @ptrCast(@alignCast(ptr));
+                try self.entry.inline_writer.validate();
+            }
+
+            fn reject(ptr: *anyopaque) void {
+                const self: *InlineDensePublication = @ptrCast(@alignCast(ptr));
+                self.entry.inline_writer.reject();
+            }
+
+            fn complete(ptr: *anyopaque, outcome: anyerror!u64) void {
+                const self: *InlineDensePublication = @ptrCast(@alignCast(ptr));
+                self.apply_guard.relockIndex();
+                defer self.apply_guard.unlockIndex();
+                if (outcome) |_| {
+                    self.entry.index.publishQueuedStagedWrite(&self.staged, self.vector_id) catch |err| {
+                        self.install_error = err;
+                        self.apply_guard.manager.index_publication_reopen_required.store(true, .release);
+                        self.entry.inline_writer.reject();
+                    };
+                } else |_| {}
+                const queue = &self.entry.inline_writer;
+                if (queue.pending == 1 and self.entry.index.parkInlineWriter(&queue.view.?)) queue.view = null;
+                self.entry.inline_writer.completed(outcome);
+            }
+
+            pub fn participant(self: *InlineDensePublication) commit_participant.Participant {
+                return .{
+                    .ptr = self,
+                    .reset = reset,
+                    .observe = observe,
+                    .stage = stage,
+                    .queued = .{ .ptr = self, .validate = validate, .apply = applyQueued, .reject = reject, .complete = complete },
+                };
+            }
+
+            /// Called immediately after the primary ticket is returned. The
+            /// completion callback can only advance the serving state after
+            /// acquiring the index guard that is released here.
+            pub fn markEnqueued(self: *InlineDensePublication) void {
+                const queue = &self.entry.inline_writer;
+                queue.enqueued();
+                self.enqueued = true;
+                queue.view.?.advancePrivateStagedWrite(&self.staged) catch queue.reject();
+                self.apply_guard.unlockIndex();
+            }
+
+            pub fn install(self: *InlineDensePublication) !void {
+                std.debug.assert(self.enqueued);
+                const install_error = self.install_error;
+                self.abort();
+                if (install_error) |err| return err;
+            }
+
+            pub fn abort(self: *InlineDensePublication) void {
+                const owner = if (self.enqueued) self.entry.index else &self.entry.inline_writer.view.?;
+                owner.abortStagedWrite(&self.staged);
+                if (self.coverage_plan) |*plan| plan.deinit(self.alloc);
+                if (self.enqueued) {
+                    self.apply_guard.unlockCatalog();
+                } else {
+                    self.entry.inline_writer.discardIdle();
+                    self.apply_guard.unlock();
+                }
+                self.alloc.destroy(self);
+            }
+        };
+
+        /// WS4-for-vectors' dense extension of the fast path above: prepares
+        /// one managed dense index's single-vector inline publication.
+        /// Returns `error.InlineDensePublicationUnsupported` for every case
+        /// outside `IndexManager.denseEmbeddingWriteEligibleForInlinePublication`'s
+        /// own narrow scope (non-`.native_catalog` stores, via
+        /// `nativeCatalogScope()`) AND for every case needing a vector-id
+        /// collision resolved through `reserveDenseVectorIdTxn`'s durable
+        /// counter (`assignDenseVectorIdInlineTxn` returning `null`) or the
+        /// library's own staged-publication support (`insertWithMetadataStaged`
+        /// returning `error.StagedPublicationUnsupported`, e.g. a LEANN-backed
+        /// index), so the caller falls back to
+        /// `applyDenseEmbeddingWritesByNameWithOptions`, which remains
+        /// correct (and is not changed by any of this) for all of them.
+        pub fn prepareInlineDensePublication(
+            alloc: Allocator,
+            store: *docstore_mod.DocStore,
+            index_manager: *index_manager_mod.IndexManager,
+            write: derived_types.DerivedDenseEmbeddingWrite,
+            index_ref: index_manager_mod.ManagedIndexRef,
+            sequence: u64,
+        ) !*InlineDensePublication {
+            if (index_ref.kind != .dense_vector) return error.InlineDensePublicationUnsupported;
+            const entry = index_manager.denseIndex(index_ref.name) orelse return error.InlineDensePublicationUnsupported;
+            if (!index_manager.denseEmbeddingWriteEligibleForInlinePublication(entry, write)) return error.InlineDensePublicationUnsupported;
+            // An outstanding embedding-artifact repair issue for this exact
+            // artifact must be cleared the way the slow path would (see
+            // `inlineWriteHasPendingEmbeddingRepairIssue`'s own doc
+            // comment); fall back rather than leave it stuck open forever.
+            if (try inlineWriteHasPendingEmbeddingRepairIssue(alloc, store, index_ref.name, write.artifact_key)) return error.InlineDensePublicationUnsupported;
+
+            const scope = entry.index.nativeCatalogScope() orelse return error.InlineDensePublicationUnsupported;
+
+            var apply_guard = try index_manager.lockManagedIndexApply(index_ref);
+            errdefer apply_guard.unlock();
+
+            const coverage_plan = try prepareInlineCoveragePlan(alloc, store, index_manager, index_ref.name, write.doc_key);
+            errdefer if (coverage_plan) |plan| plan.deinit(alloc);
+
+            // Mirrors `prepareInlineSparsePublication`'s own read-only probe
+            // transaction: the deterministic, conflict-free branch of vector
+            // id assignment only needs point reads against the primary
+            // store's durable state as of just before this write, not a
+            // mutable transaction (the one real mutation path --
+            // `reserveDenseVectorIdTxn`'s durable counter -- is exactly what
+            // `assignDenseVectorIdInlineTxn` refuses to reach).
+            var probe_txn = try store.beginProbeTxn();
+            defer probe_txn.abort();
+            const assignment = (try index_manager.assignDenseVectorIdInlineTxn(&probe_txn, entry, index_ref.name, write.doc_key)) orelse
+                return error.InlineDensePublicationUnsupported;
+
+            const queue = &entry.inline_writer;
+            try queue.validate();
+            if (queue.view == null) queue.start(try entry.index.forkInlineWriter());
+            errdefer queue.discardIdle();
+            const queued_owner = queue.view.?.getMetadata(assignment.vector_id) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (queued_owner) |owner| {
+                defer queue.view.?.alloc.free(owner);
+                if (!std.mem.eql(u8, owner, write.doc_key)) return error.InlineDensePublicationUnsupported;
+            }
+            var staged = queue.view.?.insertWithMetadataStaged(assignment.vector_id, write.vector, write.doc_key) catch |err| switch (err) {
+                error.StagedPublicationUnsupported => return error.InlineDensePublicationUnsupported,
+                else => return err,
+            };
+
+            errdefer queue.view.?.abortStagedWrite(&staged);
+            const result = try alloc.create(InlineDensePublication);
+            result.* = .{
+                .alloc = alloc,
+                .index_manager = index_manager,
+                .entry = entry,
+                .apply_guard = apply_guard,
+                .staged = staged,
+                .scope = scope,
+                .index_name = index_ref.name,
+                .doc_key = write.doc_key,
+                .vector_id = assignment.vector_id,
+                .vector = write.vector,
+                .coverage_plan = coverage_plan,
+                .progress = .{
+                    .consumer = index_ref.name,
+                    .sequence = sequence,
+                    .generation = entry.config.coverage_generation,
+                    .config_hash = types.indexConfigHash(entry.config),
+                },
+            };
+            return result;
+        }
+
+        /// Single-commit write path, algebraic workstream: an algebraic
+        /// index's facts live entirely in the primary DocStore already
+        /// (under the `\x00\x00__algebraic__:` private-metadata prefix,
+        /// `storage/db/algebraic/index.zig`'s `storagePrefixAlloc`), so --
+        /// unlike full-text/dense/sparse/graph -- there is no separate
+        /// storage backend to migrate here. The only change needed is
+        /// where the commit happens: `Index.applyBatchWithOptionsView`
+        /// (see its doc comment) runs the SAME read-modify-write fact
+        /// maintenance `applyAlgebraicBatchByNameWithOptions` always ran,
+        /// but against a `commit_participant.View` onto the write's own
+        /// host transaction instead of a transaction it opens and commits
+        /// itself.
+        ///
+        /// Unlike `InlineTextPublication`, `apply_guard` is released at the
+        /// end of `stage` itself, not at `install`/`abort`. Text holds its
+        /// guard through `install` because `install` still has real work to
+        /// do there (syncing the `.native_catalog` backend's in-memory
+        /// mirror, publishing segment/delete-tracking state) that must stay
+        /// serialized against the next writer's `prepare`. Algebraic's
+        /// `install` only schedules best-effort HLL maintenance -- nothing
+        /// that depends on `apply_guard` -- so holding it past `stage`
+        /// would only serialize unrelated work for no correctness benefit.
+        /// That matters here specifically because `prepare` (where
+        /// `apply_guard` is acquired) runs under the caller's DB-wide apply
+        /// lock: holding a second, per-index lock across this write's own
+        /// durability wait would park the *next* writer to this same index
+        /// inside that DB-wide lock for this write's entire commit-to-
+        /// durable latency, defeating WS3's "release the apply lock before
+        /// the wait" group-commit concurrency. Releasing at the end of
+        /// `stage` keeps the serialization window to just prepare-through-
+        /// stage (the window `apply_guard` actually needs to protect: the
+        /// `entry` pointer's catalog validity), matching how the DB-wide
+        /// apply lock itself is released before the wait.
+        pub const InlineAlgebraicPublication = struct {
+            alloc: Allocator,
+            entry: *index_manager_mod.IndexManager.AlgebraicIndex,
+            apply_guard: ?index_manager_mod.IndexManager.ManagedIndexApplyGuard,
+            store: *docstore_mod.DocStore,
+            batch: derived_types.DerivedBatch,
+            options: algebraic_index_mod.ApplyOptions,
+            progress: apply_state.Progress,
+
+            fn reset(_: *anyopaque) void {}
+            fn observe(_: *anyopaque, _: []const u8, _: ?[]const u8) void {}
+            fn stage(ptr: *anyopaque, view: commit_participant.View, _: []const u8) anyerror!void {
+                const self: *InlineAlgebraicPublication = @ptrCast(@alignCast(ptr));
+                defer {
+                    if (self.apply_guard) |*guard| guard.unlock();
+                    self.apply_guard = null;
+                }
+                try self.entry.index.applyBatchWithOptionsView(view, self.batch, self.options);
+                _ = try apply_state.contributeProgressTxn(view, self.progress);
+            }
+
+            /// `commit_participant.Participant.stage` runs before the
+            /// host's native commit, so by the time it returns, `self`'s
+            /// fact writes and progress record are staged into the SAME
+            /// transaction as the write's primary rows -- but not yet
+            /// durable. Call `install` only once that transaction's commit
+            /// has actually returned successfully, never from inside
+            /// `stage` itself.
+            pub fn participant(self: *InlineAlgebraicPublication) commit_participant.Participant {
+                return .{ .ptr = self, .reset = reset, .observe = observe, .stage = stage };
+            }
+
+            pub fn install(self: *InlineAlgebraicPublication) void {
+                std.debug.assert(self.apply_guard == null);
+                // Best-effort, and only after this write's own commit is
+                // durable (see `scheduleHllMaintenanceIfDirty`'s doc
+                // comment): a dirtied HLL sketch still gets picked up by
+                // background maintenance exactly as it would on the
+                // non-inline path.
+                self.entry.index.scheduleHllMaintenanceIfDirty(self.store);
+                self.alloc.destroy(self);
+            }
+
+            /// Either the host transaction's own `stage` never ran (an
+            /// error elsewhere in the caller before the primary write was
+            /// even staged) and `apply_guard` is still held, or it ran and
+            /// already released it; either way this is safe to call
+            /// without knowing which.
+            pub fn abort(self: *InlineAlgebraicPublication) void {
+                if (self.apply_guard) |*guard| guard.unlock();
+                self.alloc.destroy(self);
+            }
+        };
+
+        /// Returns `error.InlineAlgebraicPublicationUnsupported` when
+        /// `index_ref` is not an algebraic index or has no entry (the
+        /// caller falls back to `applyDerivedBatchToIndexContextProfiled`,
+        /// which remains correct -- and is unchanged by any of this -- for
+        /// every case this does not handle).
+        pub fn prepareInlineAlgebraicPublication(
+            alloc: Allocator,
+            store: *docstore_mod.DocStore,
+            index_manager: *index_manager_mod.IndexManager,
+            batch: derived_types.DerivedBatch,
+            index_ref: index_manager_mod.ManagedIndexRef,
+        ) !*InlineAlgebraicPublication {
+            if (index_ref.kind != .algebraic) return error.InlineAlgebraicPublicationUnsupported;
+
+            var apply_guard = try index_manager.lockManagedIndexApply(index_ref);
+            errdefer apply_guard.unlock();
+            const entry = index_manager.algebraicIndex(index_ref.name) orelse return error.InlineAlgebraicPublicationUnsupported;
+
+            const result = try alloc.create(InlineAlgebraicPublication);
+            result.* = .{
+                .alloc = alloc,
+                .entry = entry,
+                .apply_guard = apply_guard,
+                .store = store,
+                .batch = batch,
+                // Matches `applyAlgebraicBatchByNameWithOptions`'s existing
+                // non-inline call site (`.algebraic` case below): algebraic
+                // adaptive-materialization tensor-delta bookkeeping is gated
+                // on `.bulk_ingest` mode regardless of batch size (see
+                // `Index.buildBatchMaintenanceContext`), so this must match
+                // to keep that bookkeeping running on every write, exactly
+                // as it does today.
+                .options = .{ .batch_options = .{ .mode = .bulk_ingest } },
+                .progress = .{
+                    .consumer = index_ref.name,
+                    .sequence = batch.sequence,
+                    .config_hash = types.indexConfigHash(entry.config),
+                },
+            };
+            return result;
         }
 
         pub fn applyDerivedBatchToIndexContext(ctx: *const AsyncContext, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) !void {
@@ -3398,6 +4641,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 );
                 defer collected.deinit();
                 if (collected.missing_required != 0) return error.ReplayDocumentNotVisible;
+                var replay_versions = try TextReplayVersions.init(ctx.alloc, batch, collected.docs.items);
+                defer replay_versions.deinit();
 
                 const reservation_limit = if (ctx.text_merge_runtime) |runtime| runtime.producerSegmentReservationLimit() else std.math.maxInt(usize);
                 var write_start: usize = 0;
@@ -3481,10 +4726,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                     publication_context,
                                 );
                             defer if (delete_keys.len > 0) ctx.alloc.free(delete_keys);
+                            const versioned = if (ctx.index_manager.textIndexEntry(index_ref.name)) |entry| entry.persistent.versioned else false;
+                            var deletes = if (versioned) try replay_versions.deletesAlloc(delete_keys) else TextReplayVersions.Deletes{ .keys = delete_keys };
+                            defer if (versioned) deletes.deinit(ctx.alloc);
                             try ctx.index_manager.applyPreparedTextMapperPublicationByNameWithOptions(
                                 ctx.store,
                                 index_ref.name,
-                                delete_keys,
+                                deletes.keys,
+                                deletes.versions,
                                 &prepared_publication,
                                 text_replay_options,
                             );
@@ -3611,7 +4860,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // streaming replay session before the upsert restores the member.
                     // Reserve the delete lane for actual source/artifact removals.
                     const chunk_backed = if (ctx.index_manager.denseIndex(index_ref.name)) |entry|
-                        entry.chunk_name != null
+                        entry.memberBacked()
                     else
                         false;
                     const external = ctx.index_manager.denseIndexUsesExternalCoverage(index_ref.name);
@@ -3750,11 +4999,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         batch.deleted_keys,
                     );
                     defer freeOwnedKeySlice(ctx.alloc, replay_delete_keys);
-                    try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, replay_delete_keys, batch_options);
                     // As in dense replay, caller-owned vectors change only through
                     // explicit artifact mutations, never an unrelated source edit.
                     const external = ctx.index_manager.sparseIndexUsesExternalCoverage(index_ref.name);
-                    if (!external) try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, batch.overwritten_doc_keys, batch_options);
+                    // These two key sets used to cost one native commit each
+                    // (both delete-only, nothing observable happens between
+                    // them but the `external` read above): combined into one
+                    // deleteSparseBatchByNameWithOptions call.
+                    if (!external and batch.overwritten_doc_keys.len > 0) {
+                        const combined_delete_keys = try ctx.alloc.alloc([]const u8, replay_delete_keys.len + batch.overwritten_doc_keys.len);
+                        defer ctx.alloc.free(combined_delete_keys);
+                        for (replay_delete_keys, 0..) |key, i| combined_delete_keys[i] = key;
+                        for (batch.overwritten_doc_keys, 0..) |key, i| combined_delete_keys[replay_delete_keys.len + i] = key;
+                        try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, combined_delete_keys, batch_options);
+                    } else {
+                        try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, replay_delete_keys, batch_options);
+                    }
                     if (!ctx.projection_only) {
                         try deleteDerivedCoverageForDocKeysWithPlan(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, if (external) replay_delete_keys else batch.deleted_keys, coverage_plan);
                         if (ctx.index_manager.sparseIndexUsesManagedDirectField(index_ref.name)) {
@@ -3908,7 +5168,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 },
                 .algebraic => {
                     if (ctx.projection_only) return error.InvalidShadowIndexKind;
-                    try ctx.index_manager.applyAlgebraicBatchByNameWithOptions(ctx.store, index_ref.name, batch, .{ .mode = .bulk_ingest });
+                    // Journal replay carries logical keys, not inline JSON.
+                    // Resolve the profile-specific primary namespace and pin
+                    // the row's declared layout through the shared collector.
+                    // A missing live row must not advance the index checkpoint.
+                    var writes = try collectDocumentWritesProfiled(ctx.alloc, ctx.store, ctx.index_manager, batch.documents, ctx.index_manager.byte_range, .{
+                        .prefer_inline_when_store_tip_matches_sequence = batch.sequence,
+                        .relational_base_rows = ctx.relational_base_rows,
+                    }, null);
+                    defer writes.deinit();
+                    if (writes.missing_required != 0) return error.ReplayDocumentNotVisible;
+                    const documents = try ctx.alloc.alloc(derived_types.DerivedDocument, writes.items.len);
+                    defer ctx.alloc.free(documents);
+                    for (writes.items, documents) |write, *document| document.* = .{ .key = write.key, .action = .upsert, .cleaned_value = write.value };
+                    var prepared = batch;
+                    prepared.documents = documents;
+                    try ctx.index_manager.applyAlgebraicBatchByNameWithOptions(ctx.store, index_ref.name, prepared, .{ .mode = .bulk_ingest });
                 },
             }
             if (!ctx.projection_only) try clearPublishedAssetArtifactRepairIssuesContext(ctx, index_ref.name, batch.changed_artifact_keys, batch.sequence);
@@ -4877,7 +6152,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             borrowed_write_count = writes.items.len;
             try appendArtifactRepairSummaryDirtyForStore(ctx.alloc, ctx.store, &writes, &deletes, &owned_delete_keys);
-            try ctx.store.putBatch(writes.items, deletes.items);
+            // Repair-issue bookkeeping, not primary data: if this clear is lost
+            // in a crash, the issue row just survives until the next pass
+            // observes the same healthy artifact and clears it again. Ride
+            // along instead of paying a dedicated fsync per cleared issue
+            // (lite-single-commit-write-path.md §3.2a).
+            try ctx.store.putBatchWithReplayWithOptions(null, writes.items, deletes.items, null, .{ .durability = .ride_along });
         }
 
         /// Requires artifact_repair_issue_mutex. Preserve the diagnosis and
@@ -4897,7 +6177,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             completion.failed_sequence = published_sequence;
             var encoded: [artifact_repair_completion_state_len]u8 = undefined;
             encodeArtifactRepairCompletionState(&encoded, completion);
-            try ctx.store.put(key, &encoded);
+            // Status-like bookkeeping (lite-single-commit-write-path.md §3.2a):
+            // `failed_sequence` is derived from the publication sequence and
+            // is recomputed identically if this write is lost on crash (the
+            // next failed publication at or past this sequence sets it
+            // again). Ride along instead of paying a dedicated fsync.
+            try ctx.store.putBatchWithReplayWithOptions(null, &.{.{ .key = key, .value = &encoded }}, &.{}, null, .{ .durability = .ride_along });
         }
 
         pub fn clearPublishedEmbeddingArtifactRepairIssuesContext(
@@ -5717,6 +7002,81 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
         }
 
+        /// Full-text versions for one replayed batch, which may fold several
+        /// journal records: each copy and each delete takes its own record's
+        /// sequence (`DerivedDocument.sequence`, `DerivedBatch.delete_sequences`),
+        /// with positions counted per sequence.
+        pub const TextReplayVersions = struct {
+            alloc: Allocator,
+            batch: derived_types.DerivedBatch,
+            next_position: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+            indexed: std.StringHashMapUnmanaged(void) = .empty,
+
+            pub const Deletes = struct {
+                keys: []const []const u8,
+                versions: []const u64 = &.{},
+
+                pub fn deinit(self: *Deletes, alloc: Allocator) void {
+                    if (self.keys.len != 0) alloc.free(self.keys);
+                    if (self.versions.len != 0) alloc.free(self.versions);
+                }
+            };
+
+            /// Stamps `docs` with their versions.
+            pub fn init(alloc: Allocator, batch: derived_types.DerivedBatch, docs: []mapper.MapperDoc) !TextReplayVersions {
+                var self: TextReplayVersions = .{ .alloc = alloc, .batch = batch };
+                errdefer self.deinit();
+                var sequences = std.StringHashMapUnmanaged(u64).empty;
+                defer sequences.deinit(alloc);
+                for (batch.documents) |doc| try sequences.put(alloc, doc.key, if (doc.sequence != 0) doc.sequence else self.keySequence());
+                for (docs) |*doc| {
+                    doc.doc_version = try self.next(sequences.get(doc.key) orelse self.keySequence());
+                    try self.indexed.put(alloc, doc.key, {});
+                }
+                return self;
+            }
+
+            pub fn deinit(self: *TextReplayVersions) void {
+                self.next_position.deinit(self.alloc);
+                self.indexed.deinit(self.alloc);
+            }
+
+            fn keySequence(self: *const TextReplayVersions) u64 {
+                return if (self.batch.key_sequence != 0) self.batch.key_sequence else self.batch.sequence;
+            }
+
+            fn next(self: *TextReplayVersions, sequence: u64) !u64 {
+                const slot = try self.next_position.getOrPut(self.alloc, sequence);
+                if (!slot.found_existing) slot.value_ptr.* = 0;
+                defer slot.value_ptr.* += 1;
+                return try persistent_mod.DocVersion.of(sequence, slot.value_ptr.*);
+            }
+
+            /// The keys this batch deletes without indexing a new copy, at
+            /// their records' versions. A key indexed again needs no delete:
+            /// its new copy supersedes the old one.
+            pub fn deletesAlloc(self: *TextReplayVersions, delete_keys: []const []const u8) !Deletes {
+                var sequences = std.StringHashMapUnmanaged(u64).empty;
+                defer sequences.deinit(self.alloc);
+                if (self.batch.delete_sequences.len == self.batch.overwritten_doc_keys.len) {
+                    for (self.batch.overwritten_doc_keys, self.batch.delete_sequences) |key, sequence| if (sequence != 0) try sequences.put(self.alloc, key, sequence);
+                }
+                if (self.batch.deleted_sequences.len == self.batch.deleted_keys.len) {
+                    for (self.batch.deleted_keys, self.batch.deleted_sequences) |key, sequence| if (sequence != 0) try sequences.put(self.alloc, key, sequence);
+                }
+                var keys = std.ArrayListUnmanaged([]const u8).empty;
+                errdefer keys.deinit(self.alloc);
+                var versions = std.ArrayListUnmanaged(u64).empty;
+                errdefer versions.deinit(self.alloc);
+                for (delete_keys) |key| {
+                    if (self.indexed.contains(key)) continue;
+                    try versions.append(self.alloc, try self.next(sequences.get(key) orelse self.keySequence()));
+                    try keys.append(self.alloc, key);
+                }
+                return .{ .keys = try keys.toOwnedSlice(self.alloc), .versions = try versions.toOwnedSlice(self.alloc) };
+            }
+        };
+
         pub fn collectTextReplayDeleteKeys(
             alloc: Allocator,
             index_manager: *index_manager_mod.IndexManager,
@@ -6002,6 +7362,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
 
+            if (producer_cfg.type == .reader or producer_cfg.type == .generator) {
+                if (try enrichment_types.withGenerationBudgetAlloc(alloc, producer_cfg.config_json, request.execution_json)) |updated| {
+                    alloc.free(producer_cfg.config_json);
+                    producer_cfg.config_json = updated;
+                }
+            }
             if (producer_cfg.type != .copy) {
                 if (deferred_asset_producer_items) |items| {
                     const request_clone = try enrichment_types.cloneGeneratedRequest(alloc, request);
@@ -6486,6 +7852,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var config = try document_extraction_mod.parseConfig(alloc, config_json);
             defer config.deinit(alloc);
             enrichment_runtime_mod.applyDocumentExtractionRuntimePolicy(&config);
+            try document_extraction_mod.applyExecutionPolicy(alloc, &config, request.execution_json);
             try document_extraction_mod.applySourceMetadataFromJson(alloc, &config, doc_value);
 
             const state_key = try assetStateKeyAlloc(alloc, request.doc_key, artifact_name);
@@ -6514,12 +7881,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             else
                 0;
             const to_generation = from_generation + 1;
+            const must_force = force_reprocess and (request.reprocess_generation == 0 or from_generation < request.reprocess_generation);
 
             const metadata_fingerprint = try document_extraction_mod.metadataFingerprintAlloc(alloc, source_url, config_json, config);
             defer if (metadata_fingerprint) |fingerprint| alloc.free(fingerprint);
             // As in async replay, checksum opt-in requires verified bytes;
             // metadata-only legacy fingerprints cannot prove that provenance.
-            if (!force_reprocess) {
+            if (!must_force) {
                 if (metadata_fingerprint) |fingerprint| {
                     if (try reuseDocumentExtractionByFingerprint(alloc, db, request.doc_key, artifact_name, fingerprint, existing_state, existing_manifest, manifest_key, from_generation, artifact_writes, artifact_delete_keys)) return;
                 }
@@ -6572,7 +7940,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 else
                     raw_err;
                 if (err != error.DocumentExtractionWorkingSetTooLarge and !document_extraction_mod.remoteContentErrorIsPermanent(err)) return err;
-                try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(err), "remote content download failed", "remote_content_download", artifact_writes);
+                try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(err), "remote content download failed", "remote_content_download", request.execution_json, artifact_writes);
                 return;
             };
             const downloaded = switch (fetched) {
@@ -6582,7 +7950,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         return error.RemoteDocumentFetchFailed;
                     const message = try std.fmt.allocPrint(alloc, "{s}: HTTP {d}", .{ http_error.message, http_error.status });
                     defer alloc.free(message);
-                    try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, "RemoteDocumentFetchFailed", message, "remote_content_http", artifact_writes);
+                    try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, "RemoteDocumentFetchFailed", message, "remote_content_http", request.execution_json, artifact_writes);
                     return;
                 },
             };
@@ -6598,7 +7966,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 var content_digest: [32]u8 = undefined;
                 std.crypto.hash.sha2.Sha256.hash(downloaded_mut.data, &content_digest, .{});
                 document_extraction_mod.verifyChecksumDigest(config, &content_digest) catch |raw_err| {
-                    try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(raw_err), "declared checksum does not match the downloaded bytes", "document_checksum_verification", artifact_writes);
+                    try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(raw_err), "declared checksum does not match the downloaded bytes", "document_checksum_verification", request.execution_json, artifact_writes);
                     return;
                 };
             }
@@ -6610,7 +7978,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer if (byte_source_fingerprint) |fingerprint| alloc.free(fingerprint);
             const source_fingerprint = metadata_fingerprint orelse byte_source_fingerprint.?;
 
-            if (metadata_fingerprint == null and !force_reprocess and
+            if (metadata_fingerprint == null and !must_force and
                 try reuseDocumentExtractionByFingerprint(alloc, db, request.doc_key, artifact_name, source_fingerprint, existing_state, existing_manifest, manifest_key, from_generation, artifact_writes, artifact_delete_keys)) return;
 
             // Downloaded bytes, inspection state, and decoded extraction results are
@@ -6647,10 +8015,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const exact_error_name = if (err != raw_err) @errorName(err) else boundaryFailureErrorName(&extraction_failure, err);
                 const decode_failure = document_extraction_mod.failureStageFromErrorName(exact_error_name, "").len != 0;
                 if (err == error.OutOfMemory or err == error.ResourceTemporarilyUnavailable or err == error.Canceled or err == error.Cancelled or err == error.DeadlineExceeded or err == error.Timeout or (!decode_failure and enrichment_runtime_mod.isRetryableEnrichmentError(err))) return err;
-                try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, exact_error_name, "document extraction failed", document_extraction_mod.failureStageFromErrorName(exact_error_name, "document_extraction"), artifact_writes);
+                try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, exact_error_name, "document extraction failed", document_extraction_mod.failureStageFromErrorName(exact_error_name, "document_extraction"), request.execution_json, artifact_writes);
                 return;
             };
             defer extraction.deinit(document_extraction_alloc);
+            extraction.execution_json = request.execution_json;
             if (S.ownerField(db, "enrichment_runtime").*) |runtime| {
                 enrichment_runtime_mod.completeDocumentExtractionGeneratedTextForRequestWithMemory(
                     if (document_execution) |execution| &execution.runtime else runtime,
@@ -6672,7 +8041,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     else
                         raw_err;
                     if (err != error.DocumentExtractionWorkingSetTooLarge) return err;
-                    try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(err), "generated document text exceeded its working-set limit", "document_generated_text", artifact_writes);
+                    try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(err), "generated document text exceeded its working-set limit", "document_generated_text", request.execution_json, artifact_writes);
                     return;
                 };
             } else if (document_extraction_mod.ocrEnabledForRoute(config, extraction.route_type) or config.transcription_enabled) {
@@ -7685,6 +9054,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             error_code: []const u8,
             error_message: []const u8,
             error_stage: []const u8,
+            execution_json: []const u8,
         ) ![]u8 {
             var out = std.ArrayListUnmanaged(u8).empty;
             errdefer out.deinit(alloc);
@@ -7699,6 +9069,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try appendJsonFieldString(alloc, &out, &first, "source_fingerprint", "");
             try appendJsonFieldString(alloc, &out, &first, "content_type", "");
             try appendJsonFieldString(alloc, &out, &first, "route_type", "error");
+            if (execution_json.len > 0) {
+                try appendJsonFieldName(alloc, &out, &first, "execution");
+                try out.appendSlice(alloc, execution_json);
+            }
             try appendJsonFieldUsize(alloc, &out, &first, "unit_count", unit_keys.len);
             try appendJsonFieldUsize(alloc, &out, &first, "chunk_count", chunk_keys.len);
             try appendJsonFieldName(alloc, &out, &first, "child_ranges");
@@ -7782,6 +9156,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try appendJsonFieldString(alloc, &out, &first, "source_fingerprint", fingerprint);
             try appendJsonFieldString(alloc, &out, &first, "content_type", extraction.content_type);
             try appendJsonFieldString(alloc, &out, &first, "route_type", extraction.route_type);
+            if (extraction.execution_json.len > 0) {
+                try appendJsonFieldName(alloc, &out, &first, "execution");
+                try out.appendSlice(alloc, extraction.execution_json);
+            }
             if (extraction.unsupported_reason.len > 0) {
                 try appendJsonFieldString(alloc, &out, &first, "unsupported_reason", extraction.unsupported_reason);
             }

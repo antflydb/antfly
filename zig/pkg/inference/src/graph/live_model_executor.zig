@@ -18,12 +18,14 @@ const backends = @import("../backends/backends.zig");
 const cache_mod = @import("cache.zig");
 const decode_state_runtime = @import("decode_state_runtime.zig");
 const session_factory = @import("../architectures/session_factory.zig");
-const generation = @import("../pipelines/generation.zig");
 const gpt_arch = @import("../architectures/gpt.zig");
 const gpt_mod = @import("../models/gpt.zig");
 const ops = @import("../ops/ops.zig");
 const runtime = @import("../runtime/root.zig");
 const model_runtime = @import("model_runtime.zig");
+const decoder_forward = @import("../execution/decoder_forward.zig");
+const decoder_storage = @import("../execution/decoder_storage.zig");
+const session_decoder = @import("session_decoder.zig");
 
 /// Live whole-model executor for native sessions.
 ///
@@ -32,31 +34,26 @@ const model_runtime = @import("model_runtime.zig");
 /// generation path, this runtime owns decode-state advancement itself: prefill
 /// seeds the cache, decode consumes one token and advances the cache for the
 /// next step.
-const ExecutorContext = struct {
-    allocator: std.mem.Allocator,
-    session: backends.Session,
-    gpt_config: gpt_mod.Config,
-    kv_dtype: ?runtime.kv.pool.KvDType = null,
-    shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache,
-};
-
 const RuntimeContext = struct {
     allocator: std.mem.Allocator,
     cb: ops.ComputeBackend,
-    gpt_config: gpt_mod.Config,
+    native_program: ?*@import("../execution/native_decoder_program.zig").Program = null,
+    native_program_attempted: bool = false,
+    native_program_decline: ?anyerror = null,
+    definition: *session_decoder.Definition,
     kv_manager: runtime.kv.manager.KvManager,
     pool_id: runtime.kv.block.KvPoolId,
     decode_runtime: decode_state_runtime.DecodeStateRuntime,
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache,
 
-    fn init(
-        allocator: std.mem.Allocator,
-        session: backends.Session,
-        gpt_config: gpt_mod.Config,
-        kv_dtype_override: ?runtime.kv.pool.KvDType,
-        shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache,
-    ) !*RuntimeContext {
-        const cb = try session_factory.getComputeBackend(session, allocator);
+    fn init(allocator: std.mem.Allocator, source: *session_decoder.Definition) !*RuntimeContext {
+        const definition = try source.acquireForRuntime(allocator);
+        errdefer definition.release();
+        const session = definition.session;
+        const gpt_config = definition.configuration.value;
+        const kv_dtype_override = definition.kv_dtype;
+        const shared_moe_cache = definition.shared_moe_cache;
+        const cb = try session.acquireComputeBackend(allocator, .{});
         errdefer {
             var cb_mut = cb;
             cb_mut.deinit();
@@ -73,23 +70,20 @@ const RuntimeContext = struct {
             .wasm => return error.UnexpectedWasmBackend,
         };
         const kv_dtype = kv_dtype_override orelse session_factory.recommendedKvDTypeForSession(session, backend_kind);
-        const sliding_window_size = gpt_config.kvPoolSlidingWindowSize(false);
 
-        const pool_id = try kv_manager.addPool(.{
-            .backend = backend_kind,
-            .dtype = kv_dtype,
-            .page_size_tokens = 16,
-            .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
-            .num_kv_heads = gpt_config.maxKvHeads(),
-            .head_dim = gpt_config.maxHeadDim(),
-            .sliding_window_size = sliding_window_size,
-        });
+        const pool_id = try kv_manager.addPool(decoder_storage.poolPlan(
+            backend_kind,
+            kv_dtype,
+            &gpt_config,
+            .{ .layer_layout = .architectural },
+        ));
 
         const ctx = try allocator.create(RuntimeContext);
+        errdefer allocator.destroy(ctx);
         ctx.* = .{
             .allocator = allocator,
             .cb = cb,
-            .gpt_config = gpt_config,
+            .definition = definition,
             .kv_manager = kv_manager,
             .pool_id = pool_id,
             .decode_runtime = undefined,
@@ -102,24 +96,67 @@ const RuntimeContext = struct {
             shared_moe_cache,
         );
         ctx.decode_runtime.configureForGptConfig(gpt_config);
+        errdefer ctx.decode_runtime.deinit();
+        try ctx.decode_runtime.state.ensureQwen35LinearCache(gpt_config);
+        if (cb.kind() == .native and kv_dtype == .f32) {
+            const program_context = @import("execution.zig").Context{ .allocator = allocator, .cb = &ctx.cb, .gpt_config = &ctx.definition.configuration.value, .session = session };
+            ctx.native_program_attempted = true;
+            switch (try @import("../execution/native_decoder_program.zig").Program.prepareWithTemplate(allocator, &program_context, definition.nativeTemplateSlot(source))) {
+                .prepared => |value| ctx.native_program = value,
+                .declined => |reason| ctx.native_program_decline = reason,
+            }
+        }
         return ctx;
     }
 
     fn resetState(self: *RuntimeContext) !void {
-        self.decode_runtime.deinit();
+        return self.resetStateWithCleanup(.{});
+    }
+    fn resetStateWithCleanup(self: *RuntimeContext, current: @import("../execution/cleanup_context.zig").Context) !void {
+        if (comptime @import("build_options").enable_cuda) if (self.cb.kind() == .cuda) {
+            const C = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
+            if (current.boundary != null or current.outside_execution) try C.invalidateLightOnDecodeGraphWithCleanup(&self.cb, current) else C.invalidateLightOnDecodeGraph(&self.cb);
+        };
+        // Recurrent storage belongs to this immutable model/runtime, not one
+        // prefill call. Reset its contents while retaining the same warmed
+        // host/device backing; KV and other request state keep their teardown.
+        const recurrent = self.decode_runtime.state.qwen35_linear_cache;
+        self.decode_runtime.state.qwen35_linear_cache = null;
+        errdefer self.decode_runtime.state.qwen35_linear_cache = recurrent;
+        try self.decode_runtime.deinitWithCleanup(current);
         self.decode_runtime = decode_state_runtime.DecodeStateRuntime.initPaged(
             self.allocator,
             &self.kv_manager,
             self.pool_id,
             self.shared_moe_cache,
         );
-        self.decode_runtime.configureForGptConfig(self.gpt_config);
+        self.decode_runtime.configureForGptConfig(self.definition.configuration.value);
+        self.decode_runtime.state.qwen35_linear_cache = recurrent;
+        self.decode_runtime.state.resetQwen35LinearCache();
+        if (self.native_program) |program| try program.afterStateReset(current);
     }
 
     pub fn deinit(self: *RuntimeContext) void {
-        self.decode_runtime.deinit();
+        self.deinitWithCleanup(.{ .outside_execution = true });
+    }
+    pub fn deinitWithCleanup(self: *RuntimeContext, current: @import("../execution/cleanup_context.zig").Context) void {
+        // The public raw outside close has no enclosing B. Create its actual
+        // local owner before cleanup guards; seal only after those guards end.
+        if (self.native_program != null and current.boundary == null and current.outside_execution) {
+            var owner = @import("../execution/cleanup_owner.zig").Owner.beginOutsideCleanup() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+            defer owner.finishAfterUnlock();
+            self.deinitWithCleanup(.{ .boundary = owner.epoch() });
+            return;
+        }
+        var cleanup = self.definition.beginCleanup();
+        defer cleanup.deinit();
+        const program = self.native_program;
+        self.native_program = null;
+        if (program) |owned| owned.destroyWithCleanup(current);
+        self.decode_runtime.deinitWithCleanup(current) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         self.kv_manager.deinit();
-        self.cb.deinit();
+        self.cb.deinitWithCleanup(current);
+        self.definition.releaseWithCleanup(current);
         self.allocator.destroy(self);
     }
 
@@ -127,7 +164,7 @@ const RuntimeContext = struct {
         return self.decode_runtime.currentTokenCount();
     }
 
-    fn kvView(self: *const RuntimeContext) ?generation.KvView {
+    fn kvView(self: *const RuntimeContext) ?decode_state_runtime.KvView {
         return self.decode_runtime.kvView();
     }
 
@@ -165,18 +202,18 @@ const RuntimeContext = struct {
         query_seq_len: usize,
         attention_mode: cache_mod.AttentionMode,
     ) gpt_arch.DecodeContext {
-        return self.decode_runtime.makeDecodeContext(seq_len, query_seq_len, attention_mode);
+        return self.decode_runtime.makeDecodeContextForMode(seq_len, query_seq_len, attention_mode);
     }
 
     fn preparePrefill(self: *RuntimeContext, seq_len: usize, query_seq_len: usize, attention_mode: cache_mod.AttentionMode) !gpt_arch.DecodeContext {
-        return self.decode_runtime.preparePrefill(seq_len, query_seq_len, attention_mode);
+        return self.decode_runtime.preparePrefillForMode(seq_len, query_seq_len, attention_mode);
     }
 
     fn beginDecodeStep(self: *RuntimeContext, position: usize, attention_mode: cache_mod.AttentionMode) !struct {
         seq_len: usize,
         decode_context: gpt_arch.DecodeContext,
     } {
-        const step = try self.decode_runtime.beginDecodeStep(position, attention_mode);
+        const step = try self.decode_runtime.beginDecodeStepForMode(position, attention_mode);
         return .{
             .seq_len = step.seq_len,
             .decode_context = step.decode_context,
@@ -184,19 +221,33 @@ const RuntimeContext = struct {
     }
 };
 
+fn acceptsOperationBackend(table: *const model_runtime.ModelRuntime.VTable) bool {
+    return table == &runtime_vtable;
+}
+fn operationBackend(raw: *anyopaque) *const ops.ComputeBackend {
+    const self: *RuntimeContext = @ptrCast(@alignCast(raw));
+    return &self.cb;
+}
+fn runtimeDeinitWithCleanup(raw: *anyopaque, current: @import("../execution/cleanup_context.zig").Context) void {
+    const ctx: *RuntimeContext = @ptrCast(@alignCast(raw));
+    ctx.deinitWithCleanup(current);
+}
+fn runtimeResetWithCleanup(raw: *anyopaque, current: @import("../execution/cleanup_context.zig").Context) !void {
+    const ctx: *RuntimeContext = @ptrCast(@alignCast(raw));
+    try ctx.resetStateWithCleanup(current);
+}
+const runtime_cleanup_services = model_runtime.ModelRuntime.ColdCleanupServices{ .accepts = acceptsOperationBackend, .deinit = runtimeDeinitWithCleanup, .reset = runtimeResetWithCleanup };
 const runtime_vtable = model_runtime.ModelRuntime.VTable{
+    .operation_backend = operationBackend,
+    .accepts_operation_backend = acceptsOperationBackend,
     .capabilities = runtimeCapabilities,
     .prefill = runtimePrefill,
     .decode = runtimeDecode,
     .decode_sample = runtimeDecodeSample,
     .decode_greedy = runtimeDecodeGreedy,
     .deinit = runtimeDeinit,
+    .cold_cleanup_services = &runtime_cleanup_services,
     .reset = runtimeReset,
-};
-
-const executor_vtable = model_runtime.ModelExecutor.VTable{
-    .create_runtime = createRuntime,
-    .deinit = executorDeinit,
 };
 
 fn supportsBackend(backend: backends.BackendType) bool {
@@ -204,6 +255,37 @@ fn supportsBackend(backend: backends.BackendType) bool {
         .native, .metal => true,
         else => false,
     };
+}
+
+/// Exact maintained runtime metadata; copied/custom tables are declined before
+/// any context cast. The owning caller excludes runtime destruction.
+pub fn authoredProgramStatistics(model: model_runtime.ModelRuntime) ?@import("../execution/native_decoder_program.zig").Program.Statistics {
+    if (model.vtable != &runtime_vtable) return null;
+    const context: *RuntimeContext = @ptrCast(@alignCast(model.ptr));
+    const program = context.native_program orelse return null;
+    return program.statistics();
+}
+
+/// Explicit nonblocking metadata query on the ACTUAL retaining Definition.
+/// A Program retains only Template, never a caller-owned TemplateSlot pointer.
+fn constructionSnapshot(context: *const RuntimeContext) @import("../execution/diagnostics.zig").NativeProgramConstruction {
+    return .{ .outcome = if (context.native_program != null) .prepared else if (context.native_program_attempted) .declined else .not_attempted, .error_name = if (context.native_program_decline) |err| @import("../execution/diagnostics.zig").Text.init(@errorName(err)) else null };
+}
+/// Explicit metadata query: actual retained Runtime constructor result, never
+/// a numerical invocation hit or a guessed reason for a coarse absence.
+pub fn authoredProgramConstruction(model: model_runtime.ModelRuntime) ?@import("../execution/diagnostics.zig").NativeProgramConstruction {
+    if (model.vtable != &runtime_vtable) return null;
+    const context: *RuntimeContext = @ptrCast(@alignCast(model.ptr));
+    if (context.cb.kind() != .native) return null;
+    return constructionSnapshot(context);
+}
+
+pub fn authoredDefinitionTemplateStatistics(model: model_runtime.ModelRuntime) ?@import("../execution/diagnostics.zig").NativeDefinitionTemplates {
+    if (model.vtable != &runtime_vtable) return null;
+    const context: *RuntimeContext = @ptrCast(@alignCast(model.ptr));
+    if (context.cb.kind() != .native) return null;
+    const value = context.definition.native_template.tryStatistics();
+    return .{ .availability = if (value != null) .sampled else .busy, .stats = value };
 }
 
 pub fn supportsSession(session: backends.Session) bool {
@@ -218,32 +300,11 @@ pub fn createModelExecutor(
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache,
 ) !model_runtime.ModelExecutor {
     if (!supportsSession(session)) return error.UnsupportedCompileBackend;
-    const ctx = try allocator.create(ExecutorContext);
-    ctx.* = .{
-        .allocator = allocator,
-        .session = session,
-        .gpt_config = gpt_config,
-        .kv_dtype = kv_dtype,
-        .shared_moe_cache = shared_moe_cache,
-    };
-    return .{ .ptr = ctx, .vtable = &executor_vtable };
+    return session_decoder.createExecutor(allocator, session, &gpt_config, kv_dtype, shared_moe_cache, createRuntime);
 }
 
-fn createRuntime(ctx: *anyopaque, allocator: std.mem.Allocator) !model_runtime.ModelRuntime {
-    const exec_ctx: *ExecutorContext = @ptrCast(@alignCast(ctx));
-    const runtime_ctx = try RuntimeContext.init(
-        allocator,
-        exec_ctx.session,
-        exec_ctx.gpt_config,
-        exec_ctx.kv_dtype,
-        exec_ctx.shared_moe_cache,
-    );
-    return .{ .ptr = runtime_ctx, .vtable = &runtime_vtable };
-}
-
-fn executorDeinit(ctx: *anyopaque) void {
-    const exec_ctx: *ExecutorContext = @ptrCast(@alignCast(ctx));
-    exec_ctx.allocator.destroy(exec_ctx);
+fn createRuntime(definition: *session_decoder.Definition, allocator: std.mem.Allocator) !model_runtime.ModelRuntime {
+    return .{ .ptr = try RuntimeContext.init(allocator, definition), .vtable = &runtime_vtable };
 }
 
 fn runtimeCapabilities(ctx: *anyopaque) model_runtime.RuntimeCapabilities {
@@ -287,6 +348,7 @@ fn runtimePrefill(
             request.seq_len,
             request.query_seq_len,
             &decode_context,
+            .prefill,
         ),
     };
 }
@@ -301,7 +363,7 @@ fn runtimeDecode(
     const step = try runtime_ctx.beginDecodeStep(request.position, request.attention_mode);
     try request.check();
     const input_ids = [_]i64{request.token_id};
-    return .{ .logits = try forwardLastLogits(runtime_ctx, allocator, input_ids[0..], step.seq_len, 1, &step.decode_context) };
+    return .{ .logits = try forwardLastLogits(runtime_ctx, allocator, input_ids[0..], step.seq_len, 1, &step.decode_context, .decode_step) };
 }
 
 fn runtimeDecodeSample(
@@ -316,11 +378,11 @@ fn runtimeDecodeSample(
     }
 
     var output = try runtimeDecode(ctx, allocator, request.decode);
-    defer output.deinit(allocator);
+    defer output.deinitWithCleanup(allocator, .{ .boundary = request.decode.cleanup_epoch, .operation = request.decode.backend_operation });
     return .{
         .token_id = @intCast(model_runtime.sampleTokenFromLogits(
             allocator,
-            try output.hostLogits(allocator),
+            try output.hostLogitsWithCleanup(allocator, .{ .boundary = request.decode.cleanup_epoch, .operation = request.decode.backend_operation }),
             request.sampling,
             request.token_history,
         )),
@@ -341,7 +403,7 @@ fn runtimeDecodeGreedy(
         .token_id = @intCast(try gpt_arch.forwardGreedyLastToken(
             &runtime_ctx.cb,
             allocator,
-            runtime_ctx.gpt_config,
+            runtime_ctx.definition.configuration.value,
             input_ids[0..],
             1,
             step.seq_len,
@@ -357,20 +419,31 @@ fn forwardLastLogits(
     seq_len: usize,
     query_seq_len: usize,
     decode_context: *const gpt_arch.DecodeContext,
+    operation: @import("../execution/diagnostics.zig").Operation,
 ) ![]f32 {
-    const logits = try gpt_arch.forward(
-        &runtime_ctx.cb,
-        allocator,
-        runtime_ctx.gpt_config,
-        input_ids,
-        1,
-        seq_len,
-        decode_context,
-    );
-    defer allocator.free(logits);
-    const vocab_size: usize = @intCast(runtime_ctx.gpt_config.vocab_size);
-    const last_pos_offset = (query_seq_len - 1) * vocab_size;
-    return allocator.dupe(f32, logits[last_pos_offset..][0..vocab_size]);
+    const selected = runtime_ctx.definition.session.invocation_diagnostics;
+    if (selected) |binding| if (binding.diagnostics.isEnabled()) {
+        var actual = binding.forBackend(runtime_ctx.cb);
+        actual.capture_programs = true;
+        actual.native_definition_templates = null;
+        actual.native_program_construction = null;
+        if (runtime_ctx.cb.kind() == .native) {
+            actual.native_program_construction = constructionSnapshot(runtime_ctx);
+            const value = runtime_ctx.definition.native_template.tryStatistics();
+            actual.native_definition_templates = .{ .availability = if (value != null) .sampled else .busy, .stats = value };
+        }
+        return @import("../execution/invocation_observation.zig").callOperation(actual, operation, forwardLastLogitsUnobserved, .{ runtime_ctx, allocator, input_ids, seq_len, query_seq_len, decode_context });
+    };
+    return forwardLastLogitsUnobserved(runtime_ctx, allocator, input_ids, seq_len, query_seq_len, decode_context);
+}
+fn forwardLastLogitsUnobserved(runtime_ctx: *RuntimeContext, allocator: std.mem.Allocator, input_ids: []const i64, seq_len: usize, query_seq_len: usize, decode_context: *const gpt_arch.DecodeContext) ![]f32 {
+    std.debug.assert(query_seq_len == decode_context.query_sequence_len);
+    var decoder = decoder_forward.Runtime{ .native_program = runtime_ctx.native_program, .context = .{
+        .allocator = allocator,
+        .cb = &runtime_ctx.cb,
+        .gpt_config = &runtime_ctx.definition.configuration.value,
+    } };
+    return decoder.forwardLastLogits(input_ids, 1, seq_len, decode_context);
 }
 
 test "live model executor supports native and metal backends" {
@@ -378,3 +451,112 @@ test "live model executor supports native and metal backends" {
     try std.testing.expect(supportsBackend(.metal));
     try std.testing.expect(!supportsBackend(.pjrt));
 }
+
+test "native whole model recurrent state preserves chunked prefill decode and warm reset backing" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data =
+        \\{"model_type":"qwen3_5","tie_word_embeddings":true,"text_config":{"model_type":"qwen3_5_text","hidden_size":4,"intermediate_size":8,"vocab_size":16,"num_hidden_layers":1,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":4,"max_position_embeddings":32,"tie_word_embeddings":true,"rms_norm_eps":0.000001,"full_attention_interval":4,"linear_conv_kernel_dim":4,"linear_key_head_dim":2,"linear_value_head_dim":2,"linear_num_key_heads":1,"linear_num_value_heads":1}}
+    });
+    const Spec = struct { name: []const u8, shape: []const i64, constant: ?f32 = null };
+    const specs = [_]Spec{
+        .{ .name = "model.embed_tokens.weight", .shape = &.{ 16, 4 } },
+        .{ .name = "model.norm.weight", .shape = &.{4}, .constant = 0.125 },
+        .{ .name = "model.layers.0.input_layernorm.weight", .shape = &.{4}, .constant = 0.125 },
+        .{ .name = "model.layers.0.post_attention_layernorm.weight", .shape = &.{4}, .constant = 0.125 },
+        .{ .name = "model.layers.0.mlp.gate_proj.weight", .shape = &.{ 8, 4 } },
+        .{ .name = "model.layers.0.mlp.up_proj.weight", .shape = &.{ 8, 4 } },
+        .{ .name = "model.layers.0.mlp.down_proj.weight", .shape = &.{ 4, 8 } },
+        .{ .name = "model.layers.0.linear_attn.in_proj_qkv.weight", .shape = &.{ 6, 4 } },
+        .{ .name = "model.layers.0.linear_attn.in_proj_z.weight", .shape = &.{ 2, 4 } },
+        .{ .name = "model.layers.0.linear_attn.in_proj_a.weight", .shape = &.{ 1, 4 } },
+        .{ .name = "model.layers.0.linear_attn.in_proj_b.weight", .shape = &.{ 1, 4 } },
+        .{ .name = "model.layers.0.linear_attn.out_proj.weight", .shape = &.{ 4, 2 } },
+        .{ .name = "model.layers.0.linear_attn.conv1d.weight", .shape = &.{ 6, 1, 4 }, .constant = 0.25 },
+        .{ .name = "model.layers.0.linear_attn.A_log", .shape = &.{1}, .constant = -1 },
+        .{ .name = "model.layers.0.linear_attn.dt_bias", .shape = &.{1}, .constant = 0.1 },
+        .{ .name = "model.layers.0.linear_attn.norm.weight", .shape = &.{2}, .constant = 1 },
+    };
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    var header = std.ArrayListUnmanaged(u8).empty;
+    var payload = std.ArrayListUnmanaged(u8).empty;
+    try header.append(arena, '{');
+    for (specs, 0..) |spec, index| {
+        var count: usize = 1;
+        for (spec.shape) |dim| count *= @intCast(dim);
+        const offset = payload.items.len;
+        for (0..count) |i| {
+            const value = spec.constant orelse @as(f32, @floatFromInt(@as(i32, @intCast((i * 7 + spec.name.len) % 23)) - 11)) / 32;
+            var bytes: [4]u8 = undefined;
+            std.mem.writeInt(u32, &bytes, @bitCast(value), .little);
+            try payload.appendSlice(arena, &bytes);
+        }
+        const shape = try std.json.Stringify.valueAlloc(arena, spec.shape, .{});
+        const entry = try std.fmt.allocPrint(arena, "{s}\"{s}\":{{\"dtype\":\"F32\",\"shape\":{s},\"data_offsets\":[{d},{d}]}}", .{ if (index == 0) "" else ",", spec.name, shape, offset, payload.items.len });
+        try header.appendSlice(arena, entry);
+    }
+    try header.append(arena, '}');
+    while (header.items.len % 8 != 0) try header.append(arena, ' ');
+    const checkpoint = try arena.alloc(u8, 8 + header.items.len + payload.items.len);
+    std.mem.writeInt(u64, checkpoint[0..8], header.items.len, .little);
+    @memcpy(checkpoint[8..][0..header.items.len], header.items);
+    @memcpy(checkpoint[8 + header.items.len ..], payload.items);
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = checkpoint });
+    const path = try directory.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    const session = try session_factory.createNativeSession(a, path);
+    defer session.close();
+    const cfg = session_factory.getGptConfig(session) orelse return error.MissingDecoderConfig;
+    var executor = try createModelExecutor(a, session, cfg, .f32, null);
+    defer executor.deinit();
+    var decoder = try executor.createRuntime(a);
+    defer decoder.deinit();
+    const ids = [_]i64{ 1, 2, 3, 4 };
+    var full = try decoder.prefill(a, .{ .input_ids = &ids, .seq_len = 4, .query_seq_len = 4, .attention_mode = .paged_prefill });
+    defer full.deinit(a);
+    const expected = try a.dupe(f32, try full.hostLogits(a));
+    defer a.free(expected);
+    var full_next = try decoder.decode(a, .{ .token_id = 5, .position = 4 });
+    defer full_next.deinit(a);
+    const expected_next = try a.dupe(f32, try full_next.hostLogits(a));
+    defer a.free(expected_next);
+    try decoder.reset();
+    var first = try decoder.prefill(a, .{ .input_ids = ids[0..2], .seq_len = 2, .query_seq_len = 2, .attention_mode = .paged_prefill });
+    defer first.deinit(a);
+    var second = try decoder.prefill(a, .{ .input_ids = ids[2..], .seq_len = 4, .query_seq_len = 2, .attention_mode = .paged_prefill });
+    defer second.deinit(a);
+    for (expected, try second.hostLogits(a)) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.00001);
+    var next = try decoder.decode(a, .{ .token_id = 5, .position = 4 });
+    defer next.deinit(a);
+    for (expected_next, try next.hostLogits(a)) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.00001);
+    const context: *RuntimeContext = @ptrCast(@alignCast(decoder.ptr));
+    const cache = context.decode_runtime.state.qwen35_linear_cache orelse return error.MissingRetainedRecurrentState;
+    const conv = cache.layers[0].conv.ptr;
+    const recurrent = cache.layers[0].recurrent.ptr;
+    try decoder.reset();
+    const reset_cache = context.decode_runtime.state.qwen35_linear_cache.?;
+    try std.testing.expectEqual(cache.layers.ptr, reset_cache.layers.ptr);
+    try std.testing.expectEqual(conv, reset_cache.layers[0].conv.ptr);
+    try std.testing.expectEqual(recurrent, reset_cache.layers[0].recurrent.ptr);
+    for (reset_cache.layers[0].conv) |value| try std.testing.expectEqual(@as(f32, 0), value);
+    for (reset_cache.layers[0].recurrent) |value| try std.testing.expectEqual(@as(f32, 0), value);
+    const Construction = struct {
+        fn run(allocator: std.mem.Allocator, source: *const model_runtime.ModelExecutor) !void {
+            var instance = try source.createRuntime(allocator);
+            defer instance.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Construction.run, .{&executor});
+}
+
+pub const Testing = if (@import("builtin").is_test) struct {
+    pub fn program(instance: model_runtime.ModelRuntime) ?*@import("../execution/native_decoder_program.zig").Program {
+        if (instance.vtable != &runtime_vtable) return null;
+        const context: *RuntimeContext = @ptrCast(@alignCast(instance.ptr));
+        return context.native_program;
+    }
+} else struct {};

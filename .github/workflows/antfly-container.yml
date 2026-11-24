@@ -11,7 +11,7 @@ on:
         required: true
         type: string
       channel:
-        description: "Validated stable, next, or nightly channel"
+        description: "Validated policy-defined release channel"
         required: true
         type: string
       source_commit:

@@ -385,7 +385,7 @@ pub fn decodeArtifactPublicIdAlloc(alloc: Allocator, artifact_id: []const u8) !?
             source.window_index = try std.fmt.parseUnsigned(u32, parts.next() orelse return error.InvalidArgument, 10);
             source_marker = parts.next();
         }
-        if (source.kind == .chunk and source_marker != null and std.mem.eql(u8, source_marker.?, "unit")) {
+        if ((source.kind == .chunk or source.kind == .asset) and source_marker != null and std.mem.eql(u8, source_marker.?, "unit")) {
             const source_unit_raw = parts.next() orelse return error.InvalidArgument;
             source.unit_id = try decodeBase64UrlComponentAlloc(alloc, source_unit_raw);
             source_marker = parts.next();
@@ -504,7 +504,8 @@ fn validateArtifactRef(artifact_ref: types.ArtifactRef) !void {
         if (artifact_ref.kind != .embedding) return error.InvalidArgument;
         switch (source.kind) {
             .chunk => if (source.chunk_id == null) return error.InvalidArgument,
-            .asset, .embedding => if (source.chunk_id != null or source.unit_id != null) return error.InvalidArgument,
+            .asset => if (source.chunk_id != null) return error.InvalidArgument,
+            .embedding => if (source.chunk_id != null or source.unit_id != null) return error.InvalidArgument,
         }
     }
 }
@@ -675,6 +676,23 @@ test "artifact public id round trips document unit chunk derived embedding refs"
     var decoded_internal = (try decodeArtifactRefAlloc(alloc, internal_key)).?;
     defer decoded_internal.deinit(alloc);
     try expectArtifactRefEqual(artifact_ref, decoded_internal);
+}
+
+test "source semantic media input PDF page embedding member round trips through its public and stored keys" {
+    const a = std.testing.allocator;
+    const base = try internal_keys.documentUnitArtifactKeyAlloc(a, "source/a", "pages", "page:000001");
+    defer a.free(base);
+    const key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(a, base, "visual");
+    defer a.free(key);
+    var public = try resolvePublicArtifactIdentityAlloc(a, key);
+    defer public.deinit(a);
+    var decoded = (try decodeArtifactPublicIdAlloc(a, public.id)).?;
+    defer decoded.deinit(a);
+    try std.testing.expectEqualStrings("source/a", decoded.document_id);
+    try std.testing.expectEqualStrings("page:000001", decoded.source.?.unit_id.?);
+    const restored = try internalKeyForArtifactRefAlloc(a, decoded);
+    defer a.free(restored);
+    try std.testing.expectEqualSlices(u8, key, restored);
 }
 
 test "decode embedding artifact identity for document embedding" {

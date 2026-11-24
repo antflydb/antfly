@@ -44,6 +44,38 @@ import (
 
 type relationalHTTPDoer func(*http.Request) (*http.Response, error)
 
+func TestRelationalPartialIndexConstantRoundTrip(t *testing.T) {
+	for _, value := range []bool{false, true} {
+		predicate := RelationalIndexPredicate{Constant: &value}
+		encoded, err := json.Marshal(predicate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fields map[string]interface{}
+		if err := json.Unmarshal(encoded, &fields); err != nil {
+			t.Fatal(err)
+		}
+		if len(fields) != 1 || fields["constant"] != value {
+			t.Fatalf("constant membership lost or acquired comparison fields: %s", encoded)
+		}
+		var restored RelationalIndexPredicate
+		if err := json.Unmarshal(encoded, &restored); err != nil {
+			t.Fatal(err)
+		}
+		if restored.Constant == nil || *restored.Constant != value {
+			t.Fatalf("constant membership lost on decode: %s", encoded)
+		}
+	}
+	ordinary := RelationalIndexPredicate{Column: "n", Op: oapi.RelationalComparisonOpGt, Value: 0}
+	encoded, err := json.Marshal(ordinary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "constant") {
+		t.Fatalf("ordinary comparison acquired constant membership: %s", encoded)
+	}
+}
+
 func TestRelationalUniqueOwnershipOriginRoundTrip(t *testing.T) {
 	for _, origin := range []RelationalUniqueConstraintOrigin{RelationalUniqueConstraintOriginConstraint, RelationalUniqueConstraintOriginIndex} {
 		rule := RelationalUniqueConstraint{Name: "email_key", Columns: []string{"email"}, Origin: origin}
@@ -61,6 +93,29 @@ func TestRelationalUniqueOwnershipOriginRoundTrip(t *testing.T) {
 	}
 	if RelationalUniqueConstraintOrigin("display-label").Valid() {
 		t.Fatal("invalid ownership kind accepted")
+	}
+}
+
+func TestRelationalJSONNullPublicExpressionContract(t *testing.T) {
+	for _, source := range []string{`{"op":"literal","type":"json","json_null":true}`, `{"op":"literal","type":"json","value":null,"json_null":true}`} {
+		var expression RelationalScalarExpression
+		if err := json.Unmarshal([]byte(source), &expression); err != nil {
+			t.Fatal(err)
+		}
+		if expression.Type != oapi.RelationalExpressionTypeJson || !expression.JsonNull {
+			t.Fatalf("lost JSON null identity: %+v", expression)
+		}
+		encoded, err := json.Marshal(expression)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var restored map[string]any
+		if err := json.Unmarshal(encoded, &restored); err != nil {
+			t.Fatal(err)
+		}
+		if restored["json_null"] != true || restored["type"] != "json" {
+			t.Fatalf("JSON null marker did not survive omitted optional value: %s", encoded)
+		}
 	}
 }
 
@@ -82,6 +137,50 @@ func TestRelationalExactNumericPublicExpressionContract(t *testing.T) {
 	}
 	if restored.Type != expression.Type || restored.SqlType != expression.SqlType || restored.Value != expression.Value {
 		t.Fatalf("lost exact NUMERIC contract after transport: %s", encoded)
+	}
+}
+
+func TestRelationalNumericFunctionOperations(t *testing.T) {
+	for _, op := range []oapi.RelationalExpressionOp{oapi.RelationalExpressionOpAbs, oapi.RelationalExpressionOpCeil, oapi.RelationalExpressionOpFloor, oapi.RelationalExpressionOpRound, oapi.RelationalExpressionOpTrunc, oapi.RelationalExpressionOpSign, oapi.RelationalExpressionOpSqrt} {
+		if !op.Valid() {
+			t.Fatalf("generated numeric operation rejected: %s", op)
+		}
+		source := RelationalScalarExpression{Op: op, SqlType: oapi.SQLBuiltinTypeNumeric, Args: []RelationalScalarExpression{{Op: oapi.RelationalExpressionOpLiteral, Type: oapi.RelationalExpressionTypeNumeric, SqlType: oapi.SQLBuiltinTypeNumeric, Value: "9007199254740993.5"}}}
+		if op == oapi.RelationalExpressionOpRound || op == oapi.RelationalExpressionOpTrunc {
+			source.Args = append(source.Args, RelationalScalarExpression{Op: oapi.RelationalExpressionOpLiteral, Type: oapi.RelationalExpressionTypeInteger, SqlType: oapi.SQLBuiltinTypeInt32, Value: -2})
+		}
+		encoded, err := json.Marshal(source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var restored RelationalScalarExpression
+		if err := json.Unmarshal(encoded, &restored); err != nil {
+			t.Fatal(err)
+		}
+		if restored.Op != op || restored.SqlType != oapi.SQLBuiltinTypeNumeric || restored.Args[0].Value != source.Args[0].Value || len(restored.Args) != len(source.Args) {
+			t.Fatalf("numeric identity or exact literal lost: %s", encoded)
+		}
+	}
+}
+
+func TestRelationalTextExpressionOperations(t *testing.T) {
+	var expression RelationalScalarExpression
+	if err := json.Unmarshal([]byte("{\"op\":\"md5\",\"args\":[{\"op\":\"replace\",\"args\":[{\"op\":\"column\",\"column\":\"s\"},{\"op\":\"literal\",\"type\":\"string\",\"value\":\"a\"},{\"op\":\"literal\",\"type\":\"string\",\"value\":\"X\"}]}]}"), &expression); err != nil {
+		t.Fatal(err)
+	}
+	if !expression.Op.Valid() || expression.Op != oapi.RelationalExpressionOpMd5 || len(expression.Args) != 1 || !expression.Args[0].Op.Valid() || expression.Args[0].Op != oapi.RelationalExpressionOpReplace || len(expression.Args[0].Args) != 3 {
+		t.Fatalf("lost nested text operation contract: %+v", expression)
+	}
+	encoded, err := json.Marshal(expression)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored RelationalScalarExpression
+	if err := json.Unmarshal(encoded, &restored); err != nil {
+		t.Fatal(err)
+	}
+	if restored.Op != expression.Op || restored.Args[0].Op != expression.Args[0].Op || restored.Args[0].Args[2].Value != "X" {
+		t.Fatalf("text operation contract changed after transport: %s", encoded)
 	}
 }
 
@@ -301,5 +400,33 @@ func TestRelationalRecoveryRoutesAndOutcomes(t *testing.T) {
 	retirement, err := client.RetireRelationalConstraints(context.Background(), "rows", RelationalConstraintRetirementRequest{SchemaVersion: 2, Drop: drop})
 	if err != nil || retirement.Status != "accepted" || calls != 3 {
 		t.Fatalf("retirement=%#v err=%v calls=%d", retirement, err, calls)
+	}
+}
+
+func TestRelationalClockPrecisionPreservesExplicitZero(t *testing.T) {
+	for _, precision := range []*int{nil, new(int)} {
+		source := RelationalScalarExpression{Op: oapi.RelationalExpressionOpTransactionTimestamp, Precision: precision}
+		encoded, err := json.Marshal(source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(encoded, &fields); err != nil {
+			t.Fatal(err)
+		}
+		value, present := fields["precision"]
+		if present != (precision != nil) {
+			t.Fatalf("precision presence changed: %s", encoded)
+		}
+		if present && string(value) != "0" {
+			t.Fatalf("explicit zero precision changed: %s", encoded)
+		}
+		var restored RelationalScalarExpression
+		if err := json.Unmarshal(encoded, &restored); err != nil {
+			t.Fatal(err)
+		}
+		if (restored.Precision != nil) != present || (present && *restored.Precision != 0) {
+			t.Fatalf("precision round trip changed: %s", encoded)
+		}
 	}
 }

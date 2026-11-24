@@ -87,6 +87,10 @@ pub fn project(a: A, snapshot: PolicySnapshot, key: []const u8, source: []const 
     if (snapshot.prepared.policy.mode == .monitor) return a.dupe(u8, source);
     const original = try std.json.parseFromSlice(std.json.Value, a, source, .{ .parse_numbers = false });
     const canonical = try std.json.Stringify.valueAlloc(a, original.value, .{});
+    return projectCanonical(a, snapshot, key, canonical, read);
+}
+
+fn projectCanonical(a: A, snapshot: PolicySnapshot, key: []const u8, canonical: []const u8, read: anytype) ![]u8 {
     const artifact_key = try keys.artifactNamedPrefixAlloc(a, key, "asset", snapshot.artifact_name);
     var input = try @import("artifact_extraction_generation.zig").captureInput(a, read, artifact_key);
     defer input.deinit();
@@ -126,7 +130,7 @@ pub fn observation(a: A, snapshot: PolicySnapshot, key: []const u8, source: []co
 }
 
 fn requireArtifactPublication(a: A, snapshot: PolicySnapshot, source: []const u8, artifact: []const u8, output: []const u8, proof_key: []const u8, proof_value: ?[]const u8, read: anytype) !void {
-    if (snapshot.native and try @import("../source_authority.zig").maintenanceMode(read) == .local and try @import("artifact_publication.zig").authority(read) == null) {
+    if (try usesLocalWitness(snapshot, read)) {
         return @import("../../privacy/local_publication.zig").require(a, read, artifact, snapshot.prepared.version, source, output);
     }
     var accepted = (try @import("artifact_producer_provenance.zig").readCurrentForArtifact(a, read, proof_key, proof_value)) orelse return error.PrivacyPublicationPending;
@@ -161,6 +165,28 @@ pub fn pending(err: anyerror) bool {
         err == error.EnrichmentSourceChanged or err == error.ArtifactPublicationPending or err == error.ArtifactCatalogDrift;
 }
 
+fn usesLocalWitness(snapshot: PolicySnapshot, read: anytype) !bool {
+    return snapshot.native and try @import("../source_authority.zig").maintenanceMode(read) == .local and try @import("artifact_publication.zig").authority(read) == null;
+}
+
+fn projectLocalArtifact(a: A, snapshot: PolicySnapshot, physical: []const u8, read: anytype, raw: []const u8) ![]u8 {
+    var ref = (try @import("artifact_ids.zig").decodeArtifactRefAlloc(a, physical)) orelse return error.UnsupportedQueryRequest;
+    defer ref.deinit(a);
+    const root = std.mem.eql(u8, ref.name, snapshot.artifact_name);
+    const version = snapshot.prepared.version;
+    if (!root and !std.meta.eql(document.consumerPolicyVersion(ref.name), @as(?[64]u8, version))) return error.UnsupportedQueryRequest;
+    const primary = try keys.documentKeyAlloc(a, ref.document_id);
+    const source = read.get(primary) catch |err| if (err == error.NotFound) return error.PrivacyStale else return err;
+    if (root) return project(a, snapshot, ref.document_id, source, read);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, source, .{ .parse_numbers = false });
+    const canonical = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+    const expected = try @import("../../privacy/local_publication.zig").expectedOutput(a, read, physical, version, canonical);
+    // Check both publications on this cut before fetching an external vector.
+    if (snapshot.prepared.policy.mode != .monitor) _ = try projectCanonical(a, snapshot, ref.document_id, canonical, read);
+    if (!std.mem.eql(u8, &expected, &contract.fingerprint(raw))) return error.PrivacyStale;
+    return a.dupe(u8, raw);
+}
+
 /// Derived bytes are safe only when accepted under the active policy-owned
 /// producer graph. Orphaned pre-policy chunks/assets remain physically present
 /// for GC but cannot be read through their old public IDs.
@@ -168,23 +194,7 @@ pub fn projectArtifact(a: A, snapshot: PolicySnapshot, physical: []const u8, rea
     var input = try @import("artifact_extraction_generation.zig").captureInput(a, read, physical);
     defer input.deinit();
     const raw = input.value orelse return error.PrivacyPending;
-    if (snapshot.native and try @import("../source_authority.zig").maintenanceMode(read) == .local and try @import("artifact_publication.zig").authority(read) == null) {
-        var ref = (try @import("artifact_ids.zig").decodeArtifactRefAlloc(a, physical)) orelse return error.UnsupportedQueryRequest;
-        defer ref.deinit(a);
-        const root = std.mem.eql(u8, ref.name, snapshot.artifact_name);
-        const version = snapshot.prepared.version;
-        if (!root and !std.meta.eql(document.consumerPolicyVersion(ref.name), @as(?[64]u8, version))) return error.UnsupportedQueryRequest;
-        const primary = try keys.documentKeyAlloc(a, ref.document_id);
-        const source = read.get(primary) catch |err| if (err == error.NotFound) return error.PrivacyStale else return err;
-        if (root) return project(a, snapshot, ref.document_id, source, read);
-        const parsed = try std.json.parseFromSlice(std.json.Value, a, source, .{ .parse_numbers = false });
-        const canonical = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
-        try @import("../../privacy/local_publication.zig").require(a, read, physical, version, canonical, raw);
-        // Independently require the current root, even when the descendant's
-        // own publication is current. These bytes never grant original access.
-        _ = try project(a, snapshot, ref.document_id, source, read);
-        return a.dupe(u8, raw);
-    }
+    if (try usesLocalWitness(snapshot, read)) return projectLocalArtifact(a, snapshot, physical, read, raw);
     var proof = (try @import("artifact_producer_provenance.zig").readCurrentForArtifact(a, read, input.proofKey(physical), input.proofValue())) orelse return error.PrivacyPublicationPending;
     defer proof.deinit();
     const name = proof.proof.producer_artifact_name;
@@ -202,6 +212,91 @@ pub fn projectArtifact(a: A, snapshot: PolicySnapshot, physical: []const u8, rea
     }
     if (!std.mem.startsWith(u8, name, prefix)) return error.UnsupportedQueryRequest;
     return a.dupe(u8, raw);
+}
+
+const ReceiptRead = struct {
+    scope: @import("../backend_erased.zig").ReadScope,
+    payload: ?*@import("../artifact_payload.zig").Session,
+    alloc: A,
+
+    fn logical(self: *@This(), key: []const u8, stored: []const u8) ![]const u8 {
+        const payload = @import("../artifact_payload.zig");
+        if (!payload.isEmbeddingKey(key) or !payload.isReference(stored)) return stored;
+        const session = self.payload orelse return error.VectorMigrationReadEpochChanged;
+        return session.getAlloc(self.alloc, key, stored);
+    }
+
+    pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+        return self.logical(key, try self.scope.get(key));
+    }
+};
+
+/// All calls in a batch share a pinned transaction and policy. Retain only
+/// document IDs and fingerprints. Decoded sources and vector bodies stay in
+/// the candidate arena, including when a later output supplies the citation.
+pub const PageValidation = struct {
+    alloc: A,
+    policy: PolicySnapshot,
+    local: ?bool = null,
+    sources: std.StringHashMapUnmanaged(?[64]u8) = .empty,
+
+    pub fn deinit(self: *@This()) void {
+        var it = self.sources.keyIterator();
+        while (it.next()) |key| self.alloc.free(key.*);
+        self.sources.deinit(self.alloc);
+    }
+
+    fn rootFingerprint(self: *@This(), a: A, id: []const u8, read: *ReceiptRead) ![64]u8 {
+        if (self.sources.get(id)) |cached| return cached orelse error.PrivacyStale;
+        const fingerprint = validatedRootFingerprint(a, self.policy, id, read) catch |err| blk: {
+            if (!pending(err)) return err;
+            break :blk null;
+        };
+        const key = try self.alloc.dupe(u8, id);
+        self.sources.put(self.alloc, key, fingerprint) catch |err| {
+            self.alloc.free(key);
+            return err;
+        };
+        // The map owns key even when this document is ineligible.
+        return fingerprint orelse return error.PrivacyStale;
+    }
+
+    pub fn permits(self: *@This(), a: A, physical: []const u8, stored: []const u8, scope: @import("../backend_erased.zig").ReadScope, payload: ?*@import("../artifact_payload.zig").Session) !bool {
+        var read = ReceiptRead{ .alloc = a, .scope = scope, .payload = payload };
+        if (self.local == null) self.local = try usesLocalWitness(self.policy, &read);
+        return self.validate(a, physical, stored, &read) catch |err| {
+            if (pending(err) or err == error.UnsupportedQueryRequest) return false;
+            return err;
+        };
+    }
+
+    fn validate(self: *@This(), a: A, physical: []const u8, stored: []const u8, read: *ReceiptRead) !bool {
+        const snapshot = self.policy;
+        if (self.local.?) {
+            var ref = (try @import("artifact_ids.zig").decodeArtifactRefAlloc(a, physical)) orelse return false;
+            defer ref.deinit(a);
+            const version = snapshot.prepared.version;
+            if (std.mem.eql(u8, ref.name, snapshot.artifact_name) or !std.meta.eql(document.consumerPolicyVersion(ref.name), @as(?[64]u8, version))) return false;
+            const fingerprint = try self.rootFingerprint(a, ref.document_id, read);
+            const expected = try @import("../../privacy/local_publication.zig").expectedOutputFingerprint(a, read, physical, version, fingerprint);
+            return std.mem.eql(u8, &expected, &contract.fingerprint(try read.logical(physical, stored)));
+        }
+        var proof = (try @import("artifact_producer_provenance.zig").readCurrentArtifactMetadata(a, read, physical)) orelse return false;
+        defer proof.deinit();
+        const name = proof.proof.producer_artifact_name;
+        if (std.mem.eql(u8, name, snapshot.artifact_name) or !std.meta.eql(document.consumerPolicyVersion(name), @as(?[64]u8, snapshot.prepared.version))) return false;
+        for (proof.proof.effects) |effect| if (std.mem.eql(u8, effect.key, physical)) return effect.value_digest != null;
+        return error.ArtifactCatalogCorrupt;
+    }
+};
+
+fn validatedRootFingerprint(a: A, policy: PolicySnapshot, id: []const u8, read: *ReceiptRead) ![64]u8 {
+    const primary = try keys.documentKeyAlloc(a, id);
+    const source = read.get(primary) catch |err| if (err == error.NotFound) return error.PrivacyStale else return err;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, source, .{ .parse_numbers = false });
+    const canonical = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+    if (policy.prepared.policy.mode != .monitor) _ = try projectCanonical(a, policy, id, canonical, read);
+    return contract.fingerprint(canonical);
 }
 
 // Resolve exactly the physical consumers used by retrieval and text filters.

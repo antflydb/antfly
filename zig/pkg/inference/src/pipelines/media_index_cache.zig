@@ -38,6 +38,9 @@ pub const Cache = struct {
     pub fn acquireBuild(self: *Cache, identity: [32]u8, control: @import("../execution_control.zig").InferenceExecutionControl) !@import("media_speaker_flights.zig").Registry.Lease {
         return self.builds.acquire(std.heap.smp_allocator, identity, control);
     }
+    pub fn tryAcquireBuild(self: *Cache, identity: [32]u8, control: @import("../execution_control.zig").InferenceExecutionControl) !?@import("media_speaker_flights.zig").Registry.Lease {
+        return self.builds.tryAcquire(std.heap.smp_allocator, identity, control);
+    }
     pub const Admission = struct {
         context: *anyopaque,
         acquire: *const fn (*anyopaque, usize) anyerror!@import("../runtime/tier/memory.zig").AdmissionLease,
@@ -60,19 +63,28 @@ pub const Cache = struct {
             track: media.webm.Track,
             packets: []media.webm.Packet,
             cues: []media.webm.Cue,
+            source_timeline: ?media.webm.SourceTimeline,
             timestamp_scale_ns: u64,
             duration_seconds: ?f64,
             pub fn reader(self: @This(), a: std.mem.Allocator, source: *media.source.Source) media.webm.Reader {
-                return .{ .allocator = a, .input = source, .metadata = .{ .bytes = &.{}, .source = null }, .track = self.track, .packets = self.packets, .cues = self.cues, .timestamp_scale_ns = self.timestamp_scale_ns, .duration_seconds = self.duration_seconds };
+                return .{ .allocator = a, .input = source, .metadata = .{ .bytes = &.{}, .source = null }, .track = self.track, .packets = self.packets, .cues = self.cues, .source_timeline = self.source_timeline, .timestamp_scale_ns = self.timestamp_scale_ns, .duration_seconds = self.duration_seconds };
             }
         },
     };
     pub const WebmSnapshot = struct {
         index: video.webm_pictures.Index,
-        source_bound: bool,
         timeline: video.sampling.Timeline,
         origin: i64,
         duration: i128,
+        /// The caller has already matched the immutable media cache key and
+        /// rebuilt this reader from the corresponding packet snapshot.
+        pub fn rebind(self: *const WebmSnapshot, reader: *const media.webm.Reader) video.webm_pictures.Index {
+            var index = self.index;
+            index.allocator = reader.allocator;
+            index.reader = reader;
+            return index;
+        }
+
         fn copy(a: std.mem.Allocator, value: WebmSnapshot) !WebmSnapshot {
             var result = value;
             result.index.reader = null;
@@ -80,6 +92,7 @@ pub const Cache = struct {
             result.index.allocator = a;
             result.index.pictures = try a.dupe(video.webm_pictures.Picture, value.index.pictures);
             result.index.restarts = try a.dupe(video.webm_pictures.Restart, value.index.restarts);
+            result.index.packet_byte_prefix = try a.dupe(usize, value.index.packet_byte_prefix);
             result.timeline.allocator = a;
             result.timeline.entries = try a.dupe(@typeInfo(@TypeOf(value.timeline.entries)).pointer.child, value.timeline.entries);
             result.timeline.maxima = try a.dupe(i128, value.timeline.maxima);
@@ -89,6 +102,7 @@ pub const Cache = struct {
     pub const Planning = union(enum) { mp4: *const video_owner.Owner, webm: WebmSnapshot };
     pub const Entry = struct {
         allocation: admitted.AdmittedAllocator,
+        admission: Admission,
         header_lease: @import("../runtime/tier/memory.zig").AdmissionLease,
         arena: std.heap.ArenaAllocator,
         key: [32]u8,
@@ -109,6 +123,7 @@ pub const Cache = struct {
             if (self.opus_owned) switch (self.data.audio) {
                 inline .opus, .flac => |*index| index.deinit(),
                 .webm => |*index| index.codec.opus.deinit(),
+                .webm_flac => self.data.audio.deinit(),
                 else => unreachable,
             };
             if (self.speaker_blocks_owned) self.data.speaker_analysis.shared.?.releaseBlocks();
@@ -119,6 +134,10 @@ pub const Cache = struct {
         }
     };
     pub fn key(source: *const media.source.Source, webm: bool, max_packets: usize, max_working_bytes: usize) ?[32]u8 {
+        return videoKey(source, if (webm) .webm else .mp4, max_packets, max_working_bytes);
+    }
+    pub const Container = enum(u8) { mp4, webm, transport };
+    pub fn videoKey(source: *const media.source.Source, container: Container, max_packets: usize, max_working_bytes: usize) ?[32]u8 {
         const binding = switch (source.storage) {
             .range => |range| range.immutable_binding orelse return null,
             .borrowed => return null,
@@ -127,7 +146,7 @@ pub const Cache = struct {
         hash.update("media-container-index-v1");
         hash.update(&binding);
         hash.update(source.identity);
-        hash.update(&.{@intFromBool(webm)});
+        hash.update(&.{@backingInt(container)});
         for ([_]u64{ source.length(), max_packets, max_working_bytes }) |n| {
             var raw: [8]u8 = undefined;
             std.mem.writeInt(u64, &raw, n, .little);
@@ -138,10 +157,16 @@ pub const Cache = struct {
         return result;
     }
     pub fn inlineAudioKey(content: [32]u8, aac: bool, max_packets: usize, max_bytes_: usize) [32]u8 {
+        return inlineKey("media-inline-audio-seek-v1", content, @intFromBool(aac), max_packets, max_bytes_);
+    }
+    pub fn inlineVideoKey(content: [32]u8, container: Container, max_packets: usize, max_bytes_: usize) [32]u8 {
+        return inlineKey("media-inline-video-seek-v1", content, @backingInt(container), max_packets, max_bytes_);
+    }
+    fn inlineKey(domain: []const u8, content: [32]u8, format: u8, max_packets: usize, max_bytes_: usize) [32]u8 {
         var hash = std.crypto.hash.Blake3.init(.{});
-        hash.update("media-inline-audio-seek-v1");
+        hash.update(domain);
         hash.update(&content);
-        hash.update(&.{@intFromBool(aac)});
+        hash.update(&.{format});
         for ([_]u64{ max_packets, max_bytes_ }) |n| {
             var raw: [8]u8 = undefined;
             std.mem.writeInt(u64, &raw, n, .little);
@@ -151,11 +176,22 @@ pub const Cache = struct {
         hash.final(&result);
         return result;
     }
-    pub fn audioKey(source: *const media.source.Source, max_packets: usize, max_bytes_: usize) ?[32]u8 {
-        const base = key(source, false, max_packets, max_bytes_) orelse return null;
+    pub const AudioParser = enum(u8) { embedded, mp3, flac, ogg, opus };
+
+    pub fn audioKey(source: *const media.source.Source, parser: AudioParser, max_packets: usize, max_bytes_: usize) ?[32]u8 {
+        const binding = switch (source.storage) {
+            .range => |range| range.immutable_binding orelse return null,
+            .borrowed => return null,
+        };
         var hash = std.crypto.hash.Blake3.init(.{});
-        hash.update("media-audio-seek-v1");
-        hash.update(&base);
+        hash.update("media-audio-seek-v3");
+        hash.update(&.{@backingInt(parser)});
+        hash.update(&binding);
+        for ([_]u64{ source.length(), max_packets, max_bytes_ }) |n| {
+            var raw: [8]u8 = undefined;
+            std.mem.writeInt(u64, &raw, n, .little);
+            hash.update(&raw);
+        }
         var result: [32]u8 = undefined;
         hash.final(&result);
         return result;
@@ -239,22 +275,46 @@ pub const Cache = struct {
     pub fn remember(self: *Cache, a: std.mem.Allocator, identity: [32]u8, data: Input, admission: Admission) void {
         self.rememberPlanned(a, identity, data, admission, null);
     }
+    const SpeakerPublish = enum { covered, replace, retry };
+
+    fn speakerPublishState(old: ?*Entry, snapshot: @import("media_speaker_state.zig").Snapshot) SpeakerPublish {
+        const entry = old orelse return .replace;
+        if (entry.data != .speaker_analysis) return .retry;
+        const current = entry.data.speaker_analysis;
+        if (current.next_window > snapshot.next_window or
+            (current.next_window == snapshot.next_window and (current.complete or !snapshot.complete))) return .covered;
+        if (entry.refs != 0 or !snapshot.extends(current)) return .retry;
+        return .replace;
+    }
+
+    /// True when the cache retained this frontier or already serves a newer one.
+    pub fn rememberSpeaker(self: *Cache, a: std.mem.Allocator, identity: [32]u8, snapshot: @import("media_speaker_state.zig").Snapshot, admission: Admission) bool {
+        self.lock();
+        const initial = speakerPublishState(self.find(identity), snapshot);
+        self.mutex.unlock();
+        if (initial != .replace) return initial == .covered;
+        snapshot.validate() catch return false;
+
+        const entry = self.prepareEntry(a, identity, .{ .speaker_analysis = snapshot }, admission, null) orelse return false;
+        var inserted = false;
+        defer if (!inserted) entry.destroy();
+        self.lock();
+        defer self.mutex.unlock();
+        const old = self.find(identity);
+        const current = speakerPublishState(old, snapshot);
+        if (current != .replace) return current == .covered;
+        if (old) |previous| {
+            entry.speaker_disk = previous.speaker_disk;
+            self.remove(previous);
+        }
+        self.insert(entry);
+        inserted = true;
+        return true;
+    }
+
     pub fn rememberPlanned(self: *Cache, a: std.mem.Allocator, identity: [32]u8, data: Input, admission: Admission, planning: ?Planning) void {
         if (data == .speaker_analysis) {
-            const snapshot = data.speaker_analysis;
-            snapshot.validate() catch return;
-            const entry = self.prepareEntry(a, identity, data, admission, null) orelse return;
-            self.lock();
-            defer self.mutex.unlock();
-            if (self.find(identity)) |old| {
-                if (old.data != .speaker_analysis or old.refs != 0 or !snapshot.extends(old.data.speaker_analysis) or (snapshot.next_window == old.data.speaker_analysis.next_window and snapshot.complete == old.data.speaker_analysis.complete)) {
-                    entry.destroy();
-                    return;
-                }
-                entry.speaker_disk = old.speaker_disk;
-                self.remove(old);
-            }
-            self.insert(entry);
+            _ = self.rememberSpeaker(a, identity, data.speaker_analysis, admission);
             return;
         }
         if (data == .audio_plan) {
@@ -270,6 +330,12 @@ pub const Cache = struct {
         }
         self.insert(entry);
     }
+    fn admitClone(owner: *const admitted.AdmittedAllocator, bytes: usize) !@import("../runtime/tier/memory.zig").AdmissionLease {
+        if (bytes > (max_bytes - @sizeOf(Entry)) -| owner.reserved_bytes) return error.ResourceLimitExceeded;
+        const entry: *const Entry = @alignCast(@fieldParentPtr("allocation", owner));
+        return entry.admission.acquire(entry.admission.context, bytes);
+    }
+
     fn prepareEntry(self: *Cache, a: std.mem.Allocator, identity: [32]u8, data: Input, admission: Admission, planning: ?Planning) ?*Entry {
         const estimate = switch (data) {
             .speaker_analysis => |value| @sizeOf(@import("inference_chunker").diarization.Registry) + value.spanCount() * @sizeOf(@import("inference_chunker").diarization.Span),
@@ -277,15 +343,19 @@ pub const Cache = struct {
             .aac => |owner| @import("media_chunking_audio_source.zig").Mp4.Snapshot.estimatedBytes(owner),
             .audio => |index| index.estimatedBytes(),
             .mp4 => |r| std.math.mul(usize, r.packets.len, @sizeOf(media.mp4.Packet)) catch return null,
-            .webm => |r| (std.math.mul(usize, r.packets.len, @sizeOf(media.webm.Packet)) catch return null) +| (std.math.mul(usize, r.cues.len, @sizeOf(media.webm.Cue)) catch return null),
+            .webm => |r| (std.math.mul(usize, r.packets.len, @sizeOf(media.webm.Packet)) catch return null) +| (std.math.mul(usize, r.cues.len, @sizeOf(media.webm.Cue)) catch return null) +| (if (r.source_timeline) |timeline| timeline.samples.len *| @sizeOf(media.webm.SourceTimeline.Sample) else 0),
         };
-        if (estimate > max_bytes) return null;
+        const planning_bytes = if (planning) |plan| switch (plan) {
+            .mp4 => |owner| video_owner.Snapshot.storageBytes(owner),
+            .webm => |snapshot| std.mem.sliceAsBytes(snapshot.index.pictures).len +| std.mem.sliceAsBytes(snapshot.index.restarts).len +| std.mem.sliceAsBytes(snapshot.index.packet_byte_prefix).len +| std.mem.sliceAsBytes(snapshot.timeline.entries).len +| std.mem.sliceAsBytes(snapshot.timeline.maxima).len,
+        } else 0;
+        if (estimate +| planning_bytes > max_bytes - @sizeOf(Entry)) return null;
         var header_lease = admission.acquire(admission.context, @sizeOf(Entry)) catch return null;
         const entry = a.create(Entry) catch {
             header_lease.release();
             return null;
         };
-        entry.* = .{ .header_lease = header_lease, .allocation = .{ .backing = a, .admission_context = admission.context, .admit = admission.acquire }, .arena = undefined, .key = identity, .data = undefined, .refs = 0 };
+        entry.* = .{ .header_lease = header_lease, .admission = admission, .allocation = .{ .backing = a, .admit_owned = admitClone }, .arena = undefined, .key = identity, .data = undefined, .refs = 0 };
         entry.arena = .init(entry.allocation.allocator());
         self.copy(entry, data) catch {
             entry.destroy();
@@ -293,8 +363,7 @@ pub const Cache = struct {
         };
         if (planning) |value| switch (value) {
             .mp4 => |owner| {
-                // In-band parameter registries own mutable request context.
-                if (owner.registry == null) entry.mp4_plan = video_owner.Snapshot.copy(entry.arena.allocator(), owner) catch {
+                entry.mp4_plan = video_owner.Snapshot.copy(entry.arena.allocator(), owner) catch {
                     entry.destroy();
                     return null;
                 };
@@ -385,11 +454,12 @@ pub const Cache = struct {
             .aac => |owner| entry.data = .{ .aac = try @import("media_chunking_audio_source.zig").Mp4.Snapshot.copy(a, owner) },
             .audio => |index| {
                 entry.data = .{ .audio = try index.copy(a) };
-                entry.opus_owned = index == .opus or index == .flac or (index == .webm and index.webm.codec == .opus);
+                entry.opus_owned = index == .opus or index == .flac or index == .webm_flac or (index == .webm and index.webm.codec == .opus);
             },
             .mp4 => |original| {
                 var track = original.track;
                 track.avcc = try a.dupe(u8, track.avcc);
+                track.codec_config = try a.dupe(u8, track.codec_config);
                 track.color_info = try a.dupe(u8, track.color_info);
                 entry.data = .{ .mp4 = .{ .track = track, .packets = try a.dupe(media.mp4.Packet, original.packets), .limits = original.limits } };
             },
@@ -398,7 +468,9 @@ pub const Cache = struct {
                 track.codec_private = try a.dupe(u8, track.codec_private);
                 track.presentation.projection_private = try a.dupe(u8, track.presentation.projection_private);
                 track.colour.mastering = try a.dupe(u8, track.colour.mastering);
-                entry.data = .{ .webm = .{ .track = track, .packets = try a.dupe(media.webm.Packet, original.packets), .cues = try a.dupe(media.webm.Cue, original.cues), .timestamp_scale_ns = original.timestamp_scale_ns, .duration_seconds = original.duration_seconds } };
+                var timeline = original.source_timeline;
+                if (timeline) |*clock| clock.samples = try a.dupe(media.webm.SourceTimeline.Sample, clock.samples);
+                entry.data = .{ .webm = .{ .source_timeline = timeline, .track = track, .packets = try a.dupe(media.webm.Packet, original.packets), .cues = try a.dupe(media.webm.Cue, original.cues), .timestamp_scale_ns = original.timestamp_scale_ns, .duration_seconds = original.duration_seconds } };
             },
         }
     }
@@ -446,7 +518,7 @@ test "model aware media immutable container cache owns metadata and fences sourc
     const identity = Cache.key(&source, false, 100, 1024).?;
     var private = [_]u8{ 1, 2, 3 };
     var packets = [_]media.mp4.Packet{.{ .offset = 20, .size = 4, .dts = 0, .media_pts = 0, .pts = 0, .duration = 1, .sync = true }};
-    const reader = media.mp4.Reader{ .allocator = a, .input = &source, .metadata = .{ .bytes = &.{}, .source = null }, .track = .{ .id = 1, .timescale = 1, .width = 1, .height = 1, .avcc = &private, .nal_length_bytes = 4, .display_matrix = @splat(0) }, .packets = &packets, .limits = .{} };
+    const reader = media.mp4.Reader{ .allocator = a, .input = &source, .metadata = .{ .bytes = &.{}, .source = null }, .track = .{ .id = 1, .timescale = 1, .width = 1, .height = 1, .avcc = &private, .codec_config = &private, .nal_length_bytes = 4, .display_matrix = @splat(0) }, .packets = &packets, .limits = .{} };
     var cache: Cache = .{};
     defer cache.deinit();
     cache.remember(a, identity, .{ .mp4 = reader }, .{ .context = &provider, .acquire = Provider.acquire });
@@ -456,6 +528,7 @@ test "model aware media immutable container cache owns metadata and fences sourc
         const hit = cache.get(identity).?;
         defer cache.release(hit);
         try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, hit.data.mp4.track.avcc);
+        try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, hit.data.mp4.track.codec_config);
         try std.testing.expectEqual(@as(u64, 20), hit.data.mp4.packets[0].offset);
         source.storage.range.immutable_binding = @splat(2);
         try std.testing.expect(cache.get(Cache.key(&source, false, 100, 1024).?) == null);
@@ -465,11 +538,17 @@ test "model aware media immutable container cache owns metadata and fences sourc
         source.storage.range.immutable_binding = @splat(3);
         const webm_identity = Cache.key(&source, true, 100, 1024).?;
         private = .{ 4, 5, 6 };
-        const webm_reader = media.webm.Reader{ .allocator = a, .input = &source, .metadata = .{ .bytes = &.{}, .source = null }, .track = .{ .number = 1, .codec = .vp9, .width = 1, .height = 1, .codec_private = &private, .presentation = .{ .projection_private = &private }, .colour = .{ .mastering = &private } }, .packets = &.{}, .cues = &.{}, .timestamp_scale_ns = 1_000_000 };
+        var samples = [_]media.webm.SourceTimeline.Sample{.{ .pts = -7, .duration = 11 }};
+        var webm_packets = [_]media.webm.Packet{.{ .cluster_offset = 20, .offset = 20, .size = 4, .pts = -70_000_000, .duration_ns = 110_000_000, .sync = true, .discardable = false, .invisible = false }};
+        const webm_reader = media.webm.Reader{ .source_timeline = .{ .timescale = 100, .edit = .{ .source_duration = 25 }, .samples = &samples }, .allocator = a, .input = &source, .metadata = .{ .bytes = &.{}, .source = null }, .track = .{ .number = 1, .codec = .av1, .width = 1, .height = 1, .codec_private = &private, .presentation = .{ .projection_private = &private }, .colour = .{ .mastering = &private } }, .packets = &webm_packets, .cues = &.{}, .timestamp_scale_ns = 1_000_000 };
         cache.remember(a, webm_identity, .{ .webm = webm_reader }, .{ .context = &provider, .acquire = Provider.acquire });
         @memset(&private, 0);
+        samples[0].pts = 0;
         const webm_hit = cache.get(webm_identity).?;
         defer cache.release(webm_hit);
+        const copied = webm_hit.data.webm.reader(a, &source).source_timeline.?;
+        try std.testing.expectEqual(@as(i64, -7), copied.samples[0].pts);
+        try std.testing.expectEqual(@as(?i64, 25), copied.edit.source_duration);
         try std.testing.expectEqualSlices(u8, &.{ 4, 5, 6 }, webm_hit.data.webm.track.codec_private);
         try std.testing.expectEqualSlices(u8, &.{ 4, 5, 6 }, webm_hit.data.webm.track.presentation.projection_private);
         try std.testing.expectEqualSlices(u8, &.{ 4, 5, 6 }, webm_hit.data.webm.track.colour.mastering);
@@ -678,8 +757,10 @@ test "model aware media speaker cache owns immutable progress and cannot regress
     const D = @import("inference_chunker").diarization;
     const Fixture = struct {
         controller: @import("../runtime/tier/memory.zig").AdmissionController = .{},
+        acquisitions: usize = 0,
         fn acquire(raw: *anyopaque, bytes: usize) !@import("../runtime/tier/memory.zig").AdmissionLease {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            self.acquisitions += 1;
             return self.controller.tryAcquire(.cpu, .{ .host_limit_bytes = Cache.max_bytes }, .{ .host_scratch_bytes = bytes }, false);
         }
     };
@@ -695,12 +776,16 @@ test "model aware media speaker cache owns immutable progress and cannot regress
     const advanced = Speaker.Snapshot{ .registry = registry, .spans = &.{.{ .start_ns = 0, .end_ns = 3 * std.time.ns_per_s, .speaker_index = 0 }}, .sample_rate = 16000, .next_window = 2, .covered_samples = 48000, .total_samples = 48000, .complete = true };
     cache.remember(a, @splat(1), .{ .speaker_analysis = initial }, admission);
     const pinned = cache.get(@splat(1)).?;
-    cache.remember(a, @splat(1), .{ .speaker_analysis = advanced }, admission);
+    const initial_acquisitions = fixture.acquisitions;
+    try std.testing.expect(!cache.rememberSpeaker(a, @splat(1), advanced, admission));
+    try std.testing.expectEqual(initial_acquisitions, fixture.acquisitions);
     try std.testing.expectEqual(@as(u64, 1), pinned.data.speaker_analysis.next_window);
     try std.testing.expectEqual(@as(usize, 0), Cache.reclaim(&cache, Cache.max_bytes));
     cache.release(pinned);
-    cache.remember(a, @splat(1), .{ .speaker_analysis = advanced }, admission);
-    cache.remember(a, @splat(1), .{ .speaker_analysis = initial }, admission);
+    try std.testing.expect(cache.rememberSpeaker(a, @splat(1), advanced, admission));
+    const advanced_acquisitions = fixture.acquisitions;
+    try std.testing.expect(cache.rememberSpeaker(a, @splat(1), initial, admission));
+    try std.testing.expectEqual(advanced_acquisitions, fixture.acquisitions);
     const complete = cache.get(@splat(1)).?;
     try std.testing.expect(complete.data.speaker_analysis.complete);
     registry.sums[0][0] = 0.25;
@@ -708,4 +793,19 @@ test "model aware media speaker cache owns immutable progress and cannot regress
     cache.release(complete);
     try std.testing.expect(Cache.reclaim(&cache, Cache.max_bytes) > 0);
     try std.testing.expectEqual(@as(usize, 0), fixture.controller.snapshot().hostTotalBytes());
+}
+
+test "model aware media pinned audio keys ignore request-local identity aliases" {
+    var marker: u8 = 0;
+    const Provider = struct {
+        fn read(_: *anyopaque, _: u64, _: []u8, _: media.source.Control) !usize {
+            return error.UnexpectedRead;
+        }
+    };
+    var source = media.source.Source{ .allocator = std.testing.allocator, .identity = "resource", .storage = .{ .range = .{ .context = &marker, .read_at = Provider.read, .length = 100, .immutable_binding = @splat(1) } } };
+    const key = Cache.audioKey(&source, .embedded, 10, 100).?;
+    source.identity = "video chunk fingerprint";
+    try std.testing.expect(!std.mem.eql(u8, &key, &Cache.audioKey(&source, .flac, 10, 100).?));
+    try std.testing.expectEqual(key, Cache.audioKey(&source, .embedded, 10, 100).?);
+    try std.testing.expect(!std.mem.eql(u8, &key, &Cache.audioKey(&source, .embedded, 11, 100).?));
 }

@@ -93,6 +93,11 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .target = wasm_target,
         .optimize = optimize,
     });
+    const wasm_tile_mod = b.createModule(.{
+        .root_source_file = b.path("lib/tile/src/mod.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
     const wasm_vector_mod = b.createModule(.{
         .root_source_file = b.path("lib/vector/src/mod.zig"),
         .target = wasm_target,
@@ -129,6 +134,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     wasm_objectstore_mod.addImport("antfly_platform", wasm_platform_mod);
     wasm_objectstore_mod.addImport("antfly_google", wasm_google_mod);
     wasm_vector_mod.addImport("protobuf", wasm_protobuf_mod);
+    wasm_vector_mod.addImport("antfly_tile", wasm_tile_mod);
     wasm_vectorindex_mod.addImport("antfly_vector", wasm_vector_mod);
     wasm_vectorindex_mod.addImport("antfly_platform", wasm_platform_mod);
     wasm_vectorindex_mod.addImport("antfly_hash", wasm_hash_mod);
@@ -199,6 +205,11 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     const wasm_storage_boundary = @import("storage_boundary.zig").createWithOptions(b, wasm_target, optimize, .{ .runtime_abi = wasm_runtime_abi_mod });
     @call(.auto, configureBrowserModule, .{ b, wasm_storage_boundary, embedded_support_wasm_mod } ++ embedded_wasm_deps ++ .{addSnowballModule});
     embedded_support_wasm_mod.addImport("sql_parser", wasm_sql_parser_mod);
+    embedded_support_wasm_mod.addImport("antfly_compress", b.createModule(.{
+        .root_source_file = b.path("lib/compress/src/mod.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    }));
     const wasm_cypher_mod = @import("../../lib/cypher/build_support.zig").createModule(b, b.path("lib/cypher"), wasm_target, optimize);
     wasm_cypher_mod.addImport("cypher_regex_capture", sql_regex_mod.import_table.get("antfly_capture_regex").?);
     embedded_support_wasm_mod.addImport("cypher", wasm_cypher_mod);
@@ -411,6 +422,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     inference_wasm_build_options.addOption(bool, "enable_pjrt", false);
     inference_wasm_build_options.addOption(bool, "enable_cuda", false);
     inference_wasm_build_options.addOption([]const u8, "cuda_artifacts", "portable");
+    inference_wasm_build_options.addOption([]const u8, "cuda_libraries", "off");
     inference_wasm_build_options.addOption(bool, "enable_metal", false);
     inference_wasm_build_options.addOption(bool, "enable_native", false);
     inference_wasm_build_options.addOption(bool, "enable_system_blas", false);
@@ -447,6 +459,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .target = wasm_target,
         .optimize = optimize,
     });
+    wasm_inference_linalg_mod.addImport("antfly_tile", wasm_tile_mod);
     const wasm_inference_ml_mod = b.createModule(.{
         .root_source_file = b.path("lib/ml/src/root.zig"),
         .target = wasm_target,
@@ -548,6 +561,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     inference_wasm_inference_mod.addImport("build_options", inference_wasm_build_options_mod);
     inference_wasm_inference_mod.addImport("inference_audio", wasm_inference_audio_mod);
     inference_wasm_inference_mod.addImport("antfly_media", wasm_inference_audio_mod.import_table.get("antfly_media").?);
+    inference_wasm_inference_mod.addImport("antfly_tile", wasm_tile_mod);
     inference_wasm_inference_mod.addImport("inference_linalg", wasm_inference_linalg_mod);
     inference_wasm_inference_mod.addImport("inference_tokenizer", wasm_inference_tokenizer_mod);
     inference_wasm_inference_mod.addImport("inference_hf_tokenizer", wasm_inference_hf_tokenizer_mod);
@@ -621,6 +635,8 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .max_rss = (if (strip) @as(u64, 20) else 32) * 1024 * 1024 * 1024,
     });
     antfly_wasm.entry = .disabled;
+    // Embedded batch commits can have over 1 MiB of nested wasm32 frames.
+    antfly_wasm.stack_size = 4 * 1024 * 1024;
     antfly_wasm.rdynamic = true;
     antfly_wasm.export_memory = true;
     const install_antfly_wasm = b.addInstallArtifact(antfly_wasm, .{
@@ -634,6 +650,10 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     const install_antfly_wasm_client = b.addInstallFile(
         b.path("pkg/antfly-embedded/wasm_client.mjs"),
         "antfly-wasm/antfly_embedded_wasm_client.mjs",
+    );
+    const install_antfly_wasm_opfs_fs = b.addInstallFile(
+        b.path("pkg/antfly-embedded/wasm_opfs_fs.mjs"),
+        "antfly-wasm/antfly_embedded_opfs_fs.mjs",
     );
     const install_antfly_wasm_browser = b.addInstallFile(
         b.path("pkg/antfly-embedded/wasm_smoke_browser.mjs"),
@@ -688,6 +708,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
                 .optimize = optimize,
             }) }, .{ .name = "vector", .module = b.createModule(.{
                 .root_source_file = b.path("lib/vector/src/vector.zig"),
+                .imports = &.{.{ .name = "antfly_tile", .module = wasm_tile_mod }},
                 .target = wasm_target,
                 .optimize = optimize,
             }) }, .{ .name = "platform_atomic", .module = b.createModule(.{
@@ -718,6 +739,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
                 &install_antfly_wasm.step,
                 &install_antfly_wasm_smoke_run.step,
                 &install_antfly_wasm_client.step,
+                &install_antfly_wasm_opfs_fs.step,
                 &install_antfly_wasm_browser.step,
                 &install_antfly_wasm_index.step,
                 &install_antfly_wasm_readme.step,

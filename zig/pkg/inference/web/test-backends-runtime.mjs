@@ -198,6 +198,9 @@ async function embeddingFixture(directory) {
     for (const [name, shape] of [['self_attn.q_proj.weight', [4 * d, 512]], ['self_attn.k_proj.weight', [kv * d, 512]], ['self_attn.v_proj.weight', [kv * d, 512]], ['self_attn.o_proj.weight', [512, 4 * d]], ['mlp.gate_proj.weight', [2048, 512]], ['mlp.up_proj.weight', [2048, 512]], ['mlp.down_proj.weight', [512, 2048]], ['ple_block.per_layer_input_gate.weight', [512, 512]], ['ple_block.per_layer_projection.weight', [512, 512]]]) add(p + name, shape);
     for (const name of ['input_layernorm.weight', 'post_attention_layernorm.weight', 'pre_feedforward_layernorm.weight', 'post_feedforward_layernorm.weight', 'ple_block.post_per_layer_input_norm.weight', 'self_attn.q_norm.weight', 'self_attn.k_norm.weight', 'layer_scalar']) add(p + name, [name === 'layer_scalar' ? 1 : name.startsWith('self_attn') ? d : 512], name === 'layer_scalar' ? [0] : []);
   }
+  // The real checkpoint's media towers include scalar (shape []) clip bounds;
+  // the text adapter skips them, but the tensor directory must accept them.
+  add('audio_tower.layers.0.feed_forward1.ffw_layer_1.input_max', []);
   const bytes = Buffer.from(JSON.stringify(header)), prefix = Buffer.alloc(8); prefix.writeBigUInt64LE(BigInt(bytes.length));
   const path = join(directory, 'model.safetensors'), file = await open(path, 'w');
   try { await file.write(prefix); await file.write(bytes); await file.truncate(8 + bytes.length + offset); for (const position of writes) await file.write(Buffer.from([0x80, 0x3f]), 0, 2, 8 + bytes.length + position); } finally { await file.close(); }
@@ -239,6 +242,22 @@ test('EmbeddingGemma2 full geometry: native identity, cosine prototypes and mult
     assert.throws(() => runtime.run({ ...input, questions: [{ name: 'score', type: 'score', levels: [{ label: 'low' }, { label: 'high' }], instructions: 'score' }] }, true, 'decide'), /UnsupportedEmbeddingDecisionKind/);
     assert.throws(() => runtime.run({ ...input, input: 'word '.repeat(3000) }, true, 'decide'), /Limit/);
     assert(runtime.wasm.extraction_live_bytes(runtime.handle) < before + 128 * 1024);
+    // Retrieval embeddings reuse the decision encoder and model identity.
+    const embedRequest = { inputs: ['state', 'title: none | other'], task_type: 'RETRIEVAL_DOCUMENT', dimensions: 256, max_tokens: 64 };
+    assert.equal(runtime.run(embedRequest, true, 'embed').value.valid, true);
+    const embedded = runtime.run(embedRequest, false, 'embed').value;
+    assert.equal(embedded.model_identity, result.model_identity);
+    assert.equal(embedded.dimensions, 256);
+    assert.equal(embedded.embeddings.length, 2);
+    assert(embedded.embeddings.every(vector => vector.length === 256 && vector.every(Number.isFinite)));
+    assert(embedded.usage.input_tokens > 0);
+    const query = runtime.run({ ...embedRequest, inputs: ['state'], task_type: 'RETRIEVAL_QUERY' }, false, 'embed').value;
+    assert.equal(query.embeddings[0].length, 256);
+    assert.throws(() => runtime.run({ ...embedRequest, inputs: [] }, true, 'embed'), /Limit/);
+    assert.throws(() => runtime.run({ ...embedRequest, dimensions: 769 }, true, 'embed'), /Dimensions/);
+    assert.throws(() => runtime.run({ ...embedRequest, task_type: 'NOPE' }, true, 'embed'), /UnsupportedEmbeddingTask/);
+    // Long documents truncate to max_tokens instead of failing.
+    assert.equal(runtime.run({ ...embedRequest, inputs: ['word '.repeat(3000)] }, false, 'embed').value.embeddings.length, 1);
     const calibration = {
       version: 1, method: 'heldout-abstention-v1', qualified: true,
       binding: { model_identity: result.model_identity, renderer_version: result.renderer_version, task_type: 'CLUSTERING', dimensions: 768, prototype_set_hash: result.answers[0].prototype_set_hash, labels: ['search', 'fetch'], mode: 'single' },

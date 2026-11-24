@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const ExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
 pub const in_progress_filename = ".antfly-download-in-progress";
 pub const plan_filename = ".antfly-download-plan.json";
@@ -113,18 +114,28 @@ pub const ArtifactStamp = struct {
 };
 
 pub fn verifyValidatedArtifactSha256AndStamp(io: std.Io, artifact: *const ValidatedArtifact, expected_hex: []const u8) !ArtifactStamp {
+    return verifyValidatedArtifactSha256AndStampWithControl(io, artifact, expected_hex, .{});
+}
+
+pub fn verifyValidatedArtifactSha256AndStampWithControl(io: std.Io, artifact: *const ValidatedArtifact, expected_hex: []const u8, control: ExecutionControl) !ArtifactStamp {
+    try control.check();
     // Keep malformed-contract errors independent of filesystem availability.
     if (expected_hex.len != 64) return error.ChecksumMismatch;
     var expected: [32]u8 = undefined;
     _ = std.fmt.hexToBytes(&expected, expected_hex) catch return error.ChecksumMismatch;
     var file = try std.Io.Dir.cwd().openFile(io, artifact.canonical_path, .{});
     defer file.close(io);
-    return verifyOpenedArtifactSha256AndStamp(io, file, artifact, expected_hex);
+    return verifyOpenedArtifactSha256AndStampWithControl(io, file, artifact, expected_hex, control);
 }
 
 /// Hash the same retained file construction will read, without seeking or
 /// reopening its pathname. Positional reads permit shared tensor regions.
 pub fn verifyOpenedArtifactSha256AndStamp(io: std.Io, file: std.Io.File, artifact: *const ValidatedArtifact, expected_hex: []const u8) !ArtifactStamp {
+    return verifyOpenedArtifactSha256AndStampWithControl(io, file, artifact, expected_hex, .{});
+}
+
+pub fn verifyOpenedArtifactSha256AndStampWithControl(io: std.Io, file: std.Io.File, artifact: *const ValidatedArtifact, expected_hex: []const u8, control: ExecutionControl) !ArtifactStamp {
+    try control.check();
     if (expected_hex.len != 64) return error.ChecksumMismatch;
     var expected: [32]u8 = undefined;
     _ = std.fmt.hexToBytes(&expected, expected_hex) catch return error.ChecksumMismatch;
@@ -135,6 +146,7 @@ pub fn verifyOpenedArtifactSha256AndStamp(io: std.Io, file: std.Io.File, artifac
     var buf: [64 * 1024]u8 = undefined;
     var offset: u64 = 0;
     while (true) {
+        try control.check();
         const n = try file.readPositionalAll(io, &buf, offset);
         if (n == 0) break;
         hasher.update(buf[0..n]);

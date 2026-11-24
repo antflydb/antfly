@@ -413,7 +413,9 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
     if (@hasDecl(BackendType, "releaseRootLockState")) {
         backend.releaseRootLockState();
     }
-    if (@hasField(BackendType, "storage_owner")) {
+    if (@hasField(BackendType, "storage_owner") and
+        (!@hasField(BackendType, "native_storage_owner_transferred") or !backend.native_storage_owner_transferred))
+    {
         if (backend.storage_owner) |owned| {
             owned.deinit();
             std.heap.page_allocator.destroy(owned);

@@ -38,6 +38,24 @@ pub const Registry = struct {
             a.destroy(entry);
         }
     }
+    pub fn tryAcquire(self: *Registry, a: std.mem.Allocator, key: [32]u8, control: Control) !?Lease {
+        // Wait only for registry bookkeeping. An active build for this
+        // key is handled by the caller at its first point of use.
+        try control.lockWithPoll(&self.mutex, 100 * std.time.ns_per_us);
+        defer self.mutex.unlock();
+        const entry = if (self.entries.get(key)) |current| current else blk: {
+            if (self.entries.count() >= 256) return null;
+            const created = try a.create(Entry);
+            errdefer a.destroy(created);
+            created.* = .{ .key = key };
+            try self.entries.put(a, key, created);
+            break :blk created;
+        };
+        if (!entry.mutex.tryLock()) return null;
+        entry.refs += 1;
+        return .{ .registry = self, .allocator = a, .entry = entry };
+    }
+
     pub fn acquire(self: *Registry, a: std.mem.Allocator, key: [32]u8, control: Control) !Lease {
         try control.lockWithPoll(&self.mutex, 100 * std.time.ns_per_us);
         const entry = blk: {
@@ -69,7 +87,8 @@ test "model aware media speaker flights serialize one identity and release cance
     const a = std.testing.allocator;
     var registry: Registry = .{};
     defer registry.deinit(a);
-    const owner = try registry.acquire(a, @splat(1), .{});
+    const owner = (try registry.tryAcquire(a, @splat(1), .{})).?;
+    try std.testing.expect((try registry.tryAcquire(a, @splat(1), .{})) == null);
     const Cancel = struct {
         checks: usize = 0,
         fn check(raw: ?*anyopaque) !void {
@@ -81,6 +100,12 @@ test "model aware media speaker flights serialize one identity and release cance
     var cancel: Cancel = .{};
     try std.testing.expectError(error.Cancelled, registry.acquire(a, @splat(1), .{ .ptr = &cancel, .check_fn = Cancel.check }));
     try std.testing.expectEqual(@as(usize, 1), owner.entry.refs);
+    {
+        try std.testing.expect(registry.mutex.tryLock());
+        defer registry.mutex.unlock();
+        var metadata_wait: Cancel = .{};
+        try std.testing.expectError(error.Cancelled, registry.tryAcquire(a, @splat(2), .{ .ptr = &metadata_wait, .check_fn = Cancel.check }));
+    }
     const independent = try registry.acquire(a, @splat(2), .{});
     independent.deinit();
     const Waiter = struct {

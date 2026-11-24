@@ -23,6 +23,7 @@ const template_remote_host = support.template_remote_host;
 pub const object_database = support.object_storage.transactional_store;
 pub const object_commit_log = support.object_storage.immutable_log;
 pub const lsm_storage = support.lsm_storage;
+pub const host_file_storage = support.host_file_storage;
 pub const enrichment_runtime = support.enrichment_runtime;
 pub const enrichment_embedder = support.enrichment_embedder;
 pub const ttl_runtime = support.ttl_runtime;
@@ -404,7 +405,6 @@ fn toDbOpenOptions(opts: OpenOptions, profile: Profile) db_mod.OpenOptions {
         if (!storage.supportsNativePathLocks() or !storage.supportsHostPathGenerationPublication()) {
             resolved.physical_root_mode = .external_backend;
             resolved.index_repair_checkpoint_storage = storage;
-            resolved.external_derived_checkpoints = false;
         }
     }
     if (profile == .hosted) {
@@ -430,7 +430,6 @@ test "embedded custom storage owns its physical namespace" {
         const options = toDbOpenOptions(.{ .storage = storage }, profile);
         try std.testing.expectEqual(.external_backend, options.physical_root_mode);
         try std.testing.expectEqual(storage.ptr, options.index_repair_checkpoint_storage.?.ptr);
-        try std.testing.expect(!options.external_derived_checkpoints);
     }
     var native_paths = storage.vtable.*;
     native_paths.supports_native_path_locks = true;
@@ -635,9 +634,9 @@ test "embedded db liteStatus exposes storage stats work and capabilities" {
     try std.testing.expectEqualStrings("native_single_file", status.storage.engine);
     try std.testing.expectEqualStrings("native_replay_lanes_in_document_catalog", status.storage.replay_layout);
     try std.testing.expectEqualStrings("__antfly_lite", status.storage.index_namespace.?);
-    // Fresh Lite files use the indexed-reclamation format, rather than the
-    // legacy native format version. The public status must report that format.
-    try std.testing.expectEqual(@as(?u32, 4), status.storage.format_version);
+    // Fresh Lite files use the current native format; the public status must
+    // report it (tracking the constant, which advances with format changes).
+    try std.testing.expectEqual(@as(?u32, support.lite_native.format_version), status.storage.format_version);
     try std.testing.expectEqual(@as(?u32, 4096), status.storage.page_size);
     try std.testing.expect(status.storage.active_checkpoint != null);
     try std.testing.expectEqual(@as(u64, 1), status.stats.doc_count);

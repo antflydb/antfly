@@ -247,7 +247,7 @@ pub fn apply(a: A, batch: types.ColumnBatch, table: catalog.Table, condition: ca
         const literal = try @import("lake_values.zig").comparisonDatum(a, condition.datum(), definition);
         const number = literal.numeric orelse return false;
         const decimal = vector.values.decimal128;
-        const numeric = @import("numeric_value.zig");
+        const numeric = @import("numeric/value.zig");
         const coefficient = numeric.coefficientAtScale(number.*, @intCast(decimal.scale));
         var context: numeric.Context = .{ .alloc = a };
         for (keep, 0..) |*active, row| {

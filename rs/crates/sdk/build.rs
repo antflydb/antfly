@@ -28,7 +28,7 @@ fn main() {
     // heterogeneous response schemas. Adapt the generator input below.
     strip_non_json_media_types(&mut spec);
     preserve_query_request_properties(&mut spec);
-    expand_sql_default_error_responses(&mut spec);
+    expand_default_error_responses(&mut spec);
     unify_error_response_schemas(&mut spec);
     normalize_mutation_success_transport(&mut spec);
     unify_success_response_schemas(&mut spec);
@@ -88,7 +88,7 @@ fn preserve_query_request_properties(spec: &mut serde_yaml::Value) {
 // response plus a distinct default error body makes client generation panic.
 // Keep the public OpenAPI contract intact and use error ranges only in the
 // Rust generator input.
-fn expand_sql_default_error_responses(spec: &mut serde_yaml::Value) {
+fn expand_default_error_responses(spec: &mut serde_yaml::Value) {
     use serde_yaml::Value;
 
     for methods in spec["paths"].as_mapping_mut().expect("paths").values_mut() {
@@ -99,27 +99,40 @@ fn expand_sql_default_error_responses(spec: &mut serde_yaml::Value) {
             let Some(id) = operation.get("operationId").and_then(Value::as_str) else {
                 continue;
             };
-            if ![
-                "openSQLConnection",
-                "closeSQLConnection",
-                "prepareSQL",
-                "executePreparedSQL",
-                "closePreparedSQL",
-            ]
-            .contains(&id)
-            {
+            let sql_error = matches!(
+                id,
+                "openSQLConnection"
+                    | "closeSQLConnection"
+                    | "prepareSQL"
+                    | "executePreparedSQL"
+                    | "closePreparedSQL"
+                    | "getSQLCatalogOperation"
+                    | "pollSQLNotifications"
+            );
+            let Some(responses) = operation
+                .get_mut("responses")
+                .and_then(Value::as_mapping_mut)
+            else {
+                continue;
+            };
+            let default_key = Value::String("default".into());
+            let changefeed_error = responses
+                .get(&default_key)
+                .and_then(|response| response.get("$ref"))
+                .and_then(Value::as_str)
+                == Some("#/components/responses/ChangefeedError");
+            if !sql_error && !changefeed_error {
                 continue;
             }
-            let responses = operation["responses"].as_mapping_mut().expect("responses");
             let default = responses
-                .remove(Value::String("default".into()))
-                .expect("SQL operation has a default error response");
+                .remove(&default_key)
+                .expect("operation has a default error response");
             for range in ["4XX", "5XX"] {
                 assert!(
                     responses
                         .insert(Value::String(range.into()), default.clone())
                         .is_none(),
-                    "SQL error range already exists"
+                    "default error range already exists"
                 );
             }
         }
@@ -349,27 +362,47 @@ properties:
 "#,
     )
     .unwrap();
-    spec.get_mut("components")
+    let schemas = spec
+        .get_mut("components")
         .and_then(|value| value.get_mut("schemas"))
         .and_then(serde_yaml::Value::as_mapping_mut)
-        .expect("OpenAPI components.schemas must be a mapping")
-        .insert(
-            serde_yaml::Value::String("CreateIndexError".to_owned()),
-            create_index_error,
-        );
+        .expect("OpenAPI components.schemas must be a mapping");
+    schemas.insert(
+        serde_yaml::Value::String("CreateIndexError".to_owned()),
+        create_index_error,
+    );
+    // Preserve uncertain execution receipts and SQLSTATE by referencing the
+    // public spec models, rather than inventing a second receipt envelope.
+    schemas.insert(serde_yaml::Value::String("SQLExecutionFailure".into()), serde_yaml::from_str(
+        "oneOf:\n  - $ref: '#/components/schemas/SQLDiagnostic'\n  - $ref: '#/components/schemas/SQLResponse'\n"
+    ).unwrap());
 
     if let Some(paths) = spec.get_mut("paths").and_then(|p| p.as_mapping_mut()) {
         for (_path, methods) in paths.iter_mut() {
             if let Some(methods) = methods.as_mapping_mut() {
                 for (_method, operation) in methods.iter_mut() {
-                    let error_type = if operation
+                    // All changefeed error responses already reference the same
+                    // public schema, including the expanded fallback ranges.
+                    if operation["responses"]["4XX"]["$ref"].as_str()
+                        == Some("#/components/responses/ChangefeedError")
+                    {
+                        continue;
+                    }
+                    let error_type = match operation
                         .get("operationId")
                         .and_then(|value| value.as_str())
-                        == Some("createIndex")
                     {
-                        "CreateIndexError"
-                    } else {
-                        "Error"
+                        Some("createIndex") => "CreateIndexError",
+                        Some("executeSQL" | "executePreparedSQL") => "SQLExecutionFailure",
+                        Some(
+                            "openSQLConnection"
+                            | "closeSQLConnection"
+                            | "prepareSQL"
+                            | "closePreparedSQL"
+                            | "getSQLCatalogOperation"
+                            | "pollSQLNotifications",
+                        ) => "SQLDiagnostic",
+                        _ => "Error",
                     };
                     let error_schema: serde_yaml::Value = serde_yaml::from_str(&format!(
                         "content:\n  application/json:\n    schema:\n      $ref: '#/components/schemas/{error_type}'\n"

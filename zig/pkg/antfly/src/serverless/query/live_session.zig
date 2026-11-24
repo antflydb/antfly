@@ -169,19 +169,29 @@ pub const Session = struct {
                 return true;
             }
         };
-        return self.searchTextCore(req, max_output_bytes, All{}, null, null);
+        return self.searchTextCore(req, max_output_bytes, All{}, null, null, true);
     }
     /// Filter current bodies before offset/limit and refill from an admitted
     /// ranked prefix. Exhausting that prefix is an explicit budget failure.
     pub fn searchTextFilteredAlloc(self: *Session, req: @import("request.zig").QueryRequest, max_output_bytes: usize, predicate: anytype, max_candidates: usize) ![]@import("request.zig").SearchHit {
         if (max_candidates == 0 or max_candidates > 4096) return error.QueryCandidateBudgetExceeded;
-        return self.searchTextCore(req, max_output_bytes, predicate, max_candidates, null);
+        return self.searchTextCore(req, max_output_bytes, predicate, max_candidates, null, true);
     }
     pub const RankPosition = struct { score: u32, id: []const u8 };
     pub fn searchTextPageAlloc(self: *Session, req: @import("request.zig").QueryRequest, max_output_bytes: usize, predicate: anytype, after: ?RankPosition) ![]@import("request.zig").SearchHit {
-        return self.searchTextCore(req, max_output_bytes, predicate, 4096, after);
+        return self.searchTextCore(req, max_output_bytes, predicate, 4096, after, true);
     }
-    fn searchTextCore(self: *Session, req: @import("request.zig").QueryRequest, max_output_bytes: usize, predicate: anytype, candidate_budget: ?usize, after: ?RankPosition) ![]@import("request.zig").SearchHit {
+    /// Rank IDs without loading bodies. The caller can apply visibility from
+    /// its own metadata and fetch only the documents it will return.
+    pub fn searchTextIdsAlloc(self: *Session, req: @import("request.zig").QueryRequest, max_output_bytes: usize, after: ?RankPosition) ![]@import("request.zig").SearchHit {
+        const All = struct {
+            pub fn matches(_: @This(), _: Overlay.Document) !bool {
+                return true;
+            }
+        };
+        return self.searchTextCore(req, max_output_bytes, All{}, if (after != null) 4096 else null, after, false);
+    }
+    fn searchTextCore(self: *Session, req: @import("request.zig").QueryRequest, max_output_bytes: usize, predicate: anytype, candidate_budget: ?usize, after: ?RankPosition, comptime include_body: bool) ![]@import("request.zig").SearchHit {
         if (self.view.point_id != null) return error.PointReadIdentityMismatch;
         if (req.mode != .text or req.count_only or req.filter_text != null or req.exclusion_text != null or
             req.filter_prefix != null or req.fields != null or req.semantic_search != null or req.indexes != null or req.vector != null or req.sparse != null)
@@ -257,9 +267,12 @@ pub const Session = struct {
         for (candidates.items) |candidate| {
             try self.cancellation.check();
             if (after) |position| if (candidate.score > position.score or (candidate.score == position.score and std.mem.order(u8, candidate.doc_id, position.id) != .gt)) continue;
-            const body = (try self.lookupAlloc(candidate.doc_id)) orelse return error.DocumentBodyNotFound;
-            defer self.alloc.free(body);
-            if (!try predicate.matches(Overlay.Document{ .doc_id = candidate.doc_id, .body = body })) continue;
+            const body = if (include_body)
+                (try self.lookupAlloc(candidate.doc_id)) orelse return error.DocumentBodyNotFound
+            else
+                &.{};
+            defer if (include_body) self.alloc.free(body);
+            if (include_body and !try predicate.matches(Overlay.Document{ .doc_id = candidate.doc_id, .body = body })) continue;
             matched += 1;
             if (matched <= req.offset) continue;
             bytes = std.math.add(usize, bytes, body.len + candidate.doc_id.len) catch return error.QueryCandidateBudgetExceeded;

@@ -3,6 +3,2052 @@
 
 const std = @import("std");
 
+pub const InternalChangefeedStateReply = struct {
+    version: i64,
+    action: []const u8,
+    metadata_group_id: i64,
+    metadata_incarnation: []const u8,
+    id: ?[]const i64 = null,
+    /// Exact validated state envelope, present only for read
+    state: ?[]const u8 = null,
+    /// Present only for authority; omitted before first feed mutation
+    authority: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "action", "action", false },
+        .{ "metadata_group_id", "metadata_group_id", false },
+        .{ "metadata_incarnation", "metadata_incarnation", false },
+        .{ "id", "id", true },
+        .{ "state", "state", true },
+        .{ "authority", "authority", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("action");
+        try jw.write(self.action);
+        try jw.objectField("metadata_group_id");
+        try jw.write(self.metadata_group_id);
+        try jw.objectField("metadata_incarnation");
+        try jw.write(self.metadata_incarnation);
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.state) |value| {
+            try jw.objectField("state");
+            try jw.write(value);
+        }
+        if (self.authority) |value| {
+            try jw.objectField("authority");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const InternalChangefeedStateRequest = struct {
+    version: i64,
+    action: []const u8,
+    metadata_group_id: i64,
+    /// Expected immutable metadata cluster identity; checked before dispatch
+    metadata_incarnation: []const u8,
+    /// Required only for read; immutable feed ID
+    id: ?[]const i64 = null,
+    /// Required only for mutate; exact encoded private revision-fenced write
+    write: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "action", "action", false },
+        .{ "metadata_group_id", "metadata_group_id", false },
+        .{ "metadata_incarnation", "metadata_incarnation", false },
+        .{ "id", "id", true },
+        .{ "write", "write", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("action");
+        try jw.write(self.action);
+        try jw.objectField("metadata_group_id");
+        try jw.write(self.metadata_group_id);
+        try jw.objectField("metadata_incarnation");
+        try jw.write(self.metadata_incarnation);
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.write) |value| {
+            try jw.objectField("write");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const NativeHistoryAcknowledge = struct {
+    reference: NativeHistoryReference,
+    previous: u64,
+    next: u64,
+};
+
+pub const NativeHistoryApplied = struct {
+    policy: ?NativeHistoryPolicySnapshot = null,
+    consumer: ?NativeHistoryConsumer = null,
+    reclaimed_frames: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "policy", "policy", true },
+        .{ "consumer", "consumer", true },
+        .{ "reclaimed_frames", "reclaimed_frames", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.policy) |value| {
+            try jw.objectField("policy");
+            try jw.write(value);
+        }
+        if (self.consumer) |value| {
+            try jw.objectField("consumer");
+            try jw.write(value);
+        }
+        if (self.reclaimed_frames) |value| {
+            try jw.objectField("reclaimed_frames");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const NativeHistoryCollect = struct {
+    namespace: NativeHistoryNamespace,
+    authority: NativeHistoryDigest,
+    max_frames: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "namespace", "namespace", false },
+        .{ "authority", "authority", false },
+        .{ "max_frames", "max_frames", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("namespace");
+        try jw.write(self.namespace);
+        try jw.objectField("authority");
+        try jw.write(self.authority);
+        if (self.max_frames) |value| {
+            try jw.objectField("max_frames");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const NativeHistoryConsumer = struct {
+    id: NativeHistoryConsumerId,
+    epoch: u64,
+    start: u64,
+    acknowledged: u64,
+    expires_at_seconds: u64,
+    policy_revision: u64,
+};
+
+pub const NativeHistoryConsumerId = []const i64;
+
+pub const NativeHistoryControlCommand = std.json.Value;
+
+/// Version is mandatory. Submit requires a null or omitted receipt. Recover requires the original receipt. Namespace must match the authenticated route. Unknown and duplicate fields are rejected.
+pub const NativeHistoryControlRequest = std.json.Value;
+
+/// Outcome requires a receipt. Recovery echoes the original receipt. Null outcome or superseded means unconfirmed; applied and rejected are resolved results, not equivalent success. Applied consumer identity/epoch and ACK/renew/reclamation bounds must match the request.
+pub const NativeHistoryControlResponse = struct {
+    version: i64,
+    receipt: ?NativeHistoryReceipt = null,
+    outcome: ?NativeHistoryOutcome = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "receipt", "receipt", true },
+        .{ "outcome", "outcome", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        if (self.receipt) |value| {
+            try jw.objectField("receipt");
+            try jw.write(value);
+        }
+        if (self.outcome) |value| {
+            try jw.objectField("outcome");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const NativeHistoryDecisionAdmission = struct {
+    version: i64,
+    transaction_id: NativeHistoryConsumerId,
+    admission_digest: NativeHistoryDigest,
+    coordinator_namespace: NativeHistoryNamespace,
+    coordinator_fence: NativeHistoryDigest,
+    participants: []const NativeHistoryDecisionParticipant,
+};
+
+pub const NativeHistoryDecisionAdmissionEnvelope = struct {
+    admission: NativeHistoryDecisionAdmission,
+    digest: NativeHistoryDigest,
+};
+
+pub const NativeHistoryDecisionError = struct {
+    version: i64,
+    code: []const u8,
+};
+
+pub const NativeHistoryDecisionEvidenceValue = struct {
+    record: NativeHistoryDecisionRecord,
+    admission: NativeHistoryDecisionAdmissionEnvelope,
+};
+
+pub const NativeHistoryDecisionEvidence = ?NativeHistoryDecisionEvidenceValue;
+
+pub const NativeHistoryDecisionParticipant = struct {
+    namespace: NativeHistoryNamespace,
+    owner_fence: NativeHistoryDigest,
+    roles: i64,
+    input_digest: NativeHistoryDigest,
+    locator: []const u8,
+    routed_owner: NativeHistoryPublicationOwner,
+};
+
+pub const NativeHistoryDecisionRecord = struct {
+    status: []const u8,
+    begin_timestamp: u64,
+    created_at_ns: u64,
+    commit_version: u64,
+    finalized_at_ns: u64,
+    prepared: bool,
+    intents_resolved: bool,
+    digest: NativeHistoryDigest,
+    /// Optional retained source admission fingerprint. Source-owned pending transactions cannot be expired by ordinary transaction recovery.
+    source_purpose: ?NativeHistoryDigest = null,
+    /// Optional retained protocol-39 attempt identity. Required on every routed resolution of a scoped source transaction.
+    source_scope: ?NativeSourceScopeReference = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "status", "status", false },
+        .{ "begin_timestamp", "begin_timestamp", false },
+        .{ "created_at_ns", "created_at_ns", false },
+        .{ "commit_version", "commit_version", false },
+        .{ "finalized_at_ns", "finalized_at_ns", false },
+        .{ "prepared", "prepared", false },
+        .{ "intents_resolved", "intents_resolved", false },
+        .{ "digest", "digest", false },
+        .{ "source_purpose", "source_purpose", true },
+        .{ "source_scope", "source_scope", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("status");
+        try jw.write(self.status);
+        try jw.objectField("begin_timestamp");
+        try jw.write(self.begin_timestamp);
+        try jw.objectField("created_at_ns");
+        try jw.write(self.created_at_ns);
+        try jw.objectField("commit_version");
+        try jw.write(self.commit_version);
+        try jw.objectField("finalized_at_ns");
+        try jw.write(self.finalized_at_ns);
+        try jw.objectField("prepared");
+        try jw.write(self.prepared);
+        try jw.objectField("intents_resolved");
+        try jw.write(self.intents_resolved);
+        try jw.objectField("digest");
+        try jw.write(self.digest);
+        if (self.source_purpose) |value| {
+            try jw.objectField("source_purpose");
+            try jw.write(value);
+        }
+        if (self.source_scope) |value| {
+            try jw.objectField("source_scope");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const NativeHistoryDecisionReply = struct {
+    version: i64,
+    request_digest: NativeHistoryDigest,
+    cut: NativeHistoryPublicationCut,
+    decision: NativeHistoryDecisionEvidence,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "request_digest", "request_digest", false },
+        .{ "cut", "cut", false },
+        .{ "decision", "decision", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("request_digest");
+        try jw.write(self.request_digest);
+        try jw.objectField("cut");
+        try jw.write(self.cut);
+        try jw.objectField("decision");
+        try jw.write(self.decision);
+        try jw.endObject();
+    }
+};
+
+pub const NativeHistoryDecisionRequest = struct {
+    version: i64,
+    owner: NativeHistoryPublicationOwner,
+    transaction_id: NativeHistoryConsumerId,
+    minimum_applied_index: u64,
+};
+
+pub const NativeHistoryDigest = []const i64;
+
+pub const NativeHistoryGrant = struct {
+    namespace: NativeHistoryNamespace,
+    authority: NativeHistoryDigest,
+    consumer: NativeHistoryConsumerId,
+    definition: NativeHistoryDigest,
+    sequence: u64,
+    expires_at_seconds: u64,
+    policy_revision: u64,
+    limit: ?u64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "namespace", "namespace", false },
+        .{ "authority", "authority", false },
+        .{ "consumer", "consumer", false },
+        .{ "definition", "definition", false },
+        .{ "sequence", "sequence", false },
+        .{ "expires_at_seconds", "expires_at_seconds", false },
+        .{ "policy_revision", "policy_revision", false },
+        .{ "limit", "limit", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("namespace");
+        try jw.write(self.namespace);
+        try jw.objectField("authority");
+        try jw.write(self.authority);
+        try jw.objectField("consumer");
+        try jw.write(self.consumer);
+        try jw.objectField("definition");
+        try jw.write(self.definition);
+        try jw.objectField("sequence");
+        try jw.write(self.sequence);
+        try jw.objectField("expires_at_seconds");
+        try jw.write(self.expires_at_seconds);
+        try jw.objectField("policy_revision");
+        try jw.write(self.policy_revision);
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const NativeHistoryGrantActive = struct {
+    grant: u64,
+    consumer: NativeHistoryConsumer,
+    limit: u64,
+};
+
+pub const NativeHistoryGrantError = struct {
+    version: i64,
+    code: []const u8,
+};
+
+pub const NativeHistoryGrantIdentity = struct {
+    namespace: NativeHistoryNamespace,
+    authority: NativeHistoryDigest,
+    consumer: NativeHistoryConsumerId,
+    definition: NativeHistoryDigest,
+    sequence: u64,
+    policy_revision: u64,
+};
+
+/// Active requires the exact requested grant. Other_grant is not confirmation of it. Absent floor is below the requested sequence; retired floor is at or above it.
+pub const NativeHistoryGrantObservation = std.json.Value;
+
+pub const NativeHistoryGrantReply = struct {
+    version: i64,
+    request_digest: NativeHistoryDigest,
+    observation: NativeHistoryGrantObservation,
+};
+
+pub const NativeHistoryGrantRequest = struct {
+    version: i64,
+    identity: NativeHistoryGrantIdentity,
+};
+
+pub const NativeHistoryNamespace = []const i64;
+
+pub const NativeHistoryOutcome = std.json.Value;
+
+pub const NativeHistoryOwnerObservation = struct {
+    version: i64,
+    request_digest: NativeHistoryDigest,
+    cut: NativeHistoryPublicationCut,
+    retention_limit_bytes: u64,
+};
+
+pub const NativeHistoryOwnerReply = struct {
+    version: i64,
+    owner: NativeHistoryPublicationOwner,
+    observation: NativeHistoryOwnerObservation,
+};
+
+pub const NativeHistoryOwnerRequest = struct {
+    version: i64,
+    expected_table_binding: NativeHistoryDigest,
+};
+
+pub const NativeHistoryPageError = struct {
+    version: i64,
+    code: []const u8,
+};
+
+pub const NativeHistoryPageRead = struct {
+    reference: NativeHistoryReference,
+    after: NativeHistoryPosition,
+    now_seconds: u64,
+    max_events: ?u32 = null,
+    max_bytes: ?u32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "reference", "reference", false },
+        .{ "after", "after", false },
+        .{ "now_seconds", "now_seconds", false },
+        .{ "max_events", "max_events", true },
+        .{ "max_bytes", "max_bytes", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("reference");
+        try jw.write(self.reference);
+        try jw.objectField("after");
+        try jw.write(self.after);
+        try jw.objectField("now_seconds");
+        try jw.write(self.now_seconds);
+        if (self.max_events) |value| {
+            try jw.objectField("max_events");
+            try jw.write(value);
+        }
+        if (self.max_bytes) |value| {
+            try jw.objectField("max_bytes");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// At most 4096 bytes; version is mandatory; reject unknown and duplicate fields. Reference namespace must equal the catalog fence namespace.
+pub const NativeHistoryPageRequest = struct {
+    version: i64,
+    request: NativeHistoryPageRead,
+};
+
+/// Install or replace root capture policy by exact predecessor revision. Revision must advance; matching exact retries are idempotent. Limit includes retained data and outstanding credits. Initial activation is fenced against prepared legacy effects; it does not enroll a consumer, invent an ACK or establish a bootstrap cut. Requires data-Raft policy protocol activation.
+pub const NativeHistoryPolicyConfigure = struct {
+    namespace: NativeHistoryNamespace,
+    authority: NativeHistoryDigest,
+    previous_revision: u64,
+    revision: u64,
+    limit: u64,
+};
+
+pub const NativeHistoryPolicyScope = struct {
+    namespace: NativeHistoryNamespace,
+    authority: NativeHistoryDigest,
+};
+
+/// Root-scoped retained capture policy, not a consumer lease or source acknowledgement.
+pub const NativeHistoryPolicySnapshot = struct {
+    revision: u64,
+    limit: u64,
+};
+
+pub const NativeHistoryPosition = struct {
+    sequence: u64,
+    event: u32,
+};
+
+pub const NativeHistoryPublicationCut = struct {
+    term: u64,
+    index: u64,
+};
+
+pub const NativeHistoryPublicationError = struct {
+    version: i64,
+    code: []const u8,
+};
+
+pub const NativeHistoryPublicationEvidenceValue = struct {
+    digest: NativeHistoryDigest,
+    retained_bytes: u64,
+    position: NativeHistoryPublicationCut,
+};
+
+pub const NativeHistoryPublicationEvidence = ?NativeHistoryPublicationEvidenceValue;
+
+pub const NativeHistoryPublicationOwner = struct {
+    version: i64,
+    metadata_group_id: u64,
+    /// Canonical 32-byte nonzero lowercase hexadecimal incarnation encoded as ASCII bytes.
+    metadata_incarnation: NativeHistoryDigest,
+    namespace: NativeHistoryNamespace,
+    table_binding: NativeHistoryDigest,
+    root_generation: u64,
+    group_id: u64,
+    topology_epoch: u64,
+};
+
+pub const NativeHistoryPublicationReply = struct {
+    version: i64,
+    request_digest: NativeHistoryDigest,
+    cut: NativeHistoryPublicationCut,
+    publication: NativeHistoryPublicationEvidence,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "request_digest", "request_digest", false },
+        .{ "cut", "cut", false },
+        .{ "publication", "publication", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("request_digest");
+        try jw.write(self.request_digest);
+        try jw.objectField("cut");
+        try jw.write(self.cut);
+        try jw.objectField("publication");
+        try jw.write(self.publication);
+        try jw.endObject();
+    }
+};
+
+pub const NativeHistoryPublicationRequest = struct {
+    version: i64,
+    owner: NativeHistoryPublicationOwner,
+    transaction_id: NativeHistoryConsumerId,
+    manifest_digest: NativeHistoryDigest,
+    commit_version: u64,
+    minimum_applied_index: u64,
+};
+
+pub const NativeHistoryReceipt = struct {
+    term: u64,
+    index: u64,
+};
+
+pub const NativeHistoryReclaim = struct {
+    reference: NativeHistoryReference,
+    max_frames: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "reference", "reference", false },
+        .{ "max_frames", "max_frames", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("reference");
+        try jw.write(self.reference);
+        if (self.max_frames) |value| {
+            try jw.objectField("max_frames");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const NativeHistoryReference = struct {
+    namespace: NativeHistoryNamespace,
+    authority: NativeHistoryDigest,
+    consumer: NativeHistoryConsumerId,
+    definition: NativeHistoryDigest,
+    epoch: u64,
+    grant: u64,
+};
+
+pub const NativeHistoryRenew = struct {
+    reference: NativeHistoryReference,
+    previous: u64,
+    next: u64,
+};
+
+pub const NativeHistoryResolutionCut = struct {
+    native_sequence: i64,
+    term: u64,
+    index: u64,
+};
+
+pub const NativeHistoryResolutionError = struct {
+    version: i64,
+    code: []const u8,
+};
+
+pub const NativeHistoryResolutionEvidenceValue = struct {
+    namespace: NativeHistoryNamespace,
+    owner_fence: NativeHistoryDigest,
+    manifest_digest: NativeHistoryDigest,
+    commit_version: u64,
+    source_position: NativeHistoryDigest,
+    outcome: std.json.Value,
+};
+
+pub const NativeHistoryResolutionEvidence = ?NativeHistoryResolutionEvidenceValue;
+
+pub const NativeHistoryResolutionReply = struct {
+    version: i64,
+    request_digest: NativeHistoryDigest,
+    cut: NativeHistoryResolutionCut,
+    resolution: NativeHistoryResolutionEvidence,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "request_digest", "request_digest", false },
+        .{ "cut", "cut", false },
+        .{ "resolution", "resolution", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("request_digest");
+        try jw.write(self.request_digest);
+        try jw.objectField("cut");
+        try jw.write(self.cut);
+        try jw.objectField("resolution");
+        try jw.write(self.resolution);
+        try jw.endObject();
+    }
+};
+
+pub const NativeHistoryResolutionRequest = struct {
+    version: i64,
+    authority: []const u8,
+    namespace: NativeHistoryNamespace,
+    transaction_id: NativeHistoryConsumerId,
+    owner_fence: NativeHistoryDigest,
+    manifest_digest: NativeHistoryDigest,
+    commit_version: u64,
+    minimum_applied_index: u64,
+    minimum_native_sequence: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "authority", "authority", false },
+        .{ "namespace", "namespace", false },
+        .{ "transaction_id", "transaction_id", false },
+        .{ "owner_fence", "owner_fence", false },
+        .{ "manifest_digest", "manifest_digest", false },
+        .{ "commit_version", "commit_version", false },
+        .{ "minimum_applied_index", "minimum_applied_index", false },
+        .{ "minimum_native_sequence", "minimum_native_sequence", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("authority");
+        try jw.write(self.authority);
+        try jw.objectField("namespace");
+        try jw.write(self.namespace);
+        try jw.objectField("transaction_id");
+        try jw.write(self.transaction_id);
+        try jw.objectField("owner_fence");
+        try jw.write(self.owner_fence);
+        try jw.objectField("manifest_digest");
+        try jw.write(self.manifest_digest);
+        try jw.objectField("commit_version");
+        try jw.write(self.commit_version);
+        try jw.objectField("minimum_applied_index");
+        try jw.write(self.minimum_applied_index);
+        if (self.minimum_native_sequence) |value| {
+            try jw.objectField("minimum_native_sequence");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const NativeHistoryRetirement = struct {
+    namespace: NativeHistoryNamespace,
+    authority: NativeHistoryDigest,
+    consumer: NativeHistoryConsumerId,
+    definition: NativeHistoryDigest,
+    sequence: u64,
+    grant: u64,
+};
+
+pub const NativeLegacyInventoryItem = struct {
+    transaction_id: NativeHistoryConsumerId,
+    record_digest: NativeHistoryDigest,
+    status: []const u8,
+    prepared: bool,
+    prepared_known: bool,
+    coordinator: bool,
+    coordinator_known: bool,
+    intents_resolved: bool,
+    intents_resolved_known: bool,
+};
+
+pub const NativeLegacyInventoryObservation = struct {
+    version: i64,
+    owner: NativeHistoryPublicationOwner,
+    cut: NativeHistoryPublicationCut,
+    page: NativeLegacyInventoryPage,
+};
+
+pub const NativeLegacyInventoryPage = struct {
+    closure: NativeSourceProducerClosureState,
+    items: []const NativeLegacyInventoryItem,
+    scanned_records: i64,
+    next_after: ?NativeHistoryConsumerId,
+    reached_end: bool,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "closure", "closure", false },
+        .{ "items", "items", false },
+        .{ "scanned_records", "scanned_records", false },
+        .{ "next_after", "next_after", false },
+        .{ "reached_end", "reached_end", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("closure");
+        try jw.write(self.closure);
+        try jw.objectField("items");
+        try jw.write(self.items);
+        try jw.objectField("scanned_records");
+        try jw.write(self.scanned_records);
+        try jw.objectField("next_after");
+        try jw.write(self.next_after);
+        try jw.objectField("reached_end");
+        try jw.write(self.reached_end);
+        try jw.endObject();
+    }
+};
+
+pub const NativeLegacyInventoryQuery = struct {
+    version: i64,
+    owner: NativeHistoryPublicationOwner,
+    after: ?NativeHistoryConsumerId,
+    max_records: i64,
+    minimum_applied_index: u64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "owner", "owner", false },
+        .{ "after", "after", false },
+        .{ "max_records", "max_records", false },
+        .{ "minimum_applied_index", "minimum_applied_index", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("owner");
+        try jw.write(self.owner);
+        try jw.objectField("after");
+        try jw.write(self.after);
+        try jw.objectField("max_records");
+        try jw.write(self.max_records);
+        try jw.objectField("minimum_applied_index");
+        try jw.write(self.minimum_applied_index);
+        try jw.endObject();
+    }
+};
+
+pub const NativeLegacyInventoryReply = struct {
+    version: i64,
+    request_digest: NativeHistoryDigest,
+    observation: NativeLegacyInventoryObservation,
+};
+
+pub const NativeLegacyInventoryRequest = struct {
+    version: i64,
+    request_id: NativeHistoryConsumerId,
+    query: NativeLegacyInventoryQuery,
+};
+
+/// Trusted native recovery derives the original decision/version from the matching durable terminal record. It never decides pending work.
+pub const NativeLegacyTerminalCommand = struct {
+    version: i64,
+    owner: NativeHistoryPublicationOwner,
+    proof: NativeLegacyTerminalProof,
+};
+
+/// Original commit version or ABORT finalization timestamp; not a new commit clock or PostgreSQL LSN.
+pub const NativeLegacyTerminalDecision = struct {
+    kind: []const u8,
+    timestamp: u64,
+};
+
+/// Fresh ownership/ReadIndex qualified observation. Native closure, receipt and actual cut come from one snapshot.
+pub const NativeLegacyTerminalObservation = struct {
+    version: i64,
+    owner: NativeHistoryPublicationOwner,
+    command_digest: NativeHistoryDigest,
+    entry: NativeHistoryPublicationCut,
+    cut: NativeHistoryPublicationCut,
+    outcome: NativeLegacyTerminalOutcome,
+};
+
+/// One bounded checksummed exact-command receipt per root, atomically retained with effects or deterministic rejection and actual marker. Supersession confirms neither success nor failure.
+pub const NativeLegacyTerminalOutcome = std.json.Value;
+
+/// Exact original terminal record binding; no chosen outcome or drain claim.
+pub const NativeLegacyTerminalProof = struct {
+    root: NativeSourceScopeBasis,
+    transaction_id: NativeHistoryConsumerId,
+    record_digest: NativeHistoryDigest,
+};
+
+/// Full-request correlation. Recovery always preserves its original accepted entry. Valid accepted positions survive unknown confirmation; absent or superseded outcomes authorize no mutation replay or source ACK.
+pub const NativeLegacyTerminalReply = struct {
+    version: i64,
+    request_digest: NativeHistoryDigest,
+    receipt: ?NativeHistoryPublicationCut,
+    outcome: ?NativeLegacyTerminalObservation,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "request_digest", "request_digest", false },
+        .{ "receipt", "receipt", false },
+        .{ "outcome", "outcome", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("request_digest");
+        try jw.write(self.request_digest);
+        try jw.objectField("receipt");
+        try jw.write(self.receipt);
+        try jw.objectField("outcome");
+        try jw.write(self.outcome);
+        try jw.endObject();
+    }
+};
+
+/// Submit: null receipt and zero minimum. Recover: exact accepted receipt and minimum at least its index. Nonzero request_id is correlation only, never retry permission. Owner must equal command.owner.
+pub const NativeLegacyTerminalRequest = struct {
+    version: i64,
+    operation: []const u8,
+    request_id: NativeHistoryConsumerId,
+    owner: NativeHistoryPublicationOwner,
+    command: NativeLegacyTerminalCommand,
+    receipt: ?NativeHistoryPublicationCut,
+    minimum_applied_index: u64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "operation", "operation", false },
+        .{ "request_id", "request_id", false },
+        .{ "owner", "owner", false },
+        .{ "command", "command", false },
+        .{ "receipt", "receipt", false },
+        .{ "minimum_applied_index", "minimum_applied_index", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("operation");
+        try jw.write(self.operation);
+        try jw.objectField("request_id");
+        try jw.write(self.request_id);
+        try jw.objectField("owner");
+        try jw.write(self.owner);
+        try jw.objectField("command");
+        try jw.write(self.command);
+        try jw.objectField("receipt");
+        try jw.write(self.receipt);
+        try jw.objectField("minimum_applied_index");
+        try jw.write(self.minimum_applied_index);
+        try jw.endObject();
+    }
+};
+
+/// Durable source-journal checkpoint authority, metadata protocol 103. Bind before the first source reservation; later batches reuse this full owner independently of row routing. Retirement proof must be supplied by qualified native fencing before reseeding; this record alone does not create or migrate a storage authority.
+pub const NativeSourceCheckpointAuthority = struct {
+    binding: NativeHistoryDigest,
+    table_name: []const u8,
+    owner: NativeHistoryPublicationOwner,
+    retirement: OpenApiOptionalNullable(NativeHistoryDigest) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("binding");
+        try jw.write(self.binding);
+        try jw.objectField("table_name");
+        try jw.write(self.table_name);
+        try jw.objectField("owner");
+        try jw.write(self.owner);
+        switch (self.retirement) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("retirement");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("retirement");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+/// Private canonical prepare_source_checkpoint_v1 payload, admitted only with data-Raft protocol 37. This command is included in frozen PREPARE input and is never accepted from public batch JSON. The named checkpoint participant predicates on the previous head and commits the new head with transaction resolution. Physical checkpoint authority is routed and frozen separately; binding is the immutable logical source scope. Receipt-window commands use prepare_source_checkpoint_v2 and data-Raft protocol 38; matching BEGIN uses begin_source_checkpoint_v2 before any participant admission. A positive immutable receipt_window retains exactly that many sequence slots, each with the complete command digest; omitted or zero retains legacy protocol-37 behavior. Window changes require a new source binding, never reinterpretation of existing history.
+pub const NativeSourceCheckpointCommand = struct {
+    binding: NativeHistoryDigest,
+    purpose: NativeHistoryDigest,
+    sequence: u64,
+    checkpoint: []const u8,
+    expected_checkpoint: OpenApiOptionalNullable([]const u8) = .absent,
+    accepted_at_ns: u64,
+    receipt_window: ?u32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "binding", "binding", false },
+        .{ "purpose", "purpose", false },
+        .{ "sequence", "sequence", false },
+        .{ "checkpoint", "checkpoint", false },
+        .{ "expected_checkpoint", "expected_checkpoint", false },
+        .{ "accepted_at_ns", "accepted_at_ns", false },
+        .{ "receipt_window", "receipt_window", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("binding");
+        try jw.write(self.binding);
+        try jw.objectField("purpose");
+        try jw.write(self.purpose);
+        try jw.objectField("sequence");
+        try jw.write(self.sequence);
+        try jw.objectField("checkpoint");
+        try jw.write(self.checkpoint);
+        switch (self.expected_checkpoint) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("expected_checkpoint");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("expected_checkpoint");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("accepted_at_ns");
+        try jw.write(self.accepted_at_ns);
+        if (self.receipt_window) |value| {
+            try jw.objectField("receipt_window");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Request-bound observation. Head and receipt are canonical base64 of checksummed SCP1/SCP2 records, at most 1196 decoded bytes each; validate complete command identity and retention window. Absence is unproven. No coordinator decision, completion, replan, source ACK or reclamation authority is implied.
+pub const NativeSourceCheckpointReadReply = struct {
+    version: i64,
+    request_digest: NativeHistoryDigest,
+    cut: std.json.Value,
+    disposition: []const u8,
+    head: OpenApiOptionalNullable([]const u8) = .absent,
+    receipt: OpenApiOptionalNullable([]const u8) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("request_digest");
+        try jw.write(self.request_digest);
+        try jw.objectField("cut");
+        try jw.write(self.cut);
+        try jw.objectField("disposition");
+        try jw.write(self.disposition);
+        switch (self.head) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("head");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("head");
+                try jw.write(value);
+            },
+        }
+        switch (self.receipt) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("receipt");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("receipt");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+pub const NativeSourceCheckpointReadRequest = struct {
+    version: i64,
+    source_owner: NativeHistoryPublicationOwner,
+    transaction_id: NativeHistoryConsumerId,
+    command: NativeSourceCheckpointCommand,
+    minimum_applied_index: u64,
+};
+
+/// Retained original pending identity. Metadata delivery-plan digest and frozen artifact-plan digest are distinct; neither grants transaction outcome or replay authority.
+pub const NativeSourceMetadataCapturePending = struct {
+    reference: NativeSourceScopeReference,
+    transaction_id: NativeHistoryConsumerId,
+    purpose: NativeHistoryDigest,
+    reservation: NativeHistoryDigest,
+    plan_digest: NativeHistoryDigest,
+    artifact_plan_digest: NativeHistoryDigest,
+};
+
+/// Exact native source actor and metadata incarnation. The service must establish ReadIndex and capture at an actual applied index at or beyond the requested minimum.
+pub const NativeSourceMetadataCaptureQuery = struct {
+    metadata_group_id: u64,
+    metadata_incarnation: []const i64,
+    actor_table_id: u64,
+    source_id: NativeHistoryDigest,
+    minimum_applied_index: u64,
+};
+
+/// Correlated read-only reply, bounded to 8 KiB. The service revalidates metadata identity before returning and the client withholds inconsistent or cancelled replies.
+pub const NativeSourceMetadataCaptureReply = struct {
+    version: i64,
+    request_digest: NativeHistoryDigest,
+    snapshot: NativeSourceMetadataCaptureSnapshot,
+};
+
+/// Private read-only metadata capture. Requires an independently authenticated internal service and shared routing budget.
+pub const NativeSourceMetadataCaptureRequest = struct {
+    version: i64,
+    query: NativeSourceMetadataCaptureQuery,
+};
+
+/// One actual applied metadata snapshot. Binding uses active/live definition; close uses closing or retired; drop uses retired. The trusted destination must independently obtain this capture, compare its exact binding and qualify its own physical root. These bytes alone certify no physical fencing, global outcome or legacy-worker drainage.
+pub const NativeSourceMetadataCaptureSnapshot = struct {
+    cut: NativeSourceScopeMetadataCut,
+    spec: NativeSourceScopeSpec,
+    phase: []const u8,
+    actor_revision: u64,
+    live_definition: bool,
+    checkpoint_table: []const u8,
+    pending: OpenApiOptionalNullable(NativeSourceMetadataCapturePending) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("cut");
+        try jw.write(self.cut);
+        try jw.objectField("spec");
+        try jw.write(self.spec);
+        try jw.objectField("phase");
+        try jw.write(self.phase);
+        try jw.objectField("actor_revision");
+        try jw.write(self.actor_revision);
+        try jw.objectField("live_definition");
+        try jw.write(self.live_definition);
+        try jw.objectField("checkpoint_table");
+        try jw.write(self.checkpoint_table);
+        switch (self.pending) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("pending");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("pending");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+pub const NativeSourcePlanChunkQuery = struct {
+    root: NativeSourcePlanRoot,
+    spec: NativeSourcePlanSpec,
+    minimum_applied_index: u64,
+    minimum_native_sequence: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "root", "root", false },
+        .{ "spec", "spec", false },
+        .{ "minimum_applied_index", "minimum_applied_index", false },
+        .{ "minimum_native_sequence", "minimum_native_sequence", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("root");
+        try jw.write(self.root);
+        try jw.objectField("spec");
+        try jw.write(self.spec);
+        try jw.objectField("minimum_applied_index");
+        try jw.write(self.minimum_applied_index);
+        if (self.minimum_native_sequence) |value| {
+            try jw.objectField("minimum_native_sequence");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// At most 2 MiB JSON and 1 MiB decoded binary. Validate exact request digest, root/cut, live seal, decoded size, canonical base64 and ordinal chunk hash before using bytes.
+pub const NativeSourcePlanChunkReply = struct {
+    version: i64,
+    request_digest: NativeHistoryDigest,
+    observation: NativeSourcePlanObservation,
+    chunk_base64: []const u8,
+};
+
+pub const NativeSourcePlanChunkRequest = struct {
+    version: i64,
+    source_owner: NativeHistoryPublicationOwner,
+    request: NativeSourcePlanRead,
+};
+
+/// Chunk uses exactly the spec ordinal length and canonical base64, at most 1 MiB decoded. Other actions require ordinal zero and an empty chunk. Only reclaim may change max_chunks from eight. Seal authenticates bytes; semantic frozen-plan restoration remains mandatory before admission.
+pub const NativeSourcePlanCommand = struct {
+    version: i64,
+    root: NativeSourcePlanRoot,
+    spec: NativeSourcePlanSpec,
+    action: []const u8,
+    ordinal: ?i64 = null,
+    chunk_base64: ?[]const u8 = null,
+    max_chunks: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "root", "root", false },
+        .{ "spec", "spec", false },
+        .{ "action", "action", false },
+        .{ "ordinal", "ordinal", true },
+        .{ "chunk_base64", "chunk_base64", true },
+        .{ "max_chunks", "max_chunks", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("root");
+        try jw.write(self.root);
+        try jw.objectField("spec");
+        try jw.write(self.spec);
+        try jw.objectField("action");
+        try jw.write(self.action);
+        if (self.ordinal) |value| {
+            try jw.objectField("ordinal");
+            try jw.write(value);
+        }
+        if (self.chunk_base64) |value| {
+            try jw.objectField("chunk_base64");
+            try jw.write(value);
+        }
+        if (self.max_chunks) |value| {
+            try jw.objectField("max_chunks");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// At most 4096 bytes. Outcome requires a positive exact receipt. Null or superseded outcome is unconfirmed; a known rejection is not success. Recovery echoes the original receipt. A lost response or malformed reply must not cause automatic re-proposal.
+pub const NativeSourcePlanControlReply = struct {
+    version: i64,
+    request_digest: NativeHistoryDigest,
+    receipt: ?NativeHistoryReceipt = null,
+    outcome: ?NativeSourcePlanOutcome = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "request_digest", "request_digest", false },
+        .{ "receipt", "receipt", true },
+        .{ "outcome", "outcome", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("request_digest");
+        try jw.write(self.request_digest);
+        if (self.receipt) |value| {
+            try jw.objectField("receipt");
+            try jw.write(value);
+        }
+        if (self.outcome) |value| {
+            try jw.objectField("outcome");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const NativeSourcePlanControlRequest = std.json.Value;
+
+/// One native snapshot after serving-owner ReadIndex qualification. Cut is the actual sparse native Raft apply position, not a fabricated quorum watermark. Status is null only when no spec was queried.
+pub const NativeSourcePlanObservation = struct {
+    root: NativeSourcePlanRoot,
+    cut: NativeHistoryDigest,
+    quota: NativeSourcePlanQuota,
+    status: NativeSourcePlanStatus,
+};
+
+/// At most 4096 bytes. Query digest binds unsealed presence and bitmap status as well as sealed evidence to the exact request.
+pub const NativeSourcePlanObservationReply = struct {
+    version: i64,
+    query_digest: NativeHistoryDigest,
+    observation: NativeSourcePlanObservation,
+};
+
+pub const NativeSourcePlanObserveRequest = struct {
+    version: i64,
+    source_owner: NativeHistoryPublicationOwner,
+    query: NativeSourcePlanQuery,
+};
+
+pub const NativeSourcePlanOutcome = std.json.Value;
+
+/// Route-qualified Raft-root query. Optional spec requests upload status; omission requests root quota only. All response evidence must be at or beyond the minimum applied index.
+pub const NativeSourcePlanQuery = struct {
+    root: NativeSourcePlanRoot,
+    spec: ?NativeSourcePlanSpec = null,
+    minimum_applied_index: u64,
+    minimum_native_sequence: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "root", "root", false },
+        .{ "spec", "spec", true },
+        .{ "minimum_applied_index", "minimum_applied_index", false },
+        .{ "minimum_native_sequence", "minimum_native_sequence", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("root");
+        try jw.write(self.root);
+        if (self.spec) |value| {
+            try jw.objectField("spec");
+            try jw.write(value);
+        }
+        try jw.objectField("minimum_applied_index");
+        try jw.write(self.minimum_applied_index);
+        if (self.minimum_native_sequence) |value| {
+            try jw.objectField("minimum_native_sequence");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Root-wide bounded staging accounting. Charge remains held through accepted work and partial reclamation. Explicit fencing advances epoch; absent old grants cannot restart.
+pub const NativeSourcePlanQuota = struct {
+    epoch: u64,
+    active: i64,
+    reserved: u64,
+};
+
+/// Read one sealed chunk. Fenced, missing or reclaimed work cannot be read as owned input. Result bytes must match the spec ordinal hash and the expected seal.
+pub const NativeSourcePlanRead = struct {
+    query: NativeSourcePlanChunkQuery,
+    seal: NativeHistoryDigest,
+    ordinal: i64,
+};
+
+/// Exact physical root. Fence is the canonical digest of the original routed source_owner; a supplied digest establishes no authority by itself. Generation zero is valid.
+pub const NativeSourcePlanRoot = struct {
+    authority: []const u8,
+    namespace: NativeHistoryNamespace,
+    generation: u64,
+    fence: NativeHistoryDigest,
+};
+
+/// Immutable native upload grant. Namespace binds root and storage epoch; domain binds the source binding. Attempt contains a positive big-endian upload token and nonzero nonce. Storage epoch must be less than maximum uint64. Whole-object checksum, frozen-plan digest and ordered chunk hashes are distinct authenticated identities. No age expiry is implied.
+pub const NativeSourcePlanSpec = struct {
+    namespace: NativeHistoryDigest,
+    storage_epoch: u64,
+    binding: NativeHistoryDigest,
+    domain: NativeHistoryDigest,
+    attempt: NativeHistoryConsumerId,
+    bytes: u64,
+    checksum: NativeHistoryDigest,
+    plan_digest: NativeHistoryDigest,
+    chunk_hashes: []const NativeHistoryDigest,
+};
+
+/// Snapshot status for exactly one immutable spec. Received is a 128-bit chunk bitmap with unused bits zero. Proof/position pairs, original seal/fence cuts and reclamation epoch must validate; absent or unsealed work never proves input ownership.
+pub const NativeSourcePlanStatus = struct {
+    present: bool,
+    received: NativeHistoryConsumerId,
+    sealed_position: NativeHistoryDigest,
+    fenced_position: NativeHistoryDigest,
+    seal: NativeHistoryDigest,
+    fence: NativeHistoryDigest,
+    reclamation: NativeHistoryDigest,
+};
+
+pub const NativeSourceProducerCloseReply = struct {
+    version: i64,
+    request_digest: NativeHistoryDigest,
+    /// Accepted proposal term/index only; it may remain uncommitted or be overwritten.
+    receipt: ?NativeHistoryPublicationCut,
+    /// Qualified current closure state at or beyond the accepted index. Not an original command outcome, source ACK or drainage certificate.
+    outcome: ?NativeSourceProducerClosureObservation,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "request_digest", "request_digest", false },
+        .{ "receipt", "receipt", false },
+        .{ "outcome", "outcome", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("request_digest");
+        try jw.write(self.request_digest);
+        try jw.objectField("receipt");
+        try jw.write(self.receipt);
+        try jw.objectField("outcome");
+        try jw.write(self.outcome);
+        try jw.endObject();
+    }
+};
+
+pub const NativeSourceProducerCloseRequest = struct {
+    version: i64,
+    /// Fresh nonzero per-attempt correlation nonce; never a transaction identity or retry authorization.
+    request_id: []const i64,
+    owner: NativeHistoryPublicationOwner,
+};
+
+/// One native snapshot of actual applied cut and optional producer intake closure. Absence grants no transaction outcome, replay, drainage or source activation authority. Validate the complete owner and minimum cut; source/checkpoint/feed/LSN positions remain distinct.
+pub const NativeSourceProducerClosureObservation = struct {
+    version: i64,
+    owner: NativeHistoryPublicationOwner,
+    cut: NativeHistoryPublicationCut,
+    closure: ?NativeSourceProducerClosureState,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "owner", "owner", false },
+        .{ "cut", "cut", false },
+        .{ "closure", "closure", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("owner");
+        try jw.write(self.owner);
+        try jw.objectField("cut");
+        try jw.write(self.cut);
+        try jw.objectField("closure");
+        try jw.write(self.closure);
+        try jw.endObject();
+    }
+};
+
+/// Read-only physical producer-intake closure query. Requires current catalog ownership and leader ReadIndex; a nonzero minimum is a read bound, never an acknowledgement.
+pub const NativeSourceProducerClosureQuery = struct {
+    version: i64,
+    owner: NativeHistoryPublicationOwner,
+    minimum_applied_index: u64,
+};
+
+/// Immutable cumulative intake closure for one original physical root. This cut proves no old transaction drainage, global source ACK, or first-strict activation.
+pub const NativeSourceProducerClosureState = struct {
+    version: i64,
+    root: NativeSourceScopeBasis,
+    first_closed_at: NativeHistoryPublicationCut,
+};
+
+pub const NativeSourceRetirementOutcome = std.json.Value;
+
+/// Read-only exact retirement recovery. Minimum must cover the entry. Entire original command including coordinator read cut is immutable.
+pub const NativeSourceRetirementRecovery = struct {
+    command: NativeSourceScopeAbortCommand,
+    entry: NativeHistoryPublicationCut,
+    minimum_applied_index: u64,
+};
+
+/// At most 16802816 bytes. Full-request SHA-256 correlation. Command may survive an ambiguous submission without known entry; outcome then must be null. Known entry requires exact command. Recovery preserves original command and entry. Unknown/superseded authorize no retry, source ACK, retention release or global outcome.
+pub const NativeSourceRetirementReply = struct {
+    version: i64,
+    request_digest: NativeHistoryDigest,
+    command: OpenApiOptionalNullable(NativeSourceScopeAbortCommand) = .absent,
+    receipt: OpenApiOptionalNullable(NativeHistoryPublicationCut) = .absent,
+    outcome: OpenApiOptionalNullable(NativeSourceRetirementOutcome) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("request_digest");
+        try jw.write(self.request_digest);
+        switch (self.command) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("command");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("command");
+                try jw.write(value);
+            },
+        }
+        switch (self.receipt) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("receipt");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("receipt");
+                try jw.write(value);
+            },
+        }
+        switch (self.outcome) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("outcome");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("outcome");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+/// At most 16798720 bytes. Nonzero fresh request_id. Submit requires intent and coordinator_locator with null recovery; no caller observation is accepted. Recover requires recovery with null intent/locator and is strictly read-only.
+pub const NativeSourceRetirementRequest = struct {
+    version: i64,
+    request_id: NativeHistoryConsumerId,
+    operation: []const u8,
+    intent: OpenApiOptionalNullable(NativeSourceScopeAbortIntent) = .absent,
+    coordinator_locator: OpenApiOptionalNullable([]const u8) = .absent,
+    recovery: OpenApiOptionalNullable(NativeSourceRetirementRecovery) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("request_id");
+        try jw.write(self.request_id);
+        try jw.objectField("operation");
+        try jw.write(self.operation);
+        switch (self.intent) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("intent");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("intent");
+                try jw.write(value);
+            },
+        }
+        switch (self.coordinator_locator) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("coordinator_locator");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("coordinator_locator");
+                try jw.write(value);
+            },
+        }
+        switch (self.recovery) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("recovery");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("recovery");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+/// Trusted ordered reducer command constructed only after an independent qualified coordinator read. Requires the retained original scoped ABORT and original participant membership. Never accept this command body as self-authenticating public or private HTTP evidence.
+pub const NativeSourceScopeAbortCommand = struct {
+    version: i64,
+    intent: NativeSourceScopeAbortIntent,
+    observation: NativeHistoryDecisionReply,
+};
+
+/// Private original-owner retirement intent. The receiving control owner must independently read the named coordinator through qualified ReadIndex; caller-supplied absence, a digest, or an outcome body is never abort authority.
+pub const NativeSourceScopeAbortIntent = struct {
+    version: i64,
+    owner: NativeHistoryPublicationOwner,
+    coordinator: NativeHistoryDecisionRequest,
+    reference: NativeSourceScopeReference,
+    source_purpose: NativeHistoryDigest,
+    admission_digest: NativeHistoryDigest,
+};
+
+/// Local attempt fencing receipt, not a global commit, publication or all-owner ACK. The applying root atomically advances its bounded token floor before emitting this receipt; delayed BEGIN remains rejected after transaction record cleanup.
+pub const NativeSourceScopeAbortReply = struct {
+    version: i64,
+    request_digest: NativeHistoryDigest,
+    coordinator_record_digest: NativeHistoryDigest,
+    cut: NativeHistoryPublicationCut,
+    closed_through_token: u64,
+    disposition: []const u8,
+};
+
+pub const NativeSourceScopeAction = std.json.Value;
+
+/// Immutable physical owner basis; schema/topology leases are qualified separately. All metadata indices in a registry share this metadata group/incarnation.
+pub const NativeSourceScopeBasis = struct {
+    metadata_group_id: u64,
+    metadata_incarnation: []const i64,
+    namespace: NativeHistoryNamespace,
+    root_generation: u64,
+    group_id: u64,
+};
+
+/// Trusted ordered command constructed from an independently qualified metadata read. Never accepted as new-write HTTP authorization. Read-only receipt recovery may carry its exact original command. Scope mutation and the actual apply marker commit atomically. First strict admission also requires independently verified legacy worker handover and transaction drainage.
+pub const NativeSourceScopeControlCommand = struct {
+    version: i64,
+    intent: NativeSourceScopeControlIntent,
+    metadata_cut: NativeSourceScopeMetadataCut,
+};
+
+/// Private scope lifecycle intent. The control owner independently reads metadata at or beyond the minimum index, verifies the exact binding and active/closing/retired actor phase, and qualifies the physical destination owner. No caller-supplied lifecycle state or drain flag grants authority.
+pub const NativeSourceScopeControlIntent = struct {
+    version: i64,
+    owner: NativeHistoryPublicationOwner,
+    spec: NativeSourceScopeSpec,
+    minimum_metadata_index: u64,
+    action: NativeSourceScopeAction,
+};
+
+/// Private correlated reply, at most 24 KiB. request_digest binds the entire request including request_id and operation. An unknown submit may have null command/receipt/outcome; never replay from that state. Every known accepted entry carries both its exact freshly captured command and positive receipt, even if outcome is null. Recovery preserves its exact original command and entry; changing the metadata cut is not recovery. A superseded receipt confirms neither success nor failure. A known rejection is not an applied effect. Applied evidence must match command, action, physical owner and actual ordered cut. One root receipt proves no all-owner fencing or row transaction outcome.
+pub const NativeSourceScopeControlReply = struct {
+    version: i64,
+    request_digest: NativeHistoryDigest,
+    command: OpenApiOptionalNullable(NativeSourceScopeControlCommand) = .absent,
+    receipt: OpenApiOptionalNullable(NativeHistoryPublicationCut) = .absent,
+    outcome: OpenApiOptionalNullable(NativeSourceScopeOutcome) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("request_digest");
+        try jw.write(self.request_digest);
+        switch (self.command) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("command");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("command");
+                try jw.write(value);
+            },
+        }
+        switch (self.receipt) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("receipt");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("receipt");
+                try jw.write(value);
+            },
+        }
+        switch (self.outcome) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("outcome");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("outcome");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+/// Private lifecycle RPC contract, at most 16 KiB. A fresh nonzero request_id correlates one RPC attempt and grants no replay or transaction outcome authority. submit requires intent and null/absent recovery; the receiving leader independently captures fresh signed metadata authority. recover requires recovery and null/absent intent, and only reads the exact prior command/entry. Caller metadata cuts are never accepted as new-write authorization. First strict activation remains gated on independently proven legacy-worker handover.
+pub const NativeSourceScopeControlRequest = struct {
+    version: i64,
+    request_id: NativeHistoryConsumerId,
+    operation: []const u8,
+    intent: OpenApiOptionalNullable(NativeSourceScopeControlIntent) = .absent,
+    recovery: OpenApiOptionalNullable(NativeSourceScopeRecovery) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("request_id");
+        try jw.write(self.request_id);
+        try jw.objectField("operation");
+        try jw.write(self.operation);
+        switch (self.intent) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("intent");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("intent");
+                try jw.write(value);
+            },
+        }
+        switch (self.recovery) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("recovery");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("recovery");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+/// Bounded physical-root registry. The monotonic metadata floor and strict admission survive deletion of the last domain; no unbounded generation tombstones are retained.
+pub const NativeSourceScopeHeader = struct {
+    version: i64,
+    root: NativeSourceScopeBasis,
+    metadata_floor: u64,
+    domains: i64,
+    strict: bool,
+};
+
+/// Qualified metadata actor/configuration cut, not a caller-supplied lease. The trusted control owner must independently capture active/closing/retired actor state at this same cut. Native monotonic floors reject stale bind after cleanup.
+pub const NativeSourceScopeMetadataCut = struct {
+    group_id: u64,
+    incarnation: []const i64,
+    index: u64,
+};
+
+/// One qualified physical-root snapshot. A local closure receipt does not prove all-owner fencing, global commit, publication, or safe metadata retirement.
+pub const NativeSourceScopeObservation = struct {
+    version: i64,
+    owner: NativeHistoryPublicationOwner,
+    domain: NativeHistoryDigest,
+    cut: NativeHistoryPublicationCut,
+    header: NativeSourceScopeHeader,
+    record: ?NativeSourceScopeRecord,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "owner", "owner", false },
+        .{ "domain", "domain", false },
+        .{ "cut", "cut", false },
+        .{ "header", "header", false },
+        .{ "record", "record", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("owner");
+        try jw.write(self.owner);
+        try jw.objectField("domain");
+        try jw.write(self.domain);
+        try jw.objectField("cut");
+        try jw.write(self.cut);
+        try jw.objectField("header");
+        try jw.write(self.header);
+        try jw.objectField("record");
+        try jw.write(self.record);
+        try jw.endObject();
+    }
+};
+
+/// Bounded latest-control replay aid, one receipt per physical root. Persist in the same transaction as scope mutation or deterministic rejection and actual ordered apply marker. Not a global all-owner fencing certificate.
+pub const NativeSourceScopeOutcome = std.json.Value;
+
+/// ReadIndex-qualified physical-root scope observation. Absence is not an outcome or replay grant.
+pub const NativeSourceScopeQuery = struct {
+    version: i64,
+    owner: NativeHistoryPublicationOwner,
+    domain: NativeHistoryDigest,
+    minimum_applied_index: u64,
+};
+
+/// One current generation and at most one attempt slot per source domain. Closing prevents new admission and prepares while original decisions drain. Closed records retain their first actual ordered close cut.
+pub const NativeSourceScopeRecord = struct {
+    spec: NativeSourceScopeSpec,
+    bound_metadata_index: u64,
+    phase: []const u8,
+    closed_through_token: u64,
+    last_committed_sequence: u64,
+    last_committed_token: u64,
+    slot: ?NativeSourceScopeSlot,
+    close_metadata_index: u64,
+    closed_at: ?NativeHistoryPublicationCut,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "spec", "spec", false },
+        .{ "bound_metadata_index", "bound_metadata_index", false },
+        .{ "phase", "phase", false },
+        .{ "closed_through_token", "closed_through_token", false },
+        .{ "last_committed_sequence", "last_committed_sequence", false },
+        .{ "last_committed_token", "last_committed_token", false },
+        .{ "slot", "slot", false },
+        .{ "close_metadata_index", "close_metadata_index", false },
+        .{ "closed_at", "closed_at", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("spec");
+        try jw.write(self.spec);
+        try jw.objectField("bound_metadata_index");
+        try jw.write(self.bound_metadata_index);
+        try jw.objectField("phase");
+        try jw.write(self.phase);
+        try jw.objectField("closed_through_token");
+        try jw.write(self.closed_through_token);
+        try jw.objectField("last_committed_sequence");
+        try jw.write(self.last_committed_sequence);
+        try jw.objectField("last_committed_token");
+        try jw.write(self.last_committed_token);
+        try jw.objectField("slot");
+        try jw.write(self.slot);
+        try jw.objectField("close_metadata_index");
+        try jw.write(self.close_metadata_index);
+        try jw.objectField("closed_at");
+        try jw.write(self.closed_at);
+        try jw.endObject();
+    }
+};
+
+/// Private qualified receipt recovery. Minimum applied index must cover the original entry; the serving owner independently establishes ReadIndex and physical-root identity before reading the bounded receipt.
+pub const NativeSourceScopeRecovery = struct {
+    command: NativeSourceScopeControlCommand,
+    entry: NativeHistoryPublicationCut,
+    minimum_applied_index: u64,
+};
+
+/// Frozen protocol-39 BEGIN/PREPARE reference. Token is the positive source upload/attempt token; sequence is the logical source sequence. Native local retirement floors prevent delayed BEGIN after transaction metadata GC. A reference alone grants no authority.
+pub const NativeSourceScopeReference = struct {
+    domain: NativeHistoryDigest,
+    binding: NativeHistoryDigest,
+    generation: u64,
+    token: u64,
+    sequence: u64,
+};
+
+pub const NativeSourceScopeSlot = struct {
+    reference: NativeSourceScopeReference,
+    transaction_id: NativeHistoryConsumerId,
+    source_purpose: NativeHistoryDigest,
+    admission_digest: NativeHistoryDigest,
+};
+
+/// Private protocol-39 source scope registration. Domain derives from actor_table_id/source_id and stays stable across generations. Binding authenticates one immutable source configuration. A source may target roots different from its actor table or checkpoint authority.
+pub const NativeSourceScopeSpec = struct {
+    actor_table_id: u64,
+    source_id: NativeHistoryDigest,
+    generation: u64,
+    binding: NativeHistoryDigest,
+    checkpoint_owner: NativeSourceScopeBasis,
+};
+
 pub const StandbyCreateReplicationSlotRequest = struct {
     slot_name: StandbySlotName,
     /// Optional LSN to initialize the slot at. Defaults to the current primary LSN.

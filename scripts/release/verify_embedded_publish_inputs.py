@@ -82,8 +82,8 @@ def verify_identity(
         or document.get("build_contract_schema") not in {2, 3, 4, 5, 6, 7}
         or document.get("build_controller_commit") != controller
         or document.get("release_line") != line.name
-        or document.get("source_ref") != line.source_ref
-        or document.get("channel") not in {"stable", "next"}
+        or document.get("source_ref") not in line.trusted_source_refs
+        or document.get("channel") not in load_policy()["channels"]
     ):
         raise ValueError(
             "embedded release request differs from its controller or release line"
@@ -96,7 +96,7 @@ def verify_identity(
         controller,
         git(root, "rev-parse", "FETCH_HEAD"),
     )
-    git(root, "fetch", "--no-tags", "origin", line.source_ref)
+    git(root, "fetch", "--no-tags", "origin", document["source_ref"])
     source_head = git(root, "rev-parse", "FETCH_HEAD")
     git(root, "merge-base", "--is-ancestor", document["source_ref_head"], source_head)
     git(root, "merge-base", "--is-ancestor", commit, document["source_ref_head"])
@@ -110,7 +110,9 @@ def verify_identity(
         "tag": tag,
         # Authenticate prerelease inputs too, but never admit them to registry
         # preparation, dispatch, or credential-bearing publication jobs.
-        "publish": str(document["channel"] == "stable").lower(),
+        "publish": str(
+            channel["tag_kind"] == "stable" and channel["publish_npm"]
+        ).lower(),
     }
 
 

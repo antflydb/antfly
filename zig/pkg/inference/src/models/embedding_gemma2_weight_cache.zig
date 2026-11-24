@@ -15,6 +15,12 @@
 
 const std = @import("std");
 
+/// Model-owned retained execution policy. Device storage and retirement are
+/// implemented by the CUDA cache, independently of checkpoint interpretation.
+pub const execution_packed_limit = 512 * 1024 * 1024;
+pub const execution_arena_limit = 128 * 1024 * 1024;
+pub const execution_graph_rows_limit = 4096;
+
 /// Independent of the request's activation workspace. Every inserted payload
 /// also requires resident-tier admission and lives only with its model owner.
 pub const max_bytes: usize = 640 * 1024 * 1024;

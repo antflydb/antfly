@@ -230,7 +230,7 @@ pub fn currentRow(core: anytype, a: A, document: []const u8) !?V {
     var view = core.acquireSchemaView();
     defer if (view) |*value| value.release();
     const relational = if (view) |value| value.storageMode() == .relational else false;
-    const rows = @import("relational_store.zig");
+    const rows = @import("relational/rows/store.zig");
     const selected = if (relational) try rows.keyAlloc(a, document) else try @import("../internal_keys.zig").documentKeyAlloc(a, document);
     const raw = core.store.get(a, selected) catch |err| return if (err == error.NotFound) null else err;
     const bytes = if (relational) blk: {

@@ -53,6 +53,7 @@ test {
     _ = timeline;
     _ = mp4;
     _ = webm;
+    _ = webm_audio;
     _ = @import("webm_test.zig");
     _ = @import("mp4_test.zig");
 }

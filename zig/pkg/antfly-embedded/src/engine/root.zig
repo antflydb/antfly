@@ -20,6 +20,7 @@ pub const cypher = support.cypher;
 pub const db = @import("embedded_db_surface");
 pub const api = @import("embedded_api_surface");
 pub const host_environment = support.host_environment;
+pub const host_file_storage = support.host_file_storage;
 pub const object_database = support.object_storage.transactional_store;
 pub const object_commit_log = support.object_storage.immutable_log;
 pub const object_storage = support.object_storage;
@@ -33,6 +34,7 @@ test "embedded package surfaces are reachable" {
     _ = db;
     _ = api;
     _ = host_environment;
+    _ = host_file_storage;
     _ = object_storage;
     _ = lsm_backend;
     _ = storage_backend;

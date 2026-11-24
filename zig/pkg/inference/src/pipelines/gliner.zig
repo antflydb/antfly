@@ -479,14 +479,7 @@ pub const GlinerPipeline = struct {
         alloc: std.mem.Allocator,
     ) ![]Tensor {
         if (self.execution_control) |control| try control.update(.executing, 0, 1);
-        if (self.execution_lock) |mutex| {
-            if (self.execution_control) |control|
-                try control.lock(mutex)
-            else
-                platform.sync.lockYielding(mutex);
-        }
-        defer if (self.execution_lock) |mutex| mutex.unlock();
-        return permit.runWithControl(inputs, alloc, self.execution_control);
+        return @import("../execution/tensor_dispatch.zig").run(alloc, self.session, permit, self.execution_lock, inputs, self.execution_control, null);
     }
 
     pub fn usesDistributedGpuHosted(self: *const GlinerPipeline) bool {
@@ -1064,20 +1057,9 @@ pub const GlinerPipeline = struct {
             @memcpy(positions[physical_row * labels ..][0..row.marker_positions.len], row.marker_positions);
             @memcpy(mask[physical_row * labels ..][0..row.marker_mask.len], row.marker_mask);
         }
-        const shape = [_]i64{ @intCast(indexes.len), @intCast(seq) };
-        const marker_shape = [_]i64{ @intCast(indexes.len), @intCast(labels) };
-        var inputs: [4]Tensor = undefined;
-        var initialized: usize = 0;
-        defer for (inputs[0..initialized]) |*input| input.deinit();
-        inputs[0] = try Tensor.initInt64(a, "input_ids", &shape, ids);
-        initialized += 1;
-        inputs[1] = try Tensor.initInt64(a, "attention_mask", &shape, attention);
-        initialized += 1;
-        inputs[2] = try Tensor.initInt64(a, "decision_marker_positions", &marker_shape, positions);
-        initialized += 1;
-        inputs[3] = try Tensor.initInt64(a, "decision_marker_mask", &marker_shape, mask);
-        initialized += 1;
-        return self.lockedSessionRun(&permit, &inputs, a);
+        var inputs = try @import("../architectures/frontends/marker_classifier.zig").Inputs.init(a, indexes.len, seq, labels, ids, attention, positions, mask);
+        defer inputs.deinit();
+        return self.lockedSessionRun(&permit, &inputs.values, a);
     }
 
     /// Recognize entities in a single text.

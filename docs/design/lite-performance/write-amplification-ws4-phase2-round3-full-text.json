@@ -1,0 +1,228 @@
+{
+  "source_commit": "c1762f0b9be2e1e701c660a1a1442579bf43bab2",
+  "harness_commit": "this commit (WS4 phase 2 round 3: fix the inline text fast path's use-after-free in inline_text_handled_names)",
+  "measurement_scope": "Lite write-amplification counting harness (zig build lite-write-amplification, Debug), 'full_text sync level' mode: 128 single-doc updates, 1 KiB changing text per update, sync_level=full_text, 1 writer, default Lite configuration (background index workers running). Measured on perf/lwa-ws4-worker-progress after merging perf/lwa-integration at d4f01aad25 and fixing the alternation bug described below. full_index mode is not re-measured here: batchInternalPreparedOwned's inline fast path is gated on `effective_req.sync_level == .full_text` specifically (mutation_commit.zig), so full_index writes never take it and are architecturally unaffected by this change -- its numbers are identical before and after, and the pre-existing 'lite write amplification ceilings' test (unchanged, still passing) is the regression evidence for that.",
+  "root_cause": "batchInternalPreparedOwned captured inline_text_handled_names[i] as a direct alias of the sync_targets.full_text_indexes entry it came from (target_name). The very next block filters sync_targets.full_text_indexes to exclude every inline-handled name and frees each excluded entry as it goes -- well before the install loop at the bottom of the function reads inline_text_handled_names[i] to call Executor.advanceAppliedSequenceIfContiguous. That call's name comparison was therefore always against already-freed memory, so it never matched the registered worker and the in-memory fast-forward silently failed on every single write. With the fast-forward never landing, the following write's precondition check (worker_applied + 1 == sequence) failed too, forcing it onto the slow, worker-driven catch-up path -- whose unbounded catchUpWorker scan (no target_sequence cap in ManualRuntime.waitForIndexes/DerivedRuntime's threaded equivalent) then applied straight through to the journal's current tip, landing two sequences ahead in one pass. Net effect: a period-2 alternation (worker.applied_sequence traced 0, 1, 1, 3, 3, 5, 5, ... instead of 0, 1, 2, 3, 4, 5, 6, ...), confirmed with temporary instrumentation printing the precheck/prepare/advance sequence of a small 6-update run before being reverted. Fix: give inline_text_handled_names its own owned copy of the name (freed by a dedicated defer) instead of aliasing sync_targets.full_text_indexes.",
+  "comparison": {
+    "full_text_calling_thread_syncs_per_update": {
+      "before_fix_alternation_bug": 4.977,
+      "after_fix": 2.03125
+    },
+    "full_text_durable_commits_per_write": {
+      "before_fix_alternation_bug": 2.992,
+      "after_fix": 1.03125
+    },
+    "note": "before_fix_alternation_bug is this same mode measured on perf/lwa-ws4-inline-workers (7e08ef3044, this branch's own starting point) before the fix in this commit, reproduced independently during root-cause investigation. after_fix is durable_commits_per_write=1.03: steady state now costs one native commit per write (the inline fast path engages on every write but the unavoidable first one, which legitimately defers to the slow, worker-driven path -- see batchInternalPreparedOwned's comment on the very first write a worker is asked to apply for an index). The remaining gap between durable_commits_per_write (1.03) and calling_thread_syncs_per_update (2.03) is the native commit protocol issuing more than one physical fsync per logical commit, which is native.zig/Store.stage territory and out of this change's scope (see the task rule against editing it)."
+  },
+  "known_limitations": [
+    "Journal suppression (a per-write 'published inline' hint so writeReplayEntries skips the hinted-lane record for consumers whose publication rode in the ack commit) is not implemented by this change: every inline-handled write still appends its canonical journal record for replication/other-consumer catch-up. This does not cost an extra commit (the append rides in the same native transaction as the primary write), only extra journal bytes/replay-scan cost for other consumers, which is outside this measurement's commit-count scope.",
+    "full_index mode (and dense/sparse/graph vector modes) are not re-measured by this receipt; see measurement_scope above for why full_index specifically cannot regress from this change."
+  ],
+  "after_full_text_mode": {
+    "updates": 128,
+    "calling_thread_syncs_per_update": 2.03125,
+    "background_syncs_per_update": 0,
+    "fsyncs_per_write_overall": 2.03125,
+    "durable_commits_per_write": 1.03125,
+    "mean_primary_group_size": 0,
+    "indicative_writes_per_second_debug": 4.6548231641729565,
+    "stages": {
+      "primary_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_stage": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_link": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_pin": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "lsm_wal": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 1,
+        "commits_background": 0
+      },
+      "progress": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "status_snapshot": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "replay_retirement": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_cleanup": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_write": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_append": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_rename": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_delete": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_sync": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_finish": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_lease": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "main_txn_commit": {
+        "sync_calling_thread": 2,
+        "sync_background": 0,
+        "write_calls_calling_thread": 7,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 32768,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 2,
+        "commits_background": 0
+      },
+      "lsm_backend_wal": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "other": {
+        "sync_calling_thread": 258,
+        "sync_background": 0,
+        "write_calls_calling_thread": 1397,
+        "write_calls_background": 342,
+        "write_bytes_calling_thread": 7200768,
+        "write_bytes_background": 1400832,
+        "commits_calling_thread": 129,
+        "commits_background": 0
+      }
+    },
+    "background_ops": {
+      "source_turn": 1,
+      "maintenance_lease_acquired": 0,
+      "serving_runtime_refresh": 0,
+      "derived_worker_turn": 1
+    }
+  }
+}

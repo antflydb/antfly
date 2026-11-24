@@ -1818,7 +1818,7 @@
   "zig/pkg/antfly-embedded/src/storage/db/group_prior_context.zig": "1558a1d386de8ef94c46fe7d96c8d7282ebc636b5b83aa3c6963debcee45c6f0",
   "zig/pkg/antfly-embedded/src/storage/db/group_prior_scan.zig": "391b67d74bfac9c629732e6f6dfaa92ec1b9b901b00e9f5686d33247b7befe85",
   "zig/pkg/antfly-embedded/src/storage/db/query/search_exec.zig": "369f27f9dd74ec1457e0da95e2babf2f5d7daa0caf4b0a6bdc6fa7364c3a5122",
-  "zig/pkg/antfly-embedded/src/storage/db/relational_store.zig": "fff16623e78afb0de977427e9e727ce341bde117ca01e9e713dea807f3010d29",
+  "zig/pkg/antfly-embedded/src/storage/db/relational/rows/store.zig": "fff16623e78afb0de977427e9e727ce341bde117ca01e9e713dea807f3010d29",
   "zig/pkg/antfly-embedded/src/storage/lite/backup_preflight.zig": "3e3fe48dd6b92d06e27a0526388e3c283ee4e5dd3f373a3602e51f960c33b523",
   "zig/pkg/antfly-embedded/src/storage/lite/restore_staging.zig": "1ec29b5fbbee5f6959094c7fc34666fc3d4b02dd9702bc5fb5468015be28633a",
   "zig/pkg/antfly-embedded/src/storage/portable_backup.zig": "2c7ae8fa161c22a5a283fc175d4187612d47b8c40d8b0be4a065c15883a17243",

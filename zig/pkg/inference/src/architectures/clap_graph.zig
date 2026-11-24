@@ -21,7 +21,9 @@ const null_node = ml.graph.null_node;
 
 const clap_mod = @import("../models/clap.zig");
 const ops = @import("../ops/ops.zig");
-const graph_runtime = @import("../graph/runtime.zig");
+const executable_mod = @import("../execution/executable.zig");
+const graph_runtime = executable_mod.runtime_module;
+const ModelProgram = @import("../execution/program.zig").ModelProgram;
 const interpreter = @import("../graph/interpreter.zig");
 
 const ComputeBackend = ops.ComputeBackend;
@@ -67,13 +69,16 @@ pub fn runAudioTailGraph(
 
     try appendF32RuntimeInput(cb, allocator, &rt_inputs, &owned_cts, hidden_node, hidden, &.{ @intCast(batch * tokens), @intCast(hidden_dim) });
 
-    var runtime = try graph_runtime.Runtime.init(allocator, &graph, cb, strategy);
-    defer runtime.deinit();
-    var result = try runtime.execute(allocator, &graph, .{ .runtime_inputs = rt_inputs.items });
-    defer result.deinit(&runtime);
+    var program = try ModelProgram.init(allocator, &graph, &.{});
+    defer program.deinit();
+    const bound_inputs = try program.remapInputs(rt_inputs.items);
+    var executable = try executable_mod.prepareWithOptions(allocator, &program, cb, strategy, .{ .input_bindings = bound_inputs });
+    defer executable.deinit();
+    var result = try executable.run(allocator, .{ .runtime_inputs = bound_inputs, .output_placement = .producer });
+    defer result.deinit(&executable.runtime);
 
     if (result.outputs.len == 0) return error.MissingGraphOutput;
-    return cb.toFloat32(result.outputs[0], allocator);
+    return result.backendFor(&executable.runtime, 0).toFloat32(result.outputs[0], allocator);
 }
 
 pub fn runAudioQkvGraph(
@@ -105,17 +110,20 @@ pub fn runAudioQkvGraph(
     }
     try appendF32RuntimeInput(cb, allocator, &rt_inputs, &owned_cts, windows_node, windows, &.{ @intCast(rows), @intCast(dim) });
 
-    var runtime = try graph_runtime.Runtime.init(allocator, &graph, cb, strategy);
-    defer runtime.deinit();
-    var result = try runtime.execute(allocator, &graph, .{ .runtime_inputs = rt_inputs.items });
-    defer result.deinit(&runtime);
+    var program = try ModelProgram.init(allocator, &graph, &.{});
+    defer program.deinit();
+    const bound_inputs = try program.remapInputs(rt_inputs.items);
+    var executable = try executable_mod.prepareWithOptions(allocator, &program, cb, strategy, .{ .input_bindings = bound_inputs });
+    defer executable.deinit();
+    var result = try executable.run(allocator, .{ .runtime_inputs = bound_inputs, .output_placement = .producer });
+    defer result.deinit(&executable.runtime);
     if (result.outputs.len != 3) return error.MissingGraphOutput;
 
-    const q = try cb.toFloat32(result.outputs[0], allocator);
+    const q = try result.backendFor(&executable.runtime, 0).toFloat32(result.outputs[0], allocator);
     errdefer allocator.free(q);
-    const k = try cb.toFloat32(result.outputs[1], allocator);
+    const k = try result.backendFor(&executable.runtime, 1).toFloat32(result.outputs[1], allocator);
     errdefer allocator.free(k);
-    const v = try cb.toFloat32(result.outputs[2], allocator);
+    const v = try result.backendFor(&executable.runtime, 2).toFloat32(result.outputs[2], allocator);
     return .{ .q = q, .k = k, .v = v };
 }
 
@@ -218,13 +226,16 @@ pub fn runAudioPatchEmbedGraph(
 
     try appendF32RuntimeInput(cb, allocator, &rt_inputs, &owned_cts, image_node, image, &.{ @intCast(batch), 1, @intCast(height), @intCast(width) });
 
-    var runtime = try graph_runtime.Runtime.init(allocator, &graph, cb, strategy);
-    defer runtime.deinit();
-    var result = try runtime.execute(allocator, &graph, .{ .runtime_inputs = rt_inputs.items });
-    defer result.deinit(&runtime);
+    var program = try ModelProgram.init(allocator, &graph, &.{});
+    defer program.deinit();
+    const bound_inputs = try program.remapInputs(rt_inputs.items);
+    var executable = try executable_mod.prepareWithOptions(allocator, &program, cb, strategy, .{ .input_bindings = bound_inputs });
+    defer executable.deinit();
+    var result = try executable.run(allocator, .{ .runtime_inputs = bound_inputs, .output_placement = .producer });
+    defer result.deinit(&executable.runtime);
 
     if (result.outputs.len == 0) return error.MissingGraphOutput;
-    return cb.toFloat32(result.outputs[0], allocator);
+    return result.backendFor(&executable.runtime, 0).toFloat32(result.outputs[0], allocator);
 }
 
 fn executeSingleF32Graph(
@@ -245,13 +256,16 @@ fn executeSingleF32Graph(
     }
     try appendF32RuntimeInput(cb, allocator, &rt_inputs, &owned_cts, input_node, input, input_shape);
 
-    var runtime = try graph_runtime.Runtime.init(allocator, graph, cb, strategy);
-    defer runtime.deinit();
-    var result = try runtime.execute(allocator, graph, .{ .runtime_inputs = rt_inputs.items });
-    defer result.deinit(&runtime);
+    var program = try ModelProgram.init(allocator, graph, &.{});
+    defer program.deinit();
+    const bound_inputs = try program.remapInputs(rt_inputs.items);
+    var executable = try executable_mod.prepareWithOptions(allocator, &program, cb, strategy, .{ .input_bindings = bound_inputs });
+    defer executable.deinit();
+    var result = try executable.run(allocator, .{ .runtime_inputs = bound_inputs, .output_placement = .producer });
+    defer result.deinit(&executable.runtime);
 
     if (result.outputs.len == 0) return error.MissingGraphOutput;
-    return cb.toFloat32(result.outputs[0], allocator);
+    return result.backendFor(&executable.runtime, 0).toFloat32(result.outputs[0], allocator);
 }
 
 fn buildAudioTailGraph(

@@ -289,7 +289,7 @@ credentials.
    any PyPI, npm, Homebrew, or public container-tag write, so a known precedence or
    immutable-identity collision cannot be discovered after publishing a
    registry version. `scripts/release/channels.json`
-   is the canonical policy for `stable`, `next`, and `nightly`: tag class,
+   is the canonical policy for global and maintenance channels: tag class,
    ordering rule, journal, package-registry eligibility, mutable aliases,
    GitHub visibility, and recovery source. Compare-and-swap journals in R2
    record each channel's `pending` and `current` release identity (tag, source
@@ -523,7 +523,7 @@ logs, memory summaries, and linker maps are uploaded on failure as separate
 diagnostic artifacts, without compiler caches. macOS cross builds resolve the
 versioned LLVM linker directory and check linker/nm availability before compiling.
 
-The immutable 0.3 and nightly build also runs the released v0.2.5 writer and
+The immutable 0.3, 0.4, and nightly build also runs the released v0.2.5 writer and
 `scripts/ci/qualify-v02-server-upgrade.py` against the newly built Darwin server
 archive. This gates publication on in-place data reopen, updates/deletes, crash
 recovery, the rollback gate, and portable/native restore. It is separate from
@@ -560,8 +560,8 @@ journals during recovery, but cannot create a new release candidate.
 
 `scripts/release/release-lines.json` is the default-branch controller's map
 from a tag's `X.Y` version line to its trusted source branch. It maps `0.2` to
-`v0.2.x` and `0.3` to `main`. The branches share the `v0.2.1` release commit,
-`e5261e9e2937d03943b518974bf8063351ad1449`. Release tags are
+`v0.2.x`, `0.3` to `v0.3.x`, and `0.4` to `main`. The 0.3 maintenance
+branch starts at `v0.3.2` (`4f7d20a1b2c40dd64995c35c4ab1c08f94c1c3d4`). Release tags are
 still created and pushed manually. A non-nightly tag is accepted when its
 commit belongs to the selected branch when the controller validates it. This
 keeps a tag request replayable after the branch advances. The request cannot
@@ -579,9 +579,51 @@ For the active release lines:
 - Backport later 0.2 fixes through PRs into `v0.2.x`, and create canonical
   `v0.2.*` tags only from commits in that branch. Do not merge 0.3-era `main`
   back into the maintenance branch.
-- Develop 0.3 on `main` and create canonical `v0.3.*` tags from its commits.
+- Backport later 0.3 fixes through PRs into `v0.3.x`, and create canonical
+  `v0.3.*` tags only from commits in that branch. Do not merge 0.4-era `main`
+  back into the maintenance branch.
+- Develop 0.4 on `main` and create canonical `v0.4.*` tags from its commits.
+- Keep both `refs/heads/main` and `refs/heads/v0.3.x` in the 0.3 line's
+  `trusted_source_refs` so releases through v0.3.2 remain verifiable.
 - Keep both `refs/heads/main` and `refs/heads/v0.2.x` in the 0.2 line's
   `trusted_source_refs` so releases built before the handoff remain verifiable.
+
+### Maintaining v0.3
+
+`v0.3.x` remains active for patch releases. Backport fixes through reviewed PRs,
+then create and push annotated tags such as `v0.3.3` from the maintenance branch.
+The existing tag request workflow invokes the controller on `main`; no workflow
+copy or release-policy backport is required.
+
+Stable `v0.3.*` tags automatically select the dedicated `v0-3` channel from
+`scripts/release/channels.json`, including before v0.4.0 ships. This channel has
+its own monotonic promotion journal and permanently retained release artifacts.
+It publishes regular GitHub Releases with Latest explicitly disabled, versioned
+container tags plus the `v0-3` alias, CLI npm versions with dist-tag `v0-3`, and
+the R2 metadata pointer `antfly/v0-3/metadata.json`. Embedded npm publication uses
+the same series dist-tag. Existing embedded PyPI/Cargo publication behavior is
+preserved; CLI PyPI publication remains paused.
+
+Maintenance releases do not change global `latest` aliases, the default
+installer bootstrap, or the unversioned Homebrew formula. Default installs stay
+on v0.3.2 until the next global stable release. Install a maintenance version
+explicitly with the installer (for example, `sh install.sh v0.3.3`), use
+`@antfly/cli@v0-3` with npm, or select the `v0-3` container tag. Existing v0.3
+releases retain their recorded `stable` or `next` channel during recovery; pass
+that recorded channel explicitly when recovering a release from before the handoff.
+Maintenance prereleases such as `v0.3.3-rc.1` automatically select `v0-3-next`,
+with a separate promotion journal, container alias and R2 metadata pointer.
+They publish GitHub prereleases and follow the existing prerelease policy of no
+npm/PyPI publication. Global `next` remains available for v0.4 prereleases;
+advancing it cannot block v0.3 release candidates. Maintenance prereleases use
+the same retention grace period after their matching stable release as global
+prereleases.
+
+Protect `v0.3.x` with the same review requirements and app-bound checks as
+`main`: `PR CI` and `Apache license boundary`, an up-to-date branch, one review,
+code-owner review, dismissal of stale approvals, approval of the latest push,
+and resolved conversations. Disable force pushes and branch deletion. These
+settings are applied in GitHub, independently of this PR's versioned policy.
 
 When `main` begins a later minor line, first create that outgoing line's
 maintenance branch at its intended final shared commit. Then, in a reviewed

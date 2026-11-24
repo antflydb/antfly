@@ -54,6 +54,8 @@ const HeaderDefaults = struct {
 };
 
 const FrameHeader = struct {
+    number: u64,
+    variable_block_size: bool,
     block_size: u16,
     sample_rate: u32,
     bits_per_sample: u8,
@@ -101,6 +103,23 @@ pub fn visitInterleaved(allocator: std.mem.Allocator, bytes: []const u8, sink: @
     var decoded = try decodeTo(allocator, bytes, sink);
     defer decoded.deinit();
 }
+/// WebM stores complete frame runs in borrowed packets. Use the same frame
+/// decoder as a native stream without copying the coded track into one buffer.
+pub fn visitPackets(allocator: std.mem.Allocator, codec_private: []const u8, packets: []const []const u8, sink: @import("pcm_sink.zig").Sink) !void {
+    const parsed = try parseStream(codec_private);
+    if (parsed.data_offset != codec_private.len) return error.UnsupportedAudioFormat;
+    for (packets) |packet| {
+        var cursor: usize = 0;
+        while (cursor < packet.len) {
+            try @import("work_control.zig").check();
+            var frame = try decodeFrameAlloc(allocator, parsed.stream_info, packet[cursor..]);
+            defer frame.deinit();
+            try sink.push(frame.samples, frame.sample_rate, frame.channels);
+            cursor += frame.consumed;
+        }
+    }
+}
+
 fn decodeTo(allocator: std.mem.Allocator, bytes: []const u8, sink: ?@import("pcm_sink.zig").Sink) !DecodedInterleaved {
     const parsed = try parseStream(bytes);
     var cursor = parsed.data_offset;
@@ -253,7 +272,7 @@ pub fn parseStreamInfoBlock(payload: []const u8) !StreamInfo {
     const channels = @as(u8, @intCast(((packed_info >> 41) & 0x7) + 1));
     const bits_per_sample = @as(u8, @intCast(((packed_info >> 36) & 0x1f) + 1));
     const total_samples = packed_info & 0x0f_ffff_ffff;
-    if (channels == 0 or channels > 8) return error.UnsupportedAudioFormat;
+    if (sample_rate == 0 or channels == 0 or channels > 8) return error.UnsupportedAudioFormat;
     if (bits_per_sample < 4 or bits_per_sample > 32) return error.UnsupportedAudioFormat;
 
     return .{
@@ -269,14 +288,47 @@ pub fn parseStreamInfoBlock(payload: []const u8) !StreamInfo {
     };
 }
 
-pub fn decodeFrameAlloc(allocator: std.mem.Allocator, stream_info: StreamInfo, bytes: []const u8) !FrameDecoded {
+/// Frame coordinates from a CRC-validated native header.
+pub fn frameStart(info: StreamInfo, bytes: []const u8) !u64 {
     var reader = BitReader.init(bytes);
-    const header = try parseFrameHeader(&reader, stream_info);
+    const header = parseFrameHeader(&reader, info) catch |err| return if (err == error.IncompleteFlacFrame) error.UnsupportedAudioFormat else err;
+    const size = reader.bit_offset / 8;
+    if (size >= bytes.len or crc8(bytes[0..size]) != bytes[size]) return error.UnsupportedAudioFormat;
+    if (header.variable_block_size) return header.number;
+    if (info.max_block_size == 0) return error.UnsupportedAudioFormat;
+    return std.math.mul(u64, header.number, info.max_block_size);
+}
+
+pub fn decodeFrameAlloc(allocator: std.mem.Allocator, stream_info: StreamInfo, bytes: []const u8) !FrameDecoded {
+    return decodeFramePrefixAlloc(allocator, stream_info, bytes) catch |err| return if (err == error.IncompleteFlacFrame) error.UnsupportedAudioFormat else err;
+}
+
+/// Decodes one frame from a possibly partial prefix. Only exhaustion of the
+/// input is retryable; syntax and CRC failures are definitive.
+pub fn decodeFramePrefixAlloc(allocator: std.mem.Allocator, stream_info: StreamInfo, bytes: []const u8) !FrameDecoded {
+    var reader = BitReader.init(bytes);
+    return decodeFrameReader(allocator, stream_info, &reader);
+}
+
+pub const FrameInput = struct {
+    context: *anyopaque,
+    /// Return a stable view of the frame prefix through at least end bytes.
+    /// The decoder retains no slices across calls.
+    refill: *const fn (*anyopaque, usize) anyerror![]const u8,
+};
+
+pub fn decodeFrameRefillAlloc(allocator: std.mem.Allocator, stream_info: StreamInfo, prefix: []const u8, input: FrameInput) !FrameDecoded {
+    var reader = BitReader{ .bytes = prefix, .input = input };
+    return decodeFrameReader(allocator, stream_info, &reader);
+}
+
+fn decodeFrameReader(allocator: std.mem.Allocator, stream_info: StreamInfo, reader: *BitReader) !FrameDecoded {
+    const header = try parseFrameHeader(reader, stream_info);
 
     const header_without_crc_len = reader.bit_offset / 8;
-    if (header_without_crc_len >= bytes.len) return error.UnsupportedAudioFormat;
-    const expected_header_crc = bytes[header_without_crc_len];
-    const actual_header_crc = crc8(bytes[0..header_without_crc_len]);
+    try reader.ensureBytes(header_without_crc_len + 1);
+    const expected_header_crc = reader.bytes[header_without_crc_len];
+    const actual_header_crc = crc8(reader.bytes[0..header_without_crc_len]);
     if (expected_header_crc != actual_header_crc) return error.UnsupportedAudioFormat;
     try reader.skipBits(8);
 
@@ -289,7 +341,7 @@ pub fn decodeFrameAlloc(allocator: std.mem.Allocator, stream_info: StreamInfo, b
     for (decoded_channels, 0..) |*channel, index| {
         channel.* = try decodeSubframeAlloc(
             allocator,
-            &reader,
+            reader,
             header.block_size,
             subframeBitsPerSample(header.channel_assignment, header.bits_per_sample, @intCast(index)),
         );
@@ -298,9 +350,9 @@ pub fn decodeFrameAlloc(allocator: std.mem.Allocator, stream_info: StreamInfo, b
 
     try reader.alignToByteAndValidateZero();
     const footer_offset = reader.bit_offset / 8;
-    if (footer_offset + 2 > bytes.len) return error.UnsupportedAudioFormat;
-    const expected_footer_crc = readU16(bytes[footer_offset .. footer_offset + 2]);
-    const actual_footer_crc = crc16(bytes[0..footer_offset]);
+    try reader.ensureBytes(footer_offset + 2);
+    const expected_footer_crc = readU16(reader.bytes[footer_offset .. footer_offset + 2]);
+    const actual_footer_crc = crc16(reader.bytes[0..footer_offset]);
     if (expected_footer_crc != actual_footer_crc) return error.UnsupportedAudioFormat;
 
     const out_channels = encoded_channels;
@@ -381,7 +433,7 @@ fn parseFrameHeaderWithDefaults(reader: *BitReader, defaults: HeaderDefaults) !F
     const bits_code = try reader.readBits(u8, 3);
     if ((try reader.readBits(u1, 1)) != 0) return error.UnsupportedAudioFormat;
 
-    _ = try readUtf8Integer(reader);
+    const number = try readUtf8Integer(reader);
 
     const block_size = try resolveBlockSize(reader, block_size_code, defaults.max_block_size);
     const sample_rate = try resolveSampleRate(reader, sample_rate_code, defaults.sample_rate);
@@ -402,6 +454,8 @@ fn parseFrameHeaderWithDefaults(reader: *BitReader, defaults: HeaderDefaults) !F
     }
 
     return .{
+        .number = number,
+        .variable_block_size = blocking_strategy != 0,
         .block_size = block_size,
         .sample_rate = sample_rate,
         .bits_per_sample = bits_per_sample,
@@ -724,13 +778,28 @@ fn crc16(bytes: []const u8) u16 {
 const BitReader = struct {
     bytes: []const u8,
     bit_offset: usize = 0,
+    input: ?FrameInput = null,
 
     fn init(bytes: []const u8) BitReader {
         return .{ .bytes = bytes };
     }
 
+    fn ensureBytes(self: *BitReader, end: usize) !void {
+        if (end <= self.bytes.len) return;
+        const input = self.input orelse return error.IncompleteFlacFrame;
+        self.bytes = try input.refill(input.context, end);
+        if (self.bytes.len < end) return error.IncompleteFlacFrame;
+    }
+
+    inline fn ensureBits(self: *BitReader, count: usize) !void {
+        if (count <= self.bytes.len * 8 -| self.bit_offset) return;
+        const stop = try std.math.add(usize, self.bit_offset, count);
+        try self.ensureBytes(stop / 8 + @intFromBool(stop % 8 != 0));
+    }
+
     fn readBits(self: *BitReader, comptime T: type, count: usize) !T {
-        if (count > @bitSizeOf(T) or self.bit_offset + count > self.bytes.len * 8) return error.UnsupportedAudioFormat;
+        if (count > @bitSizeOf(T)) return error.UnsupportedAudioFormat;
+        try self.ensureBits(count);
         var value: u64 = 0;
         for (0..count) |_| {
             const byte = self.bytes[self.bit_offset / 8];
@@ -748,7 +817,7 @@ const BitReader = struct {
     }
 
     fn skipBits(self: *BitReader, count: usize) !void {
-        if (self.bit_offset + count > self.bytes.len * 8) return error.UnsupportedAudioFormat;
+        try self.ensureBits(count);
         self.bit_offset += count;
     }
 
@@ -764,6 +833,52 @@ const BitReader = struct {
 fn signExtend(raw: u64, bit_count: usize) i64 {
     const shift = 64 - bit_count;
     return @as(i64, @bitCast(raw << @intCast(shift))) >> @intCast(shift);
+}
+
+test "FLAC STREAMINFO rejects a missing sample rate" {
+    var info: [34]u8 = @splat(0);
+    std.mem.writeInt(u64, info[10..18], (@as(u64, 15) << 36) | 1, .big);
+    try std.testing.expectError(error.UnsupportedAudioFormat, parseStreamInfoBlock(&info));
+}
+
+test "FLAC frame probes separate incomplete input from definitive corruption" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../testdata/codec-corpus/tone-stereo.flac");
+    const parsed = try parseStream(bytes);
+    const coded = bytes[parsed.data_offset..];
+    var frame = try decodeFrameAlloc(a, parsed.stream_info, coded);
+    defer frame.deinit();
+    try std.testing.expectError(error.IncompleteFlacFrame, decodeFramePrefixAlloc(a, parsed.stream_info, coded[0 .. frame.consumed - 1]));
+    const corrupt = try a.dupe(u8, coded[0..frame.consumed]);
+    defer a.free(corrupt);
+    corrupt[corrupt.len - 1] ^= 1;
+    try std.testing.expectError(error.UnsupportedAudioFormat, decodeFramePrefixAlloc(a, parsed.stream_info, corrupt));
+}
+
+test "FLAC refill resumes decoding without reallocating subframes" {
+    const bytes = @embedFile("../testdata/codec-corpus/tone-stereo.flac");
+    const parsed = try parseStream(bytes);
+    const coded = bytes[parsed.data_offset..];
+    const Input = struct {
+        coded: []const u8,
+        calls: usize = 0,
+        fn refill(raw: *anyopaque, required: usize) ![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return self.coded[0..@min(self.coded.len, required + 7)];
+        }
+    };
+    var one_shot = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var expected = try decodeFrameAlloc(one_shot.allocator(), parsed.stream_info, coded);
+    defer expected.deinit();
+    var chunked = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var input = Input{ .coded = coded[0..expected.consumed] };
+    var actual = try decodeFrameRefillAlloc(chunked.allocator(), parsed.stream_info, &.{}, .{ .context = &input, .refill = Input.refill });
+    defer actual.deinit();
+    try std.testing.expect(input.calls > 1);
+    try std.testing.expectEqual(expected.consumed, actual.consumed);
+    try std.testing.expectEqual(one_shot.alloc_index, chunked.alloc_index);
+    try std.testing.expectEqualSlices(f32, expected.samples, actual.samples);
 }
 
 test "parse checked-in flac streaminfo" {

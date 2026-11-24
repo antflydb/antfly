@@ -23,6 +23,9 @@ const protocol = @import("topology_protocol.zig");
 const r = @import("antfly_local_sources").system_catalog_relation_reconciliation;
 const incarnation = @import("antfly_local_sources").metadata_incarnation;
 
+pub const Mode = enum { background, startup };
+pub const Outcome = enum { applied, scanning, idle, published };
+
 pub const Coordinator = struct {
     next_round_at_ns: u64 = 0,
     prefer_gc: bool = false,
@@ -30,13 +33,20 @@ pub const Coordinator = struct {
     /// Caller serializes this lane with catalog mutations and excludes HA
     /// owners. One durable intent at most per round; scans are bounded by the
     /// storage owner and every apply rechecks the observed source/root cut.
-    /// true means exactly one control intent was successfully applied.
-    pub fn step(self: *Coordinator, store: anytype, alloc: std.mem.Allocator, group: u64, identity: incarnation.MetadataClusterIncarnation, node_id: u64, now_ns: u64) !bool {
-        if (now_ns < self.next_round_at_ns) return false;
-        self.next_round_at_ns = now_ns +| worker.round_interval_ns;
+    pub fn step(self: *Coordinator, store: anytype, alloc: std.mem.Allocator, group: u64, identity: incarnation.MetadataClusterIncarnation, node_id: u64, now_ns: u64, mode: Mode) !Outcome {
+        if (mode == .background) {
+            if (now_ns < self.next_round_at_ns) return .idle;
+            self.next_round_at_ns = now_ns +| worker.round_interval_ns;
+        }
         try store.expireRelationPublicationProofs(now_ns);
         const activation: protocol.Activation = .{
-            .version = protocol.relation_mutation_version,
+            // Standalone has one binary and one metadata/data membership.
+            // Advertise its current decoder cohort, not the original relation
+            // mutation floor: later view, role-default and sequence records
+            // must not rely on a synthetic test-only activation. Feature
+            // readiness, publication/owner ACKs and SQL ingress capabilities
+            // remain separate gates. HA is excluded by the caller.
+            .version = protocol.current_version,
             .incarnation = identity,
             .member_count = 1,
             .membership_fingerprint = @import("reallocation_request.zig").membershipFingerprint(&.{node_id}),
@@ -46,34 +56,47 @@ pub const Coordinator = struct {
             const bytes = try std.json.Stringify.valueAlloc(alloc, activation, .{});
             defer alloc.free(bytes);
             try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = bytes });
-            return true;
+            return .applied;
         }
         const work = try store.relationReconciliationWork(group);
+        if (mode == .startup) {
+            if (work.epoch) |epoch| {
+                if (work.published_epoch) |published| if (work.root != null and published.eql(epoch)) return .published;
+                if (work.current) |state| if (state.epoch.eql(epoch)) switch (state.failure) {
+                    .none => {},
+                    .name_conflict => return error.CatalogAlreadyExists,
+                    .source_limit => return error.CatalogCommandTooLarge,
+                };
+            }
+        }
         const command: control.Command = blk: {
-            if (work.epoch == null) {
-                var adoption = activation;
-                adoption.version = protocol.relation_reconciliation_version;
-                break :blk .{ .adopt = adoption };
+            // Share the replicated worker's generation-building migration.
+            // A relation-only seal is not proof of constraint-name coverage.
+            var occupancy = activation;
+            occupancy.version = protocol.constraint_occupancy_version;
+            if (try worker.coverageMigration(work, group, occupancy)) |migration| {
+                try store.cancelRelationPublicationProof(group);
+                break :blk migration;
             }
             if (!(self.prefer_gc and work.garbage != null)) {
                 if (work.current) |state| {
                     if (state.epoch.eql(work.epoch.?) and state.phase == .ready and state.failure == .none and
                         (work.root == null or !work.root.?.eql(r.Generation.of(&state))))
                     {
-                        const proof = (try store.stepRelationPublicationProof(state, now_ns)) orelse return false;
+                        const proof = (try store.stepRelationPublicationProof(state, now_ns)) orelse return .scanning;
                         var publication_activation = activation;
-                        publication_activation.version = protocol.relation_publication_version;
+                        publication_activation.version = control.publicationVersion(proof.state.coverage);
                         break :blk .{ .publish = .{ .state = proof.state, .prior = proof.root, .activation = publication_activation } };
                     }
                 }
             }
             try store.cancelRelationPublicationProof(group);
-            break :blk (try worker.nextIntent(work, group, self.prefer_gc)) orelse return false;
+            break :blk (try worker.nextIntent(work, group, self.prefer_gc)) orelse return .idle;
         };
         const bytes = try command.encodeAlloc(alloc);
         defer alloc.free(bytes);
         try store.applyStandaloneCommand(group, .{ .apply_relation_reconciliation = bytes });
         self.prefer_gc = command != .garbage;
-        return true;
+        return .applied;
     }
 };

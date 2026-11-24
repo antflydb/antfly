@@ -23,10 +23,26 @@ pub const Command = union(enum) {
     prepare: struct { name: []const u8, types: []const Type, descriptors: []const @import("backend.zig").Parameter, statement: []const u8 },
     execute: struct { name: []const u8, expressions: []const []const u8 },
     deallocate: ?[]const u8,
-    declare_cursor: struct { name: []const u8, statement: []const u8, scroll: bool = false, hold: bool = false },
+    declare_cursor: struct { name: []const u8, statement: []const u8, scroll: bool = false, hold: bool = false, binary: bool = false },
     fetch_cursor: Fetch,
     close_cursor: ?[]const u8,
 };
+
+pub fn isCopy(input: []const u8) bool {
+    var parser: Parser = .{ .alloc = undefined, .input = input };
+    return std.ascii.eqlIgnoreCase(parser.word() catch return false, "copy");
+}
+
+pub fn isPrepareTransaction(input: []const u8) bool {
+    var parser: Parser = .{ .alloc = undefined, .input = input };
+    const verb = parser.word() catch return false;
+    if (!std.ascii.eqlIgnoreCase(verb, "prepare")) return false;
+    if (!std.ascii.eqlIgnoreCase(parser.word() catch return false, "transaction")) return false;
+    // TRANSACTION is also an unreserved prepared-statement name. An argument
+    // list or AS belongs to ordinary PREPARE; a GID goes to native SQL.
+    if (parser.take('(') catch return true) return false;
+    return !std.ascii.eqlIgnoreCase(parser.word() catch return true, "as");
+}
 
 pub fn isCommit(input: []const u8) bool {
     var parser: Parser = .{ .alloc = undefined, .input = input };
@@ -94,13 +110,62 @@ pub const Setting = union(enum) {
     application_name: ApplicationNameSetting,
     client_encoding: EncodingSetting,
     catalog: CatalogSetting,
+    wal_level,
+    transaction_snapshot: []const u8,
+    transaction_options: @import("backend.zig").TransactionOptions,
     reset_all,
     discard_all,
+    discard_sequences,
 };
+
+fn transactionSnapshot(alloc: std.mem.Allocator, input: []const u8) !?[]const u8 {
+    var p: Parser = .{ .alloc = alloc, .input = input };
+    for ([_][]const u8{ "set", "transaction", "snapshot" }) |keyword| {
+        if (!std.ascii.eqlIgnoreCase(p.word() catch return null, keyword)) return null;
+    }
+    const name = try p.quoted('\'');
+    errdefer alloc.free(name);
+    try p.finish();
+    if (name.len == 0 or name.len > 256 or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidParameter;
+    return name;
+}
+
+fn transactionOptions(alloc: std.mem.Allocator, input: []const u8) !?@import("backend.zig").TransactionOptions {
+    var p: Parser = .{ .alloc = alloc, .input = input };
+    for ([_][]const u8{ "set", "transaction" }) |keyword| {
+        if (!std.ascii.eqlIgnoreCase(p.word() catch return null, keyword)) return null;
+    }
+    var options: @import("backend.zig").TransactionOptions = .{};
+    while (true) {
+        const word = try p.word();
+        if (std.ascii.eqlIgnoreCase(word, "isolation")) {
+            if (options.isolation != null or !std.ascii.eqlIgnoreCase(try p.word(), "level")) return error.InvalidSqlSyntax;
+            const level = try p.word();
+            if (std.ascii.eqlIgnoreCase(level, "serializable")) {
+                options.isolation = .serializable;
+            } else if (std.ascii.eqlIgnoreCase(level, "repeatable") and std.ascii.eqlIgnoreCase(try p.word(), "read")) {
+                options.isolation = .repeatable_read;
+            } else if (std.ascii.eqlIgnoreCase(level, "read")) {
+                const visibility = try p.word();
+                if (!std.ascii.eqlIgnoreCase(visibility, "committed") and !std.ascii.eqlIgnoreCase(visibility, "uncommitted")) return error.InvalidSqlSyntax;
+                options.isolation = .read_committed;
+            } else return error.InvalidSqlSyntax;
+        } else if (std.ascii.eqlIgnoreCase(word, "read")) {
+            if (options.mode != null) return error.InvalidSqlSyntax;
+            const mode = try p.word();
+            options.mode = if (std.ascii.eqlIgnoreCase(mode, "only")) .read_only else if (std.ascii.eqlIgnoreCase(mode, "write")) .read_write else return error.InvalidSqlSyntax;
+        } else return error.UnsupportedSqlShape;
+        if (!try p.take(',')) break;
+    }
+    try p.finish();
+    return options;
+}
 
 /// The protocol uses one classifier for Describe, Execute, and both streaming
 /// paths. A locally owned setting must never be sent to the SQL read provider.
 pub fn settingCommand(alloc: std.mem.Allocator, input: []const u8) !?Setting {
+    if (try transactionSnapshot(alloc, input)) |name| return .{ .transaction_snapshot = name };
+    if (try transactionOptions(alloc, input)) |options| return .{ .transaction_options = options };
     if (try readRequirementsSetting(alloc, input)) |value| return .{ .read_requirements = value };
     if (try visibilitySetting(alloc, input, "antfly.read_visibility")) |value| return .{ .read_visibility = value };
     if (try lakeVisibilitySetting(alloc, input)) |value| return .{ .lake_visibility = value };
@@ -110,6 +175,13 @@ pub fn settingCommand(alloc: std.mem.Allocator, input: []const u8) !?Setting {
     if (try applicationNameSetting(alloc, input)) |value| return .{ .application_name = value };
     if (try encodingSetting(alloc, input)) |value| return .{ .client_encoding = value };
     var p: Parser = .{ .alloc = alloc, .input = input };
+    if (std.ascii.eqlIgnoreCase(p.word() catch return null, "show")) {
+        if (std.ascii.eqlIgnoreCase(p.word() catch return null, "wal_level")) {
+            try p.finish();
+            return .wal_level;
+        }
+    }
+    p.pos = 0;
     if (std.ascii.eqlIgnoreCase(p.word() catch return null, "reset")) {
         if (std.ascii.eqlIgnoreCase(p.word() catch return null, "all")) {
             try p.finish();
@@ -118,7 +190,12 @@ pub fn settingCommand(alloc: std.mem.Allocator, input: []const u8) !?Setting {
     }
     p.pos = 0;
     if (std.ascii.eqlIgnoreCase(p.word() catch return null, "discard")) {
-        if (std.ascii.eqlIgnoreCase(p.word() catch return null, "all")) {
+        const what = p.word() catch return null;
+        if (std.ascii.eqlIgnoreCase(what, "sequences")) {
+            try p.finish();
+            return .discard_sequences;
+        }
+        if (std.ascii.eqlIgnoreCase(what, "all")) {
             try p.finish();
             return .discard_all;
         }
@@ -392,6 +469,13 @@ fn timeoutValue(p: *Parser) !u32 {
     return std.math.mul(u32, @intCast(value), multiplier) catch error.InvalidParameter;
 }
 
+pub fn parseTimeoutText(alloc: std.mem.Allocator, input: []const u8) !u32 {
+    var parser: Parser = .{ .alloc = alloc, .input = input };
+    const value = try timeoutValue(&parser);
+    try parser.finish();
+    return value;
+}
+
 test "pgwire timeout syntax is bounded and does not consume native constraint settings" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -619,6 +703,7 @@ pub fn parse(alloc: std.mem.Allocator, input: []const u8, max_parameters: usize)
     var p: Parser = .{ .alloc = alloc, .input = input };
     const verb = p.word() catch return null;
     if (std.ascii.eqlIgnoreCase(verb, "prepare")) {
+        if (isPrepareTransaction(input)) return null;
         const name = try p.name();
         var types: std.ArrayList(Type) = .empty;
         var descriptors: std.ArrayList(@import("backend.zig").Parameter) = .empty;
@@ -684,12 +769,30 @@ pub fn parse(alloc: std.mem.Allocator, input: []const u8, max_parameters: usize)
         const name = try p.name();
         try p.space();
         if (p.pos == input.len or input[p.pos] == ';') return error.InvalidSqlSyntax;
-        const modifier = try p.word();
-        const scroll = std.ascii.eqlIgnoreCase(modifier, "scroll");
-        if (std.ascii.eqlIgnoreCase(modifier, "no")) {
-            if (!std.ascii.eqlIgnoreCase(try p.word(), "scroll")) return error.InvalidSqlSyntax;
-        } else if (!scroll and !std.ascii.eqlIgnoreCase(modifier, "cursor")) return error.InvalidSqlSyntax;
-        if ((scroll or std.ascii.eqlIgnoreCase(modifier, "no")) and !std.ascii.eqlIgnoreCase(try p.word(), "cursor")) return error.InvalidSqlSyntax;
+        // PostgreSQL permits these options in any order. Keep the complete
+        // declaration intent; formatting is selected at FETCH, never baked
+        // into the typed cursor spool.
+        var binary = false;
+        var sensitivity: ?bool = null;
+        var scroll = false;
+        var scroll_seen = false;
+        while (true) {
+            const modifier = try p.word();
+            if (std.ascii.eqlIgnoreCase(modifier, "cursor")) break;
+            if (std.ascii.eqlIgnoreCase(modifier, "binary")) {
+                binary = true;
+            } else if (std.ascii.eqlIgnoreCase(modifier, "asensitive") or std.ascii.eqlIgnoreCase(modifier, "insensitive")) {
+                const asensitive = std.ascii.eqlIgnoreCase(modifier, "asensitive");
+                if (sensitivity) |previous| if (previous != asensitive) return error.InvalidCursorDefinition;
+                sensitivity = asensitive;
+            } else if (std.ascii.eqlIgnoreCase(modifier, "scroll") or std.ascii.eqlIgnoreCase(modifier, "no")) {
+                const next = std.ascii.eqlIgnoreCase(modifier, "scroll");
+                if (scroll_seen and scroll != next) return error.InvalidCursorDefinition;
+                scroll_seen = true;
+                scroll = next;
+                if (!scroll and !std.ascii.eqlIgnoreCase(try p.word(), "scroll")) return error.InvalidSqlSyntax;
+            } else return error.InvalidSqlSyntax;
+        }
         var following = try p.word();
         var hold = false;
         if (std.ascii.eqlIgnoreCase(following, "with") or std.ascii.eqlIgnoreCase(following, "without")) {
@@ -704,7 +807,7 @@ pub fn parse(alloc: std.mem.Allocator, input: []const u8, max_parameters: usize)
         if (p.pos == input.len) return error.InvalidSqlSyntax;
         const statement = std.mem.trim(u8, input[p.pos..], " \r\n\t;");
         if (statement.len == 0) return error.InvalidSqlSyntax;
-        return .{ .declare_cursor = .{ .name = name, .statement = statement, .scroll = scroll, .hold = hold } };
+        return .{ .declare_cursor = .{ .name = name, .statement = statement, .scroll = scroll, .hold = hold, .binary = binary } };
     }
     if (std.ascii.eqlIgnoreCase(verb, "fetch") or std.ascii.eqlIgnoreCase(verb, "move")) {
         var fetch: Fetch = .{ .name = "", .move = std.ascii.eqlIgnoreCase(verb, "move") };
@@ -949,4 +1052,65 @@ test "pgwire canonical read settings parse receipts and reject unsupported visib
     try std.testing.expectError(error.UnsupportedReadVisibility, settingCommand(a, "SET antfly.read_requirements = '{\"visibility\":\"published\"}'"));
     try std.testing.expectError(error.InvalidReadRequirements, settingCommand(a, "SET antfly.read_requirements = '{\"wait_ms\":60001}'"));
     try std.testing.expectError(error.InvalidParameter, settingCommand(a, "SET antfly.read_requirements = '{\"through\":{}}'"));
+}
+
+test "pgwire cursor declaration options retain binary identity in every PostgreSQL order" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "BINARY SCROLL",             "SCROLL BINARY",                         "BINARY INSENSITIVE SCROLL",
+        "INSENSITIVE SCROLL BINARY", "SCROLL BINARY ASENSITIVE",              "ASENSITIVE BINARY SCROLL",
+        "BINARY BINARY SCROLL",      "INSENSITIVE INSENSITIVE BINARY SCROLL", "SCROLL SCROLL BINARY",
+    }) |options| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const sql = try std.fmt.allocPrint(arena.allocator(), "DECLARE c {s} CURSOR WITH HOLD FOR SELECT 1", .{options});
+        const declaration = (try parse(arena.allocator(), sql, 0)).?.declare_cursor;
+        try std.testing.expect(declaration.binary and declaration.scroll and declaration.hold);
+        try std.testing.expectEqualStrings("SELECT 1", declaration.statement);
+    }
+    for ([_][]const u8{ "SCROLL NO SCROLL", "NO SCROLL SCROLL", "ASENSITIVE INSENSITIVE" }) |options| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const sql = try std.fmt.allocPrint(arena.allocator(), "DECLARE c {s} CURSOR FOR SELECT 1", .{options});
+        try std.testing.expectError(error.InvalidCursorDefinition, parse(arena.allocator(), sql, 0));
+    }
+    for ([_][]const u8{ "NO BINARY", "BINARY CURSOR SCROLL" }) |options| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const sql = try std.fmt.allocPrint(arena.allocator(), "DECLARE c {s} CURSOR FOR SELECT 1", .{options});
+        try std.testing.expectError(error.InvalidSqlSyntax, parse(arena.allocator(), sql, 0));
+    }
+}
+
+test "pgwire transaction preparation delegates to native SQL without shadowing prepared statement names" {
+    const a = std.testing.allocator;
+    try std.testing.expect(isPrepareTransaction("PREPARE /* before GID */ TRANSACTION 'gid'"));
+    try std.testing.expect(!isPrepareTransaction("PREPARE \"TRANSACTION\" AS SELECT 1"));
+    try std.testing.expect((try parse(a, "PREPARE TRANSACTION 'gid'", 16)) == null);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const named = (try parse(arena.allocator(), "PREPARE \"TRANSACTION\" AS SELECT 1", 16)).?;
+    try std.testing.expectEqualStrings("TRANSACTION", named.prepare.name);
+    for ([_][]const u8{ "PREPARE TRANSACTION AS SELECT 1", "PREPARE TRANSACTION /* types */ (integer) AS SELECT $1" }, 0..) |sql, parameters| {
+        try std.testing.expect(!isPrepareTransaction(sql));
+        const unquoted = (try parse(arena.allocator(), sql, 16)).?;
+        try std.testing.expectEqualStrings("transaction", unquoted.prepare.name);
+        try std.testing.expectEqual(parameters, unquoted.prepare.types.len);
+    }
+}
+
+test "pgwire transaction snapshot setting accepts one quoted name and rejects trailing SQL" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const command = (try settingCommand(a, "SET TRANSACTION SNAPSHOT 'abcd-1';")).?;
+    try std.testing.expectEqualStrings("abcd-1", command.transaction_snapshot);
+    try std.testing.expectError(error.InvalidSqlSyntax, settingCommand(a, "SET TRANSACTION SNAPSHOT 'abcd-1'; SELECT 1"));
+    try std.testing.expectError(error.InvalidSqlSyntax, settingCommand(a, "SET TRANSACTION SNAPSHOT abcd"));
+    try std.testing.expectError(error.InvalidParameter, settingCommand(a, "SET TRANSACTION SNAPSHOT ''"));
+    const options = (try settingCommand(a, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;")).?.transaction_options;
+    try std.testing.expect(options.isolation == .repeatable_read);
+    try std.testing.expect(options.mode == .read_only);
+    try std.testing.expectError(error.InvalidSqlSyntax, settingCommand(a, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; SELECT 1"));
+    try std.testing.expectError(error.InvalidSqlSyntax, settingCommand(a, "SET TRANSACTION READ ONLY, READ WRITE"));
 }

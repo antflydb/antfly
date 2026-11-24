@@ -28,6 +28,19 @@ const ProofKey = struct {
     index: ?tracking.IndexSpan,
 };
 
+pub const ProofMap = std.AutoHashMapUnmanaged(ProofKey, ?u64);
+
+/// Returns true only for the first observation of this bucket or index span.
+pub fn observe(proofs: *ProofMap, alloc: std.mem.Allocator, proof: Proof) !bool {
+    const slot = try proofs.getOrPut(alloc, .{ .bucket = proof.bucket, .index = proof.index });
+    if (slot.found_existing) {
+        if (slot.value_ptr.* != proof.generation) return error.SqlWriteConflict;
+        return false;
+    }
+    slot.value_ptr.* = proof.generation;
+    return true;
+}
+
 pub const Owned = struct {
     arena: std.heap.ArenaAllocator,
     value: []const OwnerRangeProof,
@@ -37,7 +50,7 @@ pub const Owned = struct {
     }
 };
 
-fn sameOwner(a: metadata.CatalogRouteFence, b: metadata.CatalogRouteFence) bool {
+pub fn sameOwner(a: metadata.CatalogRouteFence, b: metadata.CatalogRouteFence) bool {
     return a.protocol == b.protocol and a.metadata_group_id == b.metadata_group_id and
         std.meta.eql(a.metadata_incarnation, b.metadata_incarnation) and
         a.table_id == b.table_id and a.topology_epoch == b.topology_epoch and std.meta.eql(a.route, b.route);
@@ -64,7 +77,7 @@ pub fn merge(alloc: std.mem.Allocator, previous: []const OwnerRangeProof, incomi
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
     const owned = arena.allocator();
-    const Entry = struct { fence: metadata.CatalogRouteFence, proofs: std.AutoHashMapUnmanaged(ProofKey, ?u64) = .empty };
+    const Entry = struct { fence: metadata.CatalogRouteFence, proofs: ProofMap = .empty };
     var entries: std.ArrayList(Entry) = .empty;
     var owners: std.AutoHashMapUnmanaged(u64, usize) = .empty;
     var count: usize = 0;
@@ -83,13 +96,9 @@ pub fn merge(alloc: std.mem.Allocator, previous: []const OwnerRangeProof, incomi
         if (!sameOwner(entry.fence, owner.fence)) return error.CatalogGenerationChanged;
         entry.fence.catalog_revision = @max(entry.fence.catalog_revision, owner.fence.catalog_revision);
         for (owner.proofs) |proof| {
-            const observed = try entry.proofs.getOrPut(owned, .{ .bucket = proof.bucket, .index = proof.index });
-            if (observed.found_existing) {
-                if (observed.value_ptr.* != proof.generation) return error.SqlWriteConflict;
-            } else {
+            if (try observe(&entry.proofs, owned, proof)) {
                 count += 1;
                 if (count > max_proofs) return error.TransactionTooLarge;
-                observed.value_ptr.* = proof.generation;
             }
         }
     };

@@ -50,7 +50,9 @@ class CreatedEnrichmentConfig:
             ("started_by -> John Andrew Rice"). The sampled block participates in the producer's skip state, so a changed
             adjacency re-runs the producer.
         execution (ExecutionPolicy | Unset): Non-semantic execution policy for one producer or index maintenance
-            operation. These fields tune how work is batched and do not change generated artifact identity.
+            operation. Updates persist separately from the frozen publication catalog and affect future invocations without
+            invalidating accepted artifacts. To retry incomplete extraction or regenerate accepted output, explicitly use
+            the bounded reprocess APIs. Node/provider ceilings still apply.
     """
 
     name: str

@@ -34,6 +34,7 @@ pub const NodeId = node.NodeId;
 pub const null_node = node.null_node;
 pub const OpCode = node.OpCode;
 pub const DebertaTrainingAttentionAttrs = node.DebertaTrainingAttentionAttrs;
+pub const RangeTrainingAttentionAttrs = node.RangeTrainingAttentionAttrs;
 pub const ModernBertTrainingAttentionAttrs = node.ModernBertTrainingAttentionAttrs;
 pub const SegmentTrainingAttentionAttrs = node.SegmentTrainingAttentionAttrs;
 pub const Graph = graph.Graph;

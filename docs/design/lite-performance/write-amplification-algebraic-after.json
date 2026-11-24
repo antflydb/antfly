@@ -1,0 +1,3929 @@
+{
+  "text_bytes": 1024,
+  "dense_dims": 128,
+  "sparse_terms": 32,
+  "primary_only": {
+    "updates": 128,
+    "calling_thread_syncs_per_update": 1.984375,
+    "background_syncs_per_update": 0,
+    "fsyncs_per_write_overall": 1.984375,
+    "durable_commits_per_write": 1,
+    "mean_primary_group_size": 0,
+    "indicative_writes_per_second_debug": 8.150462893760086,
+    "stages": {
+      "primary_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_stage": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_link": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_pin": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "lsm_wal": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "progress": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "status_snapshot": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "replay_retirement": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_cleanup": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_write": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_append": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_rename": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_delete": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_sync": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_finish": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_lease": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "main_txn_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "lsm_backend_wal": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_forward_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_reverse_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_metric_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_artifact": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_txn_begin": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_intent_write": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_intent_resolve": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_coordinator_hint": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_apply": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_bulk_finish": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_hll_maintenance": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_adaptive": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "other": {
+        "sync_calling_thread": 254,
+        "sync_background": 0,
+        "write_calls_calling_thread": 1407,
+        "write_calls_background": 322,
+        "write_bytes_calling_thread": 6795264,
+        "write_bytes_background": 1318912,
+        "commits_calling_thread": 128,
+        "commits_background": 0
+      }
+    },
+    "background_ops": {
+      "source_turn": 0,
+      "maintenance_lease_acquired": 0,
+      "serving_runtime_refresh": 0,
+      "derived_worker_turn": 0
+    }
+  },
+  "primary_only_8_writers": {
+    "updates": 128,
+    "calling_thread_syncs_per_update": 2,
+    "background_syncs_per_update": 0,
+    "fsyncs_per_write_overall": 2,
+    "durable_commits_per_write": 1,
+    "mean_primary_group_size": 0,
+    "indicative_writes_per_second_debug": 7.985244473983993,
+    "stages": {
+      "primary_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_stage": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_link": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_pin": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "lsm_wal": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "progress": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "status_snapshot": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "replay_retirement": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_cleanup": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_write": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_append": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_rename": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_delete": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_sync": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_finish": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_lease": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "main_txn_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "lsm_backend_wal": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_forward_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_reverse_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_metric_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_artifact": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_txn_begin": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_intent_write": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_intent_resolve": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_coordinator_hint": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_apply": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_bulk_finish": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_hll_maintenance": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_adaptive": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "other": {
+        "sync_calling_thread": 256,
+        "sync_background": 0,
+        "write_calls_calling_thread": 1414,
+        "write_calls_background": 324,
+        "write_bytes_calling_thread": 6832128,
+        "write_bytes_background": 1327104,
+        "commits_calling_thread": 128,
+        "commits_background": 0
+      }
+    },
+    "background_ops": {
+      "source_turn": 0,
+      "maintenance_lease_acquired": 0,
+      "serving_runtime_refresh": 0,
+      "derived_worker_turn": 0
+    }
+  },
+  "indexed": {
+    "updates": 128,
+    "calling_thread_syncs_per_update": 2.03125,
+    "background_syncs_per_update": 0,
+    "fsyncs_per_write_overall": 2.03125,
+    "durable_commits_per_write": 1.03125,
+    "mean_primary_group_size": 0,
+    "indicative_writes_per_second_debug": 4.8446949682153,
+    "stages": {
+      "primary_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_stage": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_link": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_pin": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "lsm_wal": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 1,
+        "commits_background": 0
+      },
+      "progress": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "status_snapshot": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "replay_retirement": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_cleanup": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_write": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_append": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_rename": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_delete": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_sync": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_finish": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_lease": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "main_txn_commit": {
+        "sync_calling_thread": 2,
+        "sync_background": 0,
+        "write_calls_calling_thread": 7,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 32768,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 2,
+        "commits_background": 0
+      },
+      "lsm_backend_wal": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_forward_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_reverse_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_metric_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_artifact": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_txn_begin": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_intent_write": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_intent_resolve": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_coordinator_hint": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_apply": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_bulk_finish": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_hll_maintenance": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_adaptive": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "other": {
+        "sync_calling_thread": 258,
+        "sync_background": 0,
+        "write_calls_calling_thread": 1831,
+        "write_calls_background": 394,
+        "write_bytes_calling_thread": 10199040,
+        "write_bytes_background": 1613824,
+        "commits_calling_thread": 129,
+        "commits_background": 0
+      }
+    },
+    "background_ops": {
+      "source_turn": 1,
+      "maintenance_lease_acquired": 0,
+      "serving_runtime_refresh": 0,
+      "derived_worker_turn": 1
+    }
+  },
+  "indexed_8_writers": {
+    "updates": 128,
+    "calling_thread_syncs_per_update": 2.0234375,
+    "background_syncs_per_update": 0,
+    "fsyncs_per_write_overall": 2.0234375,
+    "durable_commits_per_write": 1.03125,
+    "mean_primary_group_size": 0,
+    "indicative_writes_per_second_debug": 4.802562647488732,
+    "stages": {
+      "primary_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_stage": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_link": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_pin": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "lsm_wal": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 1,
+        "commits_background": 0
+      },
+      "progress": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "status_snapshot": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "replay_retirement": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_cleanup": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_write": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_append": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_rename": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_delete": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_sync": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_finish": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_lease": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "main_txn_commit": {
+        "sync_calling_thread": 2,
+        "sync_background": 0,
+        "write_calls_calling_thread": 7,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 32768,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 2,
+        "commits_background": 0
+      },
+      "lsm_backend_wal": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_forward_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_reverse_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_metric_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_artifact": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_txn_begin": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_intent_write": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_intent_resolve": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_coordinator_hint": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_apply": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_bulk_finish": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_hll_maintenance": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_adaptive": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "other": {
+        "sync_calling_thread": 257,
+        "sync_background": 0,
+        "write_calls_calling_thread": 1787,
+        "write_calls_background": 392,
+        "write_bytes_calling_thread": 10309632,
+        "write_bytes_background": 1605632,
+        "commits_calling_thread": 129,
+        "commits_background": 0
+      }
+    },
+    "background_ops": {
+      "source_turn": 1,
+      "maintenance_lease_acquired": 0,
+      "serving_runtime_refresh": 0,
+      "derived_worker_turn": 1
+    }
+  },
+  "graph": {
+    "updates": 128,
+    "calling_thread_syncs_per_update": 2,
+    "background_syncs_per_update": 0,
+    "fsyncs_per_write_overall": 2,
+    "durable_commits_per_write": 1,
+    "mean_primary_group_size": 0,
+    "indicative_writes_per_second_debug": 6.736822796110745,
+    "stages": {
+      "primary_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_stage": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_link": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_pin": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "lsm_wal": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "progress": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "status_snapshot": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "replay_retirement": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_cleanup": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_write": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_append": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_rename": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_delete": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_sync": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_finish": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_lease": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "main_txn_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "lsm_backend_wal": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_forward_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_reverse_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_metric_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_artifact": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_txn_begin": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_intent_write": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_intent_resolve": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_coordinator_hint": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_apply": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_bulk_finish": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_hll_maintenance": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_adaptive": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "other": {
+        "sync_calling_thread": 256,
+        "sync_background": 0,
+        "write_calls_calling_thread": 1528,
+        "write_calls_background": 369,
+        "write_bytes_calling_thread": 7057408,
+        "write_bytes_background": 1511424,
+        "commits_calling_thread": 128,
+        "commits_background": 0
+      }
+    },
+    "background_ops": {
+      "source_turn": 0,
+      "maintenance_lease_acquired": 0,
+      "serving_runtime_refresh": 0,
+      "derived_worker_turn": 0
+    }
+  },
+  "graph_8_writers": {
+    "updates": 128,
+    "calling_thread_syncs_per_update": 2,
+    "background_syncs_per_update": 0,
+    "fsyncs_per_write_overall": 2,
+    "durable_commits_per_write": 1,
+    "mean_primary_group_size": 0,
+    "indicative_writes_per_second_debug": 5.236678066223685,
+    "stages": {
+      "primary_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_stage": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_link": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_pin": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "lsm_wal": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "progress": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "status_snapshot": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "replay_retirement": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_cleanup": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_write": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_append": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_rename": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_delete": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_sync": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_finish": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_lease": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "main_txn_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "lsm_backend_wal": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_forward_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_reverse_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_metric_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_artifact": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_txn_begin": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_intent_write": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_intent_resolve": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_coordinator_hint": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_apply": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_bulk_finish": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_hll_maintenance": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_adaptive": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "other": {
+        "sync_calling_thread": 256,
+        "sync_background": 0,
+        "write_calls_calling_thread": 1737,
+        "write_calls_background": 388,
+        "write_bytes_calling_thread": 9162752,
+        "write_bytes_background": 1589248,
+        "commits_calling_thread": 128,
+        "commits_background": 0
+      }
+    },
+    "background_ops": {
+      "source_turn": 0,
+      "maintenance_lease_acquired": 0,
+      "serving_runtime_refresh": 0,
+      "derived_worker_turn": 0
+    }
+  },
+  "dense_vector": {
+    "updates": 128,
+    "calling_thread_syncs_per_update": 2,
+    "background_syncs_per_update": 0,
+    "fsyncs_per_write_overall": 2,
+    "durable_commits_per_write": 1,
+    "mean_primary_group_size": 0,
+    "indicative_writes_per_second_debug": 3.1332239032022398,
+    "stages": {
+      "primary_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_stage": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_link": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_pin": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "lsm_wal": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "progress": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "status_snapshot": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "replay_retirement": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_cleanup": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_write": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_append": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_rename": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_delete": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_sync": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_finish": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_lease": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "main_txn_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "lsm_backend_wal": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_forward_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_reverse_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_metric_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_artifact": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_txn_begin": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_intent_write": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_intent_resolve": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_coordinator_hint": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_apply": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_bulk_finish": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_hll_maintenance": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_adaptive": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "other": {
+        "sync_calling_thread": 256,
+        "sync_background": 0,
+        "write_calls_calling_thread": 1685,
+        "write_calls_background": 377,
+        "write_bytes_calling_thread": 9113600,
+        "write_bytes_background": 1544192,
+        "commits_calling_thread": 128,
+        "commits_background": 0
+      }
+    },
+    "background_ops": {
+      "source_turn": 0,
+      "maintenance_lease_acquired": 0,
+      "serving_runtime_refresh": 0,
+      "derived_worker_turn": 0
+    }
+  },
+  "dense_vector_8_writers": {
+    "updates": 128,
+    "calling_thread_syncs_per_update": 2,
+    "background_syncs_per_update": 0,
+    "fsyncs_per_write_overall": 2,
+    "durable_commits_per_write": 1,
+    "mean_primary_group_size": 0,
+    "indicative_writes_per_second_debug": 4.793543164706422,
+    "stages": {
+      "primary_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_stage": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_link": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_pin": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "lsm_wal": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "progress": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "status_snapshot": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "replay_retirement": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_cleanup": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_write": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_append": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_rename": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_delete": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_sync": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_finish": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_lease": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "main_txn_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "lsm_backend_wal": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_forward_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_reverse_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_metric_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_artifact": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_txn_begin": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_intent_write": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_intent_resolve": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_coordinator_hint": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_apply": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_bulk_finish": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_hll_maintenance": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_adaptive": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "other": {
+        "sync_calling_thread": 256,
+        "sync_background": 0,
+        "write_calls_calling_thread": 1682,
+        "write_calls_background": 373,
+        "write_bytes_calling_thread": 9101312,
+        "write_bytes_background": 1527808,
+        "commits_calling_thread": 128,
+        "commits_background": 0
+      }
+    },
+    "background_ops": {
+      "source_turn": 0,
+      "maintenance_lease_acquired": 0,
+      "serving_runtime_refresh": 0,
+      "derived_worker_turn": 0
+    }
+  },
+  "sparse_vector": {
+    "updates": 128,
+    "calling_thread_syncs_per_update": 2,
+    "background_syncs_per_update": 0,
+    "fsyncs_per_write_overall": 2,
+    "durable_commits_per_write": 1,
+    "mean_primary_group_size": 0,
+    "indicative_writes_per_second_debug": 0.7467345596676666,
+    "stages": {
+      "primary_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_stage": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_link": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_pin": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "lsm_wal": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "progress": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "status_snapshot": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "replay_retirement": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_cleanup": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_write": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_append": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_rename": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_delete": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_sync": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_finish": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_lease": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "main_txn_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "lsm_backend_wal": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_forward_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_reverse_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_metric_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_artifact": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_txn_begin": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_intent_write": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_intent_resolve": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_coordinator_hint": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_apply": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_bulk_finish": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_hll_maintenance": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_adaptive": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "other": {
+        "sync_calling_thread": 256,
+        "sync_background": 0,
+        "write_calls_calling_thread": 1779,
+        "write_calls_background": 415,
+        "write_bytes_calling_thread": 15110144,
+        "write_bytes_background": 1699840,
+        "commits_calling_thread": 128,
+        "commits_background": 0
+      }
+    },
+    "background_ops": {
+      "source_turn": 0,
+      "maintenance_lease_acquired": 0,
+      "serving_runtime_refresh": 0,
+      "derived_worker_turn": 0
+    }
+  },
+  "sparse_vector_8_writers": {
+    "updates": 128,
+    "calling_thread_syncs_per_update": 2,
+    "background_syncs_per_update": 0,
+    "fsyncs_per_write_overall": 2,
+    "durable_commits_per_write": 1,
+    "mean_primary_group_size": 0,
+    "indicative_writes_per_second_debug": 0.6508847432573609,
+    "stages": {
+      "primary_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_stage": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_link": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_pin": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "lsm_wal": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "progress": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "status_snapshot": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "replay_retirement": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_cleanup": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_write": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_append": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_rename": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_delete": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_sync": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_finish": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_lease": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "main_txn_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "lsm_backend_wal": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_forward_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_reverse_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_metric_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_artifact": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_txn_begin": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_intent_write": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_intent_resolve": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_coordinator_hint": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_apply": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_bulk_finish": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_hll_maintenance": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_adaptive": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "other": {
+        "sync_calling_thread": 256,
+        "sync_background": 0,
+        "write_calls_calling_thread": 2547,
+        "write_calls_background": 798,
+        "write_bytes_calling_thread": 14995456,
+        "write_bytes_background": 3268608,
+        "commits_calling_thread": 128,
+        "commits_background": 0
+      }
+    },
+    "background_ops": {
+      "source_turn": 0,
+      "maintenance_lease_acquired": 0,
+      "serving_runtime_refresh": 0,
+      "derived_worker_turn": 0
+    }
+  },
+  "algebraic": {
+    "updates": 128,
+    "calling_thread_syncs_per_update": 2,
+    "background_syncs_per_update": 0,
+    "fsyncs_per_write_overall": 2,
+    "durable_commits_per_write": 1,
+    "mean_primary_group_size": 0,
+    "indicative_writes_per_second_debug": 3.713355634741575,
+    "stages": {
+      "primary_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_stage": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_link": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_pin": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "lsm_wal": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "progress": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "status_snapshot": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "replay_retirement": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_cleanup": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_write": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_append": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_rename": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_delete": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_sync": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_finish": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_lease": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "main_txn_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "lsm_backend_wal": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_forward_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_reverse_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_metric_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_artifact": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_txn_begin": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_intent_write": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_intent_resolve": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_coordinator_hint": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_apply": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_bulk_finish": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_hll_maintenance": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_adaptive": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "other": {
+        "sync_calling_thread": 256,
+        "sync_background": 0,
+        "write_calls_calling_thread": 3215,
+        "write_calls_background": 584,
+        "write_bytes_calling_thread": 19197952,
+        "write_bytes_background": 2392064,
+        "commits_calling_thread": 128,
+        "commits_background": 0
+      }
+    },
+    "background_ops": {
+      "source_turn": 0,
+      "maintenance_lease_acquired": 0,
+      "serving_runtime_refresh": 0,
+      "derived_worker_turn": 0
+    }
+  },
+  "algebraic_8_writers": {
+    "updates": 128,
+    "calling_thread_syncs_per_update": 2,
+    "background_syncs_per_update": 0,
+    "fsyncs_per_write_overall": 2,
+    "durable_commits_per_write": 1,
+    "mean_primary_group_size": 0,
+    "indicative_writes_per_second_debug": 3.1397666671976263,
+    "stages": {
+      "primary_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_stage": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_link": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_pin": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "lsm_wal": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "progress": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "status_snapshot": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "replay_retirement": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_cleanup": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_write": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_append": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_rename": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_delete": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_sync": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "vfs_finish": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "artifact_lease": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "main_txn_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "lsm_backend_wal": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_forward_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_reverse_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_metric_commit": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "graph_artifact": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_txn_begin": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_intent_write": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_intent_resolve": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "relational_coordinator_hint": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_apply": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_bulk_finish": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_hll_maintenance": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "algebraic_adaptive": {
+        "sync_calling_thread": 0,
+        "sync_background": 0,
+        "write_calls_calling_thread": 0,
+        "write_calls_background": 0,
+        "write_bytes_calling_thread": 0,
+        "write_bytes_background": 0,
+        "commits_calling_thread": 0,
+        "commits_background": 0
+      },
+      "other": {
+        "sync_calling_thread": 256,
+        "sync_background": 0,
+        "write_calls_calling_thread": 3348,
+        "write_calls_background": 597,
+        "write_bytes_calling_thread": 19546112,
+        "write_bytes_background": 2445312,
+        "commits_calling_thread": 128,
+        "commits_background": 0
+      }
+    },
+    "background_ops": {
+      "source_turn": 0,
+      "maintenance_lease_acquired": 0,
+      "serving_runtime_refresh": 0,
+      "derived_worker_turn": 0
+    }
+  }
+}

@@ -42,18 +42,25 @@ const index_manager_mod = @import("catalog/index_manager.zig");
 const index_repair_state = @import("derived/index_repair_state.zig");
 const internal_keys = @import("../internal_keys.zig");
 const mapper = @import("document_mapper.zig");
+
+fn preparationValidator(input: anytype, historical: bool) @TypeOf(input) {
+    if (input) |validator| if (historical) return validator.forHistoricalImport();
+    return input;
+}
 const merge_state_mod = @import("merge_state.zig");
 const platform = @import("antfly_platform");
 const platform_clock = @import("antfly_platform").clock;
 const platform_time = @import("antfly_platform").time;
 const range_cardinality = @import("range_cardinality.zig");
 const range_state_mod = @import("range_state.zig");
-const relational_index_catalog = @import("relational_index_catalog.zig");
-const relational_index_jobs = @import("relational_index_jobs.zig");
-const relational_index_plans = @import("relational_index_plan.zig");
-const relational_index_records = @import("relational_index_records.zig");
+const relational_index_catalog = @import("relational/indexes/catalog.zig");
+const relational_index_jobs = @import("relational/indexes/jobs.zig");
+const relational_index_plans = @import("relational/indexes/plan.zig");
+const relational_index_records = @import("relational/indexes/records.zig");
+const wal_trace = @import("../write_amplification_trace.zig");
 const relational_row_codec = @import("algebraic/relational_row_codec.zig");
-const relational_store = @import("relational_store.zig");
+const relational_store = @import("relational/rows/store.zig");
+const replay_reference = @import("derived/replay_reference.zig");
 const replication_commit = @import("commit_integration.zig");
 const replication_contract = @import("replication_contract.zig");
 const replication_effects_mod = @import("replication_effects.zig");
@@ -149,6 +156,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const applyDerivedBatchProfiled = S.applyDerivedBatchProfiled;
         const applyDerivedBatchTargetsProfiled = S.applyDerivedBatchTargetsProfiled;
         const applyDerivedBatchToIndexContext = S.applyDerivedBatchToIndexContext;
+        const InlineTextPublication = S.InlineTextPublication;
+        const prepareInlineTextPublication = S.prepareInlineTextPublication;
+        const InlineGraphPublication = S.InlineGraphPublication;
+        const prepareInlineGraphPublication = S.prepareInlineGraphPublication;
+        const InlineSparsePublication = S.InlineSparsePublication;
+        const prepareInlineSparsePublication = S.prepareInlineSparsePublication;
+        const InlineDensePublication = S.InlineDensePublication;
+        const prepareInlineDensePublication = S.prepareInlineDensePublication;
+        const InlineAlgebraicPublication = S.InlineAlgebraicPublication;
+        const prepareInlineAlgebraicPublication = S.prepareInlineAlgebraicPublication;
         const attachPreparedUpsertDocumentProjections = S.attachPreparedUpsertDocumentProjections;
         const augmentExtractedWriteWithGraphFieldEdges = S.augmentExtractedWriteWithGraphFieldEdges;
         const augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed = S.augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed;
@@ -206,7 +223,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .ordered_artifact_publication_required = S.ownerField(self, "local_execution").*.artifact_publication_dispatcher != null,
                 .alloc = S.ownerField(self, "alloc").*,
                 .store = resources.store,
-                .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
                 .index_repair_checkpoint = resources.index_repair_checkpoint,
                 .shard_manager = resources.shard_manager,
                 .change_journal = resources.change_journal,
@@ -397,7 +413,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 return @import("antfly_source_root").antfly_sources.storage_engine.call("batchPrepared", .{ self, req, profile, opts, generated_memo, prepared_row_allocator });
             }
             @setEvalBranchQuota(100_000);
-            const maintenance_contract = @import("relational_index_maintenance_contract.zig");
+            const maintenance_contract = @import("relational/indexes/maintenance_contract.zig");
             var maintenance_attempted = false;
             defer if (maintenance_attempted) {
                 // Only a scheduling hint: the worker re-reads durable desired state.
@@ -407,6 +423,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
             for (req.writes) |write| if (relational_index_catalog.Controller.isReservedMetadataKey(write.key)) {
                 const trusted = opts.transaction_resolution != null or opts.replication_applied_lsn_marker != null;
+                const validation = @import("relational/integrity/activation_contract.zig");
+                if (trusted and std.mem.eql(u8, write.key, validation.validation_key)) {
+                    _ = try validation.ForeignKeyValidationRecord.decode(write.value);
+                    continue;
+                }
+                if (trusted and std.mem.eql(u8, write.key, validation.validation_inputs_key)) {
+                    _ = try @import("relational/schema_change/schema_owner_contract.zig").inputParts(write.value);
+                    continue;
+                }
                 if (!trusted or !maintenance_contract.isControlKey(write.key)) return error.ReservedRelationalIndexMetadataKey;
                 _ = try maintenance_contract.Control.decode(write.value);
                 maintenance_attempted = true;
@@ -420,11 +445,29 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (schema_namespace != S.ownerField(self, "core").*.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
             if (openModeRequiresReadOnlyBackends(S.ownerField(self, "open_mode").*)) return error.ReadOnly;
             if (!opts.bypass_replication_write_gate and self.denseRepairWriteBackpressured()) return error.DenseRepairBackpressure;
-            var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
+            if (!opts.bypass_replication_write_gate) {
+                if (opts.checked_native_atomic) |checked| {
+                    // Real preflight completed before row-policy/preparation
+                    // admission. Recheck flags without repeating waits.
+                    if (checked.schema_namespace_generation != S.ownerField(self, "core").*.schemaNamespaceGeneration() or
+                        S.ownerField(self, "async_context").*.primary_replication_append_pending.load(.acquire) or
+                        S.ownerField(self, "local_execution").*.durable_replication_startup_barrier_pending.load(.acquire) or
+                        S.ownerField(self, "local_execution").*.row_policy_replication_outbox_pending.load(.acquire)) return error.PreparedReadSetChanged;
+                } else try self.ensureDurableReplicationStartupBarrier();
+            }
+            var replication_mutation = if (opts.checked_native_atomic) |checked| moved: {
+                const owned = checked.replication_owner.*;
+                checked.replication_owner.* = null;
+                break :moved owned;
+            } else if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
             defer if (replication_mutation) |*lease| lease.release();
-            if (!opts.bypass_replication_write_gate) try self.ensureDurableReplicationStartupBarrier();
             if (!opts.bypass_replication_write_gate) try self.enforceReplicationWriteGate();
-            if (!opts.bypass_replication_write_gate) try self.preflightReplicationBatchSyncCommit();
+            // Checked native admission ran the real synchronous policy preflight
+            // before RLS/preparation/apply admission. Its moved shared lease
+            // pins that configuration; do not reacquire the publisher log mutex
+            // while the native planner already owns apply. Normal commit still
+            // performs the configured durable append and acknowledgement checks.
+            if (!opts.bypass_replication_write_gate and opts.checked_native_atomic == null) try self.preflightReplicationBatchSyncCommit();
             const total_start_ns = monotonicTimeNs();
             var schedule_replication_recovery_on_exit = false;
             defer {
@@ -443,10 +486,44 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // calls on a PreparedRow that cannot yet commit. Maintenance workers
             // remain able to drain the pressure because no DB apply lock is held.
             if (S.ownerField(self, "core").*.index_manager.resource_manager) |manager| {
-                try manager.awaitAdmission(.lsm_in_memory_state, projectedBatchLsmAdmissionBytes(req));
+                if (opts.checked_native_atomic != null) {
+                    // The real pressure wait ran before native apply admission.
+                    // A changed hard limit must reject here rather than park
+                    // while retaining the checked planner fence.
+                    const bytes = projectedBatchLsmAdmissionBytes(req);
+                    const decision = manager.admissionDecision(.lsm_in_memory_state, bytes);
+                    if ((decision.hard_limit_bytes != 0 and bytes > decision.hard_limit_bytes) or decision.action == .reject_work) return error.ResourceBudgetExceeded;
+                    if (decision.action == .throttle_writes and decision.pressure == .hard) return error.ResourceTemporarilyUnavailable;
+                } else try manager.awaitAdmission(.lsm_in_memory_state, projectedBatchLsmAdmissionBytes(req));
             }
             const preparation_timestamp_ns = if (req.document_version_scheme == .revision_v1 or req.timestamp_ns != 0) req.timestamp_ns else S.ownerField(self, "backend_runtime").*.clock().nowRealtimeNs();
             const preparation_alloc = prepared_row_allocator.allocator();
+            var reserved_document_versions = std.StringHashMapUnmanaged(u64).empty;
+            defer reserved_document_versions.deinit(preparation_alloc);
+            if (opts.transaction_resolution) |resolution| {
+                for (resolution.document_revision_references) |reference| {
+                    if (reference.version == 0 or reference.version > @import("../document_revision_reservation.zig").max_version) return error.InvalidTxnRecord;
+                    const slot = try reserved_document_versions.getOrPut(preparation_alloc, reference.key);
+                    if (slot.found_existing) return error.InvalidTxnRecord;
+                    slot.value_ptr.* = reference.version;
+                }
+            }
+
+            // Everything below through the index-plan/writer scratch lives only
+            // until this attempt's commit completes (same lifetime the explicit
+            // frees already gave it): the coalesced write/delete order map, the
+            // transform read snapshot, the merged graph write/delete arrays, the
+            // relational index-ready flags, and the index-record writer. Bump
+            // allocation from one arena replaces many small tracked
+            // allocator calls (each independently charged against the
+            // DebugAllocator's per-allocation bookkeeping) with a handful of
+            // page requests; the individual `.deinit`/`.free` calls below stay
+            // in place (a no-op against an arena allocator) so a retry/error
+            // path that forgets one costs nothing extra, and `commit_arena`
+            // itself is torn down, once, when this attempt returns.
+            var commit_arena = std.heap.ArenaAllocator.init(preparation_alloc);
+            defer commit_arena.deinit();
+            const commit_alloc = commit_arena.allocator();
 
             // Resolve request ordering and transforms before row preparation. A
             // transform that reads durable state carries an optimistic version
@@ -454,23 +531,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // JSON and every derived artifact from a fresh base.
             const resolve_transforms_start_ns = monotonicTimeNs();
             var transform_snapshot = try self.captureTransformReadSnapshot(
-                preparation_alloc,
+                commit_alloc,
                 types.BatchWrite,
                 req.writes,
                 req.deletes,
                 req.transforms,
             );
-            defer transform_snapshot.deinit(preparation_alloc);
+            defer transform_snapshot.deinit(commit_alloc);
             var effective_ops = try coalesceKeyValueRequest(
                 self,
-                preparation_alloc,
+                commit_alloc,
                 types.BatchWrite,
                 req.writes,
                 req.deletes,
                 req.transforms,
                 &transform_snapshot,
             );
-            defer effective_ops.deinit(preparation_alloc);
+            defer effective_ops.deinit(commit_alloc);
             if (req.commit_requires == .direct_enrichments)
                 _ = try @import("commit_requirements.zig").sourceBudget(effective_ops.writes, effective_ops.deletes);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.resolve_transforms_ns, resolve_transforms_start_ns);
@@ -483,11 +560,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             const merge_effective_req_start_ns = monotonicTimeNs();
             var owned_effective_graph_writes: ?[]types.GraphEdgeWrite = null;
-            defer if (owned_effective_graph_writes) |owned| preparation_alloc.free(owned);
+            defer if (owned_effective_graph_writes) |owned| commit_alloc.free(owned);
             const effective_graph_writes = if (effective_ops.graph_writes.items.len == 0)
                 req.graph_writes
             else blk: {
-                const combined = try preparation_alloc.alloc(types.GraphEdgeWrite, req.graph_writes.len + effective_ops.graph_writes.items.len);
+                const combined = try commit_alloc.alloc(types.GraphEdgeWrite, req.graph_writes.len + effective_ops.graph_writes.items.len);
                 @memcpy(combined[0..req.graph_writes.len], req.graph_writes);
                 @memcpy(combined[req.graph_writes.len..], effective_ops.graph_writes.items);
                 owned_effective_graph_writes = combined;
@@ -495,11 +572,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
 
             var owned_effective_graph_deletes: ?[]types.GraphEdgeDelete = null;
-            defer if (owned_effective_graph_deletes) |owned| preparation_alloc.free(owned);
+            defer if (owned_effective_graph_deletes) |owned| commit_alloc.free(owned);
             const effective_graph_deletes = if (effective_ops.graph_deletes.items.len == 0)
                 req.graph_deletes
             else blk: {
-                const combined = try preparation_alloc.alloc(types.GraphEdgeDelete, req.graph_deletes.len + effective_ops.graph_deletes.items.len);
+                const combined = try commit_alloc.alloc(types.GraphEdgeDelete, req.graph_deletes.len + effective_ops.graph_deletes.items.len);
                 @memcpy(combined[0..req.graph_deletes.len], req.graph_deletes);
                 @memcpy(combined[req.graph_deletes.len..], effective_ops.graph_deletes.items);
                 owned_effective_graph_deletes = combined;
@@ -511,6 +588,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .row_policy_principal_proof = req.row_policy_principal_proof,
                 .row_policy_database = req.row_policy_database,
                 .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
+                .trigger_receipts = req.trigger_receipts,
+                .trigger_preparation_proof = req.trigger_preparation_proof,
+                .trigger_preparation_group_id = req.trigger_preparation_group_id,
+                .trigger_preparation_command_digest = req.trigger_preparation_command_digest,
+                .trigger_preparation_admitted_at_seconds = req.trigger_preparation_admitted_at_seconds,
                 .normalized_graph_rows = req.normalized_graph_rows,
                 .range_guards = req.range_guards,
                 .restore_staging_scope = req.restore_staging_scope,
@@ -563,8 +645,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // schema or its durable catalog.
             const request_schema_binding: ?transactions_mod.SchemaBinding = if (opts.transaction_resolution) |resolution|
                 resolution.schema_binding
-            else if (opts.ordered_apply_receipt != null and req.relational_schema_version != null)
-                .{ .version = req.relational_schema_version }
+            else if (opts.ordered_apply_receipt != null and (req.relational_schema_version != null or req.schema_version != null))
+                .{ .version = req.relational_schema_version orelse req.schema_version }
             else
                 null;
             var request_schema_view = try self.acquireTransactionSchemaView(preparation_alloc, request_schema_binding);
@@ -576,25 +658,79 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Only authenticated hot-standby replay may supply final scoped metadata effects
             // without local participant intents. Scope, key kinds, owner range and
             // generation are revalidated below under the apply fence.
+            const historical_restore = if (opts.restore_staging) |admission| admission.population == null else false;
             const scoped_restore_replication_apply = opts.replication_applied_lsn_marker != null and effective_req.restore_staging_scope != null and opts.restore_staging == null;
             const live_replication_apply = opts.replication_applied_lsn_marker != null and effective_req.restore_staging_scope == null and opts.restore_staging == null;
-            if (opts.transaction_resolution == null and !scoped_restore_replication_apply and !live_replication_apply) {
+            // lite-single-commit-write-path.md §3.3c: a single-table write
+            // deciding its own UNIQUE claims for the first time, in this
+            // same call (`capi/sql.zig`'s `commitCoordinated`). Unlike
+            // `live_replication_apply`/`scoped_restore_replication_apply`
+            // (replaying a decision some OTHER writer already made), this
+            // caller is the first and only decider, so it still runs full
+            // validation below -- see `prepareLocalIntegrityDecision`.
+            const local_decision_apply = opts.integrity_authority == .local_decision;
+            if (opts.transaction_resolution == null and !scoped_restore_replication_apply and !live_replication_apply and !local_decision_apply) {
                 for (effective_ops.writes) |write| if (isProtectedIntegrityKey(write.key) or isProtectedRangeWriteKey(write.key)) return error.InvalidIntegrityOperation;
                 for (effective_ops.deletes) |key| if (isProtectedIntegrityKey(key) or isProtectedRangeWriteKey(key)) return error.InvalidIntegrityOperation;
-                if (!req.graph_endpoint_cleanup_planned and hasCoordinatedConstraints(request_schema_view) and opts.restore_staging == null and req.split_replication == null and req.merge_replication == null and (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0))
+                if (opts.checked_native_atomic == null and !req.graph_endpoint_cleanup_planned and hasCoordinatedConstraints(request_schema_view) and opts.restore_staging == null and req.split_replication == null and req.merge_replication == null and (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0))
                     return error.ForeignKeyCoordinationRequired;
+            }
+            // Physical population/resolution already carries owner-authenticated
+            // row provenance and never runs triggers. Every logical mutation,
+            // including ordered replay of prepared statements, verifies the
+            // immutable trigger receipt before parsing or entering apply.
+            if (opts.checked_native_atomic == null and opts.transaction_resolution == null and opts.restore_staging == null and
+                !scoped_restore_replication_apply and !live_replication_apply and
+                req.split_replication == null and req.merge_replication == null)
+            {
+                try @import("../../sql/trigger_native_admission.zig").requireSchemaView(req, request_schema_view != null);
+                try @import("../../sql/trigger_native_admission.zig").requireOwnerTable(req, S.ownerField(self, "core").*.identity_namespace.table_id);
+                if (request_schema_view) |view| try @import("../../sql/trigger_native_admission.zig").verify(
+                    preparation_alloc,
+                    view,
+                    req,
+                    S.ownerField(self, "local_execution").*.sql_preparation_secret,
+                    S.ownerField(self, "local_execution").*.sql_preparation_issuer,
+                    @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)),
+                    opts.ordered_apply_receipt != null or opts.native_initial_child_entry != null,
+                ) else try @import("../../sql/trigger_native_admission.zig").verifyNoSchema(
+                    preparation_alloc,
+                    req,
+                    S.ownerField(self, "local_execution").*.sql_preparation_secret,
+                    S.ownerField(self, "local_execution").*.sql_preparation_issuer,
+                    @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)),
+                    opts.ordered_apply_receipt != null or opts.native_initial_child_entry != null,
+                );
             }
             if (req.relational_schema_version) |version| {
                 const view = request_schema_view orelse return error.InvalidRelationalRowsRequest;
                 if (view.storageMode() != .relational) return error.InvalidRelationalRowsRequest;
                 if (view.version() != version) return error.PreparedGenerationChanged;
             }
-            // Integrity effects may only enter through durable transaction prepare.
-            if (req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or req.relational_retirement != null or req.relational_index_maintenance != null) return error.InvalidIntegrityOperation;
+            var prepared_document: ?mapper.PreparedDocumentBatch = null;
+            defer if (prepared_document) |*prepared| prepared.deinit();
+            if (request_schema_view) |view| if (view.storageMode() == .document and (if (view.validator()) |validator| validator.requiresDocumentPreparation() else false) and effective_req.writes.len != 0) {
+                const validator = preparationValidator(view.validator(), historical_restore) orelse return error.InvalidSchemaUpdateRequest;
+                prepared_document = try mapper.PreparedDocumentBatch.init(preparation_alloc, effective_req.writes, validator, historical_restore or opts.preserve_logical_values or opts.replication_applied_lsn_marker != null or req.split_replication != null or req.merge_replication != null);
+                effective_req.writes = prepared_document.?.writes;
+            };
+            // Integrity effects may only enter through durable transaction
+            // prepare, or (new) a `.local_decision` call's own
+            // `integrity_commands` -- validated and applied below, in this
+            // same apply-locked section, never read back from storage.
+            if (req.integrity.len != 0 or req.relational_activation != null or req.relational_retirement != null or req.relational_index_maintenance != null) return error.InvalidIntegrityOperation;
+            if (req.integrity_commands.len != 0 and !local_decision_apply) return error.InvalidIntegrityOperation;
             var relational_index_snapshot = S.ownerField(self, "core").*.relational_indexes.acquire();
             defer if (relational_index_snapshot) |*index_snapshot| index_snapshot.deinit();
-            const index_ready = try preparation_alloc.alloc(bool, if (relational_index_snapshot) |index_snapshot| index_snapshot.plan.boundIndexes().len else 0);
-            defer preparation_alloc.free(index_ready);
+            // index_ready is a one-shot flag array sized once per batch, unlike
+            // prepared_index_keys/index_writer below, which the comments on
+            // their own types document as reusable flat buffers meant to
+            // amortize across every row of a multi-row batch via
+            // clearRetainingCapacity/ensureTotalCapacity; those stay on
+            // preparation_alloc so a large batch keeps reusing one backing
+            // allocation instead of abandoning a page per row inside an arena.
+            const index_ready = try commit_alloc.alloc(bool, if (relational_index_snapshot) |index_snapshot| index_snapshot.plan.boundIndexes().len else 0);
+            defer commit_alloc.free(index_ready);
             var prepared_index_keys: ?relational_index_plans.Batch = if (relational_index_snapshot) |index_snapshot|
                 relational_index_plans.Batch.init(preparation_alloc, index_snapshot.plan)
             else
@@ -630,6 +766,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // already handles by recomputing from a fresh snapshot -- never by
             // silently reusing stale precompute.
             var document_generated_write_plan_generation: ?u64 = null;
+            if (prepared_document != null) {
+                preparation.write_plan = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
+                document_generated_write_plan_generation = preparation.write_plan.?.generation();
+            }
             if (request_schema_view) |view| if (view.storageMode() == .relational) {
                 var stable_keys = std.StringHashMapUnmanaged(void).empty;
                 defer stable_keys.deinit(preparation_alloc);
@@ -670,7 +810,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         S.ownerField(self, "backend_runtime").*.io(),
                         self,
                         effective_req.writes,
-                        view.validator(),
+                        preparationValidator(view.validator(), historical_restore),
                         view.tableSchema().*,
                         view.physicalLayout(),
                         preparation.write_plan.?.plan().*,
@@ -679,7 +819,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         rows,
                         opts.durable_rows,
                         opts.restore_timestamps,
-                        opts.restore_staging != null or opts.preserve_logical_values,
+                        historical_restore or opts.preserve_logical_values,
                     );
                     // Authorize the exact old/postimage pair before exposing
                     // source fields to any producer. The policy lease pins the
@@ -697,7 +837,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         if (request_schema_binding == null) try self.validatePreparedSchemaViewLocked(request_schema_view);
                         try self.validateTransformReadSnapshot(transform_snapshot);
                         try self.validateGeneratedWriteReadSnapshot(preparation.generated_snapshot);
-                        try self.enforceRowPolicyMutationLocked(view, effective_req, rows, principal);
+                        try self.enforceRowPolicyMutationLocked(view, effective_req, rows, null, principal);
                     };
                     if (prepared_index_keys) |*keys| {
                         var largest_document: usize = 0;
@@ -804,6 +944,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             extracted_rows,
                             generatedPrecomputeMode(req),
                             opts.force_generated_artifact_names,
+                            opts.force_only_incomplete_assets,
                             &preparation.generated_plan.?,
                             generated_memo,
                         );
@@ -861,7 +1002,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // any catalog publication racing with this precompute is
                     // also caught as a generation change under the lock, never
                     // silently used.
-                    preparation.write_plan = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
+                    if (preparation.write_plan == null) preparation.write_plan = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
                     document_generated_write_plan_generation = preparation.write_plan.?.generation();
                     const extracted_rows = try preparation_alloc.alloc(mapper.ExtractedWrite, effective_req.writes.len);
                     var extracted_rows_initialized: usize = 0;
@@ -883,13 +1024,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             extracted_rows_initialized += 1;
                             continue;
                         }
-                        extracted_rows[i] = try mapper.extractWrite(preparation_alloc, write.key, write.value);
+                        const root = if (prepared_document) |prepared| prepared.roots[i] else null;
+                        extracted_rows[i] = if (root) |value| try mapper.extractWriteFromParsed(preparation_alloc, write.key, write.value, value) else try mapper.extractWrite(preparation_alloc, write.key, write.value);
                         extracted_rows_initialized += 1;
                         if (doc_plan_needs_parse) {
-                            var parsed = try std.json.parseFromSlice(std.json.Value, preparation_alloc, write.value, .{});
-                            defer parsed.deinit();
-                            try augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed(doc_plan, preparation_alloc, write.key, parsed.value, &extracted_rows[i]);
-                            try doc_plan.appendIndexFieldEmbeddingsFromParsedToExtractedWrite(preparation_alloc, write.key, parsed.value, &extracted_rows[i]);
+                            var parsed = if (root == null) try std.json.parseFromSlice(std.json.Value, preparation_alloc, write.value, .{}) else null;
+                            defer if (parsed) |*value| value.deinit();
+                            const value = root orelse parsed.?.value;
+                            try augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed(doc_plan, preparation_alloc, write.key, value, &extracted_rows[i]);
+                            try doc_plan.appendIndexFieldEmbeddingsFromParsedToExtractedWrite(preparation_alloc, write.key, value, &extracted_rows[i]);
                         }
                     }
                     preparation.document_generated = if (decoded_prepared) |packet| if (opts.transaction_resolution != null) try restorePreparedEnrichments(preparation_alloc, packet.value) else try restorePreparedEnrichmentsForRows(self, preparation_alloc, effective_req, extracted_rows[0..extracted_rows_initialized], preparation.write_plan.?.plan(), packet.value) else try prepareGeneratedEnrichments(
@@ -899,6 +1042,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         extracted_rows[0..extracted_rows_initialized],
                         generatedPrecomputeMode(effective_req),
                         opts.force_generated_artifact_names,
+                        opts.force_only_incomplete_assets,
                         null,
                         generated_memo,
                     );
@@ -974,7 +1118,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (req.commit_requires != .direct_enrichments) return error.InvalidBatchRequest;
                 if (preparation.write_plan == null) preparation.write_plan = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
                 if (preparation.generated == null and preparation.document_generated == null)
-                    preparation.document_generated = try prepareGeneratedEnrichments(self, preparation_alloc, effective_req, &.{}, .direct, &.{}, null, generated_memo);
+                    preparation.document_generated = try prepareGeneratedEnrichments(self, preparation_alloc, effective_req, &.{}, .direct, &.{}, false, null, generated_memo);
                 try capturePreparedEnrichments(self, capture, effective_req, preparation.write_plan.?.plan(), if (preparation.generated) |*generated| generated else &preparation.document_generated.?);
                 errdefer if (capture.json) |json| {
                     capture.alloc.free(json);
@@ -986,7 +1130,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 return;
             }
 
-            var snapshot_mutation = if (opts.snapshot_mutation) |lease| lease.retain() else S.ownerField(self, "core").*.snapshot_admission.acquireMutation();
+            var snapshot_mutation = if (opts.checked_native_atomic) |checked| checked.snapshot_owner.take() else if (opts.snapshot_mutation) |lease| lease.retain() else S.ownerField(self, "core").*.snapshot_admission.acquireMutation();
             defer snapshot_mutation.release();
             std.debug.assert(snapshot_mutation.admission == S.ownerField(self, "core").*.snapshot_admission);
             if (builtin.is_test) {
@@ -1004,6 +1148,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (preparation.write_plan == null and (S.ownerField(self, "core").*.index_manager.hasGroupSources() or opts.group_source_command != null) and
                 (effective_req.writes.len != 0 or effective_req.deletes.len != 0 or opts.group_source_command != null))
                 preparation.write_plan = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
+            var native_atomic_effects: execution_resources.NativeAtomicEffects = .{};
             const apply_lock_wait_start_ns = monotonicTimeNs();
             if (opts.ordered_apply_receipt != null) {
                 // A committed Raft entry must yield its progress mutex when
@@ -1033,6 +1178,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var apply_mutex_held = true;
             const apply_lock_acquired_ns = monotonicTimeNs();
             errdefer if (apply_mutex_held) unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
+            if (opts.transaction_resolution == null) {
+                var publication = try S.ownerField(self, "core").*.store.beginProbeTxn();
+                defer publication.abort();
+                try @import("logical_replication_outbox.zig").requireOrdinaryRequest(preparation_alloc, &publication, effective_req);
+            }
             // A durable epoch survives active-schema publication, not replacement
             // of the entire database namespace with reused version/transaction IDs.
             if (schema_namespace != S.ownerField(self, "core").*.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
@@ -1044,19 +1194,29 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         effective_req.relational_topology.?.action != .release_initial_child and
                         effective_req.relational_topology.?.action != .cancel_initial_child)))
                 return error.InitialChildNotPublished;
-            if (req.schema_version != null) try self.validatePreparedSchemaViewLocked(request_schema_view);
+            // Durable intents already retain a historical schema identity.
+            // Ordinary requests must still prove their speculative epoch current.
+            if (request_schema_binding == null) try self.validatePreparedSchemaViewLocked(request_schema_view);
+            try @import("prepared_graph_effects.zig").requireIndexes(preparation_alloc, S.ownerField(self, "core").*.index_manager, opts.prepared_graph_indexes);
+            if (req.graph_preparation) |proof| try @import("prepared_graph_effects.zig").requireDefinitions(preparation_alloc, S.ownerField(self, "core").*.index_manager, proof);
+            if (prepared_document != null and S.ownerField(self, "core").*.index_manager.writePlanGeneration() != document_generated_write_plan_generation.?) return error.PreparedGenerationChanged;
             if (!S.ownerField(self, "core").*.relational_indexes.isCurrent(relational_index_snapshot)) return error.PreparedGenerationChanged;
             if (live_replication_apply) {
                 var integrity_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
                 defer integrity_read.abort();
                 try self.validateLiveReplicationIntegrityEffects(preparation_alloc, &integrity_read, effective_req);
             }
-            if (S.ownerField(self, "local_execution").*.restore_staging_required.load(.acquire) or opts.restore_staging != null or effective_req.restore_staging_scope != null) {
+            if (S.ownerField(self, "local_execution").*.restore_staging_required.load(.acquire) or S.ownerField(self, "local_execution").*.materialized_view_read_only.load(.acquire) or opts.restore_staging != null or effective_req.restore_staging_scope != null) {
                 var restore_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
                 defer restore_read.abort();
-                if (opts.restore_staging) |admission|
-                    try @import("restore_staging.zig").validateImport(preparation_alloc, &restore_read, admission, effective_req.writes.len, effective_req.deletes.len)
-                else if (opts.transaction_resolution == null) {
+                if (opts.restore_staging == null and (effective_req.writes.len != 0 or effective_req.deletes.len != 0 or effective_req.graph_writes.len != 0 or effective_req.graph_deletes.len != 0))
+                    try @import("restore_staging.zig").requirePrimaryWritable(preparation_alloc, &restore_read);
+                if (opts.restore_staging) |admission| {
+                    if (admission.population != null) for (req.writes) |write| {
+                        if (!S.ownerField(self, "core").*.index_manager.byte_range.contains(write.key)) return error.KeyOutOfRange;
+                    };
+                    try @import("restore_staging.zig").validateImport(preparation_alloc, &restore_read, admission, effective_req.writes.len, effective_req.deletes.len, req.writes);
+                } else if (opts.transaction_resolution == null) {
                     if (opts.replication_applied_lsn_marker != null and effective_req.restore_staging_scope != null) {
                         try @import("restore_staging.zig").requireMutableScope(preparation_alloc, &restore_read, effective_req.restore_staging_scope);
                         try self.validateRestoreStagingReplicationEffects(preparation_alloc, &restore_read, effective_req);
@@ -1075,6 +1235,32 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         return;
                     },
                 }
+            }
+
+            // The apply mutex is held across this check and primary commit;
+            // ordered producer closure takes the same mutex. Replay was already
+            // recognized above and cannot execute stale row effects here.
+            {
+                var producer_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
+                defer producer_read.abort();
+                // Scoped resolution already carries original native scope and
+                // admission identity; it is not ordinary/legacy row inference.
+                const policy = @import("../source_producer_policy.zig");
+                const row_producer = try policy.rowProducer(req.source_producer, opts.source_producer);
+                const producer = if (opts.transaction_resolution != null and opts.transaction_resolution.?.source_scope != null) scoped: {
+                    if (row_producer != .unlabelled and row_producer != .scoped_source) return error.SourceTransactionIdentityConflict;
+                    break :scoped policy.Producer.scoped_source;
+                } else ordinary: {
+                    if (row_producer == .scoped_source) return error.InvalidSourceAdmission;
+                    break :ordinary row_producer;
+                };
+                if (opts.transaction_resolution != null and opts.transaction_resolution.?.legacy_terminal != null) {
+                    const resolution = opts.transaction_resolution.?;
+                    const proof = resolution.legacy_terminal.?;
+                    if (resolution.source_scope != null or !std.mem.eql(u8, &proof.transaction_id, &resolution.txn_id) or (producer != .unlabelled and producer != .legacy_cdc)) return error.SourceTransactionIdentityConflict;
+                    const decision = try S.ownerField(self, "core").*.closedLegacyTerminalDecision(proof);
+                    if (decision.status != resolution.status or decision.timestamp != resolution.commit_version) return error.SourceTransactionIdentityConflict;
+                } else try @import("../source_producer_policy.zig").Store.requirePhysical(preparation_alloc, &producer_read, @import("online_source_contract.zig").namespaceBytes(S.ownerField(self, "core").*.identity_namespace), S.ownerField(self, "core").*.root_generation, producer);
             }
 
             var merge_page_value: ?[]u8 = null;
@@ -1239,19 +1425,28 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // the same terminal batch before Raft advances this entry.
                     var raft_marker_value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
                     const completion_writes: []const docstore_mod.KVPair = if (opts.ordered_apply_receipt) |identity|
-                        &.{orderedApplyReceiptWrite(identity, &raft_marker_value_buf)}
+                        if (resolution.legacy_outcome_write) |outcome| &.{ orderedApplyReceiptWrite(identity, &raft_marker_value_buf), outcome } else &.{orderedApplyReceiptWrite(identity, &raft_marker_value_buf)}
                     else
                         &.{};
-                    const outcome = try S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(
+                    const outcome = try S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatchAndLegacy(
                         resolution.txn_id,
                         resolution.status,
                         resolution.commit_version,
                         .{
+                            .external_decision_owner = resolution.external_decision_owner,
+                            .replication_resolution = resolution.replication_resolution,
+                            .publication_ordered_position = if (opts.ordered_apply_receipt) |cut| .{ .term = cut.term, .index = cut.index } else null,
+                            .source_purpose = resolution.source_purpose,
+                            .source_scope = resolution.source_scope,
+                            .source_scope_cut = if (opts.ordered_apply_receipt) |entry| .{ .term = entry.term, .index = entry.index } else null,
+                            .completion_owner = resolution.completion_owner,
                             .completion_writes = completion_writes,
                             .resolved_participant = resolution.resolved_participant,
                             .expected_intent_revision = resolution.expected_intent_revision,
+                            .prepared_graph_effects_checked = resolution.prepared_graph_effects_checked,
                             .known_intent_keys = resolution.intent_keys,
                         },
+                        resolution.legacy_terminal,
                     );
                     unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
                     if (!opts.bypass_replication_write_gate) try self.flushTransactionReplicationOutbox(resolution.txn_id);
@@ -1271,25 +1466,43 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 null;
             defer if (graph_publication) |*lease| lease.release();
 
+            // perf/lwa-write-overhead: a single probe/read `Txn` opened lazily
+            // here and reused by every read-only prep check below (instead of
+            // each check opening and aborting its own) -- see this function's
+            // own `batchProbe` helper just below. Nothing in this prep phase
+            // durably writes to `core.store` before the batch's own commit
+            // runs much further down, and Lite's probe reads are a "current
+            // tip, no snapshot clone" view that never holds a store-wide lock
+            // past its own `beginProbeTxn()` call -- so every one of these
+            // checks sees exactly the state it would have seen opening its
+            // own probe at that same point, and holding this one open a
+            // while longer costs nothing a later `beginWrite` would notice.
+            var batch_probe: ?docstore_mod.DocStore.Txn = null;
+            defer if (batch_probe) |*t| t.abort();
+            const batchProbe = struct {
+                fn get(probe: *?docstore_mod.DocStore.Txn, inner_self: anytype) !*docstore_mod.DocStore.Txn {
+                    if (probe.* == null) probe.* = try S.ownerField(inner_self, "core").*.store.beginProbeTxn();
+                    return &probe.*.?;
+                }
+            }.get;
+
             var coordinated_handoff = false;
             if (req.split_replication != null or req.split_checkpoint != null) {
-                var topology_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
-                defer topology_read.abort();
-                coordinated_handoff = try @import("relational_integrity_handoff.zig").admitSplitRequest(S.ownerField(self, "alloc").*, &topology_read, req);
+                const topology_read = try batchProbe(&batch_probe, self);
+                coordinated_handoff = try @import("relational/integrity/handoff.zig").admitSplitRequest(S.ownerField(self, "alloc").*, topology_read, req);
                 if (hasCoordinatedConstraints(request_schema_view) and !coordinated_handoff) return error.CoordinatedConstraintTopologyUnsupported;
             }
             if (req.merge_replication != null or req.merge_checkpoint != null or req.merge_page != null) {
-                var topology_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
-                defer topology_read.abort();
+                const topology_read = try batchProbe(&batch_probe, self);
                 // Source retention remains authoritative after its brief pin
                 // fence is released. Receiving another merge would replace that
                 // source's range state while its immutable cut/tail are in use.
-                if (try @import("../retained_effects.zig").load(&topology_read)) |retained| {
+                if (try @import("../retained_effects.zig").load(topology_read)) |retained| {
                     const namespace = @import("online_source_contract.zig").namespaceBytes(S.ownerField(self, "core").*.identity_namespace);
                     if (retained.active() and std.mem.eql(u8, &retained.namespace, &namespace)) return error.IntegrityTopologyBusy;
                 }
-                coordinated_handoff = try @import("online_integrity_shadow.zig").admit(S.ownerField(self, "alloc").*, &topology_read, req, S.ownerField(self, "core").*.identity_namespace);
-                if (!coordinated_handoff) coordinated_handoff = try @import("relational_integrity_handoff.zig").admitMergeRequest(S.ownerField(self, "alloc").*, &topology_read, req);
+                coordinated_handoff = try @import("online_integrity_shadow.zig").admit(S.ownerField(self, "alloc").*, topology_read, req, S.ownerField(self, "core").*.identity_namespace);
+                if (!coordinated_handoff) coordinated_handoff = try @import("relational/integrity/handoff.zig").admitMergeRequest(S.ownerField(self, "alloc").*, topology_read, req);
                 if (hasCoordinatedConstraints(request_schema_view) and !coordinated_handoff) return error.CoordinatedConstraintTopologyUnsupported;
             }
             // hot-standby carries already committed effects, including prepared decisions
@@ -1298,9 +1511,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (!coordinated_handoff and opts.transaction_resolution == null and !live_replication_apply and !scoped_restore_replication_apply and (effective_req.writes.len != 0 or effective_req.deletes.len != 0 or
                 effective_req.graph_writes.len != 0 or effective_req.graph_deletes.len != 0))
             {
-                var topology_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
-                defer topology_read.abort();
-                try @import("relational_integrity_topology.zig").requireUnfenced(&topology_read);
+                const topology_read = try batchProbe(&batch_probe, self);
+                try @import("relational/integrity/topology.zig").requireWriteUnfenced(topology_read);
             }
 
             // A pending coalescer flush may itself run a complete nested batch and
@@ -1319,8 +1531,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // preflight remains useful for early UX feedback, but every embedded,
             // replicated, recovery, and direct DB caller gets the same contract.
             if (schema_namespace != S.ownerField(self, "core").*.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
-            // Coalescer draining above can release/reacquire apply. An index-only
-            // publication need not change the schema or managed-index generation.
+            // Coalescer draining above can release/reacquire apply. Even a
+            // schemaless or unconstrained document write must not bypass a newly
+            // published schema. Durable decisions retain their admitted epoch.
+            if (request_schema_binding == null) try self.validatePreparedSchemaViewLocked(request_schema_view);
+            try @import("prepared_graph_effects.zig").requireIndexes(preparation_alloc, S.ownerField(self, "core").*.index_manager, opts.prepared_graph_indexes);
+            if (req.graph_preparation) |proof| try @import("prepared_graph_effects.zig").requireDefinitions(preparation_alloc, S.ownerField(self, "core").*.index_manager, proof);
+            // An index-only publication need not change the schema generation.
             if (!S.ownerField(self, "core").*.relational_indexes.isCurrent(relational_index_snapshot)) return error.PreparedGenerationChanged;
             if (preparation.write_plan) |pinned| if (pinned.plan().group_sources) |group_plan| {
                 if (group_plan.entries.len > 0 and pinned.generation() != S.ownerField(self, "core").*.index_manager.writePlanGeneration()) return error.PreparedGenerationChanged;
@@ -1379,8 +1596,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // revision independently of their admitted wall-clock timestamp.
             // Untagged historical commands retain their original semantics.
             const document_revisions = effective_req.document_version_scheme != .legacy;
-            const document_version = if (document_revisions and relationalColumns(self) == null)
-                try @import("../ttl.zig").nextDocumentVersion(S.ownerField(self, "core").*.store, S.ownerField(self, "alloc").*, batch_timestamp_ns, effective_req.writes, effective_req.deletes)
+            if (reserved_document_versions.count() != 0 and (!document_revisions or relationalColumns(self) != null or opts.restore_timestamps != null or opts.restore_document_version_floor != 0)) return error.InvalidTxnRecord;
+            const document_version = if (reserved_document_versions.count() == 0 and document_revisions and relationalColumns(self) == null)
+                try @import("../ttl.zig").nextDocumentVersionTxn(try batchProbe(&batch_probe, self), S.ownerField(self, "alloc").*, batch_timestamp_ns, effective_req.writes, effective_req.deletes)
             else
                 null;
 
@@ -1393,6 +1611,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     policy_schema_view,
                     effective_req,
                     if (use_preprepared_rows) preparation.rows else null,
+                    if (use_preprepared_rows) preparation.effects else null,
                     principal,
                 );
             }
@@ -1401,13 +1620,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // path too. The key-oriented intent index keeps this O(touched keys)
             // instead of scanning every outstanding transaction.
             if (opts.transaction_resolution == null) {
-                try S.ownerField(self, "core").*.checkOrdinaryWriteConflicts(effective_ops.writes, effective_ops.deletes);
+                try S.ownerField(self, "core").*.checkOrdinaryWriteConflictsWithProbe(effective_ops.writes, effective_ops.deletes, try batchProbe(&batch_probe, self));
                 var graph_sources: std.ArrayList(types.BatchWrite) = .empty;
                 defer graph_sources.deinit(S.ownerField(self, "alloc").*);
                 for (effective_req.graph_writes) |edge| try graph_sources.append(S.ownerField(self, "alloc").*, .{ .key = edge.source, .value = "" });
                 for (effective_req.graph_deletes) |edge| try graph_sources.append(S.ownerField(self, "alloc").*, .{ .key = edge.source, .value = "" });
-                try S.ownerField(self, "core").*.checkOrdinaryWriteConflicts(graph_sources.items, &.{});
+                try S.ownerField(self, "core").*.checkOrdinaryWriteConflictsWithProbe(graph_sources.items, &.{}, try batchProbe(&batch_probe, self));
             }
+            var pessimistic = try @import("pessimistic_access.zig").Guard.init(preparation_alloc, S.ownerField(self, "core").*, if (opts.transaction_resolution) |resolution| resolution.txn_id else null);
+            defer pessimistic.deinit();
+            const user_writes = for (effective_req.writes) |write| {
+                if (!isMetadataKey(write.key)) break true;
+            } else false;
+            const user_changes = user_writes or for (effective_req.deletes) |key| {
+                if (!isMetadataKey(key)) break true;
+            } else false;
+            if (user_changes) try pessimistic.table(.row_exclusive);
+            for (effective_req.deletes) |key| try pessimistic.row(key, .update);
             try self.validateTransformReadSnapshot(transform_snapshot);
             // Catches a concurrent commit to one of this batch's own write keys
             // between the pre-lock precompute read and this lock acquisition --
@@ -1416,6 +1645,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // data changes. use_preprepared_document_generated already forced a
             // retry on a stale catalog; this call does the same for a stale key.
             try self.validateGeneratedWriteReadSnapshot(preparation.generated_snapshot);
+
+            if (opts.checked_native_atomic) |checked| {
+                if (checked.schema_namespace_generation != S.ownerField(self, "core").*.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
+                native_atomic_effects = try checked.finalize_fn(checked.ptr);
+            }
 
             if (effective_req.predicates.len > 0) {
                 const predicates_start_ns = monotonicTimeNs();
@@ -1426,6 +1660,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         .key = predicate.key,
                         .expected_version = predicate.expected_version,
                         .expected_content_digest = predicate.expected_content_digest,
+                        .expected_mutation_revision = predicate.expected_mutation_revision,
                         .unique_absence = predicate.unique_absence,
                     });
                 }
@@ -1477,6 +1712,28 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .use_preprepared_rows = use_preprepared_rows,
             };
             defer write_buffers.deinit();
+            if (local_decision_apply) {
+                // `preparation.effects_arena` outlives this call through
+                // the rest of the native commit below (see its own use for
+                // other inline-publication effects, e.g. line ~701), so
+                // the claim writes returned here stay valid without
+                // tracking individual frees against `preparation_alloc`.
+                const local_integrity_writes = try prepareLocalIntegrityDecision(
+                    self,
+                    preparation.effects_arena.allocator(),
+                    req.relational_schema_version orelse req.schema_version,
+                    req.relational_integrity_generation_set,
+                    req.integrity_commands,
+                    opts.relational_child_existence_check,
+                );
+                for (local_integrity_writes) |intent| {
+                    if (intent.value) |value| {
+                        try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = intent.key, .value = value });
+                    } else {
+                        try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, intent.key);
+                    }
+                }
+            }
             // Live rows alone cannot preserve the history of absent keys.
             // Max-merge the certified source floor with restored versions and
             // local admission, in the same transaction as the page receipt.
@@ -1520,7 +1777,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 var probe = try S.ownerField(self, "core").*.store.beginReadTxn();
                 defer probe.abort();
                 if (!try ranges.isActive(&probe)) {
-                    if (try S.ownerField(self, "core").*.hasTopologySensitiveTransactions()) return error.IntentConflict;
+                    var manager = try S.ownerField(self, "core").*.initTxnManager();
+                    defer manager.deinit();
+                    if (try manager.hasRangeActivationTransactions()) return error.IntentConflict;
                     try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = ranges.activation_key, .value = ranges.activation_value });
                 }
             }
@@ -1710,10 +1969,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     preparation.rows.?[i] = null;
                     break :blk prepared;
                 } else if (apply_schema_view) |view|
-                    if (write.json_null_fields.len != 0)
-                        try mapper.PreparedRelationalWrite.initTyped(S.ownerField(self, "alloc").*, S.ownerField(self, "alloc").*, S.ownerField(self, "alloc").*, false, write.key, write.value, view.validator(), view.tableSchema().*, view.physicalLayout(), write.json_null_fields, opts.restore_staging != null or opts.preserve_logical_values)
-                    else if (opts.restore_staging != null or opts.preserve_logical_values)
-                        try mapper.PreparedRelationalWrite.initPreserved(S.ownerField(self, "alloc").*, write.key, write.value, view.validator(), view.tableSchema().*, view.physicalLayout())
+                    if (write.json_null_fields.len != 0 or write.prepared_domain != null)
+                        try mapper.PreparedRelationalWrite.initTyped(S.ownerField(self, "alloc").*, S.ownerField(self, "alloc").*, S.ownerField(self, "alloc").*, false, write.key, write.value, preparationValidator(view.validator(), historical_restore), view.tableSchema().*, view.physicalLayout(), write.json_null_fields, try @import("../../schema/domain_handoff.zig").preserveFor(view.validator(), write.prepared_domain, historical_restore or opts.preserve_logical_values))
+                    else if (historical_restore or opts.preserve_logical_values)
+                        try mapper.PreparedRelationalWrite.initPreserved(S.ownerField(self, "alloc").*, write.key, write.value, preparationValidator(view.validator(), historical_restore), view.tableSchema().*, view.physicalLayout())
                     else
                         try mapper.PreparedRelationalWrite.initFromIntent(
                             S.ownerField(self, "alloc").*,
@@ -1727,6 +1986,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 else
                     null;
                 defer if (prepared_relational) |*prepared| prepared.deinit(S.ownerField(self, "alloc").*);
+                try pessimistic.write(S.ownerField(self, "core").*, write.key, if (prepared_relational) |prepared| prepared.packed_row else write.value);
                 var fallback_consumer_plan = if (!use_preprepared_rows and prepared_relational != null) try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot() else null;
                 defer if (fallback_consumer_plan) |*plan| plan.release();
                 if (fallback_consumer_plan) |plan| try requireRelationalConsumerFields(&prepared_relational.?, apply_schema_view.?.tableSchema().*, plan.plan().*, false);
@@ -1745,16 +2005,26 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const semantic_hash = if (prepared_relational) |*prepared| prepared.semantic_hash else null;
                 extracted[i] = if (prepared_relational) |*prepared|
                     prepared.takeExtracted()
+                else if (if (prepared_document) |prepared| prepared.roots[i] else null) |root|
+                    try mapper.extractWriteFromParsed(S.ownerField(self, "alloc").*, write.key, write.value, root)
                 else
                     try mapper.extractWrite(S.ownerField(self, "alloc").*, write.key, write.value);
                 // Ownership has transferred even if a later graph/vector consumer
                 // rejects this row. Include it in error cleanup immediately.
                 extracted_initialized += 1;
+                if (if (prepared_document) |prepared| prepared.roots[i] else null) |root| {
+                    extracted[i].prepared_text_root = root;
+                    extracted[i].prepared_text_source_bytes = mapper.estimateJsonValueRetainedBytes(root);
+                    extracted[i].prepared_schema_version = request_schema_view.?.version();
+                    extracted[i].prepared_write_plan_generation = document_generated_write_plan_generation.?;
+                }
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_mapper_ns, mapper_extract_start_ns);
                 const graph_field_extract_start_ns = monotonicTimeNs();
                 if (!use_preprepared_rows) {
                     if (prepared_relational) |*prepared|
                         try augmentExtractedWriteWithGraphFieldEdgesParsed(self, S.ownerField(self, "alloc").*, write.key, prepared.parsedValue(), &extracted[i])
+                    else if (if (prepared_document) |prepared| prepared.roots[i] else null) |root|
+                        try augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed(preparation.write_plan.?.plan().*, S.ownerField(self, "alloc").*, write.key, root, &extracted[i])
                     else
                         try augmentExtractedWriteWithGraphFieldEdges(self, S.ownerField(self, "alloc").*, write.key, write.value, &extracted[i]);
                 }
@@ -1763,6 +2033,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (!use_preprepared_rows) {
                     if (prepared_relational) |*prepared|
                         try S.ownerField(self, "core").*.index_manager.appendIndexFieldEmbeddingsFromPreparedToExtractedWrite(S.ownerField(self, "alloc").*, write.key, prepared.parsedValue(), try prepared.typedView(apply_schema_view.?.tableSchema().*, apply_schema_view.?.physicalLayout()), &extracted[i])
+                    else if (if (prepared_document) |prepared| prepared.roots[i] else null) |root|
+                        try preparation.write_plan.?.plan().*.appendIndexFieldEmbeddingsFromParsedToExtractedWrite(S.ownerField(self, "alloc").*, write.key, root, &extracted[i])
                     else
                         try S.ownerField(self, "core").*.index_manager.appendIndexFieldEmbeddingsToExtractedWrite(S.ownerField(self, "alloc").*, write.key, write.value, &extracted[i]);
                 }
@@ -1835,7 +2107,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // persistence and timestamps use the prepared typed authority.
                     const cleaned = if (prepared_relational == null) extracted[i].cleaned_value.? else "";
                     if (prepared_relational == null) if (group_plan) |plan| {
-                        const logical = try std.json.parseFromSliceLeaky(std.json.Value, group_alloc, cleaned, .{});
+                        const logical = (if (prepared_document) |prepared| prepared.roots[i] else null) orelse try std.json.parseFromSliceLeaky(std.json.Value, group_alloc, cleaned, .{});
                         group_changes[i] = try plan.prepareRow(group_alloc, write.key, logical);
                     };
                     const restored_source = if (opts.restore_ttl_sources) |sources| sources.get(write.key) else null;
@@ -1869,6 +2141,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (!use_preprepared_rows) {
                         if (prepared_relational) |*prepared|
                             try validateDocumentExtractionInlineSourcesSnapshotParsed(S.ownerField(self, "alloc").*, self, fallback_consumer_plan.?.plan().*, prepared.parsedValue(), extracted[i])
+                        else if (if (prepared_document) |prepared| prepared.roots[i] else null) |root|
+                            try validateDocumentExtractionInlineSourcesSnapshotParsed(S.ownerField(self, "alloc").*, self, preparation.write_plan.?.plan().*, root, extracted[i])
                         else
                             try validateDocumentExtractionInlineSources(self, cleaned);
                     }
@@ -1927,7 +2201,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             else if (!document_revisions and restored_version == null)
                                 try encodeTimestampValue(S.ownerField(self, "alloc").*, std.math.cast(u64, resolved_write_timestamp_ns.?) orelse return error.InvalidArgument)
                             else
-                                try encodeDocumentTimestampValue(S.ownerField(self, "alloc").*, if (effective_req.document_version_scheme == .revision_v1) document_version orelse batch_timestamp_ns else batch_timestamp_ns, resolved_write_timestamp_ns.?, restored_version);
+                                try encodeDocumentTimestampValue(S.ownerField(self, "alloc").*, if (reserved_document_versions.count() != 0) reserved_document_versions.get(write.key) orelse return error.InvalidTxnRecord else if (effective_req.document_version_scheme == .revision_v1) document_version orelse batch_timestamp_ns else batch_timestamp_ns, resolved_write_timestamp_ns.?, restored_version);
                         };
                         errdefer if (!use_preprepared_rows) S.ownerField(self, "alloc").*.free(timestamp_value);
                         try write_buffers.timestamp_writes.append(S.ownerField(self, "alloc").*, .{
@@ -1948,7 +2222,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             const identity_capacity_start_ns = monotonicTimeNs();
             if (!S.ownerField(self, "bulk_identity").*.enabled or effective_req.deletes.len != 0) {
-                try self.failIfIdentityOrdinalExhaustedForNewUpserts(write_buffers.identity_upsert_keys.items);
+                try failIfIdentityOrdinalExhaustedForNewUpsertsTxn(self, try batchProbe(&batch_probe, self), write_buffers.identity_upsert_keys.items);
             }
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.identity_capacity_check_ns, identity_capacity_start_ns);
 
@@ -2024,8 +2298,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
 
             const cleanup_contract = @import("../graph_cleanup_contract.zig");
-            var graph_lifecycle_generation: u64 = if (effective_req.graph_endpoint_cleanup or effective_req.graph_deletes.len != 0 or effective_req.deletes.len != 0 or
-                (std.mem.indexOfScalar(bool, derived_changed_flags, true) != null))
+            // derived_changed_flags defaults to true for every write (it is
+            // only cleared for proven semantic no-ops), so "some write's
+            // content changed" is true for almost every ordinary commit.
+            // Advancing the lifecycle generation only matters for fencing
+            // stale graph retirement stamps against fresh graph artifacts;
+            // without any graph index there is nothing to fence, so a store
+            // with no graph indexes configured no longer pays a
+            // document_index write for this on every primary-only update.
+            var graph_lifecycle_generation: u64 = if (S.ownerField(self, "core").*.index_manager.hasGraphIndexes() and
+                (effective_req.graph_endpoint_cleanup or effective_req.graph_deletes.len != 0 or effective_req.deletes.len != 0 or
+                    (std.mem.indexOfScalar(bool, derived_changed_flags, true) != null)))
                 try appendGraphLifecycleGeneration(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, if (opts.ordered_apply_receipt) |entry| entry.index else 0, &write_buffers.store_writes, &write_buffers.owned_store_values)
             else
                 0;
@@ -2405,6 +2688,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         extracted[0..extracted_initialized],
                         generatedPrecomputeMode(effective_req),
                         opts.force_generated_artifact_names,
+                        opts.force_only_incomplete_assets,
                         null,
                         generated_memo,
                     );
@@ -2659,7 +2943,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (profile) |active_profile| active_profile.source_sequence = sequence;
             const identity_metadata_start_ns = monotonicTimeNs();
             const identity_live_before = if (write_buffers.identity_upsert_keys.items.len != 0 or effective_req.deletes.len != 0)
-                (try doc_identity.fastStatsFromStore(S.ownerField(self, "core").*.store)).live_ordinals
+                (try doc_identity.fastStatsFromTxn(try batchProbe(&batch_probe, self))).live_ordinals
             else
                 0;
             var used_trusted_identity_path = false;
@@ -2719,7 +3003,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 );
             };
             var next_table_catalog: ?table_catalog_mod.Catalog = null;
-            var table_catalog_value: [table_catalog_mod.encoded_len]u8 = undefined;
+            var table_catalog_value: table_catalog_mod.Encoded = undefined;
             if (pending_identity_visibility_summary != null or merge_count_prepared) {
                 var catalog = S.ownerField(self, "core").*.table_catalog;
                 const previous = catalog;
@@ -2743,10 +3027,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     catalog.reconciled != previous.reconciled)
                 {
                     catalog.generation +|= 1;
-                    table_catalog_value = catalog.encode();
+                    table_catalog_value = try catalog.encodeDurable();
                     next_table_catalog = catalog;
                 }
-            } else if (S.ownerField(self, "core").*.table_catalog.row_count == 0 and (effective_req.writes.len != 0 or effective_req.deletes.len != 0)) {
+            } else if (S.ownerField(self, "core").*.table_catalog.row_count == 0 and
+                (user_changes or (!S.ownerField(self, "core").*.table_catalog.reconciled and (effective_req.writes.len != 0 or effective_req.deletes.len != 0))))
+            {
                 // An older/unreconciled owner can contain primary rows but lack a
                 // visibility summary. Absence of a counter is not an empty-table
                 // proof: a write proves presence, while a delete keeps it unknown
@@ -2754,7 +3040,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // empty. Never grant empty-table CHECK/rewrite admission from zero
                 // metadata on a populated root. A later explicit reconciliation
                 // may clear this conservative presence bit after delete-only work.
-                const has_user_data = effective_req.writes.len != 0 or try storeHasUserDataBounded(S.ownerField(self, "core").*.store);
+                // The same key classification used for row-lock admission
+                // distinguishes actual rows from internal activation/control
+                // writes. A metadata write cannot prove user-row presence.
+                // Older unreconciled roots still probe even for control-only
+                // work; mixed metadata-write/user-delete work also probes.
+                const has_user_data = user_writes or try storeHasUserDataBounded(S.ownerField(self, "core").*.store);
                 if (has_user_data) {
                     var catalog = S.ownerField(self, "core").*.table_catalog;
                     catalog.mode_initialized = true;
@@ -2762,14 +3053,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     catalog.active_schema_version = if (S.ownerField(self, "core").*.schema) |table_schema| table_schema.version else 0;
                     catalog.row_count = 1;
                     catalog.generation +|= 1;
-                    table_catalog_value = catalog.encode();
+                    table_catalog_value = try catalog.encodeDurable();
                     next_table_catalog = catalog;
                 }
             }
             try write_buffers.store_writes.appendSlice(S.ownerField(self, "alloc").*, write_buffers.identity_writes.items);
             if (next_table_catalog != null) try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{
                 .key = table_catalog_mod.key,
-                .value = &table_catalog_value,
+                .value = table_catalog_value.slice(),
             });
             try appendDocumentChildRangeOutboxWrites(
                 S.ownerField(self, "alloc").*,
@@ -2781,6 +3072,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 &owned_child_range_outbox_values,
             );
             const build_derived_start_ns = monotonicTimeNs();
+            // Journal suppression (below, after inline-publication prepare)
+            // reuses this in-memory record -- when available and still in
+            // sync with `replay_payload` -- to encode the suppressed local
+            // journal payload exactly once, instead of decoding the bytes
+            // `encodeRecord` just produced only to re-encode them. Only the
+            // `else blk:` branch below (the non-thin, non-group-source-
+            // command path) ever builds one; inline publication requires
+            // `materialized_derived_batch != null`, which only that branch
+            // sets, so suppression never has anything to do on the other
+            // two paths anyway. `record_matches_replay_payload` goes false
+            // if the `transferred_group_changed`/`deleted` merge below
+            // re-encodes `replay_payload` from a decoded copy instead of
+            // this struct, so a later reuse attempt never reads a stale
+            // hint/key set for what was actually journaled.
+            var maybe_record: ?change_journal_mod.Record = null;
+            defer if (maybe_record) |*r| change_journal_mod.deinitRecord(S.ownerField(self, "alloc").*, r);
+            var record_matches_replay_payload = true;
             var replay_payload = if (opts.group_source_command != null)
                 try change_journal_mod.encodeRecord(S.ownerField(self, "alloc").*, .{ .sequence = sequence, .changed_doc_keys = try group_staged.replayDocuments(group_alloc), .deleted_doc_keys = group_staged.deleted, .changed_artifact_keys = changed_graph_artifact_keys.items, .target_hints = &.{ .enrichment, .graph, .dense_vector, .sparse_vector } })
             else if (use_thin_replay_fast_path)
@@ -2817,13 +3125,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 precomputed_generated.generated_enrichment_refs = &.{};
                 materialized_derived_batch.?.sequence = sequence;
                 var record = try prepareDirectChangeRecord(&self.batchContext(), materialized_derived_batch.?, sequence, effective_req, S.ownerField(self, "local_execution").*.row_policy_table_name);
-                defer change_journal_mod.deinitRecord(S.ownerField(self, "alloc").*, &record);
+                // Ownership moves to the outer `maybe_record`/its top-level
+                // `defer` immediately -- on any error after this point
+                // (including from the rest of this block), that `defer`
+                // still runs and frees it exactly once.
+                maybe_record = record;
                 if (precomputed_generated.pending_child_work and !journalRecordHasHint(record, .enrichment)) {
                     const hints = try S.ownerField(self, "alloc").*.alloc(change_journal_mod.TargetHint, record.target_hints.len + 1);
                     @memcpy(hints[0..record.target_hints.len], record.target_hints);
                     hints[record.target_hints.len] = .enrichment;
                     if (record.target_hints.len != 0) S.ownerField(self, "alloc").*.free(record.target_hints);
                     record.target_hints = hints;
+                    maybe_record = record;
                 }
                 const payload = try change_journal_mod.encodeRecord(S.ownerField(self, "alloc").*, record);
                 errdefer S.ownerField(self, "alloc").*.free(payload);
@@ -2858,6 +3171,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const encoded = try change_journal_mod.encodeRecord(S.ownerField(self, "alloc").*, record);
                 S.ownerField(self, "alloc").*.free(replay_payload);
                 replay_payload = encoded;
+                // `replay_payload` now reflects `decoded.record` (this
+                // transfer merge's own group_alloc-backed copy), not
+                // `maybe_record` (still the pre-merge, alloc-owned
+                // original) -- never reuse it for the suppressed re-encode
+                // below; fall back to its own decode of these new bytes
+                // instead, same as before this change.
+                record_matches_replay_payload = false;
             }
             const append_derived_replay = !opts.suppress_derived_replay_append and
                 !elide_semantic_noop_replay;
@@ -2928,12 +3248,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             const store_write_start_ns = monotonicTimeNs();
             if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
-            const store_batch_options: backend_types.BatchOptions = if (opts.store_batch_options.mode != .default)
+            var store_batch_options: backend_types.BatchOptions = if (opts.store_batch_options.mode != .default)
                 opts.store_batch_options
             else if (self.bulkSessionActive())
                 .{ .mode = .bulk_ingest, .defer_commit_flush = true }
             else
                 .{};
+            if (req.split_replication != null or req.merge_replication != null)
+                store_batch_options.capture_committed_rows = false;
             var replication_applied_lsn_value_buf: [replication_applied_lsn_value_len]u8 = undefined;
             if (opts.replication_applied_lsn_marker) |lsn| {
                 if (lsn != 0) {
@@ -2974,6 +3296,41 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (try @import("artifact_reconcile_intent.zig").validateCompletion(S.ownerField(self, "alloc").*, &read, command, entry.index)) try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, @import("artifact_reconcile_intent.zig").key);
                 try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, @import("artifact_reconcile_intent.zig").resolver_cursor_key);
             }
+            const history = @import("../committed_history.zig");
+            var merge_history_key: history.MergeCut.Key = undefined;
+            var merge_history_cut: [history.MergeCut.encoded_size]u8 = undefined;
+            if (req.merge_source_transition) |transition| {
+                if (transition.kind == .finalize and opts.ordered_apply_receipt != null) {
+                    const receipt = opts.ordered_apply_receipt.?;
+                    const core = S.ownerField(self, "core").*;
+                    const namespace = @import("online_source_contract.zig").namespaceBytes(core.identity_namespace);
+                    try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = history.MergeCut.admission_fence_key, .value = "1" });
+                    var read = try core.store.beginReadTxn();
+                    defer read.abort();
+                    if (try history.MergeCut.load(&read, transition.transition_id)) |previous| {
+                        if (!std.mem.eql(u8, &previous.namespace, &namespace) or previous.receiver_group != transition.receiver_group_id)
+                            return error.HistoryResynchronizationRequired;
+                    } else if (try history.load(&read)) |frontier| {
+                        if (!std.mem.eql(u8, &frontier.namespace, &namespace)) return error.HistoryResynchronizationRequired;
+                        merge_history_key = history.MergeCut.key(transition.transition_id);
+                        merge_history_cut = (history.MergeCut{
+                            .namespace = namespace,
+                            .transition = transition.transition_id,
+                            .receiver_group = transition.receiver_group_id,
+                            .term = receipt.term,
+                            .index = receipt.index,
+                            .latest = frontier.latest,
+                            .reclaimed = frontier.reclaimed,
+                            .root_generation = core.root_generation,
+                            .reserved_bytes = frontier.reserved_bytes,
+                        }).encode();
+                        try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = &merge_history_key, .value = &merge_history_cut });
+                    }
+                }
+            }
+            var split_history_seed: ?history.SplitJournalSeed = null;
+            var split_history_namespace: history.frame.Namespace = undefined;
+            var split_history_origin: [history.SplitOrigin.encoded_size]u8 = undefined;
             var split_sequence_buf: [8]u8 = undefined;
             var split_marker_buf: [4 * @sizeOf(u64) + 1]u8 = undefined;
             var persisted_range: ?types.ByteRange = null;
@@ -2990,11 +3347,40 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
             if (req.split_checkpoint) |checkpoint| {
+                if (checkpoint.history_policy) |policy| {
+                    if (checkpoint.kind != .destination_complete or opts.ordered_apply_receipt == null)
+                        return error.InvalidHistoryAdmission;
+                    var read = try S.ownerField(self, "core").*.store.beginReadTxn();
+                    defer read.abort();
+                    const namespace = @import("online_source_contract.zig").namespaceBytes(S.ownerField(self, "core").*.identity_namespace);
+                    const origin: history.SplitOrigin = .{
+                        .transition = checkpoint.transition_id,
+                        .attempt = checkpoint.attempt_epoch,
+                        .predecessor_group = checkpoint.source_group_id,
+                        .successor_group = checkpoint.destination_group_id,
+                    };
+                    if (!origin.valid()) return error.InvalidHistoryAdmission;
+                    split_history_seed = try history.SplitJournalSeed.prepare(&read, policy, namespace);
+                    if (split_history_seed == null) try origin.require(&read);
+                    if (split_history_seed != null) {
+                        if (try doc_identity.loadNamespaceTxn(&read)) |persisted| {
+                            if (!persisted.eql(S.ownerField(self, "core").*.identity_namespace)) return error.HistoryResynchronizationRequired;
+                        } else {
+                            split_history_namespace = namespace;
+                            try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = &internal_keys.identity_namespace_key, .value = &split_history_namespace });
+                            try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = &internal_keys.identity_live_directory_manifest_key, .value = internal_keys.identity_live_directory_manifest_value });
+                        }
+                        try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = history.state_key, .value = &split_history_seed.?.state });
+                        try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = history.policy_key, .value = &split_history_seed.?.policy });
+                        split_history_origin = origin.encode();
+                        try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = history.SplitOrigin.key, .value = &split_history_origin });
+                    }
+                }
                 if (coordinated_handoff and checkpoint.kind == .destination_complete) {
-                    const raw_catalog = (try S.ownerField(self, "core").*.getStoreValue(S.ownerField(self, "alloc").*, @import("relational_integrity_catalog.zig").key)) orelse return error.IntegrityCatalogChanged;
+                    const raw_catalog = (try S.ownerField(self, "core").*.getStoreValue(S.ownerField(self, "alloc").*, @import("relational/integrity/catalog.zig").key)) orelse return error.IntegrityCatalogChanged;
                     defer S.ownerField(self, "alloc").*.free(raw_catalog);
-                    integrity_coverage_value = try @import("relational_integrity_handoff.zig").coverageForRange(S.ownerField(self, "alloc").*, raw_catalog, S.ownerField(self, "core").*.identity_namespace, .{ .start = checkpoint.range_start, .end = checkpoint.range_end });
-                    try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("relational_integrity_activation.zig").key, .value = integrity_coverage_value.? });
+                    integrity_coverage_value = try @import("relational/integrity/handoff.zig").coverageForRange(S.ownerField(self, "alloc").*, raw_catalog, S.ownerField(self, "core").*.identity_namespace, .{ .start = checkpoint.range_start, .end = checkpoint.range_end });
+                    try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("relational/integrity/activation.zig").key, .value = integrity_coverage_value.? });
                 }
                 if (checkpoint.kind != .source_ack) {
                     persisted_range = .{ .start = checkpoint.range_start, .end = checkpoint.range_end };
@@ -3104,12 +3490,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, shadow.range_key);
                 }
                 if (plan.applies_checkpoint and coordinated_handoff and (checkpoint.kind == .finalize or checkpoint.kind == .rollback)) {
-                    const catalog = @import("relational_integrity_catalog.zig");
+                    const catalog = @import("relational/integrity/catalog.zig");
                     const raw_catalog = try S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, catalog.key);
                     defer S.ownerField(self, "alloc").*.free(raw_catalog);
-                    const coverage = try @import("relational_integrity_handoff.zig").coverageForRange(S.ownerField(self, "alloc").*, raw_catalog, S.ownerField(self, "core").*.identity_namespace, plan.range);
+                    const coverage = try @import("relational/integrity/handoff.zig").coverageForRange(S.ownerField(self, "alloc").*, raw_catalog, S.ownerField(self, "core").*.identity_namespace, plan.range);
                     try write_buffers.owned_store_values.append(S.ownerField(self, "alloc").*, coverage);
-                    try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("relational_integrity_activation.zig").key, .value = coverage });
+                    try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("relational/integrity/activation.zig").key, .value = coverage });
                 }
             }
             if (persisted_range) |range| try S.ownerField(self, "core").*.index_manager.validateRangeTransition(range);
@@ -3172,19 +3558,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 &write_buffers.owned_store_values,
             );
             try write_buffers.store_writes.appendSlice(S.ownerField(self, "alloc").*, opts.extra_store_writes);
+            try write_buffers.store_writes.appendSlice(S.ownerField(self, "alloc").*, native_atomic_effects.writes);
             if (opts.outcome_marker_write) |marker| try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, marker);
             if (req.merge_page) |page| if (page.integrity.len != 0) {
                 // Private page shape, exact generation/ownership and replay cursor
                 // have been checked under this same apply fence. The physical
                 // shadow records commit with primary/index effects and receipt.
                 if (!coordinated_handoff) return error.CoordinatedConstraintTopologyUnsupported;
-                const catalog_mod = @import("relational_integrity_catalog.zig");
+                const catalog_mod = @import("relational/integrity/catalog.zig");
                 const raw = try S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, catalog_mod.key);
                 defer S.ownerField(self, "alloc").*.free(raw);
                 var compiled = try catalog_mod.decode(S.ownerField(self, "alloc").*, raw);
                 defer compiled.deinit();
                 for (page.integrity) |effect| {
-                    const address = (try @import("relational_integrity_contract.zig").parseKey(effect.key)).address;
+                    const address = (try @import("relational/integrity/contract.zig").parseKey(effect.key)).address;
                     if (page.phase != .cleanup_integrity and compiled.findGeneration(address.generation) == null) return error.IntegrityCatalogChanged;
                     if (effect.value) |value| try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = effect.key, .value = value }) else try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, effect.key);
                 }
@@ -3196,6 +3583,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, .{ .key = effect.key, .value = effect.value orelse return error.InvalidMergePage });
             };
             try write_buffers.delete_keys.appendSlice(S.ownerField(self, "alloc").*, opts.extra_store_deletes);
+            try write_buffers.delete_keys.appendSlice(S.ownerField(self, "alloc").*, native_atomic_effects.deletes);
             if (index_stage) |*stage| {
                 const effects = try stage.seal();
                 if (opts.transaction_resolution == null and !live_replication_apply and !scoped_restore_replication_apply) {
@@ -3243,13 +3631,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     transaction_replication_replay_payload = payload;
                 };
             };
-            const replay_append: ?docstore_mod.DocStore.ReplayAppend = if (append_derived_replay)
+            // Mutable: the journal-suppression block below (after every
+            // inline publication has resolved which indexes it actually
+            // serviced) may repoint `.payload` at a hint-filtered re-
+            // encoding for the LOCAL journal write only. `replay_payload`
+            // itself is never touched -- it already fed the full-hint
+            // bytes to the replication-mirror outbox above, and a
+            // replica's own inline-publication state is independent of
+            // this node's, so replication must keep every hint.
+            var replay_append: ?docstore_mod.DocStore.ReplayAppend = if (append_derived_replay)
                 .{
                     .sequence = sequence,
                     .payload = replay_payload,
                 }
             else
                 null;
+            var suppressed_replay_payload: ?[]u8 = null;
+            defer if (suppressed_replay_payload) |payload| S.ownerField(self, "alloc").*.free(payload);
             // This is the final fallible replay-retention boundary. It is an
             // immediate node-wide reservation: no reclamation, disk I/O, or wait
             // occurs while the apply fence is held. A hard-limit failure is
@@ -3279,6 +3677,481 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 write_buffers.store_writes.items,
             );
             defer authored_acceptance.deinit();
+            // WS4 phase 2: for a synchronous full_text write with no
+            // background executor workers (today's inline-apply case,
+            // below at `applyDerivedBatchTargetsProfiled`), try to
+            // prepare each target index's inline publication now, before
+            // the primary write is staged, so it can be attached as a
+            // commit_participant and land in the SAME native transaction
+            // -- instead of the existing post-commit path's own several
+            // commits (indexSegmentOwned/publishProjectionSeal/progress).
+            // An index whose write does not fit the fast path (a
+            // multi-chunk plan, a projection change mid-build, a
+            // non-`.native_catalog` index, ...) simply fails to prepare
+            // here and falls through to that existing path unchanged,
+            // further down this function.
+            // Sized independently of `commit_participant.List.max_participants`:
+            // that constant bounds the TOTAL number of contributors one write's
+            // commit may carry (authored_acceptance + inline text + inline
+            // dense + inline sparse + inline graph, ...); this array bounds only
+            // how many SIMULTANEOUS inline text publications one write may
+            // attempt (a write touching more than `max_inline_text_publications`
+            // managed full_text indexes still acks correctly -- the excess
+            // indexes simply fall through to the existing worker-driven catch-up
+            // path below, same as any other `prepareInlineTextPublication`
+            // failure). Conflating the two used to mean raising the shared
+            // commit-participant capacity for dense/sparse/graph would have
+            // silently also raised how many text publications this function
+            // attempts inline, with no review of whether that's still safe.
+            const max_inline_text_publications = 4;
+            var inline_text_publications: [max_inline_text_publications]?*InlineTextPublication = @splat(null);
+            // Captured once at prepare time, never nulled: `install` below
+            // nulls `inline_text_publications` slots so its own cleanup
+            // `defer` knows what still needs `abort`, but the filter at
+            // `applyDerivedBatchTargetsProfiled` (further down) must still
+            // know which index names were handled inline regardless.
+            // Each entry is this function's OWN duplicate of the index name
+            // (see the capture site below), never an alias into
+            // `sync_targets.full_text_indexes`: the "filter
+            // `sync_targets.full_text_indexes` once" block further down
+            // frees every handled original entry as soon as it builds the
+            // filtered array, which runs well before the `install` loop
+            // at the bottom of this function reads `inline_text_handled_names`
+            // to call `advanceAppliedSequenceIfContiguous`. Storing the
+            // alias directly here used to make that call a guaranteed
+            // use-after-free: the name compared against every registered
+            // worker's name was already-freed memory, so the comparison
+            // never matched and the fast-forward silently (and always)
+            // failed, forcing every other write back onto the slow,
+            // worker-driven catch-up path (see the regression test this
+            // fix adds for the resulting alternation).
+            var inline_text_handled_names: [@import("../commit_participant.zig").List.max_participants][]const u8 = undefined;
+            var inline_text_publication_count: usize = 0;
+            defer for (inline_text_publications[0..inline_text_publication_count]) |maybe_prepared| {
+                // Only still non-null if `install` below never ran for it
+                // (an error elsewhere in this function, or the primary
+                // write's own commit/ticket failed) -- `install` nulls
+                // its slot out once it has taken over the cleanup.
+                if (maybe_prepared) |prepared| prepared.abort();
+            };
+            defer for (inline_text_handled_names[0..inline_text_publication_count]) |name| {
+                S.ownerField(self, "alloc").*.free(name);
+            };
+            // Phase 2 round 2: attempt the inline fast path regardless of
+            // `executor.hasWorkers()` -- the default Lite configuration runs
+            // with background index workers, and the fast path's own
+            // concurrency story (the per-index `lockManagedIndexApply` guard
+            // held from `prepareInlineTextPublication` through
+            // `install`/`abort`, below) already serializes it against a
+            // worker's own `applyPreparedTextMapperPublicationByNameWithOptions`
+            // call, which takes the same per-index guard
+            // (mutation_materialization.zig's `applyDerivedBatchToIndexContextProfiled`).
+            const inline_executor_has_workers = S.ownerField(self, "executor").*.hasWorkers();
+            // `opts.transaction_resolution != null` means this commit routes
+            // through `resolveTransactionIntentsWithExtraBatch` below, whose
+            // own `commit_participant` is `authored_acceptance.participant()`
+            // alone -- never `combined_commit_participant` (built further
+            // down from this same `inline_text_publications` array). Any
+            // publication prepared here for that path would stage nothing,
+            // get `abort`-ed by this function's own top-level `defer`, and
+            // never reach `install`. Preparing it anyway would be pure waste
+            // at best; worse, the `sync_targets.full_text_indexes` filter
+            // just below only looks at whether a publication was prepared,
+            // not whether it was ever staged, so it would wrongly exclude
+            // these names from the notify/wait call further down even
+            // though their actual index effects still need that worker's
+            // ordinary (non-inline) catch-up. Skip the whole attempt for
+            // this path instead.
+            //
+            // `.full_index` requires this text index's visibility too --
+            // it is `.full_text`'s superset (`types.SyncLevel`'s enum order
+            // is `propose`/`write`/`full_text`/`enrichments`/`full_index`)
+            // -- so the fast path must engage there as well, same as the
+            // graph extension below is already gated on `.full_index`.
+            // Without this, an `indexed`/`full_index` write with a text
+            // index never takes the fast path at all: the exact-equality
+            // check this replaces used to make every such write fall
+            // through to the slow, several-commits-per-write path even
+            // though the write's own effective sync level already demands
+            // text visibility. The `all_indexes` filter below (not just
+            // `full_text_indexes`) is what then keeps the `.full_index`
+            // no-worker fallback from re-applying an index this inline
+            // publication already made durable.
+            if (append_derived_replay and
+                (effective_req.sync_level == .full_text or effective_req.sync_level == .full_index) and
+                opts.transaction_resolution == null and materialized_derived_batch != null)
+            {
+                for (sync_targets.full_text_indexes) |target_name| {
+                    if (inline_text_publication_count >= inline_text_publications.len) break;
+                    // A background worker may still be catching this index
+                    // up from an earlier write that never required
+                    // `.full_text` visibility (nothing else ever applies
+                    // that backlog except the worker's own catch-up).
+                    // Jumping straight to `sequence` here while that gap is
+                    // still open would silently skip it forever: once
+                    // durable progress says `sequence`, nothing ever
+                    // revisits anything below it. Only take the fast path
+                    // when the worker (if any is registered) is EXACTLY
+                    // caught up through `sequence - 1`; otherwise fall
+                    // through to the existing slow path below, which
+                    // correctly forces catch-up (including the gap) before
+                    // this write's own ack returns.
+                    if (inline_executor_has_workers) {
+                        const worker_applied = S.ownerField(self, "executor").*.appliedSequence(target_name) orelse 0;
+                        // `worker_applied == 0` together with the contiguity
+                        // check below (`worker_applied + 1 == sequence`)
+                        // means `sequence == 1`: the very first write this
+                        // worker has ever been asked to apply for this
+                        // index. A worker's own first catch-up also
+                        // finalizes that index's one-time admission
+                        // bookkeeping (clearing its durable
+                        // pending-activation marker via
+                        // `finalizeCompletedIndexAdmissionLocked`) as a
+                        // side effect of running through the ordinary
+                        // apply path at all -- `prepareInlineTextPublication`
+                        // only republishes an established index's ordinary
+                        // per-write effects and does not replicate that
+                        // one-time dance. Taking the fast path here would
+                        // leave the index durably stuck advertising pending
+                        // activation with no worker catch-up ever left to
+                        // resolve it (reproduced by the "crash sweep: full
+                        // text synchronous visibility" test: search() never
+                        // left `IndexRebuilding` after reopen, even on the
+                        // uncrashed run). Defer every index's very first
+                        // apply to the slow, worker-driven path; the fast
+                        // path only ever engages once steady state begins.
+                        if (worker_applied == 0 or worker_applied + 1 != sequence) continue;
+                    }
+                    const index_ref: index_manager_mod.ManagedIndexRef = .{ .name = target_name, .kind = .full_text };
+                    const prepared = prepareInlineTextPublication(
+                        S.ownerField(self, "alloc").*,
+                        S.ownerField(self, "core").*.store,
+                        S.ownerField(self, "core").*.index_manager,
+                        materialized_derived_batch.?,
+                        index_ref,
+                    ) catch continue;
+                    // Own a copy of the name now: `target_name` aliases
+                    // `sync_targets.full_text_indexes`, whose "filter once"
+                    // block below frees exactly this entry (it is now
+                    // known handled) long before the `install` loop at the
+                    // bottom of this function reads `inline_text_handled_names`.
+                    const handled_name = S.ownerField(self, "alloc").*.dupe(u8, target_name) catch |dup_err| {
+                        prepared.abort();
+                        return dup_err;
+                    };
+                    inline_text_publications[inline_text_publication_count] = prepared;
+                    inline_text_handled_names[inline_text_publication_count] = handled_name;
+                    inline_text_publication_count += 1;
+                }
+            }
+            // With a background executor running, every index this write just
+            // published inline must never also be handed to that executor for
+            // this same write: `notifyIndexes`/`waitForIndexes` would bump the
+            // worker's `target_sequence` and either make the ack wait on a
+            // worker that has nothing left to do, or -- worse -- invite it to
+            // redo the same apply the inline path already made durable.
+            // Rewrite `sync_targets.full_text_indexes` once, here, before any
+            // consumer (the notify call below, the visibility wait, and the
+            // `applyDerivedBatchTargetsProfiled` fallback for the no-worker
+            // case) sees it. `sync_targets.deinit()` (this function's own
+            // `defer`, above) frees whatever this field holds when the
+            // function returns, so the old backing array and every excluded
+            // name are freed right here instead of leaking, and the new array
+            // is a normal owned allocation deinit already knows how to free.
+            //
+            // The "which original entries are handled" decision is computed
+            // into a local `handled` flag array BEFORE any free() call: the
+            // original entries alias `inline_text_handled_names`' pointers
+            // (set to the very same `target_name` slice elements above), so
+            // comparing against them (`std.mem.eql`) after freeing even one
+            // earlier entry would read already-freed memory.
+            if (inline_text_publication_count != 0) {
+                const filter_alloc = S.ownerField(self, "alloc").*;
+                const handled = try filter_alloc.alloc(bool, sync_targets.full_text_indexes.len);
+                defer filter_alloc.free(handled);
+                var kept_count: usize = 0;
+                for (sync_targets.full_text_indexes, 0..) |name, i| {
+                    handled[i] = for (inline_text_handled_names[0..inline_text_publication_count]) |h| {
+                        if (std.mem.eql(u8, h, name)) break true;
+                    } else false;
+                    if (!handled[i]) kept_count += 1;
+                }
+                if (kept_count != sync_targets.full_text_indexes.len) {
+                    const filtered = try filter_alloc.alloc([]const u8, kept_count);
+                    errdefer filter_alloc.free(filtered);
+                    var fill: usize = 0;
+                    for (sync_targets.full_text_indexes, 0..) |name, i| {
+                        if (handled[i]) {
+                            filter_alloc.free(@constCast(name));
+                        } else {
+                            filtered[fill] = name;
+                            fill += 1;
+                        }
+                    }
+                    filter_alloc.free(@constCast(sync_targets.full_text_indexes));
+                    sync_targets.full_text_indexes = filtered;
+                }
+                // `.full_index` writes drive their no-worker fallback and
+                // worker-catchup bookkeeping off `sync_targets.all_indexes`,
+                // not `full_text_indexes` -- see the `.full_index` branch
+                // of the `applyDerivedBatchTargetsProfiled` dispatch below.
+                // Every name in `full_text_indexes` is also in
+                // `all_indexes` (`collectManagedSyncTargets*` adds a
+                // `.full_text` candidate's name to both arrays), so the
+                // same `inline_text_handled_names` set applies here too.
+                // Skipping this for a `.full_text` write is harmless -- its
+                // own fallback never reads `all_indexes` -- but filtering
+                // unconditionally keeps this correct if that ever changes.
+                const handled_all = try filter_alloc.alloc(bool, sync_targets.all_indexes.len);
+                defer filter_alloc.free(handled_all);
+                var kept_all_count: usize = 0;
+                for (sync_targets.all_indexes, 0..) |name, i| {
+                    handled_all[i] = for (inline_text_handled_names[0..inline_text_publication_count]) |h| {
+                        if (std.mem.eql(u8, h, name)) break true;
+                    } else false;
+                    if (!handled_all[i]) kept_all_count += 1;
+                }
+                if (kept_all_count != sync_targets.all_indexes.len) {
+                    const filtered_all = try filter_alloc.alloc([]const u8, kept_all_count);
+                    errdefer filter_alloc.free(filtered_all);
+                    var fill_all: usize = 0;
+                    for (sync_targets.all_indexes, 0..) |name, i| {
+                        if (handled_all[i]) {
+                            filter_alloc.free(@constCast(name));
+                        } else {
+                            filtered_all[fill_all] = name;
+                            fill_all += 1;
+                        }
+                    }
+                    filter_alloc.free(@constCast(sync_targets.all_indexes));
+                    sync_targets.all_indexes = filtered_all;
+                }
+            }
+            // lite-single-commit-write-path.md §3.3a: the graph extension
+            // of the fast path above. Deliberately narrow -- exactly one
+            // graph edge write and nothing else graph-related in this
+            // batch (no deletes, no doc clears, no OTHER artifact
+            // materialization) -- so every precondition
+            // `prepareInlineGraphPublication`/`graphEdgeWriteEligibleFor
+            // InlinePublication` cannot itself check (multiple edges in
+            // one batch, mixed writes/deletes needing a specific apply
+            // order) is simply never attempted here; the caller falls back
+            // to the existing `applyGraphMutationsByName` path for all of
+            // those, same as before this change. Gated on `.full_index`
+            // (not `.full_text`): graph has no narrower sync level of its
+            // own, matching `types.SyncLevel`'s enum order and
+            // `collectManagedSyncTargetsWithGeneratedSource`'s treatment
+            // of non-full_text managed indexes.
+            //
+            // `changed_artifact_keys` is *not* required to be empty: every
+            // `effective_req.graph_writes` entry unconditionally produces
+            // its own "graph relationship artifact" record (`appendGraph
+            // EdgeArtifactWrite`, above, well before this check) -- the
+            // durable record that lets a later source-document delete find
+            // and retire this edge. For the single-caller-supplied-edge
+            // case (the common shape: a plain `graph_writes` batch with no
+            // owner/owner_document, no document body, no field-derived
+            // contributors) that one key is *always* present and is always
+            // this same write's own artifact, which already lands in the
+            // primary commit's `write_buffers.store_writes` unconditionally
+            // above, independent of whether the graph index's own forward/
+            // reverse publication below is inline or not. So a batch whose
+            // only changed-artifact key is verifiably this write's own
+            // artifact is exactly as narrow as the empty case this gate
+            // originally required -- not a batch with unrelated/multiple
+            // artifact effects needing the slow path's own ordering.
+            // These callers publish effects outside the native transaction
+            // while holding the DB apply lock. Keep them on the ordinary path.
+            const allow_queued_index_publication = opts.committed_batch_effects_observer == null and
+                review_plan == null and next_table_catalog == null and persisted_range == null and
+                !shouldAppendSplitDelta(self) and
+                S.ownerField(self, "local_execution").*.replication_async_batch_mirror == null and
+                S.ownerField(self, "local_execution").*.replication_async_effect_mirror == null;
+            var inline_graph_publication: ?*InlineGraphPublication = null;
+            var inline_graph_handled_name: []const u8 = &.{};
+            defer if (inline_graph_publication) |prepared| prepared.abort();
+            defer if (inline_graph_handled_name.len != 0) S.ownerField(self, "alloc").*.free(@constCast(inline_graph_handled_name));
+            var graph_own_artifact_key: ?[]u8 = null;
+            defer if (graph_own_artifact_key) |key| S.ownerField(self, "alloc").*.free(key);
+            if (materialized_derived_batch != null and materialized_derived_batch.?.graph_writes.len == 1) {
+                const w = materialized_derived_batch.?.graph_writes[0];
+                const owner_key = if (w.owner_document.len > 0) w.owner_document else if (w.owner.len > 0) w.owner else w.source;
+                graph_own_artifact_key = internal_keys.graphRelationshipArtifactKeyAlloc(
+                    S.ownerField(self, "alloc").*,
+                    owner_key,
+                    w.index_name,
+                    w.edge_type,
+                    w.target,
+                    w.source,
+                    w.edge_id,
+                ) catch null;
+            }
+            const graph_changed_artifacts_are_own_edge = materialized_derived_batch != null and
+                materialized_derived_batch.?.changed_artifact_keys.len == 1 and
+                graph_own_artifact_key != null and
+                std.mem.eql(u8, materialized_derived_batch.?.changed_artifact_keys[0], graph_own_artifact_key.?);
+            // Diagnostic (test-only, see write_amplification_trace.zig):
+            // distinguishes "never attempted" (this batch's shape failed
+            // the caller-level gate below) from every reason `prepare*`
+            // itself can reject a write, so the write-amplification
+            // harness's graph mode can report exactly why it never shows
+            // one durable commit per write instead of guessing from the
+            // aggregate fsync/commit counts alone.
+            const graph_write_batch = materialized_derived_batch != null and materialized_derived_batch.?.graph_writes.len != 0;
+            const graph_gate_ok = allow_queued_index_publication and append_derived_replay and effective_req.sync_level == .full_index and
+                opts.transaction_resolution == null and materialized_derived_batch != null and
+                materialized_derived_batch.?.graph_writes.len == 1 and
+                materialized_derived_batch.?.graph_deletes.len == 0 and
+                materialized_derived_batch.?.graph_doc_clears.len == 0 and
+                (materialized_derived_batch.?.changed_artifact_keys.len == 0 or graph_changed_artifacts_are_own_edge) and
+                materialized_derived_batch.?.deleted_keys.len == 0;
+            if (graph_write_batch and !graph_gate_ok) {
+                if (!append_derived_replay) wal_trace.recordOp(.graph_inline_gate_not_append_derived_replay);
+                if (effective_req.sync_level != .full_index) wal_trace.recordOp(.graph_inline_gate_sync_level_not_full_index);
+                if (opts.transaction_resolution != null) wal_trace.recordOp(.graph_inline_gate_transaction_resolution);
+                if (materialized_derived_batch.?.graph_writes.len != 1) wal_trace.recordOp(.graph_inline_gate_multiple_graph_writes);
+                if (materialized_derived_batch.?.graph_deletes.len != 0) wal_trace.recordOp(.graph_inline_gate_graph_deletes_present);
+                if (materialized_derived_batch.?.graph_doc_clears.len != 0) wal_trace.recordOp(.graph_inline_gate_graph_doc_clears_present);
+                if (materialized_derived_batch.?.changed_artifact_keys.len != 0 and !graph_changed_artifacts_are_own_edge) wal_trace.recordOp(.graph_inline_gate_changed_artifact_keys_present);
+                if (materialized_derived_batch.?.deleted_keys.len != 0) wal_trace.recordOp(.graph_inline_gate_deleted_keys_present);
+            }
+            if (graph_gate_ok) {
+                const write = materialized_derived_batch.?.graph_writes[0];
+                const index_ref: index_manager_mod.ManagedIndexRef = .{ .name = write.index_name, .kind = .graph };
+                if (prepareInlineGraphPublication(
+                    S.ownerField(self, "alloc").*,
+                    S.ownerField(self, "core").*.index_manager,
+                    write,
+                    index_ref,
+                    sequence,
+                )) |prepared| {
+                    const handled_name = S.ownerField(self, "alloc").*.dupe(u8, write.index_name) catch |dup_err| {
+                        prepared.abort();
+                        return dup_err;
+                    };
+                    inline_graph_publication = prepared;
+                    inline_graph_handled_name = handled_name;
+                    wal_trace.recordOp(.graph_inline_engaged);
+                } else |err| {
+                    // `graphEdgeWriteEligibleForInlinePublication`/
+                    // `prepareInlineEdgePublication` already recorded a
+                    // specific reason for `error.InlineGraphPublicationUnsupported`/
+                    // `error.InlineEdgePublicationUnsupported`; only an
+                    // unexpected error (allocator failure, a real bug) needs
+                    // recording here.
+                    if (err != error.InlineGraphPublicationUnsupported) wal_trace.recordOp(.graph_inline_prepare_other_error);
+                }
+            } else if (graph_write_batch) {
+                wal_trace.recordOp(.graph_inline_caller_gate_failed);
+            }
+            // lite-single-commit-write-path.md §3.3a's sparse extension of
+            // the fast path above, mirroring the graph block immediately
+            // above it. Deliberately narrow -- exactly one sparse
+            // embedding write and nothing else sparse-related in this
+            // batch (no deletes, no overwritten docs, no changed
+            // artifacts) -- so every precondition
+            // `prepareInlineSparsePublication`/`sparseEmbeddingWriteEligible
+            // ForInlinePublication` cannot itself check (multiple
+            // embeddings in one batch, an artifact-backed write needing its
+            // own read, a document-field-derived index needing a second
+            // commit) is simply never attempted here; the caller falls
+            // back to the existing `applySparseEmbeddingWritesByNameWith
+            // Options` path for all of those, same as before this change.
+            // Gated on `.full_index`, same reasoning as graph's own gate:
+            // sparse has no narrower sync level of its own.
+            var inline_sparse_publication: ?*InlineSparsePublication = null;
+            var inline_sparse_handled_name: []const u8 = &.{};
+            defer if (inline_sparse_publication) |prepared| prepared.abort();
+            defer if (inline_sparse_handled_name.len != 0) S.ownerField(self, "alloc").*.free(@constCast(inline_sparse_handled_name));
+            if (allow_queued_index_publication and append_derived_replay and effective_req.sync_level == .full_index and
+                opts.transaction_resolution == null and materialized_derived_batch != null and
+                materialized_derived_batch.?.sparse_embeddings.len == 1 and
+                materialized_derived_batch.?.deleted_keys.len == 0 and
+                inlineVectorWriteOnlyTouchesItself(materialized_derived_batch.?, materialized_derived_batch.?.sparse_embeddings[0].doc_key, materialized_derived_batch.?.sparse_embeddings[0].artifact_key))
+            {
+                const write = materialized_derived_batch.?.sparse_embeddings[0];
+                const index_ref: index_manager_mod.ManagedIndexRef = .{ .name = write.index_name, .kind = .sparse_vector };
+                if (prepareInlineSparsePublication(
+                    S.ownerField(self, "alloc").*,
+                    S.ownerField(self, "core").*.store,
+                    S.ownerField(self, "core").*.index_manager,
+                    write,
+                    index_ref,
+                    sequence,
+                )) |prepared| {
+                    const handled_name = S.ownerField(self, "alloc").*.dupe(u8, write.index_name) catch |dup_err| {
+                        prepared.abort();
+                        return dup_err;
+                    };
+                    inline_sparse_publication = prepared;
+                    inline_sparse_handled_name = handled_name;
+                } else |_| {}
+            }
+            // lite-single-commit-write-path.md §3.3a's dense extension of
+            // the fast path above, mirroring the sparse block immediately
+            // above it. Deliberately narrow -- exactly one dense embedding
+            // write and nothing else dense-related in this batch (no
+            // deletes, no overwritten docs, no changed artifacts) -- so
+            // every precondition `prepareInlineDensePublication`/
+            // `denseEmbeddingWriteEligibleForInlinePublication` cannot
+            // itself check (multiple embeddings in one batch, a document
+            // replacement needing the slow path's own delete-then-upsert
+            // ordering) is simply never attempted here; the caller falls
+            // back to the existing `applyDenseEmbeddingWritesByNameWith
+            // Options` path for all of those, same as before this change.
+            // Gated on `.full_index`, same reasoning as graph's and
+            // sparse's own gates: dense has no narrower sync level of its
+            // own.
+            var inline_dense_publication: ?*InlineDensePublication = null;
+            var inline_dense_handled_name: []const u8 = &.{};
+            defer if (inline_dense_publication) |prepared| prepared.abort();
+            defer if (inline_dense_handled_name.len != 0) S.ownerField(self, "alloc").*.free(@constCast(inline_dense_handled_name));
+            if (allow_queued_index_publication and append_derived_replay and effective_req.sync_level == .full_index and
+                opts.transaction_resolution == null and materialized_derived_batch != null and
+                materialized_derived_batch.?.dense_embeddings.len == 1 and
+                materialized_derived_batch.?.deleted_keys.len == 0 and
+                inlineVectorWriteOnlyTouchesItself(materialized_derived_batch.?, materialized_derived_batch.?.dense_embeddings[0].doc_key, materialized_derived_batch.?.dense_embeddings[0].artifact_key))
+            {
+                var write = materialized_derived_batch.?.dense_embeddings[0];
+                // `buildDerivedBatch` deliberately zeroes `.vector` whenever
+                // `.artifact_key` is set (every caller-supplied-vector write
+                // reaches here with `artifact_key` already set --
+                // `appendEmbeddingArtifactWrite`'s own earlier, unconditional
+                // artifact write, well before this block runs), so the slow
+                // path's consumer knows to load the vector from the durable
+                // artifact. That artifact is not durable yet here -- it is
+                // only staged in `write_buffers.explicit_embedding_artifact_
+                // writes`, part of this SAME not-yet-committed primary write
+                // -- so resolve it from there instead of reading storage.
+                // `denseEmbeddingWriteEligibleForInlinePublication` requires
+                // a real inline vector; leaving `write.vector` zeroed here
+                // would always and incorrectly fall back to the slow path.
+                if (write.vector.len == 0) resolve: {
+                    const artifact_key = write.artifact_key orelse break :resolve;
+                    for (write_buffers.explicit_embedding_artifact_writes.items) |artifact_write| {
+                        if (!std.mem.eql(u8, artifact_write.key, artifact_key)) continue;
+                        const view = enrichment_artifact_codec.denseEmbeddingVectorView(artifact_write.value) catch break :resolve;
+                        write.vector = view orelse break :resolve;
+                        break;
+                    }
+                }
+                const index_ref: index_manager_mod.ManagedIndexRef = .{ .name = write.index_name, .kind = .dense_vector };
+                if (prepareInlineDensePublication(
+                    S.ownerField(self, "alloc").*,
+                    S.ownerField(self, "core").*.store,
+                    S.ownerField(self, "core").*.index_manager,
+                    write,
+                    index_ref,
+                    sequence,
+                )) |prepared| {
+                    const handled_name = S.ownerField(self, "alloc").*.dupe(u8, write.index_name) catch |dup_err| {
+                        prepared.abort();
+                        return dup_err;
+                    };
+                    inline_dense_publication = prepared;
+                    inline_dense_handled_name = handled_name;
+                } else |_| {}
+            }
             var generated_acceptance: ?@import("prepared_producer_acceptance.zig").Prepared = if (effective_req.commit_requires == .direct_enrichments) blk: {
                 var authority_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
                 defer authority_read.abort();
@@ -3290,6 +4163,352 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 break :blk try @import("prepared_producer_acceptance.zig").Prepared.init(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, plan.plan(), S.ownerField(self, "root_incarnation").*, sequence, if (current) precomputed_generated.prepared_producers else &.{}, write_buffers.store_writes.items, precomputed_generated.artifact_writes, precomputed_generated.artifact_delete_keys, if (authored_acceptance.vectors.len != 0) authored_acceptance.participant() else null);
             } else null;
             defer if (generated_acceptance) |*acceptance| acceptance.deinit();
+            var commit_participants: @import("../commit_participant.zig").List = .{};
+            // `generated_acceptance` wraps `authored_acceptance` as its inner
+            // participant, so append whichever is outermost.
+            if (generated_acceptance) |*acceptance| try commit_participants.append(acceptance.participant()) else if (authored_acceptance.vectors.len != 0) try commit_participants.append(authored_acceptance.participant());
+            for (inline_text_publications[0..inline_text_publication_count]) |maybe_prepared| {
+                if (maybe_prepared) |prepared| try commit_participants.append(prepared.participant());
+            }
+            if (inline_graph_publication) |prepared| {
+                if (commit_participants.append(prepared.participant())) {
+                    // Appended successfully: this write's commit now
+                    // carries the graph publication, so exclude its index
+                    // name from every generic sync_targets consumer below
+                    // (the has-workers notify/wait path reads `all_indexes`
+                    // only through `target_identities`/global sequence
+                    // wake, never by name for `.full_index` -- see
+                    // `notifyExecutorForSyncLevel` -- but the NO-WORKERS
+                    // fallback further down applies every name still left
+                    // in `all_indexes`, so it must not see this one).
+                    const filter_alloc = S.ownerField(self, "alloc").*;
+                    var kept_count: usize = 0;
+                    for (sync_targets.all_indexes) |name| {
+                        if (!std.mem.eql(u8, name, inline_graph_handled_name)) kept_count += 1;
+                    }
+                    if (kept_count != sync_targets.all_indexes.len) {
+                        const filtered = try filter_alloc.alloc([]const u8, kept_count);
+                        errdefer filter_alloc.free(filtered);
+                        var fill: usize = 0;
+                        for (sync_targets.all_indexes) |name| {
+                            if (std.mem.eql(u8, name, inline_graph_handled_name)) {
+                                filter_alloc.free(@constCast(name));
+                            } else {
+                                filtered[fill] = name;
+                                fill += 1;
+                            }
+                        }
+                        filter_alloc.free(@constCast(sync_targets.all_indexes));
+                        sync_targets.all_indexes = filtered;
+                    }
+                } else |_| {
+                    // `commit_participant.List` is at fixed capacity
+                    // (raised, but still finite -- see its own doc
+                    // comment): never silently drop this write's graph
+                    // effect because the list happened to be full. Abort
+                    // the prepared publication now and fall through to the
+                    // ordinary (non-inline) graph apply path exactly as if
+                    // `prepareInlineGraphPublication` itself had returned
+                    // `error.InlineGraphPublicationUnsupported` -- nothing
+                    // above this point committed anything for it yet.
+                    prepared.abort();
+                    inline_graph_publication = null;
+                }
+            }
+            if (inline_sparse_publication) |prepared| {
+                if (commit_participants.append(prepared.participant())) {
+                    // Mirrors the graph block above: exclude this write's
+                    // sparse index name from `sync_targets.all_indexes` so
+                    // the `.full_index` no-worker fallback further down
+                    // never re-applies an index this inline publication
+                    // already made durable.
+                    const filter_alloc = S.ownerField(self, "alloc").*;
+                    var kept_count: usize = 0;
+                    for (sync_targets.all_indexes) |name| {
+                        if (!std.mem.eql(u8, name, inline_sparse_handled_name)) kept_count += 1;
+                    }
+                    if (kept_count != sync_targets.all_indexes.len) {
+                        const filtered = try filter_alloc.alloc([]const u8, kept_count);
+                        errdefer filter_alloc.free(filtered);
+                        var fill: usize = 0;
+                        for (sync_targets.all_indexes) |name| {
+                            if (std.mem.eql(u8, name, inline_sparse_handled_name)) {
+                                filter_alloc.free(@constCast(name));
+                            } else {
+                                filtered[fill] = name;
+                                fill += 1;
+                            }
+                        }
+                        filter_alloc.free(@constCast(sync_targets.all_indexes));
+                        sync_targets.all_indexes = filtered;
+                    }
+                } else |_| {
+                    // Same reasoning as the graph block above: never
+                    // silently drop this write's sparse effect because
+                    // the commit-participant list happened to be full.
+                    prepared.abort();
+                    inline_sparse_publication = null;
+                }
+            }
+            if (inline_dense_publication) |prepared| {
+                if (commit_participants.append(prepared.participant())) {
+                    // Mirrors the graph/sparse blocks above: exclude this
+                    // write's dense index name from `sync_targets.all_indexes`
+                    // so the `.full_index` no-worker fallback further down
+                    // never re-applies an index this inline publication
+                    // already made durable.
+                    const filter_alloc = S.ownerField(self, "alloc").*;
+                    var kept_count: usize = 0;
+                    for (sync_targets.all_indexes) |name| {
+                        if (!std.mem.eql(u8, name, inline_dense_handled_name)) kept_count += 1;
+                    }
+                    if (kept_count != sync_targets.all_indexes.len) {
+                        const filtered = try filter_alloc.alloc([]const u8, kept_count);
+                        errdefer filter_alloc.free(filtered);
+                        var fill: usize = 0;
+                        for (sync_targets.all_indexes) |name| {
+                            if (std.mem.eql(u8, name, inline_dense_handled_name)) {
+                                filter_alloc.free(@constCast(name));
+                            } else {
+                                filtered[fill] = name;
+                                fill += 1;
+                            }
+                        }
+                        filter_alloc.free(@constCast(sync_targets.all_indexes));
+                        sync_targets.all_indexes = filtered;
+                    }
+                } else |_| {
+                    // Same reasoning as the graph/sparse blocks above: never
+                    // silently drop this write's dense effect because the
+                    // commit-participant list happened to be full.
+                    prepared.abort();
+                    inline_dense_publication = null;
+                }
+            }
+            // Algebraic workstream: single-commit write path for algebraic
+            // indexes. Unlike full_text, algebraic facts already live in the
+            // primary DocStore (no separate storage backend to migrate), so
+            // the gate here only needs to match the sync level that actually
+            // forces synchronous algebraic visibility: `syncLevelRequiresDerivedVisibility`
+            // below is false for `.enrichments`, so only `.full_index` ever
+            // reaches the untargeted `applyDerivedBatchProfiled` fallback
+            // this is short-circuiting (see that call site further down).
+            // Prepared only up to whatever room is left in `commit_participants`
+            // after `authored_acceptance`/text above -- a publication that
+            // cannot get a slot is aborted immediately (not left prepared)
+            // and simply falls back to the existing non-inline path for that
+            // one index; it must never turn a write that would otherwise
+            // succeed into a failure.
+            //
+            // Attempted regardless of `executor.hasWorkers()` -- mirroring
+            // text's own "Phase 2 round 2" fix above (the default Lite
+            // configuration runs with background index workers, so gating
+            // on no-workers would mean this fast path almost never engages).
+            // `InlineAlgebraicPublication.stage` reaches `Index.
+            // applyBatchWithOptionsView`, which takes the SAME `self.
+            // lockWrites()` mutex a worker's own `applyAlgebraicBatchByName
+            // WithOptions` -> `applyBatchWritesLocked` call takes, so the two
+            // are already mutually exclusive without needing `!hasWorkers()`
+            // as a proxy for "no concurrent worker apply".
+            //
+            // `opts.transaction_resolution == null`, matching text's/
+            // graph's/sparse's/dense's own gates above: a transaction-
+            // resolution commit below stages only `authored_acceptance`'s
+            // participant into `resolveTransactionIntentsWithExtraBatchStaged`
+            // (not `combined_commit_participant`), so a publication prepared
+            // here would never have `stage` run and would still be installed
+            // by the unconditional install loop further down -- tripping
+            // `InlineAlgebraicPublication.install`'s `apply_guard == null`
+            // assertion, since only `stage`'s own `defer` clears it.
+            var inline_algebraic_publications: [2]?*InlineAlgebraicPublication = @splat(null);
+            var inline_algebraic_handled_names: [2][]const u8 = undefined;
+            var inline_algebraic_publication_count: usize = 0;
+            defer for (inline_algebraic_publications[0..inline_algebraic_publication_count]) |maybe_prepared| {
+                if (maybe_prepared) |prepared| prepared.abort();
+            };
+            if (append_derived_replay and effective_req.sync_level == .full_index and
+                opts.transaction_resolution == null and materialized_derived_batch != null)
+            {
+                for (sync_targets.all_indexes) |target_name| {
+                    if (inline_algebraic_publication_count >= inline_algebraic_publications.len) break;
+                    if (commit_participants.len >= @import("../commit_participant.zig").List.max_participants) break;
+                    const index_ref: index_manager_mod.ManagedIndexRef = .{ .name = target_name, .kind = .algebraic };
+                    const prepared = prepareInlineAlgebraicPublication(
+                        S.ownerField(self, "alloc").*,
+                        S.ownerField(self, "core").*.store,
+                        S.ownerField(self, "core").*.index_manager,
+                        materialized_derived_batch.?,
+                        index_ref,
+                    ) catch continue;
+                    commit_participants.append(prepared.participant()) catch {
+                        prepared.abort();
+                        break;
+                    };
+                    inline_algebraic_publications[inline_algebraic_publication_count] = prepared;
+                    inline_algebraic_handled_names[inline_algebraic_publication_count] = target_name;
+                    inline_algebraic_publication_count += 1;
+                }
+            }
+            // Journal suppression (lite-single-commit-write-path.md §3.2a
+            // "Journal"): an inline-published index's facts and progress
+            // are already proven by THIS SAME native transaction, so
+            // recovery never needs its journal hint for this write. Must
+            // run only now, after every inline publication above has
+            // resolved which indexes it actually serviced -- never pre-
+            // guessed from the gate conditions alone, since a publication
+            // that failed to prepare or lost its `commit_participants`
+            // slot to an earlier one falls through to the non-inline path
+            // and still needs its hint kept. A kind's hint is dropped only
+            // when EVERY target of that kind in this write was serviced
+            // inline; a mixed batch (two indexes of the same kind, only
+            // one inline-handled) keeps the hint for the other.
+            if (replay_append) |entry| {
+                // text/graph/sparse/dense's own blocks above already strip
+                // their handled name(s) out of `sync_targets.all_indexes`
+                // (and, for text, `full_text_indexes` too) on success, so
+                // what's left in those lists at this point is already the
+                // REMAINING, non-inline-serviced set for those four kinds
+                // -- "fully serviced" is exactly "nothing of that kind is
+                // left". Algebraic's own block does NOT strip (its targets
+                // stay in `all_indexes` whether handled or not), so its
+                // remaining count needs the handled ones subtracted back
+                // out explicitly.
+                const suppress_full_text = inline_text_publication_count != 0 and
+                    sync_targets.full_text_indexes.len == 0;
+                var suppress_graph = false;
+                var suppress_sparse = false;
+                var suppress_dense = false;
+                var suppress_algebraic = false;
+                if (inline_graph_publication != null or inline_sparse_publication != null or
+                    inline_dense_publication != null or inline_algebraic_publication_count != 0)
+                {
+                    // No dedicated per-kind target list exists for these
+                    // four kinds the way `full_text_indexes` does, so count
+                    // them out of the (already-filtered) `all_indexes` by
+                    // looking each remaining name's kind up in the catalog.
+                    var graph_remaining: usize = 0;
+                    var sparse_remaining: usize = 0;
+                    var dense_remaining: usize = 0;
+                    var algebraic_remaining: usize = 0;
+                    for (sync_targets.all_indexes) |target_name| {
+                        const cfg = S.ownerField(self, "core").*.index_manager.get(target_name) orelse continue;
+                        switch (cfg.kind) {
+                            .full_text => {},
+                            .graph => graph_remaining += 1,
+                            .sparse_vector => sparse_remaining += 1,
+                            .dense_vector => dense_remaining += 1,
+                            .algebraic => algebraic_remaining += 1,
+                        }
+                    }
+                    // Algebraic's handled targets are still counted above
+                    // (its block never strips `all_indexes`); back them out
+                    // so `algebraic_remaining` means the same thing the
+                    // other three kinds' counts already do: how many
+                    // targets of this kind still need the slow path.
+                    algebraic_remaining -|= inline_algebraic_publication_count;
+                    suppress_graph = inline_graph_publication != null and graph_remaining == 0;
+                    suppress_sparse = inline_sparse_publication != null and sparse_remaining == 0;
+                    suppress_dense = inline_dense_publication != null and dense_remaining == 0;
+                    suppress_algebraic = inline_algebraic_publication_count != 0 and algebraic_remaining == 0;
+                }
+                if (suppress_full_text or suppress_graph or suppress_sparse or suppress_dense or suppress_algebraic) {
+                    const Dropper = struct {
+                        fn drop(hint: change_journal_mod.TargetHint, ft: bool, g: bool, sp: bool, d: bool, alg: bool) bool {
+                            return switch (hint) {
+                                .full_text => ft,
+                                .graph => g,
+                                .sparse_vector => sp,
+                                .dense_vector => d,
+                                .algebraic => alg,
+                                .enrichment, .resolution, .promotion => false,
+                            };
+                        }
+                    };
+                    // Common case: the in-memory record `encodeRecord`
+                    // already consumed to produce `entry.payload` is still
+                    // right here and still matches those exact bytes --
+                    // reuse it directly (just swapping `target_hints`,
+                    // every other field borrowed as-is) instead of
+                    // decoding the bytes it just encoded only to re-encode
+                    // them. Falls back to decode/filter/re-encode only for
+                    // the rare paths with no such record available (the
+                    // thin-replay/group-source-command payload shapes,
+                    // neither of which materializes a batch inline
+                    // publication could ever have serviced anyway, or the
+                    // transferred-group merge just above, which already
+                    // repointed `replay_payload` at its own decoded copy).
+                    if (maybe_record != null and record_matches_replay_payload) {
+                        const record = maybe_record.?;
+                        // `record.target_hints` is built per-document by
+                        // `recordFromDerivedBatch` (one append per matching
+                        // `doc.targets` entry, across every document in the
+                        // batch) and is NOT deduplicated like the encoded
+                        // on-disk bitmask is -- a batch of more than
+                        // `TargetHint`'s 8 variants can carry more than 8
+                        // (duplicate) hints. A fixed `[8]TargetHint` buffer
+                        // here (one slot per variant, matching the *decoded*
+                        // invariant, not this in-memory one) silently assumed
+                        // that bound and overflowed it. `Dropper.drop` only
+                        // ever filters this same slice down, never adds to
+                        // it, so `kept_hints` can never exceed
+                        // `record.target_hints.len` -- size it from that
+                        // real input instead, the same way the sibling
+                        // decode-path branch below already does.
+                        var kept_hints: std.ArrayListUnmanaged(change_journal_mod.TargetHint) = .empty;
+                        for (record.target_hints) |hint| {
+                            if (!Dropper.drop(hint, suppress_full_text, suppress_graph, suppress_sparse, suppress_dense, suppress_algebraic)) try kept_hints.append(group_alloc, hint);
+                        }
+                        if (kept_hints.items.len != record.target_hints.len) {
+                            var suppressed_record = record;
+                            suppressed_record.target_hints = kept_hints.items;
+                            const encoded = try change_journal_mod.encodeRecord(S.ownerField(self, "alloc").*, suppressed_record);
+                            suppressed_replay_payload = encoded;
+                            replay_append = .{ .sequence = entry.sequence, .payload = encoded };
+                        }
+                    } else {
+                        var decoded = try change_journal_mod.decodeRecord(group_alloc, entry.payload);
+                        defer decoded.deinit();
+                        var kept_hints: std.ArrayListUnmanaged(change_journal_mod.TargetHint) = .empty;
+                        for (decoded.record.target_hints) |hint| {
+                            if (!Dropper.drop(hint, suppress_full_text, suppress_graph, suppress_sparse, suppress_dense, suppress_algebraic)) try kept_hints.append(group_alloc, hint);
+                        }
+                        if (kept_hints.items.len != decoded.record.target_hints.len) {
+                            var suppressed_record = decoded.record;
+                            suppressed_record.target_hints = kept_hints.items;
+                            const encoded = try change_journal_mod.encodeRecord(S.ownerField(self, "alloc").*, suppressed_record);
+                            suppressed_replay_payload = encoded;
+                            replay_append = .{ .sequence = entry.sequence, .payload = encoded };
+                        }
+                    }
+                }
+            }
+            const queued_index_publication = inline_graph_publication != null or inline_sparse_publication != null or inline_dense_publication != null;
+            const QueuedCommitCompletion = struct {
+                executor: *derived_executor_mod.Executor,
+                admission: *derived_executor_mod.BacklogAdmission,
+                sequence: u64,
+                primary_committed: ?*bool,
+                disposition: ?*execution_resources.PreparedCommitDisposition,
+
+                fn run(ptr: *anyopaque, outcome: anyerror!u64) void {
+                    const context: *@This() = @ptrCast(@alignCast(ptr));
+                    _ = outcome catch return;
+                    context.executor.commitBacklogAdmission(context.sequence, context.admission);
+                    if (context.primary_committed) |committed| committed.* = true;
+                    if (context.disposition) |disposition| disposition.markPrimaryCommitted();
+                }
+            };
+            var queued_commit_completion: QueuedCommitCompletion = .{
+                .executor = S.ownerField(self, "executor").*,
+                .admission = &backlog_admission,
+                .sequence = sequence,
+                .primary_committed = opts.primary_committed,
+                .disposition = opts.prepared_commit_disposition,
+            };
+            if (queued_index_publication)
+                commit_participants.completion = .{ .ptr = &queued_commit_completion, .run = QueuedCommitCompletion.run };
+            const combined_commit_participant: ?@import("../commit_participant.zig").Participant =
+                if (commit_participants.len != 0) commit_participants.participant() else null;
             const commit_participant = if (generated_acceptance) |*acceptance| acceptance.participant() else if (authored_acceptance.vectors.len != 0) authored_acceptance.participant() else null;
 
             if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
@@ -3297,6 +4516,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 test_before_primary_commit = null;
                 try hook.run(hook.ptr);
             };
+            // WS3: staged, not yet durable. The primary write is applied and
+            // enqueued for the native store's group commit here, under the
+            // apply lock (sequence assignment/validation above stays under
+            // it, per WS2's durability-order-equals-apply-order guarantee),
+            // but the fsync wait moves past the apply lock release below so
+            // concurrent writers can share one group-commit fsync instead of
+            // serializing behind each other's durability wait.
+            var primary_ticket: ?docstore_mod.DocStore.StagedDocBatch = null;
+            // WS3 (relational/transactional surface): like `primary_ticket`
+            // above, staged but not yet durable. Only the transaction-
+            // resolution branch below ever populates this; see its own
+            // `errdefer`/wait pairing further down, mirrored from
+            // `primary_ticket`'s.
+            var txn_ticket: ?@import("../backend_erased.zig").Ticket = null;
             // Validate the actual atomic effect set, including coverage, source
             // revisions, counters and the journal. Preparation checks bound work
             // between producers; this final check bounds durable amplification.
@@ -3306,43 +4539,90 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (replay_append) |entry| try effect_budget.reserve(entry.payload.len, 1);
             }
             const transaction_applied = if (opts.transaction_resolution) |resolution| blk: {
-                const outcome = try S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(
+                const staged = try S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatchStagedAndLegacy(
                     resolution.txn_id,
                     resolution.status,
                     resolution.commit_version,
                     .{
+                        .external_decision_owner = resolution.external_decision_owner,
+                        .replication_resolution = resolution.replication_resolution,
+                        .publication_ordered_position = if (opts.ordered_apply_receipt) |cut| .{ .term = cut.term, .index = cut.index } else null,
+                        .source_purpose = resolution.source_purpose,
+                        .source_scope = resolution.source_scope,
+                        .source_scope_cut = if (opts.ordered_apply_receipt) |entry| .{ .term = entry.term, .index = entry.index } else null,
+                        .completion_owner = resolution.completion_owner,
                         .commit_participant = commit_participant,
                         .writes = write_buffers.store_writes.items,
                         .deletes = write_buffers.delete_keys.items,
                         .replay = if (replay_append) |entry| .{ .sequence = entry.sequence, .payload = entry.payload } else null,
                         .expected_intent_revision = resolution.expected_intent_revision,
+                        .prepared_graph_effects_checked = resolution.prepared_graph_effects_checked,
                         .known_intent_keys = resolution.intent_keys,
                         .skip_all_intent_application = relationalColumns(self) != null,
-                        .completion_writes = if (ordered_apply_receipt_write) |write| &.{write} else &.{},
+                        .completion_writes = if (ordered_apply_receipt_write) |write| if (resolution.legacy_outcome_write) |outcome| &.{ write, outcome } else &.{write} else &.{},
                         .resolved_participant = resolution.resolved_participant,
                     },
+                    resolution.legacy_terminal,
                 );
-                if (outcome.applied) {
+                if (staged.outcome.applied) {
+                    // Hot path (every ordinary commitTransaction/SQL DML
+                    // commit on a fresh, not-yet-resolved transaction takes
+                    // this branch -- see `TxnManager.resolveIntentsWithExtraBatchStaged`'s
+                    // `was_terminal` branches for the only other case).
+                    // Defer the wait to the same point `primary_ticket`'s
+                    // wait happens, below, so this commit's fsync can share
+                    // a group-commit window instead of blocking under the
+                    // apply lock and the capi writer lane.
+                    txn_ticket = staged.ticket;
                     if (replay_append) |entry| S.ownerField(self, "core").*.store.observeExternalReplayCommit(entry.sequence);
+                } else if (staged.ticket) |ticket| {
+                    // Rare terminal-retry path (this transaction was already
+                    // resolved by an earlier attempt): wait immediately,
+                    // exactly like this call did before staging existed.
+                    // Not performance sensitive -- no new commit happens on
+                    // the common case here, only idempotent completion
+                    // writes/deletes, if any.
+                    var owned = ticket;
+                    try owned.wait();
                 }
-                break :blk outcome;
+                break :blk staged.outcome;
             } else blk: {
                 if (durable_replication_batch_outbox_key != null or durable_replication_replay_outbox_key != null)
                     S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.store(true, .release);
-                try S.ownerField(self, "core").*.store.putBatchWithReplayAndParticipant(
+                primary_ticket = try S.ownerField(self, "core").*.store.putBatchWithHistoryTimeStaged(
                     S.ownerField(self, "backend_runtime").*.io(),
                     write_buffers.store_writes.items,
                     write_buffers.delete_keys.items,
                     replay_append,
                     store_batch_options,
-                    commit_participant,
+                    combined_commit_participant,
+                    if (opts.ordered_apply_receipt == null and opts.replication_applied_lsn_marker == null)
+                        std.math.cast(i64, S.ownerField(self, "backend_runtime").*.clock().nowRealtimeNs()) orelse 0
+                    else
+                        opts.ordered_history_commit_time_ns,
                 );
                 schedule_replication_recovery_on_exit = durable_replication_batch_outbox_key != null or durable_replication_replay_outbox_key != null;
                 break :blk transactions_mod.ResolutionOutcome{ .applied = true, .replay_sequence = sequence };
             };
+            // The write is staged regardless of what happens next in this
+            // function: once `putBatchWithReplayStagedAndParticipant`
+            // returns a ticket, it will become durable on its own (WS2's
+            // group commit does not take instructions back). If anything
+            // below fails before the normal wait point, still wait here so
+            // the ticket's heap state is freed and the apply order this
+            // write was assigned is honored, surfacing the later error above it.
+            errdefer if (primary_ticket) |*ticket| ticket.wait() catch {};
+            // Same reasoning as `primary_ticket`'s errdefer immediately
+            // above, for the transaction-resolution commit's own ticket.
+            errdefer if (txn_ticket) |*ticket| ticket.wait() catch {};
+            if (inline_graph_publication) |prepared| prepared.markEnqueued();
+            if (inline_sparse_publication) |prepared| prepared.markEnqueued();
+            if (inline_dense_publication) |prepared| prepared.markEnqueued();
             local_coverage_guard.release();
-            if (opts.primary_committed) |committed| committed.* = true;
-            if (opts.prepared_commit_disposition) |disposition| disposition.markPrimaryCommitted();
+            if (!queued_index_publication) {
+                if (opts.primary_committed) |committed| committed.* = true;
+                if (opts.prepared_commit_disposition) |disposition| disposition.markPrimaryCommitted();
+            }
             if (graph_publication) |*lease| lease.release();
             if (comptime @import("builtin").is_test) if (test_fail_after_primary_commit) |err| {
                 test_fail_after_primary_commit = null;
@@ -3385,11 +4665,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (opts.committed_batch_effects_observer) |observer| {
                 try observer.observe(if (append_derived_replay) replay_payload else "");
             }
-            if (pending_identity_visibility_summary) |summary| {
+            if (!queued_index_publication) if (pending_identity_visibility_summary) |summary| {
                 S.ownerField(self, "core").*.identity_visibility.summary = summary;
                 self.clearLiveDocSetCache();
                 self.clearNonVisibleDocSetCache();
-            }
+            };
             if (profile) |active_profile| {
                 recordProfileNs(profile, &active_profile.store_write_ns, store_write_start_ns);
                 active_profile.store_write_count += @intCast(write_buffers.store_writes.items.len);
@@ -3405,7 +4685,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.split_delta_ns, split_delta_start_ns);
             }
 
-            if (append_derived_replay) {
+            if (append_derived_replay and !queued_index_publication) {
                 const append_replay_journal_start_ns = monotonicTimeNs();
                 S.ownerField(self, "executor").*.commitBacklogAdmission(sequence, &backlog_admission);
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.append_replay_journal_ns, append_replay_journal_start_ns);
@@ -3414,7 +4694,186 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 split_shadow_ticket = reserveSplitShadowApplyTicket(self);
             }
             unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
+            // WS3: drop the capi connection-level locks (path lease, per-
+            // connection call mutex) too, before paying for the fsync -- the
+            // apply lock release above already let another thread start its
+            // own staging; this lets it finish entering (admission, refresh)
+            // while this call's ticket is still pending. Only called when a
+            // ticket is actually outstanding: `primary_ticket` xor
+            // `txn_ticket` (never both -- the transaction-resolution branch
+            // above never populates `primary_ticket`, and vice versa).
+            //
+            // Only when nothing after the wait writes. A sync level past
+            // `.write` applies this call's derived work below, and a child
+            // range outbox drains: those commit, and a commit needs the
+            // lease. Once released, another process (or another instance on
+            // this inode) can write, and this runtime's in-memory index state
+            // would then be stale.
+            // An inline index install still runs on this runtime after the
+            // wait. Releasing the lease before it let a same-process reopen
+            // retire the generation under work that still held its
+            // resources, and corrupted page-shaped values (8-thread indexed
+            // `lite-mp-bench`); hold it.
+            const commits_after_wait = (effective_req.sync_level != .write and effective_req.sync_level != .propose) or opts.document_child_range_dispatcher != null;
+            if ((primary_ticket != null or txn_ticket != null) and !commits_after_wait) {
+                if (opts.writer_lane_release_before_wait) |hook| hook.release(hook.ptr);
+            }
+            var indexed_lane_yielded = false;
+            if (primary_ticket != null and (inline_graph_publication != null or inline_sparse_publication != null or inline_dense_publication != null)) {
+                if (opts.writer_lane_release_before_wait) |hook| {
+                    if (hook.resume_after_indexed_wait != null) {
+                        if (hook.release_for_indexed_wait) |release| indexed_lane_yielded = release(hook.ptr);
+                    }
+                }
+            }
+            // WS3: wait for the primary write's durability only now, with the
+            // apply lock (and, above `batchInternalPreparedOwned`, the capi
+            // connection gate) already released, so this call's fsync can
+            // share a group with whatever other writers staged while this
+            // one ran its own apply-lock-protected bookkeeping above.
+            if (primary_ticket) |ticket| {
+                // Clear before waiting, not after: `wait` must run at most
+                // once. If it fails, the `errdefer` registered above this
+                // would otherwise see `primary_ticket` still set and call
+                // `wait` on it a second time -- a use-after-free, since
+                // `wait` frees the ticket's owned heap state unconditionally
+                // the first time (success or failure).
+                primary_ticket = null;
+                var owned_ticket = ticket;
+                // Regression-B test hook: a caller that wants this write's
+                // own commit sequence (`opts.committed_sequence_out`) waits
+                // via `waitSequence` instead of `wait` -- same contract,
+                // same one-shot free of the ticket's owned heap state,
+                // just also reporting which commit this was. See
+                // `execution_resources.zig`'s `committed_sequence_out` doc
+                // comment.
+                if (opts.committed_sequence_out) |sequence_out| {
+                    sequence_out.* = owned_ticket.waitSequence() catch |err| {
+                        // See the plain `wait()` branch below for why
+                        // `primary_committed` is corrected here too.
+                        if (opts.primary_committed) |committed| committed.* = false;
+                        return err;
+                    };
+                } else owned_ticket.wait() catch |err| {
+                    // `opts.primary_committed` was set true as soon as this
+                    // write was staged into the group (above), before this
+                    // wait -- the one place that actually confirms the
+                    // write's own durability -- could ever resolve. A
+                    // failure here (most notably a checkpoint publication
+                    // that left `checkpoint_publication_uncertain` set) means
+                    // that confirmation never happened: correct the flag
+                    // before it reaches any caller, so "primary committed"
+                    // continues to mean what its callers (`mutate`,
+                    // `trackedBatchWithWriterLaneHook`'s outcome-receipt
+                    // retirement, `batchFailureCode`) rely on it meaning --
+                    // this write's own durability is confirmed, not merely
+                    // that it was staged.
+                    if (opts.primary_committed) |committed| committed.* = false;
+                    return err;
+                };
+            }
+            // Relational/transactional surface counterpart: the hot-path
+            // transaction-resolution commit (every ordinary commitTransaction/
+            // SQL DML commit) staged its native transaction above, under the
+            // apply lock, exactly like the primary path. Wait for it now,
+            // with every lock already released, so it too can share a
+            // group-commit fsync instead of blocking other writers behind it.
+            if (txn_ticket) |ticket| {
+                txn_ticket = null;
+                var owned_ticket = ticket;
+                owned_ticket.wait() catch |err| {
+                    // Same reasoning as `primary_ticket`'s wait, immediately above.
+                    if (opts.primary_committed) |committed| committed.* = false;
+                    return err;
+                };
+            }
+            // WS4 phase 2: the primary commit is durable now, and every
+            // inline text publication's mutations rode in that SAME
+            // native transaction (commit_participant.List.stage ran
+            // before it, under store.putBatchWithReplayStagedAndParticipant
+            // above). Install each one's in-memory snapshot and null its
+            // slot out so the top-of-function `defer` no longer aborts
+            // it; from here, a later failure in this function must not
+            // undo an already-durable, already-installed publication.
+            for (inline_text_publications[0..inline_text_publication_count], 0..) |maybe_prepared, i| {
+                if (maybe_prepared) |prepared| {
+                    inline_text_publications[i] = null;
+                    try prepared.install();
+                    // Mirror this index's now-durable progress into the
+                    // background worker's own bookkeeping (a safe no-op if
+                    // there is no worker for this index, or if it is not
+                    // exactly caught up through `sequence - 1`; see
+                    // `Executor.advanceAppliedSequenceIfContiguous`). This
+                    // is what lets the worker skip ever re-scanning this
+                    // exact sequence for this index, instead of only
+                    // avoiding it on the next write's own pre-check above.
+                    if (inline_executor_has_workers) {
+                        _ = S.ownerField(self, "executor").*.advanceAppliedSequenceIfContiguous(inline_text_handled_names[i], sequence);
+                    }
+                }
+            }
+            // `install()` above may have just flipped `compaction_pending`
+            // on (see `IndexManager.noteInlineTextPublicationSegments`).
+            // Wake the merge worker the same way
+            // `applyDerivedBatchTargetsProfiled` already does for the
+            // non-inline path, instead of leaving it to find the work on
+            // its own next idle poll.
+            if (inline_text_publication_count != 0) {
+                if (S.ownerField(self, "text_merge_runtime").*) |runtime| runtime.notify();
+            }
+            const executor = S.ownerField(self, "executor").*;
+            if (inline_graph_publication) |prepared| {
+                inline_graph_publication = null;
+                try prepared.install();
+                if (executor.hasWorkers()) _ = executor.advanceAppliedSequenceIfContiguous(inline_graph_handled_name, sequence);
+            }
+            if (inline_sparse_publication) |prepared| {
+                inline_sparse_publication = null;
+                try prepared.install();
+                if (executor.hasWorkers()) _ = executor.advanceAppliedSequenceIfContiguous(inline_sparse_handled_name, sequence);
+            }
+            if (inline_dense_publication) |prepared| {
+                inline_dense_publication = null;
+                try prepared.install();
+                if (executor.hasWorkers()) _ = executor.advanceAppliedSequenceIfContiguous(inline_dense_handled_name, sequence);
+            }
+            // Same durability boundary as the inline text publications just
+            // above, for the algebraic ones. Mirror each now-durable
+            // publication's sequence into the background worker's own
+            // bookkeeping the same way text does above (see
+            // `Executor.advanceAppliedSequenceIfContiguous`'s doc comment):
+            // without this, a registered algebraic worker's `applied_
+            // sequence` never advances past what catch-up itself sets, so
+            // every write's `waitForAll`/notify cycle finds this worker
+            // still behind target and runs a redundant catch-up turn --
+            // which, finding nothing left to replay, still persists its
+            // own applied-sequence advancement as a second durable commit.
+            for (inline_algebraic_publications[0..inline_algebraic_publication_count], 0..) |maybe_prepared, i| {
+                if (maybe_prepared) |prepared| {
+                    prepared.install();
+                    inline_algebraic_publications[i] = null;
+                    if (S.ownerField(self, "executor").*.hasWorkers()) {
+                        _ = S.ownerField(self, "executor").*.advanceAppliedSequenceIfContiguous(inline_algebraic_handled_names[i], sequence);
+                    }
+                }
+            }
             snapshot_mutation.release();
+            // The inline publications retain shared catalog guards until
+            // cleanup. DDL may already own the lane and be waiting for them.
+            if (indexed_lane_yielded) {
+                const hook = opts.writer_lane_release_before_wait.?;
+                try hook.resume_after_indexed_wait.?(hook.ptr);
+            }
+            if (queued_index_publication and pending_identity_visibility_summary != null) {
+                try self.lockApplyForPortableRuntime();
+                defer S.ownerField(self, "core").*.unlockApply();
+                const core = S.ownerField(self, "core").*;
+                // A later member may already be durable. Read the current
+                // committed summary instead of reinstalling a stale snapshot.
+                core.identity_visibility.summary = doc_identity.visibilitySummaryFromStore(core.store) catch null;
+                core.identity_visibility.clearLive();
+                core.identity_visibility.clearNonvisible();
+            }
             if (split_shadow_ticket) |ticket| {
                 const apply_shadow_start_ns = monotonicTimeNs();
                 applyCommittedBatchToShadowOrdered(self, materialized_derived_batch.?, ticket);
@@ -3471,8 +4930,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         durable_outbox_deletes[durable_outbox_delete_count] = key;
                         durable_outbox_delete_count += 1;
                     }
+                    // The remote wait above already proved durability and
+                    // authority; this clear is bookkeeping that is safe to
+                    // lose on crash (the row is re-read and re-published,
+                    // tolerated by the at-least-once replication adapter),
+                    // so it rides along instead of forcing its own fsync
+                    // (lite-single-commit-write-path.md §3.2a).
                     if (durable_outbox_delete_count != 0)
-                        try S.ownerField(self, "core").*.store.putBatch(&.{}, durable_outbox_deletes[0..durable_outbox_delete_count]);
+                        try S.ownerField(self, "core").*.store.putBatchWithReplayWithOptions(null, &.{}, durable_outbox_deletes[0..durable_outbox_delete_count], null, .{ .durability = .ride_along });
                 }
             }
             if (opts.document_child_range_dispatcher) |dispatcher| {
@@ -3503,9 +4968,58 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (opts.wait_for_sync_level and syncLevelRequiresDerivedVisibility(effective_req.sync_level)) {
                     const derived_apply_start_ns = monotonicTimeNs();
                     if (effective_req.sync_level == .full_text) {
-                        try applyDerivedBatchTargetsProfiled(self, materialized_derived_batch.?, sync_targets.full_text_indexes, profile);
-                    } else {
+                        // WS4 phase 2: every index this write already
+                        // published inline (same native transaction as
+                        // the primary commit, already installed above)
+                        // must not also run through this post-commit
+                        // path -- that would re-index it a second time.
+                        // `sync_targets.full_text_indexes` already excludes
+                        // every inline-handled name (filtered once, above,
+                        // before this no-worker fallback and the
+                        // has-workers notify/wait path both run), so no
+                        // separate "remaining targets" computation is
+                        // needed here any more.
+                        if (sync_targets.full_text_indexes.len != 0) {
+                            try applyDerivedBatchTargetsProfiled(self, materialized_derived_batch.?, sync_targets.full_text_indexes, profile);
+                        }
+                    } else if (effective_req.sync_level == .full_index) {
+                        // Mirrors the `.full_text` branch above for the
+                        // text and graph inline fast paths:
+                        // `sync_targets.all_indexes` already excludes every
+                        // inline-handled text index name and the
+                        // inline-handled graph index name (each filtered
+                        // once, above, before this no-workers fallback and
+                        // the has-workers notify/wait path both run).
+                        // Applying only to what is left is equivalent to
+                        // the original unfiltered `applyDerivedBatchProfiled`
+                        // call when nothing was handled inline (every
+                        // managed index not actually relevant to this batch
+                        // is already a no-op there via
+                        // `batchAdvancesManagedIndexApplyState`), and
+                        // correctly skips re-applying an index this commit
+                        // already published inline when something was.
+                        if (sync_targets.all_indexes.len != 0) {
+                            try applyDerivedBatchTargetsProfiled(self, materialized_derived_batch.?, sync_targets.all_indexes, profile);
+                        }
+                    } else if (inline_algebraic_publication_count == 0) {
                         try applyDerivedBatchProfiled(self, materialized_derived_batch.?, profile);
+                    } else {
+                        // Algebraic workstream: every index already published
+                        // inline above (same native transaction as the primary
+                        // commit, already installed above) must not also run
+                        // through this post-commit path -- that would re-apply
+                        // it a second time, same as the full_text case above.
+                        var remaining_targets = std.ArrayListUnmanaged([]const u8).empty;
+                        defer remaining_targets.deinit(S.ownerField(self, "alloc").*);
+                        remaining: for (sync_targets.all_indexes) |target_name| {
+                            for (inline_algebraic_handled_names[0..inline_algebraic_publication_count]) |handled_name| {
+                                if (std.mem.eql(u8, handled_name, target_name)) continue :remaining;
+                            }
+                            try remaining_targets.append(S.ownerField(self, "alloc").*, target_name);
+                        }
+                        if (remaining_targets.items.len != 0) {
+                            try applyDerivedBatchTargetsProfiled(self, materialized_derived_batch.?, remaining_targets.items, profile);
+                        }
                     }
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.derived_apply_ns, derived_apply_start_ns);
                 }
@@ -3561,14 +5075,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             generated_memo.context = opts.preparation_context;
             // Cache restoration is an internal preservation operation. Ordinary
             // writes and explicit regeneration retain their provider semantics.
-            generated_memo.reuse_stored_artifacts = if (opts.restore_staging) |admission| !admission.rewrite else false;
+            generated_memo.reuse_stored_artifacts = if (opts.restore_staging) |admission| !admission.rewrite and admission.population == null else false;
             defer generated_memo.deinit();
             while (true) {
                 var disposition: execution_resources.PreparedCommitDisposition = .{};
                 var attempt_options = opts;
                 attempt_options.prepared_commit_disposition = &disposition;
                 self.batchInternalPrepared(req, profile, attempt_options, &generated_memo, allocator_guard) catch |err| {
-                    if (!disposition.permitsPreparationRetry(err) or retry_count >= max_prepared_generation_retries) return err;
+                    if (opts.checked_native_atomic != null or !disposition.permitsPreparationRetry(err) or retry_count >= max_prepared_generation_retries) return err;
                     retry_count += 1;
                     continue;
                 };
@@ -3632,6 +5146,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             schema_view: schema_registry_mod.SchemaView,
             req: types.BatchRequest,
             prepared_rows: ?[]?mapper.PreparedRelationalWrite,
+            prepared_effects: ?[]const PreparedRowEffects,
             principal: *const row_policy_authority_mod.Payload,
         ) !void {
             if (principal.access != .write or req.graph_writes.len != 0 or req.graph_deletes.len != 0 or
@@ -3641,58 +5156,81 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 return error.RowPolicyMutationUnsupported;
             const bundle = if (S.ownerField(self, "local_execution").*.row_policy_bundle) |*installed| installed else return error.RowPolicyCatalogChanged;
             const schema = schema_view.tableSchema().*;
-            var insert_check = try bundle.captureEvaluation(S.ownerField(self, "alloc").*, schema, principal, .insert);
+            var requirements = try @import("row_policy_bundle.zig").MutationRequirements.init(S.ownerField(self, "alloc").*, req.predicates, principal);
+            defer requirements.deinit(S.ownerField(self, "alloc").*);
+            const select_check = if (requirements.needsSelect()) try bundle.captureEvaluationAtSchemaView(S.ownerField(self, "alloc").*, schema_view, principal, .select) else null;
+            defer if (select_check) |evaluation| evaluation.deinit();
+            var insert_check = try bundle.captureEvaluationAtSchemaView(S.ownerField(self, "alloc").*, schema_view, principal, .insert);
             defer insert_check.deinit();
-            var update_old = try bundle.captureEvaluation(S.ownerField(self, "alloc").*, schema, principal, .update_old);
+            var update_old = try bundle.captureEvaluationAtSchemaView(S.ownerField(self, "alloc").*, schema_view, principal, .update_old);
             defer update_old.deinit();
-            var update_new = try bundle.captureEvaluation(S.ownerField(self, "alloc").*, schema, principal, .update_new);
+            var update_new = try bundle.captureEvaluationAtSchemaView(S.ownerField(self, "alloc").*, schema_view, principal, .update_new);
             defer update_new.deinit();
-            var delete_old = try bundle.captureEvaluation(S.ownerField(self, "alloc").*, schema, principal, .delete);
+            var delete_old = try bundle.captureEvaluationAtSchemaView(S.ownerField(self, "alloc").*, schema_view, principal, .delete);
             defer delete_old.deinit();
             var probe = try S.ownerField(self, "core").*.store.beginProbeTxn();
             defer probe.abort();
             for (req.writes, 0..) |write, i| {
                 if (isMetadataKey(write.key)) return error.RowPolicyMutationUnsupported;
-                const store_key = try encodeStoreLookupKeyAlloc(self, S.ownerField(self, "alloc").*, write.key);
-                defer S.ownerField(self, "alloc").*.free(store_key);
+                const requirement = try requirements.forKey(write.key);
+                if (requirement.isDelete()) return error.RowPolicyAuthenticationRequired;
+                // When the caller already encoded this write's store key into
+                // preparation.effects (the relational preprepared-rows path),
+                // borrow it instead of re-encoding and re-acquiring a schema
+                // view for the exact same key. The cache is owned by the
+                // caller's PreparedBatchResources and freed/transferred there;
+                // only a freshly-encoded key (document mode, or no cache) is
+                // freed here.
+                const cached_store_key: ?[]const u8 = if (prepared_effects) |effects| effects[i].store_key else null;
+                const store_key = cached_store_key orelse try encodeStoreLookupKeyAlloc(self, S.ownerField(self, "alloc").*, write.key);
+                defer if (cached_store_key == null) S.ownerField(self, "alloc").*.free(store_key);
                 const old_bytes: ?[]const u8 = probe.getLeased(store_key) catch |err| switch (err) {
                     error.NotFound => null,
                     else => return err,
                 };
                 if (old_bytes) |bytes| {
-                    if (try relational_store.rowSchemaVersion(bytes) != schema.version) return error.RowPolicyCatalogChanged;
-                    const old = if (S.ownerField(self, "core").*.store.valuesAreAuthenticated())
-                        try relational_row_codec.ordinalRowViewTrusted(bytes, schema, schema_view.physicalLayout())
-                    else
-                        try relational_row_codec.ordinalRowViewSelective(bytes, schema, schema_view.physicalLayout());
+                    if (requirement.isInsert()) return error.RowPolicyDenied;
+                    var physical = try row_policy_bundle_mod.PhysicalRow.init(S.ownerField(self, "core").*, schema_view, bytes);
+                    defer physical.deinit();
+                    const old = physical.row;
                     if (!try update_old.permits(old)) return error.RowPolicyDenied;
+                    if (requirement.requiresSelect() and !try select_check.?.permits(old)) return error.RowPolicyDenied;
                 }
+                if (old_bytes == null and requirement.isUpdate()) return error.RowPolicyDenied;
                 const prepared = prepared_rows.?[i] orelse return error.RowPolicyMutationUnsupported;
                 const new = try relational_row_codec.ordinalRowViewTrusted(prepared.packed_row, schema, schema_view.physicalLayout());
                 if (!try (if (old_bytes != null) update_new else insert_check).permits(new))
                     return error.RowPolicyDenied;
+                if (requirement.requiresSelect() and !try select_check.?.permits(new)) return error.RowPolicyDenied;
             }
             for (req.deletes) |key| {
                 if (isMetadataKey(key)) return error.RowPolicyMutationUnsupported;
+                const requirement = try requirements.forKey(key);
+                if (requirement.isInsert() or requirement.isUpdate()) return error.RowPolicyAuthenticationRequired;
                 const store_key = try encodeStoreLookupKeyAlloc(self, S.ownerField(self, "alloc").*, key);
                 defer S.ownerField(self, "alloc").*.free(store_key);
                 const bytes = probe.getLeased(store_key) catch |err| switch (err) {
                     error.NotFound => continue,
                     else => return err,
                 };
-                if (try relational_store.rowSchemaVersion(bytes) != schema.version) return error.RowPolicyCatalogChanged;
-                const old = if (S.ownerField(self, "core").*.store.valuesAreAuthenticated())
-                    try relational_row_codec.ordinalRowViewTrusted(bytes, schema, schema_view.physicalLayout())
-                else
-                    try relational_row_codec.ordinalRowViewSelective(bytes, schema, schema_view.physicalLayout());
+                var physical = try row_policy_bundle_mod.PhysicalRow.init(S.ownerField(self, "core").*, schema_view, bytes);
+                defer physical.deinit();
+                const old = physical.row;
                 if (!try delete_old.permits(old)) return error.RowPolicyDenied;
+                if (requirement.requiresSelect() and !try select_check.?.permits(old)) return error.RowPolicyDenied;
             }
         }
 
         pub fn ensureDurableReplicationStartupBarrier(self: anytype) !void {
             // A failed primary append must complete before a later mutation can
             // overtake its afterimage in the hot-standby tail.
-            while (S.ownerField(self, "async_context").*.primary_replication_append_pending.load(.acquire)) try self.flushDurableReplicationOutboxes();
+            while (S.ownerField(self, "async_context").*.primary_replication_append_pending.load(.acquire)) {
+                // The admission flag closes an ordering gap, not a hint-only
+                // spin loop. Force a bounded truth scan even if another hint
+                // is stale or staging aborted before its transaction commit.
+                S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.store(true, .release);
+                try self.flushDurableReplicationOutboxes();
+            }
             if (!S.ownerField(self, "local_execution").*.durable_replication_startup_barrier_pending.load(.acquire) and
                 !S.ownerField(self, "local_execution").*.row_policy_replication_outbox_pending.load(.acquire)) return;
             const io = S.ownerField(self, "backend_runtime").*.io() orelse std.Options.debug_io;
@@ -3719,9 +5257,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn failIfIdentityOrdinalExhaustedForNewUpserts(self: anytype, doc_ids: []const []const u8) !void {
             if (doc_ids.len == 0) return;
-
             var txn = try S.ownerField(self, "core").*.store.beginProbeTxn();
             defer txn.abort();
+            try failIfIdentityOrdinalExhaustedForNewUpsertsTxn(self, &txn, doc_ids);
+        }
+
+        /// Same as `failIfIdentityOrdinalExhaustedForNewUpserts`, reading
+        /// through an already-open probe/read transaction instead of
+        /// opening (and aborting) its own. perf/lwa-write-overhead: lets a
+        /// mutation's own prep phase share one transaction across this and
+        /// its other read-only checks instead of paying a separate overlay
+        /// pin/unpin for each.
+        pub fn failIfIdentityOrdinalExhaustedForNewUpsertsTxn(self: anytype, txn: anytype, doc_ids: []const []const u8) !void {
+            if (doc_ids.len == 0) return;
 
             const raw_next = txn.get(internal_keys.identity_next_ordinal_key[0..]) catch |err| switch (err) {
                 error.NotFound => return,
@@ -3736,9 +5284,80 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             for (doc_ids) |doc_id| {
                 if (seen.contains(doc_id)) continue;
                 try seen.put(S.ownerField(self, "alloc").*, doc_id, {});
-                if (try doc_identity.lookupOrdinalTxn(S.ownerField(self, "alloc").*, &txn, doc_id) != null) continue;
+                if (try doc_identity.lookupOrdinalTxn(S.ownerField(self, "alloc").*, txn, doc_id) != null) continue;
                 return error.DocOrdinalExhausted;
             }
+        }
+
+        /// Complete only the exact Raft-authored future-schema intent. The
+        /// old durable schema/bundle remain intact until this single commit.
+        pub fn finalizePendingRowPolicySchemaPairLocked(self: anytype, expected: row_policy_bundle_mod.Receipt) !?row_policy_bundle_mod.Receipt {
+            const alloc = S.ownerField(self, "alloc").*;
+            const core = S.ownerField(self, "core").*;
+            const raw = core.store.get(alloc, row_policy_bundle_mod.candidate_key) catch |err| switch (err) {
+                error.NotFound => return null,
+                else => return err,
+            };
+            defer alloc.free(raw);
+            var parsed = try std.json.parseFromSlice(@import("../../system_catalog/policies.zig").InstallSnapshot, alloc, raw, .{ .ignore_unknown_fields = false });
+            defer parsed.deinit();
+            const pair = parsed.value.schema_pair orelse return null;
+            if (expected.phase != .serving_install or parsed.value.phase != .serving_install or
+                expected.table_id != parsed.value.table_id or expected.generation != parsed.value.policy_generation or
+                expected.catalog_epoch != parsed.value.catalog_epoch) return error.RowPolicyCatalogChanged;
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
+            if (!std.mem.eql(u8, &digest, &expected.bundle_digest)) return error.RowPolicyCatalogChanged;
+            const native = @import("../schema.zig");
+            const schemas = try pair.materialize(alloc);
+            defer native.freeSchema(alloc, schemas.before);
+            defer native.freeSchema(alloc, schemas.after);
+            const observed_schema = core.schema orelse return error.RowPolicyCatalogChanged;
+            const observed = try native.serializeSchema(alloc, observed_schema);
+            defer alloc.free(observed);
+            std.crypto.hash.Blake3.hash(observed, &digest, .{});
+            if (!std.mem.eql(u8, &digest, &pair.before_schema_digest)) return error.RowPolicyCatalogChanged;
+            var installed = try row_policy_bundle_mod.Installed.init(alloc, raw, core.identity_namespace.table_id, schemas.after);
+            var installed_owned = true;
+            defer if (installed_owned) installed.deinit();
+            const public_schema = @import("../../schema/mod.zig");
+            const versioned = try public_schema.versionedSchemaKeyAlloc(alloc, schemas.after.version);
+            defer alloc.free(versioned);
+            var receipt_buffer: [128]u8 = undefined;
+            const receipt_key = try expected.key(&receipt_buffer);
+            const encoded_receipt = expected.encode();
+            const writes = [_]docstore_mod.KVPair{
+                .{ .key = internal_keys.public_schema_json_key, .value = pair.after_schema_json },
+                .{ .key = versioned, .value = pair.after_schema_json },
+                .{ .key = row_policy_bundle_mod.key, .value = raw },
+                .{ .key = receipt_key, .value = &encoded_receipt },
+            };
+            var prepared = try core.prepareSchemaMetadataAtVersion(schemas.after, &writes, schemas.before.version);
+            defer prepared.deinit();
+            const core_mod = @import("core.zig");
+            var recovery = if (S.ownerField(self, "transaction_recovery_identity_context").* != null)
+                try core_mod.PreparedRecoveryRelationalState.init(S.ownerField(self, "runtime_alloc").*, schemas.after.relational_columns, schemas.after.version)
+            else
+                null;
+            defer if (recovery) |*state| state.deinit();
+            _ = try core.commitPreparedSchemaMetadataPolicy(&prepared, &writes, &.{ row_policy_bundle_mod.pending_key, row_policy_bundle_mod.candidate_key }, .{
+                .table_id = expected.table_id,
+                .before_schema_version = schemas.before.version,
+                .before_schema_digest = pair.before_schema_digest,
+                .after_schema_digest = pair.after_schema_digest,
+                .before_policy_generation = pair.before_policy_generation,
+                .before_catalog_epoch = pair.before_catalog_epoch,
+                .policy_generation = expected.generation,
+                .catalog_epoch = expected.catalog_epoch,
+            });
+            if (S.ownerField(self, "transaction_recovery_identity_context").*) |context| {
+                if (recovery) |*state| context.installPreparedRelationalState(state) else unreachable;
+            }
+            if (S.ownerField(self, "local_execution").*.row_policy_bundle) |*old| old.deinit();
+            S.ownerField(self, "local_execution").*.row_policy_bundle = installed;
+            installed_owned = false;
+            try S.ownerField(self, "local_execution").*.row_policy_gate.publishCommitted(core.table_catalog);
+            return expected;
         }
 
         pub fn finalizePendingRowPolicyReceiptLocked(self: anytype, expected: row_policy_bundle_mod.Receipt) !row_policy_bundle_mod.Receipt {
@@ -3748,6 +5367,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var manager = try S.ownerField(self, "core").*.initTxnManager();
             defer manager.deinit();
             if (try manager.hasSchemaLeases()) return error.RowPolicyReadersActive;
+            if (try self.finalizePendingRowPolicySchemaPairLocked(expected)) |receipt| return receipt;
             const schema = S.ownerField(self, "core").*.schema orelse return error.RowPolicyCatalogChanged;
             const bundle_bytes = try S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, row_policy_bundle_mod.key);
             defer S.ownerField(self, "alloc").*.free(bundle_bytes);
@@ -3774,14 +5394,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .disabled => .disabled,
             };
             next.generation +|= 1;
-            const catalog_bytes = next.encode();
+            const catalog_bytes = try next.encodeDurable();
             const encoded_receipt = expected.encode();
             var receipt_key_buf: [128]u8 = undefined;
             const receipt_key = try expected.key(&receipt_key_buf);
             var txn = try S.ownerField(self, "core").*.store.beginWriteTxn();
             errdefer txn.abort();
             try txn.put(receipt_key, &encoded_receipt);
-            try txn.put(table_catalog_mod.key, &catalog_bytes);
+            try txn.put(table_catalog_mod.key, catalog_bytes.slice());
             try txn.delete(row_policy_bundle_mod.pending_key);
             try txn.commit();
             S.ownerField(self, "core").*.table_catalog = next;
@@ -3866,9 +5486,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const mirror = switch (kind) {
                     .batch, .restore_batch => S.ownerField(self, "local_execution").*.replication_async_batch_mirror,
                     .replay, .primary_effect => S.ownerField(self, "local_execution").*.replication_async_effect_mirror,
-                    .schema, .row_policy => S.ownerField(self, "local_execution").*.replication_async_metadata_mirror,
+                    .schema, .row_policy, .metadata_control => S.ownerField(self, "local_execution").*.replication_async_metadata_mirror,
                 } orelse return error.ReplicationPublisherUnavailable;
-                if (kind != .restore_batch and kind != .primary_effect and kind != .row_policy and !replicationMirrorRequiresDurableOutbox(mirror)) return error.ReplicationPublisherUnavailable;
+                if (kind != .restore_batch and kind != .primary_effect and kind != .row_policy and kind != .metadata_control and !replicationMirrorRequiresDurableOutbox(mirror)) return error.ReplicationPublisherUnavailable;
                 var ctx = self.batchContext();
                 try recoverDurableReplicationOutboxContext(&ctx, mirror, outbox, kind);
                 // The key names this exact mutation, so concurrent publishers cannot
@@ -3927,37 +5547,41 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn isProtectedIntegrityKey(key: []const u8) bool {
+            if (@import("../source_admission.zig").isProtectedKey(key)) return true;
+            if (std.mem.startsWith(u8, key, @import("../source_checkpoint.zig").prefix)) return true;
             if (@import("../artifact_footprint.zig").isKey(key)) return true;
-            if (@import("relational_index_catalog.zig").Controller.isReservedMetadataKey(key)) return true;
+            if (@import("relational/indexes/catalog.zig").Controller.isReservedMetadataKey(key)) return true;
             if (@import("retirement_set_summary.zig").isKey(key)) return true;
             if (@import("native_topology_receipt.zig").isKey(key)) return true;
-            const generation_admission = @import("relational_integrity_generation_admission.zig");
-            return std.mem.eql(u8, key, @import("restore_staging.zig").key) or std.mem.eql(u8, key, @import("restore_staging.zig").bootstrap_key) or @import("relational_integrity.zig").isKey(key) or std.mem.eql(u8, key, @import("relational_integrity_catalog.zig").key) or
-                std.mem.eql(u8, key, @import("relational_integrity_activation.zig").key) or
-                std.mem.eql(u8, key, @import("relational_integrity_topology.zig").fence_key) or
-                std.mem.eql(u8, key, @import("relational_integrity_topology.zig").receipt_key) or
-                std.mem.startsWith(u8, key, @import("relational_integrity_topology.zig").abort_prefix) or
-                std.mem.eql(u8, key, @import("relational_integrity_retirement.zig").key) or
-                std.mem.eql(u8, key, @import("relational_integrity_generation_retirement.zig").key) or
-                std.mem.startsWith(u8, key, @import("relational_integrity_generation_retirement.zig").active_prefix) or
-                std.mem.eql(u8, key, @import("relational_integrity_generation_retirement.zig").gc_progress_key) or
-                std.mem.eql(u8, key, @import("relational_integrity_generation_retirement.zig").activation_receipt_key) or
-                std.mem.eql(u8, key, @import("relational_integrity_generation_retirement.zig").completed_pending_key) or
-                std.mem.eql(u8, key, @import("relational_integrity_generation_retirement.zig").acknowledged_receipt_key) or
+            const generation_admission = @import("relational/integrity/generation_admission.zig");
+            const validation = @import("relational/integrity/activation_contract.zig");
+            if (std.mem.eql(u8, key, validation.validation_key) or std.mem.eql(u8, key, validation.validation_inputs_key)) return true;
+            return std.mem.eql(u8, key, @import("restore_staging.zig").key) or std.mem.eql(u8, key, @import("restore_staging.zig").bootstrap_key) or @import("relational/integrity/integrity.zig").isKey(key) or std.mem.eql(u8, key, @import("relational/integrity/catalog.zig").key) or
+                std.mem.eql(u8, key, @import("relational/integrity/activation.zig").key) or
+                std.mem.eql(u8, key, @import("relational/integrity/topology.zig").fence_key) or
+                std.mem.eql(u8, key, @import("relational/integrity/topology.zig").receipt_key) or
+                std.mem.startsWith(u8, key, @import("relational/integrity/topology.zig").abort_prefix) or
+                std.mem.eql(u8, key, @import("relational/integrity/retirement.zig").key) or
+                std.mem.eql(u8, key, @import("relational/integrity/generation_retirement.zig").key) or
+                std.mem.startsWith(u8, key, @import("relational/integrity/generation_retirement.zig").active_prefix) or
+                std.mem.eql(u8, key, @import("relational/integrity/generation_retirement.zig").gc_progress_key) or
+                std.mem.eql(u8, key, @import("relational/integrity/generation_retirement.zig").activation_receipt_key) or
+                std.mem.eql(u8, key, @import("relational/integrity/generation_retirement.zig").completed_pending_key) or
+                std.mem.eql(u8, key, @import("relational/integrity/generation_retirement.zig").acknowledged_receipt_key) or
                 std.mem.startsWith(u8, key, generation_admission.prefix) or
                 std.mem.eql(u8, key, generation_admission.staged_receipt_key) or
                 std.mem.eql(u8, key, generation_admission.activation_receipt_key) or
-                std.mem.eql(u8, key, generation_admission.acknowledged_receipt_key) or
+                std.mem.eql(u8, key, generation_admission.pending_reference_coverage_key) or std.mem.eql(u8, key, generation_admission.acknowledged_receipt_key) or
                 std.mem.eql(u8, key, generation_admission.dual_acknowledged_fence_key) or
                 std.mem.eql(u8, key, generation_admission.dual_canceled_fence_key) or
                 std.mem.eql(u8, key, generation_admission.cancel_receipt_key) or
                 std.mem.eql(u8, key, generation_admission.source_cancel_receipt_key) or
                 std.mem.eql(u8, key, generation_admission.source_fence_receipt_key) or
                 std.mem.eql(u8, key, generation_admission.source_install_receipt_key) or
-                std.mem.eql(u8, key, @import("relational_initial_child_publication.zig").key) or
-                std.mem.eql(u8, key, @import("relational_integrity_handoff.zig").manifest_key) or
-                std.mem.eql(u8, key, @import("relational_integrity_handoff.zig").progress_key) or
-                std.mem.eql(u8, key, @import("relational_integrity_handoff.zig").prune_key);
+                std.mem.eql(u8, key, @import("relational/integrity/initial_child_publication.zig").key) or
+                std.mem.eql(u8, key, @import("relational/integrity/handoff.zig").manifest_key) or
+                std.mem.eql(u8, key, @import("relational/integrity/handoff.zig").progress_key) or
+                std.mem.eql(u8, key, @import("relational/integrity/handoff.zig").prune_key);
         }
 
         pub fn isProtectedRangeWriteKey(key: []const u8) bool {
@@ -3967,6 +5591,124 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 std.mem.startsWith(u8, key, protection.writer_prefix) or
                 std.mem.startsWith(u8, key, protection.index_counter_prefix) or
                 std.mem.startsWith(u8, key, protection.index_writer_prefix);
+        }
+
+        /// lite-single-commit-write-path.md §3.3c/§7.5 (FK coordinator):
+        /// validates and materializes UNIQUE- and FOREIGN-KEY-constraint
+        /// integrity effects for a table write deciding them for the first
+        /// time in this one call (`BatchExecutionOptions.integrity_authority
+        /// == .local_decision`, set only by `capi/sql.zig`'s
+        /// `commitCoordinated` fast path and its multi-table FK coordinator)
+        /// -- no durable intent record, no begin record. Runs the same
+        /// `relational_integrity.prepare`/`validatePreparedEffects`/
+        /// `checkVersionPredicates` sequence `storage/db/db.zig`'s
+        /// `writeTransactionInternalOnce` runs for `req.integrity_commands`,
+        /// just without the durable round trip through "intents": the
+        /// caller must already be holding the SAME apply-exclusive lock
+        /// this commit is about to write under (this never acquires or
+        /// releases it), so the check and the write land in one native
+        /// batch with no gap a concurrent writer could land in between.
+        /// Both `.unique` and `.foreign_key` generation commands are
+        /// accepted: a single-table call (`prepared.tables.len == 1`) is
+        /// self-contained by construction (the dependency-catalog
+        /// preparation in `api/relational_integrity_commit.zig` only
+        /// attributes a command to a table whose own store must receive
+        /// it), and a cross-table FK command (e.g. a child's `.attach`
+        /// against a parent's claim) is safe here too as long as the
+        /// caller also holds every OTHER participant table's apply-
+        /// exclusive lock for the duration -- `capi/sql.zig`'s
+        /// `commitCoordinatedFusedMultiTable` is the only caller that
+        /// invokes this against a table other than the one driving the
+        /// enclosing native commit, and it establishes that lock
+        /// discipline itself (ascending `identity_namespace.table_id`)
+        /// before calling in. Returned intents are allocated from `alloc`
+        /// and remain valid for the caller's own commit lifetime (the
+        /// same `preparation_alloc` arena every other per-call buffer in
+        /// this function uses, for the single-table caller; the
+        /// multi-table coordinator passes its own longer-lived arena).
+        pub fn prepareLocalIntegrityDecision(
+            self: anytype,
+            alloc: Allocator,
+            schema_version: ?u32,
+            generation_set: ?[32]u8,
+            commands: []const @import("relational/integrity/contract.zig").Command,
+            child_exists: ?@import("relational/integrity/integrity.zig").ChildExistenceCheck,
+        ) ![]const transactions_mod.WriteIntent {
+            if (commands.len == 0) return &.{};
+            const integrity_mod = @import("relational/integrity/integrity.zig");
+            const catalog_mod = @import("relational/integrity/catalog.zig");
+            const retirement_mod = @import("relational/integrity/retirement.zig");
+            const shadow_mod = @import("online_integrity_shadow.zig");
+            const store = S.ownerField(self, "core").*.store;
+            const byte_range = S.ownerField(self, "core").*.byteRange();
+
+            // Nothing was ever begun or written as an "intent" under any
+            // txn id for this call, so a fresh random id only needs to
+            // avoid colliding with a REAL pending transaction's id -- it
+            // exists purely so the read guard below can tell this call's
+            // (nonexistent) own pending writes apart from someone else's.
+            var scratch_txn_id: transactions_mod.TxnId = undefined;
+            const scratch_io = S.ownerField(self, "backend_runtime").*.io() orelse std.Options.debug_io;
+            try scratch_io.randomSecure(&scratch_txn_id);
+            var integrity_read = try integrity_mod.CurrentView.initForTransaction(store, alloc, scratch_txn_id);
+            defer integrity_read.deinit();
+
+            for (commands) |command| try shadow_mod.requireServing(&integrity_read, byte_range, &command.address.routing);
+
+            const raw_catalog = integrity_read.get(catalog_mod.key) catch |err| switch (err) {
+                error.NotFound => return error.IntegrityCatalogChanged,
+                else => return err,
+            };
+            var catalog = try catalog_mod.decode(alloc, raw_catalog);
+            defer catalog.deinit();
+            if (generation_set) |expected| {
+                const actual = @import("relational/integrity/activation.zig").generationSet(catalog);
+                if (!std.mem.eql(u8, &expected, &actual)) return error.IntegrityCatalogChanged;
+            }
+            const version = schema_version orelse return error.PreparedGenerationChanged;
+            if (catalog.schema_version != version) return error.PreparedGenerationChanged;
+            const incarnation = try catalog_mod.incarnationFromTableId(S.ownerField(self, "core").*.identity_namespace.table_id);
+            if (!std.mem.eql(u8, &incarnation, &catalog.incarnation)) return error.IntegrityCatalogIncarnationMismatch;
+            for (commands) |command| {
+                const generation = catalog.findGeneration(command.address.generation) orelse return error.IntegrityCatalogChanged;
+                if (generation.definition.kind != .unique and generation.definition.kind != .foreign_key) return error.InvalidIntegrityOperation;
+                if (generation.retired and (command.operation == .establish or command.operation == .attach)) return error.IntegrityCatalogChanged;
+            }
+
+            try retirement_mod.requireMutable(&integrity_read);
+            try retirement_mod.admitCommands(&integrity_read, commands);
+
+            var effects = try integrity_mod.prepareWithChildCheck(alloc, &integrity_read, commands, child_exists);
+            defer effects.deinit();
+            try integrity_mod.validatePreparedEffects(alloc, &integrity_read, effects.operations);
+
+            var predicates = std.ArrayListUnmanaged(transactions_mod.VersionPredicate).empty;
+            defer predicates.deinit(alloc);
+            var intents = std.ArrayListUnmanaged(transactions_mod.WriteIntent).empty;
+            errdefer intents.deinit(alloc);
+            for (effects.operations) |operation| {
+                try shadow_mod.requireServing(&integrity_read, byte_range, operation.routing_key);
+                const parsed = try integrity_mod.parseKey(operation.key);
+                const generation = catalog.findGeneration(parsed.address.generation) orelse return error.IntegrityCatalogChanged;
+                if (generation.definition.kind != .unique and generation.definition.kind != .foreign_key) return error.InvalidIntegrityOperation;
+                if (generation.retired and operation.kind != .delete) return error.IntegrityCatalogChanged;
+                try predicates.append(alloc, integrity_mod.predicate(operation));
+                if (operation.kind != .guard) {
+                    // Copy out of `effects.arena` (freed by the `defer`
+                    // above when this function returns) into `alloc`,
+                    // which the caller keeps alive for the whole commit.
+                    const key_copy = try alloc.dupe(u8, operation.key);
+                    const value_copy = if (operation.value) |value| try alloc.dupe(u8, value) else null;
+                    try intents.append(alloc, .{ .key = key_copy, .value = value_copy });
+                }
+            }
+
+            var manager = try S.ownerField(self, "core").*.initTxnManager();
+            defer manager.deinit();
+            try manager.checkVersionPredicates(predicates.items, null);
+            try manager.checkIntentConflicts(intents.items, null);
+
+            return try intents.toOwnedSlice(alloc);
         }
 
         pub fn tryLockApplyForPortableRuntime(self: anytype) !void {
@@ -4023,19 +5765,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn noPendingEnrichmentReplayThrough(self: anytype, applied_sequence: u64, sequence: u64) !bool {
-            var cursor = try S.ownerField(self, "core").*.replaySource().openMatchingCursor(S.ownerField(self, "alloc").*, applied_sequence, .enrichment);
-            defer cursor.deinit(S.ownerField(self, "alloc").*);
-            const Probe = struct {
-                through: u64,
-                pending: bool = false,
-                fn consume(ptr: *anyopaque, at: u64, _: []const u8) !void {
-                    const probe: *@This() = @ptrCast(@alignCast(ptr));
-                    probe.pending = at <= probe.through;
-                }
-            };
-            var probe = Probe{ .through = sequence };
-            _ = try cursor.forEachNext(1, &probe, Probe.consume);
-            return !probe.pending;
+            return try S.ownerField(self, "core").*.replaySource().noMatchingRecordThrough(S.ownerField(self, "alloc").*, applied_sequence, .enrichment, sequence);
         }
 
         pub fn notifyQueryVisibilityEvent(ctx: *AsyncContext, event: QueryVisibilityEvent) void {
@@ -4115,11 +5845,30 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             visibility_cancellation: types.CancellationToken,
             ordered_receipt: ?OrderedApplyReceipt,
             resolved_participant: ?[]const u8,
+            source_purpose: ?[32]u8,
+            completion_owner: ?@import("../transaction_completion.zig").RoutedOwner,
+        ) !void {
+            return resolveTransactionIntentsInternalScoped(self, txn_id, status, commit_version, sync_level, visibility_cancellation, ordered_receipt, resolved_participant, source_purpose, completion_owner, null);
+        }
+
+        pub fn resolveTransactionIntentsInternalScoped(
+            self: anytype,
+            txn_id: transactions_mod.TxnId,
+            status: transactions_mod.TxnStatus,
+            commit_version: u64,
+            sync_level: types.SyncLevel,
+            visibility_cancellation: types.CancellationToken,
+            ordered_receipt: ?OrderedApplyReceipt,
+            resolved_participant: ?[]const u8,
+            source_purpose: ?[32]u8,
+            completion_owner: ?@import("../transaction_completion.zig").RoutedOwner,
+            source_scope: ?@import("../source_scope.zig").Reference,
         ) !void {
             var preparation: RequestPreparationContext = undefined;
             preparation.init(self);
             defer preparation.deinit();
-            self.resolveTransactionIntentsPrepared(
+            resolveTransactionIntentsPreparedScoped(
+                self,
                 txn_id,
                 status,
                 commit_version,
@@ -4127,8 +5876,29 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 visibility_cancellation,
                 ordered_receipt,
                 resolved_participant,
+                source_purpose,
+                completion_owner,
                 &preparation.guard,
+                source_scope,
             ) catch |err| return preparation.mapError(err);
+        }
+
+        pub fn resolveExternalTransactionIntents(
+            self: anytype,
+            txn_id: transactions_mod.TxnId,
+            status: transactions_mod.TxnStatus,
+            commit_version: u64,
+            sync_level: types.SyncLevel,
+            cancellation: types.CancellationToken,
+            receipt: ?OrderedApplyReceipt,
+            participant: ?[]const u8,
+            owner: transactions_mod.ExternalDecisionOwner,
+            replication: ?transactions_mod.ReplicationOrderedPhase,
+        ) !void {
+            var preparation: RequestPreparationContext = undefined;
+            preparation.init(self);
+            defer preparation.deinit();
+            resolveTransactionIntentsPreparedScopedWithLegacy(self, txn_id, status, commit_version, sync_level, cancellation, receipt, participant, null, null, &preparation.guard, null, null, null, owner, replication) catch |err| return preparation.mapError(err);
         }
 
         pub fn resolveTransactionIntentsPrepared(
@@ -4140,7 +5910,55 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             visibility_cancellation: types.CancellationToken,
             ordered_receipt: ?OrderedApplyReceipt,
             resolved_participant: ?[]const u8,
+            source_purpose: ?[32]u8,
+            completion_owner: ?@import("../transaction_completion.zig").RoutedOwner,
             preparation: *PreparedRowAllocator,
+        ) !void {
+            return resolveTransactionIntentsPreparedScoped(self, txn_id, status, commit_version, sync_level, visibility_cancellation, ordered_receipt, resolved_participant, source_purpose, completion_owner, preparation, null);
+        }
+
+        pub fn resolveTransactionIntentsPreparedScoped(
+            self: anytype,
+            txn_id: transactions_mod.TxnId,
+            status: transactions_mod.TxnStatus,
+            commit_version: u64,
+            sync_level: types.SyncLevel,
+            visibility_cancellation: types.CancellationToken,
+            ordered_receipt: ?OrderedApplyReceipt,
+            resolved_participant: ?[]const u8,
+            source_purpose: ?[32]u8,
+            completion_owner: ?@import("../transaction_completion.zig").RoutedOwner,
+            preparation: *PreparedRowAllocator,
+            source_scope: ?@import("../source_scope.zig").Reference,
+        ) !void {
+            return resolveTransactionIntentsPreparedScopedWithLegacy(self, txn_id, status, commit_version, sync_level, visibility_cancellation, ordered_receipt, resolved_participant, source_purpose, completion_owner, preparation, source_scope, null, null, null, null);
+        }
+
+        pub fn resolveClosedLegacyTerminalInternal(self: anytype, proof: transactions_mod.LegacyTerminalResolution, receipt: OrderedApplyReceipt, owner: @import("../transaction_completion.zig").RoutedOwner, outcome_write: docstore_mod.KVPair) !void {
+            const decision = try S.ownerField(self, "core").*.closedLegacyTerminalDecision(proof);
+            var preparation: RequestPreparationContext = undefined;
+            preparation.init(self);
+            defer preparation.deinit();
+            resolveTransactionIntentsPreparedScopedWithLegacy(self, proof.transaction_id, decision.status, decision.timestamp, .write, .none, receipt, null, null, owner, &preparation.guard, null, proof, outcome_write, null, null) catch |err| return preparation.mapError(err);
+        }
+
+        fn resolveTransactionIntentsPreparedScopedWithLegacy(
+            self: anytype,
+            txn_id: transactions_mod.TxnId,
+            status: transactions_mod.TxnStatus,
+            commit_version: u64,
+            sync_level: types.SyncLevel,
+            visibility_cancellation: types.CancellationToken,
+            ordered_receipt: ?OrderedApplyReceipt,
+            resolved_participant: ?[]const u8,
+            source_purpose: ?[32]u8,
+            completion_owner: ?@import("../transaction_completion.zig").RoutedOwner,
+            preparation: *PreparedRowAllocator,
+            source_scope: ?@import("../source_scope.zig").Reference,
+            legacy_terminal: ?transactions_mod.LegacyTerminalResolution,
+            legacy_outcome_write: ?docstore_mod.KVPair,
+            external_decision_owner: ?transactions_mod.ExternalDecisionOwner,
+            replication_resolution: ?transactions_mod.ReplicationOrderedPhase,
         ) !void {
             const alloc = preparation.allocator();
             // Ordered apply must never await work whose publication needs a
@@ -4165,16 +5983,30 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         .already_applied => return,
                         .apply => {},
                     }
-                    break :blk &.{orderedApplyReceiptWrite(identity, &marker_value_buf)};
+                    break :blk if (legacy_outcome_write) |outcome| &.{ orderedApplyReceiptWrite(identity, &marker_value_buf), outcome } else &.{orderedApplyReceiptWrite(identity, &marker_value_buf)};
                 } else &.{};
-                _ = S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{
-                    .completion_writes = marker_writes,
-                    .resolved_participant = resolved_participant,
-                }) catch |err| switch (err) {
+                _ = S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatchAndLegacy(
+                    txn_id,
+                    status,
+                    commit_version,
+                    .{
+                        .external_decision_owner = external_decision_owner,
+                        .replication_resolution = replication_resolution,
+                        .publication_ordered_position = if (ordered_receipt) |cut| .{ .term = cut.term, .index = cut.index } else null,
+                        .source_purpose = source_purpose,
+                        .source_scope = source_scope,
+                        .source_scope_cut = if (ordered_receipt) |entry| .{ .term = entry.term, .index = entry.index } else null,
+                        .completion_owner = completion_owner,
+                        .completion_writes = marker_writes,
+                        .resolved_participant = resolved_participant,
+                    },
+                    legacy_terminal,
+                ) catch |err| switch (err) {
                     // An abort decision for a participant that was declared but
                     // never enlisted is already satisfied. Treat it as an
                     // idempotent no-op so coordinator recovery can acknowledge it.
                     transactions_mod.TxnError.TxnNotFound => {
+                        if (source_scope != null) return error.SourceOutcomeUnresolved;
                         if (marker_writes.len != 0) try S.ownerField(self, "core").*.store.putBatch(marker_writes, &.{});
                         return;
                     },
@@ -4207,7 +6039,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             },
                             .apply => {},
                         }
-                        break :blk &.{orderedApplyReceiptWrite(identity, &marker_value_buf)};
+                        break :blk if (legacy_outcome_write) |outcome| &.{ orderedApplyReceiptWrite(identity, &marker_value_buf), outcome } else &.{orderedApplyReceiptWrite(identity, &marker_value_buf)};
                     } else &.{};
                     if (comptime @import("builtin").is_test) if (test_before_primary_commit) |hook| {
                         test_before_primary_commit = null;
@@ -4216,16 +6048,24 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             return err;
                         };
                     };
-                    const outcome = S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(
+                    const outcome = S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatchAndLegacy(
                         txn_id,
                         status,
                         commit_version,
                         .{
+                            .external_decision_owner = external_decision_owner,
+                            .replication_resolution = replication_resolution,
+                            .publication_ordered_position = if (ordered_receipt) |cut| .{ .term = cut.term, .index = cut.index } else null,
+                            .source_purpose = source_purpose,
+                            .source_scope = source_scope,
+                            .source_scope_cut = if (ordered_receipt) |entry| .{ .term = entry.term, .index = entry.index } else null,
+                            .completion_owner = completion_owner,
                             .completion_writes = marker_writes,
                             .resolved_participant = resolved_participant,
                             .expected_intent_revision = intents.revision,
                             .known_intent_keys = intent_keys,
                         },
+                        legacy_terminal,
                     ) catch |err| {
                         S.ownerField(self, "core").*.unlockApply();
                         if (err == error.IntentSnapshotChanged) continue;
@@ -4240,16 +6080,45 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 var graph_arena = std.heap.ArenaAllocator.init(alloc);
                 defer graph_arena.deinit();
                 const graph_batch = try @import("graph_transaction_effects.zig").materialize(graph_arena.allocator(), intents);
+                const graph_alloc = graph_arena.allocator();
+                var graph_writes: std.ArrayList(types.GraphEdgeWrite) = .empty;
+                try graph_writes.appendSlice(graph_alloc, graph_batch.graph_writes);
+                var graph_deletes: std.ArrayList(types.GraphEdgeDelete) = .empty;
+                try graph_deletes.appendSlice(graph_alloc, graph_batch.graph_deletes);
+                var graph_indexes: std.StringHashMapUnmanaged(@import("prepared_graph_effects.zig").Index) = .empty;
+                for (intents.prepared_graph_effects, 0..) |maybe_effects, row_index| if (maybe_effects) |bytes| {
+                    const effects = try std.json.parseFromSliceLeaky(@import("prepared_graph_effects.zig").Effects, graph_alloc, bytes, .{ .allocate = .alloc_always });
+                    try effects.validate(intents.writes[row_index].key);
+                    try graph_writes.appendSlice(graph_alloc, effects.writes);
+                    try graph_deletes.appendSlice(graph_alloc, effects.deletes);
+                    for (effects.indexes) |index| {
+                        const slot = try graph_indexes.getOrPut(graph_alloc, index.name);
+                        if (slot.found_existing) {
+                            if (slot.value_ptr.generation != index.generation or !std.mem.eql(u8, &slot.value_ptr.definition_digest, &index.definition_digest)) return error.PreparedGenerationChanged;
+                        } else slot.value_ptr.* = index;
+                    }
+                };
+                const required_graph_indexes = try graph_alloc.alloc(@import("prepared_graph_effects.zig").Index, graph_indexes.count());
+                var index_iterator = graph_indexes.valueIterator();
+                for (required_graph_indexes) |*index| index.* = index_iterator.next().?.*;
                 var durable_rows = std.StringHashMapUnmanaged([]const u8).empty;
                 defer durable_rows.deinit(alloc);
                 for (intents.prepared_rows, 0..) |maybe_row, i| if (maybe_row) |row| {
                     try durable_rows.put(alloc, intents.writes[i].key, row);
                 };
+                // This transaction's intents are materialized into real rows
+                // through the same combined-batch path an ordinary primary
+                // write uses (`transaction_resolution` folds the resolution's
+                // own KV changes into that one native commit), so without
+                // this tag the commit would attribute to `.primary_commit`
+                // like any other write instead of `.relational_intent_resolve`.
+                const wal_trace_scope = wal_trace.scope(.relational_intent_resolve);
+                defer wal_trace_scope.end();
                 self.batchInternalWithPreparationAllocator(.{
                     .writes = graph_batch.writes,
                     .deletes = graph_batch.deletes,
-                    .graph_writes = graph_batch.graph_writes,
-                    .graph_deletes = graph_batch.graph_deletes,
+                    .graph_writes = graph_writes.items,
+                    .graph_deletes = graph_deletes.items,
                     .commit_requires = if (intents.prepared_enrichments_json != null) .direct_enrichments else null,
                     .prepared_enrichments_json = intents.prepared_enrichments_json,
                     .timestamp_ns = commit_version,
@@ -4260,8 +6129,21 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .visibility_cancellation = visibility_cancellation,
                     .bypass_replication_write_gate = bypass_replication_write_gate,
                     .ordered_apply_receipt = ordered_receipt,
+                    // Original immutable provenance travels with the captured
+                    // intent revision, including restart resolution.
+                    .source_producer = if (intents.ordinary_producer) .ordinary else if (intents.legacy_producer) .legacy_cdc else .unlabelled,
                     .durable_rows = &durable_rows,
+                    .prepared_graph_indexes = required_graph_indexes,
                     .transaction_resolution = .{
+                        .prepared_graph_effects_checked = true,
+                        .document_revision_references = intents.document_revision_references,
+                        .external_decision_owner = external_decision_owner,
+                        .replication_resolution = replication_resolution,
+                        .legacy_terminal = legacy_terminal,
+                        .legacy_outcome_write = legacy_outcome_write,
+                        .source_purpose = source_purpose,
+                        .source_scope = source_scope,
+                        .completion_owner = completion_owner,
                         .txn_id = txn_id,
                         .status = status,
                         .commit_version = commit_version,
@@ -4405,20 +6287,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn validateLiveReplicationIntegrityEffects(self: anytype, alloc: Allocator, txn: anytype, req: types.BatchRequest) !void {
-            const integrity = @import("relational_integrity.zig");
-            const activation = @import("relational_integrity_activation.zig");
-            const retirement = @import("relational_integrity_retirement.zig");
-            const catalog_mod = @import("relational_integrity_catalog.zig");
+            const integrity = @import("relational/integrity/integrity.zig");
+            const activation = @import("relational/integrity/activation.zig");
+            const retirement = @import("relational/integrity/retirement.zig");
+            const catalog_mod = @import("relational/integrity/catalog.zig");
             var loaded: ?catalog_mod.Catalog = null;
             defer if (loaded) |*catalog| catalog.deinit();
             for (req.writes) |write| {
                 if (!isProtectedIntegrityKey(write.key)) continue;
-                const maintenance = @import("relational_index_maintenance_contract.zig");
+                const maintenance = @import("relational/indexes/maintenance_contract.zig");
                 if (maintenance.isControlKey(write.key)) {
                     // Index maintenance does not require an FK/unique catalog.
                     // The replicated desired state is fenced by its index identity,
                     // never by this replica's independent coverage progress.
-                    const id = try @import("relational_index_records.zig").Id.decode(write.key[maintenance.control_prefix.len..]);
+                    const id = try @import("relational/indexes/records.zig").Id.decode(write.key[maintenance.control_prefix.len..]);
                     var pinned = S.ownerField(self, "core").*.relational_indexes.acquire() orelse return error.PreparedGenerationChanged;
                     defer pinned.deinit();
                     const index = for (pinned.plan.boundIndexes()) |candidate| {
@@ -4436,7 +6318,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     else => return err,
                 });
                 const catalog = loaded.?;
-                if (std.mem.eql(u8, write.key, activation.key)) {
+                if (std.mem.eql(u8, write.key, activation.validation_key)) {
+                    const next = try activation.ValidationRecord.decode(write.value);
+                    const namespace = (try @import("doc_identity.zig").loadNamespaceTxn(txn)) orelse return error.IdentityNamespaceMismatch;
+                    if (!next.binding.fence.namespace.eql(namespace) or !next.progress.matches(catalog, try activation.ownership(txn)) or
+                        !std.mem.eql(u8, &next.binding.before_schema, &catalog.schema_digest) or next.binding.before_version != catalog.schema_version)
+                        return error.SchemaValidationJobChanged;
+                } else if (std.mem.eql(u8, write.key, activation.validation_inputs_key)) {
+                    var expected: ?[32]u8 = null;
+                    for (req.writes) |sibling| if (std.mem.eql(u8, sibling.key, activation.validation_key)) {
+                        expected = (try activation.ValidationRecord.decode(sibling.value)).binding.inputs;
+                        break;
+                    };
+                    if (expected == null) expected = (try activation.ValidationRecord.decode(try txn.get(activation.validation_key))).binding.inputs;
+                    if (!std.mem.eql(u8, &@import("relational/schema_change/schema_owner_contract.zig").hash(write.value), &expected.?)) return error.SchemaValidationJobChanged;
+                    _ = try @import("relational/schema_change/schema_owner_contract.zig").inputParts(write.value);
+                } else if (std.mem.eql(u8, write.key, activation.key)) {
                     const next = try activation.Progress.decode(write.value);
                     if (!next.matches(catalog, try activation.ownership(txn)) or next.schema_version != catalog.schema_version)
                         return error.IntegrityCatalogChanged;
@@ -4501,7 +6398,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn validateResolvedKeyOwnership(self: anytype, key: []const u8) !void {
-            const integrity = @import("relational_integrity.zig");
+            const integrity = @import("relational/integrity/integrity.zig");
             if (integrity.isKey(key)) {
                 const parsed = try integrity.parseKey(key);
                 return S.ownerField(self, "core").*.validateKeyOwnership(&parsed.address.routing);
@@ -4511,9 +6408,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn validateRestoreStagingReplicationEffects(self: anytype, alloc: Allocator, txn: anytype, req: types.BatchRequest) !void {
             if (req.relational_index_maintenance != null) return error.InvalidRestoreStagingCommand;
-            const integrity = @import("relational_integrity.zig");
-            const activation = @import("relational_integrity_activation.zig");
-            const catalog_mod = @import("relational_integrity_catalog.zig");
+            const integrity = @import("relational/integrity/integrity.zig");
+            const activation = @import("relational/integrity/activation.zig");
+            const catalog_mod = @import("relational/integrity/catalog.zig");
             if (req.transforms.len != 0 or req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.relational_repair or req.relational_activation != null or req.relational_retirement != null or req.integrity.len != 0 or req.integrity_commands.len != 0) return error.InvalidRestoreStagingCommand;
             const raw_catalog = txn.get(catalog_mod.key) catch |err| switch (err) {
                 error.NotFound => return error.IntegrityCatalogChanged,
@@ -4637,7 +6534,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .io = S.ownerField(self, "backend_runtime").*.io(),
                 .store = async_resources.store,
                 .relational_base_rows = relationalColumns(self) != null,
-                .applied_sequence_checkpoint_path = async_resources.applied_sequence_checkpoint_path,
                 .index_manager = shadow.manager,
                 .apply_mutex = async_resources.apply_mutex,
                 .snapshot_replay_admission = async_resources.snapshot_replay_admission,
@@ -5058,7 +6954,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             alloc: Allocator,
             index_manager: *const index_manager_mod.IndexManager,
             store: anytype,
-            applied_sequence_checkpoint_path: ?[]const u8,
             index_ref: index_manager_mod.ManagedIndexRef,
         ) !u64 {
             // A WAL-authoritative dense index carries its exact durable replay
@@ -5071,13 +6966,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     return error.InvalidDerivedApplyState;
                 return checkpoint.applied_sequence;
             }
-            return try apply_state.loadAppliedSequenceWithCheckpoint(
-                alloc,
-                index_manager.checkpointIo(),
-                store,
-                applied_sequence_checkpoint_path,
-                index_ref.name,
-            );
+            return try apply_state.loadAppliedSequence(alloc, store, index_ref.name);
         }
 
         pub fn lockApply(self: anytype) void {
@@ -5154,6 +7043,108 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const backoff_step = @min(attempts - 128, 5);
                 const sleep_ns = @min(@as(u64, 50_000) << @intCast(backoff_step), @as(u64, 1_000_000));
                 sleepNs(sleep_ns);
+                sleep_loops += 1;
+            }
+
+            const wait_ns = elapsedSince(wait_start_ns);
+            _ = stats.spin_loops.fetchAdd(spin_loops, .monotonic);
+            _ = stats.yield_loops.fetchAdd(yield_loops, .monotonic);
+            _ = stats.sleep_loops.fetchAdd(sleep_loops, .monotonic);
+            _ = stats.wait_ns.fetchAdd(wait_ns, .monotonic);
+            atomicMaxU64(&stats.max_wait_ns, wait_ns);
+            return .{
+                .mutex = mutex,
+                .stats = stats,
+                .hold_start_ns = monotonicTimeNs(),
+                .profiled = true,
+            };
+        }
+
+        /// Like `lockAtomicWithBackoff`, but yields through the given Io
+        /// instead of a raw OS `nanosleep` once spinning/yielding alone
+        /// stops being productive. VOPR's cooperative scheduler runs its
+        /// deterministic scenario on a single logical thread; a raw
+        /// `nanosleep` there blocks the exact thread a contending lock
+        /// holder needs to run again (to finish its own work and release
+        /// the lock), starving it forever instead of just slowing it down.
+        /// Production backends see no behavior change: `io.sleep` resolves
+        /// to the real OS clock there too. Used only for
+        /// `applied_sequence_mutex`; see `DETERMINISM_AUDIT.md` for why the
+        /// other `lockAtomicWithBackoff(Profiled)` callers were left alone.
+        pub fn lockAtomicWithBackoffIo(mutex: *std.atomic.Mutex, io: std.Io) void {
+            var attempts: usize = 0;
+            while (!mutex.tryLock()) : (attempts += 1) {
+                if (builtin.os.tag == .freestanding or builtin.single_threaded) {
+                    std.atomic.spinLoopHint();
+                    continue;
+                }
+                if (attempts < 64) {
+                    std.atomic.spinLoopHint();
+                    continue;
+                }
+                if (attempts < 128) {
+                    @import("antfly_platform").time.yieldNow();
+                    continue;
+                }
+                const backoff_step = @min(attempts - 128, 5);
+                const sleep_ns = @min(@as(u64, 50_000) << @intCast(backoff_step), @as(u64, 1_000_000));
+                io.sleep(std.Io.Duration.fromNanoseconds(@intCast(sleep_ns)), .awake) catch {};
+            }
+        }
+
+        /// Io-aware counterpart to `lockAtomicWithBackoffProfiled`; see
+        /// `lockAtomicWithBackoffIo`'s doc comment for why this variant
+        /// exists and is intentionally not a drop-in replacement for the
+        /// general helper above.
+        pub fn lockAtomicWithBackoffProfiledIo(mutex: *std.atomic.Mutex, stats: *MutexContentionStats, io: std.Io) ProfiledLock {
+            if (!asyncIndexProfileEnabled()) {
+                lockAtomicWithBackoffIo(mutex, io);
+                return .{
+                    .mutex = mutex,
+                    .stats = stats,
+                    .hold_start_ns = 0,
+                    .profiled = false,
+                };
+            }
+            _ = stats.lock_calls.fetchAdd(1, .monotonic);
+            if (mutex.tryLock()) {
+                return .{
+                    .mutex = mutex,
+                    .stats = stats,
+                    .hold_start_ns = monotonicTimeNs(),
+                    .profiled = true,
+                };
+            }
+
+            _ = stats.contended_calls.fetchAdd(1, .monotonic);
+            const current_waiters = stats.current_waiters.fetchAdd(1, .monotonic) + 1;
+            atomicMaxU64(&stats.max_waiters, current_waiters);
+            defer _ = stats.current_waiters.fetchSub(1, .monotonic);
+
+            const wait_start_ns = monotonicTimeNs();
+            var attempts: usize = 0;
+            var spin_loops: u64 = 0;
+            var yield_loops: u64 = 0;
+            var sleep_loops: u64 = 0;
+            while (!mutex.tryLock()) : (attempts += 1) {
+                if (builtin.os.tag == .freestanding or builtin.single_threaded) {
+                    std.atomic.spinLoopHint();
+                    spin_loops += 1;
+                    continue;
+                }
+                if (attempts < 64) {
+                    std.atomic.spinLoopHint();
+                    spin_loops += 1;
+                    continue;
+                }
+                if (attempts < 128) {
+                    @import("antfly_platform").time.yieldNow();
+                    yield_loops += 1;
+                    continue;
+                }
+                const backoff_step = @min(attempts - 128, 5);
+                const sleep_ns = @min(@as(u64, 50_000) << @intCast(backoff_step), @as(u64, 1_000_000));
+                io.sleep(std.Io.Duration.fromNanoseconds(@intCast(sleep_ns)), .awake) catch {};
                 sleep_loops += 1;
             }
 
@@ -5333,9 +7324,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return ticket;
         }
 
+        /// `deferred_progress` is forwarded to `saveAppliedSequencesBatchLockedContext`'s
+        /// progress commit: `true` for a background/catch-up flush pass (for
+        /// example replay catch-up), `false` for a synchronous-ack caller.
+        /// See `apply_state.contributeProgressDeferred`'s doc comment for
+        /// exactly what `true` buys today.
         pub fn saveAppliedSequencesBatchContext(
             ctx: *const BatchExecutionContext,
             updates: []const apply_state.AppliedSequenceUpdate,
+            deferred_progress: bool,
         ) !void {
             if (updates.len == 0) return;
             const enriched_updates = try appliedSequenceUpdatesWithConfigHashes(ctx.alloc, ctx.index_manager, updates);
@@ -5346,9 +7343,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     &async_ctx.stats.applied_sequence_mutex,
                 );
                 defer seq_lock.unlock();
-                return try saveAppliedSequencesBatchLockedContext(ctx, enriched_updates, async_ctx);
+                return try saveAppliedSequencesBatchLockedContext(ctx, enriched_updates, async_ctx, deferred_progress);
             }
-            return try saveAppliedSequencesBatchLockedContext(ctx, enriched_updates, null);
+            return try saveAppliedSequencesBatchLockedContext(ctx, enriched_updates, null, deferred_progress);
         }
 
         pub fn shouldAppendSplitDelta(self: anytype) bool {
@@ -5401,9 +7398,69 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
         }
 
+        /// WS5 (a): `DocStore.ExtraConsumerProgressFn` callback registered
+        /// onto `ctx.store` by `truncateReplayJournalIfSafeContext` below.
+        /// Reads every non-managed-index journal consumer kind fresh,
+        /// straight off the stable `AsyncContext` `ctx_ptr` points at --
+        /// enrichment (`enrichment_state.loadAppliedSequence`, ride-along
+        /// since perf/lwa-integration's enrichment/resolver bookkeeping
+        /// conversion) and resolution/promotion (`stats().applied_sequence`,
+        /// gated the same way `truncateReplayJournalIfSafeContext`'s own
+        /// walk gates them: `resolverReplayRetentionRequired`). Duplicates
+        /// that walk's enrichment/resolution/promotion arm deliberately:
+        /// this runs at `serviceRetirement`'s drain time, independent of
+        /// whenever `truncateReplayJournalIfSafeContext` last ran, which is
+        /// exactly the point -- see that function's own min_applied-vs-
+        /// `known_safe_retirement_watermark` staleness problem this sibling
+        /// mechanism (a fresh read, not a push) exists to avoid.
+        fn extraConsumerMinAppliedSequenceCallback(ctx_ptr: *anyopaque, alloc: Allocator) anyerror!u64 {
+            const async_ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
+            var min_applied: u64 = std.math.maxInt(u64);
+            if (async_ctx.index_manager.hasGeneratedEnrichmentTargets()) {
+                const enrichment_applied = try enrichment_state.loadAppliedSequence(
+                    alloc,
+                    async_ctx.store,
+                    enrichment_runtime_mod.scope_name,
+                );
+                min_applied = @min(min_applied, enrichment_applied);
+            }
+            if (async_ctx.resolution_runtime) |runtime| {
+                const stats = runtime.stats();
+                if (resolverReplayRetentionRequired(async_ctx.index_manager, stats)) {
+                    min_applied = @min(min_applied, stats.applied_sequence);
+                }
+            }
+            if (async_ctx.promotion_runtime) |runtime| {
+                const stats = runtime.stats();
+                if (resolverReplayRetentionRequired(async_ctx.index_manager, stats)) {
+                    min_applied = @min(min_applied, stats.applied_sequence);
+                }
+            }
+            // `ExtraConsumerProgressFn` returns the same exclusive-bound
+            // unit as `apply_state.minAppliedSequenceAcrossAllConsumers`
+            // (see its doc comment): a consumer whose applied_sequence is
+            // N has durably consumed 1..N inclusive, so the safe ceiling
+            // is N + 1.
+            if (min_applied == std.math.maxInt(u64)) return min_applied;
+            return min_applied + 1;
+        }
+
         pub fn truncateReplayJournalIfSafeContext(ctx: *const BatchExecutionContext) !void {
             if (ctx.repair_replay_mutex) |mutex| mutex.lockUncancelable(ctx.index_manager.checkpointIo());
             defer if (ctx.repair_replay_mutex) |mutex| mutex.unlock(ctx.index_manager.checkpointIo());
+            // WS5 (a): register the consumer-generic clamp callback
+            // unconditionally, before either managed-index early return
+            // below -- an enrichment/resolution/promotion consumer with no
+            // managed index at all must still protect its own journal
+            // entries from `Store.serviceRetirement`/`DocStore.
+            // serviceRetirement`'s independent clamp. `ctx.async_context`
+            // is the DB's own stable, heap-owned context (outlives this
+            // short-lived `BatchExecutionContext`), so it is safe to hand
+            // to a callback the store retains past this call's return.
+            // Idempotent and cheap: safe to re-register on every call.
+            if (ctx.async_context) |async_ctx| {
+                ctx.store.setExtraConsumerProgressProvider(async_ctx, extraConsumerMinAppliedSequenceCallback);
+            }
             if (!ctx.index_manager.hasManagedIndexes()) return;
 
             const managed_indexes = try ctx.index_manager.managedIndexes(ctx.alloc);
@@ -5419,7 +7476,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     ctx.alloc,
                     ctx.index_manager,
                     ctx.store,
-                    ctx.applied_sequence_checkpoint_path,
                     index_ref,
                 );
                 min_applied = @min(min_applied, applied);
@@ -5446,12 +7502,55 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             min_applied = try ctx.index_manager.clampReplayForGraphReplacementBuilds(ctx.store, min_applied);
             min_applied = try clampReplayTruncationForRepairPins(ctx.alloc, ctx.index_repair_checkpoint, min_applied);
+
+            // WS5 (a): diagnostic push only -- `DocStore.serviceRetirement`/
+            // `Store.serviceRetirement`'s actual safety clamp is
+            // `apply_state.minAppliedSequenceAcrossAllConsumers`, a fresh
+            // scan of every progress-v2 record read at drain time, not
+            // this pushed value. Kept so `known_safe_retirement_watermark`
+            // reflects the latest consumer walk for diagnostics/tests.
+            ctx.store.noteSafeRetirementWatermark(min_applied);
+
+            // WS5: this same consumer walk is a minimal, catalog-derived
+            // consumer registry for the hinted replay lanes. A durable,
+            // explicitly-registered registry is WS7's job; until it lands,
+            // refresh the gate every time retirement safety is evaluated so
+            // a dropped index (or a never-configured resolver/promoter)
+            // stops paying for lanes nothing consumes, and a newly-added one
+            // starts getting them again on its very next safety pass.
+            var hint_presence = replay_reference.Presence{
+                .full_text = false,
+                .dense_vector = false,
+                .sparse_vector = false,
+                .graph = false,
+                .algebraic = false,
+                .enrichment = ctx.index_manager.hasGeneratedEnrichmentTargets(),
+                .resolution = ctx.resolution_runtime != null,
+                .promotion = ctx.promotion_runtime != null,
+            };
+            for (managed_indexes) |index_ref| {
+                switch (index_ref.kind) {
+                    .full_text => hint_presence.full_text = true,
+                    .dense_vector => hint_presence.dense_vector = true,
+                    .sparse_vector => hint_presence.sparse_vector = true,
+                    .graph => hint_presence.graph = true,
+                    .algebraic => hint_presence.algebraic = true,
+                }
+            }
+            ctx.store.setActiveConsumerHintMask(hint_presence.toMask());
+
             if (min_applied == 0 or min_applied == std.math.maxInt(u64)) return;
             try truncateReplayLogs(ctx, min_applied);
         }
 
+        /// WS5: foreground/ack callers never physically retire the replay
+        /// journal -- that would reintroduce the extra commit this
+        /// workstream removes from the acknowledgement path. This only
+        /// raises the watermark; the owner-only maintenance turn (Lite
+        /// path-lease holder or Raft leader) drains it one bounded,
+        /// single-transaction chunk per turn via `DocStore.serviceRetirement`.
         pub fn truncateReplayLogs(ctx: *const BatchExecutionContext, up_to_sequence: u64) !void {
-            try ctx.store.truncateReplayUpTo(ctx.alloc, up_to_sequence);
+            ctx.store.requestRetirement(up_to_sequence);
             ctx.executor.releaseBacklogThrough(up_to_sequence);
         }
 
@@ -5477,4 +7576,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
         }
     };
+}
+
+/// An inline vector publication's batch may overwrite its own document and
+/// change its own embedding artifact (an authored vector replacing the
+/// previous one: the publication removes the old copy itself), but touch
+/// nothing else the general path would have to apply.
+fn inlineVectorWriteOnlyTouchesItself(batch: anytype, doc_key: []const u8, artifact_key: ?[]const u8) bool {
+    for (batch.overwritten_doc_keys) |key| if (!std.mem.eql(u8, key, doc_key)) return false;
+    for (batch.changed_artifact_keys) |key| {
+        const own = artifact_key orelse return false;
+        if (!std.mem.eql(u8, key, own)) return false;
+    }
+    return true;
 }

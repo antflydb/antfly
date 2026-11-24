@@ -70,7 +70,7 @@ pub fn initializeOwnerRange(alloc: Allocator, store: *docstore_mod.DocStore, ini
     if (present != null) return;
     if (try @import("doc_identity.zig").loadNamespaceTxn(&txn)) |namespace|
         if (!namespace.eql(initial.namespace)) return error.IdentityNamespaceMismatch;
-    try @import("relational_integrity_topology.zig").requireUnfenced(&txn);
+    try @import("relational/integrity/topology.zig").requireUnfenced(&txn);
     var scratch: std.ArrayListUnmanaged(u8) = .empty;
     defer scratch.deinit(alloc);
     {

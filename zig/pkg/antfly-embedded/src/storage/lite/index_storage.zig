@@ -28,6 +28,7 @@ const platform_sync = @import("antfly_platform").sync;
 const docstore = @import("docstore.zig");
 const native = @import("native.zig");
 const storage_io = @import("../lsm_backend/storage_io.zig");
+const wal_trace = @import("../write_amplification_trace.zig");
 
 const Allocator = std.mem.Allocator;
 const AtomicWriteSink = storage_io.AtomicWriteSink;
@@ -306,6 +307,8 @@ const CatalogWrite = struct {
 };
 
 fn writeFileReserved(self: *Store, path: []const u8, contents: []const u8) !void {
+    const wal_trace_scope = wal_trace.scope(.vfs_write);
+    defer wal_trace_scope.end();
     var mutation = CatalogWrite{ .kind = .put, .path = path, .value = contents };
     try self.docs.submitIndexMutation(&mutation, CatalogWrite.apply, true);
 }
@@ -313,6 +316,8 @@ fn writeFileReserved(self: *Store, path: []const u8, contents: []const u8) !void
 fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
+    const wal_trace_scope = wal_trace.scope(.vfs_append);
+    defer wal_trace_scope.end();
     var mutation = CatalogWrite{ .kind = .append, .path = path, .value = contents };
     try self.docs.submitIndexMutation(&mutation, CatalogWrite.apply, sync);
 }
@@ -328,6 +333,8 @@ fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, old_path);
     try validateIndexPath(self, new_path);
+    const wal_trace_scope = wal_trace.scope(.vfs_rename);
+    defer wal_trace_scope.end();
     var mutation = CatalogWrite{ .kind = .rename, .path = old_path, .value = new_path };
     try self.docs.submitIndexMutation(&mutation, CatalogWrite.apply, true);
 }
@@ -335,6 +342,8 @@ fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !
 fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
+    const wal_trace_scope = wal_trace.scope(.vfs_delete);
+    defer wal_trace_scope.end();
     var mutation = CatalogWrite{ .kind = .delete, .path = path };
     try self.docs.submitIndexMutation(&mutation, CatalogWrite.apply, true);
 }
@@ -343,79 +352,12 @@ fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
     const directory = if (std.mem.eql(u8, path, "/")) path else std.mem.trimEnd(u8, path, "/");
     try validateIndexPath(self, directory);
-    const Context = struct {
-        store: *Store,
-        path: []const u8,
-        fn apply(context: *anyopaque, _: *native.NativeFile) !void {
-            const request: *@This() = @ptrCast(@alignCast(context));
-            try deleteTreeLocked(request.store, request.path);
-        }
-    };
-    var request = Context{ .store = self, .path = directory };
-    try self.docs.submitIndexMutation(&request, Context.apply, true);
-}
-
-// Subtree deletion stays one atomic native transaction. Each private flush
-// releases keys and editor scratch; the cursor retains the original immutable
-// root so subsequent batches cannot skip entries as the active tree shrinks.
-const CatalogDeleteBatch = struct {
-    const max_keys = 64;
-    const max_key_bytes = 16 * 1024;
-    allocator: Allocator,
-    file: *native.NativeFile,
-    mutations: std.ArrayListUnmanaged(native.CatalogMutation) = .empty,
-    key_bytes: usize = 0,
-
-    fn clear(self: *@This()) void {
-        for (self.mutations.items) |mutation| self.allocator.free(mutation.key);
-        self.mutations.clearRetainingCapacity();
-        self.key_bytes = 0;
-    }
-
-    pub fn deinit(self: *@This()) void {
-        self.clear();
-        self.mutations.deinit(self.allocator);
-    }
-
-    fn add(self: *@This(), key: []const u8) !void {
-        if (self.mutations.items.len != 0 and
-            (self.mutations.items.len >= max_keys or self.key_bytes + key.len > max_key_bytes)) try self.flush();
-        const owned = try self.allocator.dupe(u8, key);
-        errdefer self.allocator.free(owned);
-        try self.mutations.append(self.allocator, .{ .key = owned, .is_delete = true });
-        self.key_bytes += owned.len;
-    }
-
-    fn flush(self: *@This()) !void {
-        if (self.mutations.items.len == 0) return;
-        try self.file.putIndexCatalogBatch(self.mutations.items);
-        _ = try self.file.materializeTransactionCheckpoint();
-        self.clear();
-    }
-};
-
-fn deleteTreeLocked(self: *Store, path: []const u8) !void {
-    const directory = if (std.mem.eql(u8, path, "/")) path else std.mem.trimEnd(u8, path, "/");
-    try validateIndexPath(self, directory);
-    const file = &self.docs.file;
-    // Include earlier callbacks in this group before pinning the scan root.
-    const checkpoint = try file.materializeTransactionCheckpoint();
-    var batch = CatalogDeleteBatch{ .allocator = self.allocator, .file = file };
-    defer batch.deinit();
-    // Include the exact file, but never a neighboring name such as /a-other.
-    if (try file.getIndexCatalogRecordSizeAtCheckpoint(directory, checkpoint) != null) try batch.add(directory);
     const prefix = if (std.mem.eql(u8, directory, "/"))
         try self.allocator.dupe(u8, "/")
     else
         try std.fmt.allocPrint(self.allocator, "{s}/", .{directory});
     defer self.allocator.free(prefix);
-    var cursor = try file.indexCatalogCursor(checkpoint, prefix);
-    defer cursor.deinit();
-    while (try cursor.next()) |record| {
-        defer file.allocator.free(record.key);
-        if (!std.mem.eql(u8, record.key, directory)) try batch.add(record.key);
-    }
-    try batch.flush();
+    try self.docs.submitIndexTreeDeletion(prefix, directory);
 }
 
 fn listDirectoryNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) ![][]u8 {
@@ -493,6 +435,8 @@ fn listFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) !
 fn syncContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
+    const wal_trace_scope = wal_trace.scope(.vfs_sync);
+    defer wal_trace_scope.end();
     try self.docs.syncIndexContents();
 }
 
@@ -744,6 +688,8 @@ const NativeAtomicWriteSink = struct {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         defer self.deinit();
         if (self.failure) |err| return err;
+        const wal_trace_scope = wal_trace.scope(.vfs_finish);
+        defer wal_trace_scope.end();
         if (self.file != null) try self.flush();
         try self.storage.docs.submitIndexMutation(self, publish, true);
     }
@@ -752,6 +698,8 @@ const NativeAtomicWriteSink = struct {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         defer self.deinit();
         if (self.failure) |err| return err;
+        const wal_trace_scope = wal_trace.scope(.vfs_finish);
+        defer wal_trace_scope.end();
         if (self.file != null) try self.flush();
         try self.storage.docs.submitIndexMutation(self, publish, true);
         return self.storage.docs.openArtifactSource(self.path);
@@ -761,6 +709,8 @@ const NativeAtomicWriteSink = struct {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         defer self.deinit();
         if (self.failure) |err| return err;
+        const wal_trace_scope = wal_trace.scope(.vfs_finish);
+        defer wal_trace_scope.end();
         // Map the builder's existing staging inode, avoiding a second export
         // after native publication. Small buffered artifacts spill once here.
         const file = try self.ensureFile();
@@ -853,7 +803,13 @@ test "lite native index storage persists logical files across reopen" {
 
         const checkpoint = docs.file.activeCheckpoint();
         try std.testing.expectEqual(@as(u64, 0), checkpoint.catalog_root_page);
-        try std.testing.expect(checkpoint.index_catalog_root_page != 0);
+        // Under the redo log (the default), every one of these writes
+        // diverts logically into the overlay and is never folded into a
+        // real B-tree root until a checkpointRedoLog fold runs, so
+        // index_catalog_root_page legitimately stays 0 here too -- the
+        // data itself is still live and correctly readable through every
+        // catalog read path (ReadView/MergedCursor), verified below via
+        // snapshotIndexCatalogRecordsAlloc and, after reopen, readFileAlloc.
         const records = try docs.file.snapshotIndexCatalogRecordsAlloc(allocator);
         defer native.NativeFile.freeSnapshotCatalogRecords(allocator, records);
         try std.testing.expectEqual(@as(usize, 2), records.len);
@@ -1035,13 +991,25 @@ test "lite native index storage handles large files rename and delete tree" {
     const append_suffix = " native append keeps old pages streaming";
     const before_append_page_count = docs.file.activeCheckpoint().page_count;
     try storage.appendFileAbsolute(allocator, "/dense/a/blob", append_suffix, true);
-    try std.testing.expectEqual(before_append_page_count + 6, docs.file.activeCheckpoint().page_count);
+    // Under the redo log (the default), only the external value chain's own
+    // tail pages are real (the "one page-shaped exception" a diverting
+    // transactional commit still makes, per RedoCommitState's own doc
+    // comment): one fresh tail page for the appended bytes, plus the
+    // previous tail rewritten (copy-on-write) with its new `next` pointer.
+    // The catalog entry's own update (new external_value_len/root) is
+    // purely logical and costs no real pages, unlike the legacy B-tree
+    // rebuild (tree node, free map, manifest reservation) this count used
+    // to include.
+    try std.testing.expectEqual(before_append_page_count + 2, docs.file.activeCheckpoint().page_count);
     try std.testing.expectEqual(@as(u64, @intCast(large.len + append_suffix.len)), try storage.fileSize("/dense/a/blob"));
 
     const before_rename_page_count = docs.file.activeCheckpoint().page_count;
     try storage.renameAbsolute("/dense/a/blob", "/dense/a/blob2");
-    // Two packed records share one page, plus tree node, descriptor and free map.
-    try std.testing.expectEqual(before_rename_page_count + 4, docs.file.activeCheckpoint().page_count);
+    // A rename is a delete-old/put-new catalog mutation pair over the same
+    // external value chain -- purely logical under redo diversion, no real
+    // pages at all (unlike the legacy B-tree rebuild this count used to
+    // include).
+    try std.testing.expectEqual(before_rename_page_count, docs.file.activeCheckpoint().page_count);
     try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(allocator, "/dense/a/blob", 8));
     const after_rename_check = try docs.file.check();
     try std.testing.expect(after_rename_check.valid);
@@ -1236,19 +1204,17 @@ test "lite native index storage recovers previous checkpoint after interrupted u
         const storage = index_store.storage();
 
         try storage.writeFileAbsolute("/indexes/ft/stable.tbl", "stable");
+        const stable_sequence = docs.file.durableSequence();
+        const stable_tail = docs.file.redo.?.writer.tail;
 
         var writer = try storage.beginAtomicWrite(allocator, "/indexes/ft/stable.tbl");
         try writer.appendSlice("replacement");
-        try writer.finish();
-
-        const active_slot = docs.file.header.active_checkpoint;
-        const previous_slot: u8 = if (active_slot == 0) 1 else 0;
-        const previous = docs.file.header.checkpoints[previous_slot];
-        try std.testing.expect(previous.commit_sequence > 0);
-        try std.testing.expect(docs.file.activeCheckpoint().commit_sequence > previous.commit_sequence);
-
-        try docs.file.file.setLength(docs.file.runtime(), previous.page_count * @as(u64, docs.file.header.page_size));
-        try docs.file.file.sync(docs.file.runtime());
+        // Interrupt the replacement before its durability barrier can publish.
+        docs.file.test_fail_redo_sync = error.TestInjectedFailure;
+        try std.testing.expectError(error.OutcomeUnknown, writer.finish());
+        try std.testing.expectEqual(@as(?anyerror, null), docs.file.test_fail_redo_sync);
+        try std.testing.expectEqual(stable_sequence, docs.file.durableSequence());
+        try std.testing.expectEqual(stable_tail, docs.file.redo.?.writer.tail);
     }
 
     {
@@ -1348,6 +1314,16 @@ test "lite native staged atomic writes bound heap and survive concurrent commits
     {
         var docs = try docstore.Store.createWithOptions(budget.allocator(), path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = std.testing.io });
         defer docs.close();
+        // The redo log (the default) starts a background ride-along flush
+        // loop on this Store's first commit (`applyMutationGroup`'s own
+        // `ensureRideAlongFlushStarted` call, gated on `self.file.redo !=
+        // null` -- a mechanism that does not exist at all for a legacy,
+        // non-redo file). Left running, it can land its own ride-along
+        // commit at an unpredictable point between this test's `before`
+        // snapshot and `writer.finish()`, perturbing the exact
+        // commit_sequence delta this test checks for reasons that have
+        // nothing to do with what it is actually testing.
+        docs.ride_along_flush_unavailable.store(true, .release);
         docs.file.page_cache_enabled.store(false, .monotonic);
         var indexes = Store.init(budget.allocator(), &docs);
         const storage = indexes.storage();
@@ -1541,7 +1517,14 @@ test "lite native cold atomic writes preserve hot pages with bounded cache admis
                 if (entry.value_ptr.bytes[4] == @backingInt(native.PageKind.value)) payload_pages += 1;
             }
             try std.testing.expectEqual(hot_pages.items.len, payload_pages);
-            try std.testing.expect(docs.file.page_cache.pages.contains(docs.file.activeCheckpoint().index_catalog_root_page));
+            // Under the redo log (the default), this single-key catalog
+            // write diverts logically into the overlay and never builds a
+            // real B-tree root page at all, so index_catalog_root_page
+            // stays 0 here -- there is no catalog-tree page for cache
+            // admission to pin in the first place. The external value
+            // pages this loop actually exercises (hot_pages/payload_pages,
+            // above) remain real, page-shaped writes under diversion, so
+            // the cache-admission policy they verify is unaffected.
         }
 
         // Policy is local to the sink, and can be changed before publication.
@@ -1628,6 +1611,84 @@ test "lite native directory cursor skips large subtrees and preserves boundary f
     const names = try indexes.storage().listFileNamesAlloc(alloc, "/a");
     defer StorageIo.freeFileNames(alloc, names);
     try std.testing.expectEqual(@as(usize, 5), names.len);
+    try std.testing.expect((try reopened.file.check()).valid);
+}
+
+// Regression for the redo-only "directory listing comes back empty" bug: a
+// large bare `putIndexCatalogBatch` diverts its own real pages into the
+// shared redo overlay (never touching `appendLogicalMutation` -- see
+// `RedoCommitState`'s own doc comment in native.zig, "only external value
+// chains use this"), so it fills the log without ever staging a *logical*
+// head for `checkpointRedoLog`'s own `has_logical_work` check. A later,
+// ordinary small commit's own logical head is what actually triggers the
+// opportunistic fold (`maybeAutoCheckpointRedoLog`), at which point
+// `checkpointRedoLog` finally flushes the big batch's raw pages to their
+// real locations and must publish a durable checkpoint that covers them --
+// previously it only did so when something in the fold's own replayed
+// heads genuinely changed `commit_sequence`; a small commit whose own
+// value happens to match what's already on disk left `changed == false`,
+// so the real pages were written but nothing durable ever pointed at them,
+// and the fold's own epilogue then reset the log that was the only other
+// record of them. Confirmed the data itself is not destroyed (the raw
+// pages this fold flushes are byte-correct) -- only unreachable: before
+// this fix, both the on-disk checkpoint slot and the redo log that could
+// have recovered them were left pointing at nothing.
+//
+// This exact fold (any real `checkpointRedoLog` fold following a large
+// bare/diverted batch, delete or not) used to also surface a second,
+// separate `error.InvalidNativeAllocator` from `validateIndexedOwnership`:
+// a page `redo_fold_retain_pending` retroactively retained as a plain
+// continuation page was also, in the same persist cycle, selected by
+// `allocator_v4.State.persist`'s own metadata/delta-chain rotation as a
+// retirement candidate, double-booking it (both live-counted and pending
+// retirement at once). Root cause: pages the ledger never counts the
+// normal way -- the current free-map root, and anything still on the
+// active snapshot/pending/delta chains -- are flushed raw by a bare
+// commit's `PageWriteBatch.flushCount` under redo exactly like any other
+// page-shaped write, so they can land in `redo_fold_retain_pending`
+// alongside genuine, never-retained continuation pages. The retain loop
+// could not tell them apart from `count() == 0` alone. Fixed by
+// `allocator_v4.State.isSelfDescribingPage`, which the retain loop now
+// consults before retaining: a page that is the ledger's own root or on
+// its own metadata chains is skipped, never retained, leaving
+// `preparePersist`'s rotation as its only owner. See `check()` below.
+test "lite redo log checkpoint fold survives a close and reopen after a large diverted batch" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "redo-fold-survives-reopen.aflite");
+    defer alloc.free(path);
+    {
+        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
+        defer docs.close();
+        var indexes = Store.initWithNamespace(alloc, &docs, "/a");
+        const storage = indexes.storage();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var mutations = std.ArrayList(native.CatalogMutation).empty;
+        for (0..4096) |i| {
+            try mutations.append(scratch, .{ .key = try std.fmt.allocPrint(scratch, "/a/sub/deep/{d:0>8}", .{i}), .value = "nested" });
+        }
+        try docs.file.putIndexCatalogBatch(mutations.items);
+        // The big batch alone never stages a logical head (it is
+        // page-shaped only), so `checkpointRedoLog`'s own opportunistic
+        // trigger right after it is a no-op. An ordinary small write is
+        // what actually staged a logical head and triggers the real fold.
+        try storage.writeFileAbsolute("/a/marker", "value");
+        const names = try storage.listFileNamesAlloc(alloc, "/a/sub/deep");
+        defer StorageIo.freeFileNames(alloc, names);
+        try std.testing.expectEqual(@as(usize, 4096), names.len);
+    }
+    var reopened = try docstore.Store.open(alloc, path, true);
+    defer reopened.close();
+    var indexes = Store.initWithNamespace(alloc, &reopened, "/a");
+    const names = try indexes.storage().listFileNamesAlloc(alloc, "/a/sub/deep");
+    defer StorageIo.freeFileNames(alloc, names);
+    try std.testing.expectEqual(@as(usize, 4096), names.len);
+    const marker = try indexes.storage().readFileAlloc(alloc, "/a/marker", 16);
+    defer alloc.free(marker);
+    try std.testing.expectEqualStrings("value", marker);
     try std.testing.expect((try reopened.file.check()).valid);
 }
 
@@ -1819,6 +1880,12 @@ test "lite subtree deletion bounds heap across private batches and preserves sna
         var docs = try docstore.Store.createWithOptions(budget.allocator(), path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = std.testing.io });
         defer docs.close();
         docs.file.page_cache_enabled.store(false, .monotonic);
+        // perf/lwa-txn-overlay: see the matching comment in "lite subtree
+        // deletion rolls back earlier private batches on failure" -- keep
+        // the background idle-flush timer from folding the overlay (and
+        // bumping `commit_sequence` an extra time) during this test's own
+        // run.
+        docs.ride_along_idle_ns = 10 * std.time.ns_per_s;
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const mutations = try arena.allocator().alloc(native.CatalogMutation, count);
@@ -1855,6 +1922,107 @@ test "lite subtree deletion bounds heap across private batches and preserves sna
     }
 }
 
+// perf/lwa-fold-boundary: the large-transaction fallback (§9.7e,
+// `RedoCommitState.overLargeTransactionThreshold`) makes some of *this*
+// transaction's own later private batches real, physical B-tree writes
+// instead of diverting them -- but it must never be mistaken for a fold
+// of anything *else*: an unrelated, still-unfolded commit from earlier in
+// the same file's lifetime (never run through an explicit
+// `checkpointRedoLog`) must survive both this large commit and a
+// subsequent reopen unchanged. Deterministic regression test for the
+// structural fold-boundary fix (`redo_folded_through`): before it, any
+// real-publish path that advanced `commit_sequence` without folding
+// could cause exactly this content to be silently skipped as "already
+// checkpointed" on the next reopen.
+test "lite subtree deletion's large-transaction fallback preserves an unrelated unfolded commit across reopen" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/large-txn-fold-boundary.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = std.testing.io });
+    var docs_open = true;
+    defer if (docs_open) docs.close();
+    docs.file.page_cache_enabled.store(false, .monotonic);
+    // Keep the background idle-flush timer from opportunistically folding
+    // the overlay (and bumping `commit_sequence`/`redo_folded_through` on
+    // its own) during this test's own run -- same reasoning as the
+    // sibling tests above.
+    docs.ride_along_idle_ns = 10 * std.time.ns_per_s;
+
+    // An earlier, wholly unrelated commit whose own mutation stays
+    // overlay-only: never folded by an explicit `checkpointRedoLog`, and
+    // not touched at all by the large transaction below. Through
+    // `Store.beginWrite`/`Txn`, not a bare `docs.file.putDocument` call
+    // (a bare, no-`Txn` commit always writes a real, physical page
+    // directly, 4a7817f3dd, never diverting into the overlay regardless
+    // of redo-log status) and not a raw `docs.file.beginTransaction()`
+    // either (bypasses `Store`'s own mutex/staging machinery that
+    // `deleteTree` below also needs, which deadlocked when tried).
+    {
+        var txn = try docs.beginWrite();
+        errdefer txn.abort();
+        try txn.put("doc:early", "unfolded");
+        try txn.commit();
+    }
+    // root index 2 == `TransactionWrites.Root.documents` (not `pub`, so
+    // named by its known-stable backing value here instead).
+    try std.testing.expect(docs.file.redo.?.shared.count(std.testing.io, 2) > 0);
+
+    // One single transaction (`deleteTree`'s own subtree walk) large
+    // enough to cross `large_txn_fallback_bytes` (16 KiB default): per
+    // §9.7e, this commit's own later private batches switch from
+    // diverting into real, physical B-tree writes mid-transaction.
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const count = 16384;
+    const mutations = try arena.allocator().alloc(native.CatalogMutation, count);
+    for (mutations, 0..) |*mutation, i| {
+        const key = try arena.allocator().alloc(u8, 128);
+        @memset(key, 'x');
+        _ = try std.fmt.bufPrint(key[0..15], "/scope/{d:0>8}", .{i});
+        mutation.* = .{ .key = key, .value = "" };
+    }
+    try docs.file.putIndexCatalogBatch(mutations);
+    try docs.file.putIndexCatalogRecord("/scope", "exact");
+    // The last sorted row exists only in the old overlay. Later physical
+    // delete batches must clear it along with the already folded rows.
+    {
+        var mutation = native.CatalogMutation{ .key = "/scope/overlay-only", .value = "old" };
+        // This writes through the normal index queue below, using the same
+        // index root and redo path as the tree delete.
+        const Insert = struct {
+            fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
+                const record: *const native.CatalogMutation = @ptrCast(@alignCast(ptr));
+                try file.putIndexCatalogBatch(&.{record.*});
+            }
+        };
+        try docs.submitIndexMutation(&mutation, Insert.apply, true);
+    }
+    var store = Store.initWithNamespace(a, &docs, "/scope");
+    try store.storage().deleteTree("/scope");
+
+    // Still readable on the live handle immediately after the large
+    // commit.
+    const early = (try docs.file.getDocumentAlloc(a, "doc:early")).?;
+    defer a.free(early);
+    try std.testing.expectEqualStrings("unfolded", early);
+    try std.testing.expectEqual(@as(?usize, null), try docs.file.getIndexCatalogRecordSize("/scope"));
+
+    try std.testing.expectEqual(@as(?usize, null), try docs.file.getIndexCatalogRecordSize("/scope/overlay-only"));
+
+    docs.close();
+    docs_open = false;
+    var reopened = try docstore.Store.openWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    defer reopened.close();
+    const early_reopened = (try reopened.file.getDocumentAlloc(a, "doc:early")).?;
+    defer a.free(early_reopened);
+    try std.testing.expectEqualStrings("unfolded", early_reopened);
+    try std.testing.expectEqual(@as(?usize, null), try reopened.file.getIndexCatalogRecordSize("/scope"));
+    try std.testing.expectEqual(@as(?usize, null), try reopened.file.getIndexCatalogRecordSize("/scope/overlay-only"));
+    try std.testing.expect((try reopened.checkWithCancel(null)).valid);
+}
+
 test "lite subtree deletion rolls back earlier private batches on failure" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1864,6 +2032,13 @@ test "lite subtree deletion rolls back earlier private batches on failure" {
     var docs = try docstore.Store.createWithOptions(a, path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = std.testing.io });
     defer docs.close();
     docs.file.page_cache_enabled.store(false, .monotonic);
+    // perf/lwa-txn-overlay: long enough that the background idle-flush
+    // timer (`maybeCheckpointRedoLogOnIdleTurn`, woken every
+    // `ride_along_idle_ns`) cannot opportunistically fold the overlay
+    // during this test's own run, which would add an extra, unrelated
+    // `commit_sequence` bump on top of the one this test's own assertions
+    // are about (same pattern as the "ride along" tests use).
+    docs.ride_along_idle_ns = 10 * std.time.ns_per_s;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const mutations = try arena.allocator().alloc(native.CatalogMutation, 2048);
@@ -1875,11 +2050,18 @@ test "lite subtree deletion rolls back earlier private batches on failure" {
     const pinned = docs.file.activeCheckpoint();
     const size = (try docs.file.file.stat(std.testing.io)).size;
     var store = Store.initWithNamespace(a, &docs, "/scope");
-    const before = docs.file.test_page_writes.load(.monotonic);
-    docs.file.test_page_write_fail_after = 30;
+    // perf/lwa-txn-overlay: under the redo log (the default), a deleteTree
+    // batch's mutations divert logically (`appendLogicalMutation`), never
+    // building a real page at all -- `test_page_write_fail_after` (the
+    // page-shaped fault hook) can never fire on this path, so this test
+    // used to exercise nothing under the true default. Switched to
+    // `test_logical_write_fail_after` (added alongside the logical
+    // diversion path itself), which fires mid-batch the same way.
+    const before = docs.file.test_logical_mutations.load(.monotonic);
+    docs.file.test_logical_write_fail_after = 30;
     try std.testing.expectError(error.TestPageWriteFailure, store.storage().deleteTree("/scope"));
-    docs.file.test_page_write_fail_after = null;
-    try std.testing.expect(docs.file.test_page_writes.load(.monotonic) > before);
+    docs.file.test_logical_write_fail_after = null;
+    try std.testing.expect(docs.file.test_logical_mutations.load(.monotonic) > before);
     try std.testing.expectEqual(pinned.index_catalog_root_page, docs.file.activeCheckpoint().index_catalog_root_page);
     try std.testing.expectEqual(size, (try docs.file.file.stat(std.testing.io)).size);
     try std.testing.expect((try docs.checkWithCancel(null)).valid);
@@ -2056,9 +2238,15 @@ test "lite mapped publication failure consumes writer and preserves old artifact
     var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 128 * 1024 };
     var writer = try storage.beginAtomicWrite(budget.allocator(), "/mapped");
     try writer.appendSlice("new");
-    docs.file.test_page_write_fail_after = 0;
+    // "new" is a 3-byte inline value -- under the redo log's default
+    // diversion this catalog mutation never touches a real page at all
+    // (`flushTransactionWrites`'s own diverting branch), so
+    // `test_page_write_fail_after` would never fire.
+    // `test_logical_write_fail_after` is its counterpart for a purely
+    // logical diverting mutation.
+    docs.file.test_logical_write_fail_after = 0;
     try std.testing.expectError(error.TestPageWriteFailure, writer.vtable.finish_mapped.?(writer.ptr));
-    docs.file.test_page_write_fail_after = null;
+    docs.file.test_logical_write_fail_after = null;
     try std.testing.expectEqual(@as(usize, 0), budget.live);
     const retained = try storage.readFileAlloc(a, "/mapped", 100);
     defer a.free(retained);
@@ -2228,6 +2416,22 @@ test "lite artifact leases survive owner close and do not pin document retiremen
     var docs_open = true;
     defer if (docs_open) docs.close();
     docs.maintenance_start_suppressed = true;
+    // This store's own debt (the lease's artifact and the loop's own
+    // "/other" churn below) is pure logical redo-overlay content -- a
+    // catalog-direct external value, never page-shaped -- so nothing
+    // here ever crosses `maybeAutoCheckpointRedoLog`'s own byte
+    // threshold. The only thing that ever folds it is the ride-along
+    // idle-flush timer's own `maybeCheckpointRedoLogOnIdleTurn`, gated
+    // on real idleness (never on busy wakes, see that function's own
+    // doc comment), debounced against both the last commit and the
+    // last fold -- deliberately left at its production default
+    // (50ms), not shrunk: shrinking it below the time consecutive
+    // writes in the loop below actually take (under load, that can
+    // exceed a few ms) would let the timer catch "idle" *between*
+    // individual writes and fold once per write instead of batching
+    // the whole loop's debt into one fold on the explicit idle wait
+    // after it -- exactly the write-amplification regression this
+    // same idle gate exists to avoid.
     var store = Store.init(a, &docs);
     const storage = store.storage();
     const payload = try a.alloc(u8, 256 * 1024);
@@ -2243,6 +2447,15 @@ test "lite artifact leases survive owner close and do not pin document retiremen
         try storage.deleteFileAbsolute("/other");
         try docs.maintainOnce(false);
     }
+    // Past the loop, wait for the background idle-flush timer to fold
+    // everything the loop queued in one pass. Poll the ledger's own
+    // "nothing left superseded" signal (`docstore.waitForRedoFold`, the
+    // same deadline+yield pattern "lite ride-along idle-flush timer
+    // alone makes N ride-alongs durable with exactly 1 sync" uses for
+    // its own background commit) rather than a fixed sleep: under heavy
+    // concurrent load on this box, a fixed window flakes on whether the
+    // fold actually ran before the assertion below reads the numbers.
+    try docstore.waitForRedoFold(&docs);
     try std.testing.expect((try docs.reclamationStatus()).reused_pages > 0);
     var out: [137]u8 = undefined;
     try source.readInto(12345, &out);
@@ -2264,6 +2477,61 @@ test "lite artifact leases survive owner close and do not pin document retiremen
     defer cursor.deinit();
     try std.testing.expect((try cursor.next()) == null);
     try std.testing.expect((try reopened.checkWithCancel(null)).valid);
+}
+
+// Regression (perf/lwa-lease-fold): deterministic, no maintenance loop, no
+// budget -- an explicit `checkpointRedoLog` fold, called directly, used to
+// retire the leased chain's own pages out from under the still-open lease
+// whenever the lease's own catalog record (an alias pointing at the exact
+// same `external_value_root_page`, never a new chain) and the original
+// key's own supersession landed in the same fold window: `checkpointRedoLog`
+// retained the chain once (via the generic staged-page sweep or the
+// surviving alias's own write) and then *also* queued it for retirement,
+// releasing the alias's only hold on it. Draining that bogus retirement
+// (a second `checkpointRedoLog`/`reclaimPages` call, or ordinary maintenance)
+// then genuinely reused the page, corrupting the lease's own bytes.
+test "lite fold with an open lease never corrupts the leased bytes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "lease-fold-corruption.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var store = Store.init(a, &docs);
+    const storage = store.storage();
+    const payload = try a.alloc(u8, 256 * 1024);
+    defer a.free(payload);
+    for (payload, 0..) |*byte, i| byte.* = @truncate(i);
+    try storage.writeFileAbsolute("/leased", payload);
+    var source = try storage.openLeasedImmutableSource(a, "/leased");
+    defer source.close();
+    // The lease's own catalog record and the original key's own delete
+    // both land in the same, still-unfolded redo window.
+    try storage.deleteFileAbsolute("/leased");
+    // Force the fold the lease is supposed to survive, directly -- no
+    // maintenance loop, no budget, no reliance on background timing.
+    try docs.checkpointRedoLog();
+    var out: [4096]u8 = undefined;
+    try source.readInto(0, &out);
+    try std.testing.expectEqualSlices(u8, payload[0..out.len], &out);
+    try source.readInto(payload.len - out.len, &out);
+    try std.testing.expectEqualSlices(u8, payload[payload.len - out.len ..], &out);
+    try std.testing.expect((try docs.checkWithCancel(null)).valid);
+    // A second fold (nothing new superseded this time) must not disturb
+    // the still-live lease either, and page reuse driven by unrelated
+    // churn afterward must not land on the lease's own pages.
+    try docs.checkpointRedoLog();
+    for (0..8) |_| {
+        try storage.writeFileAbsolute("/other", payload);
+        try storage.deleteFileAbsolute("/other");
+    }
+    try docs.checkpointRedoLog();
+    _ = try docs.file.reclaimPages(8192);
+    try source.readInto(0, &out);
+    try std.testing.expectEqualSlices(u8, payload[0..out.len], &out);
+    try std.testing.expect((try docs.checkWithCancel(null)).valid);
 }
 
 test "lite artifact leases close without reentering writer admission" {

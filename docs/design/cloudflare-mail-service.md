@@ -90,8 +90,8 @@ browser UI supports verified login/recovery, inbox/search, attachment download,
 compose/reply and outbox inspection. Outbound intent quotas are atomic per mailbox.
 
 Current ownership is one private mailbox per user. Shared memberships, labels,
-drafts, account/content deletion and delivery-event reconciliation remain future
-work. Account deletion is disabled in the application until that lifecycle is
+drafts, account deletion, retention policies and delivery-event reconciliation
+remain future work; message deletion is described below. Account deletion is disabled in the application until that lifecycle is
 implemented. Provider acceptance remains distinct from recipient delivery.
 
 Live SMTP events receive independent UUID receipts. Immutable content hashes
@@ -116,3 +116,262 @@ The native integration reused the unchanged qualified WASM artifacts from
 `9b81fa0021`; no native engine code was changed or rebuilt for this auth work.
 These local checks do not qualify a live domain, SMTP delivery or the performance
 gate. No existing MX/DNS/routing records were modified and no real mail was sent.
+
+## On-device search (progressive web app)
+
+The mail app is also an installable PWA that can keep an **opt-in, private copy
+of one mailbox in the browser** and search it by meaning. Retrieval runs at the
+edge in the literal sense: on the user's device, with no inference service. The
+server copy stays authoritative. The local copy is a rebuildable cache.
+
+```
+Mailbox actor ──/mail/sync (text only, cursor)──▶ page
+                                                   │ EmbeddingGemma 2 (@antfly/web, WASM CPU)
+                                                   ▼
+                       database worker: Antfly embedded WASM (hosted profile)
+                                                   │ HostFileStorage (sync file ops)
+                                                   ▼
+                          OPFS: pool of sync access handles (slot files)
+```
+
+### Sync log
+
+Each mailbox actor keeps an append-only log (`mail/v1/sync/log/<seq>`) written
+in the **same transaction** that marks a message indexed and lists it. A
+per-message marker makes recording idempotent across queue replay. Mailboxes
+created before the log existed are backfilled in bounded steps by walking the
+received-order index; markers prevent duplicates when new mail races the
+backfill. A cursor beyond the log's head, for example after a server-side
+restore, gets `reset: true` and the replica rebuilds from the start instead of
+failing on every sync. `GET /mail/sync?cursor=<seq>` returns up to 25 messages
+after the cursor, oldest first: id, thread, subject, addresses, time, attachment names and
+sizes, and text truncated to 64 KiB. It omits attachment bytes, R2 keys and
+digests. The session selects the actor, as for every other route; a cursor is
+only a position and grants nothing. Deleting a message appends a tombstone
+entry (`{id, deleted: true}`) in the same transaction that hides it; pages
+carry tombstones as `deleted` ids. A replica applies a page's upserts,
+deletions and next cursor as one database batch, so it never resurrects a
+message or skips one. Messages are immutable once delivered, so there are no
+edits to propagate.
+
+### Trash and retention
+
+Like Gmail, Delete moves a message to Trash, and Trash is emptied after a
+retention period (`MAIL_TRASH_DAYS`, default 30). `MailTrash` keeps two
+transactional indexes per trashed message: newest-trashed first for listing
+(`mail/v1/trash/<inverted time>/<id>`) and oldest-trashed first for expiry
+(`mail/v1/trash-expiry/<time>/<id>`).
+
+- **Trash** (only for indexed messages; mail still being ingested returns 409)
+  removes the inbox order key, adds both Trash keys, stamps `trashed_at` and
+  appends a sync tombstone, all in one transaction. The search document and
+  R2 objects are kept, so a trashed message can be opened (with its deletion
+  date) and its attachments downloaded. Inbox listing and search exclude it,
+  as Gmail's search excludes Trash.
+- **Restore** reverses that and appends a fresh upsert to the sync log, so
+  devices fetch and embed the message again. Sync skips messages that are
+  currently trashed, so a message restored and re-trashed before a device
+  syncs is never re-sent.
+- **Delete forever**, Empty Trash and expiry all go through `MailDeletion`,
+  which also removes the Trash keys. Emptying and expiry run in batches of 25
+  and continue through `empty` / `expire` queue hints. The scheduled sweep
+  queues `expire` for each mailbox whose oldest Trash entry is past the
+  retention period.
+
+The UI follows Gmail's wording:
+
+- "Message moved to Trash" with Undo;
+- "Messages that have been in Trash more than 30 days will be deleted
+  automatically" with "Empty Trash now";
+- "Deleted forever in N days" on each Trash row;
+- Restore and Delete forever on a trashed message.
+
+Retention is per deployment, and there are no legal holds yet.
+
+### Message deletion
+
+Raw MIME and attachments used to be content-addressed and shared by identical
+deliveries, which would have needed reference counting with races between a
+new delivery and object deletion. New deliveries store them per receipt
+(`raw/<receipt>`, `attachments/<receipt>/<index>`); projections were already
+per message. A message then owns its objects outright.
+
+`DELETE /mail/messages/:id` (session-scoped, same-origin) proceeds in two steps:
+
+1. **Mark.** One transaction marks the receipt `deleted`, removes its inbox
+   order key, appends the sync tombstone and records a durable purge intent.
+   Lookups check the mark, so the message vanishes from listing, search and
+   attachment routes immediately.
+2. **Purge.** Deletes the search document (`{kind: "delete"}` mutation),
+   deletes the owned R2 objects and reduces the receipt to a tombstone. It
+   runs inline; on failure the queue (`purge` hints) and the scheduled sweep
+   retry it from the intent.
+
+A deletion can race an ingest of the same message. Each ingest transaction
+checks for the mark. Objects the ingest wrote after the mark are recorded on
+the receipt, and the purge is re-armed if the ingest's upsert may have landed
+after the purge. Purge mutations are idempotent by operation id, so each
+re-arm uses a new attempt number. Legacy content-addressed objects may be
+shared and are retained.
+
+### Embeddings
+
+`@antfly/web` gained an `embed()` task for EmbeddingGemma 2. It is the same
+browser encoder path as embedding-similarity decisions: the task prefix
+(`RETRIEVAL_DOCUMENT` / `RETRIEVAL_QUERY`), tokenization, encoder and
+Matryoshka truncation, plus the same `model_identity`. Unlike decisions, inputs
+are truncated to `max_tokens` (default 512, configured to 256 here) instead of
+rejected, because documents are routinely long. Requests carry at most 32 inputs
+and 16,384 tokens. Execution is WASM CPU only; the browser has no WebGPU path for
+this encoder yet.
+
+The operator publishes the model once with `publish-local-model.mjs`. The
+browser never loads the media towers, so the script removes exactly those
+tensors (the regex the runtime uses to skip them). That roughly halves the
+download and keeps every file under `@antfly/web`'s 1 GiB catalog file limit.
+The bundle's own integrity receipt pins the unstripped weights, so it is
+replaced by catalog SHA-256 pins, which `downloadCatalogModel` verifies and
+caches in OPFS. Weights are served same-origin from a private R2 bucket, which keeps
+`connect-src 'self'`. The deployment must not become an open mirror, but
+`@antfly/web` downloads pinned files with `credentials: "omit"`, so a cookie
+cannot authorize them. Instead, the session-authenticated catalog response
+rewrites each file URL with a one-hour grant: an HMAC-SHA-256 over the path and
+expiry, keyed by `LOCAL_MODEL_GRANT_SECRET`. The weight route accepts a session
+or a valid, unexpired grant for that exact path. Rotating the secret revokes
+outstanding grants. The weights keep their upstream license.
+
+Vectors are written as an **external** `dense_vector` index (cosine, 256 dims by
+default) through `_embeddings`, so the embedded database needs no embedder
+callback. Queries combine a full-text match on one `content` field (subject,
+sender, body) with the query vector, merged with RRF. The local space records
+the model id, file pins, dimensions and token limit. A copy built for a
+different space is discarded and rebuilt, never mixed.
+
+### Persistence in the browser
+
+The database's files live directly in OPFS. `HostFileStorage` implements
+Antfly's `Storage` interface over a small synchronous file-operation table,
+which the WASM bundle imports from the host (`antfly_host_fs_*`).
+`antfly_embedded_opfs_fs.mjs` supplies that table in the database worker.
+
+OPFS's synchronous API works only on files that are already open; opening,
+renaming and deleting are asynchronous. So, like SQLite's `opfs-sahpool` VFS,
+the backend pre-opens a pool of physical slot files and keeps the logical
+namespace inside them:
+
+- **Slots.** Each slot carries two checksummed header records (generation +
+  path) ahead of its data. Create, rename and delete overwrite the older record
+  and flush before returning. A torn write therefore leaves the previous record
+  in force, and each namespace change is all-or-nothing.
+- **Rename.** The moved slot's record (with a newer generation) is flushed
+  before the replaced destination is freed, and reopen keeps the higher
+  generation. That gives the engine the atomic rename its publication protocol
+  relies on.
+- **Data.** File data is durable at `sync`.
+- **Capacity.** The pool grows asynchronously between database calls
+  (`ensureCapacity`). An operation that finds no free slot fails cleanly rather
+  than losing data.
+- **One tab at a time.** Access handles are exclusive, so a second tab is told
+  the index is open elsewhere.
+
+The sync cursor and vector-space descriptor are a `_local/state` document
+written in the same batch as each page of messages. Cursor and data therefore
+commit together through the database's own log, and a reload resumes after the
+last committed page. Only caches stay in WASM memory, so the copy is no longer
+bounded by the 2 GiB wasm32 memory.
+
+### Privacy and lifecycle
+
+- **Off by default.** Enabling asks for confirmation and shows the model's
+  download size, then requests persistent storage.
+- **Text and vectors stay on the device.** The server sees only `/mail/sync`
+  reads, the same data the inbox already shows that user.
+- **Sign-out removes every on-device copy** and the remembered offline identity,
+  for shared machines. The database worker releases its exclusive OPFS handles
+  before the copy is deleted. The offline identity is removed first, so offline
+  reopening is impossible even if deletion fails (for example, while another
+  tab holds the copy). Sign-out always completes. A failed deletion is retried
+  on the next page load and blocks the copy from being reopened until it
+  succeeds. The model cache is kept because it contains no user data.
+- **"Remove from this device"** deletes one mailbox's copy.
+- **Offline.** The service worker caches the shell, the content-addressed runtime
+  (immutable), and the runtime config and model catalog (network-first). It
+  never caches mail, auth or weights. If the server is unreachable at startup
+  and this device holds an opted-in copy, the app opens into on-device search
+  instead of the sign-in screen; messages open from the local copy.
+- **CSP.** It adds only `'wasm-unsafe-eval'`, `worker-src 'self'` and
+  `manifest-src 'self'`. Everything stays same-origin.
+
+### Validation and limits
+
+Verified end to end in headless Chromium (`test/local-search-browser.mjs`).
+The test uses the real `mail-public` app, the Worker's CSP, the runtime from
+`build-local.mjs` and the real EmbeddingGemma 2 checkpoint
+(`google/embeddinggemma-2` @914f7f8, stripped by `publish-local-model.mjs`);
+only the server APIs are stubbed.
+
+- Opting in, downloading and loading the model, then syncing and embedding 5
+  messages into OPFS took 59 s.
+- Device-only searches ("how much do I owe the plumber", "when does my plane
+  leave", "weekend noodle plans with friends") each ranked the right message
+  first, in about 3 s.
+- Moving a message to Trash in the UI removed it from on-device search at
+  once. Undo restored it, and the device re-embedded it and found it again. A
+  deletion made on another device reached this device as a sync tombstone.
+- After a reload the copy reopened from OPFS without re-indexing, and the
+  next query was also correct.
+
+Other checks:
+
+- **Real checkpoint in the browser runtime**
+  (`test-embedding-gemma2-retrieval.mjs`): five queries each retrieve their
+  message, with a clear gap to the rest (0.855 against at most 0.606). The
+  552 MiB text-only copy embeds identically to the 1.49 GB bundle (cosine
+  above 0.99999).
+- **OPFS pool:** `wasm_opfs_fs_test.mjs` simulates OPFS with separate durable
+  and volatile bytes. It covers the storage contract, unsynced-data loss,
+  interrupted renames, torn header records, deletion, capacity and the
+  exclusive lock. `wasm_opfs_fs_browser_test.mjs` repeats the round trip on
+  real sync access handles in Chromium, and with `ANTFLY_WASM` runs a real
+  database through 20 batches, a reload and searches.
+- **Native and WASM:** a native embedded API test runs a hosted database
+  through `HostFileStorage`; the WASM smoke test does the same through the
+  real module and the pool.
+- **Message deletion:** `test/mailbox-actor.test.mjs` runs the real `Mailbox`
+  actor over in-memory store, R2 and engine fakes (Node module hooks stub its
+  WASM imports). It covers delete and purge, a failed purge completed by
+  retry, a delete racing an ingest (the late upsert is purged again under a
+  new operation id), deletion before ingest, and the Trash lifecycle: hiding,
+  opening, restoring with re-sync, expiry at exactly the retention boundary,
+  and Empty Trash. `test/mail-workerd.test.mjs`
+  adds the same checks on the native engine (cross-user and cross-site
+  refusal, object cleanup, sync tombstone, restart). It needs the serverless
+  WASM, whose build on `main` currently fails in the lake query code, so that
+  part has not run here.
+- **Mail example:** `test/mail-local.test.mjs` covers the sync log and reset,
+  route scoping and model grants, CSP and caching, document and query shapes,
+  model stripping, the opt-in UI, sign-out wipe and retry, offline start and
+  service-worker caching.
+
+Issues these runs found and fixed:
+
+- Dense search was compiled out of the WASM build.
+- The browser runtime rejected the real checkpoint's scalar tensors.
+- External vector indexes need a `field`.
+- The pool's reserve was too small for an index build's file burst.
+
+Limits and remaining work:
+
+- **Deployment.** A real Cloudflare deployment (R2, Better Auth, Email
+  Routing) has not been run; Workers behavior is covered by the Node tests
+  above.
+- **Browsers.** Only Chromium was exercised. Safari and Firefox support sync
+  access handles in workers, but they are unverified here.
+- **Throughput.** Embedding runs on WASM CPU, at roughly a few seconds per
+  message on this host, so a large mailbox's first sync takes a long time.
+  It runs in the background and resumes after reloads.
+- **Build memory.** The embedded database WASM link needs about 20 GiB.
+- **Delete forever is permanent.** Objects stored before per-delivery keys are
+  retained when their message is deleted, because they may be shared.
+  Retention is one setting per deployment, with no per-mailbox override or
+  legal hold.

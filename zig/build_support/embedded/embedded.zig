@@ -273,11 +273,18 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     });
     native_inference_mod.sanitize_thread = antfly_imports.sanitize_thread;
     antfly_imports.configureInference(b, native_inference_mod, link_libc);
-    const native_inference = @import("shared_library.zig").addProviderArchive(
+    const shared_library = @import("shared_library.zig");
+    const inference_compile_rss = shared_library.inferenceCompileMaxRss(target.result.os.tag, antfly_imports.shared_inference_core, antfly_imports.darwin_release_memory, antfly_imports.darwin_cross_release_memory);
+    const native_inference = shared_library.addProviderArchive(
         b,
         native_inference_mod,
         "antfly-inference-core",
-        @import("shared_library.zig").inferenceCompileMaxRss(target.result.os.tag, antfly_imports.shared_inference_core, antfly_imports.darwin_release_memory, antfly_imports.darwin_cross_release_memory),
+        // Darwin -> Linux ARM64 Debug peaked at 13.02 GB.
+        if (b.graph.host.result.os.tag == .macos and target.result.os.tag == .linux and
+            target.result.cpu.arch == .aarch64 and optimize == .debug)
+            14 * 1024 * 1024 * 1024
+        else
+            shared_library.nativeInferenceCompileMaxRss(b.graph.host.result, target.result, optimize, inference_compile_rss),
     );
     native_inference.link_function_sections = true;
     native_inference.link_data_sections = true;
@@ -332,6 +339,25 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     addMacosSdkPaths(b, libantfly_link_mod, target);
     const libantfly = @import("shared_library.zig").addWithStorageOwner(b, libantfly_link_mod, &.{ native_inference, native_enrichment }, native_storage);
     const install_libantfly = libantfly.install;
+    // `zig build lite-mp-bench`, then `zig-out/bin/lite-mp-bench --dir DIR`:
+    // the multi-writer Lite benchmark, linked against the same storage, inference
+    // and enrichment archives as libantfly, so only storage edits recompile.
+    if (native_storage) |storage_owner| {
+        const bench_mod = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly-embedded/src/bench/lite_mp_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        antfly_imports.build_info.link(bench_mod);
+        addMacosSdkPaths(b, bench_mod, target);
+        bench_mod.linkLibrary(storage_owner);
+        bench_mod.linkLibrary(native_inference);
+        bench_mod.linkLibrary(native_enrichment);
+        const bench_exe = b.addExecutable(.{ .name = "lite-mp-bench", .root_module = bench_mod });
+        b.step("lite-mp-bench", "Build the multi-writer Lite C API benchmark (zig-out/bin/lite-mp-bench)").dependOn(&b.addInstallArtifact(bench_exe, .{}).step);
+    }
+
     b.addNamedLazyPath("libantfly", libantfly.binary);
     if (native_storage) |owner| {
         const client_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/public_capi_root.zig"), .target = target, .optimize = optimize });
@@ -533,6 +559,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
 
     const capi_model_filters = [_][]const u8{"capi local model "};
     const capi_default_filters = [_][]const u8{
+        "lite write amplification",
         "capi lite standalone snapshots",
         "issue1015",
         "capi SQL",
@@ -583,6 +610,8 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi get edges json does not double free a non-empty edge slice",
         "capi native memory",
         "capi native short lived writers",
+        "capi native separate writer processes",
+        "queued sparse publication releases and resumes admission",
         "capi native marker sweep",
         "capi native unbounded writer admits reusable pool before a large request",
         "capi native allocator proof",
@@ -594,6 +623,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi graph replacement retains indexed serving edges",
         "capi native resolver maintenance retries",
         "capi native idle maintenance",
+        "capi native refresh during a lane-pinned write does not mark that generation read-only",
         "SQL overlay native pages retain typed cells",
         "capi Lite models_dir loads a real extractor",
         "capi Lite promotion resolves ANN",
@@ -610,6 +640,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi lite AddIndexJSON registers a graph config",
         "inline resolver replacement",
         "capi lite AddIndexJSON restores the enrichment catalog when admission rejects the index",
+        "batch wire",
     };
     const memory_capi_check = linked_tests.add(b, .{ .name = "memory-capi-check", .root_module = capi_root_mod, .filters = &.{"capi native memory"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("memory-capi-check", "Compile native memory C ABI persistence tests").dependOn(&memory_capi_check.object.step);
@@ -621,7 +652,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .root_module = capi_root_mod,
         // Keep this consumer's measured native floor separate from its
         // implementation partition; retain authored claims on other profiles.
-        .max_rss = @import("../../pkg/antfly/build/runtime_memory.zig").testCompileMaxRss(@import("../../pkg/antfly/build/test_owner_names.zig").capi_contract, b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024),
+        .max_rss = @import("../../pkg/antfly/build/runtime_memory.zig").testCompileMaxRss(@import("../../pkg/antfly/build/test_owner_names.zig").capi_contract, b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos and optimize == .debug) 20 else if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024),
         .filters = selectTestFilters(b, &capi_compile_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
@@ -646,10 +677,26 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     // it once through capi_default_filters.
     b.step("antfly-remote-content-owner-test", "Verify live remote-content policy snapshots across the storage owner boundary")
         .dependOn(&capiTestRun(b, capi_tests, &.{"storage owner remote content source"}, true).step);
+    b.step("lite-write-amplification", "Run the Lite write-amplification counting harness and print its JSON report")
+        .dependOn(&capiTestRun(b, capi_tests, &.{"lite write amplification"}, true).step);
+    b.step("lite-write-amplification-cpu", "Run the Lite write-amplification CPU-cost harness (allocations/syscalls/CPU time per write) and print its JSON report")
+        .dependOn(&capiTestRun(b, capi_tests, &.{"lite write amplification cpu"}, true).step);
     const run_capi_models = capiTestRun(b, capi_tests, &capi_model_filters, true);
     run_capi_models.addArg("--require-no-skips");
     b.step("capi-local-model-test", "Qualify embedded inference with installed embedding, reranking and generation models")
         .dependOn(&run_capi_models.step);
+    if (options.server_integration_tests) {
+        const native_index_owner_tests = b.addTest(.{
+            .root_module = capi_root_mod,
+            .filters = &.{ "storage owner native index", "storage owner Raft index", "storage owner runtime status" },
+            .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        });
+        const index_owner_run = addFilteredTestRunArtifact(b, native_index_owner_tests);
+        b.step("native-index-owner-capi-test", "Verify private native index controls and Raft owner observations through the C ABI")
+            .dependOn(&index_owner_run.step);
+        b.step("index-owner-capi-test", "Verify authority-specific index owner contracts through the C ABI")
+            .dependOn(&index_owner_run.step);
+    }
     const maintenance_activity_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/capi/maintenance_activity.zig"),
         .target = target,

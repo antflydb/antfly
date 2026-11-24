@@ -21,6 +21,7 @@ const docstore = @import("antfly_local_sources").storage_docstore;
 const domain = @import("antfly_local_sources").system_catalog_domain;
 const settings = @import("antfly_local_sources").system_catalog_settings;
 const policies = @import("antfly_local_sources").system_catalog_policies;
+const routines = @import("antfly_local_sources").sql_catalog.routines.records;
 
 pub const Meta = domain.Meta;
 
@@ -34,7 +35,7 @@ fn keyAlloc(alloc: std.mem.Allocator, group_id: u64, suffix: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:system_catalog:{d}:{s}", .{ group_id, suffix });
 }
 
-fn recordKeyAlloc(alloc: std.mem.Allocator, group_id: u64, kind: domain.Kind, id: u64) ![]u8 {
+pub fn recordKeyAlloc(alloc: std.mem.Allocator, group_id: u64, kind: domain.Kind, id: u64) ![]u8 {
     return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:system_catalog:{d}:record:{s}:{d}", .{ group_id, @tagName(kind), id });
 }
 
@@ -65,6 +66,18 @@ fn policyPublicationWorkKeyAlloc(alloc: std.mem.Allocator, group_id: u64, table_
     @memcpy(key[0..prefix.len], prefix);
     std.mem.writeInt(u64, key[prefix.len..][0..8], table_id, .big);
     return key;
+}
+
+/// The work index and serving stamp are committed in the same transaction.
+pub fn hasPolicyPublicationWork(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64) !bool {
+    const key = try policyPublicationWorkKeyAlloc(alloc, group_id, table_id);
+    defer alloc.free(key);
+    const value = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    if (!std.mem.eql(u8, value, &.{1})) return error.InvalidRowPolicyPublication;
+    return true;
 }
 
 pub fn policyPublicationNeedsWork(publication: policies.Publication) bool {
@@ -101,7 +114,7 @@ pub fn nextPolicyPublicationWork(alloc: std.mem.Allocator, txn: *docstore.DocSto
     return publication;
 }
 
-fn policyInstallSnapshotKeyAlloc(alloc: std.mem.Allocator, group_id: u64, table_id: u64, generation: u64, phase: policies.Publication.Phase) ![]u8 {
+pub fn policyInstallSnapshotKeyAlloc(alloc: std.mem.Allocator, group_id: u64, table_id: u64, generation: u64, phase: policies.Publication.Phase) ![]u8 {
     return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:system_catalog:{d}:policy-install:{d}:{d}:{s}", .{ group_id, table_id, generation, @tagName(phase) });
 }
 
@@ -164,9 +177,45 @@ pub fn loadServingPolicyInstallSnapshot(alloc: std.mem.Allocator, txn: *docstore
     try parsed.value.validateShape();
     if (parsed.value.table_id != table_id or parsed.value.policy_generation != generation or parsed.value.phase != .active or
         (publication.value.serving_catalog_epoch != null and parsed.value.catalog_epoch != publication.value.serving_catalog_epoch.?) or
-        parsed.value.schema_version != publication.value.schema_version or !std.mem.eql(u8, &parsed.value.schema_digest, &publication.value.schema_digest))
+        !servingSnapshotSchemaMatches(parsed.value, publication.value))
         return error.RowPolicyCatalogChanged;
     return parsed;
+}
+
+fn servingSnapshotSchemaMatches(snapshot: policies.InstallSnapshot, publication: policies.Publication) bool {
+    if (publication.phase == .pending_install) if (publication.schema_pair) |pair| {
+        // Desired owner descriptors bind the future schema. New readers during
+        // pending admission still bind the retained, independently hashed cut.
+        return snapshot.schema_version < std.math.maxInt(u32) and
+            snapshot.schema_version + 1 == publication.schema_version and
+            std.mem.eql(u8, &snapshot.schema_digest, &pair.before_schema_digest) and
+            std.mem.eql(u8, &publication.schema_digest, &pair.after_schema_digest);
+    };
+    return snapshot.schema_version == publication.schema_version and
+        std.mem.eql(u8, &snapshot.schema_digest, &publication.schema_digest);
+}
+
+fn policyReferenceGenerations(publication: ?policies.Publication) [2]?u64 {
+    const value = publication orelse return .{ null, null };
+    return .{ if (value.phase == .disabled) null else value.generation, value.serving_generation };
+}
+fn policyGenerationDependencies(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, publication: policies.Publication, generation: u64, adding: bool) !void {
+    const current = generation == publication.generation;
+    const bytes = try loadPolicyInstallSnapshotBytesForPhase(a, txn, group_id, publication.table_id, generation, if (current) publication.catalog_epoch else publication.serving_catalog_epoch orelse return error.InvalidRowPolicyPublication, if (current) publication.phase else .active);
+    defer a.free(bytes);
+    var parsed = try std.json.parseFromSlice(policies.InstallSnapshot, a, bytes, .{});
+    defer parsed.deinit();
+    try @import("authorization_storage.zig").policyInstallDependency(a, txn, group_id, parsed.value, adding);
+}
+fn syncPolicyPublicationDependencies(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, previous: ?policies.Publication, next: ?policies.Publication) !void {
+    const before = policyReferenceGenerations(previous);
+    const after = policyReferenceGenerations(next);
+    for (before) |old| if (old) |generation| {
+        if (after[0] != generation and after[1] != generation) try policyGenerationDependencies(a, txn, group_id, previous.?, generation, false);
+    };
+    for (after) |new| if (new) |generation| {
+        if (before[0] != generation and before[1] != generation) try policyGenerationDependencies(a, txn, group_id, next.?, generation, true);
+    };
 }
 
 fn putPolicyInstallSnapshot(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, snapshot: policies.InstallSnapshot) !void {
@@ -215,6 +264,31 @@ pub fn loadPolicyPublicationStamp(alloc: std.mem.Allocator, txn: *docstore.DocSt
     return parsed.value;
 }
 
+/// Same-writer runtime progress admission. Authored/schema/policy changes use
+/// the ordinary journal; this helper only refreshes its current physical stamp.
+/// Pending policy custody must remain byte-stable until its exact ACK cut.
+pub fn refreshPolicyRuntimeFingerprint(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, table: u64, expected: [32]u8, replacement: [32]u8) !bool {
+    var publication = (try loadPolicyPublication(alloc, txn, group, table)) orelse return true;
+    defer publication.deinit();
+    if (publication.value.schema_pair != null or policyPublicationNeedsWork(publication.value)) return false;
+    if (publication.value.phase != .active and publication.value.phase != .disabled) return false;
+    if (!std.mem.eql(u8, &publication.value.schema_record_digest, &expected)) return false;
+    const stamp = (try loadPolicyPublicationStamp(alloc, txn, group, table)) orelse return false;
+    if (!std.meta.eql(stamp, policies.PublicationStamp.fromPublication(publication.value))) return false;
+    publication.value.schema_record_digest = replacement;
+    const key = try policyPublicationKeyAlloc(alloc, group, table);
+    defer alloc.free(key);
+    const bytes = try std.json.Stringify.valueAlloc(alloc, publication.value, .{});
+    defer alloc.free(bytes);
+    const stamp_key = try policyPublicationStampKeyAlloc(alloc, group, table);
+    defer alloc.free(stamp_key);
+    const stamp_bytes = try std.json.Stringify.valueAlloc(alloc, policies.PublicationStamp.fromPublication(publication.value), .{});
+    defer alloc.free(stamp_bytes);
+    try txn.put(key, bytes);
+    try txn.put(stamp_key, stamp_bytes);
+    return true;
+}
+
 pub fn loadPolicyPublications(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64) ![]const policies.Publication {
     const prefix = try keyAlloc(alloc, group_id, "policy-publication:");
     defer alloc.free(prefix);
@@ -239,6 +313,83 @@ pub fn loadPolicyPublications(alloc: std.mem.Allocator, txn: *docstore.DocStore.
     return out;
 }
 
+fn policyNameKeyAlloc(a: std.mem.Allocator, group: u64, table: u64, name: []const u8) ![]u8 {
+    const key = try std.fmt.allocPrint(a, "\x00\x00__metadata_derived__:system_catalog_name:{d}:policy:{d}:{s}", .{ group, table, name });
+    for (key[key.len - name.len ..]) |*byte| byte.* = std.ascii.toLower(byte.*);
+    return key;
+}
+
+fn writePolicyName(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, record: policies.Record) !void {
+    const key = try policyNameKeyAlloc(a, group, record.table_id, record.name);
+    defer a.free(key);
+    var id: [8]u8 = undefined;
+    std.mem.writeInt(u64, &id, record.id, .little);
+    try txn.put(key, &id);
+}
+
+fn lookupPolicyName(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, table: u64, name: []const u8) !?u64 {
+    const key = try policyNameKeyAlloc(a, group, table, name);
+    defer a.free(key);
+    const raw = txn.get(key) catch |err| return if (err == error.NotFound) null else err;
+    if (raw.len != 8) return error.InvalidRowPolicyRecord;
+    return std.mem.readInt(u64, raw[0..8], .little);
+}
+
+fn policyById(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, id: u64) !?policies.Record {
+    const raw = txn.get(try policyKeyAlloc(a, group, id)) catch |err| return if (err == error.NotFound) null else err;
+    const record = try std.json.parseFromSliceLeaky(policies.Record, a, raw, .{ .allocate = .alloc_always });
+    try record.validateShape();
+    if (record.id != id) return error.InvalidRowPolicyRecord;
+    return record;
+}
+
+fn policyCountKey(buf: []u8, group: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "\x00\x00__metadata_derived__:system_catalog_name:{d}:policy_count", .{group});
+}
+
+fn policyCount(txn: *docstore.DocStore.Txn, group: u64) !u32 {
+    var buf: [128]u8 = undefined;
+    const raw = txn.get(try policyCountKey(&buf, group)) catch |err| return if (err == error.NotFound) 0 else err;
+    if (raw.len != 4) return error.InvalidRowPolicyRecord;
+    return std.mem.readInt(u32, raw[0..4], .little);
+}
+
+pub fn policyCreateHasCapacity(txn: *docstore.DocStore.Txn, group: u64) !bool {
+    return try policyCount(txn, group) < policies.max_definitions;
+}
+
+fn putPolicyCount(txn: *docstore.DocStore.Txn, group: u64, count: usize) !void {
+    if (count > policies.max_stored_definitions) return error.RowPolicyLimitExceeded;
+    var buf: [128]u8 = undefined;
+    const key = try policyCountKey(&buf, group);
+    if (count == 0) {
+        _ = txn.get(key) catch |err| return if (err == error.NotFound) {} else err;
+        return txn.delete(key);
+    }
+    var value: [4]u8 = undefined;
+    std.mem.writeInt(u32, &value, @intCast(count), .little);
+    try txn.put(key, &value);
+}
+
+pub fn readPolicyDefinition(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, request: domain.PolicyRead) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const meta = try readMeta(scratch, txn, group);
+    var state: domain.State = .{ .revision = meta.revision, .next_id = meta.next_id };
+    const id = request.id orelse (try lookupPolicyName(scratch, txn, group, request.table_id, request.name)) orelse return std.json.Stringify.valueAlloc(a, state, .{});
+    const record = (try policyById(scratch, txn, group, id)) orelse {
+        if (request.id == null) return error.InvalidRowPolicyRecord;
+        return std.json.Stringify.valueAlloc(a, state, .{});
+    };
+    if (record.table_id == request.table_id and std.ascii.eqlIgnoreCase(record.name, request.name)) {
+        state.policies = &.{record};
+        return std.json.Stringify.valueAlloc(a, state, .{});
+    }
+    if (request.id == null) return error.InvalidRowPolicyRecord;
+    return std.json.Stringify.valueAlloc(a, state, .{});
+}
+
 pub fn loadPolicies(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64) ![]const policies.Record {
     const prefix = try keyAlloc(alloc, group_id, "policy:");
     defer alloc.free(prefix);
@@ -250,7 +401,7 @@ pub fn loadPolicies(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group
         }
         alloc.free(kvs);
     }
-    if (kvs.len > 1024) return error.RowPolicyLimitExceeded;
+    if (kvs.len > policies.max_stored_definitions) return error.RowPolicyLimitExceeded;
     const records = try alloc.alloc(policies.Record, kvs.len);
     for (kvs, records, 0..) |kv, *record, i| {
         record.* = try std.json.parseFromSliceLeaky(policies.Record, alloc, kv.value, .{ .allocate = .alloc_always });
@@ -266,15 +417,21 @@ pub fn loadPolicies(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group
 /// Only trusted admin admission may propose this internal transition. The
 /// deterministic apply path checks revision and table identity again; it does
 /// not activate policy enforcement merely by storing a definition.
-pub fn applyPolicyCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, command: policies.Command, command_hash: [32]u8) !void {
-    if (command.version != 1) return error.InvalidRowPolicyRecord;
+pub fn applyPolicyCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, command: policies.Command, command_hash: [32]u8, on_full: enum { reject, skip }) !void {
+    if (command.version != 1 and command.version != policies.capacity_checked_version) return error.InvalidRowPolicyRecord;
     const meta = try readMeta(alloc, txn, group_id);
     if (meta.revision != command.expected_revision) return;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
-    const records = try loadPolicies(a, txn, group_id);
     var next_id = meta.next_id;
+    const table_id = switch (command.change) {
+        .put => |record| record.table_id,
+        .drop => |identity| identity.table_id,
+    };
+    if (command.publication) |publication| {
+        if (publication.table_id != table_id or publication.phase != .pending_install) return error.InvalidRowPolicyPublication;
+    }
     switch (command.change) {
         .put => |record| {
             try record.validateShape();
@@ -286,17 +443,28 @@ pub fn applyPolicyCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn,
             if (publication != null and (publication.?.value.phase == .pending_install or publication.?.value.phase == .serving_install or publication.?.value.phase == .pending_disable or publication.?.value.phase == .serving_disable)) return error.RowPolicyCatalogChanged;
             const table = (try getById(a, txn, group_id, .table, record.table_id)) orelse return error.TableNotFound;
             defer table.deinit();
-            var existing: ?policies.Record = null;
-            for (records) |prior| {
-                if (prior.id == record.id) existing = prior;
-                if (prior.table_id == record.table_id and std.ascii.eqlIgnoreCase(prior.name, record.name) and prior.id != record.id) return error.InvalidRowPolicyRecord;
-            }
+            const owner = try lookupPolicyName(a, txn, group_id, record.table_id, record.name);
+            if (owner != null and owner.? != record.id) return error.InvalidRowPolicyRecord;
+            const existing = try policyById(a, txn, group_id, record.id);
             if (existing) |prior| {
+                if (owner == null) return error.InvalidRowPolicyRecord;
                 if (prior.table_id != record.table_id or !std.mem.eql(u8, prior.name, record.name) or record.generation != try std.math.add(u64, prior.generation, 1)) return error.RowPolicyCatalogChanged;
             } else {
+                if (owner != null) return error.InvalidRowPolicyRecord;
                 if (record.id != meta.next_id or record.generation != 1) return error.RowPolicyCatalogChanged;
+                const count = try policyCount(txn, group_id);
+                if (count >= policies.max_definitions) {
+                    if (on_full == .reject) return error.RowPolicyLimitExceeded;
+                    // A predecessor could commit exactly one extra definition.
+                    // Preserve its applied revision and command receipt on replay.
+                    if (command.version >= policies.capacity_checked_version or count >= policies.max_stored_definitions) return;
+                }
+                try putPolicyCount(txn, group_id, count + 1);
                 next_id = try std.math.add(u64, next_id, 1);
             }
+            if (existing) |prior| try @import("authorization_storage.zig").policyDependency(a, txn, group_id, prior, false);
+            try @import("authorization_storage.zig").policyDependency(a, txn, group_id, record, true);
+            try writePolicyName(a, txn, group_id, record);
             const key = try policyKeyAlloc(a, group_id, record.id);
             const encoded = try std.json.Stringify.valueAlloc(a, record, .{});
             try txn.put(key, encoded);
@@ -305,13 +473,17 @@ pub fn applyPolicyCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn,
             var publication = try loadPolicyPublication(a, txn, group_id, identity.table_id);
             defer if (publication) |*value| value.deinit();
             if (publication != null and (publication.?.value.phase == .pending_install or publication.?.value.phase == .serving_install or publication.?.value.phase == .pending_disable or publication.?.value.phase == .serving_disable)) return error.RowPolicyCatalogChanged;
-            const prior = for (records) |record| {
-                if (record.id == identity.id) break record;
-            } else return error.RowPolicyCatalogChanged;
+            const prior = (try policyById(a, txn, group_id, identity.id)) orelse return error.RowPolicyCatalogChanged;
             if (prior.generation != identity.generation or prior.table_id != identity.table_id) return error.RowPolicyCatalogChanged;
+            try @import("authorization_storage.zig").policyDependency(a, txn, group_id, prior, false);
+            try putPolicyCount(txn, group_id, std.math.sub(u32, try policyCount(txn, group_id), 1) catch return error.InvalidRowPolicyRecord);
+            try txn.delete(try policyNameKeyAlloc(a, group_id, prior.table_id, prior.name));
             const key = try policyKeyAlloc(a, group_id, identity.id);
             try txn.delete(key);
         },
+    }
+    if (command.publication) |publication| {
+        return applyPolicyPublicationCommandWithNextId(alloc, txn, group_id, .{ .expected_revision = command.expected_revision, .change = .{ .begin = publication } }, command_hash, next_id, null);
     }
     try applyDelta(alloc, txn, group_id, .{ .upserts = @constCast(&[_]domain.Resource{}), .removes = @constCast(&[_]domain.Resource{}), .next_id = next_id }, meta, command_hash);
 }
@@ -319,7 +491,75 @@ pub fn applyPolicyCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn,
 /// Replicated, deterministic publication transition. Metadata admission
 /// verifies the owner topology cut before proposing `begin` and `promote`;
 /// apply independently checks monotonic identity and exact committed ACKs.
+pub fn reboundSchemaPolicies(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, publication: policies.Publication) ![]const policies.Record {
+    const pair = publication.schema_pair orelse return error.InvalidRowPolicyPublication;
+    const schemas = try pair.materialize(a);
+    defer @import("antfly_local_sources").storage_schema.freeSchema(a, schemas.before);
+    defer @import("antfly_local_sources").storage_schema.freeSchema(a, schemas.after);
+    const records = try loadPolicies(a, txn, group);
+    var selected: std.ArrayList(policies.Record) = .empty;
+    defer selected.deinit(a);
+    for (records) |record| if (record.table_id == publication.table_id) {
+        if (selected.items.len == 1024 or record.schema_version != schemas.before.version or
+            !std.mem.eql(u8, &record.schema_digest, &pair.before_schema_digest)) return error.RowPolicyCatalogChanged;
+        var rebound = record;
+        rebound.generation = try std.math.add(u64, record.generation, 1);
+        rebound.schema_version = schemas.after.version;
+        rebound.schema_digest = pair.after_schema_digest;
+        try selected.append(a, rebound);
+    };
+    const result = try selected.toOwnedSlice(a);
+    const policy_settings = try loadSettings(a, txn, group);
+    const bundle = try std.json.Stringify.valueAlloc(a, policies.InstallSnapshot{
+        .table_id = publication.table_id,
+        .schema_version = schemas.after.version,
+        .schema_digest = pair.after_schema_digest,
+        .policy_generation = publication.generation,
+        .catalog_epoch = publication.catalog_epoch,
+        .phase = .pending_install,
+        .schema_pair = pair,
+        .records = result,
+        .settings = policy_settings,
+    }, .{});
+    defer a.free(bundle);
+    if (bundle.len > policies.max_install_snapshot_bytes) return error.CatalogCommandTooLarge;
+    // Validate every persisted typed DAG and setting against the actual
+    // successor before any metadata or policy generation can be published.
+    var installed = try @import("antfly_local_sources").storage_db_row_policy_bundle.Installed.init(a, bundle, publication.table_id, schemas.after);
+    defer installed.deinit();
+    return result;
+}
+
+pub fn beginCoupledSchemaPolicy(backing: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, publication: policies.Publication, delta: domain.Delta, command_hash: [32]u8) !void {
+    var region = std.heap.ArenaAllocator.init(backing);
+    defer region.deinit();
+    const a = region.allocator();
+    const pair = publication.schema_pair orelse return error.InvalidRowPolicyPublication;
+    const meta = try readMeta(a, txn, group);
+    var prior = (try loadPolicyPublication(a, txn, group, publication.table_id)) orelse return error.RowPolicyCatalogChanged;
+    defer prior.deinit();
+    if (prior.value.phase != .active or prior.value.generation != pair.before_policy_generation or
+        prior.value.catalog_epoch != pair.before_catalog_epoch or publication.phase != .pending_install or
+        publication.generation != try std.math.add(u64, prior.value.generation, 1) or
+        publication.catalog_epoch != try std.math.add(u64, meta.revision, 1)) return error.RowPolicyCatalogChanged;
+    const records = try reboundSchemaPolicies(a, txn, group, publication);
+    const before = try loadPolicies(a, txn, group);
+    for (records) |record| {
+        const old = for (before) |candidate| {
+            if (candidate.id == record.id) break candidate;
+        } else return error.RowPolicyCatalogChanged;
+        try @import("authorization_storage.zig").policyDependency(a, txn, group, old, false);
+        try @import("authorization_storage.zig").policyDependency(a, txn, group, record, true);
+        try txn.put(try policyKeyAlloc(a, group, record.id), try std.json.Stringify.valueAlloc(a, record, .{}));
+    }
+    try applyPolicyPublicationCommandWithNextId(a, txn, group, .{ .expected_revision = meta.revision, .change = .{ .begin = publication } }, command_hash, null, delta);
+}
+
 pub fn applyPolicyPublicationCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, command: policies.PublicationCommand, command_hash: [32]u8) !void {
+    return applyPolicyPublicationCommandWithNextId(alloc, txn, group_id, command, command_hash, null, null);
+}
+
+fn applyPolicyPublicationCommandWithNextId(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, command: policies.PublicationCommand, command_hash: [32]u8, next_id: ?u64, coupled_delta: ?domain.Delta) !void {
     if (command.version != 1) return error.InvalidRowPolicyPublication;
     const meta = try readMeta(alloc, txn, group_id);
     if (meta.revision != command.expected_revision) return;
@@ -336,8 +576,8 @@ pub fn applyPolicyPublicationCommand(alloc: std.mem.Allocator, txn: *docstore.Do
             if (incoming.acknowledged_owners.len != 0 or incoming.serving_acknowledged_owners.len != 0 or incoming.disabled_acknowledged_owners.len != 0 or incoming.catalog_epoch != try std.math.add(u64, meta.revision, 1)) return error.RowPolicyCatalogChanged;
             const table = (try getById(a, txn, group_id, .table, incoming.table_id)) orelse return error.TableNotFound;
             defer table.deinit();
-            var prior = try loadPolicyPublication(a, txn, group_id, incoming.table_id);
-            defer if (prior) |*value| value.deinit();
+            retained_prior = try loadPolicyPublication(a, txn, group_id, incoming.table_id);
+            const prior = retained_prior;
             if (prior) |value| {
                 if (value.value.phase != .active and value.value.phase != .disabled) return error.RowPolicyCatalogChanged;
                 if (value.value.phase == .disabled and value.value.disabled_acknowledged_owners.len != value.value.required_owners.len) return error.RowPolicyCatalogChanged;
@@ -353,7 +593,6 @@ pub fn applyPolicyPublicationCommand(alloc: std.mem.Allocator, txn: *docstore.Do
                 if (record.schema_version != incoming.schema_version or !std.mem.eql(u8, &record.schema_digest, &incoming.schema_digest)) return error.RowPolicyCatalogChanged;
                 try selected.append(a, record);
             };
-            if (incoming.phase == .pending_install and selected.items.len == 0) return error.RowPolicyCatalogChanged;
             const setting_records = try loadSettings(a, txn, group_id);
             try putPolicyInstallSnapshot(a, txn, group_id, .{
                 .table_id = incoming.table_id,
@@ -362,6 +601,7 @@ pub fn applyPolicyPublicationCommand(alloc: std.mem.Allocator, txn: *docstore.Do
                 .policy_generation = incoming.generation,
                 .catalog_epoch = incoming.catalog_epoch,
                 .phase = incoming.phase,
+                .schema_pair = incoming.schema_pair,
                 .records = selected.items,
                 .settings = setting_records,
             });
@@ -425,12 +665,20 @@ pub fn applyPolicyPublicationCommand(alloc: std.mem.Allocator, txn: *docstore.Do
             prior.value.phase = input.phase;
             try putPolicyInstallSnapshot(a, txn, group_id, prior.value);
             next.phase = input.phase;
+            if (input.phase == .active) {
+                if (next.schema_pair) |pair| next.schema_record_digest = pair.after_record_digest;
+                // The immutable ACTIVE snapshot above retains the exact pair
+                // for operation recovery. The live head is now ordinary active
+                // state; later valid progress must use its current stamps.
+                next.schema_pair = null;
+            }
             if (input.phase == .active or input.phase == .disabled) {
                 next.serving_generation = null;
                 next.serving_catalog_epoch = null;
             }
         },
     }
+    try syncPolicyPublicationDependencies(a, txn, group_id, if (retained_prior) |value| value.value else null, next);
     try next.validateShape();
     const key = try policyPublicationKeyAlloc(a, group_id, next.table_id);
     const encoded = try std.json.Stringify.valueAlloc(a, next, .{});
@@ -443,7 +691,7 @@ pub fn applyPolicyPublicationCommand(alloc: std.mem.Allocator, txn: *docstore.Do
         try txn.put(work_key, &.{1})
     else
         try txn.delete(work_key);
-    try applyDelta(alloc, txn, group_id, .{ .upserts = @constCast(&[_]domain.Resource{}), .removes = @constCast(&[_]domain.Resource{}), .next_id = meta.next_id }, meta, command_hash);
+    try applyDelta(alloc, txn, group_id, coupled_delta orelse .{ .upserts = @constCast(&[_]domain.Resource{}), .removes = @constCast(&[_]domain.Resource{}), .next_id = next_id orelse meta.next_id }, meta, command_hash);
 }
 
 pub fn loadSettings(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64) ![]const settings.Record {
@@ -472,13 +720,28 @@ pub fn loadSettings(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group
 
 pub fn applySettingCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, command: settings.Command, command_hash: [32]u8) !void {
     if (command.version != 1) return error.InvalidSettingRecord;
+    if ((command.role_defaults_only and command.change != .put) or (command.database_defaults_only and command.change != .put and command.change != .reset_database_defaults)) return error.InvalidSettingRecord;
+    if (command.role_defaults_only and command.database_defaults_only) return error.InvalidSettingRecord;
+    if (command.change == .reset_database_defaults and !command.database_defaults_only) return error.InvalidSettingRecord;
     const meta = try readMeta(alloc, txn, group_id);
     if (meta.revision != command.expected_revision) return;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
+    if (command.command_fence) |fence| try @import("command_fence.zig").check(a, txn, group_id, fence.backend.incarnation, fence);
     const records = try loadSettings(a, txn, group_id);
+    if (command.database_defaults_only) try settings.requireCapacity(records, switch (command.change) {
+        .put => |record| record,
+        .reset_database_defaults => null,
+        .drop => unreachable,
+    });
     const publication_sensitive = switch (command.change) {
+        .reset_database_defaults => |database| blk: {
+            for (records) |record| if (record.policy_sensitive) {
+                for (record.database_defaults) |entry| if (std.mem.eql(u8, entry.database, database)) return error.SettingWriteForbidden;
+            };
+            break :blk false;
+        },
         .put => |record| blk: {
             if (record.policy_sensitive) break :blk true;
             for (records) |prior| if (prior.identity.id == record.identity.id and prior.policy_sensitive) break :blk true;
@@ -495,6 +758,25 @@ pub fn applySettingCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn
     }
     var next_id = meta.next_id;
     switch (command.change) {
+        .reset_database_defaults => |database| {
+            try domain.validateName(database);
+            if (!std.mem.eql(u8, database, domain.default_database_name)) {
+                var target = (try find(a, txn, group_id, .database, 0, database)) orelse return error.DatabaseNotFound;
+                target.deinit();
+            }
+            for (records) |record| {
+                const affected = for (record.database_defaults) |entry| {
+                    if (std.mem.eql(u8, entry.database, database)) break true;
+                } else false;
+                if (!affected) continue;
+                const change: settings.DatabaseDefaultChange = .{ .name = record.name, .database = database, .value = null };
+                var replacement = record;
+                replacement.database_defaults = try change.applyAlloc(a, record);
+                try replacement.validate();
+                const key = try settingKeyAlloc(a, group_id, record.identity.id);
+                try txn.put(key, try std.json.Stringify.valueAlloc(a, replacement, .{}));
+            }
+        },
         .put => |record| {
             try record.validate();
             var existing: ?settings.Record = null;
@@ -503,11 +785,36 @@ pub fn applySettingCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn
                 if (std.ascii.eqlIgnoreCase(prior.name, record.name) and prior.identity.id != record.identity.id) return error.InvalidSettingRecord;
             }
             if (existing) |prior| {
-                if (!std.mem.eql(u8, prior.name, record.name) or record.identity.generation != try std.math.add(u64, prior.identity.generation, 1)) return error.SettingCatalogChanged;
+                if (!std.mem.eql(u8, prior.name, record.name)) return error.SettingCatalogChanged;
+                if (command.database_defaults_only) {
+                    if (!std.meta.eql(prior.identity, record.identity) or !settings.sameDatabaseDefaultDefinition(prior, record)) return error.SettingCatalogChanged;
+                } else if (command.role_defaults_only) {
+                    if (!std.meta.eql(prior.identity, record.identity) or !settings.sameDefinition(prior, record)) return error.SettingCatalogChanged;
+                } else {
+                    if (!settings.databaseBindingsRetained(record.role_defaults, prior)) return error.InvalidSettingRecord;
+                    if (record.identity.generation != try std.math.add(u64, prior.identity.generation, 1)) return error.SettingCatalogChanged;
+                }
             } else {
+                if (command.database_defaults_only) {
+                    const native_input = settings.builtinInput(record.name) orelse return error.SettingCatalogChanged;
+                    if (!settings.sameDatabaseDefaultDefinition(native_input.record(record.identity), record)) return error.SettingCatalogChanged;
+                } else if (command.role_defaults_only) {
+                    const native_input = settings.builtinInput(record.name) orelse return error.SettingCatalogChanged;
+                    if (!settings.sameDefinition(native_input.record(record.identity), record)) return error.SettingCatalogChanged;
+                } else if (!settings.databaseBindingsRetained(record.role_defaults, null)) return error.InvalidSettingRecord;
                 if (record.identity.id != meta.next_id or record.identity.generation != 1) return error.SettingCatalogChanged;
                 next_id = try std.math.add(u64, meta.next_id, 1);
             }
+            if (command.database_defaults_only) {
+                if (record.policy_sensitive) return error.SettingWriteForbidden;
+                for (record.database_defaults) |entry| {
+                    try (settings.DatabaseDefaultChange{ .name = record.name, .database = entry.database, .value = entry.value }).validate();
+                    if (std.mem.eql(u8, entry.database, domain.default_database_name)) continue;
+                    var database = (try find(a, txn, group_id, .database, 0, entry.database)) orelse return error.DatabaseNotFound;
+                    database.deinit();
+                }
+            }
+            try settings.requireDatabaseBindings(a, record, existing, SettingDatabaseReader{ .alloc = a, .txn = txn, .group = group_id });
             const key = try settingKeyAlloc(a, group_id, record.identity.id);
             const encoded = try std.json.Stringify.valueAlloc(a, record, .{});
             try txn.put(key, encoded);
@@ -524,18 +831,128 @@ pub fn applySettingCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn
     try applyDelta(alloc, txn, group_id, .{ .upserts = @constCast(&[_]domain.Resource{}), .removes = @constCast(&[_]domain.Resource{}), .next_id = next_id }, meta, command_hash);
 }
 
+const SettingDatabaseReader = struct {
+    alloc: std.mem.Allocator,
+    txn: *docstore.DocStore.Txn,
+    group: u64,
+    pub fn requireDatabase(self: @This(), id: u64) !void {
+        if (id == domain.default_database_id) return;
+        var database = (try getById(self.alloc, self.txn, self.group, .database, id)) orelse return error.DatabaseNotFound;
+        defer database.deinit();
+        if (database.value.kind != .database or database.value.id != id or database.value.parent_id != 0) return error.InvalidCatalogRecord;
+    }
+};
+
 pub fn nameKeyAlloc(alloc: std.mem.Allocator, group_id: u64, kind: domain.Kind, parent: u64, name: []const u8) ![]u8 {
     try domain.validateResourceName(kind, name);
-    return std.fmt.allocPrint(alloc, "\x00\x00__metadata_derived__:system_catalog_name:{d}:{s}:{d}:{s}", .{ group_id, @tagName(kind), parent, name });
+    const base = try std.fmt.allocPrint(alloc, "\x00\x00__metadata_derived__:system_catalog_name:{d}:{s}:{d}:{s}", .{ group_id, @tagName(kind), parent, name });
+    if (kind != .routine) return base;
+    defer alloc.free(base);
+    return std.fmt.allocPrint(alloc, "{s}\x00", .{base});
 }
 
-pub fn readMeta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64) !Meta {
-    const key = try keyAlloc(alloc, group_id, "meta");
-    defer alloc.free(key);
-    const bytes = txn.get(key) catch |err| switch (err) {
-        error.NotFound => return .{},
+/// A callable's logical name and input signature form one catalog key. Other
+/// object encodings remain unchanged. NUL cannot occur in either component.
+fn resourceNameKeyAlloc(a: std.mem.Allocator, group: u64, resource: domain.Resource) ![]u8 {
+    const key = try nameKeyAlloc(a, group, resource.kind, resource.parent_id, resource.name);
+    if (resource.kind != .routine) return key;
+    defer a.free(key);
+    return std.fmt.allocPrint(a, "{s}{s}", .{ key, resource.signature orelse return error.InvalidCatalogRecord });
+}
+
+pub fn findFunction(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, namespace: u64, name: []const u8, signature: []const u8) !?std.json.Parsed(domain.Resource) {
+    const key = try resourceNameKeyAlloc(a, group, .{ .kind = .routine, .id = 1, .parent_id = namespace, .name = name, .signature = signature });
+    defer a.free(key);
+    const raw = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return null,
         else => return err,
     };
+    if (raw.len != 8) return error.InvalidCatalogRecord;
+    var record = (try getById(a, txn, group, .routine, std.mem.readInt(u64, raw[0..8], .little))) orelse return error.InvalidCatalogRecord;
+    errdefer record.deinit();
+    if (record.value.parent_id != namespace or !std.mem.eql(u8, record.value.name, name) or !std.mem.eql(u8, record.value.signature orelse return error.InvalidCatalogRecord, signature)) return error.InvalidCatalogRecord;
+    return record;
+}
+
+/// Bounded name-index discovery; no unrelated functions, relations or bodies
+/// enter overload resolution. The caller owns the transaction's snapshot.
+pub const CallableHeader = domain.RoutineHeader;
+pub fn functionOverloads(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, namespace: u64, name: []const u8) ![]const CallableHeader {
+    const prefix = try nameKeyAlloc(a, group, .routine, namespace, name);
+    defer a.free(prefix);
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var records: std.ArrayList(CallableHeader) = .empty;
+    var row = try cursor.seekAtOrAfter(prefix);
+    while (row) |item| : (row = try cursor.next()) {
+        if (!std.mem.startsWith(u8, item.key, prefix)) break;
+        if (records.items.len >= 100) return error.SqlProgramLimitExceeded;
+        if (item.value.len != 8) return error.InvalidCatalogRecord;
+        const id = std.mem.readInt(u64, item.value[0..8], .little);
+        if (id == 0) return error.InvalidCatalogRecord;
+        try records.append(a, .{ .id = id, .signature = try a.dupe(u8, item.key[prefix.len..]) });
+    }
+    return records.toOwnedSlice(a);
+}
+
+pub const SelinuxAuthorityState = struct {
+    epoch: u64 = 0,
+    active: ?domain.security_labels.KernelRelabel.Authority = null,
+};
+
+pub const SelinuxAuthorityUpdate = struct {
+    pub const max_bytes = 1024;
+    incarnation: [16]u8,
+    expected_epoch: u64,
+    active: ?domain.security_labels.KernelRelabel.Authority,
+
+    pub fn validate(self: @This()) !void {
+        if (std.mem.allEqual(u8, &self.incarnation, 0) or self.expected_epoch == std.math.maxInt(u64))
+            return error.InvalidCatalogMutation;
+        if (self.active) |authority| {
+            const Key = std.crypto.sign.Ed25519.PublicKey;
+            if (authority.epoch != 0 or std.mem.allEqual(u8, &authority.policy.digest, 0) or std.mem.allEqual(u8, &authority.verifier, 0))
+                return error.InvalidCatalogMutation;
+            _ = Key.fromBytes(authority.verifier) catch return error.InvalidCatalogMutation;
+        }
+    }
+};
+
+pub fn readSelinuxAuthorityState(a: std.mem.Allocator, txn: anytype, group: u64) !SelinuxAuthorityState {
+    const key = try keyAlloc(a, group, "selinux-authority:v1");
+    defer a.free(key);
+    const bytes = txn.get(key) catch |err| return if (err == error.NotFound) .{} else err;
+    if (bytes.len > SelinuxAuthorityUpdate.max_bytes) return error.InvalidCatalogRecord;
+    var parsed = try std.json.parseFromSlice(SelinuxAuthorityState, a, bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value.epoch == 0) return error.InvalidCatalogRecord;
+    if (parsed.value.active) |authority| if (authority.epoch != parsed.value.epoch) return error.InvalidCatalogRecord;
+    return parsed.value;
+}
+
+pub fn readSelinuxAuthority(a: std.mem.Allocator, txn: anytype, group: u64) !?domain.security_labels.KernelRelabel.Authority {
+    return (try readSelinuxAuthorityState(a, txn, group)).active;
+}
+
+/// Ordered maintenance uses an epoch even when withdrawing the active key,
+/// so a delayed installation cannot restore trust after withdrawal.
+pub fn applySelinuxAuthority(a: std.mem.Allocator, txn: anytype, group: u64, update: SelinuxAuthorityUpdate) !void {
+    try update.validate();
+    const previous = try readSelinuxAuthorityState(a, txn, group);
+    if (previous.epoch != update.expected_epoch) return;
+    var next: SelinuxAuthorityState = .{ .epoch = previous.epoch + 1, .active = update.active };
+    if (next.active) |*authority| authority.epoch = next.epoch;
+    const key = try keyAlloc(a, group, "selinux-authority:v1");
+    defer a.free(key);
+    const bytes = try std.json.Stringify.valueAlloc(a, next, .{});
+    defer a.free(bytes);
+    try txn.put(key, bytes);
+}
+
+pub fn readMeta(alloc: std.mem.Allocator, txn: anytype, group_id: u64) !Meta {
+    const key = try keyAlloc(alloc, group_id, "meta");
+    defer alloc.free(key);
+    const bytes = txn.get(key) catch |err| return if (err == error.NotFound) .{} else err;
     var parsed = try std.json.parseFromSlice(Meta, alloc, bytes, .{});
     defer parsed.deinit();
     if (parsed.value.version != 1 or parsed.value.next_id < 3) return error.InvalidCatalogRecord;
@@ -560,7 +977,58 @@ pub fn loadState(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id
     const loaded_settings = try loadSettings(a, txn, group_id);
     const loaded_policies = try loadPolicies(a, txn, group_id);
     const loaded_publications = try loadPolicyPublications(a, txn, group_id);
-    return .{ .arena = arena, .meta = meta, .value = .{ .revision = meta.revision, .next_id = meta.next_id, .resources = resources, .settings = loaded_settings, .policies = loaded_policies, .policy_publications = loaded_publications } };
+    const loaded_privileges = try @import("authorization_storage.zig").loadAll(a, txn, group_id);
+    return .{ .arena = arena, .meta = meta, .value = .{ .revision = meta.revision, .next_id = meta.next_id, .resources = resources, .settings = loaded_settings, .policies = loaded_policies, .policy_publications = loaded_publications, .privileges = loaded_privileges } };
+}
+
+/// Point lookup of the current physical table for a stable SQL relation.
+/// Only non-default bindings need an extra row. Older nil identity records
+/// continue using their existing immutable physical-ID point lookup.
+pub fn logicalRelationPrefixForGroup(buffer: []u8, group: u64) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "\x00\x00__metadata_derived__:system_catalog_name:{d}:logical-relation:", .{group});
+}
+fn logicalRelationPrefixAlloc(a: std.mem.Allocator, group: u64) ![]u8 {
+    var buffer: [192]u8 = undefined;
+    return a.dupe(u8, try logicalRelationPrefixForGroup(&buffer, group));
+}
+
+/// Discover only the durable logical directory among legacy derived names.
+/// This lets native checkpoint verification find reverse-only orphan groups.
+pub const logical_relation_directory_groups = "\x00\x00__metadata_derived__:system_catalog_name:";
+pub fn logicalRelationGroupFromKey(key: []const u8) !?u64 {
+    if (!std.mem.startsWith(u8, key, logical_relation_directory_groups)) return null;
+    const tail = key[logical_relation_directory_groups.len..];
+    const separator = std.mem.indexOfScalar(u8, tail, ':') orelse return null;
+    if (!std.mem.startsWith(u8, tail[separator + 1 ..], "logical-relation:")) return null;
+    if (separator == 0 or tail[0] == '0') return error.InvalidCatalogRecord;
+    for (tail[0..separator]) |byte| if (byte < '0' or byte > '9') return error.InvalidCatalogRecord;
+    const group = std.fmt.parseInt(u64, tail[0..separator], 10) catch return error.InvalidCatalogRecord;
+    var buffer: [192]u8 = undefined;
+    const prefix = try logicalRelationPrefixForGroup(&buffer, group);
+    if (!std.mem.startsWith(u8, key, prefix) or key.len != prefix.len + 8) return error.InvalidCatalogRecord;
+    return group;
+}
+fn logicalRelationKeyAlloc(a: std.mem.Allocator, group: u64, id: u64) ![]u8 {
+    if (id == 0) return error.InvalidCatalogRecord;
+    const prefix = try logicalRelationPrefixAlloc(a, group);
+    defer a.free(prefix);
+    const key = try a.alloc(u8, prefix.len + 8);
+    @memcpy(key[0..prefix.len], prefix);
+    std.mem.writeInt(u64, key[prefix.len..][0..8], id, .big);
+    return key;
+}
+pub fn getTableByLogicalRelationId(a: std.mem.Allocator, txn: anytype, group: u64, id: u64) !?std.json.Parsed(domain.Resource) {
+    if (id == 0 or id > domain.max_relation_oid) return error.InvalidCatalogRecord;
+    const key = try logicalRelationKeyAlloc(a, group, id);
+    defer a.free(key);
+    const value = txn.get(key) catch |err| return if (err == error.NotFound) null else err;
+    if (value.len != 8) return error.InvalidCatalogRecord;
+    const physical = std.mem.readInt(u64, value[0..8], .little);
+    if (physical == 0) return error.InvalidCatalogRecord;
+    var resource = (try getById(a, txn, group, .table, physical)) orelse return error.InvalidCatalogRecord;
+    errdefer resource.deinit();
+    if (resource.value.sql_relation_id == null or resource.value.sql_relation_id.? != id) return error.InvalidCatalogRecord;
+    return resource;
 }
 
 pub fn getById(alloc: std.mem.Allocator, txn: anytype, group_id: u64, kind: domain.Kind, id: u64) !?std.json.Parsed(domain.Resource) {
@@ -572,10 +1040,7 @@ pub fn getById(alloc: std.mem.Allocator, txn: anytype, group_id: u64, kind: doma
 pub fn getByIdLimited(alloc: std.mem.Allocator, txn: anytype, group_id: u64, kind: domain.Kind, id: u64, max_bytes: usize) !?std.json.Parsed(domain.Resource) {
     const key = try recordKeyAlloc(alloc, group_id, kind, id);
     defer alloc.free(key);
-    const bytes = txn.get(key) catch |err| switch (err) {
-        error.NotFound => return null,
-        else => return err,
-    };
+    const bytes = txn.get(key) catch |err| return if (err == error.NotFound) null else err;
     if (bytes.len > max_bytes) return error.PreflightLimitExceeded;
     var parsed = try std.json.parseFromSlice(domain.Resource, alloc, bytes, .{ .allocate = .alloc_always });
     errdefer parsed.deinit();
@@ -618,6 +1083,27 @@ pub fn findIdentity(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group
     return id;
 }
 
+/// Project just the graph identity header. Large graph definitions are skipped
+/// in place when checking a retained cursor across unrelated catalog changes.
+pub fn graphRevisionMatches(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, binding: domain.CursorBinding) !bool {
+    const name_key = try nameKeyAlloc(alloc, group_id, .graph, 0, binding.physical);
+    defer alloc.free(name_key);
+    const id = txn.get(name_key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    if (id.len != 8) return error.InvalidCatalogRecord;
+    if (std.mem.readInt(u64, id[0..8], .little) != binding.id) return false;
+    const key = try recordKeyAlloc(alloc, group_id, .graph, binding.id);
+    defer alloc.free(key);
+    const Header = struct { kind: domain.Kind, parent_id: u64 = 0, name: []const u8, id: u64, graph_revision: u64 = 1 };
+    var header = try std.json.parseFromSlice(Header, alloc, try txn.get(key), .{ .ignore_unknown_fields = true });
+    defer header.deinit();
+    const row = header.value;
+    if (row.kind != .graph or row.parent_id != 0 or row.id != binding.id or !std.mem.eql(u8, row.name, binding.physical)) return error.InvalidCatalogRecord;
+    return row.graph_revision == binding.version;
+}
+
 pub fn find(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, kind: domain.Kind, parent: u64, name: []const u8) !?std.json.Parsed(domain.Resource) {
     const key = try nameKeyAlloc(alloc, group_id, kind, parent, name);
     defer alloc.free(key);
@@ -633,14 +1119,53 @@ pub fn find(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64
     return resource;
 }
 
+/// The existing table encoding remains eight bytes. New view backings carry
+/// an explicit kind byte; no storage lookup falls back to a catalog scan.
+pub fn getBindingForStorage(a: std.mem.Allocator, txn: anytype, group: u64, name: []const u8) !?std.json.Parsed(domain.Resource) {
+    const key = try storageBindingKey(a, group, name);
+    defer a.free(key);
+    const bytes = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    const kind: domain.Kind = if (bytes.len == 8) .table else if (bytes.len == 9 and bytes[0] == 'v') .view else return error.InvalidCatalogRecord;
+    const id = std.mem.readInt(u64, bytes[bytes.len - 8 ..][0..8], .little);
+    var record = (try getById(a, txn, group, kind, id)) orelse return error.InvalidCatalogRecord;
+    errdefer record.deinit();
+    if (!domain.hasPhysicalStorageBinding(record.value) or !std.mem.eql(u8, record.value.storage_name, name)) return error.InvalidCatalogRecord;
+    return record;
+}
+fn storageBindingValue(resource: domain.Resource, buffer: *[9]u8) []const u8 {
+    const offset: usize = if (resource.kind == .view) 1 else 0;
+    if (offset == 1) buffer[0] = 'v';
+    std.mem.writeInt(u64, buffer[offset..][0..8], resource.id, .little);
+    return buffer[0 .. offset + 8];
+}
+
 /// All returned records borrow this view's arena. Its transaction pins one
 /// catalog revision for both planning and response projection.
+pub const TemporaryNamespaceLookup = struct {
+    alloc: std.mem.Allocator,
+    txn: *docstore.DocStore.Txn,
+    group_id: u64,
+    pub fn requireNamespace(self: @This(), expected: @import("temporary_namespace_index.zig").Reference) !void {
+        var actual = (try getById(self.alloc, self.txn, self.group_id, .namespace, expected.namespace_id)) orelse return error.InvalidSqlTemporaryNamespace;
+        defer actual.deinit();
+        const observed = (try @import("temporary_namespace_index.zig").reference(actual.value)) orelse return error.InvalidSqlTemporaryNamespace;
+        if (!std.meta.eql(observed, expected)) return error.InvalidSqlTemporaryNamespace;
+    }
+};
+
 pub const View = struct {
     alloc: std.mem.Allocator,
     txn: *docstore.DocStore.Txn,
     group_id: u64,
     meta: Meta,
 
+    pub fn tableByLogicalRelationId(self: View, id: u64) !?domain.Resource {
+        const record = (try getTableByLogicalRelationId(self.alloc, self.txn, self.group_id, id)) orelse return null;
+        return record.value;
+    }
     pub fn byId(self: View, kind: domain.Kind, id: u64) !?domain.Resource {
         if (try getById(self.alloc, self.txn, self.group_id, kind, id)) |record| return record.value;
         return (domain.State{}).byId(kind, id);
@@ -653,38 +1178,51 @@ pub const View = struct {
         return self.childrenPage(kind, parent, limit, "", null);
     }
     pub fn childrenPage(self: View, kind: domain.Kind, parent: u64, limit: usize, name_prefix: []const u8, after: ?[]const u8) ![]const domain.Resource {
+        return self.childrenInternal(kind, parent, limit, name_prefix, after, null);
+    }
+    /// Complete bounded dependency capture, including every callable overload.
+    /// Reject before decoding a row beyond either budget; a truncated child
+    /// directory is never evidence that a scope can be atomically retired.
+    pub fn childrenBounded(self: View, kind: domain.Kind, parent: u64, count: usize, bytes: usize) ![]const domain.Resource {
+        return self.childrenInternal(kind, parent, count, "", null, bytes);
+    }
+    fn childrenInternal(self: View, kind: domain.Kind, parent: u64, limit: usize, name_prefix: []const u8, after: ?[]const u8, byte_limit: ?usize) ![]const domain.Resource {
         const base = try std.fmt.allocPrint(self.alloc, "\x00\x00__metadata_derived__:system_catalog_name:{d}:children:{s}:{d}:", .{ self.group_id, @tagName(kind), parent });
         const prefix = try std.mem.concat(self.alloc, u8, &.{ base, name_prefix });
         const seek = if (after) |name| try std.mem.concat(self.alloc, u8, &.{ base, name }) else prefix;
         var cursor = try self.txn.openCursor();
         defer cursor.close();
         var out: std.ArrayListUnmanaged(domain.Resource) = .empty;
+        var remaining = byte_limit orelse std.math.maxInt(usize);
         var entry = try cursor.seekAtOrAfter(if (std.mem.lessThan(u8, seek, prefix)) prefix else seek);
         while (entry) |kv| : (entry = try cursor.next()) {
             if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+            if (byte_limit != null and (out.items.len == limit or kv.value.len > remaining)) return error.SqlProgramLimitExceeded;
+            remaining -= @min(remaining, kv.value.len);
             const record = try std.json.parseFromSliceLeaky(domain.Resource, self.alloc, kv.value, .{ .allocate = .alloc_always });
             if (record.kind != kind or record.parent_id != parent or record.id == 0 or !std.mem.eql(u8, kv.key, try childKey(self.alloc, self.group_id, record))) return error.InvalidCatalogRecord;
             try domain.validateResourceName(record.kind, record.name);
             if (after) |name| if (!std.mem.lessThan(u8, name, record.name)) continue;
             try out.append(self.alloc, record);
-            if (limit != 0 and out.items.len >= limit) break;
+            if (byte_limit == null and limit != 0 and out.items.len >= limit) break;
         }
         if (out.items.len == 0 and self.meta.revision == 0) {
-            if (kind == .database and parent == 0) try out.append(self.alloc, domain.default_database);
-            if (kind == .namespace and parent == domain.default_database_id) try out.append(self.alloc, domain.default_namespace);
+            const fallback: ?domain.Resource = if (kind == .database and parent == 0) domain.default_database else if (kind == .namespace and parent == domain.default_database_id) domain.default_namespace else null;
+            if (fallback) |resource| {
+                if (byte_limit) |maximum| {
+                    if (limit == 0) return error.SqlProgramLimitExceeded;
+                    var count = std.Io.Writer.Discarding.init(&.{});
+                    try std.json.Stringify.value(resource, .{}, &count.writer);
+                    if (count.fullCount() > maximum) return error.SqlProgramLimitExceeded;
+                }
+                try out.append(self.alloc, resource);
+            }
         }
         return out.items;
     }
     pub fn bindingForStorage(self: View, name: []const u8) !?domain.Resource {
-        const key = try storageBindingKey(self.alloc, self.group_id, name);
-        const bytes = self.txn.get(key) catch |err| switch (err) {
-            error.NotFound => return null,
-            else => return err,
-        };
-        if (bytes.len != 8) return error.InvalidCatalogRecord;
-        const record = (try self.byId(.table, std.mem.readInt(u64, bytes[0..8], .little))) orelse return error.InvalidCatalogRecord;
-        if (!std.mem.eql(u8, record.storage_name, name)) return error.InvalidCatalogRecord;
-        return record;
+        const record = (try getBindingForStorage(self.alloc, self.txn, self.group_id, name)) orelse return null;
+        return record.value;
     }
     pub fn tablespaceInUse(self: View, id: u64) !bool {
         const prefix = try std.fmt.allocPrint(self.alloc, "\x00\x00__metadata_derived__:system_catalog_name:{d}:uses:{d}:", .{ self.group_id, id });
@@ -709,8 +1247,13 @@ pub const View = struct {
         const id = if (explicit != 0) explicit else if (namespace.tablespace_id != 0) namespace.tablespace_id else db.tablespace_id;
         return if (id == 0) null else (try self.byId(.tablespace, id)) orelse return error.TablespaceNotFound;
     }
+    pub fn requireNoLogicalReplication(self: View, database: u64) !void {
+        if ((try self.children(.publication, database, 1)).len != 0 or
+            (try self.children(.subscription, database, 1)).len != 0) return error.DatabaseNotEmpty;
+    }
+
     pub fn read(self: View, request: domain.Read) !domain.State {
-        if (request.kind == .table) return error.InvalidCatalogMutation;
+        if (domain.namespaceRelation(request.kind) or domain.logicalReplicationResource(request.kind)) return error.InvalidCatalogMutation;
         const parent = if (request.kind == .namespace) ((try self.lookup(.database, 0, request.database)) orelse return error.DatabaseNotFound).id else 0;
         var out: std.ArrayListUnmanaged(domain.Resource) = .empty;
         if (request.name) |name| {
@@ -751,35 +1294,78 @@ pub fn rebuildNameIndex(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, g
         alloc.free(rows);
     }
     for (rows) |row| try txn.delete(row.key);
+    try putPolicyCount(txn, group_id, state.value.policies.len);
+    for (state.value.policies) |record| try writePolicyName(alloc, txn, group_id, record);
     for (state.value.resources) |resource| {
-        const key = try nameKeyAlloc(alloc, group_id, resource.kind, resource.parent_id, resource.name);
+        const key = try resourceNameKeyAlloc(alloc, group_id, resource);
         defer alloc.free(key);
         var id: [8]u8 = undefined;
         std.mem.writeInt(u64, &id, resource.id, .little);
         try txn.put(key, &id);
         try writeReferences(alloc, txn, group_id, resource);
     }
+    for (state.value.privileges) |record| {
+        try @import("authorization_storage.zig").rebuildIndexes(alloc, txn, group_id, record);
+    }
+    for (state.value.policies) |record| try @import("authorization_storage.zig").policyDependency(alloc, txn, group_id, record, true);
+    for (state.value.policy_publications) |publication| try syncPolicyPublicationDependencies(alloc, txn, group_id, null, publication);
+    try validateNameIndex(alloc, txn, group_id);
 }
 
 pub fn validateNameIndex(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64) !void {
+    try validateLogicalRelationIndex(alloc, txn, group_id);
+    try @import("temporary_namespace_index.zig").validate(alloc, txn, group_id, TemporaryNamespaceLookup{ .alloc = alloc, .txn = txn, .group_id = group_id });
+    try @import("temporary_source_binding.zig").validate(alloc, txn, group_id, TemporaryNamespaceLookup{ .alloc = alloc, .txn = txn, .group_id = group_id });
     var state = try loadState(alloc, txn, group_id);
     defer state.deinit();
     var index = try domain.StateIndex.init(alloc, state.value);
     defer index.deinit(alloc);
+    if (try policyCount(txn, group_id) != state.value.policies.len) return error.InvalidCatalogRecord;
+    for (state.value.policies) |record| {
+        if ((try lookupPolicyName(alloc, txn, group_id, record.table_id, record.name)) != record.id) return error.InvalidCatalogRecord;
+    }
     for (state.value.resources) |resource| {
-        var found = (try find(alloc, txn, group_id, resource.kind, resource.parent_id, resource.name)) orelse return error.InvalidCatalogRecord;
+        if (resource.sql_relation_id != null) {
+            var logical = (try getTableByLogicalRelationId(alloc, txn, group_id, resource.effectiveLogicalRelationId())) orelse return error.InvalidCatalogRecord;
+            defer logical.deinit();
+            if (logical.value.id != resource.id) return error.InvalidCatalogRecord;
+        }
+        try @import("temporary_namespace_index.zig").requireResource(alloc, txn, group_id, resource);
+        try @import("temporary_source_binding.zig").requireResource(alloc, txn, group_id, resource);
+        var found = (if (resource.kind == .routine) try findFunction(alloc, txn, group_id, resource.parent_id, resource.name, resource.signature orelse return error.InvalidCatalogRecord) else try find(alloc, txn, group_id, resource.kind, resource.parent_id, resource.name)) orelse return error.InvalidCatalogRecord;
         defer found.deinit();
+        if (resource.kind == .routine or resource.kind == .cast) {
+            var dependencies = try @import("antfly_local_sources").sql_catalog.callable_dependencies.Set.init(alloc, resource);
+            defer dependencies.deinit(alloc);
+            try validateFunctionUses(alloc, txn, group_id, dependencies.uses);
+            for (dependencies.uses) |use| {
+                const reference = use.reference;
+                const key = try functionDependencyKey(alloc, group_id, reference.id, resource.id);
+                defer alloc.free(key);
+                const bytes = txn.get(key) catch return error.InvalidCatalogRecord;
+                if (bytes.len != 9 or bytes[0] != (if (resource.kind == .cast) @as(u8, 'c') else 'r') or std.mem.readInt(u64, bytes[1..9], .little) != resource.id) return error.InvalidCatalogRecord;
+            }
+        }
+        if (resource.kind == .named_type) {
+            var record = try @import("antfly_local_sources").sql_catalog.named_types.Record.decode(alloc, resource.source_json);
+            defer record.deinit();
+            if (try namedTypeByOrigin(alloc, txn, group_id, record.value.identity.origin_id) != resource.id) return error.InvalidCatalogRecord;
+            const expected = try @import("antfly_local_sources").sql_catalog.named_layouts.digest(alloc, record.value);
+            const actual = (try namedTypeLayoutDigest(alloc, txn, group_id, resource.id)) orelse return error.InvalidCatalogRecord;
+            if (!std.mem.eql(u8, &expected, &actual)) return error.InvalidCatalogRecord;
+        }
         if (found.value.id != resource.id) return error.InvalidCatalogRecord;
         const child_key = try childKey(alloc, group_id, resource);
         defer alloc.free(child_key);
         const child_json = try std.json.Stringify.valueAlloc(alloc, resource, .{});
         defer alloc.free(child_json);
         if (!std.mem.eql(u8, txn.get(child_key) catch return error.InvalidCatalogRecord, child_json)) return error.InvalidCatalogRecord;
-        if (resource.kind == .table) {
+        if (domain.hasPhysicalStorageBinding(resource)) {
             const key = try storageBindingKey(alloc, group_id, resource.storage_name);
             defer alloc.free(key);
             const bytes = txn.get(key) catch return error.InvalidCatalogRecord;
-            if (bytes.len != 8 or std.mem.readInt(u64, bytes[0..8], .little) != resource.id) return error.InvalidCatalogRecord;
+            var expected: [9]u8 = undefined;
+            if (!std.mem.eql(u8, bytes, storageBindingValue(resource, &expected))) return error.InvalidCatalogRecord;
         }
         if (resource.tablespace_id != 0) {
             const key = try tablespaceUseKey(alloc, group_id, resource);
@@ -789,6 +1375,20 @@ pub fn validateNameIndex(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, 
     }
 }
 
+fn validateLogicalRelationIndex(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64) !void {
+    const prefix = try logicalRelationPrefixAlloc(a, group);
+    defer a.free(prefix);
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var item = try cursor.seekAtOrAfter(prefix);
+    while (item) |entry| : (item = try cursor.next()) {
+        if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+        if (entry.key.len != prefix.len + 8 or entry.value.len != 8) return error.InvalidCatalogRecord;
+        const logical = std.mem.readInt(u64, entry.key[prefix.len..][0..8], .big);
+        var record = (try getTableByLogicalRelationId(a, txn, group, logical)) orelse return error.InvalidCatalogRecord;
+        defer record.deinit();
+    }
+}
 fn storageBindingKey(alloc: std.mem.Allocator, group_id: u64, name: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "\x00\x00__metadata_derived__:system_catalog_name:{d}:storage:{s}", .{ group_id, name });
 }
@@ -798,8 +1398,205 @@ fn tablespaceUseKey(alloc: std.mem.Allocator, group_id: u64, r: domain.Resource)
 // Covering parent rows keep list reads sequential. These values are derived,
 // written atomically with the primary record, and rebuilt on index migration.
 fn childKey(alloc: std.mem.Allocator, group_id: u64, r: domain.Resource) ![]u8 {
-    return std.fmt.allocPrint(alloc, "\x00\x00__metadata_derived__:system_catalog_name:{d}:children:{s}:{d}:{s}", .{ group_id, @tagName(r.kind), r.parent_id, r.name });
+    const base = try std.fmt.allocPrint(alloc, "\x00\x00__metadata_derived__:system_catalog_name:{d}:children:{s}:{d}:{s}", .{ group_id, @tagName(r.kind), r.parent_id, r.name });
+    if (r.kind != .routine) return base;
+    defer alloc.free(base);
+    return std.fmt.allocPrint(alloc, "{s}\x00{s}", .{ base, r.signature orelse return error.InvalidCatalogRecord });
 }
+fn namedTypeLayoutKey(a: std.mem.Allocator, group: u64, id: u64) ![]u8 {
+    return std.fmt.allocPrint(a, "\x00\x00__metadata_derived__:system_catalog_name:{d}:type_layout:{d}", .{ group, id });
+}
+pub fn namedTypeLayoutDigest(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, id: u64) !?[32]u8 {
+    const key = try namedTypeLayoutKey(a, group, id);
+    defer a.free(key);
+    const bytes = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    if (bytes.len != 32) return error.InvalidCatalogRecord;
+    return bytes[0..32].*;
+}
+fn namedTypeOriginKey(a: std.mem.Allocator, group: u64, origin: [16]u8) ![]u8 {
+    const prefix = try namePrefixAlloc(a, group);
+    defer a.free(prefix);
+    const key = try a.alloc(u8, prefix.len + "type_origin:".len + origin.len);
+    @memcpy(key[0..prefix.len], prefix);
+    @memcpy(key[prefix.len..][0.."type_origin:".len], "type_origin:");
+    @memcpy(key[prefix.len + "type_origin:".len ..], &origin);
+    return key;
+}
+/// A covering immutable-origin directory allows restore adoption and duplicate
+/// rejection without scanning namespace/name inventories.
+pub fn namedTypeByOrigin(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, origin: [16]u8) !?u64 {
+    const key = try namedTypeOriginKey(a, group, origin);
+    defer a.free(key);
+    const value = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    if (value.len != 8) return error.InvalidCatalogRecord;
+    const id = std.mem.readInt(u64, value[0..8], .little);
+    var resource = (try getById(a, txn, group, .named_type, id)) orelse return error.InvalidCatalogRecord;
+    defer resource.deinit();
+    var record = try @import("antfly_local_sources").sql_catalog.named_types.Record.decode(a, resource.value.source_json);
+    defer record.deinit();
+    if (record.value.identity.id != id or !std.mem.eql(u8, &record.value.identity.origin_id, &origin)) return error.InvalidCatalogRecord;
+    return id;
+}
+fn functionDependencyPrefix(a: std.mem.Allocator, group: u64, function: u64) ![]u8 {
+    return std.fmt.allocPrint(a, "\x00\x00__metadata_derived__:system_catalog_name:{d}:routine_dependency:{d}:", .{ group, function });
+}
+fn functionDependencyKey(a: std.mem.Allocator, group: u64, function: u64, dependent: u64) ![]u8 {
+    const prefix = try functionDependencyPrefix(a, group, function);
+    defer a.free(prefix);
+    return std.fmt.allocPrint(a, "{s}{d}", .{ prefix, dependent });
+}
+
+/// Reads only the referenced function's covering dependency directory. The
+/// statement bound prevents an unbounded CASCADE under serialized apply.
+pub fn functionDependents(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, function: u64, limit: usize) ![]const domain.Resource {
+    const prefix = try functionDependencyPrefix(a, group, function);
+    defer a.free(prefix);
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var result: std.ArrayList(domain.Resource) = .empty;
+    var row = try cursor.seekAtOrAfter(prefix);
+    while (row) |item| : (row = try cursor.next()) {
+        if (!std.mem.startsWith(u8, item.key, prefix)) break;
+        if (result.items.len >= limit) return error.SqlProgramLimitExceeded;
+        if (item.value.len != 9) return error.InvalidCatalogRecord;
+        const kind: domain.Kind = switch (item.value[0]) {
+            'r' => .routine,
+            'c' => .cast,
+            else => return error.InvalidCatalogRecord,
+        };
+        const id = std.mem.readInt(u64, item.value[1..9], .little);
+        const resource = (try getById(a, txn, group, kind, id)) orelse return error.InvalidCatalogRecord;
+        var dependencies = try @import("antfly_local_sources").sql_catalog.callable_dependencies.Set.init(a, resource.value);
+        defer dependencies.deinit(a);
+        if (dependencies.id() != id) return error.InvalidCatalogRecord;
+        const found = for (dependencies.uses) |use| {
+            if (use.reference.id == function) break true;
+        } else false;
+        if (!found) return error.InvalidCatalogRecord;
+        try result.append(a, resource.value);
+    }
+    return result.toOwnedSlice(a);
+}
+/// Stream a covering callable directory with scratch bounded to one resource.
+/// The visitor admits retained bytes before decoding and owns any copy it keeps.
+pub fn visitFunctionDependents(backing: std.mem.Allocator, txn: anytype, group: u64, function: u64, limit: usize, visitor: anytype) !void {
+    const prefix = try functionDependencyPrefix(backing, group, function);
+    defer backing.free(prefix);
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var row = try cursor.seekAtOrAfter(prefix);
+    var count: usize = 0;
+    while (row) |item| : (row = try cursor.next()) {
+        if (!std.mem.startsWith(u8, item.key, prefix)) break;
+        if (count == limit) return error.SqlProgramLimitExceeded;
+        count += 1;
+        if (item.value.len != 9) return error.InvalidCatalogRecord;
+        const kind: domain.Kind = switch (item.value[0]) {
+            'r' => .routine,
+            'c' => .cast,
+            else => return error.InvalidCatalogRecord,
+        };
+        const id = std.mem.readInt(u64, item.value[1..9], .little);
+        if (id == 0) return error.InvalidCatalogRecord;
+        var region = std.heap.ArenaAllocator.init(backing);
+        defer region.deinit();
+        const a = region.allocator();
+        if (!std.mem.eql(u8, item.key, try functionDependencyKey(a, group, function, id))) return error.InvalidCatalogRecord;
+        const raw = txn.get(try recordKeyAlloc(a, group, kind, id)) catch |err| return if (err == error.NotFound) error.InvalidCatalogRecord else err;
+        try visitor.admit(kind, id, raw.len);
+        const resource = try std.json.parseFromSliceLeaky(domain.Resource, a, raw, .{ .allocate = .alloc_always });
+        if (resource.kind != kind or resource.id != id) return error.InvalidCatalogRecord;
+        var dependencies = try @import("antfly_local_sources").sql_catalog.callable_dependencies.Set.init(a, resource);
+        defer dependencies.deinit(a);
+        if (dependencies.id() != id) return error.InvalidCatalogRecord;
+        const found = for (dependencies.uses) |use| {
+            if (use.reference.id == function) break true;
+        } else false;
+        if (!found) return error.InvalidCatalogRecord;
+        try visitor.accept(resource);
+    }
+}
+
+fn requireCallableReferencesWritable(a: std.mem.Allocator, txn: anytype, group: u64, resource: domain.Resource) !void {
+    if (resource.kind != .routine and resource.kind != .cast) return;
+    var dependencies = try @import("antfly_local_sources").sql_catalog.callable_dependencies.Set.init(a, resource);
+    defer dependencies.deinit(a);
+    for (dependencies.uses) |use| {
+        const selected = (try @import("../metadata/retirement/scope/ledger.zig").member(txn, group, .routine, use.reference.id)) orelse continue;
+        // Holding a support function freezes its definition. New unrelated
+        // users may still bind it; only retiring sources forbid new edges.
+        if (selected.intent == .retire) return error.TableTransitionActive;
+    }
+}
+
+pub fn validateFunctionUses(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, uses: []const routines.FunctionUse) !void {
+    for (uses) |use| {
+        const reference = use.reference;
+        var resource = (try getById(a, txn, group, .routine, reference.id)) orelse return error.InvalidCatalogRecord;
+        defer resource.deinit();
+        if (resource.value.parent_id != reference.namespace_id) return error.InvalidCatalogRecord;
+        var parsed_function = try routines.Record.decode(a, resource.value.source_json);
+        defer parsed_function.deinit();
+        const function = parsed_function.value;
+        if (function.kind != .function or function.id != reference.id or function.definition.arguments.len != use.arguments.len or function.definition.result == null or !std.meta.eql(function.definition.result.?, use.result)) return error.InvalidCatalogRecord;
+        for (function.definition.arguments, use.arguments) |actual, declared| if (!std.meta.eql(actual.type, declared)) return error.InvalidCatalogRecord;
+    }
+}
+
+fn sqlExtensionMemberKeyAlloc(a: std.mem.Allocator, group: u64, routine_id: u64) ![]u8 {
+    return std.fmt.allocPrint(a, "\x00\x00__metadata_derived__:system_catalog_name:{d}:sql_extension_member:{d}", .{ group, routine_id });
+}
+pub fn sqlExtensionMemberOwner(backing: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, routine_id: u64) !?u64 {
+    var region: std.heap.ArenaAllocator = .init(backing);
+    defer region.deinit();
+    const a = region.allocator();
+    const key = try sqlExtensionMemberKeyAlloc(a, group, routine_id);
+    defer a.free(key);
+    const bytes = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    if (bytes.len != 8) return error.InvalidSqlExtensionRecord;
+    const id = std.mem.readInt(u64, bytes[0..8], .big);
+    if (id == 0) return error.InvalidSqlExtensionRecord;
+    const extension = (try getById(a, txn, group, .extension, id)) orelse return error.InvalidSqlExtensionRecord;
+    const record = try @import("sql_extensions.zig").Record.decode(a, extension.value);
+    for (record.members) |member| if (member.id == routine_id) return id;
+    return error.InvalidSqlExtensionRecord;
+}
+fn sqlExtensionReferences(backing: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, resource: domain.Resource, adding: bool) !void {
+    if (resource.kind != .extension) return;
+    var region: std.heap.ArenaAllocator = .init(backing);
+    defer region.deinit();
+    const a = region.allocator();
+    const record = try @import("sql_extensions.zig").Record.decode(a, resource);
+    for (record.members) |member| {
+        const key = try sqlExtensionMemberKeyAlloc(a, group, member.id);
+        defer a.free(key);
+        var encoded: [8]u8 = undefined;
+        std.mem.writeInt(u64, &encoded, record.id, .big);
+        const previous = txn.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (adding) {
+            if (previous) |bytes| if (!std.mem.eql(u8, bytes, &encoded)) return error.SqlExtensionOwnedObject;
+            try txn.put(key, &encoded);
+        } else {
+            if (previous) |bytes| {
+                if (!std.mem.eql(u8, bytes, &encoded)) return error.InvalidSqlExtensionRecord;
+                try txn.delete(key);
+            }
+        }
+    }
+}
+
 fn graphTablePrefix(a: std.mem.Allocator, group_id: u64, table_id: u64) ![]u8 {
     return std.fmt.allocPrint(a, "\x00\x00__metadata_derived__:system_catalog_name:{d}:graph_table:{d}:", .{ group_id, table_id });
 }
@@ -823,6 +1620,22 @@ pub fn graphsForTable(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_i
     return out.items;
 }
 fn writeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, r: domain.Resource) !void {
+    try @import("replication/membership.zig").write(alloc, txn, group_id, r, false);
+    try sqlExtensionReferences(alloc, txn, group_id, r, true);
+    try r.validateLogicalRelationId();
+    if (r.sql_relation_id) |logical| {
+        try domain.requireRelationOid(logical);
+        const key = try logicalRelationKeyAlloc(alloc, group_id, logical);
+        defer alloc.free(key);
+        var physical: [8]u8 = undefined;
+        std.mem.writeInt(u64, &physical, r.id, .little);
+        const prior = txn.get(key) catch |err| if (err == error.NotFound) null else return err;
+        if (prior) |value| if (!std.mem.eql(u8, value, &physical)) return error.InvalidCatalogRecord;
+        try txn.put(key, &physical);
+    }
+    try @import("temporary_source_binding.zig").requireResource(alloc, txn, group_id, r);
+    try @import("temporary_namespace_index.zig").stage(alloc, txn, group_id, r, true);
+    try @import("authorization_storage.zig").resourceDependency(alloc, txn, group_id, r, true);
     const child_key = try childKey(alloc, group_id, r);
     defer alloc.free(child_key);
     const child_json = try std.json.Stringify.valueAlloc(alloc, r, .{});
@@ -833,17 +1646,65 @@ fn writeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_
         defer alloc.free(key);
         try txn.put(key, child_json);
     };
-    if (r.kind == .table) {
-        const key = try storageBindingKey(alloc, group_id, r.storage_name);
+    if (r.kind == .role) {
+        var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").system_catalog_privileges.Role, alloc, r.source_json, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        const role = parsed.value;
+        try role.validate();
+        if (role.id != r.id or r.parent_id != 0 or !std.mem.eql(u8, role.name, r.name)) return error.InvalidCatalogRecord;
+        const role_key = try @import("authorization_storage.zig").roleOriginKey(alloc, group_id, role.instance);
+        defer alloc.free(role_key);
+        var encoded: [8]u8 = undefined;
+        std.mem.writeInt(u64, &encoded, r.id, .little);
+        const previous = txn.get(role_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (previous) |value| if (!std.mem.eql(u8, value, &encoded)) return error.InvalidCatalogRecord;
+        try txn.put(role_key, &encoded);
+    }
+    if (r.kind == .named_type) {
+        var record = try @import("antfly_local_sources").sql_catalog.named_types.Record.decode(alloc, r.source_json);
+        defer record.deinit();
+        const key = try namedTypeOriginKey(alloc, group_id, record.value.identity.origin_id);
         defer alloc.free(key);
-        var id: [8]u8 = undefined;
-        std.mem.writeInt(u64, &id, r.id, .little);
         const previous = txn.get(key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
         };
-        if (previous) |value| if (!std.mem.eql(u8, value, &id)) return error.InvalidCatalogRecord;
-        try txn.put(key, &id);
+        var encoded: [8]u8 = undefined;
+        std.mem.writeInt(u64, &encoded, r.id, .little);
+        if (previous) |value| if (!std.mem.eql(u8, value, &encoded)) return error.InvalidCatalogRecord;
+        try txn.put(key, &encoded);
+        const layout_key = try namedTypeLayoutKey(alloc, group_id, r.id);
+        defer alloc.free(layout_key);
+        const digest = try @import("antfly_local_sources").sql_catalog.named_layouts.digest(alloc, record.value);
+        try txn.put(layout_key, &digest);
+    }
+    if (r.kind == .routine or r.kind == .cast) {
+        var dependencies = try @import("antfly_local_sources").sql_catalog.callable_dependencies.Set.init(alloc, r);
+        defer dependencies.deinit(alloc);
+        for (dependencies.uses) |use| {
+            const reference = use.reference;
+            const key = try functionDependencyKey(alloc, group_id, reference.id, r.id);
+            defer alloc.free(key);
+            var id: [9]u8 = undefined;
+            id[0] = if (r.kind == .cast) 'c' else 'r';
+            std.mem.writeInt(u64, id[1..9], r.id, .little);
+            try txn.put(key, &id);
+        }
+    }
+    if (domain.hasPhysicalStorageBinding(r)) {
+        const key = try storageBindingKey(alloc, group_id, r.storage_name);
+        defer alloc.free(key);
+        var id_buffer: [9]u8 = undefined;
+        const id = storageBindingValue(r, &id_buffer);
+        const previous = txn.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (previous) |value| if (!std.mem.eql(u8, value, id)) return error.InvalidCatalogRecord;
+        try txn.put(key, id);
     }
     if (r.tablespace_id != 0) {
         const key = try tablespaceUseKey(alloc, group_id, r);
@@ -852,6 +1713,17 @@ fn writeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_
     }
 }
 fn removeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, r: domain.Resource) !void {
+    try @import("replication/membership.zig").write(alloc, txn, group_id, r, true);
+    try sqlExtensionReferences(alloc, txn, group_id, r, false);
+    if (r.sql_relation_id) |logical| {
+        const key = try logicalRelationKeyAlloc(alloc, group_id, logical);
+        defer alloc.free(key);
+        const value = txn.get(key) catch return error.InvalidCatalogRecord;
+        if (value.len != 8 or std.mem.readInt(u64, value[0..8], .little) != r.id) return error.InvalidCatalogRecord;
+        try txn.delete(key);
+    }
+    try @import("temporary_namespace_index.zig").stage(alloc, txn, group_id, r, false);
+    try @import("authorization_storage.zig").resourceDependency(alloc, txn, group_id, r, false);
     if (r.kind == .graph) for (r.graph_tables, 0..) |table, ordinal| {
         var repeated = false;
         for (r.graph_tables[0..ordinal]) |prior| if (prior.table_id == table.table_id) {
@@ -872,7 +1744,48 @@ fn removeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group
         error.NotFound => {},
         else => return err,
     };
-    if (r.kind == .table) {
+    if (r.kind == .role) {
+        var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").system_catalog_privileges.Role, alloc, r.source_json, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        const role = parsed.value;
+        try role.validate();
+        const key = try @import("authorization_storage.zig").roleOriginKey(alloc, group_id, role.instance);
+        defer alloc.free(key);
+        txn.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+    if (r.kind == .named_type) {
+        var record = try @import("antfly_local_sources").sql_catalog.named_types.Record.decode(alloc, r.source_json);
+        defer record.deinit();
+        const key = try namedTypeOriginKey(alloc, group_id, record.value.identity.origin_id);
+        defer alloc.free(key);
+        txn.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+        const layout_key = try namedTypeLayoutKey(alloc, group_id, r.id);
+        defer alloc.free(layout_key);
+        txn.delete(layout_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+    if (r.kind == .routine or r.kind == .cast) {
+        var dependencies = try @import("antfly_local_sources").sql_catalog.callable_dependencies.Set.init(alloc, r);
+        defer dependencies.deinit(alloc);
+        for (dependencies.uses) |use| {
+            const reference = use.reference;
+            const key = try functionDependencyKey(alloc, group_id, reference.id, r.id);
+            defer alloc.free(key);
+            txn.delete(key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        }
+    }
+    if (domain.hasPhysicalStorageBinding(r)) {
         const key = try storageBindingKey(alloc, group_id, r.storage_name);
         defer alloc.free(key);
         txn.delete(key) catch |err| switch (err) {
@@ -891,11 +1804,20 @@ fn removeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group
 }
 
 pub fn writeResource(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, resource: domain.Resource) !void {
+    try resource.validateLogicalRelationId();
     if (try getById(alloc, txn, group_id, resource.kind, resource.id)) |old_value| {
         var old = old_value;
         defer old.deinit();
+        if (resource.kind == .table and old.value.sql_relation_id != null and old.value.sql_relation_id != resource.sql_relation_id) return error.InvalidCatalogMutation;
+        if (resource.kind == .sequence and (resource.parent_id != old.value.parent_id or
+            !std.mem.eql(u8, resource.name, old.value.name) or !std.mem.eql(u8, resource.source_json, old.value.source_json)))
+            try @import("sequence_leases.zig").requireUnleased(txn, group_id, resource.id);
+        if (resource.kind == .view and (resource.parent_id != old.value.parent_id or
+            !std.mem.eql(u8, resource.name, old.value.name) or !std.mem.eql(u8, resource.source_json, old.value.source_json) or
+            !std.mem.eql(u8, resource.storage_name, old.value.storage_name)))
+            try @import("view_leases.zig").requireUnleased(txn, group_id, resource.id);
         try removeReferences(alloc, txn, group_id, old.value);
-        const old_name_key = try nameKeyAlloc(alloc, group_id, old.value.kind, old.value.parent_id, old.value.name);
+        const old_name_key = try resourceNameKeyAlloc(alloc, group_id, old.value);
         defer alloc.free(old_name_key);
         txn.delete(old_name_key) catch |err| switch (err) {
             error.NotFound => {},
@@ -904,7 +1826,7 @@ pub fn writeResource(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, grou
     }
     const record_key = try recordKeyAlloc(alloc, group_id, resource.kind, resource.id);
     defer alloc.free(record_key);
-    const name_key = try nameKeyAlloc(alloc, group_id, resource.kind, resource.parent_id, resource.name);
+    const name_key = try resourceNameKeyAlloc(alloc, group_id, resource);
     defer alloc.free(name_key);
     const json = try std.json.Stringify.valueAlloc(alloc, resource, .{});
     defer alloc.free(json);
@@ -916,10 +1838,25 @@ pub fn writeResource(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, grou
 }
 
 pub fn removeResource(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, resource: domain.Resource) !void {
+    return removeResourceRow(alloc, txn, group_id, resource, true);
+}
+
+/// Unlink every old binding before inserting replacements (including swaps).
+/// A retained durable ID keeps its ACL, policy programs, namespace defaults
+/// and sequence-use summary; actual deletion retires those dependent records.
+fn removeResourceRow(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, resource: domain.Resource, retire: bool) !void {
+    if (retire) try @import("temporary_source_binding.zig").remove(alloc, txn, group_id, resource);
+    if (resource.kind == .view) try @import("view_leases.zig").requireUnleased(txn, group_id, resource.id);
+    if (resource.kind == .sequence) {
+        try @import("sequence_leases.zig").requireUnleased(txn, group_id, resource.id);
+        if (retire) try @import("sequence_default_dependencies.zig").removeUnusedSummary(txn, group_id, resource.id);
+    }
+    if (retire and resource.kind == .table) try @import("authorization_storage.zig").erase(alloc, txn, group_id, .{ .table = resource.id });
+    if (retire and resource.kind == .namespace) try @import("authorization_storage.zig").eraseNamespace(alloc, txn, group_id, resource.id);
     try removeReferences(alloc, txn, group_id, resource);
     const record_key = try recordKeyAlloc(alloc, group_id, resource.kind, resource.id);
     defer alloc.free(record_key);
-    const name_key = try nameKeyAlloc(alloc, group_id, resource.kind, resource.parent_id, resource.name);
+    const name_key = try resourceNameKeyAlloc(alloc, group_id, resource);
     defer alloc.free(name_key);
     txn.delete(record_key) catch |err| switch (err) {
         error.NotFound => {},
@@ -931,13 +1868,234 @@ pub fn removeResource(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, gro
     };
 }
 
-pub fn applyDelta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, delta: domain.Delta, previous: Meta, command_hash: [32]u8) !void {
+/// Constant-depth checks through the same immutable parent policy used by
+/// admission and capture. No global catalog scan or query mutex is involved.
+pub fn requireScopeResourceWritable(alloc: std.mem.Allocator, txn: anytype, group: u64, resource: domain.Resource, meta: Meta) !void {
+    _ = meta;
+    return requireScopeResourceWritableWithParents(alloc, txn, group, resource, &.{});
+}
+fn requireScopeResourceWritableWithParents(alloc: std.mem.Allocator, txn: anytype, group: u64, resource: domain.Resource, planned: []const domain.Resource) !void {
+    const retirement = @import("../metadata/retirement/scope/ledger.zig");
+    if (try retirement.member(txn, group, resource.kind, resource.id) != null) return error.TableTransitionActive;
+    switch (domain.parentScope(resource.kind)) {
+        .global => {},
+        .database => if (try retirement.member(txn, group, .database, resource.parent_id) != null) return error.TableTransitionActive,
+        .namespace => {
+            if (try retirement.member(txn, group, .namespace, resource.parent_id) != null) return error.TableTransitionActive;
+            var stored = try getById(alloc, txn, group, .namespace, resource.parent_id);
+            defer if (stored) |*value| value.deinit();
+            const parent = if (stored) |value| value.value else (domain.State{}).byId(.namespace, resource.parent_id) orelse blk: {
+                for (planned) |value| if (value.kind == .namespace and value.id == resource.parent_id) break :blk value;
+                return error.InvalidCatalogRecord;
+            };
+            if (try retirement.member(txn, group, .database, parent.parent_id) != null) return error.TableTransitionActive;
+        },
+    }
+}
+
+/// Existing identities need three writes, independent of child/settings count.
+/// The authority replans this delta inside the serialized catalog transaction.
+pub fn applyPresentationRecord(alloc: std.mem.Allocator, txn: anytype, group_id: u64, resource: domain.Resource, previous: Meta, command_hash: [32]u8) !void {
+    try requireScopeResourceWritable(alloc, txn, group_id, resource, previous);
+    const record_key = try recordKeyAlloc(alloc, group_id, resource.kind, resource.id);
+    defer alloc.free(record_key);
+    const bytes = try std.json.Stringify.valueAlloc(alloc, resource, .{});
+    defer alloc.free(bytes);
+    try txn.put(record_key, bytes);
+    // Parent listings are deliberately covering: retain sequential reads and
+    // update their value in the same transaction, without rewriting bindings.
+    const child_key = try childKey(alloc, group_id, resource);
+    defer alloc.free(child_key);
+    try txn.put(child_key, bytes);
+    try writeMeta(alloc, txn, group_id, previous, previous.next_id, command_hash);
+}
+
+/// Burn a target identity range in the existing catalog counter, in the same
+/// native transaction as the immutable Job. No public resource changed yet,
+/// so the source-definition revision remains pinned for that Job's population.
+pub fn reserveRelationOidRange(a: std.mem.Allocator, txn: anytype, group: u64, first: u64, after: u64) !void {
+    var meta = try readMeta(a, txn, group);
+    if (meta.next_id != first or after < first) return error.CatalogGenerationChanged;
+    if (after == first) return;
+    try domain.requireRelationOid(first);
+    try domain.requireRelationOid(after - 1);
+    meta.next_id = after;
+    const key = try keyAlloc(a, group, "meta");
+    defer a.free(key);
+    const bytes = try std.json.Stringify.valueAlloc(a, meta, .{});
+    defer a.free(bytes);
+    try txn.put(key, bytes);
+}
+
+fn writeMeta(alloc: std.mem.Allocator, txn: anytype, group_id: u64, previous: Meta, next_id: u64, command_hash: [32]u8) !void {
+    const meta: Meta = .{ .revision = try std.math.add(u64, previous.revision, 1), .next_id = next_id, .last_command = command_hash, .sequence_outcome_head = previous.sequence_outcome_head };
+    const key = try keyAlloc(alloc, group_id, "meta");
+    defer alloc.free(key);
+    const bytes = try std.json.Stringify.valueAlloc(alloc, meta, .{});
+    defer alloc.free(bytes);
+    try txn.put(key, bytes);
+}
+
+/// Pure admission: all source/target scope leases precede the first write.
+fn requireSqlExtensionDelta(backing: std.mem.Allocator, txn: anytype, group: u64, delta: domain.Delta) !void {
+    var region: std.heap.ArenaAllocator = .init(backing);
+    defer region.deinit();
+    const a = region.allocator();
+    for (delta.removes) |resource| {
+        if (resource.kind != .routine) continue;
+        const owner = (try sqlExtensionMemberOwner(a, txn, group, resource.id)) orelse continue;
+        const authorized = for (delta.removes) |extension| {
+            if (extension.kind == .extension and extension.id == owner) break true;
+        } else for (delta.upserts) |extension| {
+            if (extension.kind == .extension and extension.id == owner) break true;
+        } else false;
+        if (!authorized) return error.SqlExtensionOwnedObject;
+    }
+    for (delta.upserts) |resource| {
+        if (resource.kind != .routine) continue;
+        const callable = (try routines.Record.decode(a, resource.source_json)).value;
+        const owner = try sqlExtensionMemberOwner(a, txn, group, resource.id);
+        if (owner != null) {
+            // COMMENT changes presentation only and cannot rebind membership.
+            const prior = (try getById(a, txn, group, .routine, resource.id)) orelse return error.InvalidSqlExtensionRecord;
+            if (prior.value.parent_id == resource.parent_id and std.mem.eql(u8, prior.value.name, resource.name) and std.mem.eql(u8, prior.value.source_json, resource.source_json) and std.mem.eql(u8, prior.value.signature orelse "", resource.signature orelse "")) continue;
+        } else if (callable.definition.wasm == null) continue;
+        var member_found = false;
+        for (delta.upserts) |extension| {
+            if (extension.kind != .extension) continue;
+            if (owner) |id| if (id != extension.id) continue;
+            const record = try @import("sql_extensions.zig").Record.decode(a, extension);
+            for (record.members) |member| if (member.id == resource.id and member.generation == callable.generation) {
+                const binding = callable.definition.wasm orelse return error.SqlExtensionOwnedObject;
+                if (resource.parent_id != record.namespace_id or !std.mem.eql(u8, member.name, resource.name) or !std.mem.eql(u8, member.signature, resource.signature orelse "") or !std.mem.eql(u8, binding.package_name, record.package_name) or !std.mem.eql(u8, binding.package_version, record.package_version) or !std.mem.eql(u8, &binding.package_digest, &record.package_digest)) return error.InvalidSqlExtensionRecord;
+                member_found = true;
+                break;
+            };
+        }
+        if (!member_found) return error.SqlExtensionOwnedObject;
+    }
+}
+
+pub fn requireScopeDeltaWritable(alloc: std.mem.Allocator, txn: anytype, group_id: u64, delta: domain.Delta) !void {
+    try requireSqlExtensionDelta(alloc, txn, group_id, delta);
+    const meta = try readMeta(alloc, txn, group_id);
+    {
+        // View returns borrowed Resource values whose parsed backing belongs
+        // to its allocation region. Logical admission retains those values
+        // only for this call; no scratch pointer enters the supplied delta or
+        // escapes into the writer. Release the complete region on every exit.
+        var region = std.heap.ArenaAllocator.init(alloc);
+        defer region.deinit();
+        const scratch = region.allocator();
+        const LogicalReader = struct {
+            view: View,
+            cache: *@import("logical_relation_allocations.zig").Cache,
+            pub fn nextCatalogId(r: @This()) u64 {
+                return r.view.meta.next_id;
+            }
+            pub fn byId(r: @This(), kind: domain.Kind, id: u64) !?domain.Resource {
+                return r.view.byId(kind, id);
+            }
+            pub fn tableByLogicalRelationId(r: @This(), id: u64) !?domain.Resource {
+                return r.view.tableByLogicalRelationId(id);
+            }
+            pub fn reservedLogicalRelation(r: @This(), record: domain.Resource) !bool {
+                return r.cache.reserved(r.view.alloc, r.view.txn, r.view.group_id, record, r.view.meta.next_id);
+            }
+        };
+        var reservations: @import("logical_relation_allocations.zig").Cache = .{};
+        try domain.requireLogicalRelationDelta(scratch, LogicalReader{ .view = .{ .alloc = scratch, .txn = txn, .group_id = group_id, .meta = meta }, .cache = &reservations }, delta);
+    }
+    try @import("trigger_restore_leases.zig").requireUnleasedDelta(txn, group_id, delta);
+    // Validate the complete footprint, including old parents of a move, before
+    // any settings, ownership, topology or catalog effect can be committed.
+    for (delta.removes) |resource| try requireScopeResourceWritableWithParents(alloc, txn, group_id, resource, delta.upserts);
+    for (delta.upserts) |resource| {
+        try requireScopeResourceWritableWithParents(alloc, txn, group_id, resource, delta.upserts);
+        try requireCallableReferencesWritable(alloc, txn, group_id, resource);
+        if (try getById(alloc, txn, group_id, resource.kind, resource.id)) |value| {
+            var prior = value;
+            defer prior.deinit();
+            if (prior.value.parent_id != resource.parent_id) try requireScopeResourceWritableWithParents(alloc, txn, group_id, prior.value, delta.upserts);
+        }
+    }
+}
+
+pub fn applyDelta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, requested: domain.Delta, previous: Meta, command_hash: [32]u8) !void {
+    var region = std.heap.ArenaAllocator.init(alloc);
+    defer region.deinit();
+    const catalog_alloc = region.allocator();
+    const view: View = .{ .alloc = catalog_alloc, .txn = txn, .group_id = group_id, .meta = previous };
+    const delta = try @import("replication/membership.zig").augment(catalog_alloc, view, requested);
+    try requireScopeDeltaWritable(alloc, txn, group_id, delta);
+    if (delta.presentation_only and (delta.upserts.len != 1 or delta.removes.len != 0 or delta.next_id != previous.next_id or
+        (delta.upserts[0].kind != .database and delta.upserts[0].kind != .namespace and delta.upserts[0].kind != .named_type))) return error.InvalidCatalogMutation;
+    if (delta.presentation_only and previous.revision != 0) {
+        const resource = delta.upserts[0];
+        if (try getById(alloc, txn, group_id, resource.kind, resource.id)) |existing_value| {
+            var existing = existing_value;
+            defer existing.deinit();
+            // Reject attempts to hide structural changes behind a presentation delta.
+            var structural_before = existing.value;
+            structural_before.description = null;
+            var structural_after = resource;
+            structural_after.description = null;
+            const expected = try std.json.Stringify.valueAlloc(alloc, structural_before, .{});
+            defer alloc.free(expected);
+            const actual = try std.json.Stringify.valueAlloc(alloc, structural_after, .{});
+            defer alloc.free(actual);
+            if (!std.mem.eql(u8, expected, actual)) return error.InvalidCatalogMutation;
+            return applyPresentationRecord(alloc, txn, group_id, resource, previous, command_hash);
+        }
+    }
+    const Identity = struct { kind: domain.Kind, id: u64 };
+    for (delta.removes) |resource| if (resource.kind == .database) try view.requireNoLogicalReplication(resource.id);
+    var replacements: std.AutoHashMapUnmanaged(Identity, void) = .empty;
+    try replacements.ensureTotalCapacity(catalog_alloc, @intCast(delta.upserts.len));
+    var new_tables: std.ArrayList(domain.Resource) = .empty;
+    for (delta.upserts) |resource| {
+        const replication = @import("antfly_local_sources").system_catalog_logical_replication_catalog;
+        switch (resource.kind) {
+            .publication => _ = try replication.decodePublication(catalog_alloc, resource),
+            .subscription => _ = try replication.decodeSubscription(catalog_alloc, resource),
+            else => {},
+        }
+        if ((try replacements.getOrPut(catalog_alloc, .{ .kind = resource.kind, .id = resource.id })).found_existing) return error.InvalidCatalogMutation;
+        if (resource.sql_owner != null) {
+            const prior = try getById(catalog_alloc, txn, group_id, resource.kind, resource.id);
+            if (prior) |owned| {
+                if (!std.meta.eql(owned.value.sql_owner, resource.sql_owner)) return error.InvalidCatalogMutation;
+            } else try new_tables.append(catalog_alloc, resource);
+        }
+    }
+    if (!delta.presentation_only) {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var changes = try settings.DatabaseChanges.init(a, delta.removes, delta.upserts, previous.next_id);
+        defer changes.deinit(a);
+        // Rename deltas contain only the replacement. Read the old binding by
+        // immutable ID before any resource writes, in this same transaction.
+        const before: View = .{ .alloc = a, .txn = txn, .group_id = group_id, .meta = previous };
+        for (delta.upserts) |resource| if (resource.kind == .database and resource.id < previous.next_id) {
+            const prior = (try before.byId(.database, resource.id)) orelse return error.InvalidCatalogMutation;
+            try changes.bindPreviousName(a, resource.id, prior.name);
+        };
+        if (!changes.empty()) {
+            const records = try loadSettings(a, txn, group_id);
+            for (records) |record| if (try changes.applyAlloc(a, record)) |replacement| {
+                const key = try settingKeyAlloc(a, group_id, record.identity.id);
+                const bytes = try std.json.Stringify.valueAlloc(a, replacement, .{});
+                try txn.put(key, bytes);
+            };
+        }
+    }
     if (previous.revision == 0) {
         try writeResource(alloc, txn, group_id, domain.default_database);
         try writeResource(alloc, txn, group_id, domain.default_namespace);
     }
     var removed_tables: bool = false;
-    for (delta.removes) |resource| if (resource.kind == .table) {
+    for (delta.removes) |resource| if (resource.kind == .table and !replacements.contains(.{ .kind = resource.kind, .id = resource.id })) {
         removed_tables = true;
         break;
     };
@@ -946,11 +2104,20 @@ pub fn applyDelta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_i
         defer arena.deinit();
         const a = arena.allocator();
         const policy_records = try loadPolicies(a, txn, group_id);
-        for (delta.removes) |resource| if (resource.kind == .table) {
+        var remaining = policy_records.len;
+        for (delta.removes) |resource| if (resource.kind == .table and !replacements.contains(.{ .kind = resource.kind, .id = resource.id })) {
             for (policy_records) |record| if (record.table_id == resource.id) {
+                try @import("authorization_storage.zig").policyDependency(a, txn, group_id, record, false);
                 const policy_key = try policyKeyAlloc(a, group_id, record.id);
                 try txn.delete(policy_key);
+                try txn.delete(try policyNameKeyAlloc(a, group_id, record.table_id, record.name));
+                remaining -= 1;
             };
+            if (try loadPolicyPublication(a, txn, group_id, resource.id)) |value| {
+                var owned = value;
+                defer owned.deinit();
+                try syncPolicyPublicationDependencies(a, txn, group_id, owned.value, null);
+            }
             const publication_key = try policyPublicationKeyAlloc(a, group_id, resource.id);
             try txn.delete(publication_key);
             const stamp_key = try policyPublicationStampKeyAlloc(a, group_id, resource.id);
@@ -958,27 +2125,40 @@ pub fn applyDelta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_i
             const work_key = try policyPublicationWorkKeyAlloc(a, group_id, resource.id);
             try txn.delete(work_key);
         };
+        if (remaining != policy_records.len) try putPolicyCount(txn, group_id, remaining);
     }
-    for (delta.removes) |resource| try removeResource(alloc, txn, group_id, resource);
+
+    for (delta.removes) |resource| try removeResourceRow(alloc, txn, group_id, resource, !replacements.contains(.{ .kind = resource.kind, .id = resource.id }));
     for (delta.upserts) |resource| try writeResource(alloc, txn, group_id, resource);
-    const meta: Meta = .{ .revision = try std.math.add(u64, previous.revision, 1), .next_id = delta.next_id, .last_command = command_hash };
-    const key = try keyAlloc(alloc, group_id, "meta");
-    defer alloc.free(key);
-    const bytes = try std.json.Stringify.valueAlloc(alloc, meta, .{});
-    defer alloc.free(bytes);
-    try txn.put(key, bytes);
+    for (new_tables.items) |resource| try @import("authorization_storage.zig").initializeTable(catalog_alloc, txn, group_id, resource);
+    try writeMeta(alloc, txn, group_id, previous, delta.next_id, command_hash);
 }
 
 /// Bootstrap a previously published standalone row journal without renumbering
 /// its logical catalog generation. Never overwrite an initialized authority.
 pub fn importState(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, state: domain.State) !void {
-    if ((try readMeta(alloc, txn, group_id)).revision != 0) return error.CatalogGenerationChanged;
+    var validated = try domain.StateIndex.init(alloc, state);
+    defer validated.deinit(alloc);
+    // The legacy logical envelope has no allocator-state lane. Never turn a
+    // portable import into a sequence reset; binary metadata snapshots carry
+    // definitions/counters together through their verified projection cut.
+    for (state.resources) |resource| {
+        if (resource.kind == .sequence) return error.SequenceCatalogStateRequired;
+        // Publication definitions alone cannot restore capture ownership.
+        // Verified native checkpoints preserve the full metadata journal.
+        if (resource.kind == .publication or resource.sql_publications != null or resource.sql_all_publications != null)
+            return error.LogicalReplicationCatalogStateRequired;
+    }
+    const previous = try readMeta(alloc, txn, group_id);
+    if (previous.revision != 0) return error.CatalogGenerationChanged;
     if (state.next_id < 3) return error.InvalidCatalogRecord;
     try writeResource(alloc, txn, group_id, domain.default_database);
     try writeResource(alloc, txn, group_id, domain.default_namespace);
     for (state.resources) |resource| try writeResource(alloc, txn, group_id, resource);
+    for (state.privileges) |record| try @import("authorization_storage.zig").write(alloc, txn, group_id, record);
     for (state.settings, 0..) |record, i| {
         try record.validate();
+        try settings.requireDatabaseBindings(alloc, record, null, SettingDatabaseReader{ .alloc = alloc, .txn = txn, .group = group_id });
         if (record.identity.id >= state.next_id) return error.InvalidSettingRecord;
         for (state.settings[0..i]) |prior| if (prior.identity.id == record.identity.id or std.ascii.eqlIgnoreCase(prior.name, record.name)) return error.InvalidSettingRecord;
         const setting_key = try settingKeyAlloc(alloc, group_id, record.identity.id);
@@ -987,6 +2167,7 @@ pub fn importState(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_
         defer alloc.free(encoded);
         try txn.put(setting_key, encoded);
     }
+    try putPolicyCount(txn, group_id, state.policies.len);
     for (state.policies, 0..) |record, i| {
         try record.validateShape();
         if (record.id >= state.next_id) return error.InvalidRowPolicyRecord;
@@ -1002,6 +2183,8 @@ pub fn importState(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_
         const encoded = try std.json.Stringify.valueAlloc(alloc, record, .{});
         defer alloc.free(encoded);
         try txn.put(policy_key, encoded);
+        try @import("authorization_storage.zig").policyDependency(alloc, txn, group_id, record, true);
+        try writePolicyName(alloc, txn, group_id, record);
     }
     for (state.policy_publications, 0..) |publication, index| {
         try publication.validateShape();
@@ -1029,7 +2212,252 @@ pub fn importState(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_
     }
     const key = try keyAlloc(alloc, group_id, "meta");
     defer alloc.free(key);
-    const bytes = try std.json.Stringify.valueAlloc(alloc, Meta{ .revision = state.revision, .next_id = state.next_id }, .{});
+    const bytes = try std.json.Stringify.valueAlloc(alloc, Meta{ .revision = state.revision, .next_id = state.next_id, .sequence_outcome_head = previous.sequence_outcome_head }, .{});
     defer alloc.free(bytes);
     try txn.put(key, bytes);
+}
+
+/// Streaming cold/checkpoint verifier. Point reads rejoin each authoritative
+/// forward field and each reverse row; absence/corruption is never repaired.
+pub fn verifyLogicalRelationDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, rows: anytype, cancelled: ?*const std.atomic.Value(bool)) !bool {
+    const meta = try readMeta(backing, reader, group);
+    const prefix = try logicalRelationPrefixAlloc(backing, group);
+    defer backing.free(prefix);
+    var buffer: [160]u8 = undefined;
+    const records = try tableRecordPrefixForGroup(&buffer, group);
+    var found = false;
+    try rows.reset();
+    while (try rows.next()) |row| {
+        if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
+        if (std.mem.startsWith(u8, row.key, records)) {
+            var resource = try std.json.parseFromSlice(domain.Resource, backing, row.value, .{});
+            defer resource.deinit();
+            try resource.value.validateLogicalRelationId();
+            if (resource.value.sql_relation_id) |logical| {
+                if (logical == 0 or logical > domain.max_relation_oid or logical >= meta.next_id) return error.InvalidCatalogRecord;
+                found = true;
+                const physical = (try tableIdFromRecordKey(row.key, group)) orelse return error.InvalidCatalogRecord;
+                if (resource.value.kind != .table or physical != resource.value.id) return error.InvalidCatalogRecord;
+                var actual = (try getTableByLogicalRelationId(backing, reader, group, logical)) orelse return error.InvalidCatalogRecord;
+                defer actual.deinit();
+                if (actual.value.id != resource.value.id) return error.InvalidCatalogRecord;
+            }
+        } else if (std.mem.startsWith(u8, row.key, prefix)) {
+            found = true;
+            if (row.key.len != prefix.len + 8 or row.value.len != 8) return error.InvalidCatalogRecord;
+            const logical = std.mem.readInt(u64, row.key[prefix.len..][0..8], .big);
+            var actual = (try getTableByLogicalRelationId(backing, reader, group, logical)) orelse return error.InvalidCatalogRecord;
+            defer actual.deinit();
+        }
+    }
+    return found;
+}
+
+test "SQL logical relation native reverse lookup survives cold publication and rejects missing orphan substituted indexes" {
+    const a = std.testing.allocator;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/logical-relation", .{directory.sub_path}, 0);
+    defer a.free(path);
+    const group: u64 = 1;
+    const original: domain.Resource = .{ .kind = .table, .id = 7, .sql_relation_id = 7, .parent_id = 2, .name = "items", .storage_name = "physical:7" };
+    var replacement = try original.withPhysicalRelationId(11);
+    replacement.storage_name = "physical:11";
+    {
+        var store = try docstore.DocStore.open(a, path, .{});
+        defer store.close();
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const meta = try readMeta(a, &txn, group);
+        var initial_upserts = [_]domain.Resource{original};
+        try applyDelta(a, &txn, group, .{ .upserts = &initial_upserts, .removes = &.{}, .next_id = 12 }, meta, @splat(1));
+        try txn.commit();
+        var cut = try store.beginReadTxn();
+        defer cut.abort();
+        var before = (try getTableByLogicalRelationId(a, &cut, group, 7)).?;
+        defer before.deinit();
+        try std.testing.expectEqual(@as(u64, 7), before.value.id);
+        var writer = try store.beginWriteTxn();
+        errdefer writer.abort();
+        var replacement_upserts = [_]domain.Resource{replacement};
+        var original_removes = [_]domain.Resource{original};
+        const rewrite: domain.Delta = .{ .removes = &original_removes, .upserts = &replacement_upserts, .next_id = 12 };
+        const Admission = struct {
+            fn check(backing: std.mem.Allocator, transaction: *docstore.DocStore.Txn, group_id: u64, delta: domain.Delta) !void {
+                try requireScopeDeltaWritable(backing, transaction, group_id, delta);
+            }
+        };
+        // Exercise the production-owned scratch region with an ordinary leak-
+        // checking allocator, including all failing allocation exits. Validation
+        // must leave the exact old binding and metadata untouched.
+        const unchanged_meta = try readMeta(a, &writer, group);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Admission.check, .{ &writer, group, rewrite });
+        var false_claims = [_]domain.Resource{original};
+        false_claims[0].sql_relation_id = 99;
+        try std.testing.expectError(error.CatalogGenerationChanged, requireScopeDeltaWritable(a, &writer, group, .{ .upserts = &.{}, .removes = &false_claims, .next_id = 12 }));
+        try std.testing.expectEqualDeep(unchanged_meta, try readMeta(a, &writer, group));
+        {
+            var unchanged = (try getById(a, &writer, group, .table, original.id)).?;
+            defer unchanged.deinit();
+            try std.testing.expectEqualStrings(original.storage_name, unchanged.value.storage_name);
+        }
+        try applyDelta(a, &writer, group, rewrite, unchanged_meta, @splat(2));
+        try writer.commit();
+        // The old pinned cut remains old; the new mapping is not a mutable
+        // process-global redirect and never substitutes a fresh physical cut.
+        var retained = (try getTableByLogicalRelationId(a, &cut, group, 7)).?;
+        defer retained.deinit();
+        try std.testing.expectEqual(@as(u64, 7), retained.value.id);
+    }
+    {
+        var store = try docstore.DocStore.open(a, path, .{});
+        defer store.close();
+        var read = try store.beginReadTxn();
+        var selected = (try getTableByLogicalRelationId(a, &read, group, 7)).?;
+        try std.testing.expectEqual(@as(u64, 11), selected.value.id);
+        selected.deinit();
+        try validateNameIndex(a, &read, group);
+        read.abort();
+        const key = try logicalRelationKeyAlloc(a, group, 7);
+        defer a.free(key);
+        inline for (.{ "missing", "orphan", "substitute" }) |corruption| {
+            var txn = try store.beginWriteTxn();
+            defer txn.abort();
+            if (comptime std.mem.eql(u8, corruption, "missing")) {
+                try txn.delete(key);
+            } else if (comptime std.mem.eql(u8, corruption, "orphan")) {
+                const orphan = try logicalRelationKeyAlloc(a, group, 99);
+                defer a.free(orphan);
+                var bytes: [8]u8 = undefined;
+                std.mem.writeInt(u64, &bytes, 11, .little);
+                try txn.put(orphan, &bytes);
+            } else {
+                var bytes: [8]u8 = undefined;
+                std.mem.writeInt(u64, &bytes, 99, .little);
+                try txn.put(key, &bytes);
+            }
+            try std.testing.expectError(error.InvalidCatalogRecord, validateNameIndex(a, &txn, group));
+        }
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        var unrelated = replacement;
+        unrelated.id = 13;
+        unrelated.name = "unrelated";
+        unrelated.storage_name = "physical:13";
+        var unrelated_upserts = [_]domain.Resource{unrelated};
+        try std.testing.expectError(error.InvalidCatalogMutation, applyDelta(a, &txn, group, .{ .upserts = &unrelated_upserts, .removes = &.{}, .next_id = 14 }, try readMeta(a, &txn, group), @splat(3)));
+        var actual = (try getTableByLogicalRelationId(a, &txn, group, 7)).?;
+        defer actual.deinit();
+        try std.testing.expectEqual(@as(u64, 11), actual.value.id);
+    }
+}
+
+test "SQL relation OID counter reservations burn only committed slots and reject unowned donation after cold restart" {
+    const a = std.testing.allocator;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/oid-counter", .{directory.sub_path}, 0);
+    defer a.free(path);
+    const group: u64 = 1;
+    {
+        var store = try docstore.DocStore.open(a, path, .{});
+        defer store.close();
+        var discarded = try store.beginWriteTxn();
+        try reserveRelationOidRange(a, &discarded, group, 3, 5);
+        discarded.abort();
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqual(@as(u64, 3), (try readMeta(a, &txn, group)).next_id);
+        try reserveRelationOidRange(a, &txn, group, 3, 5);
+        const meta = try readMeta(a, &txn, group);
+        try std.testing.expectEqual(@as(u64, 0), meta.revision);
+        try txn.commit();
+    }
+    {
+        var store = try docstore.DocStore.open(a, path, .{});
+        defer store.close();
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const meta = try readMeta(a, &txn, group);
+        try std.testing.expectEqual(@as(u64, 5), meta.next_id);
+        try std.testing.expectEqual(@as(u64, 0), meta.revision);
+        var records = [_]domain.Resource{.{ .kind = .table, .id = std.math.maxInt(u64), .sql_relation_id = 3, .parent_id = 2, .name = "fresh", .storage_name = "opaque:physical" }};
+        try std.testing.expectError(error.InvalidCatalogMutation, applyDelta(a, &txn, group, .{ .upserts = &records, .removes = &.{}, .next_id = 6 }, meta, @splat(1)));
+        // Same physical bytes can use only the actual next fresh slot.
+        records[0].sql_relation_id = 5;
+        try applyDelta(a, &txn, group, .{ .upserts = &records, .removes = &.{}, .next_id = 6 }, meta, @splat(1));
+        var numeric_alias = [_]domain.Resource{.{ .kind = .table, .id = 5, .sql_relation_id = 6, .parent_id = 2, .name = "second", .storage_name = "physical:5" }};
+        try applyDelta(a, &txn, group, .{ .upserts = &numeric_alias, .removes = &.{}, .next_id = 7 }, try readMeta(a, &txn, group), @splat(2));
+        try txn.commit();
+    }
+    {
+        var store = try docstore.DocStore.open(a, path, .{});
+        defer store.close();
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        var resource = (try getTableByLogicalRelationId(a, &txn, group, 5)).?;
+        defer resource.deinit();
+        try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), resource.value.id);
+        try std.testing.expectEqual(@as(u64, 7), (try readMeta(a, &txn, group)).next_id);
+        var physical = (try getById(a, &txn, group, .table, 5)).?;
+        defer physical.deinit();
+        try std.testing.expectEqual(@as(u64, 6), physical.value.effectiveLogicalRelationId());
+        var second = (try getTableByLogicalRelationId(a, &txn, group, 6)).?;
+        defer second.deinit();
+        try std.testing.expectEqual(@as(u64, 5), second.value.id);
+        try validateNameIndex(a, &txn, group);
+    }
+}
+
+test "SQL relation OID adoption opens mainline high physical catalogs without allocating on reads" {
+    const a = std.testing.allocator;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/oid-upgrade", .{directory.sub_path}, 0);
+    defer a.free(path);
+    const group: u64 = 1;
+    const physical: u64 = std.math.maxInt(u64) - 7;
+    const predecessor: domain.Resource = .{ .kind = .table, .id = physical, .parent_id = 2, .name = "existing", .storage_name = "physical:existing" };
+    {
+        var store = try docstore.DocStore.open(a, path, .{});
+        defer store.close();
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        // Genuine mainline representation: no SQL OID and a high opaque ID.
+        try writeResource(a, &txn, group, predecessor);
+        try txn.commit();
+    }
+    {
+        var store = try docstore.DocStore.open(a, path, .{});
+        defer store.close();
+        var read = try store.beginReadTxn();
+        var ordinary = (try find(a, &read, group, .table, 2, "existing")).?;
+        defer ordinary.deinit();
+        try std.testing.expectEqual(physical, ordinary.value.id);
+        try std.testing.expect(ordinary.value.sql_relation_id == null);
+        var state = try loadState(a, &read, group);
+        defer state.deinit();
+        var indexed = try domain.StateIndex.init(a, state.value);
+        defer indexed.deinit(a);
+        try std.testing.expect(indexed.tableByLogicalRelationId(physical) == null);
+        try std.testing.expectEqual(@as(u64, 3), (try readMeta(a, &read, group)).next_id);
+        read.abort();
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        var adopted = [_]domain.Resource{predecessor};
+        adopted[0].sql_relation_id = 3;
+        try applyDelta(a, &txn, group, .{ .upserts = &adopted, .removes = &.{}, .next_id = 4 }, try readMeta(a, &txn, group), @splat(1));
+        try txn.commit();
+    }
+    {
+        var store = try docstore.DocStore.open(a, path, .{});
+        defer store.close();
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        var adopted = (try getTableByLogicalRelationId(a, &read, group, 3)).?;
+        defer adopted.deinit();
+        try std.testing.expectEqual(physical, adopted.value.id);
+        try std.testing.expectEqual(@as(u64, 4), (try readMeta(a, &read, group)).next_id);
+        try validateNameIndex(a, &read, group);
+    }
 }

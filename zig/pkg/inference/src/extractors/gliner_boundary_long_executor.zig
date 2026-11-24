@@ -15,6 +15,7 @@
 
 //! Admitted serial windows followed by document-global task decisions. Model
 //! tensors die after each window; only bounded scalar evidence survives.
+const compute_provider = @import("../backends/compute_provider.zig");
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const wire = @import("extraction_v2.zig");
@@ -64,6 +65,7 @@ pub const Limits = struct {
     }
 };
 pub const Options = struct {
+    compiled_session: ?@import("../backends/session.zig").Session = null,
     preparations: ?*PreparationStore = null,
     identity: artifact.Identity,
     processor: processor.Options = .{},
@@ -184,7 +186,19 @@ fn profile(a: Allocator, config: *const model.Config, item: *const wire.Item, op
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("antfly-gliner-boundary-window-inference/v1\x00");
     hash.update(&options.identity.fingerprint());
-    hash.update(backend);
+    if (options.compiled_session) |session| {
+        if (comptime !@import("build_options").enable_pjrt) return error.PjrtNotEnabled;
+        if (session.backend() != .pjrt) return error.UnsupportedGlinerBoundaryBackend;
+        const factory = @import("../architectures/session_factory.zig");
+        const live = try factory.getGlinerBoundaryIdentity(session);
+        if (!std.mem.eql(u8, &options.identity.fingerprint(), &live.fingerprint())) return error.GlinerBoundaryArtifactMismatch;
+        const client: *@import("pjrt").pjrt.Client = @ptrCast(@alignCast(factory.getPjrtClientPtr(session) orelse return error.MissingPjrtClient));
+        const precision = factory.getPjrtPrecision(session) orelse return error.UnsupportedGlinerBoundaryBackend;
+        hash.update("pjrt\x00");
+        hash.update(try client.platformName());
+        hash.update("\x00");
+        hash.update(@tagName(precision));
+    } else hash.update(backend);
     hash.update("\x00");
     hashOptions(&hash, options.pipeline);
     hash.update("global-joint/native-window-resources-v1\x00");
@@ -915,6 +929,7 @@ pub fn planGeometry(backend: compute.BackendKind, allocator: Allocator, config: 
 }
 
 pub fn executeQualified(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, item: *const wire.Item, supplied: Options, gate: *qualification.Admission) !Result {
+    if (supplied.compiled_session != null) return error.UnsupportedGlinerBoundaryRuntime;
     if (cb.kind() != .native and (cb.kind() != .metal and cb.kind() != .cuda)) return error.UnsupportedGlinerBoundaryBackend;
     if (cb.kind() == .metal and cb.decoderRuntimeHasActiveFrame()) return error.GlinerBoundaryExternalFrame;
     return executeChecked(cb, allocator, config, tokenizer, item, supplied, gate);
@@ -946,7 +961,9 @@ fn encodeGroup(
     pipeline_options: pipeline.Options,
     control: ?Control,
     head_limits: head.Limits,
+    compiled_session: ?@import("../backends/session.zig").Session,
 ) !pipeline.WindowResult {
+    if (compiled_session) |session| return @import("../pipelines/gliner_boundary_program.zig").runWindows(session, allocator, output_allocator, config, prepared, schemas, pipeline_options, engine_options);
     return switch (cb.kind()) {
         .native, .wasm => native: {
             var encoded = try engine.encodeNative(cb, allocator, config, prepared, engine_options);
@@ -1037,7 +1054,7 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
                 attempt_usage.attention > options.limits.max_total_attention_work.? - attention) return error.LongDocumentWorkLimitExceeded;
             encoded_tokens += attempt_usage.tokens;
             attention += attempt_usage.attention;
-            if (encodeGroup(cb, allocator, config, &prepared, engine_options, device_options, schemas, budget.allocator(), pipeline_options, options.control, options.pipeline.head_limits)) |value| {
+            if (encodeGroup(cb, allocator, config, &prepared, engine_options, device_options, schemas, budget.allocator(), pipeline_options, options.control, options.pipeline.head_limits, options.compiled_session)) |value| {
                 break :attempt value;
             } else |err| {
                 const classified = evidenceAllocationError(terminal, err);
@@ -1253,7 +1270,7 @@ fn testPinnedSmallWindows(directory: []const u8, metal: bool) !void {
     defer if (watchdog) |owner| owner.destroy();
     if (watchdog) |owner| try owner.start(std.testing.io);
     const control = Control{ .hard_cancellation = if (watchdog) |owner| owner.boundary() else null, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 180 * std.time.ns_per_s };
-    var managed = try factory.getManagedComputeBackend(session, a, null, control);
+    var managed = try compute_provider.acquire(session, a, null, control);
     defer managed.deinit();
     for (reference.value.cases) |case| {
         errdefer std.debug.print("long executor case: {s}\n", .{case.id});
@@ -1441,7 +1458,7 @@ test "gliner boundary long executor adaptive group shrink recovers from injected
     defer a.free(tokenizer_bytes);
     const tokenizer = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, tokenizer_bytes);
     defer tokenizer.tokenizer().deinitTokenizer();
-    var managed = try factory.getManagedComputeBackend(session, a, null, null);
+    var managed = try compute_provider.acquire(session, a, null, null);
     defer managed.deinit();
 
     // 12 repeats of an 11-word sentence, windowed at word_words=20/overlap=2,

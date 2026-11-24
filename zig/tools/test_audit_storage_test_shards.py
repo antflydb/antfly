@@ -109,6 +109,34 @@ class StorageTestShardAuditTest(unittest.TestCase):
             ),
         )
 
+    def test_resolves_reexport_through_the_physical_backend_module(self):
+        self.write("local/storage/db/rows/rows.zig", 'test "rows" {}\n')
+        self.write(
+            "local/storage/read_session_source.zig",
+            'pub const RelationalRows = @import("db/rows/rows.zig");\n',
+        )
+        self.write(
+            "local/source_catalog.zig",
+            'pub const rows = @import("read_session_backend").RelationalRows;\n',
+        )
+        self.write(
+            "server/storage/test_manifest.zig",
+            '_ = @import("antfly_local_sources").rows;\n',
+        )
+        self.assertEqual(
+            [],
+            audit.audit_manifest(
+                self.root / "local/storage",
+                self.root / "server/storage/test_manifest.zig",
+                ["storage.db.rows.rows."],
+                catalog=self.root / "local/source_catalog.zig",
+                module_sources={
+                    "read_session_backend": self.root
+                    / "local/storage/read_session_source.zig"
+                },
+            ),
+        )
+
     def test_cli_routes_dedicated_local_module_tests_to_their_physical_owner(self):
         self.write("server/storage/test_manifest.zig", "")
         self.write("local/source_catalog.zig", "")

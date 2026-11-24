@@ -22,7 +22,7 @@ import argparse
 import re
 from collections import Counter
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 
 TEST_DECLARATION = re.compile(r'(?m)^\s*(?:pub\s+)?test(?:\s|")')
@@ -48,15 +48,16 @@ def test_modules(root: Path) -> Iterable[tuple[Path, tuple[str, ...]]]:
 
 
 def manifest_sources(
-    root: Path, manifest: Path, catalog: Path | None = None
+    root: Path,
+    manifest: Path,
+    catalog: Path | None = None,
+    module_sources: Mapping[str, Path] | None = None,
 ) -> list[Path]:
     imports = MANIFEST_IMPORT.findall(manifest.read_text(encoding="utf-8"))
     sources = [(manifest.parent / imported).resolve() for imported in imports]
     if catalog is None:
         return sources
-    entries = dict(
-        re.findall(r'pub const (\w+) = @import\("([^"\n]+)"\);', catalog.read_text())
-    )
+    entries = catalog_const_entries(catalog, module_sources)
     names = re.findall(
         r'_\s*=\s*@import\("antfly_local_sources"\)\.(\w+);', manifest.read_text()
     )
@@ -67,10 +68,22 @@ def manifest_sources(
     return [source for source in sources if source.is_relative_to(root)]
 
 
-def catalog_const_entries(catalog: Path) -> dict[str, str]:
-    return dict(
-        re.findall(r'pub const (\w+) = @import\("([^"\n]+)"\);', catalog.read_text())
-    )
+def catalog_const_entries(
+    catalog: Path, module_sources: Mapping[str, Path] | None = None
+) -> dict[str, str]:
+    content = catalog.read_text()
+    entries = dict(re.findall(r'pub const (\w+) = @import\("([^"\n]+)"\);', content))
+    if module_sources:
+        for name, module, symbol in re.findall(
+            r'pub const (\w+) = @import\("([^"\n]+)"\)\.(\w+);', content
+        ):
+            source = module_sources.get(module)
+            if source is None:
+                continue
+            imported = catalog_const_entries(source).get(symbol)
+            if imported is not None:
+                entries[name] = str((source.parent / imported).resolve())
+    return entries
 
 
 def suggested_catalog_name(relative: Path) -> str:
@@ -107,16 +120,17 @@ def audit_manifest(
     filters: Sequence[str],
     dedicated_sources: Sequence[Path] = (),
     catalog: Path | None = None,
+    module_sources: Mapping[str, Path] | None = None,
 ) -> list[str]:
     root = root.resolve()
     manifest = manifest.resolve()
     declared = {source.resolve(): names for source, names in test_modules(root)}
-    imported = manifest_sources(root, manifest, catalog)
+    imported = manifest_sources(root, manifest, catalog, module_sources)
     counts = Counter(imported)
     failures: list[str] = []
     reverse_catalog: dict[Path, str] = {}
     if catalog is not None:
-        for name, import_path in catalog_const_entries(catalog).items():
+        for name, import_path in catalog_const_entries(catalog, module_sources).items():
             reverse_catalog[(catalog.parent / import_path).resolve()] = name
 
     dedicated_counts = Counter(
@@ -223,6 +237,13 @@ def main() -> int:
     parser.add_argument("--local-root", type=Path)
     parser.add_argument("--local-catalog", type=Path)
     parser.add_argument(
+        "--local-module",
+        nargs=2,
+        action="append",
+        default=[],
+        metavar=("NAME", "SOURCE"),
+    )
+    parser.add_argument(
         "--dedicated",
         type=Path,
         action="append",
@@ -250,8 +271,16 @@ def main() -> int:
         parser.error("--local-root and --local-catalog must be used together")
     if args.local_dedicated and not args.local_root:
         parser.error("--local-dedicated requires --local-root and --local-catalog")
+    if args.local_module and not args.local_catalog:
+        parser.error("--local-module requires --local-catalog")
+    module_sources = {name: Path(source) for name, source in args.local_module}
     failures = audit_manifest(
-        args.root, args.manifest, args.filter, args.dedicated, args.local_catalog
+        args.root,
+        args.manifest,
+        args.filter,
+        args.dedicated,
+        args.local_catalog,
+        module_sources,
     )
     if args.local_root:
         failures.extend(
@@ -261,6 +290,7 @@ def main() -> int:
                 args.filter,
                 args.local_dedicated,
                 catalog=args.local_catalog,
+                module_sources=module_sources,
             )
         )
     if args.runtime_partition_source:

@@ -26,7 +26,7 @@ test {
     _ = @import("api/lake_native_refresh_test.zig");
     _ = @import("serverless/lake_wal.zig");
     _ = @import("serverless/lake_ingestion.zig");
-    _ = @import("api/sql_execution.zig");
+    _ = @import("api/sql/execution/execution.zig");
     _ = @import("api/tables.zig");
     _ = @import("api/table_contract.zig");
     _ = @import("serverless/build/lake_sidecar_text.zig");
@@ -147,4 +147,5 @@ comptime {
     _ = @import("serverless/lake_vacuum_plan.zig");
     _ = @import("serverless/lake_vacuum_inputs.zig");
     _ = @import("api/lake_search_overlay.zig");
+    _ = @import("api/lake_publication_changefeed.zig");
 }

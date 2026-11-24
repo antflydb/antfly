@@ -205,7 +205,7 @@ test "SQL overlay native pages retain typed cells after source page release" {
             errdefer arena.deinit();
             const owned = arena.allocator();
             const layout = try catalog.Row.TypedLayout.init(owned, &.{ "n", "a", "j", "sql_null" });
-            const array = try @import("../sql/array_text.zig").decode(owned, .int64, "[-1:1]={9007199254740993,NULL,2}", .{});
+            const array = try @import("../sql/array/text.zig").decode(owned, .int64, "[-1:1]={9007199254740993,NULL,2}", .{});
             const rows = try owned.alloc(catalog.Row, 2);
             for (rows, 0..) |*row, i| {
                 row.* = try catalog.Row.fromDatums(owned, if (i == 0) "a" else "b", layout, &.{
@@ -238,7 +238,7 @@ test "SQL overlay native pages retain typed cells after source page release" {
     try std.testing.expect(overlay.native_done and overlay.page == null);
     try std.testing.expectEqual(@as(usize, 2), page.rows.len);
     try std.testing.expect(page.rows[0].typed_cells.?.layout == page.rows[1].typed_cells.?.layout);
-    var expected = try @import("../sql/array_text.zig").decode(a, .int64, "[-1:1]={9007199254740993,NULL,2}", .{});
+    var expected = try @import("../sql/array/text.zig").decode(a, .int64, "[-1:1]={9007199254740993,NULL,2}", .{});
     defer expected.deinit();
     for (page.rows, 0..) |row, i| {
         try std.testing.expectEqualStrings(if (i == 0) "a" else "b", row.id);
@@ -246,7 +246,7 @@ test "SQL overlay native pages retain typed cells after source page release" {
         try std.testing.expectEqual(9007199254740993 + @as(i64, @intCast(i)), (try row.cell("n")).value.integer);
         const cell = try row.cell("a");
         try std.testing.expect(!cell.sql_null and cell.value == .null);
-        var work: @import("../sql/array_value.zig").Budget = .{};
+        var work: @import("../sql/array/value.zig").Budget = .{};
         try std.testing.expectEqual(std.math.Order.eq, try expected.value.compare((cell.array orelse return error.ExpectedNativeArrayCell).*, &work));
         const json_null = try row.cell("j");
         try std.testing.expect(!json_null.sql_null and json_null.value == .null);

@@ -147,6 +147,30 @@ class ReleaseUpgradeGateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 17, result.stderr)
         self.assertTrue(called)
 
+    def test_gate_and_evidence_cover_v04_and_maintenance_releases(self):
+        evidence = WORKFLOW.split(
+            "      - name: Upload in-place upgrade evidence\n", 1
+        )[1].split("      - name:", 1)[0]
+        for step in (STEP, evidence):
+            condition = step.split("        if: ${{ ", 1)[1].split(" }}", 1)[0]
+            expression = (
+                condition.replace("inputs.release_line", "release_line")
+                .replace("||", "or")
+                .replace("&&", "and")
+                .replace("always()", "True")
+            )
+            for line, expected in (
+                ("0.3", True),
+                ("0.4", True),
+                ("nightly", True),
+                ("0.2", False),
+            ):
+                with self.subTest(step=step[:30], line=line):
+                    self.assertEqual(
+                        eval(expression, {"__builtins__": {}}, {"release_line": line}),
+                        expected,
+                    )
+
     def test_upgrade_is_required_before_recording_release(self):
         self.assertIn("inputs.release_line == '0.3'", STEP)
         self.assertIn("inputs.release_line == 'nightly'", STEP)

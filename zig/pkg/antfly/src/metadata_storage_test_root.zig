@@ -17,14 +17,39 @@ const storage = @import("metadata/storage/mod.zig");
 
 test {
     _ = storage.raft_apply_store;
+    _ = @import("metadata/sql/testing/extensions/store_test.zig");
+    _ = @import("metadata/sql/testing/extensions/control_test.zig");
+    _ = @import("metadata/sql/testing/extensions/auxiliary_test.zig");
+    _ = @import("system_catalog/foreign_key_dependencies.zig");
+    _ = @import("system_catalog/logical_relation_allocations.zig");
+    _ = @import("metadata/trigger_catalog.zig");
+    _ = @import("metadata/restore_staging.zig");
     _ = @import("antfly_local_sources").metadata_lake_index_catalog;
 }
 
 test {
     _ = @import("metadata/report_collection.zig");
+    _ = @import("metadata/http_client.zig");
     _ = @import("metadata/fk_generation_publication.zig");
+    _ = @import("metadata/relational_index/candidate.zig");
+    _ = @import("metadata/relational_index/publication.zig");
+    _ = @import("metadata/schema_validation/attestation.zig");
+    _ = @import("metadata/schema_validation/publication.zig");
+    _ = @import("metadata/schema_validation/plan.zig");
+    _ = @import("metadata/schema_validation/ledger.zig");
+    _ = @import("metadata/schema_migration_finalization.zig");
+    _ = @import("api/tables.zig");
+    _ = @import("api/native_retained_cut.zig");
+    _ = @import("metadata/relational_index/worker.zig");
+    _ = @import("metadata/relational_index/delivery_journal.zig");
+    _ = @import("api/relational_index/owner_execution.zig");
+    _ = @import("api/relational_index/plan_builder.zig");
+    _ = @import("api/index_publication_recovery.zig");
+    _ = @import("api/relational_index/admission.zig");
+    _ = @import("api/relational_index/claim_delivery_test.zig");
     _ = @import("metadata/fk_initial_retirement_ack.zig");
     _ = @import("system_catalog/operations.zig");
+    _ = @import("metadata/schema_publication_shape.zig");
 }
 
 /// Implementation source choices for this compilation root.
@@ -37,6 +62,10 @@ pub const local_test_sources = if (@import("builtin").is_test) @import("local_te
 // anonymous root above. The physical owner's persistence tests must be loaded.
 test "system catalog native memory ownership storage root" {
     _ = storage.raft_apply_store;
+}
+
+comptime {
+    _ = @import("metadata/storage/sql_notifications_test.zig");
 }
 
 test "metadata alias persistence discovery" {

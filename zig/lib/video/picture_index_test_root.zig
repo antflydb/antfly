@@ -216,3 +216,27 @@ test "AVC header cache pressure preserves long clip configuration scanning" {
     try std.testing.expectEqual(@as(usize, 0), registry.header_packets.items.len);
     try std.testing.expectEqual(@as(usize, 0), registry.header_budget.live);
 }
+
+test "AVC header caching fits dynamic MP4 planning within the cache-free peak" {
+    const bytes = @embedFile("testdata/h264-dynamic-geometry.mp4");
+    var cap: u64 = std.math.maxInt(u64);
+    var expected: usize = 0;
+    for ([_]bool{ false, true }) |cache| {
+        var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+        const a = backing.allocator();
+        var pool = media.admission.Pool{ .limits = .{ .host_bytes = cap } };
+        defer std.debug.assert(pool.snapshot().host_bytes == 0);
+        var source = media.source.Source{ .allocator = a, .identity = "dynamic-pressure", .storage = .{ .borrowed = bytes } };
+        var reader = try media.mp4.Reader.init(a, &source, .{});
+        defer reader.deinit();
+        source.admission_pool = &pool;
+        const Session = @import("src/h264_dynamic.zig").Session;
+        const session = if (cache) try Session.initPlanning(a, &reader, .{}) else try Session.init(a, &reader, .{});
+        defer session.deinit();
+        var index = try pictures.planning(a, &reader, .{}, session);
+        defer index.deinit();
+        if (cache) try std.testing.expectEqual(expected, index.pictures.len);
+        expected = index.pictures.len;
+        cap = pool.high_water.host_bytes;
+    }
+}

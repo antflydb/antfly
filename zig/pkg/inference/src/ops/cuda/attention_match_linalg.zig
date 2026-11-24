@@ -106,7 +106,7 @@ pub const Linalg = struct {
     }
     pub fn deinit(self: *Linalg) void {
         self.context.makeCurrent() catch {};
-        _ = self.context.driver.fns.cuStreamSynchronize(self.stream);
+        _ = self.context.synchronizeStreamResult(self.stream);
         _ = self.solver.destroy(self.sh);
         _ = self.blas.destroy(self.bh);
         self.workspace.free(self.context);

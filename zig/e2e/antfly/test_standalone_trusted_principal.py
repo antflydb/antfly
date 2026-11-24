@@ -37,6 +37,7 @@ def _token(
     tables=None,
     admin=False,
     issuer="cloudaf",
+    subject="key:hosted-fixture",
     expired=False,
     operations=None,
     row_filter=None,
@@ -47,7 +48,7 @@ def _token(
     now = int(time.time())
     payload = {
         "iss": issuer,
-        "sub": "key:hosted-fixture",
+        "sub": subject,
         "iat": now - 120 if expired else now,
         "exp": now - 60 if expired else now + 300,
         "admin": admin,
