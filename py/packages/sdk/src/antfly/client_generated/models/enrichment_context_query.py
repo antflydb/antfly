@@ -8,6 +8,7 @@ from attrs import define as _attrs_define
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.enrichment_context_cypher import EnrichmentContextCypher
     from ..models.enrichment_context_query_embeddings import EnrichmentContextQueryEmbeddings
     from ..models.enrichment_context_query_exclusion_query import EnrichmentContextQueryExclusionQuery
     from ..models.enrichment_context_query_filter_query import EnrichmentContextQueryFilterQuery
@@ -64,6 +65,14 @@ class EnrichmentContextQuery:
                 direction, and `max_documents` bounds the rows reached. A `filter_query` beside it narrows the reached rows and
                 stays live. Anything else (`match`, shortest paths, `edge_filter`, `edge_weight`, `limit`, metrics, deeper
                 traversals, several operations) runs in the query engine as a snapshot.
+            cypher (EnrichmentContextCypher | Unset): Ranking clause: a read-only Cypher statement against a graph, run as
+                the principal that declared the enrichment (its graph and table permissions and row policies apply; the server
+                binds the declaration to that principal, and revoking the credential stops rebuilds). Members are the nodes of
+                the source `table` the statement returns, anywhere in a row (bare nodes, paths, lists, maps), in result order,
+                each once, up to `limit`, and render as those rows' `fields`. Nodes of other tables are context the statement
+                used, not members. Only `limit` may sit beside it. A Cypher source is a snapshot: a statement's result depends
+                on rows it does not return, so dependents rebuild on `refresh_interval` or manually. Statements that write
+                (`CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`) or `EXPLAIN` are rejected.
             limit (int | Unset): Ranked queries: member count.
             text (Any | Unset): Shorthand ranking clause: query text literal or `{"$source":"/pointer"}`, with `text_field`.
             text_field (str | Unset):
@@ -84,6 +93,7 @@ class EnrichmentContextQuery:
     reranker: EnrichmentContextQueryReranker | Unset = UNSET
     exclusion_query: EnrichmentContextQueryExclusionQuery | Unset = UNSET
     graph_queries: EnrichmentContextQueryGraphQueries | Unset = UNSET
+    cypher: EnrichmentContextCypher | Unset = UNSET
     limit: int | Unset = UNSET
     text: Any | Unset = UNSET
     text_field: str | Unset = UNSET
@@ -132,6 +142,10 @@ class EnrichmentContextQuery:
         if not isinstance(self.graph_queries, Unset):
             graph_queries = self.graph_queries.to_dict()
 
+        cypher: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.cypher, Unset):
+            cypher = self.cypher.to_dict()
+
         limit = self.limit
 
         text = self.text
@@ -171,6 +185,8 @@ class EnrichmentContextQuery:
             field_dict["exclusion_query"] = exclusion_query
         if graph_queries is not UNSET:
             field_dict["graph_queries"] = graph_queries
+        if cypher is not UNSET:
+            field_dict["cypher"] = cypher
         if limit is not UNSET:
             field_dict["limit"] = limit
         if text is not UNSET:
@@ -188,6 +204,7 @@ class EnrichmentContextQuery:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.enrichment_context_cypher import EnrichmentContextCypher
         from ..models.enrichment_context_query_embeddings import EnrichmentContextQueryEmbeddings
         from ..models.enrichment_context_query_exclusion_query import EnrichmentContextQueryExclusionQuery
         from ..models.enrichment_context_query_filter_query import EnrichmentContextQueryFilterQuery
@@ -210,6 +227,7 @@ class EnrichmentContextQuery:
             "reranker",
             "exclusion_query",
             "graph_queries",
+            "cypher",
             "limit",
             "text",
             "text_field",
@@ -281,6 +299,13 @@ class EnrichmentContextQuery:
         else:
             graph_queries = EnrichmentContextQueryGraphQueries.from_dict(_graph_queries)
 
+        _cypher = d.pop("cypher", UNSET)
+        cypher: EnrichmentContextCypher | Unset
+        if isinstance(_cypher, Unset):
+            cypher = UNSET
+        else:
+            cypher = EnrichmentContextCypher.from_dict(_cypher)
+
         limit = d.pop("limit", UNSET)
 
         text = d.pop("text", UNSET)
@@ -310,6 +335,7 @@ class EnrichmentContextQuery:
             reranker=reranker,
             exclusion_query=exclusion_query,
             graph_queries=graph_queries,
+            cypher=cypher,
             limit=limit,
             text=text,
             text_field=text_field,

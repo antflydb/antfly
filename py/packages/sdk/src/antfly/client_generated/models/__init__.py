@@ -461,6 +461,8 @@ from .embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
 from .enrichment_config import EnrichmentConfig
 from .enrichment_config_context_sources import EnrichmentConfigContextSources
 from .enrichment_config_embedding_input import EnrichmentConfigEmbeddingInput
+from .enrichment_context_cypher import EnrichmentContextCypher
+from .enrichment_context_cypher_parameters import EnrichmentContextCypherParameters
 from .enrichment_context_document import EnrichmentContextDocument
 from .enrichment_context_query import EnrichmentContextQuery
 from .enrichment_context_query_embeddings import EnrichmentContextQueryEmbeddings
@@ -3208,6 +3210,8 @@ __all__ = (
     "EnrichmentConfig",
     "EnrichmentConfigContextSources",
     "EnrichmentConfigEmbeddingInput",
+    "EnrichmentContextCypher",
+    "EnrichmentContextCypherParameters",
     "EnrichmentContextDocument",
     "EnrichmentContextQuery",
     "EnrichmentContextQueryEmbeddings",

@@ -285,6 +285,7 @@ pub const EmbeddingSourceCoverageStatus = types.EmbeddingSourceCoverageStatus;
 pub const EmbeddingsIndexConfig = types.EmbeddingsIndexConfig;
 pub const EmbeddingsIndexStats = types.EmbeddingsIndexStats;
 pub const EnrichmentConfig = types.EnrichmentConfig;
+pub const EnrichmentContextCypher = types.EnrichmentContextCypher;
 pub const EnrichmentContextDocument = types.EnrichmentContextDocument;
 pub const EnrichmentContextQuery = types.EnrichmentContextQuery;
 pub const EnrichmentContextSource = types.EnrichmentContextSource;

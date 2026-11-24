@@ -18523,6 +18523,17 @@ export interface components {
             /** @description JSON pointer into the source document yielding the referenced key. */
             key_from: string;
         };
+        /** @description Ranking clause: a read-only Cypher statement against a graph, run as the principal that declared the enrichment (its graph and table permissions and row policies apply; the server binds the declaration to that principal, and revoking the credential stops rebuilds). Members are the nodes of the source `table` the statement returns, anywhere in a row (bare nodes, paths, lists, maps), in result order, each once, up to `limit`, and render as those rows' `fields`. Nodes of other tables are context the statement used, not members. Only `limit` may sit beside it. A Cypher source is a snapshot: a statement's result depends on rows it does not return, so dependents rebuild on `refresh_interval` or manually. Statements that write (`CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`) or `EXPLAIN` are rejected. */
+        EnrichmentContextCypher: {
+            /** @description Graph name (see `/graphs/{graphName}`). */
+            graph: string;
+            /** @description Cypher statement. */
+            query: string;
+            /** @description Statement parameters; values are literals or `{"$source":"/pointer"}` bindings from the dependent row. */
+            parameters?: {
+                [key: string]: unknown;
+            };
+        };
         /** @description A filter (tracked live) or a ranked retrieval (a snapshot). Any ranking clause makes the whole query a public QueryRequest executed by the table's query engine, with `{"$source":"/pointer"}` bindings anywhere; `limit` (at most 1000) is then the member count, and paging (`offset`, `search_after`, `search_before`), `count`, `aggregations`, and a top-N `order_by` are rejected. Distributed tables refuse `semantic_search` (data servers have no query embedder); pass precomputed vectors in `embeddings` instead. */
         EnrichmentContextQuery: {
             /** @description Table queried; omitted means the enrichment's own table. */
@@ -18550,6 +18561,7 @@ export interface components {
             exclusion_query?: Record<string, never>;
             /** @description Graph operations (QueryRequest shape). Exactly one `traverse` from the dependent row (or `start: {keys: [{"$source": "/pointer"}]}`) with only `edge_types`, `direction`, `max_depth` (at most 3), and the context options `max_fanout` (edges per visited node, default 100) and `include_generated` (also follow field-derived and enrichment-generated edges) is a live traversal: dependents watch every visited node's edges and every reached row, members render with depth, edge type, and direction, and `max_documents` bounds the rows reached. A `filter_query` beside it narrows the reached rows and stays live. Anything else (`match`, shortest paths, `edge_filter`, `edge_weight`, `limit`, metrics, deeper traversals, several operations) runs in the query engine as a snapshot. */
             graph_queries?: Record<string, never>;
+            cypher?: components["schemas"]["EnrichmentContextCypher"];
             /** @description Ranked queries: member count. */
             limit?: number;
             /** @description Shorthand ranking clause: query text literal or `{"$source":"/pointer"}`, with `text_field`. */
@@ -18561,7 +18573,7 @@ export interface components {
             /** @default 10 */
             k?: number;
         };
-        /** @description One named context source: exactly one of `document` (a referenced row) or `query` (a filter, a graph traversal, or a ranked retrieval). `tracking` decides the freshness guarantee. A query whose membership is decided row by row is tracked live: subscriptions invalidate dependents exactly and they can be `current`. That covers a `filter_query` (optionally with a top-N `order_by`) and one plain bounded `graph_queries` traverse (optionally with a `filter_query` narrowing the rows it reaches). A query with any ranking clause (`full_text_search`, `semantic_search`, `embeddings`, `indexes`, `merge_config`, `reranker`, `exclusion_query`, `limit`, the `text`/`vector` shorthands, or `graph_queries` beyond one plain bounded traverse) depends on the whole corpus and is a snapshot: its dependents are `unverified` and rebuild on `refresh_interval` or manually. Registration reports each source's effective tracking and, for a snapshot, the clause that made it one. */
+        /** @description One named context source: exactly one of `document` (a referenced row) or `query` (a filter, a graph traversal, or a ranked retrieval). `tracking` decides the freshness guarantee. A query whose membership is decided row by row is tracked live: subscriptions invalidate dependents exactly and they can be `current`. That covers a `filter_query` (optionally with a top-N `order_by`) and one plain bounded `graph_queries` traverse (optionally with a `filter_query` narrowing the rows it reaches). A query with any ranking clause (`full_text_search`, `semantic_search`, `embeddings`, `indexes`, `merge_config`, `reranker`, `exclusion_query`, `limit`, `cypher`, the `text`/`vector` shorthands, or `graph_queries` beyond one plain bounded traverse) depends on the whole corpus and is a snapshot: its dependents are `unverified` and rebuild on `refresh_interval` or manually. Registration reports each source's effective tracking and, for a snapshot, the clause that made it one. */
         EnrichmentContextSource: {
             document?: components["schemas"]["EnrichmentContextDocument"];
             query?: components["schemas"]["EnrichmentContextQuery"];

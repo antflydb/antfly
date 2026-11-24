@@ -4864,6 +4864,44 @@ pub const EnrichmentConfig = struct {
     }
 };
 
+/// Ranking clause: a read-only Cypher statement against a graph, run as the principal that declared the enrichment (its graph and table permissions and row policies apply; the server binds the declaration to that principal, and revoking the credential stops rebuilds). Members are the nodes of the source `table` the statement returns, anywhere in a row (bare nodes, paths, lists, maps), in result order, each once, up to `limit`, and render as those rows' `fields`. Nodes of other tables are context the statement used, not members. Only `limit` may sit beside it. A Cypher source is a snapshot: a statement's result depends on rows it does not return, so dependents rebuild on `refresh_interval` or manually. Statements that write (`CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`) or `EXPLAIN` are rejected.
+pub const EnrichmentContextCypher = struct {
+    /// Graph name (see `/graphs/{graphName}`).
+    graph: []const u8,
+    /// Cypher statement.
+    query: []const u8,
+    /// Statement parameters; values are literals or `{"$source":"/pointer"}` bindings from the dependent row.
+    parameters: ?std.json.ArrayHashMap(std.json.Value) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "graph", "graph", false },
+        .{ "query", "query", false },
+        .{ "parameters", "parameters", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("graph");
+        try jw.write(self.graph);
+        try jw.objectField("query");
+        try jw.write(self.query);
+        if (self.parameters) |value| {
+            try jw.objectField("parameters");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const EnrichmentContextDocument = struct {
     /// Table holding the referenced document; omitted means the enrichment's own table. Resolved to an immutable table identity at admission, so renaming or recreating a table cannot retarget the dependency.
     table: ?[]const u8 = null,
@@ -4916,6 +4954,7 @@ pub const EnrichmentContextQuery = struct {
     exclusion_query: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Graph operations (QueryRequest shape). Exactly one `traverse` from the dependent row (or `start: {keys: [{"$source": "/pointer"}]}`) with only `edge_types`, `direction`, `max_depth` (at most 3), and the context options `max_fanout` (edges per visited node, default 100) and `include_generated` (also follow field-derived and enrichment-generated edges) is a live traversal: dependents watch every visited node's edges and every reached row, members render with depth, edge type, and direction, and `max_documents` bounds the rows reached. A `filter_query` beside it narrows the reached rows and stays live. Anything else (`match`, shortest paths, `edge_filter`, `edge_weight`, `limit`, metrics, deeper traversals, several operations) runs in the query engine as a snapshot.
     graph_queries: ?std.json.ArrayHashMap(std.json.Value) = null,
+    cypher: ?EnrichmentContextCypher = null,
     /// Ranked queries: member count.
     limit: ?i64 = null,
     /// Shorthand ranking clause: query text literal or `{"$source":"/pointer"}`, with `text_field`.
@@ -4939,6 +4978,7 @@ pub const EnrichmentContextQuery = struct {
         .{ "reranker", "reranker", true },
         .{ "exclusion_query", "exclusion_query", true },
         .{ "graph_queries", "graph_queries", true },
+        .{ "cypher", "cypher", true },
         .{ "limit", "limit", true },
         .{ "text", "text", false },
         .{ "text_field", "text_field", true },
@@ -5008,6 +5048,10 @@ pub const EnrichmentContextQuery = struct {
             try jw.objectField("graph_queries");
             try jw.write(value);
         }
+        if (self.cypher) |value| {
+            try jw.objectField("cypher");
+            try jw.write(value);
+        }
         if (self.limit) |value| {
             try jw.objectField("limit");
             try jw.write(value);
@@ -5043,7 +5087,7 @@ pub const EnrichmentContextQuery = struct {
     }
 };
 
-/// One named context source: exactly one of `document` (a referenced row) or `query` (a filter, a graph traversal, or a ranked retrieval). `tracking` decides the freshness guarantee. A query whose membership is decided row by row is tracked live: subscriptions invalidate dependents exactly and they can be `current`. That covers a `filter_query` (optionally with a top-N `order_by`) and one plain bounded `graph_queries` traverse (optionally with a `filter_query` narrowing the rows it reaches). A query with any ranking clause (`full_text_search`, `semantic_search`, `embeddings`, `indexes`, `merge_config`, `reranker`, `exclusion_query`, `limit`, the `text`/`vector` shorthands, or `graph_queries` beyond one plain bounded traverse) depends on the whole corpus and is a snapshot: its dependents are `unverified` and rebuild on `refresh_interval` or manually. Registration reports each source's effective tracking and, for a snapshot, the clause that made it one.
+/// One named context source: exactly one of `document` (a referenced row) or `query` (a filter, a graph traversal, or a ranked retrieval). `tracking` decides the freshness guarantee. A query whose membership is decided row by row is tracked live: subscriptions invalidate dependents exactly and they can be `current`. That covers a `filter_query` (optionally with a top-N `order_by`) and one plain bounded `graph_queries` traverse (optionally with a `filter_query` narrowing the rows it reaches). A query with any ranking clause (`full_text_search`, `semantic_search`, `embeddings`, `indexes`, `merge_config`, `reranker`, `exclusion_query`, `limit`, `cypher`, the `text`/`vector` shorthands, or `graph_queries` beyond one plain bounded traverse) depends on the whole corpus and is a snapshot: its dependents are `unverified` and rebuild on `refresh_interval` or manually. Registration reports each source's effective tracking and, for a snapshot, the clause that made it one.
 pub const EnrichmentContextSource = struct {
     document: ?EnrichmentContextDocument = null,
     query: ?EnrichmentContextQuery = null,

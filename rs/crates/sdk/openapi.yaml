@@ -43992,6 +43992,34 @@ components:
         key_from:
           type: string
           description: JSON pointer into the source document yielding the referenced key.
+    EnrichmentContextCypher:
+      type: object
+      additionalProperties: false
+      required:
+        - graph
+        - query
+      description: 'Ranking clause: a read-only Cypher statement against a graph, run as the principal
+        that declared the enrichment (its graph and table permissions and row policies apply; the server
+        binds the declaration to that principal, and revoking the credential stops rebuilds). Members
+        are the nodes of the source `table` the statement returns, anywhere in a row (bare nodes, paths,
+        lists, maps), in result order, each once, up to `limit`, and render as those rows'' `fields`.
+        Nodes of other tables are context the statement used, not members. Only `limit` may sit beside
+        it. A Cypher source is a snapshot: a statement''s result depends on rows it does not return, so
+        dependents rebuild on `refresh_interval` or manually. Statements that write (`CREATE`, `MERGE`,
+        `SET`, `DELETE`, `REMOVE`) or `EXPLAIN` are rejected.'
+      properties:
+        graph:
+          type: string
+          description: Graph name (see `/graphs/{graphName}`).
+        query:
+          type: string
+          maxLength: 16384
+          description: Cypher statement.
+        parameters:
+          type: object
+          additionalProperties: true
+          description: Statement parameters; values are literals or `{"$source":"/pointer"}` bindings
+            from the dependent row.
     EnrichmentContextQuery:
       type: object
       additionalProperties: false
@@ -44066,6 +44094,8 @@ components:
             it narrows the reached rows and stays live. Anything else (`match`, shortest paths, `edge_filter`,
             `edge_weight`, `limit`, metrics, deeper traversals, several operations) runs in the query
             engine as a snapshot.'
+        cypher:
+          $ref: '#/components/schemas/EnrichmentContextCypher'
         limit:
           type: integer
           minimum: 1
@@ -44098,10 +44128,11 @@ components:
         exactly and they can be `current`. That covers a `filter_query` (optionally with a top-N `order_by`)
         and one plain bounded `graph_queries` traverse (optionally with a `filter_query` narrowing the
         rows it reaches). A query with any ranking clause (`full_text_search`, `semantic_search`, `embeddings`,
-        `indexes`, `merge_config`, `reranker`, `exclusion_query`, `limit`, the `text`/`vector` shorthands,
-        or `graph_queries` beyond one plain bounded traverse) depends on the whole corpus and is a snapshot:
-        its dependents are `unverified` and rebuild on `refresh_interval` or manually. Registration reports
-        each source''s effective tracking and, for a snapshot, the clause that made it one.'
+        `indexes`, `merge_config`, `reranker`, `exclusion_query`, `limit`, `cypher`, the `text`/`vector`
+        shorthands, or `graph_queries` beyond one plain bounded traverse) depends on the whole corpus
+        and is a snapshot: its dependents are `unverified` and rebuild on `refresh_interval` or manually.
+        Registration reports each source''s effective tracking and, for a snapshot, the clause that made
+        it one.'
       properties:
         document:
           $ref: '#/components/schemas/EnrichmentContextDocument'

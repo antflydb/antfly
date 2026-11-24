@@ -24,7 +24,7 @@ class EnrichmentContextSource:
     tracked live: subscriptions invalidate dependents exactly and they can be `current`. That covers a `filter_query`
     (optionally with a top-N `order_by`) and one plain bounded `graph_queries` traverse (optionally with a
     `filter_query` narrowing the rows it reaches). A query with any ranking clause (`full_text_search`,
-    `semantic_search`, `embeddings`, `indexes`, `merge_config`, `reranker`, `exclusion_query`, `limit`, the
+    `semantic_search`, `embeddings`, `indexes`, `merge_config`, `reranker`, `exclusion_query`, `limit`, `cypher`, the
     `text`/`vector` shorthands, or `graph_queries` beyond one plain bounded traverse) depends on the whole corpus and is
     a snapshot: its dependents are `unverified` and rebuild on `refresh_interval` or manually. Registration reports each
     source's effective tracking and, for a snapshot, the clause that made it one.
