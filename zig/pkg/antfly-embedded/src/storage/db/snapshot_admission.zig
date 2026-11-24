@@ -132,6 +132,16 @@ pub const SnapshotAdmission = struct {
         }
     };
 
+    pub fn acquirePhysicalMaintenance(self: *@This()) PhysicalMaintenanceLease {
+        self.lock.lockShared();
+        return .{ .admission = self };
+    }
+
+    pub fn acquirePhysicalMaintenanceIo(self: *@This(), io: std.Io, cancellation: anytype) !PhysicalMaintenanceLease {
+        try self.lock.lockSharedIo(io, cancellation);
+        return .{ .admission = self };
+    }
+
     pub fn tryAcquirePhysicalMaintenance(self: *@This()) ?PhysicalMaintenanceLease {
         if (!self.lock.tryLockShared()) return null;
         return .{ .admission = self };

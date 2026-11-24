@@ -7576,18 +7576,22 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("runLsmMaintenanceStep", .{self});
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
-        return try self.runLsmMaintenanceStepWithReplicationMutationHeld();
+        var physical = try self.acquireLsmPhysicalMaintenance();
+        defer physical.release();
+        return self.runLsmMaintenanceStepAdmitted(&physical);
     }
 
-    fn runLsmMaintenanceStepWithReplicationMutationHeld(self: *DB) !bool {
-        var snapshot_replay = try self.acquireSnapshotReplayMutation();
-        defer snapshot_replay.release();
-        return self.runLsmMaintenanceStepAdmitted(&snapshot_replay);
+    fn acquireLsmPhysicalMaintenance(self: *DB) !snapshot_admission_mod.SnapshotAdmission.PhysicalMaintenanceLease {
+        const admission = self.core.snapshot_replay_admission;
+        if (self.backend_runtime.filesystemIo()) |io| {
+            return try admission.acquirePhysicalMaintenanceIo(io, @as(?types.CancellationToken, null));
+        }
+        return admission.acquirePhysicalMaintenance();
     }
 
-    fn runLsmMaintenanceStepAdmitted(self: *DB, snapshot_replay: *const snapshot_admission_mod.SnapshotAdmission.MutationLease) !bool {
-        std.debug.assert(snapshot_replay.active and snapshot_replay.admission == self.core.snapshot_replay_admission);
-        if (self.source_pin_cleanup.takeTurn() and try self.runSourcePinCleanupStep()) return true;
+    fn runLsmMaintenanceStepAdmitted(self: *DB, physical: *const snapshot_admission_mod.SnapshotAdmission.PhysicalMaintenanceLease) !bool {
+        std.debug.assert(physical.admission == self.core.snapshot_replay_admission);
+        if (self.source_pin_cleanup.takeTurn() and try self.runSourcePinCleanupStepWithAdmission(physical)) return true;
         if (try self.core.index_manager.runLsmObsoleteReclaimDue()) return true;
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
         if (primary_reclaim_due) {
@@ -7599,7 +7603,7 @@ pub const DB = struct {
         if (primary_score == 0 and index_score == 0) {
             self.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
             self.core.index_manager.refreshLsmMaintenanceDebtHint();
-            return try self.runSourcePinCleanupStep();
+            return try self.runSourcePinCleanupStepWithAdmission(physical);
         }
         if (primary_score >= index_score) {
             return try self.core.primary_store_owner.runLsmMaintenanceStep();
@@ -7669,8 +7673,8 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("runPrimaryLsmMaintenanceStep", .{self});
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
-        var snapshot_replay = try self.acquireSnapshotReplayMutation();
-        defer snapshot_replay.release();
+        var physical = try self.acquireLsmPhysicalMaintenance();
+        defer physical.release();
         if (try self.core.primary_store_owner.runDueLsmObsoleteReclaim()) return true;
         const primary_score = self.core.primary_store_owner.lsmMaintenanceScore();
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
@@ -7712,8 +7716,8 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("runDueLsmObsoleteReclaimUntilIdle", .{ self, max_steps });
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
-        var snapshot_replay = try self.acquireSnapshotReplayMutation();
-        defer snapshot_replay.release();
+        var physical = try self.acquireLsmPhysicalMaintenance();
+        defer physical.release();
         var steps: usize = 0;
         while (steps < max_steps) : (steps += 1) {
             var progressed = false;
@@ -7723,10 +7727,57 @@ pub const DB = struct {
             if (!progressed) {
                 const wake_due = if (self.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
                 if (!wake_due) break;
-                if (!try self.runLsmMaintenanceStepAdmitted(&snapshot_replay)) break;
+                if (!try self.runLsmMaintenanceStepAdmitted(&physical)) break;
             }
         }
         return steps;
+    }
+
+    test "db lsm maintenance schedules only actionable partitioned L0 pressure" {
+        const alloc = std.testing.allocator;
+        var directory = try TestDirectory.init("db");
+        defer directory.cleanup();
+        var db = try DB.open(alloc, directory.path(), .{
+            .start_optional_runtimes = false,
+            .start_index_workers = false,
+            .executor = .{ .backend = .manual },
+        });
+        defer db.close();
+        const backend = db.core.primary_store_owner.lsmBackend().?;
+        try backend.flushBufferedWritesWithOptions(.{ .compact = false, .flush = true });
+        const initial_runs = backend.snapshotMaintenanceStats().l0_runs;
+        for (0..5) |i| {
+            var key_buffer: [16]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buffer, "doc:{d}", .{i});
+            var txn = try backend.beginWrite();
+            try txn.put(.{ .name = "docs" }, key, "{}");
+            try txn.commit();
+            try backend.flushBufferedWritesWithOptions(.{ .compact = false, .flush = true });
+        }
+        _ = try db.runLsmMaintenanceUntilIdle();
+        const l0_runs = backend.snapshotMaintenanceStats().l0_runs;
+        try std.testing.expectEqual(initial_runs + 5, l0_runs);
+        const revision = db.core.snapshot_replay_admission.mutationRevision();
+        for (0..3) |_| {
+            backend.refreshMaintenanceDebtHint();
+            try std.testing.expectEqual(@as(u64, 0), backend.readyMaintenanceScoreBestEffort(false));
+            try std.testing.expect(!try db.runLsmMaintenanceStepBestEffort());
+        }
+        try std.testing.expectEqual(revision, db.core.snapshot_replay_admission.mutationRevision());
+
+        // A byte excess smaller than one scoring unit still schedules the hard bound.
+        const hard_bytes = backend.options.l0_hard_limit_bytes;
+        backend.options.l0_hard_limit_bytes = backend.snapshotMaintenanceStats().l0_bytes - 1;
+        backend.refreshMaintenanceDebtHint();
+        try std.testing.expect(backend.readyMaintenanceScoreBestEffort(false) > 0);
+        backend.options.l0_hard_limit_bytes = hard_bytes;
+
+        // The same runs are actionable once the tiered lane reaches its soft limit.
+        backend.options.l0_soft_limit_runs = @intCast(l0_runs - 1);
+        backend.refreshMaintenanceDebtHint();
+        try std.testing.expect(backend.readyMaintenanceScoreBestEffort(false) > 0);
+        try std.testing.expect(try db.runLsmMaintenanceStep());
+        try std.testing.expectEqual(revision, db.core.snapshot_replay_admission.mutationRevision());
     }
 
     test "db lsm maintenance idle best-effort polls preserve the replay revision" {
@@ -52886,7 +52937,7 @@ pub const DB = struct {
         started: Io.Event = .unset,
         release: Io.Event = .unset,
         workspace_bytes: usize = HybridComponents.workspace_bytes,
-        check_idle_maintenance: bool = false,
+        maintenance: enum { none, idle, flush } = .none,
         mutation_at_fusion: bool = false,
         replacement: ?struct { id: u64, bytes: []const u8 } = null,
         cancellation: ?*std.atomic.Value(bool) = null,
@@ -53127,8 +53178,21 @@ pub const DB = struct {
             if (self.probe) |probe| {
                 probe.overlapped = true;
                 defer probe.release.set(io);
-                if (probe.check_idle_maintenance) {
-                    try std.testing.expect(!try self.db.runLsmMaintenanceStepBestEffort());
+                switch (probe.maintenance) {
+                    .none => {},
+                    .idle => try std.testing.expect(!try self.db.runLsmMaintenanceStepBestEffort()),
+                    .flush => {
+                        const backend = self.db.core.primary_store_owner.lsmBackend().?;
+                        const before = backend.snapshotWriteStats().flushes;
+                        {
+                            const locked = lsm_backend_mod.runtime.lockBackend(lsm_backend_mod.Backend, backend);
+                            defer lsm_backend_mod.runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+                            backend.options.mutable_idle_flush_after_ns = 1;
+                            backend.noteRecoveredWriteMutationLocked();
+                        }
+                        try std.testing.expect(try self.db.runPrimaryLsmMaintenanceStepBestEffort());
+                        try std.testing.expectEqual(before + 1, backend.snapshotWriteStats().flushes);
+                    },
                 }
                 if (probe.replacement) |segment| {
                     var mutation = self.db.core.snapshot_replay_admission.acquireMutation();
@@ -133133,7 +133197,10 @@ test "db hybrid search does not hard-filter dense leg with scoring full_text" {
     const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
+    var primary_options = db_config.primary_lsm_options_default;
+    primary_options.mutable_idle_flush_after_ns = 0;
     var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .lsm = primary_options },
         .start_index_workers = false,
         .start_optional_runtimes = false,
     });
@@ -133261,12 +133328,19 @@ test "db hybrid search does not hard-filter dense leg with scoring full_text" {
     _ = try db.runLsmMaintenanceUntilIdle();
     db.source_pin_cleanup.epoch.store(1, .release);
     db.core.primary_store_owner.lsmBackend().?.notePotentialMaintenanceDebt();
-    probe = .{ .check_idle_maintenance = true };
+    probe = .{ .maintenance = .idle };
     var maintained = try db.searchWithExecutionContext(alloc, filtered, parallel_context);
     defer maintained.deinit();
     try std.testing.expect(probe.overlapped);
     try std.testing.expectEqual(@as(?anyerror, null), probe.retry);
     try std.testing.expectEqualDeep(serial.hits, maintained.hits);
+
+    probe = .{ .maintenance = .flush };
+    var flushed = try db.searchWithExecutionContext(alloc, filtered, parallel_context);
+    defer flushed.deinit();
+    try std.testing.expect(probe.overlapped);
+    try std.testing.expectEqual(@as(?anyerror, null), probe.retry);
+    try std.testing.expectEqualDeep(serial.hits, flushed.hits);
 
     probe = .{ .mutation_at_fusion = true };
     var fusion_retried = try db.searchWithExecutionContext(alloc, filtered, parallel_context);
