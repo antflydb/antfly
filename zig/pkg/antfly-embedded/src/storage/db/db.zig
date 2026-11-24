@@ -4162,9 +4162,13 @@ pub const DB = struct {
                 break :blk_runtime owned_backend_runtime.?.runtime;
             };
             if (opts.require_existing_catalog and opts.physical_root_mode == .filesystem_managed) {
-                const io = backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
-                // Check before generation-lock admission can create any path.
-                try std.Io.Dir.cwd().access(io, path, .{});
+                if (comptime builtin.os.tag == .freestanding) {
+                    return error.UnsupportedPlatform;
+                } else {
+                    const io = backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+                    // Check before generation-lock admission can create any path.
+                    try std.Io.Dir.cwd().access(io, path, .{});
+                }
             }
             var generation_read_lease = if (opts.staged_generation) |staged_generation| staged_blk: {
                 try staged_generation.validatePath(path);
@@ -54865,7 +54869,6 @@ pub const DB = struct {
     }
 
     fn searchDenseInternal(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery, speculative: bool) !types.SearchResult {
-        if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
         const metric_name = self.denseQueryMetricIndexName(req);
         const start_ns = platform_time.monotonicNs();
         errdefer observeSearchFailureMetric(metric_name, .vector, platform_time.monotonicNs() -| start_ns);
@@ -55017,7 +55020,6 @@ pub const DB = struct {
     ) !ProfiledDenseSearchWithCapturedRequestResult {
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         defer row_policy_lease.release();
-        if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
         try self.enforcePortableRuntimeGate();
         if (self.async_context.resource_manager) |manager| manager.beginForegroundQuery();
         defer if (self.async_context.resource_manager) |manager| manager.finishForegroundQuery();

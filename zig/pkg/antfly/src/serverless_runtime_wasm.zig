@@ -291,6 +291,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         working_set_bytes: usize = 20 * 1024 * 1024,
         filters: []const @import("serverless/query/live_filter.zig").Clause = &.{},
         fresh: bool = false,
+        search_ids_only: bool = false,
         required_visibility: ?[]const u8 = null,
         cursor: ?[]const u8 = null,
         exact_scan: bool = false,
@@ -314,6 +315,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     if (req.limit > 100 or (req.limit == 0 and (req.op == .list or req.op == .search))) return error.QueryCandidateBudgetExceeded;
     const filter = @import("serverless/query/live_filter.zig").Filter{ .alloc = a, .clauses = req.filters };
     try filter.validate();
+    if (req.search_ids_only and (req.op != .search or req.mode != .text or req.filters.len != 0)) return error.InvalidSearchProjection;
     if (req.filters.len != 0 and req.op != .list and req.op != .search) return error.FilterCapabilityUnsupported;
     if (req.cursor != null and req.op != .list and !(req.op == .search and req.mode == .text)) return error.QueryCursorCapabilityUnsupported;
     var host = objects.wasm_host.Host{ .alloc = a, .transfer_allocator = wasm_allocator };
@@ -429,7 +431,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
                 try @import("serverless/api/service.zig").validatePublicMutation(arena.allocator(), mutation);
                 if (mutation.doc_id.len == 0 or mutation.doc_id.len > 256 * 1024) return error.InvalidDocumentMutation;
                 switch (mutation.kind) {
-                    .checkpoint, .enriched => return error.InvalidDocumentMutation,
+                    .checkpoint, .enriched, .prepared, .catalog => return error.InvalidDocumentMutation,
                     .delete => if (mutation.body != null) return error.InvalidDocumentMutation,
                     .upsert => {
                         const body = mutation.body orelse return error.InvalidDocumentMutation;
@@ -644,9 +646,15 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         defer @import("serverless/query/request.zig").freeHits(a, hits);
         return std.json.Stringify.valueAlloc(a, .{ .hits = hits, .visibility = visibility.Token.init(req.namespace, session.manifest.wal_end_lsn).encode(), .embeddings_ready = pending == 0 }, .{});
     }
-    if (req.op == .lookup or req.op == .list or req.op == .count or (req.op == .search and (req.fresh or req.required_visibility != null or req.filters.len != 0 or req.cursor != null))) {
+    if (req.op == .lookup or req.op == .list or req.op == .count or (req.op == .search and (req.fresh or req.search_ids_only or req.required_visibility != null or req.filters.len != 0 or req.cursor != null))) {
         const visibility = @import("serverless/visibility.zig");
-        const query_identity = try std.json.Stringify.valueAlloc(a, .{ .op = req.op, .limit = req.limit, .filters = req.filters, .text = req.text }, .{});
+        const query_identity = try std.json.Stringify.valueAlloc(a, .{
+            .op = req.op,
+            .limit = req.limit,
+            .filters = req.filters,
+            .text = req.text,
+            .search_ids_only = if (req.search_ids_only) @as(?bool, true) else null,
+        }, .{ .emit_null_optional_fields = false });
         defer a.free(query_identity);
         const query_hash = visibility.Token.init(query_identity, 0).scope;
         const cursor = if (req.cursor) |text| try visibility.Cursor.decode(text, a, req.namespace, query_hash) else null;
@@ -702,7 +710,13 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         defer live.deinit();
         if (req.op == .search) {
             const after: ?@import("serverless/query/live_session.zig").Session.RankPosition = if (cursor) |value| .{ .score = value.cursor.rank_score orelse return error.InvalidQueryCursor, .id = value.cursor.after } else null;
-            const hits = if (req.filters.len == 0 and after == null) try live.searchTextAlloc(.{ .text = req.text, .limit = req.limit }, 1024 * 1024) else try live.searchTextPageAlloc(.{ .text = req.text, .limit = req.limit }, 1024 * 1024, filter, after);
+            const query = @import("serverless/query/request.zig").QueryRequest{ .text = req.text, .limit = req.limit };
+            const hits = if (req.search_ids_only)
+                try live.searchTextIdsAlloc(query, 1024 * 1024, after)
+            else if (req.filters.len == 0 and after == null)
+                try live.searchTextAlloc(query, 1024 * 1024)
+            else
+                try live.searchTextPageAlloc(query, 1024 * 1024, filter, after);
             defer @import("serverless/query/request.zig").freeHits(a, hits);
             const next_cursor = if (hits.len == req.limit) try (visibility.Cursor{ .scope = live.view.token.scope, .query = query_hash, .generation = live.generation(), .cutoff = live.view.token.lsn, .after = hits[hits.len - 1].doc_id, .rank_score = hits[hits.len - 1].score }).encode(a) else null;
             defer if (next_cursor) |value| a.free(value);

@@ -22,7 +22,7 @@ const Allocator = std.mem.Allocator;
 /// Reservations include failures and concurrent workers. Retrying cannot turn
 /// a selective query into an unbounded speculative scan.
 pub const ReadAheadBudget = struct {
-    used: std.atomic.Value(u64) = .init(0),
+    used: @import("antfly_platform").atomic.Value(u64) = .init(0),
     failure_mutex: std.atomic.Mutex = .unlocked,
     failures: [16]?[32]u8 = @splat(null),
     failure_cursor: usize = 0,
@@ -103,9 +103,9 @@ pub const IoTrace = struct {
         }
     };
     const fields = @typeInfo(Snapshot).@"struct".field_names.len;
-    values: [fields]std.atomic.Value(u64) = @splat(.init(0)),
-    active: std.atomic.Value(u64) = .init(0),
-    source_active: std.atomic.Value(u64) = .init(0),
+    values: [fields]@import("antfly_platform").atomic.Value(u64) = @splat(.init(0)),
+    active: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    source_active: @import("antfly_platform").atomic.Value(u64) = .init(0),
     read_ahead_budget: ReadAheadBudget = .{},
     /// Composed leaves/refills share their outer request's one allowance.
     read_ahead_shared: ?*ReadAheadBudget = null,
