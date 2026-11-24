@@ -3533,3 +3533,22 @@ test "terminal pipeline cancels only an actual accepted stop before submit" {
     try std.testing.expectError(error.InvalidModelOutput, cancelStoppedPipelineToken(&cb, 9, 8, policy));
     try std.testing.expectEqual(@as(usize, 4), probe.cancels);
 }
+
+test "actual Metal greedy arm rejects an already submitted frame without disturbing it" {
+    const Fixture = struct {
+        fn populate(_: *@import("../ops/native_compute.zig").WeightStore) !void {}
+        fn check(cb: ops.ComputeBackend, _: ops.ComputeBackend) !void {
+            const Metal = @import("../ops/metal_compute.zig").MetalCompute;
+            const compute: *Metal = @ptrCast(@alignCast(cb.ptr));
+            const runtime = compute.provider_impl.raw_decode_runtime orelse return error.ExpectedActualMetalProvider;
+            try metal_runtime.beginFrame(runtime);
+            errdefer if (metal_runtime.hasActiveFrame(runtime)) metal_runtime.cancelFrame(runtime) catch {};
+            try metal_runtime.submitFrame(runtime);
+            defer metal_runtime.waitFrame(runtime) catch unreachable;
+            try std.testing.expectError(error.FrameAlreadyActive, decoder_gated_runtime.decoderRuntimePipelinedControl(&cb, .submit_only));
+            try std.testing.expect(metal_runtime.hasSubmittedFrame(runtime));
+            try std.testing.expect(!metal_runtime.hasActiveFrame(runtime));
+        }
+    };
+    try @import("../ops/media_residency_test.zig").onMetal(Fixture.populate, Fixture.check);
+}
