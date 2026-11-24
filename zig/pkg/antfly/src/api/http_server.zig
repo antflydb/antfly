@@ -10854,6 +10854,16 @@ pub const ApiHttpServer = struct {
         return try search_pattern_filter.storedDocMatchesPatternFilter(self.alloc, key, json, row_filter_json);
     }
 
+    /// Row-policy visibility of a document named by its physical table:
+    /// policies resolve by the logical name, the row is read physically.
+    pub fn documentVisibleUnder(self: *ApiHttpServer, physical: []const u8, logical: []const u8, key: []const u8, identity: ?AuthenticatedIdentity) !bool {
+        const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, identity, logical);
+        defer if (row_filter_json) |value| self.alloc.free(value);
+        const filter = row_filter_json orelse return true;
+        const source = self.table_reads orelse return false;
+        return try self.docMatchesRowFilter(source, physical, key, filter);
+    }
+
     pub fn sourceDocumentVisibleToIdentity(
         self: *ApiHttpServer,
         table_name: []const u8,
@@ -19216,6 +19226,11 @@ pub const ApiHttpServer = struct {
         const source = context_host.findByName(tables, table) orelse return error.TableNotFound;
         const input_identity = try context_host.identityAlloc(a, source.table_id);
         const public_names = try self.publicTableNamesAlloc(a, request, tables);
+        // Row policies are scoped by logical name; catalog records carry
+        // physical storage names, which a policy never names directly.
+        const storage_names = try a.alloc([]const u8, tables.len);
+        for (tables, storage_names) |t, *n| n.* = t.name;
+        const logical_names = try self.logicalTableNamesInArena(a, request, storage_names);
         // Breadth-first over (table, key, artifact): the input row first,
         // then (transitively) each dependent output, followed into the
         // tables whose declarations read that output as `_artifacts.<name>`.
@@ -19242,6 +19257,9 @@ pub const ApiHttpServer = struct {
                     else => return err,
                 };
                 const public_name = for (tables, public_names) |t, n| {
+                    if (t.table_id == dependent.table_id) break n;
+                } else dependent.name;
+                const logical_name = for (tables, logical_names) |t, n| {
                     if (t.table_id == dependent.table_id) break n;
                 } else dependent.name;
                 const own_identity = try context_host.identityAlloc(a, dependent.table_id);
@@ -19280,7 +19298,7 @@ pub const ApiHttpServer = struct {
                             } else false;
                             if (!reads) continue;
                         }
-                        if (!try self.sourceDocumentVisibleToIdentity(dependent.name, row_key.string, caller)) {
+                        if (!try self.documentVisibleUnder(dependent.name, logical_name, row_key.string, caller)) {
                             complete = false;
                             continue;
                         }

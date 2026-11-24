@@ -485,6 +485,104 @@ comptime {
     });
 }
 
+test "capi Lite cross-table context sources: transitive impact and an unavailable table keep their dependents" {
+    const a = std.testing.allocator;
+    const asset_producer = @import("../storage/db/enrichment/asset_producer.zig");
+    const Producer = struct {
+        fn produce(_: *anyopaque, alloc: std.mem.Allocator, request: asset_producer.Request) anyerror![]u8 {
+            return std.fmt.allocPrint(alloc, "summary:{s}", .{request.source_text});
+        }
+        fn memory(_: *anyopaque, _: std.mem.Allocator, _: []const asset_producer.Request) anyerror!@import("antfly_inference_work").InvocationMemoryPlan {
+            return .{ .attachment_transport = .borrowed_binary, .fixed_bytes = 8 << 20, .allocator_limit_bytes = 8 << 20, .max_result_bytes_per_item = 4 << 20, .max_result_bytes = 4 << 20 };
+        }
+        fn interface(self: *@This()) asset_producer.Producer {
+            return .{ .ptr = self, .vtable = &.{ .produce = produce, .invocation_memory_for_requests = memory } };
+        }
+    };
+    var producer = Producer{};
+    var tmp = try api.TestDirectory.init("lite-context-transitive");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    defer a.free(path);
+    const handle = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+    const id = try api.publishHandle(handle);
+    defer api.antfly_db_close(id);
+    for ([_][]const u8{ "orgs", "teams" }) |name| try std.testing.expectEqual(h.capi.ErrorCode.ok, tables.antfly_db_create_table_json(id, .fromSlice(name), .fromSlice("{}")));
+    const orgs = try tables.get(handle, "orgs");
+    const teams = try tables.get(handle, "teams");
+    try orgs.batch(.{ .writes = &.{.{ .key = "org:1", .value = "{\"voice\":\"warm\"}" }}, .sync_level = .write });
+
+    // default.summary reads orgs; teams.digest reads default's summaries.
+    const summary =
+        \\{"name":"summary","kind":"asset","field":"body","content_type":"text/plain",
+        \\ "producer_json":"{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+        \\ "context_sources":{"organization":{"document":{"table":"orgs","key_from":"/org"},"fields":["voice"],"required":true}}}
+    ;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_enrichment_json(id, .fromSlice(summary)));
+    var teams_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, tables.antfly_db_open_table(id, .fromSlice("teams"), &teams_handle));
+    defer api.antfly_db_close(teams_handle);
+    const digest =
+        \\{"name":"digest","kind":"asset","field":"body","content_type":"text/plain",
+        \\ "producer_json":"{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+        \\ "context_sources":{"members":{"query":{"table":"default","filter_query":{"field":"org","term":{"$source":"/org"}}},"fields":["_artifacts.summary"]}}}
+    ;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_enrichment_json(teams_handle, .fromSlice(digest)));
+    try handle.db.reconfigureEnrichmentRuntime(.{ .asset_producer = producer.interface() });
+    try teams.reconfigureEnrichmentRuntime(.{ .asset_producer = producer.interface() });
+    try sync(handle);
+    _ = try orgs.advanceContextShadowBackfill(64);
+    _ = try handle.db.advanceContextShadowBackfill(64);
+
+    try handle.db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"hello\",\"org\":\"org:1\"}" }}, .sync_level = .write });
+    try handle.db.enrichment_runtime.?.catchUpUntilForDrain(handle.db.core.nextDerivedSequence());
+    try handle.db.runDerivedUntil(handle.db.core.nextDerivedSequence());
+    try teams.batch(.{ .writes = &.{.{ .key = "team:1", .value = "{\"body\":\"team\",\"org\":\"org:1\"}" }}, .sync_level = .write });
+    try teams.enrichment_runtime.?.catchUpUntilForDrain(teams.core.nextDerivedSequence());
+    try teams.runDerivedUntil(teams.core.nextDerivedSequence());
+    {
+        const json = try dependenciesJsonAlloc(a, teams, "team:1", "digest", 4);
+        defer a.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"state\":\"current\"") != null);
+    }
+
+    // Direct impact of the org row stops at default.summary; transitive
+    // impact follows it into teams.digest, which read that summary.
+    {
+        const direct = try impactJsonAlloc(a, handle, "{\"table\":\"orgs\",\"key\":\"org:1\",\"limit\":10}");
+        defer a.free(direct);
+        try std.testing.expect(std.mem.indexOf(u8, direct, "\"key\":\"doc:a\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, direct, "\"key\":\"team:1\"") == null);
+        const transitive = try impactJsonAlloc(a, handle, "{\"table\":\"orgs\",\"key\":\"org:1\",\"traversal\":\"transitive\",\"max_depth\":4,\"limit\":10}");
+        defer a.free(transitive);
+        try std.testing.expect(std.mem.indexOf(u8, transitive, "\"key\":\"team:1\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, transitive, "\"artifact\":\"digest\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, transitive, "\"complete\":true") != null);
+    }
+
+    // teams fails to open on a later sync: the root table must keep its
+    // persisted subscription for teams instead of dropping it.
+    const teams_id = handle.embedded_table_records.get("teams").?;
+    const teams_identity = try identityAlloc(a, teams_id);
+    defer a.free(teams_identity);
+    const removed = handle.embedded_tables.fetchRemove("teams").?;
+    try handle.embedded_table_errors.put(handle.alloc, "teams", "InjectedOpenFailure");
+    const discovered = handle.embedded_tables_discovered;
+    handle.embedded_tables_discovered = true;
+    const resync = sync(handle);
+    handle.embedded_tables_discovered = discovered;
+    _ = handle.embedded_table_errors.remove("teams");
+    try handle.embedded_tables.put(handle.alloc, removed.key, removed.value);
+    try resync;
+    var persisted = (try handle.db.contextPersistedInboundAlloc(a)).?;
+    defer persisted.deinit();
+    var kept = false;
+    for (persisted.value.inbound) |d| if (std.mem.eql(u8, d.dependent_table_id, teams_identity)) {
+        kept = true;
+    };
+    try std.testing.expect(kept);
+}
+
 test "capi Lite cross-table context sources invalidate dependents in another table" {
     const a = std.testing.allocator;
     const asset_producer = @import("../storage/db/enrichment/asset_producer.zig");
