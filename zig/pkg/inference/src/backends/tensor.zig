@@ -211,9 +211,17 @@ pub const Tensor = struct {
 
     /// Synchronous consumers may borrow an immutable payload and its shape.
     pub fn borrowInt64(allocator: std.mem.Allocator, name: []const u8, shape: []const i64, values: []const i64) Tensor {
+        return borrow(allocator, name, shape, std.mem.sliceAsBytes(values), .i64);
+    }
+
+    pub fn borrowFloat32(allocator: std.mem.Allocator, name: []const u8, shape: []const i64, values: []const f32) Tensor {
+        return borrow(allocator, name, shape, std.mem.sliceAsBytes(values), .f32);
+    }
+
+    fn borrow(allocator: std.mem.Allocator, name: []const u8, shape: []const i64, bytes: []const u8, dtype: DType) Tensor {
         return .{
-            .data = @constCast(std.mem.sliceAsBytes(values)),
-            .dtype = .i64,
+            .data = @constCast(bytes),
+            .dtype = dtype,
             .shape = shape,
             .name = name,
             .allocator = allocator,

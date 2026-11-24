@@ -60,10 +60,10 @@ pub fn patchImages(session: Session, a: std.mem.Allocator, config: gpt.Config, i
         if (control) |active| try active.check();
         var prepared = try patch.prepareProjectedImageResident(a, config, bytes, limits, .{ .context = &control, .check_fn = checkImageControl });
         defer prepared.deinit();
-        var input = try Tensor.initFloat32(a, "patch_values", &.{ 1, @intCast(prepared.geometry.patchCount()), @intCast(3 * config.vision_patch_size * config.vision_patch_size) }, prepared.patch_rows);
-        defer input.deinit();
-        var layout = try Tensor.initInt64(a, "image_grid", &.{2}, &.{ @intCast(prepared.geometry.grid_y), @intCast(prepared.geometry.grid_x) });
-        defer layout.deinit();
+        const patch_shape = [3]i64{ 1, @intCast(prepared.geometry.patchCount()), @intCast(3 * config.vision_patch_size * config.vision_patch_size) };
+        const grid_values = [2]i64{ @intCast(prepared.geometry.grid_y), @intCast(prepared.geometry.grid_x) };
+        const input = Tensor.borrowFloat32(a, "patch_values", &patch_shape, prepared.patch_rows);
+        const layout = Tensor.borrowInt64(a, "image_grid", &.{2}, &grid_values);
         const outputs = try session.runWithControl(&.{ input, layout }, a, control);
         defer a.free(outputs);
         defer for (outputs) |*output| output.deinit();
@@ -108,13 +108,13 @@ pub fn companionAudio(session: Session, a: std.mem.Allocator, clips: []const com
         const layout = try companion.namedAudioLayout(metadata, prepared.frames, prepared.mel_bins);
         if (hidden != 0 and hidden != layout.hidden) return error.InvalidTensorShape;
         hidden = layout.hidden;
-        var features = try Tensor.initFloat32(a, "audio_values", &.{ 1, @intCast(prepared.frames), @intCast(prepared.mel_bins) }, prepared.data);
-        defer features.deinit();
+        const features_shape = [3]i64{ 1, @intCast(prepared.frames), @intCast(prepared.mel_bins) };
+        const mask_shape = [2]i64{ 1, @intCast(prepared.frames) };
+        const features = Tensor.borrowFloat32(a, "audio_values", &features_shape, prepared.data);
         const bits = try a.alloc(i64, prepared.frames);
         defer a.free(bits);
         for (bits, prepared.mask) |*bit, valid| bit.* = @intFromBool(valid);
-        var mask = try Tensor.initInt64(a, "audio_mask", &.{ 1, @intCast(prepared.frames) }, bits);
-        defer mask.deinit();
+        const mask = Tensor.borrowInt64(a, "audio_mask", &mask_shape, bits);
         const outputs = try session.runWithControl(&.{ features, mask }, a, control);
         defer a.free(outputs);
         defer for (outputs) |*output| output.deinit();
@@ -126,8 +126,8 @@ pub fn companionAudio(session: Session, a: std.mem.Allocator, clips: []const com
 }
 
 fn imageFeatures(session: Session, a: std.mem.Allocator, prepared: companion.PreparedImage, control: ?Control) !Tensor {
-    var input = try Tensor.initFloat32(a, "pixel_values", &.{ 1, 3, @intCast(prepared.geometry.height), @intCast(prepared.geometry.width) }, prepared.pixels);
-    defer input.deinit();
+    const shape = [4]i64{ 1, 3, @intCast(prepared.geometry.height), @intCast(prepared.geometry.width) };
+    const input = Tensor.borrowFloat32(a, "pixel_values", &shape, prepared.pixels);
     const outputs = try session.runWithControl(&.{input}, a, control);
     defer a.free(outputs);
     errdefer for (outputs) |*output| output.deinit();
