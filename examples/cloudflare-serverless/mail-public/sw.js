@@ -22,7 +22,7 @@
 //   stored here. Message data lives only in the opt-in OPFS copy, and the
 //   weights in @antfly/web's verified OPFS model cache.
 const SHELL = "antfly-mail-shell-v1";
-const RUNTIME = "antfly-mail-runtime-v1";
+const RUNTIME = "antfly-mail-runtime-v2";
 const SHELL_FILES = [
   "/",
   "/mail.css",
@@ -87,8 +87,8 @@ self.addEventListener("fetch", (event) => {
       caches.open(RUNTIME).then(async (cache) => {
         const hit = await cache.match(request);
         if (hit) return hit;
-        const response = await fetch(request);
-        if (response.ok && response.type === "basic") await cache.put(request, response.clone());
+        const response = await fetch(request, { cache: "reload" });
+        if (response.ok && response.type === "basic" && !response.headers.get("Content-Type")?.includes("text/html")) await cache.put(request, response.clone());
         return response;
       })
     );
@@ -99,8 +99,8 @@ self.addEventListener("fetch", (event) => {
     (async () => {
       const cache = await caches.open(SHELL);
       try {
-        const response = await fetch(request);
-        if (response.ok && response.type === "basic") {
+        const response = await fetch(request, { cache: "reload" });
+        if (response.ok && response.type === "basic" && !response.headers.get("Content-Type")?.includes("text/html")) {
           const key = request.mode === "navigate" ? "/" : request;
           await cache.put(key, response.clone());
           if (url.pathname === "/local/config.json") event.waitUntil(pruneRuntime(response.clone()));
