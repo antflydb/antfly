@@ -205,6 +205,11 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     const wasm_storage_boundary = @import("storage_boundary.zig").createWithOptions(b, wasm_target, optimize, .{ .runtime_abi = wasm_runtime_abi_mod });
     @call(.auto, configureBrowserModule, .{ b, wasm_storage_boundary, embedded_support_wasm_mod } ++ embedded_wasm_deps ++ .{addSnowballModule});
     embedded_support_wasm_mod.addImport("sql_parser", wasm_sql_parser_mod);
+    embedded_support_wasm_mod.addImport("antfly_compress", b.createModule(.{
+        .root_source_file = b.path("lib/compress/src/mod.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    }));
     const wasm_cypher_mod = @import("../../lib/cypher/build_support.zig").createModule(b, b.path("lib/cypher"), wasm_target, optimize);
     wasm_cypher_mod.addImport("cypher_regex_capture", sql_regex_mod.import_table.get("antfly_capture_regex").?);
     embedded_support_wasm_mod.addImport("cypher", wasm_cypher_mod);
@@ -418,6 +423,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     inference_wasm_build_options.addOption(bool, "enable_cuda", false);
     inference_wasm_build_options.addOption([]const u8, "cuda_libraries", "off");
     inference_wasm_build_options.addOption([]const u8, "cuda_artifacts", "portable");
+    inference_wasm_build_options.addOption([]const u8, "cuda_libraries", "off");
     inference_wasm_build_options.addOption(bool, "enable_metal", false);
     inference_wasm_build_options.addOption(bool, "enable_native", false);
     inference_wasm_build_options.addOption(bool, "enable_system_blas", false);
@@ -630,6 +636,8 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .max_rss = (if (strip) @as(u64, 20) else 32) * 1024 * 1024 * 1024,
     });
     antfly_wasm.entry = .disabled;
+    // Embedded batch commits can have over 1 MiB of nested wasm32 frames.
+    antfly_wasm.stack_size = 4 * 1024 * 1024;
     antfly_wasm.rdynamic = true;
     antfly_wasm.export_memory = true;
     // Hosted writes can stack the commit, publication, and index-replay
@@ -647,6 +655,10 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     const install_antfly_wasm_client = b.addInstallFile(
         b.path("pkg/antfly-embedded/wasm_client.mjs"),
         "antfly-wasm/antfly_embedded_wasm_client.mjs",
+    );
+    const install_antfly_wasm_opfs_fs = b.addInstallFile(
+        b.path("pkg/antfly-embedded/wasm_opfs_fs.mjs"),
+        "antfly-wasm/antfly_embedded_opfs_fs.mjs",
     );
     const install_antfly_wasm_browser = b.addInstallFile(
         b.path("pkg/antfly-embedded/wasm_smoke_browser.mjs"),
@@ -732,6 +744,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
                 &install_antfly_wasm.step,
                 &install_antfly_wasm_smoke_run.step,
                 &install_antfly_wasm_client.step,
+                &install_antfly_wasm_opfs_fs.step,
                 &install_antfly_wasm_browser.step,
                 &install_antfly_wasm_index.step,
                 &install_antfly_wasm_readme.step,

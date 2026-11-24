@@ -60,6 +60,13 @@ pub fn Value(comptime T: type) type {
                 return old;
             }
 
+            pub inline fn fetchMax(self: *@This(), operand: T, order: anytype) T {
+                _ = order;
+                const old = self.raw;
+                self.raw = @max(old, operand);
+                return old;
+            }
+
             pub inline fn fetchOr(self: *@This(), operand: T, order: anytype) T {
                 _ = order;
                 const old = self.raw;

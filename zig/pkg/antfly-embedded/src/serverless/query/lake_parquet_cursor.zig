@@ -15,6 +15,7 @@
 
 //! Align independently paged flat columns without retaining a decoded row group.
 const std = @import("std");
+const cacheAllocator = @import("antfly_platform").allocator.concurrentFallback;
 const parquet = @import("lake_parquet_rowgroup.zig");
 const page = @import("lake_parquet_page.zig");
 const external = @import("../external_source/types.zig");
@@ -64,7 +65,7 @@ pub const Cursor = struct {
             const held: *@This() = @ptrCast(@alignCast(raw));
             if (held.refs.fetchSub(1, .acq_rel) != 1) return;
             held.parent.release();
-            std.heap.smp_allocator.destroy(held);
+            cacheAllocator().destroy(held);
         }
     };
     const Column = struct {
@@ -240,9 +241,9 @@ pub const Cursor = struct {
             errdefer self.admission.releaseInput(length, context);
             // Declining optional admission is a successful null return, so an
             // errdefer cannot release an owner allocated before that decision.
-            const held = try std.heap.smp_allocator.create(HydrationChunk);
-            errdefer std.heap.smp_allocator.destroy(held);
-            const parent = try self.reader.readPlannedLease(std.heap.smp_allocator, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = chunk.file_offset, .len = chunk.compressed_len }, .purpose = .parquet_column_chunk });
+            const held = try cacheAllocator().create(HydrationChunk);
+            errdefer cacheAllocator().destroy(held);
+            const parent = try self.reader.readPlannedLease(cacheAllocator(), .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = chunk.file_offset, .len = chunk.compressed_len }, .purpose = .parquet_column_chunk });
             errdefer parent.release();
             held.* = .{ .parent = try self.admission.wrapInput(parent, length, context) };
             column.hydration_chunk = held;
@@ -720,14 +721,14 @@ pub const Cursor = struct {
                 // Fetch small complete unindexed chunks together; otherwise
                 // each column pays a discovery round trip before its payload.
                 reads[count] = .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = column.chunk.file_offset, .len = column.chunk.compressed_len }, .purpose = .parquet_column_chunk };
-                remaining -= column.chunk.compressed_len;
+                remaining -= @intCast(column.chunk.compressed_len);
                 count += 1;
                 continue;
             }
             const offset = column.chunk.offset_index_offset orelse continue;
             const length = column.chunk.offset_index_length orelse continue;
             if (length > budget or length > remaining) continue;
-            remaining -= length;
+            remaining -= @intCast(length);
             reads[count] = .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = offset, .len = length }, .purpose = .parquet_page_index };
             count += 1;
         }

@@ -268,3 +268,314 @@ export class MailOutbox {
     ]);
   }
 }
+// Append-only per-mailbox change log for offline replicas (the PWA's local
+// index). Every indexed message gets exactly one monotonically increasing
+// sequence; a replica stores the last sequence it applied as its cursor.
+// Messages indexed before the log existed are appended by a bounded backfill
+// that walks the received-order index, so the log converges for old mailboxes.
+export const syncLimits = Object.freeze({ pageMessages: 25, textBytes: 64 * 1024, backfill: 50 });
+const SEQUENCE_DIGITS = 13;
+export class MailSyncLog {
+  constructor(store, { prefix = "mail/v1/sync/" } = {}) {
+    this.store = store;
+    this.prefix = prefix;
+  }
+  entryKey(sequence) {
+    return this.prefix + "log/" + String(sequence).padStart(SEQUENCE_DIGITS, "0");
+  }
+  cursorSequence(cursor) {
+    if (cursor === "" || cursor == null) return 0;
+    if (typeof cursor !== "string" || !/^\d{1,13}$/.test(cursor)) throw Error("InvalidSyncCursor");
+    return Number(cursor);
+  }
+  /** Append `id` once. Call inside the transaction that makes it searchable. */
+  async record(tx, id) {
+    if (!uuid(id)) throw Error("InvalidMessageIdentity");
+    const marker = this.prefix + "id/" + id;
+    if (await tx.get(marker)) return false;
+    const sequence = ((await tx.get(this.prefix + "head")) ?? 0) + 1;
+    await tx.put(this.prefix + "head", sequence);
+    await tx.put(this.entryKey(sequence), id);
+    await tx.put(marker, sequence);
+    return true;
+  }
+  /** Append `id` again (e.g. restored from Trash) so replicas re-add it. */
+  async recordUpsert(tx, id) {
+    if (!uuid(id)) throw Error("InvalidMessageIdentity");
+    const sequence = ((await tx.get(this.prefix + "head")) ?? 0) + 1;
+    await tx.put(this.prefix + "head", sequence);
+    await tx.put(this.entryKey(sequence), id);
+    await tx.put(this.prefix + "id/" + id, sequence);
+    return sequence;
+  }
+  /** Append a deletion tombstone for `id`. Call inside the deleting transaction. */
+  async recordDelete(tx, id) {
+    if (!uuid(id)) throw Error("InvalidMessageIdentity");
+    const sequence = ((await tx.get(this.prefix + "head")) ?? 0) + 1;
+    await tx.put(this.prefix + "head", sequence);
+    await tx.put(this.entryKey(sequence), { id, deleted: true });
+    return sequence;
+  }
+  /** Append up to `limit` pre-existing messages; true when none remain. */
+  async backfill(limit = syncLimits.backfill) {
+    return this.store.transaction(async (tx) => {
+      const state = (await tx.get(this.prefix + "backfill")) ?? { after: "", done: false };
+      if (state.done) return true;
+      const page = await tx.list({ prefix: "mail/v1/order/", startAfter: state.after, limit });
+      for (const [key, id] of page) {
+        await this.record(tx, id);
+        state.after = key;
+      }
+      state.done = page.size < limit;
+      await tx.put(this.prefix + "backfill", state);
+      return state.done;
+    });
+  }
+  /** Message identities after `cursor`, oldest first, with the next cursor. */
+  async page(cursor = "", limit = syncLimits.pageMessages) {
+    const after = this.cursorSequence(cursor);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw Error("InvalidSyncLimit");
+    return this.store.transaction(async (tx) => {
+      const head = (await tx.get(this.prefix + "head")) ?? 0;
+      // A cursor past the head means the log was restored or rebuilt since the
+      // replica synced: tell it to rebuild from the start, not fail forever.
+      if (after > head) return { ids: [], cursor: "", head, more: head > 0, reset: true };
+      const page = await tx.list({
+        prefix: this.prefix + "log/",
+        startAfter: after ? this.entryKey(after) : "",
+        limit,
+      });
+      const latest = new Map();
+      let last = after;
+      for (const [key, entry] of page) {
+        const id = typeof entry === "string" ? entry : entry.id;
+        latest.delete(id);
+        latest.set(id, typeof entry !== "string");
+        last = Number(key.slice(this.prefix.length + 4));
+      }
+      const ids = [];
+      const deleted = [];
+      for (const [id, isDeleted] of latest) (isDeleted ? deleted : ids).push(id);
+      return { ids, deleted, cursor: String(last), head, more: last < head };
+    });
+  }
+}
+/** The replica view of a message: text only, bounded, no attachment bytes. */
+export function syncMessage(message) {
+  const bytes = new TextEncoder().encode(message.text ?? "");
+  const truncated = bytes.length > syncLimits.textBytes;
+  const text = truncated
+    ? new TextDecoder().decode(bytes.slice(0, syncLimits.textBytes)).replace(/�$/, "")
+    : (message.text ?? "");
+  return {
+    id: message.id,
+    thread_id: message.thread_id ?? message.id,
+    subject: message.subject ?? "",
+    from: message.from ?? "",
+    to: message.to ?? "",
+    received_at: message.received_at ?? 0,
+    quarantined: message.quarantined === true,
+    attachments: (message.attachments ?? []).map(({ index, filename, size }) => ({ index, filename, size })),
+    text,
+    text_truncated: truncated,
+  };
+}
+
+// Objects in private R2 that belong to exactly one message and can be removed
+// with it. Deliveries now store raw MIME and attachments under the receipt id;
+// older content-addressed objects ("raw/<sha256>", "attachments/<sha256>") may
+// be shared by identical deliveries, so deletion leaves them in place.
+export function ownedObjects(prefix, receipt) {
+  if (!uuid(receipt?.id)) return [];
+  const keys = [];
+  if (receipt.key === prefix + "raw/" + receipt.id) keys.push(receipt.key);
+  const projection = receipt.projection?.key;
+  if (typeof projection === "string" && projection.startsWith(prefix + "projections/")) keys.push(projection);
+  for (const part of receipt.prepared?.attachments ?? [])
+    if (typeof part?.key === "string" && part.key.startsWith(prefix + "attachments/" + receipt.id + "/")) keys.push(part.key);
+  return keys;
+}
+const orderKey = (receipt) =>
+  "mail/v1/order/" + String(9999999999999 - receipt.received_at).padStart(13, "0") + "/" + receipt.id;
+const pad = (n) => String(n).padStart(13, "0");
+// Trash is listed newest-trashed first and expires oldest-first.
+const trashKeys = (receipt) => [
+  "mail/v1/trash/" + pad(9999999999999 - receipt.trashed_at) + "/" + receipt.id,
+  "mail/v1/trash-expiry/" + pad(receipt.trashed_at) + "/" + receipt.id,
+];
+export const DAY_MS = 24 * 60 * 60 * 1000;
+
+// Gmail-style Trash. Moving a message to Trash hides it from the inbox, search
+// and device copies (a sync tombstone) but keeps it, with its search document
+// and objects, so it can be opened or restored. Messages left in Trash longer
+// than the retention period are deleted forever by the scheduled sweep, through
+// MailDeletion. Restoring puts the message back in the inbox and re-announces it
+// to replicas, which embed it again.
+export class MailTrash {
+  constructor(store, syncLog, { clock = Date.now, retentionDays = 30, prefix = "mail/v1/" } = {}) {
+    if (!Number.isInteger(retentionDays) || retentionDays < 1 || retentionDays > 3650)
+      throw Error("InvalidTrashRetention");
+    this.store = store;
+    this.syncLog = syncLog;
+    this.clock = clock;
+    this.retentionMs = retentionDays * DAY_MS;
+    this.retentionDays = retentionDays;
+    this.prefix = prefix;
+  }
+  receiptKey(id) {
+    if (!uuid(id)) throw Error("InvalidMessageIdentity");
+    return this.prefix + "receipt/" + id;
+  }
+  /** Move an inbox message to Trash; returns its expiry time. Idempotent. */
+  async trash(id) {
+    return this.store.transaction(async (tx) => {
+      const receipt = await tx.get(this.receiptKey(id));
+      if (!receipt || receipt.state === "deleted") throw Error("UnknownMessage");
+      if (receipt.state !== "indexed") throw Error("MessageNotReady");
+      if (Number.isFinite(receipt.trashed_at)) return receipt.trashed_at + this.retentionMs;
+      const trashed = { ...receipt, trashed_at: this.clock() };
+      await tx.delete(orderKey(receipt));
+      for (const key of trashKeys(trashed)) await tx.put(key, id);
+      await tx.put(this.receiptKey(id), trashed);
+      await this.syncLog.recordDelete(tx, id);
+      return trashed.trashed_at + this.retentionMs;
+    });
+  }
+  /** Return a trashed message to the inbox. Idempotent. */
+  async restore(id) {
+    return this.store.transaction(async (tx) => {
+      const receipt = await tx.get(this.receiptKey(id));
+      if (!receipt || receipt.state === "deleted") throw Error("UnknownMessage");
+      if (!Number.isFinite(receipt.trashed_at)) return false;
+      for (const key of trashKeys(receipt)) await tx.delete(key);
+      const { trashed_at: _, ...restored } = receipt;
+      await tx.put(this.receiptKey(id), restored);
+      await tx.put(orderKey(restored), id);
+      await this.syncLog.recordUpsert(tx, id);
+      return true;
+    });
+  }
+  expiresAt(trashedAt) {
+    return trashedAt + this.retentionMs;
+  }
+  /** One page of Trash, most recently trashed first. */
+  async list(cursor = "", limit = 10) {
+    if (typeof cursor !== "string" || (cursor && !/^mail\/v1\/trash\/\d{13}\/[a-f0-9-]{36}$/.test(cursor)))
+      throw Error("InvalidMailCursor");
+    return this.store.transaction(async (tx) => {
+      const page = await tx.list({ prefix: this.prefix + "trash/", startAfter: cursor, limit: limit + 1 });
+      const entries = [...page].slice(0, limit);
+      return { ids: entries.map(([, id]) => id), cursor: page.size > limit ? entries.at(-1)[0] : null };
+    });
+  }
+  /** Trashed ids whose retention has elapsed, oldest first. */
+  async expired(limit = 25, now = this.clock()) {
+    return this.store.transaction(async (tx) => {
+      const page = await tx.list({ prefix: this.prefix + "trash-expiry/", limit });
+      const cutoff = now - this.retentionMs;
+      return [...page].filter(([key]) => Number(key.split("/")[3]) <= cutoff).map(([, id]) => id);
+    });
+  }
+}
+
+// Deleting a message is a transactional mark followed by an idempotent purge.
+// The mark hides the message everywhere at once (list order, lookups, search
+// results) and appends a sync tombstone so on-device copies drop it too; the
+// purge removes the search document and the message's own R2 objects, and is
+// retried from a durable marker until it completes.
+export class MailDeletion {
+  constructor(store, syncLog, { clock = Date.now, prefix = "mail/v1/" } = {}) {
+    this.store = store;
+    this.syncLog = syncLog;
+    this.clock = clock;
+    this.prefix = prefix;
+  }
+  receiptKey(id) {
+    if (!uuid(id)) throw Error("InvalidMessageIdentity");
+    return this.prefix + "receipt/" + id;
+  }
+  async markReceipt(tx, receipt) {
+    const { id } = receipt;
+    if (Number.isFinite(receipt.received_at)) await tx.delete(orderKey(receipt));
+    if (Number.isFinite(receipt.trashed_at)) for (const key of trashKeys(receipt)) await tx.delete(key);
+    await tx.delete(this.prefix + "pending/" + id);
+    await tx.put(this.receiptKey(id), { ...receipt, state: "deleted", deleted_at: this.clock() });
+    await tx.put(this.prefix + "purge/" + id, id);
+    await this.syncLog.recordDelete(tx, id);
+  }
+  /** Mark a message and return whether it needs purging. */
+  async mark(id) {
+    return this.store.transaction(async (tx) => {
+      const receipt = await tx.get(this.receiptKey(id));
+      if (!receipt) throw Error("UnknownMessage");
+      if (receipt.state === "deleted") return !!(await tx.get(this.prefix + "purge/" + id));
+      await this.markReceipt(tx, receipt);
+      return true;
+    });
+  }
+  /** Select and mark one batch under the same transaction as Restore. */
+  async markTrash(limit, cutoff, empty = false) {
+    return this.store.transaction(async (tx) => {
+      const job = this.prefix + "empty-trash";
+      const before = cutoff ?? (empty ? await tx.get(job) : null);
+      if (before == null) return { ids: [], done: true };
+      const page = await tx.list({ prefix: this.prefix + "trash-expiry/", limit });
+      const candidates = await tx.getMany([...page.values()].map((id) => this.receiptKey(id)));
+      const ids = [];
+      for (const receipt of candidates) {
+        if (receipt?.state !== "indexed" || !Number.isFinite(receipt.trashed_at)) continue;
+        if (receipt.trashed_at > before) break;
+        await this.markReceipt(tx, receipt);
+        ids.push(receipt.id);
+      }
+      const done = ids.length < limit;
+      if (empty) {
+        // Persist the original cutoff across continuations. A later request
+        // can explicitly extend it to include items trashed in the meantime.
+        if (done) await tx.delete(job);
+        else await tx.put(job, before);
+      }
+      return { ids, done };
+    });
+  }
+  async emptyTrashPending() {
+    return this.store.transaction(async (tx) => (await tx.get(this.prefix + "empty-trash")) != null);
+  }
+  /** Receipt still holding object keys, while its purge is outstanding. */
+  async purging(id) {
+    return this.store.transaction(async (tx) => {
+      if (!(await tx.get(this.prefix + "purge/" + id))) return null;
+      return (await tx.get(this.receiptKey(id))) ?? null;
+    });
+  }
+  /**
+   * Re-arm the purge (e.g. an ingest indexed a message after it was deleted).
+   * Each attempt gets a new number: purge mutations are idempotent by
+   * operation id, so a repeated id would not delete a re-indexed document.
+   */
+  async requirePurge(tx, id) {
+    const receipt = await tx.get(this.receiptKey(id));
+    if (receipt) await tx.put(this.receiptKey(id), { ...receipt, purge_attempt: (receipt.purge_attempt ?? 0) + 1 });
+    await tx.put(this.prefix + "purge/" + id, id);
+  }
+  async pending(limit = 16) {
+    return this.store.transaction(async (tx) => [
+      ...(await tx.list({ prefix: this.prefix + "purge/", limit })).values(),
+    ]);
+  }
+  /** Drop the marker and keep only a small tombstone receipt. */
+  async finish(id, attempt) {
+    return this.store.transaction(async (tx) => {
+      const receipt = await tx.get(this.receiptKey(id));
+      if (!receipt || (receipt.purge_attempt ?? 0) !== attempt) return false;
+      await tx.delete(this.prefix + "purge/" + id);
+      await tx.put(this.receiptKey(id), {
+        id,
+        state: "deleted",
+        deleted_at: receipt.deleted_at,
+        purge_attempt: attempt,
+      });
+      return true;
+    });
+  }
+}
