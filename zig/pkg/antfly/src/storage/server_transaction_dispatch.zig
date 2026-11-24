@@ -55,8 +55,14 @@ pub fn applyReplicatedTransactionMutationAtRaftEntry(
     req: db_mod.types.BatchRequest,
     raft_entry: db_mod.OrderedApplyReceipt,
 ) !void {
+    const adapter = @import("server_db_adapter.zig");
+    if (req.transaction == null) return error.InvalidBatchRequest;
+    // The Raft entry is immutable. The native watermark can outlive the
+    // transaction record, participant ACKs, and completion certificate after
+    // history collection. Skip replay before dispatch consults any of them.
+    if (db.orderedMutationAlreadyApplied(raft_entry) catch |err| return adapter.normalizeOrderedApplyError(err)) return;
     applyReplicatedTransactionMutationInternal(alloc, db, table_name, group_id, req, .none, raft_entry) catch |err|
-        return @import("server_db_adapter.zig").normalizeOrderedApplyError(err);
+        return adapter.normalizeOrderedApplyError(err);
 }
 
 pub fn applyReplicatedTransactionMutationInternal(

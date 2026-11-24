@@ -945,6 +945,22 @@ test "db replicated transaction commits each raft receipt atomically" {
     defer alloc.free(raw);
     try std.testing.expectEqualStrings("{\"title\":\"newer\"}", raw);
     try std.testing.expectEqual(@as(u64, 16_000), try db.getTimestamp(alloc, "doc:receipt"));
+
+    // Transaction cleanup may commit ahead of the replicated apply checkpoint.
+    // Recovery must replay through the dispatcher even after it loses all
+    // participant state for the original decision.
+    const cleanup_entry: OrderedApplyReceipt = .{ .term = 3, .index = 14 };
+    try std.testing.expect(try db.cleanupReplicatedTransactionAtOrderedReceipt(txn_id, std.math.maxInt(u64), std.math.maxInt(u64), cleanup_entry));
+    try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(txn_id));
+    const resolve: types.BatchRequest = .{ .transaction = .{ .resolve = .{
+        .txn_id = txn_id,
+        .status = .committed,
+        .commit_version = 15_000,
+    } } };
+    const dispatch = @import("server_transaction_dispatch.zig");
+    try dispatch.applyReplicatedTransactionMutationAtRaftEntry(alloc, &db, "table:receipts", 7, resolve, resolve_entry);
+    try std.testing.expectEqualDeep(cleanup_entry, (try db.orderedApplyReceipt()).?);
+    try std.testing.expectError(error.ConflictingOrderedApplyReceipt, dispatch.applyReplicatedTransactionMutationAtRaftEntry(alloc, &db, "table:receipts", 7, resolve, .{ .term = 4, .index = cleanup_entry.index }));
 }
 
 test "storage.hot_standby merge proof adoption certifies receiver-local absent output" {

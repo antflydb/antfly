@@ -1404,8 +1404,9 @@ class StatefulAntflyServer:
             )
 
     def debug_logs(self) -> str:
-        self.metadata_log_file.flush()
-        self.data_log_file.flush()
+        for log in (self.metadata_log_file, self.data_log_file):
+            if not log.closed:
+                log.flush()
         metadata_out = _read_log_tail(self.metadata_log_path)
         data_out = _read_log_tail(self.data_log_path)
         return f"[metadata]\n{metadata_out}\n[data]\n{data_out}"

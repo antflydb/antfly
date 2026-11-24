@@ -2718,10 +2718,11 @@ const RaftTableApplyStateMachine = struct {
                             }
                             return error.RaftApplyWriterUnavailable;
                         } else {
-                            std.log.err("data raft document apply failed group_id={} index={} table={s} err={}", .{
+                            std.log.err("data raft document apply failed group_id={} index={} table={s} transaction_phase={s} err={}", .{
                                 group_id,
                                 entry.index,
                                 decoded.table_name,
+                                if (decoded.batch.req.transaction) |transaction| @tagName(transaction) else "none",
                                 err,
                             });
                             return err;
