@@ -1087,6 +1087,7 @@ test "prepared physical CUDA replay owns address banks and preserves held output
         try std.testing.expectEqual(@as(u64, 0), result.stats.device_host_accesses);
         if (iteration == 1 or iteration == 4) try std.testing.expectEqual(@as(u64, 1), result.stats.physical_graph_captures);
         if (iteration == 2 or iteration == 5) {
+            try std.testing.expect(result.stats.physical_replay_blocker == null);
             try std.testing.expectEqual(@as(u64, 1), result.stats.physical_graph_replays);
             try std.testing.expectEqual(@as(u64, 0), result.stats.physical_storage_allocations);
             try std.testing.expectEqual(@as(u64, 2), result.stats.physical_input_copies);

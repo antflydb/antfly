@@ -4404,13 +4404,18 @@ const InvocationInputFacts = struct {
     }
 
     fn promoteOwnedDeviceInputs(self: *InvocationInputFacts, target: *const ImportedOnnxSession, selected: ?*const PreparedRoutes, shapes: session_mod.ShapeInputs) void {
-        const cuda = target.requested_strategy == .compiled_required and target.cb.kind() == .cuda;
-        const metal = target.cb.kind() == .metal and if (target.executable.runtime.physical_pool) |pool| pool.metal_frame_dispatch and !pool.mixed_frame_dispatch and !pool.metal_projection_region_candidate else false;
-        if (!cuda and !metal) return;
+        const pool = target.executable.runtime.physical_pool orelse return;
+        const cuda_strict = target.cb.kind() == .cuda and target.requested_strategy == .compiled_required;
+        // An all-CUDA preferred graph can capture when its typed stage
+        // controls have stable banks. Keep existing F32 inputs on their
+        // original route and retain ordinary placement for mixed graphs.
+        const cuda_typed = target.cb.kind() == .cuda and target.requested_strategy == .compiled_preferred and pool.cuda_frame_dispatch and !pool.mixed_frame_dispatch;
+        const metal = target.cb.kind() == .metal and pool.metal_frame_dispatch and !pool.mixed_frame_dispatch and !pool.metal_projection_region_candidate;
+        if (!cuda_strict and !cuda_typed and !metal) return;
         for (self.inputs) |*input| {
             const logical = switch (input.value) {
                 .resident => |resident| resident.logical,
-                .imported_host => |host| if (cuda and shapes == .stage_inputs and selected == null) host.logical else continue,
+                .imported_host => |host| if ((cuda_strict or cuda_typed) and shapes == .stage_inputs and selected == null) host.logical else continue,
                 else => continue,
             };
             if (selected) |routes| {
@@ -4419,6 +4424,7 @@ const InvocationInputFacts = struct {
                 if (saved != .imported_device) continue;
             }
             if (logical.dtype != .f32 and logical.dtype != .i32 and logical.dtype != .i64) continue;
+            if (cuda_typed and logical.dtype == .f32) continue;
 
             if (!@import("../execution/assigned_kernel_route.zig").bindingDense(target.cb, input.value, logical)) continue;
             if (metal) {
@@ -5831,40 +5837,42 @@ test "Imported CUDA changing typed host indices replay without readback and reje
     }
     try std.testing.expectEqual(@as(u64, 1), captures);
     try std.testing.expect(replays >= 2);
-    const device_session = try createSessionWithOptions(a, path, .cuda, .{
-        .graph_runtime_strategy = .compiled_required,
-        .shared_backend_ctx = impl.shared_backend_ctx,
-    });
-    defer device_session.close();
-    try std.testing.expect(device_session.configureExecutionDiagnostics(true));
-    const device_backend = impl.shared_backend_ctx.stableBackend();
-    const control: InferenceExecutionControl = .{ .native_call_policy = .in_process };
-    var device_replays: u64 = 0;
-    for (0..4) |iteration| {
-        const index = iteration % 3;
-        const raw_indices = [_]i64{ @intCast(index), -1 };
-        const value = (try device_backend.fromReadOnlyBytes(std.mem.sliceAsBytes(&raw_indices), .i64, &.{2})).?;
-        defer device_backend.free(value);
-        const device_input: session_mod.StageInput = .{ .resident = .{ .value = value, .backend = device_backend, .shape = &.{2}, .estimated_bytes = 16 } };
-        var result = (try device_session.runStageInputsWithControl(&.{device_input}, a, control)).?;
-        defer result.deinit();
-        const stats = device_session.executionDiagnostics().?.execution.?;
-        device_replays += stats.physical_graph_replays;
-        try std.testing.expectEqual(@as(u64, 16), stats.physical_input_copy_bytes);
-        const actual = try result.backend.toFloat32(result.outputs[0], a);
-        defer a.free(actual);
-        const expected = [_]f32{ -@as(f32, @floatFromInt(11 + 4 * index)), -@as(f32, @floatFromInt(13 + 4 * index)), -23, -25 };
-        try std.testing.expectEqualSlices(f32, &expected, actual);
-    }
-    try std.testing.expect(device_replays >= 2);
-    {
-        const invalid = [_]i64{ 3, -1 };
-        const value = (try device_backend.fromReadOnlyBytes(std.mem.sliceAsBytes(&invalid), .i64, &.{2})).?;
-        defer device_backend.free(value);
-        const device_input: session_mod.StageInput = .{ .resident = .{ .value = value, .backend = device_backend, .shape = &.{2}, .estimated_bytes = 16 } };
-        const before = compute.stats.d2d_bytes;
-        try std.testing.expectError(error.IndexOutOfBounds, device_session.runStageInputsWithControl(&.{device_input}, a, control));
-        try std.testing.expectEqual(before, compute.stats.d2d_bytes);
+    for ([_]graph_runtime_mod.Strategy{ .compiled_required, .compiled_preferred }) |strategy| {
+        const device_session = try createSessionWithOptions(a, path, .cuda, .{
+            .graph_runtime_strategy = strategy,
+            .shared_backend_ctx = impl.shared_backend_ctx,
+        });
+        defer device_session.close();
+        try std.testing.expect(device_session.configureExecutionDiagnostics(true));
+        const device_backend = impl.shared_backend_ctx.stableBackend();
+        const control: InferenceExecutionControl = .{ .native_call_policy = .in_process };
+        var device_replays: u64 = 0;
+        for (0..4) |iteration| {
+            const index = iteration % 3;
+            const raw_indices = [_]i64{ @intCast(index), -1 };
+            const value = (try device_backend.fromReadOnlyBytes(std.mem.sliceAsBytes(&raw_indices), .i64, &.{2})).?;
+            defer device_backend.free(value);
+            const device_input: session_mod.StageInput = .{ .resident = .{ .value = value, .backend = device_backend, .shape = &.{2}, .estimated_bytes = 16 } };
+            var result = (try device_session.runStageInputsWithControl(&.{device_input}, a, control)).?;
+            defer result.deinit();
+            const stats = device_session.executionDiagnostics().?.execution.?;
+            device_replays += stats.physical_graph_replays;
+            try std.testing.expectEqual(@as(u64, 16), stats.physical_input_copy_bytes);
+            const actual = try result.backend.toFloat32(result.outputs[0], a);
+            defer a.free(actual);
+            const expected = [_]f32{ -@as(f32, @floatFromInt(11 + 4 * index)), -@as(f32, @floatFromInt(13 + 4 * index)), -23, -25 };
+            try std.testing.expectEqualSlices(f32, &expected, actual);
+        }
+        try std.testing.expect(device_replays >= 2);
+        {
+            const invalid = [_]i64{ 3, -1 };
+            const value = (try device_backend.fromReadOnlyBytes(std.mem.sliceAsBytes(&invalid), .i64, &.{2})).?;
+            defer device_backend.free(value);
+            const device_input: session_mod.StageInput = .{ .resident = .{ .value = value, .backend = device_backend, .shape = &.{2}, .estimated_bytes = 16 } };
+            const before = compute.stats.d2d_bytes;
+            try std.testing.expectError(error.IndexOutOfBounds, device_session.runStageInputsWithControl(&.{device_input}, a, control));
+            try std.testing.expectEqual(before, compute.stats.d2d_bytes);
+        }
     }
 
     {
@@ -7548,6 +7556,7 @@ fn qualifyT5CachedRows(a: std.mem.Allocator, session: Session, selected: []const
                             captures += stats.physical_graph_captures;
                             replays += stats.physical_graph_replays;
                             std.debug.print("t5 replay prefix={d} step={d} decision={s}\n", .{ case.prefix, offset, @tagName(stats.physical_replay) });
+                            if (stats.physical_replay_blocker) |blocker| std.debug.print("t5 CUDA replay blocker node={d} op={s} dtype={s} reason={s}\n", .{ blocker.node, if (blocker.operation) |op| @tagName(op) else "unknown", if (blocker.dtype) |dtype| @tagName(dtype) else "unknown", @tagName(blocker.reason) });
                         }
                     }
                 }

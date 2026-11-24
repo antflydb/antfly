@@ -439,6 +439,7 @@ pub const Runtime = struct {
         stats.assigned_regions = physical.assigned_regions;
         stats.planned_storage = physical.storage_usage;
         stats.physical_replay = physical.replay_decision;
+        stats.physical_replay_blocker = if (physical.replay_decision == .unsupported_graph) physical.replay_blocker else null;
         stats.assigned_kernel_dispatches += physical.dispatches;
         stats.physical_transfer_dispatches += physical.transfers;
         stats.physical_transfer_bytes += physical.transfer_bytes;

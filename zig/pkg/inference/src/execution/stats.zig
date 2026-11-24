@@ -35,6 +35,17 @@ pub const PhysicalReplayDecision = enum {
     busy_frame,
 };
 
+/// First concrete node rejected by capture admission. A missing record means
+/// that no node-specific rejection was observed for this invocation.
+pub const PhysicalReplayBlocker = struct {
+    node: u32,
+    operation: ?@import("std").meta.Tag(@import("ml").graph.OpCode) = null,
+    dtype: ?@import("ml").graph.DType = null,
+    reason: Reason,
+
+    pub const Reason = enum { literal_storage, typed_input, region, view, missing_kernel, foreign_partition, kernel_route, output };
+};
+
 /// Assigned region callbacks observed in one successfully published Frame.
 /// A callback may encode a CUDA recording. Graph launches count separately.
 pub const AssignedRegions = struct {
@@ -65,6 +76,7 @@ pub const ExecutionStats = struct {
     /// Lifetime peaks are not per-request peaks or total model/device residency.
     planned_storage: ?@import("storage_accounting.zig").Snapshot = null,
     physical_replay: PhysicalReplayDecision = .not_requested,
+    physical_replay_blocker: ?PhysicalReplayBlocker = null,
     physical_graph_captures: u64 = 0,
     physical_capture_failures: u64 = 0,
     physical_replay_error: ?[]const u8 = null,

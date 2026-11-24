@@ -34,6 +34,7 @@ const prepared_routes = @import("prepared_routes.zig");
 const RouteSelection = @import("route_selection.zig").Selection;
 pub const SharedLiteralStore = @import("immutable_literals.zig").SharedLiteralStore;
 const ReplayDecision = @import("stats.zig").PhysicalReplayDecision;
+const ReplayBlocker = @import("stats.zig").PhysicalReplayBlocker;
 
 pub const Stats = struct {
     /// Cold prepared admission metadata of the actual successfully finished
@@ -41,6 +42,7 @@ pub const Stats = struct {
     prepared_payload_coverage: ?@import("owned_coverage.zig").Coverage = null,
     storage_usage: ?accounting.Snapshot = null,
     replay_decision: ReplayDecision = .not_requested,
+    replay_blocker: ?ReplayBlocker = null,
     dispatches: u64 = 0,
     region_callbacks: u64 = 0,
     region_callback_nodes: u64 = 0,
@@ -235,6 +237,7 @@ pub const Pool = struct {
     replay_config: ?struct { graph: *const Graph, bindings: []const Binding, costs: @import("placement.zig").RegionCosts } = null,
     replay_backend: ?usize = null,
     replay_decision: ReplayDecision = .unsupported_backend,
+    replay_blocker: ?ReplayBlocker = null,
     storage_requirement: ?@import("../runtime/tier/memory.zig").AdmissionAmounts = null,
     storage_requirement_bounds: []usize = &.{},
 
@@ -423,6 +426,11 @@ pub const Pool = struct {
     /// Admit complete assigned-output CUDA graphs with explicit parameter
     /// roles. Graphs with unknown bindings, unsupported literals or partial
     /// descriptor coverage keep their existing execution path.
+    fn blockReplay(self: *Pool, graph: *const Graph, node: usize, reason: ReplayBlocker.Reason) void {
+        const value = graph.node(@intCast(node));
+        self.replay_blocker = .{ .node = @intCast(node), .operation = std.meta.activeTag(value.op), .dtype = value.output_shape.dtype, .reason = reason };
+    }
+
     pub fn prepareReplay(self: *Pool, graph: *const Graph, plan: *buffers.BufferPlan, bindings: []const Binding, costs: @import("placement.zig").RegionCosts) !void {
         std.debug.assert(self.frames.items.len == 0);
         if (self.root_pool == null) self.replay_config = .{ .graph = graph, .bindings = bindings, .costs = costs };
@@ -439,6 +447,7 @@ pub const Pool = struct {
         }
         const index = backend_index orelse return;
         self.replay_decision = .unsupported_graph;
+        self.replay_blocker = null;
         if (costs.transfer_bytes_per_unit == 0) return error.InvalidRegionCosts;
         var input_count: u64 = 0;
         var input_bytes: u64 = 0;
@@ -448,9 +457,9 @@ pub const Pool = struct {
             if (self.coverage_reachable) |reachable| if (!reachable[id]) continue;
             if (node.op == .constant) {
                 if (emptyReplayLiteral(&node)) continue;
-                const store = self.literal_store orelse return;
+                const store = self.literal_store orelse return self.blockReplay(graph, id, .literal_storage);
                 const literal_index = store.node_indices[id];
-                if (literal_index == ml.graph.null_node or store.literals[literal_index].backend_index != index) return;
+                if (literal_index == ml.graph.null_node or store.literals[literal_index].backend_index != index) return self.blockReplay(graph, id, .literal_storage);
                 binding_count += 1;
                 continue;
             }
@@ -458,10 +467,10 @@ pub const Pool = struct {
                 binding_count += 1;
                 if (node.output_shape.dtype != .f32) {
                     const node_id: NodeId = @intCast(id);
-                    if (self.hostInputIndex(node_id) == null) {
-                        const device_index = self.deviceInputIndex(node_id) orelse return;
-                        if (self.device_input_plans[device_index].index_bounds == null) return;
-                    }
+                    // Typed payload banks and numeric index proofs are separate.
+                    // Selected gather routes declare their bounds before copies.
+                    if (self.hostInputIndex(node_id) == null and self.deviceInputIndex(node_id) == null)
+                        return self.blockReplay(graph, id, .typed_input);
                 }
                 var mutable = false;
                 var immutable = false;
@@ -490,22 +499,22 @@ pub const Pool = struct {
             // standalone allocation was deliberately removed by recoloring.
             // Check region ownership before requiring individual reshape slots.
             if (self.regionForNode(@intCast(id))) |installed| {
-                if (installed.backend_index != index or installed.owner.requirements.capture != .supported) return;
+                if (installed.backend_index != index or installed.owner.requirements.capture != .supported) return self.blockReplay(graph, id, .region);
                 if (installed.owner.entry_node == id) count += 1;
                 continue;
             }
             if (node.op == .slice and self.replaySlice(plan, @intCast(id)) != null) continue;
             if (node.op == .reshape and self.backends[index].vtable.kernels.?.physicalReplayReshapeViews) {
-                const slot = plan.slotForNode(@intCast(id)) orelse return;
+                const slot = plan.slotForNode(@intCast(id)) orelse return self.blockReplay(graph, id, .view);
                 if (slot.backend != .cuda or node.num_inputs != 1 or node.output_shape.dtype != .f32 or
-                    node.output_shape.numElements() == null or node.output_shape.numElements() != graph.node(node.inputs[0]).output_shape.numElements()) return;
+                    node.output_shape.numElements() == null or node.output_shape.numElements() != graph.node(node.inputs[0]).output_shape.numElements()) return self.blockReplay(graph, id, .view);
                 continue;
             }
-            const kernel = self.kernels[id] orelse return;
-            if (kernel.backend_index != index) return;
+            const kernel = self.kernels[id] orelse return self.blockReplay(graph, id, .missing_kernel);
+            if (kernel.backend_index != index) return self.blockReplay(graph, id, .foreign_partition);
             if (self.preparedKernelRoute(@intCast(id))) |owned| {
-                if (owned.requirements.capture != .supported) return;
-            } else if (!self.backends[index].vtable.kernels.?.physicalReplayKernelSupported.?(self.backends[index].ptr, &kernel.descriptor)) return;
+                if (owned.requirements.capture != .supported) return self.blockReplay(graph, id, .kernel_route);
+            } else if (!self.backends[index].vtable.kernels.?.physicalReplayKernelSupported.?(self.backends[index].ptr, &kernel.descriptor)) return self.blockReplay(graph, id, .kernel_route);
             count += 1;
         }
         if (count == 0 or graph.outputs.items.len == 0) return;
@@ -520,14 +529,14 @@ pub const Pool = struct {
             return;
         }
         for (graph.outputs.items) |id| {
-            const source = (self.replayOutputSource(graph, plan, id) orelse return).node;
+            const source = (self.replayOutputSource(graph, plan, id) orelse return self.blockReplay(graph, id, .output)).node;
             if (self.kernels[source] != null or self.regionForNode(source) != null or graph.node(source).op == .constant) continue;
             var mutable = false;
             for (bindings) |binding| if (binding.node_id == source and (binding.kind == .input or binding.kind == .state_input)) {
                 mutable = true;
                 break;
             };
-            if (!mutable) return;
+            if (!mutable) return self.blockReplay(graph, id, .output);
         }
         if (self.replay_inputs.len != 0 or self.replay_outputs.len != 0 or self.replay_input_indices.len != 0) {
             // A private variant may replace primitive dispatches with regions
@@ -1372,7 +1381,7 @@ pub const Pool = struct {
         const ledger = try accounting.Ledger.create(self.allocator);
         errdefer ledger.release();
         const child = try self.allocator.create(Pool);
-        child.* = .{ .metadata_aliases = metadata_aliases, .replay_config = self.replay_config, .coverage_graph = self.coverage_graph, .coverage_reachable = self.coverage_reachable, .native_frame_dispatch = self.native_frame_dispatch, .mixed_frame_dispatch = self.mixed_frame_dispatch, .cuda_frame_dispatch = self.cuda_frame_dispatch, .metal_frame_dispatch = self.metal_frame_dispatch, .metal_projection_region_candidate = self.metal_projection_region_candidate, .coverage_backend = self.coverage_backend, .reshape_sources = reshapes, .allocator = self.allocator, .accounting = ledger, .plan = plan, .owns_plan = true, .kernels = selected, .transfers = transfers, .backends = backends, .workspace_allocations = workspaces, .host_workspace_allocation = self.host_workspace_allocation, .max_frames = self.max_frames, .replay_inputs = replay_inputs, .replay_input_indices = replay_indices, .replay_outputs = replay_outputs, .replay_kernel_count = self.replay_kernel_count, .replay_backend = self.replay_backend, .replay_decision = self.replay_decision, .host_alignment = self.host_alignment, .host_workspace_allocator = self.host_workspace_allocator, .root_pool = self };
+        child.* = .{ .metadata_aliases = metadata_aliases, .replay_config = self.replay_config, .coverage_graph = self.coverage_graph, .coverage_reachable = self.coverage_reachable, .native_frame_dispatch = self.native_frame_dispatch, .mixed_frame_dispatch = self.mixed_frame_dispatch, .cuda_frame_dispatch = self.cuda_frame_dispatch, .metal_frame_dispatch = self.metal_frame_dispatch, .metal_projection_region_candidate = self.metal_projection_region_candidate, .coverage_backend = self.coverage_backend, .reshape_sources = reshapes, .allocator = self.allocator, .accounting = ledger, .plan = plan, .owns_plan = true, .kernels = selected, .transfers = transfers, .backends = backends, .workspace_allocations = workspaces, .host_workspace_allocation = self.host_workspace_allocation, .max_frames = self.max_frames, .replay_inputs = replay_inputs, .replay_input_indices = replay_indices, .replay_outputs = replay_outputs, .replay_kernel_count = self.replay_kernel_count, .replay_backend = self.replay_backend, .replay_decision = self.replay_decision, .replay_blocker = self.replay_blocker, .host_alignment = self.host_alignment, .host_workspace_allocator = self.host_workspace_allocator, .root_pool = self };
         if (self.literal_store) |store| {
             store.retain();
             child.literal_store = store;
@@ -1657,6 +1666,7 @@ pub const Pool = struct {
         self.replay_backend = null;
         self.replay_kernel_count = 0;
         self.replay_decision = .unsupported_graph;
+        self.replay_blocker = null;
         self.managed_terminal_eligible = self.managedTerminalPlanEligible(graph, reachable);
     }
     fn managedTerminalPlanEligible(self: *const Pool, graph: *const Graph, reachable: []const bool) bool {
@@ -2049,7 +2059,7 @@ pub const Pool = struct {
             return err;
         };
         if (capability) |cap| try frame.adoptAdmission(cap);
-        frame.stats = .{ .replay_decision = self.replay_decision };
+        frame.stats = .{ .replay_decision = self.replay_decision, .replay_blocker = self.replay_blocker };
         return frame;
     }
 
@@ -2235,7 +2245,7 @@ pub const Frame = struct {
         @memset(region_assigned, null);
         const self = try pool.allocator.create(Frame);
         errdefer pool.allocator.destroy(self);
-        self.* = .{ .region_claims = region_claims, .region_started = region_started, .region_assigned = region_assigned, .host_input_resources = host_resources, .host_bound_inputs = host_inputs, .device_bound_inputs = device_inputs, .metal_device_sources = metal_device_sources, .assigned = assigned, .storage_admission = capability, .host_workspace_admission = host_binding.reservation, .host_workspace_retirement_owner = if (host_binding.backing) |value| value.owner else null, .host_workspace = host_workspace, .host_workspace_allocator = host_workspace_allocator, .capture_pins = capture_pins, .pool = pool, .storages = leases, .completions = completions, .bound_inputs = bound_inputs, .binding_states = binding_states, .stats = .{ .replay_decision = pool.replay_decision } };
+        self.* = .{ .region_claims = region_claims, .region_started = region_started, .region_assigned = region_assigned, .host_input_resources = host_resources, .host_bound_inputs = host_inputs, .device_bound_inputs = device_inputs, .metal_device_sources = metal_device_sources, .assigned = assigned, .storage_admission = capability, .host_workspace_admission = host_binding.reservation, .host_workspace_retirement_owner = if (host_binding.backing) |value| value.owner else null, .host_workspace = host_workspace, .host_workspace_allocator = host_workspace_allocator, .capture_pins = capture_pins, .pool = pool, .storages = leases, .completions = completions, .bound_inputs = bound_inputs, .binding_states = binding_states, .stats = .{ .replay_decision = pool.replay_decision, .replay_blocker = pool.replay_blocker } };
         // This is the first stable Frame address. Register before publication,
         // claim transfer or any later adoption/assigned-resource callback.
         errdefer self.managed_terminal_evidence.deinit();
@@ -2852,7 +2862,7 @@ pub const Frame = struct {
                 self.metal_device_sources[index] = input.value;
                 self.metal_device_copy_pending = true;
             } else {
-                const copy = if (plan.shape.dtype == .f32) functions.copyPhysicalInput.? else functions.copyPhysicalIndexInput.?;
+                const copy = if (plan.index_bounds != null) functions.copyPhysicalIndexInput.? else functions.copyPhysicalInput.?;
                 try copy(backend.ptr, target, input.value);
                 self.stats.input_copies += 1;
                 self.stats.input_copy_bytes += @as(u64, @intCast(plan.shape.numElements().?)) * plan.shape.dtype.byteSize();
@@ -2911,7 +2921,7 @@ pub const Frame = struct {
         }
         if (self.pool.deviceInputIndex(binding.node)) |index| {
             const plan = self.pool.device_input_plans[index];
-            return plan.allocation == allocation and plan.index_bounds != null and self.ownsDeviceInput(binding.node, value);
+            return plan.allocation == allocation and self.ownsDeviceInput(binding.node, value);
         }
         return false;
     }
@@ -3075,6 +3085,7 @@ pub const Frame = struct {
             const allowed = if (owned) |route_owner| route_owner.requirements.capture == .supported else backend.vtable.kernels.?.physicalReplayKernelSupported.?(backend.ptr, &kernel.descriptor);
             if (!allowed or kernel.backend_index != index) {
                 self.stats.replay_decision = .unsupported_graph;
+                self.stats.replay_blocker = .{ .node = @intCast(node), .operation = if (self.pool.coverage_graph) |graph| std.meta.activeTag(graph.node(@intCast(node)).op) else null, .dtype = kernel.descriptor.output_shape.dtype, .reason = if (kernel.backend_index != index) .foreign_partition else .kernel_route };
                 self.replay_disabled = .unsupported_graph;
                 return false;
             }
