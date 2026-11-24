@@ -8103,9 +8103,15 @@ fn resolveArchModelProgram(ptr: *anyopaque, stage: @import("model_frontend.zig")
         return null;
     }
     if (stage == .image_projection and self.arch_config == .gpt) {
-        if (auxiliaryProjectorStore(self)) |metadata| return @import("../architectures/frontends/projector.zig").image(metadata);
-        if (self.arch_config.gpt.hasQwen35VisionArchitectureContract()) return @import("../architectures/frontends/patch_projector.zig").image(&self.arch_config.gpt);
-        return null;
+        var forward = if (auxiliaryProjectorStore(self)) |metadata|
+            @import("../architectures/frontends/projector.zig").image(metadata)
+        else if (self.arch_config.gpt.hasQwen35VisionArchitectureContract())
+            @import("../architectures/frontends/patch_projector.zig").image(&self.arch_config.gpt)
+        else
+            return null;
+        // XLA consumes the portable attention pattern directly.
+        if (self.backend_type == .pjrt) forward.optimization = .provider_fusion;
+        return forward;
     }
     const encoder = switch (self.arch_config) {
         .bert, .modern_bert, .nomic_bert, .embedding_gemma2, .gpt, .deberta, .gliner => true,
