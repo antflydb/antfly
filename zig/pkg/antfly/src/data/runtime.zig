@@ -5749,6 +5749,18 @@ const ReplicatedTransitionLease = struct {
         if (self.activity) |*activity| activity.deinit();
     }
 
+    fn takeActivity(self: *ReplicatedTransitionLease) antfly.public_api.ProvisionedTableWriteSource.GroupTransitionActivity {
+        if (comptime linked_storage) {
+            const activity = self.activity.?;
+            self.activity = null;
+            return activity;
+        }
+        const context: *TransitionDbLeaseContext = @ptrCast(@alignCast(self.owner.ctx));
+        const activity = context.activity;
+        context.activity.active = false;
+        return activity;
+    }
+
     fn reconcile(self: *ReplicatedTransitionLease, alloc: std.mem.Allocator, store: *DataRaftApplyStore, group_id: u64, expected: ?DataRaftAppliedBatch) !DataServer.SplitProjectionReconcileResult {
         if (comptime linked_storage) {
             return switch (try self.owner.reconcile(store, alloc, expected)) {
@@ -22877,35 +22889,37 @@ pub const DataServer = struct {
                 try self.releaseRelationalMergeReceiver(op.donor_group_id, op.receiver_group_id, op.transition_id, op.table_contract);
                 return;
             }
-            // Proposal preflight acquires the ordinary catalog descriptor.
-            // The transition descriptor intentionally omits initial-range
-            // hints, so holding its native owner while proposing to that same
-            // donor waits for our own lease to drain. Keep transition activity
-            // through cutover, but release the copied owner's lease first.
-            var transition_activity: ?antfly.public_api.ProvisionedTableWriteSource.GroupTransitionActivity = null;
-            defer if (transition_activity) |*activity| activity.deinit();
-            var donor_lease = try self.leaseReplicatedTransitionOwner(
-                op.donor_group_id,
-                op.table_contract,
-                .source,
-                .exact,
-            );
-            var owner_released = false;
-            defer if (!owner_released) donor_lease.release();
-            const attempt = try self.replicateMergeCopyUnderLease(
-                op.transition_id,
-                op.donor_group_id,
-                op.receiver_group_id,
-                op.allow_doc_identity_reassignment,
-                op.table_contract,
-                &donor_lease,
-            );
-            if (comptime linked_storage) {
-                transition_activity = donor_lease.activity;
-                donor_lease.activity = null;
-                donor_lease.release();
-                owner_released = true;
-            }
+            // The source copy needs the transition writer, but proposal and
+            // committed apply need the ordinary writer. Drop only the copy
+            // writer before Raft, preserving the transition's admission.
+            var transition_activity: antfly.public_api.ProvisionedTableWriteSource.GroupTransitionActivity = undefined;
+            const attempt = copied: {
+                var donor_lease = try self.leaseReplicatedTransitionOwner(
+                    op.donor_group_id,
+                    op.table_contract,
+                    .source,
+                    .exact,
+                );
+                defer donor_lease.release();
+                const attempt = try self.replicateMergeCopyUnderLease(
+                    op.transition_id,
+                    op.donor_group_id,
+                    op.receiver_group_id,
+                    op.allow_doc_identity_reassignment,
+                    op.table_contract,
+                    &donor_lease,
+                );
+                transition_activity = donor_lease.takeActivity();
+                break :copied attempt;
+            };
+            defer transition_activity.deinit();
+            // The direct storage path shares the transition admission gate
+            // with ordered apply. Transfer it only to this committed finalize.
+            if (comptime !linked_storage) transition_activity.handoffMergeFinalize(.{
+                .kind = .finalize,
+                .transition_id = op.transition_id,
+                .receiver_group_id = op.receiver_group_id,
+            });
             try self.replicateMergeSourceTransition(
                 op.transition_id,
                 op.donor_group_id,
@@ -39625,7 +39639,21 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                         const tables = try response_alloc.alloc(?catalog.ResolvedTable, input.targets.len);
                         defer response_alloc.free(tables);
                         for (input.targets, tables) |target, *table| table.* = resolve(snapshot, target);
-                        break :blk try std.json.Stringify.valueAlloc(response_alloc, catalog.ResolvedMany{ .revision = snapshot.status.metadata_epoch, .tables = tables }, .{});
+                        const storage_tables: []?catalog.ResolvedTable = if (input.include_storage_bindings)
+                            try response_alloc.alloc(?catalog.ResolvedTable, input.storage_names.len)
+                        else
+                            &.{};
+                        defer response_alloc.free(storage_tables);
+                        for (input.storage_names[0..storage_tables.len], storage_tables) |name, *binding| {
+                            const table = antfly.public_api.tables.findTableByName(snapshot, name) orelse {
+                                binding.* = null;
+                                continue;
+                            };
+                            var resolved = catalog.ResolvedTable.fromTable(table);
+                            if (input.include_query_definitions) resolved.query_definition = catalog.QueryDefinition.fromTable(table);
+                            binding.* = resolved;
+                        }
+                        break :blk try std.json.Stringify.valueAlloc(response_alloc, catalog.ResolvedMany{ .revision = snapshot.status.metadata_epoch, .tables = tables, .storage_tables = storage_tables }, .{});
                     },
                     .table_record_read => |name| blk: {
                         const table = antfly.public_api.tables.findTableByName(snapshot, name);
@@ -67985,6 +68013,9 @@ fn implementationTests() type {
             }
 
             try server.syncDataRaftFromSnapshot(&snapshot, .linearizable);
+            // This fixture starts Raft directly instead of starting its HTTP
+            // listener. Attach the writer cache the listener normally wires.
+            server.data_raft_apply.?.attachProvisionedStorage(&server.provisioned_storage);
 
             const Shared = struct {
                 server: *DataServer,
