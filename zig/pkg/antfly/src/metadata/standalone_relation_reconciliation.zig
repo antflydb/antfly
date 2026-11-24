@@ -40,7 +40,13 @@ pub const Coordinator = struct {
         }
         try store.expireRelationPublicationProofs(now_ns);
         const activation: protocol.Activation = .{
-            .version = protocol.relation_mutation_version,
+            // Standalone has one binary and one metadata/data membership.
+            // Advertise its current decoder cohort, not the original relation
+            // mutation floor: later view, role-default and sequence records
+            // must not rely on a synthetic test-only activation. Feature
+            // readiness, publication/owner ACKs and SQL ingress capabilities
+            // remain separate gates. HA is excluded by the caller.
+            .version = protocol.current_version,
             .incarnation = identity,
             .member_count = 1,
             .membership_fingerprint = @import("reallocation_request.zig").membershipFingerprint(&.{node_id}),
@@ -64,10 +70,13 @@ pub const Coordinator = struct {
             }
         }
         const command: control.Command = blk: {
-            if (work.epoch == null) {
-                var adoption = activation;
-                adoption.version = protocol.relation_reconciliation_version;
-                break :blk .{ .adopt = adoption };
+            // Share the replicated worker's generation-building migration.
+            // A relation-only seal is not proof of constraint-name coverage.
+            var occupancy = activation;
+            occupancy.version = protocol.constraint_occupancy_version;
+            if (try worker.coverageMigration(work, group, occupancy)) |migration| {
+                try store.cancelRelationPublicationProof(group);
+                break :blk migration;
             }
             if (!(self.prefer_gc and work.garbage != null)) {
                 if (work.current) |state| {
@@ -76,7 +85,7 @@ pub const Coordinator = struct {
                     {
                         const proof = (try store.stepRelationPublicationProof(state, now_ns)) orelse return .scanning;
                         var publication_activation = activation;
-                        publication_activation.version = protocol.relation_publication_version;
+                        publication_activation.version = control.publicationVersion(proof.state.coverage);
                         break :blk .{ .publish = .{ .state = proof.state, .prior = proof.root, .activation = publication_activation } };
                     }
                 }

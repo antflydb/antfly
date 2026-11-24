@@ -32,9 +32,39 @@ pub const EmptyGenerationHandoffExpectation = struct {
     retired_count: u64,
     expected_install_receipt_digest: Digest,
 };
-/// Authenticated by the HA stream and pinned to the immutable reserved owner.
-/// New hidden owners created after a seed can therefore be reconstructed before
-/// applying their first lifecycle record, without consulting public placement.
+/// Explicit metadata-authorized empty target provenance. A physical schema-only
+/// snapshot has no source owner Pin or loss receipt. Both origins install only
+/// new target acceptance scopes before publication.
+pub const NativeEmptyExpectation = struct {
+    origin: @import("native_empty_origin.zig").Origin,
+    expected_install_digest: Digest,
+    pub fn validate(self: @This(), scope: Scope) !void {
+        try self.origin.validate();
+        if (!scope.empty_generation or scope.population != null or scope.rewrite != null or scope.native_empty_origin == null or
+            !std.meta.eql(scope.native_empty_origin.?, self.origin) or std.mem.allEqual(u8, &self.expected_install_digest, 0)) return error.InvalidRestoreStagingCommand;
+        switch (self.origin) {
+            .lost_source => |loss| {
+                if (scope.source_namespace.table_id != loss.source.table_id or scope.source_namespace.shard_id != loss.source.shard_id or
+                    scope.source_namespace.range_id != loss.source.range_id or scope.target_namespace.table_id == loss.source.table_id) return error.InvalidRestoreStagingCommand;
+            },
+            .schema_only_snapshot => {
+                if (scope.source_namespace.table_id != 0 or scope.source_namespace.shard_id != 0 or scope.source_namespace.range_id != 0) return error.InvalidRestoreStagingCommand;
+            },
+        }
+    }
+    pub fn digest(self: @This(), scope: Scope) !Digest {
+        try self.validate(scope);
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("antfly/native-empty-generation-expectation/v1\x00");
+        hash.update(&scope.digest());
+        hash.update(&try self.origin.digest());
+        hash.update(&self.expected_install_digest);
+        var result: Digest = undefined;
+        hash.final(&result);
+        return result;
+    }
+};
+
 pub const OwnerBootstrap = struct {
     scope: Scope,
     table_name: []const u8,
@@ -52,11 +82,12 @@ pub const OwnerBootstrap = struct {
     /// sealed its closed-fence source summary. The hidden target itself never
     /// trusts source IDs or generations as active authority.
     empty_generation_handoff: ?EmptyGenerationHandoffExpectation = null,
+    native_empty_source: ?NativeEmptyExpectation = null,
 
     pub fn jsonStringify(self: @This(), jw: anytype) @TypeOf(jw.*).Error!void {
         try jw.beginObject();
         try jw.objectField("scope");
-        try @import("relational_integrity_json.zig").write(self.scope, jw);
+        try @import("relational/integrity/json.zig").write(self.scope, jw);
         try jw.objectField("table_name");
         try jw.write(self.table_name);
         try jw.objectField("schema_json");
@@ -66,28 +97,37 @@ pub const OwnerBootstrap = struct {
         try jw.objectField("indexes_json");
         try jw.write(self.indexes_json);
         try jw.objectField("byte_range");
-        try @import("relational_integrity_json.zig").write(self.byte_range, jw);
+        try @import("relational/integrity/json.zig").write(self.byte_range, jw);
         if (self.source_generation_proof_digest) |proof_digest| {
             try jw.objectField("source_generation_proof_digest");
-            try @import("relational_integrity_json.zig").write(proof_digest, jw);
+            try @import("relational/integrity/json.zig").write(proof_digest, jw);
         }
         if (self.generation_admission) |binding| {
             try jw.objectField("generation_admission");
-            try @import("relational_integrity_json.zig").write(binding, jw);
+            try @import("relational/integrity/json.zig").write(binding, jw);
         }
         if (self.empty_generation_handoff) |binding| {
             try jw.objectField("empty_generation_handoff");
-            try @import("relational_integrity_json.zig").write(binding, jw);
+            try @import("relational/integrity/json.zig").write(binding, jw);
+        }
+        if (self.native_empty_source) |binding| {
+            try jw.objectField("native_empty_source");
+            try @import("relational/integrity/json.zig").write(binding, jw);
         }
         try jw.endObject();
     }
     pub fn validate(self: @This()) !void {
         try self.scope.validate();
+        if (self.scope.population != null and (self.source_generation_proof_digest != null or self.generation_admission != null or (self.empty_generation_handoff != null and !self.scope.isCatalogCurrentPopulation()))) return error.InvalidRestoreStagingCommand;
         // Empty-generation targets cannot be opened without the immutable
         // source authority they must install before publication. Catch a
         // missing cold-descriptor projection before it reaches Raft apply.
-        if ((self.scope.empty_generation or self.scope.rewrite != null) and self.empty_generation_handoff == null)
+        if ((self.scope.empty_generation or self.scope.rewrite != null) and self.empty_generation_handoff == null and self.native_empty_source == null)
             return error.InvalidRestoreStagingCommand;
+        if (self.native_empty_source) |loss| {
+            try loss.validate(self.scope);
+            if (self.empty_generation_handoff != null or self.source_generation_proof_digest != null or self.generation_admission != null) return error.InvalidRestoreStagingCommand;
+        }
         if (self.table_name.len == 0 or (self.table_name.len > 255 and !(try @import("../../system_catalog/domain.zig").isRestoreTarget(self.table_name))) or std.mem.indexOfAny(u8, self.table_name, "/\\\x00") != null or std.mem.eql(u8, self.table_name, ".") or std.mem.eql(u8, self.table_name, "..") or
             self.schema_json.len +| self.read_schema_json.len > 4 * 1024 * 1024 or self.indexes_json.len == 0 or self.indexes_json.len > 4 * 1024 * 1024 or
             !std.unicode.utf8ValidateSlice(self.table_name) or !std.unicode.utf8ValidateSlice(self.schema_json) or !std.unicode.utf8ValidateSlice(self.read_schema_json) or !std.unicode.utf8ValidateSlice(self.indexes_json) or
@@ -105,7 +145,7 @@ pub const OwnerBootstrap = struct {
                 return error.InvalidRestoreStagingCommand;
         }
         if (self.empty_generation_handoff) |binding| {
-            if (!(self.scope.empty_generation or self.scope.rewrite != null) or self.source_generation_proof_digest != null or
+            if (!(self.scope.empty_generation or self.scope.rewrite != null or self.scope.isCatalogCurrentPopulation()) or self.source_generation_proof_digest != null or
                 self.generation_admission != null or std.mem.allEqual(u8, &binding.source_summary_digest, 0) or
                 std.mem.allEqual(u8, &binding.retired_digest, 0) or
                 std.mem.allEqual(u8, &binding.expected_install_receipt_digest, 0))
@@ -147,6 +187,10 @@ pub const Timestamp = struct {
 pub const Artifact = struct { key: []const u8, value: []const u8 };
 
 pub const ImportPage = struct {
+    pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
+        return (std.mem.eql(u8, name, "population") and self.population == null) or
+            (std.mem.eql(u8, name, "document_timestamps") and self.document_timestamps == null);
+    }
     expected: Digest,
     next: []const u8,
     scope: Digest,
@@ -168,10 +212,7 @@ pub const ImportPage = struct {
     /// One bounded, replicated proof-only metadata page precedes row import.
     /// It is never admitted as a user artifact or active FK authority.
     source_generation_proof_page: bool = false,
-
-    pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
-        return std.mem.eql(u8, name, "document_timestamps") and self.document_timestamps == null;
-    }
+    population: ?@import("relational/schema_change/population_contract.zig").Delivery = null,
 };
 
 /// Source admission evidence is not portable authority: physical child IDs and
@@ -184,8 +225,8 @@ pub const GenerationAdmissionMapping = struct {
     target_child_table_id: u64,
     target_child_table_name: []const u8,
     constraint_name: []const u8,
-    source_generation: ?@import("relational_integrity_contract.zig").Generation,
-    target_generation: ?@import("relational_integrity_contract.zig").Generation,
+    source_generation: ?@import("relational/integrity/contract.zig").Generation,
+    target_generation: ?@import("relational/integrity/contract.zig").Generation,
     source_scope_digest: Digest,
 
     pub fn validate(self: @This()) !void {
@@ -370,16 +411,21 @@ pub const Control = union(enum) {
     /// as a preservation-only restore page.
     rewrite_page: ImportPage,
     install_generation_admissions: InstallGenerationAdmissions,
+    install_native_empty: @import("native_empty_generation.zig").Install,
     finish: Finish,
     pub fn jsonStringify(self: @This(), jw: anytype) @TypeOf(jw.*).Error!void {
-        try @import("relational_integrity_json.zig").write(self, jw);
+        try @import("relational/integrity/json.zig").write(self, jw);
     }
 };
 
 pub const Scope = struct {
     pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
-        return (std.mem.eql(u8, name, "empty_generation") and !self.empty_generation) or
-            (std.mem.eql(u8, name, "graph_retirement_digest") and self.graph_retirement_digest == null);
+        return (std.mem.eql(u8, name, "native_empty_origin") and self.native_empty_origin == null) or
+            (std.mem.eql(u8, name, "empty_generation") and !self.empty_generation) or
+            (std.mem.eql(u8, name, "graph_retirement_digest") and self.graph_retirement_digest == null) or
+            (std.mem.eql(u8, name, "catalog_intent_digest") and self.catalog_intent_digest == null) or
+            (std.mem.eql(u8, name, "frozen_base") and self.frozen_base == null) or
+            (std.mem.eql(u8, name, "population") and self.population == null);
     }
     plan_id: [16]u8,
     plan_digest: Digest,
@@ -391,12 +437,59 @@ pub const Scope = struct {
     preserve_artifacts: bool = false,
     /// A fresh, proven-pristine owner; never accepts source rows or artifacts.
     empty_generation: bool = false,
+    native_empty_origin: ?@import("native_empty_origin.zig").Origin = null,
     /// Exact graph declaration/old-new incarnation proof from the immutable
     /// metadata plan. Only an empty owner may carry this retirement barrier.
     graph_retirement_digest: ?Digest = null,
-    rewrite: ?@import("relational_rewrite_contract.zig").Binding = null,
+    rewrite: ?@import("relational/schema_change/rewrite_contract.zig").Binding = null,
+    population: ?@import("relational/schema_change/population_contract.zig").Binding = null,
 
+    /// Issued only for the native transaction cohort. The provisioned owner
+    /// scope and metadata plan seal this digest before accepting row pages.
+    catalog_intent_digest: ?Digest = null,
+    frozen_base: ?@import("relational/rows/frozen_contract.zig").Binding = null,
+
+    pub fn isCatalogCurrentPopulation(self: Scope) bool {
+        const binding = self.population orelse return false;
+        const image = binding.transaction_rows orelse return false;
+        return self.catalog_intent_digest != null and image.image == .current;
+    }
+
+    fn validatePopulation(self: Scope) !void {
+        if (self.frozen_base) |base| {
+            try base.validate();
+            const binding = self.population orelse return error.InvalidRestoreStagingCommand;
+            const rows = binding.transaction_rows orelse return error.InvalidRestoreStagingCommand;
+            if (rows.image != .current or !base.namespace.eql(self.target_namespace) or
+                std.mem.eql(u8, &base.population, &self.source_artifact_digest))
+                return error.InvalidRestoreStagingCommand;
+        }
+        if (self.population) |binding| {
+            if ((binding.transaction_rows != null) != (self.catalog_intent_digest != null)) return error.InvalidRestoreStagingCommand;
+            if (self.catalog_intent_digest) |digest_bytes| {
+                if (std.mem.allEqual(u8, &digest_bytes, 0)) return error.InvalidRestoreStagingCommand;
+            }
+            try binding.validate();
+            if (self.empty_generation or self.preserve_artifacts or self.rewrite != null or self.graph_retirement_digest != null or binding.partition != self.target_namespace.shard_id or
+                self.source_namespace.table_id != 0 or self.source_namespace.shard_id != 0 or self.source_namespace.range_id != 0 or
+                !std.mem.eql(u8, &binding.target_schema, &self.target_schema_digest) or
+                !std.mem.eql(u8, &try binding.digest(), &self.source_artifact_digest) or
+                !std.mem.allEqual(u8, &self.source_descriptor_digest, 0)) return error.InvalidRestoreStagingCommand;
+        } else if (self.catalog_intent_digest != null) return error.InvalidRestoreStagingCommand;
+    }
+    fn validateNativeEmptyOrigin(self: Scope) !void {
+        if (self.native_empty_origin) |origin| {
+            try origin.validate();
+            if (!self.empty_generation or self.population != null or self.rewrite != null or self.graph_retirement_digest != null) return error.InvalidRestoreStagingCommand;
+            switch (origin) {
+                .lost_source => |loss| if (self.source_namespace.table_id != loss.source.table_id or self.source_namespace.shard_id != loss.source.shard_id or self.source_namespace.range_id != loss.source.range_id) return error.InvalidRestoreStagingCommand,
+                .schema_only_snapshot => if (self.source_namespace.table_id != 0 or self.source_namespace.shard_id != 0 or self.source_namespace.range_id != 0) return error.InvalidRestoreStagingCommand,
+            }
+        }
+    }
     pub fn validateReservation(self: Scope) !void {
+        try self.validatePopulation();
+        try self.validateNativeEmptyOrigin();
         if (self.empty_generation and (self.preserve_artifacts or self.rewrite != null)) return error.InvalidRestoreStagingCommand;
         if (!self.empty_generation and self.graph_retirement_digest != null) return error.InvalidRestoreStagingCommand;
         if (self.rewrite) |rewrite| {
@@ -410,6 +503,8 @@ pub const Scope = struct {
     }
 
     pub fn validate(self: Scope) !void {
+        try self.validatePopulation();
+        try self.validateNativeEmptyOrigin();
         if (self.empty_generation and (self.preserve_artifacts or self.rewrite != null or !std.mem.allEqual(u8, &self.source_artifact_digest, 0) or !std.mem.allEqual(u8, &self.source_descriptor_digest, 0))) return error.InvalidRestoreStagingCommand;
         if (!self.empty_generation and self.graph_retirement_digest != null) return error.InvalidRestoreStagingCommand;
         if (self.preserve_artifacts and self.rewrite != null) return error.InvalidRestoreStagingCommand;
@@ -420,7 +515,7 @@ pub const Scope = struct {
         if (std.mem.allEqual(u8, &self.plan_id, 0) or std.mem.allEqual(u8, &self.plan_digest, 0) or
             (!self.empty_generation and std.mem.allEqual(u8, &self.source_artifact_digest, 0)) or self.target_namespace.table_id == 0 or
             self.target_namespace.shard_id == 0 or self.target_namespace.range_id == 0 or
-            self.source_namespace.table_id == 0 or self.source_namespace.table_id == self.target_namespace.table_id)
+            (self.population == null and !(self.native_empty_origin != null and self.native_empty_origin.? == .schema_only_snapshot) and (self.source_namespace.table_id == 0 or self.source_namespace.table_id == self.target_namespace.table_id)))
             return error.InvalidRestoreStagingCommand;
     }
     pub fn digest(self: Scope) Digest {
@@ -438,8 +533,29 @@ pub const Scope = struct {
             }
         }
         hash.update(&self.target_schema_digest);
+        if (self.population) |binding| {
+            hash.update("query-population-v1");
+            hash.update(&binding.fingerprint());
+        }
+        if (self.catalog_intent_digest) |intent| {
+            hash.update("sql-catalog-intent-v1");
+            hash.update(&intent);
+        }
+        if (self.frozen_base) |base| {
+            hash.update("frozen-base-v1");
+            hash.update(&base.scope);
+            hash.update(&base.population);
+            hash.update(&base.content);
+            var rows: [8]u8 = undefined;
+            std.mem.writeInt(u64, &rows, base.rows, .little);
+            hash.update(&rows);
+        }
         if (self.preserve_artifacts) hash.update("native-artifact-preservation-v1");
         if (self.empty_generation) hash.update("empty-generation-v1");
+        if (self.native_empty_origin) |origin| {
+            hash.update("native-empty-origin-v1");
+            hash.update(&origin.digestUnchecked());
+        }
         if (self.graph_retirement_digest) |retirement| {
             hash.update("graph-retirement-v1");
             hash.update(&retirement);
@@ -528,9 +644,13 @@ test "sealed portable bootstrap requires source proof even without mapped admiss
 }
 
 pub const Progress = struct {
+    pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
+        return std.mem.eql(u8, name, "population") and self.population == null;
+    }
     scope: Scope,
     phase: Phase = .importing,
     source_generation_proofs_complete: bool = false,
+    population: ?@import("relational/schema_change/population_contract.zig").Cursor = null,
     rows: u64 = 0,
     cursor: []const u8 = "",
     logical_digest: Digest = @splat(0),
@@ -538,9 +658,9 @@ pub const Progress = struct {
     artifacts_complete: bool = false,
     rows_complete: bool = false,
     projection_cursor: []const u8 = "",
-    rewrite: ?@import("relational_rewrite_contract.zig").Progress = null,
+    rewrite: ?@import("relational/schema_change/rewrite_contract.zig").Progress = null,
     pub fn jsonStringify(self: @This(), jw: anytype) @TypeOf(jw.*).Error!void {
-        try @import("relational_integrity_json.zig").write(self, jw);
+        try @import("relational/integrity/json.zig").write(self, jw);
     }
     pub fn encode(self: Progress, alloc: Allocator) ![]u8 {
         try self.validateRewrite();
@@ -567,6 +687,18 @@ pub const Progress = struct {
         return parsed;
     }
     fn validateRewrite(self: Progress) !void {
+        if (self.scope.population) |binding| {
+            if (self.phase != .reserved and !(self.phase == .canceled and self.population == null)) {
+                const cursor = self.population orelse return error.InvalidRestoreStagingCommand;
+                try cursor.validate();
+                if (!std.meta.eql(cursor.transaction_rows, binding.transaction_rows) or !std.mem.eql(u8, &cursor.binding, &try binding.digest()) or cursor.rows != self.rows or
+                    !std.mem.eql(u8, &cursor.chain, &self.logical_digest) or
+                    ((self.phase == .imported or self.phase == .validated or self.phase == .published) and !cursor.sealed) or
+                    (self.phase == .importing and cursor.sealed) or !self.source_generation_proofs_complete or
+                    self.cursor.len != 0 or self.artifact_cursor.len != 0 or self.projection_cursor.len != 0 or
+                    !self.artifacts_complete or self.rows_complete != cursor.sealed) return error.InvalidRestoreStagingCommand;
+            }
+        } else if (self.population != null) return error.InvalidRestoreStagingCommand;
         if (self.scope.empty_generation and (self.phase == .importing or self.rows != 0 or self.cursor.len != 0 or self.artifact_cursor.len != 0 or self.projection_cursor.len != 0 or self.rewrite != null or !std.mem.allEqual(u8, &self.logical_digest, 0))) return error.InvalidRestoreStagingCommand;
         if (self.scope.rewrite) |binding| {
             // Reservations and terminal cancellation may precede initialization.
@@ -582,6 +714,19 @@ pub const Progress = struct {
         hash.update(&self.scope.digest());
         hash.update(@tagName(self.phase));
         hash.update(&self.logical_digest);
+        if (self.population) |cursor| {
+            hash.update("query-population-v1");
+            hash.update(&cursor.binding);
+            var pages: [8]u8 = undefined;
+            std.mem.writeInt(u64, &pages, cursor.pages, .little);
+            hash.update(&pages);
+            hash.update(&.{@intFromBool(cursor.sealed)});
+            if (cursor.source_rows) |source_rows| {
+                var total: [8]u8 = undefined;
+                std.mem.writeInt(u64, &total, source_rows, .little);
+                hash.update(&total);
+            }
+        }
         if (self.rewrite) |rewrite| {
             var sequence: [8]u8 = undefined;
             std.mem.writeInt(u64, &sequence, rewrite.sequence, .little);

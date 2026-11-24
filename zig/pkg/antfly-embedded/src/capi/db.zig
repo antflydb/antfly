@@ -946,6 +946,30 @@ pub const HandleGuard = struct {
     /// off an undurable tip. Only `leave`'s reacquire (which runs after the
     /// ticket this guard is shielding has resolved) may close or hand off
     /// the lease to someone else, exactly as it always has.
+    fn releaseWriterLaneForIndexedWait(self: *HandleGuard) bool {
+        if (!self.lane_managed or !self.connection_gate_held or self.writer_lane_released) return false;
+        self.releaseWriterLaneBeforeWait();
+        return true;
+    }
+
+    fn resumeWriterLaneAfterIndexedWait(self: *HandleGuard) !void {
+        std.debug.assert(self.lane_managed and self.writer_lane_released);
+        const connection = self.connection.?;
+        const io = handleLockIo();
+        connection.mutex.lockUncancelable(io);
+        errdefer connection.mutex.unlock(io);
+        const lane = &connection.owner.writer_lane;
+        const root = try lane.checkout(connection, .mutation);
+        // checkout acquired another pin; the original stays with this guard.
+        defer _ = root.lane_pins.fetchSub(1, .release);
+        if (root != self.lane_pinned_root.?) {
+            lane.checkin(connection, root.owned_lite_backend.?.native_docstore.?);
+            return error.EnrichmentSourceChanged;
+        }
+        self.connection_gate_held = true;
+        self.writer_lane_released = false;
+    }
+
     pub fn releaseWriterLaneBeforeWait(self: *HandleGuard) void {
         const connection = self.connection orelse return;
         if (!self.connection_gate_held or self.writer_lane_released) return;
@@ -990,7 +1014,13 @@ pub const HandleGuard = struct {
         // reacquire below only needs to take `connection.mutex` back.
         if (self.path_lease) |lease| {
             var owned = lease;
+            // The write still runs on this generation after its wait (an
+            // inline index install among it): keep it alive until `leave`,
+            // as `WriterLane.checkout`'s pin does for lane-managed writes.
+            const pinned = if (self.lane_pinned_root == null) connection.current else null;
+            if (pinned) |root| _ = root.lane_pins.fetchAdd(1, .acq_rel);
             if (connection.gate.mutex.retainForWaiter(io, &owned, connection.storeIdentity())) {
+                self.lane_pinned_root = pinned;
                 // Handing the lease to another same-process caller also
                 // hands it the right to call `refresh`/`pin` -> `attach` on
                 // this shared `Connection`, which asserts nothing is
@@ -1006,7 +1036,7 @@ pub const HandleGuard = struct {
                 self.path_lease = null;
                 connection.gate.mutex.unlock(io);
                 self.connection_gate_held = false;
-            }
+            } else if (pinned) |root| _ = root.lane_pins.fetchSub(1, .release);
         }
         if (comptime builtin.is_test) if (test_writer_lane_release_hook) |hook| hook.notify(hook.ptr);
     }
@@ -1166,6 +1196,7 @@ pub const HandleGuard = struct {
             if (guard.read_slot) connection.owner.writer_lane.endRead();
             if (guard.connection_gate_held) connection.gate.mutex.unlock(io);
             if (writer_lane_owes_connection_mutex_release) connection.mutex.unlock(io);
+            if (guard.lane_pinned_root) |pinned| _ = pinned.lane_pins.fetchSub(1, .release);
             return;
         }
         switch (guard.access) {
@@ -1196,6 +1227,18 @@ pub fn writerLaneHookFromGuard(guard: *HandleGuard) @import("../storage/db/execu
             fn run(ptr: *anyopaque) void {
                 const typed: *HandleGuard = @ptrCast(@alignCast(ptr));
                 typed.releaseWriterLaneBeforeWait();
+            }
+        }.run,
+        .release_for_indexed_wait = struct {
+            fn run(ptr: *anyopaque) bool {
+                const typed: *HandleGuard = @ptrCast(@alignCast(ptr));
+                return typed.releaseWriterLaneForIndexedWait();
+            }
+        }.run,
+        .resume_after_indexed_wait = struct {
+            fn run(ptr: *anyopaque) anyerror!void {
+                const typed: *HandleGuard = @ptrCast(@alignCast(ptr));
+                return typed.resumeWriterLaneAfterIndexedWait();
             }
         }.run,
     };
@@ -1507,7 +1550,13 @@ pub fn beginWithIdAndParticipants(
     for (participants, 0..) |*entry, i| {
         entry.* = participants_ptr.?[i].bytes();
     }
-    _ = try handle.database().*.beginTransactionWithIdAndParticipants(txn_id, timestamp_ns, participants);
+    // Preserve the raw C API's policy barrier. The shared producer BEGIN
+    // allows metadata-only admission for authenticated serving paths.
+    var raw_policy_lease = try handle.database().local_execution.row_policy_gate.enterRaw();
+    defer raw_policy_lease.release();
+    // The exported local C API is trusted ordinary ingress. Preserve its
+    // original follower role and terminal-retention behavior.
+    _ = try handle.database().*.beginProducerTransactionScoped(txn_id, timestamp_ns, timestamp_ns, participants, false, false, null, .ordinary);
 }
 
 pub fn writeIntentsInternal(
@@ -1546,6 +1595,7 @@ pub fn writeIntentsInternal(
     }
 
     try handle.database().*.writeTransaction(txn_id, .{
+        .completion_ordinary_producer = true,
         .writes = writes[0..write_len],
         .deletes = deletes.items,
         .predicates = predicates,
@@ -1640,11 +1690,14 @@ pub fn trackedBatchWithWriterLaneHook(
     table_name: ?[]const u8,
     writer_lane_release_before_wait: ?@import("../storage/db/execution_resources.zig").WriterLaneReleaseHook,
 ) anyerror!void {
+    if ((req.source_producer != .unlabelled and req.source_producer != .ordinary) or req.transaction != null or req.online_source != null) return error.SourceTransactionIdentityConflict;
+    var ordinary = req;
+    ordinary.source_producer = .ordinary;
     const receipts = @import("outcome_receipts.zig");
-    const writer = receipts.activeWriter() orelse return database.batchTrackedWithMarkerAndWriterLaneHook(req, primary_committed, null, writer_lane_release_before_wait);
+    const writer = receipts.activeWriter() orelse return database.batchTrackedWithMarkerAndWriterLaneHook(ordinary, primary_committed, null, writer_lane_release_before_wait);
     const named = if (table_name) |name| (if (std.mem.eql(u8, name, "default")) null else name) else null;
     const marker = writer.next(named);
-    database.batchTrackedWithMarkerAndWriterLaneHook(req, primary_committed, marker, writer_lane_release_before_wait) catch |err| {
+    database.batchTrackedWithMarkerAndWriterLaneHook(ordinary, primary_committed, marker, writer_lane_release_before_wait) catch |err| {
         if (!primary_committed.* and antfly.capi_dependencies.sql_errors.isUnknownOutcome(err))
             writer.retire(marker, if (named) |name| .{ .name = name, .id = database.core.identity_namespace.table_id } else null);
         return err;
@@ -3182,6 +3235,7 @@ pub const StorageKind = enum {
 };
 
 pub const LiteResolvedOpenOptions = struct {
+    redo_recovery_base: ?lite_backend.native.RedoRecoveryCursor = null,
     storage_kind: StorageKind = .lite,
     open_mode: db_mod.OpenOptions.OpenMode = .writer,
     profile: lite_backend.Profile = .native,
@@ -3463,6 +3517,7 @@ pub fn openLiteHandleAllocWithSharedInference(
         })
     else
         try lite_backend.Handle.open(alloc, path, .{
+            .redo_recovery_base = resolved.redo_recovery_base,
             .externally_locked = resolved.externally_locked,
             .read_only = resolved.open_mode == .query_readonly or resolved.open_mode == .status_only,
             .no_sync = resolved.no_sync,
@@ -6741,7 +6796,7 @@ const PreparedEmbeddedSql = struct {
     fn init(budget: *EmbeddedSqlBudget, request_json: []const u8) !PreparedEmbeddedSql {
         if (request_json.len > @import("sql.zig").runtime.resource_limits.request_bytes) return error.SqlRequestTooLarge;
         const a = budget.allocator();
-        var parsed = std.json.parseFromSlice(EmbeddedSqlRequest, a, request_json, .{ .allocate = .alloc_always }) catch |err| {
+        var parsed = std.json.parseFromSlice(EmbeddedSqlRequest, a, request_json, .{ .allocate = .alloc_always, .parse_numbers = false }) catch |err| {
             if (err == error.OutOfMemory) {
                 // A request-local program limit is distinct from shared
                 // preparation pressure (or a backing allocator failure).
@@ -10586,6 +10641,167 @@ test "issue1015 concurrent Lite handles sustain primary writes and full-text cat
     for (workers[0..joined]) |worker| if (worker.failure) |err| return err;
 }
 
+test "capi SQL owns composite expression partial declarations and exact NUMERIC domains across restart" {
+    const Test = struct {
+        fn execute(a: Allocator, id: ?*anyopaque, statement: []const u8) !std.json.Value {
+            return executeParameters(a, id, statement, &.{});
+        }
+        fn executeParameters(a: Allocator, id: ?*anyopaque, statement: []const u8, parameters: []const std.json.Value) !std.json.Value {
+            const request = try std.json.Stringify.valueAlloc(a, .{ .statement = statement, .parameters = parameters }, .{});
+            var output: capi.Buffer = .{};
+            defer antfly_buffer_free(&output);
+            const code = antfly_db_sql_json(id, .fromSlice(request), &output);
+            if (code != .ok) std.debug.print("SQL fixture failed: {s}: {s}\n", .{ statement, if (output.ptr) |bytes| bytes[0..output.len] else "no diagnostic" });
+            try std.testing.expectEqual(capi.ErrorCode.ok, code);
+            return std.json.parseFromSliceLeaky(std.json.Value, a, output.ptr.?[0..output.len], .{ .allocate = .alloc_always });
+        }
+        fn reject(a: Allocator, id: ?*anyopaque, statement: []const u8, expected_code: []const u8) !void {
+            const request = try std.json.Stringify.valueAlloc(a, .{ .statement = statement }, .{});
+            var output: capi.Buffer = .{};
+            defer antfly_buffer_free(&output);
+            try std.testing.expect(antfly_db_sql_json(id, .fromSlice(request), &output) != .ok);
+            const diagnostic = try std.json.parseFromSliceLeaky(std.json.Value, a, output.ptr.?[0..output.len], .{ .allocate = .alloc_always });
+            try std.testing.expectEqualStrings(expected_code, diagnostic.object.get("error").?.object.get("code").?.string);
+        }
+        fn checkRow(result: std.json.Value, expected: []const u8) !void {
+            const rows = result.object.get("rows").?.array.items;
+            try std.testing.expectEqual(@as(usize, 1), rows.len);
+            try std.testing.expectEqualStrings(expected, rows[0].array.items[0].string);
+        }
+    };
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var directory = try TestDirectory.init("sql-index-numeric-binding");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    const options: LiteResolvedOpenOptions = .{ .no_sync = true, .profile = .hosted, .busy_timeout_ms = 5000 };
+    const first = try openLiteHandleAlloc(path, options, true);
+    const first_id = try publishHandle(first);
+    defer antfly_db_close(first_id);
+    _ = try Test.execute(a, first_id, "CREATE TABLE invoices (amount NUMERIC(20,4), label TEXT, tenant BIGINT)");
+    _ = try Test.execute(a, first_id, "CREATE TABLE range_values (value numrange, dates daterange, ts tsrange, tz tstzrange)");
+    _ = try Test.execute(a, first_id, "INSERT INTO range_values (_id,value,dates,ts,tz) VALUES ('ranges','[1.00,10.000)'::numrange,'[2025-01-01,2025-02-01]'::daterange,tsrange('2000-01-01 00:00:00','2000-01-02 00:00:00'),tstzrange('2000-01-01T01:00:00+01:00','2000-01-02T00:00:00Z'))");
+    try Test.checkRow(try Test.execute(a, first_id, "SELECT value FROM range_values"), "[1.00,10.000)");
+    _ = try Test.execute(a, first_id, "INSERT INTO invoices (_id,amount,label,tenant) VALUES ('one',9007199254740993.1250,'READY',7)");
+    // A schema CAS alone cannot validate existing rows. The embedded adapter
+    // must not expose tightening through its generic DDL fallback.
+    try Test.reject(a, first_id, "ALTER TABLE invoices ALTER COLUMN amount SET NOT NULL", "0A000");
+    try Test.checkRow(try Test.execute(a, first_id, "SELECT amount FROM invoices"), "9007199254740993.1250");
+    _ = try Test.execute(a, first_id, "CREATE TABLE nullable_columns (id BIGINT NOT NULL DEFAULT 1, g BIGINT GENERATED ALWAYS AS (id+1) STORED)");
+    _ = try Test.execute(a, first_id, "INSERT INTO nullable_columns (_id) VALUES ('one')");
+    _ = try Test.execute(a, first_id, "ALTER TABLE nullable_columns ALTER COLUMN id SET NOT NULL");
+    _ = try Test.execute(a, first_id, "ALTER TABLE nullable_columns ALTER COLUMN id DROP NOT NULL");
+    _ = try Test.execute(a, first_id, "INSERT INTO nullable_columns (_id,id) VALUES ('two',NULL)");
+    try Test.checkRow(try Test.execute(a, first_id, "SELECT g FROM nullable_columns WHERE _id='one'"), "2");
+    _ = try Test.execute(a, first_id, "CREATE INDEX tenant_idx ON invoices(tenant)");
+    _ = try Test.execute(a, first_id, "CREATE INDEX mixed_idx ON invoices(tenant DESC NULLS FIRST,lower(label)) INCLUDE(amount) WHERE tenant>0");
+    try Test.checkRow(try Test.executeParameters(a, first_id, "SELECT amount FROM invoices WHERE tenant=7 AND tenant>0 AND lower(label)=$1", &.{.{ .string = "ready" }}), "9007199254740993.1250");
+    const table = blk: {
+        const guard = enterHandle(first_id, .exclusive).?;
+        defer guard.leave();
+        try std.testing.expect(guard.entry_error == null);
+        var adapter = @import("sql.zig").Adapter(antfly){ .handle = guard.handle, .db = &guard.handle.db, .table_name = "default" };
+        const backend = adapter.backend();
+        const resolved = try backend.vtable.resolve(backend.ptr, a, .{ .table = "invoices" }, .read);
+        const indexed_db = try @import("tables.zig").get(guard.handle, "invoices");
+        for (0..256) |_| {
+            if ((try indexed_db.relationalIndexBuildStatus("mixed_idx")).state == .ready) break;
+            _ = try indexed_db.buildRelationalIndexStep("mixed_idx", .{});
+        }
+        try std.testing.expectEqual(.ready, (try indexed_db.relationalIndexBuildStatus("mixed_idx")).state);
+        break :blk resolved;
+    };
+    try Test.checkRow(try Test.executeParameters(a, first_id, "SELECT amount FROM invoices WHERE tenant=7 AND tenant>0 AND lower(label)=$1", &.{.{ .string = "ready" }}), "9007199254740993.1250");
+    const no_match = try Test.executeParameters(a, first_id, "SELECT amount FROM invoices WHERE tenant=7 AND tenant>0 AND lower(label)=$1", &.{.{ .string = "missing" }});
+    try std.testing.expectEqual(@as(usize, 0), no_match.object.get("rows").?.array.items.len);
+    const amount = try table.column("amount");
+    try std.testing.expectEqual(.numeric, amount.element_type.?);
+    try std.testing.expectEqual(@as(u16, 20), amount.numeric_modifier.?.precision);
+    try std.testing.expectEqual(@as(i16, 4), amount.numeric_modifier.?.scale);
+    try std.testing.expectEqual(@as(usize, 2), table.index_definitions.len);
+    const mixed = table.index_definitions[1];
+    try std.testing.expectEqualStrings("mixed_idx", mixed.name);
+    try std.testing.expectEqualStrings("tenant", mixed.keys[0].column);
+    try std.testing.expectEqual(.desc, mixed.keys[0].direction);
+    try std.testing.expectEqual(.first, mixed.keys[0].nulls);
+    try std.testing.expectEqualStrings("lower_ascii", mixed.keys[1].expression.?.object.get("op").?.string);
+    try std.testing.expectEqualDeep(mixed.keys[1].identity.?, try mixed.keys[1].bindIdentity(a, try table.expressionSchemaLeaky(a)));
+    try std.testing.expectEqualStrings("amount", mixed.include_columns[0]);
+    try std.testing.expectEqualStrings("tenant", mixed.where[0].column);
+    try std.testing.expectEqual(.gt, mixed.where[0].op);
+    _ = try Test.execute(a, first_id, "CREATE INDEX default_label_idx ON invoices(coalesce(label,'empty'))");
+    {
+        const guard = enterHandle(first_id, .exclusive).?;
+        defer guard.leave();
+        const indexed_db = try @import("tables.zig").get(guard.handle, "invoices");
+        for (0..256) |_| {
+            if ((try indexed_db.relationalIndexBuildStatus("default_label_idx")).state == .ready) break;
+            _ = try indexed_db.buildRelationalIndexStep("default_label_idx", .{});
+        }
+        try std.testing.expectEqual(.ready, (try indexed_db.relationalIndexBuildStatus("default_label_idx")).state);
+    }
+    try Test.checkRow(try Test.executeParameters(a, first_id, "SELECT p.amount FROM invoices p CROSS JOIN invoices q WHERE p.tenant=7 AND p.tenant>0 AND lower(p.label)=$1", &.{.{ .string = "ready" }}), "9007199254740993.1250");
+    try Test.checkRow(try Test.executeParameters(a, first_id, "SELECT p.amount FROM invoices p LEFT JOIN invoices q ON true WHERE lower(q.label)=$1", &.{.{ .string = "ready" }}), "9007199254740993.1250");
+    for ([_][]const u8{
+        "SELECT p.amount FROM invoices p LEFT JOIN invoices q ON true WHERE coalesce(q.label,'empty')='empty'",
+        "SELECT p.amount FROM invoices p FULL JOIN invoices q ON true WHERE coalesce(q.label,'empty')='empty'",
+    }) |statement| {
+        const filtered = try Test.execute(a, first_id, statement);
+        try std.testing.expectEqual(@as(usize, 0), filtered.object.get("rows").?.array.items.len);
+    }
+    try Test.checkRow(try Test.execute(a, first_id, "SELECT p.amount FROM invoices p LEFT JOIN invoices q ON coalesce(q.label,'empty')='empty'"), "9007199254740993.1250");
+    _ = try Test.execute(a, first_id, "INSERT INTO invoices (_id,amount,label,tenant) VALUES ('two',2.0000,'OTHER',8)");
+    try Test.checkRow(try Test.execute(a, first_id, "SELECT p.amount FROM invoices p WHERE p._id='one'"), "9007199254740993.1250");
+    try Test.checkRow(try Test.execute(a, first_id, "SELECT p.amount FROM invoices p WHERE p.amount=9007199254740993.1250"), "9007199254740993.1250");
+    try Test.checkRow(try Test.executeParameters(a, first_id, "SELECT amount FROM invoices WHERE amount=$1", &.{.{ .number_string = "9007199254740993.1250" }}), "9007199254740993.1250");
+    try Test.checkRow(try Test.executeParameters(a, first_id, "SELECT p.amount FROM invoices p WHERE p.amount=$1", &.{.{ .number_string = "9007199254740993.1250" }}), "9007199254740993.1250");
+    try Test.checkRow(try Test.executeParameters(a, first_id, "SELECT p.amount FROM (SELECT amount FROM invoices) p WHERE p.amount=$1", &.{.{ .number_string = "9007199254740993.1250" }}), "9007199254740993.1250");
+    try Test.checkRow(try Test.execute(a, first_id, "UPDATE invoices p SET amount=p.amount FROM invoices q WHERE p._id='one' AND q._id='two' AND q.tenant=8 RETURNING p.amount"), "9007199254740993.1250");
+    const numeric_miss = try Test.execute(a, first_id, "SELECT p.amount FROM invoices p WHERE p.amount=9007199254740993.1251");
+    try std.testing.expectEqual(@as(usize, 0), numeric_miss.object.get("rows").?.array.items.len);
+    const limited = try Test.execute(a, first_id, "SELECT p.amount FROM (SELECT amount,label FROM invoices ORDER BY _id LIMIT 1) p WHERE coalesce(p.label,'empty')='OTHER'");
+    try std.testing.expectEqual(@as(usize, 0), limited.object.get("rows").?.array.items.len);
+    const shared = try Test.execute(a, first_id, "WITH c AS MATERIALIZED (SELECT amount,label FROM invoices) SELECT p.amount FROM c p CROSS JOIN c q WHERE lower(p.label)='ready'");
+    try std.testing.expectEqual(@as(usize, 2), shared.object.get("rows").?.array.items.len);
+    try Test.checkRow(try Test.execute(a, first_id, "WITH c AS MATERIALIZED (SELECT amount,label FROM invoices WHERE lower(label)='ready') SELECT p.amount FROM c p CROSS JOIN c q"), "9007199254740993.1250");
+    _ = try Test.execute(a, first_id, "DELETE FROM invoices WHERE _id='two'");
+    try Test.checkRow(try Test.execute(a, first_id, "UPDATE invoices SET amount=amount+0.0001 RETURNING amount"), "9007199254740993.1251");
+    antfly_db_close(first_id);
+    // Retained bindings must not borrow the retired database/schema parser.
+    try std.testing.expectEqualStrings("label", mixed.keys[1].expression.?.object.get("args").?.array.items[0].object.get("column").?.string);
+    const reopened = try openLiteHandleAlloc(path, options, false);
+    const reopened_id = try publishHandle(reopened);
+    defer antfly_db_close(reopened_id);
+    try Test.checkRow(try Test.execute(a, reopened_id, "SELECT amount FROM invoices"), "9007199254740993.1251");
+    try Test.checkRow(try Test.execute(a, reopened_id, "UPDATE invoices SET amount=amount+0.0001 RETURNING amount"), "9007199254740993.1252");
+    try Test.reject(a, reopened_id, "UPDATE invoices SET amount=abs('-9223372036854775808'::bigint)", "22003");
+    try Test.checkRow(try Test.execute(a, reopened_id, "SELECT amount FROM invoices"), "9007199254740993.1252");
+    try Test.reject(a, reopened_id, "UPDATE invoices SET amount='1.2300'::text", "42804");
+    try Test.checkRow(try Test.execute(a, reopened_id, "SELECT amount FROM invoices"), "9007199254740993.1252");
+    // JSON numeric tokens must reach the contextual NUMERIC frame directly,
+    // rather than acquiring binary64 rounding before parameter preparation.
+    try Test.checkRow(try Test.executeParameters(a, reopened_id, "UPDATE invoices SET amount=$1 RETURNING amount", &.{.{ .number_string = "9007199254740993.1253" }}), "9007199254740993.1253");
+    antfly_db_close(reopened_id);
+    const final_owner = try openLiteHandleAlloc(path, options, false);
+    const final_id = try publishHandle(final_owner);
+    defer antfly_db_close(final_id);
+    try Test.checkRow(try Test.execute(a, final_id, "SELECT value FROM range_values"), "[1.00,10.000)");
+    try Test.checkRow(try Test.execute(a, final_id, "SELECT value FROM range_values WHERE value='[1,10)'"), "[1.00,10.000)");
+    try Test.checkRow(try Test.executeParameters(a, final_id, "SELECT value FROM range_values WHERE value=$1::numrange", &.{.{ .string = "[1,10)" }}), "[1.00,10.000)");
+    try Test.checkRow(try Test.execute(a, final_id, "SELECT dates FROM range_values"), "[2025-01-01,2025-02-02)");
+    try Test.checkRow(try Test.execute(a, final_id, "SELECT ts FROM range_values"), "[\"2000-01-01 00:00:00\",\"2000-01-02 00:00:00\")");
+    try Test.checkRow(try Test.execute(a, final_id, "SELECT tz FROM range_values"), "[\"2000-01-01 00:00:00+00\",\"2000-01-02 00:00:00+00\")");
+    try Test.reject(a, final_id, "ALTER TABLE invoices ALTER COLUMN amount SET NOT NULL", "0A000");
+    try Test.checkRow(try Test.execute(a, final_id, "SELECT g FROM nullable_columns WHERE _id='one'"), "2");
+    try Test.checkRow(try Test.execute(a, final_id, "SELECT count(*) FROM nullable_columns WHERE id IS NULL AND g IS NULL"), "1");
+    try Test.checkRow(try Test.execute(a, final_id, "SELECT amount FROM invoices"), "9007199254740993.1253");
+    try Test.checkRow(try Test.executeParameters(a, final_id, "SELECT amount FROM invoices WHERE tenant=7 AND tenant>0 AND lower(label)=$1", &.{.{ .string = "ready" }}), "9007199254740993.1253");
+    try Test.checkRow(try Test.executeParameters(a, final_id, "SELECT p.amount FROM invoices p CROSS JOIN invoices q WHERE p.tenant=7 AND p.tenant>0 AND lower(p.label)=$1", &.{.{ .string = "ready" }}), "9007199254740993.1253");
+}
+
 /// WS3: a single-document write's `sync_level: "write"` batch, through the
 /// same public C ABI entry point an embedder's threads share.
 fn ws3WriterLaneProbeWrite(handle: ?*anyopaque, ordinal: usize, index: usize) !void {
@@ -10914,6 +11130,14 @@ test "WS3 writer lane: a slow fsync forces concurrent writers to share groups" {
 // it continue -- a deterministic window to assert both are actually free,
 // instead of racing real fsync timing.
 test "WS3 writer lane: capi connection locks are free during the primary write's durability wait" {
+    try testWriterLaneDurabilityWait(false);
+}
+
+test "WS3 writer lane: queued sparse publication releases and resumes admission" {
+    try testWriterLaneDurabilityWait(true);
+}
+
+fn testWriterLaneDurabilityWait(indexed: bool) !void {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var directory = try TestDirectory.init("ws3-writer-lane-lock-free-wait");
@@ -10925,6 +11149,12 @@ test "WS3 writer lane: capi connection locks are free during the primary write's
     const create_options: capi.OpenOptions = .{ .storage_kind = capi.storage_kind_lite };
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &create_options, &handle));
     defer antfly_db_close(handle);
+
+    if (indexed) {
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .fromSlice(
+            "{\"name\":\"vec\",\"kind\":\"sparse_vector\",\"config_json\":\"{\\\"field\\\":\\\"embedding\\\",\\\"external\\\":true}\"}",
+        )));
+    }
 
     const entry = HandleEntry.capture(handle).?;
     defer entry.release();
@@ -10946,8 +11176,10 @@ test "WS3 writer lane: capi connection locks are free during the primary write's
     const Probe = struct {
         released: std.Io.Event = .unset,
         proceed: std.Io.Event = .unset,
+        hook_seen: bool = false,
         fn notify(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.hook_seen = true;
             self.released.set(handleLockIo());
             self.proceed.waitUncancelable(handleLockIo());
         }
@@ -10958,16 +11190,21 @@ test "WS3 writer lane: capi connection locks are free during the primary write's
 
     const Writer = struct {
         handle: ?*anyopaque,
+        probe: *Probe,
+        indexed: bool,
         code: capi.ErrorCode = .invalid_argument,
         fn run(self: *@This()) void {
-            var request_buffer: [128]u8 = undefined;
-            const request = std.fmt.bufPrint(&request_buffer, "{{\"inserts\":{{\"k\":{{\"v\":\"probe\"}}}},\"sync_level\":\"write\"}}", .{}) catch unreachable;
+            defer self.probe.released.set(handleLockIo());
+            const request = if (self.indexed)
+                "{\"inserts\":{\"k\":{\"v\":\"probe\",\"_embeddings\":{\"vec\":{\"indices\":[3],\"values\":[1.0]}}}},\"sync_level\":\"full_index\"}"
+            else
+                "{\"inserts\":{\"k\":{\"v\":\"probe\"}},\"sync_level\":\"write\"}";
             var output: capi.Buffer = .{};
             defer antfly_buffer_free(&output);
             self.code = antfly_db_batch_json(self.handle, .{ .ptr = request.ptr, .len = request.len }, &output);
         }
     };
-    var writer: Writer = .{ .handle = handle };
+    var writer: Writer = .{ .handle = handle, .probe = &probe, .indexed = indexed };
     const thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});
 
     probe.released.waitUncancelable(handleLockIo());
@@ -11007,9 +11244,47 @@ test "WS3 writer lane: capi connection locks are free during the primary write's
     // free carries no priority-inversion risk the way it would have under
     // the old per-call retain/handoff design.
     const gate_mutex_free = LockProbe.acquirable(&connection.gate.mutex);
+    const CatalogChange = struct {
+        handle: ?*anyopaque,
+        code: capi.ErrorCode = .invalid_argument,
+
+        fn run(self: *@This()) void {
+            self.code = antfly_db_add_index_json(self.handle, .fromSlice(
+                "{\"name\":\"concurrent_text\",\"kind\":\"full_text\",\"config_json\":\"{}\"}",
+            ));
+        }
+    };
+    var change: CatalogChange = .{ .handle = handle };
+    const catalog_thread = if (indexed and probe.hook_seen)
+        std.Thread.spawn(.{}, CatalogChange.run, .{&change}) catch |err| {
+            probe.proceed.set(handleLockIo());
+            thread.join();
+            return err;
+        }
+    else
+        null;
+    var catalog_entered = false;
+    if (catalog_thread != null) {
+        // The catalog call must own connection admission before the writer
+        // resumes, so the test exercises the former reversed lock order.
+        for (0..1000) |_| {
+            if (!connection.mutex.tryLock()) {
+                catalog_entered = true;
+                break;
+            }
+            connection.mutex.unlock(handleLockIo());
+            handleLockIo().sleep(.fromMilliseconds(1), .awake) catch {};
+        }
+    }
     probe.proceed.set(handleLockIo());
     thread.join();
+    if (catalog_thread) |worker| {
+        worker.join();
+        try std.testing.expect(catalog_entered);
+        try std.testing.expectEqual(capi.ErrorCode.ok, change.code);
+    }
 
+    try std.testing.expect(probe.hook_seen);
     try std.testing.expect(connection_mutex_free);
     try std.testing.expect(gate_mutex_free);
     try std.testing.expectEqual(capi.ErrorCode.ok, writer.code);

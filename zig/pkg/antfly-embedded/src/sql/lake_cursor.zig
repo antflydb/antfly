@@ -46,7 +46,7 @@ pub fn openWithCache(alloc: Allocator, table: catalog.Table, request: catalog.Sc
 /// Fractional equality uses an inclusive superset; the typed residual remains
 /// authoritative. Non-finite/out-of-range operands decline optional pruning.
 fn numericPruning(a: std.mem.Allocator, column: []const u8, op: catalog.Condition.Op, datum: scalar.Datum) !?@import("../serverless/query/lake_stream.zig").Predicate {
-    const numeric = @import("numeric_value.zig");
+    const numeric = @import("numeric/value.zig");
     const Predicate = @import("../serverless/query/lake_stream.zig").Predicate;
     var operator = std.meta.stringToEnum(Predicate.Op, @tagName(op)) orelse return null;
     var integer: i64 = undefined;
@@ -91,7 +91,7 @@ fn typedPruning(a: Allocator, column: catalog.Column, op: catalog.Condition.Op, 
         const datum = try @import("lake_values.zig").comparisonDatum(a, raw, column);
         const number = datum.numeric orelse return null;
         if (number.kind != .finite or number.scale > 38) return null;
-        const coefficient = @import("numeric_value.zig").coefficientAtScale(number.*, number.scale) orelse return null;
+        const coefficient = @import("numeric/value.zig").coefficientAtScale(number.*, number.scale) orelse return null;
         return .{ .column = column.path, .op = operator, .value = .{ .decimal = .{ .coefficient = coefficient, .scale = number.scale, .max_physical_scale = if (column.numeric_modifier) |modifier| std.math.cast(u16, modifier.scale) else null } } };
     }
     if (column.type == .datetime) {
@@ -217,6 +217,7 @@ fn openPinnedMaterializedMode(alloc: Allocator, table: catalog.Table, request: c
     const Stream = @import("../serverless/query/lake_stream.zig").Stream;
     var stream = if (partition != null) try Stream.initMaterialized(alloc, source, columns.items, pruning.items, .{ .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, .{}) else try Stream.init(alloc, source, columns.items, pruning.items, .{ .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, .{});
     errdefer stream.deinit();
+    stream.speculation = request.lake_speculation;
     if (partition) |part| try stream.partitionRows(part.index, part.count);
     stream.identity_only = identity_only;
     if (request.physical_selection) |selection| {
@@ -2226,7 +2227,7 @@ test "lake SQL candidate windows share owned projected reader plans after cursor
 
 test "external lake exact NUMERIC integer pruning retains signed fractional and large boundaries" {
     const a = std.testing.allocator;
-    var work: @import("array_value.zig").Budget = .{};
+    var work: @import("array/value.zig").Budget = .{};
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const cases = [_]struct { text: []const u8, op: catalog.Condition.Op, result_op: @import("../serverless/query/lake_stream.zig").Predicate.Op, integer: i64 }{
@@ -2442,6 +2443,24 @@ test "lake SQL paged publication scans retain one file and split independent ord
     defer counted.close(counted.ptr);
     try std.testing.expectEqual(@as(?u64, 30), try counted.count_rows.?(counted.ptr));
     try std.testing.expectEqual(@as(?u64, null), try counted.count_rows.?(counted.ptr));
+    const IsolatedSweep = struct {
+        fn run(alloc: Allocator, exercise: *const fn (Allocator, catalog.Table, *serving.ServingSource) anyerror!void, table: catalog.Table, source: *serving.ServingSource) !void {
+            // Allocation sweeps require deterministic planning. Exercise the
+            // concurrent path above and below with independent task allocators.
+            const original = source.scanner.shared_reader.?;
+            // Every injected-failure attempt starts from the same cache state.
+            // A previous failed attempt may otherwise warm decoded pages and
+            // reduce the allocation count of the next attempt.
+            var isolated = @import("../serverless/query/lake_serving_cache.zig").Cache.init(std.testing.allocator);
+            defer isolated.deinit();
+            var reader = original.*;
+            reader.cache = &isolated;
+            reader.context.io = null;
+            source.scanner.shared_reader = &reader;
+            defer source.scanner.shared_reader = original;
+            try exercise(alloc, table, source);
+        }
+    };
     const Failure = struct {
         fn run(alloc: Allocator, table: catalog.Table, source: *serving.ServingSource) !void {
             const cursor = try openPinned(alloc, table, .{ .fields = &.{"amount"}, .limit = 1024 }, .{}, source);
@@ -2453,11 +2472,11 @@ test "lake SQL paged publication scans retain one file and split independent ord
             }
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Failure.run, .{ lake.table, &lake.source });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, IsolatedSweep.run, .{ Failure.run, lake.table, &lake.source });
     // Tiny inventories use private bounded views, leaving the source unchanged.
     navigation.order = order[0..2];
     lake.source.file_navigation.?.count = 2;
-    try std.testing.checkAllAllocationFailures(a, Failure.run, .{ lake.table, &lake.source });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, IsolatedSweep.run, .{ Failure.run, lake.table, &lake.source });
     const Small = struct {
         fn run(alloc: Allocator, table: catalog.Table, source: *serving.ServingSource) !void {
             const cursor = try openPinned(alloc, table, .{ .fields = &.{"amount"}, .limit = 1024 }, .{}, source);
@@ -2481,25 +2500,9 @@ test "lake SQL paged publication scans retain one file and split independent ord
             };
             try std.testing.expectEqual(@as(usize, 6), rows_seen);
         }
-        fn failureRun(alloc: Allocator, table: catalog.Table, source: *serving.ServingSource) !void {
-            // Allocation sweeps require deterministic planning. Exercise the
-            // concurrent path above and below with independent task allocators.
-            const original = source.scanner.shared_reader.?;
-            // Every injected-failure attempt starts from the same cache state.
-            // A previous failed attempt may otherwise warm decoded pages and
-            // reduce the allocation count of the next attempt.
-            var isolated = @import("../serverless/query/lake_serving_cache.zig").Cache.init(std.testing.allocator);
-            defer isolated.deinit();
-            var reader = original.*;
-            reader.cache = &isolated;
-            reader.context.io = null;
-            source.scanner.shared_reader = &reader;
-            defer source.scanner.shared_reader = original;
-            try run(alloc, table, source);
-        }
     };
     try Small.run(a, lake.table, &lake.source);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Small.failureRun, .{ lake.table, &lake.source });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, IsolatedSweep.run, .{ Small.run, lake.table, &lake.source });
     // One independently produced Parquet file still exposes multiple workers.
     var single: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
     try single.populateData(a, 1, @embedFile("../serverless/query/testdata/pyarrow_plain_nullable_snappy.parquet"));
@@ -3164,4 +3167,66 @@ test "lake SQL bounded window profiles selected small chunks avoid separate head
         calls[i] = lake.meter.reads;
     }
     try std.testing.expectEqual(calls[1] + 1, calls[0]);
+}
+
+test "lake SQL typed composite batching measures projected Parquet bytes" {
+    const a = std.testing.allocator;
+    var tenant: [1024]i64 = undefined;
+    var time: [1024]i64 = undefined;
+    var payload: [1024]i64 = undefined;
+    for (&tenant, &time, &payload, 0..) |*key, *ts, *value, i| {
+        key.* = @intCast(i / 512);
+        ts.* = @as(i64, @intCast(i % 512)) * std.time.us_per_s;
+        value.* = @intCast(i);
+    }
+    const data = try @import("../serverless/query/lake_parquet_rowgroup.zig").buildTestPlainI64ParquetObjectAlloc(a, &.{
+        .{ .column_id = "tenant", .values = &tenant, .field_id = 1, .page_rows = 128, .write_statistics = true },
+        .{ .column_id = "observed", .values = &time, .field_id = 2, .converted_type = 10, .page_rows = 128, .write_statistics = true },
+        .{ .column_id = "payload", .values = &payload, .field_id = 3, .page_rows = 128 },
+    });
+    defer a.free(data);
+    var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+    try lake.populateData(a, 1, data);
+    defer lake.deinit(a);
+    lake.table.columns = &.{
+        .{ .name = "tenant", .path = "tenant", .type = .integer },
+        .{ .name = "observed", .path = "observed", .type = .datetime },
+        .{ .name = "payload", .path = "payload", .type = .integer },
+    };
+    const first: std.json.Value = .{ .string = "1970-01-01T00:00:05Z" };
+    const last: std.json.Value = .{ .string = "1970-01-01T00:00:12Z" };
+    const keys: []const []const u8 = &.{ "tenant", "observed" };
+    const fields: []const []const u8 = &.{ "tenant", "observed", "payload" };
+    const scan = struct {
+        fn count(alloc: Allocator, fixture: *TestLake, columns: []const []const u8, conditions: []const catalog.Condition) !usize {
+            const cursor = try openPinned(alloc, fixture.table, .{ .fields = columns, .conditions = conditions, .limit = 4 }, .{}, &fixture.source);
+            defer cursor.close(cursor.ptr);
+            var seen: usize = 0;
+            while (true) {
+                const page = try cursor.next(cursor.ptr, alloc, 4);
+                defer page.deinit();
+                seen += page.rows.len;
+                if (page.after == null) return seen;
+            }
+        }
+    };
+    for ([_]std.json.Value{ first, last }) |key| {
+        try std.testing.expectEqual(@as(usize, 1), try scan.count(a, &lake, fields, &.{
+            .{ .column = "tenant", .op = .eq, .value = .{ .integer = 0 } },
+            .{ .column = "observed", .op = .eq, .value = key },
+        }));
+    }
+    const point_bytes = lake.meter.bytes;
+    const range: []const catalog.Condition = &.{
+        .{ .column = "tenant", .op = .eq, .value = .{ .integer = 0 } },
+        .{ .column = "observed", .op = .gte, .value = first },
+        .{ .column = "observed", .op = .lte, .value = last },
+    };
+    try std.testing.expectEqual(@as(usize, 8), try scan.count(a, &lake, fields, range));
+    const batch_bytes = lake.meter.bytes - point_bytes;
+    try std.testing.expectEqual(@as(usize, 8), try scan.count(a, &lake, keys, range));
+    const keys_bytes = lake.meter.bytes - point_bytes - batch_bytes;
+    std.debug.print("typed composite scan bytes: points={d} (2 cursors), rows={d} (1 cursor), keys={d} (1 cursor)\n", .{ point_bytes, batch_bytes, keys_bytes });
+    try std.testing.expect(batch_bytes < point_bytes);
+    try std.testing.expect(keys_bytes < batch_bytes);
 }

@@ -41,6 +41,8 @@ pub const backend_runtime_request_forward: u32 = 32;
 /// Request/deadline, nested connect/deadline, and socket operation/deadline.
 /// Admission reserves the complete HTTP/1 task graph before sending a byte.
 pub const request_forward_workers_per_request: u32 = 6;
+/// SQL also schedules the synchronous peer client on the reserved lane.
+pub const sql_request_forward_workers_per_request: u32 = request_forward_workers_per_request + 1;
 pub const backend_runtime_raft_inbound: u32 = 32;
 pub const backend_runtime_raft_outbound: u32 = 32;
 pub const backend_runtime_inference: u32 = 48;
@@ -90,7 +92,7 @@ pub const BackendRuntimeLaneLimits = struct {
     pub fn validate(self: @This()) !void {
         if (self.durable_background == 0 or self.durable_background > backend_runtime_aggregate or
             self.api == 0 or self.api > backend_runtime_aggregate or
-            self.request_forward < request_forward_workers_per_request or self.request_forward > backend_runtime_aggregate or
+            self.request_forward < sql_request_forward_workers_per_request or self.request_forward > backend_runtime_aggregate or
             self.raft_inbound == 0 or self.raft_inbound > backend_runtime_aggregate or
             self.raft_outbound == 0 or self.raft_outbound > backend_runtime_aggregate or
             self.inference == 0 or self.inference > backend_runtime_aggregate or
@@ -123,6 +125,11 @@ pub fn initServerlessObjectStore(alloc: std.mem.Allocator) std.Io.Threaded {
 }
 
 test "threaded io worker reservations share the aggregate lane budget" {
+    var undersized = BackendRuntimeLaneLimits{ .request_forward = request_forward_workers_per_request };
+    try std.testing.expectError(error.InvalidBackendRuntimeLaneLimits, undersized.validate());
+    undersized.request_forward = sql_request_forward_workers_per_request;
+    try undersized.validate();
+
     var limits = BackendRuntimeLaneLimits{};
     const fixed_lanes = limits.total() - limits.worker_capacity;
     limits.worker_capacity = @intCast(backend_runtime_aggregate - fixed_lanes);

@@ -185,6 +185,13 @@ test "external lake owned serving retries a remotely durable write after native 
     const payload = "{\"batch_id\":\"first\",\"source\":\"test\",\"epoch\":\"1\",\"checkpoint\":\"1\",\"key_fields\":[\"id\"],\"changes\":[{\"op\":\"upsert\",\"row\":{\"id\":1}}]}";
     try std.testing.expectError(error.LakeCommitOutcomeUnknown, ingestion.accept(a, binding, options, .{}, payload));
     try std.testing.expectEqual(@as(?u64, 1), ack.lsn);
+    const batch = try std.json.parseFromSliceLeaky(ingestion.Batch, a, payload, .{});
+    const observed = (try ingestion.observeBatch(a, binding, options, .{}, batch)).?;
+    try std.testing.expectEqual(ingestion.BatchOutcome{ .accepted_sequence = 1, .committed = false }, observed);
+    try std.testing.expectEqual(@as(usize, 1), ack.calls);
+    var stale = options;
+    stale.native_owner.?.token = @splat(2);
+    try std.testing.expectError(error.LakeSourceOwnerRequired, ingestion.observeBatch(a, binding, stale, .{}, batch));
     // An exact retry repeats the native acknowledgement, never the WAL append.
     try std.testing.expectEqual(@as(u64, 1), try ingestion.accept(a, binding, options, .{}, payload));
     try std.testing.expectEqual(@as(usize, 2), ack.calls);

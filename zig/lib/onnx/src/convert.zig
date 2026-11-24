@@ -467,6 +467,18 @@ pub const Model = struct {
         dim_overrides: ?*const DimOverrides,
         input_shapes: ?*const std.StringHashMapUnmanaged(Shape),
     ) ConvertError!ConvertResult {
+        return self.convertToGraphWithBindings(allocator, dim_overrides, input_shapes, null);
+    }
+
+    pub const BooleanBinding = struct { name: []const u8, value: bool };
+
+    pub fn convertToGraphWithBindings(
+        self: *Model,
+        allocator: std.mem.Allocator,
+        dim_overrides: ?*const DimOverrides,
+        input_shapes: ?*const std.StringHashMapUnmanaged(Shape),
+        boolean: ?BooleanBinding,
+    ) ConvertError!ConvertResult {
         const onnx_graph = self.graph() orelse return error.OutputNotFound;
 
         var inference_graph = Graph.init(allocator);
@@ -486,6 +498,12 @@ pub const Model = struct {
 
             const shape = (if (input_shapes) |shapes| shapes.get(input.name) else null) orelse
                 inputShapeWithOverrides(input, dim_overrides) orelse Shape.init(.f32, &.{1});
+            if (boolean) |binding| if (std.mem.eql(u8, input.name, binding.name)) {
+                if (shape.dtype != .bool_ or shape.numElements() != 1) return error.ShapeMismatch;
+                const value = [_]u8{@intFromBool(binding.value)};
+                try converted.put(allocator, input.name, try builder.tensorConstBytes(&value, shape));
+                continue;
+            };
             const node_id = try builder.parameter(input.name, shape);
             try converted.put(allocator, input.name, node_id);
             try param_names.append(allocator, input.name);
@@ -607,7 +625,7 @@ pub const Model = struct {
         try converted.put(allocator, name, null_node);
         errdefer _ = converted.remove(name);
 
-        if (node.inputs.len > 16 or node.outputs.len > 8) return error.UnsupportedOp;
+        if (node.inputs.len > 16) return error.UnsupportedOp;
 
         // Recursively convert all inputs (up to 16 for ops like BatchNorm with 5)
         var input_ids: [16]NodeId = @splat(null_node);
@@ -637,9 +655,29 @@ pub const Model = struct {
         // Pass the parent `converted` map as an outer scope so that
         // If/Loop/Scan bodies can resolve implicit captures by name.
         const num_inputs = @min(node.inputs.len, 16);
-        var extra_outputs: [7]NodeId = @splat(null_node);
-        const extra_slice = if (node.outputs.len > 1) extra_outputs[0..@min(node.outputs.len - 1, 7)] else extra_outputs[0..0];
-        const parent_scope = ops.NameScope{ .map = converted };
+        const extra_count = node.outputs.len -| 1;
+        var inline_extras: [7]NodeId = undefined;
+        const extra_slice = if (extra_count <= inline_extras.len) inline_extras[0..extra_count] else try allocator.alloc(NodeId, extra_count);
+        defer if (extra_count > inline_extras.len) allocator.free(extra_slice);
+        @memset(extra_slice, null_node);
+        const Capture = struct {
+            model: *Model,
+            allocator: std.mem.Allocator,
+            builder: *Builder,
+            converted: *std.StringHashMapUnmanaged(NodeId),
+            names: *std.ArrayListUnmanaged([]const u8),
+            graph: *const GraphProto,
+
+            fn resolve(raw: *anyopaque, captured: []const u8) ops.ConvertError!NodeId {
+                const ctx: *@This() = @ptrCast(@alignCast(raw));
+                return ctx.model.recursiveConvert(ctx.allocator, ctx.builder, ctx.converted, ctx.names, ctx.graph, captured) catch |err| switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => error.MissingInput,
+                };
+            }
+        };
+        var capture: Capture = .{ .model = self, .allocator = allocator, .builder = builder, .converted = converted, .names = param_names, .graph = onnx_graph };
+        const parent_scope = ops.NameScope{ .map = converted, .capture = .{ .context = &capture, .resolve = Capture.resolve } };
         const result_id = ops.convertNodeWithScope(
             allocator,
             builder,

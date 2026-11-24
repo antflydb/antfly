@@ -1154,7 +1154,7 @@ test "model program real Whisper resident full-window banks and first decode mat
         }
         const tokens = [_]i64{ cfg.decoder_start_token_id, cfg.bos_token_id, cfg.eos_token_id, cfg.decoder_start_token_id };
         for ([_]usize{ 3, 4 }) |length| {
-            const actual = try decoder.encoderDecoderText(tokens[0..length], hidden, mask, a, DecoderQualification.control);
+            const actual = try decoder.encoderDecoderSuffix(.{ .position = decoder.position, .tokens = tokens[decoder.position..length] }, hidden, mask, a, DecoderQualification.control);
             defer a.free(actual);
             {
                 const state = decoder.resident.?;
@@ -1182,7 +1182,7 @@ test "model program real Whisper resident full-window banks and first decode mat
             if (length == 4) {
                 var fresh = (try DecoderQualification.Decoder.initEncoderDecoder(a, session, rows, true, DecoderQualification.control)).?;
                 defer fresh.deinit();
-                const fresh_logits = try fresh.encoderDecoderText(tokens[0..length], hidden, mask, a, DecoderQualification.control);
+                const fresh_logits = try fresh.encoderDecoderSuffix(.{ .position = 0, .tokens = tokens[0..length] }, hidden, mask, a, DecoderQualification.control);
                 defer a.free(fresh_logits);
                 var native_backend = try factory.getComputeBackend(session, a);
                 defer native_backend.deinit();

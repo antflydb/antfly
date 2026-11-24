@@ -195,9 +195,8 @@ fn readInto(source: *media.source.Source, offset: u64, out: []u8) !void {
     }
 }
 
-/// Codec adapters share one borrowed PCM provider. Source-backed MP4 AAC-LC
-/// uses bounded seeks; other codec/container profiles use a bounded input spool
-/// and a forward codec-block queue, never a full decoded PCM copy.
+/// Codec adapters share one borrowed PCM provider. MP4 AAC and WebM
+/// audio use source-backed packet indexes.
 pub const Track = struct {
     allocator: std.mem.Allocator,
     control: @import("../execution_control.zig").InferenceExecutionControl = .{},
@@ -210,32 +209,79 @@ pub const Track = struct {
     cached: ?*@import("media_index_cache.zig").Cache.Entry = null,
     seek: ?@import("media_audio_seek.zig").Index = null,
     seek_reader: @import("media_audio_seek.zig").Reader = undefined,
+    range_source: ?*media.source.Source = null,
     pub fn init(a: std.mem.Allocator, source: *media.source.Source, control: @import("../execution_control.zig").InferenceExecutionControl, max_bytes: usize, max_packets: usize) !Track {
         return initCached(a, source, control, max_bytes, max_packets, null, null);
     }
+    /// Take ownership of an existing cache pin.
+    pub fn fromCachedAudio(a: std.mem.Allocator, source: *media.source.Source, control: @import("../execution_control.zig").InferenceExecutionControl, cache: *@import("media_index_cache.zig").Cache, entry: *@import("media_index_cache.zig").Cache.Entry) Track {
+        return .{ .allocator = a, .control = control, .cache = cache, .cached = entry, .seek_reader = .{ .index = &entry.data.audio, .source = source, .control = control } };
+    }
+
+    pub fn initObservedWebm(a: std.mem.Allocator, source: *media.source.Source, control: @import("../execution_control.zig").InferenceExecutionControl, max_bytes: usize, max_packets: usize, cache: ?*@import("media_index_cache.zig").Cache, admission: ?@import("media_index_cache.zig").Cache.Admission, builder: *media.webm_audio.DirectoryBuilder, directory_bytes: usize, flight_held: bool) !Track {
+        var self = Track{ .allocator = a, .cache = cache, .control = control };
+        errdefer self.deinit();
+        try control.check();
+        const identity = @import("media_index_cache.zig").Cache.audioKey(source, .embedded, max_packets, max_bytes);
+        if (self.bindCached(source, null, identity)) return self;
+        const directory = try builder.borrowDirectory();
+        const flight = if (!flight_held and admission != null) if (identity) |key| if (cache) |retained| try retained.acquireBuild(key, control) else null else null else null;
+        defer if (flight) |lease| lease.deinit();
+        if (flight != null and self.bindCached(source, null, identity)) return self;
+        const check = control.imageWorkControl();
+        const scope = audio.work_control.Scope.enter(.{ .context = check.context, .check_fn = check.check_fn });
+        defer scope.deinit();
+        const Seek = @import("media_audio_seek.zig").Index;
+        const quota: ?Seek.Admission = if (admission) |value| .{ .context = value.context, .acquire = value.acquire } else null;
+        const index = try Seek.initWebmDirectory(a, directory, source, max_packets, max_bytes, directory_bytes, quota);
+        self.installRangeWebm(source, index, identity, admission);
+        return self;
+    }
+
+    fn installRangeWebm(self: *Track, source: *media.source.Source, index: @import("media_audio_seek.zig").Index, identity: ?[32]u8, admission: ?@import("media_index_cache.zig").Cache.Admission) void {
+        self.seek = index;
+        self.range_source = source;
+        const cache = self.cache orelse return;
+        _ = cache.audio_builds.fetchAdd(1, .monotonic);
+        if (identity) |key| if (admission) |admit| cache.remember(std.heap.smp_allocator, key, .{ .audio = index }, admit);
+    }
+
+    fn bindCached(self: *Track, source: *media.source.Source, aac: ?[32]u8, audio_index: ?[32]u8) bool {
+        const cache = self.cache orelse return false;
+        if (aac) |key| if (cache.get(key)) |hit| {
+            self.cached = hit;
+            self.mp4 = hit.data.aac.reader(self.allocator, source);
+            return true;
+        };
+        if (audio_index) |key| if (cache.get(key)) |hit| {
+            self.cached = hit;
+            self.seek_reader = .{ .index = &hit.data.audio, .source = source, .control = self.control };
+            return true;
+        };
+        return false;
+    }
+
     pub fn initCached(a: std.mem.Allocator, source: *media.source.Source, control: @import("../execution_control.zig").InferenceExecutionControl, max_bytes: usize, max_packets: usize, cache: ?*@import("media_index_cache.zig").Cache, admission: ?@import("media_index_cache.zig").Cache.Admission) !Track {
         var self = Track{ .allocator = a, .cache = cache, .control = control };
         errdefer self.deinit();
         try control.check();
         const identity = @import("media_index_cache.zig").Cache.aacKey(source, max_packets, max_bytes);
-        const flight = if (identity) |key| if (cache) |retained| try retained.acquireBuild(key, control) else null else null;
+        const audio_identity = @import("media_index_cache.zig").Cache.audioKey(source, .embedded, max_packets, max_bytes);
+        if (self.bindCached(source, identity, audio_identity)) return self;
+        const flight = if (admission != null) if (audio_identity orelse identity) |key| if (cache) |retained| lease: {
+            if (!source.optional_range) break :lease try retained.acquireBuild(key, control);
+            if (try retained.tryAcquireBuild(key, control)) |acquired| break :lease acquired;
+            if (self.bindCached(source, identity, audio_identity)) return self;
+            return error.OptionalAudioBudgetExceeded;
+        } else null else null else null;
         defer if (flight) |lease| lease.deinit();
-        if (identity) |key| if (cache) |retained| if (retained.get(key)) |hit| {
-            self.cached = hit;
-            self.mp4 = hit.data.aac.reader(a, source);
-            return self;
-        };
-        const audio_identity = @import("media_index_cache.zig").Cache.audioKey(source, max_packets, max_bytes);
-        const audio_flight = if (audio_identity) |key| if (cache) |retained| try retained.acquireBuild(key, control) else null else null;
-        defer if (audio_flight) |lease| lease.deinit();
-        if (audio_identity) |key| if (cache) |retained| if (retained.get(key)) |hit| {
-            self.cached = hit;
-            self.seek_reader = .{ .index = &hit.data.audio, .source = source, .control = control };
-            return self;
-        };
-        var prefix: [4]u8 = undefined;
+        if (flight != null and self.bindCached(source, identity, audio_identity)) return self;
         if (source.length() < 4) return error.UnsupportedAudioFormat;
-        try readInto(source, 0, &prefix);
+        const prefix = sniff: {
+            var lease = try source.readSparse(0, 4);
+            defer lease.deinit();
+            break :sniff lease.bytes[0..4].*;
+        };
         if (!std.mem.eql(u8, &prefix, "\x1a\x45\xdf\xa3")) {
             self.mp4 = Mp4.init(a, source, @min(64 * 1024 * 1024, max_bytes), max_packets) catch |err| switch (err) {
                 error.UnsupportedAudioFormat, error.UnsupportedStreamingAudioProfile => null,
@@ -246,6 +292,15 @@ pub const Track = struct {
                 if (identity) |key| if (cache) |retained| if (admission) |admit| retained.remember(std.heap.smp_allocator, key, .{ .aac = owner }, admit);
                 return self;
             }
+        }
+        if (source.storage == .range and std.mem.eql(u8, &prefix, "\x1a\x45\xdf\xa3")) {
+            const check = control.imageWorkControl();
+            const scope = audio.work_control.Scope.enter(.{ .context = check.context, .check_fn = check.check_fn });
+            defer scope.deinit();
+            const quota: ?@import("media_audio_seek.zig").Index.Admission = if (admission) |value| .{ .context = value.context, .acquire = value.acquire } else null;
+            const index = try @import("media_audio_seek.zig").Index.initWebmSource(a, source, max_packets, max_bytes, quota);
+            self.installRangeWebm(source, index, audio_identity, admission);
+            return self;
         }
         const length = std.math.cast(usize, source.length()) orelse return error.AudioTooLarge;
         if (length > max_bytes) return error.AudioTooLarge;
@@ -283,7 +338,7 @@ pub const Track = struct {
     pub fn provider(self: *Track) providers.Provider {
         if (self.mp4) |*owner| return owner.provider();
         if (self.seek) |*index| {
-            self.seek_reader = .{ .index = index, .bytes = self.bytes.?, .control = self.control };
+            self.seek_reader = .{ .index = index, .source = self.range_source, .bytes = self.bytes orelse &.{}, .control = self.control };
             return self.seek_reader.provider();
         }
         if (self.cached != null) return self.seek_reader.provider();

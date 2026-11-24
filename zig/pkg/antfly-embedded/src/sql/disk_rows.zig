@@ -30,7 +30,10 @@ pub const Integers = struct {
     pub fn init(manager: *spill.Manager) !Integers {
         var file = try manager.create();
         errdefer file.close();
-        return .{ .file = file, .buffer = try manager.alloc.alloc(u8, @min(4096, @max(128, manager.max_record_bytes / 16))) };
+        const budget = @min(4096, @max(128, @min(manager.buffer_bytes, manager.max_record_bytes / 16)));
+        // Each disk slot is a u64, so it must fit within one buffer page.
+        const capacity = budget & ~@as(usize, 7);
+        return .{ .file = file, .buffer = try manager.alloc.alloc(u8, capacity) };
     }
     pub fn deinit(self: *Integers) void {
         self.file.manager.alloc.free(self.buffer);

@@ -1917,7 +1917,7 @@ pub const EmbeddingStageControl = struct {
     /// live_inputs or the caller request is stored by a cache or late owner.
     cache_inputs_fn: ?*const fn (*anyopaque, *const ComputeBackend, *EmbeddingCacheInputs) anyerror!EmbeddingCacheScope = null,
     cache_handoff_fn: ?*const fn (*anyopaque, *CT) anyerror!void = null,
-    video_cache_fn: ?*const fn (*anyopaque, *const ComputeBackend, []const u8, usize) anyerror!EmbeddingCacheScope = null,
+    video_cache_fn: ?*const fn (*anyopaque, *const ComputeBackend, *const @import("cuda/video.zig").PreparedEmbedding, usize) anyerror!EmbeddingCacheScope = null,
     video_consumer_fn: ?*const fn (*anyopaque, *const ComputeBackend) anyerror!EmbeddingCacheScope = null,
     image_cache_fn: ?*const fn (*anyopaque, *const ComputeBackend, EmbeddingImageCacheRequest, []const *CT) anyerror!EmbeddingCacheScope = null,
     vision_cache_fn: ?*const fn (*anyopaque, *const ComputeBackend, EmbeddingVisionCacheRequest, []const *CT) anyerror!EmbeddingCacheScope = null,
@@ -1927,9 +1927,9 @@ pub const EmbeddingStageControl = struct {
     /// Marks the actual synchronous cuvid consumer boundary. Only a scope
     /// already bound before this call may supply frontend cache admissions;
     /// a newly introduced cold window must never release its live decoder.
-    pub fn videoCache(self: *const @This(), cb: *const ComputeBackend, bytes: []const u8, max_tokens: usize) !EmbeddingCacheScope {
+    pub fn videoCache(self: *const @This(), cb: *const ComputeBackend, prepared: *const @import("cuda/video.zig").PreparedEmbedding, max_tokens: usize) !EmbeddingCacheScope {
         const run = self.video_cache_fn orelse return .{};
-        return run(self.ptr, cb, bytes, max_tokens);
+        return run(self.ptr, cb, prepared, max_tokens);
     }
     pub fn videoConsumer(self: *const @This(), cb: *const ComputeBackend) !EmbeddingCacheScope {
         const run = self.video_consumer_fn orelse return .{};
@@ -3621,6 +3621,8 @@ pub const ComputeBackend = struct {
         /// lookup; publication snapshots a completed value and returns a new
         /// caller-owned handle. Keys describe immutable model computations.
         modelConstant: ?*const fn (ctx: *anyopaque, key: []const u8, value: ?CT) anyerror!?CT = null,
+        /// Upload a snapshot that may be used only as a read-only operand.
+        fromReadOnlyBytes: ?*const fn (*anyopaque, []const u8, GraphDType, []const i64) anyerror!?CT = null,
         fromConstantBytes: ?*const fn (ctx: *anyopaque, data: []const u8, dtype: GraphDType, shape: []const i64) anyerror!?CT = null,
 
         /// Copy tensor data to a caller-owned f32 slice.
@@ -6060,6 +6062,11 @@ pub const ComputeBackend = struct {
         // but a canceled consumer must release its handle and return no value.
         try self.checkExecutionControl();
         return result;
+    }
+
+    pub fn fromReadOnlyBytes(self: *const ComputeBackend, data: []const u8, dtype: GraphDType, shape: []const i64) !?CT {
+        if (self.vtable.fromReadOnlyBytes) |op| if (try op(self.ptr, data, dtype, shape)) |value| return value;
+        return self.fromConstantBytes(data, dtype, shape);
     }
 
     pub fn fromConstantBytes(self: *const ComputeBackend, data: []const u8, dtype: GraphDType, shape: []const i64) !?CT {

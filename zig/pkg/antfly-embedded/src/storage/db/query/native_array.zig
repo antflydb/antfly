@@ -16,8 +16,8 @@
 //! Borrowed projection of an admitted flat SQL-array payload. No element vector
 //! or JSON envelope is materialized; only the selected scalar may own scratch.
 const std = @import("std");
-const storage = @import("../../../sql/array_storage.zig");
-const arrays = @import("../../../sql/array_value.zig");
+const storage = @import("../../../sql/array/storage.zig");
+const arrays = @import("../../../sql/array/value.zig");
 const A = std.mem.Allocator;
 pub const Part = enum { whole, dimensions, values, sql_nulls };
 const Counter = struct {
@@ -123,10 +123,10 @@ pub const Prepared = struct {
         return n;
     }
     pub fn value(self: *const Prepared, a: A, index: usize) !std.json.Value {
-        var ctx: @import("../../../sql/numeric_value.zig").Context = .{ .alloc = a, .remaining = (arrays.Limits{}).work };
+        var ctx: @import("../../../sql/numeric/value.zig").Context = .{ .alloc = a, .remaining = (arrays.Limits{}).work };
         return self.valueWithContext(a, index, &ctx);
     }
-    fn valueWithContext(self: *const Prepared, a: A, index: usize, ctx: *@import("../../../sql/numeric_value.zig").Context) !std.json.Value {
+    fn valueWithContext(self: *const Prepared, a: A, index: usize, ctx: *@import("../../../sql/numeric/value.zig").Context) !std.json.Value {
         const cell = try self.view.cell(index);
         if (cell.sql_null) return .null;
         return switch (self.view.kind) {
@@ -139,8 +139,8 @@ pub const Prepared = struct {
             .float32 => float(@as(f32, @bitCast(std.mem.readInt(u32, cell.bytes[0..4], .little)))),
             .float64 => float(@bitCast(std.mem.readInt(u64, cell.bytes[0..8], .little))),
             .numeric => blk: {
-                const numeric = @import("../../../sql/numeric_value.zig");
-                var decoded = try @import("../../../sql/numeric_binary.zig").decodeCanonical(ctx, cell.bytes);
+                const numeric = @import("../../../sql/numeric/value.zig");
+                var decoded = try @import("../../../sql/numeric/binary.zig").decodeCanonical(ctx, cell.bytes);
                 defer decoded.deinit();
                 break :blk .{ .string = try numeric.format(ctx, decoded.value) };
             },
@@ -165,7 +165,7 @@ pub const Prepared = struct {
         try writer.writeByte('[');
         var scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(a));
         defer scratch.deinit();
-        var ctx: @import("../../../sql/numeric_value.zig").Context = .{ .alloc = scratch.allocator(), .remaining = (arrays.Limits{}).work };
+        var ctx: @import("../../../sql/numeric/value.zig").Context = .{ .alloc = scratch.allocator(), .remaining = (arrays.Limits{}).work };
         for (0..self.length(part)) |i| {
             if (i != 0) try writer.writeByte(',');
             switch (part) {
@@ -209,13 +209,13 @@ test "public graph metric borrowed wire borrowed SQL arrays preserve PostgreSQL 
         const bytes = try a.alloc(u8, entry.binary.len / 2);
         defer a.free(bytes);
         _ = try std.fmt.hexToBytes(bytes, entry.binary);
-        var decoded = try @import("../../../sql/array_binary.zig").decode(a, entry.element_type, bytes, .{});
+        var decoded = try @import("../../../sql/array/binary.zig").decode(a, entry.element_type, bytes, .{});
         defer decoded.deinit();
         const stored = try storage.encodeAlloc(a, decoded.value, .{});
         defer a.free(stored);
         var admitted = try storage.decode(a, entry.element_type, stored, .{});
         defer admitted.deinit();
-        const expected = try @import("../../../sql/array_wire.zig").encodeAlloc(a, admitted.value, .{});
+        const expected = try @import("../../../sql/array/wire.zig").encodeAlloc(a, admitted.value, .{});
         defer a.free(expected);
         const Check = struct {
             fn run(scratch: A, kind: arrays.ElementType, raw: []const u8, want: []const u8) !void {

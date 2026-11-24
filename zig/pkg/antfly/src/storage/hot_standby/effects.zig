@@ -24,6 +24,9 @@ const codecs = @import("antfly_local_sources").storage_db_replication_effects;
 const Allocator = std.mem.Allocator;
 const change_journal = @import("antfly_local_sources").storage_db_derived_change_journal;
 pub const primary_effect = codecs.primary_effect;
+pub const schema_owner_control = codecs.schema_owner_control;
+const publication_control = codecs.publication_control;
+const Namespace = @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace;
 const db_types = @import("antfly_local_sources").storage_db_types;
 const primary_mod = @import("primary.zig");
 const replication_record = @import("antfly_local_sources").storage_db_replication_record;
@@ -129,14 +132,32 @@ pub fn appendSchemaMetadataMutation(
     return try appendEncodedSchemaMetadataMutation(primary, payload, options);
 }
 
+/// Shared by append and recovery to keep the binary kind and route checks identical.
+pub fn metadataControlNamespace(payload: []const u8) !?Namespace {
+    if (std.mem.startsWith(u8, payload, "ALPC")) {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        return (try publication_control.Frame.decode(arena.allocator(), payload)).position.namespace;
+    }
+    if (std.mem.startsWith(u8, payload, "ASVC"))
+        return (try schema_owner_control.Frame.decode(payload)).position.namespace;
+    return null;
+}
+
 pub fn appendEncodedSchemaMetadataMutation(
     primary: *primary_mod.Primary,
     payload: []const u8,
     options: AppendMetadataMutationOptions,
 ) !u64 {
+    const control = try metadataControlNamespace(payload);
+    if (control) |namespace| {
+        if ((options.table_id orelse primary.identity.table_id) != namespace.table_id or
+            (options.shard_id orelse primary.identity.shard_id) != namespace.shard_id)
+            return error.IdentityNamespaceMismatch;
+    }
     return try primary.append(.{
         .kind = .metadata_mutation,
-        .payload_codec = .json,
+        .payload_codec = if (control != null) .binary else .json,
         .shard_id = options.shard_id,
         .table_id = options.table_id,
         .commit_timestamp_ns = options.commit_timestamp_ns,

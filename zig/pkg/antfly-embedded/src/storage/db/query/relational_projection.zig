@@ -640,8 +640,8 @@ test "public graph metric borrowed wire native whole text and indexed vectors us
 
 test "public graph metric borrowed wire borrowed native composites preserve ordered logical projections" {
     const a = std.testing.allocator;
-    const arrays = @import("../../../sql/array_value.zig");
-    const array_storage = @import("../../../sql/array_storage.zig");
+    const arrays = @import("../../../sql/array/value.zig");
+    const array_storage = @import("../../../sql/array/storage.zig");
     const columns = [_]schema.RelationalColumn{
         .{ .name = "point", .path = "point", .column_type = .geopoint },
         .{ .name = "array", .path = "array", .column_type = .sql_array, .sql_element_type = .int64 },
@@ -751,8 +751,8 @@ test "public graph metric borrowed wire wide native writer snapshot releases met
 
 test "public graph metric borrowed wire flat SQL array indexed projection and streaming bound scratch" {
     const a = std.testing.allocator;
-    const arrays = @import("../../../sql/array_value.zig");
-    const storage = @import("../../../sql/array_storage.zig");
+    const arrays = @import("../../../sql/array/value.zig");
+    const storage = @import("../../../sql/array/storage.zig");
     const elements = try a.alloc(arrays.Element, 32768);
     defer a.free(elements);
     for (elements) |*element| element.* = arrays.Element.json(.{ .integer = 42 });
@@ -792,8 +792,8 @@ test "public graph metric borrowed wire flat SQL array indexed projection and st
 
 test "public graph metric borrowed wire multiple prepared SQL arrays release sidecars on every failure" {
     const a = std.testing.allocator;
-    const arrays = @import("../../../sql/array_value.zig");
-    const storage = @import("../../../sql/array_storage.zig");
+    const arrays = @import("../../../sql/array/value.zig");
+    const storage = @import("../../../sql/array/storage.zig");
     const value = try arrays.Value.init(.int64, &.{.{ .length = 2 }}, &.{ arrays.Element.json(.{ .integer = 42 }), .{} }, .{});
     const raw = try storage.encodeAlloc(a, value, .{});
     defer a.free(raw);

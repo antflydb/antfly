@@ -117,9 +117,12 @@ pub const TableApi = struct {
         Conflict,
         IntegrityTopologyBusy,
         UniqueConstraintViolation,
+        TemporalOverlapViolation,
+        TemporalEmptyRange,
         RelationalCheckViolation,
         ForeignKeyParentMissing,
         ForeignKeyReferenced,
+        ForeignKeyMatchFullViolation,
         MethodNotAllowed,
         Backpressured,
         StorageDescriptorPressure,
@@ -128,6 +131,7 @@ pub const TableApi = struct {
         WriteUnavailable,
         WritePrecommitReadUnavailable,
         ConstraintActivationUnavailable,
+        TransactionPrepareAbortedRowPolicyDenied,
         WriteDefinitelyAbortedUnavailable,
         HAWriteDurabilityPending,
         OutcomeUnknown,
@@ -137,6 +141,7 @@ pub const TableApi = struct {
         WriteOutcomeUnknown,
         DocIdentityUnavailable,
         ExternalLakeReadOnly,
+        MaterializedViewReadOnly,
         HAReadOnlyStandby,
         HAPromotedStandbyRequiresPrimaryOpen,
         HAFencedPrimary,
@@ -1840,7 +1845,7 @@ fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batc
             .json = true,
             .retry_after_seconds = 1,
         },
-        error.UniqueConstraintViolation, error.RelationalCheckViolation, error.ForeignKeyParentMissing, error.ForeignKeyReferenced => return .{
+        error.UniqueConstraintViolation, error.TemporalOverlapViolation, error.TemporalEmptyRange, error.RelationalCheckViolation, error.ForeignKeyParentMissing, error.ForeignKeyReferenced, error.ForeignKeyMatchFullViolation => return .{
             .status = 409,
             .json = true,
             .body = try std.json.Stringify.valueAlloc(alloc, .{ .@"error" = @errorName(err) }, .{}),
@@ -1878,9 +1883,14 @@ fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batc
             .json = true,
             .retry_after_seconds = 1,
         },
+        error.TransactionPrepareAbortedRowPolicyDenied => return .{
+            .status = 403,
+            .body = try alloc.dupe(u8, "{\"status\":\"aborted\",\"error\":\"row_policy_denied\",\"code\":\"row_policy_denied\",\"message\":\"Row policy denied the write.\",\"retryable\":false}"),
+            .json = true,
+        },
         error.WriteDefinitelyAbortedUnavailable => return .{
             .status = 503,
-            .body = try alloc.dupe(u8, "{\"code\":\"transaction_precommit_aborted\",\"message\":\"the transaction was durably aborted before commit; retrying the batch is safe\",\"retryable\":true,\"retry_after_ms\":1000}"),
+            .body = try alloc.dupe(u8, "{\"status\":\"aborted\",\"error\":\"transaction_precommit_aborted\",\"code\":\"transaction_precommit_aborted\",\"message\":\"The transaction did not commit. Retrying the batch is safe.\",\"retryable\":true,\"retry_after_ms\":1000}"),
             .json = true,
             .retry_after_seconds = 1,
         },
@@ -1932,6 +1942,7 @@ fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batc
         error.WriteOutcomeUnknown => return .{ .status = 409, .body = try alloc.dupe(u8, "write outcome unknown") },
         error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
         error.ExternalLakeReadOnly => return .{ .status = 400, .body = try alloc.dupe(u8, "external lake tables are read-only") },
+        error.MaterializedViewReadOnly => return .{ .status = 400, .body = try alloc.dupe(u8, "materialized views are read-only; use REFRESH MATERIALIZED VIEW") },
         error.HAReadOnlyStandby => return .{ .status = 409, .body = try alloc.dupe(u8, "standby is read-only") },
         error.HAPromotedStandbyRequiresPrimaryOpen => return .{ .status = 409, .body = try alloc.dupe(u8, "promoted standby requires primary open") },
         error.HAFencedPrimary => return .{ .status = 409, .body = try alloc.dupe(u8, "fenced primary rejects writes") },
@@ -3071,6 +3082,7 @@ pub fn handleReprocessDocumentArtifactRange(
     api: TableApi,
 ) !OwnedResponse {
     const Request = struct {
+        selection: db_mod.types.ArtifactReprocessSelection = .all,
         from_key: []const u8 = "",
         to_key: []const u8 = "",
         limit: u32 = 100,
@@ -3110,6 +3122,7 @@ pub fn handleReprocessDocumentArtifactRange(
     defer parsed.deinit();
 
     var result = api.executeReprocessDocumentArtifactRange(alloc, table_name, artifact_name, .{
+        .selection = parsed.value.selection,
         .from_key = parsed.value.from_key,
         .to_key = parsed.value.to_key,
         .limit = parsed.value.limit,
@@ -4007,7 +4020,8 @@ test "public table batch handler maps write unavailable errors" {
         .{ .err = error.WriteUnavailable, .status = 503, .body = "write unavailable" },
         .{ .err = error.WritePrecommitReadUnavailable, .status = 503, .body = "{\"code\":\"transaction_precommit_read_unavailable\",\"message\":\"a required integrity read is unavailable; no mutation was admitted\",\"retryable\":true,\"retry_after_ms\":1000}", .json = true, .retry_after_seconds = 1 },
         .{ .err = error.ConstraintActivationUnavailable, .status = 503, .body = "{\"code\":\"constraint_activation_pending\",\"message\":\"constraint activation is not ready; no mutation was admitted\",\"retryable\":true,\"retry_after_ms\":1000}", .json = true, .retry_after_seconds = 1 },
-        .{ .err = error.WriteDefinitelyAbortedUnavailable, .status = 503, .body = "{\"code\":\"transaction_precommit_aborted\",\"message\":\"the transaction was durably aborted before commit; retrying the batch is safe\",\"retryable\":true,\"retry_after_ms\":1000}", .json = true, .retry_after_seconds = 1 },
+        .{ .err = error.TransactionPrepareAbortedRowPolicyDenied, .status = 403, .body = "{\"status\":\"aborted\",\"error\":\"row_policy_denied\",\"code\":\"row_policy_denied\",\"message\":\"Row policy denied the write.\",\"retryable\":false}", .json = true },
+        .{ .err = error.WriteDefinitelyAbortedUnavailable, .status = 503, .body = "{\"status\":\"aborted\",\"error\":\"transaction_precommit_aborted\",\"code\":\"transaction_precommit_aborted\",\"message\":\"The transaction did not commit. Retrying the batch is safe.\",\"retryable\":true,\"retry_after_ms\":1000}", .json = true, .retry_after_seconds = 1 },
         .{ .err = error.IntegrityTopologyBusy, .status = 409, .body = "{\"code\":\"integrity_topology_busy\",\"message\":\"table integrity topology is changing; retry this batch after publication\",\"retryable\":true,\"retry_after_ms\":1000}", .json = true, .retry_after_seconds = 1 },
         .{
             .err = error.OutcomeUnknown,
@@ -6789,6 +6803,7 @@ test "public document artifact reprocess handler returns accepted" {
 
 test "public document artifact range reprocess handler returns bounded summary" {
     const Backend = struct {
+        var expected_selection: db_mod.types.ArtifactReprocessSelection = .incomplete;
         fn iface() TableApi {
             return .{
                 .ptr = undefined,
@@ -6818,6 +6833,7 @@ test "public document artifact range reprocess handler returns bounded summary" 
         ) TableApi.ExecuteReprocessDocumentArtifactRangeError!db_mod.types.DocumentArtifactTableReprocessResult {
             if (!std.mem.eql(u8, table_name, "docs")) return error.InternalFailure;
             if (!std.mem.eql(u8, artifact_name, "document_units_v1")) return error.InternalFailure;
+            if (req.selection != expected_selection) return error.InternalFailure;
             if (!std.mem.eql(u8, req.from_key, "doc:a")) return error.InternalFailure;
             if (req.shard_cursors.len != 1) return error.InternalFailure;
             if (req.shard_cursors[0].group_id != 42) return error.InternalFailure;
@@ -6856,7 +6872,7 @@ test "public document artifact range reprocess handler returns bounded summary" 
         std.testing.allocator,
         "docs",
         "document_units_v1",
-        "{\"from_key\":\"doc:a\",\"limit\":10,\"shard_cursors\":[{\"group_id\":42,\"next_key\":\"doc:b\",\"limit\":10}]}",
+        "{\"selection\":\"incomplete\",\"from_key\":\"doc:a\",\"limit\":10,\"shard_cursors\":[{\"group_id\":42,\"next_key\":\"doc:b\",\"limit\":10}]}",
         Backend.iface(),
     );
     defer resp.deinit(std.testing.allocator);
@@ -6907,6 +6923,15 @@ test "public document artifact range reprocess handler returns bounded summary" 
     try std.testing.expectEqual(@as(usize, 1), parsed.value.shard_cursors[0].reprocessed);
     try std.testing.expectEqual(@as(usize, 1), parsed.value.shard_cursors[0].failed);
     try std.testing.expectEqual(@as(u32, 10), parsed.value.shard_cursors[0].limit);
+    // Omitted selection keeps the all default; unknown policies must not be
+    // silently interpreted as a request to regenerate accepted artifacts.
+    Backend.expected_selection = .all;
+    var defaults = try handleReprocessDocumentArtifactRange(std.testing.allocator, "docs", "document_units_v1", "{\"from_key\":\"doc:a\",\"limit\":10,\"shard_cursors\":[{\"group_id\":42,\"next_key\":\"doc:b\",\"limit\":10}]}", Backend.iface());
+    defer defaults.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), defaults.status);
+    var invalid = try handleReprocessDocumentArtifactRange(std.testing.allocator, "docs", "document_units_v1", "{\"selection\":\"unknown\"}", Backend.iface());
+    defer invalid.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), invalid.status);
 }
 test "public table graph metric action handler returns status response" {
     const Backend = struct {

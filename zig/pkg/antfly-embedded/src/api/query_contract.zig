@@ -4676,6 +4676,12 @@ pub fn encodeQueryResponsesWithDelivery(
     result: db_mod.types.SearchResult,
     delivery: ?@import("query_response.zig").Delivery,
 ) !QueryResponse {
+    if (delivery) |sink| if (sink.native_graph_result) |target| {
+        try target.consume(target.ptr, result.graph_results);
+        // Native relations consume the authorized engine result directly.
+        // Do not encode and parse a second public graph representation.
+        return .{ .json = try alloc.alloc(u8, 0), .delivered_bytes = 0 };
+    };
     var meta = execution_meta;
     if (req.public_query_started_ns) |started| {
         meta.took_ms = @intCast((platform_time.monotonicNs() -| started) / std.time.ns_per_ms);

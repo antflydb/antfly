@@ -586,10 +586,7 @@ fn familyExtractionServiceParity(comptime backend: BackendType) !void {
     const runtime_cpu_thread_budget = if (perf_config != null) try runtimeCpuThreadBudget() else 1;
     const perf_source_head = if (perf_config != null) try perf.sourceHead() else "";
     const worker_memory_bytes = if (backend == .cuda) cuda_service_worker_memory_bytes else service_worker_memory_bytes;
-    // CUDA evidence here covers multi-v1. The distinct multi-Decide checkpoint
-    // retains its own backend qualification and must be exercised separately.
-    const selected_profiles = if (backend == .cuda) profiles[0..1] else &profiles;
-    for (selected_profiles) |profile| {
+    for (profiles) |profile| {
         if (perf_config) |config| if (!config.profileEnabled(profile.name)) continue;
         const requested = platform.env.getenv(profile.environment) orelse return error.SkipZigTest;
         const directory = try realDirectory(a, requested);
@@ -751,7 +748,7 @@ fn familyDecisionServiceParity(comptime backend: BackendType) !void {
         .max_concurrent_requests = 1,
         .keep_alive_ms = 30 * 60 * 1000,
         .process_termination_available = true,
-        .process_memory_limit_bytes = service_worker_memory_bytes,
+        .process_memory_limit_bytes = if (backend == .cuda) cuda_service_worker_memory_bytes else service_worker_memory_bytes,
         .process_memory_limit_provenance = .explicit,
         .generation_budget_overrides = .{ .host_limit_bytes = service_generation_memory_bytes, .backend_limit_bytes = service_generation_memory_bytes, .scratch_limit_bytes = service_generation_memory_bytes, .combined_limit_bytes = service_generation_memory_bytes, .kv_limit_bytes = service_generation_memory_bytes },
     });
@@ -780,7 +777,7 @@ fn familyDecisionServiceParity(comptime backend: BackendType) !void {
         if (cached == null) {
             cached = try expectCached(&node, directory, profiles[1].pins, backend);
             resident_weights = direct_idle;
-            if (backend == .metal)
+            if (backend == .metal or backend == .cuda)
                 try std.testing.expect(resident_weights.?.backend_weight_bytes >= profiles[1].pins.@"model.safetensors".size_bytes)
             else
                 try std.testing.expect(resident_weights.?.host_weight_bytes >= profiles[1].pins.@"model.safetensors".size_bytes);
@@ -860,4 +857,8 @@ test "GLiNER2.5 multilingual Decide pinned native direct and HTTP distributions"
 
 test "GLiNER2.5 multilingual Decide pinned Metal direct and HTTP distributions" {
     try familyDecisionServiceParity(.metal);
+}
+
+test "GLiNER2.5 multilingual Decide pinned CUDA direct and HTTP distributions" {
+    try familyDecisionServiceParity(.cuda);
 }

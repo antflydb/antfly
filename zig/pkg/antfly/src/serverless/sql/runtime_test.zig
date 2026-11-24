@@ -1995,8 +1995,14 @@ fn reconcileWindow(early_running: bool) !void {
     service.coordination = coordination;
     coordination.retry(coordination.ptr, query);
     var reached = false;
-    for (0..8) |turn| {
-        service.context.deadline_ns = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s;
+    // A quantum bounds work, not a fixed number of completed waves: Debug
+    // allocation accounting and a loaded host can defer additional reads.
+    // Require the durable cursor to finish within one bounded campaign.
+    const campaign_deadline = @import("antfly_platform").time.monotonicNs() + 30 * std.time.ns_per_s;
+    for (0..64) |turn| {
+        const now = @import("antfly_platform").time.monotonicNs();
+        try std.testing.expect(now < campaign_deadline);
+        service.context.deadline_ns = @min(campaign_deadline, now + std.time.ns_per_s);
         _ = try service.turn(query, dispatcher);
         var current = (try records.load(a, query_key)).?;
         defer current.deinit(a);
@@ -2023,7 +2029,9 @@ fn reconcileWindow(early_running: bool) !void {
             defer a.free(key);
             try records.complete(a, key, held.?, .{ .key = "accepted", .hash = @splat('c'), .bytes = 0, .rows = 1 });
             coordination.retry(coordination.ptr, query);
-            service.context.deadline_ns = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s;
+            const completion_now = @import("antfly_platform").time.monotonicNs();
+            try std.testing.expect(completion_now < campaign_deadline);
+            service.context.deadline_ns = @min(campaign_deadline, completion_now + std.time.ns_per_s);
             _ = try service.turn(query, dispatcher);
             reached = true;
             break;
@@ -2277,20 +2285,31 @@ test "distributed SQL admission priority advances a slow partially filled window
     };
     var delivery: Delivery = .{};
     const dispatcher: runtime.Dispatcher = .{ .ptr = &delivery, .dispatch = Delivery.dispatch };
-    for (0..2) |turn| {
-        service.context.deadline_ns = @import("antfly_platform").time.monotonicNs() + 700 * std.time.ns_per_ms;
+    var admitted = false;
+    const campaign_deadline = @import("antfly_platform").time.monotonicNs() + 15 * std.time.ns_per_s;
+    for (0..16) |turn| {
+        const now = @import("antfly_platform").time.monotonicNs();
+        try std.testing.expect(now < campaign_deadline);
+        service.context.deadline_ns = @min(campaign_deadline, now + 700 * std.time.ns_per_ms);
         _ = try service.turn(query, dispatcher);
         var value = (try records.load(a, key)).?;
         defer value.deinit(a);
         if (turn == 0) {
             try std.testing.expect(value.value.pending_admission);
             try std.testing.expectEqual(@as(u32, 1), value.value.cursor);
+        } else if (value.value.pending_admission) {
+            // A suspended admission retains its exact durable cursor. The next
+            // turn must keep prioritizing it rather than rescan the slow task.
+            try std.testing.expectEqual(@as(u32, 1), value.value.cursor);
+            try std.testing.expectEqualSlices(u32, &.{0}, value.value.pending);
         } else {
-            try std.testing.expect(!value.value.pending_admission);
             try std.testing.expectEqual(@as(u32, 2), value.value.cursor);
             try std.testing.expectEqualSlices(u32, &.{ 0, 1 }, value.value.pending);
+            admitted = true;
+            break;
         }
     }
+    try std.testing.expect(admitted);
     try std.testing.expectEqual(@as(usize, 1), delivery.tasks);
 }
 

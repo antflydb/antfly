@@ -496,13 +496,13 @@ fn temporaryPreparationPath(allocator: Allocator, io: std.Io, prefix: []const u8
 }
 
 /// No archive-sized buffer, and the cap is checked before forwarding bytes.
-const LimitedWriter = struct {
+pub const LimitedWriter = struct {
     interface: std.Io.Writer,
     output: *std.Io.Writer,
     remaining: u64,
     exceeded: bool = false,
 
-    fn init(output: *std.Io.Writer, limit: u64) LimitedWriter {
+    pub fn init(output: *std.Io.Writer, limit: u64) LimitedWriter {
         return .{ .interface = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} }, .output = output, .remaining = limit };
     }
 
@@ -1178,6 +1178,53 @@ test "lite portable generation scavenging reaps stale data and lease-only crashe
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, stale_lock, .{}));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, lease_only_lock, .{}));
     try std.Io.Dir.cwd().access(io, active_lock, .{});
+}
+
+test "lite portable restore stages and publishes beside a symlink target" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "destination", .default_dir);
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    var long_basename: [237]u8 = @splat('a');
+    @memcpy(long_basename[230..], ".aflite");
+    const destination = try std.fs.path.join(allocator, &.{ root, "destination", &long_basename });
+    defer allocator.free(destination);
+    const alias = try std.fs.path.join(allocator, &.{ root, "alias.aflite" });
+    defer allocator.free(alias);
+    {
+        var target = try LiteDb.create(allocator, destination, true);
+        target.close();
+    }
+    try std.Io.Dir.cwd().symLink(io, destination, alias, .{});
+    var target = try LiteDb.open(allocator, alias, .writer);
+    defer target.close();
+    const Populate = struct {
+        fn run(expected_parent: []const u8, _: Allocator, prepared: *LiteDb) !void {
+            const path = prepared.backend.native_docstore.?.file.path;
+            try std.testing.expectEqualStrings(expected_parent, std.fs.path.dirname(path).?);
+        }
+    };
+    try @import("portable_restore.zig").importPreparedIntoLiteDb(
+        allocator,
+        &target.db,
+        &target.backend,
+        connection.embeddedRootIdentity(),
+        std.fs.path.dirname(destination).?,
+        Populate.run,
+    );
+    const resolved = try std.Io.Dir.realPathFileAbsoluteAlloc(io, alias, allocator);
+    defer allocator.free(resolved);
+    try std.testing.expectEqualStrings(destination, resolved);
+    var directory = try tmp.dir.openDir(io, "destination", .{ .iterate = true });
+    defer directory.close(io);
+    var entries = directory.iterateAssumeFirstIteration();
+    while (try entries.next(io)) |entry| {
+        try std.testing.expect(std.mem.indexOf(u8, entry.name, ".portable-restore-") == null);
+    }
 }
 
 test "lite portable restore enforces staging budget and preserves target" {
@@ -2656,7 +2703,7 @@ test "backup preflight relational rows use archived schema for active media fiel
     defer @import("../schema.zig").freeSchema(a, runtime);
     const encoded = try @import("../schema.zig").serializeSchema(a, runtime);
     defer a.free(encoded);
-    const row = try @import("../db/relational_store.zig").encodeValueForSchemaAlloc(a, "{\"media\":\"http://[0:0:0:0:0:0:0:1]:8888/source\"}", runtime);
+    const row = try @import("../db/relational/rows/store.zig").encodeValueForSchemaAlloc(a, "{\"media\":\"http://[0:0:0:0:0:0:0:1]:8888/source\"}", runtime);
     defer a.free(row);
     const key = try internal_keys.relationalRowKeyAlloc(a, "row:late");
     defer a.free(key);

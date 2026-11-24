@@ -581,6 +581,16 @@ pub const ConcatAxis = struct {
     a_axis: usize,
     b_axis: usize,
 
+    /// An empty concat axis contributes no payload. The other operand has
+    /// the exact result geometry when all remaining axes agree.
+    pub fn emptyIdentity(a: []const i64, b: []const i64, axis: usize) ?enum { lhs, rhs } {
+        if (a.len != b.len or axis >= a.len or (a[axis] != 0 and b[axis] != 0)) return null;
+        for (a, b, 0..) |lhs, rhs, dim| {
+            if (lhs < 0 or rhs < 0 or (dim != axis and lhs != rhs)) return null;
+        }
+        return if (a[axis] == 0) .rhs else .lhs;
+    }
+
     pub inline fn init(a: []const i64, b: []const i64, axis: usize, output: []i64) !ConcatAxis {
         if (a.len == 0 or a.len > 8 or a.len != b.len or axis >= a.len or output.len < a.len) return error.InvalidShape;
         var result = ConcatAxis{ .outer = 1, .inner = 1, .a_axis = 0, .b_axis = 0 };

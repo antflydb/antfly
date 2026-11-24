@@ -113,11 +113,11 @@ const row_policy_authority_mod = @import("../../usermgr/row_policy_authority.zig
 
 const schema_registry_mod = @import("schema_registry.zig");
 
-const relational_index_plans = @import("relational_index_plan.zig");
+const relational_index_plans = @import("relational/indexes/plan.zig");
 
 const transactions_mod = @import("../transactions.zig");
 
-const relational_store = @import("relational_store.zig");
+const relational_store = @import("relational/rows/store.zig");
 
 const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 
@@ -989,7 +989,7 @@ pub const PreparedRowEffects = struct {
 };
 
 pub const RelationalPriorMembership = struct {
-    const Source = @import("relational_index_predicate.zig").Source;
+    const Source = @import("relational/indexes/partial_predicate.zig").Source;
     alloc: Allocator,
     members: []bool,
     sources: []?Source,
@@ -1078,6 +1078,20 @@ pub const BatchVisibilityCompletion = struct {
     }
 };
 
+pub const NativeAtomicEffects = struct {
+    writes: []const docstore_mod.KVPair = &.{},
+    deletes: []const []const u8 = &.{},
+};
+
+pub const CheckedNativeAtomic = struct {
+    snapshot_owner: *snapshot_admission_mod.SnapshotAdmission.MutationLease,
+    replication_owner: *?MutationBarrier.SharedLease,
+    schema_namespace_generation: u64,
+    // DB-owned attempt/finalizer; process-local and never supplied by JSON.
+    ptr: *anyopaque,
+    finalize_fn: *const fn (*anyopaque) anyerror!NativeAtomicEffects,
+};
+
 /// WS3: lets a capi caller drop its own connection-level locks (the path
 /// gate's lease and the per-connection call-serializing mutex) across the
 /// primary write's durability wait, not just the DB apply lock. Invoked
@@ -1088,6 +1102,8 @@ pub const BatchVisibilityCompletion = struct {
 pub const WriterLaneReleaseHook = struct {
     ptr: *anyopaque,
     release: *const fn (ptr: *anyopaque) void,
+    release_for_indexed_wait: ?*const fn (ptr: *anyopaque) bool = null,
+    resume_after_indexed_wait: ?*const fn (ptr: *anyopaque) anyerror!void = null,
 };
 
 /// One synchronous prepared attempt's irreversible disposition. It is separate
@@ -1113,6 +1129,8 @@ pub const PreparationCapture = struct {
 };
 
 pub const BatchExecutionOptions = struct {
+    // Process-local checked plan, never serialized or derived from JSON.
+    checked_native_atomic: ?*const CheckedNativeAtomic = null,
     preparation_context: ?@import("antfly_inference_execution_context").RequestContext = null,
     preparation_capture: ?*PreparationCapture = null,
     resolver_review_command: ?*const @import("resolver_review.zig").Command = null,
@@ -1151,16 +1169,21 @@ pub const BatchExecutionOptions = struct {
     /// retained by asynchronous publication or shared across retries.
     prepared_commit_disposition: ?*PreparedCommitDisposition = null,
     force_generated_artifact_names: []const []const u8 = &.{},
+    force_only_incomplete_assets: bool = false,
     document_child_range_dispatcher: ?DocumentArtifactChildRangeDispatcher = null,
     committed_batch_effects_observer: ?CommittedBatchEffectsObserver = null,
     bypass_replication_write_gate: bool = false,
     replication_applied_lsn_marker: ?u64 = null,
     online_source_applied_index: ?u64 = null,
     ordered_apply_receipt: ?OrderedApplyReceipt = null,
+    ordered_history_commit_time_ns: i64 = 0,
+    /// Trusted native ingress classification; missing old transport stays unlabelled.
+    source_producer: @import("../source_producer_policy.zig").Producer = .unlabelled,
     /// Metadata-authorized native hidden-child receipt identity. Never
     /// writes the data-Raft watermark into a native source-authority root.
     native_initial_child_entry: ?OrderedApplyReceipt = null,
     native_fk_generation_entry: ?OrderedApplyReceipt = null,
+    native_fk_generation_control: bool = false,
     native_topology_position: ?@import("receipt_position.zig").Native = null,
     suppress_derived_replay_append: bool = false,
     extra_store_writes: []const docstore_mod.KVPair = &.{},
@@ -1170,6 +1193,7 @@ pub const BatchExecutionOptions = struct {
     extra_store_deletes: []const []const u8 = &.{},
     merge_chunk_expected_progress: ?[32]u8 = null,
     transaction_resolution: ?TransactionResolution = null,
+    prepared_graph_indexes: []const @import("prepared_graph_effects.zig").Index = &.{},
     durable_rows: ?*const std.StringHashMapUnmanaged([]const u8) = null,
     /// lite-single-commit-write-path.md §3.3c. `.none` (default): a
     /// coordinated-constraint table's ordinary writes are refused on this
@@ -1198,7 +1222,7 @@ pub const BatchExecutionOptions = struct {
     /// `.attach` write, self-healing it (queuing its deletion in this
     /// same commit) instead of refusing the parent change forever. `null`
     /// preserves exact today's-behavior: any live Reference blocks.
-    relational_child_existence_check: ?@import("relational_integrity.zig").ChildExistenceCheck = null,
+    relational_child_existence_check: ?@import("relational/integrity/integrity.zig").ChildExistenceCheck = null,
     /// Borrowed by this synchronous call and consumed only after primary
     /// durability, while waiting for requested derived visibility.
     visibility_cancellation: types.CancellationToken = .none,
@@ -1209,6 +1233,15 @@ pub const BatchExecutionOptions = struct {
 pub const OrderedApplyReceipt = types.OrderedApplyReceipt;
 
 pub const TransactionResolution = struct {
+    replication_resolution: ?transactions_mod.ReplicationOrderedPhase = null,
+    document_revision_references: []const @import("../document_revision_reservation.zig").Reference = &.{},
+    prepared_graph_effects_checked: bool = false,
+    external_decision_owner: ?transactions_mod.ExternalDecisionOwner = null,
+    legacy_terminal: ?transactions_mod.LegacyTerminalResolution = null,
+    legacy_outcome_write: ?@import("../docstore.zig").KVPair = null,
+    source_scope: ?@import("../source_scope.zig").Reference = null,
+    completion_owner: ?@import("../transaction_completion.zig").RoutedOwner = null,
+    source_purpose: ?[32]u8 = null,
     txn_id: transactions_mod.TxnId,
     status: transactions_mod.TxnStatus,
     commit_version: u64,
@@ -1269,6 +1302,8 @@ pub const LocalExecutionState = struct {
     row_policy_bundle: ?row_policy_bundle_mod.Installed = null,
     /// Borrowed from the opaque owner handle; Lite leaves these unset and
     /// therefore cannot turn a raw local read into an authenticated one.
+    sql_preparation_secret: ?[]const u8 = null,
+    sql_preparation_issuer: ?[]const u8 = null,
     row_policy_authority_secret: ?[]const u8 = null,
     row_policy_authority_issuer: ?[]const u8 = null,
     row_policy_table_name: ?[]const u8 = null,
@@ -1278,8 +1313,9 @@ pub const LocalExecutionState = struct {
     merge_artifact_layout: @import("merge_artifact_catalog.zig").Cache = .{},
     source_publication: @import("source_publication_job.zig").Job = .{},
     restore_staging_required: std.atomic.Value(bool) = .init(false),
+    materialized_view_read_only: std.atomic.Value(bool) = .init(false),
     initial_child_hidden: std.atomic.Value(bool) = .init(false),
-    initial_child_bootstrap: ?@import("relational_initial_child_publication.zig").Bootstrap = null,
+    initial_child_bootstrap: ?@import("relational/integrity/initial_child_publication.zig").Bootstrap = null,
     vector_migration_reopen_required: std.atomic.Value(bool) = .init(false),
     graph_merge_import_recovery_pending: std.atomic.Value(bool) = .init(false),
     source_vectors: std.atomic.Value(?*vector_payload_store_mod.Store) = .init(null),
@@ -1306,7 +1342,7 @@ pub const LocalExecutionState = struct {
     /// reconciliation cost.
     schema_reconcile: @import("schema_reconcile_owner.zig").Owner = .{},
     relational_index_maintenance_cursor: std.atomic.Value(usize) = .init(0),
-    relational_index_maintenance_sweep: @import("relational_index_maintenance_sweep.zig").Sweep = .{},
+    relational_index_maintenance_sweep: @import("relational/indexes/maintenance_sweep.zig").Sweep = .{},
     relational_index_retry_after_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
     index_structural_mutation_mutex: std.atomic.Mutex = .unlocked,
     optional_runtime_workers_enabled: bool = false,
@@ -2136,7 +2172,7 @@ pub const PreparedEnrichments = struct {
         var output: std.Io.Writer.Allocating = .init(a);
         defer output.deinit();
         var stream: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
-        try @import("relational_integrity_json.zig").writeCompact(value, &stream);
+        try @import("relational/integrity/json.zig").writeCompact(value, &stream);
         const bytes = try output.toOwnedSlice();
         defer a.free(bytes);
         var digest: [32]u8 = undefined;
@@ -2154,7 +2190,7 @@ pub const PreparedEnrichments = struct {
     };
 
     pub fn jsonStringify(self: @This(), stream: anytype) !void {
-        return @import("relational_integrity_json.zig").writeCompact(self, stream);
+        return @import("relational/integrity/json.zig").writeCompact(self, stream);
     }
 };
 

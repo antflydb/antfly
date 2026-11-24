@@ -4224,6 +4224,331 @@ pub const ChainLink = struct {
     }
 };
 
+pub const ChangefeedCheckpoint = struct {
+    cursor: ChangefeedCursor,
+};
+
+pub const ChangefeedCreate = struct {
+    tables: []const []const u8,
+    selectors: ?[]const ChangefeedSelector = null,
+    start: ?[]const u8 = null,
+    events: ?[]const []const u8 = null,
+    include: ?[]const u8 = null,
+    lease_seconds: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "tables", "tables", false },
+        .{ "selectors", "selectors", true },
+        .{ "start", "start", true },
+        .{ "events", "events", true },
+        .{ "include", "include", true },
+        .{ "lease_seconds", "lease_seconds", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("tables");
+        try jw.write(self.tables);
+        if (self.selectors) |value| {
+            try jw.objectField("selectors");
+            try jw.write(value);
+        }
+        if (self.start) |value| {
+            try jw.objectField("start");
+            try jw.write(value);
+        }
+        if (self.events) |value| {
+            try jw.objectField("events");
+            try jw.write(value);
+        }
+        if (self.include) |value| {
+            try jw.objectField("include");
+            try jw.write(value);
+        }
+        if (self.lease_seconds) |value| {
+            try jw.objectField("lease_seconds");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ChangefeedCreated = struct {
+    id: []const u8,
+    cursor: ChangefeedCursor,
+    expires_at: i64,
+};
+
+pub const ChangefeedCursor = []const u8;
+
+pub const ChangefeedError = struct {
+    @"error": []const u8,
+};
+
+pub const ChangefeedEvent = struct {
+    event_id: []const u8,
+    table_id: []const u8,
+    transaction_id: ?[]const u8 = null,
+    version: ?[]const u8 = null,
+    operation: ?[]const u8 = null,
+    kind: ?[]const u8 = null,
+    key: ?ChangefeedKey = null,
+    before: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
+    after: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", false },
+        .{ "table_id", "table_id", false },
+        .{ "transaction_id", "transaction_id", true },
+        .{ "version", "version", true },
+        .{ "operation", "operation", true },
+        .{ "kind", "kind", true },
+        .{ "key", "key", true },
+        .{ "before", "before", false },
+        .{ "after", "after", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("event_id");
+        try jw.write(self.event_id);
+        try jw.objectField("table_id");
+        try jw.write(self.table_id);
+        if (self.transaction_id) |value| {
+            try jw.objectField("transaction_id");
+            try jw.write(value);
+        }
+        if (self.version) |value| {
+            try jw.objectField("version");
+            try jw.write(value);
+        }
+        if (self.operation) |value| {
+            try jw.objectField("operation");
+            try jw.write(value);
+        }
+        if (self.kind) |value| {
+            try jw.objectField("kind");
+            try jw.write(value);
+        }
+        if (self.key) |value| {
+            try jw.objectField("key");
+            try jw.write(value);
+        }
+        switch (self.before) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("before");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("before");
+                try jw.write(value);
+            },
+        }
+        switch (self.after) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("after");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("after");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ChangefeedKey = struct {
+    encoding: []const u8,
+    value: []const u8,
+};
+
+pub const ChangefeedLease = struct {
+    expires_at: i64,
+};
+
+pub const ChangefeedPage = struct {
+    version: i64,
+    events: []const ChangefeedEvent,
+    transaction: OpenApiOptionalNullable(std.json.Value) = .absent,
+    snapshot: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "events", "events", false },
+        .{ "transaction", "transaction", false },
+        .{ "snapshot", "snapshot", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("events");
+        try jw.write(self.events);
+        switch (self.transaction) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("transaction");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("transaction");
+                try jw.write(value);
+            },
+        }
+        if (self.snapshot) |value| {
+            try jw.objectField("snapshot");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ChangefeedPredicate = struct {
+    field: []const u8,
+    /// A JSON scalar or null. Missing and null are distinct.
+    value: std.json.Value,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "field", "field", false },
+        .{ "value", "value", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("field");
+        try jw.write(self.field);
+        try jw.objectField("value");
+        try jw.write(self.value);
+        try jw.endObject();
+    }
+};
+
+pub const ChangefeedProgress = struct {
+    phase: []const u8,
+    acknowledged_cursor: ChangefeedCursor,
+    unacknowledged_deliveries: i64,
+    oldest_unacknowledged_at: OpenApiOptionalNullable(i64) = .absent,
+    cursor_window: i64,
+    cursor_byte_limit: i64,
+    expires_at: i64,
+    bootstrap_expires_at: OpenApiOptionalNullable(i64) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("phase");
+        try jw.write(self.phase);
+        try jw.objectField("acknowledged_cursor");
+        try jw.write(self.acknowledged_cursor);
+        try jw.objectField("unacknowledged_deliveries");
+        try jw.write(self.unacknowledged_deliveries);
+        switch (self.oldest_unacknowledged_at) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("oldest_unacknowledged_at");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("oldest_unacknowledged_at");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("cursor_window");
+        try jw.write(self.cursor_window);
+        try jw.objectField("cursor_byte_limit");
+        try jw.write(self.cursor_byte_limit);
+        try jw.objectField("expires_at");
+        try jw.write(self.expires_at);
+        switch (self.bootstrap_expires_at) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("bootstrap_expires_at");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("bootstrap_expires_at");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ChangefeedSelector = struct {
+    table: []const u8,
+    fields: ?[]const []const u8 = null,
+    predicates: ?[]const ChangefeedPredicate = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "table", "table", false },
+        .{ "fields", "fields", true },
+        .{ "predicates", "predicates", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("table");
+        try jw.write(self.table);
+        if (self.fields) |value| {
+            try jw.objectField("fields");
+            try jw.write(value);
+        }
+        if (self.predicates) |value| {
+            try jw.objectField("predicates");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const ChatGPTAccount = struct {
     connection_id: []const u8,
     email: []const u8,
@@ -5408,7 +5733,7 @@ pub const ChunkOutputTarget = struct {
     model: []const u8,
     /// False retains this model as a planning boundary while skipping its inference; used for independent output repairs.
     execute: ?bool = null,
-    /// Execution-only repair mask for already accepted sub-windows; does not affect the model recipe or boundary plan. Skipped windows return receipts with status skipped.
+    /// Execution-only repair mask for accepted receipts. A sub_index of 4294967295 skips all outputs at that ordinal. Other entries skip individual sub-windows. Masks leave recipe and boundary identities unchanged.
     skip_windows: ?[]const std.json.Value = null,
     required: ?bool = null,
     model_identity: ?[]const u8 = null,
@@ -6671,6 +6996,8 @@ pub const ClusterHealth = enum {
 
 /// Native cohort restores use the existing asynchronous restore job to provision hidden fresh generations, import rows, rebuild indexes and coordinated constraints, and publish the dependency-complete target set atomically. Document, relational, and mixed native cohorts use the same workflow (at most 128 tables/4096 ranges). Skipping a live parent cannot substitute it for a parent generation required by a restored child. Overwrite retains the old generation until validation and cutover; cancellation after publication completes publication rather than rollback. Reserved destination authorization is immutable: changing principal requires canceling the old job and creating a new restore.
 pub const ClusterRestoreRequest = struct {
+    /// Explicit immutable routine identity handoff for trigger attachments. Cross-catalog restores require a mapping for every referenced trigger function. Destination functions must already exist and be authorized compatible zero-argument trigger functions. Routine bodies and names are never imported or rebound by this operation. Mappings are part of the durable job and its idempotency identity.
+    routine_mappings: ?[]const RestoreRoutineMapping = null,
     /// Unique identifier of the backup to restore from.
     backup_id: []const u8,
     /// Storage location where the backup is stored.
@@ -6684,6 +7011,7 @@ pub const ClusterRestoreRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "routine_mappings", "routine_mappings", true },
         .{ "backup_id", "backup_id", false },
         .{ "location", "location", false },
         .{ "connection", "connection", false },
@@ -6701,6 +7029,10 @@ pub const ClusterRestoreRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.routine_mappings) |value| {
+            try jw.objectField("routine_mappings");
+            try jw.write(value);
+        }
         try jw.objectField("backup_id");
         try jw.write(self.backup_id);
         try jw.objectField("location");
@@ -10695,6 +11027,8 @@ pub const DatabaseCatalogRecord = struct {
     name: []const u8,
     /// JSON-encoded database settings owned by the catalog.
     settings_json: []const u8,
+    /// SQL COMMENT annotation. NULL or an empty string removes the annotation without changing the object's identity or data schema.
+    description: OpenApiOptionalNullable([]const u8) = .absent,
     /// Optional durable tablespace binding inherited by new namespace/table placement policy.
     tablespace_name: OpenApiOptionalNullable([]const u8) = .absent,
 
@@ -10706,6 +11040,17 @@ pub const DatabaseCatalogRecord = struct {
         try jw.write(self.name);
         try jw.objectField("settings_json");
         try jw.write(self.settings_json);
+        switch (self.description) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("description");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("description");
+                try jw.write(value);
+            },
+        }
         switch (self.tablespace_name) {
             .absent => {},
             .null_value => {
@@ -12627,7 +12972,7 @@ pub const DocumentArtifactManifest = struct {
     last_error_code: OpenApiOptionalNullable([]const u8) = .absent,
     /// Human-readable last extraction or materialization error summary, when available.
     last_error_message: OpenApiOptionalNullable([]const u8) = .absent,
-    /// Opaque JSON manifest for the artifact units and provenance. Present only for raw detail responses.
+    /// Opaque JSON manifest for the artifact units and provenance. Present only for raw detail responses. Newly produced document-extraction generations include the declared execution policy under execution, including on failed generations; it is not a measured provider budget. Older manifests may omit it.
     manifest_json: ?[]const u8 = null,
     /// Optional opaque JSON state for incremental processing. Present only for raw detail responses.
     state_json: OpenApiOptionalNullable([]const u8) = .absent,
@@ -12810,6 +13155,8 @@ pub const DocumentArtifactReprocessFailure = struct {
 };
 
 pub const DocumentArtifactReprocessJob = struct {
+    /// all explicitly regenerates selected source records, including accepted artifacts. incomplete selects only missing or incomplete document_extraction artifacts, including converged manifests with failed OCR pages. Complete accepted results are skipped. Other producer kinds reject incomplete selection. Selection and cursors are retained by durable jobs. Acceptance does not certify inference completion.
+    selection: ?[]const u8 = null,
     /// Server-assigned durable repair job identifier.
     job_id: u64,
     /// Monotonic execution attempt token for the current running pass.
@@ -12855,8 +13202,47 @@ pub const DocumentArtifactReprocessJob = struct {
     /// Unix epoch milliseconds after which the retained job status may be removed.
     expires_at_millis: u64,
 
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "selection", "selection", true },
+        .{ "job_id", "job_id", false },
+        .{ "attempt_id", "attempt_id", false },
+        .{ "table_name", "table_name", false },
+        .{ "artifact_name", "artifact_name", false },
+        .{ "phase", "phase", false },
+        .{ "reprocess_status", "reprocess_status", false },
+        .{ "from_key", "from_key", false },
+        .{ "to_key", "to_key", false },
+        .{ "limit", "limit", false },
+        .{ "next_key", "next_key", false },
+        .{ "scanned", "scanned", false },
+        .{ "reprocessed", "reprocessed", false },
+        .{ "skipped", "skipped", false },
+        .{ "failed", "failed", false },
+        .{ "pending_shards", "pending_shards", false },
+        .{ "failures", "failures", false },
+        .{ "shard_cursors", "shard_cursors", false },
+        .{ "last_error", "last_error", false },
+        .{ "cancel_requested", "cancel_requested", false },
+        .{ "created_at_millis", "created_at_millis", false },
+        .{ "last_updated_at_millis", "last_updated_at_millis", false },
+        .{ "expires_at_millis", "expires_at_millis", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.selection) |value| {
+            try jw.objectField("selection");
+            try jw.write(value);
+        }
         try jw.objectField("job_id");
         try jw.write(self.job_id);
         try jw.objectField("attempt_id");
@@ -12925,6 +13311,8 @@ pub const DocumentArtifactReprocessJob = struct {
 
 /// Request to create a durable table artifact reprocess job.
 pub const DocumentArtifactReprocessJobStartRequest = struct {
+    /// all explicitly regenerates selected source records, including accepted artifacts. incomplete selects only missing or incomplete document_extraction artifacts, including converged manifests with failed OCR pages. Complete accepted results are skipped. Other producer kinds reject incomplete selection. Selection and cursors are retained by durable jobs. Acceptance does not certify inference completion.
+    selection: ?[]const u8 = null,
     /// Exclusive lower bound source document key.
     from_key: ?[]const u8 = null,
     /// Inclusive upper bound source document key, or empty for the end of the table/range.
@@ -12936,6 +13324,7 @@ pub const DocumentArtifactReprocessJobStartRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "selection", "selection", true },
         .{ "from_key", "from_key", true },
         .{ "to_key", "to_key", true },
         .{ "limit", "limit", true },
@@ -12952,6 +13341,10 @@ pub const DocumentArtifactReprocessJobStartRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.selection) |value| {
+            try jw.objectField("selection");
+            try jw.write(value);
+        }
         if (self.from_key) |value| {
             try jw.objectField("from_key");
             try jw.write(value);
@@ -13024,6 +13417,8 @@ pub const DocumentArtifactReprocessShardCursor = struct {
 
 /// Bounded request for reprocessing a derived artifact across source rows in key order.
 pub const DocumentArtifactTableReprocessRequest = struct {
+    /// all explicitly regenerates selected source records, including accepted artifacts. incomplete selects only missing or incomplete document_extraction artifacts, including converged manifests with failed OCR pages. Complete accepted results are skipped. Other producer kinds reject incomplete selection. Selection and cursors are retained by durable jobs. Acceptance does not certify inference completion.
+    selection: ?[]const u8 = null,
     /// Exclusive lower bound source document key. Use the prior response next_key to continue.
     from_key: ?[]const u8 = null,
     /// Inclusive upper bound source document key, or empty for the end of the table/range.
@@ -13035,6 +13430,7 @@ pub const DocumentArtifactTableReprocessRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "selection", "selection", true },
         .{ "from_key", "from_key", true },
         .{ "to_key", "to_key", true },
         .{ "limit", "limit", true },
@@ -13051,6 +13447,10 @@ pub const DocumentArtifactTableReprocessRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.selection) |value| {
+            try jw.objectField("selection");
+            try jw.write(value);
+        }
         if (self.from_key) |value| {
             try jw.objectField("from_key");
             try jw.write(value);
@@ -13134,6 +13534,9 @@ pub const DocumentArtifactTableReprocessResponse = struct {
         try jw.endObject();
     }
 };
+
+/// Document SQL alias declared by x-antfly-column-name on a JSON Schema property. Nested aliases bind literal object-key segments, including keys containing dots or slashes. Aliases do not create stored fields. Names must be unique across physical roots and aliases within a document type and must resolve to the same path across document types. Reserved _id, _doc and _version names are not allowed. Aliases require a fixed property path; array-item, pattern-property and conditional-schema aliases are rejected. Physical root columns remain available alongside aliases. Ancestor and descendant columns cannot be assigned together in one SQL mutation.
+pub const DocumentColumnName = []const u8;
 
 /// Configuration for the `document_extraction` producer. It downloads the source URL and persists derived units such as PDF pages, sections, images, and audio. Native text (PDF text layers, Office documents, HTML, email, plain text) is extracted with no model. Scanned pages and images are read only when `ocr` names a reader or generator, and audio is transcribed only when `transcription` names a transcriber. Units that need a producer that is not configured report `extraction_status` `ocr_not_configured` or `transcription_not_configured`. **Example:** ```json { "source": {"filename_field": "filename", "content_type_field": "mime_type"}, "ocr": {"reader": {"provider": "antfly", "model": "lightonai/LightOnOCR-3-0.8B"}}, "transcription": {"transcriber": {"provider": "antfly", "model": "openai/whisper-small"}} } ```
 pub const DocumentExtractionConfig = struct {
@@ -13855,6 +14258,14 @@ pub const DocumentFieldMapping = struct {
         }
         try jw.endObject();
     }
+};
+
+pub const DocumentSQLColumn = struct {
+    name: []const u8,
+    /// Literal object keys, without wildcard or array traversal.
+    path: []const []const u8,
+    /// Existing strict SQL document scalar domain. Numeric/object values are never stringified for keyword or text columns.
+    type: []const u8,
 };
 
 /// Defines the structure of a document type
@@ -17538,8 +17949,10 @@ pub const ExactSortError = struct {
     }
 };
 
-/// Non-semantic execution policy for one producer or index maintenance operation. These fields tune how work is batched and do not change generated artifact identity.
+/// Non-semantic execution policy for one producer or index maintenance operation. Updates persist separately from the frozen publication catalog and affect future invocations without invalidating accepted artifacts. To retry incomplete extraction or regenerate accepted output, explicitly use the bounded reprocess APIs. Node/provider ceilings still apply.
 pub const ExecutionPolicy = struct {
+    /// Invocation output-token budget for reader/generator assets and document-extraction OCR pages. Overrides producer max_tokens at execution only; it does not change the stored recipe, source fingerprint, or completed outputs. A lower value does not retroactively reject accepted output. Omit to use the producer budget.
+    max_output_tokens_per_item: ?u32 = null,
     /// Maximum items to process in one batch for this operation.
     batch_items: ?i64 = null,
     /// Approximate maximum source bytes to process in one batch for this operation.
@@ -17549,6 +17962,7 @@ pub const ExecutionPolicy = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "max_output_tokens_per_item", "max_output_tokens_per_item", true },
         .{ "batch_items", "batch_items", true },
         .{ "batch_bytes", "batch_bytes", true },
         .{ "max_document_pages", "max_document_pages", true },
@@ -17564,6 +17978,10 @@ pub const ExecutionPolicy = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.max_output_tokens_per_item) |value| {
+            try jw.objectField("max_output_tokens_per_item");
+            try jw.write(value);
+        }
         if (self.batch_items) |value| {
             try jw.objectField("batch_items");
             try jw.write(value);
@@ -29623,6 +30041,80 @@ pub const IndexMutationServiceUnavailableError = struct {
     retryable: bool,
 };
 
+pub const IndexPublicationFailure = enum {
+    duplicate_key,
+    invalid_candidate,
+    requested,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .duplicate_key => "duplicate_key",
+            .invalid_candidate => "invalid_candidate",
+            .requested => "requested",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "duplicate_key", .duplicate_key },
+            .{ "invalid_candidate", .invalid_candidate },
+            .{ "requested", .requested },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const IndexPublicationPhase = enum {
+    fencing,
+    reserving,
+    building,
+    installing,
+    releasing,
+    published,
+    canceling,
+    cancel_releasing,
+    canceled,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .fencing => "fencing",
+            .reserving => "reserving",
+            .building => "building",
+            .installing => "installing",
+            .releasing => "releasing",
+            .published => "published",
+            .canceling => "canceling",
+            .cancel_releasing => "cancel_releasing",
+            .canceled => "canceled",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "fencing", .fencing },
+            .{ "reserving", .reserving },
+            .{ "building", .building },
+            .{ "installing", .installing },
+            .{ "releasing", .releasing },
+            .{ "published", .published },
+            .{ "canceling", .canceling },
+            .{ "cancel_releasing", .cancel_releasing },
+            .{ "canceled", .canceled },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Publication behavior for a managed embeddings index. `progressive` makes a safely checkpointed active generation queryable before initial source coverage is complete. `atomic` keeps a new generation unavailable until complete validation and activation.
 pub const IndexPublicationPolicy = enum {
     progressive,
@@ -29648,6 +30140,140 @@ pub const IndexPublicationPolicy = enum {
         return map.get(s) orelse error.UnexpectedToken;
     }
 };
+
+pub const IndexPublicationState = enum {
+    admission_unknown,
+    pending,
+    published,
+    failed,
+    canceled,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .admission_unknown => "admission_unknown",
+            .pending => "pending",
+            .published => "published",
+            .failed => "failed",
+            .canceled => "canceled",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "admission_unknown", .admission_unknown },
+            .{ "pending", .pending },
+            .{ "published", .published },
+            .{ "failed", .failed },
+            .{ "canceled", .canceled },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const IndexPublicationStatusIndexType = enum {
+    relational,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .relational => "relational",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "relational", .relational },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Exact observation of an online relational-index publication job, not a query-readiness certificate. Published means this retained job completed; later schema/index changes may supersede its artifacts. An absent or unmirrored job is admission_unknown, never permission to replay DDL.
+pub const IndexPublicationStatus = struct {
+    index_type: IndexPublicationStatusIndexType,
+    index_name: []const u8,
+    publication_token: IndexPublicationToken,
+    table_id: []const u8,
+    publication_id: []const u8,
+    plan_digest: []const u8,
+    metadata_incarnation: []const u8,
+    state: IndexPublicationState,
+    phase: ?IndexPublicationPhase = null,
+    failure: ?IndexPublicationFailure = null,
+    replication_pending: bool,
+    owner_count: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "index_type", "index_type", false },
+        .{ "index_name", "index_name", false },
+        .{ "publication_token", "publication_token", false },
+        .{ "table_id", "table_id", false },
+        .{ "publication_id", "publication_id", false },
+        .{ "plan_digest", "plan_digest", false },
+        .{ "metadata_incarnation", "metadata_incarnation", false },
+        .{ "state", "state", false },
+        .{ "phase", "phase", true },
+        .{ "failure", "failure", true },
+        .{ "replication_pending", "replication_pending", false },
+        .{ "owner_count", "owner_count", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("index_type");
+        try jw.write(self.index_type);
+        try jw.objectField("index_name");
+        try jw.write(self.index_name);
+        try jw.objectField("publication_token");
+        try jw.write(self.publication_token);
+        try jw.objectField("table_id");
+        try jw.write(self.table_id);
+        try jw.objectField("publication_id");
+        try jw.write(self.publication_id);
+        try jw.objectField("plan_digest");
+        try jw.write(self.plan_digest);
+        try jw.objectField("metadata_incarnation");
+        try jw.write(self.metadata_incarnation);
+        try jw.objectField("state");
+        try jw.write(self.state);
+        if (self.phase) |value| {
+            try jw.objectField("phase");
+            try jw.write(value);
+        }
+        if (self.failure) |value| {
+            try jw.objectField("failure");
+            try jw.write(value);
+        }
+        try jw.objectField("replication_pending");
+        try jw.write(self.replication_pending);
+        if (self.owner_count) |value| {
+            try jw.objectField("owner_count");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Opaque versioned recovery handle binding a metadata incarnation, immutable table identity, publication ID and plan commitment. This is not authentication or permission to execute, cancel, adopt a root or replay DDL. Retain it before admission and use current table authorization when observing the publication.
+pub const IndexPublicationToken = []const u8;
 
 /// Stable machine-readable reason why an index is pending, partial, or failed.
 pub const IndexReadinessReason = enum {
@@ -29998,9 +30624,41 @@ pub const IndexStats = union(enum) {
 };
 
 pub const IndexStatus = struct {
+    publication: ?IndexPublicationStatus = null,
     shard_status: std.json.ArrayHashMap(IndexStats),
     config: CreatedIndex,
     status: IndexStats,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "publication", "publication", true },
+        .{ "shard_status", "shard_status", false },
+        .{ "config", "config", false },
+        .{ "status", "status", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.publication) |value| {
+            try jw.objectField("publication");
+            try jw.write(value);
+        }
+        try jw.objectField("shard_status");
+        try jw.write(self.shard_status);
+        try jw.objectField("config");
+        try jw.write(self.config);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        try jw.endObject();
+    }
 };
 
 /// The type of the index.
@@ -38224,6 +38882,247 @@ pub const LsmStorageStatus = struct {
     }
 };
 
+pub const ManagedSourceConfigured = struct {
+    table_id: u64,
+    sources_hash: []const u8,
+    state: []const u8,
+};
+
+pub const ManagedSourceDestinationContract = struct {
+    version: i64,
+    adapter: OpenApiOptionalNullable([]const u8) = .absent,
+    input: []const u8,
+    accepted_by: []const u8,
+    committed_by: []const u8,
+    transaction_scope: []const u8,
+    committed_history: []const u8,
+    outbound: std.json.Value,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        switch (self.adapter) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("adapter");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("adapter");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("input");
+        try jw.write(self.input);
+        try jw.objectField("accepted_by");
+        try jw.write(self.accepted_by);
+        try jw.objectField("committed_by");
+        try jw.write(self.committed_by);
+        try jw.objectField("transaction_scope");
+        try jw.write(self.transaction_scope);
+        try jw.objectField("committed_history");
+        try jw.write(self.committed_history);
+        try jw.objectField("outbound");
+        try jw.write(self.outbound);
+        try jw.endObject();
+    }
+};
+
+pub const ManagedSourceProgress = struct {
+    table_id: u64,
+    source_ordinal: i64,
+    source_kind: []const u8,
+    external_table: ?[]const u8 = null,
+    cutover_mode: ?[]const u8 = null,
+    slot_name: ?[]const u8 = null,
+    publication_name: ?[]const u8 = null,
+    phase: []const u8,
+    /// Opaque destination progress token.
+    checkpoint: ?[]const u8 = null,
+    snapshot_offset: ?u64 = null,
+    prepared_checkpoint: ?[]const u8 = null,
+    stream_checkpoint: ?[]const u8 = null,
+    accepted_stream_checkpoint: OpenApiOptionalNullable([]const u8) = .absent,
+    failure_class: ?[]const u8 = null,
+    last_error: ?[]const u8 = null,
+    lag_records: ?u64 = null,
+    lag_millis: ?u64 = null,
+    consecutive_failures: ?u64 = null,
+    last_source_commit_at_ms: ?u64 = null,
+    last_success_at_ms: ?u64 = null,
+    last_change_applied_at_ms: ?u64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "table_id", "table_id", false },
+        .{ "source_ordinal", "source_ordinal", false },
+        .{ "source_kind", "source_kind", false },
+        .{ "external_table", "external_table", true },
+        .{ "cutover_mode", "cutover_mode", true },
+        .{ "slot_name", "slot_name", true },
+        .{ "publication_name", "publication_name", true },
+        .{ "phase", "phase", false },
+        .{ "checkpoint", "checkpoint", true },
+        .{ "snapshot_offset", "snapshot_offset", true },
+        .{ "prepared_checkpoint", "prepared_checkpoint", true },
+        .{ "stream_checkpoint", "stream_checkpoint", true },
+        .{ "accepted_stream_checkpoint", "accepted_stream_checkpoint", false },
+        .{ "failure_class", "failure_class", true },
+        .{ "last_error", "last_error", true },
+        .{ "lag_records", "lag_records", true },
+        .{ "lag_millis", "lag_millis", true },
+        .{ "consecutive_failures", "consecutive_failures", true },
+        .{ "last_source_commit_at_ms", "last_source_commit_at_ms", true },
+        .{ "last_success_at_ms", "last_success_at_ms", true },
+        .{ "last_change_applied_at_ms", "last_change_applied_at_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("table_id");
+        try jw.write(self.table_id);
+        try jw.objectField("source_ordinal");
+        try jw.write(self.source_ordinal);
+        try jw.objectField("source_kind");
+        try jw.write(self.source_kind);
+        if (self.external_table) |value| {
+            try jw.objectField("external_table");
+            try jw.write(value);
+        }
+        if (self.cutover_mode) |value| {
+            try jw.objectField("cutover_mode");
+            try jw.write(value);
+        }
+        if (self.slot_name) |value| {
+            try jw.objectField("slot_name");
+            try jw.write(value);
+        }
+        if (self.publication_name) |value| {
+            try jw.objectField("publication_name");
+            try jw.write(value);
+        }
+        try jw.objectField("phase");
+        try jw.write(self.phase);
+        if (self.checkpoint) |value| {
+            try jw.objectField("checkpoint");
+            try jw.write(value);
+        }
+        if (self.snapshot_offset) |value| {
+            try jw.objectField("snapshot_offset");
+            try jw.write(value);
+        }
+        if (self.prepared_checkpoint) |value| {
+            try jw.objectField("prepared_checkpoint");
+            try jw.write(value);
+        }
+        if (self.stream_checkpoint) |value| {
+            try jw.objectField("stream_checkpoint");
+            try jw.write(value);
+        }
+        switch (self.accepted_stream_checkpoint) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("accepted_stream_checkpoint");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("accepted_stream_checkpoint");
+                try jw.write(value);
+            },
+        }
+        if (self.failure_class) |value| {
+            try jw.objectField("failure_class");
+            try jw.write(value);
+        }
+        if (self.last_error) |value| {
+            try jw.objectField("last_error");
+            try jw.write(value);
+        }
+        if (self.lag_records) |value| {
+            try jw.objectField("lag_records");
+            try jw.write(value);
+        }
+        if (self.lag_millis) |value| {
+            try jw.objectField("lag_millis");
+            try jw.write(value);
+        }
+        if (self.consecutive_failures) |value| {
+            try jw.objectField("consecutive_failures");
+            try jw.write(value);
+        }
+        if (self.last_source_commit_at_ms) |value| {
+            try jw.objectField("last_source_commit_at_ms");
+            try jw.write(value);
+        }
+        if (self.last_success_at_ms) |value| {
+            try jw.objectField("last_success_at_ms");
+            try jw.write(value);
+        }
+        if (self.last_change_applied_at_ms) |value| {
+            try jw.objectField("last_change_applied_at_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ManagedSourceReplacement = struct {
+    table_id: u64,
+    expected_sources_hash: []const u8,
+    replication_sources: []const ReplicationSource,
+};
+
+pub const ManagedSourceStatus = struct {
+    table_id: u64,
+    sources_hash: []const u8,
+    /// Source definitions with credential material redacted.
+    replication_sources: []const std.json.ArrayHashMap(std.json.Value),
+    progress: []const ManagedSourceProgress,
+    destination_contract: ManagedSourceDestinationContract,
+    index_publication: OpenApiOptionalNullable(std.json.Value) = .absent,
+    cdc_supported: bool,
+    cdc_unsupported_reason: []const u8,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("table_id");
+        try jw.write(self.table_id);
+        try jw.objectField("sources_hash");
+        try jw.write(self.sources_hash);
+        try jw.objectField("replication_sources");
+        try jw.write(self.replication_sources);
+        try jw.objectField("progress");
+        try jw.write(self.progress);
+        try jw.objectField("destination_contract");
+        try jw.write(self.destination_contract);
+        switch (self.index_publication) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("index_publication");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("index_publication");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("cdc_supported");
+        try jw.write(self.cdc_supported);
+        try jw.objectField("cdc_unsupported_reason");
+        try jw.write(self.cdc_unsupported_reason);
+        try jw.endObject();
+    }
+};
+
 pub const MatchAllQuery = struct {
     match_all: std.json.ArrayHashMap(std.json.Value),
     boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
@@ -44778,6 +45677,8 @@ pub const NamespaceCatalogRecord = struct {
     database_name: []const u8,
     /// Namespace name.
     name: []const u8,
+    /// SQL COMMENT annotation. NULL or an empty string removes the annotation without changing the object's identity or data schema.
+    description: OpenApiOptionalNullable([]const u8) = .absent,
     /// Optional durable tablespace binding inherited by new table placement policy in this namespace.
     tablespace_name: OpenApiOptionalNullable([]const u8) = .absent,
 
@@ -44791,6 +45692,17 @@ pub const NamespaceCatalogRecord = struct {
         try jw.write(self.database_name);
         try jw.objectField("name");
         try jw.write(self.name);
+        switch (self.description) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("description");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("description");
+                try jw.write(value);
+            },
+        }
         switch (self.tablespace_name) {
             .absent => {},
             .null_value => {
@@ -45512,6 +46424,7 @@ pub const PackageManifest = struct {
     dependencies: ?[]const PackageDependency = null,
     artifacts: ?[]const PackageArtifact = null,
     install: InstallManifest,
+    sql: ?SQLPackageControl = null,
     updates: ?[]const UpdateManifestRef = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -45530,6 +46443,7 @@ pub const PackageManifest = struct {
         .{ "dependencies", "dependencies", true },
         .{ "artifacts", "artifacts", true },
         .{ "install", "install", false },
+        .{ "sql", "sql", true },
         .{ "updates", "updates", true },
     };
 
@@ -45587,6 +46501,10 @@ pub const PackageManifest = struct {
         }
         try jw.objectField("install");
         try jw.write(self.install);
+        if (self.sql) |value| {
+            try jw.objectField("sql");
+            try jw.write(value);
+        }
         if (self.updates) |value| {
             try jw.objectField("updates");
             try jw.write(value);
@@ -46076,12 +46994,13 @@ pub const Permission = struct {
     }
 };
 
-/// Type of permission.
+/// Type of permission. replicate explicitly permits authorized changefeed and PostgreSQL logical replication access to the selected resource. It does not grant ordinary read, write, or administrative access. read, write, and curator do not imply replicate. admin includes replicate. Replication still requires current row/field policies and feed, slot, and publication ownership checks; a replication position is not an access credential.
 pub const PermissionType = enum {
     read,
     write,
     curator,
     admin,
+    replicate,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -46089,6 +47008,7 @@ pub const PermissionType = enum {
             .write => "write",
             .curator => "curator",
             .admin => "admin",
+            .replicate => "replicate",
         };
         try jw.write(s);
     }
@@ -46103,6 +47023,7 @@ pub const PermissionType = enum {
             .{ "write", .write },
             .{ "curator", .curator },
             .{ "admin", .admin },
+            .{ "replicate", .replicate },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -49608,6 +50529,8 @@ pub const RegexpQuery = struct {
 
 /// A typed CHECK. Supply either expression or column and op (with optional value and collation), never both forms. Expressions must return boolean and use the shared bounded immutable scalar expression vocabulary. New writes are checked from schema publication; existing rows are validated separately. SQL UNKNOWN satisfies CHECK. Comparison values must match the column type. Integer values may also use exact decimal strings to avoid client-side floating-point rounding.
 pub const RelationalCheckConstraint = struct {
+    /// Enforce this CHECK on every new or changed row without asserting that historical rows satisfy it. Explicit validation clears this declaration only after an unpublished generation has validated all rows and atomically replaced the active generation. Disposable background scan coverage does not change this declaration.
+    not_valid: ?bool = null,
     name: []const u8,
     column: ?[]const u8 = null,
     op: ?RelationalComparisonOp = null,
@@ -49619,6 +50542,7 @@ pub const RelationalCheckConstraint = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "not_valid", "not_valid", true },
         .{ "name", "name", false },
         .{ "column", "column", true },
         .{ "op", "op", true },
@@ -49637,6 +50561,10 @@ pub const RelationalCheckConstraint = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.not_valid) |value| {
+            try jw.objectField("not_valid");
+            try jw.write(value);
+        }
         try jw.objectField("name");
         try jw.write(self.name);
         if (self.column) |value| {
@@ -49670,9 +50598,83 @@ pub const RelationalCheckConstraint = struct {
     }
 };
 
+/// Exactly one of expression or the backend-bound sequence reference is required. Sequence references are column defaults only and cannot define stored generated columns.
 pub const RelationalColumnExpression = struct {
     column: []const u8,
-    expression: RelationalScalarExpression,
+    expression: ?RelationalScalarExpression = null,
+    sequence: ?RelationalColumnSequence = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "column", "column", false },
+        .{ "expression", "expression", true },
+        .{ "sequence", "sequence", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("column");
+        try jw.write(self.column);
+        if (self.expression) |value| {
+            try jw.objectField("expression");
+            try jw.write(value);
+        }
+        if (self.sequence) |value| {
+            try jw.objectField("sequence");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Backend-bound owned-sequence default, assigned atomically with the table and stable attribute identity. Names are descriptive; allocation uses the exact catalog incarnation and native 64-bit identities. Requires reader capability 37. Preparation allocates only for absent inputs; explicit NULL never requests a new value. Restore preserves stored values and never consumes the sequence. Clients cannot mint ownership by copying a descriptor onto a different table or column. Bulk mutation APIs preserve explicit identity values, like PostgreSQL COPY; SQL enforces ALWAYS and OVERRIDING rules. Implicit identity allocation uses table write authority; serial defaults and explicit sequence functions require sequence privileges.
+pub const RelationalColumnSequence = struct {
+    generation: RelationalColumnSequenceGeneration,
+    incarnation: []const u8,
+    sequence_id: []const u8,
+    namespace_id: []const u8,
+    table_id: []const u8,
+    column_id: []const u8,
+    database: []const u8,
+    namespace: []const u8,
+    name: []const u8,
+};
+
+/// SQL owned-sequence default policy. Serial defaults preserve explicit values even under OVERRIDING USER VALUE; identity defaults obey PostgreSQL overriding rules.
+pub const RelationalColumnSequenceGeneration = enum {
+    serial,
+    by_default,
+    always,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .serial => "serial",
+            .by_default => "by_default",
+            .always => "always",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "serial", .serial },
+            .{ "by_default", .by_default },
+            .{ "always", .always },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const RelationalComparisonOp = enum {
@@ -50026,6 +51028,25 @@ pub const RelationalExpressionOp = enum {
     in_list,
     not_in_list,
     array,
+    replace,
+    md5,
+    abs,
+    ceil,
+    floor,
+    round,
+    trunc,
+    sign,
+    sqrt,
+    jsonb_typeof,
+    jsonb_array_length,
+    jsonb_extract_path,
+    jsonb_extract_path_text,
+    uuidv4,
+    uuidv7,
+    transaction_timestamp,
+    length,
+    octet_length,
+    bit_length,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -50059,6 +51080,25 @@ pub const RelationalExpressionOp = enum {
             .in_list => "in_list",
             .not_in_list => "not_in_list",
             .array => "array",
+            .replace => "replace",
+            .md5 => "md5",
+            .abs => "abs",
+            .ceil => "ceil",
+            .floor => "floor",
+            .round => "round",
+            .trunc => "trunc",
+            .sign => "sign",
+            .sqrt => "sqrt",
+            .jsonb_typeof => "jsonb_typeof",
+            .jsonb_array_length => "jsonb_array_length",
+            .jsonb_extract_path => "jsonb_extract_path",
+            .jsonb_extract_path_text => "jsonb_extract_path_text",
+            .uuidv4 => "uuidv4",
+            .uuidv7 => "uuidv7",
+            .transaction_timestamp => "transaction_timestamp",
+            .length => "length",
+            .octet_length => "octet_length",
+            .bit_length => "bit_length",
         };
         try jw.write(s);
     }
@@ -50099,6 +51139,25 @@ pub const RelationalExpressionOp = enum {
             .{ "in_list", .in_list },
             .{ "not_in_list", .not_in_list },
             .{ "array", .array },
+            .{ "replace", .replace },
+            .{ "md5", .md5 },
+            .{ "abs", .abs },
+            .{ "ceil", .ceil },
+            .{ "floor", .floor },
+            .{ "round", .round },
+            .{ "trunc", .trunc },
+            .{ "sign", .sign },
+            .{ "sqrt", .sqrt },
+            .{ "jsonb_typeof", .jsonb_typeof },
+            .{ "jsonb_array_length", .jsonb_array_length },
+            .{ "jsonb_extract_path", .jsonb_extract_path },
+            .{ "jsonb_extract_path_text", .jsonb_extract_path_text },
+            .{ "uuidv4", .uuidv4 },
+            .{ "uuidv7", .uuidv7 },
+            .{ "transaction_timestamp", .transaction_timestamp },
+            .{ "length", .length },
+            .{ "octet_length", .octet_length },
+            .{ "bit_length", .bit_length },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -50113,6 +51172,12 @@ pub const RelationalExpressionType = enum {
     number,
     numeric,
     sql_array,
+    json,
+    numrange,
+    daterange,
+    tsrange,
+    tstzrange,
+    enumeration,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -50124,6 +51189,12 @@ pub const RelationalExpressionType = enum {
             .number => "number",
             .numeric => "numeric",
             .sql_array => "sql_array",
+            .json => "json",
+            .numrange => "numrange",
+            .daterange => "daterange",
+            .tsrange => "tsrange",
+            .tstzrange => "tstzrange",
+            .enumeration => "enumeration",
         };
         try jw.write(s);
     }
@@ -50142,13 +51213,21 @@ pub const RelationalExpressionType = enum {
             .{ "number", .number },
             .{ "numeric", .numeric },
             .{ "sql_array", .sql_array },
+            .{ "json", .json },
+            .{ "numrange", .numrange },
+            .{ "daterange", .daterange },
+            .{ "tsrange", .tsrange },
+            .{ "tstzrange", .tstzrange },
+            .{ "enumeration", .enumeration },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
 };
 
-/// Composite foreign key. Child and parent columns correspond by position and must have the same physical comparison types. The parent columns must identify a unique key. Existing-row validation is independent of new-write enforcement and is never client-writable. Enforcement and referential actions share the bounded distributed transaction path, including TTL expiry. Partial matching uses ordered support indexes on the parent; activation waits until these are ready. SET NULL requires every child column to accept explicit NULL.
+/// Composite foreign key. Child and parent columns correspond by position and must have the same physical comparison types. The parent columns must identify a unique key. Existing-row validation is independent of new-write enforcement. Clearing NOT VALID requires coordinated historical validation. Enforcement and referential actions share the bounded distributed transaction path, including TTL expiry. Partial matching uses ordered support indexes on the parent; activation waits until these are ready. SET NULL requires every child column to accept explicit NULL.
 pub const RelationalForeignKeyConstraint = struct {
+    /// Retain historical references without requiring their parents to exist. New writes and parent referential actions remain enforced. Setting false on an existing unvalidated declaration requires coordinated validation before publication; it cannot certify coverage itself.
+    not_valid: ?bool = null,
     name: []const u8,
     child_columns: []const []const u8,
     /// Literal parent table name in the child table's database and namespace. Resolved to an immutable table identity when the constraint is declared; renaming a parent preserves the reference. Public schemas show its current name.
@@ -50162,6 +51241,7 @@ pub const RelationalForeignKeyConstraint = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "not_valid", "not_valid", true },
         .{ "name", "name", false },
         .{ "child_columns", "child_columns", false },
         .{ "parent_table", "parent_table", false },
@@ -50183,6 +51263,10 @@ pub const RelationalForeignKeyConstraint = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.not_valid) |value| {
+            try jw.objectField("not_valid");
+            try jw.write(value);
+        }
         try jw.objectField("name");
         try jw.write(self.name);
         try jw.objectField("child_columns");
@@ -50474,21 +51558,24 @@ pub const RelationalIndexKeyNulls = enum {
     }
 };
 
-/// A typed partial-index conjunct. Only TRUE is indexed; FALSE and SQL UNKNOWN are excluded.
+/// A typed partial-index conjunct. Specify either a constant truth value, or a column and comparison operation, never both. Only TRUE is indexed; FALSE and SQL UNKNOWN are excluded. A constant false conjunct represents an empty index without inventing a column dependency.
 pub const RelationalIndexPredicate = struct {
-    column: []const u8,
-    op: RelationalComparisonOp,
+    column: ?[]const u8 = null,
+    op: ?RelationalComparisonOp = null,
     /// Typed scalar operand; integer columns also accept exact decimal strings. Omission means NULL.
     value: OpenApiOptionalNullable(std.json.Value) = .absent,
     /// String comparison collation with the same semantics as ordered keys.
     collation: ?[]const u8 = null,
+    /// Constant membership truth. SQL UNKNOWN is normalized to false for index membership. Requires reader capability version 26.
+    constant: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "column", "column", false },
-        .{ "op", "op", false },
+        .{ "column", "column", true },
+        .{ "op", "op", true },
         .{ "value", "value", false },
         .{ "collation", "collation", true },
+        .{ "constant", "constant", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -50501,10 +51588,14 @@ pub const RelationalIndexPredicate = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        try jw.objectField("column");
-        try jw.write(self.column);
-        try jw.objectField("op");
-        try jw.write(self.op);
+        if (self.column) |value| {
+            try jw.objectField("column");
+            try jw.write(value);
+        }
+        if (self.op) |value| {
+            try jw.objectField("op");
+            try jw.write(value);
+        }
         switch (self.value) {
             .absent => {},
             .null_value => {
@@ -50518,6 +51609,10 @@ pub const RelationalIndexPredicate = struct {
         }
         if (self.collation) |value| {
             try jw.objectField("collation");
+            try jw.write(value);
+        }
+        if (self.constant) |value| {
+            try jw.objectField("constant");
             try jw.write(value);
         }
         try jw.endObject();
@@ -50928,16 +52023,24 @@ pub const RelationalRowQueryRequest = struct {
     }
 };
 
-/// Immutable typed scalar expression, limited to 128 nodes and 16 levels. A literal requires type; omitted value means typed null. A column requires column; other operations require args. Unknown or irrelevant fields are rejected. Arithmetic operands have the same integer or number type. Integer division truncates toward zero. Overflow and division by zero reject the write. Arithmetic and string operations propagate null. ASCII case operations leave non-ASCII bytes unchanged. No volatile functions are accepted. Allocated results are bounded to 1 MiB each. Allocations and byte-comparison operand work share a 4 MiB evaluation budget per row and expression set. An integer literal may use a decimal string for exact int64 transport; blob uses base64 and datetime uses the normal relational datetime representation. Comparisons require operands of compatible types (integer and number may mix) and return boolean or SQL UNKNOWN (null); is_distinct and is_not_distinct always return a boolean. Unary is_null and is_not_null test presence/null. AND and OR evaluate left to right with SQL three-valued short-circuit semantics; NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE. Numeric literals and arithmetic operations may specify sql_type to retain PostgreSQL builtin overflow and float4 rounding semantics. Without it, integer and number operations retain int64 and float64 semantics. Numeric cast requires type and sql_type, takes one numeric argument, and performs a checked conversion when evaluated (not when the schema is compiled). Floating-to-integer casts round ties to even. The numeric expression type uses exact PostgreSQL NUMERIC values and may specify sql_type numeric. Its literals accept decimal strings or exact JSON numeric lexemes, including string-valued special values. Exact NUMERIC programs require reader capability version 21 even when their result is boolean or integer. Float/integer assignment casts keep their declared PostgreSQL rounding and overflow semantics. A cast to numeric may specify numeric_modifier for PostgreSQL precision and signed-scale coercion. Overflow is checked when the selected cast executes; unselected lazy branches do not fail. Modifier-bearing programs require reader capability version 23 even with integer/boolean output. The sql_array expression type requires sql_type on literals, including typed NULL, to declare the element builtin. Non-null literals use the ordinal SQL array envelope (dimensions with length/lower_bound, values, and sql_nulls), retaining shape and lower bounds. Array columns derive their exact element identity from the immutable schema. Comparisons, IN, COALESCE and CASE require matching array element identities; no element type is inferred from values. Array-dependent programs require reader capability version 24 even with scalar output. Assignment to a NUMERIC array column applies its precision/signed-scale modifier to each element. Array casts require type sql_array and an explicit matching sql_type; identity casts borrow the immutable input. Casts of numeric arrays may additionally specify numeric_modifier, coercing each non-NULL element with PostgreSQL precision and signed-scale semantics while preserving dimensions, lower bounds and NULL slots. Coercion is lazy and shares invocation admission with the surrounding expression. Array-valued ordered index keys and element-changing array casts are not supported by this expression contract. The array constructor requires sql_type and zero to 32 arguments. Constructor programs additionally require reader capability version 25, including constructors hidden inside scalar/boolean expressions. Scalar arguments must have the declared element domain, with explicit width-preserving numeric casts where needed. SQL NULL arguments become NULL elements. Array arguments must all have matching element types, dimensions and lower bounds; one leading dimension with lower bound 1 is added. All empty/NULL subarrays produce an empty array; mixing an empty/NULL subarray with a nonempty one is a dimension mismatch. Child expressions execute once, with shared work/cancellation and byte limits. case_when takes alternating boolean conditions and result expressions, followed by a mandatory fallback result (3 to 31 arguments, at most 15 branches). Conditions are evaluated in order; only the selected result is evaluated, and a NULL condition is not TRUE. All result expressions must have the same physical type. Numeric SQL lowering records builtin result-domain promotions as explicit casts. This operation requires schema capability version 18. modulo takes two same-domain integer or NUMERIC operands and returns the signed remainder (minInt modulo -1 is zero); a zero divisor rejects the write. in_list and not_in_list take one probe followed by 1 to 127 same-domain candidates. The probe is evaluated once; NULL probes return UNKNOWN. A matching candidate wins over NULL candidates; otherwise a NULL candidate makes the result UNKNOWN. These operations require schema capability version 19.
+/// Typed scalar expression, limited to 128 nodes and 16 levels. CHECK, generated-column and index expressions must be immutable. UUIDv4 and UUIDv7 generation are permitted only in column defaults and require reader capability version 33. They run once during owned row preparation, never during schema publication or restore verification. Transaction-clock defaults require reader capability version 34 and use the transaction owner's captured instant, shared across rows and statements in an explicit transaction. Stored values are preserved on restore. The uuidv4, uuidv7 and transaction_timestamp operations take no args; uuidv7 may specify shift and transaction_timestamp may specify precision. A literal requires type; omitted value means typed null. A column requires column; other operations except uuidv4, uuidv7 and transaction_timestamp require args. Unknown or irrelevant fields are rejected. Arithmetic operands have the same integer or number type. Integer division truncates toward zero. Overflow and division by zero reject the write. Arithmetic and string operations propagate null. ASCII case operations leave non-ASCII bytes unchanged. Volatile operations are restricted to column defaults. Allocated results are bounded to 1 MiB each. The replace operation takes three text arguments and performs literal, non-overlapping replacement; an empty search string leaves the input unchanged. md5 takes one text argument and returns 32 lowercase hex characters (a SQL compatibility fingerprint, not a security primitive). Both are strict in SQL NULL and require reader capability version 27, including when nested inside scalar/boolean expressions. Literal search patterns are prepared with immutable plans; matching, copies and dynamic pattern preparation share invocation work/cancellation admission. Numeric functions abs, ceil, floor, round, trunc, sign and sqrt require reader capability version 28, even when nested in boolean programs. They take one NUMERIC or float64 argument; abs also preserves integer widths and float32. round and trunc optionally accept an int32 scale as a second argument only for NUMERIC. Operands must already have their resolved SQL types; SQL lowering inserts required promotions. NUMERIC round uses ties away from zero; float64 round uses ties to even. All selected arguments evaluate before strict NULL propagation. NUMERIC execution never converts through float and shares invocation admission. Allocations and byte-comparison operand work share a 4 MiB evaluation budget per row and expression set. An integer literal may use a decimal string for exact int64 transport; blob uses base64 and datetime uses the normal relational datetime representation. Comparisons require operands of compatible types (integer and number may mix) and return boolean or SQL UNKNOWN (null); is_distinct and is_not_distinct always return a boolean. Unary is_null and is_not_null test presence/null. AND and OR evaluate left to right with SQL three-valued short-circuit semantics; NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE. Numeric literals and arithmetic operations may specify sql_type to retain PostgreSQL builtin overflow and float4 rounding semantics. Without it, integer and number operations retain int64 and float64 semantics. Numeric cast requires type and sql_type, takes one numeric argument, and performs a checked conversion when evaluated (not when the schema is compiled). Floating-to-integer casts round ties to even. The numeric expression type uses exact PostgreSQL NUMERIC values and may specify sql_type numeric. Its literals accept decimal strings or exact JSON numeric lexemes, including string-valued special values. Exact NUMERIC programs require reader capability version 21 even when their result is boolean or integer. Float/integer assignment casts keep their declared PostgreSQL rounding and overflow semantics. A cast to numeric may specify numeric_modifier for PostgreSQL precision and signed-scale coercion. Overflow is checked when the selected cast executes; unselected lazy branches do not fail. Modifier-bearing programs require reader capability version 23 even with integer/boolean output. The sql_array expression type requires sql_type on literals, including typed NULL, to declare the element builtin. Non-null literals use the ordinal SQL array envelope (dimensions with length/lower_bound, values, and sql_nulls), retaining shape and lower bounds. Array columns derive their exact element identity from the immutable schema. Comparisons, IN, COALESCE and CASE require matching array element identities; no element type is inferred from values. Array-dependent programs require reader capability version 24 even with scalar output. Assignment to a NUMERIC array column applies its precision/signed-scale modifier to each element. Array casts require type sql_array and an explicit matching sql_type; identity casts borrow the immutable input. Casts of numeric arrays may additionally specify numeric_modifier, coercing each non-NULL element with PostgreSQL precision and signed-scale semantics while preserving dimensions, lower bounds and NULL slots. Coercion is lazy and shares invocation admission with the surrounding expression. Array-valued ordered index keys and element-changing array casts are not supported by this expression contract. The array constructor requires sql_type and zero to 32 arguments. Constructor programs additionally require reader capability version 25, including constructors hidden inside scalar/boolean expressions. Scalar arguments must have the declared element domain, with explicit width-preserving numeric casts where needed. SQL NULL arguments become NULL elements. Array arguments must all have matching element types, dimensions and lower bounds; one leading dimension with lower bound 1 is added. All empty/NULL subarrays produce an empty array; mixing an empty/NULL subarray with a nonempty one is a dimension mismatch. Child expressions execute once, with shared work/cancellation and byte limits. case_when takes alternating boolean conditions and result expressions, followed by a mandatory fallback result (3 to 31 arguments, at most 15 branches). Conditions are evaluated in order; only the selected result is evaluated, and a NULL condition is not TRUE. All result expressions must have the same physical type. Numeric SQL lowering records builtin result-domain promotions as explicit casts. This operation requires schema capability version 18. modulo takes two same-domain integer or NUMERIC operands and returns the signed remainder (minInt modulo -1 is zero); a zero divisor rejects the write. in_list and not_in_list take one probe followed by 1 to 127 same-domain candidates. The probe is evaluated once; NULL probes return UNKNOWN. A matching candidate wins over NULL candidates; otherwise a NULL candidate makes the result UNKNOWN. These operations require schema capability version 19. Enumeration expressions require reader capability version 40. Enum literals and casts declare named_type_id from the owning schema directory. Input labels are exact and case-sensitive; comparisons retain declaration order and reject unrelated named identities. Enum/text conversions are explicit; stored enum values retain four-byte symbols. CHECK, generated values, defaults, typed-row ingress and restore share the native validator. JSON expressions require reader capability version 30. The json type carries JSONB semantics, including exact numeric values and display scale. jsonb_typeof and jsonb_array_length take one JSON argument; array length rejects a non-array value. jsonb_extract_path and jsonb_extract_path_text take a JSON argument followed by 1 to 31 text path components. Negative array ordinals count from the end; a missing path returns SQL NULL. JSON extraction retains JSON null; text extraction converts JSON null to SQL NULL. Arguments are evaluated strictly, while enclosing CASE/coalesce retain their short-circuit semantics.
 pub const RelationalScalarExpression = struct {
     op: RelationalExpressionOp,
     type: ?RelationalExpressionType = null,
+    /// Required on enumeration literals and casts, including typed NULL. Resolved from the immutable schema-owned named-type directory; labels and executable definitions are never accepted here. Requires reader capability version 40. Other expression types reject this field.
+    named_type_id: ?u64 = null,
     /// Numeric builtin result identity on numeric literals, arithmetic, negate, and cast (capability version 18), or required array element identity on sql_array literals including typed NULL (capability version 24).
     sql_type: ?SQLBuiltinType = null,
     /// Optional precision/signed-scale coercion; accepted only on cast with type numeric and sql_type numeric. Requires reader capability version 23.
     numeric_modifier: ?SQLNumericModifier = null,
     /// Typed literal value, including null.
     value: OpenApiOptionalNullable(std.json.Value) = .absent,
+    /// Canonical PostgreSQL interval text, accepted only on a uuidv7 default operation. SQL lowering resolves and binds calendar months, days, and microseconds before publication. Omission generates an unshifted UUID; SQL NULL shifts lower to a NULL literal instead. Infinite intervals remain representable declarations but fail when evaluated.
+    shift: ?[]const u8 = null,
+    /// Fractional-second precision (omission means 6), accepted only on a transaction_timestamp column default. Rounding uses the shared PostgreSQL timestamp semantics. Requires reader capability version 34.
+    precision: ?i64 = null,
+    /// For a literal of type json only. True denotes present JSON null and requires value to be omitted or null. False or omission leaves an omitted/null value as SQL NULL. This explicit marker survives SDKs that omit optional null values. Requires reader capability version 30.
+    json_null: ?bool = null,
     column: ?[]const u8 = null,
     /// Optional binary or ASCII case-insensitive collation for string comparisons and in_list; aliases match ordered indexes.
     collation: ?[]const u8 = null,
@@ -50947,9 +52050,13 @@ pub const RelationalScalarExpression = struct {
     pub const openApiFieldMetadata = .{
         .{ "op", "op", false },
         .{ "type", "type", true },
+        .{ "named_type_id", "named_type_id", true },
         .{ "sql_type", "sql_type", true },
         .{ "numeric_modifier", "numeric_modifier", true },
         .{ "value", "value", false },
+        .{ "shift", "shift", true },
+        .{ "precision", "precision", true },
+        .{ "json_null", "json_null", true },
         .{ "column", "column", true },
         .{ "collation", "collation", true },
         .{ "args", "args", true },
@@ -50971,6 +52078,10 @@ pub const RelationalScalarExpression = struct {
             try jw.objectField("type");
             try jw.write(value);
         }
+        if (self.named_type_id) |value| {
+            try jw.objectField("named_type_id");
+            try jw.write(value);
+        }
         if (self.sql_type) |value| {
             try jw.objectField("sql_type");
             try jw.write(value);
@@ -50989,6 +52100,18 @@ pub const RelationalScalarExpression = struct {
                 try jw.objectField("value");
                 try jw.write(value);
             },
+        }
+        if (self.shift) |value| {
+            try jw.objectField("shift");
+            try jw.write(value);
+        }
+        if (self.precision) |value| {
+            try jw.objectField("precision");
+            try jw.write(value);
+        }
+        if (self.json_null) |value| {
+            try jw.objectField("json_null");
+            try jw.write(value);
         }
         if (self.column) |value| {
             try jw.objectField("column");
@@ -51012,11 +52135,15 @@ pub const RelationalUniqueConstraint = struct {
     origin: ?RelationalUniqueConstraintOrigin = null,
     /// SQL primary-key identity. At most one per relational table; all key columns must be required and nonnullable.
     primary: ?bool = null,
+    /// Non-key payload columns for this constraint's covering ordered index. They never participate in uniqueness, foreign-key target identity, or primary-key nullability. Only column-key, constraint-owned declarations support INCLUDE.
+    include_columns: ?[]const []const u8 = null,
     columns: ?[]const []const u8 = null,
     /// Typed native unique keys. Specify either columns or keys.
     keys: ?[]const RelationalIndexKey = null,
     /// Conjunction restricting uniqueness to matching rows.
     where: ?[]const RelationalIndexPredicate = null,
+    /// Range-valued final key column for PostgreSQL WITHOUT OVERLAPS. Other key columns define equality groups; nonempty ranges within each group must be disjoint. The column remains in columns. Temporal keys are not equality-only foreign-key targets or ON CONFLICT arbiters.
+    without_overlaps_column: ?[]const u8 = null,
     /// When true, NULL components compare equal for uniqueness.
     nulls_not_distinct: ?bool = null,
     /// Permit uniqueness checks at transaction commit. Never eligible as an ON CONFLICT arbiter or a referenced foreign key target.
@@ -51028,9 +52155,11 @@ pub const RelationalUniqueConstraint = struct {
         .{ "name", "name", false },
         .{ "origin", "origin", true },
         .{ "primary", "primary", true },
+        .{ "include_columns", "include_columns", true },
         .{ "columns", "columns", true },
         .{ "keys", "keys", true },
         .{ "where", "where", true },
+        .{ "without_overlaps_column", "without_overlaps_column", true },
         .{ "nulls_not_distinct", "nulls_not_distinct", true },
         .{ "deferrable", "deferrable", true },
         .{ "timing", "timing", true },
@@ -51056,6 +52185,10 @@ pub const RelationalUniqueConstraint = struct {
             try jw.objectField("primary");
             try jw.write(value);
         }
+        if (self.include_columns) |value| {
+            try jw.objectField("include_columns");
+            try jw.write(value);
+        }
         if (self.columns) |value| {
             try jw.objectField("columns");
             try jw.write(value);
@@ -51066,6 +52199,10 @@ pub const RelationalUniqueConstraint = struct {
         }
         if (self.where) |value| {
             try jw.objectField("where");
+            try jw.write(value);
+        }
+        if (self.without_overlaps_column) |value| {
+            try jw.objectField("without_overlaps_column");
             try jw.write(value);
         }
         if (self.nulls_not_distinct) |value| {
@@ -54883,12 +56020,54 @@ pub const RestoreJobList = struct {
 };
 
 pub const RestoreRequest = struct {
+    /// Explicit immutable routine identity handoff for trigger attachments. Cross-catalog restores require a mapping for every referenced trigger function. Destination functions must already exist and be authorized compatible zero-argument trigger functions. Routine bodies and names are never imported or rebound by this operation. Mappings are part of the durable job and its idempotency identity.
+    routine_mappings: ?[]const RestoreRoutineMapping = null,
     /// Identifier of the published backup to restore.
     backup_id: []const u8,
     /// Storage location containing the backup. The server detects the native or portable format from the published manifest and artifact.
     location: []const u8,
     /// ID of a configured `external_io` connection with `restore.read`. Object locations enforce bucket and prefix scopes; filesystem URI paths resolve beneath the connection root.
     connection: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "routine_mappings", "routine_mappings", true },
+        .{ "backup_id", "backup_id", false },
+        .{ "location", "location", false },
+        .{ "connection", "connection", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.routine_mappings) |value| {
+            try jw.objectField("routine_mappings");
+            try jw.write(value);
+        }
+        try jw.objectField("backup_id");
+        try jw.write(self.backup_id);
+        try jw.objectField("location");
+        try jw.write(self.location);
+        try jw.objectField("connection");
+        try jw.write(self.connection);
+        try jw.endObject();
+    }
+};
+
+pub const RestoreRoutineMapping = struct {
+    /// Metadata catalog incarnation recorded in the source attachment.
+    source_metadata_incarnation: []const u8,
+    /// Immutable source function identifier, expressed losslessly as decimal.
+    source_routine_id: []const u8,
+    /// Existing immutable destination function identifier, expressed losslessly as decimal.
+    destination_routine_id: []const u8,
 };
 
 /// Request for the retrieval agent. Queries define which tables and indexes to search, each as an ordinary QueryRequest. Optional tree or graph exploration is configured by steps.retrieval.navigation, targeting one query by index. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes. A query may contain only a table scope and caller constraints: build_query delegates to the query-builder agent, then search executes its validated QueryRequest. Refinements use the same canonical full-DSL validator, not keyword substitution. Authenticated row filters are enforced on every initial and generated operation in both modes, including scans, aggregates, and graph/tree traversal. They cannot be replaced or weakened by model tool arguments.
@@ -56208,10 +57387,232 @@ pub const SQLBuiltinType = enum {
     }
 };
 
+/// Catalog object affected by an exact recoverable operation.
+pub const SQLCatalogObjectKind = enum {
+    sequence,
+    function,
+    procedure,
+    operator,
+    aggregate,
+    cast,
+    type,
+    authorization,
+    table,
+    index,
+    database,
+    namespace,
+    tablespace,
+    query_source,
+    view,
+    extension,
+    collation,
+    publication,
+    subscription,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .sequence => "sequence",
+            .function => "function",
+            .procedure => "procedure",
+            .operator => "operator",
+            .aggregate => "aggregate",
+            .cast => "cast",
+            .type => "type",
+            .authorization => "authorization",
+            .table => "table",
+            .index => "index",
+            .database => "database",
+            .namespace => "namespace",
+            .tablespace => "tablespace",
+            .query_source => "query_source",
+            .view => "view",
+            .extension => "extension",
+            .collation => "collation",
+            .publication => "publication",
+            .subscription => "subscription",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "sequence", .sequence },
+            .{ "function", .function },
+            .{ "procedure", .procedure },
+            .{ "operator", .operator },
+            .{ "aggregate", .aggregate },
+            .{ "cast", .cast },
+            .{ "type", .type },
+            .{ "authorization", .authorization },
+            .{ "table", .table },
+            .{ "index", .index },
+            .{ "database", .database },
+            .{ "namespace", .namespace },
+            .{ "tablespace", .tablespace },
+            .{ "query_source", .query_source },
+            .{ "view", .view },
+            .{ "extension", .extension },
+            .{ "collation", .collation },
+            .{ "publication", .publication },
+            .{ "subscription", .subscription },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const SQLCatalogOperationKind = enum {
+    create,
+    alter,
+    rename,
+    drop,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .create => "create",
+            .alter => "alter",
+            .rename => "rename",
+            .drop => "drop",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "create", .create },
+            .{ "alter", .alter },
+            .{ "rename", .rename },
+            .{ "drop", .drop },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Recovery receipt for an atomic native catalog mutation, separate from physical table/schema publication receipts. Retain recovery_token and observe it with getSQLCatalogOperation; never resubmit uncertain DDL. Retention is bounded by catalog activity, not a promised wall-clock interval. Missing, expired, inaccessible or superseded-authority outcomes cannot be inferred from a current object name and remain unknown. This receipt does not make a new request idempotent or recover a token lost with an entire response. All identity integers are exact decimal strings.
+pub const SQLCatalogOperationReceipt = struct {
+    kind: SQLCatalogObjectKind,
+    operation: SQLCatalogOperationKind,
+    database: []const u8,
+    namespace: []const u8,
+    name: []const u8,
+    state: SQLCatalogOperationState,
+    /// Opaque versioned operation handle. Send it unchanged; it is not a reusable admission ticket.
+    recovery_token: []const u8,
+    /// Actual committed catalog identity, when the result carries one; never a predicted allocation.
+    object_id: ?[]const u8 = null,
+    generation: ?[]const u8 = null,
+    catalog_revision: ?[]const u8 = null,
+    diagnostic: ?SQLDiagnostic = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "kind", "kind", false },
+        .{ "operation", "operation", false },
+        .{ "database", "database", false },
+        .{ "namespace", "namespace", false },
+        .{ "name", "name", false },
+        .{ "state", "state", false },
+        .{ "recovery_token", "recovery_token", false },
+        .{ "object_id", "object_id", true },
+        .{ "generation", "generation", true },
+        .{ "catalog_revision", "catalog_revision", true },
+        .{ "diagnostic", "diagnostic", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        try jw.objectField("operation");
+        try jw.write(self.operation);
+        try jw.objectField("database");
+        try jw.write(self.database);
+        try jw.objectField("namespace");
+        try jw.write(self.namespace);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("state");
+        try jw.write(self.state);
+        try jw.objectField("recovery_token");
+        try jw.write(self.recovery_token);
+        if (self.object_id) |value| {
+            try jw.objectField("object_id");
+            try jw.write(value);
+        }
+        if (self.generation) |value| {
+            try jw.objectField("generation");
+            try jw.write(value);
+        }
+        if (self.catalog_revision) |value| {
+            try jw.objectField("catalog_revision");
+            try jw.write(value);
+        }
+        if (self.diagnostic) |value| {
+            try jw.objectField("diagnostic");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// A retained authoritative result, or an unconfirmed outcome. Unknown is never permission to replay DDL.
+pub const SQLCatalogOperationState = enum {
+    committed,
+    rejected,
+    unknown,
+    pending,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .committed => "committed",
+            .rejected => "rejected",
+            .unknown => "unknown",
+            .pending => "pending",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "committed", .committed },
+            .{ "rejected", .rejected },
+            .{ "unknown", .unknown },
+            .{ "pending", .pending },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const SQLCatalogRecoveryRequest = struct {
+    recovery_token: []const u8,
+};
+
 pub const SQLColumn = struct {
     /// Display label. Labels need not be unique; rows use matching ordinal positions.
     name: []const u8,
     type: SQLColumnType,
+    /// Required for enum and domain values, including NULL. Identifies the immutable logical catalog type and its scalar/array wire OIDs. The type and element_type fields describe the physical value; enum cells use exact label strings. Domain parameters undergo fresh constraint validation; a declared identity does not prove an already validated value. SQL NULL remains a null cell.
+    named_type: ?SQLNamedTypeIdentity = null,
+    temporal_kind: ?SQLTemporalKind = null,
     /// Required for array columns and exact NUMERIC number columns. Identifies scalar widths when supplied. The descriptor applies even to NULL or empty arrays.
     element_type: ?SQLArrayElementType = null,
     /// Present only for constrained NUMERIC scalar or array results. Prepared result metadata is stable before execution-time constant folding.
@@ -56221,6 +57622,8 @@ pub const SQLColumn = struct {
     pub const openApiFieldMetadata = .{
         .{ "name", "name", false },
         .{ "type", "type", false },
+        .{ "named_type", "named_type", true },
+        .{ "temporal_kind", "temporal_kind", true },
         .{ "element_type", "element_type", true },
         .{ "numeric_modifier", "numeric_modifier", true },
     };
@@ -56239,6 +57642,14 @@ pub const SQLColumn = struct {
         try jw.write(self.name);
         try jw.objectField("type");
         try jw.write(self.type);
+        if (self.named_type) |value| {
+            try jw.objectField("named_type");
+            try jw.write(value);
+        }
+        if (self.temporal_kind) |value| {
+            try jw.objectField("temporal_kind");
+            try jw.write(value);
+        }
         if (self.element_type) |value| {
             try jw.objectField("element_type");
             try jw.write(value);
@@ -56251,7 +57662,7 @@ pub const SQLColumn = struct {
     }
 };
 
-/// Logical SQL result type. Integer values and numbers with element_type numeric are decimal strings to preserve exact precision in every client.
+/// Logical SQL result type. The void pseudotype uses an empty string for a non-NULL value and cannot be stored in table columns. Integer values and numbers with element_type numeric are decimal strings to preserve exact precision in every client. Bytea results use PostgreSQL hex text (a backslash followed by x and lowercase hex digits) in JSON and opaque bytes in PostgreSQL binary format.
 pub const SQLColumnType = enum {
     string,
     uuid,
@@ -56262,6 +57673,13 @@ pub const SQLColumnType = enum {
     json,
     array,
     unknown,
+    numrange,
+    daterange,
+    tsrange,
+    tstzrange,
+    enumeration,
+    bytea,
+    void,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -56274,6 +57692,13 @@ pub const SQLColumnType = enum {
             .json => "json",
             .array => "array",
             .unknown => "unknown",
+            .numrange => "numrange",
+            .daterange => "daterange",
+            .tsrange => "tsrange",
+            .tstzrange => "tstzrange",
+            .enumeration => "enumeration",
+            .bytea => "bytea",
+            .void => "void",
         };
         try jw.write(s);
     }
@@ -56293,6 +57718,13 @@ pub const SQLColumnType = enum {
             .{ "json", .json },
             .{ "array", .array },
             .{ "unknown", .unknown },
+            .{ "numrange", .numrange },
+            .{ "daterange", .daterange },
+            .{ "tsrange", .tsrange },
+            .{ "tstzrange", .tstzrange },
+            .{ "enumeration", .enumeration },
+            .{ "bytea", .bytea },
+            .{ "void", .void },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -56340,7 +57772,7 @@ pub const SQLConnectionResponse = struct {
     namespace: []const u8,
 };
 
-/// Durable DDL declaration receipt. admission_unknown means admission has not been confirmed; reconcile restore_job_id and idempotency_key without replaying DDL. Pending or invalid means the declaration committed but validation has not established an active constraint. Do not replay it. Inspect table constraint status using this immutable table identity and schema generation; a later generation supersedes this receipt.
+/// Durable DDL operation receipt. admission_unknown means admission has not been confirmed; retain the matching restore job, FK publication ID, index publication token, or schema validation token and reconcile its status without replaying DDL. Pending means a durable operation was admitted, not necessarily that its successor schema is published. Invalid means declaration validation failed. Do not replay either. For an index build, observe the exact publication token. For validation-only schema changes, observe the exact schema validation token; otherwise inspect its restore job or table constraint status using this immutable table identity and schema generation. A later generation may supersede the completed operation.
 pub const SQLDDLReceipt = struct {
     database: []const u8,
     namespace: []const u8,
@@ -56353,6 +57785,10 @@ pub const SQLDDLReceipt = struct {
     restore_job_id: ?[]const u8 = null,
     /// Durable retry identity for an admitted or uncertain schema rewrite. Retain it with restore_job_id when reconciling admission; do not replay the DDL.
     idempotency_key: ?[]const u8 = null,
+    /// Immutable FK-generation publication identity. Retain it when admission is unknown or activation remains pending; do not replay DDL.
+    fk_generation_publication_id: ?[]const u8 = null,
+    index_publication_token: ?IndexPublicationToken = null,
+    schema_validation_token: ?SchemaValidationToken = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -56365,6 +57801,9 @@ pub const SQLDDLReceipt = struct {
         .{ "diagnostic", "diagnostic", true },
         .{ "restore_job_id", "restore_job_id", true },
         .{ "idempotency_key", "idempotency_key", true },
+        .{ "fk_generation_publication_id", "fk_generation_publication_id", true },
+        .{ "index_publication_token", "index_publication_token", true },
+        .{ "schema_validation_token", "schema_validation_token", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -56399,6 +57838,18 @@ pub const SQLDDLReceipt = struct {
         }
         if (self.idempotency_key) |value| {
             try jw.objectField("idempotency_key");
+            try jw.write(value);
+        }
+        if (self.fk_generation_publication_id) |value| {
+            try jw.objectField("fk_generation_publication_id");
+            try jw.write(value);
+        }
+        if (self.index_publication_token) |value| {
+            try jw.objectField("index_publication_token");
+            try jw.write(value);
+        }
+        if (self.schema_validation_token) |value| {
+            try jw.objectField("schema_validation_token");
             try jw.write(value);
         }
         try jw.endObject();
@@ -56437,6 +57888,7 @@ pub const SQLDDLReceiptState = enum {
 };
 
 pub const SQLDiagnostic = struct {
+    notices: ?[]const SQLNotice = null,
     /// Five-character SQLSTATE error code.
     code: []const u8,
     /// Human-readable diagnostic with no sensitive parameter values.
@@ -56453,6 +57905,7 @@ pub const SQLDiagnostic = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "notices", "notices", true },
         .{ "code", "code", false },
         .{ "message", "message", false },
         .{ "column_name", "column_name", true },
@@ -56472,6 +57925,10 @@ pub const SQLDiagnostic = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.notices) |value| {
+            try jw.objectField("notices");
+            try jw.write(value);
+        }
         try jw.objectField("code");
         try jw.write(self.code);
         try jw.objectField("message");
@@ -56532,21 +57989,613 @@ pub const SQLMutationOutcome = enum {
     }
 };
 
+/// Exactly one builtin or named base. The server resolves and verifies the complete base chain before publication.
+pub const SQLNamedDomainBase = struct {
+    kind: []const u8,
+    builtin: ?SQLBuiltinType = null,
+    named: ?SQLNamedTypeReference = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "kind", "kind", false },
+        .{ "builtin", "builtin", true },
+        .{ "named", "named", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        if (self.builtin) |value| {
+            try jw.objectField("builtin");
+            try jw.write(value);
+        }
+        if (self.named) |value| {
+            try jw.objectField("named");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// A named CHECK over the typed VALUE input. Unvalidated constraints still enforce every new assignment.
+pub const SQLNamedDomainCheck = struct {
+    name: []const u8,
+    expression: RelationalScalarExpression,
+    validated: bool,
+};
+
+/// Server-resolved immutable domain contract. Defaults affect future assignments; restrictive changes require dependent-owner activation.
+pub const SQLNamedDomainDefinition = struct {
+    base: SQLNamedDomainBase,
+    numeric_modifier: ?SQLNumericModifier = null,
+    default_expression: ?RelationalScalarExpression = null,
+    not_null: bool,
+    checks: []const SQLNamedDomainCheck,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "base", "base", false },
+        .{ "numeric_modifier", "numeric_modifier", true },
+        .{ "default_expression", "default_expression", true },
+        .{ "not_null", "not_null", false },
+        .{ "checks", "checks", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("base");
+        try jw.write(self.base);
+        if (self.numeric_modifier) |value| {
+            try jw.objectField("numeric_modifier");
+            try jw.write(value);
+        }
+        if (self.default_expression) |value| {
+            try jw.objectField("default_expression");
+            try jw.write(value);
+        }
+        try jw.objectField("not_null");
+        try jw.write(self.not_null);
+        try jw.objectField("checks");
+        try jw.write(self.checks);
+        try jw.endObject();
+    }
+};
+
+/// A schema-bound enum column. JSON values are exact labels; SQL NULL is distinct from every label, including the empty string.
+pub const SQLNamedEnumColumnSchema = struct {
+    type: []const u8,
+    /// Resolved catalog type ID. The table's named_types directory supplies its immutable executable definition.
+    x_antfly_sql_type_id: u64,
+    nullable: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "x-antfly-sql-type-id", "x_antfly_sql_type_id", false },
+        .{ "nullable", "nullable", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("x-antfly-sql-type-id");
+        try jw.write(self.x_antfly_sql_type_id);
+        if (self.nullable) |value| {
+            try jw.objectField("nullable");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Immutable enum symbol. Symbol IDs are append-only; order keys are opaque stable ordering metadata.
+pub const SQLNamedEnumLabel = struct {
+    id: u32,
+    /// Exact UTF-8 label; PostgreSQL limits its encoded length to 63 bytes.
+    text: []const u8,
+    /// Server-managed immutable ordering key encoded as lowercase hexadecimal.
+    order_key: []const u8,
+};
+
+/// Server-resolved immutable SQL type identity. Origin survives restore remapping of local IDs and wire OIDs.
+pub const SQLNamedTypeIdentity = struct {
+    id: u64,
+    namespace_id: u64,
+    generation: u32,
+    /// Opaque durable 128-bit origin, encoded as lowercase hexadecimal.
+    origin_id: []const u8,
+    oid: u32,
+    array_oid: u32,
+};
+
+/// Server-resolved executable type layout retained by a table schema epoch. Enum layouts require labels; domain layouts require domain. The alternatives are mutually exclusive. Catalog ownership is separate from value representation.
+pub const SQLNamedTypeLayout = struct {
+    kind: []const u8,
+    identity: SQLNamedTypeIdentity,
+    labels: ?[]const SQLNamedEnumLabel = null,
+    domain: ?SQLNamedDomainDefinition = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "kind", "kind", false },
+        .{ "identity", "identity", false },
+        .{ "labels", "labels", true },
+        .{ "domain", "domain", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        try jw.objectField("identity");
+        try jw.write(self.identity);
+        if (self.labels) |value| {
+            try jw.objectField("labels");
+            try jw.write(value);
+        }
+        if (self.domain) |value| {
+            try jw.objectField("domain");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Immutable named-base identity pinned by a domain definition.
+pub const SQLNamedTypeReference = struct {
+    id: u64,
+    origin_id: []const u8,
+    generation: u32,
+};
+
+pub const SQLNotice = struct {
+    code: []const u8,
+    /// Nonfatal statement notice; prior notices remain visible if a later instruction fails.
+    message: []const u8,
+};
+
+pub const SQLNotification = struct {
+    channel: []const u8,
+    /// UTF-8 payload, fewer than 8000 bytes.
+    payload: []const u8,
+    /// Sender backend identifier; equals pgwire BackendKeyData for wire clients.
+    sender_pid: i32,
+};
+
+pub const SQLNotificationPage = struct {
+    notifications: []const SQLNotification,
+    /// Opaque connection-bound acknowledgement cursor for this page.
+    cursor: ?[]const u8 = null,
+    /// More queue work remains, or a committed notification is waiting for its visibility barrier. Poll again without replaying any SQL.
+    pending: bool,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "notifications", "notifications", false },
+        .{ "cursor", "cursor", true },
+        .{ "pending", "pending", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("notifications");
+        try jw.write(self.notifications);
+        if (self.cursor) |value| {
+            try jw.objectField("cursor");
+            try jw.write(value);
+        }
+        try jw.objectField("pending");
+        try jw.write(self.pending);
+        try jw.endObject();
+    }
+};
+
+pub const SQLNotificationPollRequest = struct {
+    /// Cursor from a previously received page. Acknowledge only after consuming every notification in that page; omitted acknowledgements replay the same unconsumed prefix.
+    acknowledge: ?[]const u8 = null,
+    limit: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "acknowledge", "acknowledge", true },
+        .{ "limit", "limit", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.acknowledge) |value| {
+            try jw.objectField("acknowledge");
+            try jw.write(value);
+        }
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// PostgreSQL NUMERIC precision and signed scale. For arrays this describes every element, not dimensions. Absent means unconstrained NUMERIC.
 pub const SQLNumericModifier = struct {
     precision: i64,
     scale: i64,
 };
 
-/// Immutable positional input contract. Element identity also preserves primitive widths; array inputs require it. Unknown slots have no SQL constraint.
+pub const SQLPackageArgument = struct {
+    name: OpenApiOptionalNullable([]const u8) = .absent,
+    type: SQLPackageType,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        switch (self.name) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("name");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("name");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
+};
+
+/// Database-scoped SQL installation over the existing owned package registry. Requires embedded_db scope, SHA256-bound core WASM artifacts, no other install objects/shapes and no host capabilities. Familiar package names imply no upstream extension payload.
+pub const SQLPackageControl = struct {
+    /// Initial package-level default intent used only when the first SQL version is registered. Later defaults are explicit digest-bound operator promotions; version names are opaque.
+    default_version: []const u8,
+    /// Optional fixed installation namespace; requires relocatable false.
+    schema: OpenApiOptionalNullable([]const u8) = .absent,
+    exports: []const SQLPackageExport,
+    /// Predecessor versions supported by this version's declarative typed-export transition, separate from REST update scripts.
+    updates_from: ?[]const []const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "default_version", "default_version", false },
+        .{ "schema", "schema", false },
+        .{ "exports", "exports", false },
+        .{ "updates_from", "updates_from", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("default_version");
+        try jw.write(self.default_version);
+        switch (self.schema) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("schema");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("schema");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("exports");
+        try jw.write(self.exports);
+        if (self.updates_from) |value| {
+            try jw.objectField("updates_from");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Current global SQL default selection. Retained promotion receipts remain private to durable metadata and checkpoints.
+pub const SQLPackageDefaultControl = struct {
+    name: ExtensionIdentifier,
+    identity: []const i64,
+    generation: i64,
+    default_version: []const u8,
+    /// Null while the initial declared target has not been registered. Explicit promotions always bind an immutable SHA256 target digest.
+    default_digest: ?[]const i64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "identity", "identity", false },
+        .{ "generation", "generation", false },
+        .{ "default_version", "default_version", false },
+        .{ "default_digest", "default_digest", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("identity");
+        try jw.write(self.identity);
+        try jw.objectField("generation");
+        try jw.write(self.generation);
+        try jw.objectField("default_version");
+        try jw.write(self.default_version);
+        try jw.objectField("default_digest");
+        try jw.write(self.default_digest);
+        try jw.endObject();
+    }
+};
+
+/// A pure scalar SQL function implemented by the declared immutable core WASM runtime; no host capabilities or native-library fallback.
+pub const SQLPackageExport = struct {
+    name: []const u8,
+    runtime: ExtensionIdentifier,
+    /// Tool selector passed to antfly_extension_call_tool.
+    export_name: []const u8,
+    arguments: ?[]const SQLPackageArgument = null,
+    result: SQLPackageType,
+    strict: ?bool = null,
+    volatility: ?SQLPackageVolatility = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "runtime", "runtime", false },
+        .{ "export_name", "export_name", false },
+        .{ "arguments", "arguments", true },
+        .{ "result", "result", false },
+        .{ "strict", "strict", true },
+        .{ "volatility", "volatility", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("runtime");
+        try jw.write(self.runtime);
+        try jw.objectField("export_name");
+        try jw.write(self.export_name);
+        if (self.arguments) |value| {
+            try jw.objectField("arguments");
+            try jw.write(value);
+        }
+        try jw.objectField("result");
+        try jw.write(self.result);
+        if (self.strict) |value| {
+            try jw.objectField("strict");
+            try jw.write(value);
+        }
+        if (self.volatility) |value| {
+            try jw.objectField("volatility");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Exact native SQL callable scalar domains, preserving integer widths and temporal/range identities.
+pub const SQLPackageScalarType = enum {
+    text,
+    uuid,
+    int16,
+    int32,
+    int64,
+    float32,
+    float64,
+    boolean,
+    jsonb,
+    numeric,
+    date,
+    time,
+    time_tz,
+    timestamp,
+    timestamp_tz,
+    interval,
+    numrange,
+    daterange,
+    tsrange,
+    tstzrange,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .text => "text",
+            .uuid => "uuid",
+            .int16 => "int16",
+            .int32 => "int32",
+            .int64 => "int64",
+            .float32 => "float32",
+            .float64 => "float64",
+            .boolean => "boolean",
+            .jsonb => "jsonb",
+            .numeric => "numeric",
+            .date => "date",
+            .time => "time",
+            .time_tz => "time_tz",
+            .timestamp => "timestamp",
+            .timestamp_tz => "timestamp_tz",
+            .interval => "interval",
+            .numrange => "numrange",
+            .daterange => "daterange",
+            .tsrange => "tsrange",
+            .tstzrange => "tstzrange",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "text", .text },
+            .{ "uuid", .uuid },
+            .{ "int16", .int16 },
+            .{ "int32", .int32 },
+            .{ "int64", .int64 },
+            .{ "float32", .float32 },
+            .{ "float64", .float64 },
+            .{ "boolean", .boolean },
+            .{ "jsonb", .jsonb },
+            .{ "numeric", .numeric },
+            .{ "date", .date },
+            .{ "time", .time },
+            .{ "time_tz", .time_tz },
+            .{ "timestamp", .timestamp },
+            .{ "timestamp_tz", .timestamp_tz },
+            .{ "interval", .interval },
+            .{ "numrange", .numrange },
+            .{ "daterange", .daterange },
+            .{ "tsrange", .tsrange },
+            .{ "tstzrange", .tstzrange },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const SQLPackageType = struct {
+    scalar: SQLPackageScalarType,
+    /// Arrays support text, uuid, int16, int32, int64, float32, float64, boolean, jsonb and numeric. Other scalar domains require false.
+    array: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "scalar", "scalar", false },
+        .{ "array", "array", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("scalar");
+        try jw.write(self.scalar);
+        if (self.array) |value| {
+            try jw.objectField("array");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const SQLPackageVolatility = enum {
+    immutable,
+    stable,
+    @"volatile",
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .immutable => "immutable",
+            .stable => "stable",
+            .@"volatile" => "volatile",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "immutable", .immutable },
+            .{ "stable", .stable },
+            .{ "volatile", .@"volatile" },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Immutable positional input contract. Element identity also preserves primitive widths; array inputs require it. Unknown slots have no SQL constraint. Bytea arguments are PostgreSQL bytea input strings; use hex text (a backslash followed by x and hexadecimal octets) for arbitrary binary data. SQL NULL remains a null cell.
 pub const SQLParameterDescriptor = struct {
     type: SQLColumnType,
+    /// Required for enum and domain values, including NULL. Identifies the immutable logical catalog type and its scalar/array wire OIDs. The type and element_type fields describe the physical value; enum cells use exact label strings. Domain parameters undergo fresh constraint validation; a declared identity does not prove an already validated value. SQL NULL remains a null cell.
+    named_type: ?SQLNamedTypeIdentity = null,
+    temporal_kind: ?SQLTemporalKind = null,
     element_type: ?SQLArrayElementType = null,
     nullable: bool,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "type", "type", false },
+        .{ "named_type", "named_type", true },
+        .{ "temporal_kind", "temporal_kind", true },
         .{ "element_type", "element_type", true },
         .{ "nullable", "nullable", false },
     };
@@ -56563,6 +58612,14 @@ pub const SQLParameterDescriptor = struct {
         try jw.beginObject();
         try jw.objectField("type");
         try jw.write(self.type);
+        if (self.named_type) |value| {
+            try jw.objectField("named_type");
+            try jw.write(value);
+        }
+        if (self.temporal_kind) |value| {
+            try jw.objectField("temporal_kind");
+            try jw.write(value);
+        }
         if (self.element_type) |value| {
             try jw.objectField("element_type");
             try jw.write(value);
@@ -56686,6 +58743,43 @@ pub const SQLPreparedResponse = struct {
     columns: []const SQLColumn,
 };
 
+/// A relational PostgreSQL range column. JSON ingress and SQL results use PostgreSQL range text. The declared subtype supplies identity even for NULL, empty and unbounded values. Packed rows retain canonical binary endpoints, inclusive/exclusive flags and exact NUMERIC precision. Empty ranges, omitted bounds, subtype infinities and SQL NULL are distinct. DATE ranges canonicalize finite endpoints to [lower,upper). Timestamp endpoints use the execution's UTC zone. Requires schema reader capability version 35.
+pub const SQLRangeColumnSchema = struct {
+    type: []const u8,
+    nullable: ?bool = null,
+    description: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "nullable", "nullable", true },
+        .{ "description", "description", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.nullable) |value| {
+            try jw.objectField("nullable");
+            try jw.write(value);
+        }
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Execute one SQL statement. Parameters are positional (`$1`, `$2`, ...), never interpolated into SQL text. To preserve integer precision in JavaScript clients, supply integers outside the exact JSON number range as decimal strings; binding coerces parameters to the expected type. The result limit is an admission bound, not an implicit SQL LIMIT: statements whose results exceed it fail instead of silently truncating. Request bodies are limited to 4 MiB, preparation to 8 MiB of allocated memory, and encoded results to a 16 MiB allocation budget.
 pub const SQLRequest = struct {
     read_requirements: ?ReadRequirements = null,
@@ -56762,6 +58856,7 @@ pub const SQLRequest = struct {
 
 /// Ordinal result rows with corresponding logical column metadata. SQL NULL is JSON null; sql_nulls distinguishes it from a JSON column containing the JSON literal null. Integer-typed values are exact decimal strings; datetime values are strings. Objects and arrays in JSON columns remain JSON. Array-typed columns contain SQLArrayValue envelopes, with their element descriptor in the corresponding SQLColumn. They are not JSON columns.
 pub const SQLResponse = struct {
+    notices: ?[]const SQLNotice = null,
     /// Concrete graph index names selected from the statement catalog cut.
     resolved_indexes: ?[]const []const u8 = null,
     columns: []const SQLColumn,
@@ -56774,6 +58869,7 @@ pub const SQLResponse = struct {
     command_tag: []const u8,
     mutation_outcome: ?SQLMutationOutcome = null,
     ddl_receipt: ?SQLDDLReceipt = null,
+    catalog_receipt: ?SQLCatalogOperationReceipt = null,
     /// Native transaction receipt for visibility or repair reconciliation; never replay a committed statement.
     transaction_id: ?[]const u8 = null,
     /// Opaque SQL session identifier for subsequent requests.
@@ -56782,6 +58878,7 @@ pub const SQLResponse = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "notices", "notices", true },
         .{ "resolved_indexes", "resolved_indexes", true },
         .{ "columns", "columns", false },
         .{ "rows", "rows", false },
@@ -56790,6 +58887,7 @@ pub const SQLResponse = struct {
         .{ "command_tag", "command_tag", false },
         .{ "mutation_outcome", "mutation_outcome", true },
         .{ "ddl_receipt", "ddl_receipt", true },
+        .{ "catalog_receipt", "catalog_receipt", true },
         .{ "transaction_id", "transaction_id", true },
         .{ "session_id", "session_id", true },
         .{ "transaction_status", "transaction_status", true },
@@ -56805,6 +58903,10 @@ pub const SQLResponse = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.notices) |value| {
+            try jw.objectField("notices");
+            try jw.write(value);
+        }
         if (self.resolved_indexes) |value| {
             try jw.objectField("resolved_indexes");
             try jw.write(value);
@@ -56829,6 +58931,10 @@ pub const SQLResponse = struct {
             try jw.objectField("ddl_receipt");
             try jw.write(value);
         }
+        if (self.catalog_receipt) |value| {
+            try jw.objectField("catalog_receipt");
+            try jw.write(value);
+        }
         if (self.transaction_id) |value| {
             try jw.objectField("transaction_id");
             try jw.write(value);
@@ -56842,6 +58948,44 @@ pub const SQLResponse = struct {
             try jw.write(value);
         }
         try jw.endObject();
+    }
+};
+
+/// Exact temporal identity for datetime-family SQL values. Omission means timestamp_tz. Intervals preserve separate calendar months, days, and microseconds and use PostgreSQL interval text in JSON results.
+pub const SQLTemporalKind = enum {
+    date,
+    time,
+    time_tz,
+    timestamp,
+    timestamp_tz,
+    interval,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .date => "date",
+            .time => "time",
+            .time_tz => "time_tz",
+            .timestamp => "timestamp",
+            .timestamp_tz => "timestamp_tz",
+            .interval => "interval",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "date", .date },
+            .{ "time", .time },
+            .{ "time_tz", .time_tz },
+            .{ "timestamp", .timestamp },
+            .{ "timestamp_tz", .timestamp_tz },
+            .{ "interval", .interval },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
     }
 };
 
@@ -56872,6 +59016,13 @@ pub const SQLTransactionStatus = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+pub const SQLViewIndexRequirement = struct {
+    /// Unqualified canonical view name in this document source's namespace. Does not create a view or grant permissions.
+    view_name: []const u8,
+    /// Required full-text indexes. Canonical view admission captures their actual server-managed incarnations. Dropping and recreating an index or changing its logical configuration invalidates the captured dependency until the view is explicitly replaced. Maintenance and rebuilds of the same logical index acquire a fresh ready publication for each retained read.
+    required_indexes: []const []const u8,
 };
 
 /// Terminal retrieval failure. Capacity events carry the complete InferenceCapacityError envelope, including message, reason, retryable and retry_after_ms; generic failures may carry only error.
@@ -57308,6 +59459,196 @@ pub const ScanKeysRequest = struct {
         try jw.endObject();
     }
 };
+
+pub const SchemaValidationFailure = enum {
+    requested,
+    not_null_violation,
+    foreign_key_violation,
+    owner_failed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .requested => "requested",
+            .not_null_violation => "not_null_violation",
+            .foreign_key_violation => "foreign_key_violation",
+            .owner_failed => "owner_failed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "requested", .requested },
+            .{ "not_null_violation", .not_null_violation },
+            .{ "foreign_key_violation", .foreign_key_violation },
+            .{ "owner_failed", .owner_failed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const SchemaValidationPhase = enum {
+    validating,
+    validated,
+    installing,
+    installed,
+    releasing,
+    succeeded,
+    canceling,
+    canceled,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .validating => "validating",
+            .validated => "validated",
+            .installing => "installing",
+            .installed => "installed",
+            .releasing => "releasing",
+            .succeeded => "succeeded",
+            .canceling => "canceling",
+            .canceled => "canceled",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "validating", .validating },
+            .{ "validated", .validated },
+            .{ "installing", .installing },
+            .{ "installed", .installed },
+            .{ "releasing", .releasing },
+            .{ "succeeded", .succeeded },
+            .{ "canceling", .canceling },
+            .{ "canceled", .canceled },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const SchemaValidationState = enum {
+    admission_unknown,
+    pending,
+    succeeded,
+    canceled,
+    failed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .admission_unknown => "admission_unknown",
+            .pending => "pending",
+            .succeeded => "succeeded",
+            .canceled => "canceled",
+            .failed => "failed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "admission_unknown", .admission_unknown },
+            .{ "pending", .pending },
+            .{ "succeeded", .succeeded },
+            .{ "canceled", .canceled },
+            .{ "failed", .failed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Historical job completion, not an authorization or promise that a later DDL has not superseded this schema. Success requires all owner installation, metadata publication and fence release barriers. Current table ownership is checked atomically with the job observation.
+pub const SchemaValidationStatus = struct {
+    schema_validation_token: SchemaValidationToken,
+    table_id: []const u8,
+    active_schema_version: i64,
+    state: SchemaValidationState,
+    phase: ?SchemaValidationPhase = null,
+    failure: ?SchemaValidationFailure = null,
+    owner_count: ?i32 = null,
+    ready: ?i32 = null,
+    installed: ?i32 = null,
+    released: ?i32 = null,
+    canceled: ?i32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "schema_validation_token", "schema_validation_token", false },
+        .{ "table_id", "table_id", false },
+        .{ "active_schema_version", "active_schema_version", false },
+        .{ "state", "state", false },
+        .{ "phase", "phase", true },
+        .{ "failure", "failure", true },
+        .{ "owner_count", "owner_count", true },
+        .{ "ready", "ready", true },
+        .{ "installed", "installed", true },
+        .{ "released", "released", true },
+        .{ "canceled", "canceled", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("schema_validation_token");
+        try jw.write(self.schema_validation_token);
+        try jw.objectField("table_id");
+        try jw.write(self.table_id);
+        try jw.objectField("active_schema_version");
+        try jw.write(self.active_schema_version);
+        try jw.objectField("state");
+        try jw.write(self.state);
+        if (self.phase) |value| {
+            try jw.objectField("phase");
+            try jw.write(value);
+        }
+        if (self.failure) |value| {
+            try jw.objectField("failure");
+            try jw.write(value);
+        }
+        if (self.owner_count) |value| {
+            try jw.objectField("owner_count");
+            try jw.write(value);
+        }
+        if (self.ready) |value| {
+            try jw.objectField("ready");
+            try jw.write(value);
+        }
+        if (self.installed) |value| {
+            try jw.objectField("installed");
+            try jw.write(value);
+        }
+        if (self.released) |value| {
+            try jw.objectField("released");
+            try jw.write(value);
+        }
+        if (self.canceled) |value| {
+            try jw.objectField("canceled");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Opaque immutable validation-only schema job identity. Retain it across timeouts or lost replies and observe its exact status without replaying DDL. It grants no authorization.
+pub const SchemaValidationToken = []const u8;
 
 /// Merge within explicit exclusive key bounds. Records and retained IDs must be inside the range and after last_merged_id. Overlapping writers still require external serialization. Upsert pages normally set delete_missing=false. After a complete authoritative inventory has been written and verified, an empty-record page with retain_ids reconciles the entire bounded range without retransmitting document content.
 pub const ScopedLinearMergePage = struct {
@@ -58962,10 +61303,11 @@ pub const SuccessMessage = struct {
     }
 };
 
-/// Response acknowledgment/publication barrier, independent of commit_requires: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for durable application to the local key-value store - "full_text": Wait for full-text index WAL write - "enrichments": Wait for this write's enrichment publication - "full_index": Wait for full-text, enrichment and vector-index publication A post-commit wait failure never rolls back the source. Terminal background failures may return committed_repair_required. During the embedded migration window, omitting commit_requires retains legacy precomputation for enrichments and full_index; explicit none disables that implicit admission prerequisite.
+/// Response acknowledgment/publication barrier, independent of commit_requires: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for durable application to the local key-value store - "query": Wait for durable application and document full-text query visibility - "full_text": Compatibility alias for query - "enrichments": Wait for this write's enrichment publication - "full_index": Wait for full-text, enrichment and vector-index publication A post-commit wait failure never rolls back the source. Terminal background failures may return committed_repair_required. During the embedded migration window, omitting commit_requires retains legacy precomputation for enrichments and full_index; explicit none disables that implicit admission prerequisite.
 pub const SyncLevel = enum {
     propose,
     write,
+    query,
     full_text,
     enrichments,
     full_index,
@@ -58974,6 +61316,7 @@ pub const SyncLevel = enum {
         const s = switch (self) {
             .propose => "propose",
             .write => "write",
+            .query => "query",
             .full_text => "full_text",
             .enrichments => "enrichments",
             .full_index => "full_index",
@@ -58989,6 +61332,7 @@ pub const SyncLevel = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "propose", .propose },
             .{ "write", .write },
+            .{ "query", .query },
             .{ "full_text", .full_text },
             .{ "enrichments", .enrichments },
             .{ "full_index", .full_index },
@@ -59882,16 +62226,24 @@ pub const TableRestoreStatus = struct {
 
 /// Schema definition for a table with multiple document types
 pub const TableSchema = struct {
+    /// Read-only typed SQL aliases over literal document paths, independent of JSON Schema write validation. SQL assignments reject these computed aliases; raw document ingress remains unchanged. Missing paths produce SQL NULL; JSON null is retained for json columns and SQL NULL for scalar columns. Scalar domain mismatches fail when the value is demanded instead of converting to text. Untaken CASE and COALESCE branches do not evaluate a hidden typed failure. Alias names cannot shadow existing schema columns or reserved document columns. Document storage only.
+    document_sql_columns: ?[]const DocumentSQLColumn = null,
+    /// Document-source dependency policies consumed by ordinary CREATE VIEW in the same namespace. Typed paths use schema-owned document_sql_columns or existing document property aliases; this field creates no second view catalog. Required index lifetimes and readiness are checked once per retained physical read cut. Relational sources reject these policies.
+    sql_view_requirements: ?[]const SQLViewIndexRequirement = null,
+    /// Server-resolved immutable SQL type layouts, sorted by catalog ID. Clients reference types through x-antfly-sql-type-id; catalog admission verifies every layout against its active definition. Retained by backups and schema epochs for deterministic cold decoding.
+    named_types: ?[]const SQLNamedTypeLayout = null,
     /// Backend-managed schema generation used for migrations. Omit it from create and update requests.
     version: ?u32 = null,
     /// Physical document index order. Fields must have sortable scalar mappings. Changing the order requires rebuilding physical coverage. Relational tables use relational_indexes instead.
     index_sort: ?[]const std.json.Value = null,
     storage_mode: ?TableStorageMode = null,
+    /// PostgreSQL logical replication identity for native relational tables. Default uses the primary key. Full emits the complete old row.
+    replica_identity: ?[]const u8 = null,
     /// External tables require relational storage mode. Ordinary row writes are read-only; an explicit iceberg_writer catalog binding permits Iceberg file commits. Omit for native tables.
     base_source: ?ExternalLakeTableSource = null,
     /// Immutable typed expressions applied only to absent columns on new writes, never explicit null. Defaults cannot reference columns. A column cannot have both a default and a generated expression. Omission or [] declares none. Relational tables only.
     column_defaults: ?[]const RelationalColumnExpression = null,
-    /// Stored immutable generated columns, evaluated in dependency order on writes before validation and indexing. Cycles are rejected. Generated columns are output-only; submitted values are replaced by the computed value. Omission or [] declares none. Defaults and generated declarations together are limited to 256 columns, 4096 expression nodes, and 4 MiB of literal data. Evaluation has a shared 4 MiB allocation budget across all column expressions. Restore verifies stored results instead of silently recomputing them. Changing, adding, or removing generated semantics through an existing table's schema update requires explicit rewrite=true on the PUT or PATCH schema route. This returns a durable restore job and replaces the complete authorized dependency cohort only after distributed transformation and validation. Ordinary schema updates reject these changes, even when a table appears empty. Declaration reordering and default-only changes remain allowed. Relational tables only.
+    /// Stored immutable generated columns, evaluated in dependency order on writes before validation and indexing. Cycles are rejected. Generated columns are output-only; submitted values are replaced by the computed value. Omission or [] declares none. Defaults and generated declarations together are limited to 256 columns, 4096 expression nodes, and 4 MiB of literal data. Evaluation has a shared 4 MiB allocation budget across all column expressions. Restore verifies stored results instead of silently recomputing them. On relational tables, changing, adding, or removing generated semantics through a schema update requires explicit rewrite=true on the PUT or PATCH schema route. This returns a durable restore job and replaces the complete authorized dependency cohort only after distributed transformation and validation. Ordinary schema updates reject these changes, even when a table appears empty. Declaration reordering and default-only changes remain allowed. Supported by relational and document tables. Document declarations require one enforced document type and target declared root fields. Expressions may read persisted declared roots; SQL virtual fields and transport directives cannot be expression sources. SQL NULL removes the generated member; a JSON null datum remains present. Unknown members are preserved. SQL column assignments to generated roots or their aliases are rejected, while whole-document writes replace submitted generated members with computed values. Document producer definitions are immutable through schema-update routes, including rewrite=true. Changing these definitions requires a replacement table and explicit data migration; ordinary restore preserves and verifies existing computed values.
     generated_columns: ?[]const RelationalColumnExpression = null,
     /// Named scalar CHECK constraints for a relational schema. This is part of the complete schema: omission or [] declares no checks. New writes enforce every check. Existing-row validation status is maintained separately and is never accepted from the client.
     checks: ?[]const RelationalCheckConstraint = null,
@@ -59918,9 +62270,13 @@ pub const TableSchema = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "document_sql_columns", "document_sql_columns", true },
+        .{ "sql_view_requirements", "sql_view_requirements", true },
+        .{ "named_types", "named_types", true },
         .{ "version", "version", true },
         .{ "index_sort", "index_sort", true },
         .{ "storage_mode", "storage_mode", true },
+        .{ "replica_identity", "replica_identity", true },
         .{ "base_source", "base_source", true },
         .{ "column_defaults", "column_defaults", true },
         .{ "generated_columns", "generated_columns", true },
@@ -59947,6 +62303,18 @@ pub const TableSchema = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.document_sql_columns) |value| {
+            try jw.objectField("document_sql_columns");
+            try jw.write(value);
+        }
+        if (self.sql_view_requirements) |value| {
+            try jw.objectField("sql_view_requirements");
+            try jw.write(value);
+        }
+        if (self.named_types) |value| {
+            try jw.objectField("named_types");
+            try jw.write(value);
+        }
         if (self.version) |value| {
             try jw.objectField("version");
             try jw.write(value);
@@ -59957,6 +62325,10 @@ pub const TableSchema = struct {
         }
         if (self.storage_mode) |value| {
             try jw.objectField("storage_mode");
+            try jw.write(value);
+        }
+        if (self.replica_identity) |value| {
+            try jw.objectField("replica_identity");
             try jw.write(value);
         }
         if (self.base_source) |value| {
@@ -61835,6 +64207,60 @@ pub const TransactionStageWriteRequest = struct {
 pub const TransactionStatusResponse = struct {
     status: []const u8,
     transaction_id: []const u8,
+};
+
+/// A classified write failure. An aborted status confirms that the transaction did not commit.
+pub const TransactionWriteError = struct {
+    /// Set to aborted for a confirmed transaction abort.
+    status: ?[]const u8 = null,
+    /// Machine-readable cause, including row_policy_denied and transaction_precommit_aborted.
+    code: []const u8,
+    message: []const u8,
+    retryable: bool,
+    /// The transaction ID for session commit responses.
+    transaction_id: ?[]const u8 = null,
+    retry_after_ms: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "status", "status", true },
+        .{ "code", "code", false },
+        .{ "message", "message", false },
+        .{ "retryable", "retryable", false },
+        .{ "transaction_id", "transaction_id", true },
+        .{ "retry_after_ms", "retry_after_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        try jw.objectField("code");
+        try jw.write(self.code);
+        try jw.objectField("message");
+        try jw.write(self.message);
+        try jw.objectField("retryable");
+        try jw.write(self.retryable);
+        if (self.transaction_id) |value| {
+            try jw.objectField("transaction_id");
+            try jw.write(value);
+        }
+        if (self.retry_after_ms) |value| {
+            try jw.objectField("retry_after_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Speech-to-text provider for the `transcriber` enrichment shorthand. Carries the provider's STT configuration (`provider`, `model`, `api_url`, `api_key`, ...) plus the transcription options below. The fields are declared inline rather than composed from `STTConfig` so that a generated client can leave an option out: a composed schema makes a typed client serialize every field, and a `max_download_bytes` of zero would reject every recording. **Example:** ```yaml name: call_transcripts kind: asset field: recording_url transcriber: provider: antfly model: openai/whisper-base language_code: en timestamps: true ```

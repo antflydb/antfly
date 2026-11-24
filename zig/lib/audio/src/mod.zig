@@ -1071,38 +1071,49 @@ pub fn downmixToMono(allocator: std.mem.Allocator, samples: []const f32, channel
 }
 
 pub fn resample(allocator: std.mem.Allocator, samples: []const f32, src_rate: u32, dst_rate: u32) ![]f32 {
-    if (src_rate == 0 or dst_rate == 0 or samples.len == 0) return error.UnsupportedAudioFormat;
+    return copyOrResampleParts(allocator, samples, &.{}, src_rate, dst_rate);
+}
+
+/// Resample one logical PCM window kept in two adjacent slices.
+pub fn copyOrResampleParts(allocator: std.mem.Allocator, prefix: []const f32, tail: []const f32, src_rate: u32, dst_rate: u32) ![]f32 {
+    const len = std.math.add(usize, prefix.len, tail.len) catch return error.UnsupportedAudioFormat;
+    if (src_rate == 0 or dst_rate == 0 or len == 0) return error.UnsupportedAudioFormat;
     if (src_rate == dst_rate) {
-        const out = try allocator.alloc(f32, samples.len);
-        @memcpy(out, samples);
+        const out = try allocator.alloc(f32, len);
+        @memcpy(out[0..prefix.len], prefix);
+        @memcpy(out[prefix.len..], tail);
         return out;
     }
 
+    return if (tail.len == 0)
+        resampleLinear(allocator, prefix, &.{}, len, src_rate, dst_rate, false)
+    else
+        resampleLinear(allocator, prefix, tail, len, src_rate, dst_rate, true);
+}
+
+fn resampleLinear(allocator: std.mem.Allocator, prefix: []const f32, tail: []const f32, len: usize, src_rate: u32, dst_rate: u32, comptime split: bool) ![]f32 {
     const ratio = @as(f64, @floatFromInt(src_rate)) / @as(f64, @floatFromInt(dst_rate));
-    const out_len: usize = @intFromFloat(@as(f64, @floatFromInt(samples.len)) / ratio);
+    const output_samples = @as(f64, @floatFromInt(len)) / ratio;
+    if (output_samples >= @as(f64, @floatFromInt(@as(u128, std.math.maxInt(usize)) + 1))) return error.UnsupportedAudioFormat;
+    const out_len: usize = @intFromFloat(output_samples);
     const out = try allocator.alloc(f32, out_len);
     errdefer allocator.free(out);
 
     for (0..out_len) |i| {
         const src_pos = @as(f64, @floatFromInt(i)) * ratio;
         const idx0: usize = @intFromFloat(@floor(src_pos));
-        const idx1 = @min(idx0 + 1, samples.len - 1);
+        const idx1 = @min(idx0 + 1, len - 1);
         const frac: f32 = @floatCast(src_pos - @as(f64, @floatFromInt(idx0)));
-        out[i] = samples[idx0] * (1.0 - frac) + samples[idx1] * frac;
+        const v0 = if (!split or idx0 < prefix.len) prefix[idx0] else tail[idx0 - prefix.len];
+        const v1 = if (!split or idx1 < prefix.len) prefix[idx1] else tail[idx1 - prefix.len];
+        out[i] = v0 * (1.0 - frac) + v1 * frac;
     }
 
     return out;
 }
 
 pub fn copyOrResample(allocator: std.mem.Allocator, samples: []const f32, src_rate: u32, dst_rate: u32) ![]f32 {
-    if (src_rate == 0 or dst_rate == 0 or samples.len == 0) return error.UnsupportedAudioFormat;
-    if (src_rate == dst_rate) {
-        const out = try allocator.alloc(f32, samples.len);
-        @memcpy(out, samples);
-        return out;
-    }
-
-    return resample(allocator, samples, src_rate, dst_rate);
+    return copyOrResampleParts(allocator, samples, &.{}, src_rate, dst_rate);
 }
 
 pub fn logMelSpectrogramWithConfig(

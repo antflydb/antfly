@@ -119,6 +119,29 @@ from .catalog_tablespace_binding_request import CatalogTablespaceBindingRequest
 from .cdc_connection import CdcConnection
 from .chain_condition import ChainCondition
 from .chain_link import ChainLink
+from .changefeed_checkpoint import ChangefeedCheckpoint
+from .changefeed_create import ChangefeedCreate
+from .changefeed_create_events_item import ChangefeedCreateEventsItem
+from .changefeed_create_include import ChangefeedCreateInclude
+from .changefeed_create_start import ChangefeedCreateStart
+from .changefeed_created import ChangefeedCreated
+from .changefeed_error import ChangefeedError
+from .changefeed_event import ChangefeedEvent
+from .changefeed_event_after_type_0 import ChangefeedEventAfterType0
+from .changefeed_event_before_type_0 import ChangefeedEventBeforeType0
+from .changefeed_event_kind import ChangefeedEventKind
+from .changefeed_event_operation import ChangefeedEventOperation
+from .changefeed_key import ChangefeedKey
+from .changefeed_key_encoding import ChangefeedKeyEncoding
+from .changefeed_lease import ChangefeedLease
+from .changefeed_page import ChangefeedPage
+from .changefeed_page_snapshot import ChangefeedPageSnapshot
+from .changefeed_page_transaction_type_0 import ChangefeedPageTransactionType0
+from .changefeed_page_version import ChangefeedPageVersion
+from .changefeed_predicate import ChangefeedPredicate
+from .changefeed_progress import ChangefeedProgress
+from .changefeed_progress_phase import ChangefeedProgressPhase
+from .changefeed_selector import ChangefeedSelector
 from .chat_gpt_account import ChatGPTAccount
 from .chat_gpt_accounts import ChatGPTAccounts
 from .chat_gpt_authorize import ChatGPTAuthorize
@@ -374,11 +397,14 @@ from .document_artifact_reprocess_failure import DocumentArtifactReprocessFailur
 from .document_artifact_reprocess_job import DocumentArtifactReprocessJob
 from .document_artifact_reprocess_job_phase import DocumentArtifactReprocessJobPhase
 from .document_artifact_reprocess_job_reprocess_status import DocumentArtifactReprocessJobReprocessStatus
+from .document_artifact_reprocess_job_selection import DocumentArtifactReprocessJobSelection
 from .document_artifact_reprocess_job_start_request import DocumentArtifactReprocessJobStartRequest
+from .document_artifact_reprocess_job_start_request_selection import DocumentArtifactReprocessJobStartRequestSelection
 from .document_artifact_reprocess_response import DocumentArtifactReprocessResponse
 from .document_artifact_reprocess_response_reprocess import DocumentArtifactReprocessResponseReprocess
 from .document_artifact_reprocess_shard_cursor import DocumentArtifactReprocessShardCursor
 from .document_artifact_table_reprocess_request import DocumentArtifactTableReprocessRequest
+from .document_artifact_table_reprocess_request_selection import DocumentArtifactTableReprocessRequestSelection
 from .document_artifact_table_reprocess_response import DocumentArtifactTableReprocessResponse
 from .document_artifact_table_reprocess_response_reprocess import DocumentArtifactTableReprocessResponseReprocess
 from .document_artifact_table_reprocess_response_reprocess_status import (
@@ -411,6 +437,8 @@ from .document_schema import DocumentSchema
 from .document_schema_schema import DocumentSchemaSchema
 from .document_source import DocumentSource
 from .document_source_media_type import DocumentSourceMediaType
+from .document_sql_column import DocumentSQLColumn
+from .document_sql_column_type import DocumentSQLColumnType
 from .document_subfield_mapping import DocumentSubfieldMapping
 from .document_subfield_mapping_missing_null_policy import DocumentSubfieldMappingMissingNullPolicy
 from .drop_extension_request import DropExtensionRequest
@@ -1041,7 +1069,12 @@ from .index_mutation_conflict_error import IndexMutationConflictError
 from .index_mutation_conflict_error_error import IndexMutationConflictErrorError
 from .index_mutation_service_unavailable_error import IndexMutationServiceUnavailableError
 from .index_mutation_service_unavailable_error_error import IndexMutationServiceUnavailableErrorError
+from .index_publication_failure import IndexPublicationFailure
+from .index_publication_phase import IndexPublicationPhase
 from .index_publication_policy import IndexPublicationPolicy
+from .index_publication_state import IndexPublicationState
+from .index_publication_status import IndexPublicationStatus
+from .index_publication_status_index_type import IndexPublicationStatusIndexType
 from .index_readiness_reason import IndexReadinessReason
 from .index_readiness_state import IndexReadinessState
 from .index_readiness_status import IndexReadinessStatus
@@ -1366,6 +1399,22 @@ from .lsm_storage_status import LsmStorageStatus
 from .maintain_lake_table_body import MaintainLakeTableBody
 from .maintain_lake_table_body_action import MaintainLakeTableBodyAction
 from .maintain_lake_table_response_200 import MaintainLakeTableResponse200
+from .managed_source_configured import ManagedSourceConfigured
+from .managed_source_configured_state import ManagedSourceConfiguredState
+from .managed_source_destination_contract import ManagedSourceDestinationContract
+from .managed_source_destination_contract_accepted_by import ManagedSourceDestinationContractAcceptedBy
+from .managed_source_destination_contract_adapter import ManagedSourceDestinationContractAdapter
+from .managed_source_destination_contract_committed_by import ManagedSourceDestinationContractCommittedBy
+from .managed_source_destination_contract_committed_history import ManagedSourceDestinationContractCommittedHistory
+from .managed_source_destination_contract_input import ManagedSourceDestinationContractInput
+from .managed_source_destination_contract_outbound import ManagedSourceDestinationContractOutbound
+from .managed_source_destination_contract_transaction_scope import ManagedSourceDestinationContractTransactionScope
+from .managed_source_destination_contract_version import ManagedSourceDestinationContractVersion
+from .managed_source_progress import ManagedSourceProgress
+from .managed_source_replacement import ManagedSourceReplacement
+from .managed_source_status import ManagedSourceStatus
+from .managed_source_status_index_publication_type_0 import ManagedSourceStatusIndexPublicationType0
+from .managed_source_status_replication_sources_item import ManagedSourceStatusReplicationSourcesItem
 from .match_all_query import MatchAllQuery
 from .match_all_query_match_all import MatchAllQueryMatchAll
 from .match_none_query import MatchNoneQuery
@@ -2300,6 +2349,8 @@ from .reauthorize_table_destinations_response_200_status import ReauthorizeTable
 from .regexp_query import RegexpQuery
 from .relational_check_constraint import RelationalCheckConstraint
 from .relational_column_expression import RelationalColumnExpression
+from .relational_column_sequence import RelationalColumnSequence
+from .relational_column_sequence_generation import RelationalColumnSequenceGeneration
 from .relational_comparison_op import RelationalComparisonOp
 from .relational_constraint_activation_phase import RelationalConstraintActivationPhase
 from .relational_constraint_conflict_reason import RelationalConstraintConflictReason
@@ -2448,6 +2499,7 @@ from .restore_job_result_restore import RestoreJobResultRestore
 from .restore_job_result_status import RestoreJobResultStatus
 from .restore_job_scope import RestoreJobScope
 from .restore_request import RestoreRequest
+from .restore_routine_mapping import RestoreRoutineMapping
 from .result_extract_document_job_response_200 import ResultExtractDocumentJobResponse200
 from .result_read_document_job_response_200 import ResultReadDocumentJobResponse200
 from .retrieval_agent_request import RetrievalAgentRequest
@@ -2477,6 +2529,10 @@ from .runtime_decl_mode import RuntimeDeclMode
 from .runtime_resolver_suppression import RuntimeResolverSuppression
 from .saved_query_source import SavedQuerySource
 from .scan_keys_request import ScanKeysRequest
+from .schema_validation_failure import SchemaValidationFailure
+from .schema_validation_phase import SchemaValidationPhase
+from .schema_validation_state import SchemaValidationState
+from .schema_validation_status import SchemaValidationStatus
 from .scoped_linear_merge_page import ScopedLinearMergePage
 from .scoped_linear_merge_page_key_range import ScopedLinearMergePageKeyRange
 from .scoped_linear_merge_page_records import ScopedLinearMergePageRecords
@@ -2516,17 +2572,46 @@ from .sql_array_dimension import SQLArrayDimension
 from .sql_array_element_type import SQLArrayElementType
 from .sql_array_value import SQLArrayValue
 from .sql_builtin_type import SQLBuiltinType
+from .sql_catalog_object_kind import SQLCatalogObjectKind
+from .sql_catalog_operation_kind import SQLCatalogOperationKind
+from .sql_catalog_operation_receipt import SQLCatalogOperationReceipt
+from .sql_catalog_operation_state import SQLCatalogOperationState
+from .sql_catalog_recovery_request import SQLCatalogRecoveryRequest
 from .sql_column import SQLColumn
 from .sql_column_type import SQLColumnType
 from .sql_connection_open_request import SQLConnectionOpenRequest
 from .sql_connection_response import SQLConnectionResponse
 from .sql_diagnostic import SQLDiagnostic
 from .sql_mutation_outcome import SQLMutationOutcome
+from .sql_named_domain_base import SQLNamedDomainBase
+from .sql_named_domain_base_kind import SQLNamedDomainBaseKind
+from .sql_named_domain_check import SQLNamedDomainCheck
+from .sql_named_domain_definition import SQLNamedDomainDefinition
+from .sql_named_enum_column_schema import SQLNamedEnumColumnSchema
+from .sql_named_enum_column_schema_type import SQLNamedEnumColumnSchemaType
+from .sql_named_enum_label import SQLNamedEnumLabel
+from .sql_named_type_identity import SQLNamedTypeIdentity
+from .sql_named_type_layout import SQLNamedTypeLayout
+from .sql_named_type_layout_kind import SQLNamedTypeLayoutKind
+from .sql_named_type_reference import SQLNamedTypeReference
+from .sql_notice import SQLNotice
+from .sql_notification import SQLNotification
+from .sql_notification_page import SQLNotificationPage
+from .sql_notification_poll_request import SQLNotificationPollRequest
 from .sql_numeric_modifier import SQLNumericModifier
+from .sql_package_argument import SQLPackageArgument
+from .sql_package_control import SQLPackageControl
+from .sql_package_default_control import SQLPackageDefaultControl
+from .sql_package_export import SQLPackageExport
+from .sql_package_scalar_type import SQLPackageScalarType
+from .sql_package_type import SQLPackageType
+from .sql_package_volatility import SQLPackageVolatility
 from .sql_parameter_descriptor import SQLParameterDescriptor
 from .sql_prepare_request import SQLPrepareRequest
 from .sql_prepared_execution_request import SQLPreparedExecutionRequest
 from .sql_prepared_response import SQLPreparedResponse
+from .sql_range_column_schema import SQLRangeColumnSchema
+from .sql_range_column_schema_type import SQLRangeColumnSchemaType
 from .sql_request import SQLRequest
 from .sql_response import SQLResponse
 from .sql_setting_database_default import SqlSettingDatabaseDefault
@@ -2538,7 +2623,9 @@ from .sql_setting_role_default import SqlSettingRoleDefault
 from .sql_setting_value_type_0 import SqlSettingValueType0
 from .sql_setting_value_type_1 import SqlSettingValueType1
 from .sql_setting_value_type_2 import SqlSettingValueType2
+from .sql_temporal_kind import SQLTemporalKind
 from .sql_transaction_status import SQLTransactionStatus
+from .sql_view_index_requirement import SQLViewIndexRequirement
 from .sqlddl_receipt import SQLDDLReceipt
 from .sqlddl_receipt_state import SQLDDLReceiptState
 from .sse_error import SSEError
@@ -2609,6 +2696,7 @@ from .table_schema_document_schemas import TableSchemaDocumentSchemas
 from .table_schema_index_sort_item import TableSchemaIndexSortItem
 from .table_schema_index_sort_item_order import TableSchemaIndexSortItemOrder
 from .table_schema_patch import TableSchemaPatch
+from .table_schema_replica_identity import TableSchemaReplicaIdentity
 from .table_shards import TableShards
 from .table_statistics import TableStatistics
 from .table_statistics_field_stats import TableStatisticsFieldStats
@@ -2696,6 +2784,7 @@ from .transaction_stage_read_snapshot import TransactionStageReadSnapshot
 from .transaction_stage_write_request import TransactionStageWriteRequest
 from .transaction_stage_write_request_document import TransactionStageWriteRequestDocument
 from .transaction_status_response import TransactionStatusResponse
+from .transaction_write_error import TransactionWriteError
 from .transcriber_enrichment_config import TranscriberEnrichmentConfig
 from .transform import Transform
 from .transform_op import TransformOp
@@ -2870,6 +2959,29 @@ __all__ = (
     "CdcConnection",
     "ChainCondition",
     "ChainLink",
+    "ChangefeedCheckpoint",
+    "ChangefeedCreate",
+    "ChangefeedCreated",
+    "ChangefeedCreateEventsItem",
+    "ChangefeedCreateInclude",
+    "ChangefeedCreateStart",
+    "ChangefeedError",
+    "ChangefeedEvent",
+    "ChangefeedEventAfterType0",
+    "ChangefeedEventBeforeType0",
+    "ChangefeedEventKind",
+    "ChangefeedEventOperation",
+    "ChangefeedKey",
+    "ChangefeedKeyEncoding",
+    "ChangefeedLease",
+    "ChangefeedPage",
+    "ChangefeedPageSnapshot",
+    "ChangefeedPageTransactionType0",
+    "ChangefeedPageVersion",
+    "ChangefeedPredicate",
+    "ChangefeedProgress",
+    "ChangefeedProgressPhase",
+    "ChangefeedSelector",
     "ChatGPTAccount",
     "ChatGPTAccounts",
     "ChatGPTAuthorize",
@@ -3125,11 +3237,14 @@ __all__ = (
     "DocumentArtifactReprocessJob",
     "DocumentArtifactReprocessJobPhase",
     "DocumentArtifactReprocessJobReprocessStatus",
+    "DocumentArtifactReprocessJobSelection",
     "DocumentArtifactReprocessJobStartRequest",
+    "DocumentArtifactReprocessJobStartRequestSelection",
     "DocumentArtifactReprocessResponse",
     "DocumentArtifactReprocessResponseReprocess",
     "DocumentArtifactReprocessShardCursor",
     "DocumentArtifactTableReprocessRequest",
+    "DocumentArtifactTableReprocessRequestSelection",
     "DocumentArtifactTableReprocessResponse",
     "DocumentArtifactTableReprocessResponseReprocess",
     "DocumentArtifactTableReprocessResponseReprocessStatus",
@@ -3160,6 +3275,8 @@ __all__ = (
     "DocumentSchemaSchema",
     "DocumentSource",
     "DocumentSourceMediaType",
+    "DocumentSQLColumn",
+    "DocumentSQLColumnType",
     "DocumentSubfieldMapping",
     "DocumentSubfieldMappingMissingNullPolicy",
     "DropExtensionRequest",
@@ -3784,7 +3901,12 @@ __all__ = (
     "IndexMutationConflictErrorError",
     "IndexMutationServiceUnavailableError",
     "IndexMutationServiceUnavailableErrorError",
+    "IndexPublicationFailure",
+    "IndexPublicationPhase",
     "IndexPublicationPolicy",
+    "IndexPublicationState",
+    "IndexPublicationStatus",
+    "IndexPublicationStatusIndexType",
     "IndexReadinessReason",
     "IndexReadinessState",
     "IndexReadinessStatus",
@@ -4109,6 +4231,22 @@ __all__ = (
     "MaintainLakeTableBody",
     "MaintainLakeTableBodyAction",
     "MaintainLakeTableResponse200",
+    "ManagedSourceConfigured",
+    "ManagedSourceConfiguredState",
+    "ManagedSourceDestinationContract",
+    "ManagedSourceDestinationContractAcceptedBy",
+    "ManagedSourceDestinationContractAdapter",
+    "ManagedSourceDestinationContractCommittedBy",
+    "ManagedSourceDestinationContractCommittedHistory",
+    "ManagedSourceDestinationContractInput",
+    "ManagedSourceDestinationContractOutbound",
+    "ManagedSourceDestinationContractTransactionScope",
+    "ManagedSourceDestinationContractVersion",
+    "ManagedSourceProgress",
+    "ManagedSourceReplacement",
+    "ManagedSourceStatus",
+    "ManagedSourceStatusIndexPublicationType0",
+    "ManagedSourceStatusReplicationSourcesItem",
     "MatchAllQuery",
     "MatchAllQueryMatchAll",
     "MatchesQuery",
@@ -4821,6 +4959,8 @@ __all__ = (
     "RegexpQuery",
     "RelationalCheckConstraint",
     "RelationalColumnExpression",
+    "RelationalColumnSequence",
+    "RelationalColumnSequenceGeneration",
     "RelationalComparisonOp",
     "RelationalConstraintActivationPhase",
     "RelationalConstraintConflictReason",
@@ -4969,6 +5109,7 @@ __all__ = (
     "RestoreJobResultStatus",
     "RestoreJobScope",
     "RestoreRequest",
+    "RestoreRoutineMapping",
     "ResultExtractDocumentJobResponse200",
     "ResultReadDocumentJobResponse200",
     "RetrievalAgentRequest",
@@ -4998,6 +5139,10 @@ __all__ = (
     "RuntimeResolverSuppression",
     "SavedQuerySource",
     "ScanKeysRequest",
+    "SchemaValidationFailure",
+    "SchemaValidationPhase",
+    "SchemaValidationState",
+    "SchemaValidationStatus",
     "ScopedLinearMergePage",
     "ScopedLinearMergePageKeyRange",
     "ScopedLinearMergePageRecords",
@@ -5037,6 +5182,11 @@ __all__ = (
     "SQLArrayElementType",
     "SQLArrayValue",
     "SQLBuiltinType",
+    "SQLCatalogObjectKind",
+    "SQLCatalogOperationKind",
+    "SQLCatalogOperationReceipt",
+    "SQLCatalogOperationState",
+    "SQLCatalogRecoveryRequest",
     "SQLColumn",
     "SQLColumnType",
     "SQLConnectionOpenRequest",
@@ -5045,11 +5195,35 @@ __all__ = (
     "SQLDDLReceiptState",
     "SQLDiagnostic",
     "SQLMutationOutcome",
+    "SQLNamedDomainBase",
+    "SQLNamedDomainBaseKind",
+    "SQLNamedDomainCheck",
+    "SQLNamedDomainDefinition",
+    "SQLNamedEnumColumnSchema",
+    "SQLNamedEnumColumnSchemaType",
+    "SQLNamedEnumLabel",
+    "SQLNamedTypeIdentity",
+    "SQLNamedTypeLayout",
+    "SQLNamedTypeLayoutKind",
+    "SQLNamedTypeReference",
+    "SQLNotice",
+    "SQLNotification",
+    "SQLNotificationPage",
+    "SQLNotificationPollRequest",
     "SQLNumericModifier",
+    "SQLPackageArgument",
+    "SQLPackageControl",
+    "SQLPackageDefaultControl",
+    "SQLPackageExport",
+    "SQLPackageScalarType",
+    "SQLPackageType",
+    "SQLPackageVolatility",
     "SQLParameterDescriptor",
     "SQLPreparedExecutionRequest",
     "SQLPreparedResponse",
     "SQLPrepareRequest",
+    "SQLRangeColumnSchema",
+    "SQLRangeColumnSchemaType",
     "SQLRequest",
     "SQLResponse",
     "SqlSettingDatabaseDefault",
@@ -5061,7 +5235,9 @@ __all__ = (
     "SqlSettingValueType0",
     "SqlSettingValueType1",
     "SqlSettingValueType2",
+    "SQLTemporalKind",
     "SQLTransactionStatus",
+    "SQLViewIndexRequirement",
     "SSEError",
     "SSEErrorReason",
     "SSEEvent",
@@ -5130,6 +5306,7 @@ __all__ = (
     "TableSchemaIndexSortItem",
     "TableSchemaIndexSortItemOrder",
     "TableSchemaPatch",
+    "TableSchemaReplicaIdentity",
     "TableShards",
     "TablespaceCatalogRecord",
     "TableStatistics",
@@ -5217,6 +5394,7 @@ __all__ = (
     "TransactionStageWriteRequest",
     "TransactionStageWriteRequestDocument",
     "TransactionStatusResponse",
+    "TransactionWriteError",
     "TranscriberEnrichmentConfig",
     "Transform",
     "TransformOp",

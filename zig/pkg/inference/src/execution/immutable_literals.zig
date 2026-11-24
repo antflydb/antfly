@@ -26,7 +26,7 @@ const CT = ops.CT;
 pub const Literal = struct {
     node: ml.graph.NodeId,
     shape: ml.graph.Shape,
-    data: []const f32,
+    data: []align(@alignOf(f32)) const u8,
     allocation: buffers.AllocationId,
     backend_index: usize,
     cold_bound: usize,
@@ -83,7 +83,7 @@ pub const SharedLiteralStore = struct {
         for (graph.nodes.items, 0..) |node, node_id| {
             const backend = eligible(graph, plan, backends, @intCast(node_id)) orelse continue;
             const attrs = node.op.constant;
-            const bytes = try std.math.mul(usize, attrs.data_len, @sizeOf(f32));
+            const bytes = try std.math.mul(usize, attrs.data_len, node.output_shape.dtype.byteSize());
             const bound = try ops.physical_storage.reservationBytes(backends[backend], .{ .byte_size = bytes });
             if (bound < bytes) return error.InvalidPhysicalStorageReservation;
             var staging_bound: usize = 0;
@@ -95,7 +95,7 @@ pub const SharedLiteralStore = struct {
                     staging_bound = try ops.physical_storage.reservationBytes(backends[backend], initializer.staging);
                 };
             }
-            literals[index] = .{ .node = @intCast(node_id), .shape = node.output_shape, .data = graph.constantData(attrs.data_offset, attrs.data_len), .allocation = try plan.addConstantBinding(backends[backend].kind(), bytes), .backend_index = backend, .cold_bound = bound, .staging_bound = staging_bound };
+            literals[index] = .{ .node = @intCast(node_id), .shape = node.output_shape, .data = @alignCast(graph.constant_pool.items[attrs.data_offset..][0..bytes]), .allocation = try plan.addConstantBinding(backends[backend].kind(), bytes), .backend_index = backend, .cold_bound = bound, .staging_bound = staging_bound };
             indices[node_id] = @intCast(index);
             index += 1;
         }
@@ -162,7 +162,7 @@ pub const SharedLiteralStore = struct {
             const literal = indices[slot.node_id];
             if (literal == ml.graph.null_node) continue;
             const item = literals[literal];
-            const bytes = try std.math.mul(usize, item.data.len, @sizeOf(f32));
+            const bytes = item.data.len;
             const id = try plan.addWorkspace(backends[item.backend_index].kind(), bytes, @alignOf(f32));
             plan.allocations[id].kind = .tensor;
             plan.allocations[id].reusable = false;
@@ -175,7 +175,7 @@ pub const SharedLiteralStore = struct {
 
     fn eligible(graph: *const ml.graph.Graph, plan: *const buffers.BufferPlan, backends: []const ops.ComputeBackend, node_id: ml.graph.NodeId) ?usize {
         const node = graph.node(node_id);
-        if (node.op != .constant or node.output_shape.dtype != .f32) return null;
+        if (node.op != .constant) return null;
         const elements = node.output_shape.numElements() orelse return null;
         if (elements <= 0 or elements > std.math.maxInt(i32) or elements != node.op.constant.data_len) return null;
         const slot = plan.slotForNode(node_id) orelse return null;
@@ -183,7 +183,12 @@ pub const SharedLiteralStore = struct {
             if (backend.kind() != slot.backend) continue;
             const functions = backend.vtable.kernels orelse continue;
             if (!functions.accepts(backend.vtable)) continue;
-            if (functions.physicalTensorView != null and functions.writePhysicalFloat32 != null and functions.copyPhysicalInput != null) return index;
+            if (functions.physicalTensorView == null or functions.copyPhysicalInput == null) continue;
+            switch (node.output_shape.dtype) {
+                .f32 => if (functions.writePhysicalFloat32 != null) return index,
+                .i32, .i64 => if (functions.writePhysicalIntegerLiteral != null) return index,
+                else => {},
+            }
         }
         return null;
     }
@@ -418,7 +423,7 @@ pub const SharedLiteralStore = struct {
         }
         // Refresh construction capability before any SDK allocation. An active
         // frame or changed staging policy cannot silently use legacy staging.
-        const literal_bytes = try std.math.mul(usize, literal.data.len, @sizeOf(f32));
+        const literal_bytes = literal.data.len;
         const initializer: ?ops.physical_storage.LiteralInitializer = if (literal.staging_bound != 0) blk: {
             const binding_supported = functions.physicalLiteralBindingSupported orelse return error.UnsupportedPhysicalLiteralInitialization;
             if (!binding_supported(cb.ptr)) return error.UnsupportedPhysicalLiteralInitialization;
@@ -433,23 +438,29 @@ pub const SharedLiteralStore = struct {
             if (functions.createPhysicalCompletion) |make| self.completions[literal.backend_index] = try make(cb.ptr);
         }
         if (self.completions[literal.backend_index]) |completion| try completion.beforeReuse();
-        const lease = (try ops.physical_storage.Lease.createAdmitted(self.allocator, cb, try std.math.mul(usize, literal.data.len, 4), ledger, .constant, capability)) orelse return error.PhysicalStorageAllocationDeclined;
+        const lease = (try ops.physical_storage.Lease.createAdmitted(self.allocator, cb, literal_bytes, ledger, .constant, capability)) orelse return error.PhysicalStorageAllocationDeclined;
         var published = false;
         errdefer if (!published) lease.releaseWithCleanup(construction_cleanup);
         var dimensions: [8]i32 = undefined;
         for (literal.shape.dims[0..literal.shape.rank()], 0..) |dimension, axis| dimensions[axis] = @intCast(dimension);
-        const tensor = (try functions.physicalTensorView.?(cb.ptr, .{ .storage = lease, .shape = dimensions[0..literal.shape.rank()] })) orelse return error.UnsupportedPhysicalTensorView;
+        const tensor = (try functions.physicalTensorView.?(cb.ptr, .{ .storage = lease, .shape = dimensions[0..literal.shape.rank()], .dtype = literal.shape.dtype })) orelse return error.UnsupportedPhysicalTensorView;
         errdefer if (!published) cb.freeWithCleanup(tensor, construction_cleanup);
         var failure: ?anyerror = null;
         if (initializer) |initialize| {
             const stage = (try ops.physical_storage.Lease.createAdmittedWithUsage(self.allocator, cb, initialize.staging.byte_size, ledger, .activation, capability, .host_input)) orelse return error.PhysicalStorageAllocationDeclined;
             defer stage.releaseWithCleanup(construction_cleanup);
-            initialize.initialize(cb.ptr, lease, stage, literal.data) catch |err| {
+            initialize.initialize(cb.ptr, lease, stage, std.mem.bytesAsSlice(f32, literal.data)) catch |err| {
                 failure = err;
             };
-        } else functions.writePhysicalFloat32.?(cb.ptr, tensor, literal.data) catch |err| {
-            failure = err;
-        };
+        } else if (literal.shape.dtype == .f32) {
+            functions.writePhysicalFloat32.?(cb.ptr, tensor, std.mem.bytesAsSlice(f32, literal.data)) catch |err| {
+                failure = err;
+            };
+        } else {
+            functions.writePhysicalIntegerLiteral.?(cb.ptr, tensor, literal.data) catch |err| {
+                failure = err;
+            };
+        }
         // Even a failed upload can have queued work. Record its attempted
         // stream; a failed record retains the backend's checked drain proof.
         if (self.completions[literal.backend_index]) |completion| completion.record() catch |err| {
@@ -586,7 +597,7 @@ fn literalCallbackCase(allocator: std.mem.Allocator, comptime fail_upload: bool)
         const backend = ops.ComputeBackend{ .ptr = &probe.compute, .vtable = &LiteralCallbackProbe.table };
         var owners = [_]Owner{.{}};
         const data = [_]f32{ 0.5, 1, -3, 7 };
-        var literals = [_]Literal{.{ .node = 0, .shape = ml.graph.Shape.init(.f32, &.{4}), .data = &data, .allocation = 0, .backend_index = 0, .cold_bound = 16 }};
+        var literals = [_]Literal{.{ .node = 0, .shape = ml.graph.Shape.init(.f32, &.{4}), .data = std.mem.sliceAsBytes(&data), .allocation = 0, .backend_index = 0, .cold_bound = 16 }};
         var backends = [_]ops.ComputeBackend{backend};
         var completions = [_]?ops.physical_storage.Completion{null};
         // Stack fixture owns its arrays; value's temporary store pin must
@@ -692,7 +703,7 @@ fn preparedLiteralConstructionRollbackCase(comptime quarantine_upload: bool) !vo
     const backend = ops.ComputeBackend{ .ptr = &probe.compute, .vtable = &LiteralCallbackProbe.table };
     var owners = [_]Owner{.{}};
     const values = [_]f32{ 0.5, 1, -3, 7 };
-    var literals = [_]Literal{.{ .node = 0, .shape = ml.graph.Shape.init(.f32, &.{4}), .data = &values, .allocation = 0, .backend_index = 0, .cold_bound = 16 }};
+    var literals = [_]Literal{.{ .node = 0, .shape = ml.graph.Shape.init(.f32, &.{4}), .data = std.mem.sliceAsBytes(&values), .allocation = 0, .backend_index = 0, .cold_bound = 16 }};
     var backends = [_]ops.ComputeBackend{backend};
     var completions = [_]?ops.physical_storage.Completion{null};
     var store = SharedLiteralStore{ .allocator = a, .literals = &literals, .node_indices = &.{}, .publications = &.{}, .consumers = &.{}, .owners = &owners, .backends = &backends, .completions = &completions };
@@ -870,7 +881,7 @@ fn preparedLiteralMetalAttachmentRollbackCase(comptime partial_payload: bool, co
     var owners = [_]Owner{.{}};
     const data = [_]f32{ 0.5, 1, -3, 7 };
     const upper = try ops.physical_storage.reservationBytes(backend, .{ .byte_size = 16 });
-    var literals = [_]Literal{.{ .node = 0, .shape = ml.graph.Shape.init(.f32, &.{4}), .data = &data, .allocation = 0, .backend_index = 0, .cold_bound = upper }};
+    var literals = [_]Literal{.{ .node = 0, .shape = ml.graph.Shape.init(.f32, &.{4}), .data = std.mem.sliceAsBytes(&data), .allocation = 0, .backend_index = 0, .cold_bound = upper }};
     var backends = [_]ops.ComputeBackend{backend};
     var completions = [_]?ops.physical_storage.Completion{null};
     var store = SharedLiteralStore{ .allocator = a, .literals = &literals, .node_indices = &.{}, .publications = &.{}, .consumers = &.{}, .owners = &owners, .backends = &backends, .completions = &completions };
@@ -1035,7 +1046,7 @@ test "Metal literal Shared staging keeps Private bank immutable and warm credit 
     defer if (prepared_live and !prepared_bound) prepared.abortBeforeExecution() catch @panic("literal preparation rollback");
     var owners = [_]Owner{.{}};
     const data = [_]f32{ -1, 2, 3.5, -4 };
-    var literals = [_]Literal{.{ .node = 0, .shape = ml.graph.Shape.init(.f32, &.{ 2, 2 }), .data = &data, .allocation = 0, .backend_index = 0, .cold_bound = bound, .staging_bound = stage_bound }};
+    var literals = [_]Literal{.{ .node = 0, .shape = ml.graph.Shape.init(.f32, &.{ 2, 2 }), .data = std.mem.sliceAsBytes(&data), .allocation = 0, .backend_index = 0, .cold_bound = bound, .staging_bound = stage_bound }};
     var backends = [_]ops.ComputeBackend{cb};
     var completions = [_]?ops.physical_storage.Completion{null};
     var store = SharedLiteralStore{ .allocator = a, .literals = &literals, .node_indices = &.{}, .publications = &.{}, .consumers = &.{}, .owners = &owners, .backends = &backends, .completions = &completions };
@@ -1193,7 +1204,7 @@ test "Metal literal completed copy error releases transient stage and quarantine
     const descriptor = (try Fault.query(backend.ptr, 16)) orelse return error.SkipZigTest;
     var owners = [_]Owner{.{}};
     const data = [_]f32{ 1, 3, 5, 7 };
-    var literals = [_]Literal{.{ .node = 0, .shape = ml.graph.Shape.init(.f32, &.{4}), .data = &data, .allocation = 0, .backend_index = 0, .cold_bound = try ops.physical_storage.reservationBytes(backend, .{ .byte_size = 16 }), .staging_bound = try ops.physical_storage.reservationBytes(backend, descriptor.staging) }};
+    var literals = [_]Literal{.{ .node = 0, .shape = ml.graph.Shape.init(.f32, &.{4}), .data = std.mem.sliceAsBytes(&data), .allocation = 0, .backend_index = 0, .cold_bound = try ops.physical_storage.reservationBytes(backend, .{ .byte_size = 16 }), .staging_bound = try ops.physical_storage.reservationBytes(backend, descriptor.staging) }};
     var backends = [_]ops.ComputeBackend{backend};
     var completions = [_]?ops.physical_storage.Completion{null};
     var store = SharedLiteralStore{ .allocator = a, .literals = &literals, .node_indices = &.{}, .publications = &.{}, .consumers = &.{}, .owners = &owners, .backends = &backends, .completions = &completions };

@@ -1,0 +1,869 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL 18 user-defined aggregate execution and dependency retirement",
+  "before": [
+    {
+      "sql": "CREATE TABLE aggregate_rows(id integer PRIMARY KEY,g text,value text,sort_key integer)",
+      "command_tag": "CREATE TABLE",
+      "notices": []
+    },
+    {
+      "sql": "INSERT INTO aggregate_rows VALUES(1,'a',NULL,1),(2,'a','first',2),(3,'b','later',3)",
+      "command_tag": "INSERT 0 3",
+      "notices": []
+    },
+    {
+      "sql": "CREATE FUNCTION first_sfunc(text,text) RETURNS text LANGUAGE sql IMMUTABLE AS $$SELECT coalesce($1,$2)$$",
+      "command_tag": "CREATE FUNCTION",
+      "notices": []
+    },
+    {
+      "sql": "CREATE AGGREGATE first_value_text(text) (SFUNC = first_sfunc, STYPE = text)",
+      "id": "sql-0136",
+      "source_entry_sha256": "f52b42feb6edc8e43513521d525d4ffbc87753f49dd5bb89cd176ba3032c52e9",
+      "command_tag": "CREATE AGGREGATE",
+      "notices": []
+    },
+    {
+      "sql": "SELECT first_value_text(value ORDER BY sort_key) AS first FROM aggregate_rows",
+      "command_tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "first"
+        ],
+        "column_oids": [
+          25
+        ],
+        "rows": [
+          [
+            "first"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "SELECT g,first_value_text(value ORDER BY sort_key) AS first FROM aggregate_rows GROUP BY g ORDER BY g",
+      "command_tag": "SELECT 2",
+      "output": {
+        "columns": [
+          "g",
+          "first"
+        ],
+        "column_oids": [
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "a",
+            "first"
+          ],
+          [
+            "b",
+            "later"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "SELECT first_value_text(value) AS empty FROM aggregate_rows WHERE id<0",
+      "command_tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "empty"
+        ],
+        "column_oids": [
+          25
+        ],
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            true
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "SELECT first_value_text(value) AS absent FROM aggregate_rows WHERE value IS NULL",
+      "command_tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "absent"
+        ],
+        "column_oids": [
+          25
+        ],
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            true
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "SELECT first_value_text(value ORDER BY sort_key) FILTER(WHERE id>1) AS filtered FROM aggregate_rows",
+      "command_tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "filtered"
+        ],
+        "column_oids": [
+          25
+        ],
+        "rows": [
+          [
+            "first"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "SELECT first_value_text(DISTINCT value ORDER BY value) AS distinct_value FROM aggregate_rows",
+      "command_tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "distinct_value"
+        ],
+        "column_oids": [
+          25
+        ],
+        "rows": [
+          [
+            "first"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "CREATE FUNCTION uppercase_result(text) RETURNS text LANGUAGE sql IMMUTABLE AS $$SELECT upper($1)$$",
+      "command_tag": "CREATE FUNCTION",
+      "notices": []
+    },
+    {
+      "sql": "CREATE AGGREGATE upper_first(text)(SFUNC=first_sfunc,STYPE=text,FINALFUNC=uppercase_result)",
+      "command_tag": "CREATE AGGREGATE",
+      "notices": []
+    },
+    {
+      "sql": "CREATE AGGREGATE seeded_first(text)(SFUNC=first_sfunc,STYPE=text,INITCOND='seed')",
+      "command_tag": "CREATE AGGREGATE",
+      "notices": []
+    },
+    {
+      "sql": "SELECT upper_first(value ORDER BY sort_key) AS finalized,seeded_first(value) AS initialized FROM aggregate_rows",
+      "command_tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "finalized",
+          "initialized"
+        ],
+        "column_oids": [
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "FIRST",
+            "seed"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "SELECT upper_first(value) AS empty_finalized,seeded_first(value) AS empty_initialized FROM aggregate_rows WHERE id<0",
+      "command_tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "empty_finalized",
+          "empty_initialized"
+        ],
+        "column_oids": [
+          25,
+          25
+        ],
+        "rows": [
+          [
+            null,
+            "seed"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            true,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "CREATE FUNCTION strict_first(text,text) RETURNS text LANGUAGE sql IMMUTABLE STRICT AS $$SELECT coalesce($1,$2)$$",
+      "command_tag": "CREATE FUNCTION",
+      "notices": []
+    },
+    {
+      "sql": "CREATE AGGREGATE strict_first_value(text)(SFUNC=strict_first,STYPE=text)",
+      "command_tag": "CREATE AGGREGATE",
+      "notices": []
+    },
+    {
+      "sql": "SELECT strict_first_value(value ORDER BY sort_key) AS strict_value FROM aggregate_rows",
+      "command_tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "strict_value"
+        ],
+        "column_oids": [
+          25
+        ],
+        "rows": [
+          [
+            "first"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "CREATE FUNCTION bad_transition(integer,text) RETURNS integer LANGUAGE sql STRICT AS $$SELECT $1$$",
+      "command_tag": "CREATE FUNCTION",
+      "notices": []
+    },
+    {
+      "sql": "CREATE AGGREGATE invalid_first(text)(SFUNC=bad_transition,STYPE=integer)",
+      "sqlstate": "42P13",
+      "notices": []
+    },
+    {
+      "sql": "CREATE FUNCTION first_value_text(text) RETURNS text LANGUAGE sql AS $$SELECT $1$$",
+      "sqlstate": "42723",
+      "notices": []
+    },
+    {
+      "sql": "CREATE AGGREGATE first_value_text(text) (SFUNC = first_sfunc, STYPE = text)",
+      "sqlstate": "42723",
+      "notices": []
+    },
+    {
+      "sql": "DROP FUNCTION first_sfunc(text,text)",
+      "sqlstate": "2BP01",
+      "notices": []
+    },
+    {
+      "sql": "DROP FUNCTION uppercase_result(text)",
+      "sqlstate": "2BP01",
+      "notices": []
+    },
+    {
+      "sql": "CREATE OR REPLACE FUNCTION first_sfunc(text,text) RETURNS text LANGUAGE sql IMMUTABLE AS $$SELECT coalesce($2,$1)$$",
+      "command_tag": "CREATE FUNCTION",
+      "notices": []
+    },
+    {
+      "sql": "SELECT first_value_text(value ORDER BY sort_key) AS replaced FROM aggregate_rows",
+      "command_tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "replaced"
+        ],
+        "column_oids": [
+          25
+        ],
+        "rows": [
+          [
+            "later"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "CREATE FUNCTION int_sum(integer,integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$SELECT coalesce($1,0)+coalesce($2,0)$$",
+      "command_tag": "CREATE FUNCTION",
+      "notices": []
+    },
+    {
+      "sql": "CREATE AGGREGATE int_total(integer)(SFUNC=int_sum,STYPE=integer,INITCOND='0')",
+      "command_tag": "CREATE AGGREGATE",
+      "notices": []
+    },
+    {
+      "sql": "SELECT int_total(id) AS total,int_total(id) FILTER(WHERE id>1) AS filtered FROM aggregate_rows",
+      "command_tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "total",
+          "filtered"
+        ],
+        "column_oids": [
+          23,
+          23
+        ],
+        "rows": [
+          [
+            6,
+            5
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "CREATE FUNCTION int_final(integer) RETURNS text LANGUAGE sql IMMUTABLE AS $$SELECT $1::text$$",
+      "command_tag": "CREATE FUNCTION",
+      "notices": []
+    },
+    {
+      "sql": "CREATE AGGREGATE shown_total(integer)(SFUNC=int_sum,STYPE=integer,FINALFUNC=int_final,INITCOND='0')",
+      "command_tag": "CREATE AGGREGATE",
+      "notices": []
+    },
+    {
+      "sql": "SELECT shown_total(id) AS finalized_integer FROM aggregate_rows",
+      "command_tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "finalized_integer"
+        ],
+        "column_oids": [
+          25
+        ],
+        "rows": [
+          [
+            "6"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "SELECT shown_total(id) AS empty_integer FROM aggregate_rows WHERE id<0",
+      "command_tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "empty_integer"
+        ],
+        "column_oids": [
+          25
+        ],
+        "rows": [
+          [
+            "0"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "CREATE AGGREGATE invalid_seed(integer)(SFUNC=int_sum,STYPE=integer,INITCOND='bad')",
+      "sqlstate": "22P02",
+      "notices": []
+    },
+    {
+      "sql": "CREATE FUNCTION pair_first(text,text,text) RETURNS text LANGUAGE sql IMMUTABLE AS $$SELECT coalesce($1,concat($2,':',$3))$$",
+      "command_tag": "CREATE FUNCTION",
+      "notices": []
+    },
+    {
+      "sql": "CREATE AGGREGATE first_pair(text,text)(SFUNC=pair_first,STYPE=text)",
+      "command_tag": "CREATE AGGREGATE",
+      "notices": []
+    },
+    {
+      "sql": "SELECT first_pair(g,value ORDER BY sort_key) AS pair_value FROM aggregate_rows",
+      "command_tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "pair_value"
+        ],
+        "column_oids": [
+          25
+        ],
+        "rows": [
+          [
+            "a:"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "CREATE SCHEMA aggregate_tools",
+      "command_tag": "CREATE SCHEMA",
+      "notices": []
+    },
+    {
+      "sql": "CREATE FUNCTION aggregate_tools.first_text(text,text) RETURNS text LANGUAGE sql AS $$SELECT coalesce($1,$2)$$",
+      "command_tag": "CREATE FUNCTION",
+      "notices": []
+    },
+    {
+      "sql": "CREATE AGGREGATE renamed_first(text)(SFUNC=aggregate_tools.first_text,STYPE=text)",
+      "command_tag": "CREATE AGGREGATE",
+      "notices": []
+    },
+    {
+      "sql": "ALTER SCHEMA aggregate_tools RENAME TO aggregate_renamed",
+      "command_tag": "ALTER SCHEMA",
+      "notices": []
+    },
+    {
+      "sql": "SELECT renamed_first(value ORDER BY sort_key) AS renamed FROM aggregate_rows",
+      "command_tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "renamed"
+        ],
+        "column_oids": [
+          25
+        ],
+        "rows": [
+          [
+            "first"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false
+          ]
+        ]
+      },
+      "notices": []
+    }
+  ],
+  "cold": [
+    {
+      "sql": "SELECT int_total(id) AS integer_state,shown_total(id) AS integer_final,first_pair(g,value ORDER BY sort_key) AS pair_value FROM aggregate_rows",
+      "command_tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "integer_state",
+          "integer_final",
+          "pair_value"
+        ],
+        "column_oids": [
+          23,
+          25,
+          25
+        ],
+        "rows": [
+          [
+            6,
+            "6",
+            "a:"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "SELECT g,first_value_text(value ORDER BY sort_key) AS first FROM aggregate_rows GROUP BY g ORDER BY g",
+      "command_tag": "SELECT 2",
+      "output": {
+        "columns": [
+          "g",
+          "first"
+        ],
+        "column_oids": [
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "a",
+            "first"
+          ],
+          [
+            "b",
+            "later"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "SELECT upper_first(value ORDER BY sort_key) AS finalized,seeded_first(value ORDER BY sort_key) AS initialized,strict_first_value(value ORDER BY sort_key) AS strict_value,renamed_first(value ORDER BY sort_key) AS renamed FROM aggregate_rows",
+      "command_tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "finalized",
+          "initialized",
+          "strict_value",
+          "renamed"
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "LATER",
+            "later",
+            "first",
+            "first"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    }
+  ],
+  "after": [
+    {
+      "sql": "DROP AGGREGATE first_value_text(text)",
+      "id": "sql-0137",
+      "source_entry_sha256": "390fa866d9da63fd8c9ee1e1a4061b64396c46183a9b0b8416d24305be6b1c75",
+      "command_tag": "DROP AGGREGATE",
+      "notices": []
+    },
+    {
+      "sql": "SELECT first_value_text(value) AS missing FROM aggregate_rows",
+      "sqlstate": "42883",
+      "notices": []
+    },
+    {
+      "sql": "DROP AGGREGATE IF EXISTS first_value_text(text)",
+      "id": "sql-0138",
+      "source_entry_sha256": "df8e3ebdbbfa381f829cb19c3d178e5282e9cd67fd6ac0616276843ed0e04b4d",
+      "command_tag": "DROP AGGREGATE",
+      "notices": [
+        {
+          "code": "00000",
+          "message": "aggregate first_value_text(text) does not exist, skipping"
+        }
+      ]
+    },
+    {
+      "sql": "CREATE AGGREGATE first_value_text(text) (SFUNC = first_sfunc, STYPE = text)",
+      "command_tag": "CREATE AGGREGATE",
+      "notices": []
+    },
+    {
+      "sql": "DROP FUNCTION uppercase_result(text) CASCADE",
+      "command_tag": "DROP FUNCTION",
+      "notices": [
+        {
+          "code": "00000",
+          "message": "drop cascades to function upper_first(text)"
+        }
+      ]
+    },
+    {
+      "sql": "SELECT upper_first(value) AS missing_final FROM aggregate_rows",
+      "sqlstate": "42883",
+      "notices": []
+    },
+    {
+      "sql": "SELECT first_value_text(value ORDER BY sort_key) AS retained FROM aggregate_rows",
+      "command_tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "retained"
+        ],
+        "column_oids": [
+          25
+        ],
+        "rows": [
+          [
+            "later"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "DROP AGGREGATE seeded_first(text)",
+      "command_tag": "DROP AGGREGATE",
+      "notices": []
+    },
+    {
+      "sql": "DROP FUNCTION first_sfunc(text,text) CASCADE",
+      "command_tag": "DROP FUNCTION",
+      "notices": [
+        {
+          "code": "00000",
+          "message": "drop cascades to function first_value_text(text)"
+        }
+      ]
+    },
+    {
+      "sql": "SELECT first_value_text(value) AS missing_transition FROM aggregate_rows",
+      "sqlstate": "42883",
+      "notices": []
+    },
+    {
+      "sql": "CREATE FUNCTION first_sfunc(text,text) RETURNS text LANGUAGE sql AS $$SELECT $2$$",
+      "command_tag": "CREATE FUNCTION",
+      "notices": []
+    },
+    {
+      "sql": "SELECT first_value_text(value) AS no_name_retarget FROM aggregate_rows",
+      "sqlstate": "42883",
+      "notices": []
+    },
+    {
+      "sql": "CREATE AGGREGATE first_value_text(text) (SFUNC = first_sfunc, STYPE = text)",
+      "command_tag": "CREATE AGGREGATE",
+      "notices": []
+    },
+    {
+      "sql": "SELECT first_value_text(value ORDER BY sort_key) AS fresh FROM aggregate_rows",
+      "command_tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "fresh"
+        ],
+        "column_oids": [
+          25
+        ],
+        "rows": [
+          [
+            "later"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false
+          ]
+        ]
+      },
+      "notices": []
+    }
+  ],
+  "prepared": {
+    "setup": [
+      {
+        "sql": "CREATE TABLE prepared_aggregate_rows(id integer PRIMARY KEY)",
+        "command_tag": "CREATE TABLE",
+        "notices": []
+      },
+      {
+        "sql": "INSERT INTO prepared_aggregate_rows VALUES(1),(2),(3)",
+        "command_tag": "INSERT 0 3",
+        "notices": []
+      },
+      {
+        "sql": "CREATE FUNCTION mixed(integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$SELECT $1+10$$",
+        "command_tag": "CREATE FUNCTION",
+        "notices": []
+      },
+      {
+        "sql": "CREATE FUNCTION add_big(bigint,bigint) RETURNS bigint LANGUAGE sql IMMUTABLE AS $$SELECT $1+$2$$",
+        "command_tag": "CREATE FUNCTION",
+        "notices": []
+      },
+      {
+        "sql": "CREATE AGGREGATE mixed(bigint)(SFUNC=add_big,STYPE=bigint,INITCOND='0')",
+        "command_tag": "CREATE AGGREGATE",
+        "notices": []
+      }
+    ],
+    "statement": "WITH totals AS (SELECT mixed(id::bigint) AS total FROM prepared_aggregate_rows) SELECT id,mixed(id) AS ordinary,total FROM prepared_aggregate_rows CROSS JOIN totals ORDER BY id",
+    "before": {
+      "columns": [
+        "id",
+        "ordinary",
+        "total"
+      ],
+      "column_oids": [
+        23,
+        23,
+        20
+      ],
+      "rows": [
+        [
+          1,
+          11,
+          6
+        ],
+        [
+          2,
+          12,
+          6
+        ],
+        [
+          3,
+          13,
+          6
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ]
+      ]
+    },
+    "mutation": {
+      "sql": "CREATE OR REPLACE FUNCTION add_big(bigint,bigint) RETURNS bigint LANGUAGE sql IMMUTABLE AS $$SELECT $1+$2+1$$",
+      "command_tag": "CREATE FUNCTION",
+      "notices": []
+    },
+    "after": {
+      "columns": [
+        "id",
+        "ordinary",
+        "total"
+      ],
+      "column_oids": [
+        23,
+        23,
+        20
+      ],
+      "rows": [
+        [
+          1,
+          11,
+          9
+        ],
+        [
+          2,
+          12,
+          9
+        ],
+        [
+          3,
+          13,
+          9
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ]
+      ]
+    }
+  }
+}

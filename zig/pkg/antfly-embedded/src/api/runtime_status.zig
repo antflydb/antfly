@@ -60,6 +60,9 @@ pub const RuntimeStatusMetadata = struct {
     // latest accepted table target. Serving authority remains index-scoped in
     // DBIndexStats and is intentionally unaffected by this bit.
     target_observation_complete: bool = true,
+    /// Durable execution mode and native cut sampled with this owner status.
+    /// Unknown is not native, and a native sequence is never a Raft index.
+    source_authority: ?@import("../storage/source_authority.zig").State = null,
     store_id: u64 = 0,
     node_id: u64 = 0,
 

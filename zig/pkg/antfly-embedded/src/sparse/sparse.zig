@@ -2762,6 +2762,49 @@ pub const SparseIndex = struct {
         return result;
     }
 
+    /// Brings this process's view up to the index as committed, after
+    /// another process committed under its scope: reloads the
+    /// native-catalog mirror (every query and write reads through it) and
+    /// the counters. Caller holds the index's apply guard, which an inline
+    /// publication holds until it installs.
+    pub fn refreshFromTip(self: *SparseIndex) !void {
+        const backend = switch (self.owner) {
+            .native_catalog => |backend| backend,
+            else => return error.UnsupportedRefresh,
+        };
+        try backend.reloadMirror();
+        try self.refreshCounters();
+    }
+
+    pub fn refreshPeerDelta(self: *SparseIndex, delta: []const native_catalog_backend.Mutation) !void {
+        const backend = switch (self.owner) {
+            .native_catalog => |backend| backend,
+            else => return error.UnsupportedRefresh,
+        };
+        try backend.applyExternallyCommittedMutations(delta);
+        try self.refreshCounters();
+    }
+
+    fn refreshCounters(self: *SparseIndex) !void {
+        var txn = try self.store.beginRead();
+        defer txn.abort();
+        const Counter = struct {
+            fn read(read_txn: anytype, tag: u8, fallback: u64) !u64 {
+                const data = read_txn.get(metaKey(tag)) catch |err| switch (err) {
+                    error.NotFound => return fallback,
+                    else => return err,
+                };
+                return if (data.len >= 8) std.mem.readInt(u64, data[0..8], .little) else fallback;
+            }
+        };
+        // Counters another process advanced only move forward here, so an
+        // id this process handed out is never reused.
+        self.next_doc_num = @max(self.next_doc_num, try Counter.read(&txn, meta_next_doc_num, 0));
+        self.next_segment_id = @max(self.next_segment_id, try Counter.read(&txn, meta_next_segment_id, 1));
+        self.doc_count = try Counter.read(&txn, meta_doc_count, 0);
+        self.term_count = try Counter.read(&txn, meta_term_count, 0);
+    }
+
     pub fn close(self: *SparseIndex) void {
         self.store.deinit();
         self.owner.close(self.alloc);
@@ -3067,6 +3110,31 @@ pub const SparseIndex = struct {
         alloc.free(items);
     }
 
+    /// Owns a private catalog root and a separate allocation/counter state.
+    /// Subsequent staged writes on this view see the earlier queued writes.
+    pub fn forkInlineWriter(self: *SparseIndex) !SparseIndex {
+        const original = switch (self.owner) {
+            .native_catalog => |backend| backend,
+            else => return error.InlineSparsePublicationUnsupported,
+        };
+        const backend = try self.alloc.create(native_catalog_backend.Backend);
+        errdefer self.alloc.destroy(backend);
+        backend.* = try original.forkWriterView();
+        errdefer backend.close();
+        return .{
+            .alloc = self.alloc,
+            .store = try backend.runtimeStore(self.alloc, .{}),
+            .owner = .{ .native_catalog = backend },
+            .construction_cancellation = self.construction_cancellation,
+            .chunk_size = self.chunk_size,
+            .next_doc_num = self.next_doc_num,
+            .next_segment_id = self.next_segment_id,
+            .doc_count = self.doc_count,
+            .term_count = self.term_count,
+            .resource_manager = self.resource_manager,
+        };
+    }
+
     /// Builds one small sparse batch's `InlineSparsePublication`, without
     /// touching this index's durable sink (see `native_catalog_backend.
     /// Backend.boundWrite`'s "never talks to sink" note). Returns
@@ -3144,6 +3212,12 @@ pub const SparseIndex = struct {
     /// counter values -- the step after which a synchronous sparse-visible
     /// write's ack may return.
     pub fn installInlineSparsePublication(self: *SparseIndex, publication: *InlineSparsePublication) !void {
+        try self.applyInlinePublicationToView(publication);
+        publication.abort();
+    }
+
+    /// Advances this view using a publication retained by its host ticket.
+    pub fn applyInlinePublicationToView(self: *SparseIndex, publication: *const InlineSparsePublication) !void {
         const backend = switch (self.owner) {
             .native_catalog => |b| b,
             else => return error.InlineSparsePublicationUnsupported,
@@ -3153,8 +3227,6 @@ pub const SparseIndex = struct {
         self.next_segment_id = publication.next_segment_id;
         self.doc_count = publication.doc_count;
         self.term_count = publication.term_count;
-        freeOwnedSparseMutations(self.alloc, publication.mutations);
-        publication.* = undefined;
     }
 
     fn estimateSparseBulkWorkingBytes(writes: []const SparseWrite) u64 {
@@ -7342,6 +7414,42 @@ const NativeCatalogTestSink = struct {
     }
 };
 
+test "sparse private writer view chains queued postings without serving them" {
+    const alloc = std.testing.allocator;
+    var buf: [256]u8 = undefined;
+    const path = tmpPath(&buf, "inline-writer-view");
+    defer cleanupTmp(path);
+
+    var test_sink = NativeCatalogTestSink{ .allocator = alloc };
+    defer test_sink.deinit();
+    var index = try SparseIndex.open(alloc, path, .{
+        .backend = .native_catalog,
+        .main_native_catalog_sink = test_sink.sink(),
+    });
+    defer index.close();
+    var writer = try index.forkInlineWriter();
+    defer writer.close();
+    const previous_submit_calls = test_sink.submit_calls;
+    const vector: SparseVector = .{ .indices = &.{3}, .values = &.{1} };
+
+    var first = try writer.prepareInlineSparsePublication(&.{.{ .doc_id = "first", .vec = vector }}, &.{});
+    defer first.abort();
+    try writer.applyInlinePublicationToView(&first);
+    var second = try writer.prepareInlineSparsePublication(&.{.{ .doc_id = "second", .vec = vector }}, &.{});
+    defer second.abort();
+    try writer.applyInlinePublicationToView(&second);
+    try std.testing.expectEqual(previous_submit_calls, test_sink.submit_calls);
+    try std.testing.expectEqual(@as(u64, 2), writer.doc_count);
+    try std.testing.expectEqual(@as(u64, 0), index.doc_count);
+
+    const queued = try writer.search(alloc, &vector, 10);
+    defer SparseIndex.freeResults(alloc, queued);
+    const served = try index.search(alloc, &vector, 10);
+    defer SparseIndex.freeResults(alloc, served);
+    try std.testing.expectEqual(@as(usize, 2), queued.len);
+    try std.testing.expectEqual(@as(usize, 0), served.len);
+}
+
 test "sparse inline publication folds one batch into an externally-owned commit and is durable after reopen" {
     const alloc = std.testing.allocator;
     var buf: [256]u8 = undefined;
@@ -10456,4 +10564,45 @@ test "external lake bounded WAL native sparse construction cancels inside bulk d
     };
     try std.testing.expectError(error.Canceled, index.batchWithOptions(&input, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true }));
     try std.testing.expect(probe.checks >= 3);
+}
+
+// Another process's writes and deletes reach this process's index through
+// `refreshFromTip`, without reopening it.
+test "sparse index refreshes another writer's commits from the tip" {
+    const alloc = std.testing.allocator;
+    var buf: [256]u8 = undefined;
+    const path = tmpPath(&buf, "refresh-from-tip");
+    defer cleanupTmp(path);
+
+    var test_sink = NativeCatalogTestSink{ .allocator = alloc };
+    defer test_sink.deinit();
+    const options: SparseIndexOptions = .{ .backend = .native_catalog, .main_native_catalog_sink = test_sink.sink() };
+    var writer = try SparseIndex.open(alloc, path, options);
+    defer writer.close();
+    var reader = try SparseIndex.open(alloc, path, options);
+    defer reader.close();
+
+    const query: SparseVector = .{ .indices = &.{3}, .values = &.{1} };
+    try writer.batch(&.{.{ .doc_id = "doc-1", .vec = .{ .indices = &.{ 3, 7 }, .values = &.{ 1.5, 2.5 } } }}, &.{});
+    {
+        const hits = try reader.search(alloc, &query, 10);
+        defer SparseIndex.freeResults(alloc, hits);
+        try std.testing.expectEqual(@as(usize, 0), hits.len);
+    }
+    try reader.refreshFromTip();
+    {
+        const hits = try reader.search(alloc, &query, 10);
+        defer SparseIndex.freeResults(alloc, hits);
+        try std.testing.expectEqual(@as(usize, 1), hits.len);
+        try std.testing.expectEqualStrings("doc-1", hits[0].doc_id);
+    }
+    try std.testing.expectEqual(writer.doc_count, reader.doc_count);
+    try std.testing.expectEqual(writer.next_doc_num, reader.next_doc_num);
+
+    try writer.batch(&.{}, &.{"doc-1"});
+    try reader.refreshFromTip();
+    const hits = try reader.search(alloc, &query, 10);
+    defer SparseIndex.freeResults(alloc, hits);
+    try std.testing.expectEqual(@as(usize, 0), hits.len);
+    try std.testing.expectEqual(@as(u64, 0), reader.doc_count);
 }

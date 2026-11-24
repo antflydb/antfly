@@ -35,6 +35,90 @@ const actor = (env, id) => {
 };
 const hint = (env, mailbox, kind, id) =>
   env.MAIL_QUEUE.send({ mailbox, kind, ...(id ? { id } : {}) });
+// WASM compilation and module workers back the optional on-device index.
+// Everything, including model downloads, stays same-origin.
+export const contentSecurityPolicy =
+  "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; " +
+  "connect-src 'self'; img-src 'self'; manifest-src 'self'; object-src 'none'; " +
+  "base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
+// Content-addressed public runtime code (no user data), so no session needed.
+async function localRuntime(env, pathname) {
+  const object = await env.MAIL_MODELS.get("local-runtime/" + pathname.slice("/local/".length));
+  if (!object) return null;
+  const type = pathname.endsWith(".wasm")
+    ? "application/wasm"
+    : /\.m?js$/.test(pathname)
+      ? "text/javascript"
+      : "application/octet-stream";
+  return new Response(object.body, { headers: { "Content-Type": type, "Content-Length": String(object.size) } });
+}
+
+// The on-device embedding model, published by the operator to a private R2
+// bucket (see publish-local-model.mjs). It never contains user data, but the
+// deployment must not become an open mirror of licensed weights. The catalog
+// is served to signed-in users with short-lived grant URLs, because the
+// browser model cache downloads pinned files without cookies.
+const GRANT_SECONDS = 3600;
+const hex = (bytes) => Array.from(new Uint8Array(bytes), (b) => b.toString(16).padStart(2, "0")).join("");
+async function grantSignature(env, path, expires) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(env.LOCAL_MODEL_GRANT_SECRET),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  return hex(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(path + "\n" + expires)));
+}
+export async function modelGrant(env, path, now = Date.now()) {
+  const expires = Math.floor(now / 1000) + GRANT_SECONDS;
+  return expires + "." + (await grantSignature(env, path, expires));
+}
+async function validGrant(env, path, grant, now = Date.now()) {
+  const match = /^(\d{1,12})\.([a-f0-9]{64})$/.exec(grant ?? "");
+  if (!match || !env.LOCAL_MODEL_GRANT_SECRET || Number(match[1]) < now / 1000) return false;
+  const expected = await grantSignature(env, path, match[1]);
+  // Constant-time comparison of equal-length hex strings.
+  let difference = 0;
+  for (let i = 0; i < expected.length; i++) difference |= expected.charCodeAt(i) ^ match[2].charCodeAt(i);
+  return difference === 0;
+}
+function modelPathOf(pathname) {
+  const path = pathname.slice("/local/models/".length);
+  return path &&
+    path.length <= 512 &&
+    !path.split("/").some((part) => !part || part === "." || part === "..") &&
+    /^[A-Za-z0-9._/-]+$/.test(path)
+    ? path
+    : null;
+}
+async function localModel(env, url, method, signedIn) {
+  const path = modelPathOf(url.pathname);
+  if (method !== "GET" || !env.MAIL_MODELS || !path) return new Response("not found", { status: 404 });
+  if (path === "catalog.json") {
+    if (!signedIn) return Response.json({ error: "SignInRequired" }, { status: 401 });
+    if (!env.LOCAL_MODEL_GRANT_SECRET)
+      return Response.json({ error: "LocalModelGrantSecretMissing" }, { status: 503 });
+  } else if (!signedIn && !(await validGrant(env, path, url.searchParams.get("grant"))))
+    return Response.json({ error: "SignInRequired" }, { status: 401 });
+  const object = await env.MAIL_MODELS.get((env.MAIL_MODEL_PREFIX ?? "local-models/") + path);
+  if (!object) return new Response("not found", { status: 404 });
+  const headers = {
+    "Content-Type": path.endsWith(".json") ? "application/json" : "application/octet-stream",
+    "X-Content-Type-Options": "nosniff",
+  };
+  if (path === "catalog.json") {
+    const catalog = JSON.parse(await new Response(object.body).text());
+    for (const file of catalog.files ?? [])
+      if (typeof file.path === "string" && modelPathOf("/local/models/" + file.path))
+        file.url = "/local/models/" + file.path + "?grant=" + (await modelGrant(env, file.path));
+    return Response.json(catalog, { headers: { ...headers, "Cache-Control": "private, no-store" } });
+  }
+  // Pinned weight files are content-checked by the browser before use.
+  return new Response(object.body, {
+    headers: { ...headers, "Content-Length": String(object.size), "Cache-Control": "private, max-age=86400" },
+  });
+}
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -45,16 +129,30 @@ export default {
       return Response.redirect(target.href, 307);
     }
     if (url.pathname.startsWith("/api/auth/")) return env.AUTH_SERVICE.fetch(request);
-    if (!url.pathname.startsWith("/mail/") && url.pathname !== "/api/me") {
+    const modelPath = url.pathname.startsWith("/local/models/");
+    // Granted weight downloads carry no cookies; they are authorized by URL.
+    if (modelPath && url.pathname !== "/local/models/catalog.json" && url.searchParams.has("grant"))
+      return localModel(env, url, request.method, false);
+    if (!url.pathname.startsWith("/mail/") && url.pathname !== "/api/me" && !modelPath) {
       if (request.method !== "GET" || !env.MAIL_ASSETS)
         return new Response("not found", { status: 404 });
-      const asset = await env.MAIL_ASSETS.fetch(request),
-        headers = new Headers(asset.headers);
-      headers.set(
-        "Content-Security-Policy",
-        "default-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
-      );
+      const runtime = /^\/local\/[a-f0-9]{16}\/[A-Za-z0-9._/-]+$/.test(url.pathname);
+      let asset = await env.MAIL_ASSETS.fetch(request);
+      // The SPA asset fallback can return the HTML shell with status 200.
+      const localAsset = runtime || url.pathname === "/local/config.json";
+      if (localAsset && (asset.status === 404 || asset.headers.get("Content-Type")?.includes("text/html"))) {
+        asset = (runtime && env.MAIL_MODELS && !url.pathname.includes("..")
+          ? await localRuntime(env, url.pathname)
+          : null) ?? new Response("not found", { status: 404 });
+      }
+      const headers = new Headers(asset.headers);
+      headers.set("Content-Security-Policy", contentSecurityPolicy);
       headers.set("X-Content-Type-Options", "nosniff");
+      // The service worker must update promptly; versioned runtimes never change.
+      if (url.pathname === "/sw.js" || url.pathname === "/local/config.json")
+        headers.set("Cache-Control", "no-cache");
+      else if (asset.ok && runtime)
+        headers.set("Cache-Control", "public, max-age=31536000, immutable");
       return new Response(asset.body, { status: asset.status, headers });
     }
     let cookies = [];
@@ -73,15 +171,35 @@ export default {
       if (request.method !== "GET" && request.headers.get("Origin") !== env.AUTH_ORIGIN)
         return reply({ error: "InvalidOrigin" }, 403);
       if (url.pathname === "/api/me" && request.method === "GET") return reply(session);
+      if (modelPath) return withCookies(await localModel(env, url, request.method, true));
       if (url.pathname === "/mail/messages" && request.method === "GET")
         return reply(
           publicPage(await takeRpcData(stub.list(mailbox.id, url.searchParams.get("cursor") ?? "")))
         );
+      if (url.pathname === "/mail/sync" && request.method === "GET")
+        return reply(await takeRpcData(stub.sync(mailbox.id, url.searchParams.get("cursor") ?? "")));
       if (url.pathname === "/mail/search" && request.method === "GET")
         return reply(publicPage(await takeRpcData(stub.search(mailbox.id, url.searchParams.get("q")))));
       const match = /^\/mail\/messages\/([a-f0-9-]{36})(?:\/attachments\/(\d{1,2}))?$/.exec(
         url.pathname
       );
+      if (url.pathname === "/mail/trash" && request.method === "GET")
+        return reply(publicPage(await takeRpcData(stub.trashList(mailbox.id, url.searchParams.get("cursor") ?? ""))));
+      if (url.pathname === "/mail/trash/empty" && request.method === "POST") {
+        const result = await takeRpcData(stub.emptyTrash(mailbox.id));
+        if (!result.done) await hint(env, mailbox.id, "empty");
+        return reply(result);
+      }
+      const action = /^\/mail\/messages\/([a-f0-9-]{36})\/(trash|restore)$/.exec(url.pathname);
+      if (action && request.method === "POST")
+        return reply(await takeRpcData(action[2] === "trash" ? stub.trash(mailbox.id, action[1]) : stub.restore(mailbox.id, action[1])));
+      // DELETE is "delete forever" (from Trash or directly), like Gmail's API.
+      if (match && !match[2] && request.method === "DELETE") {
+        const { more, ...result } = await takeRpcData(stub.delete(mailbox.id, match[1]));
+        if (more === "purge") await hint(env, mailbox.id, "purge", match[1]);
+        if (more === "publish") await hint(env, mailbox.id, "publish");
+        return reply(result);
+      }
       if (match && request.method === "GET") {
         if (match[2]) {
           const part = await takeRpcData(stub.attachment(mailbox.id, match[1], Number(match[2])));
@@ -135,6 +253,8 @@ export default {
       }
       return reply({ error: "NotFound" }, 404);
     } catch (error) {
+      if (error?.message === "UnknownMessage") return reply({ error: "NotFound" }, 404);
+      if (error?.message === "MessageNotReady") return reply({ error: "MessageNotReady" }, 409);
       if (error?.message === "MailSendRateLimited")
         return reply({ error: "MailSendRateLimited" }, 429);
       const invalid =
@@ -157,12 +277,12 @@ export default {
       message.setReject("Message too large");
       return;
     }
-    // Each SMTP invocation receives a receipt. Content hashes deduplicate bytes,
-    // never distinct deliveries; a repeated Message-ID cannot erase a message.
+    // Raw MIME is owned by one receipt, even for identical deliveries.
+    // A content digest checks integrity, and Message-ID is used for threading.
     const raw = await boundedBytes(message.raw),
       checksum = await digest(raw),
-      key = objectPrefix(mailbox.id) + "raw/" + checksum,
-      id = crypto.randomUUID();
+      id = crypto.randomUUID(),
+      key = objectPrefix(mailbox.id) + "raw/" + id;
     await env.MAIL_OBJECTS.put(key, raw, {
       onlyIf: { etagDoesNotMatch: "*" },
       httpMetadata: { contentType: "message/rfc822" },
@@ -175,8 +295,8 @@ export default {
       const body = message.body;
       if (
         !uuid(body?.mailbox) ||
-        !["ingest", "send", "publish"].includes(body.kind) ||
-        (body.kind !== "publish" && !uuid(body.id))
+        !["ingest", "send", "publish", "purge", "expire", "empty"].includes(body.kind) ||
+        (!["publish", "expire", "empty"].includes(body.kind) && !uuid(body.id))
       ) {
         message.ack();
         continue;
@@ -188,8 +308,21 @@ export default {
               ? await takeRpcData(stub.ingest(body.mailbox, body.id))
               : body.kind === "send"
                 ? await takeRpcData(stub.dispatch(body.mailbox, body.id))
-                : await takeRpcData(stub.publish(body.mailbox));
-        if (result.done === false) await hint(env, body.mailbox, "publish");
+                : body.kind === "purge"
+                  ? await takeRpcData(stub.purge(body.mailbox, body.id))
+                  : body.kind === "expire"
+                    ? await takeRpcData(stub.expire(body.mailbox))
+                    : body.kind === "empty"
+                      ? await takeRpcData(stub.emptyTrash(body.mailbox, { continuation: true }))
+                      : await takeRpcData(stub.publish(body.mailbox));
+        if (result.deferred) {
+          message.retry({ delaySeconds: 60 });
+          continue;
+        }
+        if (result.purge) await hint(env, body.mailbox, "purge", body.id);
+        // Bounded Trash work continues as its own kind; publishing as publish.
+        if (result.done === false)
+          await hint(env, body.mailbox, ["expire", "empty"].includes(body.kind) ? body.kind : "publish");
         message.ack();
       } catch {
         message.retry({ delaySeconds: 60 });
@@ -203,6 +336,10 @@ export default {
         const pending = await takeRpcData(actor(env, mailbox).pending(mailbox));
         for (const id of pending.inbound) await hint(env, mailbox, "ingest", id);
         for (const id of pending.outbound) await hint(env, mailbox, "send", id);
+        for (const id of pending.purge ?? []) await hint(env, mailbox, "purge", id);
+        // Retention: Trash older than MAIL_TRASH_DAYS (default 30) is deleted forever.
+        if (pending.expire) await hint(env, mailbox, "expire");
+        if (pending.empty) await hint(env, mailbox, "empty");
         if (pending.publish) await hint(env, mailbox, "publish");
       } catch (error) {
         failures.push(error);

@@ -1,0 +1,1355 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Shared typed-row read execution. No SQL parser, HTTP types, or JSON row
+//! parsing belongs here. One reader pins both a store snapshot and its schema;
+//! every page sees the same rows even if live writes, DDL, or GC race it.
+const std = @import("std");
+const Types = @import("read_session_types").types;
+const Source = @import("read_session_source_types").types;
+const time = Source.platform.time;
+const docstore = Source.store;
+const schema = Source.schema;
+const internal = Source.internal;
+const registry = Source.schema_registry;
+const catalog = Source.index_catalog;
+const plans = Source.index_plan;
+const records = Source.index_records;
+const jobs = Source.index_jobs;
+const tuples = Source.index_keys;
+const codec = Source.row_codec;
+const range_state = Source.range_state;
+const ttl = Source.ttl;
+const predicates = Source.predicates;
+const row_cursor_codec = Source.row_cursor;
+const Allocator = std.mem.Allocator;
+
+const request_values = Types.reader_values;
+pub const Value = request_values.Value;
+pub const Condition = request_values.Condition;
+pub const Bound = request_values.Bound;
+pub const PrimaryBound = request_values.PrimaryBound;
+pub const RowFilter = request_values.RowFilter;
+pub const Request = request_values.Request;
+const foreign_validation = Source.foreign_validation;
+const nullability = Source.nullability;
+pub const ExpressionEquality = Types.reader_values.ExpressionEquality;
+
+const session_values = Types.values;
+pub const Budget = session_values.Budget;
+pub const Row = session_values.Row;
+pub const Page = session_values.Page;
+
+pub const NullabilityPage = Types.reader_values.NullabilityPage;
+pub const NullabilityResume = Types.reader_values.NullabilityResume;
+pub const ForeignKeyValidationPage = Types.reader_values.ForeignKeyValidationPage;
+pub const ForeignKeyReplayBoundary = Types.reader_values.ForeignKeyReplayBoundary;
+pub const NullabilityReplayBoundary = Types.reader_values.NullabilityReplayBoundary;
+
+pub const Reader = struct {
+    cypher_projection: []const Source.cypher.read_fields.Projection = &.{},
+    cypher_presence_fields: []const []const u8 = &.{},
+    row_policy_lease: ?Source.row_policy_gate.Gate.Lease = null,
+    alloc: Allocator,
+    arena: std.heap.ArenaAllocator,
+    read: docstore.DocStore.Txn,
+    active: registry.SchemaView,
+    index_plan: ?plans.View,
+    /// Snapshot-local planner work, distinct from execution-page work.
+    planner_candidates: usize = 0,
+    planner_records: usize = 0,
+    index: ?plans.BoundIndex,
+    /// Full-tuple equality selected on this retained snapshot, never a prefix
+    /// or a caller assertion. Borrows the reader-owned physical lower bound.
+    exact_index_tuple: ?[]const u8 = null,
+    lower: []const u8,
+    upper: []const u8,
+    owned_lower: []const u8,
+    owned_upper: []const u8,
+    fields: []const []const u8,
+    now_ns: u64,
+    authenticated: bool,
+    include_primary_digest: bool,
+    include_cursor: bool,
+    reverse: bool,
+    cursor_identity: ?[row_cursor_codec.identity_len]u8,
+    row_filter: ?RowFilter,
+    index_only: bool = false,
+    covering_projection: ?codec.OrdinalProjectionPlan = null,
+    covering_conditions: []predicates.Source = &.{},
+    source: ?registry.SchemaView = null,
+    selected: ?codec.OrdinalProjectionPlan = null,
+    conditions: []predicates.Plan,
+    /// Exact conjuncts discharged by the pinned READY partial-index proof.
+    /// These are skipped only on the index-only path; primary reads still
+    /// evaluate the complete query against the authoritative row.
+    implied_conditions: []const bool,
+    source_conditions: []predicates.Source = &.{},
+    // Snapshot-local LRU: version numbers are not identities across restores.
+    // Retain at most eight bindings / 2 MiB, or one oversized working binding.
+    bindings: [8]?*SourceBinding = @splat(null),
+    binding_bytes: usize = 0,
+    source_compilations: usize = 0,
+    source_cache_hits: usize = 0,
+    failed_row: ?Row = null,
+    seek_arena: ?std.heap.ArenaAllocator = null,
+    after: std.ArrayList(u8) = .empty,
+    done: bool = false,
+    /// A retained cursor cannot mix query visibility or another projection
+    /// into a partially completed physical validation scan.
+    nullability_projection: ?[32]u8 = null,
+    nullability_failed: bool = false,
+
+    const ValidationVisit = struct {
+        plan: ?*const nullability.Plan = null,
+        foreign_keys: ?*foreign_validation.ChildPlan = null,
+        witness: foreign_validation.Witness = .{},
+        expected_witness: ?foreign_validation.Witness = null,
+        control: nullability.Control,
+        rows_examined: usize = 0,
+        violation_column: ?usize = null,
+        after: []const u8 = "",
+        replay: ?NullabilityReplayBoundary = null,
+
+        fn verify(self: *const @This(), record_count: usize, more: bool) !void {
+            if (self.expected_witness) |expected| if (!self.witness.eql(expected)) return error.InvalidNullabilityReplay;
+            if (self.replay) |expected| {
+                if (record_count != expected.records_examined or self.rows_examined != expected.rows_examined or
+                    self.violation_column != expected.violation_column or more != expected.more or
+                    !std.mem.eql(u8, self.after, expected.after)) return error.InvalidNullabilityReplay;
+            }
+        }
+    };
+
+    const SourceBinding = struct {
+        arena: std.heap.ArenaAllocator,
+        view: registry.SchemaView,
+        projection: codec.OrdinalProjectionPlan,
+        conditions: []predicates.Source,
+
+        fn destroy(self: *SourceBinding, alloc: Allocator) void {
+            self.view.release();
+            self.arena.deinit();
+            alloc.destroy(self);
+        }
+    };
+
+    fn evictSourceBinding(self: *Reader, slot: usize) void {
+        if (self.bindings[slot]) |binding| {
+            self.binding_bytes -= binding.arena.queryCapacity();
+            binding.destroy(self.alloc);
+            self.bindings[slot] = null;
+        }
+    }
+
+    /// Caller fences schema/catalog publication while this snapshot is opened.
+    /// Owns request data except row_filter.context, which the caller retains
+    /// through reader.deinit. The reader must close before its DB closes.
+    pub fn open(alloc: Allocator, store: *docstore.DocStore, active_view: registry.SchemaView, indexes: ?catalog.WriteSnapshot, request: Request, now_ns: u64) !Reader {
+        return openSnapshot(alloc, try store.beginReadTxn(), store.valuesAreAuthenticated(), active_view, indexes, request, now_ns);
+    }
+
+    /// Consumes the transaction on both success and error. Schema/index pins
+    /// and this transaction must have been captured under one publication
+    /// fence; predicate compilation and bounded planning need no apply lock.
+    pub fn openSnapshot(alloc: Allocator, snapshot: docstore.DocStore.Txn, authenticated: bool, active_view: registry.SchemaView, indexes: ?catalog.WriteSnapshot, request: Request, now_ns: u64) !Reader {
+        var read = snapshot;
+        errdefer read.abort();
+        try Source.transactions.checkExternalReadAdmission(&read);
+        if (active_view.storageMode() != .relational) return error.RelationalTableRequired;
+        if (request.expected_schema_version) |version| if (version != active_view.version()) return error.PreparedGenerationChanged;
+        if (request.fields.len > 256 or request.conditions.len > 256 or request.expression_equalities.len > 256 or (request.index == null and (request.lower != null or request.upper != null)))
+            return error.InvalidRelationalRowsRequest;
+        if (request.index != null and (request.primary_lower != null or request.primary_upper != null)) return error.InvalidRelationalRowsRequest;
+        if (request.after != null and request.index == null) return error.InvalidRelationalRowsRequest;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        errdefer arena.deinit();
+        const owned = arena.allocator();
+        const fields = try owned.alloc([]const u8, request.fields.len);
+        for (request.fields, fields, 0..) |field, *copy, i| {
+            if (active_view.physicalLayout().ordinalForName(active_view.tableSchema().relational_columns, field) == null)
+                return error.RelationalIndexColumnNotFound;
+            for (fields[0..i]) |prior| if (std.mem.eql(u8, field, prior)) return error.InvalidRelationalRowsRequest;
+            copy.* = try owned.dupe(u8, field);
+        }
+        const range_raw = read.get(range_state.range_key) catch |err| switch (err) {
+            error.NotFound => &(@as([8]u8, @splat(0))),
+            else => return err,
+        };
+        const range = try range_state.decodeRangeAlloc(owned, range_raw);
+        const owned_lower = try internal.documentExactPrefixAlloc(owned, range.start);
+        const owned_upper: []const u8 = if (range.end.len == 0) &.{internal.user_namespace + 1} else try internal.documentExactPrefixAlloc(owned, range.end);
+        var lower: []const u8 = owned_lower;
+        var upper: []const u8 = owned_upper;
+        var selected_index: ?plans.BoundIndex = null;
+        var full_tuple_equality = false;
+        var cursor_identity: ?[row_cursor_codec.identity_len]u8 = null;
+        if (request.primary_lower) |bound| {
+            const prefix = try internal.documentExactPrefixAlloc(owned, bound.key);
+            const requested = if (bound.inclusive) prefix else (try internal.nextPrefixAlloc(owned, prefix)) orelse return error.InvalidRelationalRowsRequest;
+            if (std.mem.order(u8, requested, lower) == .gt) lower = requested;
+        }
+        if (request.primary_upper) |bound| {
+            const prefix = try internal.documentExactPrefixAlloc(owned, bound.key);
+            const requested = if (!bound.inclusive) prefix else (try internal.nextPrefixAlloc(owned, prefix)) orelse return error.InvalidRelationalRowsRequest;
+            if (std.mem.order(u8, requested, upper) == .lt) upper = requested;
+        }
+        if (request.index) |name| {
+            const pinned = indexes orelse return error.IndexNotFound;
+            if (pinned.plan.schemaView().epoch != active_view.epoch) return error.PreparedGenerationChanged;
+            const raw_head = try read.get(catalog.head_key);
+            if (!(try catalog.Head.decode(raw_head)).eql(pinned.head)) return error.PreparedGenerationChanged;
+            selected_index = for (pinned.plan.boundIndexes()) |index| {
+                if (std.mem.eql(u8, index.name, name)) break index;
+            } else return error.IndexNotFound;
+            if ((try jobs.status(&read, selected_index.?)).state != .ready) return error.RelationalIndexNotReady;
+            if (request.include_cursor or request.after != null) cursor_identity = row_cursor_codec.orderedIdentity(active_view.version(), selected_index.?.name, selected_index.?.tuple.fingerprint, request.reverse);
+            const prefix = try records.forwardPrefix(selected_index.?.id());
+            lower = try owned.dupe(u8, &prefix);
+            upper = (try internal.nextPrefixAlloc(owned, &prefix)).?;
+            if (request.lower) |bound| lower = try boundKey(owned, selected_index.?, bound, false);
+            if (request.upper) |bound| upper = try boundKey(owned, selected_index.?, bound, true);
+            if (std.mem.order(u8, lower, upper) == .gt) return error.InvalidRelationalRowsRequest;
+            if (request.after) |encoded| {
+                const index = selected_index.?;
+                const suffix = try row_cursor_codec.decode(owned, encoded, cursor_identity.?);
+                const key = try std.mem.concat(owned, u8, &.{ &prefix, suffix });
+                _ = records.parseForward(key, index) catch return error.InvalidRelationalRowsRequest;
+                if (request.reverse) {
+                    if (std.mem.order(u8, key, upper) == .lt) upper = key;
+                } else {
+                    const requested = (try internal.nextPrefixAlloc(owned, key)) orelse return error.InvalidRelationalRowsRequest;
+                    if (std.mem.order(u8, requested, lower) == .gt) lower = requested;
+                }
+            }
+            full_tuple_equality = request.after == null and request.lower != null and request.upper != null and
+                request.lower.?.inclusive and request.upper.?.inclusive and
+                request.lower.?.values.len == selected_index.?.tuple.keys.len and
+                request.upper.?.values.len == selected_index.?.tuple.keys.len;
+        }
+        const conditions = try alloc.alloc(predicates.Plan, request.conditions.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (conditions[0..initialized]) |*condition| condition.deinit();
+            alloc.free(conditions);
+        }
+        for (conditions, request.conditions) |*plan, condition| {
+            plan.* = try predicates.Plan.init(alloc, active_view.tableSchema().*, active_view.physicalLayout(), condition);
+            initialized += 1;
+        }
+
+        // Candidate metadata belongs to the immutable pinned index plan. Bound
+        // at most sixteen promising paths, then compare actual snapshot-local
+        // cardinality probes. This never extrapolates a sample into invented
+        // table statistics; saturated samples remain lower bounds. All query
+        // predicates remain residual checks against the selected snapshot.
+        var planner_candidates: usize = 0;
+        var planner_records: usize = 0;
+        if (request.auto_index and request.primary_lower == null and request.primary_upper == null) {
+            if (indexes) |pinned| {
+                if (pinned.plan.schemaView().epoch != active_view.epoch) return error.PreparedGenerationChanged;
+                const raw_head = try read.get(catalog.head_key);
+                if (!(try catalog.Head.decode(raw_head)).eql(pinned.head)) return error.PreparedGenerationChanged;
+                var candidates: [16]Candidate = undefined;
+                var candidate_count: usize = 0;
+                const implication = try owned.alloc(bool, conditions.len);
+                const KeyConditions = struct { equality: ?Value = null, has_range: bool = false };
+                var keyed: std.AutoHashMapUnmanaged(u64, KeyConditions) = .empty;
+                const ExpressionKey = struct { identity: request_values.ExpressionKeyIdentity, fold_ascii: bool };
+                var expression_keyed: std.AutoHashMapUnmanaged(ExpressionKey, Value) = .empty;
+                try expression_keyed.ensureTotalCapacity(owned, @intCast(request.expression_equalities.len));
+                for (request.expression_equalities) |hint| {
+                    const entry = expression_keyed.getOrPutAssumeCapacity(.{ .identity = hint.identity, .fold_ascii = hint.fold_ascii });
+                    if (!entry.found_existing) entry.value_ptr.* = hint.value;
+                }
+                try keyed.ensureTotalCapacity(owned, @intCast(conditions.len));
+                for (request.conditions, conditions) |condition, compiled| {
+                    const identity = @as(u64, compiled.tuple.keys[0].ordinal) * 2 + @intFromBool(compiled.tuple.keys[0].fold_ascii);
+                    const entry = keyed.getOrPutAssumeCapacity(identity);
+                    if (!entry.found_existing) entry.value_ptr.* = .{};
+                    switch (condition.op) {
+                        .eq, .is_not_distinct => if (entry.value_ptr.equality == null) {
+                            entry.value_ptr.equality = condition.value;
+                        },
+                        .gt, .gte, .lt, .lte => if (condition.value != .null) {
+                            entry.value_ptr.has_range = true;
+                        },
+                        else => {},
+                    }
+                }
+                for (pinned.plan.boundIndexes()) |candidate| {
+                    // A resumed automatic scan keeps its exact index identity
+                    // while reapplying predicate bounds to the remaining range.
+                    if (request.index) |name| if (!std.mem.eql(u8, candidate.name, name)) continue;
+                    if (candidate.tuple.keys.len == 0) continue;
+                    var equality_count: usize = 0;
+                    var candidate_values: [32]Value = @splat(.null);
+                    for (candidate.tuple.keys) |key| {
+                        if (equality_count == candidate_values.len) break;
+                        candidate_values[equality_count] = if (key.expression) |expression|
+                            expression_keyed.get(.{ .identity = .{ .fingerprint = expression.plan.fingerprint, .kind = key.column_type, .builtin = expression.plan.result_sql_type }, .fold_ascii = key.fold_ascii }) orelse break
+                        else blk: {
+                            const operand = keyed.get(@as(u64, key.ordinal) * 2 + @intFromBool(key.fold_ascii)) orelse break;
+                            break :blk operand.equality orelse break;
+                        };
+                        equality_count += 1;
+                    }
+                    var has_range = false;
+                    if (equality_count < @min(candidate.tuple.keys.len, candidate_values.len)) {
+                        const key = candidate.tuple.keys[equality_count];
+                        if (key.expression == null) if (keyed.get(@as(u64, key.ordinal) * 2 + @intFromBool(key.fold_ascii))) |operand| {
+                            has_range = operand.has_range;
+                        };
+                    }
+                    if (equality_count == 0 and !has_range) continue;
+                    // Reject unusable access paths without touching durable
+                    // readiness records or evaluating partial-index proofs.
+                    @memset(implication, false);
+                    if (candidate.predicate) |predicate| {
+                        if (!predicate.impliedByAndMark(conditions, implication)) continue;
+                    }
+                    var covering = false;
+                    if (candidate.cover) |cover| {
+                        covering = request.row_filter == null and !request.include_primary_digest;
+                        for (fields) |field| {
+                            if (!cover.contains(field)) covering = false;
+                        }
+                        for (request.conditions, implication) |condition, implied| {
+                            if (!implied and !cover.contains(condition.column)) covering = false;
+                        }
+                    }
+                    const score = equality_count * 4 + @as(usize, @intFromBool(has_range)) * 2 + @as(usize, @intFromBool(covering));
+                    var position: usize = 0;
+                    while (position < candidate_count and (candidates[position].score > score or
+                        (candidates[position].score == score and std.mem.lessThan(u8, candidates[position].index.name, candidate.name)))) : (position += 1)
+                    {}
+                    if (position == candidates.len) continue;
+                    const end = @min(candidate_count, candidates.len - 1);
+                    std.mem.copyBackwards(Candidate, candidates[position + 1 .. end + 1], candidates[position..end]);
+                    candidates[position] = .{ .index = candidate, .score = score, .covering = covering, .equality_count = equality_count, .has_range = has_range, .values = candidate_values };
+                    candidate_count = @min(candidate_count + 1, candidates.len);
+                }
+                if (candidate_count != 0) {
+                    const owner = try jobs.ownership(&read);
+                    var best_cost: usize = std.math.maxInt(usize);
+                    var best_complete = false;
+                    var best_candidate: ?*Candidate = null;
+                    for (candidates[0..candidate_count]) |*candidate| {
+                        planner_candidates += 1;
+                        if ((try jobs.statusWithOwnership(&read, candidate.index, owner)).state != .ready) continue;
+                        var scratch = std.heap.ArenaAllocator.init(alloc);
+                        defer scratch.deinit();
+                        // An oversized search value is legal SQL data, even
+                        // when it cannot be represented as a stored index key.
+                        // Keep the residual predicate and use the primary scan.
+                        const bounds = candidate.bounds(scratch.allocator(), request.conditions, conditions) catch |err| switch (err) {
+                            error.RelationalIndexKeyTooLarge => continue,
+                            else => return err,
+                        };
+                        if (candidate_count == 1) {
+                            selected_index = candidate.index;
+                            best_candidate = candidate;
+                            break;
+                        }
+                        var count: usize = 0;
+                        var complete = std.mem.order(u8, bounds.lower, bounds.upper) != .lt;
+                        if (std.mem.order(u8, bounds.lower, bounds.upper) == .lt) {
+                            var cursor = try read.openCursor();
+                            defer cursor.close();
+                            cursor.setUpperBound(bounds.upper);
+                            var entry = try cursor.seekAtOrAfter(bounds.lower);
+                            while (entry != null) {
+                                count += 1;
+                                if (count == 8) break;
+                                entry = try cursor.next();
+                            }
+                            complete = entry == null;
+                            planner_records += count;
+                        }
+                        const cost = count * (1 + @as(usize, @intFromBool(!candidate.covering)));
+                        if (selected_index == null or (complete and !best_complete) or (complete == best_complete and cost < best_cost)) {
+                            selected_index = candidate.index;
+                            best_candidate = candidate;
+                            best_cost = cost;
+                            best_complete = complete;
+                        }
+                    }
+                    if (best_candidate) |candidate| {
+                        const bounds = try candidate.bounds(owned, request.conditions, conditions);
+                        if (request.index != null) {
+                            if (std.mem.order(u8, bounds.lower, lower) == .gt) lower = bounds.lower;
+                            if (std.mem.order(u8, bounds.upper, upper) == .lt) upper = bounds.upper;
+                        } else {
+                            lower = bounds.lower;
+                            upper = bounds.upper;
+                        }
+                        full_tuple_equality = candidate.equality_count == candidate.index.tuple.keys.len and !candidate.has_range;
+                    }
+                }
+            }
+        }
+        const implied_conditions = try owned.alloc(bool, conditions.len);
+        @memset(implied_conditions, false);
+        if (selected_index) |index| if (index.predicate) |condition| {
+            if (!condition.impliedByAndMark(conditions, implied_conditions)) return error.PartialIndexPredicateNotImplied;
+        };
+        var index_only = selected_index != null and request.row_filter == null and !request.include_primary_digest;
+        if (selected_index) |index| {
+            if (index.cover) |cover| {
+                for (fields) |field| if (!cover.contains(field)) {
+                    index_only = false;
+                };
+                for (request.conditions, implied_conditions) |condition, implied| if (!implied and !cover.contains(condition.column)) {
+                    index_only = false;
+                };
+            } else index_only = false;
+        }
+        const exact_index_tuple = if (full_tuple_equality) try exactTuple(selected_index.?, lower, upper) else null;
+        if (request.reverse and selected_index == null) return error.InvalidRelationalRowsRequest;
+        if (selected_index) |index| if (request.include_cursor) {
+            cursor_identity = row_cursor_codec.orderedIdentity(active_view.version(), index.name, index.tuple.fingerprint, request.reverse);
+        };
+        // Finish arena allocations before moving its state into the reader.
+        // A later chunk allocated through `owned` would be missing from a copy.
+        const presence = try clonePresence(owned, request.cypher_presence_fields);
+        const projection = try Source.cypher_projection.decode(owned, request.cypher_projection_json);
+        return .{
+            .alloc = alloc,
+            .arena = arena,
+            .read = read,
+            .active = active_view.clone(),
+            .index_plan = if (selected_index != null) indexes.?.plan.clone() else null,
+            .planner_candidates = planner_candidates,
+            .planner_records = planner_records,
+            .index = selected_index,
+            .exact_index_tuple = exact_index_tuple,
+            .lower = lower,
+            .upper = upper,
+            .owned_lower = owned_lower,
+            .owned_upper = owned_upper,
+            .fields = fields,
+            .cypher_presence_fields = presence,
+            .cypher_projection = projection,
+            .now_ns = now_ns,
+            .authenticated = authenticated,
+            .include_primary_digest = request.include_primary_digest,
+            .include_cursor = request.include_cursor and selected_index != null,
+            .reverse = request.reverse,
+            .cursor_identity = cursor_identity,
+            .row_filter = request.row_filter,
+            .index_only = index_only,
+            .conditions = conditions,
+            .implied_conditions = implied_conditions,
+            .done = std.mem.order(u8, lower, upper) != .lt,
+        };
+    }
+
+    const Candidate = struct {
+        index: plans.BoundIndex,
+        score: usize,
+        covering: bool,
+        equality_count: usize,
+        has_range: bool,
+        values: [32]Value,
+
+        fn bounds(self: *Candidate, alloc: Allocator, requested: []const Condition, compiled: []const predicates.Plan) !struct { lower: []const u8, upper: []const u8 } {
+            var lower = try boundKey(alloc, self.index, .{ .values = self.values[0..self.equality_count] }, false);
+            var upper = try boundKey(alloc, self.index, .{ .values = self.values[0..self.equality_count] }, true);
+            if (self.has_range) {
+                const key = self.index.tuple.keys[self.equality_count];
+                var endpoints: [2]?usize = .{ null, null };
+                for (requested, compiled, 0..) |condition, plan, i| {
+                    if (plan.tuple.keys[0].ordinal != key.ordinal or plan.tuple.keys[0].fold_ascii != key.fold_ascii or condition.value == .null) continue;
+                    const logical_upper = switch (condition.op) {
+                        .gt, .gte => false,
+                        .lt, .lte => true,
+                        else => continue,
+                    };
+                    const slot = @intFromBool(logical_upper);
+                    if (endpoints[slot]) |prior| {
+                        const order = std.mem.order(u8, plan.operand, compiled[prior].operand);
+                        if ((logical_upper and order == .gt) or (!logical_upper and order == .lt)) continue;
+                        if (order == .eq and (condition.op == .gte or condition.op == .lte)) continue;
+                    }
+                    endpoints[slot] = i;
+                }
+                // Compare precompiled scalar operands before encoding tuples:
+                // repeated constraints must not multiply wide-prefix memory.
+                for (endpoints, 0..) |endpoint, slot| {
+                    const condition = requested[endpoint orelse continue];
+                    const is_upper = (slot == 1) != key.descending;
+                    self.values[self.equality_count] = condition.value;
+                    const bound = try boundKey(alloc, self.index, .{ .values = self.values[0 .. self.equality_count + 1], .inclusive = condition.op == .gte or condition.op == .lte }, is_upper);
+                    if (is_upper) {
+                        if (std.mem.order(u8, bound, upper) == .lt) upper = bound;
+                    } else if (std.mem.order(u8, bound, lower) == .gt) lower = bound;
+                }
+            }
+            return .{ .lower = lower, .upper = upper };
+        }
+    };
+
+    fn exactTuple(index: plans.BoundIndex, lower: []const u8, upper: []const u8) !?[]const u8 {
+        const prefix = try records.forwardPrefix(index.id());
+        if (lower.len <= prefix.len or !std.mem.startsWith(u8, lower, &prefix) or !exclusiveSuccessor(lower, upper)) return null;
+        return lower[prefix.len..];
+    }
+
+    fn exclusiveSuccessor(lower: []const u8, upper: []const u8) bool {
+        // Compare nextPrefix(lower) without allocating another potentially
+        // wide tuple. Full-key arity is proven separately by the bound plan.
+        var length = lower.len;
+        while (length != 0) : (length -= 1) {
+            const ordinal = length - 1;
+            if (lower[ordinal] == 255) continue;
+            return upper.len == length and std.mem.eql(u8, lower[0..ordinal], upper[0..ordinal]) and upper[ordinal] == lower[ordinal] + 1;
+        }
+        return false;
+    }
+
+    fn boundKey(alloc: Allocator, index: plans.BoundIndex, bound: Bound, upper: bool) ![]const u8 {
+        var key = std.ArrayList(u8).empty;
+        // The caller's arena owns this scratch and its result.
+        try key.appendSlice(alloc, &(try records.forwardPrefix(index.id())));
+        _ = try index.tuple.appendLiteralValues(alloc, &key, bound.values);
+        if (upper == bound.inclusive) return (try internal.nextPrefixAlloc(alloc, key.items)) orelse error.InvalidRelationalIndexBound;
+        return key.items;
+    }
+
+    /// Rebind one equality prefix inside the same READY generation, primary
+    /// snapshot, policy evaluator and projection plan. No catalog is reopened.
+    pub fn seekPrefix(self: *Reader, values: []const Value, after: ?[]const u8) !void {
+        const index = self.index orelse return error.InvalidRelationalRowsRequest;
+        if (values.len == 0 or values.len > index.tuple.keys.len) return error.InvalidRelationalIndexBound;
+        // A failed prefix reset must never leave a readable cursor pointing
+        // into the arena we are about to reclaim. A later seek can retry.
+        self.done = true;
+        if (self.seek_arena == null) self.seek_arena = std.heap.ArenaAllocator.init(self.alloc);
+        _ = self.seek_arena.?.reset(.{ .retain_with_limit = 64 << 10 });
+        const a = self.seek_arena.?.allocator();
+        var lower = try boundKey(a, index, .{ .values = values, .inclusive = true }, false);
+        var upper = try boundKey(a, index, .{ .values = values, .inclusive = true }, true);
+        if (after) |encoded| {
+            const prefix = try records.forwardPrefix(index.id());
+            const suffix = try row_cursor_codec.decode(a, encoded, self.cursor_identity orelse return error.InvalidRelationalRowsRequest);
+            const key = try std.mem.concat(a, u8, &.{ &prefix, suffix });
+            _ = records.parseForward(key, index) catch return error.InvalidRelationalRowsRequest;
+            if (self.reverse) {
+                if (std.mem.order(u8, key, upper) == .lt) upper = key;
+            } else {
+                const next = (try internal.nextPrefixAlloc(a, key)) orelse return error.InvalidRelationalRowsRequest;
+                if (std.mem.order(u8, next, lower) == .gt) lower = next;
+            }
+        }
+        self.lower = lower;
+        self.upper = upper;
+        self.after.clearRetainingCapacity();
+        self.done = false;
+    }
+
+    pub fn deinit(self: *Reader) void {
+        if (self.seek_arena) |*arena| arena.deinit();
+        if (self.row_policy_lease) |*lease| lease.release();
+        if (self.failed_row) |row| self.alloc.free(row.key);
+        if (self.covering_projection) |*plan| plan.deinit();
+        for (self.covering_conditions) |*condition| condition.deinit();
+        self.alloc.free(self.covering_conditions);
+        for (0..self.bindings.len) |slot| self.evictSourceBinding(slot);
+        for (self.conditions) |*condition| condition.deinit();
+        self.alloc.free(self.conditions);
+        if (self.index_plan) |*plan| plan.release();
+        self.active.release();
+        self.read.abort();
+        self.after.deinit(self.alloc);
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    fn coveringView(self: *Reader, key: []const u8, value: []const u8) !codec.OrdinalRowView {
+        const cover = &self.index.?.cover.?;
+        const payload = try records.forwardPayload(key, value);
+        const row = try cover.decode(payload);
+        if (self.covering_projection == null) {
+            const selected = try codec.OrdinalProjectionPlan.init(self.alloc, cover.table(), &cover.layout, self.fields);
+            errdefer {
+                var cleanup = selected;
+                cleanup.deinit();
+            }
+            var residual_count: usize = 0;
+            for (self.implied_conditions) |implied| if (!implied) {
+                residual_count += 1;
+            };
+            const conditions = try self.alloc.alloc(predicates.Source, residual_count);
+            var initialized: usize = 0;
+            errdefer {
+                for (conditions[0..initialized]) |*condition| condition.deinit();
+                self.alloc.free(conditions);
+            }
+            for (self.conditions, self.implied_conditions) |*plan, implied| {
+                if (implied) continue;
+                conditions[initialized] = try plan.projectSource(self.alloc, cover.table(), &cover.layout);
+                initialized += 1;
+            }
+            self.covering_conditions = conditions;
+            self.covering_projection = selected;
+        }
+        return row;
+    }
+
+    fn rowView(self: *Reader, raw: []const u8) !codec.OrdinalRowView {
+        const version = try codec.rowSchemaVersion(raw);
+        if (self.source == null or self.source.?.version() != version) {
+            for (self.bindings, 0..) |entry, slot| {
+                const binding = entry orelse continue;
+                if (binding.view.version() != version) continue;
+                std.mem.copyBackwards(?*SourceBinding, self.bindings[1 .. slot + 1], self.bindings[0..slot]);
+                self.bindings[0] = binding;
+                self.source = binding.view;
+                self.selected = binding.projection;
+                self.source_conditions = binding.conditions;
+                self.source_cache_hits += 1;
+                return if (self.authenticated)
+                    try codec.ordinalRowViewTrusted(raw, binding.view.tableSchema().*, binding.view.physicalLayout())
+                else
+                    try codec.ordinalRowViewSelective(raw, binding.view.tableSchema().*, binding.view.physicalLayout());
+            }
+            const binding = try self.alloc.create(SourceBinding);
+            errdefer self.alloc.destroy(binding);
+            binding.arena = std.heap.ArenaAllocator.init(self.alloc);
+            errdefer binding.arena.deinit();
+            const alloc = binding.arena.allocator();
+            // Fault historical layouts through this read snapshot, not through
+            // the live registry: a whole-store restore may reuse version IDs.
+            const source = if (version == self.active.version()) self.active.clone() else blk: {
+                const key = try schema.schemaVersionKeyAlloc(alloc, version);
+                const encoded = self.read.get(key) catch |err| switch (err) {
+                    error.NotFound => return error.UnknownSchemaVersion,
+                    else => return err,
+                };
+                const table = try schema.deserializeSchema(alloc, encoded);
+                if (table.version != version) return error.RelationalRowSchemaMismatch;
+                break :blk registry.SchemaView{ .epoch = try registry.Epoch.createOwned(alloc, table) };
+            };
+            errdefer {
+                var release = source;
+                release.release();
+            }
+            for (self.fields) |field| {
+                const current_ordinal = self.active.physicalLayout().ordinalForName(self.active.tableSchema().relational_columns, field).?;
+                const source_ordinal = source.physicalLayout().ordinalForName(source.tableSchema().relational_columns, field) orelse continue;
+                const current_column = self.active.tableSchema().relational_columns[current_ordinal];
+                const source_column = source.tableSchema().relational_columns[source_ordinal];
+                if (current_column.column_type != source_column.column_type or current_column.sql_element_type != source_column.sql_element_type or
+                    !Source.sql_builtin_type.NumericModifier.eql(current_column.numeric_modifier, source_column.numeric_modifier))
+                    return error.RelationalIndexColumnTypeMismatch;
+            }
+            const source_conditions = try alloc.alloc(predicates.Source, self.conditions.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (source_conditions[0..initialized]) |*condition| condition.deinit();
+                alloc.free(source_conditions);
+            }
+            for (source_conditions, self.conditions) |*condition, *plan| {
+                condition.* = try plan.projectSource(alloc, source.tableSchema().*, source.physicalLayout());
+                initialized += 1;
+            }
+            const selected = try codec.OrdinalProjectionPlan.init(alloc, source.tableSchema().*, source.physicalLayout(), self.fields);
+            binding.view = source;
+            binding.projection = selected;
+            binding.conditions = source_conditions;
+            const bytes = binding.arena.queryCapacity();
+            self.evictSourceBinding(self.bindings.len - 1);
+            var slot = self.bindings.len - 1;
+            while (slot > 0 and self.binding_bytes + bytes > 2 * 1024 * 1024) {
+                slot -= 1;
+                self.evictSourceBinding(slot);
+            }
+            std.mem.copyBackwards(?*SourceBinding, self.bindings[1..], self.bindings[0 .. self.bindings.len - 1]);
+            self.bindings[0] = binding;
+            self.binding_bytes += bytes;
+            self.source_compilations += 1;
+            self.source = source;
+            self.selected = selected;
+            self.source_conditions = source_conditions;
+        }
+        return if (self.authenticated)
+            try codec.ordinalRowViewTrusted(raw, self.source.?.tableSchema().*, self.source.?.physicalLayout())
+        else
+            try codec.ordinalRowViewSelective(raw, self.source.?.tableSchema().*, self.source.?.physicalLayout());
+    }
+
+    fn observeFailedRow(self: *Reader, key: []const u8, raw: []const u8) !void {
+        const version = try codec.rowWriteTimestampNs(raw);
+        const schema_version = try codec.rowSchemaVersion(raw);
+        const decoded = (try internal.decodeStoredDocumentRowKeyAlloc(self.alloc, key)) orelse return error.InvalidRelationalRowsRequest;
+        if (self.failed_row) |old| self.alloc.free(old.key);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
+        self.failed_row = .{ .key = decoded, .json = "{}", .version = version, .schema_version = schema_version, .semantic_hash = @splat(0), .expected_content_digest = digest };
+    }
+
+    /// Page continuation advances only after successful preparation. An OOM,
+    /// cancellation, or corrupt row cannot silently consume part of the result.
+    pub fn nextPage(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget) !Page {
+        if (self.nullability_projection != null) return error.InvalidNullabilityProjection;
+        if (self.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
+        var page = try self.nextPageFormat(alloc, io, budget, false, null, null);
+        errdefer page.deinit();
+        if (self.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
+        return page;
+    }
+
+    /// Hydrate an exact primary identity using this reader's visibility cut
+    /// and cached source-layout projection. Ranked queries must retain native
+    /// SQL-null provenance rather than round-tripping through public JSON.
+    pub fn lookupTypedRow(self: *Reader, alloc: Allocator, document: []const u8) !?Row {
+        if (self.nullability_projection != null) return error.InvalidNullabilityProjection;
+        return self.lookupRowFormat(alloc, document, false, null);
+    }
+
+    pub fn lookupSqlRow(self: *Reader, alloc: Allocator, document: []const u8) !?Row {
+        return self.lookupRowFormat(alloc, document, true, null);
+    }
+
+    /// Cache belongs to the caller's page, never to this cursor. Older source
+    /// schemas may have a different field subset/order and get a new layout.
+    pub fn lookupSqlRowWithLayout(self: *Reader, alloc: Allocator, document: []const u8, shared: *?*const Source.catalog.Row.TypedLayout) !?Row {
+        return self.lookupRowFormat(alloc, document, true, shared);
+    }
+
+    fn cachedSqlLayout(alloc: Allocator, row: codec.OrdinalRowView, projection: codec.OrdinalProjectionPlan, shared: ?*?*const Source.catalog.Row.TypedLayout) !*const Source.catalog.Row.TypedLayout {
+        if (shared) |cache| if (cache.*) |layout| {
+            var same = layout.names.len == projection.ordinals.len;
+            if (same) for (layout.names, projection.ordinals) |name, ordinal| {
+                if (!std.mem.eql(u8, name, row.table_schema.relational_columns[ordinal].name)) {
+                    same = false;
+                    break;
+                }
+            };
+            if (same) return layout;
+        };
+        const layout = try sqlLayout(alloc, row, projection);
+        if (shared) |cache| cache.* = layout;
+        return layout;
+    }
+
+    fn sqlLayout(alloc: Allocator, row: codec.OrdinalRowView, projection: codec.OrdinalProjectionPlan) !*const Source.catalog.Row.TypedLayout {
+        const names = try alloc.alloc([]const u8, projection.ordinals.len);
+        for (projection.ordinals, names) |ordinal, *name| name.* = try alloc.dupe(u8, row.table_schema.relational_columns[ordinal].name);
+        return Source.catalog.Row.TypedLayout.init(alloc, names);
+    }
+
+    pub const Hydrated = Types.reader_values.Hydrated;
+
+    /// Bounded ranked microbatch. Sorted physical lookups share source probes;
+    /// rows are decoded in ranking order and stop at the delivery byte target.
+    /// Returned payloads own their bytes independently of the temporary batch.
+    pub fn lookupSqlBatch(self: *Reader, alloc: Allocator, documents: []const []const u8, layout: *const Source.catalog.Row.TypedLayout, max_bytes: usize) !Hydrated {
+        return self.lookupBatchFormat(alloc, documents, max_bytes, true, layout);
+    }
+
+    fn lookupBatchFormat(self: *Reader, alloc: Allocator, documents: []const []const u8, max_bytes: usize, comptime native_cells: bool, layout: ?*const Source.catalog.Row.TypedLayout) !Hydrated {
+        if (self.index != null or documents.len == 0 or documents.len > 64 or max_bytes == 0) return error.InvalidRelationalRowsRequest;
+        if (self.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
+        const SourceBudget = Source.sql_memory_budget;
+        const Retry = struct {
+            fn shrink(count: *usize, bytes: *usize) bool {
+                if (count.* > 1) {
+                    count.* = (count.* + 1) / 2;
+                    return true;
+                }
+                // One native row may exceed the normal source working set.
+                // Allow its bounded decode buffers, never a large prefetch.
+                if (bytes.* < 32 * 1024 * 1024) {
+                    bytes.* = 32 * 1024 * 1024;
+                    return true;
+                }
+                return false;
+            }
+        };
+        var predicate_scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer predicate_scratch.deinit();
+        var requested = documents.len;
+        var source_limit: usize = 2 * 1024 * 1024;
+        while (true) {
+            var source_budget: SourceBudget = .{ .backing = self.alloc, .limit = source_limit };
+            var scratch = std.heap.ArenaAllocator.init(source_budget.allocator());
+            defer scratch.deinit();
+            const a = scratch.allocator();
+            const Entry = struct { key: []const u8, ordinal: usize };
+            var entries: [64]Entry = undefined;
+            for (documents[0..requested], 0..) |document, i| entries[i] = .{ .key = try internal.relationalRowKeyAlloc(a, document), .ordinal = i };
+            std.mem.sort(Entry, entries[0..requested], {}, struct {
+                fn less(_: void, left: Entry, right: Entry) bool {
+                    return std.mem.order(u8, left.key, right.key) == .lt;
+                }
+            }.less);
+            var keys: [64][]const u8 = undefined;
+            var sorted: [64]?[]const u8 = undefined;
+            var raw: [64]?[]const u8 = undefined;
+            for (entries[0..requested], 0..) |entry, i| keys[i] = entry.key;
+            var scope = self.read.openReadScope(source_budget.allocator()) catch |err| {
+                if (err == error.OutOfMemory and source_budget.isExhausted()) {
+                    if (Retry.shrink(&requested, &source_limit)) continue;
+                    return error.SqlWorkingMemoryLimitExceeded;
+                }
+                return err;
+            };
+            defer scope.close();
+            scope.getManySorted(keys[0..requested], sorted[0..requested]) catch |err| {
+                if (err == error.OutOfMemory and source_budget.isExhausted()) {
+                    if (Retry.shrink(&requested, &source_limit)) continue;
+                    return error.SqlWorkingMemoryLimitExceeded;
+                }
+                return err;
+            };
+            for (entries[0..requested], sorted[0..requested]) |entry, value| raw[entry.ordinal] = if (std.mem.order(u8, entry.key, self.lower) == .lt or std.mem.order(u8, entry.key, self.upper) != .lt) null else value;
+            const rows = try alloc.alloc(?Row, requested);
+            var count: usize = 0;
+            var bytes: usize = 0;
+            // No retry after output allocation: an OOM cannot accumulate
+            // abandoned page payloads in an arena during batch downsizing.
+            for (documents[0..requested], raw[0..requested], rows) |document, value, *out| {
+                if (!predicate_scratch.reset(.{ .retain_with_limit = 256 * 1024 })) return error.OutOfMemory;
+                out.* = if (value) |v| try self.hydratePrimary(alloc, predicate_scratch.allocator(), document, v, native_cells, null, layout) else null;
+                count += 1;
+                if (out.*) |row| {
+                    bytes +|= row.key.len;
+                    if (native_cells) {
+                        bytes +|= row.typed_cells.?.presence.?.len;
+                        for (row.typed_cells.?.values) |cell| bytes +|= try Source.sql_operators.datumBytes(cell);
+                    } else bytes +|= try typedSize(row.typed.?, 0);
+                }
+                if (bytes >= max_bytes) break;
+            }
+            return .{ .rows = rows[0..count], .consumed = count, .output_bytes = bytes };
+        }
+    }
+
+    fn lookupRowFormat(self: *Reader, alloc: Allocator, document: []const u8, native_cells: bool, shared: ?*?*const Source.catalog.Row.TypedLayout) !?Row {
+        if (self.nullability_projection != null) return error.InvalidNullabilityProjection;
+        if (self.index != null) return error.InvalidRelationalRowsRequest;
+        if (self.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        const temporary = scratch.allocator();
+        const key = try internal.relationalRowKeyAlloc(temporary, document);
+        if (std.mem.order(u8, key, self.lower) == .lt or std.mem.order(u8, key, self.upper) != .lt) return null;
+        const raw = self.read.get(key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        return self.hydratePrimary(alloc, temporary, document, raw, native_cells, shared, null);
+    }
+
+    fn hydratePrimary(self: *Reader, alloc: Allocator, temporary: Allocator, document: []const u8, raw: []const u8, native_cells: bool, shared: ?*?*const Source.catalog.Row.TypedLayout, output: ?*const Source.catalog.Row.TypedLayout) !?Row {
+        const row = try self.rowView(raw);
+        if (self.active.visibilityTtlDurationNs() != 0 and row.writeTimestampNs() != 0 and
+            ttl.isExpired(row.writeTimestampNs(), self.active.visibilityTtlDurationNs(), self.now_ns)) return null;
+        var predicate_scratch = std.ArrayList(u8).empty;
+        for (self.source_conditions) |condition| {
+            if (!(try condition.evaluate(temporary, &predicate_scratch, row)).matches()) return null;
+        }
+        if (self.row_filter) |filter| if (!try filter.matchesRow(temporary, document, row)) return null;
+        const cells = if (native_cells) try row.projectSqlDatumsMappedAlloc(alloc, self.selected.?, output) else null;
+        const projected = if (!native_cells)
+            if (self.cypher_presence_fields.len != 0 or self.cypher_projection.len != 0)
+                try self.projectCypherPrimary(alloc, temporary, row)
+            else
+                try row.projectSqlTypedAlloc(alloc, self.selected.?)
+        else
+            null;
+        var bytes: usize = document.len;
+        if (cells) |values| {
+            bytes +|= values.presence.len;
+            for (values.values) |value| bytes +|= try Source.sql_operators.datumBytes(value);
+        }
+        if (projected) |value| bytes +|= (try typedSize(value.value, 0)) +| value.sql_nulls.len;
+        if (bytes > 16 * 1024 * 1024) return error.RelationalRowResultTooLarge;
+        const digest: ?[32]u8 = if (self.include_primary_digest) blk: {
+            var result: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(raw, &result, .{});
+            break :blk result;
+        } else null;
+        return .{
+            .key = try alloc.dupe(u8, document),
+            .json = "",
+            .typed = if (projected) |value| value.value else null,
+            .typed_cells = if (cells) |value| .{ .layout = output orelse try cachedSqlLayout(alloc, row, self.selected.?, shared), .values = value.values, .presence = value.presence } else null,
+            .sql_nulls = if (projected) |value| value.sql_nulls else null,
+            .version = row.writeTimestampNs(),
+            .schema_version = row.table_schema.version,
+            .semantic_hash = row.semanticHash(),
+            .expected_content_digest = digest,
+        };
+    }
+
+    fn projectCypherPrimary(self: *Reader, alloc: Allocator, scratch: Allocator, row: codec.OrdinalRowView) !codec.OrdinalRowView.TypedProjection {
+        var context: Source.streamed_projection.Context = .{
+            .scratch = scratch,
+            .property_projection = self.cypher_projection,
+            .value = .{ .row = .{ .plan = .{ .base = self.selected.?, .arena = .init(scratch) }, .row = row } },
+        };
+        const value = (try context.projectOwned(alloc, scratch, self.cypher_presence_fields)) orelse return error.InvalidRelationalRowsRequest;
+        const sql_nulls = try alloc.alloc(bool, value.object.count());
+        var position: usize = 0;
+        for (self.selected.?.ordinals) |ordinal| if (try row.findCell(ordinal)) |cell| {
+            sql_nulls[position] = cell.is_null;
+            position += 1;
+        };
+        std.debug.assert(position == sql_nulls.len);
+        return .{ .value = value, .sql_nulls = sql_nulls };
+    }
+
+    pub fn nextTypedPage(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget) !Page {
+        if (self.nullability_projection != null) return error.InvalidNullabilityProjection;
+        if (self.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
+        var page = try self.nextPageFormat(alloc, io, budget, true, null, null);
+        errdefer page.deinit();
+        if (self.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
+        return page;
+    }
+
+    /// Scan every physical primary in the owned range, including TTL-hidden
+    /// rows, through the same snapshot/cursor machinery as ordinary reads.
+    /// RLS leases, predicates, custom filters, bounds and payload projections
+    /// cannot masquerade as owner coverage. Caller independently proves the
+    /// durable fence/drain and source cut before persisting any progress.
+    /// Time limits slice read preparation only; replicated progress must bind
+    /// its exact cursor/count, not recompute a wall-time stopping decision.
+    pub fn nextNullabilityPage(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget, plan: *const nullability.Plan, control: nullability.Control) !NullabilityPage {
+        return self.nextNullabilityPageMode(alloc, io, budget, plan, control, null);
+    }
+
+    /// Re-execute a recorded prefix without a wall-time stopping decision.
+    /// Record limits and cancellation stay active. EOF claims permit one extra
+    /// bounded probe; stopping at N records alone cannot certify EOF after N.
+    pub fn nextNullabilityReplayPage(self: *Reader, alloc: Allocator, io: ?std.Io, expected: NullabilityReplayBoundary, plan: *const nullability.Plan, control: nullability.Control) !NullabilityPage {
+        try expected.validate();
+        if (expected.violation_column) |column| if (column >= plan.names.len) return error.InvalidNullabilityReplay;
+        if (expected.after.len != 0 and (!internal.isRelationalRowKey(expected.after) or
+            std.mem.order(u8, expected.after, self.owned_lower) == .lt or std.mem.order(u8, expected.after, self.owned_upper) != .lt))
+            return error.InvalidNullabilityReplay;
+        const record_limit = expected.records_examined + @intFromBool(!expected.more);
+        // The normal budget remains structurally valid, but its time field is
+        // deliberately ignored only by this independently checked replay.
+        return self.nextNullabilityPageMode(alloc, io, .{ .records = record_limit, .output_bytes = 2 * row_cursor_codec.max_key_bytes, .time_ns = 1 }, plan, control, expected);
+    }
+
+    /// Physical FK coverage shares snapshot, bounds, cancellation and replay
+    /// with NOT NULL validation. Query RLS, TTL and predicates cannot hide rows.
+    pub fn nextForeignKeyValidationPage(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget, plan: *foreign_validation.ChildPlan, control: nullability.Control) !ForeignKeyValidationPage {
+        return self.nextForeignKeyValidationPageMode(alloc, io, budget, plan, control, null);
+    }
+    pub fn nextForeignKeyValidationReplayPage(self: *Reader, alloc: Allocator, io: ?std.Io, expected: ForeignKeyReplayBoundary, plan: *foreign_validation.ChildPlan, control: nullability.Control) !ForeignKeyValidationPage {
+        try expected.scan.validate();
+        try expected.witness.validate();
+        if (expected.scan.violation_column) |rule| if (rule >= plan.rules.len) return error.InvalidNullabilityReplay;
+        return self.nextForeignKeyValidationPageMode(alloc, io, .{ .records = expected.scan.records_examined + @intFromBool(!expected.scan.more), .output_bytes = 2 * row_cursor_codec.max_key_bytes, .time_ns = 1 }, plan, control, expected);
+    }
+    fn nextForeignKeyValidationPageMode(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget, plan: *foreign_validation.ChildPlan, control: nullability.Control, replay: ?ForeignKeyReplayBoundary) !ForeignKeyValidationPage {
+        try control.ensureActive();
+        try budget.validate();
+        try self.requirePhysicalValidationProjection(plan.names, control);
+        if (self.nullability_failed) return error.NullabilityValidationFailed;
+        if (self.nullability_projection) |identity| {
+            if (!std.mem.eql(u8, &identity, &plan.identity)) return error.InvalidNullabilityProjection;
+        } else if (self.after.items.len != 0 or self.done) return error.InvalidNullabilityProjection;
+        var visit: ValidationVisit = .{ .foreign_keys = plan, .control = control, .replay = if (replay) |expected| expected.scan else null, .expected_witness = if (replay) |expected| expected.witness else null };
+        var bounded = budget;
+        bounded.rows = 1;
+        const page = try self.nextPageFormat(alloc, io, bounded, true, &visit, null);
+        self.nullability_projection = plan.identity;
+        self.nullability_failed = visit.violation_column != null;
+        return .{ .scan = .{ .page = page, .rows_examined = visit.rows_examined, .violation_column = visit.violation_column, .after = visit.after }, .witness = visit.witness };
+    }
+    pub fn resumeForeignKeyValidationScan(self: *Reader, plan: *const foreign_validation.ChildPlan, continuation: NullabilityResume, control: nullability.Control) !void {
+        try self.requirePhysicalValidationProjection(plan.names, control);
+        try self.resumePhysicalValidationScan(plan.identity, continuation, control);
+    }
+
+    fn nextNullabilityPageMode(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget, plan: *const nullability.Plan, control: nullability.Control, replay: ?NullabilityReplayBoundary) !NullabilityPage {
+        try control.ensureActive();
+        try budget.validate();
+        try self.requireNullabilityProjection(plan, control);
+        if (self.nullability_failed) return error.NullabilityValidationFailed;
+        if (self.nullability_projection) |identity| {
+            if (!std.mem.eql(u8, &identity, &plan.identity)) return error.InvalidNullabilityProjection;
+        } else if (self.after.items.len != 0 or self.done) return error.InvalidNullabilityProjection;
+        var visit: ValidationVisit = .{ .plan = plan, .control = control, .replay = replay };
+        var bounded = budget;
+        bounded.rows = 1;
+        const page = try self.nextPageFormat(alloc, io, bounded, true, &visit, null);
+        self.nullability_projection = plan.identity;
+        self.nullability_failed = visit.violation_column != null;
+        return .{ .page = page, .rows_examined = visit.rows_examined, .violation_column = visit.violation_column, .after = visit.after };
+    }
+
+    fn requireNullabilityProjection(self: *const Reader, plan: *const nullability.Plan, control: nullability.Control) !void {
+        try self.requirePhysicalValidationProjection(plan.names, control);
+    }
+
+    fn requirePhysicalValidationProjection(self: *const Reader, names: []const []const u8, control: nullability.Control) !void {
+        if (self.index != null or self.row_policy_lease != null or self.row_filter != null or
+            self.conditions.len != 0 or self.fields.len != 0 or self.include_cursor or self.include_primary_digest or
+            !std.mem.eql(u8, self.lower, self.owned_lower) or !std.mem.eql(u8, self.upper, self.owned_upper))
+            return error.InvalidNullabilityProjection;
+        for (names) |name| {
+            try control.ensureActive();
+            if (self.active.physicalLayout().ordinalForName(self.active.tableSchema().relational_columns, name) == null)
+                return error.RelationalIndexColumnNotFound;
+        }
+    }
+
+    /// Restore an explicitly admitted read-side cursor on a fresh reader.
+    /// The owner must first validate its durable predecessor record and exact
+    /// fenced source cut; this structural check does not authenticate either.
+    pub fn resumeNullabilityScan(self: *Reader, plan: *const nullability.Plan, continuation: NullabilityResume, control: nullability.Control) !void {
+        try control.ensureActive();
+        try self.requireNullabilityProjection(plan, control);
+        try self.resumePhysicalValidationScan(plan.identity, continuation, control);
+    }
+    fn resumePhysicalValidationScan(self: *Reader, identity: [32]u8, continuation: NullabilityResume, control: nullability.Control) !void {
+        try control.ensureActive();
+        if (self.nullability_projection != null or self.after.items.len != 0 or self.done or
+            !std.mem.eql(u8, &continuation.projection_identity, &identity) or continuation.after.len > row_cursor_codec.max_key_bytes)
+            return error.InvalidNullabilityProjection;
+        if (continuation.after.len != 0) {
+            if (!internal.isRelationalRowKey(continuation.after) or std.mem.order(u8, continuation.after, self.owned_lower) == .lt or
+                std.mem.order(u8, continuation.after, self.owned_upper) != .lt) return error.InvalidNullabilityProjection;
+        }
+        try self.after.ensureTotalCapacity(self.alloc, continuation.after.len);
+        try control.ensureActive();
+        @memcpy(self.after.items.ptr[0..continuation.after.len], continuation.after);
+        self.after.items.len = continuation.after.len;
+        self.nullability_projection = identity;
+    }
+
+    fn nextPageFormat(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget, typed_output: bool, validation: ?*ValidationVisit, visitor: ?Types.types.ScanVisitor) !Page {
+        try budget.validate();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        errdefer arena.deinit();
+        var result = Page{ .arena = undefined, .rows = &.{}, .more = false, .records_examined = 0, .output_bytes = 0 };
+        if (self.done) {
+            if (validation) |visit| {
+                visit.after = try arena.allocator().dupe(u8, self.after.items);
+                try visit.verify(0, false);
+                try visit.control.ensureActive();
+            }
+            result.arena = arena;
+            return result;
+        }
+        const page = arena.allocator();
+        var output = std.ArrayList(Row).empty;
+        var delivered: usize = 0;
+        var native_layout: ?*const Source.catalog.Row.TypedLayout = null;
+        var predicate_scratch = std.ArrayList(u8).empty;
+        defer predicate_scratch.deinit(alloc);
+        var continuation = std.ArrayList(u8).empty;
+        defer continuation.deinit(alloc);
+        try continuation.appendSlice(alloc, self.after.items);
+        var successor = std.ArrayList(u8).empty;
+        defer successor.deinit(alloc);
+        var cursor = try self.read.openCursor();
+        defer cursor.close();
+        if (!self.reverse) cursor.setUpperBound(self.upper);
+        const start = if (self.after.items.len == 0) (if (self.reverse) self.upper else self.lower) else if (self.index != null) self.after.items else try internal.documentPrefixSuccessor(alloc, &successor, self.after.items);
+        var entry = if (self.reverse) try cursor.seekAtOrBefore(start) else try cursor.seekAtOrAfter(start);
+        var exhausted = true;
+        const time_sliced = if (validation) |visit| visit.replay == null else true;
+        const started = if (time_sliced) time.monotonicNs() else 0;
+        while (entry) |kv| : (entry = if (self.reverse) try cursor.prev() else if (self.index != null) try cursor.next() else try cursor.seekAtOrAfter(try internal.documentPrefixSuccessor(alloc, &successor, continuation.items))) {
+            if (io) |runtime_io| try runtime_io.checkCancel();
+            if (validation) |visit| try visit.control.ensureActive();
+            if (self.reverse) {
+                if (std.mem.order(u8, kv.key, self.upper) != .lt) continue;
+                if (self.after.items.len != 0 and std.mem.order(u8, kv.key, self.after.items) != .lt) continue;
+                if (std.mem.order(u8, kv.key, self.lower) == .lt) break;
+            } else {
+                if (self.after.items.len != 0 and std.mem.order(u8, kv.key, self.after.items) != .gt) continue;
+                if (std.mem.order(u8, kv.key, self.upper) != .lt) break;
+            }
+            result.records_examined += 1;
+            if (visitor) |sink| try sink.reportProgress(1);
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            const temporary = scratch.allocator();
+            const primary: ?[]const u8 = if (self.index) |index| blk: {
+                const ownership = try records.parseForward(kv.key, index);
+                var key = std.ArrayList(u8).empty;
+                try key.append(temporary, internal.user_namespace);
+                try key.appendSlice(temporary, ownership.document_component);
+                try key.append(temporary, internal.relational_row_kind);
+                if (std.mem.order(u8, key.items, self.owned_lower) == .lt or std.mem.order(u8, key.items, self.owned_upper) != .lt) break :blk null;
+                break :blk key.items;
+            } else blk: {
+                // The timestamp companion sorts before the primary row. Walk
+                // the already pinned cursor to it instead of a point lookup
+                // that reparses the persisted-run index for every document.
+                if (internal.isRelationalRowKey(kv.key)) break :blk kv.key;
+                const end = (internal.findComponentTerminator(kv.key, 1) orelse return error.InvalidInternalUserKey) + 2;
+                const key = try temporary.alloc(u8, end + 1);
+                @memcpy(key[0..end], kv.key[0..end]);
+                key[end] = internal.relational_row_kind;
+                break :blk key;
+            };
+            // A primary locator may advance the cursor and invalidate kv.key.
+            // All record kinds in this family have the same owner successor.
+            const continuation_key = if (self.index == null) primary orelse kv.key else kv.key;
+            if (primary) |key| {
+                const raw_optional: ?[]const u8 = if (self.index_only or std.mem.eql(u8, key, kv.key)) kv.value else if (self.index == null) locate: {
+                    if (std.mem.order(u8, kv.key, key) == .gt) break :locate null;
+                    // One adjacent step handles the ordinary timestamp/row
+                    // pair; seek only when another companion intervenes. This
+                    // keeps artifact-heavy and orphan families bounded too.
+                    var candidate = try cursor.next();
+                    if (candidate) |item| if (std.mem.order(u8, item.key, key) == .lt) {
+                        candidate = try cursor.seekAtOrAfter(key);
+                    };
+                    break :locate if (candidate) |item| if (std.mem.eql(u8, item.key, key)) item.value else null else null;
+                } else lookup: {
+                    result.primary_lookups += 1;
+                    break :lookup self.read.get(key) catch |err| switch (err) {
+                        error.NotFound => return error.InvalidRelationalIndexForwardKey,
+                        else => return err,
+                    };
+                };
+                const raw = raw_optional orelse {
+                    // Orphan companions still consume one bounded unit of
+                    // work, but cannot force a scan through every artifact.
+                    continuation.clearRetainingCapacity();
+                    try continuation.appendSlice(alloc, continuation_key);
+                    if (result.records_examined >= budget.records or (time_sliced and time.monotonicNs() - started >= budget.time_ns)) {
+                        exhausted = false;
+                        break;
+                    }
+                    continue;
+                };
+                const row = if (self.index_only) try self.coveringView(kv.key, raw) else self.rowView(raw) catch |err| {
+                    if (err == error.RelationalIndexColumnTypeMismatch) try self.observeFailedRow(key, raw);
+                    return err;
+                };
+                const expired = validation == null and self.active.visibilityTtlDurationNs() != 0 and row.writeTimestampNs() != 0 and
+                    ttl.isExpired(row.writeTimestampNs(), self.active.visibilityTtlDurationNs(), self.now_ns);
+                var decoded_key: ?[]const u8 = null;
+                const matches = check: {
+                    if (validation) |visit| {
+                        visit.violation_column = if (visit.foreign_keys) |fk| blk: {
+                            const document = (try internal.decodeStoredDocumentRowKeyAlloc(temporary, key)).?;
+                            break :blk try fk.inspectRow(document, row, &visit.witness, visit.control);
+                        } else try visit.plan.?.firstNullInRow(row, visit.control);
+                        visit.rows_examined += 1;
+                        break :check visit.violation_column != null;
+                    }
+                    if (expired) break :check false;
+                    for (if (self.index_only) self.covering_conditions else self.source_conditions) |condition| {
+                        if (io) |runtime_io| try runtime_io.checkCancel();
+                        if (!(try condition.evaluate(alloc, &predicate_scratch, row)).matches()) break :check false;
+                    }
+                    if (self.row_filter) |filter| {
+                        decoded_key = (try internal.decodeStoredDocumentRowKeyAlloc(temporary, key)).?;
+                        if (!try filter.matchesRow(temporary, decoded_key.?, row)) break :check false;
+                    }
+                    break :check true;
+                };
+                if (matches) {
+                    const projection = if (self.index_only) self.covering_projection.? else self.selected.?;
+                    if (visitor) |sink| {
+                        var context: Source.streamed_projection.Context = .{
+                            .scratch = temporary,
+                            .property_projection = self.cypher_projection,
+                            .value = .{ .row = .{ .plan = .{ .base = projection, .arena = .init(temporary) }, .row = row } },
+                        };
+                        const document = decoded_key orelse (try internal.decodeStoredDocumentRowKeyAlloc(temporary, key)).?;
+                        try sink.visitEntry(.{ .id = document, .hash = row.writeTimestampNs(), .document_stream = context.borrow() });
+                        delivered += 1;
+                    } else {
+                        const native = typed_output and budget.native_cells;
+                        if (native and native_layout == null) {
+                            // One logical output shape per page, independent of
+                            // which historical physical layout sorts first. Names
+                            // must outlive the reader and source-binding cache.
+                            const names = try page.alloc([]const u8, self.fields.len);
+                            for (self.fields, names) |name, *out| out.* = try page.dupe(u8, name);
+                            native_layout = try request_values.TypedLayout.init(page, names);
+                        }
+                        // Complete projections already follow requested-field
+                        // order. Preserve their direct ordinal fast path; only
+                        // historical schemas missing fields need slot remapping.
+                        const cells = if (!native) null else if (projection.ordinals.len == self.fields.len)
+                            try row.projectSqlDatumsAlloc(page, projection)
+                        else
+                            try row.projectSqlDatumsMappedAlloc(page, projection, native_layout);
+                        const typed_projection = if (typed_output and !native) try row.projectSqlTypedAlloc(page, projection) else null;
+                        const typed = if (typed_projection) |projected| projected.value else null;
+                        const json = if (typed_output) "" else if (self.cypher_presence_fields.len == 0 and self.cypher_projection.len == 0) try row.projectAlloc(temporary, projection) else projected: {
+                            var context: Source.streamed_projection.Context = .{ .scratch = temporary, .property_projection = self.cypher_projection, .value = .{ .row = .{ .plan = .{ .base = projection, .arena = .init(temporary) }, .row = row } } };
+                            const value = (try context.borrow().countProjection(temporary, self.cypher_presence_fields)) orelse return error.InvalidRelationalRowsRequest;
+                            break :projected try std.json.Stringify.valueAlloc(temporary, value, .{});
+                        };
+                        const json_null_fields = if (typed_output) &.{} else try row.projectJsonNullFieldsAlloc(page, projection);
+                        var null_metadata_bytes: usize = json_null_fields.len * @sizeOf([]const u8);
+                        for (json_null_fields) |name| null_metadata_bytes +|= name.len;
+                        const document = decoded_key orelse (try internal.decodeStoredDocumentRowKeyAlloc(temporary, key)).?;
+                        const row_cursor = if (self.include_cursor) blk: {
+                            const identity = self.cursor_identity orelse break :blk null;
+                            break :blk try row_cursor_codec.encode(temporary, identity, kv.key[records.forward_prefix_len..]);
+                        } else null;
+                        var native_bytes: usize = 0;
+                        if (cells) |projected| {
+                            native_bytes +|= projected.presence.len;
+                            for (projected.values) |datum| native_bytes +|= try Source.sql_operators.datumBytes(datum);
+                        }
+                        const size = native_bytes +| (if (typed) |value| try typedSize(value, 0) else json.len) +| (if (typed_projection) |projected| projected.sql_nulls.len else @as(usize, 0)) +| document.len +| (if (row_cursor) |encoded| encoded.len else @as(usize, 0)) +| null_metadata_bytes;
+                        if (size > budget.output_bytes) {
+                            if (!self.index_only) try self.observeFailedRow(key, raw);
+                            return error.RelationalRowResultTooLarge;
+                        }
+                        const target = if (budget.target_bytes == 0) budget.output_bytes else budget.target_bytes;
+                        if (size > budget.output_bytes - result.output_bytes or (output.items.len != 0 and size > target -| result.output_bytes)) {
+                            exhausted = false;
+                            break;
+                        }
+                        try output.append(page, .{
+                            .key = try page.dupe(u8, document),
+                            .json = try page.dupe(u8, json),
+                            .typed = typed,
+                            .typed_cells = if (cells) |projected| .{ .layout = native_layout.?, .values = projected.values, .presence = projected.presence } else null,
+                            .sql_nulls = if (typed_projection) |projected| projected.sql_nulls else null,
+                            .json_null_fields = json_null_fields,
+                            .version = row.writeTimestampNs(),
+                            .schema_version = if (self.index_only) try Source.index_cover.Plan.sourceVersion(try records.forwardPayload(kv.key, raw)) else row.table_schema.version,
+                            .semantic_hash = row.semanticHash(),
+                            .cursor = if (row_cursor) |encoded| try page.dupe(u8, encoded) else null,
+                            .expected_content_digest = if (self.include_primary_digest) blk: {
+                                var digest: [32]u8 = undefined;
+                                std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
+                                break :blk digest;
+                            } else null,
+                        });
+                        result.output_bytes += size;
+                        if (self.index_only) result.index_only_rows += 1;
+                        delivered += 1;
+                    }
+                }
+            }
+            continuation.clearRetainingCapacity();
+            try continuation.appendSlice(alloc, continuation_key);
+            if (delivered >= budget.rows or (budget.target_bytes != 0 and result.output_bytes >= budget.target_bytes) or result.records_examined >= budget.records or (time_sliced and time.monotonicNs() - started >= budget.time_ns)) {
+                exhausted = false;
+                break;
+            }
+        }
+        // A page limit can coincide with the final index entry. Establish
+        // range exhaustion while the index cursor is still open; otherwise a
+        // caller that consumed its exact candidate ceiling would need another
+        // nonempty record budget just to discover EOF. This is a key-only
+        // continuation check: it does not hydrate, filter, emit, or advance past
+        // an unconsumed candidate. Byte-limited rows retain their old cursor.
+        if (!exhausted and self.index != null) if (entry) |last| {
+            if (std.mem.eql(u8, last.key, continuation.items)) {
+                const peek = if (self.reverse) try cursor.prev() else try cursor.next();
+                exhausted = if (peek) |next| (if (self.reverse) std.mem.order(u8, next.key, self.lower) == .lt else std.mem.order(u8, next.key, self.upper) != .lt) else true;
+            }
+        };
+        if (!exhausted and self.include_cursor and self.index != null) {
+            const prefix = try records.forwardPrefix(self.index.?.id());
+            result.next_cursor = try row_cursor_codec.encode(page, self.cursor_identity.?, continuation.items[prefix.len..]);
+        }
+        // A canceled page must not consume even its successfully inspected
+        // prefix. Historical binding-cache changes are safe to retain.
+        if (validation) |visit| {
+            if (continuation.items.len > row_cursor_codec.max_key_bytes) return error.InvalidNullabilityProjection;
+            visit.after = try page.dupe(u8, continuation.items);
+            try visit.verify(result.records_examined, !exhausted);
+            try visit.control.ensureActive();
+            if (io) |runtime_io| try runtime_io.checkCancel();
+        }
+        try self.after.ensureTotalCapacity(self.alloc, continuation.items.len);
+        @memcpy(self.after.items.ptr[0..continuation.items.len], continuation.items);
+        self.after.items.len = continuation.items.len;
+        self.done = exhausted;
+        result.arena = arena;
+        result.rows = output.items;
+        result.more = !exhausted;
+        return result;
+    }
+
+    fn typedSize(value: std.json.Value, depth: usize) error{RelationalRowResultTooLarge}!usize {
+        if (depth > 64) return error.RelationalRowResultTooLarge;
+        var size: usize = @sizeOf(std.json.Value);
+        switch (value) {
+            .string, .number_string => |text| size +|= text.len,
+            .array => |items| for (items.items) |item| {
+                size +|= try typedSize(item, depth + 1);
+            },
+            .object => |object| for (object.keys(), object.values()) |key, item| {
+                size +|= key.len +| try typedSize(item, depth + 1);
+            },
+            else => {},
+        }
+        return size;
+    }
+};
+
+/// Owner-only storage hydration behind DB.getCypherPinnedDocuments. This is
+/// never an additional consumer Reader method or a cross-runtime callback.
+pub fn lookupCypherBatch(reader: *Reader, alloc: Allocator, documents: []const []const u8, max_bytes: usize) anyerror!Reader.Hydrated {
+    return reader.lookupBatchFormat(alloc, documents, max_bytes, false, null);
+}
+
+/// Owner-only synchronous consumption: page and primary borrows never cross the
+/// storage archive. The visitor crosses through its named callback boundary.
+pub fn visitCypherRows(reader: *Reader, alloc: Allocator, io: ?std.Io, limit: usize, visitor: Types.types.ScanVisitor) !void {
+    if (!visitor.borrow_documents or limit == 0) return error.InvalidArgument;
+    var delivered: usize = 0;
+    const Counting = struct {
+        target: Types.types.ScanVisitor,
+        delivered: *usize,
+        fn progress(ptr: ?*anyopaque, examined: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            try self.target.reportProgress(examined);
+        }
+        fn visit(ptr: ?*anyopaque, entry: Types.types.ScanVisitEntry) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            try self.target.visitEntry(entry);
+            self.delivered.* += 1;
+        }
+    };
+    var counting: Counting = .{ .target = visitor, .delivered = &delivered };
+    while (delivered < limit) {
+        if (reader.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
+        var page = try reader.nextPageFormat(alloc, io, .{ .rows = @min(128, limit - delivered), .output_bytes = 16 << 20 }, false, null, .{ .borrow_documents = true, .context = &counting, .visit = Counting.visit, .progress = Counting.progress });
+        defer page.deinit();
+        if (!page.more) break;
+    }
+}
+
+fn clonePresence(a: Allocator, input: []const []const u8) ![]const []const u8 {
+    const out = try a.alloc([]const u8, input.len);
+    for (input, out) |name, *copy| copy.* = try a.dupe(u8, name);
+    return out;
+}
+
+test "relational rows snapshot exact point successor comparison handles descending suffixes without allocation" {
+    try std.testing.expect(Reader.exclusiveSuccessor("abc", "abd"));
+    try std.testing.expect(Reader.exclusiveSuccessor("abc\xff\xff", "abd"));
+    try std.testing.expect(Reader.exclusiveSuccessor("\x00\xff", "\x01"));
+    try std.testing.expect(!Reader.exclusiveSuccessor("", ""));
+    try std.testing.expect(!Reader.exclusiveSuccessor("\xff\xff", ""));
+    try std.testing.expect(!Reader.exclusiveSuccessor("abc", "abc"));
+    try std.testing.expect(!Reader.exclusiveSuccessor("abc", "abe"));
+    try std.testing.expect(!Reader.exclusiveSuccessor("abc", "abd\x00"));
+}

@@ -86,3 +86,77 @@ Ten thousand summary point reads took 14.27–16.53 ms locally — a bounded-rea
 - Each binding carries a physical catalog digest and a canonical logical-definition digest; compatibility ignores ordering and owner-local generations, so a healthy receiver does not rebuild merely because the donor assigned generations independently.
 - Replica-local drift does not determine the replicated decision: apply persists a reconciliation intent and retries until physically ready. Portable export, backup and restore reject a pending intent.
 - Evidence: one mounted fault case (`test_online_merge_recovers_after_owner_link_outage_and_crash[accept-accept_reply_restart]`), not a repeated matrix. Direct-vector native suite 15 tests plus five receiver soaks (65 total); Debug receiver timings 9.30–9.84 s (large/full-index), 5.06–5.43 s (default sync), 2.27–2.44 s (fulltext-only). Sparse compatibility suite 23 tests. Compaction/selective-query performance comparison remained unmeasured.
+
+
+## Native atomic preparation and graph admission qualification — 2026-11-06
+
+Native owner writes now reuse one checked preparation pipeline: typed AROW
+preparation and provider work occur outside exclusive apply. A short shared
+cut authorizes OLD/NEW policy images and captures mutation revisions for every
+touched key, including absence and deletes. The common commit path acquires
+apply once, revalidates those revisions, schema and policy, invokes the shared
+integrity finalizer, and commits row/index/catalog effects in one primary
+transaction without creating participant journal records. Snapshot and
+replication admission transfer to that commit path and release before derived
+visibility waits. Post-primary failures cannot start a new attempt.
+
+`antfly-native-fk-generation-test -Doptimize=Debug -j1` passed 35 tests with no
+skips or leaks. The actual provider callback verifies that shared apply can be
+acquired, commits an unrelated native write while the provider is on stack,
+and changes the same key on all three bounded attempts to prove the outer
+request never commits a stale candidate. The signed RLS fixture also proves a
+denied candidate invokes no provider. Existing startup-barrier, full-index,
+pre/post-primary fault, typed-null/default/generated-cell, cold owner, FK
+receipt and snapshot-admission tests remain green.
+
+Metadata graph logical-identity qualification passed seven tests across the
+actual owner roots; private graph preparation API qualification passed 17 tests,
+with no skips or leaks. Serving graph capability floors have not been advanced
+on the strength of these component tests alone.
+
+Public native lifetime campaigns remain incomplete: the mounted original TEMP
+campaign reproduced missing connection ownership, and all four real-process
+UNLOGGED originals reached connected reads but failed before clean/crash
+qualification. Native range activation has been corrected to preserve the
+fenced route and body-bound owner signer, including the standalone path;
+linked/public runtime verification is still required. These implementation and
+component results grant no new original-case dispositions. Generation-transaction,
+artifact restore and publication/subscription activation are still unfinished.
+
+
+### Qualified ordinary trigger supersessions; native process closure remains pending
+
+The five original rejection cases `sql-1150`, `sql-1153`, `sql-1154`,
+`sql-1155` and `sql-1157` are superseded by tested PostgreSQL-compatible
+ordinary trigger behavior. Their exact immutable declarations run with real
+`usage_records` and `audit_usage` setup, verifying INSERT, statement TRUNCATE,
+UPDATE OF, WHEN, literal arguments, DROP and cold retained activation. The
+helper uses the supported straight-line callable subset; procedural IF support
+is not claimed. The separate extra TRUNCATE witnesses validate private failure
+notices, accepted BEFORE notices and exact published AFTER notices across cold
+re-observation without VM replay.
+
+The actual Debug public trigger-originals gate ran both mounted campaigns in
+R256: 2 passed, zero skipped/failed/leaked, with metadata177 active. This is the
+trigger owning result, not a claim the entire integrated R256 build passed;
+its independent Native fixture readiness failure was subsequently corrected.
+The same exact five declarations and helper chronology passed a fresh isolated
+PostgreSQL18.6 oracle in R219, with its owned private cluster stopped afterward.
+The pinned original source corpus and SQL hashes are unchanged.
+
+Only these five rejected-to-superseded dispositions change. Native TEMP and
+UNLOGGED process originals remain unresolved until the four matching-production
+real-process campaigns pass. Current counts are 941 implemented /133 rejected /
+463 superseded /49 unresolved. No killed-process, native image or whole-release
+credit is inferred from the trigger result.
+
+
+### Configured WASM extension lifecycle and comments
+
+The eleven unchanged originals `sql-0148` and `sql-0754`–`sql-0763` qualify the generic configured-package extension lifecycle: CREATE and IF NOT EXISTS, schema/version selection, explicit and default indirect UPDATE, DROP RESTRICT/CASCADE over extension/callable membership, and COMMENT/NULL removal. Each installed member is a genuine typed core WASM function. Complete identity, generation, owner, namespace, digest and dependency postimages survive actual native cold restart. The native journal fault gate aborts a semantic-looking error after staged effects, proves no orphan extension/member/outcome, and cold-replays the exact immutable request once.
+
+Qualification passed the audited five-test Debug public gate and two-test embedded callable gate in R310, all seven strict physical metadata tests in R311, and the fresh PostgreSQL 18.6 oracle for all eleven exact statements in R307. Every owning native subgate had zero skips, failures and leaks. The added checks cover exact C ABI rejection identities, owned cold receipts, default-control promotion and checkpoint custody, standalone native creation and comment removal, operator-file separation, and preservation of released opaque document auxiliary metadata. The R310 combined build was interrupted during an independent restore-driver test and had a test-only manifest fixture failure; its passing public and callable subgates qualify their own results. The corrected metadata fixture and its full owning build passed separately. No whole-build or unrelated restore credit is inferred.
+
+PostgreSQL 18.6 uses owned private control files and ordinary real scalar members, with two actual stop/start cycles. Native execution uses owned content-addressed WASM artifacts, strict typed admission and one retained compiled runtime per statement/artifact. This supports package lifecycle under configured availability; it does not implement upstream GIS, cryptography, UUID or vector payloads, nor qualify external stored-view cascades. Read-only credentials are denied; Antfly's existing explicit database-administrator management override is tested separately from PostgreSQL's ordinary nonadministrator role and preserves the immutable creator identity.
+
+Only these eleven unresolved-to-implemented dispositions change: 952 implemented /133 rejected /463 superseded /38 unresolved. Native TEMP/UNLOGGED process recovery cases, the remaining publication/subscription work and whole-release readiness remain independently held. No inventory/source/reference hash or SQL statement is changed to obtain this count.

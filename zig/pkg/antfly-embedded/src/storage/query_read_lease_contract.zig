@@ -21,6 +21,7 @@ const callback = @import("antfly_runtime_abi").callback_abi;
 const sessions = @import("read_session_contract.zig");
 const Outcome = sessions.NativeOutcome;
 const types = @import("db/types.zig");
+pub const PolicyLease = @import("db/row_policy_gate.zig").Gate.Lease;
 pub fn Protocol(comptime SearchResult: type) type {
     return struct {
         pub const Operations = struct {
@@ -28,16 +29,17 @@ pub fn Protocol(comptime SearchResult: type) type {
             reader: *const fn (Handle, std.mem.Allocator, []const []const u8, u32) Outcome(sessions.Handle),
             documents: *const fn (Handle, std.mem.Allocator, u32) Outcome(sessions.Handle),
             search: *const fn (Handle, std.mem.Allocator, types.SearchRequest) Outcome(SearchResult),
+            retain_policy: *const fn (Handle) Outcome(PolicyLease),
         };
         pub const Boundary = callback.Boundary(Operations);
         pub const Handle = extern struct {
-            version: u32 = 1,
+            version: u32 = 2,
             context: ?*anyopaque = null,
             operations: ?*const Operations = null,
             dispatch: ?Boundary.Dispatch = null,
             owner_allocator: ?*const std.mem.Allocator = null,
             pub fn validate(self: Handle) !void {
-                if (self.version != 1) return error.UnsupportedVersion;
+                if (self.version != 2) return error.UnsupportedVersion;
                 if (self.context == null or self.operations == null or self.dispatch == null or self.owner_allocator == null) return error.InvalidArgument;
             }
             pub fn resolve(self: Handle, comptime T: type) !*T {

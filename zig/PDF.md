@@ -34,12 +34,15 @@ Release-environment qualification is tracked under [Open work](#open-work).
 Operator environment variables are read by the enrichment runtime
 (`enrichment_runtime.zig`) unless noted. Empty, malformed, or overflowing values
 fall back to the default; values that would stop progress clamp to one. The
-public `execution` policy (`ExecutionPolicy` in
+public `execution` batching and page-admission policy (`ExecutionPolicy` in
 `specs/openapi/antfly/indexes.yaml`) can request smaller values, never larger
-ones.
+ones. The output-token policy instead supplies an invocation budget subject to
+node/provider ceilings; it does not invalidate complete output. See
+[execution policy and selective regeneration](ENRICHMENTS.md#execution-policy-and-selective-regeneration).
 
 | Setting | Default | Bound and semantics |
 | --- | --- | --- |
+| `execution.max_output_tokens_per_item` | Producer/model default | Positive uint32; overrides reader/generator `max_tokens` for future invocations. Existing complete artifacts remain valid; use explicit incomplete/all reprocessing to choose retry scope. |
 | `execution.max_document_pages` / `ANTFLY_ENRICHMENT_PDF_MAX_DOCUMENT_PAGES` | 2,048 pages | Effective limit is `min(request, operator, 16,384)`; an omitted request uses the operator ceiling. Exceeding it is a stable terminal request failure. |
 | `execution.batch_items` (OCR) / `ANTFLY_ENRICHMENT_OCR_BATCH_ITEMS` | 8 | At least 1 |
 | `ANTFLY_ENRICHMENT_OCR_BATCH_MAX_ITEMS` | 16 | Clamped to 1..128; 128 is the absolute control-plane batch ceiling, also applied by the inference server |
@@ -1381,6 +1384,7 @@ are not part of the public API. Every value and its clamp is listed under
 
 ```yaml
 execution:
+  max_output_tokens_per_item: 8192
   batch_items: 8
   batch_bytes: 67108864
   max_document_pages: 2048

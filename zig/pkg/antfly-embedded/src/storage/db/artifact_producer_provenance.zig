@@ -20,7 +20,7 @@
 const std = @import("std");
 const publication = @import("artifact_publication.zig");
 const inventory = @import("artifact_inventory.zig");
-const binary = @import("relational_integrity_json.zig");
+const binary = @import("relational/integrity/json.zig");
 const internal_keys = @import("../internal_keys.zig");
 pub const prefix = "\x00\x00__artifact_publication__:proof:";
 

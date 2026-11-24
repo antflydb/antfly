@@ -17,7 +17,7 @@
 //! states. Only a wide contribution promotes a column to these owned states;
 //! count and total stay exact through partial merges and spill.
 const std = @import("std");
-const numeric = @import("numeric_value.zig");
+const numeric = @import("numeric/value.zig");
 const operators = @import("operators.zig");
 const Datum = @import("scalar.zig").Datum;
 const Count = @import("catalog.zig").Count;

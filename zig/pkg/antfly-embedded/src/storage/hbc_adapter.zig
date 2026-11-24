@@ -2660,6 +2660,8 @@ const ExperimentalPostingReadState = struct {
     alloc: Allocator,
     covered_source_sequence: u64,
     wal_generation: u64,
+    peer_checkpoint: ?vectorindex_posting_wal.Checkpoint = null,
+    peer_last_batch: ?u64 = null,
     /// One complete base followed by ordered immutable replacement deltas.
     /// Readers search deltas newest-first and then the mmap-friendly base.
     retained_segments: []posting_segment_store_mod.RetainedSegment,
@@ -3385,7 +3387,7 @@ const ExperimentalPostingReadState = struct {
         try self.replaceMaterialized(posting_id, kind, .{ .bytes = value_bytes, .owned = true });
     }
 
-    fn materializeWal(self: *ExperimentalPostingReadState, wal: *const posting_segment_store_mod.RecoveredWal) !void {
+    fn materializeWal(self: anytype, wal: *const posting_segment_store_mod.RecoveredWal) !void {
         for (wal.replay.records.items) |record| switch (record.kind) {
             .base, .quantized_checkpoint, .posting_state, .node_range, .vector_leaf, .vector_metadata, .index_metadata, .row_chunk => try self.setBorrowed(record.posting_id, record.kind, record.payload),
             .mutation => {
@@ -3850,6 +3852,9 @@ const ExperimentalPostingReadGeneration = struct {
     /// derived batches may commit at the same source sequence.
     wal_generation: @import("antfly_platform").atomic.Value(u64),
     wal_committed_bytes: @import("antfly_platform").atomic.Value(u64),
+    // Zero denotes a boundary with no WAL batch. Read and replace under
+    // index mutation admission along with the durable cursor.
+    peer_last_batch: std.atomic.Value(u64) = .init(0),
     /// Query-visible topology owned by this exact immutable posting
     /// generation. It is initialized before publication and never changes.
     search_view: SearchViewToken = .{},
@@ -3884,6 +3889,7 @@ const ExperimentalPostingReadGeneration = struct {
             .covered_source_sequence = .init(state.covered_source_sequence),
             .wal_generation = .init(state.wal_generation),
             .wal_committed_bytes = .init(state.wal_committed_bytes),
+            .peer_last_batch = .init(state.peer_last_batch orelse 0),
             .scan_admission = state.scan_admission,
             .row_debt_deadline_ns = state.row_debt_deadline_ns,
             .root = state,
@@ -4123,6 +4129,39 @@ const ExperimentalPostingReadGeneration = struct {
         const result = try self.values.getOrPut(self.alloc, experimentalPostingValueKey(posting_id, kind));
         std.debug.assert(!result.found_existing);
         result.value_ptr.* = blob;
+    }
+
+    // Full replay can borrow the WAL buffer. An overlay owns only its
+    // changed values and must keep them after the suffix buffer is freed.
+    fn setBorrowed(self: *ExperimentalPostingReadGeneration, posting_id: u64, kind: vectorindex_posting_wal.RecordKind, bytes: ?[]const u8) !void {
+        const blob = if (bytes) |payload| try ExperimentalPostingValueBlob.createCopy(self.alloc, payload) else null;
+        errdefer if (blob) |owned| owned.release();
+        const entry = try self.values.getOrPut(self.alloc, experimentalPostingValueKey(posting_id, kind));
+        if (entry.found_existing) if (entry.value_ptr.*) |previous| previous.release();
+        entry.value_ptr.* = blob;
+    }
+
+    fn setOwned(self: *ExperimentalPostingReadGeneration, posting_id: u64, kind: vectorindex_posting_wal.RecordKind, bytes: []u8) !void {
+        defer self.alloc.free(bytes);
+        try self.setBorrowed(posting_id, kind, bytes);
+    }
+
+    fn replaySuffix(
+        self: *ExperimentalPostingReadGeneration,
+        suffix: *const posting_segment_store_mod.RecoveredWal,
+        dims: usize,
+        use_quantization: bool,
+    ) !void {
+        try ExperimentalPostingReadState.materializeWal(self, suffix);
+        var changed = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer changed.deinit(self.alloc);
+        var keys = self.values.keyIterator();
+        while (keys.next()) |key| {
+            if (experimentalPostingKindAffectsLeafScan(try experimentalPostingValueKeyKind(key.*)))
+                try changed.put(self.alloc, experimentalPostingValueKeyId(key.*), {});
+        }
+        var leaves = changed.keyIterator();
+        while (leaves.next()) |id| try self.observeChangedLeafAdmission(id.*, dims, use_quantization);
     }
 
     fn observeChangedLeafAdmission(
@@ -5242,45 +5281,7 @@ pub const HBCIndex = struct {
         };
     }
 
-    /// Durably removes this index's own native-catalog KV records (dims,
-    /// root node, postings, ...) so a later re-admission of a differently
-    /// configured index under the same name starts fresh instead of
-    /// resurrecting this generation's stale metadata (#1216: a dimension
-    /// change survived delete+re-admission because nothing ever cleared
-    /// this scope). A no-op for every other backend, which either owns no
-    /// persistent root of its own to leak (`.lsm`, deleted by the caller's
-    /// own directory removal) or is the raw-storage-authority `.native`
-    /// mode this adapter never promotes a `.native_catalog` index into.
-    /// Callers must call this -- and let it complete -- before committing
-    /// the catalog mutation that makes the index's removal visible; see
-    /// `native_catalog_backend.deleteAllForScope`.
-    /// A delete for each record under this index's native-catalog scope, for
-    /// index removal to commit in the same transaction as the catalog
-    /// mutation that makes the removal visible: a crash can never leave the
-    /// catalog naming this index over an erased scope, nor a removed index's
-    /// stale scope under a later re-admission. Null for every other backend.
-    pub fn nativeCatalogScopeDeletesForRemoval(self: *HBCIndex) !?native_catalog_backend.ScopeDeletes {
-        const backend = switch (self.env_owner) {
-            .native_catalog => |backend| backend,
-            .lsm, .native => return null,
-        };
-        return try native_catalog_backend.ScopeDeletes.load(self.alloc, backend.sink, backend.scope);
-    }
-
-    /// perf/lwa-maint-serialize (#1216's own two-commit race): call before
-    /// `deleteNativeCatalogScopeForRemoval` and keep held -- via the
-    /// paired `resumeMaintenanceAcrossRemoval`, called only after the
-    /// *separate* catalog-removal commit that makes this index's removal
-    /// visible has also landed -- so background maintenance can never
-    /// observe the scope-clear commit's own retirement debt and reclaim
-    /// against it in the gap between these two commits. That gap is real:
-    /// each commit is individually protected while it runs, but nothing
-    /// before this excluded the maintenance loop's *later* work from
-    /// running between them, and reclaiming in that window raced a
-    /// concurrently-running redo commit (crash sweeps "dense native-catalog
-    /// dimension replacement delete/admit and delete (#1216)").
-    /// A no-op for every backend other than `.native_catalog`, matching
-    /// `deleteNativeCatalogScopeForRemoval`'s own scope.
+    /// Pause maintenance while the catalog transaction removes this index.
     pub fn pauseMaintenanceAcrossRemoval(self: *HBCIndex) void {
         const backend = switch (self.env_owner) {
             .native_catalog => |backend| backend,
@@ -5297,6 +5298,7 @@ pub const HBCIndex = struct {
         if (backend.sink.resumeMaintenance) |f| f(backend.sink.ptr);
     }
 
+    idle_inline_writer: ?*HBCIndex = null,
     /// Borrowed only by private synchronous construction owners. close() joins
     /// any native work before the owner may release this callback.
     construction_cancellation: ?@import("antfly_cancellation").CancellationToken = null,
@@ -6138,21 +6140,18 @@ pub const HBCIndex = struct {
         };
     }
 
-    pub fn runLsmMaintenanceStepBestEffort(self: *HBCIndex) !bool {
+    pub fn readyLsmMaintenanceScoreBestEffort(self: *const HBCIndex) u64 {
         return switch (self.env_owner) {
-            .lsm => |handle| blk: {
-                // An open HBC publication session suppresses compaction and
-                // ordinary flush work, but never a due WAL resource/durability
-                // checkpoint. Backend bulk-mode maintenance is pressure-only.
-                if (self.shouldSuppressRoutineMaintenance()) {
-                    const due = if (handle.backend.nextMaintenanceWakeDelayNsBestEffort()) |delay_ns|
-                        delay_ns == 0
-                    else
-                        false;
-                    if (!due) break :blk false;
-                }
-                break :blk try handle.backend.runMaintenanceStepBestEffort();
-            },
+            .lsm => |handle| handle.backend.readyMaintenanceScoreBestEffort(false),
+            .native, .native_catalog => 0,
+        };
+    }
+
+    pub fn runLsmMaintenanceStepBestEffort(self: *HBCIndex, due_only: bool) !bool {
+        return switch (self.env_owner) {
+            // An open HBC publication session suppresses routine work while
+            // allowing due resource and durability checkpoints.
+            .lsm => |handle| try handle.backend.runReadyMaintenanceStepBestEffort(due_only or self.shouldSuppressRoutineMaintenance()),
             .native, .native_catalog => false,
         };
     }
@@ -6585,6 +6584,63 @@ pub const HBCIndex = struct {
             break :blk loaded;
         };
 
+        var idx = try initOwnedRuntime(alloc, std.mem.span(path), config, opened, store, metadata);
+        if (lsm_options.retain_native_posting_startup_snapshot) {
+            idx.native_posting_startup_snapshot = posting_snapshot;
+            posting_snapshot = null;
+        }
+        return idx;
+    }
+
+    /// A separate dense index runtime owns the queued catalog root, HBC
+    /// metadata and caches. The serving index stays on its durable root.
+    pub fn forkInlineWriter(self: *HBCIndex) !HBCIndex {
+        if (self.leann != null or self.env_owner != .native_catalog) return error.StagedPublicationUnsupported;
+        if (self.idle_inline_writer) |writer| {
+            try writer.env_owner.native_catalog.resumeWriterView();
+            errdefer writer.env_owner.native_catalog.parkWriterView();
+            var txn = try writer.store.beginRead();
+            defer txn.abort();
+            writer.metadata = IndexMetadata.decode(try txn.get(.meta, meta_key));
+            writer.refreshPublishedSearchState();
+            self.idle_inline_writer = null;
+            defer self.alloc.destroy(writer);
+            return writer.*;
+        }
+        const backend = try self.alloc.create(native_catalog_backend.Backend);
+        errdefer self.alloc.destroy(backend);
+        backend.* = try self.env_owner.native_catalog.forkWriterView();
+        errdefer backend.close();
+        const opened: EnvOwner = .{ .native_catalog = backend };
+        var store = try openVectorIndexStore(self.alloc, opened);
+        errdefer store.deinit();
+        var txn = try store.beginRead();
+        defer txn.abort();
+        const metadata = IndexMetadata.decode(try txn.get(.meta, meta_key));
+        // A writer view only needs a small routing cache for its queued
+        // inserts. The serving cache remains sized for its query workload.
+        var config = self.config;
+        config.max_cached_nodes = @min(config.max_cached_nodes, 64);
+        config.max_cached_vectors = 0;
+        config.max_cached_metadata = 0;
+        return initOwnedRuntime(self.alloc, self.cache_path, config, opened, store, metadata);
+    }
+
+    /// Keep the writer's immutable configuration and work buffers. Release
+    /// its catalog and cached data before another path can mutate the index.
+    pub fn parkInlineWriter(self: *HBCIndex, writer: *HBCIndex) bool {
+        std.debug.assert(self.idle_inline_writer == null);
+        const parked = self.alloc.create(HBCIndex) catch return false;
+        writer.clearAllCaches();
+        vectorindex_spfresh_index.clearFlatCentroidDirectory(writer);
+        writer.env_owner.native_catalog.parkWriterView();
+        parked.* = writer.*;
+        self.idle_inline_writer = parked;
+        writer.* = undefined;
+        return true;
+    }
+
+    fn initOwnedRuntime(alloc: Allocator, path: []const u8, config: HBCConfig, opened: EnvOwner, store: vectorindex_store.NamespaceStore, metadata: IndexMetadata) !HBCIndex {
         var effective_config = config;
         if (metadata.version != hbc_index_version) return error.UnsupportedVersion;
         if (metadata.dims != config.dims) return error.DimensionMismatch;
@@ -6613,8 +6669,6 @@ pub const HBCIndex = struct {
         // writes that were already accepted.
         if (effective_config.quantization_bits > 1 and effective_config.dims < 2)
             return error.InvalidIndexConfig;
-
-        const env_owner: EnvOwner = opened;
 
         var quantizer = try quantizer_mod.RaBitQuantizer.init(
             alloc,
@@ -6665,13 +6719,14 @@ pub const HBCIndex = struct {
         @memset(metadata_clock_keys, 0);
         @memset(metadata_clock_states, .empty);
 
-        const cache_identity = try hbcCacheIdentityAlloc(alloc, std.mem.span(path));
+        const cache_identity = try hbcCacheIdentityAlloc(alloc, path);
         errdefer alloc.free(cache_identity.stable_path);
 
         const posting_wal_authoritative = if (opened == .native)
             true
         else blk: {
-            var marker_txn = try store.beginRead();
+            var readable_store = store;
+            var marker_txn = try readable_store.beginRead();
             defer marker_txn.abort();
             break :blk if (marker_txn.get(.meta, posting_wal_authoritative_key)) |value|
                 std.mem.eql(u8, value, posting_wal_authoritative_value)
@@ -6686,7 +6741,7 @@ pub const HBCIndex = struct {
 
         var idx = HBCIndex{
             .alloc = alloc,
-            .env_owner = env_owner,
+            .env_owner = opened,
             .store = store,
             .config = effective_config,
             .metadata = metadata,
@@ -6772,10 +6827,6 @@ pub const HBCIndex = struct {
             alloc,
             max_cached_search_scratches - 1,
         );
-        if (lsm_options.retain_native_posting_startup_snapshot) {
-            idx.native_posting_startup_snapshot = posting_snapshot;
-            posting_snapshot = null;
-        }
         return idx;
     }
 
@@ -8529,6 +8580,11 @@ pub const HBCIndex = struct {
     }
 
     fn deinitWithBackendDisposition(self: *HBCIndex, abandon_after_crash: bool) void {
+        if (self.idle_inline_writer) |writer| {
+            writer.close();
+            self.alloc.destroy(writer);
+            self.idle_inline_writer = null;
+        }
         if (self.native_posting_startup_snapshot) |*snapshot| snapshot.deinit();
         self.native_posting_startup_snapshot = null;
         if (self.leann) |store| {
@@ -9307,6 +9363,7 @@ pub const HBCIndex = struct {
             newest.wal_generation.load(.acquire),
             newest.wal_committed_bytes.load(.acquire),
         );
+        replacement.peer_last_batch.store(newest.peer_last_batch.load(.acquire), .release);
         var replacement_owned = true;
         errdefer if (replacement_owned) replacement.release();
         replacement.values = merged;
@@ -9355,6 +9412,7 @@ pub const HBCIndex = struct {
             lockAtomic(&self.experimental_posting_read_generation_mu);
             defer self.experimental_posting_read_generation_mu.unlock();
             if (self.experimental_posting_read_generation != parent) return error.PostingWalConcurrentWriter;
+            parent.peer_last_batch.store(posting_store.last_committed_batch orelse 0, .release);
             parent.advanceDurableBoundary(
                 covered_source_sequence,
                 durable_wal_generation,
@@ -9379,6 +9437,7 @@ pub const HBCIndex = struct {
             durable_wal_bytes,
         );
         errdefer generation.release();
+        generation.peer_last_batch.store(posting_store.last_committed_batch orelse 0, .release);
         try generation.values.ensureTotalCapacity(self.alloc, @intCast(touched_keys.len));
         for (touched_keys) |key| {
             const posting_id = experimentalPostingValueKeyId(key);
@@ -9427,6 +9486,154 @@ pub const HBCIndex = struct {
         try self.installExperimentalPostingReadGenerationReplacing(generation, parent);
         self.finishPublishedSearchStateRefresh();
         publishing = false;
+    }
+
+    pub fn ownsPeerPostingDirectory(self: *const HBCIndex, path: []const u8) bool {
+        const backend = switch (self.env_owner) {
+            .native => |backend| backend,
+            else => return false,
+        };
+        const root = backend.root_dir;
+        return std.mem.startsWith(u8, path, root) and
+            std.mem.eql(u8, path[root.len..], "/posting-segments");
+    }
+
+    pub const PreparedPeerPostingRefresh = struct {
+        index: *HBCIndex,
+        parent: *ExperimentalPostingReadGeneration,
+        next: ?*ExperimentalPostingReadGeneration = null,
+        metadata: ?IndexMetadata = null,
+
+        pub fn deinit(self: *@This()) void {
+            if (self.next) |next| next.release();
+            self.parent.release();
+            self.* = undefined;
+        }
+
+        /// The caller holds index apply admission and the runtime's query
+        /// admission until the document mapping cut is installed as well.
+        pub fn publish(self: *@This()) !void {
+            const next = self.next orelse return;
+            const index = self.index;
+            const flight = try index.preparePublishedSearchStateCommit();
+            var flight_owned = true;
+            defer if (flight_owned) index.releasePublishedSearchStateFlightRef(flight);
+            try index.beginPublishedSearchStateRefreshIo();
+            errdefer index.abortPublishedSearchStateRefresh();
+            index.markPublishedSearchStateCommittingWithFlight(flight);
+            flight_owned = false;
+            const previous_metadata = index.metadata;
+            index.metadata = self.metadata.?;
+            errdefer index.metadata = previous_metadata;
+            try index.installExperimentalPostingReadGenerationReplacing(next, self.parent);
+            self.next = null;
+            // A retained root may have populated serving caches before the
+            // peer committed. Evict only the IDs changed by a WAL suffix.
+            if (next.parent == null) {
+                index.clearAllCaches();
+            } else {
+                var changed = next.values.keyIterator();
+                while (changed.next()) |key| {
+                    const id = experimentalPostingValueKeyId(key.*);
+                    switch (experimentalPostingValueKeyKind(key.*) catch unreachable) {
+                        .base, .posting_state, .node_range => index.invalidateNodeCache(id),
+                        .quantized_checkpoint => index.invalidateQuantizedCache(id),
+                        .vector_leaf => index.invalidateVectorCache(id),
+                        .vector_metadata => {
+                            index.invalidateVectorCache(id);
+                            index.invalidateMetadataCache(id);
+                        },
+                        else => {},
+                    }
+                }
+            }
+            index.finishPublishedSearchStateRefresh();
+            index.closeExperimentalPostingWalWriter();
+            index.discardExperimentalPostingDeltaBaseState();
+            if (next.overlay_depth >= managedPostingMaxLiveOverlayDepth) {
+                _ = index.collapseExperimentalPostingReadOverlays() catch |err| {
+                    std.log.warn("dense peer posting overlay consolidation deferred err={s}", .{@errorName(err)});
+                };
+            }
+        }
+    };
+
+    /// Capture a peer's append-only WAL suffix against the same Lite cut
+    /// used by document mappings. Load a new root when CURRENT changes.
+    pub fn preparePeerPostingSuffix(
+        self: *HBCIndex,
+        file: *@import("lite/native.zig").NativeFile,
+        cut: @import("lite/native.zig").CheckpointSlot,
+        maximum_source_sequence: u64,
+    ) !PreparedPeerPostingRefresh {
+        if (self.env_owner != .native or !self.experimentalPostingWalAuthoritative() or
+            self.experimental_posting_capture_enabled or self.experimentalPostingCheckpointBuildPresent())
+            return error.UnsupportedRefresh;
+        const parent = self.retainCurrentExperimentalPostingReadGeneration() orelse return error.UnsupportedRefresh;
+        errdefer parent.release();
+        const root = experimentalPostingRootState(parent) orelse return error.UnsupportedRefresh;
+        const covered = parent.covered_source_sequence.load(.acquire);
+        const committed_bytes = parent.wal_committed_bytes.load(.acquire);
+        const last_batch = parent.peer_last_batch.load(.acquire);
+        const root_dir = try std.fs.path.join(self.alloc, &.{ self.env_owner.native.root_dir, "posting-segments" });
+        defer self.alloc.free(root_dir);
+        var selected: ?posting_segment_store_mod.RecoveredWal = null;
+        if (root.peer_checkpoint) |checkpoint| {
+            if (parent.wal_generation.load(.acquire) == checkpoint.wal_generation and
+                (committed_bytes == 0 or last_batch != 0))
+            {
+                selected = try posting_segment_store_mod.readCommittedWalSuffixAtLiteCheckpoint(
+                    self.alloc,
+                    file,
+                    cut,
+                    root_dir,
+                    checkpoint,
+                    committed_bytes,
+                    if (last_batch == 0) null else last_batch,
+                    covered,
+                );
+            }
+        }
+        var suffix = selected orelse {
+            const opened = try posting_segment_store_mod.openAtLiteCheckpoint(self.alloc, self.env_owner.native.storage, file, cut, root_dir);
+            const state = try self.loadExperimentalPostingStateFromOpened(opened, null);
+            var state_owned = true;
+            errdefer if (state_owned) {
+                state.deinit();
+                self.alloc.destroy(state);
+            };
+            if (state.covered_source_sequence < covered or state.covered_source_sequence > maximum_source_sequence)
+                return error.PostingCheckpointSequenceMismatch;
+            const next = try ExperimentalPostingReadGeneration.createRoot(self.alloc, state);
+            state_owned = false;
+            errdefer next.release();
+            return .{
+                .index = self,
+                .parent = parent,
+                .next = next,
+                .metadata = try self.metadataFromExperimentalPostingGeneration(next),
+            };
+        };
+        const checkpoint = root.peer_checkpoint.?;
+        defer suffix.deinit();
+        if (suffix.replay.covered_source_sequence > maximum_source_sequence) return error.PostingCheckpointSequenceMismatch;
+        if (suffix.bytes.len == 0) return .{ .index = self, .parent = parent };
+        const next = try ExperimentalPostingReadGeneration.createOverlay(
+            self.alloc,
+            parent,
+            suffix.replay.covered_source_sequence,
+            checkpoint.wal_generation,
+            committed_bytes + suffix.bytes.len,
+        );
+        errdefer next.release();
+        next.peer_last_batch.store(suffix.replay.last_committed_batch orelse 0, .release);
+        try next.replaySuffix(&suffix, self.metadata.dims, self.metadata.use_quantization);
+        return .{
+            .index = self,
+            .parent = parent,
+            .next = next,
+            .metadata = try self.metadataFromExperimentalPostingGeneration(next),
+        };
     }
 
     fn decodeExperimentalPostingMetadata(self: *const HBCIndex, encoded: []const u8) !IndexMetadata {
@@ -12856,6 +13063,8 @@ pub const HBCIndex = struct {
             .alloc = alloc,
             .covered_source_sequence = if (replay_wal) opened.store.covered_source_sequence else opened.store.checkpoint.?.covered_source_sequence,
             .wal_generation = opened.store.wal_generation,
+            .peer_checkpoint = opened.store.checkpoint,
+            .peer_last_batch = wal.replay.last_committed_batch,
             .retained_segments = opened.segments,
             .segments = segments,
             .vector_directory = vector_directory,
@@ -15327,7 +15536,7 @@ pub const HBCIndex = struct {
     // pre-stage state; `abortStagedWrite` restores the in-memory routing
     // tree exactly; `installStagedWrite` (after the harvested mutations
     // are durable through a separate stand-in commit) publishes it.
-    test "insertWithMetadataStaged/deleteStaged: search sees old state during stage, abort restores, install publishes" {
+    fn testStagedWriterPublication() !void {
         const TestSink = struct {
             allocator: Allocator,
             entries: std.ArrayListUnmanaged(native_catalog_backend.Entry) = .empty,
@@ -15412,6 +15621,31 @@ pub const HBCIndex = struct {
 
         const scope = idx.nativeCatalogScope().?;
 
+        {
+            const submit_calls = test_sink.submit_calls;
+            var writer = try idx.forkInlineWriter();
+            var parked = false;
+            defer if (!parked) writer.close();
+            {
+                var first = try writer.insertWithMetadataStaged(11, &.{ 1.0, 0.0 }, "");
+                defer writer.abortStagedWrite(&first);
+                try writer.advancePrivateStagedWrite(&first);
+                var next = try writer.insertWithMetadataStaged(12, &.{ 0.0, 1.0 }, "");
+                defer writer.abortStagedWrite(&next);
+                try writer.advancePrivateStagedWrite(&next);
+                try std.testing.expectEqual(@as(u64, 2), writer.publishedActiveCount());
+                try std.testing.expectEqual(@as(u64, 0), idx.publishedActiveCount());
+                try std.testing.expectEqual(submit_calls, test_sink.submit_calls);
+            }
+            parked = idx.parkInlineWriter(&writer);
+            try std.testing.expect(parked);
+            const reused_backend = idx.idle_inline_writer.?.env_owner.native_catalog;
+            var reused = try idx.forkInlineWriter();
+            defer reused.close();
+            try std.testing.expectEqual(reused_backend, reused.env_owner.native_catalog);
+            try std.testing.expectEqual(@as(u64, 0), reused.publishedActiveCount());
+        }
+
         // --- Insert, staged ---
         const submits_before = test_sink.submit_calls;
         var staged = try idx.insertWithMetadataStaged(1, &.{ 1.0, 0.0 }, "");
@@ -15466,6 +15700,30 @@ pub const HBCIndex = struct {
             var results = try idx.searchWithRequest(.{ .query = &.{ 1.0, 0.0 }, .k = 1, .search_effort = 1.0 });
             defer results.deinit();
             try std.testing.expectEqual(@as(usize, 1), results.getHits().len);
+        }
+
+        // A reader that has warmed its caches adopts an externally
+        // committed overwrite through the key delta alone.
+        {
+            var peer = try idx.forkInlineWriter();
+            defer peer.close();
+            var update = try peer.insertWithMetadataStaged(1, &.{ 0.0, 1.0 }, "peer");
+            defer peer.abortStagedWrite(&update);
+            try commitStaged(a, test_sink.sink(), scope, update.mutations);
+            const delta = try a.alloc(native_catalog_backend.Mutation, update.mutations.len);
+            defer a.free(delta);
+            for (update.mutations, delta) |m, *out| {
+                out.* = .{ .namespace = m.namespace, .key = m.key, .value = m.value, .is_delete = m.is_delete };
+            }
+            try idx.refreshCatalogDelta(delta);
+            try std.testing.expectEqual(@as(u64, 1), idx.publishedActiveCount());
+            const doc = (try idx.getMetadata(1)).?;
+            defer a.free(doc);
+            try std.testing.expectEqualStrings("peer", doc);
+            var results = try idx.searchWithRequest(.{ .query = &.{ 0.0, 1.0 }, .k = 1, .search_effort = 1.0 });
+            defer results.deinit();
+            try std.testing.expectEqual(@as(usize, 1), results.getHits().len);
+            try std.testing.expectApproxEqAbs(@as(f32, 0), results.getHits()[0].distance, 0.001);
         }
 
         // --- Delete, staged ---
@@ -19920,24 +20178,97 @@ pub const HBCIndex = struct {
     /// (`native_catalog_backend.Backend.invalidateMirror`), so this index
     /// fails closed until reopened from the committed catalog.
     pub fn installStagedWrite(self: *HBCIndex, staged: *vectorindex_hbc_index.StagedWrite) !void {
-        var mirror_err: ?anyerror = null;
-        if (self.env_owner == .native_catalog and staged.mutations.len != 0) mirror: {
-            const backend = self.env_owner.native_catalog;
-            const converted = self.alloc.alloc(native_catalog_backend.Mutation, staged.mutations.len) catch |err| {
-                backend.invalidateMirror();
-                mirror_err = err;
-                break :mirror;
-            };
-            defer self.alloc.free(converted);
-            for (staged.mutations, converted) |pending, *out| {
-                out.* = .{ .namespace = pending.namespace, .key = pending.key, .value = pending.value, .is_delete = pending.is_delete };
-            }
-            backend.applyExternallyCommittedMutations(converted) catch |err| {
-                mirror_err = err;
-            };
-        }
+        const mirrored = self.applyStagedCatalogMutations(staged.mutations);
         try vectorindex_hbc_index.installStagedWrite(self, staged);
-        if (mirror_err) |err| return err;
+        try mirrored;
+    }
+
+    fn applyStagedCatalogMutations(self: *HBCIndex, mutations: []const vectorindex_store.PendingMutation) !void {
+        if (self.env_owner != .native_catalog or mutations.len == 0) return;
+        const backend = self.env_owner.native_catalog;
+        errdefer backend.invalidateMirror();
+        const converted = try self.alloc.alloc(native_catalog_backend.Mutation, mutations.len);
+        defer self.alloc.free(converted);
+        for (mutations, converted) |pending, *out| {
+            out.* = .{ .namespace = pending.namespace, .key = pending.key, .value = pending.value, .is_delete = pending.is_delete };
+        }
+        try backend.applyExternallyCommittedMutations(converted);
+    }
+
+    /// Advances only the private runtime. The host still owns the queued
+    /// mutation bytes and releases them when the durable ticket resolves.
+    pub fn advancePrivateStagedWrite(self: *HBCIndex, staged: *vectorindex_hbc_index.StagedWrite) !void {
+        std.debug.assert(staged.publishing);
+        std.debug.assert(self.env_owner.native_catalog.writer_view_parent != null);
+        defer staged.publishing = false;
+        errdefer self.abortPublishedSearchStateRefresh();
+        try self.applyStagedCatalogMutations(staged.mutations);
+        self.finishPublishedSearchStateRefresh();
+    }
+
+    /// Publishes a previously prepared mutation on the durable serving
+    /// tree. Routing metadata and cache invalidation share its search epoch.
+    pub fn publishQueuedStagedWrite(self: *HBCIndex, staged: *const vectorindex_hbc_index.StagedWrite, vector_id: u64) !void {
+        var metadata: ?IndexMetadata = null;
+        for (staged.mutations) |mutation| {
+            const namespace = mutation.namespace orelse continue;
+            if (std.mem.eql(u8, namespace, runtimeNamespace(.meta).name.?) and std.mem.eql(u8, mutation.key, meta_key) and !mutation.is_delete)
+                metadata = IndexMetadata.decode(mutation.value);
+        }
+        const next = metadata orelse return error.InvalidQueuedIndexMetadata;
+        try self.beginPublishedSearchStateRefreshIo();
+        errdefer self.abortPublishedSearchStateRefresh();
+        try self.markPublishedSearchStateCommitting();
+        try self.applyStagedCatalogMutations(staged.mutations);
+        for (staged.mutations) |mutation| {
+            const namespace = mutation.namespace orelse continue;
+            if (std.mem.eql(u8, namespace, runtimeNamespace(.nodes).name.?)) {
+                if (decodeNodeKey(mutation.key)) |node| self.invalidateNodeCache(node.id);
+            } else if (std.mem.eql(u8, namespace, runtimeNamespace(.quant).name.?)) {
+                if (decodeQuantizedNodeId(mutation.key)) |node_id| self.invalidateQuantizedCache(node_id);
+            }
+        }
+        self.invalidateVectorCache(vector_id);
+        self.invalidateMetadataCache(vector_id);
+        self.metadata = next;
+        self.finishPublishedSearchStateRefresh();
+    }
+
+    pub fn refreshCatalogDelta(self: *HBCIndex, mutations: []const native_catalog_backend.Mutation) !void {
+        if (self.env_owner != .native_catalog or self.experimentalPostingWalAuthoritative() or self.generationRepairPending()) return error.UnsupportedRefresh;
+        var metadata = self.metadata;
+        for (mutations) |mutation| {
+            const namespace = mutation.namespace orelse return error.UnsupportedRefresh;
+            if (std.mem.eql(u8, namespace, runtimeNamespace(.meta).name.?)) {
+                if (!std.mem.eql(u8, mutation.key, meta_key) or mutation.is_delete or !IndexMetadata.isSupportedEncodedLen(mutation.value.len)) return error.UnsupportedRefresh;
+                const next = IndexMetadata.decode(mutation.value);
+                if (next.version != metadata.version or next.dims != metadata.dims or next.metric != metadata.metric or
+                    next.branching_factor != metadata.branching_factor or next.leaf_size != metadata.leaf_size or
+                    next.use_quantization != metadata.use_quantization or next.quantizer_seed != metadata.quantizer_seed or
+                    next.quantization_bits != metadata.quantization_bits) return error.UnsupportedRefresh;
+                metadata = next;
+            }
+        }
+        try self.beginPublishedSearchStateRefreshIo();
+        errdefer self.abortPublishedSearchStateRefresh();
+        try self.markPublishedSearchStateCommitting();
+        try self.env_owner.native_catalog.applyExternallyCommittedMutations(mutations);
+        for (mutations) |mutation| {
+            const namespace = mutation.namespace.?;
+            if (std.mem.eql(u8, namespace, runtimeNamespace(.nodes).name.?)) {
+                if (decodeNodeKey(mutation.key)) |node| self.invalidateNodeCache(node.id);
+            } else if (std.mem.eql(u8, namespace, runtimeNamespace(.quant).name.?)) {
+                if (decodeQuantizedNodeId(mutation.key)) |node_id| self.invalidateQuantizedCache(node_id);
+            } else if (std.mem.eql(u8, namespace, runtimeNamespace(.vecs).name.?)) {
+                if (decodeVectorDerivedKey(mutation.key)) |decoded| {
+                    if (decoded.kind == .vector_metadata) self.invalidateMetadataCache(decoded.vector_id);
+                } else if (isRawVectorKey(mutation.key)) {
+                    self.invalidateVectorCache(std.mem.readInt(u64, mutation.key[2..10], .big));
+                }
+            }
+        }
+        self.metadata = metadata;
+        self.finishPublishedSearchStateRefresh();
     }
 
     /// `staged.mutations` were never committed durably. Restores this
@@ -22061,6 +22392,10 @@ test "durable incomplete snapshot terminates when publication advances during tr
     try std.testing.expect(!hook_ctx.writer_failed.load(.acquire));
     try std.testing.expectEqual(@as(u64, 5), idx.stats().active_count);
     try std.testing.expect(!idx.generationRepairPending());
+}
+
+test "insertWithMetadataStaged/deleteStaged publishes durable local and peer state" {
+    try HBCIndex.testStagedWriterPublication();
 }
 
 test "aborted published transaction cannot leak staged topology through caches" {
@@ -26019,6 +26354,38 @@ test "posting WAL recovery reconstructs patch bases without pinning the serving 
     try state.materializeWal(&wal);
     try std.testing.expectEqualSlices(u8, &final, (try state.value(41, .base)).?);
     try std.testing.expectEqual(@as(u64, 0), state.patch_cache_accounting.current());
+}
+
+test "posting WAL suffix replaces values without modifying retained readers" {
+    const alloc = std.testing.allocator;
+    const base = try buildTestExperimentalPostingSegment(alloc, 41, .vector_metadata, 1, "old");
+    defer alloc.free(base);
+    const state = try createTestExperimentalPostingReadState(alloc, &.{base});
+    const parent = try ExperimentalPostingReadGeneration.createRoot(alloc, state);
+    defer parent.release();
+
+    var writer = vectorindex_posting_wal.Writer.initAfterCommitted(alloc, 1, 1);
+    defer writer.deinit();
+    try writer.append(.vector_metadata, 2, 41, 2, "first");
+    try writer.append(.vector_metadata, 2, 41, 2, "second");
+    try writer.commit(2, 2);
+    const next = try ExperimentalPostingReadGeneration.createOverlay(alloc, parent, 2, 1, writer.bytes().len);
+    defer next.release();
+    {
+        const bytes = try alloc.dupe(u8, writer.bytes());
+        var suffix: posting_segment_store_mod.RecoveredWal = .{
+            .alloc = alloc,
+            .bytes = bytes,
+            .replay = vectorindex_posting_wal.Replay.parseCommittedSuffix(alloc, bytes, 1, 1) catch |err| {
+                alloc.free(bytes);
+                return err;
+            },
+        };
+        defer suffix.deinit();
+        try next.replaySuffix(&suffix, 2, false);
+    }
+    try std.testing.expectEqualStrings("old", (try parent.value(41, .vector_metadata)).?);
+    try std.testing.expectEqualStrings("second", (try next.value(41, .vector_metadata)).?);
 }
 
 test "posting capture value leases release reconstructed patches at transaction end" {

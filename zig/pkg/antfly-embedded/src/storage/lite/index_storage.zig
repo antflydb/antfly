@@ -352,79 +352,12 @@ fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
     const directory = if (std.mem.eql(u8, path, "/")) path else std.mem.trimEnd(u8, path, "/");
     try validateIndexPath(self, directory);
-    const Context = struct {
-        store: *Store,
-        path: []const u8,
-        fn apply(context: *anyopaque, _: *native.NativeFile) !void {
-            const request: *@This() = @ptrCast(@alignCast(context));
-            try deleteTreeLocked(request.store, request.path);
-        }
-    };
-    var request = Context{ .store = self, .path = directory };
-    try self.docs.submitIndexMutation(&request, Context.apply, true);
-}
-
-// Subtree deletion stays one atomic native transaction. Each private flush
-// releases keys and editor scratch; the cursor retains the original immutable
-// root so subsequent batches cannot skip entries as the active tree shrinks.
-const CatalogDeleteBatch = struct {
-    const max_keys = 64;
-    const max_key_bytes = 16 * 1024;
-    allocator: Allocator,
-    file: *native.NativeFile,
-    mutations: std.ArrayListUnmanaged(native.CatalogMutation) = .empty,
-    key_bytes: usize = 0,
-
-    fn clear(self: *@This()) void {
-        for (self.mutations.items) |mutation| self.allocator.free(mutation.key);
-        self.mutations.clearRetainingCapacity();
-        self.key_bytes = 0;
-    }
-
-    pub fn deinit(self: *@This()) void {
-        self.clear();
-        self.mutations.deinit(self.allocator);
-    }
-
-    fn add(self: *@This(), key: []const u8) !void {
-        if (self.mutations.items.len != 0 and
-            (self.mutations.items.len >= max_keys or self.key_bytes + key.len > max_key_bytes)) try self.flush();
-        const owned = try self.allocator.dupe(u8, key);
-        errdefer self.allocator.free(owned);
-        try self.mutations.append(self.allocator, .{ .key = owned, .is_delete = true });
-        self.key_bytes += owned.len;
-    }
-
-    fn flush(self: *@This()) !void {
-        if (self.mutations.items.len == 0) return;
-        try self.file.putIndexCatalogBatch(self.mutations.items);
-        _ = try self.file.materializeTransactionCheckpoint();
-        self.clear();
-    }
-};
-
-fn deleteTreeLocked(self: *Store, path: []const u8) !void {
-    const directory = if (std.mem.eql(u8, path, "/")) path else std.mem.trimEnd(u8, path, "/");
-    try validateIndexPath(self, directory);
-    const file = &self.docs.file;
-    // Include earlier callbacks in this group before pinning the scan root.
-    const checkpoint = try file.materializeTransactionCheckpoint();
-    var batch = CatalogDeleteBatch{ .allocator = self.allocator, .file = file };
-    defer batch.deinit();
-    // Include the exact file, but never a neighboring name such as /a-other.
-    if (try file.getIndexCatalogRecordSizeAtCheckpoint(directory, checkpoint) != null) try batch.add(directory);
     const prefix = if (std.mem.eql(u8, directory, "/"))
         try self.allocator.dupe(u8, "/")
     else
         try std.fmt.allocPrint(self.allocator, "{s}/", .{directory});
     defer self.allocator.free(prefix);
-    var cursor = try file.indexCatalogCursor(checkpoint, prefix);
-    defer cursor.deinit();
-    while (try cursor.next()) |record| {
-        defer file.allocator.free(record.key);
-        if (!std.mem.eql(u8, record.key, directory)) try batch.add(record.key);
-    }
-    try batch.flush();
+    try self.docs.submitIndexTreeDeletion(prefix, directory);
 }
 
 fn listDirectoryNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) ![][]u8 {
@@ -1271,36 +1204,17 @@ test "lite native index storage recovers previous checkpoint after interrupted u
         const storage = index_store.storage();
 
         try storage.writeFileAbsolute("/indexes/ft/stable.tbl", "stable");
-        // The redo log (the default, `opts.use_redo_log orelse true`) is this
-        // file's only durability record for an ordinary commit -- the
-        // on-disk checkpoint slot stays untouched until a real
-        // `checkpointRedoLog` fold ever advances it (`publishCheckpoint`'s
-        // own doc comment: "build step (d) is the only thing that ever
-        // advances it for a redo-log file"), so the legacy dual-slot
-        // ping-pong this test used to truncate against no longer holds a
-        // second, independently-recoverable generation. Simulate the crash
-        // against the log's own tail instead, the same technique "lite redo
-        // log ride-along commit is lost on a crash before its sync; the
-        // durable commit survives" (native.zig) already establishes.
-        const tail_after_stable = docs.file.redo.?.writer.tail;
+        const stable_sequence = docs.file.durableSequence();
+        const stable_tail = docs.file.redo.?.writer.tail;
 
         var writer = try storage.beginAtomicWrite(allocator, "/indexes/ft/stable.tbl");
         try writer.appendSlice("replacement");
-        try writer.finish();
-        try std.testing.expect(docs.file.redo.?.writer.tail > tail_after_stable);
-
-        // Simulate a crash that landed every byte through "stable"'s own
-        // sync and nothing past it -- what an injected power loss right
-        // after that `writer.sync()` call and before "replacement"'s own
-        // append reached a durable barrier would leave. The file's total
-        // size must stay exactly what it was (a fixed, preallocated redo
-        // region, §9.1); zero the tail in place rather than truncating it.
-        const io = docs.file.runtime();
-        const capacity = docs.file.header.redo_log_capacity;
-        const zeroed = try allocator.alloc(u8, @intCast(capacity - tail_after_stable));
-        defer allocator.free(zeroed);
-        @memset(zeroed, 0);
-        try docs.file.file.writePositionalAll(io, zeroed, docs.file.header.redo_log_offset + tail_after_stable);
+        // Interrupt the replacement before its durability barrier can publish.
+        docs.file.test_fail_redo_sync = error.TestInjectedFailure;
+        try std.testing.expectError(error.OutcomeUnknown, writer.finish());
+        try std.testing.expectEqual(@as(?anyerror, null), docs.file.test_fail_redo_sync);
+        try std.testing.expectEqual(stable_sequence, docs.file.durableSequence());
+        try std.testing.expectEqual(stable_tail, docs.file.redo.?.writer.tail);
     }
 
     {
@@ -2071,6 +1985,20 @@ test "lite subtree deletion's large-transaction fallback preserves an unrelated 
     }
     try docs.file.putIndexCatalogBatch(mutations);
     try docs.file.putIndexCatalogRecord("/scope", "exact");
+    // The last sorted row exists only in the old overlay. Later physical
+    // delete batches must clear it along with the already folded rows.
+    {
+        var mutation = native.CatalogMutation{ .key = "/scope/overlay-only", .value = "old" };
+        // This writes through the normal index queue below, using the same
+        // index root and redo path as the tree delete.
+        const Insert = struct {
+            fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
+                const record: *const native.CatalogMutation = @ptrCast(@alignCast(ptr));
+                try file.putIndexCatalogBatch(&.{record.*});
+            }
+        };
+        try docs.submitIndexMutation(&mutation, Insert.apply, true);
+    }
     var store = Store.initWithNamespace(a, &docs, "/scope");
     try store.storage().deleteTree("/scope");
 
@@ -2081,6 +2009,8 @@ test "lite subtree deletion's large-transaction fallback preserves an unrelated 
     try std.testing.expectEqualStrings("unfolded", early);
     try std.testing.expectEqual(@as(?usize, null), try docs.file.getIndexCatalogRecordSize("/scope"));
 
+    try std.testing.expectEqual(@as(?usize, null), try docs.file.getIndexCatalogRecordSize("/scope/overlay-only"));
+
     docs.close();
     docs_open = false;
     var reopened = try docstore.Store.openWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
@@ -2089,6 +2019,7 @@ test "lite subtree deletion's large-transaction fallback preserves an unrelated 
     defer a.free(early_reopened);
     try std.testing.expectEqualStrings("unfolded", early_reopened);
     try std.testing.expectEqual(@as(?usize, null), try reopened.file.getIndexCatalogRecordSize("/scope"));
+    try std.testing.expectEqual(@as(?usize, null), try reopened.file.getIndexCatalogRecordSize("/scope/overlay-only"));
     try std.testing.expect((try reopened.checkWithCancel(null)).valid);
 }
 

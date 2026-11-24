@@ -660,7 +660,7 @@ const TestProvider = struct {
         var foreign = provider;
         foreign.context = @ptrFromInt(1);
         try std.testing.expectError(error.ForeignModelProgramProvider, cache.run(a, foreign, frontend, &declared, a, null));
-        if (client != null) {
+        if (@import("build_options").enable_pjrt and client != null) {
             var second_program = frontend;
             second_program.fingerprint = 1;
             const outputs = try cache.run(a, provider, second_program, &declared, a, null);
@@ -686,7 +686,7 @@ const TestProvider = struct {
         const second = try entry.acquireFrame();
         defer entry.returnFrame(second);
         try std.testing.expect(first.backend.ptr != second.backend.ptr);
-        if (client != null) {
+        if (@import("build_options").enable_pjrt and client != null) {
             const original = first.executable.?.runtime.plan.?;
             const receiving = second.executable.?.runtime.plan.?;
             var compiled_count: usize = 0;

@@ -723,6 +723,22 @@ pub fn createCudaSession(allocator: std.mem.Allocator, model_path: []const u8) !
     return createCudaSessionWithKernelJit(allocator, model_path, .{});
 }
 
+/// The offline core benchmark can exercise the compact projector on the GB10
+/// before the first media request. Serving uses the release device policy.
+pub fn createGemma4CudaQualificationSession(allocator: std.mem.Allocator, model_path: []const u8) !Session {
+    const session = try createCudaSession(allocator, model_path);
+    errdefer session.close();
+    if (comptime build_options.enable_cuda) {
+        const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+        const compute = self.backend_data.cuda.compute;
+        const cfg = getGptConfig(session) orelse return error.WrongArchitecture;
+        if (compute.gemma4_dense_qualified and @import("../ops/cuda/ple_host.zig").eligibleConfig(cfg) and
+            compute.ctx.info.compute_major == 12 and compute.ctx.info.compute_minor == 1)
+            try compute.configureGemma4Projector(.qualification);
+    }
+    return session;
+}
+
 pub const GlinerCudaPrecision = cuda_weights.GlinerCudaPrecision;
 
 /// Explicit precision for qualification and model owners. Automatic selection
@@ -3484,6 +3500,7 @@ pub fn nativeMatrixScratchGeometry(session: Session, inputs: @import("prepared_i
     return if (try nativeMatrixScratchMatches(session, geometry)) geometry else null;
 }
 pub fn nativeMatrixScratchMatches(session: Session, geometry: ops.kernel_descriptor.NativeMatrixScratchGeometry) !bool {
+    if (comptime !build_options.enable_native) return false;
     const data = nativeWeightPreparationModelData(session) orelse return false;
     const owner: *ArchSession = @ptrCast(@alignCast(session.ptr));
     if (owner.arch_config != .modern_bert) return false;
@@ -3594,6 +3611,7 @@ pub fn prepareNativeMatrixCreditsOutsideExecution(session: Session, domain: *con
 /// while a pending trunk fill owns the numerical Model. Unknown/lazy/scratch
 /// variants decline before the original task permit moves.
 pub fn nativePackedMatrixReady(session: Session, geometry: ops.kernel_descriptor.NativeMatrixScratchGeometry) !bool {
+    if (comptime !build_options.enable_native) return false;
     if (!try nativeMatrixScratchMatches(session, geometry)) return false;
     const data = nativeWeightPreparationModelData(session) orelse return false;
     const owner: *ArchSession = @ptrCast(@alignCast(session.ptr));
@@ -4415,9 +4433,10 @@ fn archRunResidentImpl(ptr: *anyopaque, inputs: []const Tensor, allocator: std.m
         cb.* = cb.withoutSynchronousBorrows();
     };
     if (current_context) |*active| {
+        if (comptime !build_options.enable_native) return error.ForeignNativeWeightModel;
         if (self.backend_type != .native or self.arch_config != .embedding_gemma2 or active.native_weights == null or active.cleanup.boundary == null or active.recurrent_state != null or active.workspace_uses != null) return error.ForeignNativeWeightModel;
         if (try active.cleanup.boundary.?.isSealed()) return error.RetirementEpochSealed;
-        if (cb.vtable != &@import("../ops/native_compute.zig").vtable_impl) return error.ForeignNativeWeightModel;
+        if (!@import("../ops/native_compute.zig").isCanonicalVTable(cb.vtable)) return error.ForeignNativeWeightModel;
         cb.call_context = active;
         try @import("../ops/native_compute.zig").NativeCompute.configurePanelPreparationPolicy(cb, true);
     }
@@ -5592,7 +5611,7 @@ fn buildColdNativeFlorence(self: *ColdNativeFlorence, allocator: std.mem.Allocat
     const session = self.source;
     self.cb = try getComputeBackendWithControl(session, allocator, control);
     const cb = self.backend();
-    if (cb.vtable != &@import("../ops/native_compute.zig").vtable_impl) return false;
+    if (!@import("../ops/native_compute.zig").isCanonicalVTable(cb.vtable)) return false;
     self.program = (try florence_arch.PreparedSingleToken.create(metadata.allocator(), cb, data, domain, config, encoder_rows, capacity)) orelse return false;
     const program = self.program.?;
     const arch: *ArchSession = @ptrCast(@alignCast(session.ptr));
@@ -8311,7 +8330,7 @@ fn archRunImplWithContext(ptr: *anyopaque, inputs: []const Tensor, allocator: st
         cb.call_context = active;
         if (self.backend_type == .native) {
             if (active.native_weights == null or active.cleanup.boundary == null or active.recurrent_state != null or active.workspace_uses != null) return error.ForeignNativeWeightModel;
-            if (self.arch_config == .embedding_gemma2) try @import("../ops/native_compute.zig").NativeCompute.configurePanelPreparationPolicy(&cb, true);
+            if (build_options.enable_native and self.arch_config == .embedding_gemma2) try @import("../ops/native_compute.zig").NativeCompute.configurePanelPreparationPolicy(&cb, true);
         } else if (comptime build_options.enable_cuda) {
             const budget = active.recurrent_state orelse return error.UnpreparedRecurrentStateBudget;
             try cuda_compute_mod.CudaCompute.validateTemporaryRecurrentBackend(&cb, budget);
@@ -11333,9 +11352,9 @@ test "native incremental stage receiver qualifies explicitly and keeps real sour
     var reference = try decoder_stage.Decoder.init(a, destination, &stateless, 2, &.{ 1, 1 }, 4, null);
     var reference_open = true;
     defer if (reference_open) reference.deinit();
-    var first = try reference.step(&.{ 0, 1 }, null, null);
+    var first = try reference.step(&.{ 0, 1 }, 0, null, null);
     defer first.deinit();
-    var second = try reference.step(&.{ 0, 1, 2 }, null, null);
+    var second = try reference.step(&.{ 0, 1, 2 }, 2, null, null);
     defer second.deinit();
     reference.deinit();
     reference_open = false;
@@ -11352,9 +11371,10 @@ test "native incremental stage receiver qualifies explicitly and keeps real sour
     source_open = false;
     encoded.deinit(a);
     encoded_open = false;
-    var actual_first = try runtime_decoder.step(&.{ 0, 1 }, null, null);
+    var actual_first = try runtime_decoder.step(&.{ 0, 1 }, 0, null, null);
     defer actual_first.deinit();
-    var actual_second = try runtime_decoder.step(&.{ 0, 1, 2 }, null, null);
+    try std.testing.expectError(error.InvalidDecoderPosition, runtime_decoder.stepSuffix(.{ .position = 1, .tokens = &.{2} }, null, null));
+    var actual_second = try runtime_decoder.step(&.{ 0, 1, 2 }, 2, null, null);
     defer actual_second.deinit();
     try std.testing.expectEqualSlices(f32, first.logits, actual_first.logits);
     try std.testing.expectEqualSlices(f32, second.logits, actual_second.logits);
@@ -12260,7 +12280,7 @@ test "owned incremental input keeps both real encoder roots across cancelled and
     var reference = try decoder_stage.Decoder.init(a, destination, &host, 2, &.{ 1, 1 }, 4, null);
     var reference_open = true;
     defer if (reference_open) reference.deinit();
-    var expected = try reference.step(&.{ 0, 1 }, null, null);
+    var expected = try reference.step(&.{ 0, 1 }, 0, null, null);
     defer expected.deinit();
     reference.deinit();
     reference_open = false;
@@ -12289,7 +12309,7 @@ test "owned incremental input keeps both real encoder roots across cancelled and
     for (0..3) |_| {
         var actual = try decoder_stage.Decoder.initWithSource(a, destination, &owned.encoder, 2, &.{ 1, 1 }, 4, null, .{}, &owned.source.?);
         defer actual.deinit();
-        var row = try actual.step(&.{ 0, 1 }, null, null);
+        var row = try actual.step(&.{ 0, 1 }, 0, null, null);
         defer row.deinit();
         try std.testing.expectEqualSlices(f32, expected.logits, row.logits);
         try std.testing.expect(!(try root_epoch.isSealed()));
@@ -12712,7 +12732,7 @@ test "foreign Metal public Whisper encoder final norm promotes before receiver a
     defer cleanup.finish();
     var permit = try encoder.admitInputs(&features, request_allocator, control);
     defer permit.deinit();
-    try stages.prepareEncoderPermit(encoder, destination, null, control, true, &permit);
+    try stages.prepareEncoderPermit(encoder, destination, null, control, .incremental, &permit);
     var encoded = try stages.encodeForIncrementalWithPermit(request_allocator, encoder, destination, &features, null, control, &permit);
     var encoded_open = true;
     defer if (encoded_open) encoded.deinit(request_allocator);
@@ -12743,7 +12763,7 @@ test "foreign Metal public Whisper encoder final norm promotes before receiver a
     store.shared_metal_native_provider_lock.unlock(std.testing.io);
     var decoder = try @import("decoder_stage.zig").Decoder.initWithSource(request_allocator, destination, &owned.encoder, 2, &.{ 1, 1 }, @import("testing/incremental_encoder_decoder.zig").config.vocab_size, control, .{}, &owned.source.?);
     defer decoder.deinit();
-    var first = try decoder.step(&.{ 0, 1 }, null, null);
+    var first = try decoder.step(&.{ 0, 1 }, 0, null, null);
     defer first.deinit();
     try std.testing.expect(first.logits.len != 0);
 }
@@ -12854,6 +12874,8 @@ test "actual Native architecture CLIP and CLAP resident entries preserve current
 test "native media geometry protects actual projected rows for both text and image audio inputs" {
     var owner: ArchSession = undefined;
     owner.task = .generic;
+    owner.backend_type = .native;
+    owner.glide_head = null;
     const info = [_]TensorInfo{
         .{ .name = "input_ids", .dtype = .i64, .shape = &.{ 2, 4 } },
         .{ .name = "pixel_values", .dtype = .f32, .shape = &.{ 2, 3, 16, 16 } },
@@ -13488,7 +13510,7 @@ pub const StagedExecution = struct {
         const self: *const StagedExecution = @ptrCast(@alignCast(raw orelse return error.InvalidVideoProbeContext));
         try self.control.check();
     }
-    fn videoCache(raw: *anyopaque, cb: *const ops.ComputeBackend, bytes: []const u8, max_tokens: usize) anyerror!ops.EmbeddingCacheScope {
+    fn videoCache(raw: *anyopaque, cb: *const ops.ComputeBackend, prepared: *const @import("../ops/cuda/video.zig").PreparedEmbedding, max_tokens: usize) anyerror!ops.EmbeddingCacheScope {
         if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
         const self: *StagedExecution = @ptrCast(@alignCast(raw));
         _ = try self.cacheReceiver(cb);
@@ -13511,9 +13533,9 @@ pub const StagedExecution = struct {
         self.active = false;
         // Parser-only metadata: no surfaces, consumer or numerical work. This
         // allocator never calls the external quota supplier under the marker;
-        // its temporary footprint replaces the same later MP4 reader lifetime.
+        // the immutable packet table and display selection are already admitted.
         const metadata = platform.allocator.processAllocator(platform.allocator.concurrentFallback());
-        const observed = @import("../ops/cuda/video.zig").probeEmbeddingMp4(metadata, &compute.ctx, bytes, .{ .context = self, .check_fn = checkVideoProbe }, &preparation) catch |err| {
+        const observed = @import("../ops/cuda/video.zig").probeEmbeddingMp4(metadata, &compute.ctx, prepared, .{ .context = self, .check_fn = checkVideoProbe }, &preparation) catch |err| {
             preparation.finishOutsideExecution();
             return err;
         };
@@ -15434,7 +15456,7 @@ test "actual Native source geometry preserves declared packed rows and refuses u
     session.run_admission = .{ .controller = controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 341 * 1024 * 1024, .scratch_limit_bytes = 341 * 1024 * 1024 }, .static_workspace_bytes = 128 * 1024 * 1024, .check_live_memory = false };
     var workspace = Admitted{ .backing = a, .session = session };
     defer workspace.deinit();
-    const declared: source_mod.RunRequest = .{ .batch = 1, .sequence = 2, .input_bytes = 8192 * 2 * @sizeOf(i64), .output_bytes = 2 * 768 * @sizeOf(f32), .workspace_bytes = try @import("../pipelines/embedding_gemma2_admission.zig").textEncoderWorkspace(2) };
+    const declared: source_mod.RunRequest = .{ .batch = 1, .sequence = 2, .input_bytes = 8192 * 2 * @sizeOf(i64), .output_bytes = 2 * 768 * @sizeOf(f32), .workspace_bytes = try @import("embedding_gemma2_admission.zig").textEncoderWorkspace(2) };
     const full_info = [_]TensorInfo{
         .{ .name = "input_ids", .dtype = .i64, .shape = &.{ 1, 8192 } },
         .{ .name = "attention_mask", .dtype = .i64, .shape = &.{ 1, 8192 } },

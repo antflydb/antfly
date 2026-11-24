@@ -54,16 +54,24 @@ lib.antfly_lighton_prefill_execute.argtypes = [
     c.c_void_p,
 ]
 lib.antfly_lighton_prefill_execute.restype = c.c_int
+
+
 class WorkspaceGeometry(c.Structure):
     _fields_ = [
-        ("key_heads", c.c_int32), ("value_heads", c.c_int32), ("items", c.c_int32),
-        ("offsets", c.c_int32 * 64), ("lengths", c.c_int32 * 64),
+        ("key_heads", c.c_int32),
+        ("value_heads", c.c_int32),
+        ("items", c.c_int32),
+        ("offsets", c.c_int32 * 64),
+        ("lengths", c.c_int32 * 64),
     ]
+
 
 assert c.sizeof(WorkspaceGeometry) == 524
 lib.antfly_recurrent_prefill_workspace_geometry_abi.restype = c.c_uint64
 assert lib.antfly_recurrent_prefill_workspace_geometry_abi() == (1 << 32) | 524
-lib.antfly_recurrent_prefill_workspace_geometry.argtypes = [c.POINTER(WorkspaceGeometry)]
+lib.antfly_recurrent_prefill_workspace_geometry.argtypes = [
+    c.POINTER(WorkspaceGeometry)
+]
 lib.antfly_recurrent_prefill_workspace_geometry.restype = c.c_size_t
 
 gpu = Driver(args.artifact)
@@ -283,7 +291,9 @@ for h in [16, 32]:
                     row += lengths[i]
             needed = lib.antfly_lighton_prefill_workspace(c.byref(p))
             assert needed != (1 << 64) - 1
-            assert needed == cold_needed, "cold metadata and actual packet workspace differ"
+            assert needed == cold_needed, (
+                "cold metadata and actual packet workspace differ"
+            )
             scratch = alloc((needed,), torch.uint8) if needed else None
             torch.cuda.synchronize()
             if needed:

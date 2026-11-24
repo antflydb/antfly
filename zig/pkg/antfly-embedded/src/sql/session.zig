@@ -22,15 +22,42 @@ const std = @import("std");
 pub const Id = [16]u8;
 pub const Isolation = enum { read_committed, repeatable_read, serializable };
 pub const ReadMode = enum { read_write, read_only };
-pub const State = enum { active, failed, committing, uncertain, committed, aborted };
+pub const State = enum { active, failed, committing, uncertain, committed, prepared, aborted };
 pub const Status = enum(u8) { idle = 'I', in_transaction = 'T', failed = 'E' };
 pub const Scope = struct { principal: []const u8, database: []const u8 = "default", namespace: []const u8 = "public" };
-pub const Begin = struct { isolation: Isolation = .serializable, mode: ReadMode = .read_write };
-pub const Transaction = struct { id: Id, state: State, isolation: Isolation, mode: ReadMode, savepoints: usize = 0 };
+pub const Begin = struct { isolation: Isolation = .serializable, mode: ReadMode = .read_write, deferrable: bool = false };
+/// Omitted characteristics retain the active transaction's value.
+pub const Characteristics = struct { isolation: ?Isolation = null, mode: ?ReadMode = null, deferrable: ?bool = null, snapshot: ?[]const u8 = null };
+pub const Transaction = struct {
+    id: Id,
+    state: State,
+    isolation: Isolation,
+    mode: ReadMode,
+    savepoints: usize = 0,
+    /// Authorized durable owner time, not a client-supplied session option.
+    started_at: ?@import("statement_clock.zig").Instant = null,
+    /// Exact durable write stamp, distinct from the microsecond SQL clock.
+    /// Owners without this contract leave it absent rather than guessing.
+    write_version: ?u64 = null,
+};
 pub const CommitOutcome = enum { committed, committed_pending, committed_repair_required, aborted, unknown };
-pub const CommitResult = struct { outcome: CommitOutcome, reconciliation_id: Id };
+pub const ConstraintFailure = enum { unique_constraint_violation, foreign_key_parent_missing, foreign_key_referenced };
+pub const CommitResult = struct {
+    outcome: CommitOutcome,
+    reconciliation_id: Id,
+    abort_cause: ?error{ RowPolicyDenied, StorageReadTemporarilyUnavailable } = null,
+    constraint_failure: ?ConstraintFailure = null,
+};
 pub const Control = union(enum) { begin: Begin, commit, rollback, savepoint: []const u8, rollback_to: []const u8, release: []const u8 };
 pub const Result = struct { status: Status, transaction_id: ?Id, commit: ?CommitResult = null };
+
+pub fn abortError(result: CommitResult) anyerror {
+    return switch (result.constraint_failure orelse return result.abort_cause orelse error.SqlWriteConflict) {
+        .unique_constraint_violation => error.UniqueConstraintViolation,
+        .foreign_key_parent_missing => error.ForeignKeyParentMissing,
+        .foreign_key_referenced => error.ForeignKeyReferenced,
+    };
+}
 
 pub const Owner = struct {
     ptr: *anyopaque,
@@ -67,9 +94,14 @@ pub const Session = struct {
     pub fn attach(self: *Session, id: Id) !void {
         if (self.transaction_id != null) return error.SqlTransactionAlreadyActive;
         const transaction = try self.owner.vtable.inspect(self.owner.ptr, self.scope, id);
+        return self.attachInspected(id, transaction);
+    }
+
+    pub fn attachInspected(self: *Session, id: Id, transaction: Transaction) !void {
+        if (self.transaction_id != null) return error.SqlTransactionAlreadyActive;
         if (!std.mem.eql(u8, &transaction.id, &id)) return error.InvalidSqlBackendResponse;
         switch (transaction.state) {
-            .committed, .aborted => return error.SqlTransactionNotActive,
+            .committed, .prepared, .aborted => return error.SqlTransactionNotActive,
             else => self.transaction_id = id,
         }
     }
@@ -80,7 +112,7 @@ pub const Session = struct {
         return switch (current.state) {
             .active => .in_transaction,
             .failed, .committing, .uncertain => .failed,
-            .committed, .aborted => blk: {
+            .committed, .prepared, .aborted => blk: {
                 self.transaction_id = null;
                 break :blk .idle;
             },
@@ -161,7 +193,7 @@ pub const Session = struct {
             .active => {},
             .failed => if (!allow_failed) return error.SqlTransactionAborted,
             .committing, .uncertain => return error.SqlTransactionOutcomeUnknown,
-            .committed, .aborted => return error.SqlTransactionNotActive,
+            .committed, .prepared, .aborted => return error.SqlTransactionNotActive,
         }
         return current;
     }
@@ -235,4 +267,16 @@ test "SQL session delegates durable state and never replays uncertain decisions"
     session.scope.principal = "alice";
     session.deinit();
     try std.testing.expectEqual(@as(usize, 1), native.abandons);
+}
+
+test "SQL commit abort preserves typed constraint diagnostics" {
+    const id: Id = @splat(1);
+    var result: CommitResult = .{ .outcome = .aborted, .reconciliation_id = id };
+    try std.testing.expectEqual(error.SqlWriteConflict, abortError(result));
+    result.constraint_failure = .unique_constraint_violation;
+    try std.testing.expectEqual(error.UniqueConstraintViolation, abortError(result));
+    result.constraint_failure = .foreign_key_parent_missing;
+    try std.testing.expectEqual(error.ForeignKeyParentMissing, abortError(result));
+    result.constraint_failure = .foreign_key_referenced;
+    try std.testing.expectEqual(error.ForeignKeyReferenced, abortError(result));
 }

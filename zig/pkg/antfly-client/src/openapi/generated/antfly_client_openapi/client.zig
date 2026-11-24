@@ -151,6 +151,12 @@ pub const ListBackupsParams = struct {
     cursor: ?[]const u8 = null,
 };
 
+pub const PullChangefeedParams = struct {
+    after: []const u8,
+    limit: ?[]const u8 = null,
+    max_bytes: ?[]const u8 = null,
+};
+
 pub const ListConnectionsParams = struct {
     /// Comma-separated list of connection kinds to include (e.g. "inference,external_io,cdc"). Defaults to all kinds. This filters by the response "kind" field.
     types: ?[]const u8 = null,
@@ -1900,6 +1906,110 @@ pub const Client = struct {
         return ApiResponse(types.MultiBatchResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Create or resume enrollment for a durable changefeed
+    /// POST /db/v1/changefeeds
+    pub fn createChangefeed(self: *@This(), body: types.ChangefeedCreate, idempotency_key: []const u8) !ApiResponse(types.ChangefeedCreated) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/changefeeds", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        try request_headers.append(self.allocator, .{ "Idempotency-Key", idempotency_key });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
+        return ApiResponse(types.ChangefeedCreated).fromResponse(self.allocator, &resp);
+    }
+
+    /// Inspect a changefeed's lease and acknowledged progress
+    /// GET /db/v1/changefeeds/{feed_id}
+    pub fn inspectChangefeed(self: *@This(), feed_id: []const u8) !ApiResponse(types.ChangefeedProgress) {
+        const encoded_feed_id = try httpx.PercentEncoding.encode(self.allocator, feed_id);
+        defer self.allocator.free(encoded_feed_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/changefeeds/{s}", .{ self.base_url, encoded_feed_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ChangefeedProgress).fromResponse(self.allocator, &resp);
+    }
+
+    /// Close a feed and release its retention grants
+    /// DELETE /db/v1/changefeeds/{feed_id}
+    pub fn closeChangefeed(self: *@This(), feed_id: []const u8) !ApiResponse(std.json.Value) {
+        const encoded_feed_id = try httpx.PercentEncoding.encode(self.allocator, feed_id);
+        defer self.allocator.free(encoded_feed_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/changefeeds/{s}", .{ self.base_url, encoded_feed_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+    }
+
+    /// Acknowledge a successfully applied page
+    /// POST /db/v1/changefeeds/{feed_id}/ack
+    pub fn acknowledgeChangefeed(self: *@This(), feed_id: []const u8, body: types.ChangefeedCheckpoint) !ApiResponse(types.ChangefeedCheckpoint) {
+        const encoded_feed_id = try httpx.PercentEncoding.encode(self.allocator, feed_id);
+        defer self.allocator.free(encoded_feed_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/changefeeds/{s}/ack", .{ self.base_url, encoded_feed_id });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.ChangefeedCheckpoint).fromResponse(self.allocator, &resp);
+    }
+
+    /// Read or replay a bounded changefeed page
+    /// GET /db/v1/changefeeds/{feed_id}/events
+    pub fn pullChangefeed(self: *@This(), feed_id: []const u8, params: PullChangefeedParams) !ApiResponse(types.ChangefeedPage) {
+        const encoded_feed_id = try httpx.PercentEncoding.encode(self.allocator, feed_id);
+        defer self.allocator.free(encoded_feed_id);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/changefeeds/{s}/events", .{ self.base_url, encoded_feed_id });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        const encoded_query_value_after = try httpx.PercentEncoding.encode(self.allocator, params.after);
+        defer self.allocator.free(encoded_query_value_after);
+        try query_buf.appendSlice(self.allocator, &.{sep});
+        try query_buf.appendSlice(self.allocator, "after=");
+        try query_buf.appendSlice(self.allocator, encoded_query_value_after);
+        sep = '&';
+        if (params.limit) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "limit=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.max_bytes) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "max_bytes=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ChangefeedPage).fromResponse(self.allocator, &resp);
+    }
+
+    /// Extend the retention lease for a streaming feed
+    /// POST /db/v1/changefeeds/{feed_id}/renew
+    pub fn renewChangefeed(self: *@This(), feed_id: []const u8, body: types.ChangefeedLease) !ApiResponse(types.ChangefeedLease) {
+        const encoded_feed_id = try httpx.PercentEncoding.encode(self.allocator, feed_id);
+        defer self.allocator.free(encoded_feed_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/changefeeds/{s}/renew", .{ self.base_url, encoded_feed_id });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.ChangefeedLease).fromResponse(self.allocator, &resp);
+    }
+
     /// Get cluster topology
     /// GET /db/v1/cluster
     pub fn getCluster(self: *@This()) !ApiResponse(types.ClusterTopology) {
@@ -2775,6 +2885,27 @@ pub const Client = struct {
         return ApiResponse(types.GraphMetricActionResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Observe an exact index publication in an explicit namespace
+    /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/publication
+    pub fn getNamespaceTableIndexPublication(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8, x_antfly_index_publication_token: []const u8) !ApiResponse(types.IndexPublicationStatus) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_index_name = try httpx.PercentEncoding.encode(self.allocator, index_name);
+        defer self.allocator.free(encoded_index_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/indexes/{s}/publication", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_index_name });
+        defer self.allocator.free(url);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        try request_headers.append(self.allocator, .{ "X-Antfly-Index-Publication-Token", x_antfly_index_publication_token });
+        var resp = try self.http.get(url, .{ .headers = request_headers.items });
+        return ApiResponse(types.IndexPublicationStatus).fromResponse(self.allocator, &resp);
+    }
+
     /// Repair an index generation
     /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/repair
     pub fn repairNamespaceIndex(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8, body: types.IndexMaintenanceRequest) !ApiResponse(types.IndexMaintenanceResponse) {
@@ -3424,6 +3555,25 @@ pub const Client = struct {
         return ApiResponse(PatchNamespaceTableSchemaResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Observe an exact namespaced validation-only schema publication
+    /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/schema/publication
+    pub fn getNamespaceSchemaValidationPublication(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, x_antfly_schema_validation_token: []const u8) !ApiResponse(types.SchemaValidationStatus) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/schema/publication", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
+        defer self.allocator.free(url);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        try request_headers.append(self.allocator, .{ "X-Antfly-Schema-Validation-Token", x_antfly_schema_validation_token });
+        var resp = try self.http.get(url, .{ .headers = request_headers.items });
+        return ApiResponse(types.SchemaValidationStatus).fromResponse(self.allocator, &resp);
+    }
+
     /// Set namespace tablespace
     /// PUT /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/tablespace
     pub fn setNamespaceTableTablespace(self: *@This(), table_name: []const u8, database_name: []const u8, namespace_name: []const u8, body: types.CatalogTablespaceBindingRequest) !ApiResponse(std.json.Value) {
@@ -3821,6 +3971,30 @@ pub const Client = struct {
         defer self.allocator.free(url);
         var resp = try self.http.delete(url, .{ .headers = self.authHeaders(), .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .max_response_size = 16777216 });
         return ApiResponse(std.json.ArrayHashMap(std.json.Value)).fromResponse(self.allocator, &resp);
+    }
+
+    /// Receive and acknowledge committed SQL notifications
+    /// POST /db/v1/sql/connections/{connection_id}/notifications
+    pub fn pollSQLNotifications(self: *@This(), connection_id: []const u8, body: types.SQLNotificationPollRequest) !ApiResponse(types.SQLNotificationPage) {
+        const encoded_connection_id = try httpx.PercentEncoding.encode(self.allocator, connection_id);
+        defer self.allocator.free(encoded_connection_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/sql/connections/{s}/notifications", .{ self.base_url, encoded_connection_id });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders(), .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .max_response_size = 1048576 });
+        return ApiResponse(types.SQLNotificationPage).fromResponse(self.allocator, &resp);
+    }
+
+    /// Observe an exact retained SQL catalog operation
+    /// POST /db/v1/sql/operations/status
+    pub fn getSQLCatalogOperation(self: *@This(), body: types.SQLCatalogRecoveryRequest) !ApiResponse(types.SQLCatalogOperationReceipt) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/sql/operations/status", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders(), .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .max_response_size = 16777216 });
+        return ApiResponse(types.SQLCatalogOperationReceipt).fromResponse(self.allocator, &resp);
     }
 
     /// Create a durable prepared SQL resource
@@ -4711,6 +4885,23 @@ pub const Client = struct {
         return ApiResponse(types.GraphMetricActionResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Observe an exact index publication
+    /// GET /db/v1/tables/{tableName}/indexes/{indexName}/publication
+    pub fn getIndexPublication(self: *@This(), table_name: []const u8, index_name: []const u8, x_antfly_index_publication_token: []const u8) !ApiResponse(types.IndexPublicationStatus) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_index_name = try httpx.PercentEncoding.encode(self.allocator, index_name);
+        defer self.allocator.free(encoded_index_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/indexes/{s}/publication", .{ self.base_url, encoded_table_name, encoded_index_name });
+        defer self.allocator.free(url);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        try request_headers.append(self.allocator, .{ "X-Antfly-Index-Publication-Token", x_antfly_index_publication_token });
+        var resp = try self.http.get(url, .{ .headers = request_headers.items });
+        return ApiResponse(types.IndexPublicationStatus).fromResponse(self.allocator, &resp);
+    }
+
     /// Repair an index generation
     /// POST /db/v1/tables/{tableName}/indexes/{indexName}/repair
     pub fn repairIndex(self: *@This(), table_name: []const u8, index_name: []const u8, body: types.IndexMaintenanceRequest) !ApiResponse(types.IndexMaintenanceResponse) {
@@ -5464,6 +5655,45 @@ pub const Client = struct {
         return ApiResponse(PatchSchemaResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Observe an exact validation-only schema publication
+    /// GET /db/v1/tables/{tableName}/schema/publication
+    pub fn getSchemaValidationPublication(self: *@This(), table_name: []const u8, x_antfly_schema_validation_token: []const u8) !ApiResponse(types.SchemaValidationStatus) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/schema/publication", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        try request_headers.append(self.allocator, .{ "X-Antfly-Schema-Validation-Token", x_antfly_schema_validation_token });
+        var resp = try self.http.get(url, .{ .headers = request_headers.items });
+        return ApiResponse(types.SchemaValidationStatus).fromResponse(self.allocator, &resp);
+    }
+
+    /// Read managed-source configuration, progress, and destination capabilities
+    /// GET /db/v1/tables/{tableName}/sources/managed
+    pub fn getManagedSources(self: *@This(), table_name: []const u8) !ApiResponse(types.ManagedSourceStatus) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/sources/managed", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ManagedSourceStatus).fromResponse(self.allocator, &resp);
+    }
+
+    /// Replace managed-source configuration using the current table ID and source hash
+    /// POST /db/v1/tables/{tableName}/sources/managed
+    pub fn replaceManagedSources(self: *@This(), table_name: []const u8, body: types.ManagedSourceReplacement) !ApiResponse(types.ManagedSourceConfigured) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/sources/managed", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.ManagedSourceConfigured).fromResponse(self.allocator, &resp);
+    }
+
     /// Create or resume a table storage migration job
     /// POST /db/v1/tables/{tableName}/storage/migrations
     pub fn createTableStorageMigration(self: *@This(), table_name: []const u8, body: std.json.Value) !ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
@@ -5878,6 +6108,17 @@ pub const Client = struct {
         defer self.allocator.free(url);
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.PackageManifest).fromResponse(self.allocator, &resp);
+    }
+
+    /// Get the explicit global SQL package default.
+    /// GET /extensions/v1/packages/{name}/sql-control
+    pub fn getExtensionSqlPackageControl(self: *@This(), name: []const u8) !ApiResponse(types.SQLPackageDefaultControl) {
+        const encoded_name = try httpx.PercentEncoding.encode(self.allocator, name);
+        defer self.allocator.free(encoded_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/packages/{s}/sql-control", .{ self.base_url, encoded_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.SQLPackageDefaultControl).fromResponse(self.allocator, &resp);
     }
 
     /// Get a specific immutable package version.

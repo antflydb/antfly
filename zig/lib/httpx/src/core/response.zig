@@ -171,8 +171,8 @@ pub const Response = struct {
         return resp;
     }
 
-    /// Serializes the response to HTTP/1.1 wire format.
-    pub fn serialize(self: *const Self, writer: anytype) !void {
+    /// Serializes the status line and headers to HTTP/1 wire format.
+    pub fn serializeHead(self: *const Self, writer: anytype) !void {
         try writer.print("{s} {d} {s}\r\n", .{
             self.version.toString(),
             self.status.code,
@@ -181,7 +181,11 @@ pub const Response = struct {
 
         try self.headers.serialize(writer);
         try writer.writeAll("\r\n");
+    }
 
+    /// Serializes the response to HTTP/1 wire format.
+    pub fn serialize(self: *const Self, writer: anytype) !void {
+        try self.serializeHead(writer);
         if (self.body) |body| {
             try writer.writeAll(body);
         }

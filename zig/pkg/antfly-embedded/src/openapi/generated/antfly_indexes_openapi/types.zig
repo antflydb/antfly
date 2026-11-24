@@ -5542,8 +5542,10 @@ pub const EnrichmentRuntimeStatus = struct {
     }
 };
 
-/// Non-semantic execution policy for one producer or index maintenance operation. These fields tune how work is batched and do not change generated artifact identity.
+/// Non-semantic execution policy for one producer or index maintenance operation. Updates persist separately from the frozen publication catalog and affect future invocations without invalidating accepted artifacts. To retry incomplete extraction or regenerate accepted output, explicitly use the bounded reprocess APIs. Node/provider ceilings still apply.
 pub const ExecutionPolicy = struct {
+    /// Invocation output-token budget for reader/generator assets and document-extraction OCR pages. Overrides producer max_tokens at execution only; it does not change the stored recipe, source fingerprint, or completed outputs. A lower value does not retroactively reject accepted output. Omit to use the producer budget.
+    max_output_tokens_per_item: ?u32 = null,
     /// Maximum items to process in one batch for this operation.
     batch_items: ?i64 = null,
     /// Approximate maximum source bytes to process in one batch for this operation.
@@ -5553,6 +5555,7 @@ pub const ExecutionPolicy = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "max_output_tokens_per_item", "max_output_tokens_per_item", true },
         .{ "batch_items", "batch_items", true },
         .{ "batch_bytes", "batch_bytes", true },
         .{ "max_document_pages", "max_document_pages", true },
@@ -5568,6 +5571,10 @@ pub const ExecutionPolicy = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.max_output_tokens_per_item) |value| {
+            try jw.objectField("max_output_tokens_per_item");
+            try jw.write(value);
+        }
         if (self.batch_items) |value| {
             try jw.objectField("batch_items");
             try jw.write(value);
@@ -11066,6 +11073,80 @@ pub const IndexMutationConflictError = struct {
     retryable: bool,
 };
 
+pub const IndexPublicationFailure = enum {
+    duplicate_key,
+    invalid_candidate,
+    requested,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .duplicate_key => "duplicate_key",
+            .invalid_candidate => "invalid_candidate",
+            .requested => "requested",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "duplicate_key", .duplicate_key },
+            .{ "invalid_candidate", .invalid_candidate },
+            .{ "requested", .requested },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const IndexPublicationPhase = enum {
+    fencing,
+    reserving,
+    building,
+    installing,
+    releasing,
+    published,
+    canceling,
+    cancel_releasing,
+    canceled,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .fencing => "fencing",
+            .reserving => "reserving",
+            .building => "building",
+            .installing => "installing",
+            .releasing => "releasing",
+            .published => "published",
+            .canceling => "canceling",
+            .cancel_releasing => "cancel_releasing",
+            .canceled => "canceled",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "fencing", .fencing },
+            .{ "reserving", .reserving },
+            .{ "building", .building },
+            .{ "installing", .installing },
+            .{ "releasing", .releasing },
+            .{ "published", .published },
+            .{ "canceling", .canceling },
+            .{ "cancel_releasing", .cancel_releasing },
+            .{ "canceled", .canceled },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Publication behavior for a managed embeddings index. `progressive` makes a safely checkpointed active generation queryable before initial source coverage is complete. `atomic` keeps a new generation unavailable until complete validation and activation.
 pub const IndexPublicationPolicy = enum {
     progressive,
@@ -11091,6 +11172,140 @@ pub const IndexPublicationPolicy = enum {
         return map.get(s) orelse error.UnexpectedToken;
     }
 };
+
+pub const IndexPublicationState = enum {
+    admission_unknown,
+    pending,
+    published,
+    failed,
+    canceled,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .admission_unknown => "admission_unknown",
+            .pending => "pending",
+            .published => "published",
+            .failed => "failed",
+            .canceled => "canceled",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "admission_unknown", .admission_unknown },
+            .{ "pending", .pending },
+            .{ "published", .published },
+            .{ "failed", .failed },
+            .{ "canceled", .canceled },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const IndexPublicationStatusIndexType = enum {
+    relational,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .relational => "relational",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "relational", .relational },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Exact observation of an online relational-index publication job, not a query-readiness certificate. Published means this retained job completed; later schema/index changes may supersede its artifacts. An absent or unmirrored job is admission_unknown, never permission to replay DDL.
+pub const IndexPublicationStatus = struct {
+    index_type: IndexPublicationStatusIndexType,
+    index_name: []const u8,
+    publication_token: IndexPublicationToken,
+    table_id: []const u8,
+    publication_id: []const u8,
+    plan_digest: []const u8,
+    metadata_incarnation: []const u8,
+    state: IndexPublicationState,
+    phase: ?IndexPublicationPhase = null,
+    failure: ?IndexPublicationFailure = null,
+    replication_pending: bool,
+    owner_count: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "index_type", "index_type", false },
+        .{ "index_name", "index_name", false },
+        .{ "publication_token", "publication_token", false },
+        .{ "table_id", "table_id", false },
+        .{ "publication_id", "publication_id", false },
+        .{ "plan_digest", "plan_digest", false },
+        .{ "metadata_incarnation", "metadata_incarnation", false },
+        .{ "state", "state", false },
+        .{ "phase", "phase", true },
+        .{ "failure", "failure", true },
+        .{ "replication_pending", "replication_pending", false },
+        .{ "owner_count", "owner_count", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("index_type");
+        try jw.write(self.index_type);
+        try jw.objectField("index_name");
+        try jw.write(self.index_name);
+        try jw.objectField("publication_token");
+        try jw.write(self.publication_token);
+        try jw.objectField("table_id");
+        try jw.write(self.table_id);
+        try jw.objectField("publication_id");
+        try jw.write(self.publication_id);
+        try jw.objectField("plan_digest");
+        try jw.write(self.plan_digest);
+        try jw.objectField("metadata_incarnation");
+        try jw.write(self.metadata_incarnation);
+        try jw.objectField("state");
+        try jw.write(self.state);
+        if (self.phase) |value| {
+            try jw.objectField("phase");
+            try jw.write(value);
+        }
+        if (self.failure) |value| {
+            try jw.objectField("failure");
+            try jw.write(value);
+        }
+        try jw.objectField("replication_pending");
+        try jw.write(self.replication_pending);
+        if (self.owner_count) |value| {
+            try jw.objectField("owner_count");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Opaque versioned recovery handle binding a metadata incarnation, immutable table identity, publication ID and plan commitment. This is not authentication or permission to execute, cancel, adopt a root or replay DDL. Retain it before admission and use current table authorization when observing the publication.
+pub const IndexPublicationToken = []const u8;
 
 /// Stable machine-readable reason why an index is pending, partial, or failed.
 pub const IndexReadinessReason = enum {

@@ -239,6 +239,45 @@ pub fn sealReplicationSourcesJsonForPrincipalAlloc(
     return try out.toOwnedSlice(alloc);
 }
 
+/// Rotate a source's provider configuration under its existing destination
+/// authority. Siblings retain their own principals and signatures.
+pub fn resealReplicationSourceReplacementAlloc(
+    alloc: std.mem.Allocator,
+    before: []const u8,
+    after: []const u8,
+    ordinal: u32,
+    source_table: []const u8,
+    authorizer: ?Authorizer,
+) ![]u8 {
+    var prior = try std.json.parseFromSlice(std.json.Value, alloc, before, .{ .duplicate_field_behavior = .@"error" });
+    defer prior.deinit();
+    var next = try std.json.parseFromSlice(std.json.Value, alloc, after, .{ .duplicate_field_behavior = .@"error" });
+    defer next.deinit();
+    if (prior.value != .array or next.value != .array or ordinal >= prior.value.array.items.len or
+        prior.value.array.items.len != next.value.array.items.len) return error.InvalidStoredDestinationConfig;
+    const old_source = prior.value.array.items[ordinal];
+    const replacement = next.value.array.items[ordinal];
+    if (old_source != .object or replacement != .object) return error.InvalidStoredDestinationConfig;
+    var destinations: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer destinations.deinit(alloc);
+    try collectRouteDestinations(alloc, replacement, &destinations);
+    if (destinations.items.len == 0) return alloc.dupe(u8, after);
+    try authorizeReplicationSourceValue(alloc, old_source, source_table, authorizer);
+    const grant = try validateGrant(old_source.object, destinations.items);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(alloc);
+    try out.append(alloc, '[');
+    for (next.value.array.items, 0..) |item, index| {
+        if (index > 0) try out.append(alloc, ',');
+        if (index == ordinal)
+            try appendSealedObject(alloc, &out, replacement.object, source_table, destinations.items, grant.principal, authorizer)
+        else
+            try appendJsonValue(alloc, &out, item);
+    }
+    try out.append(alloc, ']');
+    return out.toOwnedSlice(alloc);
+}
+
 pub fn sealIndexesJsonForPrincipalAlloc(
     alloc: std.mem.Allocator,
     json: []const u8,
@@ -614,6 +653,24 @@ test "stored destination envelopes cannot be forged and validate on resume" {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, sealed, .{});
     defer parsed.deinit();
     try authorizeReplicationSourceValue(alloc, parsed.value.array.items[0], "source", disabled_authorizer);
+    const rotated = try resealReplicationSourceReplacementAlloc(
+        alloc,
+        sealed,
+        "[{\"type\":\"postgres\",\"slot_name\":\"rotated\",\"routes\":[{\"target_table\":\"protected\"}]}]",
+        0,
+        "source",
+        disabled_authorizer,
+    );
+    defer alloc.free(rotated);
+    try authorizeReplicationSourcesJson(alloc, rotated, "source", disabled_authorizer);
+    try std.testing.expectError(error.StoredDestinationAuthorizationInvalid, resealReplicationSourceReplacementAlloc(
+        alloc,
+        sealed,
+        "[{\"type\":\"postgres\",\"slot_name\":\"rotated\",\"routes\":[{\"target_table\":\"other\"}]}]",
+        0,
+        "source",
+        disabled_authorizer,
+    ));
     try std.testing.expectError(error.StoredDestinationAuthorizationMissing, blk: {
         var unsealed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
         defer unsealed.deinit();

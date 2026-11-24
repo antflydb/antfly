@@ -37,6 +37,19 @@ pub const Status = struct {
     pub const unsupported_index: c_int = 4;
     pub const unsupported_schema: c_int = 5;
     pub const unsupported_migration: c_int = 6;
+    pub const durability_outcome_unknown: c_int = 7;
+    pub const path_already_exists: c_int = 8;
+    pub const table_not_found: c_int = 9;
+    pub const writer_locked: c_int = 10;
+    pub const backup_input_limit_exceeded: c_int = 11;
+    pub const backup_expansion_limit_exceeded: c_int = 12;
+    pub const sync_mutation_limit_exceeded: c_int = 13;
+    pub const identity_namespace_mismatch: c_int = 14;
+    pub const unsupported_backup_migration_state: c_int = 15;
+    pub const unsupported_lite_inspection_layout: c_int = 16;
+    pub const source_file_changed: c_int = 17;
+    pub const file_not_found: c_int = 18;
+    pub const operation_unsupported: c_int = 19;
 };
 
 pub const Result = extern struct {
@@ -182,4 +195,88 @@ pub fn inspectInputJsonAlloc(allocator: std.mem.Allocator, input: []const u8, de
     const bytes = (ptr orelse return error.InvalidPreflightResponse)[0..len];
     defer antfly_backup_preflight_free(bytes.ptr, bytes.len);
     return allocator.dupe(u8, bytes);
+}
+
+pub const DataSyncContext = extern struct {
+    input_ptr: [*]const u8,
+    input_len: usize,
+    output_ptr: [*]const u8,
+    output_len: usize,
+    table_ptr: [*]const u8,
+    table_len: usize,
+    selection_is_literal: bool,
+    definition_ptr: [*]const u8,
+    definition_len: usize,
+    max_input_bytes: u64,
+    max_expanded_bytes: u64,
+    result_ptr: *?[*]u8,
+    result_len: *usize,
+};
+extern fn antfly_data_sync(context: *const DataSyncContext) callconv(.c) c_int;
+
+pub fn syncDataJsonAlloc(allocator: std.mem.Allocator, input: []const u8, output: []const u8, table: []const u8, selection_is_literal: bool, definition: []const u8, max_input_bytes: u64, max_expanded_bytes: u64) ![]u8 {
+    if (comptime use_direct_implementation) return @import("data_sync.zig").syncJsonAlloc(allocator, input, output, table, definition, .{ .max_input_bytes = max_input_bytes, .max_expanded_bytes = max_expanded_bytes, .selection_is_literal = selection_is_literal });
+    var ptr: ?[*]u8 = null;
+    var len: usize = 0;
+    const status = antfly_data_sync(&.{
+        .input_ptr = input.ptr,
+        .input_len = input.len,
+        .output_ptr = output.ptr,
+        .output_len = output.len,
+        .table_ptr = table.ptr,
+        .table_len = table.len,
+        .selection_is_literal = selection_is_literal,
+        .definition_ptr = definition.ptr,
+        .definition_len = definition.len,
+        .max_input_bytes = max_input_bytes,
+        .max_expanded_bytes = max_expanded_bytes,
+        .result_ptr = &ptr,
+        .result_len = &len,
+    });
+    try checkSyncStatus(status);
+    const bytes = (ptr orelse return error.SyncReceiptDeliveryFailed)[0..len];
+    defer antfly_backup_preflight_free(bytes.ptr, bytes.len);
+    return allocator.dupe(u8, bytes) catch return error.SyncReceiptDeliveryFailed;
+}
+
+/// Keep publication outcomes distinct across the storage/CLI codegen boundary.
+pub fn syncErrorStatus(err: anyerror) c_int {
+    return switch (err) {
+        error.OutOfMemory => Status.out_of_memory,
+        error.DurabilityOutcomeUnknown => Status.durability_outcome_unknown,
+        error.PathAlreadyExists => Status.path_already_exists,
+        error.TableNotFound => Status.table_not_found,
+        error.WriterLocked => Status.writer_locked,
+        error.BackupInputLimitExceeded => Status.backup_input_limit_exceeded,
+        error.BackupExpansionLimitExceeded => Status.backup_expansion_limit_exceeded,
+        error.SyncMutationLimitExceeded => Status.sync_mutation_limit_exceeded,
+        error.IdentityNamespaceMismatch => Status.identity_namespace_mismatch,
+        error.UnsupportedBackupMigrationState => Status.unsupported_backup_migration_state,
+        error.UnsupportedLiteInspectionLayout => Status.unsupported_lite_inspection_layout,
+        error.SourceFileChanged => Status.source_file_changed,
+        error.FileNotFound => Status.file_not_found,
+        error.OperationUnsupported => Status.operation_unsupported,
+        else => Status.failed,
+    };
+}
+
+pub fn checkSyncStatus(status: c_int) !void {
+    return switch (status) {
+        Status.ok => {},
+        Status.out_of_memory => error.OutOfMemory,
+        Status.durability_outcome_unknown => error.DurabilityOutcomeUnknown,
+        Status.path_already_exists => error.PathAlreadyExists,
+        Status.table_not_found => error.TableNotFound,
+        Status.writer_locked => error.WriterLocked,
+        Status.backup_input_limit_exceeded => error.BackupInputLimitExceeded,
+        Status.backup_expansion_limit_exceeded => error.BackupExpansionLimitExceeded,
+        Status.sync_mutation_limit_exceeded => error.SyncMutationLimitExceeded,
+        Status.identity_namespace_mismatch => error.IdentityNamespaceMismatch,
+        Status.unsupported_backup_migration_state => error.UnsupportedBackupMigrationState,
+        Status.unsupported_lite_inspection_layout => error.UnsupportedLiteInspectionLayout,
+        Status.source_file_changed => error.SourceFileChanged,
+        Status.file_not_found => error.FileNotFound,
+        Status.operation_unsupported => error.OperationUnsupported,
+        else => error.InvalidBackupRequest,
+    };
 }

@@ -34,6 +34,8 @@ pub const Options = struct {
 pub const Snapshot = struct {
     input: source.Source,
     references: std.atomic.Value(usize) = .init(1),
+    /// Keeps shared codec metadata alive for independently retained payloads.
+    description_owner: ?*Snapshot = null,
     /// Segment ownership may move its identity here before releasing its ref.
     owned_identity: ?[]u8 = null,
     identity_reservation: admission.Token = .{},
@@ -79,6 +81,7 @@ pub const Snapshot = struct {
         if (self.references.fetchSub(1, .acq_rel) != 1) return;
         std.debug.assert(self.input.retained_bytes == 0);
         const allocator = self.input.allocator;
+        if (self.description_owner) |owner| owner.deinit();
         allocator.free(self.backing orelse self.bytes);
         if (self.owned_identity) |identity| allocator.free(identity);
         self.identity_reservation.deinit();

@@ -46,6 +46,12 @@ pub fn assignmentAllowed(source: Kind, target: Kind) bool {
         ((integral(source) or floating(source) or source == .numeric) and (integral(target) or floating(target) or target == .numeric));
 }
 
+/// Coarse bind admission for the numeric family. Builtin-specific rounding,
+/// narrowing and range validation remain in the shared execution cast kernel.
+pub fn numericAssignmentAllowed(source: ?@import("ast.zig").ColumnType, target: @import("ast.zig").ColumnType) bool {
+    return (source == .integer or source == .number) and (target == .integer or target == .number);
+}
+
 pub fn checkedInteger(value: i64, target: Kind) !i64 {
     if (target == .int16 and std.math.cast(i16, value) == null) return error.SqlNumericOutOfRange;
     if (target == .int32 and std.math.cast(i32, value) == null) return error.SqlNumericOutOfRange;

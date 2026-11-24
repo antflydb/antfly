@@ -22,5 +22,5 @@ pub const local_test_sources = if (@import("builtin").is_test) @import("local_te
 
 test {
     _ = @import("api/http_server.zig");
-    _ = @import("api/sql_pgwire.zig");
+    _ = @import("api/sql/transport/pgwire.zig");
 }

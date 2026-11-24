@@ -564,7 +564,35 @@ pub fn readRegionInto(allocator: std.mem.Allocator, path: []const u8, offset: u6
     try readRegionFromFd(fd, buf, offset);
 }
 
-fn readRegionFromFd(fd: std.posix.fd_t, buf: []u8, offset: u64) !void {
+/// Compare open filesystem objects, including the device so that unrelated
+/// files with the same inode number on different mounts stay distinct.
+pub fn sameOpenFile(a: std.posix.fd_t, b: std.posix.fd_t) !bool {
+    if (a == b) return true;
+    if (comptime builtin.os.tag == .linux) {
+        const first = try statOpenFileLinux(a, .{ .INO = true });
+        const second = try statOpenFileLinux(b, .{ .INO = true });
+        if (!first.mask.INO or !second.mask.INO) return error.StatFailed;
+        return first.ino == second.ino and first.dev_major == second.dev_major and first.dev_minor == second.dev_minor;
+    }
+    if (comptime !builtin.link_libc) {
+        var first: [std.fs.max_path_bytes]u8 = undefined;
+        var second: [std.fs.max_path_bytes]u8 = undefined;
+        const af: std.Io.File = .{ .handle = a, .flags = .{ .nonblocking = false } };
+        const bf: std.Io.File = .{ .handle = b, .flags = .{ .nonblocking = false } };
+        const io = std.Options.debug_io;
+        return std.mem.eql(u8, first[0..try af.realPath(io, &first)], second[0..try bf.realPath(io, &second)]);
+    }
+    var first: c.struct_stat = undefined;
+    var second: c.struct_stat = undefined;
+    if (c.fstat(a, &first) != 0 or c.fstat(b, &second) != 0) return error.StatFailed;
+    if (comptime @hasField(c.struct_stat, "st_dev")) {
+        return first.st_dev == second.st_dev and first.st_ino == second.st_ino;
+    } else {
+        return first.dev == second.dev and first.ino == second.ino;
+    }
+}
+
+pub fn readRegionFromFd(fd: std.posix.fd_t, buf: []u8, offset: u64) !void {
     var total: usize = 0;
     while (total < buf.len) {
         const read_off = try std.math.add(u64, offset, total);
@@ -749,20 +777,23 @@ pub fn renameNoReplace(allocator: std.mem.Allocator, old_path: []const u8, new_p
     }
 }
 
-fn fileSizeFromFd(fd: std.posix.fd_t) !usize {
-    if (builtin.os.tag == .linux) {
-        const linux = std.os.linux;
-        while (true) {
-            var statx = std.mem.zeroes(linux.Statx);
-            switch (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &statx))) {
-                .SUCCESS => {
-                    if (!statx.mask.SIZE) return error.StatFailed;
-                    return @intCast(statx.size);
-                },
-                .INTR => continue,
-                else => return error.StatFailed,
-            }
+fn statOpenFileLinux(fd: std.posix.fd_t, mask: std.os.linux.STATX) error{StatFailed}!std.os.linux.Statx {
+    const linux = std.os.linux;
+    while (true) {
+        var stat = std.mem.zeroes(linux.Statx);
+        switch (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, mask, &stat))) {
+            .SUCCESS => return stat,
+            .INTR => continue,
+            else => return error.StatFailed,
         }
+    }
+}
+
+fn fileSizeFromFd(fd: std.posix.fd_t) !usize {
+    if (comptime builtin.os.tag == .linux) {
+        const stat = try statOpenFileLinux(fd, .{ .SIZE = true });
+        if (!stat.mask.SIZE) return error.StatFailed;
+        return @intCast(stat.size);
     } else if (comptime builtin.link_libc) {
         var stat_buf: c.struct_stat = undefined;
         if (c.fstat(fd, &stat_buf) != 0) return error.StatFailed;
@@ -896,6 +927,24 @@ test "readFile preserves non-missing open failures" {
     defer allocator.free(path);
 
     try std.testing.expectError(error.NotDir, readFile(allocator, path));
+}
+
+test "sameOpenFile compares independent descriptors by device and inode" {
+    if (comptime builtin.os.tag != .linux and !builtin.link_libc) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "first", .data = "same bytes" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "second", .data = "same bytes" });
+    try tmp.dir.hardLink("first", tmp.dir, "alias", io, .{});
+    const first = try tmp.dir.openFile(io, "first", .{});
+    defer first.close(io);
+    const alias = try tmp.dir.openFile(io, "alias", .{});
+    defer alias.close(io);
+    const second = try tmp.dir.openFile(io, "second", .{});
+    defer second.close(io);
+    try std.testing.expect(try sameOpenFile(first.handle, alias.handle));
+    try std.testing.expect(!try sameOpenFile(first.handle, second.handle));
 }
 
 test "MmapRegion advice preserves readable mapped data" {

@@ -944,6 +944,12 @@ def main():
         "process, each with its own connection, which shares in-process group "
         "commit. 'both' measures each as a separate case.",
     )
+    parser.add_argument(
+        "--indexed",
+        choices=["both", "yes", "no"],
+        default="both",
+        help="Measure with a full-text index ('yes'), without ('no'), or both.",
+    )
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--source-commit", default="unspecified")
     args = parser.parse_args()
@@ -1016,7 +1022,9 @@ def main():
 
     save()
     try:
-        for indexed in (False, True):
+        for indexed in {"both": (False, True), "yes": (True,), "no": (False,)}[
+            args.indexed
+        ]:
             for workers in args.workers:
                 for ordinal in range(args.rounds):
                     engines = (

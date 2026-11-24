@@ -16,6 +16,7 @@
 """Physical-work regressions through the real public embedded boundary."""
 
 import json
+from collections.abc import Callable
 from contextlib import closing
 from math import comb
 
@@ -87,7 +88,9 @@ def populate(db, count):
     db.run_until_idle()
 
 
-def write_indexed_scores(db, count, *, key=lambda i: f"n{i}", id_for=None, score=int, timestamp=1):
+def write_indexed_scores(
+    db, count, *, key=lambda i: f"n{i}", id_for=None, score: Callable[[int], int | None] = int, timestamp=1
+):
     # Publish each fixture state in one typed batch and fully advance its
     # indexes before measuring query work.
     if id_for is None:

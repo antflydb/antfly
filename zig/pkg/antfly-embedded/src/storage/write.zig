@@ -377,6 +377,7 @@ pub fn corruptEmbeddingArtifactInDb(
 }
 
 pub const ManagedDbOpenOptions = struct {
+    online_source_authority: ?@import("source_authority.zig").Kind = null,
     /// Private restore installs its historical read schema before physical
     /// projections. The ordinary empty producer config must not drop persisted
     /// projections on reopen; exact reservation reconciliation follows open.
@@ -746,6 +747,9 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
             namespace: ?doc_identity.Namespace,
             open_options: ManagedDbOpenOptions,
         ) !db_mod.DB {
+            var unclaimed_enrichment = enrichment_cfg;
+            defer if (unclaimed_enrichment) |*config|
+                db_mod.enrichment_runtime.releaseConfigProviders(allocator, config);
             const schema_before_index_load = try prepareManagedSchemaBeforeIndexLoad(allocator, open_mode, open_options.schema_json_before_index_load);
             defer if (schema_before_index_load) |schema| storage_schema.freeSchema(allocator, schema.runtime_schema);
 
@@ -766,6 +770,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                     resolved.identity_namespace = namespace;
                     resolved.prefer_existing_identity_namespace = namespace != null;
                     resolved.enrichment = enrichment_cfg;
+                    resolved.online_source_authority = open_options.online_source_authority orelse resolved.online_source_authority;
                     resolved.replication_write_gate = open_options.replication_write_gate;
                     resolved.replication_async_effect_mirror = null;
                     resolved.replication_async_batch_mirror = null;
@@ -795,6 +800,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                     .identity_namespace = namespace,
                     .prefer_existing_identity_namespace = namespace != null,
                     .enrichment = enrichment_cfg,
+                    .online_source_authority = open_options.online_source_authority,
                     .replication_write_gate = open_options.replication_write_gate,
                     .replication_async_effect_mirror = open_options.replication_async_effect_mirror,
                     .replication_async_batch_mirror = open_options.replication_async_batch_mirror,
@@ -818,6 +824,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                             .remote_content = remote,
                             .identity_namespace = namespace,
                             .prefer_existing_identity_namespace = namespace != null,
+                            .online_source_authority = open_options.online_source_authority,
                             .replication_write_gate = open_options.replication_write_gate,
                             .replication_async_effect_mirror = open_options.replication_async_effect_mirror,
                             .replication_async_batch_mirror = open_options.replication_async_batch_mirror,
@@ -839,6 +846,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                             .identity_namespace = namespace,
                             .prefer_existing_identity_namespace = namespace != null,
                             .enrichment = enrichment_cfg,
+                            .online_source_authority = open_options.online_source_authority,
                             .replication_write_gate = open_options.replication_write_gate,
                             .replication_async_effect_mirror = open_options.replication_async_effect_mirror,
                             .replication_async_batch_mirror = open_options.replication_async_batch_mirror,
@@ -865,6 +873,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                             .remote_content = remote,
                             .identity_namespace = namespace,
                             .prefer_existing_identity_namespace = namespace != null,
+                            .online_source_authority = open_options.online_source_authority,
                             .replication_write_gate = open_options.replication_write_gate,
                             .replication_async_effect_mirror = open_options.replication_async_effect_mirror,
                             .replication_async_batch_mirror = open_options.replication_async_batch_mirror,
@@ -886,6 +895,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .remote_content = remote,
                         .identity_namespace = namespace,
                         .prefer_existing_identity_namespace = namespace != null,
+                        .online_source_authority = open_options.online_source_authority,
                         .replication_write_gate = open_options.replication_write_gate,
                         .schema_before_index_load = schema_before_index_load,
                         .start_resolver_workers = !open_options.defer_resolver_workers,
@@ -930,6 +940,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                             .identity_namespace = namespace,
                             .prefer_existing_identity_namespace = namespace != null,
                             .enrichment = enrichment_cfg,
+                            .online_source_authority = open_options.online_source_authority,
                             .replication_write_gate = open_options.replication_write_gate,
                             .schema_before_index_load = schema_before_index_load,
                             .start_resolver_workers = !open_options.defer_resolver_workers,
@@ -953,6 +964,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                             .remote_content = remote,
                             .identity_namespace = namespace,
                             .prefer_existing_identity_namespace = namespace != null,
+                            .online_source_authority = open_options.online_source_authority,
                             .replication_write_gate = open_options.replication_write_gate,
                             .schema_before_index_load = schema_before_index_load,
                             .start_resolver_workers = !open_options.defer_resolver_workers,
@@ -977,6 +989,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                             .identity_namespace = namespace,
                             .prefer_existing_identity_namespace = namespace != null,
                             .enrichment = enrichment_cfg,
+                            .online_source_authority = open_options.online_source_authority,
                             .replication_write_gate = open_options.replication_write_gate,
                             .open_mode = .query_readonly,
                             .start_index_workers = false,
@@ -996,6 +1009,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                             .remote_content = remote,
                             .identity_namespace = namespace,
                             .prefer_existing_identity_namespace = namespace != null,
+                            .online_source_authority = open_options.online_source_authority,
                             .replication_write_gate = open_options.replication_write_gate,
                             .open_mode = .query_readonly,
                             .start_index_workers = false,
@@ -1016,6 +1030,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                             .identity_namespace = namespace,
                             .prefer_existing_identity_namespace = namespace != null,
                             .enrichment = enrichment_cfg,
+                            .online_source_authority = open_options.online_source_authority,
                             .replication_write_gate = open_options.replication_write_gate,
                             .open_mode = .status_only,
                             .start_index_workers = false,
@@ -1035,6 +1050,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                             .remote_content = remote,
                             .identity_namespace = namespace,
                             .prefer_existing_identity_namespace = namespace != null,
+                            .online_source_authority = open_options.online_source_authority,
                             .replication_write_gate = open_options.replication_write_gate,
                             .open_mode = .status_only,
                             .start_index_workers = false,
@@ -1044,6 +1060,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         },
                 };
             };
+            unclaimed_enrichment = null;
             return try db_mod.DB.open(allocator, db_path, resolved_options);
         }
     }.run;
@@ -1484,7 +1501,7 @@ pub fn backupStorageKernelOwnerDb(
     return backupStorageKernelOwnerDbWithControl(alloc, db, db_path, group_id, backup_root, backup_id, format, null, null, .{ .deadline_ns = std.math.maxInt(u64) });
 }
 
-pub fn backupStorageKernelOwnerDbWithControl(alloc: std.mem.Allocator, db: *db_mod.DB, db_path: []const u8, group_id: u64, backup_root: []const u8, backup_id: []const u8, format: backups_api.BackupFormat, cohort: ?@import("db/relational_integrity_topology_contract.zig").Fence, sealed: ?@import("db/native_backup_seal_contract.zig").Handle, control: backups_api.BackupOperationControl) ![]backups_api.ShardSnapshot {
+pub fn backupStorageKernelOwnerDbWithControl(alloc: std.mem.Allocator, db: *db_mod.DB, db_path: []const u8, group_id: u64, backup_root: []const u8, backup_id: []const u8, format: backups_api.BackupFormat, cohort: ?@import("db/relational/integrity/topology_contract.zig").Fence, sealed: ?@import("db/native_backup_seal_contract.zig").Handle, control: backups_api.BackupOperationControl) ![]backups_api.ShardSnapshot {
     if (comptime storage_engine.enabled) return storage_engine.call("writeBackupStorageKernelOwnerDbWithControl", .{ alloc, db, db_path, group_id, backup_root, backup_id, format, cohort, sealed, control });
     try control.ensureActive();
     if (cohort) |fence| {
@@ -1628,6 +1645,13 @@ pub fn validateTableBatchAgainstLocalSchema(
     // CPU and allocation cost without improving error timing: both paths are
     // synchronous and return InvalidBatchRequest before any durable mutation.
     if (db.usesRelationalStorage()) return;
+    {
+        var view = db.core.acquireSchemaView();
+        defer if (view) |*pinned| pinned.release();
+        // The pinned native document pipeline now validates ordinary schemas
+        // as well as generated expressions, after final transform coalescing.
+        if (view) |pinned| if (pinned.validator() != null) return;
+    }
     const schema_json = (try loadLocalTableSchemaJson(alloc, db)) orelse return;
     defer alloc.free(schema_json);
     if (schema_json.len == 0) return;
@@ -1756,6 +1780,21 @@ pub fn configureStorageKernelOwnerDbAtOpen(
     historical_ordered_apply: u8,
 ) !bool {
     if (comptime storage_engine.enabled) return storage_engine.call("writeConfigureStorageKernelOwnerDbAtOpen", .{ alloc, db, table_name, schema_json, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content, inference, installed, historical_ordered_apply });
+    const schema_policy = try db.schemaOwnerCatalogPolicy(schema_json, historical_ordered_apply != 0);
+    if (schema_policy != .unprotected) {
+        if (schema_policy == .deferred) return true;
+        const durable = (try loadOwnerCatalogContract(alloc, db)) orelse return true;
+        defer alloc.free(durable);
+        if (!std.mem.eql(u8, durable, indexes_json)) return true;
+        // Restore only the already durable query/producer runtime. No schema,
+        // index reconciliation or desired-contract write is admitted here.
+        if (backend_runtime != null and (if (installed) |state| !state.matches(durable) else true)) {
+            try reconfigureManagedDbEnrichmentRuntimePaused(alloc, db, durable, backend_runtime, antfly_provider, null, inference.api_url, inference.api_key, table_name, secret_store, remote_content);
+            try db.resumeEnrichmentRuntimeAfterReconfigure("protected schema owner reopen", "*");
+        }
+        if (installed) |state| state.publish(durable);
+        return false;
+    }
     if (historical_ordered_apply != 0) {
         if (historical_ordered_apply == 2) try metadata_table_provisioner.ensureGraphReplayIndexes(alloc, db, indexes_json);
         const stored = try loadOwnerCatalogContract(alloc, db);
@@ -1848,11 +1887,11 @@ test "fenced owner reopen defers index deletion until exact cancellation" {
     try db.setSchemaJson(alloc, schema_json);
     try std.testing.expect(!(try configureStorageKernelOwnerDbAtOpen(alloc, &db, "rows", schema_json, old_indexes, null, null, null, null, .{}, null, 0)));
     try std.testing.expect(db.hasIndex("old"));
-    const catalog = try db.core.store.get(alloc, @import("db/relational_integrity_catalog.zig").key);
+    const catalog = try db.core.store.get(alloc, @import("db/relational/integrity/catalog.zig").key);
     defer alloc.free(catalog);
     var catalog_digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(catalog, &catalog_digest, .{});
-    const fence: @import("db/relational_integrity_topology.zig").Fence = .{
+    const fence: @import("db/relational/integrity/topology.zig").Fence = .{
         .transition_id = 1,
         .attempt = 1,
         .peer_group_id = 19,
@@ -1868,7 +1907,7 @@ test "fenced owner reopen defers index deletion until exact cancellation" {
     defer alloc.free(pinned_contract);
     try std.testing.expectEqualStrings(old_indexes, pinned_contract);
     try std.testing.expectEqual(contract.StorageKernelReconcileState.busy, (try reconcileStorageKernelOwnerDb(alloc, &db, "rows", schema_json, "{}", null, false, null, null, .{}, null)).state);
-    const transition: @import("db/relational_integrity_generation_admission.zig").Transition = .{
+    const transition: @import("db/relational/integrity/generation_admission.zig").Transition = .{
         .child_table_id = 17,
         .child_table_name = "rows",
         .constraint_name = "fk",
@@ -1987,6 +2026,10 @@ pub fn reconcileStorageKernelOwnerDb(
     installed: ?*OwnerManagedConfig,
 ) !StorageKernelReconcileResult {
     if (comptime storage_engine.enabled) return storage_engine.call("writeReconcileStorageKernelOwnerDb", .{ alloc, db, table_name, schema_json, indexes_json, target_index_name, advance_index_repair, backend_runtime, antfly_provider, inference, installed });
+    // A scheduler hint cannot repair or mutate this protected catalog, even
+    // if the visible descriptor happens to equal the newly installed schema.
+    if (try db.schemaOwnerCatalogPolicy("", true) != .unprotected)
+        return .{ .state = .busy };
     if (schema_json.len > 0 and try db.childGenerationSourcePinsSchemaJson(schema_json))
         return .{ .state = .busy };
     if (try db.childGenerationSourceDefersOwnerCatalog())

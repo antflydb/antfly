@@ -21,7 +21,7 @@ const context = @import("context.zig");
 const driver = @import("driver.zig");
 const buffer = @import("buffer.zig");
 const memory = @import("../../runtime/tier/memory.zig");
-const plan_mod = @import("execution_arena.zig");
+const plan_mod = @import("../../execution/stream_workspace.zig");
 const quota_mod = @import("cache_quota.zig");
 const funding_mod = @import("prepared_cache.zig");
 const retirement = @import("../../execution/resource_retirement.zig");
@@ -396,18 +396,23 @@ pub const Module = struct {
         @memcpy(self.next_positions[0..host_positions.len], host_positions);
         self.phase = .warm;
     }
+    pub fn arenaLayout(self: *const Module) !plan_mod.Layout {
+        const plan = self.plan orelse return error.InvalidState;
+        const layout = try plan.layout(0);
+        if (layout.output != null) return error.InvalidExecutionPlan;
+        return layout;
+    }
+
     pub fn reserveArena(self: *Module, ctx: *context.CudaContext) !void {
         if (self.arena.ptr != 0) return;
-        const plan = self.plan orelse return error.InvalidState;
-        if (!plan.valid or plan.peak == 0 or plan.peak > plan_mod.limit)
-            return error.InvalidExecutionPlan;
+        const layout = try self.arenaLayout();
         var lease: ?memory.AdmissionLease = null;
         if (ctx.video_cache_budget.admission) |policy|
             lease = try policy.controller.tryAcquire(.gpu, policy.limits, .{
-                .backend_scratch_bytes = plan.peak,
+                .backend_scratch_bytes = layout.bytes,
             }, policy.check_live_memory);
         errdefer if (lease) |*value| value.release();
-        self.arena = try buffer.DeviceBuffer.alloc(ctx, plan.peak);
+        self.arena = try buffer.DeviceBuffer.alloc(ctx, layout.bytes);
         self.arena_quota = quota_mod.Quota.fromRawAdmission(lease);
     }
     pub fn resetPrepared(self: *Module, ctx: *context.CudaContext, phase: *GraphPhase) !void {
@@ -444,12 +449,12 @@ pub const Module = struct {
     }
     pub fn reserveArenaPrepared(self: *Module, ctx: *context.CudaContext, phase: *GraphPhase) !void {
         if (self.arena.ptr != 0) return;
-        const plan = self.plan orelse return error.InvalidState;
-        if (!phase.bound or phase.mode != .arena or !plan.valid or plan.peak == 0 or plan.peak > plan_mod.limit or plan.peak != phase.old.peak or plan.event_count != phase.old.events) return error.InvalidPreparedCacheState;
-        const request = funding_mod.Request{ .captured_arena = .{ .epoch = phase.descriptor.epoch, .key_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(phase.descriptor.key)), .bytes = plan.peak, .events = plan.event_count } };
+        const layout = try self.arenaLayout();
+        if (!phase.bound or phase.mode != .arena or layout.bytes != phase.old.peak or layout.events != phase.old.events) return error.InvalidPreparedCacheState;
+        const request = funding_mod.Request{ .captured_arena = .{ .epoch = phase.descriptor.epoch, .key_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(phase.descriptor.key)), .bytes = layout.bytes, .events = layout.events } };
         var lease = try phase.cold.?.funding.?.take(request, request.captured_arena.amounts());
         errdefer lease.releaseAfterSdkDeath();
-        const arena = try buffer.DeviceBuffer.alloc(ctx, plan.peak);
+        const arena = try buffer.DeviceBuffer.alloc(ctx, layout.bytes);
         self.arena = arena;
         self.arena_quota = lease.publishQuota();
     }

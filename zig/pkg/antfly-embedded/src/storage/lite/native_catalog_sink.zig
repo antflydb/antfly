@@ -61,7 +61,7 @@ pub fn durableKeyAlloc(allocator: Allocator, scope: []const u8, namespace: ?[]co
     });
 }
 
-fn scopePrefixAlloc(allocator: Allocator, scope: []const u8) ![]u8 {
+pub fn scopePrefixAlloc(allocator: Allocator, scope: []const u8) ![]u8 {
     return try std.mem.concat(allocator, u8, &.{ reserved_prefix, scope, &.{0} });
 }
 
@@ -79,12 +79,85 @@ fn decodeAlloc(allocator: Allocator, scope: []const u8, full_key: []const u8, va
     const sep = std.mem.indexOfScalar(u8, remainder, 0) orelse return error.InvalidNativeCatalogKey;
     const ns = remainder[0..sep];
     const key = remainder[sep + 1 ..];
+    const owned_ns = if (ns.len == 0) null else try allocator.dupe(u8, ns);
+    errdefer if (owned_ns) |n| allocator.free(n);
+    const owned_key = try allocator.dupe(u8, key);
+    errdefer allocator.free(owned_key);
     return .{
-        .namespace = if (ns.len == 0) null else try allocator.dupe(u8, ns),
-        .key = try allocator.dupe(u8, key),
+        .namespace = owned_ns,
+        .key = owned_key,
         .value = try allocator.dupe(u8, value),
     };
 }
+
+/// Applies one commit's mutations to `file`, inside its open transaction.
+/// A `Resolver` runs here, under writer authority, reading `scope` at this
+/// point of the transaction (earlier group members and other processes'
+/// commits included); its decisions apply in its place.
+fn applyMutations(allocator: Allocator, file: *native.NativeFile, scope: []const u8, mutations: []const native_catalog_backend.Mutation) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var batch = try std.ArrayListUnmanaged(native.CatalogMutation).initCapacity(a, mutations.len);
+    for (mutations) |m| {
+        if (native_catalog_backend.isResolution(m.namespace)) {
+            try file.putIndexCatalogBatch(batch.items);
+            batch.clearRetainingCapacity();
+            const resolver = try native_catalog_backend.resolverOf(m);
+            var reader: TipReader = .{ .file = file, .scope = scope };
+            try resolver.run(.{ .ptr = &reader, .getFn = TipReader.get });
+            for (resolver.outputs.items) |out| try batch.append(a, .{
+                .key = try durableKeyAlloc(a, scope, out.namespace, out.key),
+                .value = out.value,
+                .is_delete = out.is_delete,
+            });
+            continue;
+        }
+        try batch.append(a, .{
+            .key = try durableKeyAlloc(a, scope, m.namespace, m.key),
+            .value = m.value,
+            .is_delete = m.is_delete,
+        });
+    }
+    // One call: every mutation this transaction accumulated lands in the
+    // same native commit (one `syncData`/checkpoint publication) as
+    // whatever else `submitIndexMutation`'s group-commit queue already
+    // batched with it.
+    try file.putIndexCatalogBatch(batch.items);
+}
+
+/// Runs `resolver` against `scope` at this point of `file`'s open
+/// transaction and applies its decisions (a primary write's inline
+/// publication, decided in its group apply rather than in its own thread).
+pub fn applyResolver(allocator: Allocator, file: *native.NativeFile, scope: []const u8, resolver: *native_catalog_backend.Resolver) !void {
+    var reader: TipReader = .{ .file = file, .scope = scope };
+    try resolver.run(.{ .ptr = &reader, .getFn = TipReader.get });
+    if (resolver.outputs.items.len == 0) return;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const batch = try a.alloc(native.CatalogMutation, resolver.outputs.items.len);
+    for (resolver.outputs.items, batch) |out, *m| m.* = .{
+        .key = try durableKeyAlloc(a, scope, out.namespace, out.key),
+        .value = out.value,
+        .is_delete = out.is_delete,
+    };
+    try file.putIndexCatalogBatch(batch);
+}
+
+/// `native_catalog_backend.TipReader` over the open transaction.
+const TipReader = struct {
+    file: *native.NativeFile,
+    scope: []const u8,
+
+    fn get(ptr: *anyopaque, allocator: Allocator, namespace: ?[]const u8, key: []const u8) anyerror!?[]u8 {
+        const self: *TipReader = @ptrCast(@alignCast(ptr));
+        const durable_key = try durableKeyAlloc(allocator, self.scope, namespace, key);
+        defer allocator.free(durable_key);
+        return try self.file.getIndexCatalogRecordAlloc(allocator, durable_key);
+    }
+};
 
 const ApplyCtx = struct {
     scope: []const u8,
@@ -93,23 +166,7 @@ const ApplyCtx = struct {
 
     fn apply(ptr: *anyopaque, file: *native.NativeFile) anyerror!void {
         const self: *ApplyCtx = @ptrCast(@alignCast(ptr));
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const a = arena.allocator();
-
-        const batch = try a.alloc(native.CatalogMutation, self.mutations.len);
-        for (self.mutations, batch) |m, *out| {
-            out.* = .{
-                .key = try durableKeyAlloc(a, self.scope, m.namespace, m.key),
-                .value = m.value,
-                .is_delete = m.is_delete,
-            };
-        }
-        // One call: every mutation this transaction accumulated lands in the
-        // same native commit (one `syncData`/checkpoint publication) as
-        // whatever else `submitIndexMutation`'s group-commit queue already
-        // batched with it.
-        try file.putIndexCatalogBatch(batch);
+        try applyMutations(self.allocator, file, self.scope, self.mutations);
     }
 };
 
@@ -165,19 +222,10 @@ const DeferredApplyCtx = struct {
 
     fn apply(ptr: *anyopaque, file: *native.NativeFile) anyerror!void {
         const self: *DeferredApplyCtx = @ptrCast(@alignCast(ptr));
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const a = arena.allocator();
-
-        const batch = try a.alloc(native.CatalogMutation, self.mutations.len);
-        for (self.mutations, batch) |m, *out| {
-            out.* = .{
-                .key = try durableKeyAlloc(a, self.scope, m.namespace, m.key),
-                .value = m.value,
-                .is_delete = m.is_delete,
-            };
-        }
-        try file.putIndexCatalogBatch(batch);
+        // A resolving commit is never deferred (its resolver dies with the
+        // caller's frame).
+        for (self.mutations) |m| if (native_catalog_backend.isResolution(m.namespace)) return error.InvalidResolver;
+        try applyMutations(self.allocator, file, self.scope, self.mutations);
     }
 
     /// `native_catalog_backend.Pending.waitFn`: waits for this ride-along
@@ -203,7 +251,14 @@ pub const Sink = struct {
         return .{
             .ptr = self,
             .submit = submit,
+            .submitTogether = submitTogether,
             .loadAllAlloc = loadAllAlloc,
+            .loadOneAlloc = loadOneAlloc,
+            .loadMany = loadMany,
+            .loadTipAlloc = loadTipAlloc,
+            .resolves = true,
+            .loadKeysAlloc = loadKeysAlloc,
+            .deleteScope = deleteScope,
             .submitDeferred = submitDeferred,
             .pauseMaintenance = pauseMaintenance,
             .resumeMaintenance = resumeMaintenance,
@@ -220,6 +275,24 @@ pub const Sink = struct {
     fn resumeMaintenance(ptr: *anyopaque) void {
         const self: *Sink = @ptrCast(@alignCast(ptr));
         self.store.endMultiCommitSequence();
+    }
+
+    fn submitTogether(ptr: *anyopaque, batches: *const [2]native_catalog_backend.ScopedMutations) anyerror!void {
+        const self: *Sink = @ptrCast(@alignCast(ptr));
+        const Context = struct {
+            allocator: Allocator,
+            batches: *const [2]native_catalog_backend.ScopedMutations,
+
+            fn apply(raw: *anyopaque, file: *native.NativeFile) anyerror!void {
+                const context: *@This() = @ptrCast(@alignCast(raw));
+                for (context.batches) |batch| {
+                    try applyMutations(context.allocator, file, batch.scope, batch.mutations);
+                }
+            }
+        };
+        const scopes = [_][]const u8{ batches[0].scope, batches[1].scope };
+        var context: Context = .{ .allocator = self.allocator, .batches = batches };
+        try self.store.submitIndexMutationForScopes(&scopes, &context, Context.apply);
     }
 
     fn submit(ptr: *anyopaque, scope: []const u8, mutations: []const native_catalog_backend.Mutation, durable: bool) anyerror!void {
@@ -284,16 +357,52 @@ pub const Sink = struct {
 
     fn completedWait(_: *anyopaque) anyerror!void {}
 
+    fn deleteScope(ptr: *anyopaque, scope: []const u8) anyerror!void {
+        const self: *Sink = @ptrCast(@alignCast(ptr));
+        const prefix = try scopePrefixAlloc(self.allocator, scope);
+        defer self.allocator.free(prefix);
+        const Request = struct {
+            prefix: []const u8,
+            fn run(context: *anyopaque, file: *native.NativeFile) !void {
+                const request: *@This() = @ptrCast(@alignCast(context));
+                try file.deleteIndexCatalogPrefix(request.prefix, null);
+            }
+        };
+        var request = Request{ .prefix = prefix };
+        try self.store.submitIndexScopeDeletion(scope, prefix, &request, Request.run);
+    }
+
     fn loadAllAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]native_catalog_backend.Entry {
+        return loadEntriesAlloc(ptr, allocator, scope, false);
+    }
+
+    fn loadKeysAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]native_catalog_backend.Entry {
+        return loadEntriesAlloc(ptr, allocator, scope, true);
+    }
+
+    fn loadEntriesAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8, comptime keys_only: bool) ![]native_catalog_backend.Entry {
         const self: *Sink = @ptrCast(@alignCast(ptr));
         // Unconditional: a maintenance snapshot's DB loads its indexes during
         // open, before the snapshot is given its write target.
         self.store.noteLoadedIndexScope(scope);
+        // The doc map is read through `loadOneAlloc` only; never mirrored.
+        return try self.loadScopeAlloc(allocator, scope, .mirrored, keys_only);
+    }
+
+    fn loadTipAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]native_catalog_backend.Entry {
+        const self: *Sink = @ptrCast(@alignCast(ptr));
+        return try self.loadScopeAlloc(allocator, scope, .tip, true);
+    }
+
+    fn loadScopeAlloc(self: *Sink, allocator: Allocator, scope: []const u8, which: enum { mirrored, tip }, comptime keys_only: bool) ![]native_catalog_backend.Entry {
         var txn = try self.store.beginRead();
         defer txn.abort();
         const file = try txn.readFile();
 
-        const prefix = try scopePrefixAlloc(allocator, scope);
+        const prefix = switch (which) {
+            .mirrored => try scopePrefixAlloc(allocator, scope),
+            .tip => try durableKeyAlloc(allocator, scope, native_catalog_backend.tip_namespace, ""),
+        };
         defer allocator.free(prefix);
 
         var cursor = try file.indexCatalogCursor(txn.checkpoint, prefix);
@@ -308,14 +417,52 @@ pub const Sink = struct {
             }
             result.deinit(allocator);
         }
-        while (try cursor.nextRecordAlloc(allocator)) |record| {
-            defer allocator.free(record.key);
-            defer allocator.free(record.value);
-            if (try decodeAlloc(allocator, scope, record.key, record.value)) |entry| {
-                try result.append(allocator, entry);
+        while (true) {
+            try result.ensureUnusedCapacity(allocator, 1);
+            const decoded = if (keys_only) entry: {
+                const record = (try cursor.next()) orelse break;
+                defer file.allocator.free(record.key);
+                break :entry try decodeAlloc(allocator, scope, record.key, "");
+            } else entry: {
+                const record = (try cursor.nextRecordAlloc(allocator)) orelse break;
+                defer allocator.free(record.key);
+                defer allocator.free(record.value);
+                break :entry try decodeAlloc(allocator, scope, record.key, record.value);
+            };
+            const entry = decoded orelse continue;
+            const is_tip = if (entry.namespace) |n| std.mem.eql(u8, n, native_catalog_backend.tip_namespace) else false;
+            if (is_tip != (which == .tip)) {
+                if (entry.namespace) |n| allocator.free(n);
+                allocator.free(entry.key);
+                allocator.free(entry.value);
+                continue;
             }
+            result.appendAssumeCapacity(entry);
         }
         return try result.toOwnedSlice(allocator);
+    }
+
+    fn loadMany(ptr: *anyopaque, allocator: Allocator, scope: []const u8, keys: []const native_catalog_backend.Mutation, values: []?[]const u8) anyerror!void {
+        const self: *Sink = @ptrCast(@alignCast(ptr));
+        var txn = try self.store.beginRead();
+        defer txn.abort();
+        const file = try txn.readFile();
+        for (keys, values) |key, *value| {
+            const durable_key = try durableKeyAlloc(self.allocator, scope, key.namespace, key.key);
+            defer self.allocator.free(durable_key);
+            value.* = try file.getIndexCatalogRecordAtCheckpointAlloc(allocator, durable_key, txn.checkpoint);
+        }
+    }
+
+    /// One committed record, read from the file at its current tip.
+    fn loadOneAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) anyerror!?[]u8 {
+        const self: *Sink = @ptrCast(@alignCast(ptr));
+        var txn = try self.store.beginRead();
+        defer txn.abort();
+        const file = try txn.readFile();
+        const durable_key = try durableKeyAlloc(allocator, scope, namespace, key);
+        defer allocator.free(durable_key);
+        return try file.getIndexCatalogRecordAtCheckpointAlloc(allocator, durable_key, txn.checkpoint);
     }
 };
 
@@ -369,6 +516,43 @@ test "native catalog sink key encoding disambiguates scopes that share a prefix"
             a.free(decoded.value);
         }
         return error.TestUnexpectedResult;
+    }
+}
+
+test "native catalog sink commits scoped graph records as one member" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/ncat-pair.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try docstore.Store.createWithOptions(a, path, .{ .use_redo_log = true, .io = std.testing.io });
+    defer store.close();
+
+    var sink: Sink = .{ .store = &store, .allocator = a };
+    const forward = native_catalog_backend.ScopedMutations{
+        .scope = "/graph/outgoing",
+        .mutations = &.{.{ .namespace = null, .key = "edge", .value = "target" }},
+    };
+    const invalid = native_catalog_backend.ScopedMutations{
+        .scope = "/graph/reverse",
+        .mutations = &.{.{ .namespace = native_catalog_backend.resolve_namespace, .key = "resolver", .value = "" }},
+    };
+    try std.testing.expectError(error.InvalidResolver, sink.sink().submitTogether.?(&sink, &.{ forward, invalid }));
+    const leaked = try Sink.loadOneAlloc(&sink, a, forward.scope, null, "edge");
+    defer if (leaked) |bytes| a.free(bytes);
+    try std.testing.expect(leaked == null);
+
+    const reverse = native_catalog_backend.ScopedMutations{
+        .scope = invalid.scope,
+        .mutations = &.{.{ .namespace = null, .key = "edge", .value = "source" }},
+    };
+    const before = store.file.committedSequence();
+    try sink.sink().submitTogether.?(&sink, &.{ forward, reverse });
+    try std.testing.expectEqual(before + 1, store.file.committedSequence());
+    for ([_]native_catalog_backend.ScopedMutations{ forward, reverse }) |batch| {
+        const value = (try Sink.loadOneAlloc(&sink, a, batch.scope, null, "edge")) orelse return error.MissingEdge;
+        defer a.free(value);
+        try std.testing.expectEqualStrings(batch.mutations[0].value, value);
     }
 }
 
@@ -459,4 +643,21 @@ test "native catalog sink: a mid-stream index admission is visible to loadAllAll
     try std.testing.expectEqualStrings("seg-two", findEntry(reloaded, "segments", "range:0002").?);
     try std.testing.expectEqualStrings("seg-three", findEntry(reloaded, "segments", "range:0003").?);
     try std.testing.expectEqualStrings("768", findEntry(reloaded, "meta", "dims").?);
+
+    try iface.submit(iface.ptr, scope, &.{
+        .{ .namespace = native_catalog_backend.tip_namespace, .key = "doc", .value = "version" },
+    }, true);
+    const tip = try iface.loadTipAlloc.?(iface.ptr, a, scope);
+    defer freeEntries(a, tip);
+    try std.testing.expectEqual(@as(usize, 1), tip.len);
+    try std.testing.expectEqualStrings("doc", tip[0].key);
+    try std.testing.expectEqualStrings("", tip[0].value);
+
+    const keys = try iface.loadKeysAlloc.?(iface.ptr, a, scope);
+    defer freeEntries(a, keys);
+    try std.testing.expectEqual(reloaded.len, keys.len);
+    for (keys) |entry| {
+        try std.testing.expectEqualStrings("", entry.value);
+        try std.testing.expect(findEntry(reloaded, entry.namespace.?, entry.key) != null);
+    }
 }

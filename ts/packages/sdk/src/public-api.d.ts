@@ -978,6 +978,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/sql/operations/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Observe an exact retained SQL catalog operation
+         * @description Read-only, body-bound observation of the original native catalog operation.
+         *     Requires current administrative permission on its qualified logical resource.
+         *     It does not execute, rebind, retry or admit a mutation. A retained rejection
+         *     includes its precise SQL diagnostic. Unknown or evicted outcomes remain
+         *     non-retryable SQLSTATE 40003; reconcile administratively rather than replaying.
+         */
+        post: operations["getSQLCatalogOperation"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/sql/connections": {
         parameters: {
             query?: never;
@@ -1015,6 +1039,34 @@ export interface paths {
          * @description Refuses an active, beginning or uncertain transaction; route to owner_node_id.
          */
         delete: operations["closeSQLConnection"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/sql/connections/{connection_id}/notifications": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                connection_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Receive and acknowledge committed SQL notifications
+         * @description Poll a connection's database-scoped LISTEN registrations. This operation
+         *     never evaluates or retries SQL. Delivery is deferred while the connection
+         *     has an active or uncertain transaction. Pages contain at most 128 events
+         *     and 64 KiB of logical channel/payload bytes. A lost response is replayable
+         *     until its cursor is acknowledged. Queue capacity is reserved before the
+         *     sender's irreversible commit decision. Connection close and DISCARD ALL
+         *     retire registrations through the same durable source lifecycle.
+         */
+        post: operations["pollSQLNotifications"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -1152,19 +1204,25 @@ export interface paths {
         put?: never;
         /**
          * Execute a SQL statement
-         * @description Executes one statement of the implemented SQL dialect (SELECT, INSERT,
-         *     UPDATE, DELETE, transaction control, and DDL) through the current
-         *     catalog and native typed plans, including reads over read-only lake
-         *     attachments. Parameters are bound separately from statement text.
-         *     DDL returns a durable `ddl_receipt`; a 202 response means the
-         *     declaration was admitted and validation is pending, and admitted DDL
-         *     must not be replayed. BEGIN starts a SQL session: send the returned
-         *     `session_id` with later statements until COMMIT or ROLLBACK. Open a
-         *     connection with `/sql/connections` to keep scope and settings across
-         *     requests, and use `/sql/prepared` for prepared statements.
-         *     Reads inherit native owner-local consistency, not a global SQL
-         *     transaction snapshot. Statements requiring a retained multi-page
-         *     statement snapshot fail when that capability is unavailable.
+         * @description Executes supported SQL statements through the current catalog and native
+         *     typed plans, including reads over read-only lake attachments. Stored
+         *     views use CREATE [OR REPLACE] VIEW, ALTER VIEW RENAME TO, and DROP VIEW
+         *     [CASCADE | RESTRICT] on this same endpoint. Views retain durable source
+         *     identities; owner/invoker access reuses native row policies and
+         *     caller/owner filters without changing the caller's SQL identity.
+         *     Document fields can be projected with jsonb_to_record and declared SQL
+         *     types, including typed arrays. Parameters are bound separately from
+         *     statement text. DDL returns a durable `ddl_receipt`; a 202 response
+         *     means the declaration was admitted and validation is pending, and
+         *     admitted DDL must not be replayed. BEGIN starts a SQL session: send the
+         *     returned `session_id` with later statements until COMMIT or ROLLBACK.
+         *     Open a connection with `/sql/connections` to keep scope and settings
+         *     across requests, and use `/sql/prepared` for prepared statements.
+         *     Source, DDL, session, and transaction capabilities are checked
+         *     explicitly; not every PostgreSQL statement or cross-source transaction
+         *     is supported. Reads require the native retained statement-snapshot
+         *     capabilities of their sources, not an implied global SQL transaction
+         *     snapshot.
          *     Unsupported statement shapes fail explicitly; the server never
          *     silently substitutes a different query or truncates the result.
          */
@@ -2362,7 +2420,16 @@ export interface paths {
         /**
          * Register or replace an artifact enrichment
          * @description Registers a table-level generated artifact definition. Reusing the same
-         *     artifact name replaces the existing mapping. Chunk or asset enrichments
+         *     artifact name replaces the existing mapping.
+         *     Omitting all producer fields (producer, producer_json and transcriber)
+         *     on an existing same-kind artifact retains its admitted producer. Supplying
+         *     any one of these fields explicitly replaces the producer; mutually
+         *     exclusive spellings cannot be combined. Execution-policy updates persist
+         *     separately from publication authority, without reading credentials,
+         *     reconstructing the recipe, or invalidating completed output.
+         *     Changing execution alone preserves completed artifacts; changing producer
+         *     semantics may invalidate them. Use explicit reprocessing for incomplete
+         *     or all existing work. Chunk or asset enrichments
          *     may set `full_text_index: true` to map generated text into the table's
          *     default full-text index.
          */
@@ -2526,67 +2593,6 @@ export interface paths {
         get: operations["getDocumentArtifactManifest"];
         put?: never;
         post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}/dependencies": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Name of the table */
-                tableName: string;
-                /** @description Percent-encoded source document key. */
-                key: string;
-                /** @description Name of an asset enrichment that declares context sources. */
-                artifactName: string;
-            };
-            cookie?: never;
-        };
-        /**
-         * Inspect an artifact's context dependencies and freshness
-         * @description Returns the dependency state of one generated artifact: its freshness,
-         *     live subscriptions, and retained lineage manifests. With
-         *     `freshness=require_current` the read waits up to `wait_timeout_ms` for
-         *     a read barrier: every group of every source table the enrichment reads
-         *     has delivered all committed change notices for this table, this
-         *     group's inbox has applied them, and the artifact's state is current.
-         *     Otherwise it answers 409 `artifact_not_current`. The route is
-         *     shard-aware and requires read permission on the table.
-         */
-        get: operations["getArtifactDependencies"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/db/v1/tables/{tableName}/dependencies/impact": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Name of the source table */
-                tableName: string;
-            };
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Find generated artifacts that consumed a source document
-         * @description Reverse lineage for one source document key: retained dependent artifact
-         *     versions confirmed against their lineage manifests, from every table
-         *     whose enrichments read this table, and optionally their same-document
-         *     downstream consumers. Rows from tables the caller may not read are
-         *     omitted and make the response incomplete.
-         */
-        post: operations["analyzeDependencyImpact"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2773,6 +2779,51 @@ export interface paths {
         post: operations["createIndex"];
         /** Drop an index from a table */
         delete: operations["dropIndex"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/schema/publication": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Observe an exact validation-only schema publication
+         * @description Requires administration of the current logical table. This read never replays DDL; absent or unavailable observations cannot prove non-admission.
+         */
+        get: operations["getSchemaValidationPublication"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/indexes/{indexName}/publication": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Observe an exact index publication
+         * @description Requires administration of the current logical table and the retained recovery token. This read never replays DDL. Unknown admission remains unknown, including after an absent or unmirrored observation. Published is historical job completion, not current index query readiness.
+         */
+        get: operations["getIndexPublication"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -3365,6 +3416,55 @@ export interface paths {
         post: operations["createNamespaceTableIndex"];
         /** Drop an index from an explicit namespace table */
         delete: operations["dropNamespaceTableIndex"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/schema/publication": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Observe an exact namespaced validation-only schema publication
+         * @description Requires administration of the current logical table. This read never replays DDL; absent or unavailable observations cannot prove non-admission.
+         */
+        get: operations["getNamespaceSchemaValidationPublication"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/publication": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Observe an exact index publication in an explicit namespace
+         * @description Requires administration of the current logical table and its retained recovery token. Unknown admission is not permission to replay DDL; published is historical job completion, not current index query readiness.
+         */
+        get: operations["getNamespaceTableIndexPublication"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -6414,6 +6514,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/extensions/v1/packages/{name}/sql-control": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get the explicit global SQL package default. */
+        get: operations["getExtensionSqlPackageControl"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/extensions/v1/packages/{name}/versions/{version}": {
         parameters: {
             query?: never;
@@ -7432,6 +7549,120 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/changefeeds": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Create or resume enrollment for a durable changefeed */
+        post: operations["createChangefeed"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/changefeeds/{feed_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                feed_id: components["parameters"]["ChangefeedId"];
+            };
+            cookie?: never;
+        };
+        /** Inspect a changefeed's lease and acknowledged progress */
+        get: operations["inspectChangefeed"];
+        put?: never;
+        post?: never;
+        /** Close a feed and release its retention grants */
+        delete: operations["closeChangefeed"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/changefeeds/{feed_id}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                feed_id: components["parameters"]["ChangefeedId"];
+            };
+            cookie?: never;
+        };
+        /** Read or replay a bounded changefeed page */
+        get: operations["pullChangefeed"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/changefeeds/{feed_id}/ack": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                feed_id: components["parameters"]["ChangefeedId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Acknowledge a successfully applied page */
+        post: operations["acknowledgeChangefeed"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/changefeeds/{feed_id}/renew": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                feed_id: components["parameters"]["ChangefeedId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Extend the retention lease for a streaming feed */
+        post: operations["renewChangefeed"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/sources/managed": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /** Read managed-source configuration, progress, and destination capabilities */
+        get: operations["getManagedSources"];
+        put?: never;
+        /** Replace managed-source configuration using the current table ID and source hash */
+        post: operations["replaceManagedSources"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -7718,15 +7949,20 @@ export interface components {
             revocation_confirmed: boolean;
         };
         /**
-         * @description Logical SQL result type. Integer values and numbers with element_type numeric are decimal strings to preserve exact precision in every client.
+         * @description Logical SQL result type. The void pseudotype uses an empty string for a non-NULL value and cannot be stored in table columns. Integer values and numbers with element_type numeric are decimal strings to preserve exact precision in every client. Bytea results use PostgreSQL hex text (a backslash followed by x and lowercase hex digits) in JSON and opaque bytes in PostgreSQL binary format.
          * @enum {string}
          */
-        SQLColumnType: "string" | "uuid" | "integer" | "number" | "boolean" | "datetime" | "json" | "array" | "unknown";
+        SQLColumnType: "string" | "uuid" | "integer" | "number" | "boolean" | "datetime" | "json" | "array" | "unknown" | "numrange" | "daterange" | "tsrange" | "tstzrange" | "enumeration" | "bytea" | "void";
         /**
          * @description Bound SQL scalar or array-element identity, including numeric widths and exact NUMERIC. Never inferred from JSON value shape.
          * @enum {string}
          */
         SQLArrayElementType: "text" | "int16" | "int32" | "int64" | "float32" | "float64" | "boolean" | "uuid" | "jsonb" | "numeric";
+        /**
+         * @description Exact temporal identity for datetime-family SQL values. Omission means timestamp_tz. Intervals preserve separate calendar months, days, and microseconds and use PostgreSQL interval text in JSON results.
+         * @enum {string}
+         */
+        SQLTemporalKind: "date" | "time" | "time_tz" | "timestamp" | "timestamp_tz" | "interval";
         SQLArrayDimension: {
             length: number;
             lower_bound: number;
@@ -7752,6 +7988,9 @@ export interface components {
             /** @description Display label. Labels need not be unique; rows use matching ordinal positions. */
             name: string;
             type: components["schemas"]["SQLColumnType"];
+            /** @description Required for enum and domain values, including NULL. Identifies the immutable logical catalog type and its scalar/array wire OIDs. The type and element_type fields describe the physical value; enum cells use exact label strings. Domain parameters undergo fresh constraint validation; a declared identity does not prove an already validated value. SQL NULL remains a null cell. */
+            named_type?: components["schemas"]["SQLNamedTypeIdentity"];
+            temporal_kind?: components["schemas"]["SQLTemporalKind"];
             /** @description Required for array columns and exact NUMERIC number columns. Identifies scalar widths when supplied. The descriptor applies even to NULL or empty arrays. */
             element_type?: components["schemas"]["SQLArrayElementType"];
             /** @description Present only for constrained NUMERIC scalar or array results. Prepared result metadata is stable before execution-time constant folding. */
@@ -7794,9 +8033,12 @@ export interface components {
             database: string;
             namespace: string;
         };
-        /** @description Immutable positional input contract. Element identity also preserves primitive widths; array inputs require it. Unknown slots have no SQL constraint. */
+        /** @description Immutable positional input contract. Element identity also preserves primitive widths; array inputs require it. Unknown slots have no SQL constraint. Bytea arguments are PostgreSQL bytea input strings; use hex text (a backslash followed by x and hexadecimal octets) for arbitrary binary data. SQL NULL remains a null cell. */
         SQLParameterDescriptor: {
             type: components["schemas"]["SQLColumnType"];
+            /** @description Required for enum and domain values, including NULL. Identifies the immutable logical catalog type and its scalar/array wire OIDs. The type and element_type fields describe the physical value; enum cells use exact label strings. Domain parameters undergo fresh constraint validation; a declared identity does not prove an already validated value. SQL NULL remains a null cell. */
+            named_type?: components["schemas"]["SQLNamedTypeIdentity"];
+            temporal_kind?: components["schemas"]["SQLTemporalKind"];
             element_type?: components["schemas"]["SQLArrayElementType"];
             nullable: boolean;
         };
@@ -7893,6 +8135,29 @@ export interface components {
             /** @description Durable idle HTTP connection. Its scope and settings are inherited; active transaction IDs cannot be bypassed by omitting session_id. DISCARD ALL requires this identity and is rejected while a transaction is active or uncertain. */
             connection_id?: string;
         };
+        SQLNotification: {
+            channel: string;
+            /** @description UTF-8 payload, fewer than 8000 bytes. */
+            payload: string;
+            /**
+             * Format: int32
+             * @description Sender backend identifier; equals pgwire BackendKeyData for wire clients.
+             */
+            sender_pid: number;
+        };
+        SQLNotificationPollRequest: {
+            /** @description Cursor from a previously received page. Acknowledge only after consuming every notification in that page; omitted acknowledgements replay the same unconsumed prefix. */
+            acknowledge?: string;
+            /** @default 128 */
+            limit?: number;
+        };
+        SQLNotificationPage: {
+            notifications: components["schemas"]["SQLNotification"][];
+            /** @description Opaque connection-bound acknowledgement cursor for this page. */
+            cursor?: string;
+            /** @description More queue work remains, or a committed notification is waiting for its visibility barrier. Poll again without replaying any SQL. */
+            pending: boolean;
+        };
         /**
          * @description Authoritative native SQL session state after the statement. Failed sessions require ROLLBACK or ROLLBACK TO SAVEPOINT; uncertain commit outcomes must be reconciled by transaction_id, never replayed.
          * @enum {string}
@@ -7905,6 +8170,11 @@ export interface components {
          * @enum {string}
          */
         SQLMutationOutcome: "committed" | "committed_pending" | "committed_repair_required" | "committed_graph_metric_materialization_rejected";
+        SQLNotice: {
+            code: string;
+            /** @description Nonfatal statement notice; prior notices remain visible if a later instruction fails. */
+            message: string;
+        };
         /**
          * @description Ordinal result rows with corresponding logical column metadata. SQL NULL
          *     is JSON null; sql_nulls distinguishes it from a JSON column containing
@@ -7914,6 +8184,7 @@ export interface components {
          *     descriptor in the corresponding SQLColumn. They are not JSON columns.
          */
         SQLResponse: {
+            notices?: components["schemas"]["SQLNotice"][];
             /** @description Concrete graph index names selected from the statement catalog cut. */
             resolved_indexes?: string[];
             columns: components["schemas"]["SQLColumn"][];
@@ -7933,6 +8204,7 @@ export interface components {
             command_tag: string;
             mutation_outcome?: components["schemas"]["SQLMutationOutcome"];
             ddl_receipt?: components["schemas"]["SQLDDLReceipt"];
+            catalog_receipt?: components["schemas"]["SQLCatalogOperationReceipt"];
             /** @description Native transaction receipt for visibility or repair reconciliation; never replay a committed statement. */
             transaction_id?: string;
             /** @description Opaque SQL session identifier for subsequent requests. */
@@ -7942,12 +8214,17 @@ export interface components {
         /** @enum {string} */
         SQLDDLReceiptState: "ready" | "pending" | "invalid" | "admission_unknown";
         /**
-         * @description Durable DDL declaration receipt. admission_unknown means admission has
-         *     not been confirmed; reconcile restore_job_id and idempotency_key without replaying DDL.
-         *     Pending or invalid means the declaration
-         *     committed but validation has not established an active constraint. Do not
-         *     replay it. Inspect table constraint status using this immutable table
-         *     identity and schema generation; a later generation supersedes this receipt.
+         * @description Durable DDL operation receipt. admission_unknown means admission has
+         *     not been confirmed; retain the matching restore job, FK publication ID,
+         *     index publication token, or schema validation token and reconcile its
+         *     status without replaying DDL.
+         *     Pending means a durable operation was admitted, not necessarily that its
+         *     successor schema is published. Invalid means declaration validation failed.
+         *     Do not replay either. For an index build, observe the exact publication
+         *     token. For validation-only schema changes, observe the exact schema
+         *     validation token; otherwise inspect its restore job or table constraint status using
+         *     this immutable table identity and schema generation. A later generation
+         *     may supersede the completed operation.
          */
         SQLDDLReceipt: {
             database: string;
@@ -7962,8 +8239,81 @@ export interface components {
             restore_job_id?: string;
             /** @description Durable retry identity for an admitted or uncertain schema rewrite. Retain it with restore_job_id when reconciling admission; do not replay the DDL. */
             idempotency_key?: string;
+            /** @description Immutable FK-generation publication identity. Retain it when admission is unknown or activation remains pending; do not replay DDL. */
+            fk_generation_publication_id?: string;
+            index_publication_token?: components["schemas"]["IndexPublicationToken"];
+            schema_validation_token?: components["schemas"]["SchemaValidationToken"];
+        };
+        /** @description Opaque immutable validation-only schema job identity. Retain it across timeouts or lost replies and observe its exact status without replaying DDL. It grants no authorization. */
+        SchemaValidationToken: string;
+        /** @enum {string} */
+        SchemaValidationState: "admission_unknown" | "pending" | "succeeded" | "canceled" | "failed";
+        /** @enum {string} */
+        SchemaValidationPhase: "validating" | "validated" | "installing" | "installed" | "releasing" | "succeeded" | "canceling" | "canceled";
+        /** @enum {string} */
+        SchemaValidationFailure: "requested" | "not_null_violation" | "foreign_key_violation" | "owner_failed";
+        /** @description Historical job completion, not an authorization or promise that a later DDL has not superseded this schema. Success requires all owner installation, metadata publication and fence release barriers. Current table ownership is checked atomically with the job observation. */
+        SchemaValidationStatus: {
+            schema_validation_token: components["schemas"]["SchemaValidationToken"];
+            table_id: string;
+            /** Format: int64 */
+            active_schema_version: number;
+            state: components["schemas"]["SchemaValidationState"];
+            phase?: components["schemas"]["SchemaValidationPhase"];
+            failure?: components["schemas"]["SchemaValidationFailure"];
+            /** Format: int32 */
+            owner_count?: number;
+            /** Format: int32 */
+            ready?: number;
+            /** Format: int32 */
+            installed?: number;
+            /** Format: int32 */
+            released?: number;
+            /** Format: int32 */
+            canceled?: number;
+        };
+        /**
+         * @description Catalog object affected by an exact recoverable operation.
+         * @enum {string}
+         */
+        SQLCatalogObjectKind: "sequence" | "function" | "procedure" | "operator" | "aggregate" | "cast" | "type" | "authorization" | "table" | "index" | "database" | "namespace" | "tablespace" | "query_source" | "view" | "extension" | "collation" | "publication" | "subscription";
+        /** @enum {string} */
+        SQLCatalogOperationKind: "create" | "alter" | "rename" | "drop";
+        /**
+         * @description A retained authoritative result, or an unconfirmed outcome. Unknown is never permission to replay DDL.
+         * @enum {string}
+         */
+        SQLCatalogOperationState: "committed" | "rejected" | "unknown" | "pending";
+        /**
+         * @description Recovery receipt for an atomic native catalog mutation, separate from
+         *     physical table/schema publication receipts. Retain recovery_token and
+         *     observe it with getSQLCatalogOperation; never resubmit uncertain DDL.
+         *     Retention is bounded by catalog activity, not a promised wall-clock
+         *     interval. Missing, expired, inaccessible or superseded-authority outcomes
+         *     cannot be inferred from a current object name and remain unknown.
+         *     This receipt does not make a new request idempotent or recover a token
+         *     lost with an entire response. All identity integers are exact decimal strings.
+         */
+        SQLCatalogOperationReceipt: {
+            kind: components["schemas"]["SQLCatalogObjectKind"];
+            operation: components["schemas"]["SQLCatalogOperationKind"];
+            database: string;
+            namespace: string;
+            name: string;
+            state: components["schemas"]["SQLCatalogOperationState"];
+            /** @description Opaque versioned operation handle. Send it unchanged; it is not a reusable admission ticket. */
+            recovery_token: string;
+            /** @description Actual committed catalog identity, when the result carries one; never a predicted allocation. */
+            object_id?: string;
+            generation?: string;
+            catalog_revision?: string;
+            diagnostic?: components["schemas"]["SQLDiagnostic"];
+        };
+        SQLCatalogRecoveryRequest: {
+            recovery_token: string;
         };
         SQLDiagnostic: {
+            notices?: components["schemas"]["SQLNotice"][];
             /** @description Five-character SQLSTATE error code. */
             code: string;
             /** @description Human-readable diagnostic with no sensitive parameter values. */
@@ -7996,6 +8346,8 @@ export interface components {
              * @example {}
              */
             settings_json: string;
+            /** @description SQL COMMENT annotation. NULL or an empty string removes the annotation without changing the object's identity or data schema. */
+            description?: string | null;
             /**
              * @description Optional durable tablespace binding inherited by new namespace/table placement policy.
              * @example fastspace
@@ -8026,6 +8378,8 @@ export interface components {
              * @example analytics
              */
             name: string;
+            /** @description SQL COMMENT annotation. NULL or an empty string removes the annotation without changing the object's identity or data schema. */
+            description?: string | null;
             /**
              * @description Optional durable tablespace binding inherited by new table placement policy in this namespace.
              * @example fastspace
@@ -9214,106 +9568,6 @@ export interface components {
             text_bytes?: number | null;
         };
         /**
-         * @description Dependency state of one document artifact whose enrichment declares
-         *     `context_sources`. `freshness` is null when the artifact was never
-         *     generated with context dependencies. Freshness (`current`, `stale`,
-         *     `failed`, `pending`) is reported separately from rebuild execution
-         *     state. `versions` lists retained lineage manifests, newest first.
-         */
-        ArtifactDependencies: {
-            /** @description State, generation, published generation, version, validated-through frontier, input fingerprint, rebuild state, and bounded change reasons. */
-            freshness: {
-                [key: string]: unknown;
-            } | null;
-            /**
-             * Format: int64
-             * @description Live subscription tuples registered for this artifact.
-             */
-            subscriptions?: number;
-            versions: {
-                [key: string]: unknown;
-            }[];
-            /** @description Each declared context source with its effective tracking. A ranked query (or a source declared `snapshot`) keeps the artifact `unverified`. */
-            sources?: {
-                name?: string;
-                /** @enum {string} */
-                kind?: "document" | "query";
-                /** @enum {string} */
-                tracking?: "live" | "snapshot";
-                ranked?: boolean;
-                /** @description A live graph traversal (`graph_queries` traverse). */
-                traversal?: boolean;
-            }[];
-            /**
-             * @description Present when `freshness=require_current` was requested: true when a
-             *     read barrier observed no undelivered committed change to any of the
-             *     artifact's source tables and its dependency state is current.
-             */
-            current?: boolean;
-        };
-        ArtifactNotCurrent: {
-            /** @enum {string} */
-            error: "artifact_not_current";
-            message: string;
-            retryable: boolean;
-            /** @description What kept the artifact from being current when the wait ended (for example `stale`, `inbox`, or `outbox:<table>`). */
-            pending?: string[];
-            dependencies: components["schemas"]["ArtifactDependencies"];
-        };
-        DependencyImpactRequest: {
-            /** @description Source document key whose dependents are requested. */
-            key: string;
-            /** @description Optional hex input revision; only outputs that consumed that revision are returned. */
-            revision?: string;
-            /**
-             * @description `transitive` follows every dependent output onward: same-document artifacts that consume it (live candidates with their path) and rows of any table whose declarations read it as `_artifacts.<name>` (with `via`), up to `max_depth` hops.
-             * @default direct
-             * @enum {string}
-             */
-            traversal?: "direct" | "transitive";
-            /** @default 8 */
-            max_depth?: number;
-            /** @default 100 */
-            limit?: number;
-        };
-        DependencyImpactRow: {
-            table_id: string;
-            /** @description Public name of the dependent table, when visible to the caller. */
-            table?: string;
-            key: string;
-            artifact: string;
-            /** Format: int64 */
-            version?: number;
-            historical?: boolean;
-            live_candidate?: boolean;
-            freshness: string;
-            /** @description Same-document artifact chain from the consumed input to this output. */
-            path: string[];
-            /** @description Transitive rows only, the generated outputs (in other rows or tables) this dependent consumed on the way from the input, nearest the input first. */
-            via?: {
-                table?: string;
-                key?: string;
-                artifact?: string;
-            }[];
-        };
-        /**
-         * @description Reverse lineage of one source document: dependent artifact versions that
-         *     consumed it, across every table whose enrichments read this table. A
-         *     dependency establishes possible impact, not that regenerated bytes
-         *     differ. `complete` is false whenever a depth or row budget was reached
-         *     or a group could not be read.
-         */
-        DependencyImpactResponse: {
-            input: {
-                table_id?: string;
-                key?: string;
-            };
-            dependents: components["schemas"]["DependencyImpactRow"][];
-            complete: boolean;
-            traversal: string;
-            semantics?: string;
-        };
-        /**
          * @description Inspection view for a derived document artifact produced from a source
          *     table row. The typed fields form the stable summary contract. The
          *     embedded manifest/state JSON fields are optional raw detail intended
@@ -9393,7 +9647,7 @@ export interface components {
             last_error_code?: string | null;
             /** @description Human-readable last extraction or materialization error summary, when available. */
             last_error_message?: string | null;
-            /** @description Opaque JSON manifest for the artifact units and provenance. Present only for raw detail responses. */
+            /** @description Opaque JSON manifest for the artifact units and provenance. Present only for raw detail responses. Newly produced document-extraction generations include the declared execution policy under execution, including on failed generations; it is not a measured provider budget. Older manifests may omit it. */
             manifest_json?: string;
             /** @description Optional opaque JSON state for incremental processing. Present only for raw detail responses. */
             state_json?: string | null;
@@ -9813,6 +10067,12 @@ export interface components {
         /** @description Bounded request for reprocessing a derived artifact across source rows in key order. */
         DocumentArtifactTableReprocessRequest: {
             /**
+             * @description all explicitly regenerates selected source records, including accepted artifacts. incomplete selects only missing or incomplete document_extraction artifacts, including converged manifests with failed OCR pages. Complete accepted results are skipped. Other producer kinds reject incomplete selection. Selection and cursors are retained by durable jobs. Acceptance does not certify inference completion.
+             * @default all
+             * @enum {string}
+             */
+            selection?: "all" | "incomplete";
+            /**
              * @description Exclusive lower bound source document key. Use the prior response next_key to continue.
              * @default
              */
@@ -9896,6 +10156,12 @@ export interface components {
         /** @description Request to create a durable table artifact reprocess job. */
         DocumentArtifactReprocessJobStartRequest: {
             /**
+             * @description all explicitly regenerates selected source records, including accepted artifacts. incomplete selects only missing or incomplete document_extraction artifacts, including converged manifests with failed OCR pages. Complete accepted results are skipped. Other producer kinds reject incomplete selection. Selection and cursors are retained by durable jobs. Acceptance does not certify inference completion.
+             * @default all
+             * @enum {string}
+             */
+            selection?: "all" | "incomplete";
+            /**
              * @description Exclusive lower bound source document key.
              * @default
              */
@@ -9918,6 +10184,12 @@ export interface components {
             advance?: boolean;
         };
         DocumentArtifactReprocessJob: {
+            /**
+             * @description all explicitly regenerates selected source records, including accepted artifacts. incomplete selects only missing or incomplete document_extraction artifacts, including converged manifests with failed OCR pages. Complete accepted results are skipped. Other producer kinds reject incomplete selection. Selection and cursors are retained by durable jobs. Acceptance does not certify inference completion.
+             * @default all
+             * @enum {string}
+             */
+            selection?: "all" | "incomplete";
             /**
              * Format: uint64
              * @description Server-assigned durable repair job identifier.
@@ -10174,7 +10446,8 @@ export interface components {
          * @description Response acknowledgment/publication barrier, independent of commit_requires:
          *     - "propose": Wait for Raft proposal acceptance (fastest, default)
          *     - "write": Wait for durable application to the local key-value store
-         *     - "full_text": Wait for full-text index WAL write
+         *     - "query": Wait for durable application and document full-text query visibility
+         *     - "full_text": Compatibility alias for query
          *     - "enrichments": Wait for this write's enrichment publication
          *     - "full_index": Wait for full-text, enrichment and vector-index publication
          *     A post-commit wait failure never rolls back the source. Terminal background
@@ -10184,7 +10457,7 @@ export interface components {
          * @default propose
          * @enum {string}
          */
-        SyncLevel: "propose" | "write" | "full_text" | "enrichments" | "full_index";
+        SyncLevel: "propose" | "write" | "query" | "full_text" | "enrichments" | "full_index";
         ShardConfig: {
             byte_range: components["schemas"]["ByteRange"];
         };
@@ -10672,6 +10945,7 @@ export interface components {
             buckets?: components["schemas"]["AggregationBucket"][];
         };
         IndexStatus: {
+            publication?: components["schemas"]["IndexPublicationStatus"];
             shard_status: {
                 [key: string]: components["schemas"]["IndexStats"];
             };
@@ -11857,6 +12131,19 @@ export interface components {
             current_version?: number;
             participant?: components["schemas"]["TransactionConflictParticipant"];
         };
+        /** @description A classified write failure. An aborted status confirms that the transaction did not commit. */
+        TransactionWriteError: {
+            /** @description Set to aborted for a confirmed transaction abort. */
+            status?: string;
+            /** @description Machine-readable cause, including row_policy_denied and transaction_precommit_aborted. */
+            code: string;
+            message: string;
+            retryable: boolean;
+            /** @description The transaction ID for session commit responses. */
+            transaction_id?: string;
+            /** Format: int64 */
+            retry_after_ms?: number;
+        };
         /** @description Result of an OCC transaction commit attempt. */
         TransactionCommitResponse: {
             /**
@@ -11940,7 +12227,7 @@ export interface components {
              * @description Durable read-only transaction outcome. outcome_unknown is not permission to replay a mutation with another ID.
              * @enum {string}
              */
-            disposition: "active" | "outcome_unknown" | "committed" | "committed_pending" | "committed_repair_required" | "aborted";
+            disposition: "active" | "prepared" | "outcome_unknown" | "committed" | "committed_pending" | "committed_repair_required" | "aborted";
             staged_table_count: number;
             staged_read_count: number;
             staged_write_count: number;
@@ -12016,7 +12303,24 @@ export interface components {
              */
             format?: "native" | "portable";
         };
+        RestoreRoutineMapping: {
+            /** @description Metadata catalog incarnation recorded in the source attachment. */
+            source_metadata_incarnation: string;
+            /** @description Immutable source function identifier, expressed losslessly as decimal. */
+            source_routine_id: string;
+            /** @description Existing immutable destination function identifier, expressed losslessly as decimal. */
+            destination_routine_id: string;
+        };
         RestoreRequest: {
+            /**
+             * @description Explicit immutable routine identity handoff for trigger attachments.
+             *     Cross-catalog restores require a mapping for every referenced trigger
+             *     function. Destination functions must already exist and be authorized
+             *     compatible zero-argument trigger functions. Routine bodies and names
+             *     are never imported or rebound by this operation. Mappings are part
+             *     of the durable job and its idempotency identity.
+             */
+            routine_mappings?: components["schemas"]["RestoreRoutineMapping"][];
             /**
              * @description Identifier of the published backup to restore.
              * @example backup-2025-01-15-v2
@@ -12145,6 +12449,15 @@ export interface components {
          *     canceling the old job and creating a new restore.
          */
         ClusterRestoreRequest: {
+            /**
+             * @description Explicit immutable routine identity handoff for trigger attachments.
+             *     Cross-catalog restores require a mapping for every referenced trigger
+             *     function. Destination functions must already exist and be authorized
+             *     compatible zero-argument trigger functions. Routine bodies and names
+             *     are never imported or rebound by this operation. Mappings are part
+             *     of the durable job and its idempotency identity.
+             */
+            routine_mappings?: components["schemas"]["RestoreRoutineMapping"][];
             /**
              * @description Unique identifier of the backup to restore from.
              * @example cluster-backup-2025-01-15
@@ -16139,11 +16452,11 @@ export interface components {
          */
         ResourceType: "table" | "database" | "namespace" | "tablespace" | "graph" | "user" | "inference" | "*";
         /**
-         * @description Type of permission.
+         * @description Type of permission. replicate explicitly permits authorized changefeed and PostgreSQL logical replication access to the selected resource. It does not grant ordinary read, write, or administrative access. read, write, and curator do not imply replicate. admin includes replicate. Replication still requires current row/field policies and feed, slot, and publication ownership checks; a replication position is not an access credential.
          * @example read
          * @enum {string}
          */
-        PermissionType: "read" | "write" | "curator" | "admin";
+        PermissionType: "read" | "write" | "curator" | "admin" | "replicate";
         /** @description A table or all tables in an explicit namespace. A missing table selects the namespace; a table named '*' remains literal. */
         CatalogTableScope: {
             /** @default default */
@@ -17311,11 +17624,28 @@ export interface components {
             output?: components["schemas"]["ConstrainedOutput"];
             batch?: components["schemas"]["ConstrainedGenerationBatch"];
         };
+        /** @description Server-resolved immutable SQL type identity. Origin survives restore remapping of local IDs and wire OIDs. */
+        SQLNamedTypeIdentity: {
+            /** Format: uint64 */
+            id: number;
+            /** Format: uint64 */
+            namespace_id: number;
+            /** Format: uint32 */
+            generation: number;
+            /** @description Opaque durable 128-bit origin, encoded as lowercase hexadecimal. */
+            origin_id: string;
+            /** Format: uint32 */
+            oid: number;
+            /** Format: uint32 */
+            array_oid: number;
+        };
         /** @description PostgreSQL NUMERIC precision and signed scale. For arrays this describes every element, not dimensions. Absent means unconstrained NUMERIC. */
         SQLNumericModifier: {
             precision: number;
             scale: number;
         };
+        /** @description Opaque versioned recovery handle binding a metadata incarnation, immutable table identity, publication ID and plan commitment. This is not authentication or permission to execute, cancel, adopt a root or replay DDL. Retain it before admission and use current table authorization when observing the publication. */
+        IndexPublicationToken: string;
         /**
          * @description The reranking provider to use.
          * @enum {string}
@@ -17869,7 +18199,7 @@ export interface components {
              * @default true
              */
             execute?: boolean;
-            /** @description Execution-only repair mask for already accepted sub-windows; does not affect the model recipe or boundary plan. Skipped windows return receipts with status skipped. */
+            /** @description Execution-only repair mask for accepted receipts. A sub_index of 4294967295 skips all outputs at that ordinal. Other entries skip individual sub-windows. Masks leave recipe and boundary identities unchanged. */
             skip_windows?: {
                 /** Format: uint64 */
                 ordinal: number;
@@ -18517,117 +18847,13 @@ export interface components {
              */
             limit?: number;
         };
-        EnrichmentContextDocument: {
-            /** @description Table holding the referenced document; omitted means the enrichment's own table. Resolved to an immutable table identity at admission, so renaming or recreating a table cannot retarget the dependency. */
-            table?: string;
-            /** @description JSON pointer into the source document yielding the referenced key. */
-            key_from: string;
-        };
-        /** @description Ranking clause: a read-only Cypher statement against a graph, run as the principal that declared the enrichment (its graph and table permissions and row policies apply; the server binds the declaration to that principal, and revoking the credential stops rebuilds). Members are the nodes of the source `table` the statement returns, anywhere in a row (bare nodes, paths, lists, maps), in result order, each once, up to `limit`, and render as those rows' `fields`. Nodes of other tables are context the statement used, not members. Only `limit` may sit beside it. A Cypher source is a snapshot: a statement's result depends on rows it does not return, so dependents rebuild on `refresh_interval` or manually. Statements that write (`CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`) or `EXPLAIN` are rejected. */
-        EnrichmentContextCypher: {
-            /** @description Graph name (see `/graphs/{graphName}`). */
-            graph: string;
-            /** @description Cypher statement. */
-            query: string;
-            /** @description Statement parameters; values are literals or `{"$source":"/pointer"}` bindings from the dependent row. */
-            parameters?: {
-                [key: string]: unknown;
-            };
-        };
-        /** @description A filter (tracked live) or a ranked retrieval (a snapshot). Any ranking clause makes the whole query a public QueryRequest executed by the table's query engine, with `{"$source":"/pointer"}` bindings anywhere; `limit` (at most 1000) is then the member count, and paging (`offset`, `search_after`, `search_before`), `count`, `aggregations`, and a top-N `order_by` are rejected. Distributed tables refuse `semantic_search` (data servers have no query embedder); pass precomputed vectors in `embeddings` instead. */
-        EnrichmentContextQuery: {
-            /** @description Table queried; omitted means the enrichment's own table. */
-            table?: string;
-            /** @description An Antfly `filter_query` (Query shape): `bool` (`must`/`filter`/`should`/`must_not`/`minimum_should_match`, filter-context semantics), `conjuncts`, `disjuncts` (`min`), `match_all`, `match_none`, and leaves. Leaves evaluated by context resolution itself: `term`/`terms` (equality; at the top of the conjunction they form indexed subscriptions, at most one bound `terms` set), `range` (`gt`/`gte`/`lt`/`lte`), `numeric_range`/`term_range` (`min`/`max`/`inclusive_*`), `prefix`, `match` and `match_phrase` (pinned `antfly.context.simple.v1` analyzer: lowercase ASCII words; `operator` and|or), and `similar` (`{vector, threshold, metric: cosine|dot, dims, model}` over a vector stored in a document field). Every other row-decidable leaf (wildcard, regexp, fuzzy, date and IP ranges, geo, bool fields, `exists`, doc ids, `equals`/`contains`/`matches`) is lowered at admission into the storage engine's per-row filter and evaluated per changed row. Values are literals or typed bindings `{"$source":"/json/pointer"}` from the source document (in storage-evaluated leaves, string-valued positions only). Corpus-relative text queries (`query_string`, `multi_match`, analyzer-specific `match`) are rejected in a live filter; express them as a ranking clause (`full_text_search`) instead. */
-            filter_query?: Record<string, never>;
-            /** @description Live filters only: top-N by a field (ties by key); `max_documents` is N. Invalidation tracks the current boundary. */
-            order_by?: {
-                field: string;
-                /**
-                 * @default asc
-                 * @enum {string}
-                 */
-                order?: "asc" | "desc";
-            };
-            /** @description Ranking clause: full-text relevance (QueryRequest shape). */
-            full_text_search?: Record<string, never>;
-            /** @description Ranking clause: query text embedded for vector search (QueryRequest shape). */
-            semantic_search?: unknown;
-            /** @description Ranking clause: precomputed query vectors by index (QueryRequest shape). */
-            embeddings?: Record<string, never>;
-            indexes?: string[];
-            merge_config?: Record<string, never>;
-            reranker?: Record<string, never>;
-            exclusion_query?: Record<string, never>;
-            /** @description Graph operations (QueryRequest shape). Exactly one `traverse` from the dependent row (or `start: {keys: [{"$source": "/pointer"}]}`) with only `edge_types`, `direction`, `max_depth` (at most 3), and the context options `max_fanout` (edges per visited node, default 100) and `include_generated` (also follow field-derived and enrichment-generated edges) is a live traversal: dependents watch every visited node's edges and every reached row, members render with depth, edge type, and direction, and `max_documents` bounds the rows reached. A `filter_query` beside it narrows the reached rows and stays live. Anything else (`match`, shortest paths, `edge_filter`, `edge_weight`, `limit`, metrics, deeper traversals, several operations) runs in the query engine as a snapshot. */
-            graph_queries?: Record<string, never>;
-            cypher?: components["schemas"]["EnrichmentContextCypher"];
-            /** @description Ranked queries: member count. */
-            limit?: number;
-            /** @description Shorthand ranking clause: query text literal or `{"$source":"/pointer"}`, with `text_field`. */
-            text?: unknown;
-            text_field?: string;
-            /** @description Shorthand ranking clause: `{"$source":"/pointer"}` to a query vector in the dependent row, with `vector_index`. */
-            vector?: Record<string, never>;
-            vector_index?: string;
-            /** @default 10 */
-            k?: number;
-        };
-        /** @description One named context source: exactly one of `document` (a referenced row) or `query` (a filter, a graph traversal, or a ranked retrieval). `tracking` decides the freshness guarantee. A query whose membership is decided row by row is tracked live: subscriptions invalidate dependents exactly and they can be `current`. That covers a `filter_query` (optionally with a top-N `order_by`) and one plain bounded `graph_queries` traverse (optionally with a `filter_query` narrowing the rows it reaches). A query with any ranking clause (`full_text_search`, `semantic_search`, `embeddings`, `indexes`, `merge_config`, `reranker`, `exclusion_query`, `limit`, `cypher`, the `text`/`vector` shorthands, or `graph_queries` beyond one plain bounded traverse) depends on the whole corpus and is a snapshot: its dependents are `unverified` and rebuild on `refresh_interval` or manually. Registration reports each source's effective tracking and, for a snapshot, the clause that made it one. */
-        EnrichmentContextSource: {
-            document?: components["schemas"]["EnrichmentContextDocument"];
-            query?: components["schemas"]["EnrichmentContextQuery"];
-            /** @description Projected fields consumed by the producer (dotted paths). Only these fields, predicate fields, and the order field participate in fingerprints and invalidation. `_artifacts.<artifact>[.<path>]` reads a row's generated output (asset: parsed JSON or text; chunk: array of chunk payloads; embedding: document vector) and may be used in projections and predicates; when the artifact is regenerated, dependents are invalidated like for a field change. Admission rejects artifacts that depend on the consuming enrichment (directly, through artifact streams, through other context sources, or across tables). Other fields starting with `_` are reserved and rejected. */
-            fields: string[];
-            /**
-             * @description Document sources only: a missing referenced document fails the rebuild explicitly instead of rendering null.
-             * @default false
-             */
-            required?: boolean;
-            /**
-             * Format: uint32
-             * @description Query sources: maximum members (for a traversal, rows reached). Exceeding it fails explicitly; with `order_by` it is the declared top-N.
-             * @default 100
-             */
-            max_documents?: number;
-            /**
-             * Format: uint32
-             * @description Query sources with residual predicates (range, prefix, match, similar) or `order_by`: maximum candidate rows examined after equality filtering. Exceeding it fails explicitly.
-             * @default 1000
-             */
-            max_candidates?: number;
-            /**
-             * Format: uint64
-             * @description Maximum rendered bytes for this source.
-             * @default 1048576
-             */
-            max_bytes?: number;
-            /**
-             * @default error
-             * @enum {string}
-             */
-            overflow?: "error";
-            /**
-             * @description Defaults to the strongest guarantee the source supports: `live` for filters, `snapshot` for ranked queries. `live` registers subscriptions and keeps dependents current. `snapshot` registers nothing: dependents publish with freshness `unverified` (never `current`), rebuild on `refresh_interval` or manually, and `freshness=require_current` dependency reads refuse them. Declaring `live` asserts the guarantee: a query with a ranking clause is then rejected (400 `context_source_requires_snapshot`) instead of silently becoming a snapshot. Declaring `snapshot` opts a filter out of live tracking.
-             * @enum {string}
-             */
-            tracking?: "live" | "snapshot";
-            /** @description Snapshot sources only: rebuild interval (at least 1s). */
-            refresh_interval?: string;
-        };
-        /** @description Rebuild policy for context-source invalidation. Invalidation (stale freshness) is always reported immediately; debounce only coalesces rebuild work. */
-        EnrichmentRefreshConfig: {
-            /**
-             * @description `background` journals rebuilds automatically; `manual` only marks dependents stale (rebuild with the reprocess endpoints).
-             * @default background
-             * @enum {string}
-             */
-            mode?: "background" | "manual";
-            /** @description Coalescing delay before a background rebuild (for example `2s`). */
-            debounce?: string;
-        };
-        /** @description Non-semantic execution policy for one producer or index maintenance operation. These fields tune how work is batched and do not change generated artifact identity. */
+        /** @description Non-semantic execution policy for one producer or index maintenance operation. Updates persist separately from the frozen publication catalog and affect future invocations without invalidating accepted artifacts. To retry incomplete extraction or regenerate accepted output, explicitly use the bounded reprocess APIs. Node/provider ceilings still apply. */
         ExecutionPolicy: {
+            /**
+             * Format: uint32
+             * @description Invocation output-token budget for reader/generator assets and document-extraction OCR pages. Overrides producer max_tokens at execution only; it does not change the stored recipe, source fingerprint, or completed outputs. A lower value does not retroactively reject accepted output. Omit to use the producer budget.
+             */
+            max_output_tokens_per_item?: number;
             /** @description Maximum items to process in one batch for this operation. */
             batch_items?: number;
             /**
@@ -18752,11 +18978,6 @@ export interface components {
             producer_json?: string;
             /** @description Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator, extractor, or decision); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission. */
             neighbor_context?: components["schemas"]["EnrichmentNeighborContextConfig"];
-            /** @description Named cross-document context consumed by this asset producer, rendered as a canonical `{"context":{<name>:...}}` block appended to the producer input and folded into its skip state. Changes to consumed inputs (projected fields, query membership, insertion of a first match, deletion, TTL expiry, or a missing optional document becoming present) invalidate and rebuild the artifact; unrelated rows and unconsumed fields do not. Only valid on asset enrichments whose producer consumes prompt text. Supported by embedded runtimes (single-table and multi-table Lite) and by distributed tables, where context sources are declared through the artifact enrichment endpoint (not inline at table creation) and admission resolves table names and rejects cross-table generated-input cycles. Context reads execute as the declaring principal: it must be able to read every source table, and its row filter on each is conjoined into query sources (filters, traversals, and ranked queries) at declaration (document sources, ranked graph operations, and the `text`/`vector` shorthands are refused where a row filter applies). Re-declare the enrichment to re-capture changed policies. */
-            context_sources?: {
-                [key: string]: components["schemas"]["EnrichmentContextSource"];
-            };
-            refresh?: components["schemas"]["EnrichmentRefreshConfig"];
             /** @description Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity. */
             execution?: components["schemas"]["ExecutionPolicy"];
             /** @description Typed shorthand for a transcription asset enrichment. Only valid with kind=asset and without producer_json; Antfly expands it into a document_extraction producer whose audio route transcribes each recording with this speech-to-text provider. The produced units carry the transcript text, provider confidence, and per-phrase time offsets, and chunk enrichments that consume them emit _start_time_ms/_end_time_ms on every chunk. With diarization: true the phrases also carry who spoke them, and a chunk that does not straddle a turn emits _speaker. content_type defaults to application/json. */
@@ -19475,9 +19696,9 @@ export interface components {
             aggregates?: components["schemas"]["AlgebraicAggregateConfig"][];
         };
         /** @enum {string} */
-        RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not" | "cast" | "case_when" | "modulo" | "in_list" | "not_in_list" | "array";
+        RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not" | "cast" | "case_when" | "modulo" | "in_list" | "not_in_list" | "array" | "replace" | "md5" | "abs" | "ceil" | "floor" | "round" | "trunc" | "sign" | "sqrt" | "jsonb_typeof" | "jsonb_array_length" | "jsonb_extract_path" | "jsonb_extract_path_text" | "uuidv4" | "uuidv7" | "transaction_timestamp" | "length" | "octet_length" | "bit_length";
         /** @enum {string} */
-        RelationalExpressionType: "string" | "blob" | "boolean" | "datetime" | "integer" | "number" | "numeric" | "sql_array";
+        RelationalExpressionType: "string" | "blob" | "boolean" | "datetime" | "integer" | "number" | "numeric" | "sql_array" | "json" | "numrange" | "daterange" | "tsrange" | "tstzrange" | "enumeration";
         /**
          * @description Exact PostgreSQL builtin identity for a relational root scalar column.
          *     SQL array columns use SQLArrayElementType for their element identity.
@@ -19501,16 +19722,41 @@ export interface components {
          */
         SQLBuiltinType: "text" | "int16" | "int32" | "int64" | "float32" | "float64" | "boolean" | "uuid" | "jsonb" | "numeric";
         /**
-         * @description Immutable typed scalar expression, limited to 128 nodes and 16 levels.
+         * @description Typed scalar expression, limited to 128 nodes and 16 levels. CHECK,
+         *     generated-column and index expressions must be immutable. UUIDv4 and
+         *     UUIDv7 generation are permitted only in column defaults and require
+         *     reader capability version 33. They run once during owned row
+         *     preparation, never during schema publication or restore verification.
+         *     Transaction-clock defaults require reader capability version 34 and
+         *     use the transaction owner's captured instant, shared across rows and
+         *     statements in an explicit transaction. Stored values are preserved on restore.
+         *     The uuidv4, uuidv7 and transaction_timestamp operations take no args;
+         *     uuidv7 may specify shift and transaction_timestamp may specify precision.
          *     A literal requires type; omitted value means typed null. A column
          *     requires column; other
-         *     operations require args. Unknown or irrelevant fields are rejected.
+         *     operations except uuidv4, uuidv7 and transaction_timestamp require args. Unknown or irrelevant fields are rejected.
          *     Arithmetic operands have the same integer or number type. Integer
          *     division truncates toward zero. Overflow and division by zero reject
          *     the write. Arithmetic and string operations propagate null. ASCII case
-         *     operations leave non-ASCII bytes unchanged. No volatile functions are
-         *     accepted. Allocated results are bounded to 1 MiB each. Allocations
-         *     and byte-comparison operand work share a 4 MiB evaluation budget per
+         *     operations leave non-ASCII bytes unchanged. Volatile operations are restricted to column defaults. Allocated results are bounded to 1 MiB each.
+         *     The replace operation takes three text arguments and performs literal,
+         *     non-overlapping replacement; an empty search string leaves the input
+         *     unchanged. md5 takes one text argument and returns 32 lowercase hex
+         *     characters (a SQL compatibility fingerprint, not a security primitive).
+         *     Both are strict in SQL NULL and require reader capability version 27,
+         *     including when nested inside scalar/boolean expressions. Literal search
+         *     patterns are prepared with immutable plans; matching, copies and dynamic
+         *     pattern preparation share invocation work/cancellation admission.
+         *     Numeric functions abs, ceil, floor, round, trunc, sign and sqrt require
+         *     reader capability version 28, even when nested in boolean programs.
+         *     They take one NUMERIC or float64 argument; abs also preserves integer
+         *     widths and float32. round and trunc optionally accept an int32 scale
+         *     as a second argument only for NUMERIC. Operands must already have their
+         *     resolved SQL types; SQL lowering inserts required promotions. NUMERIC
+         *     round uses ties away from zero; float64 round uses ties to even. All
+         *     selected arguments evaluate before strict NULL propagation. NUMERIC
+         *     execution never converts through float and shares invocation admission.
+         *     Allocations and byte-comparison operand work share a 4 MiB evaluation budget per
          *     row and expression set. An integer literal may use a decimal string
          *     for exact int64 transport; blob uses base64 and datetime uses the
          *     normal relational datetime representation.
@@ -19576,16 +19822,42 @@ export interface components {
          *     A matching candidate wins over NULL candidates; otherwise a NULL
          *     candidate makes the result UNKNOWN. These operations require schema
          *     capability version 19.
+         *     Enumeration expressions require reader capability version 40. Enum
+         *     literals and casts declare named_type_id from the owning schema directory.
+         *     Input labels are exact and case-sensitive; comparisons retain declaration
+         *     order and reject unrelated named identities. Enum/text conversions are
+         *     explicit; stored enum values retain four-byte symbols. CHECK, generated
+         *     values, defaults, typed-row ingress and restore share the native validator.
+         *     JSON expressions require reader capability version 30. The json type
+         *     carries JSONB semantics, including exact numeric values and display
+         *     scale. jsonb_typeof and jsonb_array_length take one JSON argument;
+         *     array length rejects a non-array value. jsonb_extract_path and
+         *     jsonb_extract_path_text take a JSON argument followed by 1 to 31 text
+         *     path components. Negative array ordinals count from the end; a missing
+         *     path returns SQL NULL. JSON extraction retains JSON null; text extraction
+         *     converts JSON null to SQL NULL. Arguments are evaluated strictly, while
+         *     enclosing CASE/coalesce retain their short-circuit semantics.
          */
         RelationalScalarExpression: {
             op: components["schemas"]["RelationalExpressionOp"];
             type?: components["schemas"]["RelationalExpressionType"];
+            /**
+             * Format: uint64
+             * @description Required on enumeration literals and casts, including typed NULL. Resolved from the immutable schema-owned named-type directory; labels and executable definitions are never accepted here. Requires reader capability version 40. Other expression types reject this field.
+             */
+            named_type_id?: number;
             /** @description Numeric builtin result identity on numeric literals, arithmetic, negate, and cast (capability version 18), or required array element identity on sql_array literals including typed NULL (capability version 24). */
             sql_type?: components["schemas"]["SQLBuiltinType"];
             /** @description Optional precision/signed-scale coercion; accepted only on cast with type numeric and sql_type numeric. Requires reader capability version 23. */
             numeric_modifier?: components["schemas"]["SQLNumericModifier"];
             /** @description Typed literal value, including null. */
             value?: unknown;
+            /** @description Canonical PostgreSQL interval text, accepted only on a uuidv7 default operation. SQL lowering resolves and binds calendar months, days, and microseconds before publication. Omission generates an unshifted UUID; SQL NULL shifts lower to a NULL literal instead. Infinite intervals remain representable declarations but fail when evaluated. */
+            shift?: string;
+            /** @description Fractional-second precision (omission means 6), accepted only on a transaction_timestamp column default. Rounding uses the shared PostgreSQL timestamp semantics. Requires reader capability version 34. */
+            precision?: number;
+            /** @description For a literal of type json only. True denotes present JSON null and requires value to be omitted or null. False or omission leaves an omitted/null value as SQL NULL. This explicit marker survives SDKs that omit optional null values. Requires reader capability version 30. */
+            json_null?: boolean;
             column?: string;
             /** @description Optional binary or ASCII case-insensitive collation for string comparisons and in_list; aliases match ordered indexes. */
             collation?: string;
@@ -19625,14 +19897,21 @@ export interface components {
         };
         /** @enum {string} */
         RelationalComparisonOp: "is_null" | "is_not_null" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_distinct" | "is_not_distinct";
-        /** @description A typed partial-index conjunct. Only TRUE is indexed; FALSE and SQL UNKNOWN are excluded. */
+        /**
+         * @description A typed partial-index conjunct. Specify either a constant truth value,
+         *     or a column and comparison operation, never both. Only TRUE is indexed;
+         *     FALSE and SQL UNKNOWN are excluded. A constant false conjunct represents
+         *     an empty index without inventing a column dependency.
+         */
         RelationalIndexPredicate: {
-            column: string;
-            op: components["schemas"]["RelationalComparisonOp"];
+            column?: string;
+            op?: components["schemas"]["RelationalComparisonOp"];
             /** @description Typed scalar operand; integer columns also accept exact decimal strings. Omission means NULL. */
             value?: unknown;
             /** @description String comparison collation with the same semantics as ordered keys. */
             collation?: string;
+            /** @description Constant membership truth. SQL UNKNOWN is normalized to false for index membership. Requires reader capability version 26. */
+            constant?: boolean;
         };
         /** @description Schema-bound composite ordered index on a relational table. Keys use stable typed comparison semantics and independent direction, null placement, and string collation. Existing rows build asynchronously; indexed queries require complete owner coverage. The table schema is the single durable authority for these definitions. */
         RelationalIndexConfig: {
@@ -19756,6 +20035,68 @@ export interface components {
         };
         /** @description Type-safe configuration for a new index. The index name is owned by the request path. */
         CreateIndexRequest: components["schemas"]["CreateFullTextIndexRequest"] | components["schemas"]["CreateEmbeddingsIndexRequest"] | components["schemas"]["CreateGraphIndexRequest"] | components["schemas"]["CreateAlgebraicIndexRequest"] | components["schemas"]["CreateRelationalIndexRequest"];
+        DocumentSQLColumn: {
+            name: string;
+            /** @description Literal object keys, without wildcard or array traversal. */
+            path: string[];
+            /**
+             * @description Existing strict SQL document scalar domain. Numeric/object values are never stringified for keyword or text columns.
+             * @enum {string}
+             */
+            type: "keyword" | "text" | "integer" | "number" | "boolean" | "json";
+        };
+        SQLViewIndexRequirement: {
+            /** @description Unqualified canonical view name in this document source's namespace. Does not create a view or grant permissions. */
+            view_name: string;
+            /** @description Required full-text indexes. Canonical view admission captures their actual server-managed incarnations. Dropping and recreating an index or changing its logical configuration invalidates the captured dependency until the view is explicitly replaced. Maintenance and rebuilds of the same logical index acquire a fresh ready publication for each retained read. */
+            required_indexes: string[];
+        };
+        /** @description Immutable enum symbol. Symbol IDs are append-only; order keys are opaque stable ordering metadata. */
+        SQLNamedEnumLabel: {
+            /** Format: uint32 */
+            id: number;
+            /** @description Exact UTF-8 label; PostgreSQL limits its encoded length to 63 bytes. */
+            text: string;
+            /** @description Server-managed immutable ordering key encoded as lowercase hexadecimal. */
+            order_key: string;
+        };
+        /** @description Immutable named-base identity pinned by a domain definition. */
+        SQLNamedTypeReference: {
+            /** Format: uint64 */
+            id: number;
+            origin_id: string;
+            /** Format: uint32 */
+            generation: number;
+        };
+        /** @description Exactly one builtin or named base. The server resolves and verifies the complete base chain before publication. */
+        SQLNamedDomainBase: {
+            /** @enum {string} */
+            kind: "builtin" | "named";
+            builtin?: components["schemas"]["SQLBuiltinType"];
+            named?: components["schemas"]["SQLNamedTypeReference"];
+        };
+        /** @description A named CHECK over the typed VALUE input. Unvalidated constraints still enforce every new assignment. */
+        SQLNamedDomainCheck: {
+            name: string;
+            expression: components["schemas"]["RelationalScalarExpression"];
+            validated: boolean;
+        };
+        /** @description Server-resolved immutable domain contract. Defaults affect future assignments; restrictive changes require dependent-owner activation. */
+        SQLNamedDomainDefinition: {
+            base: components["schemas"]["SQLNamedDomainBase"];
+            numeric_modifier?: components["schemas"]["SQLNumericModifier"];
+            default_expression?: components["schemas"]["RelationalScalarExpression"];
+            not_null: boolean;
+            checks: components["schemas"]["SQLNamedDomainCheck"][];
+        };
+        /** @description Server-resolved executable type layout retained by a table schema epoch. Enum layouts require labels; domain layouts require domain. The alternatives are mutually exclusive. Catalog ownership is separate from value representation. */
+        SQLNamedTypeLayout: {
+            /** @enum {string} */
+            kind: "enum" | "domain";
+            identity: components["schemas"]["SQLNamedTypeIdentity"];
+            labels?: components["schemas"]["SQLNamedEnumLabel"][];
+            domain?: components["schemas"]["SQLNamedDomainDefinition"];
+        };
         /**
          * @description Storage representation for the table. Omission selects "document".
          *     "relational" stores schema-bound typed rows and requires exactly one
@@ -19831,9 +20172,28 @@ export interface components {
             snapshot?: components["schemas"]["ExternalLakeSnapshotSelector"];
             catalog?: components["schemas"]["LakeCatalogConfig"];
         };
+        /**
+         * @description SQL owned-sequence default policy. Serial defaults preserve explicit values even under OVERRIDING USER VALUE; identity defaults obey PostgreSQL overriding rules.
+         * @enum {string}
+         */
+        RelationalColumnSequenceGeneration: "serial" | "by_default" | "always";
+        /** @description Backend-bound owned-sequence default, assigned atomically with the table and stable attribute identity. Names are descriptive; allocation uses the exact catalog incarnation and native 64-bit identities. Requires reader capability 37. Preparation allocates only for absent inputs; explicit NULL never requests a new value. Restore preserves stored values and never consumes the sequence. Clients cannot mint ownership by copying a descriptor onto a different table or column. Bulk mutation APIs preserve explicit identity values, like PostgreSQL COPY; SQL enforces ALWAYS and OVERRIDING rules. Implicit identity allocation uses table write authority; serial defaults and explicit sequence functions require sequence privileges. */
+        RelationalColumnSequence: {
+            generation: components["schemas"]["RelationalColumnSequenceGeneration"];
+            incarnation: string;
+            sequence_id: string;
+            namespace_id: string;
+            table_id: string;
+            column_id: string;
+            database: string;
+            namespace: string;
+            name: string;
+        };
+        /** @description Exactly one of expression or the backend-bound sequence reference is required. Sequence references are column defaults only and cannot define stored generated columns. */
         RelationalColumnExpression: {
             column: string;
-            expression: components["schemas"]["RelationalScalarExpression"];
+            expression?: components["schemas"]["RelationalScalarExpression"];
+            sequence?: components["schemas"]["RelationalColumnSequence"];
         };
         /**
          * @description A typed CHECK. Supply either expression or column and op (with optional
@@ -19845,6 +20205,11 @@ export interface components {
          *     use exact decimal strings to avoid client-side floating-point rounding.
          */
         RelationalCheckConstraint: {
+            /**
+             * @description Enforce this CHECK on every new or changed row without asserting that historical rows satisfy it. Explicit validation clears this declaration only after an unpublished generation has validated all rows and atomically replaced the active generation. Disposable background scan coverage does not change this declaration.
+             * @default false
+             */
+            not_valid?: boolean;
             name: string;
             column?: string;
             op?: components["schemas"]["RelationalComparisonOp"];
@@ -19880,11 +20245,15 @@ export interface components {
             origin?: components["schemas"]["RelationalUniqueConstraintOrigin"];
             /** @description SQL primary-key identity. At most one per relational table; all key columns must be required and nonnullable. */
             primary?: boolean;
+            /** @description Non-key payload columns for this constraint's covering ordered index. They never participate in uniqueness, foreign-key target identity, or primary-key nullability. Only column-key, constraint-owned declarations support INCLUDE. */
+            include_columns?: string[];
             columns?: string[];
             /** @description Typed native unique keys. Specify either columns or keys. */
             keys?: components["schemas"]["RelationalIndexKey"][];
             /** @description Conjunction restricting uniqueness to matching rows. */
             where?: components["schemas"]["RelationalIndexPredicate"][];
+            /** @description Range-valued final key column for PostgreSQL WITHOUT OVERLAPS. Other key columns define equality groups; nonempty ranges within each group must be disjoint. The column remains in columns. Temporal keys are not equality-only foreign-key targets or ON CONFLICT arbiters. */
+            without_overlaps_column?: string;
             /** @description When true, NULL components compare equal for uniqueness. */
             nulls_not_distinct?: boolean;
             /** @description Permit uniqueness checks at transaction commit. Never eligible as an ON CONFLICT arbiter or a referenced foreign key target. */
@@ -19907,14 +20276,22 @@ export interface components {
         /**
          * @description Composite foreign key. Child and parent columns correspond by position
          *     and must have the same physical comparison types. The parent columns
-         *     must identify a unique key. Existing-row validation is independent of
-         *     new-write enforcement and is never client-writable.
+         *     must identify a unique key. Existing-row validation is independent of new-write enforcement.
+         *     Clearing NOT VALID requires coordinated historical validation.
          *     Enforcement and referential actions share the bounded distributed
          *     transaction path, including TTL expiry. Partial matching uses ordered
          *     support indexes on the parent; activation waits until these are ready.
          *     SET NULL requires every child column to accept explicit NULL.
          */
         RelationalForeignKeyConstraint: {
+            /**
+             * @description Retain historical references without requiring their parents to exist.
+             *     New writes and parent referential actions remain enforced. Setting
+             *     false on an existing unvalidated declaration requires coordinated
+             *     validation before publication; it cannot certify coverage itself.
+             * @default false
+             */
+            not_valid?: boolean;
             name: string;
             child_columns: string[];
             /**
@@ -19949,6 +20326,8 @@ export interface components {
             /** @description Conjunction of typed predicates. Indexed queries must explicitly contain every conjunct with equivalent typed comparison semantics. */
             where?: components["schemas"]["RelationalIndexPredicate"][];
         };
+        /** @description Document SQL alias declared by x-antfly-column-name on a JSON Schema property. Nested aliases bind literal object-key segments, including keys containing dots or slashes. Aliases do not create stored fields. Names must be unique across physical roots and aliases within a document type and must resolve to the same path across document types. Reserved _id, _doc and _version names are not allowed. Aliases require a fixed property path; array-item, pattern-property and conditional-schema aliases are rejected. Physical root columns remain available alongside aliases. Ancestor and descendant columns cannot be assigned together in one SQL mutation. */
+        DocumentColumnName: string;
         /**
          * @description Field types accepted by detailed `x-antfly-field` and dynamic-template
          *     mappings. JSON-schema-oriented aliases are normalized to Antfly's
@@ -20049,6 +20428,39 @@ export interface components {
             /** @default false */
             nullable?: boolean;
             description?: string;
+        } & {
+            [key: string]: unknown;
+        };
+        /**
+         * @description A relational PostgreSQL range column. JSON ingress and SQL results use
+         *     PostgreSQL range text. The declared subtype supplies identity even for
+         *     NULL, empty and unbounded values. Packed rows retain canonical binary
+         *     endpoints, inclusive/exclusive flags and exact NUMERIC precision.
+         *     Empty ranges, omitted bounds, subtype infinities and SQL NULL are
+         *     distinct. DATE ranges canonicalize finite endpoints to [lower,upper).
+         *     Timestamp endpoints use the execution's UTC zone. Requires schema
+         *     reader capability version 35.
+         */
+        SQLRangeColumnSchema: {
+            /** @enum {string} */
+            type: "numrange" | "daterange" | "tsrange" | "tstzrange";
+            /** @default false */
+            nullable?: boolean;
+            description?: string;
+        } & {
+            [key: string]: unknown;
+        };
+        /** @description A schema-bound enum column. JSON values are exact labels; SQL NULL is distinct from every label, including the empty string. */
+        SQLNamedEnumColumnSchema: {
+            /** @enum {string} */
+            type: "sql_enum";
+            /**
+             * Format: uint64
+             * @description Resolved catalog type ID. The table's named_types directory supplies its immutable executable definition.
+             */
+            "x-antfly-sql-type-id": number;
+            /** @default false */
+            nullable?: boolean;
         } & {
             [key: string]: unknown;
         };
@@ -20154,6 +20566,12 @@ export interface components {
         };
         /** @description Schema definition for a table with multiple document types */
         TableSchema: {
+            /** @description Read-only typed SQL aliases over literal document paths, independent of JSON Schema write validation. SQL assignments reject these computed aliases; raw document ingress remains unchanged. Missing paths produce SQL NULL; JSON null is retained for json columns and SQL NULL for scalar columns. Scalar domain mismatches fail when the value is demanded instead of converting to text. Untaken CASE and COALESCE branches do not evaluate a hidden typed failure. Alias names cannot shadow existing schema columns or reserved document columns. Document storage only. */
+            document_sql_columns?: components["schemas"]["DocumentSQLColumn"][];
+            /** @description Document-source dependency policies consumed by ordinary CREATE VIEW in the same namespace. Typed paths use schema-owned document_sql_columns or existing document property aliases; this field creates no second view catalog. Required index lifetimes and readiness are checked once per retained physical read cut. Relational sources reject these policies. */
+            sql_view_requirements?: components["schemas"]["SQLViewIndexRequirement"][];
+            /** @description Server-resolved immutable SQL type layouts, sorted by catalog ID. Clients reference types through x-antfly-sql-type-id; catalog admission verifies every layout against its active definition. Retained by backups and schema epochs for deterministic cold decoding. */
+            readonly named_types?: components["schemas"]["SQLNamedTypeLayout"][];
             /**
              * Format: uint32
              * @description Backend-managed schema generation used for migrations. Omit it from create and update requests.
@@ -20169,6 +20587,11 @@ export interface components {
                 order?: "asc" | "desc";
             }[];
             storage_mode?: components["schemas"]["TableStorageMode"];
+            /**
+             * @description PostgreSQL logical replication identity for native relational tables. Default uses the primary key. Full emits the complete old row.
+             * @enum {string}
+             */
+            replica_identity?: "default" | "full";
             /** @description External tables require relational storage mode. Ordinary row writes are read-only; an explicit iceberg_writer catalog binding permits Iceberg file commits. Omit for native tables. */
             base_source?: components["schemas"]["ExternalLakeTableSource"];
             /**
@@ -20187,14 +20610,25 @@ export interface components {
              *     4096 expression nodes, and 4 MiB of literal data. Evaluation has
              *     a shared 4 MiB allocation budget across all column expressions.
              *     Restore verifies stored results instead of silently recomputing
-             *     them. Changing, adding, or removing generated semantics through
-             *     an existing table's schema update requires explicit rewrite=true
+             *     them. On relational tables, changing, adding, or removing generated
+             *     semantics through a schema update requires explicit rewrite=true
              *     on the PUT or PATCH schema route. This returns a durable restore
              *     job and replaces the complete authorized dependency cohort only
              *     after distributed transformation and validation. Ordinary schema
              *     updates reject these changes, even when a table appears empty.
              *     Declaration reordering and default-only changes remain allowed.
-             *     Relational tables only.
+             *     Supported by relational and document tables. Document declarations
+             *     require one enforced document type and target declared root fields.
+             *     Expressions may read persisted declared roots; SQL virtual fields
+             *     and transport directives cannot be expression sources.
+             *     SQL NULL removes the generated member; a JSON null datum remains
+             *     present. Unknown members are preserved. SQL column assignments to
+             *     generated roots or their aliases are rejected, while whole-document
+             *     writes replace submitted generated members with computed values.
+             *     Document producer definitions are immutable through schema-update
+             *     routes, including rewrite=true. Changing these definitions requires
+             *     a replacement table and explicit data migration; ordinary restore
+             *     preserves and verifies existing computed values.
              */
             generated_columns?: components["schemas"]["RelationalColumnExpression"][];
             /**
@@ -20471,6 +20905,29 @@ export interface components {
         };
         /** @description Discriminated normalized configuration returned after an index is created. */
         CreatedIndex: components["schemas"]["CreatedFullTextIndex"] | components["schemas"]["CreatedEmbeddingsIndex"] | components["schemas"]["CreatedGraphIndex"] | components["schemas"]["CreatedAlgebraicIndex"] | components["schemas"]["CreatedRelationalIndex"];
+        /** @enum {string} */
+        IndexPublicationState: "admission_unknown" | "pending" | "published" | "failed" | "canceled";
+        /** @enum {string} */
+        IndexPublicationPhase: "fencing" | "reserving" | "building" | "installing" | "releasing" | "published" | "canceling" | "cancel_releasing" | "canceled";
+        /** @enum {string} */
+        IndexPublicationFailure: "duplicate_key" | "invalid_candidate" | "requested";
+        /** @description Exact observation of an online relational-index publication job, not a query-readiness certificate. Published means this retained job completed; later schema/index changes may supersede its artifacts. An absent or unmirrored job is admission_unknown, never permission to replay DDL. */
+        IndexPublicationStatus: {
+            /** @enum {string} */
+            index_type: "relational";
+            index_name: string;
+            publication_token: components["schemas"]["IndexPublicationToken"];
+            table_id: string;
+            publication_id: string;
+            plan_digest: string;
+            metadata_incarnation: string;
+            state: components["schemas"]["IndexPublicationState"];
+            phase?: components["schemas"]["IndexPublicationPhase"];
+            failure?: components["schemas"]["IndexPublicationFailure"];
+            replication_pending: boolean;
+            /** Format: uint16 */
+            owner_count?: number;
+        };
         /**
          * @description Lifecycle state for the desired index incarnation. A failed desired repair may coexist with queryable=true when a separately proven serving incarnation remains available; clients must use the explicit milestone booleans.
          * @enum {string}
@@ -26674,6 +27131,61 @@ export interface components {
             /** @default {} */
             config_schema_json?: string;
         };
+        /**
+         * @description Exact native SQL callable scalar domains, preserving integer widths and temporal/range identities.
+         * @enum {string}
+         */
+        SQLPackageScalarType: "text" | "uuid" | "int16" | "int32" | "int64" | "float32" | "float64" | "boolean" | "jsonb" | "numeric" | "date" | "time" | "time_tz" | "timestamp" | "timestamp_tz" | "interval" | "numrange" | "daterange" | "tsrange" | "tstzrange";
+        /** @enum {string} */
+        SQLPackageVolatility: "immutable" | "stable" | "volatile";
+        SQLPackageType: {
+            scalar: components["schemas"]["SQLPackageScalarType"];
+            /**
+             * @description Arrays support text, uuid, int16, int32, int64, float32, float64, boolean, jsonb and numeric. Other scalar domains require false.
+             * @default false
+             */
+            array?: boolean;
+        };
+        SQLPackageArgument: {
+            name?: string | null;
+            type: components["schemas"]["SQLPackageType"];
+        };
+        /** @description A pure scalar SQL function implemented by the declared immutable core WASM runtime; no host capabilities or native-library fallback. */
+        SQLPackageExport: {
+            name: string;
+            runtime: components["schemas"]["ExtensionIdentifier"];
+            /** @description Tool selector passed to antfly_extension_call_tool. */
+            export_name: string;
+            /** @default [] */
+            arguments?: components["schemas"]["SQLPackageArgument"][];
+            result: components["schemas"]["SQLPackageType"];
+            /** @default false */
+            strict?: boolean;
+            /** @default volatile */
+            volatility?: components["schemas"]["SQLPackageVolatility"];
+        };
+        /** @description Database-scoped SQL installation over the existing owned package registry. Requires embedded_db scope, SHA256-bound core WASM artifacts, no other install objects/shapes and no host capabilities. Familiar package names imply no upstream extension payload. */
+        SQLPackageControl: {
+            /** @description Initial package-level default intent used only when the first SQL version is registered. Later defaults are explicit digest-bound operator promotions; version names are opaque. */
+            default_version: string;
+            /** @description Optional fixed installation namespace; requires relocatable false. */
+            schema?: string | null;
+            exports: components["schemas"]["SQLPackageExport"][];
+            /**
+             * @description Predecessor versions supported by this version's declarative typed-export transition, separate from REST update scripts.
+             * @default []
+             */
+            updates_from?: string[];
+        };
+        /** @description Current global SQL default selection. Retained promotion receipts remain private to durable metadata and checkpoints. */
+        SQLPackageDefaultControl: {
+            name: components["schemas"]["ExtensionIdentifier"];
+            identity: number[];
+            generation: number;
+            default_version: string;
+            /** @description Null while the initial declared target has not been registered. Explicit promotions always bind an immutable SHA256 target digest. */
+            default_digest: number[] | null;
+        };
         PackageManifest: {
             /** @enum {string} */
             manifest_api_version: "extensions/v1";
@@ -26692,6 +27204,7 @@ export interface components {
             dependencies?: components["schemas"]["PackageDependency"][];
             artifacts?: components["schemas"]["PackageArtifact"][];
             install: components["schemas"]["InstallManifest"];
+            sql?: components["schemas"]["SQLPackageControl"];
             updates?: components["schemas"]["UpdateManifestRef"][];
         };
         InstalledExtension: {
@@ -31171,6 +31684,192 @@ export interface components {
             error: string;
             retryable: boolean;
         };
+        ChangefeedCursor: string;
+        ChangefeedError: {
+            error: string;
+        };
+        ChangefeedCreate: {
+            tables: string[];
+            selectors?: components["schemas"]["ChangefeedSelector"][];
+            /**
+             * @default now
+             * @enum {string}
+             */
+            start?: "now" | "snapshot_then_changes";
+            events?: ("document_committed" | "artifact_published" | "publication_activated")[];
+            /**
+             * @default keys_and_versions
+             * @enum {string}
+             */
+            include?: "keys_and_versions" | "rows";
+            /** @default 3600 */
+            lease_seconds?: number;
+        };
+        ChangefeedSelector: {
+            table: string;
+            fields?: string[];
+            predicates?: components["schemas"]["ChangefeedPredicate"][];
+        };
+        ChangefeedPredicate: {
+            field: string;
+            /** @description A JSON scalar or null. Missing and null are distinct. */
+            value: unknown;
+        };
+        ChangefeedCreated: {
+            id: string;
+            cursor: components["schemas"]["ChangefeedCursor"];
+            /** Format: int64 */
+            expires_at: number;
+        };
+        ChangefeedCheckpoint: {
+            cursor: components["schemas"]["ChangefeedCursor"];
+        };
+        ChangefeedLease: {
+            /** Format: int64 */
+            expires_at: number;
+        };
+        ChangefeedProgress: {
+            /** @enum {string} */
+            phase: "enrolling" | "bootstrap" | "streaming" | "reset_required" | "closing" | "deleted";
+            acknowledged_cursor: components["schemas"]["ChangefeedCursor"];
+            unacknowledged_deliveries: number;
+            /** Format: int64 */
+            oldest_unacknowledged_at?: number | null;
+            cursor_window: number;
+            /** Format: int64 */
+            cursor_byte_limit: number;
+            /** Format: int64 */
+            expires_at: number;
+            /** Format: int64 */
+            bootstrap_expires_at?: number | null;
+        };
+        ChangefeedPage: {
+            /** @enum {integer} */
+            version: 1;
+            events: components["schemas"]["ChangefeedEvent"][];
+            transaction?: {
+                transaction_id: string;
+                complete: boolean;
+            } | null;
+            snapshot?: {
+                complete: boolean;
+            };
+        };
+        ChangefeedEvent: {
+            event_id: string;
+            table_id: string;
+            transaction_id?: string;
+            version?: string;
+            /** @enum {string} */
+            operation?: "insert" | "enter" | "update" | "leave" | "delete";
+            /** @enum {string} */
+            kind?: "document_snapshot" | "document_committed" | "artifact_published" | "publication_activated";
+            key?: components["schemas"]["ChangefeedKey"];
+            before?: {
+                [key: string]: unknown;
+            } | null;
+            after?: {
+                [key: string]: unknown;
+            } | null;
+        } & {
+            [key: string]: unknown;
+        };
+        ChangefeedKey: {
+            /** @enum {string} */
+            encoding: "utf8" | "base64url";
+            value: string;
+        };
+        ManagedSourceReplacement: {
+            /** Format: uint64 */
+            table_id: number;
+            expected_sources_hash: string;
+            replication_sources: components["schemas"]["ReplicationSource"][];
+        };
+        ManagedSourceConfigured: {
+            /** Format: uint64 */
+            table_id: number;
+            sources_hash: string;
+            /** @enum {string} */
+            state: "configured";
+        };
+        ManagedSourceStatus: {
+            /** Format: uint64 */
+            table_id: number;
+            sources_hash: string;
+            /** @description Source definitions with credential material redacted. */
+            replication_sources: {
+                [key: string]: unknown;
+            }[];
+            progress: components["schemas"]["ManagedSourceProgress"][];
+            destination_contract: components["schemas"]["ManagedSourceDestinationContract"];
+            index_publication?: {
+                /** Format: uint64 */
+                published_generation?: number | null;
+                published_snapshot?: string | null;
+                /** Format: uint64 */
+                building_generation?: number | null;
+                /** Format: uint64 */
+                failed_generation?: number | null;
+            } | null;
+            cdc_supported: boolean;
+            cdc_unsupported_reason: string;
+        };
+        ManagedSourceProgress: {
+            /** Format: uint64 */
+            table_id: number;
+            source_ordinal: number;
+            source_kind: string;
+            external_table?: string;
+            cutover_mode?: string;
+            slot_name?: string;
+            publication_name?: string;
+            phase: string;
+            /** @description Opaque destination progress token. */
+            checkpoint?: string;
+            /** Format: uint64 */
+            snapshot_offset?: number;
+            prepared_checkpoint?: string;
+            stream_checkpoint?: string;
+            accepted_stream_checkpoint?: string | null;
+            failure_class?: string;
+            last_error?: string;
+            /** Format: uint64 */
+            lag_records?: number;
+            /** Format: uint64 */
+            lag_millis?: number;
+            /** Format: uint64 */
+            consecutive_failures?: number;
+            /** Format: uint64 */
+            last_source_commit_at_ms?: number;
+            /** Format: uint64 */
+            last_success_at_ms?: number;
+            /** Format: uint64 */
+            last_change_applied_at_ms?: number;
+        } & {
+            [key: string]: unknown;
+        };
+        ManagedSourceDestinationContract: {
+            /** @enum {integer} */
+            version: 1;
+            /** @enum {string|null} */
+            adapter?: "native" | "writable_iceberg" | null;
+            /** @enum {string} */
+            input: "row_transactions" | "committed_snapshots" | "unavailable";
+            /** @enum {string} */
+            accepted_by: "native_transaction" | "iceberg_ingress" | "none";
+            /** @enum {string} */
+            committed_by: "native_transaction" | "iceberg_catalog_snapshot" | "external_snapshot" | "none";
+            /** @enum {string} */
+            transaction_scope: "native_transaction" | "iceberg_table" | "none";
+            /** @enum {string} */
+            committed_history: "native_rows_when_enrolled" | "iceberg_committed_wal" | "unavailable";
+            outbound: {
+                document_committed: boolean;
+                snapshot_then_changes: boolean;
+                artifact_published: boolean;
+                publication_activated: boolean;
+            };
+        };
         ChunkSourceReference: {
             /** @enum {string} */
             type: "source";
@@ -32834,6 +33533,26 @@ export interface components {
                 "application/json": components["schemas"]["InferenceCapacityError"];
             };
         };
+        /** @description Write permission was denied, or a row policy rejected the transaction. */
+        WriteForbidden: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["TransactionWriteError"] | components["schemas"]["Error"];
+                "text/plain": string;
+            };
+        };
+        /** @description Write admission or preparation is temporarily unavailable. A transaction_precommit_aborted response confirms that the transaction did not commit. */
+        WriteTemporarilyUnavailable: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["TransactionWriteError"] | components["schemas"]["Error"];
+                "text/plain": string;
+            };
+        };
         /**
          * @description Internal transaction failure. If the response says that the outcome is
          *     unknown, the request may already have committed and the stateless
@@ -32985,6 +33704,33 @@ export interface components {
                 "application/json": components["schemas"]["InferenceTransientCapacityError"];
             };
         };
+        /** @description The request was rejected or the runtime could not serve it */
+        ChangefeedError: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ChangefeedError"];
+            };
+        };
+        /** @description Retry a conflicting request, or resynchronize after expiry, invalidation, or an oversized event */
+        ChangefeedRecovery: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ChangefeedError"];
+            };
+        };
+        /** @description Acknowledge outstanding pages or retry with a larger page budget */
+        ChangefeedBackpressure: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ChangefeedError"];
+            };
+        };
     };
     parameters: {
         TransactionId: string;
@@ -32994,6 +33740,7 @@ export interface components {
         KeyIdPathParameter: string;
         /** @description Casbin subject name, such as role:tenant_reader or group:eng. */
         SubjectPathParameter: string;
+        ChangefeedId: string;
     };
     requestBodies: never;
     headers: never;
@@ -34543,26 +35290,20 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            403: components["responses"]["WriteForbidden"];
             404: components["responses"]["NotFound"];
-            /** @description Transaction aborted because a predicate, topology fence, or participant state conflicted */
+            /** @description Transaction conflict. Preparation diagnostics are returned as plain text. */
             409: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": components["schemas"]["TransactionCommitResponse"];
-                };
-            };
-            500: components["responses"]["StatelessTransactionFailure"];
-            /** @description The coordinator was unavailable before a commit decision; retry is safe */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
                     "text/plain": string;
                 };
             };
+            500: components["responses"]["StatelessTransactionFailure"];
+            503: components["responses"]["WriteTemporarilyUnavailable"];
         };
     };
     executeGraphMetricAction: {
@@ -34719,26 +35460,20 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            403: components["responses"]["WriteForbidden"];
             404: components["responses"]["NotFound"];
-            /** @description Transaction aborted due to version conflict */
+            /** @description Transaction conflict. Preparation diagnostics are returned as plain text. */
             409: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": components["schemas"]["TransactionCommitResponse"];
-                };
-            };
-            500: components["responses"]["StatelessTransactionFailure"];
-            /** @description The coordinator was unavailable before a commit decision; retry is safe */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
                     "text/plain": string;
                 };
             };
+            500: components["responses"]["StatelessTransactionFailure"];
+            503: components["responses"]["WriteTemporarilyUnavailable"];
         };
     };
     listTransactionSessions: {
@@ -35078,17 +35813,20 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            403: components["responses"]["WriteForbidden"];
             404: components["responses"]["NotFound"];
-            /** @description Session commit conflict */
+            /** @description Session commit conflict. A plain-text response describes a mismatched retry body or table identity. */
             409: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": components["schemas"]["TransactionSessionCommitResponse"];
+                    "text/plain": string;
                 };
             };
             500: components["responses"]["InternalServerError"];
+            503: components["responses"]["WriteTemporarilyUnavailable"];
         };
     };
     abortTransactionSession: {
@@ -35307,6 +36045,39 @@ export interface operations {
             500: components["responses"]["InternalServerError"];
         };
     };
+    getSQLCatalogOperation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SQLCatalogRecoveryRequest"];
+            };
+        };
+        responses: {
+            /** @description Exact retained operation result or explicitly unknown outcome */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLCatalogOperationReceipt"];
+                };
+            };
+            /** @description Authentication, current authorization, token or observation admission failed */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+        };
+    };
     openSQLConnection: {
         parameters: {
             query?: never;
@@ -35361,6 +36132,41 @@ export interface operations {
                 };
             };
             /** @description Connection close rejected */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+        };
+    };
+    pollSQLNotifications: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                connection_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SQLNotificationPollRequest"];
+            };
+        };
+        responses: {
+            /** @description Bounded notification page; an active transaction yields no events. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLNotificationPage"];
+                };
+            };
+            /** @description Notification poll rejected; no SQL was executed. */
             default: {
                 headers: {
                     [name: string]: unknown;
@@ -36645,6 +37451,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            403: components["responses"]["WriteForbidden"];
             404: components["responses"]["NotFound"];
             /**
              * @description The atomic batch conflicted, the serving replica is fenced, or the
@@ -36662,15 +37469,7 @@ export interface operations {
             };
             429: components["responses"]["DenseRepairBackpressure"];
             500: components["responses"]["StatelessTransactionFailure"];
-            /** @description Write routing, document identity, or the coordinator is temporarily unavailable before a commit decision */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/plain": string;
-                };
-            };
+            503: components["responses"]["WriteTemporarilyUnavailable"];
         };
     };
     linearMerge: {
@@ -37571,27 +38370,13 @@ export interface operations {
             };
         };
         responses: {
-            /**
-             * @description Artifact enrichment registered. With `context_sources`, reports each
-             *     source's effective tracking (`live` or `snapshot`) and, for a
-             *     snapshot, the ranking clause that made it one (or `declared`).
-             */
+            /** @description Artifact enrichment registered */
             201: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        context_sources?: {
-                            [key: string]: {
-                                /** @enum {string} */
-                                kind?: "document" | "query";
-                                /** @enum {string} */
-                                tracking?: "live" | "snapshot";
-                                reason?: string;
-                            };
-                        };
-                    };
+                    "application/json": Record<string, never>;
                 };
             };
             400: components["responses"]["BadRequest"];
@@ -37831,80 +38616,6 @@ export interface operations {
                     };
                 };
             };
-            500: components["responses"]["InternalServerError"];
-            503: components["responses"]["ServiceUnavailable"];
-        };
-    };
-    getArtifactDependencies: {
-        parameters: {
-            query?: {
-                freshness?: "any" | "require_current";
-                wait_timeout_ms?: number;
-            };
-            header?: never;
-            path: {
-                /** @description Name of the table */
-                tableName: string;
-                /** @description Percent-encoded source document key. */
-                key: string;
-                /** @description Name of an asset enrichment that declares context sources. */
-                artifactName: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Dependency state */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ArtifactDependencies"];
-                };
-            };
-            400: components["responses"]["BadRequest"];
-            404: components["responses"]["NotFound"];
-            /** @description The artifact did not become current before the wait ended. */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ArtifactNotCurrent"];
-                };
-            };
-            500: components["responses"]["InternalServerError"];
-            503: components["responses"]["ServiceUnavailable"];
-        };
-    };
-    analyzeDependencyImpact: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Name of the source table */
-                tableName: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["DependencyImpactRequest"];
-            };
-        };
-        responses: {
-            /** @description Impact rows */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["DependencyImpactResponse"];
-                };
-            };
-            400: components["responses"]["BadRequest"];
-            404: components["responses"]["NotFound"];
             500: components["responses"]["InternalServerError"];
             503: components["responses"]["ServiceUnavailable"];
         };
@@ -38403,6 +39114,108 @@ export interface operations {
             500: components["responses"]["InternalServerError"];
         };
     };
+    getSchemaValidationPublication: {
+        parameters: {
+            query?: never;
+            header: {
+                "X-Antfly-Schema-Validation-Token": components["schemas"]["SchemaValidationToken"];
+            };
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Exact historical job and current table observation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SchemaValidationStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Current logical table administration is required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Table ownership or metadata incarnation changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Metadata observation unavailable; retain the token and retry this read */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getIndexPublication: {
+        parameters: {
+            query?: never;
+            header: {
+                "X-Antfly-Index-Publication-Token": components["schemas"]["IndexPublicationToken"];
+            };
+            path: {
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Exact read-only publication observation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexPublicationStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Current logical table administration is required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Table identity, publication identity or metadata incarnation changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Authoritative relation ownership is not supported by the metadata owner */
+            426: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Metadata observation is unavailable; retain the token and retry this read */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     listQuerySources: {
         parameters: {
             query?: never;
@@ -38712,6 +39525,13 @@ export interface operations {
             404: components["responses"]["NotFound"];
             /** @description Catalog or policy generation changed, or a write conflicted */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Graph write exceeds transaction capacity */
+            413: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -39454,8 +40274,9 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            403: components["responses"]["WriteForbidden"];
             404: components["responses"]["NotFound"];
-            500: components["responses"]["InternalServerError"];
+            500: components["responses"]["StatelessTransactionFailure"];
             /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
             501: {
                 headers: {
@@ -39463,6 +40284,7 @@ export interface operations {
                 };
                 content?: never;
             };
+            503: components["responses"]["WriteTemporarilyUnavailable"];
         };
     };
     updateNamespaceTableSchema: {
@@ -39814,6 +40636,112 @@ export interface operations {
             500: components["responses"]["InternalServerError"];
             /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
             501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getNamespaceSchemaValidationPublication: {
+        parameters: {
+            query?: never;
+            header: {
+                "X-Antfly-Schema-Validation-Token": components["schemas"]["SchemaValidationToken"];
+            };
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Exact historical job and current table observation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SchemaValidationStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Current logical table administration is required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Table ownership or metadata incarnation changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Metadata observation unavailable; retain the token and retry this read */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getNamespaceTableIndexPublication: {
+        parameters: {
+            query?: never;
+            header: {
+                "X-Antfly-Index-Publication-Token": components["schemas"]["IndexPublicationToken"];
+            };
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Exact read-only publication observation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexPublicationStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Current logical table administration is required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Table identity, publication identity or metadata incarnation changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Authoritative relation ownership is not supported by the metadata owner */
+            426: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Metadata observation is unavailable; retain the token and retry this read */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -47652,6 +48580,37 @@ export interface operations {
             };
         };
     };
+    getExtensionSqlPackageControl: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: components["schemas"]["ExtensionIdentifier"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current SQL default selection, without private promotion receipts. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLPackageDefaultControl"];
+                };
+            };
+            /** @description SQL package control not found. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExtensionError"];
+                };
+            };
+        };
+    };
     getExtensionPackageVersion: {
         parameters: {
             query?: never;
@@ -54867,6 +55826,213 @@ export interface operations {
                     "application/json": components["schemas"]["MemoryError"];
                 };
             };
+        };
+    };
+    createChangefeed: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChangefeedCreate"];
+            };
+        };
+        responses: {
+            /** @description The initial cursor and lease */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChangefeedCreated"];
+                };
+            };
+            default: components["responses"]["ChangefeedError"];
+        };
+    };
+    inspectChangefeed: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                feed_id: components["parameters"]["ChangefeedId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current feed progress */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChangefeedProgress"];
+                };
+            };
+            default: components["responses"]["ChangefeedError"];
+        };
+    };
+    closeChangefeed: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                feed_id: components["parameters"]["ChangefeedId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The feed is closed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["ChangefeedError"];
+        };
+    };
+    pullChangefeed: {
+        parameters: {
+            query: {
+                after: components["schemas"]["ChangefeedCursor"];
+                limit?: number;
+                max_bytes?: number;
+            };
+            header?: never;
+            path: {
+                feed_id: components["parameters"]["ChangefeedId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The page and its successor cursor */
+            200: {
+                headers: {
+                    "Antfly-Changefeed-Cursor": components["schemas"]["ChangefeedCursor"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChangefeedPage"];
+                };
+            };
+            409: components["responses"]["ChangefeedRecovery"];
+            429: components["responses"]["ChangefeedBackpressure"];
+            default: components["responses"]["ChangefeedError"];
+        };
+    };
+    acknowledgeChangefeed: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                feed_id: components["parameters"]["ChangefeedId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChangefeedCheckpoint"];
+            };
+        };
+        responses: {
+            /** @description The durable acknowledged cursor */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChangefeedCheckpoint"];
+                };
+            };
+            409: components["responses"]["ChangefeedRecovery"];
+            default: components["responses"]["ChangefeedError"];
+        };
+    };
+    renewChangefeed: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                feed_id: components["parameters"]["ChangefeedId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChangefeedLease"];
+            };
+        };
+        responses: {
+            /** @description Effective expiry in Unix seconds */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChangefeedLease"];
+                };
+            };
+            409: components["responses"]["ChangefeedRecovery"];
+            default: components["responses"]["ChangefeedError"];
+        };
+    };
+    getManagedSources: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current managed sources and their destination contract */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagedSourceStatus"];
+                };
+            };
+            default: components["responses"]["ChangefeedError"];
+        };
+    };
+    replaceManagedSources: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ManagedSourceReplacement"];
+            };
+        };
+        responses: {
+            /** @description The resulting configuration revision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagedSourceConfigured"];
+                };
+            };
+            default: components["responses"]["ChangefeedError"];
         };
     };
 }

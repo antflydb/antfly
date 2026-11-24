@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+pub const read_session_source_path = "pkg/antfly-embedded/src/storage/read_session_source.zig";
 /// Independently compiled ELF owners and their callers share Zig callback ABI.
 pub fn llvmBackend(target: std.Target) ?bool {
     return if (target.ofmt == .elf) true else null;
@@ -145,6 +146,16 @@ pub fn adopt(consumer: *std.Build.Module) void {
 pub fn localFor(consumer: *std.Build.Module) ?*std.Build.Module {
     for (bindings.items) |binding| if (binding.consumer == consumer) return binding.local;
     return null;
+}
+
+/// Custom native link steps replace an executable's install edge. Finalize
+/// that executable explicitly before snapshotting its provider graph, since
+/// the normal top-level traversal can no longer reach the replaced artifact.
+pub fn finalizeExecutableLinks(b: *std.Build, artifact: *std.Build.Step.Compile) void {
+    if (storage_provider) |provider| {
+        var steps: std.AutoHashMap(*std.Build.Step, void) = .init(b.allocator);
+        attachStorageFinalLinks(b, &artifact.step, provider, &steps);
+    }
 }
 
 fn attachStorageFinalLinks(b: *std.Build, step: *std.Build.Step, provider: *std.Build.Step.Compile, seen: *std.AutoHashMap(*std.Build.Step, void)) void {
@@ -307,7 +318,7 @@ fn sessionTypesBridge(module: *std.Build.Module, canonical: *std.Build.Module, s
 fn createSessionBackend(module: *std.Build.Module, canonical: *std.Build.Module, source: bool) SessionBackend {
     const b = module.owner;
     const backend = b.createModule(.{
-        .root_source_file = b.path(if (source) "pkg/antfly-embedded/src/storage/read_session_source.zig" else "pkg/antfly-embedded/src/storage/read_session_client.zig"),
+        .root_source_file = b.path(if (source) read_session_source_path else "pkg/antfly-embedded/src/storage/read_session_client.zig"),
         .target = canonical.resolved_target,
         .optimize = canonical.optimize,
     });

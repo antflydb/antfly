@@ -118,6 +118,10 @@ pub const View = struct {
     /// exactly as `native_catalog_backend.Options.scope`/
     /// `native_catalog_sink.zig`'s `Sink.submit` already use.
     put_index_catalog_fn: ?*const fn (*anyopaque, scope: []const u8, mutations: []const IndexCatalogMutation) anyerror!void = null,
+    /// Reads one index-catalog record at the host transaction's tip: its own
+    /// staged `putIndexCatalog` mutations over the committed root. `null`
+    /// wherever `put_index_catalog_fn` is.
+    get_index_catalog_fn: ?*const fn (*anyopaque, allocator: std.mem.Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) anyerror!?[]u8 = null,
     /// WS4 phase 2 (coverage/repair-issue ride-along) and algebraic inline
     /// apply (see `mutation_materialization.zig`'s
     /// `InlineAlgebraicPublication`): optional delete capability into the
@@ -190,6 +194,14 @@ pub const View = struct {
         return put_index_catalog(self.ptr, scope, mutations);
     }
 
+    /// One index-catalog record as the host transaction sees it (see
+    /// `get_index_catalog_fn`), owned by `allocator`; null when absent.
+    /// `error.IndexCatalogUnsupported` on every backend but Lite.
+    pub fn getIndexCatalogAlloc(self: View, allocator: std.mem.Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) !?[]u8 {
+        const get_index_catalog = self.get_index_catalog_fn orelse return error.IndexCatalogUnsupported;
+        return get_index_catalog(self.ptr, allocator, scope, namespace, key);
+    }
+
     /// Writes one derived-coverage or repair-issue record (see
     /// `allowed_replay_kinds`) into the primary keyspace, in the SAME
     /// native transaction as the primary write. These keys are
@@ -229,6 +241,10 @@ pub const View = struct {
                 const typed: T = @ptrCast(@alignCast(ptr));
                 return typed.*.putIndexCatalogBatch(scope, mutations);
             }
+            fn getIndexCatalog(ptr: *anyopaque, allocator: std.mem.Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) !?[]u8 {
+                const typed: T = @ptrCast(@alignCast(ptr));
+                return typed.*.getIndexCatalogAlloc(allocator, scope, namespace, key);
+            }
             fn delete(ptr: *anyopaque, key: []const u8) !void {
                 const typed: T = @ptrCast(@alignCast(ptr));
                 return typed.*.delete(key);
@@ -251,6 +267,7 @@ pub const View = struct {
             .get_fn = Bridge.get,
             .put_fn = Bridge.put,
             .put_index_catalog_fn = if (@hasDecl(BaseType(T), "putIndexCatalogBatch")) Bridge.putIndexCatalog else null,
+            .get_index_catalog_fn = if (@hasDecl(BaseType(T), "getIndexCatalogAlloc")) Bridge.getIndexCatalog else null,
             .delete_fn = if (@hasDecl(BaseType(T), "delete")) Bridge.delete else null,
             .open_cursor_fn = if (@hasDecl(BaseType(T), "openCursor")) Bridge.openCursor else null,
             .append_put_fn = if (@hasDecl(BaseType(T), "appendPut")) Bridge.appendPut else null,
@@ -259,8 +276,79 @@ pub const View = struct {
     }
 };
 
+/// Callbacks borrowed by a queued native transaction through ticket
+/// completion. Rejection runs while applying the group, before the next
+/// member can consume any state derived from the rejected member.
+pub const Queued = struct {
+    ptr: *anyopaque,
+    validate: *const fn (*anyopaque) anyerror!void,
+    apply: ?*const fn (*anyopaque, View) anyerror!void = null,
+    reject: *const fn (*anyopaque) void,
+    complete: *const fn (*anyopaque, anyerror!u64) void,
+};
+
+/// Holds the private write view for one ordered run of queued publications.
+/// The index apply guard serializes preparation and completion. Validation
+/// and rejection run on the queue leader without taking that guard.
+pub fn WriterViewQueue(comptime ViewType: type) type {
+    return struct {
+        const Self = @This();
+
+        view: ?ViewType = null,
+        pending: usize = 0,
+        rejected: std.atomic.Value(bool) = .init(false),
+
+        pub fn validate(self: *const Self) !void {
+            if (self.rejected.load(.acquire)) return error.QueuedDependencyRejected;
+        }
+
+        pub fn reject(self: *Self) void {
+            self.rejected.store(true, .release);
+        }
+
+        /// Install the first view of a run. A prepare that never enqueues
+        /// must call discardIdle to release it.
+        pub fn start(self: *Self, view: ViewType) void {
+            std.debug.assert(self.pending == 0 and self.view == null);
+            std.debug.assert(!self.rejected.load(.monotonic));
+            self.view = view;
+        }
+
+        pub fn enqueued(self: *Self) void {
+            std.debug.assert(self.view != null);
+            self.pending += 1;
+        }
+
+        /// Call after installing any durable result. A failed member
+        /// poisons the remaining run so a later group cannot use its view.
+        pub fn completed(self: *Self, outcome: anyerror!u64) void {
+            std.debug.assert(self.pending != 0);
+            _ = outcome catch {
+                self.reject();
+                return self.finishMember();
+            };
+            self.finishMember();
+        }
+
+        fn finishMember(self: *Self) void {
+            self.pending -= 1;
+            self.discardIdle();
+        }
+
+        pub fn discardIdle(self: *Self) void {
+            if (self.pending != 0) return;
+            if (self.view) |*view| view.close();
+            self.view = null;
+            self.rejected.store(false, .release);
+        }
+    };
+}
+
 pub const Participant = struct {
     ptr: *anyopaque,
+    queued: ?Queued = null,
+    /// Request a real source position for a control-only commit.
+    stage_control_on_empty: bool = false,
     /// Fallible accounting covers physical mutations, including stamps staged
     /// by the host and private metadata staged by this participant.
     charge: ?*const fn (*anyopaque, []const u8, ?[]const u8) anyerror!void = null,
@@ -302,6 +390,11 @@ pub const List = struct {
     items: [max_participants]Participant = undefined,
     len: usize = 0,
 
+    completion: ?struct {
+        ptr: *anyopaque,
+        run: *const fn (*anyopaque, anyerror!u64) void,
+    } = null,
+
     pub fn append(self: *List, new_participant: Participant) !void {
         if (self.len >= max_participants) return error.TooManyCommitParticipants;
         self.items[self.len] = new_participant;
@@ -323,12 +416,48 @@ pub const List = struct {
         for (self.items[0..self.len]) |p| try p.stage(p.ptr, view, encoded_position);
     }
 
+    fn validateQueued(ptr: *anyopaque) anyerror!void {
+        const self: *List = @ptrCast(@alignCast(ptr));
+        for (self.items[0..self.len]) |p| if (p.queued) |queued| try queued.validate(queued.ptr);
+    }
+
+    fn applyQueued(ptr: *anyopaque, view: View) anyerror!void {
+        const self: *List = @ptrCast(@alignCast(ptr));
+        for (self.items[0..self.len]) |p| {
+            if (p.queued) |queued| if (queued.apply) |apply| try apply(queued.ptr, view);
+        }
+    }
+
+    fn rejectQueued(ptr: *anyopaque) void {
+        const self: *List = @ptrCast(@alignCast(ptr));
+        for (self.items[0..self.len]) |p| if (p.queued) |queued| queued.reject(queued.ptr);
+    }
+
+    fn completeQueued(ptr: *anyopaque, outcome: anyerror!u64) void {
+        const self: *List = @ptrCast(@alignCast(ptr));
+        for (self.items[0..self.len]) |p| if (p.queued) |queued| queued.complete(queued.ptr, outcome);
+        if (self.completion) |callback| callback.run(callback.ptr, outcome);
+    }
+
     /// Borrowed only for as long as `self` itself is: the returned
     /// `Participant` keeps a pointer back into `self.items`, exactly like
     /// every other `Participant` implementation in this tree keeps a
     /// pointer back into its own owning value.
     pub fn participant(self: *List) Participant {
-        return .{ .ptr = self, .reset = reset, .observe = observe, .stage = stage };
+        var control = false;
+        var queued = false;
+        for (self.items[0..self.len]) |item| {
+            control = control or item.stage_control_on_empty;
+            queued = queued or item.queued != null;
+        }
+        return .{
+            .ptr = self,
+            .stage_control_on_empty = control,
+            .reset = reset,
+            .observe = observe,
+            .stage = stage,
+            .queued = if (queued) .{ .ptr = self, .validate = validateQueued, .apply = applyQueued, .reject = rejectQueued, .complete = completeQueued } else null,
+        };
     }
 };
 
@@ -563,4 +692,32 @@ test "view putIndexCatalog reaches a host transaction that implements putIndexCa
     });
     try std.testing.expectEqualStrings("idx-scope", txn.last_scope);
     try std.testing.expectEqualStrings("bytes", try txn.get("seg:1"));
+}
+
+test "writer view queue keeps a failed dependency poisoned until the run drains" {
+    const ViewType = struct {
+        closes: *usize,
+
+        pub fn close(self: *@This()) void {
+            self.closes.* += 1;
+        }
+    };
+    var closes: usize = 0;
+    var queue: WriterViewQueue(ViewType) = .{};
+    queue.start(.{ .closes = &closes });
+    queue.enqueued();
+    queue.enqueued();
+    try queue.validate();
+
+    queue.reject();
+    queue.completed(error.InjectedMemberFailure);
+    try std.testing.expectError(error.QueuedDependencyRejected, queue.validate());
+    try std.testing.expectEqual(@as(usize, 0), closes);
+
+    queue.completed(error.QueuedDependencyRejected);
+    try queue.validate();
+    try std.testing.expectEqual(@as(usize, 1), closes);
+    queue.start(.{ .closes = &closes });
+    queue.discardIdle();
+    try std.testing.expectEqual(@as(usize, 2), closes);
 }

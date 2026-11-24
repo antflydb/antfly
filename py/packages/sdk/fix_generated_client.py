@@ -29,9 +29,22 @@ SCOPED_MERGE_BODY = re.compile(
 SCOPED_MERGE_HEADER = 'headers["Content-Type"] = "application/vnd.antfly.scoped-merge.v1+json"'
 NDJSON_HEADER = 'headers["Content-Type"] = "application/x-ndjson"'
 RELATIONAL_QUERY = Path("api/data_operations/query_relational_rows.py")
+WRITE_OPERATIONS = {
+    "batch_write": (403, 500, 503),
+    "batch_namespace_table": (403, 500, 503),
+    "multi_batch_write": (403, 409, 500, 503),
+    "commit_transaction": (403, 409, 500, 503),
+    "commit_transaction_session": (403, 409, 503),
+}
 SQL_OPERATIONS = [
     Path(f"api/data_operations/{operation}.py")
-    for operation in ("execute_sql", "prepare_sql", "execute_prepared_sql", "close_prepared_sql")
+    for operation in (
+        "execute_sql",
+        "prepare_sql",
+        "execute_prepared_sql",
+        "close_prepared_sql",
+        "poll_sql_notifications",
+    )
 ]
 EMBED_REQUEST = Path("models/inference_embed_request.py")
 NDJSON_RESPONSE = "response_200 = cast(str, response.content)"
@@ -169,6 +182,32 @@ def fix_generated_client(root: Path) -> None:
         raise RuntimeError("unexpected generated shape in dictate: required binary/JSON body")
     updates[path] = REQUIRED_BODY.sub(r"\1", source)
 
+    # openapi-python-client selects only the first media type for each status.
+    # These operations also serve text/plain denials and routing failures.
+    for operation, statuses in WRITE_OPERATIONS.items():
+        path = root / f"api/data_operations/{operation}.py"
+        source = path.read_text(encoding="utf-8")
+        for status in statuses:
+            branch = f"    if response.status_code == {status}:"
+            if source.count(branch) != 1 or "TransactionWriteError.from_dict" not in source:
+                raise RuntimeError(f"unexpected generated write response in {operation}: {status}")
+            source = source.replace(
+                branch,
+                branch
+                + '\n        if response.headers.get("content-type", "").partition(";")[0].strip().lower() == "text/plain":\n            return response.text',
+            )
+
+        def include_text(match: re.Match[str]) -> str:
+            types = list(dict.fromkeys(match.group().split(" | ")))
+            if "TransactionWriteError" in types and "str" not in types:
+                types.insert(types.index("None") if "None" in types else len(types), "str")
+            return " | ".join(types)
+
+        updates[path] = "\n".join(
+            re.sub(r"\b\w+(?: \| \w+)+", include_text, line) if "def _parse_response_" not in line else line
+            for line in source.split("\n")
+        )
+
     path = root / SCOPED_MERGE
     source = path.read_text(encoding="utf-8")
     if len(SCOPED_MERGE_BODY.findall(source)) != 5 or source.count(SCOPED_MERGE_HEADER) != 1:
@@ -188,15 +227,19 @@ def fix_generated_client(root: Path) -> None:
     for operation in SQL_OPERATIONS:
         path = root / operation
         source = path.read_text(encoding="utf-8")
+        limit = " max_response_bytes=1 << 20," if operation.stem == "poll_sql_notifications" else ""
         for original, replacement in (
             (
                 "from ...client import",
                 "from ....sql_transport import sql_request, sql_request_async\nfrom ...client import",
             ),
-            ("response = client.get_httpx_client().request(", "response = sql_request(client.get_httpx_client(),"),
+            (
+                "response = client.get_httpx_client().request(",
+                "response = sql_request(client.get_httpx_client()," + limit,
+            ),
             (
                 "response = await client.get_async_httpx_client().request(",
-                "response = await sql_request_async(client.get_async_httpx_client(),",
+                "response = await sql_request_async(client.get_async_httpx_client()," + limit,
             ),
         ):
             if source.count(original) != 1:

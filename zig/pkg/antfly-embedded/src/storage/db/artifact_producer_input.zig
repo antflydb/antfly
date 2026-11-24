@@ -200,7 +200,7 @@ pub fn sameDefinition(a: requests.GeneratedEnrichmentRequest, b: requests.Genera
 }
 
 fn definitionField(comptime name: []const u8) bool {
-    return !std.mem.eql(u8, name, "expected_vector_digest") and !std.mem.eql(u8, name, "expected_source_hash") and !std.mem.eql(u8, name, "doc_key") and !std.mem.eql(u8, name, "sequence") and !std.mem.eql(u8, name, "reprocess_generation") and !std.mem.eql(u8, name, "consumer_indexes");
+    return !std.mem.eql(u8, name, "execution_json") and !std.mem.eql(u8, name, "expected_vector_digest") and !std.mem.eql(u8, name, "expected_source_hash") and !std.mem.eql(u8, name, "doc_key") and !std.mem.eql(u8, name, "sequence") and !std.mem.eql(u8, name, "reprocess_generation") and !std.mem.eql(u8, name, "consumer_indexes");
 }
 
 /// Stable identity for exactly the fields used by sameDefinition. Framed
@@ -258,6 +258,7 @@ test "ordered artifact inventory producer definition identity binds every provid
     var routed = request;
     routed.doc_key = "other";
     routed.sequence = 123;
+    routed.execution_json = "{\"max_output_tokens_per_item\":8192}";
     var consumers = [_][]u8{@constCast("other-consumer")};
     routed.consumer_indexes = &consumers;
     try std.testing.expect(sameDefinition(request, routed));

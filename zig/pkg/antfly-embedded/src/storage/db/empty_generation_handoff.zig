@@ -17,11 +17,11 @@
 //! fence closes admission before a read-indexed summary is taken. No scan of
 //! historical tombstones occurs in the deterministic Raft apply path.
 const std = @import("std");
-const topology = @import("relational_integrity_topology_contract.zig");
-const admission = @import("relational_integrity_generation_admission.zig");
-const retirement = @import("relational_integrity_generation_retirement.zig");
+const topology = @import("relational/integrity/topology_contract.zig");
+const admission = @import("relational/integrity/generation_admission.zig");
+const retirement = @import("relational/integrity/generation_retirement.zig");
 const portable = @import("../portable_backup.zig");
-const integrity = @import("relational_integrity_contract.zig");
+const integrity = @import("relational/integrity/contract.zig");
 
 pub const intent_key = "\x00\x00__metadata__:empty_generation_handoff_intent";
 pub const seal_key = "\x00\x00__metadata__:empty_generation_handoff_seal";
@@ -257,7 +257,7 @@ pub fn stageSeal(txn: anytype, fence: topology.Fence, seal: topology.GenerationH
 
 pub fn stageSealPosition(txn: anytype, fence: topology.Fence, seal: topology.GenerationHandoffSeal, stamp: @import("receipt_position.zig").Position) !void {
     try stamp.requireNamespace(fence.namespace);
-    const current = (try @import("relational_integrity_topology.zig").current(txn)) orelse return error.IntegrityTopologyFenceMissing;
+    const current = (try @import("relational/integrity/topology.zig").current(txn)) orelse return error.IntegrityTopologyFenceMissing;
     if (!current.eql(fence)) return error.IntegrityTopologyChanged;
     const intent = (try loadIntent(txn)) orelse return error.GenerationHandoffIntentMissing;
     if (!intent.fence.eql(fence) or !std.mem.eql(u8, &intent.intent.plan_digest, &seal.plan_digest)) return error.IntegrityTopologyChanged;
@@ -275,7 +275,7 @@ pub fn stageCancel(txn: anytype, fence: topology.Fence) !void {
     if (try loadIntent(txn)) |record| {
         if (sealed) |receipt| if (!receipt.fence.eql(record.fence)) return error.InvalidGenerationHandoff;
         if (!record.fence.eql(fence)) {
-            const completed = (try @import("relational_integrity_topology.zig").completed(txn)) orelse return error.IntegrityTopologyChanged;
+            const completed = (try @import("relational/integrity/topology.zig").completed(txn)) orelse return error.IntegrityTopologyChanged;
             if (!completed.eql(record.fence) or record.fence.admission_epoch >= fence.admission_epoch)
                 return error.IntegrityTopologyChanged;
             return; // A newer non-handoff rewrite never revokes an old seal.
@@ -293,7 +293,7 @@ pub fn active(txn: anytype) !bool {
         if (try loadSeal(txn) != null) return error.InvalidGenerationHandoff;
         return false;
     };
-    const fence = (try @import("relational_integrity_topology.zig").current(txn)) orelse return false;
+    const fence = (try @import("relational/integrity/topology.zig").current(txn)) orelse return false;
     return fence.eql(record.fence);
 }
 
@@ -321,7 +321,7 @@ pub const SealStatus = struct {
 };
 
 pub fn sealStatus(txn: anytype, namespace: @import("doc_identity_namespace.zig").Namespace) !SealStatus {
-    const fence = (try @import("relational_integrity_topology.zig").current(txn)) orelse return error.IntegrityTopologyFenceMissing;
+    const fence = (try @import("relational/integrity/topology.zig").current(txn)) orelse return error.IntegrityTopologyFenceMissing;
     if (!fence.namespace.eql(namespace)) return error.IdentityNamespaceMismatch;
     const intent = (try loadIntent(txn)) orelse return error.GenerationHandoffIntentMissing;
     if (!intent.fence.eql(fence)) return error.IntegrityTopologyChanged;
@@ -352,7 +352,7 @@ pub fn summaryAlloc(alloc: std.mem.Allocator, txn: anytype, namespace: @import("
 pub fn summaryAllocControlled(alloc: std.mem.Allocator, txn: anytype, namespace: @import("doc_identity_namespace.zig").Namespace, control: ?ScanControl) !Summary {
     if (control) |value| try value.check();
     const persisted = try loadIntent(txn);
-    const fence = try @import("relational_integrity_topology.zig").current(txn);
+    const fence = try @import("relational/integrity/topology.zig").current(txn);
     if (fence) |active_fence| {
         if (persisted == null or !persisted.?.fence.eql(active_fence)) return error.IntegrityTopologyBusy;
     }

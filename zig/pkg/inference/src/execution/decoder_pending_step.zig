@@ -594,6 +594,7 @@ const PendingObservationFixture = struct {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (@import("allocation_registry.zig").enabled() != self.observed) return error.PendingDisabledPathChanged;
             self.calls += 1;
+            @import("transfer_audit.zig").upload(8);
             return .{ .handle = 42 };
         }
         fn finish(raw: *anyopaque, handle: ops.PendingI32ScalarDownload) !i32 {
@@ -602,6 +603,7 @@ const PendingObservationFixture = struct {
             if (@import("allocation_registry.zig").enabled() != self.observed) return error.PendingDisabledPathChanged;
             self.calls += 1;
             if (self.fail) return error.PendingAwaitFailure;
+            @import("transfer_audit.zig").download(4);
             return 7;
         }
         fn cancel(raw: *anyopaque, handle: ops.PendingI32ScalarDownload) void {
@@ -664,6 +666,14 @@ test "pending readback observations retain publication only and separate submiss
                 try std.testing.expect(ready.pending_interval.?.completion == .readback_returned);
                 try std.testing.expect(ready.pending_interval.?.counters_scope == .synchronous_phase_only);
                 try std.testing.expect(ready.pending_interval.?.whole_interval_counters == .unavailable);
+                const joined = ready.pending_interval.?.observed_phases.?;
+                try std.testing.expectEqual(@as(u64, 2), joined.count);
+                try std.testing.expect(joined.callback_wall_ns.? >= ready.pending_interval.?.callback_wall_ns.?);
+                try std.testing.expectEqual(@as(u64, 1), joined.uploads);
+                try std.testing.expectEqual(@as(u64, 8), joined.upload_bytes);
+                try std.testing.expectEqual(@as(u64, 1), joined.downloads);
+                try std.testing.expectEqual(@as(u64, 4), joined.download_bytes);
+                try std.testing.expectEqual(@as(u64, 0), ready.runtime.transfers.?.upload_bytes);
                 try std.testing.expectEqualDeep(ready.pending_interval.?, ready.report.?.pending_interval.?);
             }
         }

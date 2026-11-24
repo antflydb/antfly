@@ -631,6 +631,12 @@ fn publishReplacementMissingLiveCounts(
     }
 }
 
+/// Level-0 segment ids (`persistent.zig` `l0SegmentId`) carry the high bit
+/// and never advance the writer's segment id counter.
+pub fn isLevel0SegmentId(seg_id: u64) bool {
+    return seg_id & (@as(u64, 1) << 63) != 0;
+}
+
 pub const SegmentEntry = struct {
     id: u64,
     data: SegmentData,
@@ -1618,6 +1624,8 @@ pub const IndexSnapshot = struct {
     graph_ordinal_mutex: std.atomic.Mutex = .unlocked,
     graph_ordinal_incomplete: bool = false,
     segments: []SegmentEntry,
+    segment_lookup_mu: std.atomic.Mutex = .unlocked,
+    segment_lookup: ?std.AutoHashMapUnmanaged(u64, usize) = null,
     global_total_field_len: std.StringHashMapUnmanaged(u64),
     collection_doc_count: ?u32 = null,
     collection_field_lens: ?std.StringHashMapUnmanaged(u64) = null,
@@ -1666,6 +1674,19 @@ pub const IndexSnapshot = struct {
             if (self.references.fetchSub(1, .acq_rel) == 1) a.destroy(self);
         }
     };
+    pub fn segmentIndex(self: *const IndexSnapshot, id: u64) !?usize {
+        const owner = @constCast(self.inventory_owner orelse self);
+        while (!owner.segment_lookup_mu.tryLock()) spinOrYield();
+        defer owner.segment_lookup_mu.unlock();
+        if (owner.segment_lookup == null) {
+            var lookup = std.AutoHashMapUnmanaged(u64, usize).empty;
+            try lookup.ensureTotalCapacity(owner.alloc, @intCast(owner.segments.len));
+            for (owner.segments, 0..) |segment, i| lookup.putAssumeCapacity(segment.id, i);
+            owner.segment_lookup = lookup;
+        }
+        return owner.segment_lookup.?.get(id);
+    }
+
     fn awaitBinding(self: *const IndexSnapshot, flight: *BindingFlight, cancelable: bool) !void {
         const protection = if (!cancelable) (if (self.read_context_io) |io| io.swapCancelProtection(.blocked) else null) else null;
         defer {
@@ -2009,6 +2030,7 @@ pub const IndexSnapshot = struct {
         self.quiesceOwnedSources();
         const alloc = self.alloc;
         self.graph_predicates.deinit(alloc);
+        if (self.segment_lookup) |*lookup| lookup.deinit(alloc);
         self.binding_flights.deinit(alloc);
         var entries = self.bound_segments.valueIterator();
         while (entries.next()) |entry| {
@@ -3026,7 +3048,7 @@ pub const IndexSnapshot = struct {
             }
         };
 
-        spill_disabled: bool = false,
+        spill_disabled: bool = builtin.os.tag == .freestanding,
         spill_control: query_mod.ExecutionControl = .{},
         spill_manager: ?spill.Manager = null,
 
@@ -3282,7 +3304,7 @@ pub const IndexSnapshot = struct {
                 self.spill_control = control;
                 self.spill_manager = spill.initSearchSpill(
                     alloc,
-                    snapshot.read_context_io orelse std.Io.Threaded.global_single_threaded.io(),
+                    snapshot.read_context_io orelse if (builtin.os.tag == .freestanding) .failing else std.Io.Threaded.global_single_threaded.io(),
                     self,
                     Check.run,
                 );
@@ -3291,6 +3313,7 @@ pub const IndexSnapshot = struct {
         }
 
         fn buildOrdinalSpill(self: *@This(), alloc: Allocator, snapshot: *const IndexSnapshot, entry: *const SegmentEntry, offset: u32, control: query_mod.ExecutionControl) !SpillRange {
+            if (comptime builtin.os.tag == .freestanding) return error.SqlProgramLimitExceeded;
             const manager = self.spillManager(alloc, snapshot, control);
             var sorter = spill.Sort.init(alloc, manager, &.{.{}}, 512 * 1024);
             defer sorter.deinit();
@@ -3354,6 +3377,7 @@ pub const IndexSnapshot = struct {
         }
 
         fn buildKeySpill(self: *@This(), alloc: Allocator, snapshot: *const IndexSnapshot, entry: *const SegmentEntry, offset: u32, control: query_mod.ExecutionControl) !KeyRun {
+            if (comptime builtin.os.tag == .freestanding) return error.SqlProgramLimitExceeded;
             const manager = self.spillManager(alloc, snapshot, control);
             var sorter = spill.Sort.init(alloc, manager, &.{.{}}, 512 * 1024);
             defer sorter.deinit();
@@ -4155,7 +4179,9 @@ pub const IndexWriter = struct {
         fork.current.release();
         fork.current = snapshot_ref;
         fork.next_epoch = snapshot_ref.epoch + 1;
-        for (snapshot_ref.segments) |segment| fork.next_segment_id = @max(fork.next_segment_id, segment.id + 1);
+        for (snapshot_ref.segments) |segment| {
+            if (!isLevel0SegmentId(segment.id)) fork.next_segment_id = @max(fork.next_segment_id, segment.id + 1);
+        }
         return fork;
     }
 
@@ -4409,6 +4435,16 @@ pub const IndexWriter = struct {
         return @atomicLoad(*IndexSnapshot, &self.current, .acquire);
     }
 
+    /// Retain an exact SQL postings cut. The inventory and every deletion mask
+    /// come from one writer-fenced observation; later deletes cannot alter it.
+    pub fn openFilterCursor(self: *IndexWriter, alloc: Allocator, filter: query_mod.Filter, control: query_mod.ExecutionControl, limits: @import("search/filter_cursor.zig").Limits) !*@import("search/filter_cursor.zig").Cursor {
+        self.lockMutex();
+        defer self.mu.unlock();
+        const snapshot_ref = self.acquireSnapshotRaw();
+        defer snapshot_ref.release();
+        return @import("search/filter_cursor.zig").Cursor.captureLocked(alloc, snapshot_ref, filter, control, limits);
+    }
+
     /// Get the current snapshot with an incremented ref count.
     /// Caller MUST call release() when done. Safe for concurrent use.
     /// Load+retain happens under snapshot_mu so a concurrent publish cannot
@@ -4417,6 +4453,14 @@ pub const IndexWriter = struct {
         const snap = self.acquireSnapshotRaw();
         self.maybeMaintainMappedResidency(snap, platform_time.monotonicNs());
         return snap;
+    }
+
+    /// Read the published epoch without pinning the snapshot or running
+    /// mapped-residency maintenance.
+    pub fn snapshotEpoch(self: *IndexWriter) u64 {
+        self.lockSnapshotMutex();
+        defer self.snapshot_mu.unlock();
+        return self.snapshot().epoch;
     }
 
     fn acquireSnapshotRaw(self: *IndexWriter) *IndexSnapshot {
@@ -4744,7 +4788,7 @@ pub const IndexWriter = struct {
             .shared = shared,
         };
 
-        if (seg_id >= self.next_segment_id) self.next_segment_id = seg_id + 1;
+        if (!isLevel0SegmentId(seg_id) and seg_id >= self.next_segment_id) self.next_segment_id = seg_id + 1;
 
         var global_field_lens = try cloneGlobalFieldLens(self.alloc, old.global_total_field_len);
         errdefer global_field_lens.deinit(self.alloc);
@@ -4850,17 +4894,15 @@ pub const IndexWriter = struct {
 
         const old = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
 
+        var retiring = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer retiring.deinit(scratch_alloc);
+        try retiring.ensureTotalCapacity(scratch_alloc, @intCast(old_ids.len));
+        for (old_ids) |id| retiring.putAssumeCapacity(id, {});
+
         var keep_count: usize = 0;
         var retire_count: usize = 0;
         for (old.segments) |*seg| {
-            var is_old = false;
-            for (old_ids) |oid| {
-                if (seg.id == oid) {
-                    is_old = true;
-                    break;
-                }
-            }
-            if (is_old) {
+            if (retiring.contains(seg.id)) {
                 retire_count += 1;
             } else {
                 keep_count += 1;
@@ -4874,14 +4916,7 @@ pub const IndexWriter = struct {
         var idx: usize = 0;
         var ret_idx: usize = 0;
         for (old.segments) |seg| {
-            var is_old = false;
-            for (old_ids) |oid| {
-                if (seg.id == oid) {
-                    is_old = true;
-                    break;
-                }
-            }
-            if (is_old) {
+            if (retiring.contains(seg.id)) {
                 retired[ret_idx] = seg;
                 ret_idx += 1;
             } else {
@@ -4964,7 +4999,7 @@ pub const IndexWriter = struct {
         cells_created = 0;
         var next_segment_id = self.next_segment_id;
         for (replacements) |replacement| {
-            if (replacement.id >= next_segment_id) next_segment_id = replacement.id + 1;
+            if (!isLevel0SegmentId(replacement.id) and replacement.id >= next_segment_id) next_segment_id = replacement.id + 1;
         }
         return .{
             .writer = self,
@@ -5178,6 +5213,29 @@ pub const IndexWriter = struct {
             }
         }
         return try delete_infos.toOwnedSlice(alloc);
+    }
+
+    /// Sets committed tombstones on this writer's copy of `seg_id`, if it is
+    /// loaded. Used once a write's deletes are durable: queries never see a
+    /// delete before it is.
+    pub fn applyCommittedDeletes(self: *IndexWriter, seg_id: u64, local_ids: []const u32) !void {
+        self.lockMutex();
+        defer self.mu.unlock();
+        const snap = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
+        const index = (try snap.segmentIndex(seg_id)) orelse return;
+        const seg = &snap.segments[index];
+        seg.shared.lockDeletionExclusive();
+        defer seg.shared.unlockDeletionExclusive();
+        if (seg.shared.deleted == null) seg.shared.deleted = roaring.RoaringBitmap.init(self.alloc);
+        var added: u32 = 0;
+        defer _ = seg.shared.deleted_count.fetchAdd(added, .acq_rel);
+        for (local_ids) |local_id| {
+            if (local_id >= seg.reader.doc_count) continue;
+            if (seg.shared.deleted.?.contains(local_id)) continue;
+            try seg.shared.deleted.?.add(local_id);
+            updateMissingLiveCountsForDeletedDocs(seg.shared, &.{local_id}, true);
+            added += 1;
+        }
     }
 
     /// Update a document by its external ID: deletes the old version and indexes the new one.
@@ -7056,4 +7114,121 @@ test "ordinal bitmap streaming projection cancels during traversal" {
     defer shared.unlockDeletionShared();
     while ((shared.deletion_lock.load(.acquire) & SegmentShared.deletion_writer_bit) == 0) spinOrYield();
     try std.testing.expect((try snapshot_.tryDocNumBitmapForOrdinalMembershipAlloc(a, &harness, .{})) == null);
+}
+
+test "SQL text candidate cuts freeze deletions inventory and keys across compaction" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithIds(a, &.{
+        .{ .id = "a", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} },
+        .{ .id = "b", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} },
+        .{ .id = "c", .terms = &.{.{ .term = "beta", .freq = 1, .norm = 10 }} },
+    });
+    defer a.free(bytes);
+    var writer = try IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const filter: query_mod.Filter = .{ .term = .{ .field = "body", .term = "alpha" } };
+    const before = try writer.openFilterCursor(a, filter, .{}, .{});
+    defer before.deinit();
+    try std.testing.expect(try writer.deleteById("a"));
+    const after = try writer.openFilterCursor(a, filter, .{}, .{});
+    defer after.deinit();
+    try writer.addSegment(bytes);
+    const ids = try a.alloc(u64, writer.snapshot().segments.len);
+    defer a.free(ids);
+    for (writer.snapshot().segments, ids) |segment, *id| id.* = segment.id;
+    const merged = try segment_mod.mergeSegments(a, &.{ bytes, bytes });
+    defer a.free(merged);
+    try writer.replaceSegments(ids, 99, merged);
+    var page: [8]u32 = undefined;
+    const first = try before.nextPage(&page, 1);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1 }, page[0..first.len]);
+    try std.testing.expect(first.exhausted);
+    const second = try after.nextPage(&page, 1);
+    try std.testing.expectEqualSlices(u32, &.{1}, page[0..second.len]);
+    try std.testing.expect(second.exhausted);
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    try std.testing.expectEqualStrings("a", try before.key(scratch.allocator(), 0));
+    try std.testing.expectEqualStrings("b", try after.key(scratch.allocator(), 1));
+}
+
+test "SQL text candidate pages preserve exact filters and sparse nonterminal progress" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithIds(a, &.{
+        .{ .id = "a", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} },
+        .{ .id = "b", .terms = &.{ .{ .term = "alpha", .freq = 1, .norm = 10 }, .{ .term = "beta", .freq = 1, .norm = 10 } } },
+        .{ .id = "c", .terms = &.{.{ .term = "beta", .freq = 1, .norm = 10 }} },
+    });
+    defer a.free(bytes);
+    var writer = try IndexWriter.init(a);
+    defer writer.deinit();
+    for (0..17) |_| try writer.addSegment(bytes);
+    const alpha: query_mod.Filter = .{ .term = .{ .field = "body", .term = "alpha" } };
+    const beta: query_mod.Filter = .{ .term = .{ .field = "body", .term = "beta" } };
+    for ([_]query_mod.Filter{
+        alpha,                                                beta,                                                                                 .match_all,                                                                           .match_none,
+        .{ .prefix = .{ .field = "body", .prefix = "alp" } }, .{ .bool_filter = .{ .must = &.{ alpha, beta }, .should = &.{}, .must_not = &.{} } }, .{ .bool_filter = .{ .must = &.{}, .should = &.{ alpha, beta }, .must_not = &.{} } }, .{ .bool_filter = .{ .must = &.{alpha}, .should = &.{}, .must_not = &.{beta} } },
+    }) |filter| {
+        const expected = try writer.snapshot().executeFilter(a, filter);
+        defer a.free(expected);
+        for ([_]usize{ 1, 2, 3, 7, 64 }) |width| {
+            const cursor = try writer.openFilterCursor(a, filter, .{}, .{});
+            defer cursor.deinit();
+            var result: std.ArrayList(u32) = .empty;
+            defer result.deinit(a);
+            var buffer: [64]u32 = undefined;
+            var pulls: usize = 0;
+            while (true) {
+                const page = try cursor.nextPage(buffer[0..width], 1);
+                try std.testing.expect(page.segments_opened <= 1);
+                try result.appendSlice(a, buffer[0..page.len]);
+                pulls += 1;
+                if (page.exhausted) break;
+                try std.testing.expect(pulls <= 128);
+            }
+            try std.testing.expectEqualSlices(u32, expected, result.items);
+            try std.testing.expect(cursor.peakMemoryBytes() < 32 * 1024);
+        }
+    }
+}
+
+test "SQL text candidate failures reject budgets cancel and release every partial capture" {
+    const Run = struct {
+        fn run(a: Allocator) !void {
+            const bytes = try buildTestSegmentWithIds(a, &.{
+                .{ .id = "a", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} },
+                .{ .id = "b", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} },
+            });
+            defer a.free(bytes);
+            var writer = try IndexWriter.init(a);
+            defer writer.deinit();
+            try writer.addSegment(bytes);
+            _ = try writer.deleteById("a");
+            const cursor = try writer.openFilterCursor(a, .match_all, .{}, .{});
+            defer cursor.deinit();
+            var buffer: [1]u32 = undefined;
+            const page = try cursor.nextPage(&buffer, 1);
+            try std.testing.expectEqual(@as(usize, 1), page.len);
+            try std.testing.expectEqual(@as(u32, 1), buffer[0]);
+        }
+    };
+    try Run.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithIds(a, &.{.{ .id = "a", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} }});
+    defer a.free(bytes);
+    var writer = try IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, writer.openFilterCursor(a, .match_all, .{}, .{ .segments = 0 }));
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, writer.openFilterCursor(a, .match_all, .{}, .{ .memory_bytes = 0 }));
+    try std.testing.expectError(error.Timeout, writer.openFilterCursor(a, .match_all, .{ .deadline_ns = 0 }, .{}));
+    const cursor = try writer.openFilterCursor(a, .match_all, .{}, .{});
+    defer cursor.deinit();
+    var buffer: [1]u32 = undefined;
+    try std.testing.expectError(error.InvalidTextFilterCursorBudget, cursor.nextPage(&.{}, 1));
+    cursor.control.deadline_ns = 0;
+    try std.testing.expectError(error.Timeout, cursor.nextPage(&buffer, 1));
+    try std.testing.expectError(error.InvalidTextFilterCursorState, cursor.nextPage(&buffer, 1));
 }

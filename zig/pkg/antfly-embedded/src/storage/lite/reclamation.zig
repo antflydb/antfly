@@ -33,6 +33,9 @@ pub const Options = struct {
     /// Limits combined current, retired, artifact and rewrite workspace bytes. Zero is
     /// unlimited. This is an admission limit, not a filesystem free-space probe.
     max_storage_bytes: u64 = 0,
+    /// Optional additional temporary space for a redo format migration or
+    /// reservation shrink. The installed generation must fit the base cap.
+    redo_rewrite_workspace_overage_bytes: u64 = 0,
     disk_headroom_bytes: u64 = 64 * 1024 * 1024,
     /// Virtual/borrowed runtimes can supply capacity without escaping their
     /// filesystem. Native owners use the platform probe when supported.

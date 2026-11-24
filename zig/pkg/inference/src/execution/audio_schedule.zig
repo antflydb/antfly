@@ -44,7 +44,7 @@ pub const Plan = struct {
     arena: ?CT = null,
     arena_size: usize = 0,
     input_workspace_bytes: usize = 0,
-    input_workspace_wanted_bytes: usize = 0,
+    arena_recipe: ArenaLayout = .{},
     input_workspace_bank: ?CT = null,
     drop_ct: ?*const fn (CT) void = null,
     prepared: bool = false,
@@ -157,7 +157,44 @@ pub const Plan = struct {
         }
         return peak;
     }
-    pub const ArenaLayout = struct { outputs_bytes: usize, input_workspace_bytes: usize, total_bytes: usize };
+    pub const ArenaLayout = struct {
+        outputs_bytes: usize = 0,
+        input_workspace_bytes: usize = 0,
+        total_bytes: usize = 0,
+
+        /// The schedule funds one reusable scratch range. The owner may
+        /// place it after the output arena or upgrade it as a separate bank.
+        pub fn workspaceBytes(self: ArenaLayout, available_views: usize, count: usize, limit: usize) usize {
+            if (available_views != count or self.input_workspace_bytes > limit) return 0;
+            return self.input_workspace_bytes;
+        }
+
+        pub const View = struct { offset: usize, bytes: usize, shape: [2]i32 };
+
+        fn view(offset: usize, bound: usize, rows: usize, width: usize) !View {
+            const bytes = try std.math.mul(usize, try std.math.mul(usize, rows, width), @sizeOf(f32));
+            if (bytes == 0 or offset > bound or bytes > bound - offset) return error.AudioScheduleInvalid;
+            return .{
+                .offset = offset,
+                .bytes = bytes,
+                .shape = .{ std.math.cast(i32, rows) orelse return error.AudioScheduleInvalid, std.math.cast(i32, width) orelse return error.AudioScheduleInvalid },
+            };
+        }
+
+        pub fn outputView(self: ArenaLayout, node: *const Node) !?View {
+            const offset = node.arena_offset orelse return null;
+            const dims = node.outputDimensions() orelse return error.AudioScheduleInvalid;
+            return try view(offset, self.outputs_bytes, dims.rows, dims.out_dim);
+        }
+
+        pub fn workspaceView(self: ArenaLayout, node: *const Node, placement: enum { combined, separate }) !?View {
+            const shape = node.inputWorkspaceShape() orelse return null;
+            return switch (placement) {
+                .combined => try view(self.outputs_bytes, self.total_bytes, shape.rows, shape.width),
+                .separate => try view(0, self.input_workspace_bytes, shape.rows, shape.width),
+            };
+        }
+    };
 
     /// Serialized projections share one disjoint scratch tail. Both fused and
     /// unfused paths are funded before replay; no clamp temporary is implicit.
@@ -654,7 +691,18 @@ test "audio arena recipe funds one disjoint maximum clipped projection workspace
     try std.testing.expectEqual(@as(usize, 8192), recipe.outputs_bytes);
     try std.testing.expectEqual(@as(usize, 8192), recipe.input_workspace_bytes);
     try std.testing.expectEqual(@as(usize, 16384), recipe.total_bytes);
-    try std.testing.expect(nodes[2].inputWorkspaceShape() == null);
+    try std.testing.expectEqual(recipe.input_workspace_bytes, recipe.workspaceBytes(nodes.len, nodes.len, 8192));
+    try std.testing.expectEqual(@as(usize, 0), recipe.workspaceBytes(nodes.len, nodes.len, 4096));
+    const output = (try recipe.outputView(&nodes[1])).?;
+    const combined = (try recipe.workspaceView(&nodes[1], .combined)).?;
+    const separate = (try recipe.workspaceView(&nodes[1], .separate)).?;
+    try std.testing.expect(output.offset + output.bytes <= combined.offset);
+    try std.testing.expectEqual(recipe.outputs_bytes, combined.offset);
+    try std.testing.expectEqual(@as(usize, 0), separate.offset);
+    try std.testing.expectEqual(combined.bytes, separate.bytes);
+    try std.testing.expectEqual(combined.shape, separate.shape);
+    try std.testing.expect((try recipe.workspaceView(&nodes[2], .combined)) == null);
+    try std.testing.expect((try recipe.outputView(&nodes[2])) == null);
     nodes[1].prepared_slot = null;
     try std.testing.expectEqual(@as(usize, 4096), (try plan.arenaLayout()).input_workspace_bytes);
 }
