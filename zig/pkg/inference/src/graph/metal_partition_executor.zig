@@ -15950,11 +15950,8 @@ fn executeRuntimeAdd(
     };
 }
 
-const DeferredScaleMul = struct {
-    source_id: NodeId,
-    scalar_id: NodeId,
-    scale: f32,
-};
+const DeferredScaleMul = ops_mod.kernel_descriptor.ScalarProduct;
+const deferredScaleMul = DeferredScaleMul.match;
 
 const DeferredElementwiseMul = ops_mod.kernel_descriptor.F32Product;
 const deferredElementwiseMul = ops_mod.kernel_descriptor.sameShapeF32Product;
@@ -16201,24 +16198,6 @@ fn executeDeferredScaleAddFallback(
 fn pendingDeferredScaleMul(graph: *const Graph, values: []?CT, node_id: NodeId, output_shape: ml.graph.Shape) ?DeferredScaleMul {
     if (valueFor(values, node_id) != null) return null;
     return deferredScaleMul(graph, node_id, output_shape);
-}
-
-fn deferredScaleMul(graph: *const Graph, node_id: NodeId, output_shape: ml.graph.Shape) ?DeferredScaleMul {
-    if (node_id == null_node or node_id >= graph.nodeCount()) return null;
-    const node = graph.node(node_id);
-    switch (node.op) {
-        .mul, .fused_elem_multiply => {},
-        else => return null,
-    }
-    if (!shapesEqual(node.output_shape, output_shape)) return null;
-    if (node.num_inputs < 2) return null;
-    if (scalarConstantF32(graph, node.inputs[0])) |scale| {
-        return .{ .source_id = node.inputs[1], .scalar_id = node.inputs[0], .scale = scale };
-    }
-    if (scalarConstantF32(graph, node.inputs[1])) |scale| {
-        return .{ .source_id = node.inputs[0], .scalar_id = node.inputs[1], .scale = scale };
-    }
-    return null;
 }
 
 fn binaryBroadcastResultMatches(

@@ -28,6 +28,23 @@ pub const NativeMatrixScratchGeometry = struct {
 
 pub const Unary = enum { negate, sqrt, rsqrt, exp, log, sin, cos, tanh, erf, abs, gelu, gelu_exact, relu, silu };
 pub const Binary = enum { add, subtract, multiply, divide };
+pub const ScalarProduct = struct {
+    source_id: ml.graph.NodeId,
+    scalar_id: ml.graph.NodeId,
+    scale: f32,
+
+    pub fn match(graph: *const ml.graph.Graph, id: ml.graph.NodeId, shape: ml.graph.Shape) ?ScalarProduct {
+        if (id >= graph.nodeCount()) return null;
+        const node = graph.node(id);
+        if ((node.op != .mul and node.op != .fused_elem_multiply) or node.num_inputs < 2 or !node.output_shape.eq(shape)) return null;
+        for (node.inputs[0..2], 0..) |scalar, index| {
+            const scale = scalarConstantF32(graph, scalar) orelse continue;
+            return .{ .source_id = node.inputs[1 - index], .scalar_id = scalar, .scale = scale };
+        }
+        return null;
+    }
+};
+
 pub const F32ScaledAdd = struct {
     product: ml.graph.NodeId,
     source: ml.graph.NodeId,
@@ -37,15 +54,12 @@ pub const F32ScaledAdd = struct {
     pub fn match(graph: *const ml.graph.Graph, inputs: []const ml.graph.NodeId, shape: ml.graph.Shape, deferred: [2]bool) ?F32ScaledAdd {
         if (inputs.len != 2 or shape.dtype != .f32) return null;
         for (inputs, 0..) |id, index| {
-            if (!deferred[index] or deferred[1 - index] or id >= graph.nodeCount()) continue;
-            const mul = graph.node(id);
-            if ((mul.op != .mul and mul.op != .fused_elem_multiply) or mul.num_inputs != 2 or !mul.output_shape.eq(shape)) continue;
+            if (!deferred[index] or deferred[1 - index]) continue;
+            const mul = ScalarProduct.match(graph, id, shape) orelse continue;
             const addend = inputs[1 - index];
             if (addend >= graph.nodeCount() or !graph.node(addend).output_shape.eq(shape)) continue;
-            for (mul.getInputs(), 0..) |scalar, scalar_index| {
-                const scale = scalarConstantF32(graph, scalar) orelse continue;
-                const source = mul.inputs[1 - scalar_index];
-                if (source < graph.nodeCount() and graph.node(source).output_shape.eq(shape)) return .{ .product = id, .source = source, .addend = addend, .scale = scale };
+            if (mul.source_id < graph.nodeCount() and graph.node(mul.source_id).output_shape.eq(shape)) {
+                return .{ .product = id, .source = mul.source_id, .addend = addend, .scale = mul.scale };
             }
         }
         return null;
