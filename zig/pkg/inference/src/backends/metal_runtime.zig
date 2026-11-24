@@ -9946,6 +9946,7 @@ pub fn decoderRuntimeApplyScaledAddScale(self: anytype, request: anytype, stats:
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (request.dim == 0) return null;
+    const rhs_scale: ?f32 = if (@hasField(@TypeOf(request), "rhs_scale")) request.rhs_scale else null;
     if (request.lhs.elemCount() == request.rhs.elemCount() and request.lhs.elemCount() > 0 and request.lhs.isDevice() and request.rhs.isDevice()) {
         const elem_count = request.lhs.elemCount();
         var output_device = (try decoderOutputBuffer(runtime, request, &.{ request.lhs, request.rhs }, elem_count, .scaled_add_scale)) orelse return null;
@@ -9959,12 +9960,14 @@ pub fn decoderRuntimeApplyScaledAddScale(self: anytype, request: anytype, stats:
             elem_count,
             request.lhs_scale,
             request.output_scale,
+            rhs_scale orelse 1,
+            @intFromBool(rhs_scale != null),
             output_device.deviceHandle(),
             output_device.deviceByteOffset(),
         );
         if (try finishDecoderOutput(&output_device, device_rc, decoderRequestOutput(request) != null)) |output| return output;
     }
-    if (decoderRequestOutput(request) != null) return null;
+    if (decoderRequestOutput(request) != null or rhs_scale != null) return null;
 
     var scaled_lhs = (try decoderRuntimeApplyScale(self, request.lhs, request.lhs_scale)) orelse return null;
     defer scaled_lhs.deinit();
@@ -24005,6 +24008,8 @@ pub extern fn termite_metal_decode_runtime_apply_scaled_add_scale_device(
     dim: usize,
     lhs_scale: f32,
     output_scale: f32,
+    rhs_scale: f32,
+    scale_both: u32,
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;

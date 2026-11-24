@@ -13105,7 +13105,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         operand_count: usize,
         elements: usize,
         scale: ?f32 = null,
-        literal_node: [1]NodeId = .{ml.graph.null_node},
+        rhs_scale: ?f32 = null,
+        literal_nodes: [2]NodeId = undefined,
+        literal_count: usize = 0,
         gather: ?ops.kernel_descriptor.GatherAddBias = null,
         gather_inputs: [3]struct { shape: ml.graph.Shape, bytes: usize } = undefined,
 
@@ -13119,11 +13121,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const need = owned.requirements;
             if (@as(*anyopaque, @ptrCast(self.compute)) != ctx or owned.policy_key != 1 or
                 owned.entry_node != self.nodes[0] or owned.covered_nodes.ptr != &self.nodes or
-                owned.covered_nodes.len != (if (self.scale != null) @as(usize, 2) else self.operand_count - 1) or
-                (if (self.scale != null)
-                    owned.literal_nodes.len != 1 or owned.literal_nodes.ptr != &self.literal_node
-                else
-                    owned.literal_nodes.len != 0) or owned.input_nodes.ptr != &self.inputs or
+                owned.covered_nodes.len != (if (self.rhs_scale != null) @as(usize, 3) else if (self.scale != null) 2 else self.operand_count - 1) or
+                owned.literal_nodes.len != self.literal_count or
+                (self.literal_count != 0 and owned.literal_nodes.ptr != &self.literal_nodes) or owned.input_nodes.ptr != &self.inputs or
                 owned.input_nodes.len != self.input_count or need.outputs.ptr != &self.outputs or need.outputs.len != 1 or
                 need.dispatch_workspace.byte_size != 0 or need.dispatch_workspace.host_byte_size != 0 or
                 need.preparation_workspace.byte_size != 0 or need.preparation_workspace.host_byte_size != 0 or
@@ -13171,6 +13171,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     .rhs = inputs[1],
                     .dim = self.elements,
                     .lhs_scale = scale,
+                    .rhs_scale = self.rhs_scale,
                     .output_scale = @as(f32, 1),
                     .output = output,
                 }, &self.compute.timing_stats)
@@ -13287,7 +13288,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
                 const scaled = descriptor.F32ScaledAdd.match(graph, node.getInputs(), shape, deferred);
                 const recipe = if (scaled == null) descriptor.F32ProductAdd.match(graph, node.getInputs(), shape, deferred) orelse continue else null;
-                const both = if (recipe) |value| value == .pair else false;
+                const both = if (recipe) |value| value == .pair else scaled.?.rhs_product != null;
                 if (scaled != null) {
                     if (!metal_runtime.assignedScaledAddAvailable(compute.provider_impl)) continue;
                 } else if (!metal_runtime.assignedProductAddAvailable(compute.provider_impl, both)) continue;
@@ -13296,6 +13297,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (scaled) |scale| {
                     operands[0..2].* = .{ scale.source, scale.addend };
                     covered_nodes[1] = scale.product;
+                    if (scale.rhs_product != null) covered_nodes[2] = node.inputs[1];
                 } else if (both) {
                     const pair = recipe.?.pair;
                     operands = .{ pair[0].lhs_id, pair[0].rhs_id, pair[1].lhs_id, pair[1].rhs_id };
@@ -13310,7 +13312,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 const owner = try allocator.create(@This());
                 var published = false;
                 defer if (!published) allocator.destroy(owner);
-                owner.* = .{ .allocator = allocator, .compute = compute, .outputs = .{.{ .node = add, .logical = shape, .bytes = @as(usize, elements) * @sizeOf(f32) }}, .nodes = covered_nodes, .operand_count = if (scaled != null) 2 else if (both) 4 else 3, .elements = elements, .scale = if (scaled) |value| value.scale else null, .literal_node = .{if (scaled) |value| value.scalar else ml.graph.null_node} };
+                owner.* = .{ .allocator = allocator, .compute = compute, .outputs = .{.{ .node = add, .logical = shape, .bytes = @as(usize, elements) * @sizeOf(f32) }}, .nodes = covered_nodes, .operand_count = if (scaled != null) 2 else if (both) 4 else 3, .elements = elements, .scale = if (scaled) |value| value.scale else null };
+                if (scaled) |scale| {
+                    owner.literal_nodes[0] = scale.scalar;
+                    owner.literal_count = 1;
+                    if (scale.rhs_product) |rhs| {
+                        owner.rhs_scale = rhs.scale;
+                        if (rhs.scalar_id != scale.scalar) {
+                            owner.literal_nodes[1] = rhs.scalar_id;
+                            owner.literal_count = 2;
+                        }
+                    }
+                }
                 for (operands[0..owner.operand_count], owner.operand_indices[0..owner.operand_count]) |input, *index| {
                     if (input >= request.node_facts.len or !owner.accepts(request.node_facts[input], request.implementation)) break;
                     const known = std.mem.indexOfScalar(NodeId, owner.inputs[0..owner.input_count], input);
@@ -13321,7 +13334,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     }
                 } else {
                     const covered = owner.nodes[0..if (both) @as(usize, 3) else 2];
-                    try result.append(allocator, .{ .context = owner, .implementation = request.implementation, .key = add, .policy_key = request.policy_key, .covered_nodes = covered, .input_nodes = owner.inputs[0..owner.input_count], .literal_nodes = if (scaled != null) &owner.literal_node else &.{}, .entry_node = add, .requirements = .{ .outputs = &owner.outputs, .requires_execution_profile = false, .uncovered = .{} }, .vtable = &table });
+                    try result.append(allocator, .{ .context = owner, .implementation = request.implementation, .key = add, .policy_key = request.policy_key, .covered_nodes = covered, .input_nodes = owner.inputs[0..owner.input_count], .literal_nodes = owner.literal_nodes[0..owner.literal_count], .entry_node = add, .requirements = .{ .outputs = &owner.outputs, .requires_execution_profile = false, .uncovered = .{} }, .vtable = &table });
                     published = true;
                 }
             }

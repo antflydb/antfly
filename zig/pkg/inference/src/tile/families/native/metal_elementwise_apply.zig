@@ -29,8 +29,13 @@ pub const source_0 =
             \\    uint total = p.rows * p.dim; if (gid >= total) return;
             \\    output[gid] = (lhs[gid] + rhs[gid]) * scale;
             \\}
-            \\kernel void termite_apply_scaled_add_scale_1x(device const float *lhs [[buffer(0)]], device const float *rhs [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_apply_add_params &p [[buffer(3)]], constant float2 &scales [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
+            \\kernel void termite_apply_scaled_add_scale_1x(device const float *lhs [[buffer(0)]], device const float *rhs [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_apply_add_params &p [[buffer(3)]], constant float4 &scales [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
             \\    uint total = p.rows * p.dim; if (gid >= total) return;
+            \\    if (p.flags != 0u) {
+            \\        #pragma clang fp contract(off)
+            \\        output[gid] = lhs[gid] * scales.x + rhs[gid] * scales.z;
+            \\        return;
+            \\    }
             \\    output[gid] = (lhs[gid] * scales.x + rhs[gid]) * scales.y;
             \\}
             \\kernel void termite_apply_multiply_add_1x(device const float *lhs [[buffer(0)]], device const float *rhs [[buffer(1)]], device const float *addend [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_apply_add_params &p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {

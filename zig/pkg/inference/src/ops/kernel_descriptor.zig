@@ -51,9 +51,17 @@ pub const F32ScaledAdd = struct {
     addend: ml.graph.NodeId,
     scalar: ml.graph.NodeId,
     scale: f32,
+    rhs_product: ?ScalarProduct = null,
 
     pub fn match(graph: *const ml.graph.Graph, inputs: []const ml.graph.NodeId, shape: ml.graph.Shape, deferred: [2]bool) ?F32ScaledAdd {
         if (inputs.len != 2 or shape.dtype != .f32) return null;
+        if (deferred[0] and deferred[1]) {
+            const lhs = ScalarProduct.match(graph, inputs[0], shape) orelse return null;
+            const rhs = ScalarProduct.match(graph, inputs[1], shape) orelse return null;
+            if (lhs.source_id >= graph.nodeCount() or rhs.source_id >= graph.nodeCount()) return null;
+            if (!graph.node(lhs.source_id).output_shape.eq(shape) or !graph.node(rhs.source_id).output_shape.eq(shape)) return null;
+            return .{ .product = inputs[0], .source = lhs.source_id, .addend = rhs.source_id, .scalar = lhs.scalar_id, .scale = lhs.scale, .rhs_product = rhs };
+        }
         for (inputs, 0..) |id, index| {
             if (!deferred[index] or deferred[1 - index]) continue;
             const mul = ScalarProduct.match(graph, id, shape) orelse continue;

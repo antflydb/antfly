@@ -3502,9 +3502,10 @@ test "planned Metal elementwise product-add publishes into the assigned region o
     const dims = [_]i64{ 1, width };
     const shape = ml.graph.Shape.init(.f32, &dims);
     const names = [_][]const u8{ "a", "b", "c", "d" };
-    for ([_]enum { product_first, product_second, dual_product, scale_first, scale_second }{ .product_first, .product_second, .dual_product, .scale_first, .scale_second }) |order| {
+    for ([_]enum { product_first, product_second, dual_product, scale_first, scale_second, dual_scaled }{ .product_first, .product_second, .dual_product, .scale_first, .scale_second, .dual_scaled }) |order| {
         const pair = order == .dual_product;
-        const scaled = order == .scale_first or order == .scale_second;
+        const dual_scaled = order == .dual_scaled;
+        const scaled = order == .scale_first or order == .scale_second or dual_scaled;
         var graph = ml.graph.Graph.init(a);
         defer graph.deinit();
         var builder = ml.graph.Builder.init(&graph);
@@ -3515,8 +3516,8 @@ test "planned Metal elementwise product-add publishes into the assigned region o
             node.* = try builder.parameter(name, shape);
             binding.* = .{ .name = name, .node_id = node.*, .kind = .input };
         }
-        const left = try builder.mul(nodes[0], if (scaled) try builder.scalarConst(.f32, 0.5) else nodes[1]);
-        const right = if (pair) try builder.mul(nodes[2], nodes[3]) else nodes[count - 1];
+        const left = try builder.mul(nodes[0], if (scaled) try builder.scalarConst(.f32, if (dual_scaled) 0x1.fffffcp-1 else 0.5) else nodes[1]);
+        const right = if (pair) try builder.mul(nodes[2], nodes[3]) else if (dual_scaled) try builder.mul(nodes[1], try builder.scalarConst(.f32, 2)) else nodes[count - 1];
         const output_node = if (order == .product_second or order == .scale_second) try builder.add(right, left) else try builder.add(left, right);
         try graph.markOutput(output_node);
         // The default graph pipeline folds scalar products into an existing
@@ -3537,6 +3538,9 @@ test "planned Metal elementwise product-add publishes into the assigned region o
             const id = program.id_map[node];
             fact.* = .{ .node_id = id, .value = .{ .imported_host = .{ .target = .metal, .logical = shape, .owned_ingress = true } } };
             @memset(&row, @floatFromInt(index + 1));
+            // The first product rounds to 1 before adding -1. Contracting
+            // the multiply into the add would preserve the small residual.
+            if (dual_scaled) row[0] = if (index == 0) 0x1.000002p0 else -0.5;
             value.* = try Tensor.initFloat32(a, name, &dims, &row);
             initialized += 1;
             input.* = .{ .node_id = id, .value = value };
@@ -3549,7 +3553,7 @@ test "planned Metal elementwise product-add publishes into the assigned region o
         }
         try std.testing.expectEqual(@as(usize, 1), routes.pool.regions.len);
         const products = [_]ml.graph.NodeId{ left, right };
-        for (products[0..if (pair) @as(usize, 2) else 1]) |product| {
+        for (products[0..if (pair or dual_scaled) @as(usize, 2) else 1]) |product| {
             const id = program.id_map[product];
             const slot = routes.pool.plan.slotForNode(id) orelse return error.MissingPhysicalPool;
             try std.testing.expectEqual(.region_internal, slot.kind);
@@ -3571,7 +3575,7 @@ test "planned Metal elementwise product-add publishes into the assigned region o
         try std.testing.expectEqual(@as(u64, 0), result.stats.graph_plan_slots_reserved);
         const dispatch = result.stats.assigned_regions orelse return error.MissingRegionDispatch;
         try std.testing.expectEqual(@as(u64, 1), dispatch.accepted_callbacks);
-        try std.testing.expectEqual(@as(u64, if (pair) 3 else 2), dispatch.covered_callback_nodes);
+        try std.testing.expectEqual(@as(u64, if (pair or dual_scaled) 3 else 2), dispatch.covered_callback_nodes);
         @memset(&row, 5);
         var replacement = try Tensor.initFloat32(a, names[count - 1], &dims, &row);
         defer replacement.deinit();
@@ -3585,11 +3589,11 @@ test "planned Metal elementwise product-add publishes into the assigned region o
         defer next.deinit(&executable.runtime);
         const next_values = try cb.toFloat32(next.outputs[0], a);
         defer a.free(next_values);
-        for (next_values) |element| try std.testing.expectEqual(@as(f32, if (pair) 17 else if (scaled) 5.5 else 7), element);
+        for (next_values) |element| try std.testing.expectEqual(@as(f32, if (pair) 17 else if (dual_scaled) 11 else if (scaled) 5.5 else 7), element);
         const output = try cb.toFloat32(result.outputs[0], a);
         defer a.free(output);
         try std.testing.expectEqual(@as(usize, width), output.len);
-        for (output) |element| try std.testing.expectEqual(@as(f32, if (pair) 14 else if (scaled) 2.5 else 5), element);
+        for (output, 0..) |element, index| try std.testing.expectEqual(@as(f32, if (pair) 14 else if (dual_scaled) if (index == 0) 0 else 5 else if (scaled) 2.5 else 5), element);
 
         var ordinary = try executable.run(a, .{ .host_inputs = inputs[0..count], .prepared_routes = compatibility, .output_placement = .producer, .activation_readbacks = .forbidden });
         defer ordinary.deinit(&executable.runtime);

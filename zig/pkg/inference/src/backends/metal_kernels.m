@@ -13120,8 +13120,13 @@ static NSString *termite_metal_shader_source(void) {
            "    uint total = p.rows * p.dim; if (gid >= total) return;\n"
            "    output[gid] = (lhs[gid] + rhs[gid]) * scale;\n"
            "}\n"
-           "kernel void termite_apply_scaled_add_scale_1x(device const float *lhs [[buffer(0)]], device const float *rhs [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_apply_add_params &p [[buffer(3)]], constant float2 &scales [[buffer(4)]], uint gid [[thread_position_in_grid]]) {\n"
+           "kernel void termite_apply_scaled_add_scale_1x(device const float *lhs [[buffer(0)]], device const float *rhs [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_apply_add_params &p [[buffer(3)]], constant float4 &scales [[buffer(4)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.rows * p.dim; if (gid >= total) return;\n"
+           "    if (p.flags != 0u) {\n"
+           "        #pragma clang fp contract(off)\n"
+           "        output[gid] = lhs[gid] * scales.x + rhs[gid] * scales.z;\n"
+           "        return;\n"
+           "    }\n"
            "    output[gid] = (lhs[gid] * scales.x + rhs[gid]) * scales.y;\n"
            "}\n"
            "kernel void termite_apply_multiply_add_1x(device const float *lhs [[buffer(0)]], device const float *rhs [[buffer(1)]], device const float *addend [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_apply_add_params &p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {\n"
@@ -59306,6 +59311,8 @@ int termite_metal_decode_runtime_apply_scaled_add_scale_device(
     size_t dim,
     float lhs_scale,
     float output_scale,
+    float rhs_scale,
+    uint32_t scale_both,
     void *output_handle,
     size_t output_offset
 ) {
@@ -59338,8 +59345,9 @@ int termite_metal_decode_runtime_apply_scaled_add_scale_device(
         termite_metal_apply_add_params params = {
             .rows = 1,
             .dim = (uint32_t)dim,
+            .flags = scale_both,
         };
-        const float scales[2] = { lhs_scale, output_scale };
+        const float scales[4] = { lhs_scale, output_scale, rhs_scale, 0.0f };
         bool frame_owned = true;
         id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
         if (command_buffer == nil) return -8;
