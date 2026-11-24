@@ -1,11 +1,95 @@
 <!doctype html>
-<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Antfly Mail</title>
-<meta name="theme-color" content="#20232c"><link rel="manifest" href="/manifest.webmanifest"><link rel="icon" href="/icon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/mail.css"><script type="module" src="/mail.js"></script>
-<body><header><strong>Antfly Mail</strong><span id="identity"></span><button id="logout" hidden>Sign out</button></header>
-<main><section id="account"><h1>Your searchable inbox</h1><p>Sign in to read and reply to your messages.</p><form id="login"><label>Email<input name="email" type="email" autocomplete="username" required></label><label>Password<input name="password" type="password" autocomplete="current-password" minlength="12" required></label><label id="name-label">Name<input name="name" autocomplete="name"></label><div><button name="action" value="signin">Sign in</button><button name="action" value="signup">Create account</button><button name="action" value="recover" formnovalidate>Reset password</button></div></form></section>
-<section id="reset" hidden><h1>Choose a new password</h1><form id="reset-form"><label>New password<input name="password" type="password" minlength="12" autocomplete="new-password" required></label><button>Save password</button></form></section>
-<section id="mail" hidden><nav><button id="inbox">Inbox</button><button id="outbox">Outbox</button><button id="trash">Trash</button><button id="compose">New message</button><form id="search"><input name="query" type="search" aria-label="Search messages" placeholder="Search your mail" required maxlength="1024"><select name="where" id="search-where" aria-label="Search location" hidden><option value="device">On this device</option><option value="server">On the server</option></select><button>Search</button></form></nav><p id="address"></p>
-<details id="local" hidden><summary>On-device search <span id="local-badge"></span></summary><p>Optionally keep a private copy of this mailbox's text in this browser and search it by meaning with EmbeddingGemma, running entirely on this device. Messages and their embeddings never leave it, and search keeps working offline. The model is a one-time download, shared by every mailbox on this device.</p><label class="inline"><input type="checkbox" id="local-toggle"> Keep a searchable copy of this mailbox on this device</label><progress id="local-progress" hidden></progress><p id="local-status" role="status" aria-live="polite"></p><button type="button" id="local-sync" hidden>Sync now</button><button type="button" id="local-remove" hidden>Remove from this device</button></details><div class="columns"><section aria-label="Messages"><p id="trash-banner" hidden><span id="trash-retention"></span> <button type="button" id="empty-trash">Empty Trash now</button></p><div id="messages"></div><button id="next" hidden>Older messages</button></section><article id="message"><p>Select a message.</p></article></div>
-<form id="editor" hidden><h2>Write a message</h2><label>To<input name="to" type="email" required></label><label>Subject<input name="subject" maxlength="998" required></label><label>Message<textarea name="text" rows="10" required maxlength="16384"></textarea></label><button>Send</button><button type="button" id="cancel">Cancel</button></form></section>
-<p id="status" role="status" aria-live="polite"></p></main></body></html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Antfly Mail</title>
+<meta name="theme-color" content="#fafafa" media="(prefers-color-scheme: light)"><meta name="theme-color" content="#121212" media="(prefers-color-scheme: dark)">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/mail.css">
+<script type="module" src="/mail.js"></script>
+</head>
+<body>
+<svg hidden><symbol id="mark" viewBox="0 0 40 40"><path d="M39.28 28.07c0 6.19-5.02 11.21-11.21 11.21H6.11c-.73 0-1.1-.88-.58-1.4l5.56-5.56h16.98a4.26 4.26 0 0 0 4.26-4.26V11.09l5.56-5.56c.52-.52 1.4-.15 1.4.58v21.96Z"/><path d="M27.27 24.5c0 .71-.86 1.07-1.36.56l-4.73-4.73a.8.8 0 0 1 0-1.13l4.76-4.76c.5-.5 1.37-.15 1.36.57l-.03 9.49Z"/><path d="M28.31 6.96H11.22a4.26 4.26 0 0 0-4.26 4.26v17.1L1.4 33.87c-.52.52-1.4.15-1.4-.58V11.22C0 5.02 5.02 0 11.22 0h22.08c.73 0 1.1.88.58 1.4l-5.57 5.56Z"/><path d="M11.88 15.12c0-.71.86-1.07 1.36-.56l4.62 4.62a.8.8 0 0 1 0 1.13l-4.65 4.65c-.5.5-1.37.15-1.36-.57l.03-9.27Z"/></symbol></svg>
+<main>
+<section id="account" class="auth">
+  <div class="auth-brand"><svg class="mark" aria-hidden="true"><use href="#mark"/></svg><span>Antfly Mail</span></div>
+  <h1 id="auth-title">Sign in</h1>
+  <p class="auth-lede">Private webmail, searchable by meaning.</p>
+  <form id="login" data-mode="signin">
+    <label id="name-label"><span class="label">Name</span><input name="name" autocomplete="name"></label>
+    <label><span class="label">Email</span><input name="email" type="email" autocomplete="username" required></label>
+    <label><span class="label">Password</span><input name="password" type="password" autocomplete="current-password" minlength="12" required></label>
+    <button name="action" value="signin" class="primary wide" data-mode="signin">Sign in</button>
+    <button name="action" value="signup" class="primary wide" data-mode="signup">Create account</button>
+    <button name="action" value="recover" class="link" data-mode="signin" formnovalidate>Forgot password?</button>
+  </form>
+  <p class="auth-switch"><span id="mode-prompt">New here?</span> <button type="button" id="mode-switch" class="link">Create an account</button></p>
+</section>
+
+<section id="reset" class="auth" hidden>
+  <div class="auth-brand"><svg class="mark" aria-hidden="true"><use href="#mark"/></svg><span>Antfly Mail</span></div>
+  <h1>Choose a new password</h1>
+  <form id="reset-form">
+    <label><span class="label">New password</span><input name="password" type="password" minlength="12" autocomplete="new-password" required></label>
+    <button class="primary wide">Save password</button>
+  </form>
+</section>
+
+<section id="mail" class="shell" hidden>
+  <aside class="sidebar">
+    <div class="brand"><svg class="mark" aria-hidden="true"><use href="#mark"/></svg><span>Antfly Mail</span></div>
+    <button id="compose" class="brand-action">Compose</button>
+    <nav aria-label="Folders">
+      <button id="inbox" class="folder" aria-current="page">Inbox</button>
+      <button id="outbox" class="folder">Outbox</button>
+      <button id="trash" class="folder">Trash</button>
+    </nav>
+    <details id="local" class="device" hidden>
+      <summary><span class="dot" id="local-dot"></span><span>On-device search</span><small id="local-badge">Off</small></summary>
+      <div class="sheet">
+        <p class="label">On-device search</p>
+        <p>Keep a private copy of this mailbox's text in this browser and search it by meaning with EmbeddingGemma, running entirely on this device. Messages and their embeddings never leave it, and search keeps working offline. The model is a one-time download, shared by every mailbox on this device.</p>
+        <label class="inline"><input type="checkbox" id="local-toggle"> Keep a searchable copy of this mailbox on this device</label>
+        <progress id="local-progress" hidden></progress>
+        <p id="local-status" class="readout" role="status" aria-live="polite"></p>
+        <div class="row-actions"><button type="button" id="local-sync" hidden>Sync now</button><button type="button" id="local-remove" class="danger" hidden>Remove from this device</button></div>
+      </div>
+    </details>
+    <footer class="account">
+      <p class="label">Mailbox</p>
+      <p id="address" class="readout"></p>
+      <p class="signed-in"><span id="identity"></span><button id="logout" class="link" hidden>Sign out</button></p>
+    </footer>
+  </aside>
+
+  <section class="list" aria-label="Messages">
+    <form id="search" role="search">
+      <input name="query" type="search" aria-label="Search messages" placeholder="Search your mail" required maxlength="1024">
+      <select name="where" id="search-where" aria-label="Search location" hidden><option value="device">This device</option><option value="server">Server</option></select>
+      <button aria-label="Search">Search</button>
+    </form>
+    <p id="list-title" class="label">Inbox</p>
+    <p id="trash-banner" hidden><span id="trash-retention"></span> <button type="button" id="empty-trash" class="link danger">Empty Trash now</button></p>
+    <div id="messages"></div>
+    <button id="next" class="more" hidden>Older messages</button>
+  </section>
+
+  <section class="reader">
+    <button type="button" id="back" class="link back">← Back</button>
+    <article id="message"><div class="empty"><svg class="mark" aria-hidden="true"><use href="#mark"/></svg><p>Select a message to read it.</p></div></article>
+    <form id="editor" hidden>
+      <div class="editor-head"><h2 id="editor-title">New message</h2><button type="button" id="cancel" class="link">Discard</button></div>
+      <label class="field"><span class="label">To</span><input name="to" type="email" required></label>
+      <label class="field"><span class="label">Subject</span><input name="subject" maxlength="998" required></label>
+      <textarea name="text" rows="12" required maxlength="16384" aria-label="Message"></textarea>
+      <div class="editor-actions"><button class="primary">Send</button></div>
+      <div id="quote" hidden><p class="label">Replying to</p><p id="quote-meta" class="readout"></p><pre id="quote-text"></pre></div>
+    </form>
+  </section>
+</section>
+<div id="status" role="status" aria-live="polite"></div>
+</main>
+</body>
+</html>
