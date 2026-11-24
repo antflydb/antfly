@@ -112,7 +112,13 @@ def test_journal_publication_requires_enrolled_root():
             result = sql(statement)
             if result.returncode == 0:
                 return True
-            assert "ERROR:  53300:" in result.stderr, result.stderr
+            # Roster activation changes the write's catalog cut. Only a
+            # definite pre-commit rejection may retry this fixture write.
+            assert (
+                "ERROR:  53300:" in result.stderr
+                or "ERROR:  40001: The table or policy definition changed"
+                in result.stderr
+            ), result.stderr
             return False
 
         wait_until(ready, timeout_s=30)

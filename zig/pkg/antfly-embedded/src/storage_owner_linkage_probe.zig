@@ -114,7 +114,9 @@ fn exercise(alloc: std.mem.Allocator, root: []const u8, physical: []const u8, io
     if (try db.createDetachedEnrichmentRuntime(&runtime_options.enrichment.?)) |_| return error.SharedStorageInvalidBatchAccepted;
     const ReplayArgs = std.meta.ArgsTuple(@typeInfo(@FieldType(engine.VTable, "applyDerivedBatchToIndexAsync")).pointer.child);
     const replay_args: ReplayArgs = .{ db.async_context, .{}, .{ .name = "vector", .kind = .dense_vector }, .{} };
-    if (try engine.call("applyDerivedBatchToIndexAsync", replay_args)) return error.SharedStorageInvalidBatchAccepted;
+    if (engine.call("applyDerivedBatchToIndexAsync", replay_args)) |_| {
+        return error.SharedStorageInvalidBatchAccepted;
+    } else |err| if (err != error.DenseCatchUpSessionSuperseded) return error.SharedStorageErrorIdentityLost;
     const transaction = try db.beginTransaction(100);
     try db.writeTransaction(transaction, .{ .writes = &.{.{ .key = "transaction-row", .value = "{\"n\":3}" }} });
     try db.commitTransaction(transaction, 101);
