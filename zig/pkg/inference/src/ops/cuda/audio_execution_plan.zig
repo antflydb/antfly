@@ -141,15 +141,6 @@ pub const Cache = struct {
         self.* = .{};
         for (&previous.entries) |*entry| entry.retireOwner(current) catch platform.inference_process_supervisor.restartWorker();
     }
-    pub fn clearLegacy(self: *Cache) !void {
-        for (self.entries) |entry| if (entry.owner) |owner| {
-            if (owner.managed) return error.MissingCurrentCleanupEpoch;
-        };
-        try self.clearWithCleanup(.{});
-    }
-    pub fn clear(self: *Cache) void {
-        self.clearLegacy() catch platform.inference_process_supervisor.restartWorker();
-    }
 };
 test "CUDA audio plan retirement keeps custody when cleanup authority is missing" {
     var entry: Entry = .{ .key = 17, .stamp = 2, .warmed = true };

@@ -1535,7 +1535,7 @@ fn qualifyAudioMetadataRetirement(comptime adopt_warm_plan: bool) !void {
     try std.testing.expectError(error.RetirementEpochSealed, cache.clearWithCleanup(.{ .boundary = &publication_epoch }));
     try std.testing.expect(cache.entries[0].owner == owner and owner.managed);
     if (adopt_warm_plan) try std.testing.expectEqual(@as(usize, 256), (try owner.plan.layout(0)).bytes);
-    try std.testing.expectError(error.MissingCurrentCleanupEpoch, cache.clearLegacy());
+    try std.testing.expectError(error.CacheRetirementCleanupAuthorityRequired, cache.clearWithCleanup(.{}));
     const original = cache.entries[0].owner;
     for (0..3) |_| try std.testing.expect((try cache.getWithCleanup(93, .{ .boundary = &epoch })).owner == original);
     try std.testing.expect(gate.tryLock());

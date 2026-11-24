@@ -7875,9 +7875,9 @@ pub const CudaCompute = struct {
         // Detached borrowers retain their own bytes and leases until release.
     }
 
-    pub fn evictEmbeddingGemma2Caches(self: *CudaCompute) !void {
+    fn evictEmbeddingGemma2Caches(self: *CudaCompute) !void {
         if (self.audio_execution_active) return error.ResourceTemporarilyUnavailable;
-        self.audio_plans.clear();
+        try self.audio_plans.clearWithCleanup(.{});
         try self.embedding_gemma2_resize.clear(&self.ctx);
         try self.embedding_gemma2_execution.clear(self.allocator, &self.ctx);
         try self.embedding_gemma2_global_scratch.clear(&self.ctx);
