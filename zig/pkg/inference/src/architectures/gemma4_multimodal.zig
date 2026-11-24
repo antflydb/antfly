@@ -446,13 +446,15 @@ test "Metal assembles host-projected Gemma media directly on device" {
             const audio: prompt_rows.ProjectedInputRows = .{ .rows_per_item = &.{1}, .width = 4, .source = .{ .host = &.{ 5, 6, 7, 8 } } };
             var actual = try prepareExpandedPromptEmbeddingsFromRows(&backend, a, tokenizer.tokenizer(), model, &tokens, image, audio);
             defer actual.deinit(&backend);
-            try std.testing.expect(@import("../ops/metal_compute.zig").MetalCompute.debugHasDeviceTensor(&backend, actual.input_embeddings));
+            const actual_tensor = actual.input_embeddings orelse return error.MissingResidentPromptEmbedding;
+
+            try std.testing.expect(@import("../ops/metal_compute.zig").MetalCompute.debugHasDeviceTensor(&backend, actual_tensor));
 
             var expected = try prepareExpandedPromptEmbeddingsFromRows(&reference, a, tokenizer.tokenizer(), model, &tokens, image, audio);
             defer expected.deinit(&reference);
-            const have = try backend.toFloat32(actual.input_embeddings, a);
+            const have = try backend.toFloat32(actual_tensor, a);
             defer a.free(have);
-            const want = try reference.toFloat32(expected.input_embeddings, a);
+            const want = try reference.toFloat32(expected.input_embeddings orelse return error.MissingReferencePromptEmbedding, a);
             defer a.free(want);
             try std.testing.expectEqualSlices(f32, want, have);
         }
