@@ -9270,6 +9270,7 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("batchInternal", .{ self, req, profile, opts });
         const profile_span = write_stage_profile.begin(.write);
         defer profile_span.end();
+        if (self.text_merge_runtime) |runtime| runtime.mergeAtCapBeforeWrite();
         var committed = false;
         var tracked = opts;
         tracked.primary_committed = opts.primary_committed orelse &committed;

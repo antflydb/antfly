@@ -176,6 +176,10 @@ const UnsupportedTextMergeRuntime = struct {
         return .not_needed;
     }
 
+    pub fn mergeAtCapBeforeWrite(self: *@This()) void {
+        _ = self;
+    }
+
     pub const ProducerPermit = struct {
         pub fn release(_: *@This()) void {}
     };
@@ -788,6 +792,25 @@ const PlatformTextMergeRuntime = struct {
             self.apply_mutex.unlockExclusive();
             self.signalProducerAdmissionChanged();
             return true;
+        }
+    }
+
+    /// Lite runs no merge worker, and inline writes take no merge
+    /// admission: an index at `max_pending_segments` sends writes down the
+    /// replay path until something merges it. A writer that finds one there
+    /// merges on its own thread first, before it takes the apply lock and
+    /// under the writer lease it already holds (a merge commit borrows it as
+    /// a nested lease), so its write stays inline.
+    pub fn mergeAtCapBeforeWrite(self: *TextMergeRuntime) void {
+        if (!self.config.enabled or !self.config.manual_producer_assistance or self.config.max_pending_segments == 0) return;
+        var rounds: usize = 0;
+        while (rounds < 4) : (rounds += 1) {
+            lockApplyShared(self.apply_mutex);
+            const largest = self.index_manager.textMergeStatsSnapshot().max_active_segments_per_index;
+            self.apply_mutex.unlockShared();
+            if (largest < self.config.max_pending_segments) return;
+            const merged = self.runOnce() catch return;
+            if (!merged) return;
         }
     }
 
