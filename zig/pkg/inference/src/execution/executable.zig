@@ -3556,7 +3556,12 @@ test "planned Metal elementwise product-add publishes into the assigned region o
         defer compatibility.release();
         try std.testing.expect(compatibility.pool.completeOwnedPayload() == null);
         try std.testing.expectEqual(@as(usize, 0), compatibility.pool.regions.len);
-        var result = try executable.run(a, .{ .host_inputs = inputs[0..count], .prepared_routes = routes, .output_placement = .producer, .collect_partition_stats = true, .activation_readbacks = .forbidden });
+        var claims = switch (try routes.claimRegions(a, null, facts[0..count])) {
+            .ready => |owned| owned,
+            .no_regions, .reprepare => return error.MissingPreparedRegionClaims,
+        };
+        defer claims.releaseUnsubmitted();
+        var result = try executable.run(a, .{ .host_inputs = inputs[0..count], .prepared_routes = routes, .region_claims = &claims, .output_placement = .producer, .collect_partition_stats = true, .activation_readbacks = .forbidden });
         defer result.deinit(&executable.runtime);
         const dispatch = result.stats.assigned_regions orelse return error.MissingRegionDispatch;
         try std.testing.expectEqual(@as(u64, 1), dispatch.accepted_callbacks);
@@ -3565,7 +3570,12 @@ test "planned Metal elementwise product-add publishes into the assigned region o
         var replacement = try Tensor.initFloat32(a, names[count - 1], &dims, &row);
         defer replacement.deinit();
         inputs[count - 1].value = &replacement;
-        var next = try executable.run(a, .{ .host_inputs = inputs[0..count], .prepared_routes = routes, .output_placement = .producer, .collect_partition_stats = true, .activation_readbacks = .forbidden });
+        var next_claims = switch (try routes.claimRegions(a, null, facts[0..count])) {
+            .ready => |owned| owned,
+            .no_regions, .reprepare => return error.MissingPreparedRegionClaims,
+        };
+        defer next_claims.releaseUnsubmitted();
+        var next = try executable.run(a, .{ .host_inputs = inputs[0..count], .prepared_routes = routes, .region_claims = &next_claims, .output_placement = .producer, .collect_partition_stats = true, .activation_readbacks = .forbidden });
         defer next.deinit(&executable.runtime);
         const next_values = try cb.toFloat32(next.outputs[0], a);
         defer a.free(next_values);

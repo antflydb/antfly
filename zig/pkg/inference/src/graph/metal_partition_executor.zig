@@ -18784,9 +18784,9 @@ test "metal partition executor defers both same shape multiply add inputs" {
 
     const ProductAdd = ops_mod.kernel_descriptor.F32ProductAdd;
     const both = ProductAdd.match(&g, g.node(out).getInputs(), shape, .{ true, true }).?;
-    try std.testing.expectEqualDeep(ProductAdd{ .pair = .{ .{ .lhs_id = x, .rhs_id = y }, .{ .lhs_id = z, .rhs_id = w } } }, both);
+    try std.testing.expectEqualDeep(ProductAdd{ .pair = .{ .{ .node = lhs, .lhs_id = x, .rhs_id = y }, .{ .node = rhs, .lhs_id = z, .rhs_id = w } } }, both);
     const right = ProductAdd.match(&g, g.node(out).getInputs(), shape, .{ false, true }).?;
-    try std.testing.expectEqualDeep(ProductAdd{ .single = .{ .product = .{ .lhs_id = z, .rhs_id = w }, .addend = lhs } }, right);
+    try std.testing.expectEqualDeep(ProductAdd{ .single = .{ .product = .{ .node = rhs, .lhs_id = z, .rhs_id = w }, .addend = lhs } }, right);
 
     const reachable = try interpreter.computeReachable(allocator, &g);
     defer allocator.free(reachable);
@@ -20210,7 +20210,7 @@ test "metal partition executor runtime add keeps resident input device backed" {
     defer allocator.free(raw);
     try std.testing.expectEqualSlices(f32, &.{ 11.0, 22.0, 33.0, 44.0 }, raw);
 
-    const product: DeferredElementwiseMul = .{ .lhs_id = x, .rhs_id = y };
+    const product: DeferredElementwiseMul = .{ .node = null_node, .lhs_id = x, .rhs_id = y };
     const fused = (try executeDeferredElementwiseMultiplyAdd2(&cb, values, product, product, dim, null)) orelse return error.UnsupportedPrimitiveOp;
     defer cb.free(fused);
     try std.testing.expect(isMetalDeviceResident(&cb, fused));
