@@ -3650,3 +3650,30 @@ test "privacy policy installation acknowledgement survives progress but never ac
     visible.indexes_json = try privacy.replaceResource(a, requested.indexes_json, resource);
     try std.testing.expect(!try privacyPolicyInstallationMatches(a, before, requested, visible));
 }
+
+test "index alias object table mutation permits prospective policy while retaining storage and recipe fences" {
+    const a = std.testing.allocator;
+    const before: TableRecord = .{
+        .table_id = 1,
+        .name = "docs",
+        .schema_json = "{}",
+        .storage = .{ .engine = .object },
+        .min_ranges = 0,
+        .desired_replica_count = 0,
+        .indexes_json =
+        \\{"text":{"type":"full_text","sources":[{"artifact":"units"}]},"enrichments":[{"name":"units","kind":"asset","field":"url","execution":{"max_output_tokens_per_item":4096}}]}
+        ,
+    };
+    var after = before;
+    const tuned = try std.mem.replaceOwned(u8, a, before.indexes_json, "4096", "8192");
+    defer a.free(tuned);
+    after.indexes_json = tuned;
+    try validateObjectTableMutation(a, before, after);
+    after.object_storage_generation += 1;
+    try std.testing.expectError(error.ImmutableTableStorageSettings, validateObjectTableMutation(a, before, after));
+    after.object_storage_generation = before.object_storage_generation;
+    const changed = try std.mem.replaceOwned(u8, a, tuned, "url", "other_url");
+    defer a.free(changed);
+    after.indexes_json = changed;
+    try std.testing.expectError(error.ObjectTableDefinitionConflict, validateObjectTableMutation(a, before, after));
+}
