@@ -51,7 +51,7 @@ func testNativeExecutionPolicyRetry(t *testing.T, ctx context.Context, client *h
 		t.Helper()
 		raw, err := corpusRequestWithContext(ctx, client, "GET", tableURL+"/documents/"+id+"/artifacts/"+corpusUnits+"?detail=raw", nil)
 		var m manifest
-		if err != nil || json.Unmarshal(raw, &m) != nil {
+		if err != nil || json.Unmarshal(raw, &m) != nil || m.Generation == 0 || m.Raw == "" {
 			t.Fatalf("read manifest %s: %v", id, err)
 		}
 		return m

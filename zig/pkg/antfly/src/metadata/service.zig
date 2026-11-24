@@ -3770,7 +3770,12 @@ test "index alias decoder floor composes with table features and preserves CAS h
     const plain: metadata_table_manager.TableRecord = .{ .table_id = 1, .name = "docs" };
     const floor = metadata_topology_protocol.index_aliases_version;
     try std.testing.expectEqual(floor, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .upsert_table = aliases })));
-    const envelope = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .topology = .{ .create = .{ .table = aliases } } }, .{});
+    // A topology-only fragment is not a catalog command. Keep its fail-closed
+    // decoder floor distinct from the valid mutation envelope below.
+    const incomplete_envelope = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .topology = .{ .create = .{ .table = aliases } } }, .{});
+    defer std.testing.allocator.free(incomplete_envelope);
+    try std.testing.expectEqual(metadata_topology_protocol.current_version, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_system_catalog = incomplete_envelope }));
+    const envelope = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .mutation = .{ .kind = "table" }, .topology = .{ .create = .{ .table = aliases } } }, .{});
     defer std.testing.allocator.free(envelope);
     try std.testing.expectEqual(floor, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_system_catalog = envelope })));
     try std.testing.expectEqual(floor, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .compare_and_replace_table = .{ .expected = aliases, .replacement = plain } })));

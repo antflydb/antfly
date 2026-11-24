@@ -429,7 +429,7 @@ Build both binaries from the same checkout, then run the real PDF-to-grep path:
 (cd examples/grepstein && GOWORK=off GOEXPERIMENT=simd \
   ANTFLY_GREPSTEIN_E2E_BINARY="$PWD/../../zig/zig-out/bin/antfly" \
   ANTFLY_GREPSTEIN_E2E_GREP_BINARY="$PWD/../../zig/zig-out/bin/antfly-grep" \
-  go test -run '^TestLocalNativeGCS(Extraction|Transcription)$' -count=1 -v)
+  go test -run '^TestLocalNativeGCS(Extraction|Transcription|Images|ExecutionPolicy)$' -count=1 -v)
 ```
 
 This starts a standalone Antfly server and a loopback GCS protocol fixture,
