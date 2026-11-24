@@ -23,6 +23,10 @@ let me = null,
   localOpening = null;
 // On-device search is optional and loaded lazily; see local-index.js.
 const LOCAL_FLAGS = "antfly-mail-local-v1";
+// Mailboxes whose owner turned the switch on, recorded before the copy is
+// usable so the switch survives a reload mid-setup. LOCAL_FLAGS stays the
+// record of a usable copy (offline start, sign-out wipe).
+const LOCAL_WANTED = "antfly-mail-local-wanted-v1";
 // Minimal identity for opening an opted-in copy offline; removed on sign-out.
 const OFFLINE_IDENTITY = "antfly-mail-offline-identity-v1";
 // Set while a sign-out wipe is unfinished, so the next load retries it.
@@ -32,11 +36,22 @@ const localSupported = () =>
   typeof Worker !== "undefined" &&
   typeof WebAssembly !== "undefined" &&
   typeof navigator.storage?.getDirectory === "function";
-function localFlags() {
+function localFlags(key = LOCAL_FLAGS) {
   try {
-    return JSON.parse(localStorage.getItem(LOCAL_FLAGS) ?? "{}") ?? {};
+    return JSON.parse(localStorage.getItem(key) ?? "{}") ?? {};
   } catch {
     return {};
+  }
+}
+function setLocalWanted(mailboxId, on) {
+  try {
+    const wanted = localFlags(LOCAL_WANTED);
+    if (on) wanted[mailboxId] = true;
+    else delete wanted[mailboxId];
+    if (Object.keys(wanted).length) localStorage.setItem(LOCAL_WANTED, JSON.stringify(wanted));
+    else localStorage.removeItem(LOCAL_WANTED);
+  } catch {
+    /* Storage disabled: the switch lasts for this page only. */
   }
 }
 // Sign-out on a shared machine removes every on-device mailbox copy. This needs
@@ -45,6 +60,7 @@ async function wipeLocal() {
   // Never allow offline reopening after sign-out, even if deletion fails.
   try {
     localStorage.removeItem(OFFLINE_IDENTITY);
+    localStorage.removeItem(LOCAL_WANTED);
     localStorage.setItem(WIPE_PENDING, "1");
   } catch {
     /* Storage disabled: nothing was ever stored. */
@@ -490,7 +506,8 @@ async function refresh() {
     } catch {
       /* Storage disabled. */
     }
-    $("local-toggle").checked = !stillPending && localFlags()[me.mailbox.id] === true;
+    const id = me.mailbox.id;
+    $("local-toggle").checked = !stillPending && (localFlags()[id] === true || localFlags(LOCAL_WANTED)[id] === true);
     if (stillPending) localStatus("A previous sign-out's on-device copy is still being removed. Close other tabs of this app.");
     if ($("local-toggle").checked) {
       rememberIdentity();
@@ -540,8 +557,10 @@ function startLocal(confirmDownload) {
       ) {
         $("local-toggle").checked = false;
         $("local-badge").textContent = "Off";
+        setLocalWanted(mailboxId, false);
         return;
       }
+      setLocalWanted(mailboxId, true);
       local = await module.LocalMailIndex.open(mailboxId, {
         config,
         onStatus: (s) =>
@@ -564,8 +583,15 @@ function startLocal(confirmDownload) {
       if (navigator.onLine !== false) await syncLocal();
       else localStatus("Offline. " + (local.state.messages ?? 0) + " messages available on this device.");
     } catch (error) {
-      localStatus("On-device search is unavailable: " + error.message);
-      if (!local) $("local-badge").textContent = "Unavailable";
+      // local-index.js errors that already say "on-device" read fine on their own.
+      localStatus(/on-device/i.test(error.message) ? error.message + "." : "On-device search is unavailable: " + error.message);
+      // Setup never finished: turn the switch back off rather than retrying on
+      // every load. A copy that was usable before keeps its switch on.
+      if (!local && localFlags()[mailboxId] !== true) {
+        if (me?.mailbox.id === mailboxId) $("local-toggle").checked = false;
+        setLocalWanted(mailboxId, false);
+        $("local-badge").textContent = "Off";
+      } else if (!local) $("local-badge").textContent = "Unavailable";
     } finally {
       localOpening = null;
     }
@@ -588,6 +614,7 @@ async function syncLocal() {
   localStatus("Up to date. " + megabytes(state.bytes ?? 0) + " stored on this device.");
 }
 async function stopLocal() {
+  if (me) setLocalWanted(me.mailbox.id, false);
   const current = local;
   local = null;
   localReady(null);
