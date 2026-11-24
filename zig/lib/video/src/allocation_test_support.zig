@@ -40,7 +40,10 @@ pub fn checkAllAllocationFailures(comptime run: anytype, args: anytype) !void {
     // FailingAllocator still retains the stack of the injected failure.
     var checked = try CheckedAllocator.init();
     defer checked.deinit();
-    try std.testing.checkAllAllocationFailures(checked.allocator(), run, args);
+    std.testing.checkAllAllocationFailures(checked.allocator(), run, args) catch |err| {
+        std.debug.print("allocation-failure campaign returned {s}\n", .{@errorName(err)});
+        return err;
+    };
 }
 
 fn allocationTracesEnabled() !bool {
