@@ -8304,13 +8304,19 @@ pub const NativeFile = struct {
         if (previous.frontier.end_offset == 0 or previous.frontier.generation != (writer.salt orelse 0) or
             previous.frontier.segment != segment or writer.tail <= previous.frontier.end_offset) return null;
         redo.frontier_cache = null;
-        return .{ .previous = previous, .next = try redoFrontierSlots(self.header).writeNext(self.file, io, previous, .{
+        const next = redoFrontierSlots(self.header).writeNext(self.file, io, previous, .{
             .generation = writer.salt orelse 0,
             .sequence = sequence,
             .end_offset = writer.tail,
             .combined = true,
             .segment = segment,
-        }) };
+        }) catch |err| {
+            // Either mirror may hold the new slot: put the previous frontier
+            // back, as after a failed fsync.
+            const staged: StagedRedoFrontier = .{ .previous = previous, .next = .{ .slot = previous.slot ^ 1, .frontier = previous.frontier } };
+            return if (self.unstageCombinedRedoFrontier(staged)) error.RedoFrontierNotStaged else err;
+        };
+        return .{ .previous = previous, .next = next };
     }
 
     /// After the fsync that would have covered a staged frontier failed:
@@ -23179,7 +23185,7 @@ pub const NativeFile = struct {
                         // leaves the frontier uncertain, not just the records.
                         const combined = if (self.header.protected_redo and !self.no_sync)
                             self.stageCombinedRedoFrontier(&redo.writer) catch |err| {
-                                frontier_failed = true;
+                                frontier_failed = err != error.RedoFrontierNotStaged;
                                 break :blk err;
                             }
                         else
@@ -23431,7 +23437,7 @@ pub const NativeFile = struct {
                     // leaves the frontier uncertain, not just the records.
                     const combined = if (self.header.protected_redo and !self.no_sync)
                         self.stageCombinedRedoFrontier(&redo.writer) catch |err| {
-                            frontier_failed = true;
+                            frontier_failed = err != error.RedoFrontierNotStaged;
                             break :blk err;
                         }
                     else
