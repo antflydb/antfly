@@ -197,7 +197,7 @@ fn satShort(v: f32) i32 {
 
 /// `cv2.cvtColor(.., COLOR_RGB2GRAY)`: 14-bit fixed-point BT.601 weights.
 pub fn toGray(allocator: std.mem.Allocator, img: Raster) !Raster {
-    var out = try Raster.init(allocator, img.w, img.h, 1);
+    const out = try Raster.init(allocator, img.w, img.h, 1);
     if (img.ch == 1) {
         @memcpy(out.data, img.data);
         return out;
@@ -212,7 +212,7 @@ pub fn toGray(allocator: std.mem.Allocator, img: Raster) !Raster {
 
 /// `img.mean(axis=2).astype(np.uint8)`.
 fn meanGray(allocator: std.mem.Allocator, img: Raster) !Raster {
-    var out = try Raster.init(allocator, img.w, img.h, 1);
+    const out = try Raster.init(allocator, img.w, img.h, 1);
     for (out.data, 0..) |*o, i| {
         var sum: u32 = 0;
         for (img.data[i * img.ch ..][0..img.ch]) |v| sum += v;
@@ -309,8 +309,8 @@ fn resizeLinearTaps(allocator: std.mem.Allocator, img: Raster, w: usize, h: usiz
     var out = try Raster.init(allocator, w, h, ch);
     errdefer out.deinit(allocator);
     for (yt, 0..) |ytap, dy| {
-        const sy0 = ytap.sy;
-        const sy1 = @min(ytap.sy + 1, img.h - 1);
+        const sy0 = ytap.sx;
+        const sy1 = @min(ytap.sx + 1, img.h - 1);
         for ([_]usize{ sy0, sy1 }) |sy| {
             if (done[sy]) continue;
             done[sy] = true;
@@ -543,7 +543,7 @@ fn warpPerspectiveCubic(allocator: std.mem.Allocator, img: Raster, m: [9]f64, w:
         const wt = &tab.entries[a];
         var cols: [4]usize = undefined;
         for (&cols, 0..) |*col, j| col.* = @intCast(std.math.clamp(sx - 1 + @as(i64, @intCast(j)), 0, sw - 1));
-        var sum = [_]i64{0} ** 4;
+        var sum: [4]i64 = @splat(0);
         for (0..4) |i| {
             const yy: usize = @intCast(std.math.clamp(sy - 1 + @as(i64, @intCast(i)), 0, sh - 1));
             const row = img.data[yy * img.w * ch ..];
@@ -1073,10 +1073,10 @@ fn detect(env: *const Env, detector: backends.Session, opts: Options, img: Raste
     for (set.comps) |comp| {
         if (comp.len < 2) continue;
         const pix = set.pixels[comp.start..][0..comp.len];
-        var mean: f64 = 0;
-        for (pix) |p| mean += prob[p[1] * pw + p[0]];
-        mean /= @floatFromInt(pix.len);
-        if (@as(f32, @floatCast(mean)) < opts.det_min_score) continue;
+        var score: f64 = 0;
+        for (pix) |p| score += prob[p[1] * pw + p[0]];
+        score /= @floatFromInt(pix.len);
+        if (@as(f32, @floatCast(score)) < opts.det_min_score) continue;
         const rows = comp.y1 - comp.y0 + 1;
         try span.resize(a, rows);
         for (span.items) |*r| r.* = .{ std.math.maxInt(usize), 0 };
@@ -1315,7 +1315,7 @@ fn route(env: *const Env, router: backends.Session, crops: []const Raster) !Rout
             fp[start + j] = softmax(2, f[j * 2 ..])[1];
         }
     }
-    var share = [_]f64{0} ** group_count;
+    var share: [group_count]f64 = @splat(0);
     var wsum: f64 = 0;
     for (gp, crops) |p, c| {
         const wi: f64 = @floatFromInt(c.w);
@@ -1507,7 +1507,7 @@ fn splitGutters(allocator: std.mem.Allocator, img: Raster, boxes: []const Quad) 
         }
         var lo: u8 = 255;
         var hi: u8 = 0;
-        var hist = [_]f64{0} ** 256;
+        var hist: [256]f64 = @splat(0);
         var total: f64 = 0;
         var y = ya;
         while (y < yb) : (y += 1) {
@@ -1625,7 +1625,7 @@ fn splitGutters(allocator: std.mem.Allocator, img: Raster, boxes: []const Quad) 
 }
 
 fn majority(gs: []const usize) usize {
-    var n = [_]usize{0} ** group_count;
+    var n: [group_count]usize = @splat(0);
     for (gs) |g| n[g] += 1;
     var best: usize = 0;
     for (1..group_count) |i| if (n[i] > n[best]) {

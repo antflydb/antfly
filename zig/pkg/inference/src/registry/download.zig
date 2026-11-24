@@ -1227,8 +1227,8 @@ fn writeSyntheticMetadata(
                 .size = metadata.len,
             };
         },
-        .ocria_nano => |plan| {
-            const metadata = try ocriaNanoMetadataAlloc(allocator, plan);
+        .ocria_nano => |ocria_plan| {
+            const metadata = try ocriaNanoMetadataAlloc(allocator, ocria_plan);
             defer allocator.free(metadata);
             const metadata_path = try std.fmt.allocPrint(allocator, "{s}/antfly_metadata.json", .{dest_dir});
             defer allocator.free(metadata_path);
