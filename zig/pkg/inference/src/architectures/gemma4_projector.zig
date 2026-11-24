@@ -1961,10 +1961,14 @@ pub fn encodeProjectedAudioInputs(cb: *const ComputeBackend, allocator: std.mem.
     return encodeProjectedAudioInputsWithWeights(cb, allocator, &weights, inputs);
 }
 
-/// Prompt projection can keep output rows on the same CUDA stream as the decoder.
+/// Prompt projection can hand rows directly to the decoder's device backend.
 pub fn encodeProjectedAudioForPrompt(cb: *const ComputeBackend, allocator: std.mem.Allocator, projector: *ProjectorStore, inputs: []const AudioInput) !ProjectedAudio {
-    if (cb.kind() != .cuda or !cudaNativePlanSelected(cb))
-        return encodeProjectedAudioInputs(cb, allocator, projector, inputs);
+    const resident_handoff = switch (cb.kind()) {
+        .cuda => cudaNativePlanSelected(cb),
+        .metal => cb.supportsCopyRows2D() and cb.vtable.allocUninitF32Shape != null,
+        else => false,
+    };
+    if (!resident_handoff) return encodeProjectedAudioInputs(cb, allocator, projector, inputs);
     const cfg = try parseAudioConfig(&projector.gguf.parsed);
     if (cfg.direct_unified) return encodeProjectedAudioInputs(cb, allocator, projector, inputs);
     if (inputs.len == 0) return error.EmptyEmbeddingInput;
@@ -7947,7 +7951,26 @@ test "gemma4 real mmproj audio device ops match the host encoder" {
             max_ref = @max(max_ref, @abs(a));
         }
         std.debug.print("gemma4 audio device-vs-host host_ops='{s}' max_abs_diff={d:.6} max_abs_ref={d:.4}\n", .{ spec, max_diff, max_ref });
-        if (spec.len == 0) worst = max_diff;
+        if (spec.len == 0) {
+            worst = max_diff;
+            const inputs = [_]AudioInput{ .{ .encoded = audio_bytes }, .{ .encoded = audio_bytes } };
+            for (1..inputs.len + 1) |clip_count| {
+                var prompt = try encodeProjectedAudioForPrompt(&cb, allocator, projector, inputs[0..clip_count]);
+                defer prompt.deinit();
+                const resident = prompt.resident orelse return error.MissingResidentAudioProjection;
+                try std.testing.expect(metal_compute_mod.MetalCompute.debugHasDeviceTensor(&cb, resident.rows));
+                try std.testing.expectEqual(@as(usize, 0), prompt.embeddings.len);
+                try std.testing.expectEqual(clip_count, prompt.tokens_per_audio.len);
+                try std.testing.expectEqual(projected.hidden_size, prompt.hidden_size);
+                const values = try cb.toFloat32(resident.rows, allocator);
+                defer allocator.free(values);
+                try std.testing.expectEqual(projected.embeddings.len * clip_count, values.len);
+                for (prompt.tokens_per_audio, 0..) |tokens, clip| {
+                    try std.testing.expectEqual(projected.tokens_per_audio[0], tokens);
+                    try std.testing.expectEqualSlices(f32, projected.embeddings, values[clip * projected.embeddings.len ..][0..projected.embeddings.len]);
+                }
+            }
+        }
     }
     try std.testing.expect(worst < 5e-2);
 }
