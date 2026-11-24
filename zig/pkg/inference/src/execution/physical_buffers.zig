@@ -1494,7 +1494,9 @@ pub const Pool = struct {
     }
 
     fn selectBakedRegionLiterals(self: *Pool, graph: *const Graph, reachable: []const bool) !void {
-        if (!self.metal_frame_dispatch or self.region_execution_profile != .unknown or self.plan.transfers.len != 0) return;
+        // Ordinary Metal partition execution skips these graph nodes. Private
+        // decoder programs construct their views through a separate entrypoint.
+        if (self.root_pool == null or !self.metal_frame_dispatch or self.region_execution_profile != .unknown or self.plan.transfers.len != 0) return;
         for (self.regions) |installed| for (installed.owner.literal_nodes) |node| {
             const slot = self.plan.slotForNode(node) orelse continue;
             if (slot.kind == .constant and !slot.roles.graph_output and !slot.roles.partition_output)

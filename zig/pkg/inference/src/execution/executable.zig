@@ -3558,6 +3558,7 @@ test "planned Metal elementwise product-add publishes into the assigned region o
             const store = routes.pool.literal_store orelse return error.MissingPhysicalPool;
             const index = store.node_indices[literal];
             try std.testing.expect(!routes.pool.literalEnabled(index));
+            try std.testing.expect(routes.pool.plan.allocationById(store.literals[index].allocation) == null);
         }
         const products = [_]ml.graph.NodeId{ left, right };
         for (products[0..if (pair or dual_scaled) @as(usize, 2) else 1]) |product| {
