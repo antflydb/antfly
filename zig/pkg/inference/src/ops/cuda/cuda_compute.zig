@@ -17295,11 +17295,10 @@ fn recycleTempPinnedSlotsUnlocked(self: *CudaCompute, reuse: TempSlotReuse) !voi
         if (slot.in_use) return error.InvalidCudaState;
         reusable_count += @intFromBool(slot.buffer.ptr != 0);
     }
-    try self.temp_buffers.ensureUnusedCapacity(self.allocator, reusable_count);
     const cache_budget = cudaTempCacheBudgetBytes(self);
     const max_buffers = cudaTempCacheMaxBuffers(self);
-    var cached_bytes: usize = 0;
-    for (self.temp_buffers.buffers.items) |cached| cached_bytes +|= cached.len;
+    const available = max_buffers -| self.temp_buffers.buffers.items.len;
+    try self.temp_buffers.ensureUnusedCapacity(self.allocator, @min(reusable_count, available));
     // Retain only physical backing, never a request's graph or allocation ABI.
     // The next request must reprove its trace before these slots can be used.
     // A separate bounded arena bank avoids overflowing the ordinary 256-entry
@@ -17324,10 +17323,9 @@ fn recycleTempPinnedSlotsUnlocked(self: *CudaCompute, reuse: TempSlotReuse) !voi
             var buffer = slot.buffer;
             if (self.temp_buffers.buffers.items.len < max_buffers and
                 buffer.len <= cache_budget and
-                cached_bytes <= cache_budget - buffer.len)
+                self.temp_buffers.bytes <= cache_budget - buffer.len)
             {
                 self.temp_buffers.appendAssumeCapacity(buffer);
-                cached_bytes += buffer.len;
                 self.stats.temp_buffer_releases += 1;
                 buffer = .{};
             } else {
@@ -17367,6 +17365,8 @@ fn installLearnedTempArenaPlan(self: *CudaCompute) !bool {
     while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
     defer self.temp_buffer_mutex.unlock();
 
+    // Reserve descriptor capacity before changing any published slot mapping.
+    try self.temp_pinned_slots.ensureTotalCapacity(self.allocator, lengths.len);
     try recycleTempPinnedSlotsUnlocked(self, .{ .plan = lengths });
     try ensureTempPinnedSlots(self, lengths.len);
     for (lengths, 0..) |len, index| {
@@ -19127,6 +19127,36 @@ test "CUDA graph request reset clears stale capture and scalar state" {
     try std.testing.expect(self.debug_cuda_graph_capture_disabled);
 }
 
+test "CUDA decoder workspace recycling does not grow a full cache" {
+    const a = std.testing.allocator;
+    var arena_limit = try TestEnvGuard.captureAndClear(a, "ANTFLY_INFERENCE_CUDA_TEMP_ARENA_MAX_MB");
+    defer arena_limit.restore(a);
+    var compute = metadataOnlyTestCompute();
+    compute.runtime_policy = .{ .max_temp_buffers = 1, .temp_cache_mb = 1 };
+    defer compute.temp_buffers.deinit(a);
+    defer compute.temp_pinned_slots.deinit(a);
+    defer compute.temp_arena_planner.deinit(a);
+    try compute.temp_buffers.buffers.ensureTotalCapacityPrecise(a, 1);
+    compute.temp_buffers.appendAssumeCapacity(.{ .ptr = 0x1000, .len = 64 });
+    try compute.temp_pinned_slots.ensureTotalCapacityPrecise(a, 1);
+    try compute.temp_pinned_slots.append(a, .{ .buffer = .{ .ptr = 0x2000, .len = 128 }, .requested_len = 128 });
+    try compute.temp_arena_planner.candidate_lengths.appendSlice(a, &.{ 128, 256 });
+    compute.allocator = std.testing.failing_allocator;
+
+    try recycleTempPinnedSlotsUnlocked(&compute, .idle);
+
+    try std.testing.expectEqual(@as(usize, 1), compute.temp_buffers.buffers.capacity);
+    try std.testing.expectEqual(@as(usize, 64), compute.temp_buffers.bytes);
+    try std.testing.expectEqual(@as(usize, 0), compute.temp_pinned_slots.items[0].requested_len);
+    try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0x2000), compute.temp_pinned_slots.items[0].buffer.ptr);
+
+    compute.temp_arena_planner.active = true;
+    try std.testing.expectError(error.OutOfMemory, installLearnedTempArenaPlan(&compute));
+    try std.testing.expectEqual(@as(usize, 1), compute.temp_pinned_slots.items.len);
+    try std.testing.expectEqual(@as(usize, 0), compute.temp_pinned_slots.items[0].requested_len);
+    try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0x2000), compute.temp_pinned_slots.items[0].buffer.ptr);
+}
+
 test "CUDA request reset clears pinned temp slot ABI mappings" {
     var self = metadataOnlyTestCompute();
 
@@ -19196,8 +19226,10 @@ test "CUDA request reset clears pinned temp slot ABI mappings" {
     self.temp_pinned_slots.items[1] = .{};
     // A logical view can describe fewer bytes than its backing. The installed
     // plan must charge, and bind, the physical bytes of each ordinal.
-    self.temp_buffers.buffers.items[0].len = 64;
-    self.temp_buffers.buffers.items[0].allocation_bytes = 128;
+    var oversized = self.temp_buffers.orderedRemove(0);
+    oversized.len = 64;
+    oversized.allocation_bytes = 128;
+    try self.temp_buffers.append(self.allocator, oversized);
     try std.testing.expect(findExactTempBufferIndex(&self, 64) == null);
     self.temp_slot_config.configured_period = 2;
     self.debug_cuda_graph_capture_active = true;
