@@ -22,29 +22,10 @@
   --radius-lg: 10px;
   --font-sans: system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-mono: ui-monospace, "SF Mono", Menlo, Monaco, monospace;
-  color-scheme: light dark;
+  color-scheme: light;
   font: 15px/1.5 var(--font-sans);
   color: var(--foreground);
   background: var(--background);
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #121212;
-    --background-secondary: #1a1a1a;
-    --foreground: #ededec;
-    --card: #171717;
-    --muted-foreground: #b2b1ad;
-    --border: #2c2c2c;
-    --border-strong: #444443;
-    --input: #444443;
-    --hover: #1f1f1f;
-    --selected: #262626;
-    --amber: #ecb52e;
-    --amber-soft: #2a2210;
-    --destructive: #d96a61;
-    --success: #6fa362;
-    --warning: #e8854a;
-  }
 }
 * { box-sizing: border-box; }
 html, body { height: 100%; }
