@@ -42738,9 +42738,10 @@ int antfly_metal_dense_linear_assigned_mps_ready(termite_metal_decode_runtime *r
     if (runtime == NULL || rows <= 1 || rows > UINT32_MAX ||
         antfly_metal_linear_slot_prepared(runtime, slot) == 0 ||
         runtime->linear_glide_tensor_ops[slot] || runtime->lighton_vision_mpp_required ||
-        runtime->linear_weight_dtypes[slot] != TERMITE_METAL_DENSE_LINEAR_DTYPE_F32 ||
         runtime->linear_bias_pipeline == nil) return 0;
-    return termite_metal_dense_linear_uses_mps(runtime, slot, rows, runtime->linear_in_dims[slot], runtime->linear_out_dims[slot]);
+    const uint8_t dtype = runtime->linear_weight_dtypes[slot];
+    return (dtype == TERMITE_METAL_DENSE_LINEAR_DTYPE_F32 || dtype == TERMITE_METAL_DENSE_LINEAR_DTYPE_F32_MPS) &&
+        termite_metal_dense_linear_uses_mps(runtime, slot, rows, runtime->linear_in_dims[slot], runtime->linear_out_dims[slot]);
 }
 
 static int termite_metal_decode_runtime_encode_linear_multi_row_device(

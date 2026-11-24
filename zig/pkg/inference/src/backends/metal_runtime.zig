@@ -48462,10 +48462,11 @@ test "metal native decoder runtime MPS linear transitions from planned encoder" 
     } else {
         _ = unsetenv(enable_mps);
     };
-    try std.testing.expectEqual(@as(c_int, 0), setenv(enable_mps, "1", 1));
-
-    inline for (.{ false, true }, 0..) |f32_weights, slot| {
-        const rows: usize = if (f32_weights) 128 else 3;
+    const Mode = enum { f16_weights, f32_global, f32_slot };
+    inline for (.{ Mode.f16_weights, Mode.f32_global, Mode.f32_slot }, 0..) |mode, slot| {
+        try std.testing.expectEqual(@as(c_int, 0), setenv(enable_mps, if (mode == .f32_global) "1" else "0", 1));
+        const f32_weights = mode != .f16_weights;
+        const rows: usize = if (mode == .f32_global) 128 else 3;
         const hidden_size: usize = 128;
         const Weight = if (f32_weights) f32 else f16;
         const weights = try allocator.alloc(Weight, hidden_size * hidden_size);
@@ -48475,6 +48476,10 @@ test "metal native decoder runtime MPS linear transitions from planned encoder" 
         const bias: [hidden_size]f32 = @splat(0.25);
         if (f32_weights) {
             try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_linear(runtime, slot, weights.ptr, &bias, hidden_size, hidden_size));
+            if (mode == .f32_slot) {
+                try std.testing.expectEqual(@as(c_int, 0), antfly_metal_dense_linear_assigned_mps_ready(runtime, slot, rows));
+                try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prefer_linear_mps(runtime, slot));
+            }
             try std.testing.expectEqual(@as(c_int, 1), antfly_metal_dense_linear_assigned_mps_ready(runtime, slot, rows));
             try std.testing.expectEqual(@as(c_int, 0), antfly_metal_dense_linear_direct_rows_ready(runtime, slot, rows));
         } else {
