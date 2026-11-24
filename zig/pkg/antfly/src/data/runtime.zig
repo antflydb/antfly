@@ -13271,16 +13271,16 @@ pub const DataServer = struct {
         return store.node_id;
     }
 
-    fn dataReadRouterNodeStatus(ptr: *anyopaque, node_id: u64, group_id: u64) ?antfly.raft.host.HostedReplicaStatus {
+    fn dataReadRouterNodeStatus(ptr: *anyopaque, node_id: u64, group_id: u64) antfly.raft.host.HostedReplicaStatus {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (node_id == dataReadRouterLocalNodeId(ptr)) return dataReadRouterLocalStatus(ptr, group_id);
         if (self.remote_metadata) |metadata| {
-            const peers = metadata.acquireControlReadGeneration(.{}) catch return null;
+            const peers = metadata.acquireControlReadGeneration(.{}) catch return .absent;
             defer peers.release();
             return if (peers.readable(group_id, node_id) and peers.nodes.contains(node_id)) .active else .absent;
         }
         var router = @import("../api/table_router.zig").CatalogBackedGroupRouter.init(self.read_source.catalog, dataReadRouterLocalNodeId(ptr));
-        return router.router().nodeStatus(node_id, group_id);
+        return router.router().nodeStatus(node_id, group_id) orelse .absent;
     }
 
     fn dataReadRouterNodeBaseUri(ptr: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
