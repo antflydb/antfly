@@ -2578,6 +2578,15 @@ pub const RaftApplyStore = struct {
             if (!native_source_delegate) return error.StorageKernelOwnerUnavailable;
             try operations.append(alloc, .{ .require_raft_batch_protocol = .{ .version = required } });
         }
+        if (decoded.batch.req.graph_endpoint_cleanup) {
+            // The delete keys name native graph cleanup records, not rows in
+            // the projected document range. Only the native delegate applies
+            // them, including their owner and generation guards.
+            if (!native_source_delegate) return error.StorageKernelOwnerUnavailable;
+            try operations.append(alloc, .{ .require_raft_batch_protocol = .{ .version = protocol.batch_graph_cleanup_neutral_protocol_version } });
+            try operations.append(alloc, .{ .flush_split_delta = raft_index });
+            return;
+        }
         if (decoded.batch.req.relational_index_owner_control) |command| {
             if (!native_source_delegate) return error.StorageKernelOwnerUnavailable;
             try operations.append(alloc, .{ .require_raft_batch_protocol = .{
@@ -2745,7 +2754,6 @@ pub const RaftApplyStore = struct {
 test "data raft schema controls cannot advance projection state before native decoder activation" {
     const a = std.testing.allocator;
     const schema = @import("../schema_control_log.zig");
-    try std.testing.expect(schema.protocol_version > @import("../../common/data_raft_protocol.zig").batch_protocol_version);
     const command = try schema.testing.command().encodeRaft(a);
     defer a.free(command);
     const frame = try schema.encode(a, "rows", 11, command);

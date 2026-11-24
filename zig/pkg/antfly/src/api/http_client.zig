@@ -3869,7 +3869,9 @@ pub const ApiHttpClient = struct {
         try context.ensureActive();
         if (self.internal_service == null) return error.Unauthorized;
         try input.validate();
-        try @import("source_owner_scope.zig").requireFence(input.owner(), fence);
+        var owner = input.owner();
+        owner.topology_epoch = fence.topology_epoch;
+        try @import("source_owner_scope.zig").requireFence(owner, fence);
         if (group_id == 0 or group_id != fence.route.group_id or table_name.len == 0 or table_name.len > 1024) return error.InvalidCatalogRouteFence;
         const table = try percentEncodePathComponent(self.alloc, table_name);
         defer self.alloc.free(table);
@@ -4043,7 +4045,10 @@ pub const ApiHttpClient = struct {
         try fence.validate();
         if (group_id == 0 or group_id != fence.route.group_id or table_name.len == 0 or table_name.len > 1024) return error.InvalidCatalogRouteFence;
         if (comptime kind == .control) try input.validate(self.alloc) else try input.validate();
-        const owner = if (kind == .scope or kind == .producer_closure or kind == .producer_control or kind == .legacy_terminal) input.owner else if (kind == .scope_control) input.owner() else input.source_owner;
+        var owner = if (kind == .scope or kind == .producer_closure or kind == .producer_control or kind == .legacy_terminal) input.owner else if (kind == .scope_control) input.owner() else if (kind == .control) try input.routedOwner(fence.topology_epoch) else input.source_owner;
+        if (comptime kind == .checkpoint) {
+            owner.topology_epoch = fence.topology_epoch;
+        }
         const identity = fence.route.identity_namespace;
         const incarnation = fence.metadata_incarnation orelse return error.InvalidCatalogRouteFence;
         if (owner.group_id != group_id or owner.metadata_group_id != fence.metadata_group_id or owner.topology_epoch != fence.topology_epoch or

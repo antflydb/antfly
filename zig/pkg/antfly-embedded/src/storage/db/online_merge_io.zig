@@ -758,8 +758,6 @@ fn sourceStatusJson(db: *DB, alloc: Allocator, scope: source.Scope, cancellation
     };
     const retained = try @import("../retained_effects.zig").load(&txn);
     if (retained) |value| if (!std.mem.eql(u8, &value.namespace, &scope.namespace())) return error.OnlineSourceScopeChanged;
-    var manager = try db.core.initTxnManager();
-    defer manager.deinit();
     const response: wire.SourceStatus = .{
         .scope = scope,
         .certificate = if (progress != null and progress.?.phase != .released) progress.?.published_certificate orelse certificate else null,
@@ -769,7 +767,7 @@ fn sourceStatusJson(db: *DB, alloc: Allocator, scope: source.Scope, cancellation
         .retained_reclaimable = if (retained) |value| value.reclaimableThrough() else 0,
         .fence = try topology.current(&txn),
         .next_epoch = try topology.nextEpoch(&txn),
-        .drained = !try manager.hasTopologySensitiveTransactions(),
+        .drained = !try @import("../transactions.zig").TxnManager.hasTopologySensitiveTransactionsInView(alloc, &txn),
         .row_derived_indexes = try rowDerivedTransferIndexesAssumeApply(db, alloc, scope.authority == .raft),
     };
     try cancellation.check();

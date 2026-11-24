@@ -1234,7 +1234,7 @@ pub fn Adapter(comptime native: type) type {
             result: types.SearchResult,
             reader: ?DB.RelationalRows.Reader,
             documents: ?DB.DocumentRows,
-            policy: ?@FieldType(DB.QueryReadLease, "row_policy_lease"),
+            policy: ?DB.QueryReadLease.PolicyLease,
             needs_document: bool,
             source_fields: []const []const u8,
             layout: *const catalog.Row.TypedLayout,
@@ -1394,7 +1394,7 @@ pub fn Adapter(comptime native: type) type {
             // selected payload in the supplied page allocator.
             pub const typed_page_owned = true;
             pub const Result = types.SearchResult;
-            pub const Lease = @FieldType(DB.QueryReadLease, "row_policy_lease");
+            pub const Lease = DB.QueryReadLease.PolicyLease;
             pub fn hasSource(hit: types.SearchHit) bool {
                 return hit.source_value != null or hit.stored_data != null or hit.column_source != null;
             }
@@ -1437,7 +1437,7 @@ pub fn Adapter(comptime native: type) type {
             var captured = try lease.search(alloc, ranked);
             errdefer captured.result.deinit();
             if (document_root) {
-                var policy = lease.row_policy_lease.clone();
+                var policy = try lease.retainPolicy();
                 errdefer policy.release();
                 return (try SearchCursor.init(alloc, table, request.fields, captured.result, null, policy)).iface();
             }
@@ -1454,7 +1454,7 @@ pub fn Adapter(comptime native: type) type {
             }
             var reader: ?DB.RelationalRows.Reader = if (table.storage_mode == .relational) try lease.relationalRows(alloc, prepared.fields, table.schema_version) else null;
             errdefer if (reader) |*value| value.deinit();
-            var policy = if (reader == null) lease.row_policy_lease.clone() else null;
+            var policy = if (reader == null) try lease.retainPolicy() else null;
             errdefer if (policy) |*held| held.release();
             const layout = try catalog.Row.TypedLayout.init(a, output_names.keys());
             const projection: dependencies.sql_document_row.Projection = if (reader == null) try dependencies.sql_document_row.Projection.initSearch(a, table, request.fields) else .{ .columns = &.{} };

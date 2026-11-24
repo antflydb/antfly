@@ -107,9 +107,11 @@ def test_catalog_recovery_retains_unknown_receipt_without_replaying():
         client._client.set_httpx_client(http)
         with pytest.raises(SQLExecutionError) as error:
             client.execute_sql(SQLRequest(statement="CREATE SEQUENCE counter"))
-        assert error.value.catalog_receipt.recovery_token == token
+        catalog_receipt = error.value.catalog_receipt
+        assert catalog_receipt is not None
+        assert catalog_receipt.recovery_token == token
         assert error.value.diagnostic.retryable is False
-        result = client.get_sql_catalog_operation(error.value.catalog_receipt.recovery_token)
+        result = client.get_sql_catalog_operation(catalog_receipt.recovery_token)
         assert result.object_id == "18446744073709551615"
         assert result.generation == "9007199254740993"
         with pytest.raises(AntflyException, match="recovery token"):

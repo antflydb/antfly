@@ -1247,12 +1247,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // admission identity; it is not ordinary/legacy row inference.
                 const policy = @import("../source_producer_policy.zig");
                 const row_producer = try policy.rowProducer(req.source_producer, opts.source_producer);
+                // Ordered split/merge copies materialize existing effects.
+                // Their scope and receipts are validated below before the
+                // primary write, independently of legacy producer fencing.
+                const ordered_topology = opts.ordered_apply_receipt != null and
+                    (req.split_replication != null or req.split_checkpoint != null or
+                        req.merge_replication != null or req.merge_checkpoint != null);
                 const producer = if (opts.transaction_resolution != null and opts.transaction_resolution.?.source_scope != null) scoped: {
                     if (row_producer != .unlabelled and row_producer != .scoped_source) return error.SourceTransactionIdentityConflict;
                     break :scoped policy.Producer.scoped_source;
                 } else ordinary: {
                     if (row_producer == .scoped_source) return error.InvalidSourceAdmission;
-                    break :ordinary row_producer;
+                    break :ordinary if (ordered_topology and row_producer == .unlabelled) policy.Producer.ordinary else row_producer;
                 };
                 if (opts.transaction_resolution != null and opts.transaction_resolution.?.legacy_terminal != null) {
                     const resolution = opts.transaction_resolution.?;
@@ -1492,7 +1498,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 coordinated_handoff = try @import("relational/integrity/handoff.zig").admitSplitRequest(S.ownerField(self, "alloc").*, topology_read, req);
                 if (hasCoordinatedConstraints(request_schema_view) and !coordinated_handoff) return error.CoordinatedConstraintTopologyUnsupported;
             }
-            if (req.merge_replication != null or req.merge_checkpoint != null or req.merge_page != null) {
+            if (try req.validateMergeCutoverReceipt()) {
+                const topology_read = try batchProbe(&batch_probe, self);
+                if (try @import("relational/integrity/topology.zig").current(topology_read)) |fence| {
+                    if (fence.transition_id == req.merge_checkpoint.?.transition_id)
+                        return error.IntegrityTopologyBusy;
+                }
+            } else if (req.merge_replication != null or req.merge_checkpoint != null or req.merge_page != null) {
                 const topology_read = try batchProbe(&batch_probe, self);
                 // Source retention remains authoritative after its brief pin
                 // fence is released. Receiving another merge would replace that
@@ -3960,6 +3972,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // artifact is exactly as narrow as the empty case this gate
             // originally required -- not a batch with unrelated/multiple
             // artifact effects needing the slow path's own ordering.
+            // These callers publish effects outside the native transaction
+            // while holding the DB apply lock. Keep them on the ordinary path.
+            const allow_queued_index_publication = opts.committed_batch_effects_observer == null and
+                review_plan == null and next_table_catalog == null and persisted_range == null and
+                !shouldAppendSplitDelta(self) and
+                S.ownerField(self, "local_execution").*.replication_async_batch_mirror == null and
+                S.ownerField(self, "local_execution").*.replication_async_effect_mirror == null;
             var inline_graph_publication: ?*InlineGraphPublication = null;
             var inline_graph_handled_name: []const u8 = &.{};
             defer if (inline_graph_publication) |prepared| prepared.abort();
@@ -3991,7 +4010,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // one durable commit per write instead of guessing from the
             // aggregate fsync/commit counts alone.
             const graph_write_batch = materialized_derived_batch != null and materialized_derived_batch.?.graph_writes.len != 0;
-            const graph_gate_ok = append_derived_replay and effective_req.sync_level == .full_index and
+            const graph_gate_ok = allow_queued_index_publication and append_derived_replay and effective_req.sync_level == .full_index and
                 opts.transaction_resolution == null and materialized_derived_batch != null and
                 materialized_derived_batch.?.graph_writes.len == 1 and
                 materialized_derived_batch.?.graph_deletes.len == 0 and
@@ -4056,7 +4075,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var inline_sparse_handled_name: []const u8 = &.{};
             defer if (inline_sparse_publication) |prepared| prepared.abort();
             defer if (inline_sparse_handled_name.len != 0) S.ownerField(self, "alloc").*.free(@constCast(inline_sparse_handled_name));
-            if (append_derived_replay and effective_req.sync_level == .full_index and
+            if (allow_queued_index_publication and append_derived_replay and effective_req.sync_level == .full_index and
                 opts.transaction_resolution == null and materialized_derived_batch != null and
                 materialized_derived_batch.?.sparse_embeddings.len == 1 and
                 materialized_derived_batch.?.deleted_keys.len == 0 and
@@ -4099,7 +4118,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var inline_dense_handled_name: []const u8 = &.{};
             defer if (inline_dense_publication) |prepared| prepared.abort();
             defer if (inline_dense_handled_name.len != 0) S.ownerField(self, "alloc").*.free(@constCast(inline_dense_handled_name));
-            if (append_derived_replay and effective_req.sync_level == .full_index and
+            if (allow_queued_index_publication and append_derived_replay and effective_req.sync_level == .full_index and
                 opts.transaction_resolution == null and materialized_derived_batch != null and
                 materialized_derived_batch.?.dense_embeddings.len == 1 and
                 materialized_derived_batch.?.deleted_keys.len == 0 and
@@ -4475,6 +4494,31 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     }
                 }
             }
+            const queued_index_publication = inline_graph_publication != null or inline_sparse_publication != null or inline_dense_publication != null;
+            const QueuedCommitCompletion = struct {
+                executor: *derived_executor_mod.Executor,
+                admission: *derived_executor_mod.BacklogAdmission,
+                sequence: u64,
+                primary_committed: ?*bool,
+                disposition: ?*execution_resources.PreparedCommitDisposition,
+
+                fn run(ptr: *anyopaque, outcome: anyerror!u64) void {
+                    const context: *@This() = @ptrCast(@alignCast(ptr));
+                    _ = outcome catch return;
+                    context.executor.commitBacklogAdmission(context.sequence, context.admission);
+                    if (context.primary_committed) |committed| committed.* = true;
+                    if (context.disposition) |disposition| disposition.markPrimaryCommitted();
+                }
+            };
+            var queued_commit_completion: QueuedCommitCompletion = .{
+                .executor = S.ownerField(self, "executor").*,
+                .admission = &backlog_admission,
+                .sequence = sequence,
+                .primary_committed = opts.primary_committed,
+                .disposition = opts.prepared_commit_disposition,
+            };
+            if (queued_index_publication)
+                commit_participants.completion = .{ .ptr = &queued_commit_completion, .run = QueuedCommitCompletion.run };
             const combined_commit_participant: ?@import("../commit_participant.zig").Participant =
                 if (commit_participants.len != 0) commit_participants.participant() else null;
             const commit_participant = if (generated_acceptance) |*acceptance| acceptance.participant() else if (authored_acceptance.vectors.len != 0) authored_acceptance.participant() else null;
@@ -4583,9 +4627,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Same reasoning as `primary_ticket`'s errdefer immediately
             // above, for the transaction-resolution commit's own ticket.
             errdefer if (txn_ticket) |*ticket| ticket.wait() catch {};
+            if (inline_graph_publication) |prepared| prepared.markEnqueued();
+            if (inline_sparse_publication) |prepared| prepared.markEnqueued();
+            if (inline_dense_publication) |prepared| prepared.markEnqueued();
             local_coverage_guard.release();
-            if (opts.primary_committed) |committed| committed.* = true;
-            if (opts.prepared_commit_disposition) |disposition| disposition.markPrimaryCommitted();
+            if (!queued_index_publication) {
+                if (opts.primary_committed) |committed| committed.* = true;
+                if (opts.prepared_commit_disposition) |disposition| disposition.markPrimaryCommitted();
+            }
             if (graph_publication) |*lease| lease.release();
             if (comptime @import("builtin").is_test) if (test_fail_after_primary_commit) |err| {
                 test_fail_after_primary_commit = null;
@@ -4628,11 +4677,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (opts.committed_batch_effects_observer) |observer| {
                 try observer.observe(if (append_derived_replay) replay_payload else "");
             }
-            if (pending_identity_visibility_summary) |summary| {
+            if (!queued_index_publication) if (pending_identity_visibility_summary) |summary| {
                 S.ownerField(self, "core").*.identity_visibility.summary = summary;
                 self.clearLiveDocSetCache();
                 self.clearNonVisibleDocSetCache();
-            }
+            };
             if (profile) |active_profile| {
                 recordProfileNs(profile, &active_profile.store_write_ns, store_write_start_ns);
                 active_profile.store_write_count += @intCast(write_buffers.store_writes.items.len);
@@ -4648,7 +4697,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.split_delta_ns, split_delta_start_ns);
             }
 
-            if (append_derived_replay) {
+            if (append_derived_replay and !queued_index_publication) {
                 const append_replay_journal_start_ns = monotonicTimeNs();
                 S.ownerField(self, "executor").*.commitBacklogAdmission(sequence, &backlog_admission);
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.append_replay_journal_ns, append_replay_journal_start_ns);
@@ -4681,32 +4730,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if ((primary_ticket != null or txn_ticket != null) and !commits_after_wait) {
                 if (opts.writer_lane_release_before_wait) |hook| hook.release(hook.ptr);
             }
-            // Graph, sparse and dense publications read-modify-write their
-            // mirrors at prepare, so each holds its index's apply guard until
-            // its mirror carries the write. Install them once staged rather
-            // than once durable: the group applies writes in staging order,
-            // so the next writer of the index prepares from a mirror that
-            // already includes this one, and the guard no longer spans the
-            // fsync. A write that then fails to become durable leaves the
-            // outcome uncertain, which reopens the runtime.
-            var graph_installed = false;
-            var sparse_installed = false;
-            var dense_installed = false;
-            if (primary_ticket != null or txn_ticket != null) {
-                if (inline_graph_publication) |prepared| {
-                    prepared.install();
-                    inline_graph_publication = null;
-                    graph_installed = true;
-                }
-                if (inline_sparse_publication) |prepared| {
-                    prepared.install();
-                    inline_sparse_publication = null;
-                    sparse_installed = true;
-                }
-                if (inline_dense_publication) |prepared| {
-                    prepared.install();
-                    inline_dense_publication = null;
-                    dense_installed = true;
+            var indexed_lane_yielded = false;
+            if (primary_ticket != null and (inline_graph_publication != null or inline_sparse_publication != null or inline_dense_publication != null)) {
+                if (opts.writer_lane_release_before_wait) |hook| {
+                    if (hook.resume_after_indexed_wait != null) {
+                        if (hook.release_for_indexed_wait) |release| indexed_lane_yielded = release(hook.ptr);
+                    }
                 }
             }
             // WS3: wait for the primary write's durability only now, with the
@@ -4780,8 +4809,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // undo an already-durable, already-installed publication.
             for (inline_text_publications[0..inline_text_publication_count], 0..) |maybe_prepared, i| {
                 if (maybe_prepared) |prepared| {
-                    prepared.install();
                     inline_text_publications[i] = null;
+                    try prepared.install();
                     // Mirror this index's now-durable progress into the
                     // background worker's own bookkeeping (a safe no-op if
                     // there is no worker for this index, or if it is not
@@ -4804,26 +4833,21 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (inline_text_publication_count != 0) {
                 if (S.ownerField(self, "text_merge_runtime").*) |runtime| runtime.notify();
             }
+            const executor = S.ownerField(self, "executor").*;
             if (inline_graph_publication) |prepared| {
-                prepared.install();
                 inline_graph_publication = null;
-                graph_installed = true;
+                try prepared.install();
+                if (executor.hasWorkers()) _ = executor.advanceAppliedSequenceIfContiguous(inline_graph_handled_name, sequence);
             }
             if (inline_sparse_publication) |prepared| {
-                prepared.install();
                 inline_sparse_publication = null;
-                sparse_installed = true;
+                try prepared.install();
+                if (executor.hasWorkers()) _ = executor.advanceAppliedSequenceIfContiguous(inline_sparse_handled_name, sequence);
             }
             if (inline_dense_publication) |prepared| {
-                prepared.install();
                 inline_dense_publication = null;
-                dense_installed = true;
-            }
-            if (S.ownerField(self, "executor").*.hasWorkers()) {
-                const executor = S.ownerField(self, "executor").*;
-                if (graph_installed) _ = executor.advanceAppliedSequenceIfContiguous(inline_graph_handled_name, sequence);
-                if (sparse_installed) _ = executor.advanceAppliedSequenceIfContiguous(inline_sparse_handled_name, sequence);
-                if (dense_installed) _ = executor.advanceAppliedSequenceIfContiguous(inline_dense_handled_name, sequence);
+                try prepared.install();
+                if (executor.hasWorkers()) _ = executor.advanceAppliedSequenceIfContiguous(inline_dense_handled_name, sequence);
             }
             // Same durability boundary as the inline text publications just
             // above, for the algebraic ones. Mirror each now-durable
@@ -4846,6 +4870,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
             snapshot_mutation.release();
+            // The inline publications retain shared catalog guards until
+            // cleanup. DDL may already own the lane and be waiting for them.
+            if (indexed_lane_yielded) {
+                const hook = opts.writer_lane_release_before_wait.?;
+                try hook.resume_after_indexed_wait.?(hook.ptr);
+            }
+            if (queued_index_publication and pending_identity_visibility_summary != null) {
+                try self.lockApplyForPortableRuntime();
+                defer S.ownerField(self, "core").*.unlockApply();
+                const core = S.ownerField(self, "core").*;
+                // A later member may already be durable. Read the current
+                // committed summary instead of reinstalling a stale snapshot.
+                core.identity_visibility.summary = doc_identity.visibilitySummaryFromStore(core.store) catch null;
+                core.identity_visibility.clearLive();
+                core.identity_visibility.clearNonvisible();
+            }
             if (split_shadow_ticket) |ticket| {
                 const apply_shadow_start_ns = monotonicTimeNs();
                 applyCommittedBatchToShadowOrdered(self, materialized_derived_batch.?, ticket);
@@ -5866,11 +5906,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             participant: ?[]const u8,
             owner: transactions_mod.ExternalDecisionOwner,
             replication: ?transactions_mod.ReplicationOrderedPhase,
+            completion_owner: ?@import("../transaction_completion.zig").RoutedOwner,
         ) !void {
             var preparation: RequestPreparationContext = undefined;
             preparation.init(self);
             defer preparation.deinit();
-            resolveTransactionIntentsPreparedScopedWithLegacy(self, txn_id, status, commit_version, sync_level, cancellation, receipt, participant, null, null, &preparation.guard, null, null, null, owner, replication) catch |err| return preparation.mapError(err);
+            resolveTransactionIntentsPreparedScopedWithLegacy(self, txn_id, status, commit_version, sync_level, cancellation, receipt, participant, null, completion_owner, &preparation.guard, null, null, null, owner, replication) catch |err| return preparation.mapError(err);
         }
 
         pub fn resolveTransactionIntentsPrepared(

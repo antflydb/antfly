@@ -61,6 +61,7 @@ pub const Hosted = struct {
             .producer_reads = .{ .ptr = self, .read_fn = Routed(producer_read.Query, producer_read.Observation, "fetchGroupSourceProducerClosureObservation").read },
             .producer_controls = .{ .ptr = self, .execute_fn = Routed(producer_control.Request, producer_control.Reply, "fetchGroupSourceProducerClose").read },
             .scope_reads = .{ .ptr = self, .read_fn = Routed(scope_read.Query, scope_read.Observation, "fetchGroupSourceScopeObservation").read },
+            .retirements = .{ .ptr = self, .execute_fn = Routed(@import("source_retirement_operations.zig").wire.Request, @import("source_retirement_operations.zig").wire.OwnedReply, "fetchGroupSourceRetirementControl").read },
             .scope_controls = .{ .ptr = self, .execute_fn = Routed(scope_control.Request, scope_control.Reply, "fetchGroupSourceScopeControl").read },
             .checkpoints = .{ .ptr = self, .read_fn = Routed(checkpoint.Request, checkpoint.Reply, "fetchGroupSourceCheckpointObservation").read },
             .artifacts = .{

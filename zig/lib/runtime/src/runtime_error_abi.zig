@@ -1289,6 +1289,7 @@ pub const Detail = enum(c_int) {
     sql_trigger_coordination_required = 1205,
     invalid_generation_transaction = 1206,
     generation_transaction_changed = 1207,
+    stored_destination_authorization_revoked = 1208,
 };
 
 test "SQL relation persistence callback failures preserve exact identity and behavior" {
@@ -2050,6 +2051,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.RestoreIntentConflict => status(.conflict, .restore_intent_conflict),
         error.Unauthorized => status(.unauthorized, .unauthorized),
         error.Forbidden => status(.forbidden, .forbidden),
+        error.StoredDestinationAuthorizationRevoked => status(.forbidden, .stored_destination_authorization_revoked),
         // Capability barriers can be unavailable during provisioning or a
         // rolling upgrade. They fail before batch proposal admission.
         error.Unavailable, error.RaftBatchMergeProtocolUnavailable, error.RaftBatchSplitDeltaProtocolUnavailable => status(.unavailable, .unavailable),
@@ -3333,6 +3335,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .restore_intent_conflict => "RestoreIntentConflict",
         .unauthorized => "Unauthorized",
         .forbidden => "Forbidden",
+        .stored_destination_authorization_revoked => "StoredDestinationAuthorizationRevoked",
         .unavailable => "Unavailable",
         .write_unavailable => "WriteUnavailable",
         .read_unavailable => "ReadUnavailable",
@@ -4536,7 +4539,7 @@ test "native locking callback admission preserves retryable ordered apply identi
     const transported = statusFromError(error.RaftApplyWriterUnavailable);
     try std.testing.expectEqual(@backingInt(Code.retryable), transported.code);
     try std.testing.expectEqual(error.RaftApplyWriterUnavailable, errorFromStatus(transported));
-    try std.testing.expectEqual(@as(c_int, 1026), @backingInt(Detail.raft_apply_writer_unavailable));
+    try std.testing.expectEqual(@as(c_int, 1182), @backingInt(Detail.raft_apply_writer_unavailable));
 }
 
 test "scope retirement callback descriptors preserve exact lifecycle conflict and limit identities" {
@@ -4559,9 +4562,9 @@ test "scope retirement callback descriptors preserve exact lifecycle conflict an
         try std.testing.expect(errorHasStableDetail(entry[0]));
     }
     // Public enum numbers remain independent from the embedded owner ABI.
-    try std.testing.expectEqual(@as(c_int, 1026), @backingInt(Detail.raft_apply_writer_unavailable));
-    try std.testing.expectEqual(@as(c_int, 1027), @backingInt(Detail.sql_database_in_use));
-    try std.testing.expectEqual(@as(c_int, 1034), @backingInt(Detail.catalog_generation_exhausted));
+    try std.testing.expectEqual(@as(c_int, 1182), @backingInt(Detail.raft_apply_writer_unavailable));
+    try std.testing.expectEqual(@as(c_int, 1183), @backingInt(Detail.sql_database_in_use));
+    try std.testing.expectEqual(@as(c_int, 1190), @backingInt(Detail.catalog_generation_exhausted));
     try std.testing.expect(errorFromStableName("SqlDatabaseInUse\n") == null);
     try std.testing.expect(errorFromStableName("ScopeRetirementChangedPrivate") == null);
 }
@@ -4578,7 +4581,8 @@ test "generation graph and durability errors survive an actual C callback status
     const callback: Callback = State.invoke;
     const failures = [_]anyerror{ error.InvalidGenerationTransaction, error.GenerationTransactionChanged, error.GenerationTransactionDecisionRequired, error.InvalidPreparedGraphEffects, error.SqlPreparedDurabilityUnavailable };
     const codes = [_]Code{ .invalid_argument, .conflict, .conflict, .invalid_argument, .invalid_argument };
-    for (failures, codes, 1048..) |failure, code, detail| {
+    const details = [_]c_int{ 1206, 1207, 1065, 1066, 1067 };
+    for (failures, codes, details) |failure, code, detail| {
         var state: State = .{ .failure = failure };
         const transported = callback(&state);
         try std.testing.expectEqual(@backingInt(code), transported.code);
@@ -4620,7 +4624,7 @@ test "external terminal membership failure crosses callbacks without retry promo
 test "SQL extension lifecycle callback identities retain exact behavior" {
     const errors = [_]anyerror{ error.CatalogRevisionExhausted, error.DuplicateSqlExtensionExport, error.DuplicateSqlExtensionVersion, error.InconsistentSqlExtensionControl, error.InvalidPackageDigest, error.InvalidSqlExtensionArtifact, error.InvalidSqlExtensionControl, error.InvalidSqlExtensionDependency, error.InvalidSqlExtensionRecord, error.InvalidSqlExtensionRuntime, error.InvalidSqlExtensionPackageMutation, error.DuplicateSqlExtensionControl, error.SqlDependentExtensionObject, error.SqlDuplicateExtension, error.SqlDuplicateFunction, error.SqlExtensionControlConflict, error.SqlExtensionDependencyCycle, error.SqlExtensionPromotionNonceConflict, error.SqlExtensionSchemaMismatch, error.SqlExtensionUnavailable, error.SqlExtensionUpdatePathUnavailable, error.SqlExtensionVersionUnavailable, error.SqlFunctionReturnTypeChanged, error.SqlRequiredExtensionNotInstalled, error.SqlUndefinedExtension, error.UnsupportedSqlExtensionObject, error.SqlExtensionOwnedObject, error.DuplicateShapeName, error.GeneratedArtifactShapeRequired, error.NoSupportedScopes, error.ScopeMustNotNameTable, error.UnknownShapeReference };
     const codes = [_]Code{ .invalid_argument, .invalid_argument, .invalid_argument, .corrupt, .corrupt, .unsupported, .invalid_argument, .invalid_argument, .corrupt, .unsupported, .invalid_argument, .invalid_argument, .conflict, .already_exists, .already_exists, .conflict, .invalid_argument, .conflict, .invalid_argument, .unsupported, .invalid_argument, .not_found, .invalid_argument, .not_found, .not_found, .unsupported, .conflict, .invalid_argument, .invalid_argument, .invalid_argument, .invalid_argument, .invalid_argument };
-    for (errors, codes, 1054..) |err, code, ordinal| {
+    for (errors, codes, 1069..) |err, code, ordinal| {
         const wire = statusFromError(err);
         try std.testing.expectEqual(@backingInt(code), wire.code);
         try std.testing.expectEqual(@as(c_int, @intCast(ordinal)), wire.detail);
@@ -4744,6 +4748,12 @@ test "positional IO errors preserve identity without becoming retryable pressure
     const value = statusFromError(error.InputOutput);
     try std.testing.expectEqual(@backingInt(Code.internal), value.code);
     try std.testing.expectEqual(error.InputOutput, errorFromStatus(value));
+}
+
+test "durable destination authorization denial survives runtime transport" {
+    const denied = statusFromError(error.StoredDestinationAuthorizationRevoked);
+    try std.testing.expectEqual(@backingInt(Code.forbidden), denied.code);
+    try std.testing.expectEqual(error.StoredDestinationAuthorizationRevoked, errorFromStatus(denied));
 }
 
 test "source admission and history failures retain exact native boundary identities" {

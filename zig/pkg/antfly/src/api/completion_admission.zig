@@ -127,19 +127,27 @@ pub const Coordinator = struct {
             return null;
         }
         if (unsupported != 0) return error.ChangefeedCapabilityUnsupported;
-        std.mem.sort(Captured, captured.items, {}, struct {
-            fn less(_: void, left: Captured, right: Captured) bool {
-                return completion.ownerLessThan(left.input.owner, right.input.owner);
+        // Sort compact ordinals to avoid copying batch requests during comparisons
+        // and swaps. Preserve input order if two owners compare equal.
+        const order = try scratch.alloc(usize, captured.items.len);
+        for (order, 0..) |*ordinal, index| ordinal.* = index;
+        std.mem.sortUnstable(usize, order, @as([]const Captured, captured.items), struct {
+            fn less(items: []const Captured, left: usize, right: usize) bool {
+                const a_owner = items[left].input.owner;
+                const b_owner = items[right].input.owner;
+                if (completion.ownerLessThan(a_owner, b_owner)) return true;
+                if (completion.ownerLessThan(b_owner, a_owner)) return false;
+                return left < right;
             }
         }.less);
-        const frozen_inputs = try scratch.alloc(plan_mod.Input, captured.items.len);
-        for (captured.items, frozen_inputs) |item, *input| input.* = item.input;
+        const frozen_inputs = try scratch.alloc(plan_mod.Input, order.len);
+        for (order, frozen_inputs) |ordinal, *input| input.* = captured.items[ordinal].input;
         var coordinator_index: usize = 0;
-        for (captured.items, 0..) |item, index| if (item.input.roles & completion.Roles.checkpoint != 0) {
+        for (order, 0..) |ordinal, index| if (captured.items[ordinal].input.roles & completion.Roles.checkpoint != 0) {
             coordinator_index = index;
             break;
         };
-        const coordinator = captured.items[coordinator_index];
+        const coordinator = &captured.items[order[coordinator_index]];
         const checkpoint = coordinator.input.prepare.transaction.?.prepare.source_checkpoint;
         // A source reservation must be able to verify the same plan bytes
         // across worker restarts before its immutable upload is sealed.
@@ -149,7 +157,10 @@ pub const Coordinator = struct {
         const reservation = try plan.admission.reservationBytes(plan.admission_bytes.len);
         for (captured.items) |item| if (reservation > item.retention_limit_bytes) return error.HistoryTooLarge;
         const routes = try scratch.alloc(Route, captured.items.len);
-        for (captured.items, routes) |item, *route| route.* = .{ .owner = item.input.owner, .fence = item.fence, .table_name = item.table_name, .retention_limit_bytes = item.retention_limit_bytes };
+        for (order, routes) |ordinal, *route| {
+            const item = &captured.items[ordinal];
+            route.* = .{ .owner = item.input.owner, .fence = item.fence, .table_name = item.table_name, .retention_limit_bytes = item.retention_limit_bytes };
+        }
         try context.ensureActive();
         return .{ .arena = arena, .plan = plan, .routes = routes, .coordinator_index = coordinator_index };
     }
@@ -269,10 +280,19 @@ pub const Coordinator = struct {
             // Every owner, complete payload, and quota reservation size has
             // been checked before the first mutation. Unknown results leave
             // retained recovery ownership; no phase is retried in this pass.
-            for (captured, 0..) |item, index| self.recovery.participants.submit(a, plan, index, item.fence, .begin, context) catch |err| {
-                std.log.debug("retained transaction begin failed group={d} err={s}", .{ item.owner.group_id, @errorName(err) });
+            // A coordinator-side non-admission fence is conclusive only
+            // when no follower can enlist before the coordinator BEGIN.
+            if (mode == .source) self.recovery.participants.submit(a, plan, prepared.coordinator_index, coordinator.fence, .begin, context) catch |err| {
+                std.log.debug("retained source coordinator begin failed group={d} err={s}", .{ coordinator.owner.group_id, @errorName(err) });
                 return error.CommitDecisionUnknown;
             };
+            for (captured, 0..) |item, index| {
+                if (mode == .source and index == prepared.coordinator_index) continue;
+                self.recovery.participants.submit(a, plan, index, item.fence, .begin, context) catch |err| {
+                    std.log.debug("retained transaction begin failed group={d} err={s}", .{ item.owner.group_id, @errorName(err) });
+                    return error.CommitDecisionUnknown;
+                };
+            }
             for (captured, 0..) |item, index| self.recovery.participants.submit(a, plan, index, item.fence, .prepare, context) catch |err| {
                 std.log.debug("retained transaction prepare failed group={d} err={s}", .{ item.owner.group_id, @errorName(err) });
                 return error.CommitDecisionUnknown;

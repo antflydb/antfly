@@ -1040,3 +1040,13 @@ test "backup inspect requires a source and rejects restore options" {
     var old_iter = std.process.Args.Iterator.init(.{ .vector = &old });
     try std.testing.expectError(error.UnknownArgument, parseRestoreArgs(&old_iter));
 }
+
+// Snapshot synchronization has its own offline command; backup restore must not
+// silently accept its narrower schema policy or destination-file arguments.
+test "restore rejects offline sync options" {
+    for ([_][*:0]const u8{ "--data-only", "--out", "--definition", "--max-input-bytes", "--max-expanded-bytes" }) |flag| {
+        var argv = [_][*:0]const u8{flag};
+        var args = std.process.Args.Iterator.init(.{ .vector = &argv });
+        try std.testing.expectError(error.UnknownArgument, parseRestoreArgs(&args));
+    }
+}

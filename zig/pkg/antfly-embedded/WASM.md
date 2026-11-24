@@ -146,6 +146,72 @@ reopen. Raw embedded calls reject protected tables because these entry points
 do not carry authenticated principal authority. Hosts drive graph indexing
 with `runUntilIdle()` alongside other derived indexes.
 
+## Browser Database Files in OPFS
+
+`HostFileStorage` (`src/storage/host_file_storage.zig`) implements `Storage`
+over a small synchronous file-operation table supplied by the host: size,
+read, write/append, sync, rename, remove (file or tree), list and a clock. In
+the WASM bundle, the table is the `antfly_host_fs_*` env imports. The JS client
+fills them from `instantiate*({ fileSystem })`, and `openFileSystem(path)` opens
+a hosted database there. `HostFileStorage.MemoryHost` is an in-memory table for
+native tests.
+
+`antfly_embedded_opfs_fs.mjs` provides that table on the Origin Private File
+System. It must run in a dedicated worker, because synchronous access handles
+exist only there:
+
+```js
+import { openOpfsFileSystem, withCapacity } from "./antfly_embedded_opfs_fs.mjs";
+const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle("my-db", { create: true });
+const fs = await openOpfsFileSystem(dir);              // throws OpfsBusy if another tab holds it
+const api = await instantiateAntflyEmbeddedApiFromBytes(wasmBytes, { fileSystem: fs });
+await withCapacity(fs, () => api.openFileSystem("/db"));  // new or existing database
+await withCapacity(fs, () => api.putMany(docs));      // top up free slots before each call
+await withCapacity(fs, () => api.runUntilIdle());
+api.close();
+fs.close();                                            // release the handles
+```
+
+Antfly's storage calls are synchronous. OPFS can only open, rename or delete
+files asynchronously, so the backend keeps a pool of pre-opened physical "slot"
+files and stores the logical namespace inside them, like SQLite's
+`opfs-sahpool` VFS:
+
+- **Slot layout.** Each slot has two 2 KiB header records followed by file
+  data. A record holds a generation, the logical path and a CRC-32; the newest
+  valid record wins, and an empty path means free.
+- **Namespace changes.** Create, rename and delete overwrite the slot's older
+  record and flush before returning. A torn header write therefore leaves the
+  previous record in force, which makes each of those operations
+  all-or-nothing.
+- **Rename.** The moved slot's record (with a fresh generation) is flushed
+  before the replaced destination is freed. If a crash leaves both, the higher
+  generation wins on reopen, so `rename_is_atomic` holds.
+- **Data durability.** Data becomes durable at `sync`, as with `fsync`.
+  Deleted slots are truncated and reused.
+- **Capacity.** Slots can only be added asynchronously, between database
+  calls, so the free reserve must cover one call's peak file demand. That peak
+  is bursty: a first vector index build writes about 128 block files and up to
+  about 128 spool files before deleting them, measured at 159 files for 25
+  documents and 265 for 2,000. Later calls need about 10.
+  - Defaults: 512 slots with 384 kept free. Opening them takes about half a
+    second in Chromium.
+  - The pool tracks each call's peak and keeps at least twice the largest.
+  - `withCapacity(fs, fn)` tops up the reserve before a call.
+  - If a call still runs out, it fails with `OpfsPoolExhausted`. Don't retry
+    it. The hosted profile has no durable index-repair checkpoint, so an index
+    interrupted mid-build stays unusable even after a reopen. Treat the copy
+    as a cache: delete it and rebuild from the source of truth.
+- **One tab at a time.** Sync access handles are exclusive, so a second tab gets
+  `OpfsBusy`. Close the pool to hand it over.
+
+The database is no longer resident in WASM memory; only the engine's caches
+are. `wasm_opfs_fs_test.mjs` simulates OPFS with separate durable and volatile
+bytes. It checks the contract, unsynced-data loss, interrupted renames, torn
+header records, deletion, capacity exhaustion and the exclusive lock. The WASM
+smoke test runs a database with vector and hybrid search through the pool and
+reopens it in a fresh module.
+
 ## Host Storage Contracts
 
 Browser/WASM and other hosted runtimes should not need to emulate a full POSIX
@@ -349,8 +415,6 @@ Remaining concerns outside this seam include:
 - full parity between the shared hosted embedded path and every native-only
   subsystem
 
-The next useful adapter should live outside core storage logic:
-
-- browser JS host
-- `HostStorage` backed by OPFS
-- `HostObjectStorage` backed by IndexedDB or OPFS blobs
+Adapters live outside core storage logic. File-backed `Storage` on OPFS is
+covered above; the next useful one is `HostObjectStorage` backed by IndexedDB
+or OPFS blobs for object-backed consumers.

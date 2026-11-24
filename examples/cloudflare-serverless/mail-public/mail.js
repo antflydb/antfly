@@ -18,14 +18,70 @@ let me = null,
   cursor = null,
   replyTo = null,
   editorId = null,
-  folder = "inbox";
+  folder = "inbox",
+  local = null,
+  localOpening = null;
+// On-device search is optional and loaded lazily; see local-index.js.
+const LOCAL_FLAGS = "antfly-mail-local-v1";
+// Minimal identity for opening an opted-in copy offline; removed on sign-out.
+const OFFLINE_IDENTITY = "antfly-mail-offline-identity-v1";
+// Set while a sign-out wipe is unfinished, so the next load retries it.
+const WIPE_PENDING = "antfly-mail-local-wipe-pending-v1";
+const localModule = () => import("/local-index.js");
+const localSupported = () =>
+  typeof Worker !== "undefined" &&
+  typeof WebAssembly !== "undefined" &&
+  typeof navigator.storage?.getDirectory === "function";
+function localFlags() {
+  try {
+    return JSON.parse(localStorage.getItem(LOCAL_FLAGS) ?? "{}") ?? {};
+  } catch {
+    return {};
+  }
+}
+// Sign-out on a shared machine removes every on-device mailbox copy. This needs
+// no runtime download, so it works even when the local module cannot load.
+async function wipeLocal() {
+  // Never allow offline reopening after sign-out, even if deletion fails.
+  try {
+    localStorage.removeItem(OFFLINE_IDENTITY);
+    localStorage.setItem(WIPE_PENDING, "1");
+  } catch {
+    /* Storage disabled: nothing was ever stored. */
+  }
+  const current = local;
+  local = null;
+  localReady(null);
+  // The open copy's worker holds exclusive OPFS handles: have it release them
+  // and delete every copy before the worker is stopped.
+  if (current) {
+    try {
+      await current.wipeAll();
+    } finally {
+      await current.close();
+    }
+  } else if (typeof navigator.storage?.getDirectory === "function") {
+    try {
+      await (await navigator.storage.getDirectory()).removeEntry("antfly-mail-local", { recursive: true });
+    } catch (error) {
+      if (error?.name !== "NotFoundError") throw error;
+    }
+  }
+  // Forget the opt-in only once the data is gone, so a failed wipe is retried.
+  try {
+    localStorage.removeItem(LOCAL_FLAGS);
+    localStorage.removeItem(WIPE_PENDING);
+  } catch {
+    /* Storage disabled: nothing was ever stored. */
+  }
+}
 function status(text, error = false) {
   $("status").textContent = text;
   $("status").classList.toggle("error", error);
 }
-async function api(path, body) {
+async function api(path, body, method = body ? "POST" : "GET") {
   const result = await fetch(path, {
-    method: body ? "POST" : "GET",
+    method,
     headers: body ? { "Content-Type": "application/json" } : {},
     ...(body ? { body: JSON.stringify(body) } : {}),
   });
@@ -48,13 +104,24 @@ function text(tag, value) {
   element.textContent = value ?? "";
   return element;
 }
+const folderPaths = { inbox: "/mail/messages", outbox: "/mail/outbox", trash: "/mail/trash" };
 async function load(path = "/mail/messages") {
-  folder = path.startsWith("/mail/outbox") ? "outbox" : "inbox";
+  folder = path.startsWith("/mail/outbox") ? "outbox" : path.startsWith("/mail/trash") ? "trash" : "inbox";
   const result = await api(path);
   cursor = result.cursor;
+  $("trash-banner").hidden = folder !== "trash";
+  if (folder === "trash") {
+    $("trash-retention").textContent =
+      "Messages that have been in Trash more than " + result.retention_days + " days will be deleted automatically.";
+    $("empty-trash").hidden = !result.messages.length;
+  }
+  render(result.messages);
+}
+const daysLeft = (time) => Math.max(0, Math.ceil((time - Date.now()) / 86400000));
+function render(messages) {
   $("next").hidden = !cursor;
   $("messages").replaceChildren();
-  for (const message of result.messages) {
+  for (const message of messages) {
     const button = document.createElement("button");
     button.className = "mail-row";
     button.append(
@@ -66,12 +133,18 @@ async function load(path = "/mail/messages") {
           new Date(message.received_at ?? message.created_at).toLocaleString()
       )
     );
+    if (message.delete_at) button.append(text("small", "Deleted forever in " + daysLeft(message.delete_at) + " days"));
+    if (message.local) {
+      const badge = text("small", "Found on this device");
+      badge.className = "local";
+      button.append(badge);
+    }
     button.onclick = guarded(() =>
       folder === "outbox" ? showOutbound(message) : openMessage(message.id)
     );
     $("messages").append(button);
   }
-  if (!result.messages.length) $("messages").append(text("p", "No messages."));
+  if (!messages.length) $("messages").append(text("p", "No messages."));
 }
 function showOutbound(message) {
   $("message").replaceChildren(
@@ -86,7 +159,15 @@ function showOutbound(message) {
     );
 }
 async function openMessage(id) {
-  const message = await api("/mail/messages/" + encodeURIComponent(id));
+  let message;
+  try {
+    message = await api("/mail/messages/" + encodeURIComponent(id));
+  } catch (error) {
+    // Fall back only when the server could not be reached.
+    message = error instanceof TypeError && local ? await local.message(id) : null;
+    if (!message) throw error;
+    message.offline = true;
+  }
   const article = $("message");
   article.replaceChildren(
     text("h2", message.subject || "(No subject)"),
@@ -102,9 +183,78 @@ async function openMessage(id) {
   }
   if (message.html_available)
     article.append(text("small", "This message also contains HTML. Only plain text is displayed."));
+  if (message.offline)
+    article.append(
+      text("small", "Shown from this device's copy" + (message.text_truncated ? " (long text shortened)." : "."))
+    );
   const reply = text("button", "Reply");
   reply.onclick = () => edit(message);
   article.append(document.createElement("br"), reply);
+  // Changing a message needs the server; an offline copy is read-only.
+  if (message.offline) return;
+  if (message.trashed_at != null) {
+    article.prepend(
+      text("small", "This message is in Trash and will be deleted forever on " + new Date(message.delete_at).toLocaleDateString() + ".")
+    );
+    article.firstChild.className = "trash-note";
+    const restore = text("button", "Restore");
+    restore.onclick = guarded(() => restoreMessage(id));
+    const forever = text("button", "Delete forever");
+    forever.className = "danger";
+    forever.onclick = guarded(() => deleteForever(id));
+    article.append(restore, forever);
+  } else {
+    const remove = text("button", "Delete");
+    remove.className = "danger";
+    remove.onclick = guarded(() => trashMessage(id));
+    article.append(remove);
+  }
+}
+// The device copy holds the inbox only: drop messages leaving it right away
+// (the next sync carries the same change).
+async function dropLocal(id) {
+  if (local)
+    await local
+      .forget([id])
+      .then(() => localReady(local?.state))
+      .catch(() => {});
+}
+function statusWithAction(message, label, action) {
+  status(message);
+  const button = text("button", label);
+  button.type = "button";
+  button.onclick = guarded(action);
+  $("status").append(button);
+}
+async function trashMessage(id) {
+  await api("/mail/messages/" + encodeURIComponent(id) + "/trash", {});
+  await dropLocal(id);
+  $("message").replaceChildren(text("p", "Message moved to Trash."));
+  await load(folderPaths[folder] ?? folderPaths.inbox);
+  statusWithAction("Message moved to Trash.", "Undo", () => restoreMessage(id));
+}
+async function restoreMessage(id) {
+  await api("/mail/messages/" + encodeURIComponent(id) + "/restore", {});
+  $("message").replaceChildren(text("p", "Message restored to the inbox."));
+  await load(folderPaths[folder] ?? folderPaths.inbox);
+  status("Message restored to the inbox.");
+  // The restored message is re-announced to devices; fetch and embed it now.
+  if (local) syncLocal().catch((error) => localStatus(error.message));
+}
+async function deleteForever(id) {
+  if (!confirm("Delete this message forever? You can't undo this.")) return;
+  await api("/mail/messages/" + encodeURIComponent(id), null, "DELETE");
+  await dropLocal(id);
+  $("message").replaceChildren(text("p", "Message deleted forever."));
+  status("Message deleted forever.");
+  await load(folderPaths.trash);
+}
+async function emptyTrash() {
+  if (!confirm("Delete all messages in Trash forever? You can't undo this.")) return;
+  const result = await api("/mail/trash/empty", {});
+  $("message").replaceChildren(text("p", "Select a message."));
+  status(result.done ? "Trash emptied." : "Emptying Trash… larger Trash folders finish in the background.");
+  await load(folderPaths.trash);
 }
 function edit(message) {
   replyTo = message?.id ?? null;
@@ -120,20 +270,156 @@ function edit(message) {
     : "";
   $("editor").elements.text.focus();
 }
+function offlineIdentity() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(OFFLINE_IDENTITY) ?? "null");
+    return saved && localFlags()[saved.mailbox?.id] === true ? saved : null;
+  } catch {
+    return null;
+  }
+}
+function rememberIdentity() {
+  try {
+    if (localFlags()[me.mailbox.id] === true)
+      localStorage.setItem(
+        OFFLINE_IDENTITY,
+        JSON.stringify({ user: { email: me.user.email }, mailbox: { id: me.mailbox.id, address: me.mailbox.address } })
+      );
+  } catch {
+    /* Offline reopening is a convenience. */
+  }
+}
 async function refresh() {
+  let offline = false;
   try {
     me = await api("/api/me");
-  } catch {
-    me = null;
+  } catch (error) {
+    // A network failure (not a 401) with an opted-in copy opens it offline.
+    me = error instanceof TypeError ? offlineIdentity() : null;
+    offline = !!me;
   }
+  // A sign-out left a copy on disk (its wipe failed, e.g. another tab held it): retry.
+  let wipePending = false;
+  try {
+    wipePending = localStorage.getItem(WIPE_PENDING) === "1";
+  } catch {
+    /* Storage disabled: nothing was ever stored. */
+  }
+  // Finish it before anything can reopen the copy, whoever signs in next.
+  if (!offline && wipePending)
+    await wipeLocal().catch(() => {
+      /* Retried on the next load or sign-out. */
+    });
   $("account").hidden = !!me;
   $("mail").hidden = !me;
   $("logout").hidden = !me;
   $("identity").textContent = me?.user.email ?? "";
   if (me) {
     $("address").textContent = "Your mailbox: " + me.mailbox.address;
-    await load();
+    $("local").hidden = !localSupported();
+    let stillPending = false;
+    try {
+      stillPending = localStorage.getItem(WIPE_PENDING) === "1";
+    } catch {
+      /* Storage disabled. */
+    }
+    $("local-toggle").checked = !stillPending && localFlags()[me.mailbox.id] === true;
+    if (stillPending) localStatus("A previous sign-out's on-device copy is still being removed. Close other tabs of this app.");
+    if ($("local-toggle").checked) {
+      rememberIdentity();
+      startLocal(false);
+    }
+    if (offline) {
+      status("You are offline. Searching this device's copy of your mailbox.");
+      $("messages").replaceChildren(text("p", "Offline: use search to find messages on this device."));
+    } else await load();
   }
+}
+function localStatus(message, progress) {
+  $("local-status").textContent = message;
+  $("local-progress").hidden = !progress;
+  if (progress) {
+    if (progress.total) {
+      $("local-progress").max = progress.total;
+      $("local-progress").value = progress.loaded ?? 0;
+    } else $("local-progress").removeAttribute("value");
+  }
+}
+function localReady(state) {
+  $("local-badge").textContent = state ? "· " + (state.messages ?? 0) + " messages on this device" : "";
+  $("search-where").hidden = !state;
+  $("local-sync").hidden = !state;
+  $("local-remove").hidden = !state;
+}
+const megabytes = (bytes) => (bytes / 1024 ** 2).toFixed(bytes < 10 * 1024 ** 2 ? 1 : 0) + " MB";
+// Open this mailbox's on-device copy, downloading the model on first use, then sync.
+function startLocal(confirmDownload) {
+  localOpening ??= (async () => {
+    const mailboxId = me.mailbox.id;
+    try {
+      const module = await localModule();
+      const config = await module.localConfig();
+      if (
+        confirmDownload &&
+        !confirm(
+          "On-device search downloads the " + config.catalog.name + " model (" +
+            megabytes(config.downloadBytes) + ") once, then indexes this mailbox in the background. Continue?"
+        )
+      ) {
+        $("local-toggle").checked = false;
+        return;
+      }
+      local = await module.LocalMailIndex.open(mailboxId, {
+        config,
+        onStatus: (s) =>
+          localStatus(
+            s.stage === "model-download" || s.stage === "model-verify"
+              ? "Downloading the on-device model…"
+              : "Preparing the on-device model…",
+            s
+          ),
+      });
+      // Signed out or opted out while the model was loading: discard the copy.
+      if (me?.mailbox.id !== mailboxId || !$("local-toggle").checked) {
+        const opened = local;
+        local = null;
+        await opened.remove();
+        return;
+      }
+      rememberIdentity();
+      localReady(local.state);
+      if (navigator.onLine !== false) await syncLocal();
+      else localStatus("Offline. " + (local.state.messages ?? 0) + " messages available on this device.");
+    } catch (error) {
+      localStatus("On-device search is unavailable: " + error.message);
+    } finally {
+      localOpening = null;
+    }
+  })();
+  return localOpening;
+}
+async function syncLocal() {
+  const index = local;
+  if (!index) return;
+  localStatus("Indexing new messages on this device…", {});
+  const state = await index.sync({
+    onStatus: (s) => {
+      if (local !== index) return;
+      if (s.stage === "synced") localReady(index.state);
+      localStatus("Indexing new messages on this device… " + (s.loaded ?? 0) + " so far", {});
+    },
+  });
+  if (local !== index) return;
+  localReady(state);
+  localStatus("Up to date. " + megabytes(state.bytes ?? 0) + " stored on this device.");
+}
+async function stopLocal() {
+  const current = local;
+  local = null;
+  localReady(null);
+  if (current) await current.remove();
+  else if (me) await (await localModule()).removeMailbox(me.mailbox.id);
+  localStatus("Removed this mailbox's copy from this device.");
 }
 $("login").onsubmit = guarded(async (event) => {
   const form = event.currentTarget,
@@ -159,22 +445,54 @@ $("login").onsubmit = guarded(async (event) => {
   status(me ? "Signed in." : "Check your email to verify your account, then sign in.");
 });
 $("logout").onclick = guarded(async () => {
+  let wipeError = null;
+  if (local || Object.keys(localFlags()).length) await wipeLocal().catch((error) => (wipeError = error));
+  // Always end the session, even if the on-device copy could not be removed.
   await api("/api/auth/sign-out", {});
-  await refresh();
-  status("Signed out.");
+  await refresh(); // also retries a failed wipe once
+  let stillPending = false;
+  try {
+    stillPending = localStorage.getItem(WIPE_PENDING) === "1";
+  } catch {
+    /* Storage disabled. */
+  }
+  if (wipeError && stillPending)
+    status("Signed out, but this device's mailbox copy could not be removed: " + wipeError.message +
+      ". Close other tabs of this app and sign in and out again to retry.", true);
+  else status("Signed out.");
 });
 $("search").onsubmit = guarded(async (event) => {
-  await load("/mail/search?q=" + encodeURIComponent(event.currentTarget.elements.query.value));
+  const e = event.currentTarget.elements,
+    query = e.query.value;
+  if (local && (e.where.value === "device" || !navigator.onLine)) {
+    folder = "inbox";
+    cursor = null;
+    render(await local.search(query));
+    return;
+  }
+  await load("/mail/search?q=" + encodeURIComponent(query));
 });
+$("local-toggle").onchange = guarded(async (event) => {
+  if (event.currentTarget.checked) await startLocal(true);
+  else await stopLocal();
+});
+$("local-sync").onclick = guarded(syncLocal);
+$("local-remove").onclick = guarded(async () => {
+  $("local-toggle").checked = false;
+  await stopLocal();
+});
+addEventListener("online", () => {
+  if (local) syncLocal().catch((error) => localStatus(error.message));
+});
+if ("serviceWorker" in navigator)
+  navigator.serviceWorker.register("/sw.js").catch(() => {
+    /* The app still works online without the offline shell. */
+  });
 $("inbox").onclick = guarded(() => load());
 $("outbox").onclick = guarded(() => load("/mail/outbox"));
-$("next").onclick = guarded(() =>
-  load(
-    (folder === "outbox" ? "/mail/outbox" : "/mail/messages") +
-      "?cursor=" +
-      encodeURIComponent(cursor)
-  )
-);
+$("trash").onclick = guarded(() => load("/mail/trash"));
+$("empty-trash").onclick = guarded(emptyTrash);
+$("next").onclick = guarded(() => load((folderPaths[folder] ?? folderPaths.inbox) + "?cursor=" + encodeURIComponent(cursor)));
 $("compose").onclick = () => edit();
 $("cancel").onclick = () => {
   $("editor").hidden = true;

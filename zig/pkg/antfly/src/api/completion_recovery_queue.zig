@@ -69,28 +69,37 @@ pub const Queue = struct {
     }
 };
 
-test "data raft ordered history completion scheduling owns deduplicated bounded jobs" {
-    const a = std.testing.allocator;
-    const io = std.testing.io;
-    var queue: Queue = .{};
-    defer queue.deinit();
-    var locator = "table2:00000004:docs:9".*;
-    const request: Request = .{ .owner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = @splat(1), .table_binding = @splat(2), .root_generation = 3, .group_id = 9, .topology_epoch = 4 }, .transaction_id = @splat(5), .admission_digest = @splat(6), .coordinator_locator = &locator, .resolution_timestamp_ns = 100 };
-    const job = (try queue.reserve(io, a, request)).?;
-    @memset(&locator, 'x');
-    try std.testing.expectEqualStrings("table2:00000004:docs:9", job.request.coordinator_locator);
-    try std.testing.expect((try queue.reserve(io, a, request)) == null);
-    var rest: [31]*Queue.Job = undefined;
-    for (&rest, 0..) |*value, i| {
-        var next = request;
-        next.transaction_id[0] = @intCast(i + 10);
-        value.* = (try queue.reserve(io, a, next)).?;
+// These shared modules are also reachable from the physical implementation
+// root. Keep the protocol and coordinator tests with the consumer.
+const consumer_tests = if (@hasDecl(@import("antfly_source_root"), "implementation_tests_only") and
+    @import("antfly_source_root").implementation_tests_only) struct {} else struct {
+    test "data raft ordered history completion scheduling owns deduplicated bounded jobs" {
+        const a = std.testing.allocator;
+        const io = std.testing.io;
+        var queue: Queue = .{};
+        defer queue.deinit();
+        var locator = "table2:00000004:docs:9".*;
+        const request: Request = .{ .owner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = @splat(1), .table_binding = @splat(2), .root_generation = 3, .group_id = 9, .topology_epoch = 4 }, .transaction_id = @splat(5), .admission_digest = @splat(6), .coordinator_locator = &locator, .resolution_timestamp_ns = 100 };
+        const job = (try queue.reserve(io, a, request)).?;
+        @memset(&locator, 'x');
+        try std.testing.expectEqualStrings("table2:00000004:docs:9", job.request.coordinator_locator);
+        try std.testing.expect((try queue.reserve(io, a, request)) == null);
+        var rest: [31]*Queue.Job = undefined;
+        for (&rest, 0..) |*value, i| {
+            var next = request;
+            next.transaction_id[0] = @intCast(i + 10);
+            value.* = (try queue.reserve(io, a, next)).?;
+        }
+        var overflow = request;
+        overflow.transaction_id[0] = 99;
+        try std.testing.expectError(error.ResourceBudgetExceeded, queue.reserve(io, a, overflow));
+        for (rest) |value| queue.release(io, value);
+        queue.release(io, job);
+        const retry = (try queue.reserve(io, a, overflow)).?;
+        queue.release(io, retry);
     }
-    var overflow = request;
-    overflow.transaction_id[0] = 99;
-    try std.testing.expectError(error.ResourceBudgetExceeded, queue.reserve(io, a, overflow));
-    for (rest) |value| queue.release(io, value);
-    queue.release(io, job);
-    const retry = (try queue.reserve(io, a, overflow)).?;
-    queue.release(io, retry);
+};
+
+comptime {
+    if (@import("builtin").is_test) _ = consumer_tests;
 }

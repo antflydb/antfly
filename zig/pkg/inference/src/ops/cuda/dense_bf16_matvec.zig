@@ -18,7 +18,9 @@ const Context = @import("context.zig").CudaContext;
 const embedded = @import("embedded_module.zig");
 const catalog = @import("../../tile/cuda_standalone.zig");
 const DeviceBuffer = buffer.DeviceBuffer;
-const Program = embedded.EmbeddedModule(embedded.profile(catalog.dense_bf16_matvec).image, catalog.dense_bf16_matvec_entries);
+const Program = embedded.EmbeddedModule(struct {
+    pub const image = embedded.profile(catalog.dense_bf16_matvec).image;
+}, catalog.dense_bf16_matvec_entries);
 const threads = 128;
 const tile_values = 256;
 const tiles_per_block = threads / 32;

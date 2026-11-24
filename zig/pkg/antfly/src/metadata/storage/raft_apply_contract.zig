@@ -561,6 +561,7 @@ pub const CatalogProjectionRequest = union(enum) {
     changefeed_maintenance: struct { now: u64, after: ?feed.Id },
     changefeed_pressure: struct { now: u64, after: ?feed.Id },
     source_control: struct { table_id: u64, source_id: [32]u8 },
+    source_checkpoint_actors: struct { owner_group: u64, after: ?@import("../source_legacy_intake.zig").CheckpointActor, unprepared: bool = false },
     legacy_source_intake: struct { table_id: u64, ordinal: u32, definition: [32]u8 },
     native_source_recovery_scope: struct { table_id: u64, ordinal: u32, definition: [32]u8 },
     capture_source_scope: @import("../source_scope_capture.zig").Query,
@@ -599,11 +600,42 @@ pub const CatalogProjectionRequest = union(enum) {
     schema_validation_status: @import("../schema_validation/admission.zig").StatusRequest,
     schema_validation_receipt_read: @import("../schema_validation/receipt.zig").Request,
     sql_publication_capture_work: @import("../../system_catalog/replication/installation.zig").WorkRequest,
+
     sql_graph_preparation_read: @import("../../system_catalog/graph_preparation.zig").Source,
     sql_graph_preparation_outcome: @import("../../system_catalog/graph_preparation.zig").Observation,
     sql_trigger_snapshot: @import("../../system_catalog/trigger_snapshot.zig").Request,
     has_index_alias_lifecycle_state: void,
     policy_create_has_capacity: void,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        if (try source.next() != .object_begin) return error.UnexpectedToken;
+        const tag = selected: {
+            const token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
+            const name = switch (token) {
+                inline .string, .allocated_string => |name| name,
+                else => return error.UnexpectedToken,
+            };
+            defer if (token == .allocated_string) allocator.free(name);
+            break :selected std.meta.stringToEnum(std.meta.Tag(@This()), name) orelse return error.UnknownField;
+        };
+        var result: @This() = undefined;
+        switch (tag) {
+            inline else => |selected| try parseProjectionPayload(&result, selected, allocator, source, options),
+        }
+        if (try source.next() != .object_end) return error.UnexpectedToken;
+        return result;
+    }
+
+    // Debug codegen otherwise reserves independent parser temporaries for
+    // every payload in one frame, even though a request selects only one.
+    noinline fn parseProjectionPayload(out: *@This(), comptime tag: std.meta.Tag(@This()), allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !void {
+        const Payload = @FieldType(@This(), @tagName(tag));
+        const value: Payload = if (Payload == void) empty: {
+            if (try source.next() != .object_begin or try source.next() != .object_end) return error.UnexpectedToken;
+            break :empty {};
+        } else try std.json.innerParse(Payload, allocator, source, options);
+        out.* = @unionInit(@This(), @tagName(tag), value);
+    }
 };
 
 test "system catalog creation sources have a distinct strict command version" {

@@ -304,6 +304,7 @@ const PortableOutput = struct {
     writer: ?*std.Io.Writer = null,
     mode: PortableOutputMode,
     bytes_written: u64 = 0,
+    max_bytes: u64 = std.math.maxInt(u64),
     min_reader_version: u32 = 2,
     bundle_offset: u64 = 0,
     stats: ?*ExportStats = null,
@@ -311,11 +312,16 @@ const PortableOutput = struct {
 
     source_certificate: ?*source_snapshot.Builder = null,
 
+    fn chargeBytes(self: *PortableOutput, bytes: usize) !void {
+        if (bytes > self.max_bytes - self.bytes_written) return error.BackupExpansionLimitExceeded;
+        self.bytes_written += bytes;
+    }
+
     fn writeHeader(self: *PortableOutput, header: backup_codec.FileHeader) !void {
         // AFB2 owns the physical file header. Keep the logical AFB1 header in
         // the byte count so portable file-footer accounting remains stable
         // across the inventory and emission passes.
-        self.bytes_written += backup_codec.header_size;
+        try self.chargeBytes(backup_codec.header_size);
         switch (self.mode) {
             .inventory => if (self.writer) |writer| try backup_codec.writeHeaderTo(writer, header),
             .bundle => {},
@@ -325,7 +331,7 @@ const PortableOutput = struct {
     fn writeBlock(self: *PortableOutput, block_type: backup_codec.BlockType, payload: []const u8) !void {
         try self.cancellation.check();
         if (self.source_certificate) |builder| try builder.addBlock(@backingInt(block_type), payload);
-        self.bytes_written += backup_codec.block_envelope_overhead + payload.len;
+        try self.chargeBytes(backup_codec.block_envelope_overhead + payload.len);
         switch (self.mode) {
             .inventory => |objects| {
                 var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
@@ -496,7 +502,7 @@ pub const ExportOptions = struct {
     /// this so the immutable store snapshot is classified and encoded once;
     /// callers without filesystem authority retain the deterministic two-pass
     /// compatibility path.
-    spool: ?struct { io: std.Io, file: std.Io.File } = null,
+    spool: ?struct { io: std.Io, file: std.Io.File, max_bytes: u64 = std.math.maxInt(u64) } = null,
 };
 
 pub fn exportPortableToWriterWithOptions(
@@ -570,6 +576,7 @@ pub fn exportPortableToWriterWithOptions(
         var spool_buffer: [64 * 1024]u8 = undefined;
         var spool_writer = spool.file.writer(spool.io, &spool_buffer);
         inventory_out.writer = &spool_writer.interface;
+        inventory_out.max_bytes = spool.max_bytes;
         try exportPortableSnapshot(alloc, &scan, &inventory_out, options.cohort, options.source_copy);
         try spool_writer.end();
         inventory_out.writer = null;

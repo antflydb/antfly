@@ -42,6 +42,7 @@ pub const Ports = struct {
     observations: @import("source_plan_operations.zig").ObservePort,
     chunks: @import("source_plan_operations.zig").ChunkPort,
 };
+pub const payload_retention = @import("source_payload_retention.zig");
 pub const Manifest = struct {
     version: u8 = 1,
     checkpoint_authority: authority.Spec,
@@ -53,6 +54,18 @@ pub const Manifest = struct {
     begin_timestamp: u64,
     commit_version: u64,
     artifact: storage.Spec,
+    retained_payload: ?payload_retention.Reference = null,
+
+    pub fn jsonStringify(self: Manifest, stream: anytype) @TypeOf(stream.*).Error!void {
+        try stream.beginObject();
+        inline for (@typeInfo(Manifest).@"struct".field_names) |name| {
+            if ((comptime !std.mem.eql(u8, name, "retained_payload")) or self.retained_payload != null) {
+                try stream.objectField(name);
+                try stream.write(@field(self, name));
+            }
+        }
+        try stream.endObject();
+    }
 
     pub fn validate(self: Manifest) !void {
         if (self.version != 1 or self.begin_timestamp == 0 or self.commit_version <= self.begin_timestamp or std.mem.allEqual(u8, &self.transaction_id, 0) or std.mem.allEqual(u8, &self.admission_digest, 0)) return error.InvalidSourceAdmission;
@@ -61,6 +74,12 @@ pub const Manifest = struct {
         try self.source_scope.validate();
         try self.checkpoint.validate();
         try self.artifact.validate(try entry.rootFor(self.owner));
+        if (self.retained_payload) |reference| {
+            try reference.validate();
+            if (reference.bytes != self.artifact.bytes or !std.meta.eql(reference.checksum, self.artifact.checksum) or
+                !std.meta.eql(reference.upload.domain, self.artifact.domain) or !std.mem.eql(u8, reference.upload.attempt[8..], self.artifact.attempt[8..]))
+                return error.SourceTransactionIdentityConflict;
+        }
         if (self.checkpoint_authority.retirement != null or self.checkpoint.receipt_window == 0 or
             !std.mem.eql(u8, &self.source_scope.binding, &self.checkpoint_authority.binding) or
             !std.mem.eql(u8, &self.source_scope.binding, &self.checkpoint.binding) or
@@ -99,6 +118,14 @@ pub const Manifest = struct {
         try @import("source_owner_scope.zig").requireFence(self.owner, fence);
         return .{ .owner = self.owner, .fence = fence, .table = self.checkpoint_authority.table_name, .spec = self.artifact, .controls = ports.controls, .observations = ports.observations, .chunks = ports.chunks };
     }
+    pub fn cleanupTransfer(self: Manifest, fence: @import("../metadata/api.zig").CatalogRouteFence, ports: Ports) !@import("source_plan_delivery.zig").Transfer {
+        try self.validate();
+        var routed = self.owner;
+        routed.topology_epoch = fence.topology_epoch;
+        try @import("source_owner_scope.zig").requireFence(routed, fence);
+        return .{ .owner = self.owner, .fence = fence, .table = self.checkpoint_authority.table_name, .spec = self.artifact, .controls = ports.controls, .observations = ports.observations, .chunks = ports.chunks };
+    }
+
     /// Metadata's exact sealed ledger grant authorizes loading retained input.
     /// Native seal evidence and the manifest independently bind the same bytes.
     pub fn load(self: Manifest, a: A, record: @import("../metadata/source_artifact_control.zig").Record, fence: @import("../metadata/api.zig").CatalogRouteFence, ports: Ports, context: local.api_operation.RequestContext) !plans.Plan {
@@ -133,6 +160,28 @@ pub const Frozen = struct {
         self.arena.deinit();
         self.* = undefined;
     }
+    /// The actor revision supplies a spool token independently of the
+    /// destination upload. An abandoned spool write never consumes a native
+    /// admission token or reuses a previously retired spool token.
+    pub fn bindRetention(self: *Frozen, store: *const payload_retention.Store, spool_token: u64) !void {
+        const spec = self.manifest.artifact;
+        var attempt = spec.attempt;
+        std.mem.writeInt(u64, attempt[0..8], spool_token, .big);
+        const reference: payload_retention.Reference = .{
+            .namespace = store.namespace_identity orelse return error.SourcePayloadStorageUnavailable,
+            .upload = .{ .domain = spec.domain, .attempt = attempt },
+            .checksum = spec.checksum,
+            .bytes = spec.bytes,
+        };
+        var manifest = self.manifest;
+        manifest.retained_payload = reference;
+        try manifest.validate();
+        const encoded = try std.json.Stringify.valueAlloc(self.arena.allocator(), manifest, .{});
+        if (encoded.len > max_manifest_bytes) return error.HistoryTooLarge;
+        self.manifest = manifest;
+        self.encoded_manifest = encoded;
+    }
+
     /// The observation must be qualified for this exact captured coordinator.
     /// Capacity remains provisional until native artifact BEGIN commits.
     pub fn init(a: A, plan: *const plans.Plan, checkpoint_authority: authority.Spec, quota: control.Observation, commit_version: u64) !Frozen {
@@ -215,6 +264,22 @@ test "completion frozen plan source destination manifest owns exact admission an
     };
     defer frozen.deinit();
     try std.testing.expect(frozen.manifest.artifact.chunk_hashes.len > 1);
+    try std.testing.expect(std.mem.indexOf(u8, frozen.encoded_manifest, "\"retained_payload\"") == null);
+    var with_payload = frozen.manifest;
+    with_payload.retained_payload = .{
+        .namespace = @splat(5),
+        .upload = .{ .domain = with_payload.artifact.domain, .attempt = with_payload.artifact.attempt },
+        .checksum = with_payload.artifact.checksum,
+        .bytes = with_payload.artifact.bytes,
+    };
+    const retained_encoded = try std.json.Stringify.valueAlloc(a, with_payload, .{});
+    defer a.free(retained_encoded);
+    var retained = try parse(a, retained_encoded, manifestDigest(retained_encoded));
+    defer retained.deinit();
+    try std.testing.expectEqualDeep(with_payload.retained_payload, retained.value.retained_payload);
+    with_payload.retained_payload.?.checksum[0] ^= 1;
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, with_payload.validate());
+
     var parsed = try parse(a, frozen.encoded_manifest, manifestDigest(frozen.encoded_manifest));
     defer parsed.deinit();
     var restored = try parsed.value.restore(a, frozen.bytes);
@@ -232,7 +297,9 @@ test "completion frozen plan source destination manifest owns exact admission an
         index: u64 = 8,
         mutations: usize = 0,
         chunk_reads: usize = 0,
-        lose_seal: bool = true,
+        begins: usize = 0,
+        uploaded_chunks: usize = 0,
+        lose: ?@FieldType(@import("source_plan_operations.zig").wire.native.Command, "action") = .begin,
         fn cut(self: *@This()) [32]u8 {
             var result: [32]u8 = @splat(0);
             std.mem.writeInt(u64, result[0..8], 1, .little);
@@ -252,8 +319,13 @@ test "completion frozen plan source destination manifest owns exact admission an
             defer decoded.deinit();
             const result = try control.apply(alloc, &self.txn, decoded.request, self.cut());
             var reply: @import("source_plan_operations.zig").wire.ControlReply = .{ .request_digest = try request.digest(alloc), .receipt = .{ .term = 1, .index = self.index }, .outcome = .{ .applied = result } };
-            if (request.command.action == .seal and self.lose_seal) {
-                self.lose_seal = false;
+            switch (request.command.action) {
+                .begin => self.begins += 1,
+                .chunk => self.uploaded_chunks += 1,
+                else => {},
+            }
+            if (self.lose == request.command.action) {
+                self.lose = null;
                 reply.outcome = null;
             }
             return reply;
@@ -276,6 +348,18 @@ test "completion frozen plan source destination manifest owns exact admission an
     const transfer = try parsed.value.transfer(fence, ports);
     var record: @import("../metadata/source_artifact_control.zig").Record = .{ .reservation = @splat(10), .spec = delivery_plan.artifact.? };
     try std.testing.expectError(error.SourceOutcomeUnresolved, transfer.seal(a, record, frozen.bytes, .{}));
+    try std.testing.expectEqual(@as(usize, 1), native.begins);
+    try std.testing.expectEqual(@as(usize, 0), native.uploaded_chunks);
+    try std.testing.expectEqual(null, try transfer.recoverSeal(a, record, .{}));
+    native.lose = .chunk;
+    try std.testing.expectError(error.SourceOutcomeUnresolved, transfer.seal(a, record, frozen.bytes, .{}));
+    try std.testing.expectEqual(@as(usize, 1), native.begins);
+    try std.testing.expectEqual(@as(usize, 1), native.uploaded_chunks);
+    try std.testing.expectEqual(null, try transfer.recoverSeal(a, record, .{}));
+    native.lose = .seal;
+    try std.testing.expectError(error.SourceOutcomeUnresolved, transfer.seal(a, record, frozen.bytes, .{}));
+    try std.testing.expectEqual(@as(usize, 1), native.begins);
+    try std.testing.expectEqual(parsed.value.artifact.chunk_hashes.len, native.uploaded_chunks);
     const mutations_after_seal = native.mutations;
     const seal = (try transfer.recoverSeal(a, record, .{})).?;
     try std.testing.expectEqual(mutations_after_seal, native.mutations);
@@ -293,6 +377,16 @@ test "completion frozen plan source destination manifest owns exact admission an
     wrong_fence.route.group_id += 1;
     try std.testing.expectError(error.InvalidCatalogRouteFence, parsed.value.load(a, record, wrong_fence, ports, .{}));
     try std.testing.expectEqual(parsed.value.artifact.chunk_hashes.len, native.chunk_reads);
+    var refreshed_fence = fence;
+    refreshed_fence.topology_epoch -= 1;
+    try std.testing.expectError(error.InvalidCatalogRouteFence, parsed.value.transfer(refreshed_fence, ports));
+    const cleaner = try parsed.value.cleanupTransfer(refreshed_fence, ports);
+    var retired_record = record;
+    retired_record.phase = .garbage;
+    retired_record.retirement = @splat(11);
+    const reclamation = (try cleaner.reclaim(a, retired_record, .{})).?;
+    try std.testing.expectEqual(reclamation, (try cleaner.reclaim(a, retired_record, .{})).?);
+
     var changed = parsed.value;
     changed.commit_version += 1;
     try std.testing.expectError(error.SourcePayloadConflict, changed.deliveryPlan(a, frozen.encoded_manifest));

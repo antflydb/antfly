@@ -18,7 +18,9 @@ const Context = @import("context.zig").CudaContext;
 const embedded = @import("embedded_module.zig");
 const catalog = @import("../../tile/cuda_standalone.zig");
 const DeviceBuffer = buffer.DeviceBuffer;
-const Program = embedded.EmbeddedModule(embedded.profile(catalog.residual_block_mix).image, catalog.residual_block_mix_entries);
+const Program = embedded.EmbeddedModule(struct {
+    pub const image = embedded.profile(catalog.residual_block_mix).image;
+}, catalog.residual_block_mix_entries);
 const block_dim = 128;
 
 pub const Shape = struct {

@@ -19,7 +19,9 @@ const Context = @import("context.zig").CudaContext;
 const embedded = @import("embedded_module.zig");
 const catalog = @import("../../tile/cuda_standalone.zig");
 const DeviceBuffer = buffer.DeviceBuffer;
-const Program = embedded.EmbeddedModule(embedded.profile(catalog.causal_depthwise4_bf16).image, catalog.causal_depthwise4_bf16_entries);
+const Program = embedded.EmbeddedModule(struct {
+    pub const image = embedded.profile(catalog.causal_depthwise4_bf16).image;
+}, catalog.causal_depthwise4_bf16_entries);
 
 pub const Request = struct {
     input: DeviceBuffer,

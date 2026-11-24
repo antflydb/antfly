@@ -19,13 +19,16 @@ Run both generator freshness checks before exporting quant-kernel-codegen
 --inventory. This report consumes that export; it is not another kernel registry.
 Native surrounds and local include leaves remain canonical authored programs.
 """
+
 from pathlib import Path
 import argparse
 import hashlib
 import json
 import re
 
-MARKER = re.compile(rb"(?m)^[ \t]*// (tile-codegen|quant-kernel-codegen):(begin|end) ([^\n]+)\n")
+MARKER = re.compile(
+    rb"(?m)^[ \t]*// (tile-codegen|quant-kernel-codegen):(begin|end) ([^\n]+)\n"
+)
 INCLUDE = re.compile(rb'(?m)^\s*#include\s+"([^"\n]+)"')
 
 
@@ -48,7 +51,9 @@ def source_regions(data):
         else:
             if opened is None or opened[:2] != (generator, label):
                 raise ValueError("mismatched native ownership")
-            regions.append((*opened[:2], opened[2], match.end(), data[opened[3]:match.start()]))
+            regions.append(
+                (*opened[:2], opened[2], match.end(), data[opened[3] : match.start()])
+            )
             opened = None
     if opened is not None:
         raise ValueError("unclosed native ownership")
@@ -61,18 +66,41 @@ def verify_shared_dependencies(root):
     core = root / "zig/lib/tile/src"
     cache = root / "zig/pkg/inference/src/ops/cuda/retained_execution_cache.zig"
     bindings = cache.with_name("encoder_multimodal.zig")
-    retained = [cache.with_name(name + ".zig") for name in ("bounded_decode_graph", "recurrent_prefill", "paged_prefill_attention", "recurrent_device_policy")]
+    retained = [
+        cache.with_name(name + ".zig")
+        for name in (
+            "bounded_decode_graph",
+            "recurrent_prefill",
+            "paged_prefill_attention",
+            "recurrent_device_policy",
+        )
+    ]
     imports = re.compile(r'@import\(\s*"([^"\n]+)"\s*\)')
     checked = []
-    for source in sorted(core.rglob("*.zig")) + [f for f in (cache, bindings, *retained) if f.is_file()]:
+    for source in sorted(core.rglob("*.zig")) + [
+        f for f in (cache, bindings, *retained) if f.is_file()
+    ]:
         # Imports inside line comments are documentation, not dependencies.
         text = re.sub(r"//[^\n]*", "", source.read_text())
         tile = source.is_relative_to(core)
         for name in imports.findall(text):
             if not name.endswith(".zig"):
-                allowed = {"std", "builtin"} if tile else {"std", "builtin", "build_options", "antfly_platform", "antfly_tile"}
+                allowed = (
+                    {"std", "builtin"}
+                    if tile
+                    else {
+                        "std",
+                        "builtin",
+                        "build_options",
+                        "antfly_platform",
+                        "antfly_tile",
+                    }
+                )
                 if name not in allowed:
-                    raise ValueError("shared numerical/storage owner imports application module: " + name)
+                    raise ValueError(
+                        "shared numerical/storage owner imports application module: "
+                        + name
+                    )
                 continue
             target = (source.parent / name).resolve()
             if tile:
@@ -80,23 +108,48 @@ def verify_shared_dependencies(root):
                     raise ValueError("Tile core import escapes shared package: " + name)
             else:
                 package = root / "zig/pkg/inference/src"
-                allowed = [package / directory for directory in ("ops/cuda", "execution", "runtime")]
-                contracts = {package / "ops/kernel_geometry.zig", package / "graph/backend_contracts.zig"}
+                allowed = [
+                    package / directory
+                    for directory in ("ops/cuda", "execution", "runtime")
+                ]
+                contracts = {
+                    package / "ops/kernel_geometry.zig",
+                    package / "graph/backend_contracts.zig",
+                }
                 if source == bindings:
                     contracts.add(package / "ops/ops.zig")
                 if source in retained:
-                    contracts.update({package / "backends/session.zig", package / "test_error_logs.zig"})
-                if target not in contracts and not any(target.is_relative_to(directory) for directory in allowed):
-                    raise ValueError("retained CUDA cache imports model/backend adapter: " + name)
-        checked.append({"source": str(source.relative_to(root)), **fingerprint(source.read_bytes())})
+                    contracts.update(
+                        {
+                            package / "backends/session.zig",
+                            package / "test_error_logs.zig",
+                        }
+                    )
+                if target not in contracts and not any(
+                    target.is_relative_to(directory) for directory in allowed
+                ):
+                    raise ValueError(
+                        "retained CUDA cache imports model/backend adapter: " + name
+                    )
+        checked.append(
+            {
+                "source": str(source.relative_to(root)),
+                **fingerprint(source.read_bytes()),
+            }
+        )
     # Generic execution publishes contracts; configuration/weight-name frontends
     # belong to architectures, independently of CPU/CUDA/Metal/PJRT selection.
     package = root / "zig/pkg/inference/src"
     for source in sorted((package / "execution").glob("*frontend.zig")):
         for name in imports.findall(re.sub(r"//[^\n]*", "", source.read_text())):
             target = (source.parent / name).resolve()
-            if any(target.is_relative_to(package / folder) for folder in ("models", "architectures", "pipelines")):
-                raise ValueError("model frontend belongs in architecture adapter: " + str(source))
+            if any(
+                target.is_relative_to(package / folder)
+                for folder in ("models", "architectures", "pipelines")
+            ):
+                raise ValueError(
+                    "model frontend belongs in architecture adapter: " + str(source)
+                )
     return checked
 
 
@@ -105,11 +158,18 @@ def verify(root, inventory):
         raise ValueError("unknown inventory schema")
     dependencies = verify_shared_dependencies(root)
     package = (root / "zig/pkg/inference").resolve()
+
     def path(name):
         result = (package / name).resolve()
-        if not result.is_relative_to(package) and not result.is_relative_to((root / "zig/lib/tile").resolve()) and result != (root / "zig/lib/vectorindex/src/kmeans_distance.msl.h").resolve():
+        if (
+            not result.is_relative_to(package)
+            and not result.is_relative_to((root / "zig/lib/tile").resolve())
+            and result
+            != (root / "zig/lib/vectorindex/src/kmeans_distance.msl.h").resolve()
+        ):
             raise ValueError("inventory path escapes owned kernel sources")
         return result
+
     indexed = {}
     outputs = {}
     shared_sources = {}
@@ -119,12 +179,23 @@ def verify(root, inventory):
             source = program["source"]
             if source not in source_inputs:
                 raise ValueError("shared program owner absent from build inputs")
-            if program["scope"] not in ("phase", "body") or not program["precision"] or not program["schedule"]:
+            if (
+                program["scope"] not in ("phase", "body")
+                or not program["precision"]
+                or not program["schedule"]
+            ):
                 raise ValueError("incomplete shared program contract")
-            shared_sources[source] = {"source": source, **fingerprint(path(source).read_bytes())}
+            shared_sources[source] = {
+                "source": source,
+                **fingerprint(path(source).read_bytes()),
+            }
         owner, name = entry["owner"], entry["family_region"]
         if owner == "quant_region":
-            name = name.strip().removeprefix("// quant-kernel-codegen:begin ").split(" (do not edit;", 1)[0]
+            name = (
+                name.strip()
+                .removeprefix("// quant-kernel-codegen:begin ")
+                .split(" (do not edit;", 1)[0]
+            )
         key = (entry["output"], owner, name)
         if key in indexed:
             raise ValueError("duplicate native ownership")
@@ -159,16 +230,32 @@ def verify(root, inventory):
             surrounds.append(data[cursor:start])
             cursor = end
         surrounds.append(data[cursor:])
-        canonical.append({"output": output, "classification": "canonical_native_surrounds", **fingerprint(b"".join(surrounds))})
+        canonical.append(
+            {
+                "output": output,
+                "classification": "canonical_native_surrounds",
+                **fingerprint(b"".join(surrounds)),
+            }
+        )
     if verified != indexed.keys():
-        raise ValueError("inventory region absent from shipped sources: " + repr(indexed.keys() - verified))
+        raise ValueError(
+            "inventory region absent from shipped sources: "
+            + repr(indexed.keys() - verified)
+        )
     # Follow actual local includes, retaining templates and macro-only helpers.
     # System headers are deliberately outside this owned native source closure.
     standalone = []
     for profile in inventory.get("standalone_cuda", []):
         image = path("src/ops/cuda/" + profile["file"])
         producer = path("src/ops/cuda/prototypes/" + profile["producer"])
-        standalone.append({"image": str(image.relative_to(package)), "image_identity": fingerprint(image.read_bytes()), "producer": str(producer.relative_to(package)), "producer_identity": fingerprint(producer.read_bytes())})
+        standalone.append(
+            {
+                "image": str(image.relative_to(package)),
+                "image_identity": fingerprint(image.read_bytes()),
+                "producer": str(producer.relative_to(package)),
+                "producer_identity": fingerprint(producer.read_bytes()),
+            }
+        )
         queue.append(producer)
     visited, leaves = set(), []
     while queue:
@@ -181,9 +268,30 @@ def verify(root, inventory):
             if child.is_relative_to(package) and child.is_file():
                 queue.append(child)
                 name = str(child.relative_to(package))
-                if name not in outputs and not any(row["output"] == name for row in leaves):
-                    leaves.append({"output": name, "classification": "canonical_native_include", **fingerprint(child.read_bytes())})
-    return {**inventory, "verification": {"shared_dependency_boundaries": dependencies, "regions_and_files": len(verified), "standalone_cuda_inputs": standalone, "shared_program_sources": [shared_sources[name] for name in sorted(shared_sources)], "canonical_native": canonical + sorted(leaves, key=lambda row: row["output"]), "retention": "Canonical surrounds and include leaves are authored implementation, not dead-code candidates. Compatibility exports remain ABI adapters; lexical single-reference counts do not establish liveness."}}
+                if name not in outputs and not any(
+                    row["output"] == name for row in leaves
+                ):
+                    leaves.append(
+                        {
+                            "output": name,
+                            "classification": "canonical_native_include",
+                            **fingerprint(child.read_bytes()),
+                        }
+                    )
+    return {
+        **inventory,
+        "verification": {
+            "shared_dependency_boundaries": dependencies,
+            "regions_and_files": len(verified),
+            "standalone_cuda_inputs": standalone,
+            "shared_program_sources": [
+                shared_sources[name] for name in sorted(shared_sources)
+            ],
+            "canonical_native": canonical
+            + sorted(leaves, key=lambda row: row["output"]),
+            "retention": "Canonical surrounds and include leaves are authored implementation, not dead-code candidates. Compatibility exports remain ABI adapters; lexical single-reference counts do not establish liveness.",
+        },
+    }
 
 
 def main():
@@ -194,7 +302,14 @@ def main():
     args = parser.parse_args()
     report = verify(args.root, json.loads(args.inventory.read_text()))
     args.output.write_text(json.dumps(report, indent=2) + "\n")
-    print(json.dumps({"verified": report["verification"]["regions_and_files"], "canonical_native": len(report["verification"]["canonical_native"])}))
+    print(
+        json.dumps(
+            {
+                "verified": report["verification"]["regions_and_files"],
+                "canonical_native": len(report["verification"]["canonical_native"]),
+            }
+        )
+    )
 
 
 if __name__ == "__main__":

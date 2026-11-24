@@ -1072,8 +1072,6 @@ const mappings = [_]Mapping{
     .{ .status = .schema_validation_not_ready, .err = error.SchemaValidationNotReady },
     .{ .status = .schema_validation_publication_required, .err = error.SchemaValidationPublicationRequired },
     .{ .status = .schema_validation_cancellation_required, .err = error.SchemaValidationCancellationRequired },
-    .{ .status = .invalid_ordered_apply_receipt, .err = error.InvalidOrderedApplyReceipt },
-    .{ .status = .conflicting_ordered_apply_receipt, .err = error.ConflictingOrderedApplyReceipt },
     .{ .status = .invalid_relational_index_budget, .err = error.InvalidRelationalIndexBudget },
     .{ .status = .private_index_claim_backlog_full, .err = error.PrivateIndexClaimBacklogFull },
     .{ .status = .private_index_publication_canceled, .err = error.PrivateIndexPublicationCanceled },
@@ -1686,10 +1684,10 @@ test "source plan failures preserve exact opaque owner identities" {
         try validateFailureEnvelope(value, &failure, abi.abi_version);
         try std.testing.expectEqualStrings(@errorName(err), failure.errorName());
     }
-    try std.testing.expectEqual(@as(u32, 930), @backingInt(statusFromError(error.InvalidSourcePlanWire)));
-    try std.testing.expectEqual(@as(u32, 938), @backingInt(statusFromError(error.SourceOutcomeUnresolved)));
-    try std.testing.expectEqual(@as(u32, 939), @backingInt(statusFromError(error.UnsupportedBatchProtocolVersion)));
-    try std.testing.expectEqual(@as(u32, 940), @backingInt(statusFromError(error.SourceCheckpointConflict)));
-    try std.testing.expectEqual(@as(u32, 941), @backingInt(statusFromError(error.SourceTransactionIdentityConflict)));
-    try std.testing.expectEqual(@as(u32, 942), @backingInt(statusFromError(error.SourceAlreadyCommitted)));
+    try std.testing.expectEqual(@as(u32, 935), @backingInt(statusFromError(error.InvalidSourcePlanWire)));
+    try std.testing.expectEqual(@as(u32, 943), @backingInt(statusFromError(error.SourceOutcomeUnresolved)));
+    try std.testing.expectEqual(@as(u32, 944), @backingInt(statusFromError(error.UnsupportedBatchProtocolVersion)));
+    try std.testing.expectEqual(@as(u32, 945), @backingInt(statusFromError(error.SourceCheckpointConflict)));
+    try std.testing.expectEqual(@as(u32, 946), @backingInt(statusFromError(error.SourceTransactionIdentityConflict)));
+    try std.testing.expectEqual(@as(u32, 947), @backingInt(statusFromError(error.SourceAlreadyCommitted)));
 }

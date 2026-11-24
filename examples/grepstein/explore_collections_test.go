@@ -70,7 +70,7 @@ func TestExplorerCollectionSearchBoundsScopeAndTiming(t *testing.T) {
 		}
 		if strings.Contains(r.URL.Path, "audio_table") {
 			raw, _ := json.Marshal(payload["hierarchy"])
-			if !strings.Contains(string(raw), "provenance.start_ms") || !strings.Contains(string(raw), "provenance.end_ms") {
+			if !strings.Contains(string(raw), "provenance.start_time_ms") || !strings.Contains(string(raw), "provenance.end_time_ms") {
 				t.Error("audio citations lost temporal evidence")
 			}
 		}
@@ -231,6 +231,14 @@ func TestProfileMediaTypesAndGraphLimits(t *testing.T) {
 	if err != nil || payload["limit"] != 8 {
 		t.Fatal("graph root bound changed")
 	}
+	// Graph edges belong to materialized per-unit source rows. Native URL
+	// source IDs and grouped artifact hits are a different traversal domain.
+	if payload["full_text_index"] != DefaultFullTextIndex || payload["full_text_search"].(map[string]any)["field"] != "content" {
+		t.Fatal("graph anchors must search materialized graph-unit content")
+	}
+	if _, grouped := payload["hierarchy"]; grouped {
+		t.Fatal("graph anchors must retain materialized row identities")
+	}
 }
 
 func TestExplorerClientInteractionLogic(t *testing.T) {
@@ -243,5 +251,48 @@ func TestExplorerClientInteractionLogic(t *testing.T) {
 	output, err := exec.CommandContext(ctx, node, "--test", "explorer_ui_test.mjs").CombinedOutput()
 	if err != nil {
 		t.Fatalf("explorer client interactions: %v\n%s", err, output)
+	}
+}
+
+func TestExplorerGraphChecksConfigurationBeforeEmptyAnchors(t *testing.T) {
+	for _, aggregate := range []bool{false, true} {
+		for _, configured := range []bool{false, true} {
+			t.Run(fmt.Sprintf("aggregate=%t/configured=%t", aggregate, configured), func(t *testing.T) {
+				var lookups, queries atomic.Int32
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					switch {
+					case r.Method == "GET" && r.URL.Path == "/tables/pdf_table/indexes/"+DefaultAutographIndex:
+						lookups.Add(1)
+						if !configured {
+							http.NotFound(w, r)
+							return
+						}
+						io.WriteString(w, `{"name":"autograph_relations","type":"graph"}`)
+					case r.Method == "POST" && r.URL.Path == "/tables/pdf_table/query":
+						queries.Add(1)
+						io.WriteString(w, `{"responses":[{"status":200,"hits":{"hits":[]}}]}`)
+					default:
+						t.Errorf("unscoped graph request: %s %s", r.Method, r.URL.Path)
+						http.Error(w, "unexpected request", 400)
+					}
+				}))
+				defer upstream.Close()
+				var handler http.Handler = explorerCollectionHandler(upstream.URL+"/tables/pdf_table", "pdf", upstream.Client(), "", nil)
+				if aggregate {
+					handler = explorerCollectionsHandler(collectionFixture(t, upstream.URL), upstream.Client(), "", nil)
+				}
+				out := httptest.NewRecorder()
+				handler.ServeHTTP(out, httptest.NewRequest("GET", "/api/search?q=fixture&mode=graph&collection=pdf", nil))
+				status, expectedQueries := 502, int32(0)
+				if configured {
+					status, expectedQueries = 200, 1
+				} else if !strings.Contains(out.Body.String(), "not configured") {
+					t.Fatal("missing graph configuration must be actionable")
+				}
+				if out.Code != status || queries.Load() != expectedQueries || lookups.Load() != 1 {
+					t.Fatalf("status=%d lookups=%d queries=%d", out.Code, lookups.Load(), queries.Load())
+				}
+			})
+		}
 	}
 }

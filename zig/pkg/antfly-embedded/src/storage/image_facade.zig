@@ -26,6 +26,7 @@ pub const RasterFormat = v.RasterFormat;
 pub const BorrowedRasterAttachment = v.BorrowedRasterAttachment;
 pub const rgba8_raster_mime_type = v.rgba8_raster_mime_type;
 pub const EncodedImageInfo = v.EncodedImageInfo;
+pub const inspectWebpPrefix = v.inspectWebpPrefix;
 pub const inferenceFormatForMimeEssence = v.inferenceFormatForMimeEssence;
 pub const inferenceMimeEssenceForFormat = v.inferenceMimeEssenceForFormat;
 pub const supportsInferenceMimeEssence = v.supportsInferenceMimeEssence;

@@ -23,7 +23,9 @@ const embedded = @import("../ops/cuda/embedded_module.zig");
 const entries = @import("../tile/cuda_standalone.zig");
 const launch_abi = @import("../ops/cuda/launch_abi.zig");
 const MmapRegion = @import("../util/c_file.zig").MmapRegion;
-const Program = embedded.EmbeddedModule(embedded.profile(entries.patch_transformer).image, entries.patch_transformer_entries);
+const Program = embedded.EmbeddedModule(struct {
+    pub const image = embedded.profile(entries.patch_transformer).image;
+}, entries.patch_transformer_entries);
 const DeviceBuffer = buffer.DeviceBuffer;
 
 const width = 1024;

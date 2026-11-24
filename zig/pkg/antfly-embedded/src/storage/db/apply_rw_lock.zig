@@ -163,6 +163,10 @@ pub const ApplyRwLock = struct {
         }
     }
 
+    pub fn exclusiveAdmissionClosed(self: *const ApplyRwLock) bool {
+        return self.state.load(.acquire) & writer_bit != 0;
+    }
+
     pub fn tryLockShared(self: *@This()) bool {
         return self.tryLockSharedQueued(false);
     }

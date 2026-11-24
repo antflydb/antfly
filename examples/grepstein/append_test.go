@@ -78,8 +78,9 @@ func nativeAppendReaderFixture(t *testing.T, calls *atomic.Int64, images ...bool
 			return
 		}
 		var body struct {
-			Images []map[string]any `json:"images"`
-			Prompt string           `json:"prompt"`
+			Images    []map[string]any `json:"images"`
+			Prompt    string           `json:"prompt"`
+			MaxTokens int              `json:"max_tokens"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "bad request", 400)
@@ -103,7 +104,11 @@ func nativeAppendReaderFixture(t *testing.T, calls *atomic.Int64, images ...bool
 			if grounded {
 				text = imageFixtureGrounding
 			}
-			data = append(data, map[string]any{"object": "read_result", "index": i, "status": "complete", "text": text})
+			status := "complete"
+			if !grounded && body.MaxTokens > 0 && body.MaxTokens < 8192 {
+				status = "truncated"
+			}
+			data = append(data, map[string]any{"object": "read_result", "index": i, "status": status, "text": text})
 		}
 		json.NewEncoder(w).Encode(map[string]any{"object": "list", "model": model, "data": data, "usage": map[string]any{"prompt_tokens": 1, "completion_tokens": 40, "total_tokens": 41}})
 	}))

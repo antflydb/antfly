@@ -3233,6 +3233,7 @@ pub const StatusSource = struct {
                     defer read.deinit(client.alloc);
                     if (read.metadata_group_id != self.svc.metadata_group_id or !std.meta.eql(read.metadata_incarnation, incarnation)) return error.MetadataIncarnationMismatch;
                     self.result.* = try self.alloc.dupe(u8, read.body);
+                    if (self.request.sql_scope_supersession_ready) |ready| ready.* = read.sql_scope_supersession_ready;
                 } else {
                     const admin = self.input.requiresAdministrativeGrant();
                     if (admin and !self.request.setting_admin) return error.Forbidden;
@@ -20749,7 +20750,10 @@ pub const ApiHttpServer = struct {
         self.source.replaceTableDefinition(table_before, replacement) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
-            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => {
+                std.log.warn("artifact enrichment metadata conflict table={s} artifact={s} err={s} request_id={s}", .{ table_name, artifact_name, @errorName(err), request.request_id });
+                return error.Conflict;
+            },
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig, error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired => return error.InvalidEnrichmentRequest,

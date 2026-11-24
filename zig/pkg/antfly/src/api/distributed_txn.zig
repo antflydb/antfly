@@ -1317,6 +1317,9 @@ pub const external_recovery_pass_timeout_ns: u64 = 2 * std.time.ns_per_s;
 /// linearizable read and durable CAS; `admit` also requires the API owner to
 /// have durably sealed the exact execution plan and external purpose first.
 /// Returned records borrow the supplied allocator's lifetime.
+const completion_admission = @import("completion_admission.zig");
+const history_completion = completion_admission.Prepared;
+
 pub const ExternalAuthority = struct {
     ptr: *anyopaque,
     read: *const fn (*anyopaque, std.mem.Allocator, [16]u8) anyerror!?ExternalRecord,
@@ -1329,6 +1332,8 @@ pub const ExternalAuthority = struct {
     resolve_locks: ?*const fn (*anyopaque, std.mem.Allocator, ExternalRecord) anyerror!bool = null,
     retire_native: ?*const fn (*anyopaque, std.mem.Allocator, ExternalRecord) anyerror!ExternalRecord = null,
     drive_catalog: ?*const fn (*anyopaque, std.mem.Allocator, ExternalRecord, external_registry.CatalogOutcome) anyerror!bool = null,
+    publish_history: ?*const fn (*anyopaque, std.mem.Allocator, ExternalRecord) anyerror!?@import("completion_plan.zig").completion.Digest = null,
+    dispatch_history: ?*const fn (*anyopaque, std.mem.Allocator, @import("completion_plan.zig").completion.Participant, ExternalParticipant, db_mod.types.BatchRequest, ?u64) anyerror!void = null,
 
     reserve_capture: ?*const fn (*anyopaque, std.mem.Allocator, ExternalParticipant, publication_wire.Capacity.Request) anyerror!publication_wire.Proofs.CapacityReceipt = null,
     observe_capture: ?*const fn (*anyopaque, std.mem.Allocator, ExternalParticipant, publication_wire.Capacity.Observation) anyerror!?publication_wire.Proofs.OutboxReceipt = null,
@@ -1406,10 +1411,15 @@ pub const ExternalPreparation = struct {
     participant_ids: [][]const u8,
     // Borrowed from the coordinator's pinned metadata read arena.
     publication_bindings: ?[]const ?publication_installation.DemandBinding = null,
+    history: ?history_completion = null,
 
     pub fn init(a: std.mem.Allocator, catalog: table_catalog.CatalogSource, tables: []const TableCommitRequest) !ExternalPreparation {
-        if (try contract.transactionProducer(tables) != .unlabelled) return error.ChangefeedCapabilityUnsupported;
-        return fromParticipants(a, try buildParticipantTxns(a, catalog, tables, true));
+        if (try contract.transactionProducer(tables) == .legacy_cdc) return error.ChangefeedCapabilityUnsupported;
+        const participants = try buildParticipantTxns(a, catalog, tables, true);
+        // The metadata decision owner supplies provenance for this lane.
+        // Ordered-history producer flags belong to data-owned completion.
+        for (participants.items) |*participant| participant.source_producer = .unlabelled;
+        return fromParticipants(a, participants);
     }
 
     pub fn intentAt(self: *const ExternalPreparation, index: usize) db_mod.types.TransactionIntentRequest {
@@ -1441,6 +1451,7 @@ pub const ExternalPreparation = struct {
     }
 
     pub fn deinit(self: *ExternalPreparation, a: std.mem.Allocator) void {
+        if (self.history) |*plan| plan.deinit();
         for (self.participants.items) |*participant| participant.deinit(a);
         self.participants.deinit(a);
         for (self.participant_ids) |id| a.free(id);
@@ -1502,6 +1513,33 @@ pub const ExternalPreparation = struct {
         self.manifest[self.manifest.len - 1] = .{ .table_name = spec.table_name, .route = spec.route, .schema_version = spec.schema_version, .sql_locks = admission };
         self.participant_ids = try a.realloc(self.participant_ids, self.participant_ids.len + 1);
         self.participant_ids[self.participant_ids.len - 1] = id;
+    }
+
+    pub fn bindHistory(self: *ExternalPreparation, a: std.mem.Allocator, coordinator: completion_admission.Coordinator, transaction_id: [16]u8, begin_timestamp: u64, context: @import("antfly_local_sources").api_operation.RequestContext) !void {
+        if (self.manifest.len == 0) return;
+        if (self.history != null or self.publication_bindings != null) return error.InvalidTxnRequest;
+        for (self.manifest) |part| if (part.route.route.execution != .raft) return;
+        const inputs = try a.alloc(completion_admission.Input, self.manifest.len);
+        defer a.free(inputs);
+        for (self.participants.items, inputs) |*part, *input| {
+            var intent = part.intentRequest();
+            // The independent revision reservation is bound to the external
+            // admission owner when the prepare packet is dispatched.
+            intent.document_revision_handoff = null;
+            input.* = .{ .table_name = part.table_name, .group_id = part.group_id, .topology_epoch = part.topology_epoch, .intent = intent };
+        }
+        var history = (try coordinator.prepare(a, transaction_id, begin_timestamp, inputs, context)) orelse return;
+        errdefer history.deinit();
+        const owner = try history.plan.admission.coordinatorOwner();
+        for (self.manifest, 0..) |part, index| {
+            if (part.route.route.group_id != owner.group_id) continue;
+            std.mem.swap(ExternalParticipant, &self.manifest[0], &self.manifest[index]);
+            std.mem.swap(ParticipantTxn, &self.participants.items[0], &self.participants.items[index]);
+            std.mem.swap([]const u8, &self.participant_ids[0], &self.participant_ids[index]);
+            self.history = history;
+            return;
+        }
+        return error.InvalidParticipant;
     }
 
     pub fn bindPublication(self: *ExternalPreparation, a: std.mem.Allocator, transaction_id: db_mod.types.TxnId, bindings: []const ?publication_installation.DemandBinding) !void {
@@ -1571,7 +1609,7 @@ pub const ExternalPreparation = struct {
         if (record.phase != .preparing) return error.InvalidPreparedTransactionPhase;
         var slots: [external_registry.max_participants]ExternalFanoutTask.Slot = undefined;
         phase = .begin;
-        try runExternalFanout(a, worker, record, self, .begin, &slots, options);
+        try runExternalFanout(a, worker, authority, record, self, .begin, &slots, options);
         phase = .locks;
         if (authority.prepare_locks) |prepare_locks| {
             var quanta: u8 = 0;
@@ -1586,13 +1624,13 @@ pub const ExternalPreparation = struct {
         } else for (record.participants) |part| if (part.sql_locks != null) return error.UnsupportedOperation;
         phase = .vote;
         if (record.publicationCaptureMask() == 0) {
-            try runExternalFanout(a, worker, record, self, .vote, &slots, options);
+            try runExternalFanout(a, worker, authority, record, self, .vote, &slots, options);
         } else {
             // Persist the ordinary votes before sending captured prepares.
             // Cold recovery can then complete the cohort from retained evidence.
             const ordinary = record.mask() & ~record.publicationCaptureMask() & ~record.votes;
             if (ordinary != 0) {
-                try runExternalFanout(a, worker, record, self, .vote_ordinary, &slots, options);
+                try runExternalFanout(a, worker, authority, record, self, .vote_ordinary, &slots, options);
                 record = try authority.advance(authority.ptr, a, record, .{ .vote = ordinary });
             }
             record = try collectPublicationVotes(a, authority, record, options.external_deadline_ns);
@@ -1608,7 +1646,7 @@ pub const ExternalPreparation = struct {
                 try receipt.value.require(a, demand);
                 record = try authority.advance(authority.ptr, a, record, .{ .publication_capacity = receipt });
             }
-            try runExternalFanout(a, worker, record, self, .vote_capture, &slots, options);
+            try runExternalFanout(a, worker, authority, record, self, .vote_capture, &slots, options);
             record = try collectPublicationVotes(a, authority, record, options.external_deadline_ns);
             if (record.votes != record.mask()) return error.LogicalCaptureReceiptPending;
         }
@@ -1635,10 +1673,10 @@ const ExternalFanoutTask = struct {
         }
     }
 
-    fn run(worker: ParticipantWorker, record: ExternalRecord, preparation: ?*const ExternalPreparation, operation: Operation, index: usize, owner: transactions_mod.ExternalDecisionOwner, deadline: ?u64, slot: *Slot) void {
+    fn run(worker: ParticipantWorker, authority: ExternalAuthority, record: ExternalRecord, preparation: ?*const ExternalPreparation, operation: Operation, index: usize, owner: transactions_mod.ExternalDecisionOwner, deadline: ?u64, slot: *Slot) void {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        execute(arena.allocator(), worker, record, preparation, operation, index, owner, deadline) catch |err| {
+        execute(arena.allocator(), worker, authority, record, preparation, operation, index, owner, deadline) catch |err| {
             if (err == error.ExternalTransactionDecisionChanged) diagnoseDecisionFailure(operation);
             if (operation == .visibility and isTerminalVisibilityRepair(err)) {
                 slot.repair = true;
@@ -1649,7 +1687,7 @@ const ExternalFanoutTask = struct {
         slot.completed = true;
     }
 
-    fn execute(a: std.mem.Allocator, worker: ParticipantWorker, record: ExternalRecord, preparation: ?*const ExternalPreparation, operation: Operation, index: usize, owner: transactions_mod.ExternalDecisionOwner, deadline: ?u64) !void {
+    fn execute(a: std.mem.Allocator, worker: ParticipantWorker, authority: ExternalAuthority, record: ExternalRecord, preparation: ?*const ExternalPreparation, operation: Operation, index: usize, owner: transactions_mod.ExternalDecisionOwner, deadline: ?u64) !void {
         if (deadline) |limit| try ensureDecisionRecoveryDeadline(limit);
         // Explicit metadata retirement substitutes no native execution. Its
         // canonical lost-image proof was durably joined to this exact manifest.
@@ -1663,6 +1701,53 @@ const ExternalFanoutTask = struct {
             p.route.admission_relation_minter = captured.route.admission_relation_minter;
             p.route.admission_trigger_minter = captured.route.admission_trigger_minter;
             p.route.admission_sql_relation_owner = captured.route.admission_sql_relation_owner;
+        }
+        if (record.identity.history_completion) |admission| {
+            if (operation != .activate) {
+                const dispatch = authority.dispatch_history orelse return error.UnsupportedOperation;
+                const plan_index = for (admission.participants, 0..) |member, at| {
+                    if (member.routed_owner.?.group_id == p.route.route.group_id) break at;
+                } else return error.InvalidParticipant;
+                const member = admission.participants[plan_index];
+                var prepared_input: ?@import("antfly_local_sources").api_internal_batch.OwnedBatchRequest = null;
+                defer if (prepared_input) |*owned| owned.deinit(a);
+                var trigger_proof: ?[]const u8 = null;
+                defer if (trigger_proof) |proof| a.free(proof);
+                const request: db_mod.types.BatchRequest = switch (operation) {
+                    .begin => blk: {
+                        const plan = &preparation.?.history.?.plan;
+                        var batch = try plan.begin(plan_index);
+                        batch.timestamp_ns = plan.created_at_ns;
+                        batch.transaction.?.begin.external_decision_owner = owner;
+                        batch.transaction.?.begin.sql_locks = try p.lockReference(record.identity, a);
+                        batch.transaction.?.begin.document_revision_scope = if (preparation.?.participants.items[index].document_revision_handoff) |handoff| handoff.scope else null;
+                        break :blk batch;
+                    },
+                    .vote, .vote_ordinary, .vote_capture => blk: {
+                        const plan = &preparation.?.history.?.plan;
+                        prepared_input = try plan.prepare(a, plan_index);
+                        var batch = prepared_input.?.req;
+                        batch.transaction.?.prepare.external_decision_owner = owner;
+                        batch.transaction.?.prepare.document_revision_handoff = preparation.?.participants.items[index].document_revision_handoff;
+                        batch.transaction.?.prepare.publication_capture = try preparation.?.captureDemand(a, record, owner, index);
+                        if (batch.trigger_receipts.len != 0) {
+                            const minter = p.route.admission_trigger_minter orelse return error.SqlTriggerContextRequired;
+                            batch = try @import("antfly_local_sources").sql_catalog.trigger_native_admission.seal(a, minter, p.route.route.group_id, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)), batch);
+                            trigger_proof = batch.trigger_preparation_proof;
+                        }
+                        break :blk batch;
+                    },
+                    .resolve, .visibility => .{ .sync_level = if (operation == .visibility) record.decision.?.sync_level else .write, .transaction = .{ .resolve = .{
+                        .txn_id = record.identity.txn_id,
+                        .status = if (record.decision.?.status == .committed) .committed else .aborted,
+                        .commit_version = record.decision.?.version,
+                        .completion_owner = member.routed_owner,
+                        .external_decision_owner = owner,
+                    } } },
+                    else => unreachable,
+                };
+                return dispatch(authority.ptr, a, member, p, request, deadline);
+            }
         }
         switch (operation) {
             .begin => try worker.beginGroup(a, p.route.route.group_id, p.table_name, .{
@@ -1710,7 +1795,7 @@ const ExternalFanoutTask = struct {
     }
 };
 
-fn runExternalFanout(a: std.mem.Allocator, worker: ParticipantWorker, record: ExternalRecord, preparation: ?*const ExternalPreparation, operation: ExternalFanoutTask.Operation, slots: *[external_registry.max_participants]ExternalFanoutTask.Slot, options: ExecuteOptions) !void {
+fn runExternalFanout(a: std.mem.Allocator, worker: ParticipantWorker, authority: ExternalAuthority, record: ExternalRecord, preparation: ?*const ExternalPreparation, operation: ExternalFanoutTask.Operation, slots: *[external_registry.max_participants]ExternalFanoutTask.Slot, options: ExecuteOptions) !void {
     const owner = try record.identity.owner(a);
     for (slots) |*slot| slot.* = .{};
     const skip = switch (operation) {
@@ -1731,8 +1816,8 @@ fn runExternalFanout(a: std.mem.Allocator, worker: ParticipantWorker, record: Ex
         for (start..end) |i| {
             if (skip & (@as(u64, 1) << @intCast(i)) != 0) continue;
             if (options.fanout_io) |io| {
-                group.concurrent(io, ExternalFanoutTask.run, .{ worker, record, preparation, operation, i, owner, options.external_deadline_ns, &slots[i] }) catch ExternalFanoutTask.run(worker, record, preparation, operation, i, owner, options.external_deadline_ns, &slots[i]);
-            } else ExternalFanoutTask.run(worker, record, preparation, operation, i, owner, options.external_deadline_ns, &slots[i]);
+                group.concurrent(io, ExternalFanoutTask.run, .{ worker, authority, record, preparation, operation, i, owner, options.external_deadline_ns, &slots[i] }) catch ExternalFanoutTask.run(worker, authority, record, preparation, operation, i, owner, options.external_deadline_ns, &slots[i]);
+            } else ExternalFanoutTask.run(worker, authority, record, preparation, operation, i, owner, options.external_deadline_ns, &slots[i]);
         }
         if (options.fanout_io) |io| awaitFanout(&group, io);
     }
@@ -1809,6 +1894,36 @@ fn recoverCatalogQuantum(a: std.mem.Allocator, authority: ExternalAuthority, rec
     return .{ .record = next, .advanced = next.revision != record.revision };
 }
 
+fn releaseExternalHistory(a: std.mem.Allocator, authority: ExternalAuthority, record: ExternalRecord, owner: transactions_mod.ExternalDecisionOwner, deadline: ?u64) !ExternalRecord {
+    const admission = record.identity.history_completion orelse return error.InvalidCatalogRecord;
+    const certificate = record.history_certificate orelse return error.InvalidCatalogRecord;
+    const dispatch = authority.dispatch_history orelse return error.UnsupportedOperation;
+    var released: u64 = 0;
+    var remaining: u8 = 8;
+    for (record.participants, 0..) |part, index| {
+        const bit = @as(u64, 1) << @as(u6, @intCast(index));
+        if (record.history_released & bit != 0) continue;
+        const member = for (admission.participants) |member| {
+            if (member.routed_owner.?.group_id == part.route.route.group_id) break member;
+        } else return error.InvalidParticipant;
+        dispatch(authority.ptr, a, member, part, .{ .sync_level = .write, .transaction = .{
+            .publish_completion = .{
+                .txn_id = record.identity.txn_id,
+                .completion_owner = member.routed_owner.?,
+                .release = .{ .decision_owner = owner, .certificate_digest = certificate },
+            },
+        } }, deadline) catch |err| {
+            if (released == 0) return err;
+            break;
+        };
+        released |= bit;
+        remaining -= 1;
+        if (remaining == 0) break;
+    }
+    if (released == 0) return record;
+    return authority.advance(authority.ptr, a, record, .{ .history_released = released });
+}
+
 pub fn recoverExternalTransaction(a: std.mem.Allocator, worker: ParticipantWorker, authority: ExternalAuthority, operation_id: [16]u8, now_ns: u64, options: ExecuteOptions) !ExternalRecord {
     var record = (try authority.read(authority.ptr, a, operation_id)) orelse return error.SqlPreparedTransactionNotFound;
     try record.validate(a);
@@ -1845,7 +1960,7 @@ pub fn recoverExternalTransaction(a: std.mem.Allocator, worker: ParticipantWorke
             .decided, .active => {
                 const operation: ExternalFanoutTask.Operation = if (record.decision.?.status == .committed and record.phase == .decided) .activate else .resolve;
                 const failure: ?anyerror = failure: {
-                    runExternalFanout(a, worker, record, null, operation, &slots, options) catch |err| break :failure err;
+                    runExternalFanout(a, worker, authority, record, null, operation, &slots, options) catch |err| break :failure err;
                     break :failure null;
                 };
                 var completed: u64 = 0;
@@ -1872,7 +1987,7 @@ pub fn recoverExternalTransaction(a: std.mem.Allocator, worker: ParticipantWorke
                 }
                 if (record.visibility != record.visibilityMask()) {
                     const failure: ?anyerror = failure: {
-                        runExternalFanout(a, worker, record, null, .visibility, &slots, options) catch |err| break :failure err;
+                        runExternalFanout(a, worker, authority, record, null, .visibility, &slots, options) catch |err| break :failure err;
                         break :failure null;
                     };
                     var complete: u64 = 0;
@@ -1890,6 +2005,16 @@ pub fn recoverExternalTransaction(a: std.mem.Allocator, worker: ParticipantWorke
                 record = try collectPublicationTerminals(a, authority, record, options.external_deadline_ns);
                 if (record.publication_capacities.len != record.publication_terminals.len + record.publication_abort_fences.len)
                     return error.CatalogPublicationProofPending;
+                if (record.identity.history_completion != null and record.decision.?.status == .committed and record.history_certificate == null) {
+                    const publish = authority.publish_history orelse return error.UnsupportedOperation;
+                    const digest = (try publish(authority.ptr, a, record)) orelse return error.CatalogPublicationProofPending;
+                    record = try authority.advance(authority.ptr, a, record, .{ .history_published = digest });
+                    continue;
+                }
+                if (record.history_certificate != null and record.history_released != record.mask()) {
+                    record = try releaseExternalHistory(a, authority, record, owner, options.external_deadline_ns);
+                    continue;
+                }
                 // Every native image retains its own terminal custody until
                 // metadata has durably recorded resolution and lock release.
                 // Peer records have a local roster; the coordinator below has
@@ -10101,10 +10226,11 @@ fn qualifyNativeParticipantCapture(atomic: bool) !void {
     var catalog: Catalog = .{ .tables = .{.{ .table_id = 17, .name = "scratch", .sql_persistence = persistence }}, .ranges = .{.{ .group_id = 19, .table_id = 17, .start_key = "", .end_key = null }} };
     const a = std.testing.allocator;
     const writes = [_]db_mod.types.TransactionWrite{.{ .key = "key", .value = "{}" }};
-    var tables = [_]TableCommitRequest{.{ .table_name = "scratch", .sql_persistence = persistence, .writes = &writes }};
+    var tables = [_]TableCommitRequest{.{ .table_name = "scratch", .sql_persistence = persistence, .writes = &writes, .source_producer = .ordinary }};
     var captured = try ExternalPreparation.init(a, catalog.source(), &tables);
     defer captured.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), captured.manifest.len);
+    try std.testing.expect(!captured.intentAt(0).completion_ordinary_producer);
     try std.testing.expect(captured.manifest[0].route.route.execution == .native_local);
     try std.testing.expect(captured.manifest[0].route.route.execution.native_local.eql(persistence));
     const pin = captured.manifest[0].route.native_participant orelse return error.TestUnexpectedResult;

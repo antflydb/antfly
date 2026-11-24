@@ -31,6 +31,7 @@ pub fn main(init: std.process.Init) !void {
     if (!engine.enabled) return error.ProbeRequiresSharedStorage;
     const descriptor = engine.descriptorForValidation();
     engine.validateDescriptor(descriptor) catch |err| {
+        if (descriptor.version != engine.descriptor_version) return err;
         inline for (@typeInfo(engine.Descriptor).@"struct".field_names, @typeInfo(engine.Descriptor).@"struct".field_types) |field, T| {
             if (comptime T == @TypeOf(engine.table_layout)) {
                 const actual = @field(descriptor, field);
@@ -62,18 +63,30 @@ pub fn main(init: std.process.Init) !void {
         }
         return err;
     };
-    var incompatible = engine.descriptorForValidation().*;
-    incompatible.db_layout.size += 1;
-    engine.validateDescriptor(&incompatible) catch |err| {
-        if (err != error.UnsupportedVersion) return err;
-        try exerciseBorrowedRuntime(alloc, root, init.io);
-        return exercise(alloc, root, physical, init.io);
-    };
-    return error.AcceptedIncompatibleStorageLayout;
+    inline for (.{ "db_layout", "external_transaction_begin_layout", "external_transaction_resolution_layout", "completion_release_layout" }) |field| {
+        var incompatible = descriptor.*;
+        @field(incompatible, field).size += 1;
+        if (engine.validateDescriptor(&incompatible)) |_| {
+            return error.AcceptedIncompatibleStorageLayout;
+        } else |err| {
+            if (err != error.UnsupportedVersion) return err;
+        }
+    }
+    try exerciseBorrowedRuntime(alloc, root, init.io);
+    return exercise(alloc, root, physical, init.io);
 }
 fn exercise(alloc: std.mem.Allocator, root: []const u8, physical: []const u8, io: std.Io) !void {
     const db = try db_mod.DB.openOwned(alloc, physical, .{ .start_optional_runtimes = false, .start_index_workers = false });
     defer db.closeOwned();
+    {
+        var policy = retained: {
+            var lease = try db.beginQueryReadLease();
+            defer lease.release();
+            break :retained try lease.retainPolicy();
+        };
+        defer policy.release();
+        try policy.checkAt(0);
+    }
     try db.batch(.{ .writes = &.{.{ .key = "shared-row", .value = "{\"n\":1}" }}, .sync_level = .write });
     const value = (try db.get(alloc, "shared-row")) orelse return error.SharedStorageReadBackFailed;
     defer alloc.free(value);
@@ -101,7 +114,9 @@ fn exercise(alloc: std.mem.Allocator, root: []const u8, physical: []const u8, io
     if (try db.createDetachedEnrichmentRuntime(&runtime_options.enrichment.?)) |_| return error.SharedStorageInvalidBatchAccepted;
     const ReplayArgs = std.meta.ArgsTuple(@typeInfo(@FieldType(engine.VTable, "applyDerivedBatchToIndexAsync")).pointer.child);
     const replay_args: ReplayArgs = .{ db.async_context, .{}, .{ .name = "vector", .kind = .dense_vector }, .{} };
-    if (try engine.call("applyDerivedBatchToIndexAsync", replay_args)) return error.SharedStorageInvalidBatchAccepted;
+    if (engine.call("applyDerivedBatchToIndexAsync", replay_args)) |_| {
+        return error.SharedStorageInvalidBatchAccepted;
+    } else |err| if (err != error.DenseCatchUpSessionSuperseded) return error.SharedStorageErrorIdentityLost;
     const transaction = try db.beginTransaction(100);
     try db.writeTransaction(transaction, .{ .writes = &.{.{ .key = "transaction-row", .value = "{\"n\":3}" }} });
     try db.commitTransaction(transaction, 101);

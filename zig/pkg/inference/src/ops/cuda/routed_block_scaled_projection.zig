@@ -20,9 +20,13 @@ const Context = @import("context.zig").CudaContext;
 const embedded = @import("embedded_module.zig");
 const catalog = @import("../../tile/cuda_standalone.zig");
 const DeviceBuffer = buffer.DeviceBuffer;
-const Program = embedded.EmbeddedModule(embedded.profile(catalog.routed_block_scaled_projection).image, catalog.routed_block_scaled_projection_entries);
+const Program = embedded.EmbeddedModule(struct {
+    pub const image = embedded.profile(catalog.routed_block_scaled_projection).image;
+}, catalog.routed_block_scaled_projection_entries);
 
-const Matvec = embedded.EmbeddedModule(embedded.profile(catalog.routed_block_scaled_matvec).image, catalog.routed_block_scaled_matvec_entries);
+const Matvec = embedded.EmbeddedModule(struct {
+    pub const image = embedded.profile(catalog.routed_block_scaled_matvec).image;
+}, catalog.routed_block_scaled_matvec_entries);
 
 pub const Format = enum { nvfp4, mxfp8 };
 pub const ActivationPrecision = enum { block_scaled, bf16 };

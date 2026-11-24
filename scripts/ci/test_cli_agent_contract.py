@@ -222,6 +222,56 @@ def benchmark_scenarios():
     return scenarios
 
 
+def check_sync_publication_errors(binary):
+    with tempfile.TemporaryDirectory() as directory:
+        definition = Path(directory) / "trusted.json"
+        definition.write_text("{}")
+        for mode in ("--agent", "--no-agent"):
+            for source, code in (
+                ("fixture-durability-unknown.aflite", "DurabilityOutcomeUnknown"),
+                ("fixture-path-exists.aflite", "PathAlreadyExists"),
+                ("fixture-writer-locked.aflite", "WriterLocked"),
+                ("fixture-expansion-limit.aflite", "BackupExpansionLimitExceeded"),
+                ("fixture-receipt-missing.aflite", "SyncReceiptDeliveryFailed"),
+            ):
+                result, _ = invoke(
+                    binary,
+                    [
+                        mode,
+                        "sync",
+                        "--input",
+                        source,
+                        "--out",
+                        "next.aflite",
+                        "--definition",
+                        str(definition),
+                    ],
+                    environment(),
+                )
+                require(result.returncode != 0 and not result.stdout, str(result))
+                require(code.encode() in result.stderr, str(result.stderr))
+                if mode == "--agent":
+                    error = lines(result.stderr)[-1]["error"]
+                    require(error["code"] == code, str(error))
+                    if code == "DurabilityOutcomeUnknown":
+                        require(error["execution"] == "unconfirmed", str(error))
+                        require(error["category"] != "argument", str(error))
+                    if code == "SyncReceiptDeliveryFailed":
+                        require(error["execution"] == "complete", str(error))
+                        require(error["category"] == "delivery", str(error))
+                if code == "SyncReceiptDeliveryFailed":
+                    require(b"published --out" in result.stderr, str(result.stderr))
+                if code == "DurabilityOutcomeUnknown":
+                    require(
+                        b"may already have been published" in result.stderr,
+                        str(result.stderr),
+                    )
+                    require(
+                        b"Inspect --out before retrying" in result.stderr,
+                        str(result.stderr),
+                    )
+
+
 def check_review_regressions(binary):
     # Failures after submission must not acquire certainty from an error name
     # or from a legacy fatal() call. Every direct catalog route uses HTTP facts.
@@ -1031,6 +1081,7 @@ def run(binary):
                 for key in ("transaction_id", "mutation_outcome", "command_tag"):
                     require(controls[key] == payload[key], str(error))
 
+    check_sync_publication_errors(binary)
     check_review_regressions(binary)
 
     child = subprocess.Popen(

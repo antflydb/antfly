@@ -2656,7 +2656,10 @@ pub const ProvisionedKernelOwnerSource = struct {
             try request.validate(a);
             if (request.operation != .recover) return error.InvalidSourcePlanWire;
         } else try request.validate();
-        const expected = if (kind == .scope or kind == .producer_closure or kind == .legacy_terminal or kind == .legacy_inventory) request.owner else if (kind == .scope_outcome or kind == .retirement_outcome) request.command.intent.owner else request.source_owner;
+        var expected = if (kind == .scope or kind == .producer_closure or kind == .legacy_terminal or kind == .legacy_inventory) request.owner else if (kind == .scope_outcome or kind == .retirement_outcome) request.command.intent.owner else request.source_owner;
+        if (comptime kind == .checkpoint or kind == .retirement_outcome) {
+            expected.topology_epoch = fence.topology_epoch;
+        }
         const group = fence.route.group_id;
         if (expected.group_id != group) return error.TopologyChanged;
         const context = try platformDeadlineContext(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation });
@@ -2859,11 +2862,18 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (!std.mem.eql(u8, &namespace, &requested_namespace)) return error.HistoryResynchronizationRequired;
         const context = try platformDeadlineContext(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation });
         const opts: db_types.ScanOptions = .{ .execution_deadline_ns = context.deadline_ns, .cancellation = fence.admission_cancellation };
+        const requested_owner = if (comptime kind == .publication or kind == .admission or kind == .decision) routed: {
+            var current = request.owner;
+            if (comptime kind == .publication or kind == .decision) {
+                current.topology_epoch = fence.topology_epoch;
+            }
+            break :routed current;
+        } else {};
         var publication_descriptor: ?LoadedDescriptor = if (comptime kind == .publication or kind == .admission or kind == .decision) try self.loadCompletionDescriptor(alloc, group, table_name, context) else null;
         defer if (publication_descriptor) |*owned| owned.deinit(alloc);
         if (comptime kind == .publication or kind == .admission or kind == .decision) {
             try request.validate();
-            try @import("completion_owner_admission.zig").require(alloc, self.catalog, table_name, fence, publication_descriptor.?.view(), request.owner, context);
+            try @import("completion_owner_admission.zig").require(alloc, self.catalog, table_name, fence, publication_descriptor.?.view(), requested_owner, context);
         }
         try self.prepareRetainedScanRead(group, "", "", opts, .read_index);
         const proof = try capture(barrier.ptr, group);
@@ -2919,14 +2929,14 @@ pub const ProvisionedKernelOwnerSource = struct {
             .decision => try lease.owner().historyDecision(alloc, table_name, request),
         };
         errdefer if (comptime kind == .page or kind == .bootstrap or kind == .decision) result.deinit();
-        if (comptime kind == .publication or kind == .admission or kind == .decision) try @import("completion_owner_admission.zig").require(alloc, self.catalog, table_name, fence, publication_descriptor.?.view(), request.owner, context);
+        if (comptime kind == .publication or kind == .admission or kind == .decision) try @import("completion_owner_admission.zig").require(alloc, self.catalog, table_name, fence, publication_descriptor.?.view(), requested_owner, context);
         try validate(barrier.ptr, group, proof, context.deadline_ns, fence.admission_cancellation);
         try self.validateRoutedRead(alloc, fence, group, table_name);
         // Preserve the actual persisted native cut. Quorum progress is a
         // separate proof and must never be relabelled as a native mutation.
         // Return only after every final owner and quorum fence passes.
         if (comptime kind == .resolution) return table_write_source.history_resolution_wire.Reply.init(request, result.cut, result.resolution);
-        if (comptime kind == .publication) return completion_history.CompletionPublicationObservation.init(request, result.cut, result.publication);
+        if (comptime kind == .publication) return completion_history.CompletionPublicationObservation.initWithRelease(request, result.cut, result.publication, result.release);
         return result;
     }
 
@@ -3518,6 +3528,53 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer descriptor.deinit(self.alloc);
         var lease = try self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, descriptor.view(), false, .resident, descriptor.readControls(.{}));
         defer lease.deinit();
+    }
+
+    /// Capture the donor's physical descriptor for a private Raft cleanup.
+    /// The source command's exact retention scope is checked at ordered apply.
+    pub fn loadOnlineMergeMaintenanceDescriptor(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        scope: @import("antfly_local_sources").storage_db_online_source_contract.Scope,
+    ) !LoadedDescriptor {
+        try scope.validate();
+        if (scope.authority != .raft or scope.fence.owner_group_id != group_id) return error.OnlineSourceScopeChanged;
+        var lease = self.acquirePreparedOwner(group_id, table_name) catch |err| switch (err) {
+            error.StorageOwnerAdmissionPending => return error.StorageReadTemporarilyUnavailable,
+            else => return err,
+        };
+        defer lease.deinit();
+        const entry = lease.entry;
+        const namespace = scope.fence.namespace;
+        if (entry.identity.table_id != namespace.table_id or entry.identity.shard_id != namespace.shard_id or entry.identity.range_id != namespace.range_id)
+            return error.OnlineSourceScopeChanged;
+        const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
+        errdefer alloc.free(path);
+        const schema_json = try alloc.dupe(u8, entry.schema_json);
+        errdefer alloc.free(schema_json);
+        const indexes_json = try alloc.dupe(u8, entry.indexes_json);
+        errdefer alloc.free(indexes_json);
+        const initial_range = try descriptor_contract.cloneInitialRange(alloc, entry.initial_range);
+        errdefer descriptor_contract.freeInitialRange(alloc, initial_range);
+        const restore = if (entry.restore) |value| try value.clone(alloc) else null;
+        errdefer if (restore) |value| {
+            var owned = value;
+            owned.deinit(alloc);
+        };
+        const bootstrap = if (entry.initial_child_bootstrap_json.len == 0) null else try alloc.dupe(u8, entry.initial_child_bootstrap_json);
+        return .{
+            .path = path,
+            .schema_json = schema_json,
+            .indexes_json = indexes_json,
+            .table_storage = entry.table_storage,
+            .generation = entry.generation,
+            .initial_range = initial_range,
+            .identity = entry.identity,
+            .restore = restore,
+            .initial_child_bootstrap_json = bootstrap,
+        };
     }
 
     /// Apply the latest catalog schema/index contract to the already-resident

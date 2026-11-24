@@ -2717,6 +2717,7 @@ pub const MetadataServiceConfig = struct {
     internal_service_issuer: ?[]const u8 = null,
     setting_authority_secret: ?[]const u8 = null,
     setting_authority_issuer: ?[]const u8 = null,
+    cdc_payload_store: ?@import("../api/source_payload_retention.zig").Store = null,
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     reallocation_protocol_peers: []const ReallocationProtocolPeer = &.{},
 };
@@ -2952,6 +2953,15 @@ pub fn compareAndSetOnlineMerge(service: anytype, previous: @import("online_merg
     defer arena.deinit();
     const request: api_operation.RequestContext = .{ .deadline_ns = platform_time.monotonicNs() + 2 * std.time.ns_per_s };
     const context = try onlineMergeContext(service, arena.allocator(), previous, request);
+    if (comptime @TypeOf(service) == *MetadataHttpService) {
+        if (previous.phase == .tail and next.phase == .freeze and
+            !try service.prepareOnlineMergeSourceCheckpoints(arena.allocator(), context.record, request)) return false;
+        if (previous.phase == .cutover and next.phase == .release) {
+            const store = service.projectedStore() orelse return error.MissingMetadataStore;
+            if ((try store.sourceCheckpointActors(service.metadata_group_id, context.record.donor_group_id, null)).len != 0)
+                _ = try service.ensureTableTopologyProtocolReadyWithContext(request, metadata_topology_protocol.source_successor_retirement_guard_version);
+        }
+    }
     const proposal = try service.proposeTransitionCommandWithReceipt(.{ .compare_and_set_online_merge = .{
         .expected = previous,
         .next = next,
@@ -3831,12 +3841,15 @@ pub fn transitionRequiredCoordinatedDecoderVersion(a: std.mem.Allocator, command
             };
             // SQL catalog envelopes can carry an operation-specific command
             // without a generic resource mutation.
-            const Header = struct { mutation: ?Mutation = null };
+            const Header = struct { mutation: ?Mutation = null, topology: ?CatalogTopologyFeatures = null };
             var parsed = std.json.parseFromSlice(Header, a, bytes, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return metadata_topology_protocol.current_version,
             };
             defer parsed.deinit();
+            if (parsed.value.topology) |topology| if (topology.create) |create| {
+                required = @max(required, try tableDecoderVersion(a, create.table));
+            };
             if (parsed.value.mutation) |mutation| {
                 if (mutation.expected_parent_id != null) required = @max(required, metadata_topology_protocol.bound_create_parent_version);
                 if (mutation.expected_incarnation != null) required = @max(required, metadata_topology_protocol.bound_catalog_incarnation_version);
@@ -3911,9 +3924,22 @@ pub fn transitionRequiredCoordinatedDecoderVersion(a: std.mem.Allocator, command
     return required;
 }
 
+// Decode only table features relevant to admission. Field types come from the
+// durable record; unrelated schema/placement payloads remain unmaterialized.
+// Both native table commands and catalog envelopes use tableDecoderVersion.
+const TableDecoderFeatures = struct {
+    indexes_json: @FieldType(metadata_table_manager.TableRecord, "indexes_json") = "{}",
+    storage: @FieldType(metadata_table_manager.TableRecord, "storage") = .{},
+    lake_index_catalog_json: @FieldType(metadata_table_manager.TableRecord, "lake_index_catalog_json") = "",
+    schema_reader_requirements: @FieldType(metadata_table_manager.TableRecord, "schema_reader_requirements") = null,
+};
+const CatalogTopologyFeatures = struct {
+    create: ?struct { table: TableDecoderFeatures } = null,
+};
+
 // Table features compose: adding a lower-floor feature must never mask a
 // higher decoder requirement, including the prior definition in a CAS.
-fn tableDecoderVersion(a: std.mem.Allocator, table: metadata_table_manager.TableRecord) !u16 {
+fn tableDecoderVersion(a: std.mem.Allocator, table: anytype) !u16 {
     var required: u16 = 0;
     required = @max(required, try metadata_topology_protocol.indexAliasDecoderVersion(a, table.indexes_json, false));
     if (table.storage.engine == .object) required = @max(required, metadata_topology_protocol.object_table_engine_version);
@@ -3949,9 +3975,28 @@ test "relation mutation admission requires guarded plan decoders only for incarn
 test "index alias decoder floor composes with table features and preserves CAS history" {
     const aliases: metadata_table_manager.TableRecord = .{ .table_id = 1, .name = "docs", .indexes_json = "{\"_index_aliases\":{},\"_privacy\":{}}", .storage = .{ .engine = .object }, .lake_index_catalog_json = "{}" };
     const plain: metadata_table_manager.TableRecord = .{ .table_id = 1, .name = "docs" };
-    const floor = metadata_topology_protocol.index_aliases_version;
+    const floor = @max(metadata_topology_protocol.index_aliases_version, metadata_topology_protocol.privacy_version, metadata_topology_protocol.object_table_engine_version, metadata_topology_protocol.lake_index_catalog_version);
+    const cases = [_]struct { table: metadata_table_manager.TableRecord, floor: u16 }{
+        .{ .table = .{ .table_id = 1, .name = "docs", .indexes_json = "{\"_index_aliases\":{}}" }, .floor = metadata_topology_protocol.index_aliases_version },
+        .{ .table = .{ .table_id = 1, .name = "docs", .indexes_json = "{\"_privacy\":{}}" }, .floor = metadata_topology_protocol.privacy_version },
+        .{ .table = .{ .table_id = 1, .name = "docs", .storage = .{ .engine = .object } }, .floor = metadata_topology_protocol.object_table_engine_version },
+        .{ .table = .{ .table_id = 1, .name = "docs", .lake_index_catalog_json = "{}" }, .floor = metadata_topology_protocol.lake_index_catalog_version },
+        .{ .table = aliases, .floor = floor },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.floor, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .upsert_table = case.table }));
+        try std.testing.expectEqual(case.floor, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .compare_and_replace_table = .{ .expected = case.table, .replacement = plain } }));
+        const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .mutation = .{ .kind = "table" }, .topology = .{ .create = .{ .table = case.table } } }, .{});
+        defer std.testing.allocator.free(encoded);
+        try std.testing.expectEqual(case.floor, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_system_catalog = encoded }));
+    }
     try std.testing.expectEqual(floor, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .upsert_table = aliases })));
-    const envelope = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .topology = .{ .create = .{ .table = aliases } } }, .{});
+    // Malformed mutation headers retain fail-closed admission even when the
+    // surrounding topology contains recognizable lower-floor table features.
+    const invalid_envelope = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .mutation = .{ .kind = "not_a_kind" }, .topology = .{ .create = .{ .table = aliases } } }, .{});
+    defer std.testing.allocator.free(invalid_envelope);
+    try std.testing.expectEqual(metadata_topology_protocol.current_version, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_system_catalog = invalid_envelope }));
+    const envelope = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .mutation = .{ .kind = "table" }, .topology = .{ .create = .{ .table = aliases } } }, .{});
     defer std.testing.allocator.free(envelope);
     try std.testing.expectEqual(floor, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_system_catalog = envelope })));
     try std.testing.expectEqual(floor, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .compare_and_replace_table = .{ .expected = aliases, .replacement = plain } })));
@@ -4918,6 +4963,7 @@ pub fn ensureSqlPreparedPublicationCapabilityWithContext(service: anytype, conte
         .cancel_admission => |canceled| @max(minimum, canceled.original.identity.minimumDecoderVersion()),
         .advance => |advance| switch (advance.action) {
             .catalog_complete => metadata_topology_protocol.sql_catalog_completion_version,
+            .history_published, .history_released => metadata_topology_protocol.sql_external_completion_version,
             .publication_capacity, .publication_vote, .publication_terminal, .publication_abort_fence => publisher,
             .commit => |decision| if (decision.commit_time_unix_us != null) publisher else minimum,
             else => minimum,
@@ -4980,26 +5026,40 @@ pub fn ensureQueryPopulationCapabilityWithContext(service: anytype, context: api
     try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_population_version);
 }
 
-pub fn ensureRestoreStagingDecoderWithContext(service: anytype, command_json: []const u8, context: api_operation.RequestContext) !void {
+fn restoreActionRequiresSourceGuard(action: @import("restore_staging.zig").Command.Action) bool {
+    return switch (action) {
+        .reserve, .freeze_rewrite, .begin_cutover, .begin_activation, .publish => true,
+        else => false,
+    };
+}
+
+pub fn ensureRestoreStagingDecoderWithContext(service: anytype, action: @import("restore_staging.zig").Command.Action, command_json: []const u8, context: api_operation.RequestContext) !void {
+    const guards_replacement = restoreActionRequiresSourceGuard(action);
     const command: metadata_storage.TransitionCommand = .{ .apply_restore_staging = command_json };
-    if (!@import("schema_reader_wire.zig").requiresRestoreReservationOutcome(command_json))
-        return ensureCoordinatedDecoderWithContext(service, command, context);
-    try context.ensureActive();
-    try metadata_storage.raft_apply_store.validateTransitionCommandSchemaReaderRequirements(command);
-    // Receipt-bearing restore commands check the committed barrier during
-    // apply. A successful decoder probe alone cannot authorize an append.
-    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.restore_reservation_outcome_version);
+    if (@import("schema_reader_wire.zig").requiresRestoreReservationOutcome(command_json)) {
+        try context.ensureActive();
+        try metadata_storage.raft_apply_store.validateTransitionCommandSchemaReaderRequirements(command);
+        return ensureDurableDecoderActivation(service, context, if (guards_replacement)
+            metadata_topology_protocol.source_restore_guard_version
+        else
+            metadata_topology_protocol.restore_reservation_outcome_version);
+    }
+    if (guards_replacement) try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.source_restore_guard_version);
+    return ensureCoordinatedDecoderWithContext(service, command, context);
 }
 
 pub fn ensureCatalogAtomicAdmissionDecoderWithContext(service: anytype, context: api_operation.RequestContext) !void {
     try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_catalog_atomic_admission_version);
 }
 
-pub fn ensureCatalogRestoreDecoderWithContext(service: anytype, context: api_operation.RequestContext, progress: bool) !void {
-    return ensureDurableDecoderActivation(service, context, if (progress)
-        metadata_topology_protocol.sql_catalog_progress_version
+pub fn ensureCatalogRestoreDecoderWithContext(service: anytype, context: api_operation.RequestContext, progress: ?@import("restore_staging.zig").Command.Action) !void {
+    // An already-admitted restore must continue to record receipts and cancel
+    // while a rolling upgrade is still installing the replacement guard.
+    const required = if (restoreActionRequiresSourceGuard(progress orelse .reserve))
+        metadata_topology_protocol.source_restore_guard_version
     else
-        metadata_topology_protocol.sql_catalog_reservation_version);
+        metadata_topology_protocol.sql_catalog_progress_version;
+    return ensureDurableDecoderActivation(service, context, required);
 }
 
 /// Capability observation alone does not install the apply-side barrier. Own
@@ -10335,6 +10395,7 @@ pub const MetadataHttpService = struct {
     internal_service_issuer: ?[]const u8 = null,
     setting_authority_secret: ?[]const u8 = null,
     setting_authority_issuer: ?[]const u8 = null,
+    cdc_payload_store: ?@import("../api/source_payload_retention.zig").Store = null,
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     backend_runtime_mutex: std.Io.Mutex = .init,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
@@ -10351,6 +10412,10 @@ pub const MetadataHttpService = struct {
         deps: MetadataHttpServiceDeps,
         cfg: MetadataServiceConfig,
     ) !MetadataHttpService {
+        if (cfg.cdc_payload_store) |store| {
+            if (!@import("../api/source_payload_retention.zig").supportsRetention(store))
+                return error.SourcePayloadStorageUnavailable;
+        }
         const metadata_group_id = host_cfg.http.host.metadata_group_id orelse return error.MissingMetadataGroupId;
         var owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null;
         errdefer if (owned_backend_runtime) |*runtime| runtime.deinit();
@@ -10401,6 +10466,7 @@ pub const MetadataHttpService = struct {
             .setting_authority_secret = cfg.setting_authority_secret,
             .setting_authority_issuer = cfg.setting_authority_issuer,
             .destination_authorizer = cfg.destination_authorizer,
+            .cdc_payload_store = cfg.cdc_payload_store,
             .linearizable_read_tracker = read_tracker,
             .raft = try raft_service.ManagedHttpHostService.init(alloc, host_cfg, http_deps, cfg.raft, deps.raft),
         };
@@ -12157,10 +12223,11 @@ pub const MetadataHttpService = struct {
             .issuer = self.internal_service_issuer,
             .provision_policy = true,
         };
-        const admission = hosted.sourceAdmission();
+        var admission = hosted.sourceAdmission();
+        admission.retained_payload_store = self.cdc_payload_store;
         const completion = @import("../api/source_destination_completion.zig");
         if (state.artifact_control.?.current) |artifact| {
-            try completion.recover(self, admission, a, scope, catalog_digest, context);
+            try completion.recover(self, admission, a, state, catalog_digest, context);
             if (artifact.phase != .reserved) return false;
         }
         var snapshot = try @import("source_scope_capture.zig").readOnService(self, a, .{
@@ -12249,7 +12316,8 @@ pub const MetadataHttpService = struct {
 
     pub fn admitFreshNativeReplicationBootstrap(self: *MetadataHttpService, deadline_ns: ?u64) !void {
         try ensureCdcWorkPermit(self);
-        _ = try self.ensureTableTopologyProtocolReadyWithContext(.{ .deadline_ns = deadline_ns }, @import("source_control.zig").scoped_snapshot_protocol_version);
+        if (self.cdc_payload_store == null) return error.SourcePayloadStorageUnavailable;
+        _ = try self.ensureTableTopologyProtocolReadyWithContext(.{ .deadline_ns = deadline_ns }, @import("source_control.zig").payload_prewrite_protocol_version);
     }
 
     pub fn commitNativeReplicationSnapshotPage(
@@ -12411,6 +12479,8 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn beginLegacyReplicationHandover(self: *MetadataHttpService, a: std.mem.Allocator, tables: []const metadata_table_manager.TableRecord, index_allocator: std.mem.Allocator, producer_counts: *?@import("source_control.zig").ProducerCounts, table: metadata_table_manager.TableRecord, record: metadata_table_manager.ReplicationSourceStatusRecord, deadline_ns: ?u64) !bool {
+        // Keep the legacy writer eligible until its successor can retain a plan.
+        if (self.cdc_payload_store == null) return false;
         if (!try metadata_replication_backfill.legacyHandoverEligible(a, table, record, self.destination_authorizer)) return false;
         const control = @import("source_control.zig");
         const context: api_operation.RequestContext = .{ .deadline_ns = deadline_ns };
@@ -12418,7 +12488,7 @@ pub const MetadataHttpService = struct {
         if (producer_counts.* == null)
             producer_counts.* = try control.nativeProducerCounts(index_allocator, a, tables, context);
         if (producer_counts.*.?.get(table.name) != 1) return false;
-        _ = try self.ensureTableTopologyProtocolReadyWithContext(context, control.scoped_stream_lifecycle_protocol_version);
+        _ = try self.ensureTableTopologyProtocolReadyWithContext(context, control.payload_prewrite_protocol_version);
         try self.advanceNativeReplicationActor(a, table, record, control.legacyHandoverCheckpoint(record).?, context);
         return true;
     }
@@ -12642,7 +12712,14 @@ pub const MetadataHttpService = struct {
                     .version = 1,
                     .expected_table_binding = binding,
                 }, context);
-                found_checkpoint = found_checkpoint or std.meta.eql(captured.owner, authority.owner);
+                if (std.mem.eql(u8, name, authority.table_name)) {
+                    if (authority.requireOwner(captured.owner)) |_| {
+                        found_checkpoint = true;
+                    } else |err| switch (err) {
+                        error.SourceBindingConflict => {},
+                        else => return err,
+                    }
+                }
                 if (sealed) try roots.append(scratch, .{ .name = name, .fence = fence, .owner = captured.owner });
             }
         }
@@ -12699,36 +12776,223 @@ pub const MetadataHttpService = struct {
             .secret = self.internal_service_secret,
             .issuer = self.internal_service_issuer,
         };
-        const raw = try control.readOnService(self, a, scope.table_id, scope.source_id, context);
+        // The worker's ReadIndex above covers both the scope lookup and this
+        // state read. Revalidate binding here and revision on every mutation.
+        try context.ensureActive();
+        const raw = try store.getSourceControl(a, self.metadata_group_id, scope.table_id, scope.source_id);
         defer a.free(raw);
         var state = try control.parse(a, raw);
         defer state.deinit();
         if (!std.meta.eql(state.value.scope, @as(?control.Scope, scope)) or !state.value.scope_fencing)
             return error.SourceBindingConflict;
-        const admission = hosted.sourceAdmission();
-        if (state.value.artifact_control.?.current) |record| {
+        const work = try scopedWorkContext(context);
+        self.advanceScopedReplicationSource(a, runner, table, ordinal, state.value, catalog, &hosted, work) catch |err| {
+            self.recordScopedStreamError(a, table, state.value, err, context) catch |report_err|
+                std.log.debug("scoped CDC health update deferred table={s} err={s}", .{ table.name, @errorName(report_err) });
+            return err;
+        };
+    }
+
+    fn prepareOnlineMergeSourceCheckpoints(self: *MetadataHttpService, a: std.mem.Allocator, merge: transition_state.MergeTransitionRecord, context: api_operation.RequestContext) !bool {
+        const control = @import("source_control.zig");
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        var after: ?metadata_storage.raft_apply_store.RaftApplyStore.SourceCheckpointActor = null;
+        while (true) {
+            try context.ensureActive();
+            const page = try store.sourceCheckpointActorsFiltered(self.metadata_group_id, merge.donor_group_id, after, true);
+            for (page.items()) |actor| {
+                var scratch = std.heap.ArenaAllocator.init(a);
+                defer scratch.deinit();
+                const temporary = scratch.allocator();
+                const raw = try store.getSourceControl(temporary, self.metadata_group_id, actor.table_id, actor.source_id);
+                const state = (try control.parse(temporary, raw)).value;
+                const authority = state.checkpoint_authority orelse return error.SourceBindingConflict;
+                if (authority.owner.group_id != merge.donor_group_id) return false;
+                if (state.checkpoint_transfer_target) |target| {
+                    if (target.owner.group_id != merge.receiver_group_id or state.checkpoint_transfer_merge_id != merge.transition_id) return error.SourceBindingConflict;
+                    if (state.checkpoint_preparation == null) return false;
+                    continue;
+                }
+                _ = try self.ensureTableTopologyProtocolReadyWithContext(context, metadata_topology_protocol.source_successor_retirement_guard_version);
+                const binding = state.scope orelse return error.SourceBindingConflict;
+                const table = (try store.getTable(temporary, self.metadata_group_id, actor.table_id)) orelse return error.SourceBindingConflict;
+                const catalog = api_table_catalog.CatalogSource.fromMetadataHttpService(self);
+                var router = api_table_router.CatalogBackedGroupRouter.init(catalog, 0);
+                var hosted: @import("../api/hosted_completion.zig").Hosted = .{
+                    .catalog = catalog,
+                    .router = router.router(),
+                    .executor = self.raft.host.http_host.request_executor,
+                    .secret = self.internal_service_secret,
+                    .issuer = self.internal_service_issuer,
+                    .provision_policy = true,
+                };
+                var routing = (try api_table_catalog.authoritativeTableRoutingSnapshot(temporary, catalog, authority.table_name, context.deadline_ns)) orelse return error.TopologyChanged;
+                defer routing.deinit(temporary);
+                const receiver = for (routing.ranges) |range| {
+                    if (range.group_id == merge.receiver_group_id) break range;
+                } else return error.TopologyChanged;
+                const route = routing.resolveRouteForKey(receiver.start_key) orelse return error.TopologyChanged;
+                const current = (try hosted.coordinator().owners.read(
+                    temporary,
+                    routing.fenceForRoute(route),
+                    authority.table_name,
+                    .{ .version = 1, .expected_table_binding = authority.owner.table_binding },
+                    context,
+                )).owner;
+                var target = authority;
+                target.owner = current;
+                try control.mutateOnService(self, temporary, .{
+                    .table_id = actor.table_id,
+                    .source_id = actor.source_id,
+                    .expected_revision = state.revision,
+                    .expected_binding = binding.identity(),
+                    .expected_catalog_digest = control.digest(table.replication_sources_json),
+                    .mutation = .{ .begin_checkpoint_transfer = .{ .target = target, .online_merge_id = merge.transition_id } },
+                }, context);
+                return false;
+            }
+            if (page.len < page.actors.len) return true;
+            after = page.items()[page.len - 1];
+        }
+    }
+
+    fn advanceCheckpointOwnership(self: *MetadataHttpService, a: std.mem.Allocator, state: @import("source_control.zig").State, catalog_digest: [32]u8, catalog: api_table_catalog.CatalogSource, admission: @import("../api/source_destination_admission.zig").Admission, context: api_operation.RequestContext) !void {
+        const control = @import("source_control.zig");
+        const native = @import("antfly_local_sources").storage_source_scope_control;
+        const scope = state.scope orelse return error.SourceBindingConflict;
+        const donor = state.checkpoint_authority orelse return error.SourceBindingConflict;
+        const target = state.checkpoint_transfer_target orelse return error.SourceBindingConflict;
+        if (!state.checkpointTransferDrained()) return error.SourcePendingWork;
+        _ = try self.ensureTableTopologyProtocolReadyWithContext(context, metadata_topology_protocol.source_successor_retirement_guard_version);
+        var snapshot = try @import("source_scope_capture.zig").readOnService(self, a, .{
+            .metadata_group_id = donor.owner.metadata_group_id,
+            .metadata_incarnation = donor.owner.metadata_incarnation,
+            .actor_table_id = scope.table_id,
+            .source_id = scope.source_id,
+            .minimum_applied_index = 1,
+        }, context);
+        defer snapshot.deinit(a);
+        if (snapshot.actor_revision != state.revision) return error.SourcePendingWork;
+
+        const authority = if (state.checkpoint_preparation == null) donor else target;
+        var routing = (try api_table_catalog.authoritativeTableRoutingSnapshot(a, catalog, authority.table_name, context.deadline_ns)) orelse return error.TopologyChanged;
+        defer routing.deinit(a);
+        if (state.checkpoint_preparation != null) {
+            // Preparation hands publication back to the merge driver. The
+            // source worker resumes after the donor route disappears.
+            for (routing.ranges) |range| {
+                if (range.group_id == donor.owner.group_id) return;
+            }
+        }
+        const owner_range = for (routing.ranges) |range| {
+            if (range.group_id == authority.owner.group_id) break range;
+        } else return error.TopologyChanged;
+        const route = routing.resolveRouteForKey(owner_range.start_key) orelse return error.TopologyChanged;
+        const fence = routing.fenceForRoute(route);
+        const owner = (admission.coordinator.owners.read(a, fence, authority.table_name, .{
+            .version = 1,
+            .expected_table_binding = authority.owner.table_binding,
+        }, context) catch |err| {
+            std.log.debug("source checkpoint owner observation failed table={s} group={d} installing={} err={s}", .{ authority.table_name, authority.owner.group_id, state.checkpoint_preparation != null, @errorName(err) });
+            return err;
+        }).owner;
+        try authority.requireOwner(owner);
+        var intent: native.Intent = .{
+            .version = 1,
+            .owner = owner,
+            .spec = snapshot.spec,
+            .minimum_metadata_index = snapshot.cut.index,
+            .action = .close_checkpoint,
+        };
+        const mutation: control.Mutation = if (state.checkpoint_preparation) |prepared| adopt: {
+            var successor = target;
+            successor.owner = owner;
+            if (!target.samePhysicalAuthority(successor)) return error.TopologyChanged;
+            intent.spec.checkpoint_owner = try native.scope.Basis.fromOwner(owner);
+            intent.action = .{ .install_checkpoint = prepared.transfer };
+            const receipt = admission.installCheckpoint(a, fence, target.table_name, intent, context) catch |err| {
+                std.log.debug("source checkpoint install failed table={s} group={d} err={s}", .{ target.table_name, owner.group_id, @errorName(err) });
+                return err;
+            };
+            const adoption: control.checkpoint_authority.Adoption = .{
+                .previous = donor.digest(),
+                .successor = successor,
+                .transfer = prepared.transfer,
+                .installed = receipt,
+            };
+            try adoption.requireTransfer(a, donor);
+            break :adopt .{ .adopt_checkpoint_successor = adoption };
+        } else prepare: {
+            try admission.requireScope(a, fence, donor.table_name, intent, context);
+            const reads = admission.scope_reads orelse return error.ChangefeedCapabilityUnsupported;
+            const query: native.Query = .{
+                .version = 1,
+                .owner = owner,
+                .domain = intent.spec.domain(),
+                .minimum_applied_index = 1,
+                .checkpoint_evidence = .donor,
+            };
+            const observed = try reads.read(a, fence, donor.table_name, query, context);
+            try observed.validate(query);
+            break :prepare .{ .prepare_checkpoint_successor = .{ .successor = target, .transfer = observed.checkpoint_donor.? } };
+        };
+        try control.mutateOnService(self, a, .{
+            .table_id = scope.table_id,
+            .source_id = scope.source_id,
+            .expected_revision = state.revision,
+            .expected_binding = scope.identity(),
+            .expected_catalog_digest = catalog_digest,
+            .mutation = mutation,
+        }, context);
+    }
+
+    fn advanceScopedReplicationSource(self: *MetadataHttpService, a: std.mem.Allocator, runner: *metadata_replication_backfill.StreamingReplicationRunner, table: metadata_table_manager.TableRecord, ordinal: u32, state: @import("source_control.zig").State, catalog: api_table_catalog.CatalogSource, hosted: *@import("../api/hosted_completion.zig").Hosted, context: api_operation.RequestContext) !void {
+        const control = @import("source_control.zig");
+        const scope = state.scope orelse return error.SourceBindingConflict;
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        var admission = hosted.sourceAdmission();
+        admission.retained_payload_store = self.cdc_payload_store;
+        if (state.payload_prewrite != null) {
             try ensureCdcWorkPermit(self);
-            try @import("../api/source_destination_completion.zig").recover(self, admission, a, scope, control.digest(table.replication_sources_json), context);
-            if (record.phase != .reserved or state.value.closing) return;
+            return @import("../api/source_destination_completion.zig").recoverPayloadPrewrite(
+                self,
+                self.cdc_payload_store,
+                a,
+                state,
+                control.digest(table.replication_sources_json),
+                context,
+            );
+        }
+        if (state.artifact_control.?.current) |record| {
+            try ensureCdcWorkPermit(self);
+            try @import("../api/source_destination_completion.zig").recover(self, admission, a, state, control.digest(table.replication_sources_json), context);
+            if (record.phase != .reserved or state.closing or state.checkpoint_transfer_target != null) return;
             const after = try control.readOnService(self, a, scope.table_id, scope.source_id, context);
             defer a.free(after);
             var latest = try control.parse(a, after);
             defer latest.deinit();
-            if (latest.value.revision != state.value.revision) return;
-        } else if (state.value.pending != null or state.value.outstanding.len != 0) return;
-        if (state.value.closing) {
-            try self.retireNativeReplicationSourceRoots(a, catalog, admission, table, state.value, context);
+            if (latest.value.revision != state.revision) return;
+        } else if (state.pending != null and state.closing and state.pending_no_admission_receipt != null) {
+            return @import("../api/source_destination_completion.zig").recover(self, admission, a, state, control.digest(table.replication_sources_json), context);
+        } else if ((state.pending != null and state.pending_no_admission_receipt == null) or
+            state.outstanding.len != 0) return;
+        if (state.closing) {
+            try self.retireNativeReplicationSourceRoots(a, catalog, admission, table, state, context);
             return;
+        }
+        if (state.checkpoint_transfer_target != null) {
+            try ensureCdcWorkPermit(self);
+            return self.advanceCheckpointOwnership(a, state, control.digest(table.replication_sources_json), catalog, admission, context);
         }
         const source_status = (try store.getReplicationSourceStatus(a, self.metadata_group_id, scope.table_id, ordinal)) orelse return;
         defer metadata_table_manager.freeReplicationSourceStatus(a, source_status);
         try ensureCdcWorkPermit(self);
-        if (state.value.native_bootstrap_checkpoint != null and state.value.accepted.sequence == 0) {
+        if (state.native_bootstrap_checkpoint != null and state.accepted.sequence == 0) {
             try self.ensureLinearizableReadWithContext(context);
-            if (!try store.nativeRootProducerCohortReady(a, self.metadata_group_id, state.value.checkpoint_authority.?.table_name))
+            if (!try store.nativeRootProducerCohortReady(a, self.metadata_group_id, state.checkpoint_authority.?.table_name))
                 return error.SourcePendingWork;
         }
-        if (state.value.native_bootstrap_checkpoint == null and
+        if (state.native_bootstrap_checkpoint == null and
             std.mem.eql(u8, source_status.phase, control.native_bootstrap_prepared_phase))
         {
             if (!std.meta.eql(scope.provider, try control.nativeSourceProviderBinding(source_status)))
@@ -12736,14 +13000,14 @@ pub const MetadataHttpService = struct {
             return control.mutateOnService(self, a, .{
                 .table_id = scope.table_id,
                 .source_id = scope.source_id,
-                .expected_revision = state.value.revision,
+                .expected_revision = state.revision,
                 .expected_binding = scope.identity(),
                 .expected_catalog_digest = control.digest(table.replication_sources_json),
                 .mutation = .{ .certify_native_bootstrap = source_status.prepared_checkpoint },
             }, context);
         }
-        var snapshot = if (state.value.native_bootstrap_checkpoint != null) blk: {
-            const authority = state.value.checkpoint_authority.?;
+        var snapshot = if (state.native_bootstrap_checkpoint != null) blk: {
+            const authority = state.checkpoint_authority.?;
             break :blk try @import("source_scope_capture.zig").readOnService(self, a, .{
                 .metadata_group_id = authority.owner.metadata_group_id,
                 .metadata_incarnation = authority.owner.metadata_incarnation,
@@ -12753,21 +13017,12 @@ pub const MetadataHttpService = struct {
             }, context);
         } else null;
         defer if (snapshot) |*captured| captured.deinit(a);
-        if (state.value.stream_failure) |failure| if (failure.terminal) return;
-        runner.stageScopedStream(self, admission, table, source_status, state.value, snapshot, context) catch |err| {
-            if (metadata_replication_backfill.replicationErrorEndsRound(err)) return err;
-            const terminal = std.mem.eql(u8, metadata_replication_backfill.classifyReplicationError(err), "terminal");
-            if (state.value.stream_failure) |previous| {
-                if (previous.terminal == terminal and std.mem.eql(u8, previous.code, @errorName(err))) return err;
-            }
-            try self.observeScopedStreamFailure(a, table, state.value, .{
-                .code = @errorName(err),
-                .terminal = terminal,
-                .observed_at_ms = @max(1, platform_time.realtimeNs() / std.time.ns_per_ms),
-            }, context);
+        if (state.stream_failure) |failure| if (failure.terminal) return;
+        runner.stageScopedStream(self, admission, table, source_status, state, snapshot, context) catch |err| {
+            std.log.debug("source stream stage failed table={s} replacement={} err={s}", .{ table.name, state.pending_no_admission_receipt != null, @errorName(err) });
             return err;
         };
-        if (state.value.stream_failure != null) {
+        if (state.stream_failure != null) {
             const latest_raw = try control.readOnService(self, a, scope.table_id, scope.source_id, context);
             defer a.free(latest_raw);
             var latest = try control.parse(a, latest_raw);
@@ -12776,19 +13031,68 @@ pub const MetadataHttpService = struct {
         }
     }
 
+    fn scopedWorkContext(context: api_operation.RequestContext) !api_operation.RequestContext {
+        var work = try context.platformDeadline();
+        if (work.deadline_ns) |deadline| {
+            const remaining = deadline -| platform_time.monotonicNs();
+            // Leave bounded time for a health observation in this round.
+            work.deadline_ns = deadline - @min(250 * std.time.ns_per_ms, remaining / 8);
+        }
+        return work;
+    }
+
+    fn recordScopedStreamError(self: *MetadataHttpService, a: std.mem.Allocator, table: metadata_table_manager.TableRecord, state: @import("source_control.zig").State, err: anyerror, context: api_operation.RequestContext) !void {
+        if (state.closing or state.retired or metadata_replication_backfill.replicationErrorEndsRound(err)) return;
+        if (state.stream_failure) |previous| {
+            if (previous.terminal or std.mem.eql(u8, previous.code, @errorName(err))) return;
+        }
+        const control = @import("source_control.zig");
+        const scope = state.scope orelse return;
+        var reporting = context;
+        // Reporting shares the caller's round deadline and cancellation.
+        reporting = try reporting.platformDeadline();
+        const report_limit = platform_time.monotonicNs() +| std.time.ns_per_s;
+        reporting.deadline_ns = @min(reporting.deadline_ns orelse report_limit, report_limit);
+        try ensureCdcWorkPermit(self);
+        const raw = try control.readOnService(self, a, scope.table_id, scope.source_id, reporting);
+        defer a.free(raw);
+        var parsed = try control.parse(a, raw);
+        defer parsed.deinit();
+        const current = parsed.value;
+        // A revision change can represent successful or superseding work.
+        // Only attribute this failure to the exact observed attempt.
+        if (current.revision != state.revision or !std.meta.eql(current.scope, state.scope) or current.closing or current.retired) return;
+        const terminal = std.mem.eql(u8, metadata_replication_backfill.classifyReplicationError(err), "terminal");
+        if (current.stream_failure) |previous| {
+            if (previous.terminal or std.mem.eql(u8, previous.code, @errorName(err))) return;
+        }
+        try self.observeScopedStreamFailure(a, table, current, .{
+            .code = @errorName(err),
+            .terminal = terminal,
+            .observed_at_ms = @max(1, platform_time.realtimeNs() / std.time.ns_per_ms),
+        }, reporting);
+    }
+
     fn observeScopedStreamFailure(self: *MetadataHttpService, a: std.mem.Allocator, table: metadata_table_manager.TableRecord, state: @import("source_control.zig").State, failure: ?@import("source_control.zig").StreamFailure, context: api_operation.RequestContext) !void {
         const control = @import("source_control.zig");
         const scope = state.scope orelse return error.SourceBindingConflict;
         try ensureCdcWorkPermit(self);
-        control.mutateOnService(self, a, .{
+        var write: control.Write = .{
             .table_id = scope.table_id,
             .source_id = scope.source_id,
             .expected_revision = state.revision,
             .expected_binding = scope.identity(),
             .expected_catalog_digest = control.digest(table.replication_sources_json),
-            .mutation = .{ .observe_stream_failure = failure },
-        }, context) catch |err| switch (err) {
-            error.TableTopologyProtocolUpgradeRequired => {},
+            .mutation = .{ .observe_qualified_stream_failure = failure },
+        };
+        control.mutateOnService(self, a, write, context) catch |err| switch (err) {
+            error.TableTopologyProtocolUpgradeRequired => {
+                write.mutation = .{ .observe_stream_failure = failure };
+                control.mutateOnService(self, a, write, context) catch |legacy_err| switch (legacy_err) {
+                    error.TableTopologyProtocolUpgradeRequired => {},
+                    else => return legacy_err,
+                };
+            },
             else => return err,
         };
     }
@@ -13987,12 +14291,20 @@ pub const MetadataHttpService = struct {
         return try self.raft.observeMergeTransition(transition_id);
     }
 
+    fn requireOrdinaryMergeSafe(ptr: *anyopaque, record: transition_state.MergeTransitionRecord) !void {
+        const self: *MetadataHttpService = @ptrCast(@alignCast(ptr));
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        if ((try store.sourceCheckpointActors(self.metadata_group_id, record.donor_group_id, null)).len != 0)
+            return error.SourcePendingWork;
+    }
+
     fn stepTransitions(self: *MetadataHttpService) !raft_transition_service.TransitionStepResult {
         self.transition_mutex.lockUncancelable(std.Options.debug_io);
         defer self.transition_mutex.unlock(std.Options.debug_io);
-        if (self.online_merge_runtime) |runtime| if (self.raft.transition_svc) |*transitions| {
-            transitions.online_driver = runtime.driver;
-        };
+        if (self.raft.transition_svc) |*transitions| {
+            if (self.online_merge_runtime) |runtime| transitions.online_driver = runtime.driver;
+            transitions.ordinary_merge_guard = .{ .ptr = self, .require = requireOrdinaryMergeSafe };
+        }
         defer self.publishTransitionMetricsLocked();
         return try self.raft.stepTransitions();
     }
@@ -26871,6 +27183,22 @@ test "selected owner readiness transition index cancels while observations are l
 
 test "source control requires its coordinated decoder floor before metadata proposal" {
     const contract = @import("source_control.zig");
+    const floors = [_]u16{
+        metadata_topology_protocol.sql_idle_session_reenrollment_version,
+        contract.scoped_completion_health_protocol_version,
+        contract.independent_completion_stall_protocol_version,
+        contract.qualified_completion_stall_protocol_version,
+        contract.retained_payload_protocol_version,
+        contract.checkpoint_authority.successor_protocol_version,
+        metadata_topology_protocol.source_successor_retirement_guard_version,
+        contract.payload_prewrite_protocol_version,
+        contract.epoch_attempt_retirement_protocol_version,
+        contract.epoch_attempt_progress_protocol_version,
+        metadata_topology_protocol.source_restore_guard_version,
+    };
+    for (floors[0 .. floors.len - 1], floors[1..]) |previous, next|
+        try std.testing.expect(previous < next);
+    try std.testing.expect(metadata_topology_protocol.current_version >= floors[floors.len - 1]);
     const a = std.testing.allocator;
     try std.testing.expectEqual(contract.manifest_protocol_version, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_source_control = "{}" }));
     const scope: contract.Scope = .{ .table_id = 7, .source_id = @splat(1), .source_ordinal = 0, .generation = 1, .definition = @splat(2), .provider = @splat(3), .destination = .native, .destination_binding = @splat(4) };
@@ -26878,6 +27206,10 @@ test "source control requires its coordinated decoder floor before metadata prop
     const legacy = try contract.encodeWrite(a, write);
     defer a.free(legacy);
     try std.testing.expectEqual(contract.protocol_version, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_source_control = legacy }));
+    write.mutation = .{ .pin_payload_prewrite = .{ .digest = @splat(6), .bytes = "manifest" } };
+    const prewrite = try contract.encodeWrite(a, write);
+    defer a.free(prewrite);
+    try std.testing.expectEqual(contract.payload_prewrite_protocol_version, try transitionRequiredCoordinatedDecoderVersion(a, .{ .apply_source_control = prewrite }));
     write.mutation = .{ .seal_artifact = .{ .reservation_digest = @splat(6), .stamp = @splat(7) } };
     const artifact = try contract.encodeWrite(a, write);
     defer a.free(artifact);

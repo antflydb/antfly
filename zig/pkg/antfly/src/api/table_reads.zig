@@ -4032,11 +4032,13 @@ pub const ProvisionedTableReadSource = struct {
         for (scans) |input| if (input.opts.execution_deadline_ns) |deadline| {
             requested_deadline = @min(requested_deadline orelse deadline, deadline);
         };
-        var budget = self.catalog.budget(self.catalog.deadlineFrom(.{ .deadline_ns = requested_deadline }));
-        budget.deadline_ns = @min(budget.deadline_ns orelse std.math.maxInt(u64), budget.nowNs() +| 5 * std.time.ns_per_s);
+        // ScanOptions crosses native owners and always carries platform time.
+        // The retry loop can sleep on the catalog clock using a translated cut.
+        const native_deadline = @min(requested_deadline orelse std.math.maxInt(u64), platform_time.monotonicNs() +| 5 * std.time.ns_per_s);
+        const budget = self.catalog.budget(self.catalog.deadlineFrom(.{ .deadline_ns = native_deadline }));
         const bounded = try alloc.dupe(@import("antfly_local_sources").api_table_read_source.RelationalStatementScan, scans);
         defer alloc.free(bounded);
-        for (bounded) |*input| input.opts.execution_deadline_ns = budget.deadline_ns;
+        for (bounded) |*input| input.opts.execution_deadline_ns = native_deadline;
         var backoff: u64 = std.time.ns_per_ms;
         while (true) {
             for (scans) |input| if (input.opts.cancellation) |token| try token.check();
@@ -18918,11 +18920,14 @@ fn consumerTests() type {
                 fail_final_validation: bool = false,
                 closes: usize = 0,
                 releases: usize = 0,
-                fn capture(ptr: *anyopaque, _: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group: u64, _: []const u8, _: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?Fence {
+                expected_execution_deadline: ?u64 = null,
+                fn capture(ptr: *anyopaque, _: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group: u64, _: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?Fence {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expect(!self.held);
                     try std.testing.expectEqual(@as(usize, 2), self.admission.active);
                     try std.testing.expectEqual(group, fence.route.group_id);
+                    if (self.expected_execution_deadline) |deadline|
+                        try std.testing.expectEqual(@as(?u64, deadline), opts.execution_deadline_ns);
                     try std.testing.expectEqual(raft_mod.ReadConsistency.stale, consistency);
                     self.captures += 1;
                     if (self.transient_unavailable or self.persistently_unavailable) {
@@ -19017,6 +19022,19 @@ fn consumerTests() type {
             try std.testing.expectError(error.SqlStatementReadUnavailable, routed.source().openRelationalStatement(std.testing.allocator, &.{ deadline_input, deadline_input }, .stale));
             try std.testing.expectEqual(@as(usize, 0), admission.active);
             try std.testing.expect(!fixture.held);
+            // The storage callback receives platform time even when catalog
+            // routing uses a clock with a substantially different epoch.
+            const vopr = @import("vopr");
+            const now = platform_time.monotonicNs();
+            var routing_io = try vopr.vopr_io.VoprIo.init(.{ .monotonic_ns = @intCast(now + 1000 * std.time.ns_per_s) });
+            defer routing_io.deinit();
+            routed.catalog.io = @import("antfly_runtime_abi").io_abi.Borrow.init(&routing_io.io());
+            fixture.persistently_unavailable = false;
+            fixture.expected_execution_deadline = now + 3 * std.time.ns_per_s;
+            var timed_input = input;
+            timed_input.opts.execution_deadline_ns = fixture.expected_execution_deadline;
+            const timed = try routed.source().openRelationalStatement(std.testing.allocator, &.{ timed_input, timed_input }, .stale);
+            timed.deinit();
         }
 
         test "relational row query full-key index proof requires every routed owner" {

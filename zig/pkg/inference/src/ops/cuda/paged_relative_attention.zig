@@ -22,7 +22,9 @@ const cache = @import("hybrid_paged_kv.zig");
 const embedded = @import("embedded_module.zig");
 const catalog = @import("../../tile/cuda_standalone.zig");
 const DeviceBuffer = buffer.DeviceBuffer;
-const Program = embedded.EmbeddedModule(embedded.profile(catalog.paged_relative_attention).image, catalog.paged_relative_attention_entries);
+const Program = embedded.EmbeddedModule(struct {
+    pub const image = embedded.profile(catalog.paged_relative_attention).image;
+}, catalog.paged_relative_attention_entries);
 
 const head_dim = 128;
 const partial_width = head_dim + 2;

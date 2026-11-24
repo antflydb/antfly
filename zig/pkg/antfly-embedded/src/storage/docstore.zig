@@ -1308,6 +1308,13 @@ pub const DocStore = struct {
             return error.ReadOnly;
         }
 
+        /// The history collector already applied the certificate charge and
+        /// consumer-floor checks. This internal sidecar has no intent credit.
+        pub fn deleteCollectedCompletionPlan(self: *Txn, id: [16]u8) !void {
+            const key = @import("transaction_completion.zig").admission_prefix.* ++ id;
+            try self.write.?.delete(&key);
+        }
+
         pub fn delete(self: *Txn, key: []const u8) anyerror!void {
             try updateGraphEndpointCleanupAdmission(self, self.alloc, key, null);
             try removeGraphRetirementReference(self, self.alloc, key, &self.graph_retirements_maybe);
@@ -1439,6 +1446,11 @@ pub const DocStore = struct {
         source_certificate_released: bool = false,
 
         pub fn setCommitParticipant(self: *Batch, participant: @import("commit_participant.zig").Participant) !void {
+            if (participant.queued) |queued| {
+                if (self.runtime) |*runtime| {
+                    try runtime.setQueuedParticipant(queued);
+                } else return error.Unsupported;
+            }
             try self.artifact_inputs.attach(participant);
         }
 
@@ -1606,6 +1618,11 @@ pub const DocStore = struct {
                     try row_heap.put(self.runtime.?, key, primary);
                 } else try self.runtime.?.appendPut(key, primary);
                 if (self.payload_session) |session| try session.recordOwnership(self.runtime.?, key, stored);
+            }
+
+            pub fn deleteCollectedCompletionPlan(self: @This(), id: [16]u8) !void {
+                const key = @import("transaction_completion.zig").admission_prefix.* ++ id;
+                try self.runtime.?.delete(&key);
             }
 
             pub fn delete(self: @This(), key: []const u8) anyerror!void {
@@ -3796,6 +3813,17 @@ pub const DocStore = struct {
         self.retained_effects_cache.store(0, .release);
         _ = self.columnar_revision.fetchAdd(1, .acq_rel);
         _ = self.query_generation_revision.fetchAdd(1, .acq_rel);
+    }
+
+    /// Reconcile this store's replay admission after writer authority has
+    /// verified the peer cut. Keep the local reservation counter monotonic.
+    pub fn adoptWriterReplayCut(self: *DocStore) !u64 {
+        self.revalidateAdoptedState();
+        var txn = try self.beginProbeTxn();
+        defer txn.abort();
+        const sequence = try self.lastReplaySequenceFromTxn(&txn, 0);
+        if (sequence != 0) self.observeCommittedReplaySequence(sequence);
+        return sequence;
     }
 
     pub fn reserveNextReplaySequence(self: *DocStore, fallback_next: u64) u64 {

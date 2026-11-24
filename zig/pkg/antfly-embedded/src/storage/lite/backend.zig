@@ -816,6 +816,7 @@ fn openNativeSingleFile(allocator: Allocator, path: []const u8, opts: OpenOption
 
     const initial_store = try docstore.Store.openWithOptions(allocator, path, .{
         .externally_locked = opts.externally_locked,
+        .require_versioned_text = true,
         .reclamation = opts.reclamation,
         .read_only = opts.read_only,
         .no_sync = opts.no_sync,
@@ -842,6 +843,7 @@ fn createNativeSingleFile(allocator: Allocator, path: []const u8, opts: CreateOp
 
     const initial_store = try docstore.Store.createWithOptions(allocator, path, .{
         .externally_locked = opts.externally_locked,
+        .require_versioned_text = true,
         .reclamation = opts.reclamation,
         .exclusive = opts.exclusive,
         .no_sync = opts.no_sync,
@@ -2041,4 +2043,31 @@ test "lite native retained range reader releases caches before owned manager shu
     handle.deinit();
     open = false;
     try reader.source.readInto(0, &out);
+}
+
+test "lite backend writer migrates legacy format before index initialization" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "legacy-text.aflite");
+    defer alloc.free(path);
+    {
+        var legacy = try native.NativeFile.createWithIo(alloc, io, path, .{});
+        defer legacy.close();
+        try legacy.putDocument("doc", "retained");
+        try std.testing.expect(!legacy.header.versioned_text_required);
+    }
+    {
+        var backend = try Handle.open(alloc, path, .{ .io = io });
+        defer backend.deinit();
+        try std.testing.expect(backend.native_docstore.?.file.header.versioned_text_required);
+    }
+    var reader = try Handle.open(alloc, path, .{ .io = io, .read_only = true });
+    defer reader.deinit();
+    const store = reader.native_docstore.?;
+    try std.testing.expect(store.file.header.versioned_text_required);
+    const value = (try store.file.getDocumentAlloc(alloc, "doc")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("retained", value);
 }

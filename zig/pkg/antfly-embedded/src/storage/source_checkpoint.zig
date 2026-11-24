@@ -152,6 +152,52 @@ pub const Head = struct {
         if (!std.mem.eql(u8, &self.purpose, &command.purpose) or !std.mem.eql(u8, &self.transaction_id, &transaction_id) or !std.mem.eql(u8, self.checkpoint, command.checkpoint) or self.accepted_at_ns != command.accepted_at_ns or (self.receipt_window != 0 and !std.mem.eql(u8, &self.request_digest, &command.digest()))) return error.SourcePayloadConflict;
     }
 };
+/// Export the exact head used by the scoped CDC single-receipt profile.
+/// The caller owns the original root's topology fence and the read cut.
+pub fn captureScopedHandoff(a: A, txn: anytype, binding: Digest, sequence: u64, expected_checkpoint: ?[]const u8) ![]u8 {
+    const encoded = txn.get(&key(binding)) catch |err| switch (@as(anyerror, err)) {
+        error.NotFound => return error.SourceOutcomeUnresolved,
+        else => return err,
+    };
+    const head = try Head.decode(encoded);
+    if (!std.meta.eql(head.binding, binding) or head.sequence != sequence or
+        (if (expected_checkpoint) |cursor| !std.mem.eql(u8, head.checkpoint, cursor) else false)) return error.SourceCheckpointConflict;
+    if (head.receipt_window != 1) return error.InvalidSourceAdmission;
+    const receipt = txn.get(&try receiptKey(binding, sequence, 1)) catch |err| switch (@as(anyerror, err)) {
+        error.NotFound => return error.SourceAdmissionCorrupt,
+        else => return err,
+    };
+    if (!std.mem.eql(u8, encoded, receipt)) return error.SourceAdmissionCorrupt;
+    return a.dupe(u8, encoded);
+}
+
+/// Install the retained head and receipt in the same replacement-root
+/// transaction. A trusted topology caller supplies the qualified cut and
+/// must abort the enclosing writer on error.
+pub fn installScopedHandoff(txn: anytype, expected_binding: Digest, encoded: []const u8) !void {
+    const head = try Head.decode(encoded);
+    if (!std.meta.eql(head.binding, expected_binding) or head.receipt_window != 1)
+        return error.SourceCheckpointConflict;
+    const head_key = key(expected_binding);
+    const receipt_key = try receiptKey(expected_binding, head.sequence, 1);
+    const installed_head = txn.get(&head_key) catch |err| switch (@as(anyerror, err)) {
+        error.NotFound => null,
+        else => return err,
+    };
+    const installed_receipt = txn.get(&receipt_key) catch |err| switch (@as(anyerror, err)) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (installed_head != null or installed_receipt != null) {
+        if (installed_head == null or installed_receipt == null or
+            !std.mem.eql(u8, installed_head.?, encoded) or !std.mem.eql(u8, installed_receipt.?, encoded))
+            return error.SourceCheckpointConflict;
+        return;
+    }
+    try txn.put(&head_key, encoded);
+    try txn.put(&receipt_key, encoded);
+}
+
 pub const Plan = struct { key: []const u8, before: ?[]const u8, value: []const u8, receipt_key: ?[]const u8 = null };
 /// All returned bytes belong to an attempt arena. Nothing is written here.
 /// The native transaction MUST predicate on before and resolve value atomically.
@@ -275,4 +321,44 @@ test "source checkpoint receipt ring preserves exact historical retries with bou
     const legacy_json = try std.json.Stringify.valueAlloc(a, invalid, .{});
     defer a.free(legacy_json);
     try std.testing.expect(std.mem.indexOf(u8, legacy_json, "receipt_window") == null);
+}
+
+test "scoped checkpoint handoff preserves exact retry evidence and rejects a conflicting successor" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const Store = struct {
+        values: std.StringHashMap([]const u8),
+        fn get(self: *@This(), name: []const u8) ![]const u8 {
+            return self.values.get(name) orelse error.NotFound;
+        }
+        fn put(self: *@This(), name: []const u8, value: []const u8) !void {
+            const allocator = self.values.allocator;
+            try self.values.put(try allocator.dupe(u8, name), try allocator.dupe(u8, value));
+        }
+    };
+    const command: Command = .{ .binding = @splat(1), .purpose = @splat(2), .sequence = 1, .checkpoint = "opaque:old", .accepted_at_ns = 3, .receipt_window = 1 };
+    const id: [16]u8 = @splat(4);
+    var original: Store = .{ .values = .init(owned) };
+    const first = try prepare(owned, &original, id, command.purpose, command);
+    try original.put(first.key, first.value);
+    try std.testing.expectError(error.SourceAdmissionCorrupt, captureScopedHandoff(owned, &original, command.binding, 1, command.checkpoint));
+    try original.put(first.receipt_key.?, first.value);
+    try std.testing.expectError(error.SourceCheckpointConflict, captureScopedHandoff(owned, &original, command.binding, 1, "opaque:other"));
+    const cut = try captureScopedHandoff(owned, &original, command.binding, 1, command.checkpoint);
+    var successor: Store = .{ .values = .init(owned) };
+    try std.testing.expectError(error.SourceCheckpointConflict, installScopedHandoff(&successor, @splat(5), cut));
+    try installScopedHandoff(&successor, command.binding, cut);
+    try installScopedHandoff(&successor, command.binding, cut);
+    try std.testing.expectError(error.SourceAlreadyCommitted, prepare(owned, &successor, id, command.purpose, command));
+    var next = command;
+    next.sequence = 2;
+    next.expected_checkpoint = command.checkpoint;
+    next.checkpoint = "opaque:new";
+    next.purpose = @splat(6);
+    const advanced = try prepare(owned, &successor, @splat(7), next.purpose, next);
+    try successor.put(advanced.key, advanced.value);
+    try successor.put(advanced.receipt_key.?, advanced.value);
+    try std.testing.expectError(error.SourceCheckpointConflict, installScopedHandoff(&successor, command.binding, cut));
 }

@@ -540,8 +540,38 @@ def _metadata_table_id(stateful_api, table_name: str) -> int | None:
     return None
 
 
+def _cdc_artifact_config(artifacts, base_dir, *, deployment_mode):
+    return {
+        "deployment_mode": deployment_mode,
+        "storage": {
+            "engine": "local",
+            "local": {"base_dir": str(base_dir)},
+            "artifacts": {"connection": "cdc-artifacts", "bucket": "antfly"},
+        },
+        "connections": {
+            "cdc-artifacts": {
+                "kind": "external_io",
+                "capabilities": ["storage.primary"],
+                "external_io": {
+                    "protocol": "s3",
+                    "endpoint": artifacts.endpoint,
+                    "use_ssl": False,
+                    "addressing_style": "path",
+                    "region": "us-east-1",
+                    "buckets": ["antfly"],
+                    "credentials": {
+                        "source": "static",
+                        "access_key_id": "fixture",
+                        "secret_access_key": "fixture",
+                    },
+                },
+            }
+        },
+    }
+
+
 @pytest.fixture(scope="function", params=["cluster", "standalone"])
-def cdc_stateful_api(request, pg_cdc_source):
+def cdc_stateful_api(request, pg_cdc_source, tmp_path):
     # Keep the provider fixture alive until after the managed server stops so
     # its exact-cutover slots are inactive and can be removed deterministically.
     del pg_cdc_source
@@ -561,7 +591,26 @@ def cdc_stateful_api(request, pg_cdc_source):
         if mode == "standalone":
             server = StandaloneAntflyServer(binary, "127.0.0.1", port)
         else:
-            server = StatefulAntflyServer(binary, "127.0.0.1", port)
+            spool = tmp_path / "replication-spool"
+            spool.mkdir()
+            namespace = subprocess.check_output(
+                [binary, "storage", "provision-pgwire-spool", str(spool)],
+                text=True,
+                timeout=10,
+            ).strip()
+            server = StatefulAntflyServer(
+                binary,
+                "127.0.0.1",
+                port,
+                metadata_config={
+                    "pgwire": {
+                        "replication_spool": {
+                            "directory": str(spool),
+                            "namespace": namespace,
+                        }
+                    }
+                },
+            )
         base_url = server.url
         if default_root is None and os.path.basename(binary) == "antfly":
             default_root = ANTFLY_PUBLIC_API_ROOT
@@ -2849,6 +2898,7 @@ def test_postgres_bootstraps_and_streams_to_writable_iceberg(
 
         feed = None
         filtered_feeds = []
+        keys_feed = None
         if deployment != "standalone":
             if mixed:
                 call("POST", f"/tables/{native_table}", {"num_shards": 1})
@@ -2873,6 +2923,18 @@ def test_postgres_bootstraps_and_streams_to_writable_iceberg(
             ).json()
             feed = f"{feeds}/{created['id']}"
             if deployment == "distributed":
+                keys_created = _changefeed_call(
+                    client,
+                    "POST",
+                    feeds,
+                    headers={"Idempotency-Key": "keys-only-key-move"},
+                    json={
+                        "tables": ["cdc_iceberg"],
+                        "start": "now",
+                        "include": "keys_and_versions",
+                    },
+                ).json()
+                keys_feed = (f"{feeds}/{keys_created['id']}", keys_created["cursor"])
                 # One of the filtered feeds advances past an invisible suffix
                 # in the same committed key-move transaction.
                 for key in ("user-1", "user-2"):
@@ -2939,6 +3001,26 @@ def test_postgres_bootstraps_and_streams_to_writable_iceberg(
         assert resumed["antfly.cdc.checkpoint"] != cut
         assert rows() == [["user-2", "Bob"]]
         check_row_count()
+        if keys_feed is not None:
+            key_feed_url, key_cursor = keys_feed
+            response = _changefeed_call(
+                client, "GET", f"{key_feed_url}/events", params={"after": key_cursor}
+            )
+            key_page = response.json()
+            assert key_page["transaction"]["complete"]
+            assert {event["operation"] for event in key_page["events"]} == {
+                "delete",
+                "insert",
+            }
+            assert all(
+                event.get("before") is None and event.get("after") is None
+                for event in key_page["events"]
+            )
+            replay = _changefeed_call(
+                client, "GET", f"{key_feed_url}/events", params={"after": key_cursor}
+            )
+            assert replay.content == response.content
+            _changefeed_call(client, "DELETE", key_feed_url)
         for filtered_feed, cursor in filtered_feeds:
             page = _changefeed_call(
                 client, "GET", f"{filtered_feed}/events", params={"after": cursor}
@@ -3362,15 +3444,19 @@ def test_public_changefeed_multiple_tables_use_independent_row_filters():
         server.stop()
 
 
-def _changefeed_call(client, method, url, **options):
-    deadline = time.monotonic() + 30
+def _changefeed_call(client, method, url, *, timeout=15, **options):
+    deadline = time.monotonic() + max(30, timeout)
     while True:
-        reply = client.request(method, url, timeout=15, **options)
+        reply = client.request(method, url, timeout=timeout, **options)
         retryable = reply.status_code == 503 or (
             reply.status_code == 409 and "changefeed_retry_required" in reply.text
         )
         if not retryable or time.monotonic() >= deadline:
-            reply.raise_for_status()
+            try:
+                reply.raise_for_status()
+            except requests.HTTPError as exc:
+                exc.add_note(reply.text[:2048])
+                raise
             return reply
         time.sleep(0.2)
 
@@ -3477,6 +3563,227 @@ def test_public_changefeed_projects_exact_before_and_after_predicates():
         server.stop()
 
 
+@pytest.mark.parametrize("deployment", ["standalone", "raft"])
+def test_iceberg_changefeed_projects_typed_composite_key_updates_and_deletes(
+    tmp_path, request, deployment
+):
+    from test_secrets import TableObjectStorage
+
+    artifacts = TableObjectStorage()
+    request.addfinalizer(artifacts.close)
+
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    if deployment == "standalone":
+        config_path = tmp_path / "standalone.json"
+        config_path.write_text(
+            json.dumps(
+                _cdc_artifact_config(
+                    artifacts, tmp_path / "native", deployment_mode="standalone"
+                )
+            ),
+            encoding="utf-8",
+        )
+        server = StandaloneAntflyServer(
+            binary, "127.0.0.1", 0, pgwire=True, config_path=config_path
+        )
+    else:
+        server = StatefulAntflyServer(
+            binary,
+            "127.0.0.1",
+            0,
+            auth_enabled=True,
+            metadata_config=_cdc_artifact_config(
+                artifacts, tmp_path / "metadata", deployment_mode="distributed"
+            ),
+            data_config=_cdc_artifact_config(
+                artifacts, tmp_path / "data", deployment_mode="distributed"
+            ),
+        )
+    failed = True
+    try:
+        with requests.Session() as client:
+            client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+            base = server.api_url
+            table = f"{base}/tables/composite_feed"
+            feeds = f"{base}/changefeeds"
+            columns = ("tenant", "observed_at", "label")
+            keys = list(columns[:2])
+            _changefeed_call(
+                client,
+                "POST",
+                table,
+                timeout=40,
+                json={
+                    "storage": {"engine": "object"},
+                    "schema": {
+                        "storage_mode": "relational",
+                        "default_type": "row",
+                        "enforce_types": True,
+                        "document_schemas": {
+                            "row": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        name: {
+                                            "type": "integer"
+                                            if name == "observed_at"
+                                            else "string"
+                                        }
+                                        for name in columns
+                                    },
+                                    "required": list(columns),
+                                    "additionalProperties": False,
+                                }
+                            }
+                        },
+                        "base_source": {
+                            "kind": "external",
+                            "format": "iceberg",
+                            "table_id": "composite-feed",
+                            "uri": (tmp_path / "warehouse").as_uri(),
+                            "write_policy": "iceberg_writer",
+                            "catalog": {"type": "managed"},
+                            "row_identity": {"key_columns": keys},
+                        },
+                    },
+                },
+            )
+            _changefeed_call(
+                client,
+                "POST",
+                f"{table}/lake/catalog",
+                json={
+                    "commit_id": "initialize",
+                    "schema": {
+                        "type": "struct",
+                        "schema-id": 0,
+                        "identifier-field-ids": [1, 2],
+                        "fields": [
+                            {"id": index, "name": name, "required": True, "type": kind}
+                            for index, (name, kind) in enumerate(
+                                zip(columns, ("string", "timestamptz", "string")), 1
+                            )
+                        ],
+                    },
+                },
+            )
+            early = 1_735_689_600_000_000
+            late = 1_735_776_000_000_000
+
+            def write(checkpoint, changes, previous=None):
+                payload = {
+                    "batch_id": checkpoint,
+                    "source": "composite-test",
+                    "epoch": "1",
+                    "checkpoint": checkpoint,
+                    "key_fields": keys,
+                    "changes": changes,
+                }
+                if previous is not None:
+                    payload["expected_checkpoint"] = previous
+                _changefeed_call(client, "POST", f"{table}/lake/changes", json=payload)
+
+            def published():
+                catalog = _changefeed_call(
+                    client, "GET", f"{table}/lake/catalog"
+                ).json()
+                return int(
+                    catalog["metadata"]["properties"].get("antfly.wal.coverage", 0)
+                )
+
+            write(
+                "seed",
+                [
+                    {
+                        "op": "upsert",
+                        "row": {"tenant": tenant, "observed_at": ts, "label": "before"},
+                    }
+                    for tenant in ("east", "west")
+                    for ts in (early, late)
+                ],
+            )
+            assert wait_until(published, timeout_s=60, interval_s=0.25)
+            subscriptions = {}
+            for projection in ("rows", "keys_and_versions"):
+                feed = _changefeed_call(
+                    client,
+                    "POST",
+                    feeds,
+                    headers={"Idempotency-Key": f"composite-{projection}"},
+                    json={
+                        "tables": ["composite_feed"],
+                        "start": "now",
+                        "include": projection,
+                    },
+                ).json()
+                subscriptions[projection] = (f"{feeds}/{feed['id']}", feed["cursor"])
+            if deployment == "standalone":
+                server.pause(crash=True)
+                server.resume()
+            write(
+                "updated",
+                [
+                    {
+                        "op": "upsert",
+                        "row": {
+                            "tenant": "east",
+                            "observed_at": early,
+                            "label": "after",
+                        },
+                    },
+                    {"op": "delete", "row": {"tenant": "west", "observed_at": late}},
+                ],
+                previous="seed",
+            )
+            assert wait_until(lambda: published() >= 2, timeout_s=60, interval_s=0.25)
+
+            def collect(path, cursor):
+                events = {}
+                for _ in range(8):
+                    response = _changefeed_call(
+                        client, "GET", f"{path}/events", params={"after": cursor}
+                    )
+                    cursor = response.headers["Antfly-Changefeed-Cursor"]
+                    for event in response.json()["events"]:
+                        key = event["key"]["value"]
+                        assert key not in events
+                        events[key] = event
+                    _changefeed_call(
+                        client, "POST", f"{path}/ack", json={"cursor": cursor}
+                    )
+                    if len(events) >= 2:
+                        break
+                return events
+
+            rows = collect(*subscriptions["rows"])
+            projected = collect(*subscriptions["keys_and_versions"])
+            assert set(rows) == set(projected)
+            assert sorted(event["operation"] for event in rows.values()) == [
+                "delete",
+                "update",
+            ]
+            for key, event in rows.items():
+                assert event["before"]["label"] == "before"
+                if event["operation"] == "delete":
+                    assert event["before"]["tenant"] == "west"
+                    assert event["after"] is None
+                else:
+                    assert event["before"]["tenant"] == "east"
+                    assert event["after"]["label"] == "after"
+                assert projected[key]["operation"] == event["operation"]
+                assert projected[key].get("before") is None
+                assert projected[key].get("after") is None
+            for path, _ in subscriptions.values():
+                _changefeed_call(client, "DELETE", path)
+    except Exception as exc:
+        exc.add_note(server.debug_logs())
+        raise
+    else:
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
+
+
 def test_public_changefeed_bootstraps_and_streams_native_sql_rows():
     from decimal import Decimal
 
@@ -3488,14 +3795,30 @@ def test_public_changefeed_bootstraps_and_streams_native_sql_rows():
             feeds = f"{server.api_url}/changefeeds"
             amount = "12345678901234567890.12345678"
 
-            def sql(statement):
-                reply = client.post(
-                    f"{server.api_url}/sql", json={"statement": statement}, timeout=40
-                )
-                assert reply.ok, reply.text
+            def sql(statement, *, wait_for_catalog=False):
+                def execute():
+                    reply = client.post(
+                        f"{server.api_url}/sql",
+                        json={"statement": statement},
+                        timeout=40,
+                    )
+                    if (
+                        wait_for_catalog
+                        and reply.status_code == 503
+                        and "No schema change was admitted." in reply.text
+                    ):
+                        return False
+                    assert reply.ok, reply.text
+                    return True
+
+                if wait_for_catalog:
+                    wait_until(execute, timeout_s=45, interval_s=0.25)
+                else:
+                    execute()
 
             sql(
-                "CREATE TABLE cdc_rows (id BIGINT PRIMARY KEY, amount NUMERIC(38,8), label TEXT)"
+                "CREATE TABLE cdc_rows (id BIGINT PRIMARY KEY, amount NUMERIC(38,8), label TEXT)",
+                wait_for_catalog=True,
             )
             sql(
                 f"INSERT INTO cdc_rows (id, amount, label) VALUES (1, {amount}, 'before')"

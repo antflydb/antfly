@@ -59,7 +59,7 @@ pub fn executeControl(port: ?ControlPort, a: A, group: u64, table: []const u8, b
     defer parsed.deinit();
     const request = parsed.value;
     try request.validate(a);
-    var scope = try Scope.init(a, group, table, request.source_owner, context);
+    var scope = try Scope.initWithEpoch(a, group, table, request.source_owner, request.cleanupOnly(), context);
     defer scope.deinit();
     const digest = try request.digest(a);
     const target = port orelse return error.ChangefeedCapabilityUnsupported;

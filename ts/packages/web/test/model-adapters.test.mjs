@@ -38,6 +38,20 @@ test("native decider routes expose their executable capabilities", () => {
     assert.deepEqual(result.execution.decisionKinds, kinds);
   }
 });
+test("EmbeddingGemma2 executes retrieval embeddings and similarity decisions only", () => {
+  const all = resolveAdapter({ model_type: "embedding_gemma2" });
+  assert.deepEqual(all.execution.tasks, ["embed", "decide"]);
+  assert.deepEqual(all.execution.capabilities, ["embedding_similarity"]);
+  assert.deepEqual(all.execution.decisionKinds, ["choice", "multi_choice"]);
+  // Config-owned role correction: older manifests that declare trained-head
+  // roles still resolve to the encoder's real tasks, never to extraction.
+  const legacy = resolveAdapter({ model_type: "embedding_gemma2_text" }, undefined, {
+    tasks: ["extract", "classify", "decide"],
+    capabilities: ["classification", "typed_decisions"],
+  });
+  assert.deepEqual(legacy.execution.tasks, ["embed", "decide"]);
+  assert.deepEqual(legacy.execution.capabilities, ["embedding_similarity"]);
+});
 test("unsupported geometry and unknown embedding encoders report reasons", () => {
   for (const [config, encoder, manifest, reason] of [
     [marker, { model_type: "modernbert", hidden_size: 4096 }, undefined, /geometry/],

@@ -390,7 +390,17 @@ pub const iceberg_acceptance_status_version: u16 = 132;
 /// Version 136 retires absent public feed roots with catalog authority.
 /// Version 137 transfers a qualified legacy checkpoint into fenced source control.
 /// Version 138 persists scoped PostgreSQL stream health within the actor revision.
-pub const current_version: u16 = sql_idle_session_reenrollment_version;
+/// Versions 252–254 track scoped completion wait, stall, and failure provenance.
+/// Version 255 binds route-independent payload retention to a source reservation.
+/// Version 256 adopts an installed checkpoint on a topology successor.
+/// Version 257 pins successor ranges against retirement until adoption.
+/// Version 258 tracks shared spool prewrites through recovery.
+pub const source_successor_retirement_guard_version: u16 = 257;
+pub const source_restore_guard_version: u16 = 261;
+/// The prepared transaction identity can retain an independently routed
+/// history completion plan before data enlistment.
+pub const sql_external_completion_version: u16 = 262;
+pub const current_version: u16 = sql_external_completion_version;
 pub const pg_publication_version: u16 = @import("pg_publication.zig").protocol_version;
 pub const changefeed_control_version: u16 = @import("changefeed_control.zig").protocol_version;
 pub const source_control_version: u16 = @import("source_control.zig").protocol_version;

@@ -393,21 +393,29 @@ fn forcePublicSymbols(b: *std.Build, artifact: *std.Build.Step.Compile) void {
 /// again confuses the Mach-O linker. Clone rather than mutating shared modules.
 pub fn storageConsumerModule(b: *std.Build, original: *std.Build.Module) *std.Build.Module {
     var copies: std.AutoHashMap(*std.Build.Module, *std.Build.Module) = .init(b.allocator);
-    return cloneStorageConsumer(b, original, &copies);
+    return cloneStorageConsumer(b, original, &copies, false);
 }
-fn cloneStorageConsumer(b: *std.Build, original: *std.Build.Module, copies: *std.AutoHashMap(*std.Build.Module, *std.Build.Module)) *std.Build.Module {
+/// A relocatable entry object must not partially link provider archives.
+/// Their original graph is supplied separately to addNativeExecutableLinks.
+/// Keep compile-time imports/includes, but leave all physical link inputs to
+/// the final native linker; Zig's Mach-O -r path cannot preserve ObjC metadata.
+pub fn nativeExecutableEntryModule(b: *std.Build, original: *std.Build.Module) *std.Build.Module {
+    var copies: std.AutoHashMap(*std.Build.Module, *std.Build.Module) = .init(b.allocator);
+    return cloneStorageConsumer(b, original, &copies, true);
+}
+fn cloneStorageConsumer(b: *std.Build, original: *std.Build.Module, copies: *std.AutoHashMap(*std.Build.Module, *std.Build.Module), native_entry: bool) *std.Build.Module {
     if (copies.get(original)) |existing| return existing;
     const copy = @import("source_owner.zig").cloneModule(b, original);
     copy.import_table = .empty;
     copy.link_objects = .empty;
     copy.cached_graph = .{ .modules = &.{}, .names = &.{} };
     copies.put(original, copy) catch @panic("OOM");
-    for (original.link_objects.items) |input| switch (input) {
+    if (!native_entry) for (original.link_objects.items) |input| switch (input) {
         .c_source_file, .c_source_files, .assembly_file => {},
         else => copy.link_objects.append(b.allocator, input) catch @panic("OOM"),
     };
     for (original.import_table.keys(), original.import_table.values()) |name, imported|
-        copy.addImport(name, cloneStorageConsumer(b, imported, copies));
+        copy.addImport(name, cloneStorageConsumer(b, imported, copies, native_entry));
     @import("source_owner.zig").adopt(copy);
     return copy;
 }

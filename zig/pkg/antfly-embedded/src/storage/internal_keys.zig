@@ -265,13 +265,13 @@ pub const JournalCreditLedger = struct {
         var raw: [protected_len]u8 = undefined;
         raw[0..encoded_len].* = self.encode();
         std.mem.writeInt(u64, raw[encoded_len..][0..8], binding, .little);
-        std.mem.writeInt(u32, raw[protected_len - 4 ..], std.hash.Crc32.hash(raw[0 .. protected_len - 4]), .little);
+        std.mem.writeInt(u32, raw[protected_len - 4 ..], @import("antfly_hash").Crc32.hash(raw[0 .. protected_len - 4]), .little);
         return raw;
     }
 
     pub fn decodeProtected(raw: []const u8) ?JournalCreditLedger {
         if (raw.len != protected_len) return null;
-        if (std.mem.readInt(u32, raw[protected_len - 4 ..][0..4], .little) != std.hash.Crc32.hash(raw[0 .. protected_len - 4])) return null;
+        if (std.mem.readInt(u32, raw[protected_len - 4 ..][0..4], .little) != @import("antfly_hash").Crc32.hash(raw[0 .. protected_len - 4])) return null;
         return decode(raw[0..encoded_len]);
     }
 
@@ -3940,6 +3940,13 @@ test "journal credit ledger round trips and charges/releases saturate" {
     try std.testing.expectEqual(charged.records, decoded.records);
 
     try std.testing.expectEqual(@as(?JournalCreditLedger, null), JournalCreditLedger.decode(raw[0..8]));
+
+    var protected = charged.encodeProtected(17);
+    const payload_end = protected.len - @sizeOf(u32);
+    try std.testing.expectEqual(std.hash.Crc32.hash(protected[0..payload_end]), std.mem.readInt(u32, protected[payload_end..][0..4], .little));
+    try std.testing.expectEqual(@as(?u64, 17), JournalCreditLedger.protectedBinding(&protected));
+    protected[0] ^= 1;
+    try std.testing.expectEqual(@as(?JournalCreditLedger, null), JournalCreditLedger.decodeProtected(&protected));
 
     // Releasing more than charged saturates at zero rather than underflowing:
     // a retirement chunk racing a concurrently-corrected ledger must never

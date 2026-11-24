@@ -16,7 +16,9 @@ const embedded = @import("../ops/cuda/embedded_module.zig");
 const catalog = @import("../tile/cuda_standalone.zig");
 const launch_abi = @import("../ops/cuda/launch_abi.zig");
 const residual = @import("../ops/cuda/residual_block_mix_bf16.zig");
-const Program = embedded.EmbeddedModule(embedded.profile(catalog.block_decoder_bf16).image, catalog.block_decoder_bf16_entries);
+const Program = embedded.EmbeddedModule(struct {
+    pub const image = embedded.profile(catalog.block_decoder_bf16).image;
+}, catalog.block_decoder_bf16_entries);
 
 pub const block_rows = 8;
 pub const proposal_rows = block_rows - 1;

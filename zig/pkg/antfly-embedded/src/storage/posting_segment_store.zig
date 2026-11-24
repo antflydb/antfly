@@ -355,6 +355,180 @@ pub const RecoveredWal = struct {
     }
 };
 
+/// Capture only the new active WAL bytes from a caller-pinned Lite cut.
+/// A changed CURRENT requires loading the replacement posting generation.
+pub fn readCommittedWalSuffixAtLiteCheckpoint(
+    alloc: Allocator,
+    file: *@import("lite/native.zig").NativeFile,
+    cut: @import("lite/native.zig").CheckpointSlot,
+    root_dir: []const u8,
+    previous: posting_wal.Checkpoint,
+    committed_bytes: u64,
+    last_batch: ?u64,
+    covered_sequence: u64,
+) !?RecoveredWal {
+    const current_path = try checkpointCurrentPathAlloc(alloc, root_dir);
+    defer alloc.free(current_path);
+    const current = (try file.getIndexCatalogRecordLimitedAtCheckpointAlloc(alloc, current_path, max_control_bytes, cut)) orelse return error.MissingPostingCheckpoint;
+    defer alloc.free(current);
+    const checkpoint = try posting_wal.Checkpoint.decode(current);
+    if (!std.mem.eql(u8, &previous.encode(), current)) return null;
+
+    const sealed_bytes = checkpoint.sealedWalBytes();
+    if (committed_bytes < @max(sealed_bytes, checkpoint.wal_committed_bytes) or committed_bytes > max_wal_bytes)
+        return error.InvalidPostingWalBoundary;
+    const offset = committed_bytes - sealed_bytes;
+    const path = try checkpointWalPathAlloc(alloc, root_dir, checkpoint.wal_generation);
+    defer alloc.free(path);
+    const size = (try file.getIndexCatalogRecordSizeAtCheckpoint(path, cut)) orelse
+        if (offset == 0) 0 else return error.MissingPostingWal;
+    if (size < offset) return error.PostingWalShorterThanCheckpoint;
+    if (size > max_wal_bytes - sealed_bytes) return error.PostingWalTooLarge;
+    if (offset != 0) {
+        const frame_len = posting_wal.Replay.commit_frame_len;
+        if (offset < frame_len) return error.InvalidPostingWalBoundary;
+        const batch = last_batch orelse return error.InvalidPostingWalBoundary;
+        const frame = (try file.getIndexCatalogRecordRangeAtCheckpointAlloc(
+            alloc,
+            path,
+            offset - frame_len,
+            frame_len,
+            cut,
+        )) orelse return error.MissingPostingWal;
+        defer alloc.free(frame);
+        try posting_wal.Replay.verifyCommitBoundary(frame, batch, covered_sequence);
+    }
+    const len: usize = @intCast(size - offset);
+    const bytes = if (len == 0)
+        try alloc.alloc(u8, 0)
+    else
+        (try file.getIndexCatalogRecordRangeAtCheckpointAlloc(alloc, path, offset, len, cut)) orelse return error.MissingPostingWal;
+    errdefer alloc.free(bytes);
+    return .{
+        .alloc = alloc,
+        .bytes = bytes,
+        .replay = try posting_wal.Replay.parseCommittedSuffix(alloc, bytes, last_batch, covered_sequence),
+    };
+}
+
+/// Load a replacement posting generation without consulting the live
+/// pathname. The returned immutable bytes belong to the generation.
+pub fn openAtLiteCheckpoint(
+    alloc: Allocator,
+    storage: lsm_backend.Storage,
+    file: *@import("lite/native.zig").NativeFile,
+    cut: @import("lite/native.zig").CheckpointSlot,
+    root_dir: []const u8,
+) !OpenedWithSegment {
+    const Reader = struct {
+        file: *@import("lite/native.zig").NativeFile,
+        cut: @import("lite/native.zig").CheckpointSlot,
+
+        fn get(raw: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(raw));
+        }
+
+        fn read(raw: *anyopaque, a: Allocator, path: []const u8, max: usize) anyerror![]u8 {
+            const self = get(raw);
+            return (try self.file.getIndexCatalogRecordLimitedAtCheckpointAlloc(a, path, max, self.cut)) orelse error.FileNotFound;
+        }
+
+        fn readRange(raw: *anyopaque, a: Allocator, path: []const u8, offset: u64, len: usize) anyerror![]u8 {
+            const self = get(raw);
+            return (try self.file.getIndexCatalogRecordRangeAtCheckpointAlloc(a, path, offset, len, self.cut)) orelse error.FileNotFound;
+        }
+
+        fn size(raw: *anyopaque, path: []const u8) anyerror!u64 {
+            const self = get(raw);
+            return (try self.file.getIndexCatalogRecordSizeAtCheckpoint(path, self.cut)) orelse error.FileNotFound;
+        }
+
+        fn rejectPath(_: *anyopaque, _: []const u8) anyerror!void {
+            return error.ReadOnly;
+        }
+
+        fn rejectPaths(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {
+            return error.ReadOnly;
+        }
+
+        fn now(_: *anyopaque) u64 {
+            return 0;
+        }
+
+        const vtable: lsm_backend.Storage.VTable = .{
+            .read_file_alloc = read,
+            .read_file_range_alloc = readRange,
+            .file_size = size,
+            .create_dir_path = rejectPath,
+            .write_file_absolute = rejectPaths,
+            .rename_absolute = rejectPaths,
+            .delete_file_absolute = rejectPath,
+            .delete_tree = rejectPath,
+            .now_ns = now,
+        };
+    };
+    var reader: Reader = .{ .file = file, .cut = cut };
+    var opened = try Store.openReadOnlyWithSegmentAlloc(alloc, .{ .ptr = &reader, .vtable = &Reader.vtable }, root_dir);
+    // The loader used the stack capability synchronously and owns its bytes.
+    opened.store.storage = storage;
+    return opened;
+}
+
+test "Lite posting suffix reads its pinned catalog and detects checkpoint replacement" {
+    const native = @import("lite/native.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/posting-suffix.aflite", .{tmp.sub_path});
+    defer alloc.free(path);
+    var file = try native.NativeFile.createWithIo(alloc, std.testing.io, path, .{});
+    defer file.close();
+
+    const root_dir = "/dense/posting-segments";
+    var checkpoint: posting_wal.Checkpoint = .{
+        .segment_generation = 1,
+        .segment_checksum = 42,
+        .wal_generation = 1,
+        .wal_committed_bytes = 0,
+        .covered_source_sequence = 5,
+    };
+    const current_path = try checkpointCurrentPathAlloc(alloc, root_dir);
+    defer alloc.free(current_path);
+    const wal_path = try checkpointWalPathAlloc(alloc, root_dir, 1);
+    defer alloc.free(wal_path);
+    var writer = posting_wal.Writer.init(alloc);
+    defer writer.deinit();
+    try writer.append(.mutation, 1, 8, 6, "old");
+    try writer.commit(1, 6);
+    const boundary = writer.bytes().len;
+    try writer.append(.mutation, 2, 8, 7, "new");
+    try writer.commit(2, 7);
+    try file.putIndexCatalogRecord(current_path, &checkpoint.encode());
+    try file.putIndexCatalogRecord(wal_path, writer.bytes());
+
+    var suffix = (try readCommittedWalSuffixAtLiteCheckpoint(alloc, &file, file.activeCheckpoint(), root_dir, checkpoint, boundary, 1, 6)).?;
+    defer suffix.deinit();
+    try std.testing.expectEqual(writer.bytes().len - boundary, suffix.bytes.len);
+    try std.testing.expectEqual(@as(usize, 1), suffix.replay.records.items.len);
+    try std.testing.expectEqualStrings("new", suffix.replay.records.items[0].payload);
+
+    try std.testing.expectError(error.InvalidPostingWalCommit, readCommittedWalSuffixAtLiteCheckpoint(
+        alloc,
+        &file,
+        file.activeCheckpoint(),
+        root_dir,
+        checkpoint,
+        boundary,
+        2,
+        6,
+    ));
+
+    const previous = checkpoint;
+    checkpoint.segment_generation = 2;
+    try file.putIndexCatalogRecord(current_path, &checkpoint.encode());
+    try std.testing.expect((try readCommittedWalSuffixAtLiteCheckpoint(alloc, &file, file.activeCheckpoint(), root_dir, previous, boundary, 1, 6)) == null);
+}
+
 fn replayHasStateRecords(replay: *const posting_wal.Replay) bool {
     for (replay.records.items) |record| {
         if (record.kind != .coverage) return true;
