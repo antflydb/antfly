@@ -20829,6 +20829,7 @@ static bool termite_metal_decode_runtime_cached_mps_matrices(
     size_t in_dim,
     size_t out_dim,
     uint8_t weight_dtype,
+    bool frame_local,
     MPSMatrix **left_out,
     MPSMatrix **right_out,
     MPSMatrix **result_out
@@ -20837,7 +20838,7 @@ static bool termite_metal_decode_runtime_cached_mps_matrices(
         left_buffer == nil || result_buffer == nil ||
         runtime->linear_weight_buffers[slot] == nil ||
         left_out == NULL || right_out == NULL || result_out == NULL) return false;
-    const bool cache_enabled = !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_MPS_MATRIX_VIEW_CACHE"));
+    const bool cache_enabled = !frame_local && !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_MPS_MATRIX_VIEW_CACHE"));
     if (cache_enabled && runtime->linear_mps_left[slot] != nil &&
         runtime->linear_mps_right[slot] != nil &&
         runtime->linear_mps_result[slot] != nil &&
@@ -42733,6 +42734,15 @@ int antfly_metal_dense_linear_direct_rows_ready(termite_metal_decode_runtime *ru
         runtime->linear_f16_multi_row_pipeline != nil && runtime->linear_f16_multi_row_reduce_pipeline != nil;
 }
 
+int antfly_metal_dense_linear_assigned_mps_ready(termite_metal_decode_runtime *runtime, size_t slot, size_t rows) {
+    if (runtime == NULL || rows <= 1 || rows > UINT32_MAX ||
+        antfly_metal_linear_slot_prepared(runtime, slot) == 0 ||
+        runtime->linear_glide_tensor_ops[slot] || runtime->lighton_vision_mpp_required ||
+        runtime->linear_weight_dtypes[slot] != TERMITE_METAL_DENSE_LINEAR_DTYPE_F32 ||
+        runtime->linear_bias_pipeline == nil) return 0;
+    return termite_metal_dense_linear_uses_mps(runtime, slot, rows, runtime->linear_in_dims[slot], runtime->linear_out_dims[slot]);
+}
+
 static int termite_metal_decode_runtime_encode_linear_multi_row_device(
     termite_metal_decode_runtime *runtime,
     size_t slot,
@@ -42745,6 +42755,7 @@ static int termite_metal_decode_runtime_encode_linear_multi_row_device(
     size_t output_offset,
     id<MTLCommandBuffer> command_buffer,
     bool frame_owned,
+    bool assigned_views,
     bool *used_mps
 ) {
     if (runtime == NULL || input_handle == NULL || output_handle == NULL) return -1;
@@ -42847,9 +42858,15 @@ static int termite_metal_decode_runtime_encode_linear_multi_row_device(
                         in_dim,
                         out_dim,
                         mps_weight_dtype,
-                        &left,
+                        assigned_views, &left,
                         &right,
                         &result)) return -10;
+                // A planned encoder already owns the buffers. Keep these
+                // MPS view objects with that frame, outside the legacy slot cache.
+                if (assigned_views && !frame_owned &&
+                    (termite_metal_decode_runtime_retain_frame_resource(runtime, left) != 0 ||
+                     termite_metal_decode_runtime_retain_frame_resource(runtime, right) != 0 ||
+                     termite_metal_decode_runtime_retain_frame_resource(runtime, result) != 0)) return -10;
 	                // MPS owns its compute encoder. End a coalesced planned
 	                // encoder before handing it the same command buffer;
 	                // otherwise AGX aborts instead of returning an error.
@@ -43010,6 +43027,32 @@ static int termite_metal_decode_runtime_finish_linear_command_buffer(
     return result;
 }
 
+static int termite_metal_dense_linear_rows(
+    termite_metal_decode_runtime *runtime,
+    size_t slot,
+    void *input_handle,
+    size_t input_offset,
+    size_t rows,
+    size_t in_dim,
+    size_t out_dim,
+    void *output_handle,
+    size_t output_offset,
+    bool assigned_views
+) {
+    if (runtime == NULL || input_handle == NULL || output_handle == NULL) return -1;
+    @autoreleasepool {
+        bool frame_owned = true;
+        id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
+        if (command_buffer == nil) return -10;
+        bool used_mps = false;
+        const int rc = termite_metal_decode_runtime_encode_linear_multi_row_device(
+            runtime, slot, input_handle, input_offset, rows, in_dim, out_dim,
+            output_handle, output_offset, command_buffer, frame_owned, assigned_views, &used_mps);
+        if (rc != 0) return rc;
+        return termite_metal_decode_runtime_finish_linear_command_buffer(runtime, command_buffer, frame_owned, used_mps, -12);
+    }
+}
+
 int termite_metal_decode_runtime_apply_linear_multi_row_device(
     termite_metal_decode_runtime *runtime,
     size_t slot,
@@ -43021,18 +43064,21 @@ int termite_metal_decode_runtime_apply_linear_multi_row_device(
     void *output_handle,
     size_t output_offset
 ) {
-    if (runtime == NULL || input_handle == NULL || output_handle == NULL) return -1;
-    @autoreleasepool {
-        bool frame_owned = true;
-        id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
-        if (command_buffer == nil) return -10;
-        bool used_mps = false;
-        const int rc = termite_metal_decode_runtime_encode_linear_multi_row_device(
-            runtime, slot, input_handle, input_offset, rows, in_dim, out_dim,
-            output_handle, output_offset, command_buffer, frame_owned, &used_mps);
-        if (rc != 0) return rc;
-        return termite_metal_decode_runtime_finish_linear_command_buffer(runtime, command_buffer, frame_owned, used_mps, -12);
-    }
+    return termite_metal_dense_linear_rows(runtime, slot, input_handle, input_offset, rows, in_dim, out_dim, output_handle, output_offset, false);
+}
+
+int antfly_metal_dense_linear_assigned_rows(
+    termite_metal_decode_runtime *runtime,
+    size_t slot,
+    void *input_handle,
+    size_t input_offset,
+    size_t rows,
+    size_t in_dim,
+    size_t out_dim,
+    void *output_handle,
+    size_t output_offset
+) {
+    return termite_metal_dense_linear_rows(runtime, slot, input_handle, input_offset, rows, in_dim, out_dim, output_handle, output_offset, true);
 }
 
 int termite_metal_decode_runtime_apply_dense_mlp2_device(
@@ -43573,7 +43619,7 @@ int termite_metal_decode_runtime_apply_dense_ffn_layer_norm_device(
                 hidden_size,
                 intermediate_size,
                 first_weight_dtype,
-                &first_left,
+                false, &first_left,
                 &first_right,
                 &first_result)) {
             runtime->deberta_ffn_fused_fallbacks += 1;
@@ -43616,7 +43662,7 @@ int termite_metal_decode_runtime_apply_dense_ffn_layer_norm_device(
                 intermediate_size,
                 hidden_size,
                 second_weight_dtype,
-                &second_left,
+                false, &second_left,
                 &second_right,
                 &second_result)) {
             runtime->deberta_ffn_fused_fallbacks += 1;
@@ -43855,7 +43901,7 @@ int termite_metal_decode_runtime_apply_dense_linear_layer_norm_device(
                 in_dim,
                 hidden_size,
                 weight_dtype,
-                &left,
+                false, &left,
                 &right,
                 &result)) return -12;
         termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
@@ -47053,7 +47099,7 @@ static int termite_metal_decode_runtime_encode_linear_pair_slots(
         if (rows > 1) {
             const int rc = termite_metal_decode_runtime_encode_linear_multi_row_device(
                 runtime, slots[i], (__bridge void *)input_buffer, input_offset, rows, in_dim, out_dim,
-                (__bridge void *)outputs[i], output_offsets[i], command_buffer, frame_owned, used_mps);
+                (__bridge void *)outputs[i], output_offsets[i], command_buffer, frame_owned, false, used_mps);
             if (rc != 0) return rc;
             continue;
         }

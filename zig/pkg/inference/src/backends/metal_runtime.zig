@@ -22187,6 +22187,18 @@ pub extern fn termite_metal_decode_runtime_apply_linear_multi_row_device(
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
+pub extern fn antfly_metal_dense_linear_assigned_rows(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+
 pub extern fn termite_metal_decode_runtime_borrow_active_layer_projection_scratch_device(
     runtime: ?*RawMetalDecodeRuntime,
     index: usize,
@@ -28382,9 +28394,10 @@ pub fn decoderRuntimeApplyAudioLinearInto(
     out_dim: usize,
     output: MetalTensor,
 ) !bool {
-    return applyDenseLinearInto(false, self, slot, input, rows, in_dim, out_dim, output);
+    return applyDenseLinearInto(false, false, self, slot, input, rows, in_dim, out_dim, output);
 }
 
+pub extern fn antfly_metal_dense_linear_assigned_mps_ready(runtime: ?*RawMetalDecodeRuntime, slot: usize, rows: usize) c_int;
 pub extern fn antfly_metal_dense_linear_direct_rows_ready(runtime: ?*RawMetalDecodeRuntime, slot: usize, rows: usize) c_int;
 
 pub fn decoderRuntimeApplyLinearDeviceInto(
@@ -28396,11 +28409,16 @@ pub fn decoderRuntimeApplyLinearDeviceInto(
     out_dim: usize,
     output: MetalTensor,
 ) !bool {
-    return applyDenseLinearInto(true, self, slot, input, rows, in_dim, out_dim, output);
+    return applyDenseLinearInto(true, false, self, slot, input, rows, in_dim, out_dim, output);
+}
+
+pub fn decoderRuntimeApplyAssignedLinearDeviceInto(self: anytype, slot: usize, input: MetalTensor, rows: usize, in_dim: usize, out_dim: usize, output: MetalTensor) !bool {
+    return applyDenseLinearInto(true, true, self, slot, input, rows, in_dim, out_dim, output);
 }
 
 inline fn applyDenseLinearInto(
     comptime single_row_schedule: bool,
+    comptime assigned_views: bool,
     self: anytype,
     slot: usize,
     input: MetalTensor,
@@ -28436,7 +28454,8 @@ inline fn applyDenseLinearInto(
         output.deviceHandle(),
         output.deviceByteOffset(),
     ) == 0;
-    return termite_metal_decode_runtime_apply_linear_multi_row_device(
+    const dispatch = if (assigned_views) antfly_metal_dense_linear_assigned_rows else termite_metal_decode_runtime_apply_linear_multi_row_device;
+    return dispatch(
         runtime,
         slot,
         input.deviceHandle(),
@@ -48473,38 +48492,44 @@ test "metal native decoder runtime f16 MPS linear transitions from planned encod
     var output = try MetalTensor.deviceAllocate(runtime, input_data.len * @sizeOf(f32), .private, &shape);
     defer output.deinit();
 
-    try beginFrame(runtime);
-    errdefer cancelFrame(runtime) catch {};
-    try beginPlannedComputeScope(runtime, @backingInt(ComputeSource.dense_linear), .ffn);
-    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_apply_add_device(
-        runtime,
-        input.deviceHandle(),
-        input.deviceByteOffset(),
-        input.deviceHandle(),
-        input.deviceByteOffset(),
-        input_data.len,
-        scratch.deviceHandle(),
-        scratch.deviceByteOffset(),
-    ));
-    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_apply_linear_multi_row_device(
-        runtime,
-        slot,
-        input.deviceHandle(),
-        input.deviceByteOffset(),
-        rows,
-        hidden_size,
-        hidden_size,
-        output.deviceHandle(),
-        output.deviceByteOffset(),
-    ));
-    try endPlannedComputeScope(runtime);
-    try submitFrame(runtime);
-    try waitFrame(runtime);
+    // Exercise the assigned path first so legacy cache entries cannot hide
+    // the lifetime of the views bound to the planned buffers.
+    inline for ([_]bool{ true, false }) |assigned| {
+        try beginFrame(runtime);
+        errdefer cancelFrame(runtime) catch {};
+        try beginPlannedComputeScope(runtime, @backingInt(ComputeSource.dense_linear), .ffn);
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_apply_add_device(
+            runtime,
+            input.deviceHandle(),
+            input.deviceByteOffset(),
+            input.deviceHandle(),
+            input.deviceByteOffset(),
+            input_data.len,
+            scratch.deviceHandle(),
+            scratch.deviceByteOffset(),
+        ));
+        const dispatch = if (assigned) antfly_metal_dense_linear_assigned_rows else termite_metal_decode_runtime_apply_linear_multi_row_device;
+        try std.testing.expectEqual(@as(c_int, 0), dispatch(
+            runtime,
+            slot,
+            input.deviceHandle(),
+            input.deviceByteOffset(),
+            rows,
+            hidden_size,
+            hidden_size,
+            output.deviceHandle(),
+            output.deviceByteOffset(),
+        ));
+        try endPlannedComputeScope(runtime);
+        try submitFrame(runtime);
+        try waitFrame(runtime);
+        if (assigned) try std.testing.expectEqual(@as(u64, 0), termite_metal_decode_runtime_linear_view_bytes(runtime, slot + 1));
 
-    const actual = try output.toHostSlice();
-    try std.testing.expectEqual(input_data.len, actual.len);
-    for (input_data, actual) |expected, got| {
-        try std.testing.expectApproxEqAbs(expected, got, 2e-3);
+        const actual = try output.toHostSlice();
+        try std.testing.expectEqual(input_data.len, actual.len);
+        for (input_data, actual) |expected, got| {
+            try std.testing.expectApproxEqAbs(expected, got, 2e-3);
+        }
     }
 }
 

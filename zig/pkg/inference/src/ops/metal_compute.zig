@@ -12443,7 +12443,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (comptime !build_options.enable_metal) return null;
             const key = bindingKey(compute, request.descriptor, request.inputs) orelse return null;
             const slot = compute.assignedDenseLinearSlot(key) orelse return null;
-            if (direct and !directRowsReady(compute, slot, request.descriptor.operation.linear)) return null;
+            if (direct and !assignedRowsReady(compute, slot, request.descriptor.operation.linear)) return null;
             var facts: [3]route.Binding = undefined;
             var host_planes: [2]@import("../execution/storage_ownership.zig").Plane = undefined;
             var checked = request;
@@ -12505,6 +12505,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         fn directRowsReady(compute: *MetalCompute, slot: usize, linear: ops.kernel_descriptor.Linear) bool {
             return linear.rows == 1 or metal_runtime.antfly_metal_dense_linear_direct_rows_ready(compute.provider_impl.raw_decode_runtime, slot, linear.rows) != 0;
         }
+        fn assignedRowsReady(compute: *MetalCompute, slot: usize, linear: ops.kernel_descriptor.Linear) bool {
+            return directRowsReady(compute, slot, linear) or
+                metal_runtime.antfly_metal_dense_linear_assigned_mps_ready(compute.provider_impl.raw_decode_runtime, slot, linear.rows) != 0;
+        }
         fn pinValid(self: *const PreparedDenseLinear) bool {
             if (comptime !build_options.enable_metal) return false;
             return self.declaration.valid() and (if (self.payload) |pin| pin.valid() else true);
@@ -12517,7 +12521,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             try @import("../execution/assigned_kernel_route.zig").validateDescriptor(&self.direct, request.descriptor);
             const linear = request.descriptor.operation.linear;
             const key = compute.assignedDenseLinearKey(linear, request.inputs[1], if (linear.bias) request.inputs[2] else null) orelse return error.PreparedKernelBindingChanged;
-            if (!std.meta.eql(key, self.key) or request.auxiliaries.len != 0 or !directRowsReady(compute, self.slot, linear)) return error.PreparedKernelBindingChanged;
+            if (!std.meta.eql(key, self.key) or request.auxiliaries.len != 0 or !assignedRowsReady(compute, self.slot, linear)) return error.PreparedKernelBindingChanged;
             return self.slot;
         }
         fn matchesInputs(self: *PreparedDenseLinear, inputs: []const route.Binding) bool {
@@ -14371,6 +14375,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .linear => |linear| blk: {
                 const scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
                 defer self.endActivePlannedComputeScope(scope);
+                if (request.prepared_route != null) {
+                    break :blk try metal_runtime.decoderRuntimeApplyAssignedLinearDeviceInto(self.provider_impl, linear_slot.?, input, linear.rows, linear.in_dim, linear.out_dim, out_tensor);
+                }
                 break :blk try metal_runtime.decoderRuntimeApplyLinearDeviceInto(self.provider_impl, linear_slot.?, input, linear.rows, linear.in_dim, linear.out_dim, out_tensor);
             },
         };
