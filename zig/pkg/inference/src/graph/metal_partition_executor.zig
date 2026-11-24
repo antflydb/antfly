@@ -2040,6 +2040,7 @@ pub const MetalPartitionExecutor = struct {
             reachable,
             device_id,
             options.physical_frame,
+            owned_frame,
         );
         if (collect_loop_profile) loop_profile.materialize_constants_ns += metalPartitionElapsedNs(constants_start_ns, metalPartitionNowNs());
         if (trace_progress) std.debug.print("metal_partition_progress: phase=materialize_constants_end partition={d}\n", .{partition_index});
@@ -2229,6 +2230,7 @@ pub const MetalPartitionExecutor = struct {
             if (collect_loop_profile) loop_profile.nodes += 1;
             const i: usize = @intCast(node_id);
             if (i >= reachable.len or !reachable[i]) continue;
+            if (owned_frame and graph.node(node_id).op == .constant and options.physical_frame.?.pool.baked_region_literals.contains(node_id)) continue;
             if (i < skipped_nodes.len and skipped_nodes[i]) {
                 traceMetalValueLifetime("top_skip_continue", node_id, node_id);
                 if (traceRuntimeRegionsEnabled()) {
@@ -16615,12 +16617,14 @@ fn materializePartitionConstants(
     reachable: []const bool,
     device_id: DeviceId,
     physical_frame: ?*@import("../execution/physical_buffers.zig").Frame,
+    owned_frame: bool,
 ) !void {
     for (node_ids) |node_id| {
         const i: usize = @intCast(node_id);
         if (i >= reachable.len or !reachable[i]) continue;
         if (values[i] != null) continue;
         const node = graph.node(node_id);
+        if (owned_frame and node.op == .constant and physical_frame.?.pool.baked_region_literals.contains(node_id)) continue;
         const materialized = switch (node.op) {
             .constant => |attrs| if (physical_frame) |frame|
                 (try frame.materializeLiteral(cb, node_id)) orelse try executeRuntimeConstant(graph, cb, node.output_shape, attrs)

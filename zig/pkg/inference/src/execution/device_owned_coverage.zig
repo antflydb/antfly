@@ -323,6 +323,10 @@ fn assessDeviceNodes(
         }
         const node = graph.node(@intCast(id));
         if (slot.node_id != id or slot.id >= pool.plan.slots.len or pool.plan.node_slots[id] != slot.id or slot.backend != target.kind() or !slot.desc.shape.eq(node.output_shape)) return .backend_region;
+        if (target.kind() == .metal and slot.kind == .constant and pool.baked_region_literals.contains(@intCast(id))) {
+            result.literals += 1;
+            continue;
+        }
         if (target.kind() == .cuda and slot.kind == .constant and node.op == .constant and
             slot.desc.shape.dtype == .f32 and slot.desc.shape.numElements() == 0 and node.op.constant.data_len == 0)
         {

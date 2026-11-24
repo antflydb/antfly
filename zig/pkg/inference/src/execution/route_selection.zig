@@ -190,6 +190,13 @@ pub const Selection = struct {
                 active.* = reachable[literal.node];
             };
         }
+        if (pool.literal_store) |store| {
+            var baked = pool.baked_region_literals.keyIterator();
+            while (baked.next()) |node| {
+                const index = store.node_indices[node.*];
+                if (index != ml.graph.null_node) self.literal_enabled[index] = false;
+            }
+        }
         const stable = try self.allocator.alloc(bool, if (self.alias_index) |index| index.by_node.len else 0);
         defer self.allocator.free(stable);
         while (true) {

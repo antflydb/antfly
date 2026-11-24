@@ -3552,6 +3552,13 @@ test "planned Metal elementwise product-add publishes into the assigned region o
             return error.MissingProductAddCoverage;
         }
         try std.testing.expectEqual(@as(usize, 1), routes.pool.regions.len);
+        const expected_literals: usize = if (dual_scaled) 2 else if (scaled) 1 else 0;
+        try std.testing.expectEqual(expected_literals, routes.pool.baked_region_literals.count());
+        for (routes.pool.regions[0].owner.literal_nodes) |literal| {
+            const store = routes.pool.literal_store orelse return error.MissingPhysicalPool;
+            const index = store.node_indices[literal];
+            try std.testing.expect(!routes.pool.literalEnabled(index));
+        }
         const products = [_]ml.graph.NodeId{ left, right };
         for (products[0..if (pair or dual_scaled) @as(usize, 2) else 1]) |product| {
             const id = program.id_map[product];

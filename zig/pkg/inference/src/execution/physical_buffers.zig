@@ -212,6 +212,7 @@ pub const Pool = struct {
     region_owner: ?@import("region_preparation.zig").Selected = null,
     regions: []@import("region_binding.zig").Installed = &.{},
     region_by_node: []u32 = &.{},
+    baked_region_literals: std.AutoHashMapUnmanaged(NodeId, void) = .empty,
     region_runtime_last_use: []u32 = &.{},
     host_alignment: std.mem.Alignment = .@"1",
     host_workspace_allocator: ?std.mem.Allocator = null,
@@ -1484,11 +1485,37 @@ pub const Pool = struct {
     }
 
     fn deinitRegions(self: *Pool) void {
+        self.baked_region_literals.deinit(self.allocator);
         for (self.regions) |installed| self.allocator.free(installed.outputs);
         self.allocator.free(self.regions);
         self.allocator.free(self.region_by_node);
         self.allocator.free(self.region_runtime_last_use);
         if (self.region_owner) |*owner| owner.deinit();
+    }
+
+    fn selectBakedRegionLiterals(self: *Pool, graph: *const Graph, reachable: []const bool) !void {
+        if (!self.metal_frame_dispatch or self.region_execution_profile != .unknown or self.plan.transfers.len != 0) return;
+        for (self.regions) |installed| for (installed.owner.literal_nodes) |node| {
+            const slot = self.plan.slotForNode(node) orelse continue;
+            if (slot.kind == .constant and !slot.roles.graph_output and !slot.roles.partition_output)
+                try self.baked_region_literals.put(self.allocator, node, {});
+        };
+        if (self.baked_region_literals.count() == 0) return;
+        // Keep the constant if any reachable consumer still needs a tensor,
+        // including a metadata alias or an input to another region.
+        for (graph.nodes.items, reachable, 0..) |node, active, index| {
+            if (!active) continue;
+            const installed = self.regionForNode(@intCast(index));
+            for (node.getInputs()) |input| {
+                if (installed) |region| {
+                    if (std.mem.indexOfScalar(NodeId, region.owner.literal_nodes, input) != null) continue;
+                }
+                _ = self.baked_region_literals.remove(input);
+            }
+        }
+        for (self.regions) |installed| for (installed.owner.requirements.literals) |node| {
+            _ = self.baked_region_literals.remove(node);
+        };
     }
 
     pub fn regionForNode(self: *const Pool, node: NodeId) ?*const @import("region_binding.zig").Installed {
@@ -1664,6 +1691,7 @@ pub const Pool = struct {
             self.regions = &.{};
             self.region_by_node = &.{};
         }
+        try self.selectBakedRegionLiterals(graph, reachable);
         try selected.refreshWithAuthority(self, authority);
         for (installed) |value| {
             const owner = value.owner;
