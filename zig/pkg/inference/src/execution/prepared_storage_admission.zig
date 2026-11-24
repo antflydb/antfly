@@ -288,9 +288,6 @@ pub const Prepared = struct {
     }
     /// Cancellation before dispatch has no SDK owner. Once a dispatch binds
     /// its current epoch, unused tokens retire through that exact same scope.
-    pub fn finishInvocation(self: *Prepared) void {
-        self.finishInvocationWithBoundary(null);
-    }
     pub fn finishInvocationWithBoundary(self: *Prepared, current: ?*const sink.Epoch) void {
         if (self.construction_epoch != null) {
             const boundary = current orelse @import("antfly_platform").inference_process_supervisor.restartWorker();

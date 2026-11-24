@@ -5442,9 +5442,6 @@ pub const IncrementalDecoderAdapter = struct {
     }
 
     pub const PreparationOptions = struct { expected_initial_query_rows: ?usize = null };
-    pub fn fromHost(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, hidden: []const f32, rows: usize) !?State {
-        return fromHostPrepared(session, allocator, control, hidden, rows, .{});
-    }
     pub fn fromHostPrepared(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, hidden: []const f32, rows: usize, options: PreparationOptions) !?State {
         const held = if (session.model_lifetime) |model| model.retain() else null;
         defer if (held) |model| model.release();

@@ -336,11 +336,7 @@ fn poolSequence(allocator: std.mem.Allocator, backend: *const ops.ComputeBackend
     };
 }
 
-pub fn maskedMax(allocator: std.mem.Allocator, backend: *const ops.ComputeBackend, output: ops.CT, mask: []const i32, batch: usize, seq_len: usize, hidden: usize) !Value {
-    return maskedMaxWithCleanup(allocator, backend, output, mask, batch, seq_len, hidden, null);
-}
-
-pub fn maskedMaxWithCleanup(allocator: std.mem.Allocator, backend: *const ops.ComputeBackend, output: ops.CT, mask: []const i32, batch: usize, seq_len: usize, hidden: usize, cleanup: ?*const Cleanup) !Value {
+fn maskedMaxWithCleanup(allocator: std.mem.Allocator, backend: *const ops.ComputeBackend, output: ops.CT, mask: []const i32, batch: usize, seq_len: usize, hidden: usize, cleanup: ?*const Cleanup) !Value {
     const rows = std.math.mul(usize, batch, seq_len) catch return error.ShapeMismatch;
     if (batch == 0 or seq_len == 0 or hidden == 0 or mask.len != rows) return error.ShapeMismatch;
     const mask_values = try allocator.alloc(f32, rows);
