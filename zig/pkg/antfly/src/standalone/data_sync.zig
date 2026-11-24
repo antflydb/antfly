@@ -121,12 +121,14 @@ pub fn syncJsonAlloc(a: Allocator, input: []const u8, output: []const u8, select
     if (named == null and names.items.len != 1) return error.InvalidBackupRequest;
     var nonce: [16]u8 = undefined;
     try io.randomSecure(&nonce);
-    const temporary = try std.fmt.allocPrint(a, "{s}.sync-{s}.aflite", .{ output, std.fmt.bytesToHex(nonce, .lower) });
+    const scratch_name = try std.fmt.allocPrint(a, ".antfly.sync-{s}", .{std.fmt.bytesToHex(nonce, .lower)});
+    defer a.free(scratch_name);
+    const scratch = try std.fs.path.join(a, &.{ std.fs.path.dirname(output) orelse ".", scratch_name });
+    defer a.free(scratch);
+    try std.Io.Dir.cwd().createDir(io, scratch, .fromMode(0o700));
+    defer std.Io.Dir.cwd().deleteTree(io, scratch) catch {};
+    const temporary = try std.fs.path.join(a, &.{ scratch, "generation.aflite" });
     defer a.free(temporary);
-    defer std.Io.Dir.cwd().deleteFile(io, temporary) catch {};
-    const lock = try std.fmt.allocPrint(a, "{s}.lock", .{temporary});
-    defer a.free(lock);
-    defer std.Io.Dir.cwd().deleteFile(io, lock) catch {};
     var documents: u64 = 0;
     var vectors: u64 = 0;
     var remaining_expanded = options.max_expanded_bytes;
@@ -173,8 +175,8 @@ pub fn syncJsonAlloc(a: Allocator, input: []const u8, output: []const u8, select
 
         const archive_path = try std.fmt.allocPrint(a, "{s}.afb", .{temporary});
         defer a.free(archive_path);
-        defer std.Io.Dir.cwd().deleteFile(io, archive_path) catch {};
         var archive = try std.Io.Dir.cwd().createFile(io, archive_path, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
+        defer std.Io.Dir.cwd().deleteFile(io, archive_path) catch {};
         defer archive.close(io);
         const spool_path = try std.fmt.allocPrint(a, "{s}.spool", .{temporary});
         defer a.free(spool_path);
@@ -317,6 +319,10 @@ fn publishOutput(io: std.Io, temporary: []const u8, output: []const u8, comptime
         else => return error.OperationUnsupported,
     }
     confirmDurability(io, output) catch return error.DurabilityOutcomeUnknown;
+    const source_parent = std.fs.path.dirname(temporary) orelse ".";
+    const destination_parent = std.fs.path.dirname(output) orelse ".";
+    if (!std.mem.eql(u8, source_parent, destination_parent))
+        confirmDurability(io, temporary) catch return error.DurabilityOutcomeUnknown;
 }
 
 fn insertLogicalTable(a: Allocator, tables: *std.StringHashMap(usize), name: []const u8, index: usize) ![]const u8 {
@@ -1059,6 +1065,25 @@ test "data sync requires an initialized physical identity and rejects schema mig
             try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, output, .{}));
         }
     }
+}
+
+test "data sync accepts a long destination filename" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const input = try std.fs.path.join(a, &.{ root, "source.aflite" });
+    defer a.free(input);
+    const stem: [240]u8 = @splat('a');
+    const output = try std.fs.path.join(a, &.{ root, &(stem ++ ".aflite".*) });
+    defer a.free(output);
+    try createTestSource(a, input, false);
+    const report = try syncJsonAlloc(a, input, output, "records", test_definition, .{});
+    defer a.free(report);
+    const stat = try std.Io.Dir.cwd().statFile(io, output, .{});
+    try std.testing.expect(stat.size != 0);
 }
 
 test "data sync rejects occupied output entries before opening the source" {
