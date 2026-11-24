@@ -52768,9 +52768,9 @@ const CompleteCudaProgramBudget = struct {
     }
 };
 
-// A model Tensor directly consumed by Direct remains input-dependent, even
-// though the same model can feed an explicitly materializing Projection.
-fn qualifyCudaDirectModelTensorTaint(allocator: std.mem.Allocator, backend: *const ops.ComputeBackend, weight: CT, width: usize, expected: []const f32) !void {
+// The direct unary kernel writes an assigned dense output. It still validates
+// the model input on invocation and cannot confer a representation witness on it.
+fn qualifyCudaDirectModelTensorOutput(allocator: std.mem.Allocator, backend: *const ops.ComputeBackend, weight: CT, width: usize, expected: []const f32) !void {
     const ml = @import("ml");
     const program_mod = @import("../../execution/program.zig");
     const executable_mod = @import("../../execution/executable.zig");
@@ -52792,11 +52792,11 @@ fn qualifyCudaDirectModelTensorTaint(allocator: std.mem.Allocator, backend: *con
     const selection = &routes.pool.selection.?;
     const selected = selection.routes[program.id_map[output]] orelse return error.MissingDirectModelRoute;
     try std.testing.expectEqual(route.ValidationScope.invocation, selected.validation_scope);
-    try std.testing.expectEqual(route.OutputPlaneMetadata.input_dependent, selected.output_plane_metadata);
+    try std.testing.expectEqual(route.OutputPlaneMetadata.assigned_dense, selected.output_plane_metadata);
     try std.testing.expect(!selection.planes_witnessed[program.id_map[model]]);
-    try std.testing.expect(!selection.planes_witnessed[program.id_map[output]]);
-    try std.testing.expect(routes.pool.completeOwnedPayload() == null);
-    try std.testing.expectEqual(@import("../../execution/owned_coverage.zig").Reason.operation, routes.pool.payload_coverage.compatibility);
+    try std.testing.expect(selection.planes_witnessed[program.id_map[output]]);
+    const witness = routes.pool.completeOwnedPayload() orelse return error.MissingCompleteCudaPayload;
+    try std.testing.expectEqual(@as(usize, 1), witness.operations);
     const inputs = [_]@import("../../graph/interpreter.zig").RuntimeInput{.{ .node_id = program.id_map[model], .value = weight, .source_backend = backend }};
     var result = try executable.run(allocator, .{ .runtime_inputs = &inputs, .prepared_routes = routes });
     defer result.deinit(&executable.runtime);
@@ -53217,7 +53217,7 @@ fn qualifyCompleteCudaProgramRecipe(comptime format: CompleteCudaProgramFormat, 
     input.deinit();
     input_live = false;
     try budget.?.finishChecked();
-    if (format == .f32 and !activation_aliases) try qualifyCudaDirectModelTensorTaint(a, &cb, weight, width, &identity);
+    if (format == .f32 and !activation_aliases) try qualifyCudaDirectModelTensorOutput(a, &cb, weight, width, &identity);
     {
         var alias_graph = ml.graph.Graph.init(a);
         defer alias_graph.deinit();
