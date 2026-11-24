@@ -254,6 +254,13 @@ antfly inference export ./lighton-bf16 --target gguf --format q4_k \
   --output ./lighton-q4/model.gguf --projector-output ./lighton-q4/mmproj.gguf
 ```
 
+The decoder is published only after its projector is available. An existing
+projector is reused when it has identical bytes. Decoder publication preserves
+projector destinations. To export with a different
+projector, select a new destination directory or projector filename. If
+decoder publication fails, any newly installed projector remains available
+for a retry.
+
 Use `--format q8_0` for an 8-bit comparison. Antfly applies the requested
 format to eligible decoder matrices, preserves hybrid-attention state tensors
 and existing quantized weights, and copies the projector byte for byte.
