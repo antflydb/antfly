@@ -2517,6 +2517,21 @@ fn serverGenerateTimingEnabled() bool {
     return platform.env.getenvBool("TERMITE_SERVER_GENERATE_TIMING");
 }
 
+fn logWhisperTiming(comptime task: []const u8, model: []const u8, transcript: *const long_transcription.Result) void {
+    if (!serverGenerateTimingEnabled()) return;
+    const timing = transcript.timing;
+    std.log.info(task ++ " timing model={s} audio_ms={d} mel_ms={d} encoder_ms={d} prefill_ms={d} decode_ms={d} decode_steps={d} kv_cached={}", .{
+        model,
+        transcript.duration_ms,
+        timing.mel_ns / std.time.ns_per_ms,
+        timing.encoder_ns / std.time.ns_per_ms,
+        timing.prefill_ns / std.time.ns_per_ms,
+        timing.decode_ns / std.time.ns_per_ms,
+        timing.decode_steps,
+        timing.kv_cached,
+    });
+}
+
 fn elapsedMs(from_ns: u128, to_ns: u128) u64 {
     if (to_ns <= from_ns) return 0;
     return @intCast(@divTrunc(to_ns - from_ns, std.time.ns_per_ms));
@@ -23835,6 +23850,7 @@ pub const Node = struct {
             try validateInferenceExecutorInvocation(contract, .{ .item_count = 1, .media_parts_per_item = 1, .has_audio = true, .encoded_media_bytes = bytes.len });
             var result = try self.recognizePcmFromPath(a, model_path, .{ .url = "", .language = options.language, .timestamps = options.timestamps, .diarization = options.diarization }, .{ .samples = decoded.samples, .sample_rate = decoded.sample_rate }, control, audio_admission.max_decode_working_bytes, null, .{ .split_estimated_words = false });
             defer result.deinit();
+            logWhisperTiming("read", model_path, &result);
             metadata.language = options.language orelse result.language;
             metadata.language_source = if (options.language != null) .forced else if (result.language != null) .detected else .unknown;
             var unresolved_speaker = false;
@@ -25324,19 +25340,7 @@ pub const Node = struct {
         };
         defer transcript.deinit();
         transcript.requireComplete() catch |err| return documentFailureResponse(ctx, err);
-        if (serverGenerateTimingEnabled()) {
-            const t = transcript.timing;
-            std.log.info("dictate timing model={s} audio_ms={d} mel_ms={d} encoder_ms={d} prefill_ms={d} decode_ms={d} decode_steps={d} kv_cached={}", .{
-                model_name,
-                transcript.duration_ms,
-                t.mel_ns / std.time.ns_per_ms,
-                t.encoder_ns / std.time.ns_per_ms,
-                t.prefill_ns / std.time.ns_per_ms,
-                t.decode_ns / std.time.ns_per_ms,
-                t.decode_steps,
-                t.kv_cached,
-            });
-        }
+        logWhisperTiming("dictate", model_name, &transcript);
 
         const dictation_id = try allocDictationId(ctx.allocator);
         defer ctx.allocator.free(dictation_id);
