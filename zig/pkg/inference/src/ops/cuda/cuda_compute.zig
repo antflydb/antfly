@@ -17185,6 +17185,18 @@ fn pinnedWorkspaceBytes(buffer: buffer_mod.DeviceBuffer) usize {
     return @max(buffer.len, buffer.allocation_bytes);
 }
 
+fn hasBoundLearnedTempWorkspace(self: *CudaCompute) bool {
+    while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
+    defer self.temp_buffer_mutex.unlock();
+    const lengths = self.temp_arena_planner.candidate_lengths.items;
+    if (lengths.len == 0 or lengths.len > self.temp_pinned_slots.items.len) return false;
+    for (lengths, self.temp_pinned_slots.items[0..lengths.len]) |len, slot| {
+        if (slot.requested_len != len or slot.buffer.ptr == 0 or slot.buffer.borrowed or
+            slot.buffer.len != len or pinnedWorkspaceBytes(slot.buffer) != len) return false;
+    }
+    return true;
+}
+
 fn findExactTempBufferIndex(self: *const CudaCompute, len: usize) ?usize {
     for (self.temp_buffers.buffers.items, 0..) |buffer, i| {
         if (buffer.len == len and pinnedWorkspaceBytes(buffer) == len and !buffer.borrowed) return i;
@@ -18662,6 +18674,11 @@ fn debugCudaGraphCaptureBegin(ctx: *anyopaque, label: []const u8) !bool {
     // its per-request observation budget is exhausted without a stable trace,
     // the autoplan branches above fail closed with CudaGraphReplayRequired.
     if (self.temp_trace_seq < min_alloc_seq) return false;
+    if (self.temp_slot_config.configured_period == 0 and self.temp_slot_config.autoplan_enabled and !hasBoundLearnedTempWorkspace(self)) {
+        self.temp_arena_planner.markPinnedValidationFailure();
+        if (cudaRequestDecodeGraphReplayMode(self) == .required) return error.CudaGraphReplayRequired;
+        return false;
+    }
     if (self.debug_cuda_decode_scalars_host_valid and self.debug_cuda_decode_scalars_host[4] != 0) {
         if (cudaRequestDecodeGraphReplayMode(self) == .required) return error.CudaGraphReplayRequired;
         return false;
@@ -19155,6 +19172,13 @@ test "CUDA request reset clears pinned temp slot ABI mappings" {
     try std.testing.expectEqual(@as(usize, 64), self.temp_pinned_slots.items[0].requested_len);
     try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0), self.temp_pinned_slots.items[1].buffer.ptr);
     try std.testing.expectEqual(@as(usize, 1), self.temp_buffers.buffers.items.len);
+    try self.temp_arena_planner.candidate_lengths.appendSlice(std.testing.allocator, &lengths);
+    try std.testing.expect(!hasBoundLearnedTempWorkspace(&self));
+    self.temp_pinned_slots.items[1] = .{ .buffer = .{ .ptr = 0x3000, .len = 256, .allocation_bytes = 256 }, .requested_len = 256 };
+    try std.testing.expect(hasBoundLearnedTempWorkspace(&self));
+    self.temp_pinned_slots.items[1].buffer.allocation_bytes = 512;
+    try std.testing.expect(!hasBoundLearnedTempWorkspace(&self));
+    self.temp_pinned_slots.items[1] = .{};
     // A logical view can describe fewer bytes than its backing. The installed
     // plan must charge, and bind, the physical bytes of each ordinal.
     self.temp_buffers.buffers.items[0].len = 64;
