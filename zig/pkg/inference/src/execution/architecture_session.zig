@@ -21872,6 +21872,26 @@ test "Native Whisper two phase cold hits misses and Model close unwind every req
     try std.testing.checkAllAllocationFailures(std.testing.allocator, nativeWhisperDeclaredInitialCase, .{});
 }
 
+test "Native Whisper prefill declaration beyond the loaded position table keeps planned decode" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var session = try IncrementalFixture.session(a);
+    defer session.close();
+    const owner: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    // The fixture's loaded position table has eight rows.
+    owner.arch_config.whisper.max_target_positions = 9;
+    try session.installOwnedExecutionGate(a);
+    const hidden = [_]f32{ 0.2, 0.4, -0.1, 0.7, 0.5, 0.6, -0.2, 0.3 };
+    var decoder = (try IncrementalDecoderAdapter.fromHostPrepared(session, a, null, &hidden, 2, .{ .expected_initial_query_rows = 9 })) orelse return error.MissingWhisperDecoder;
+    defer decoder.deinit();
+    const program = if (decoder.cache.native_program) |*value| value else return error.MissingWhisperDecoder;
+    try std.testing.expect(program.initial == null);
+    const logits = try decoder.step(&.{0});
+    defer a.free(logits);
+    try std.testing.expectEqual(@as(usize, 4), logits.len);
+    try std.testing.expectEqual(program.schedule.steps.len, program.schedule.cursor);
+}
+
 test "Native Whisper wrong initial declaration declines before ingress while initial cancellation preserves ingress and cache positions" {
     if (comptime !build_options.enable_native) return error.SkipZigTest;
     const a = std.testing.allocator;
