@@ -33671,17 +33671,9 @@ static int termite_metal_decode_runtime_reserve_graph_plan_slots(
     return 0;
 }
 
-int termite_metal_decode_runtime_reserve_prefill_layer_scratch(
-    termite_metal_decode_runtime *runtime,
-    size_t rows,
-    size_t num_heads,
-    size_t num_kv_heads,
-    size_t head_dim,
-    size_t hidden_size,
-    size_t intermediate_size,
-    size_t tail_vocab_size
+static int termite_metal_reserve_decoder_scratch(
+    termite_metal_decode_runtime *runtime, antfly_metal_prefill_scratch_sizes sizes
 ) {
-    if (runtime == NULL) return -1;
     _Static_assert(TERMITE_METAL_GRAPH_PLAN_PROJECTION_SLOT_BASE == 0 &&
         TERMITE_METAL_GRAPH_PLAN_DIRECT_HIDDEN_SLOT_BASE == ANTFLY_PREFILL_DIRECT_HIDDEN_BASE &&
         TERMITE_METAL_GRAPH_PLAN_DIRECT_Q_SLOT == ANTFLY_PREFILL_DIRECT_Q_SLOT &&
@@ -33689,9 +33681,6 @@ int termite_metal_decode_runtime_reserve_prefill_layer_scratch(
         TERMITE_METAL_GRAPH_PLAN_HOT_HIDDEN_SLOT_BASE == ANTFLY_PREFILL_HOT_HIDDEN_BASE &&
         TERMITE_METAL_GRAPH_PLAN_HOT_INTERMEDIATE_SLOT_BASE == ANTFLY_PREFILL_HOT_INTERMEDIATE_BASE,
         "prefill scratch slot ABI changed");
-    antfly_metal_prefill_scratch_sizes sizes;
-    if (antfly_workspace_geometry_prefill_scratch(rows, num_heads, num_kv_heads,
-        head_dim, hidden_size, intermediate_size, tail_vocab_size, &sizes) != 0) return -2;
     const size_t q_bytes = sizes.q_bytes;
     const size_t kv_bytes = sizes.kv_bytes;
     const size_t direct_hidden_bytes = sizes.direct_hidden_bytes;
@@ -33715,6 +33704,34 @@ int termite_metal_decode_runtime_reserve_prefill_layer_scratch(
         runtime->sample_logits_capacity = runtime->graph_plan_capacities[TERMITE_METAL_GRAPH_PLAN_SAMPLE_LOGITS_SLOT];
     }
     return 0;
+}
+
+int termite_metal_decode_runtime_reserve_prefill_layer_scratch(
+    termite_metal_decode_runtime *runtime,
+    size_t rows,
+    size_t num_heads,
+    size_t num_kv_heads,
+    size_t head_dim,
+    size_t hidden_size,
+    size_t intermediate_size,
+    size_t tail_vocab_size
+) {
+    if (runtime == NULL) return -1;
+    antfly_metal_prefill_scratch_sizes sizes;
+    if (antfly_workspace_geometry_prefill_scratch(rows, num_heads, num_kv_heads,
+        head_dim, hidden_size, intermediate_size, tail_vocab_size, &sizes) != 0) return -2;
+    return termite_metal_reserve_decoder_scratch(runtime, sizes);
+}
+
+int antfly_metal_reserve_decode_scratch(
+    termite_metal_decode_runtime *runtime, size_t q_width, size_t kv_width,
+    size_t hidden_size, size_t intermediate_size
+) {
+    if (runtime == NULL) return -1;
+    antfly_metal_prefill_scratch_sizes sizes;
+    if (antfly_workspace_geometry_prefill_scratch_widths(1, q_width, kv_width,
+        hidden_size, intermediate_size, 0, &sizes) != 0) return -2;
+    return termite_metal_reserve_decoder_scratch(runtime, sizes);
 }
 
 // Borrow only the already-reserved direct-Q bank. Dense causal attention

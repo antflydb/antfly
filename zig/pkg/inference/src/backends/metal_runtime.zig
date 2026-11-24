@@ -2180,6 +2180,14 @@ pub fn decoderRuntimePrepareGreedy(self: anytype, request: anytype, stats: anyty
     return rc == 0;
 }
 
+extern fn antfly_metal_reserve_decode_scratch(runtime: *RawMetalDecodeRuntime, q_width: usize, kv_width: usize, hidden_size: usize, intermediate_size: usize) c_int;
+
+pub fn decoderRuntimeReserveDecodeScratch(self: anytype, q_width: usize, kv_width: usize, hidden_size: usize, intermediate_size: usize) bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    return antfly_metal_reserve_decode_scratch(runtime, q_width, kv_width, hidden_size, intermediate_size) == 0;
+}
+
 pub fn decoderRuntimeReservePrefillLayerScratch(
     self: anytype,
     rows: usize,

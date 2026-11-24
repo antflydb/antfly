@@ -158,7 +158,6 @@ Experimental controls and eligibility remain explicit:
 | `TERMITE_METAL_ENABLE_GEMMA4_MTP_HEAD_REPLAY` | Replay only the clustered drafter-head commands; buffer/layout/dtype/weight changes invalidate the template. Released slots drop cached bindings. |
 | `TERMITE_METAL_ENABLE_GEMMA4_MTP_HEAD_FRAME` | Append clustered-head scoring to the assistant frame before its scalar boundary; preserve caller ownership of an empty frame afterward. |
 | `ANTFLY_GEMMA4_MTP_RECOVERY_CHOICE_ONLY` | Skip unused recovery snapshots; retain them when an activation is needed. |
-| `TERMITE_METAL_ENABLE_GEMMA4_DECODE_SCRATCH_ENVELOPE` | Reserve singleton scratch once at layer maxima only for uniform KV-head geometry. |
 
 The target's vocabulary head is already Q8_0. The formerly attributed BF16
 projection is PLE (1,536→8,960), not the 262,144-output head. Head-format changes

@@ -864,16 +864,17 @@ fn decoderRuntimeLayerRopeTheta(layer: *const ops.DecoderRuntimeLayerSpec) f32 {
     return layer.rope_theta;
 }
 
-const Gemma4DecodeScratchEnvelope = struct { kv_heads: usize, head_dim: usize, intermediate_size: usize };
+const DecodeScratchEnvelope = struct { q_width: usize, kv_width: usize, intermediate_size: usize };
 
-fn gemma4DecodeScratchEnvelope(layers: []const ops.DecoderRuntimeLayerSpec, ple_size: usize) ?Gemma4DecodeScratchEnvelope {
-    if (layers.len == 0) return null;
-    var result = Gemma4DecodeScratchEnvelope{ .kv_heads = layers[0].kv_heads, .head_dim = 0, .intermediate_size = ple_size };
+fn decodeScratchEnvelope(layers: []const ops.DecoderRuntimeLayerSpec, heads: usize, ple_size: usize) ?DecodeScratchEnvelope {
+    if (layers.len == 0 or heads == 0) return null;
+    var result: DecodeScratchEnvelope = .{ .q_width = 0, .kv_width = 0, .intermediate_size = ple_size };
     for (layers) |layer| {
-        // Uniform KV-head geometry makes these maxima exactly the same
-        // capacity envelope as reserving every layer individually.
-        if (layer.kv_heads == 0 or layer.kv_heads != result.kv_heads or layer.head_dim == 0 or layer.intermediate_size == 0) return null;
-        result.head_dim = @max(result.head_dim, layer.head_dim);
+        if (layer.kv_heads == 0 or layer.head_dim == 0 or layer.intermediate_size == 0) return null;
+        const q = std.math.mul(usize, heads, layer.head_dim) catch return null;
+        const kv = std.math.mul(usize, layer.kv_heads, layer.head_dim) catch return null;
+        result.q_width = @max(result.q_width, q);
+        result.kv_width = @max(result.kv_width, kv);
         result.intermediate_size = @max(result.intermediate_size, layer.intermediate_size);
     }
     return result;
@@ -37985,33 +37986,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return false;
         }
         const active_decode_frame_enabled = active_decode_frame_requested;
-        const scratch_envelope = if (getenvBool("TERMITE_METAL_ENABLE_GEMMA4_DECODE_SCRATCH_ENVELOPE") and
-            request.contract == .gemma4_gated_ple_shared_kv and request.items.len == 1)
-            gemma4DecodeScratchEnvelope(request.layers, request.ple_hidden_size)
-        else
-            null;
-        if (active_decode_frame_enabled and scratch_envelope != null) {
-            const envelope = scratch_envelope.?;
-            if (!metal_runtime.decoderRuntimeReservePrefillLayerScratch(self.provider_impl, 1, request.num_attention_heads, envelope.kv_heads, envelope.head_dim, request.hidden_size, envelope.intermediate_size, 0)) {
+        if (active_decode_frame_enabled) {
+            const envelope = decodeScratchEnvelope(request.layers, request.num_attention_heads, request.ple_hidden_size) orelse return false;
+            if (!metal_runtime.decoderRuntimeReserveDecodeScratch(self.provider_impl, envelope.q_width, envelope.kv_width, request.hidden_size, envelope.intermediate_size)) {
                 self.timing_stats.active_decode_frame_scratch_failures += 1;
                 return false;
-            }
-        } else if (active_decode_frame_enabled) {
-            for (request.layers) |layer| {
-                if (layer.head_dim == 0 or layer.kv_heads == 0 or layer.intermediate_size == 0) return false;
-                if (!metal_runtime.decoderRuntimeReservePrefillLayerScratch(
-                    self.provider_impl,
-                    1,
-                    request.num_attention_heads,
-                    layer.kv_heads,
-                    layer.head_dim,
-                    request.hidden_size,
-                    @max(layer.intermediate_size, request.ple_hidden_size),
-                    0,
-                )) {
-                    self.timing_stats.active_decode_frame_scratch_failures += 1;
-                    return false;
-                }
             }
         } else {
             self.timing_stats.active_decode_frame_disabled += 1;
@@ -53121,24 +53100,22 @@ test "embeddinggemma2 Metal video producer prepares while compute lease is held 
     }
 }
 
-test "Gemma4 decode scratch envelope preserves capacity maxima and rejects mixed KV heads" {
+test "Metal decode scratch envelope resolves each physical width independently" {
     var layers = [_]ops.DecoderRuntimeLayerSpec{ std.mem.zeroes(ops.DecoderRuntimeLayerSpec), std.mem.zeroes(ops.DecoderRuntimeLayerSpec) };
-    layers[0].kv_heads = 2;
+    layers[0].kv_heads = 4;
     layers[0].head_dim = 256;
     layers[0].intermediate_size = 6144;
-    layers[1].kv_heads = 2;
+    layers[1].kv_heads = 1;
     layers[1].head_dim = 512;
     layers[1].intermediate_size = 4096;
-    const envelope = gemma4DecodeScratchEnvelope(&layers, 8960).?;
-    try std.testing.expectEqual(@as(usize, 2), envelope.kv_heads);
-    try std.testing.expectEqual(@as(usize, 512), envelope.head_dim);
+    const envelope = decodeScratchEnvelope(&layers, 8, 8960).?;
+    try std.testing.expectEqual(@as(usize, 4096), envelope.q_width);
+    try std.testing.expectEqual(@as(usize, 1024), envelope.kv_width);
     try std.testing.expectEqual(@as(usize, 8960), envelope.intermediate_size);
-    layers[1].kv_heads = 1;
-    try std.testing.expectEqual(@as(?Gemma4DecodeScratchEnvelope, null), gemma4DecodeScratchEnvelope(&layers, 8960));
-    layers[1].kv_heads = 2;
+    try std.testing.expectEqual(@as(?DecodeScratchEnvelope, null), decodeScratchEnvelope(&layers, std.math.maxInt(usize), 8960));
     layers[1].head_dim = 0;
-    try std.testing.expectEqual(@as(?Gemma4DecodeScratchEnvelope, null), gemma4DecodeScratchEnvelope(&layers, 8960));
-    try std.testing.expectEqual(@as(?Gemma4DecodeScratchEnvelope, null), gemma4DecodeScratchEnvelope(&.{}, 8960));
+    try std.testing.expectEqual(@as(?DecodeScratchEnvelope, null), decodeScratchEnvelope(&layers, 8, 8960));
+    try std.testing.expectEqual(@as(?DecodeScratchEnvelope, null), decodeScratchEnvelope(&.{}, 8, 8960));
 }
 
 test "Metal OCR parity logit summary respects suppression and stable ties" {

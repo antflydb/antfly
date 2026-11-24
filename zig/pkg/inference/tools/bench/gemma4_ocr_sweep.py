@@ -182,7 +182,6 @@ def flags_for(case):
             TERMITE_METAL_ENABLE_GEMMA4_MTP_CLUSTER_HEAD="1",
             TERMITE_METAL_ENABLE_GEMMA4_MTP_HEAD_REPLAY="1",
             ANTFLY_GEMMA4_MTP_RECOVERY_CHOICE_ONLY="1",
-            TERMITE_METAL_ENABLE_GEMMA4_DECODE_SCRATCH_ENVELOPE="1",
         )
         if case.endswith("seedreduce"):
             # Recheck the rejected seed schedule only with target Q4 matrix
