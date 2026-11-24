@@ -39,6 +39,9 @@ const replay_journal_format = @import("replay_journal_format.zig");
 const retained_effects = @import("retained_effects.zig");
 const committed_history = @import("committed_history.zig");
 const artifact_payload = @import("artifact_payload.zig");
+const row_heap = @import("row_heap.zig");
+const row_heap_scope = @import("row_heap_scope.zig");
+const physical_table_catalog = @import("db/table_catalog.zig");
 const lsm_backend = @import("lsm_backend.zig");
 const mem_backend = @import("mem_backend.zig");
 const platform_time = @import("antfly_platform").time;
@@ -757,10 +760,21 @@ fn updateGraphEndpointCleanupAdmission(txn: anytype, alloc: Allocator, key: []co
 }
 
 pub const DocStore = struct {
+    /// Actual native primary identity, installed by its DB owner. Transaction
+    /// adapters inherit this authority; request JSON never supplies it.
+    native_relation_pin: ?@import("../common/relation_persistence.zig").PhysicalPin = null,
     payload_store: ?artifact_payload.Store = null,
     payload_capture_inline: bool = false,
     payload_migration_allowance: ?u64 = null,
     payload_policy_mutex: std.Io.Mutex = .init,
+    row_heap_active: std.atomic.Value(bool) = .init(false),
+    /// Scheduling hint only. The durable retirement counters, reader epochs
+    /// and primary transaction remain the authority for every deletion.
+    row_heap_collection_pending: std.atomic.Value(bool) = .init(false),
+    // Shares payload_policy_mutex with source/reader admission. Old current-tip
+    // probes protect immutable heap bodies; stable snapshots use backend MVCC.
+    row_heap_epochs: row_heap.Epochs = .{},
+    row_heap_collection_mutex: std.Io.Mutex = .init,
     payload_recovery_required: std.atomic.Value(bool) = .init(false),
     alloc: Allocator,
     /// Process-local wake hint, published only after successful row/schema
@@ -870,6 +884,7 @@ pub const DocStore = struct {
         mutation_capture: ?*@import("txn_mutation_capture.zig").Capture = null,
         payload_session: ?*artifact_payload.Session = null,
         alloc: Allocator,
+        row_heap_probe_epoch: ?u64 = null,
         read: ?backend_erased.ReadTxn = null,
         probe: ?backend_erased.ProbeTxn = null,
         current_scan: ?backend_erased.CurrentScanTxn = null,
@@ -932,6 +947,7 @@ pub const DocStore = struct {
             self.artifact_inputs.deinit(self.alloc);
             self.document_revisions.deinit(self.alloc);
             const reader_owner = self.portable_import_reader_owner;
+            const heap_epoch = self.row_heap_probe_epoch;
             const payload_session = self.payload_session;
             defer if (payload_session) |session| session.release();
 
@@ -945,7 +961,10 @@ pub const DocStore = struct {
                 read.abort();
             }
             self.* = undefined;
-            if (reader_owner) |owner| owner.releasePortableImportReader();
+            if (reader_owner) |owner| {
+                if (heap_epoch) |epoch| owner.releaseRowHeapProbe(epoch);
+                owner.releasePortableImportReader();
+            }
         }
 
         pub fn commit(self: *Txn) !void {
@@ -1002,7 +1021,8 @@ pub const DocStore = struct {
         }
 
         pub fn get(self: *Txn, key: []const u8) ![]const u8 {
-            const value = try self.getPhysical(key);
+            const physical = try self.getPhysical(key);
+            const value = try self.resolveRowValue(key, physical);
             if (self.payload_session) |session| return try session.get(key, value);
             // A live probe admitted before migration may observe a later
             // reference. Retry with a new source lease; never leak its encoding
@@ -1012,12 +1032,53 @@ pub const DocStore = struct {
             return value;
         }
 
+        fn rowHeapReader(self: *Txn) ?row_heap.Reader {
+            if (self.write) |*write| return row_heap.Reader.from(backend_erased.WriteTxn, write);
+            if (self.read) |*read| return row_heap.Reader.from(backend_erased.ReadTxn, read);
+            if (self.probe) |*probe| if (self.row_heap_probe_epoch != null) return row_heap.Reader.from(backend_erased.ProbeTxn, probe);
+            return null;
+        }
+        fn resolveRowValue(self: *Txn, key: []const u8, raw: []const u8) ![]const u8 {
+            if ((try row_heap.decode(key, raw)) == null) return raw;
+            const reader = self.rowHeapReader() orelse return error.StorageReadTemporarilyUnavailable;
+            return row_heap.resolve(reader, key, raw);
+        }
+        fn heapActive(self: *Txn) bool {
+            const owner = self.columnar_owner orelse self.portable_import_reader_owner orelse return false;
+            return owner.row_heap_active.load(.acquire);
+        }
+
+        /// Internal physical-maintenance primitive. A native rewrite admission
+        /// must fence logical writers before calling it; the job cursor belongs
+        /// in this SAME write transaction. This bypasses logical row hooks.
+        pub fn relocatePhysicalRow(self: *Txn, key: []const u8, generation: row_heap.Generation, ordinal: u64) !u64 {
+            const writer = if (self.write) |*write| write else return error.ReadOnly;
+            const owner = self.columnar_owner orelse return error.ReadOnly;
+            owner.lockPayloadPolicy();
+            owner.row_heap_active.store(true, .release);
+            owner.unlockPayloadPolicy();
+            // A deployed DB reader rejects ATBL8 before exposing any primary
+            // location. Capability and first physical row share this commit.
+            const raw_catalog = writer.get(physical_table_catalog.key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            var facts = if (raw_catalog) |raw| try physical_table_catalog.Catalog.decode(raw) else physical_table_catalog.Catalog{};
+            if (facts.row_heap_format == 0) {
+                facts.row_heap_format = physical_table_catalog.maximum_row_heap_format;
+                const encoded = try facts.encodeDurable();
+                try writer.put(physical_table_catalog.key, encoded.slice());
+            }
+            return row_heap.relocate(self.alloc, writer, key, generation, ordinal);
+        }
+
         /// Exact key presence in this transaction's view. Physical references
         /// prove presence without resolving external source/artifact payloads.
         pub fn contains(self: *Txn, key: []const u8) !bool {
             if (self.write) |*write| return write.contains(key);
             if (self.probe) |*probe| return try probe.contains(key);
-            _ = self.getPhysical(key) catch |err| switch (err) {
+            if (self.current_scan != null) return error.Unsupported;
+            _ = self.read.?.get(key) catch |err| switch (err) {
                 error.NotFound => return false,
                 else => return err,
             };
@@ -1049,7 +1110,8 @@ pub const DocStore = struct {
         /// Immutable LSM bytes may be pinned rather than copied.
         pub fn getLeased(self: *Txn, key: []const u8) ![]const u8 {
             if (self.probe) |*probe| {
-                const value = try probe.getLeased(key);
+                const physical = try probe.getLeased(key);
+                const value = try self.resolveRowValue(key, physical);
                 if (self.payload_session) |session| return try session.get(key, value);
                 if (artifact_payload.isEmbeddingKey(key) and artifact_payload.isReference(value))
                     return error.VectorMigrationReadEpochChanged;
@@ -1061,9 +1123,9 @@ pub const DocStore = struct {
         /// Block-scoped values from this exact snapshot. Close scopes before
         /// aborting the transaction (which also owns the portable-import fence).
         pub fn openReadScope(self: *Txn, alloc: Allocator) !backend_erased.ReadScope {
-            if (self.read) |*read| return read.openReadScope(alloc);
-            if (self.write) |*write| return write.openReadScope(alloc);
-            return error.ReadOnly;
+            var physical = if (self.read) |*read| try read.openReadScope(alloc) else if (self.write) |*write| try write.openReadScope(alloc) else return error.ReadOnly;
+            errdefer physical.close();
+            return if (self.heapActive()) try row_heap_scope.wrap(alloc, physical) else physical;
         }
 
         /// Owned copies from one pinned generation, with read buffers released
@@ -1083,7 +1145,8 @@ pub const DocStore = struct {
             defer alloc.free(physical);
             try scope.getManySorted(keys, physical);
             for (keys, physical, values) |key, raw, *value| {
-                const bytes = raw orelse continue;
+                const before = raw orelse continue;
+                const bytes = try row_heap.resolve(&scope, key, before);
                 if (artifact_payload.isEmbeddingKey(key) and artifact_payload.isReference(bytes)) {
                     const session = self.payload_session orelse return error.VectorMigrationReadEpochChanged;
                     // Read-only sessions have no prepared writes: resolving a
@@ -1101,6 +1164,16 @@ pub const DocStore = struct {
 
         pub fn getManySorted(self: *Txn, keys: []const []const u8, values: []?[]const u8) !void {
             try self.getManySortedPhysical(keys, values);
+            var refs = false;
+            for (keys, values) |key, value| if (value) |raw| {
+                if ((try row_heap.decode(key, raw)) != null) refs = true;
+            };
+            if (refs) {
+                const reader = self.rowHeapReader() orelse return error.StorageReadTemporarilyUnavailable;
+                // Reader carries the exact source view/probe epoch. The raw
+                // batch adapter retains its optimized physical-order read.
+                if (self.read) |*read| try row_heap.resolveMany(self.alloc, read, keys, values) else if (self.write) |*write| try row_heap.resolveMany(self.alloc, write, keys, values) else if (self.probe) |*probe| try row_heap.resolveMany(self.alloc, probe, keys, values) else _ = reader;
+            }
             if (self.payload_session) |session| {
                 for (keys, values) |key, *value| if (value.*) |raw| {
                     value.* = try session.get(key, raw);
@@ -1109,6 +1182,13 @@ pub const DocStore = struct {
                 if (artifact_payload.isEmbeddingKey(key) and artifact_payload.isReference(raw))
                     return error.VectorMigrationReadEpochChanged;
             };
+        }
+
+        /// Release borrowed physical probe results once the caller has
+        /// consumed them. Unsupported backends keep them until abort.
+        pub fn releasePhysicalProbeResults(self: *Txn) !bool {
+            if (self.probe) |*probe| return probe.releaseResults();
+            return false;
         }
 
         pub fn getManySortedPhysical(self: *Txn, keys: []const []const u8, values: []?[]const u8) !void {
@@ -1137,6 +1217,17 @@ pub const DocStore = struct {
         pub fn getManySortedTransient(self: *Txn, keys: []const []const u8, values: []?[]const u8) !void {
             if (self.probe) |*probe| {
                 try probe.getManySortedWithBlockCacheAdmission(keys, values, .transient);
+                const Transient = struct {
+                    probe: *backend_erased.ProbeTxn,
+                    pub fn getManySorted(reader: *@This(), physical: []const []const u8, output: []?[]const u8) !void {
+                        return reader.probe.getManySortedWithBlockCacheAdmission(physical, output, .transient);
+                    }
+                };
+                for (keys, values) |key, value| if (value) |raw| {
+                    if ((try row_heap.decode(key, raw)) != null and self.row_heap_probe_epoch == null) return error.StorageReadTemporarilyUnavailable;
+                };
+                var transient: Transient = .{ .probe = probe };
+                try row_heap.resolveMany(self.alloc, &transient, keys, values);
                 if (self.payload_session) |session| {
                     for (keys, values) |key, *value| if (value.*) |raw| {
                         value.* = try session.get(key, raw);
@@ -1168,6 +1259,7 @@ pub const DocStore = struct {
         }
 
         pub fn put(self: *Txn, key: []const u8, value: []const u8) anyerror!void {
+            if (self.heapActive()) try requireRowHeapCatalogFence(key, value);
             try updateGraphOwningTable(self, key, value);
             try updateGraphEndpointCleanupAdmission(self, self.alloc, key, value);
             if (internal_keys.isInternalUserKey(key) and !self.graph_directory_checked) {
@@ -1192,7 +1284,8 @@ pub const DocStore = struct {
             try self.invalidateColumns(key);
 
             const stored = if (self.payload_session) |session| try session.put(key, value) else value;
-            try self.write.?.put(key, if (self.payload_session) |session| session.primaryValue(value, stored) else stored);
+            const primary = if (self.payload_session) |session| session.primaryValue(value, stored) else stored;
+            if (self.heapActive()) try row_heap.put(&self.write.?, key, primary) else try self.write.?.put(key, primary);
             if (self.payload_session) |session| try session.recordOwnership(&self.write.?, key, stored);
         }
 
@@ -1235,7 +1328,7 @@ pub const DocStore = struct {
             try self.markColumnarDirty(key, null);
             try self.invalidateColumns(key);
 
-            try self.write.?.delete(key);
+            if (self.heapActive()) try row_heap.remove(&self.write.?, key) else try self.write.?.delete(key);
             if (self.payload_session) |session| {
                 if (artifact_payload.isEmbeddingKey(key)) session.reference_mutated = true;
                 try session.recordOwnership(&self.write.?, key, null);
@@ -1264,9 +1357,9 @@ pub const DocStore = struct {
         }
 
         fn openCursorAdapter(self: *Txn) !CursorAdapter {
-            var cursor_adapter = try self.openPhysicalCursorAdapter();
+            var cursor_adapter = try self.openBackendCursorAdapter();
             errdefer cursor_adapter.close();
-            return try wrapPayloadCursor(self.alloc, cursor_adapter, self.payload_session, self.current_scan != null or self.probe != null);
+            return try wrapPayloadCursor(self.alloc, cursor_adapter, self.payload_session, self.current_scan != null or self.probe != null or self.heapActive(), self.rowHeapReader());
         }
 
         pub fn hasPrefix(self: *Txn, prefix: []const u8) !bool {
@@ -1290,6 +1383,17 @@ pub const DocStore = struct {
         }
 
         pub fn openPhysicalCursorAdapter(self: *Txn) !CursorAdapter {
+            // "Physical" preserves external artifact references. Primary row
+            // locations are a DocStore implementation detail: range transfer,
+            // mutation retirement and portable export must still receive row
+            // bytes, not a location without its out-of-range private body.
+            // Backend snapshots/physical GC use runtime_store directly.
+            var cursor = try self.openBackendCursorAdapter();
+            errdefer cursor.close();
+            return wrapPayloadCursor(self.alloc, cursor, null, self.heapActive(), self.rowHeapReader());
+        }
+
+        fn openBackendCursorAdapter(self: *Txn) !CursorAdapter {
             if (self.write) |*write| return try write.openCursor();
             if (self.current_scan) |*current_scan| return try current_scan.openCursor();
             if (self.probe != null) return error.Unsupported;
@@ -1335,6 +1439,11 @@ pub const DocStore = struct {
         source_certificate_released: bool = false,
 
         pub fn setCommitParticipant(self: *Batch, participant: @import("commit_participant.zig").Participant) !void {
+            if (participant.queued) |queued| {
+                if (self.runtime) |*runtime| {
+                    try runtime.setQueuedParticipant(queued);
+                } else return error.Unsupported;
+            }
             try self.artifact_inputs.attach(participant);
         }
 
@@ -1372,6 +1481,7 @@ pub const DocStore = struct {
             graph_directory_checked: *bool,
             graph_retirements_maybe: *?bool,
             unordered_bulk_append_puts: bool = false,
+            row_heap_active: bool = false,
             runtime: ?*backend_erased.Batch = null,
             // WS5: lets `setReplayOpaque` -> `writeReplayEntries` reach the
             // owning DocStore's consumer-hint mask and credit policy.
@@ -1390,7 +1500,8 @@ pub const DocStore = struct {
             }
 
             pub fn get(self: @This(), key: []const u8) ![]const u8 {
-                const value = try self.runtime.?.get(key);
+                const physical = try self.runtime.?.get(key);
+                const value = try row_heap.resolve(self.runtime.?, key, physical);
                 if (self.payload_session) |session| return try session.get(key, value);
                 // A live probe admitted before migration may observe a later
                 // reference. Retry with a new source lease; never leak its encoding
@@ -1405,6 +1516,7 @@ pub const DocStore = struct {
                 @memset(values, null);
 
                 try self.runtime.?.getManySorted(keys, values);
+                try row_heap.resolveMany(self.alloc, self.runtime.?, keys, values);
                 if (self.payload_session) |session| {
                     for (keys, values) |key, *value| if (value.*) |raw| {
                         value.* = try session.get(key, raw);
@@ -1413,6 +1525,7 @@ pub const DocStore = struct {
             }
 
             pub fn put(self: @This(), key: []const u8, value: []const u8) anyerror!void {
+                if (self.row_heap_active) try requireRowHeapCatalogFence(key, value);
                 try updateGraphOwningTable(self, key, value);
                 try updateGraphEndpointCleanupAdmission(self, self.alloc, key, value);
                 if (internal_keys.isInternalUserKey(key) and !self.graph_directory_checked.*) {
@@ -1436,7 +1549,8 @@ pub const DocStore = struct {
                 try self.invalidateColumns(key);
 
                 const stored = if (self.payload_session) |session| try session.put(key, value) else value;
-                try self.runtime.?.put(key, if (self.payload_session) |session| session.primaryValue(value, stored) else stored);
+                const primary = if (self.payload_session) |session| session.primaryValue(value, stored) else stored;
+                if (self.row_heap_active) try row_heap.put(self.runtime.?, key, primary) else try self.runtime.?.put(key, primary);
                 if (self.payload_session) |session| try session.recordOwnership(self.runtime.?, key, stored);
             }
 
@@ -1491,7 +1605,11 @@ pub const DocStore = struct {
                 try self.invalidateColumns(key);
 
                 const stored = if (self.payload_session) |session| try session.put(key, value) else value;
-                try self.runtime.?.appendPut(key, if (self.payload_session) |session| session.primaryValue(value, stored) else stored);
+                const primary = if (self.payload_session) |session| session.primaryValue(value, stored) else stored;
+                if (self.row_heap_active) {
+                    if (self.unordered_bulk_append_puts) return error.RowHeapBulkAppendUnsupported;
+                    try row_heap.put(self.runtime.?, key, primary);
+                } else try self.runtime.?.appendPut(key, primary);
                 if (self.payload_session) |session| try session.recordOwnership(self.runtime.?, key, stored);
             }
 
@@ -1514,7 +1632,7 @@ pub const DocStore = struct {
                 try self.markColumnarDirty(key, null);
                 try self.invalidateColumns(key);
 
-                try self.runtime.?.delete(key);
+                if (self.row_heap_active) try row_heap.remove(self.runtime.?, key) else try self.runtime.?.delete(key);
                 if (self.payload_session) |session| {
                     if (artifact_payload.isEmbeddingKey(key)) session.reference_mutated = true;
                     try session.recordOwnership(self.runtime.?, key, null);
@@ -1545,7 +1663,7 @@ pub const DocStore = struct {
             pub fn openCursor(self: @This()) !backend_erased.Cursor {
                 var physical = try self.openPhysicalCursorAdapter();
                 errdefer physical.close();
-                return try wrapPayloadCursor(self.alloc, physical, self.payload_session, false);
+                return try wrapPayloadCursor(self.alloc, physical, self.payload_session, self.row_heap_active, row_heap.Reader.from(backend_erased.Batch, self.runtime.?));
             }
 
             fn openPhysicalCursorAdapter(self: @This()) !backend_erased.Cursor {
@@ -1760,6 +1878,7 @@ pub const DocStore = struct {
                 .graph_directory_checked = &self.graph_directory_checked,
                 .graph_retirements_maybe = &self.graph_retirements_maybe,
                 .unordered_bulk_append_puts = self.unordered_bulk_append_puts,
+                .row_heap_active = if (self.columnar_owner) |owner| owner.row_heap_active.load(.acquire) else false,
                 .runtime = if (self.runtime) |*runtime| runtime else null,
                 .owner = self.columnar_owner,
             };
@@ -1818,6 +1937,7 @@ pub const DocStore = struct {
         var opened: DocStore = .{
             .alloc = alloc,
             .runtime_store = withWriteSerialization(runtime_store),
+            .row_heap_active = .init(try rowHeapPresent(runtime_store)),
             .owns_runtime_store = true,
             .owned_lsm_backend = backend,
             .replay_index_state = .init(replay_index_unknown),
@@ -1835,6 +1955,7 @@ pub const DocStore = struct {
         var opened: DocStore = .{
             .alloc = alloc,
             .runtime_store = withWriteSerialization(runtime_store.store),
+            .row_heap_active = .init(try rowHeapPresent(runtime_store.store)),
             .owns_runtime_store = runtime_store.owned,
             .owned_lsm_backend = null,
             .replay_index_state = .init(replay_index_unknown),
@@ -1980,6 +2101,8 @@ pub const DocStore = struct {
     const PayloadCursor = struct {
         physical: backend_erased.Cursor,
         session: ?*artifact_payload.Session,
+        heap_reader: ?row_heap.Reader,
+        keys_only: bool = false,
         arena: std.heap.ArenaAllocator,
 
         pub fn close(self: *@This()) void {
@@ -1987,46 +2110,179 @@ pub const DocStore = struct {
             self.arena.deinit();
             if (self.session) |session| session.release();
         }
-        fn resolve(self: *@This(), entry: ?backend_erased.Entry) !?backend_erased.Entry {
+        fn resolve(self: *@This(), entry: ?backend_erased.Entry, reverse: bool) !?backend_erased.Entry {
             _ = self.arena.reset(.retain_capacity);
-            const value = entry orelse return null;
-            if (self.session) |session| return .{ .key = value.key, .value = try session.getAlloc(self.arena.allocator(), value.key, value.value) };
-            if (artifact_payload.isEmbeddingKey(value.key) and artifact_payload.isReference(value.value))
-                return error.VectorMigrationReadEpochChanged;
-            return value;
+            var current = entry;
+            while (current) |value| {
+                if (row_heap.isPhysicalKey(value.key) or row_heap.isPhysicalMetadata(value.key)) {
+                    current = if (reverse) try self.physical.prev() else try self.physical.next();
+                    continue;
+                }
+                if (self.keys_only) return value;
+                var body = value.value;
+                if ((try row_heap.decode(value.key, body)) != null) {
+                    const reader = self.heap_reader orelse return error.StorageReadTemporarilyUnavailable;
+                    body = try row_heap.resolve(reader, value.key, body);
+                }
+                if (self.session) |session| return .{ .key = value.key, .value = try session.getAlloc(self.arena.allocator(), value.key, body) };
+                if (artifact_payload.isEmbeddingKey(value.key) and artifact_payload.isReference(body)) return error.VectorMigrationReadEpochChanged;
+                return .{ .key = value.key, .value = body };
+            }
+            return null;
         }
         pub fn first(self: *@This()) !?backend_erased.Entry {
-            return self.resolve(try self.physical.first());
+            return self.resolve(try self.physical.first(), false);
         }
         pub fn last(self: *@This()) !?backend_erased.Entry {
-            return self.resolve(try self.physical.last());
+            return self.resolve(try self.physical.last(), true);
         }
         pub fn next(self: *@This()) !?backend_erased.Entry {
-            return self.resolve(try self.physical.next());
+            return self.resolve(try self.physical.next(), false);
         }
         pub fn prev(self: *@This()) !?backend_erased.Entry {
-            return self.resolve(try self.physical.prev());
+            return self.resolve(try self.physical.prev(), true);
         }
         pub fn seekAtOrAfter(self: *@This(), key: []const u8) !?backend_erased.Entry {
-            return self.resolve(try self.physical.seekAtOrAfter(key));
+            return self.resolve(try self.physical.seekAtOrAfter(key), false);
         }
         pub fn seekAtOrBefore(self: *@This(), key: []const u8) !?backend_erased.Entry {
-            return self.resolve(try self.physical.seekAtOrBefore(key));
+            return self.resolve(try self.physical.seekAtOrBefore(key), true);
         }
         pub fn setUpperBound(self: *@This(), upper: ?[]const u8) void {
             self.physical.setUpperBound(upper);
         }
+        pub fn setKeysOnly(self: *@This()) void {
+            self.keys_only = true;
+            self.physical.setKeysOnly();
+        }
     };
 
-    fn wrapPayloadCursor(alloc: Allocator, physical: backend_erased.Cursor, session: ?*artifact_payload.Session, live: bool) !backend_erased.Cursor {
+    fn wrapPayloadCursor(alloc: Allocator, physical: backend_erased.Cursor, session: ?*artifact_payload.Session, live: bool, heap_reader: ?row_heap.Reader) !backend_erased.Cursor {
         if (session == null and !live) return physical;
         if (session) |owner| owner.retain();
         errdefer if (session) |owner| owner.release();
         return try backend_erased.cursorFrom(alloc, PayloadCursor{
             .physical = physical,
             .session = session,
+            .heap_reader = heap_reader,
             .arena = std.heap.ArenaAllocator.init(alloc),
         });
+    }
+    fn requireRowHeapCatalogFence(key: []const u8, value: []const u8) !void {
+        if (!std.mem.eql(u8, key, physical_table_catalog.key)) return;
+        const facts = try physical_table_catalog.Catalog.decode(value);
+        if (facts.row_heap_format != physical_table_catalog.maximum_row_heap_format) return error.RowHeapCatalogDowngrade;
+    }
+    fn rowHeapPresent(runtime: backend_erased.Store) !bool {
+        var store = runtime;
+        var read = try store.beginProbe();
+        defer read.abort();
+        const marker = read.get(row_heap.enabled_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (marker) |raw| if (!std.mem.eql(u8, raw, row_heap.magic)) return error.CorruptRowHeapCatalog;
+        const raw_catalog = read.get(physical_table_catalog.key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        // Opaque low-level stores retain their old open contract. Interpret
+        // table facts here only when they declare this physical extension;
+        // ordinary schema/catalog validation remains the DB owner's boundary.
+        if (marker == null) {
+            const raw = raw_catalog orelse return false;
+            if (raw.len < 8 or !std.mem.eql(u8, raw[0..4], "ATBL") or std.mem.readInt(u32, raw[4..8], .little) != 8) return false;
+        }
+        const required = if (raw_catalog) |raw| (try physical_table_catalog.Catalog.decode(raw)).row_heap_format else 0;
+        if (marker != null and required == 0) return error.CorruptRowHeapCatalog;
+        return required != 0;
+    }
+
+    fn releaseRowHeapProbe(self: *DocStore, epoch: u64) void {
+        self.lockPayloadPolicy();
+        defer self.unlockPayloadPolicy();
+        self.row_heap_epochs.release(epoch);
+    }
+
+    pub const RowHeapCollection = struct { done: bool, waiting_for_readers: bool = false, rows: u32 = 0, bytes: u64 = 0 };
+
+    /// Leader/primary maintenance callers supply their existing write fence.
+    /// The callback-free collector changes physical records only. Its bounded
+    /// key page and retirement removals share a transaction with the debt count.
+    pub fn collectRowHeap(self: *DocStore, maximum_rows: u32) !RowHeapCollection {
+        if (maximum_rows == 0 or maximum_rows > 2048) return error.InvalidArgument;
+        if (!self.row_heap_collection_mutex.tryLock()) return .{ .done = false };
+        defer self.row_heap_collection_mutex.unlock(payloadPolicyIo());
+        if (!self.row_heap_active.load(.acquire)) return .{ .done = true };
+        try self.ensurePortableImportOperational();
+        var store = self.runtime_store;
+        const observed = observation: {
+            var probe = try store.beginProbe();
+            defer probe.abort();
+            break :observation .{ .clock = try row_heap.retirementClock(&probe), .bytes = try row_heap.retiredBytes(&probe) };
+        };
+        if (observed.bytes == 0) {
+            self.row_heap_collection_pending.store(false, .release);
+            self.lockPayloadPolicy();
+            defer self.unlockPayloadPolicy();
+            if (self.row_heap_epochs.collectible()) |fence| try self.row_heap_epochs.finish(fence);
+            return .{ .done = true };
+        }
+        if (observed.clock == 0) return error.CorruptRowHeapCatalog;
+        self.lockPayloadPolicy();
+        self.row_heap_epochs.mark(observed.clock) catch |err| {
+            self.unlockPayloadPolicy();
+            return err;
+        };
+        const fence = self.row_heap_epochs.collectible();
+        self.unlockPayloadPolicy();
+        const committed_fence = fence orelse {
+            // A retained probe may be long lived. Audit at the ordinary idle
+            // cadence instead of hot-polling the reader's release.
+            self.row_heap_collection_pending.store(false, .release);
+            return .{ .done = false, .waiting_for_readers = true };
+        };
+        var arena: std.heap.ArenaAllocator = .init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var writer = try store.beginWrite();
+        var committed = false;
+        defer if (!committed) writer.abort();
+        var selected: std.ArrayList([]const u8) = .empty;
+        var complete = false;
+        {
+            var cursor = try writer.openCursor();
+            defer cursor.close();
+            cursor.setKeysOnly();
+            var current = try cursor.seekAtOrAfter(row_heap.retirement_prefix);
+            while (current) |entry| {
+                if (!std.mem.startsWith(u8, entry.key, row_heap.retirement_prefix)) break;
+                if (entry.key.len != row_heap.retirement_key_len) return error.CorruptRowHeapCatalog;
+                if (std.mem.readInt(u64, entry.key[row_heap.retirement_prefix.len..][0..8], .big) > committed_fence) break;
+                if (selected.items.len == maximum_rows) break;
+                try selected.append(a, try a.dupe(u8, entry.key));
+                current = try cursor.next();
+            }
+            complete = if (current) |entry| !std.mem.startsWith(u8, entry.key, row_heap.retirement_prefix) or
+                (entry.key.len == row_heap.retirement_key_len and std.mem.readInt(u64, entry.key[row_heap.retirement_prefix.len..][0..8], .big) > committed_fence) else true;
+        }
+        var bytes: u64 = 0;
+        for (selected.items) |key| bytes += try row_heap.collectRetired(&writer, key, committed_fence);
+        if (selected.items.len != 0) try writer.commit() else writer.abort();
+        committed = true;
+        if (complete) {
+            self.lockPayloadPolicy();
+            defer self.unlockPayloadPolicy();
+            try self.row_heap_epochs.finish(committed_fence);
+        }
+        var done = false;
+        if (complete) {
+            var check = try store.beginProbe();
+            defer check.abort();
+            done = try row_heap.retiredBytes(&check) == 0;
+        }
+        self.row_heap_collection_pending.store(!done, .release);
+        return .{ .done = done, .rows = @intCast(selected.items.len), .bytes = bytes };
     }
 
     fn lockPayloadPolicy(self: *DocStore) void {
@@ -2148,10 +2404,13 @@ pub const DocStore = struct {
         errdefer self.releasePortableImportReader();
         self.lockPayloadPolicy();
         defer self.unlockPayloadPolicy();
+        const heap_epoch: ?u64 = if (self.row_heap_active.load(.acquire)) try self.row_heap_epochs.acquire() else null;
+        errdefer if (heap_epoch) |epoch| self.row_heap_epochs.release(epoch);
         const payload_session = try self.createPayloadSession();
         errdefer if (payload_session) |session| session.release();
         var txn: Txn = .{
             .payload_session = payload_session,
+            .row_heap_probe_epoch = heap_epoch,
             .alloc = self.alloc,
             .probe = try self.runtime_store.beginProbeWithBlockCacheAdmission(admission),
         };
@@ -3542,6 +3801,17 @@ pub const DocStore = struct {
         self.retained_effects_cache.store(0, .release);
         _ = self.columnar_revision.fetchAdd(1, .acq_rel);
         _ = self.query_generation_revision.fetchAdd(1, .acq_rel);
+    }
+
+    /// Reconcile this store's replay admission after writer authority has
+    /// verified the peer cut. Keep the local reservation counter monotonic.
+    pub fn adoptWriterReplayCut(self: *DocStore) !u64 {
+        self.revalidateAdoptedState();
+        var txn = try self.beginProbeTxn();
+        defer txn.abort();
+        const sequence = try self.lastReplaySequenceFromTxn(&txn, 0);
+        if (sequence != 0) self.observeCommittedReplaySequence(sequence);
+        return sequence;
     }
 
     pub fn reserveNextReplaySequence(self: *DocStore, fallback_next: u64) u64 {
@@ -5363,7 +5633,7 @@ test "docstore range tracking native LSM common prefix batch benchmark" {
 
 test "docstore range tracking survives native LSM reopen and rejects generation overflow atomically" {
     const range_protection = @import("range_protection.zig");
-    const index_records = @import("db/relational_index_records.zig");
+    const index_records = @import("db/relational/indexes/records.zig");
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5626,7 +5896,7 @@ test "docstore retained REF5 graph language persists exact value and tombstone a
 
 test "docstore retained integrity and row effects share an immutable atomic frame across reopen" {
     const alloc = std.testing.allocator;
-    const integrity = @import("db/relational_integrity_contract.zig");
+    const integrity = @import("db/relational/integrity/contract.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/integrity-tail", .{tmp.sub_path});
@@ -6550,6 +6820,40 @@ test "docstore backend runtime erases store handles" {
         defer cur.close();
         try std.testing.expectEqualStrings("doc:r", (try cur.seekAtOrAfter("doc:r")).?.key);
     }
+}
+
+test "docstore immutable presence retains its policy snapshot without copying large values" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var backend = try lsm_backend.Backend.open(alloc, path, .{ .flush_threshold_bytes = 4096 });
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    const large = try alloc.alloc(u8, 4 * 1024 * 1024);
+    defer alloc.free(large);
+    @memset(large, 'p');
+    try store.put("policy-program", large);
+    var historical = blk: {
+        var original = try store.beginReadTxn();
+        defer original.abort();
+        break :blk try original.forkRead();
+    };
+    defer historical.abort();
+    try store.putBatch(&.{.{ .key = "next-program", .value = large }}, &.{"policy-program"});
+    var current = try store.beginReadTxn();
+    defer current.abort();
+    const copies = backend.snapshotReadStats().point_value_copies;
+    for (0..8) |_| {
+        try std.testing.expect(try historical.contains("policy-program"));
+        try std.testing.expect(!try historical.contains("next-program"));
+        try std.testing.expect(!try historical.contains("missing"));
+        try std.testing.expect(!try current.contains("policy-program"));
+        try std.testing.expect(try current.contains("next-program"));
+    }
+    try std.testing.expectEqual(copies, backend.snapshotReadStats().point_value_copies);
 }
 
 test "ordered artifact inventory erased document snapshots retain their cut across fork and parent close" {
@@ -8078,6 +8382,283 @@ test "graph endpoint cleanup bulk retirement mask releases ownership on decoding
     try std.testing.expectError(error.InvalidGraphRetirement, DocStore.graphBulkRetirementMask(alloc, batch.asTxn(), &.{.{ .key = edge, .value = "edge" }}));
 }
 
+test "sequence catalog journal persists creation RESTART independently of declared START through cold retry" {
+    const sequence = @import("../system_catalog/sequences.zig");
+    const journal = @import("../system_catalog/sequence_journal.zig");
+    const Counter = journal.Store(DocStore.Txn);
+    const a = std.testing.allocator;
+    const record = try sequence.Record.create(.{ .start = 100, .restart = .{ .value = 7 }, .cache = 4 });
+    const key: journal.Key = .{ .group = 31, .sequence_id = 29 };
+    const request: journal.Request = .{ .expected = record.state, .request_id = @splat(9), .operation = .reserve };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    for (0..2) |pass| {
+        var backend = try lsm_backend.Backend.open(a, path, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        if (pass == 0) {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            const counter: Counter = .{ .txn = &txn, .key = key };
+            var invalid = record;
+            invalid.state.is_called = true;
+            try std.testing.expectError(error.InvalidSequenceDefinition, counter.initialize(a, invalid));
+            try counter.initialize(a, record);
+            try txn.commit();
+        }
+        var pinned = try store.beginReadTxn();
+        defer pinned.abort();
+        const reader: Counter = .{ .txn = &pinned, .key = key };
+        const prior = (try reader.load(a, record.definition)).?;
+        try std.testing.expectEqual(@as(i64, if (pass == 0) 7 else 10), prior.last_value);
+        {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            const counter: Counter = .{ .txn = &txn, .key = key };
+            const receipt = try counter.execute(a, record.definition, request);
+            try std.testing.expectEqual(@as(i64, 7), receipt.lease.?.first);
+            try std.testing.expectEqual(@as(u64, 4), receipt.lease.?.count);
+            try std.testing.expectEqual(@as(i64, 10), receipt.state.last_value);
+            try std.testing.expectEqual(@as(u64, 2), receipt.state.revision);
+            try txn.commit();
+        }
+        try std.testing.expectEqualDeep(prior, (try reader.load(a, record.definition)).?);
+        try std.testing.expectEqual(@as(i64, 100), record.definition.start);
+    }
+}
+
+test "sequence catalog journal native LSM rollback cold retry and bounded retirement" {
+    const sequence = @import("../system_catalog/sequences.zig");
+    const journal = @import("../system_catalog/sequence_journal.zig");
+    const Counter = journal.Store(DocStore.Txn);
+    const ReadOnlyTxn = struct {
+        inner: *DocStore.Txn,
+        reads: usize = 0,
+        pub fn get(self: *@This(), name: []const u8) ![]const u8 {
+            self.reads += 1;
+            return self.inner.get(name);
+        }
+    };
+    const FailingTxn = struct {
+        inner: *DocStore.Txn,
+        fail_at: usize,
+        writes: usize = 0,
+        pub fn get(self: *@This(), name: []const u8) ![]const u8 {
+            return self.inner.get(name);
+        }
+        pub fn put(self: *@This(), name: []const u8, value: []const u8) !void {
+            self.writes += 1;
+            if (self.writes == self.fail_at) return error.TestInjectedSequenceWriteFailure;
+            try self.inner.put(name, value);
+        }
+        pub fn delete(self: *@This(), name: []const u8) !void {
+            self.writes += 1;
+            if (self.writes == self.fail_at) return error.TestInjectedSequenceWriteFailure;
+            try self.inner.delete(name);
+        }
+    };
+    const a = std.testing.allocator;
+    const t = std.testing;
+    const key: journal.Key = .{ .group = 31, .sequence_id = 17 };
+    const initial_sequence = try sequence.Record.create(.{ .cache = 32 });
+    const definition = initial_sequence.definition;
+    const request: journal.Request = .{ .expected = initial_sequence.state, .request_id = @splat(1), .operation = .reserve };
+    // This test exercises a real atomic storage transaction, not Raft or public
+    // SQL activation. The catalog revision sentinel must never be rewritten by
+    // allocation, and a restart opens an independent durable LSM owner.
+    const catalog_key = "test.sequence.catalog-revision";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    for (0..2) |pass| {
+        var backend = try lsm_backend.Backend.open(a, path, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        if (pass == 0) {
+            {
+                var txn = try store.beginWriteTxn();
+                errdefer txn.abort();
+                const counter: Counter = .{ .txn = &txn, .key = key };
+                try counter.initialize(a, initial_sequence);
+                try t.expectError(error.SequenceCounterChanged, counter.initialize(a, initial_sequence));
+                try txn.put(catalog_key, "7");
+                try txn.commit();
+            }
+            var pinned = try store.beginReadTxn();
+            defer pinned.abort();
+            const reader: Counter = .{ .txn = &pinned, .key = key };
+            try t.expectEqual(@as(u64, 1), (try reader.load(a, definition)).?.revision);
+            try t.expect((try reader.observe(a, definition, request)) == null);
+            try t.expectEqual(.ready, try reader.admission(a, definition, request));
+            try t.expectEqual(@as(u64, 1), (try reader.load(a, definition)).?.revision);
+            for ([_]usize{ 1, 2 }) |fail_at| {
+                var txn = try store.beginWriteTxn();
+                defer txn.abort();
+                var failing: FailingTxn = .{ .inner = &txn, .fail_at = fail_at };
+                const counter: journal.Store(FailingTxn) = .{ .txn = &failing, .key = key };
+                try t.expectError(error.TestInjectedSequenceWriteFailure, counter.execute(a, definition, request));
+            }
+            {
+                var txn = try store.beginWriteTxn();
+                defer txn.abort();
+                const entries = try DocStore.scanPrefixTxn(a, &txn, "\x00\x00__metadata__:sql_sequence_counters:v1:");
+                defer {
+                    for (entries) |entry| {
+                        a.free(entry.key);
+                        a.free(entry.value);
+                    }
+                    a.free(entries);
+                }
+                try t.expectEqual(@as(usize, 1), entries.len);
+                try txn.put(entries[0].key, "{\"format\":1,\"identity\":{\"group\":32,\"sequence_id\":17},\"state\":{\"generation\":1,\"revision\":1,\"last_value\":1,\"is_called\":false}}");
+                const counter: Counter = .{ .txn = &txn, .key = key };
+                try t.expectError(error.InvalidSequenceState, counter.load(a, definition));
+                // Missing call/revision fields cannot acquire defaults that
+                // rewind an allocated counter during recovery.
+                for ([_][]const u8{
+                    "{\"format\":1,\"identity\":{\"group\":31,\"sequence_id\":17},\"state\":{\"generation\":1,\"revision\":1,\"last_value\":1}}",
+                    "{\"format\":1,\"identity\":{\"group\":31,\"sequence_id\":17},\"state\":{\"generation\":1,\"last_value\":1,\"is_called\":false}}",
+                    "{\"identity\":{\"group\":31,\"sequence_id\":17},\"state\":{\"generation\":1,\"revision\":1,\"last_value\":1,\"is_called\":false}}",
+                }) |malformed| {
+                    try txn.put(entries[0].key, malformed);
+                    try t.expectError(error.InvalidSequenceState, counter.load(a, definition));
+                }
+            }
+            {
+                var txn = try store.beginWriteTxn();
+                defer txn.abort();
+                const counter: Counter = .{ .txn = &txn, .key = key };
+                try t.expectEqual(@as(i64, 32), (try counter.execute(a, definition, request)).state.last_value);
+                // Abort after staging both the state and receipt.
+            }
+            {
+                var txn = try store.beginWriteTxn();
+                errdefer txn.abort();
+                const counter: Counter = .{ .txn = &txn, .key = key };
+                try t.expectEqual(@as(u64, 1), (try counter.load(a, definition)).?.revision);
+                const result = try counter.execute(a, definition, request);
+                try t.expectEqual(@as(i64, 1), result.lease.?.first);
+                try txn.commit();
+            }
+            try t.expectEqual(@as(u64, 1), (try reader.load(a, definition)).?.revision);
+            // A pinned pre-allocation reader cannot observe the new receipt.
+            try t.expect((try reader.observe(a, definition, request)) == null);
+        } else {
+            {
+                var read_txn = try store.beginReadTxn();
+                defer read_txn.abort();
+                var readonly: ReadOnlyTxn = .{ .inner = &read_txn };
+                const reader: journal.Store(ReadOnlyTxn) = .{ .txn = &readonly, .key = key };
+                const observed = (try reader.observe(a, definition, request)).?;
+                try t.expectEqual(@as(i64, 1), observed.lease.?.first);
+                try t.expectEqual(@as(i64, 32), observed.state.last_value);
+                try t.expectEqual(@as(usize, 2), readonly.reads);
+                const Probe = struct {
+                    fn run(allocator: std.mem.Allocator, source: journal.Store(ReadOnlyTxn), def: sequence.Definition, original: journal.Request) !void {
+                        const result = (try source.observe(allocator, def, original)).?;
+                        try std.testing.expectEqual(@as(i64, 1), result.lease.?.first);
+                        try std.testing.expectEqual(@as(u64, 2), result.state.revision);
+                    }
+                };
+                try std.testing.checkAllAllocationFailures(a, Probe.run, .{ reader, definition, request });
+                var mismatch = request;
+                mismatch.request_id = @splat(2);
+                try t.expectError(error.SequenceCounterChanged, reader.observe(a, definition, mismatch));
+                try t.expectEqualDeep(observed.state, (try reader.load(a, definition)).?);
+            }
+            {
+                var damaged_txn = try store.beginWriteTxn();
+                defer damaged_txn.abort();
+                const entries = try DocStore.scanPrefixTxn(a, &damaged_txn, journal.allGroupsPrefix());
+                defer {
+                    for (entries) |entry| {
+                        a.free(entry.key);
+                        a.free(entry.value);
+                    }
+                    a.free(entries);
+                }
+                var checked = false;
+                for (entries) |entry| {
+                    if ((try journal.storedKey(entry.key)).?.revision != 2) continue;
+                    var receipt = try journal.receiptBytes(a, entry.value, definition);
+                    receipt.lease.?.first += 1;
+                    receipt.lease.?.count -= 1;
+                    const corrupted = try std.json.Stringify.valueAlloc(a, receipt, .{});
+                    defer a.free(corrupted);
+                    try damaged_txn.put(entry.key, corrupted);
+                    const damaged: Counter = .{ .txn = &damaged_txn, .key = key };
+                    try t.expectError(error.InvalidSequenceReceipt, damaged.observe(a, definition, request));
+                    try t.expectEqualDeep(receipt.state, (try damaged.load(a, definition)).?);
+                    checked = true;
+                }
+                try t.expect(checked);
+            }
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            const counter: Counter = .{ .txn = &txn, .key = key };
+            const replay = try counter.execute(a, definition, request);
+            try t.expectEqual(@as(i64, 1), replay.lease.?.first);
+            try t.expectEqual(@as(u64, 2), (try counter.load(a, definition)).?.revision);
+            const wrong_group: Counter = .{ .txn = &txn, .key = .{ .group = 32, .sequence_id = 17 } };
+            try t.expect((try wrong_group.load(a, definition)) == null);
+            var state = replay.state;
+            for (0..130) |_| {
+                var next = request;
+                next.expected = state;
+                state = (try counter.execute(a, definition, next)).state;
+            }
+            // Missing old receipt is a conflict, never another allocation.
+            try t.expectError(error.SequenceCounterChanged, counter.execute(a, definition, request));
+            try t.expect((try counter.observe(a, definition, request)) == null);
+            try t.expectEqualDeep(state, (try counter.load(a, definition)).?);
+            const prefix = "\x00\x00__metadata__:sql_sequence_counters:v1:";
+            const entries = try DocStore.scanPrefixTxn(a, &txn, prefix);
+            defer {
+                for (entries) |entry| {
+                    a.free(entry.key);
+                    a.free(entry.value);
+                }
+                a.free(entries);
+            }
+            try t.expectEqual(@as(usize, journal.retained_receipts + 1), entries.len);
+            // Admission using an earlier counter must not overwrite a lease.
+            const stale: sequence.Record = .{ .definition = definition, .state = replay.state };
+            try t.expectError(error.SequenceCounterChanged, counter.alter(a, stale, .{ .restart = .{ .value = 1000 } }));
+            const prior: sequence.Record = .{ .definition = definition, .state = state };
+            try t.expectEqualDeep(prior, try counter.alter(a, prior, .{}));
+            const restarted = try counter.alter(a, prior, .{ .restart = .{ .value = 1000 } });
+            try t.expectError(error.SequenceCatalogChanged, counter.alter(a, prior, .{ .restart = .{ .value = 1000 } }));
+            try t.expectError(error.SequenceCatalogChanged, counter.execute(a, restarted.definition, request));
+            var fresh = request;
+            fresh.expected = restarted.state;
+            const first = try counter.execute(a, restarted.definition, fresh);
+            try t.expectEqual(@as(i64, 1000), first.lease.?.first);
+            fresh.expected = first.state;
+            fresh.operation = .{ .set = .{ .value = 77, .called = false } };
+            const reset = try counter.execute(a, restarted.definition, fresh);
+            try t.expect(reset.lease == null);
+            try t.expectEqualDeep(reset, try counter.execute(a, restarted.definition, fresh));
+            fresh.expected = reset.state;
+            fresh.operation = .reserve;
+            try t.expectEqual(@as(i64, 77), (try counter.execute(a, restarted.definition, fresh)).lease.?.first);
+            try counter.remove(a, restarted.definition);
+            try t.expect((try counter.load(a, restarted.definition)) == null);
+            const retired = try DocStore.scanPrefixTxn(a, &txn, prefix);
+            defer a.free(retired);
+            try t.expectEqual(@as(usize, 0), retired.len);
+            try txn.commit();
+        }
+        const revision = try store.get(a, catalog_key);
+        defer a.free(revision);
+        try t.expectEqualStrings("7", revision);
+    }
+}
+
 test "public graph metric borrowed wire content authority shares txn batch append abort and reopen boundaries" {
     const a = std.testing.allocator;
     const revision = @import("document_mutation_revision.zig");
@@ -8762,4 +9343,226 @@ test "docstore refuses an unknown replay journal format when it opens" {
     var runtime = try backend.runtimeStore(alloc, .{});
     defer runtime.deinit();
     try std.testing.expectError(error.UnsupportedReplayJournalFormat, DocStore.openRuntime(alloc, &runtime));
+}
+
+test {
+    _ = row_heap;
+    _ = row_heap_scope;
+    _ = @import("row_heap_benchmark.zig");
+    _ = @import("row_heap_restore_test.zig");
+}
+
+test "docstore row heap placement preserves pinned rows batches logical cursors and bounded reader-safe collection" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    const first = try internal_keys.documentKeyAlloc(a, "a");
+    defer a.free(first);
+    const second = try internal_keys.documentKeyAlloc(a, "b");
+    defer a.free(second);
+    try store.put(first, "{\"status\":\"late\"}");
+    try store.put(second, "{\"status\":\"early\"}");
+    // The old current probe was admitted before the first format publication.
+    var before = try store.beginProbeTxn();
+    defer before.abort();
+    var snapshot = try store.beginReadTxn();
+    defer snapshot.abort();
+    {
+        var write = try store.beginWriteTxn();
+        errdefer write.abort();
+        _ = try write.relocatePhysicalRow(second, @splat(1), 0);
+        _ = try write.relocatePhysicalRow(first, @splat(1), 1);
+        try write.commit();
+    }
+    if (before.get(first)) |old| {
+        // Backends whose probe is already a stable snapshot retain old inline
+        // bytes. A current-tip probe must retry before following a new format.
+        try std.testing.expectEqualStrings("{\"status\":\"late\"}", old);
+    } else |err| try std.testing.expectEqual(error.StorageReadTemporarilyUnavailable, err);
+    try std.testing.expectEqualStrings("{\"status\":\"late\"}", try snapshot.get(first));
+    // New probes protect immutable payloads before reading their locations.
+    var pinned = try store.beginProbeTxn();
+    var pinned_open = true;
+    defer if (pinned_open) pinned.abort();
+    try std.testing.expectEqualStrings("{\"status\":\"late\"}", try pinned.get(first));
+    var stable = try store.beginReadTxn();
+    defer stable.abort();
+    {
+        var cursor = try stable.openCursor();
+        defer cursor.close();
+        var current = try cursor.first();
+        var seen: usize = 0;
+        while (current) |entry| {
+            try std.testing.expect(!row_heap.isPhysicalKey(entry.key));
+            try std.testing.expect(!row_heap.isPhysicalMetadata(entry.key));
+            if (internal_keys.isStoredDocumentRowKey(entry.key)) {
+                try std.testing.expect(!row_heap.isReference(entry.value));
+                seen += 1;
+            }
+            current = try cursor.next();
+        }
+        try std.testing.expectEqual(@as(usize, 2), seen);
+    }
+    {
+        var scope = try stable.openReadScope(a);
+        defer scope.close();
+        var projection: [1][]const u8 = undefined;
+        try scope.getRanges(first, &.{.{ .offset = 11, .length = 4 }}, &projection);
+        try std.testing.expectEqualStrings("late", projection[0]);
+    }
+    var values: [3]?[]const u8 = undefined;
+    try stable.getManySorted(&.{ first, second, second }, &values);
+    try std.testing.expectEqualStrings("{\"status\":\"early\"}", values[1].?);
+    try std.testing.expectEqualStrings(values[1].?, values[2].?);
+    var owned: [2]?[]u8 = undefined;
+    try stable.getManySortedOwnedScoped(a, &.{ first, second }, &owned);
+    defer for (owned) |value| if (value) |bytes| a.free(bytes);
+    try std.testing.expectEqualStrings("{\"status\":\"late\"}", owned[0].?);
+    {
+        var batch = try store.beginWriteBatch();
+        errdefer batch.abort();
+        try batch.put(first, "{\"status\":\"updated\"}");
+        try batch.delete(second);
+        try batch.commit();
+    }
+    // Existing stable snapshots still see the original rows through their own
+    // backend view; current probes can finish resolving retired locations.
+    try std.testing.expectEqualStrings("{\"status\":\"late\"}", try stable.get(first));
+    try std.testing.expectEqualStrings("{\"status\":\"early\"}", try stable.get(second));
+    const delayed = try store.collectRowHeap(1);
+    try std.testing.expect(delayed.waiting_for_readers);
+    try std.testing.expect(!store.row_heap_collection_pending.load(.acquire));
+    pinned.abort();
+    pinned_open = false;
+    var newer = try store.beginProbeTxn();
+    defer newer.abort();
+    const one = try store.collectRowHeap(1);
+    try std.testing.expectEqual(@as(u32, 1), one.rows);
+    try std.testing.expect(!one.done);
+    try std.testing.expect(store.row_heap_collection_pending.load(.acquire));
+    const two = try store.collectRowHeap(1);
+    try std.testing.expectEqual(@as(u32, 1), two.rows);
+    try std.testing.expect(two.done);
+    try std.testing.expect(!store.row_heap_collection_pending.load(.acquire));
+    // Collection did not wait for the post-mark probe, nor erase old MVCC data.
+    try std.testing.expectEqualStrings("{\"status\":\"late\"}", try stable.get(first));
+    try std.testing.expectEqualStrings("{\"status\":\"updated\"}", try newer.get(first));
+    try std.testing.expectError(error.NotFound, newer.get(second));
+    const ref = try row_heap.location(first, "{\"status\":\"late\"}", @splat(1), 1);
+    var raw = try store.runtime_store.beginRead();
+    defer raw.abort();
+    try std.testing.expectError(error.NotFound, raw.get(&ref.physicalKey()));
+}
+
+test "docstore row heap LSM restart keeps physical order atomic progress and logical revision" {
+    const a = std.testing.allocator;
+    const revision = @import("document_mutation_revision.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const first = try internal_keys.documentKeyAlloc(a, "a");
+    defer a.free(first);
+    const second = try internal_keys.documentKeyAlloc(a, "b");
+    defer a.free(second);
+    const progress = "\x00\x00__metadata__:test_heap_progress";
+    var original: revision.Content = undefined;
+    for (0..3) |pass| {
+        var backend = try lsm_backend.Backend.open(a, path, .{ .flush_threshold_bytes = 1024 * 1024 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        if (pass == 0) {
+            try store.put(first, "{\"status\":\"zulu\"}");
+            try store.put(second, "{\"status\":\"alpha\"}");
+            {
+                var read = try store.beginReadTxn();
+                defer read.abort();
+                original = (try revision.loadContent(&read, first)).?;
+            }
+            // Neither a location nor its progress may survive rollback.
+            {
+                var write = try store.beginWriteTxn();
+                defer write.abort();
+                _ = try write.relocatePhysicalRow(second, @splat(2), 0);
+                try write.put(progress, "aborted");
+            }
+            {
+                var read = try store.beginReadTxn();
+                defer read.abort();
+                try std.testing.expectError(error.NotFound, read.get(progress));
+                try std.testing.expectEqualStrings("{\"status\":\"alpha\"}", try read.get(second));
+            }
+            {
+                var write = try store.beginWriteTxn();
+                errdefer write.abort();
+                _ = try write.relocatePhysicalRow(second, @splat(3), 0);
+                _ = try write.relocatePhysicalRow(first, @splat(3), 1);
+                try write.put(progress, "complete");
+                try write.commit();
+            }
+            try backend.flushBufferedWritesWithOptions(.{ .flush = true, .compact = true });
+        }
+        {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqualStrings("complete", try read.get(progress));
+            const content = (try revision.loadContent(&read, first)).?;
+            if (pass < 2) {
+                try std.testing.expectEqualDeep(original, content);
+                try std.testing.expectEqualStrings("{\"status\":\"zulu\"}", try read.get(first));
+                try std.testing.expectEqualStrings("{\"status\":\"alpha\"}", try read.get(second));
+                var transferred = try read.openPhysicalCursorAdapter();
+                defer transferred.close();
+                const entry = (try transferred.seekAtOrAfter(first)).?;
+                try std.testing.expectEqualStrings(first, entry.key);
+                try std.testing.expectEqualStrings("{\"status\":\"zulu\"}", entry.value);
+            } else {
+                try std.testing.expect(content.revision > original.revision);
+                try std.testing.expectEqualStrings("{\"status\":\"bravo\"}", try read.get(first));
+                try std.testing.expectError(error.NotFound, read.get(second));
+            }
+        }
+        if (pass < 2) {
+            // Inspect the durable physical plane, not the logical cursor's
+            // stable primary-key order. One compacted run orders bodies by
+            // the rewrite ordinal independently of the document key.
+            var raw = try store.runtime_store.beginRead();
+            defer raw.abort();
+            var cursor = try raw.openCursor();
+            defer cursor.close();
+            const early = (try cursor.seekAtOrAfter(row_heap.key_prefix)).?;
+            try std.testing.expectEqualStrings("{\"status\":\"alpha\"}", early.value);
+            const late = (try cursor.next()).?;
+            try std.testing.expectEqualStrings("{\"status\":\"zulu\"}", late.value);
+            const end = try cursor.next();
+            try std.testing.expect(end == null or !row_heap.isPhysicalKey(end.?.key));
+            const facts = try physical_table_catalog.Catalog.decode(try raw.get(physical_table_catalog.key));
+            try std.testing.expectEqual(@as(u8, 1), facts.row_heap_format);
+        }
+        if (pass == 1) {
+            // Opening a new process-equivalent store must register probes
+            // before they can observe a location, and recover retirement debt.
+            var probe = try store.beginProbeTxn();
+            try std.testing.expectEqualStrings("{\"status\":\"zulu\"}", try probe.get(first));
+            try store.put(first, "{\"status\":\"bravo\"}");
+            try store.delete(second);
+            try std.testing.expect((try store.collectRowHeap(1)).waiting_for_readers);
+            probe.abort();
+            // Leave the committed retirement records for a cold owner.
+        }
+        if (pass == 2) {
+            try std.testing.expectEqual(@as(u32, 1), (try store.collectRowHeap(1)).rows);
+            const last = try store.collectRowHeap(1);
+            try std.testing.expectEqual(@as(u32, 1), last.rows);
+            try std.testing.expect(last.done);
+            var raw = try store.runtime_store.beginRead();
+            defer raw.abort();
+            const retired = try row_heap.location(first, "{\"status\":\"zulu\"}", @splat(3), 1);
+            try std.testing.expectError(error.NotFound, raw.get(&retired.physicalKey()));
+        }
+        try store.sync(true);
+    }
 }

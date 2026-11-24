@@ -20,7 +20,7 @@
 const replication_ingress = @import("replication_ingress.zig");
 const std = @import("std");
 const retained = @import("../retained_effects.zig");
-const topology = @import("relational_integrity_topology.zig");
+const topology = @import("relational/integrity/topology.zig");
 const contract = @import("online_source_contract.zig");
 pub const Scope = contract.Scope;
 pub const Command = contract.Command;
@@ -485,7 +485,7 @@ test "relational index system online source controls survive LSM reopen with ato
             var facts = try table.Catalog.decode(try txn.get(table.key));
             facts.storage_mode = .relational;
             try txn.put(table.key, &facts.encode());
-            try txn.delete(@import("relational_integrity_catalog.zig").key);
+            try txn.delete(@import("relational/integrity/catalog.zig").key);
             var missing_catalog = scope;
             missing_catalog.consumer_epoch = 2;
             try std.testing.expectError(error.IntegrityCatalogChanged, stage(&txn, .{ .admit = .{ .scope = missing_catalog, .limit = retained.max_frame_bytes } }, 2));

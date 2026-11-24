@@ -1121,10 +1121,10 @@ const MainStoreOwner = union(enum) {
         };
     }
 
-    fn runLsmMaintenanceStepBestEffort(self: *MainStoreOwner) !bool {
+    fn runLsmMaintenanceStepBestEffort(self: *MainStoreOwner, due_only: bool) !bool {
         return switch (self.*) {
             .mem, .native_catalog => false,
-            .lsm => |*handle| try handle.backend.runMaintenanceStepBestEffort(),
+            .lsm => |*handle| try handle.backend.runReadyMaintenanceStepBestEffort(due_only),
         };
     }
 
@@ -2161,6 +2161,7 @@ pub const PersistentIndex = struct {
                 else => {},
             }
             for (tip_entries) |entry| try txn.delete(.docmap, entry.key);
+            try deleteAllInKeyspace(self.alloc, &txn, .l0);
             try deleteAllInKeyspace(self.alloc, &txn, .dead);
             txn.delete(.meta, meta_rebuild_versions) catch |err| switch (err) {
                 error.NotFound => {},
@@ -2190,6 +2191,195 @@ pub const PersistentIndex = struct {
         if (self.retired_segment_file_deleter) |deleter| {
             for (active_ids) |seg_id| RetiredSegmentFileDeleter.delete(deleter, seg_id);
         }
+    }
+
+    /// Apply the changed records from a peer publication, including the
+    /// segment additions and retirements made by a merge.
+    pub fn refreshChangedFromTip(self: *PersistentIndex, changed: []const native_catalog_backend.Mutation) !void {
+        const backend = switch (self.main_store_owner) {
+            .native_catalog => |backend| backend,
+            else => return error.UnsupportedRefresh,
+        };
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const delta = try alloc.dupe(native_catalog_backend.Mutation, changed);
+        const values = try alloc.alloc(?[]const u8, delta.len);
+        try backend.loadCommittedValues(alloc, delta, values);
+        for (delta, values) |*key, value| {
+            key.is_delete = value == null;
+            key.value = value orelse "";
+        }
+        return self.refreshPeerDelta(delta) catch |err| switch (err) {
+            error.UnsupportedRefresh => self.refreshFromTip(),
+            else => err,
+        };
+    }
+
+    pub fn refreshPeerDelta(self: *PersistentIndex, changed: []const native_catalog_backend.Mutation) !void {
+        if (!self.versioned or self.inline_in_flight.load(.acquire) != 0) return error.UnsupportedRefresh;
+        const backend = switch (self.main_store_owner) {
+            .native_catalog => |backend| backend,
+            else => return error.UnsupportedRefresh,
+        };
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        var keys = std.ArrayListUnmanaged(native_catalog_backend.Mutation).empty;
+        for (changed) |key| {
+            const namespace = key.namespace orelse return error.UnsupportedRefresh;
+            if (std.mem.eql(u8, namespace, native_catalog_backend.tip_namespace)) continue;
+            if (!std.mem.eql(u8, namespace, dead_namespace) and
+                !std.mem.eql(u8, namespace, l0_namespace) and
+                !std.mem.eql(u8, namespace, runtimeNamespace(.deletions).name.?) and
+                !std.mem.eql(u8, namespace, runtimeNamespace(.segments).name.?) and
+                !std.mem.eql(u8, namespace, runtimeNamespace(.meta).name.?))
+                return error.UnsupportedRefresh;
+            try keys.append(alloc, key);
+        }
+        if (keys.items.len == 0) return;
+
+        for (keys.items) |key| {
+            if (std.mem.eql(u8, key.namespace.?, runtimeNamespace(.meta).name.?) and std.mem.eql(u8, key.key, meta_text_storage_format)) {
+                if (key.is_delete or key.value.len != 4 or std.mem.readInt(u32, key.value[0..4], .little) != text_storage_format_versions)
+                    return error.UnsupportedRefresh;
+            }
+            // Versioned segments derive liveness from the dead set. Merge
+            // and reset still emit tombstones for legacy deletion bitmaps.
+            if (!key.is_delete and std.mem.eql(u8, key.namespace.?, runtimeNamespace(.deletions).name.?))
+                return error.UnsupportedRefresh;
+        }
+
+        self.lockStorage();
+        defer self.unlockStorage();
+        var read = try self.beginReadMainTxn();
+        defer read.abort();
+        var changed_dead = std.AutoHashMapUnmanaged(u32, ?[]const u8).empty;
+        var dead_tip: DeadVersions = .{ .alloc = alloc };
+        defer dead_tip.deinit();
+        var newly_dead = std.ArrayListUnmanaged(u64).empty;
+        for (keys.items) |key| {
+            if (!std.mem.eql(u8, key.namespace.?, dead_namespace)) continue;
+            if (key.key.len != 4) return error.InvalidDeadVersions;
+            const bucket = std.mem.readInt(u32, key.key[0..4], .big);
+            try changed_dead.put(alloc, bucket, if (key.is_delete) null else key.value);
+            if (key.is_delete) continue;
+            const high = @as(u64, bucket) << 32;
+            const previous = read.get(.dead, key.key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            var before = if (previous) |bytes| try roaring.RoaringBitmap.fromBytes(alloc, bytes) else roaring.RoaringBitmap.init(alloc);
+            defer before.deinit();
+            var after = try roaring.RoaringBitmap.fromBytes(alloc, key.value);
+            defer after.deinit();
+            after.andNotWith(&before);
+            var it = after.iterator();
+            while (it.next()) |low| try newly_dead.append(alloc, high | low);
+        }
+
+        var regular_segment_bytes = std.AutoHashMapUnmanaged(u64, []const u8).empty;
+        for (keys.items) |key| {
+            if (key.is_delete or !std.mem.eql(u8, key.namespace.?, runtimeNamespace(.segments).name.?)) continue;
+            if (key.key.len != 8) return error.InvalidSegmentCounter;
+            const id = std.mem.readInt(u64, key.key[0..8], .big);
+            try regular_segment_bytes.put(alloc, id, key.value);
+        }
+        var removed = std.ArrayListUnmanaged(u64).empty;
+        var additions = std.ArrayListUnmanaged(index_mod.ReplacementSegmentData).empty;
+        var bitmaps = std.ArrayListUnmanaged(?roaring.RoaringBitmap).empty;
+        defer {
+            for (additions.items) |*entry| entry.data.deinit(self.alloc);
+            for (bitmaps.items) |*bitmap| if (bitmap.*) |*owned| owned.deinit();
+        }
+        const has_segment_changes = for (keys.items) |key| {
+            const namespace = key.namespace.?;
+            if (std.mem.eql(u8, namespace, l0_namespace) or
+                (std.mem.eql(u8, namespace, runtimeNamespace(.meta).name.?) and
+                    std.mem.startsWith(u8, key.key, meta_active_segment_prefix))) break true;
+        } else false;
+        const current = if (has_segment_changes) self.writer.acquireSnapshot() else null;
+        defer if (current) |snap| snap.release();
+        for (keys.items) |key| {
+            const namespace = key.namespace.?;
+            const segment_id = if (std.mem.eql(u8, namespace, l0_namespace)) id: {
+                if (key.key.len != 8) return error.InvalidLevel0Segment;
+                break :id l0SegmentId(std.mem.readInt(u64, key.key[0..8], .big));
+            } else if (std.mem.eql(u8, namespace, runtimeNamespace(.meta).name.?) and std.mem.startsWith(u8, key.key, meta_active_segment_prefix)) id: {
+                const encoded = key.key[meta_active_segment_prefix.len..];
+                if (encoded.len != 8) return error.InvalidSegmentCounter;
+                break :id std.mem.readInt(u64, encoded[0..8], .big);
+            } else continue;
+            const exists = (try current.?.segmentIndex(segment_id)) != null;
+            if (key.is_delete) {
+                if (exists) try removed.append(alloc, segment_id);
+                continue;
+            }
+            if (exists) continue;
+            const bytes = if (isL0SegmentId(segment_id)) key.value else regular_segment_bytes.get(segment_id) orelse return error.UnsupportedRefresh;
+            try additions.ensureUnusedCapacity(alloc, 1);
+            try bitmaps.ensureUnusedCapacity(alloc, 1);
+            var reader = try segment_mod.SegmentReader.init(alloc, bytes);
+            defer reader.deinit();
+            const versions = try reader.docVersionsAlloc(alloc);
+            const bitmap = try self.peerDeletionBitmap(&read, &dead_tip, &changed_dead, reader.doc_count, versions);
+            errdefer if (bitmap) |value| {
+                var owned = value;
+                owned.deinit();
+            };
+            additions.appendAssumeCapacity(.{ .id = segment_id, .data = index_mod.SegmentData.fromOwnedHeap(try self.alloc.dupe(u8, bytes)) });
+            bitmaps.appendAssumeCapacity(bitmap);
+        }
+        for (additions.items, bitmaps.items) |*entry, *bitmap| {
+            if (bitmap.*) |*value| entry.deleted = value;
+        }
+        if (removed.items.len != 0 or additions.items.len != 0) {
+            var prepared = try self.writer.prepareSegmentsManyData(removed.items, additions.items);
+            defer prepared.abort();
+            prepared.publish();
+            additions.clearRetainingCapacity();
+        }
+        if (newly_dead.items.len != 0) try self.installDeadVersionsOrError(newly_dead.items);
+        try backend.applyExternallyCommittedMutations(keys.items);
+        for (keys.items) |key| {
+            if (key.is_delete or !std.mem.eql(u8, key.namespace.?, runtimeNamespace(.meta).name.?) or !std.mem.eql(u8, key.key, meta_next_seg_id)) continue;
+            self.writer.next_segment_id = @max(self.writer.next_segment_id, try decodeNextSegmentId(key.value));
+        }
+    }
+
+    fn peerDeletionBitmap(
+        self: *PersistentIndex,
+        read: *MainTxn,
+        dead: *DeadVersions,
+        changed: *const std.AutoHashMapUnmanaged(u32, ?[]const u8),
+        count: u32,
+        versions: ?[]const u64,
+    ) !?roaring.RoaringBitmap {
+        var bitmap = roaring.RoaringBitmap.init(self.alloc);
+        errdefer bitmap.deinit();
+        for (0..count) |local| {
+            const version = if (versions) |column| column[local] else 0;
+            if (version == 0) {
+                try bitmap.add(@intCast(local));
+                continue;
+            }
+            const high: u32 = @intCast(version >> 32);
+            const slot = try dead.sets.getOrPut(dead.alloc, high);
+            if (!slot.found_existing) {
+                errdefer _ = dead.sets.remove(high);
+                const prior = if (changed.get(high)) |value| value else read.get(.dead, &deadKey(high)) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                slot.value_ptr.* = if (prior) |value| try roaring.RoaringBitmap.fromBytes(dead.alloc, value) else roaring.RoaringBitmap.init(dead.alloc);
+            }
+            if (slot.value_ptr.contains(@truncate(version))) try bitmap.add(@intCast(local));
+        }
+        if (bitmap.isEmpty()) {
+            bitmap.deinit();
+            return null;
+        }
+        return bitmap;
     }
 
     /// Brings this process's view up to the index as committed, after
@@ -2334,6 +2524,15 @@ pub const PersistentIndex = struct {
         return switch (self.main_store_owner) {
             .mem, .native_catalog => null,
             .lsm => |handle| handle.backend.nextMaintenanceWakeDelayNsBestEffort(),
+        };
+    }
+
+    pub fn readyLsmMaintenanceScoreBestEffort(self: *PersistentIndex, due_only: bool) u64 {
+        if (!self.storage_mu.tryLock()) return 0;
+        defer self.unlockStorage();
+        return switch (self.main_store_owner) {
+            .mem, .native_catalog => 0,
+            .lsm => |handle| handle.backend.readyMaintenanceScoreBestEffort(due_only),
         };
     }
 
@@ -2486,10 +2685,10 @@ pub const PersistentIndex = struct {
         return try self.main_store_owner.runLsmMaintenanceStep();
     }
 
-    pub fn runLsmMaintenanceStepBestEffort(self: *PersistentIndex) !bool {
-        self.lockStorage();
+    pub fn runLsmMaintenanceStepBestEffort(self: *PersistentIndex, due_only: bool) !bool {
+        if (!self.storage_mu.tryLock()) return false;
         defer self.unlockStorage();
-        return try self.main_store_owner.runLsmMaintenanceStepBestEffort();
+        return try self.main_store_owner.runLsmMaintenanceStepBestEffort(due_only);
     }
 
     /// Index a pre-built segment (WAL-protected, durable after return).
@@ -2543,6 +2742,32 @@ pub const PersistentIndex = struct {
             .native_catalog => |backend| try backend.applyExternallyCommittedMutations(mutations),
             .mem, .lsm => {},
         }
+    }
+
+    /// Completion callbacks may run in reverse commit order. Reload the
+    /// affected records from the durable tip before replacing mirror values.
+    pub fn reconcileInlineCommittedMutations(self: *PersistentIndex, mutations: []const native_catalog_backend.Mutation) !void {
+        if (mutations.len == 0) return;
+        const backend = switch (self.main_store_owner) {
+            .native_catalog => |backend| backend,
+            else => return error.NotNativeCatalogBackend,
+        };
+        errdefer backend.invalidateMirror();
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        var keys = std.ArrayListUnmanaged(native_catalog_backend.Mutation).empty;
+        for (mutations) |mutation| {
+            if (std.mem.eql(u8, mutation.namespace orelse "", native_catalog_backend.tip_namespace)) continue;
+            try keys.append(alloc, mutation);
+        }
+        const values = try alloc.alloc(?[]const u8, keys.items.len);
+        try backend.loadCommittedValues(alloc, keys.items, values);
+        for (keys.items, values) |*mutation, value| {
+            mutation.is_delete = value == null;
+            mutation.value = value orelse "";
+        }
+        try backend.applyExternallyCommittedMutations(keys.items);
     }
 
     /// A small ("inline") segment publication prepared for a
@@ -2640,17 +2865,53 @@ pub const PersistentIndex = struct {
     /// Runs only after `publication`'s record is durable: adds its segment to
     /// the writer snapshot, after which the write's ack may return. A failure
     /// leaves memory behind the file; the next refresh reloads it.
-    pub fn installInlineSegmentPublication(self: *PersistentIndex, publication: *InlineSegmentPublication) void {
-        var replacement = [_]index_mod.ReplacementSegmentData{.{ .id = publication.seg_id, .data = index_mod.SegmentData.fromOwnedHeap(publication.segment_bytes) }};
+    pub fn installInlineSegmentPublication(self: *PersistentIndex, publication: *InlineSegmentPublication) !void {
+        var deleted = self.inlineDeletionBitmap(publication.copies) catch |err| {
+            publication.abort(self.alloc);
+            self.invalidateNativeCatalogMirror();
+            return err;
+        };
+        defer if (deleted) |*bitmap| bitmap.deinit();
+        var replacement = [_]index_mod.ReplacementSegmentData{.{
+            .id = publication.seg_id,
+            .data = index_mod.SegmentData.fromOwnedHeap(publication.segment_bytes),
+            .deleted = if (deleted) |*bitmap| bitmap else null,
+        }};
         publication.copies_arena.deinit();
         publication.* = undefined;
         var prepared = self.writer.prepareSegmentsManyData(&.{}, &replacement) catch |err| {
-            std.log.err("full-text level-0 install failed seg={d} err={s}", .{ replacement[0].id, @errorName(err) });
             replacement[0].data.deinit(self.alloc);
             self.invalidateNativeCatalogMirror();
-            return;
+            return err;
         };
         prepared.publish();
+    }
+
+    /// Install can run after a later commit on the same key. Read the
+    /// authoritative doc map so the incoming snapshot never exposes that copy.
+    fn inlineDeletionBitmap(self: *PersistentIndex, copies: []const VersionedChange) !?roaring.RoaringBitmap {
+        const backend = switch (self.main_store_owner) {
+            .native_catalog => |backend| backend,
+            else => return error.NotNativeCatalogBackend,
+        };
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const keys = try alloc.alloc(native_catalog_backend.Mutation, copies.len);
+        const values = try alloc.alloc(?[]const u8, copies.len);
+        for (copies, keys) |copy, *key| key.* = .{ .namespace = native_catalog_backend.tip_namespace, .key = copy.key };
+        try backend.loadCommittedValues(alloc, keys, values);
+
+        var bitmap = roaring.RoaringBitmap.init(self.alloc);
+        errdefer bitmap.deinit();
+        for (copies, values, 0..) |copy, value, local| {
+            if (value == null or try DocVersion.decode(value.?) != copy.version) try bitmap.add(@intCast(local));
+        }
+        if (bitmap.isEmpty()) {
+            bitmap.deinit();
+            return null;
+        }
+        return bitmap;
     }
 
     /// Like indexSegment(), but takes ownership of segment_bytes.
@@ -4493,6 +4754,11 @@ pub const PersistentIndex = struct {
         pub fn install(self: *VersionResolution) void {
             self.index.installDeadVersions(self.newly_dead.items);
         }
+
+        pub fn installChecked(self: *VersionResolution) !void {
+            if (self.newly_dead.items.len == 0) return;
+            try self.index.installDeadVersionsOrError(self.newly_dead.items);
+        }
     };
 
     /// Versions for the next `count` documents a rebuild indexes, at the
@@ -4813,32 +5079,29 @@ pub const PersistentIndex = struct {
         defer locations.mutex.unlock();
         const snap = self.writer.acquireSnapshot();
         defer snap.release();
-        var present = std.AutoHashMapUnmanaged(u64, *const index_mod.SegmentEntry).empty;
-        defer present.deinit(self.alloc);
-        for (snap.segments) |*segment| try present.put(self.alloc, segment.id, segment);
         var refreshed = false;
         for (versions) |version| {
             var location = locations.map.get(version);
-            if (location == null or !present.contains(location.?.seg_id)) {
+            if (location == null or (try snap.segmentIndex(location.?.seg_id)) == null) {
                 if (!refreshed) {
-                    try self.indexVersionLocationsLocked(snap, &present);
+                    try self.indexVersionLocationsLocked(snap);
                     refreshed = true;
                 }
                 location = locations.map.get(version);
             }
             const found = location orelse continue;
-            if (!present.contains(found.seg_id)) continue;
+            if ((try snap.segmentIndex(found.seg_id)) == null) continue;
             try self.writer.applyCommittedDeletes(found.seg_id, &.{found.local_id});
             _ = locations.map.remove(version);
         }
     }
 
-    fn indexVersionLocationsLocked(self: *PersistentIndex, snap: *const index_mod.IndexSnapshot, present: *const std.AutoHashMapUnmanaged(u64, *const index_mod.SegmentEntry)) !void {
+    fn indexVersionLocationsLocked(self: *PersistentIndex, snap: *const index_mod.IndexSnapshot) !void {
         const locations = &self.version_locations;
         var retired = std.ArrayListUnmanaged(u64).empty;
         defer retired.deinit(self.alloc);
         var indexed_it = locations.indexed.keyIterator();
-        while (indexed_it.next()) |seg_id| if (!present.contains(seg_id.*)) try retired.append(self.alloc, seg_id.*);
+        while (indexed_it.next()) |seg_id| if ((try snap.segmentIndex(seg_id.*)) == null) try retired.append(self.alloc, seg_id.*);
         for (retired.items) |seg_id| {
             const versions = locations.indexed.fetchRemove(seg_id).?.value;
             defer self.alloc.free(versions);
@@ -6327,6 +6590,8 @@ const InlinePublicationTestSink = struct {
     entries: std.ArrayListUnmanaged(native_catalog_backend.Entry) = .empty,
     allocator: Allocator,
 
+    full_loads: usize = 0,
+
     fn findIndex(self: *@This(), namespace: ?[]const u8, key: []const u8) ?usize {
         for (self.entries.items, 0..) |e, i| {
             const ns_match = (e.namespace == null and namespace == null) or
@@ -6367,6 +6632,7 @@ const InlinePublicationTestSink = struct {
     fn loadAllAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]native_catalog_backend.Entry {
         _ = scope;
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.full_loads += 1;
         const out = try allocator.alloc(native_catalog_backend.Entry, self.entries.items.len);
         for (self.entries.items, out) |e, *copy| copy.* = .{
             .namespace = if (e.namespace) |n| try allocator.dupe(u8, n) else null,
@@ -6761,9 +7027,10 @@ test "persistent index merge folds level-0 records into a segment" {
     var publication = try pi.prepareInlineSegmentPublication(level0);
     const l0_id = publication.seg_id;
     const va = publication.copies[0].version;
+    try test_sink.foreignPut(native_catalog_backend.tip_namespace, "doc:a", &DocVersion.encode(va));
     const mutations = publication.mutations();
     try InlinePublicationTestSink.submit(&test_sink, "", &mutations, true);
-    pi.installInlineSegmentPublication(&publication);
+    try pi.installInlineSegmentPublication(&publication);
     const other = try buildSimpleSegment(alloc, "doc:b", "beta");
     defer alloc.free(other);
     try pi.indexSegment(other);
@@ -6816,6 +7083,7 @@ test "persistent index publishes an inline write as a level-0 record and reloads
             defer snap.release();
             try std.testing.expectEqual(@as(usize, 0), snap.segments.len);
         }
+        try test_sink.foreignPut(native_catalog_backend.tip_namespace, "doc:a", &DocVersion.encode(publication.copies[0].version));
         // Stands in for the write's own native transaction committing it.
         const mutations = publication.mutations();
         try InlinePublicationTestSink.submit(&test_sink, "", &mutations, true);
@@ -6823,7 +7091,7 @@ test "persistent index publishes an inline write as a level-0 record and reloads
             .native_catalog => |backend| try backend.applyExternallyCommittedMutations(&mutations),
             else => return error.TestUnexpectedResult,
         }
-        pi.installInlineSegmentPublication(&publication);
+        try pi.installInlineSegmentPublication(&publication);
         const snap = pi.writer.acquireSnapshot();
         defer snap.release();
         try std.testing.expectEqual(@as(usize, 1), snap.segments.len);
@@ -6843,6 +7111,79 @@ test "persistent index publishes an inline write as a level-0 record and reloads
     try std.testing.expectEqual(@as(u32, 1), snap.liveDocCount());
     // A level-0 id never advances the segment counter.
     try std.testing.expect(!isL0SegmentId(reopened.writer.next_segment_id));
+}
+
+test "persistent index masks a late level-0 install and clears it on rebuild" {
+    const alloc = std.testing.allocator;
+    var sink = InlinePublicationTestSink{ .allocator = alloc };
+    defer sink.deinit(alloc);
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+
+    {
+        var pi = try openVersionedTestIndex(alloc, &sink, path);
+        defer pi.close();
+        const bytes = try buildSimpleSegment(alloc, "doc:a", "old");
+        var publication = pi.prepareInlineSegmentPublication(bytes) catch |err| {
+            alloc.free(bytes);
+            return err;
+        };
+        const version = publication.copies[0].version;
+        const mutations = publication.mutations();
+        try InlinePublicationTestSink.submit(&sink, "", &mutations, true);
+        try pi.applyExternallyCommittedMutationsIfNativeCatalog(&mutations);
+        try sink.foreignPut(native_catalog_backend.tip_namespace, "doc:a", &DocVersion.encode(DocVersion.deletion(version)));
+
+        pi.installDeadVersions(&.{version});
+        try pi.installInlineSegmentPublication(&publication);
+        {
+            const snapshot = pi.writer.acquireSnapshot();
+            defer snapshot.release();
+            try std.testing.expectEqual(@as(usize, 1), snapshot.segments.len);
+            try std.testing.expectEqual(@as(u32, 0), snapshot.liveDocCount());
+        }
+        try pi.resetAllForRebuild();
+    }
+    var reopened = try openVersionedTestIndex(alloc, &sink, path);
+    defer reopened.close();
+    const snapshot = reopened.writer.acquireSnapshot();
+    defer snapshot.release();
+    try std.testing.expectEqual(@as(usize, 0), snapshot.segments.len);
+}
+
+test "persistent index reconciles dead buckets after reverse completion" {
+    const alloc = std.testing.allocator;
+    var sink = InlinePublicationTestSink{ .allocator = alloc };
+    defer sink.deinit(alloc);
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+    var pi = try openVersionedTestIndex(alloc, &sink, path);
+    defer pi.close();
+
+    const first = try DocVersion.of(1, 0);
+    const second = try DocVersion.of(2, 0);
+    const key = deadKey(@intCast(first >> 32));
+    var bitmap = roaring.RoaringBitmap.init(alloc);
+    defer bitmap.deinit();
+    try bitmap.add(@truncate(first));
+    const older_value = try bitmap.toBytes(alloc);
+    defer alloc.free(older_value);
+    try bitmap.add(@truncate(second));
+    const newer_value = try bitmap.toBytes(alloc);
+    defer alloc.free(newer_value);
+    try sink.foreignPut(dead_namespace, &key, newer_value);
+
+    try pi.reconcileInlineCommittedMutations(&.{.{ .namespace = dead_namespace, .key = &key, .value = newer_value }});
+    try pi.reconcileInlineCommittedMutations(&.{.{ .namespace = dead_namespace, .key = &key, .value = older_value }});
+
+    var read = try pi.beginReadMainTxn();
+    defer read.abort();
+    var dead = try DeadVersions.load(alloc, &read);
+    defer dead.deinit();
+    try std.testing.expect(dead.contains(first));
+    try std.testing.expect(dead.contains(second));
 }
 
 test "persistent index prepares a merged seal mutation without committing, and returns null once already covered" {
@@ -9275,4 +9616,121 @@ test "persistent index refreshes another writer's segments, rewrites and merges 
     try std.testing.expectEqual(@as(usize, 1), snap.segments.len);
     try std.testing.expect(std.mem.indexOfScalar(u64, ids.items, snap.segments[0].id) == null);
     try std.testing.expectEqual(@as(u32, 1), snap.liveDocCount());
+}
+
+test "persistent index applies peer level-0, merge and rebuild deltas" {
+    const alloc = std.testing.allocator;
+    var sink = InlinePublicationTestSink{ .allocator = alloc };
+    defer sink.deinit(alloc);
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+    var index = try openVersionedTestIndex(alloc, &sink, path);
+    defer index.close();
+
+    // Serving readers must follow the same incremental path.
+    index.read_only = true;
+    const initial_loads = sink.full_loads;
+
+    const older = try DocVersion.of(1, 0);
+    const newer = try DocVersion.of(2, 0);
+    const old_key = l0Key(l0SegmentId(older));
+    const new_key = l0Key(l0SegmentId(newer));
+    const first = try buildVersionedSegment(alloc, &.{.{ .doc_id = "doc:a", .term = "alpha", .version = older }});
+    defer alloc.free(first);
+    const second = try buildVersionedSegment(alloc, &.{.{ .doc_id = "doc:a", .term = "beta", .version = newer }});
+    defer alloc.free(second);
+
+    // The pinned cut contains this segment even though the live sink does
+    // not. Peer refresh must install the supplied value without rereading it.
+    try index.refreshPeerDelta(&.{.{ .namespace = l0_namespace, .key = &old_key, .value = first }});
+    {
+        const snapshot = index.writer.acquireSnapshot();
+        defer snapshot.release();
+        try std.testing.expectEqual(@as(usize, 1), snapshot.segments.len);
+        try std.testing.expectEqual(@as(u32, 1), snapshot.liveDocCount());
+    }
+    try sink.foreignPut(l0_namespace, &old_key, first);
+    try sink.foreignPut(native_catalog_backend.tip_namespace, "doc:a", &DocVersion.encode(older));
+
+    var dead = roaring.RoaringBitmap.init(alloc);
+    defer dead.deinit();
+    try dead.add(@truncate(older));
+    const dead_bytes = try dead.toBytes(alloc);
+    defer alloc.free(dead_bytes);
+    const dead_key = deadKey(@intCast(older >> 32));
+    try sink.foreignPut(dead_namespace, &dead_key, dead_bytes);
+    try sink.foreignPut(l0_namespace, &new_key, second);
+    try sink.foreignPut(native_catalog_backend.tip_namespace, "doc:a", &DocVersion.encode(newer));
+    try index.refreshChangedFromTip(&.{
+        .{ .namespace = dead_namespace, .key = &dead_key },
+        .{ .namespace = l0_namespace, .key = &new_key },
+    });
+    {
+        const snapshot = index.writer.acquireSnapshot();
+        defer snapshot.release();
+        try std.testing.expectEqual(@as(usize, 2), snapshot.segments.len);
+        try std.testing.expectEqual(@as(u32, 1), snapshot.liveDocCount());
+    }
+
+    const merged_id: u64 = 1;
+    const merged_key = std.mem.toBytes(std.mem.nativeToBig(u64, merged_id));
+    const active_key = activeSegmentMetaKey(merged_id);
+    try sink.foreignDelete(l0_namespace, &old_key);
+    try sink.foreignDelete(l0_namespace, &new_key);
+    try sink.foreignDelete(dead_namespace, &dead_key);
+    try sink.foreignPut("segments", &merged_key, second);
+    try sink.foreignPut("meta", &active_key, "");
+    try sink.foreignPut("meta", meta_next_seg_id, &PersistentIndex.nextSegmentIdValue(merged_id, 1));
+    try index.refreshChangedFromTip(&.{
+        .{ .namespace = l0_namespace, .key = &old_key },
+        .{ .namespace = l0_namespace, .key = &new_key },
+        .{ .namespace = dead_namespace, .key = &dead_key },
+        .{ .namespace = "deletions", .key = &old_key },
+        .{ .namespace = "segments", .key = &merged_key },
+        .{ .namespace = "meta", .key = &active_key },
+    });
+    {
+        const snapshot = index.writer.acquireSnapshot();
+        defer snapshot.release();
+        try std.testing.expectEqual(@as(usize, 1), snapshot.segments.len);
+        try std.testing.expectEqual(merged_id, snapshot.segments[0].id);
+        try std.testing.expectEqual(@as(u32, 1), snapshot.liveDocCount());
+    }
+
+    try std.testing.expectEqual(initial_loads, sink.full_loads);
+
+    var peer_path_buf: [256]u8 = undefined;
+    const peer_path = persistTmpPath(&peer_path_buf);
+    defer cleanupPersistDir(peer_path);
+    var peer = try openVersionedTestIndex(alloc, &sink, peer_path);
+    defer peer.close();
+    try peer.resetAllForRebuild();
+    const rebuilt_copy = try buildVersionedSegment(alloc, &.{.{ .doc_id = "doc:b", .term = "rebuilt", .version = try DocVersion.of(3, 0) }});
+    defer alloc.free(rebuilt_copy);
+    try peer.indexSegment(rebuilt_copy);
+    const rebuilt = peer.writer.acquireSnapshot();
+    defer rebuilt.release();
+    try std.testing.expectEqual(@as(usize, 1), rebuilt.segments.len);
+    const rebuilt_id = rebuilt.segments[0].id;
+    try std.testing.expect(rebuilt_id != merged_id);
+    const loads_before_rebuild_delta = sink.full_loads;
+    const rebuilt_key = std.mem.toBytes(std.mem.nativeToBig(u64, rebuilt_id));
+    const rebuilt_active = activeSegmentMetaKey(rebuilt_id);
+    try index.refreshChangedFromTip(&.{
+        .{ .namespace = "segments", .key = &merged_key },
+        .{ .namespace = "meta", .key = &active_key },
+        .{ .namespace = "segments", .key = &rebuilt_key },
+        .{ .namespace = "meta", .key = &rebuilt_active },
+        .{ .namespace = "meta", .key = meta_text_storage_format },
+        .{ .namespace = "meta", .key = meta_next_seg_id },
+        .{ .namespace = native_catalog_backend.tip_namespace, .key = "doc:a" },
+        .{ .namespace = native_catalog_backend.tip_namespace, .key = "doc:b" },
+    });
+    try std.testing.expectEqual(loads_before_rebuild_delta, sink.full_loads);
+    const snapshot = index.writer.acquireSnapshot();
+    defer snapshot.release();
+    try std.testing.expectEqual(@as(usize, 1), snapshot.segments.len);
+    try std.testing.expectEqual(rebuilt_id, snapshot.segments[0].id);
+    try std.testing.expectEqual(@as(u32, 1), snapshot.liveDocCount());
 }

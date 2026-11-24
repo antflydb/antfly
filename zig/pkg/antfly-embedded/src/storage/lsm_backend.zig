@@ -2361,13 +2361,19 @@ pub const Backend = struct {
     pub fn pinNativeCheckpoint(self: *Backend) !NativeCheckpoint {
         const root_dir = self.root_dir orelse return error.Unsupported;
         const storage = self.storage orelse return error.Unsupported;
-        if (self.options.backend.read_only) return error.ReadOnly;
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
 
-        try self.flushCheckpointCutLocked();
-        if (self.manifest_dirty or self.obsolete_manifest_dirty or self.manifest_backing == null) {
-            try self.writeManifestSnapshotLocked(root_dir, self.writeStatsNowNs());
+        if (self.options.backend.read_only) {
+            // An installed immutable checkpoint has no journal suffix. A
+            // read-only recovery that replayed writes cannot export its run
+            // set alone without silently losing the recovered memtables.
+            if (self.mutable.entryCount() != 0 or self.activeImmutableMemtableCount() != 0) return error.ReadOnly;
+        } else {
+            try self.flushCheckpointCutLocked();
+            if (self.manifest_dirty or self.obsolete_manifest_dirty or self.manifest_backing == null) {
+                try self.writeManifestSnapshotLocked(root_dir, self.writeStatsNowNs());
+            }
         }
         // Export only the pinned generation, not a live edit stream or its
         // obsolete-file history. Restores need no journal suffix or old SSTs.
@@ -3322,6 +3328,19 @@ pub const Backend = struct {
         if (!self.mu.tryLock()) return false;
         defer self.unlockWithReclamation();
         return try self.runMaintenanceStepLocked(false);
+    }
+
+    /// Keep the readiness recheck, attempt, and any stale-debt refresh in
+    /// the same lock acquisition. Contention never falls through to scoring.
+    pub fn runReadyMaintenanceStepBestEffort(self: *Backend, due_only: bool) !bool {
+        if (!self.mu.tryLock()) return false;
+        defer self.unlockWithReclamation();
+        if (self.readyMaintenanceScoreLocked(due_only) == 0) return false;
+        const progressed = try self.runMaintenanceStepLocked(false);
+        if (!progressed and self.maintenanceDebtHint() != 0) {
+            _ = self.refreshCachedMaintenanceHintLocked();
+        }
+        return progressed;
     }
 
     pub fn makeWalCheckpointRetryDueForTest(self: *Backend) void {
@@ -6262,7 +6281,10 @@ pub const Backend = struct {
     }
 
     pub fn checkpointWalAfterDurableBoundary(self: *Backend) !void {
-        if (!self.options.wal_enabled or self.root_dir == null or self.options.backend.read_only) return;
+        // A no-WAL owner still needs a manifested immutable boundary for
+        // clean shutdown and physical capture. Only WAL retirement below is
+        // conditional on WAL ownership; flushing user values is not.
+        if (self.root_dir == null or self.options.backend.read_only) return;
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
 
@@ -8914,6 +8936,23 @@ pub const Backend = struct {
     pub fn nextMaintenanceWakeDelayNsBestEffort(self: *Backend) ?u64 {
         if (!self.mu.tryLock()) return null;
         defer self.mu.unlock();
+        return self.nextMaintenanceWakeDelayNsLocked();
+    }
+
+    pub fn readyMaintenanceScoreBestEffort(self: *Backend, due_only: bool) u64 {
+        if (!self.mu.tryLock()) return 0;
+        defer self.mu.unlock();
+        return self.readyMaintenanceScoreLocked(due_only);
+    }
+
+    fn readyMaintenanceScoreLocked(self: *Backend, due_only: bool) u64 {
+        const debt = self.maintenanceDebtHint();
+        if (!due_only and debt != 0) return debt;
+        if (self.nextMaintenanceWakeDelayNsLocked() != @as(?u64, 0)) return 0;
+        return @max(1, debt);
+    }
+
+    fn nextMaintenanceWakeDelayNsLocked(self: *Backend) ?u64 {
         if (self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) return 0;
         if (@import("lsm_backend/memtable_reclamation.zig").pending(self)) return 0;
         if (self.manifest_recovery_required) return null;
@@ -9360,7 +9399,7 @@ pub const BackendHandle = struct {
             }
         }
 
-        backend.* = Backend.init(allocator, resolved_options);
+        backend.initInPlace(allocator, resolved_options);
         errdefer backend.close();
         if (config.internal_flush_worker) {
             internal_flush_worker = try startInternalFlushWorker(allocator, backend, config.maintenance_io orelse if (owned_runtime) |*runtime| runtime.ptr().io() else null);
@@ -11995,6 +12034,32 @@ fn implementationTests() type {
             try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
             try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
             try std.testing.expectEqualStrings("alpha", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
+        }
+
+        test "lsm backend no WAL durable boundary survives cold reopen without destructor flush" {
+            var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+            defer storage.deinit();
+            const root_dir = "/lsm-no-wal-durable-boundary";
+            const options: Options = .{ .flush_threshold = 1024, .wal_enabled = false, .storage = storage.storage() };
+            var first = try Backend.open(std.testing.allocator, root_dir, options);
+            var first_open = true;
+            defer if (first_open) first.close();
+            {
+                var txn = try first.beginWrite();
+                defer txn.abort();
+                try txn.put(.{ .name = "docs" }, "doc:a", "alpha");
+                try txn.commit();
+            }
+            try std.testing.expectEqual(@as(usize, 1), first.mutable.entryCount());
+            try std.testing.expectEqual(@as(u64, 0), first.snapshotMaintenanceStats().wal_retained_bytes);
+            try first.checkpointWalAfterDurableBoundary();
+            try std.testing.expectEqual(@as(usize, 0), first.mutable.entryCount());
+            first.abandonAfterCrash();
+            first_open = false;
+            var second = try Backend.open(std.testing.allocator, root_dir, options);
+            defer second.close();
+            try std.testing.expectEqualStrings("alpha", try second.getMergedWithMutable(&second.mutable, .{ .name = "docs" }, "doc:a"));
+            try std.testing.expectEqual(@as(u64, 0), second.snapshotMaintenanceStats().wal_retained_bytes);
         }
 
         test "lsm backend accounts in-memory recovery state in the resource manager and releases it on close" {

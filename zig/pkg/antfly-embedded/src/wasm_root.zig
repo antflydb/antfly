@@ -52,6 +52,55 @@ var global_storage: ?MemoryStorage = null;
 var global_api: ?Api = null;
 var local_embedder: ?TermiteDenseEmbedder = null;
 
+// --- Host file storage: the browser supplies files (OPFS) through env imports ---
+
+extern fn antfly_host_fs_size(path_ptr: usize, path_len: usize) i64;
+extern fn antfly_host_fs_read(path_ptr: usize, path_len: usize, offset: u64, out_ptr: usize, out_len: usize) i64;
+extern fn antfly_host_fs_write(path_ptr: usize, path_len: usize, ptr: usize, len: usize, append: u32) i64;
+extern fn antfly_host_fs_sync(path_ptr: usize, path_len: usize) i64;
+extern fn antfly_host_fs_rename(old_ptr: usize, old_len: usize, new_ptr: usize, new_len: usize) i64;
+extern fn antfly_host_fs_remove(path_ptr: usize, path_len: usize, tree: u32) i64;
+extern fn antfly_host_fs_list(path_ptr: usize, path_len: usize, dirs: u32, out_ptr: usize, out_len: usize) i64;
+extern fn antfly_host_fs_now_ns() u64;
+
+const host_fs = struct {
+    fn size(_: ?*anyopaque, path: []const u8) i64 {
+        return antfly_host_fs_size(@intFromPtr(path.ptr), path.len);
+    }
+    fn read(_: ?*anyopaque, path: []const u8, offset: u64, out: []u8) i64 {
+        return antfly_host_fs_read(@intFromPtr(path.ptr), path.len, offset, @intFromPtr(out.ptr), out.len);
+    }
+    fn write(_: ?*anyopaque, path: []const u8, bytes: []const u8, append: bool) i64 {
+        return antfly_host_fs_write(@intFromPtr(path.ptr), path.len, @intFromPtr(bytes.ptr), bytes.len, @intFromBool(append));
+    }
+    fn sync(_: ?*anyopaque, path: []const u8) i64 {
+        return antfly_host_fs_sync(@intFromPtr(path.ptr), path.len);
+    }
+    fn rename(_: ?*anyopaque, old: []const u8, new: []const u8) i64 {
+        return antfly_host_fs_rename(@intFromPtr(old.ptr), old.len, @intFromPtr(new.ptr), new.len);
+    }
+    fn remove(_: ?*anyopaque, path: []const u8, tree: bool) i64 {
+        return antfly_host_fs_remove(@intFromPtr(path.ptr), path.len, @intFromBool(tree));
+    }
+    fn list(_: ?*anyopaque, path: []const u8, dirs: bool, out: []u8) i64 {
+        return antfly_host_fs_list(@intFromPtr(path.ptr), path.len, @intFromBool(dirs), @intFromPtr(out.ptr), out.len);
+    }
+    fn now(_: ?*anyopaque) u64 {
+        return antfly_host_fs_now_ns();
+    }
+};
+
+var host_file_storage: embedded_db.HostFileStorage = .init(.{
+    .size = host_fs.size,
+    .read = host_fs.read,
+    .write = host_fs.write,
+    .sync = host_fs.sync,
+    .rename = host_fs.rename,
+    .remove = host_fs.remove,
+    .list = host_fs.list,
+    .now_ns = host_fs.now,
+});
+
 // --- TermiteDenseEmbedder: bridges antfly's DenseEmbedder vtable to termite WASM exports ---
 
 const TermiteDenseEmbedder = struct {
@@ -203,6 +252,46 @@ fn closeState() void {
     closeApiOnly();
     if (global_storage) |*storage| storage.deinit();
     global_storage = null;
+}
+
+fn openHostFiles(path: []const u8) !void {
+    closeState();
+    installHostRenderer();
+    global_api = try Api.openHosted(allocator(), path, .{
+        .table_name = "docs",
+        .db = .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            .storage = host_file_storage.storage(),
+        },
+    });
+    errdefer closeApiOnly();
+    const indexes = try global_api.?.db.listIndexes(allocator());
+    defer embedded_db.types.freeIndexConfigs(allocator(), indexes);
+    for (indexes) |index| {
+        if (std.mem.eql(u8, index.name, "full_text_index_v0")) return;
+    }
+    try global_api.?.db.addIndex(.{
+        .name = "full_text_index_v0",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+}
+
+/// Open (or reopen) a hosted database whose files the host provides through
+/// the `antfly_host_fs_*` imports (in browsers, an OPFS pool). A new database
+/// receives the default full-text index.
+pub export fn antfly_embedded_open_host_fs(path_ptr: usize, path_len: usize) u32 {
+    const path = inputSlice(path_ptr, path_len);
+    if (path.len == 0 or path[0] != '/') {
+        setMessage("InvalidPath");
+        return 1;
+    }
+    openHostFiles(path) catch |err| {
+        setMessage(@errorName(err));
+        return 1;
+    };
+    setMessage("ok");
+    return 0;
 }
 
 fn openWithCurrentStorage(add_index: bool) !void {

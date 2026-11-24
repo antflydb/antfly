@@ -431,6 +431,7 @@ fn classifyError(err: anyerror) ErrorCode {
         error.SqlArraySubscriptError,
         error.RelationalExpressionOverflow,
         error.RelationalExpressionDivisionByZero,
+        error.SqlInvalidPowerArgument,
         error.RelationalExpressionBudgetExceeded,
         error.InvalidRelationalExpressionInput,
         error.InvalidRelationalGeneratedValue,
@@ -528,6 +529,7 @@ fn classifyError(err: anyerror) ErrorCode {
         error.IndexArtifactCleanupPending,
         error.WouldBlock,
         error.WriterLocked,
+        error.QueuedDependencyRejected,
         error.FileBusy,
         error.TextMergeBackpressureTimeout,
         error.LiteRetirementBacklogExceeded,
@@ -612,6 +614,7 @@ test "unauthenticated Lite access to an RLS table is a nonretryable capability e
 test "bounded Lite retirement admission is retryable while uncertain publication is not" {
     try std.testing.expectEqual(ErrorCode.busy, mapError(error.LiteRetirementBacklogExceeded));
     try std.testing.expectEqual(ErrorCode.busy, mapError(error.FileBusy));
+    try std.testing.expectEqual(ErrorCode.busy, mapError(error.QueuedDependencyRejected));
     try std.testing.expectEqual(ErrorCode.stalled, mapError(error.CommitVisibilityNotSatisfied));
     try std.testing.expectEqual(ErrorCode.busy, mapError(error.TextMergeBackpressureTimeout));
     try std.testing.expectEqualStrings("TextMergeBackpressureTimeout", std.mem.span(lastErrorDetail()));

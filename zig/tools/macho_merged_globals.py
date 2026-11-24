@@ -111,9 +111,66 @@ def restore_merged_global_aliases(data: bytes) -> bytes:
     return bytes(output) if output is not None else data
 
 
+def shorten_private_symbol_names(data: bytes) -> bytes:
+    """Bound private entry-object names before passing them to Apple's ld.
+
+    Zig can include the contents of an embedded kernel in a compiler-private
+    symbol name. Relocations use symbol indices, so local definitions can
+    point to an appended short name without changing any original string,
+    relocation, or external symbol. The entry object's string table is last.
+    """
+    if len(data) < 32 or struct.unpack_from("<I", data)[0] != MH_MAGIC_64:
+        return data
+    count, commands_size = struct.unpack_from("<II", data, 16)
+    position = 32
+    commands_end = position + commands_size
+    for _ in range(count):
+        if position + 8 > commands_end or commands_end > len(data):
+            raise ValueError("truncated Mach-O load command")
+        command, size = struct.unpack_from("<II", data, position)
+        if size < 8 or position + size > commands_end:
+            raise ValueError("invalid Mach-O load command size")
+        if command != LC_SYMTAB:
+            position += size
+            continue
+        if size < 24:
+            raise ValueError("truncated Mach-O symbol command")
+        symbols, count, strings, strings_size = struct.unpack_from(
+            "<IIII", data, position + 8
+        )
+        strings_end = strings + strings_size
+        if strings_end != len(data) or symbols + count * 16 > strings:
+            return data
+        output = None
+        for index in range(count):
+            offset = symbols + index * 16
+            name, kind = struct.unpack_from("<IB", data, offset)
+            if kind & (N_EXT | N_STAB) or kind & N_TYPE != N_SECT:
+                continue
+            start = strings + name
+            if name >= strings_size:
+                raise ValueError("invalid Mach-O symbol name")
+            if data.find(b"\0", start, min(start + 1025, strings_end)) != -1:
+                continue
+            if data.find(b"\0", start, strings_end) == -1:
+                raise ValueError("unterminated Mach-O symbol name")
+            if output is None:
+                output = bytearray(data)
+            # Keep Darwin's temporary-label convention on names using it.
+            prefix = "L" if data[start] == ord("L") else "_"
+            struct.pack_into("<I", output, offset, len(output) - strings)
+            output.extend(f"{prefix}antfly_private_{index}\0".encode("ascii"))
+        if output is None:
+            return data
+        output.extend(b"\0" * (-len(output) % 8))
+        struct.pack_into("<I", output, position + 20, len(output) - strings)
+        return bytes(output)
+    return data
+
+
 def prepare_entry_object(source: Path, output: Path) -> Path:
     original = source.read_bytes()
-    fixed = restore_merged_global_aliases(original)
+    fixed = shorten_private_symbol_names(restore_merged_global_aliases(original))
     if fixed is original:
         return source
     retained = output.with_name(output.name + ".entry.o")

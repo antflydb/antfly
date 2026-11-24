@@ -2849,6 +2849,7 @@ test "lite allocator v4 releasing the last old reader starts idle retirement" {
 pub const OpenOptions = struct {
     redo_recovery_base: ?native.RedoRecoveryCursor = null,
     externally_locked: bool = false,
+    require_versioned_text: bool = false,
     reclamation: reclamation.Options = .{},
     read_only: bool = false,
     no_sync: bool = false,
@@ -2871,6 +2872,7 @@ pub const OpenOptions = struct {
 
 pub const CreateOptions = struct {
     externally_locked: bool = false,
+    require_versioned_text: bool = false,
     reclamation: reclamation.Options = .{},
     exclusive: bool = false,
     no_sync: bool = false,
@@ -2913,6 +2915,7 @@ pub const CreateOptions = struct {
 const MutationRequest = struct {
     context: *anyopaque,
     apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void,
+    complete: ?Store.MutationPlan.Completion = null,
     next: ?*MutationRequest = null,
     done: bool = false,
     durable: bool = true,
@@ -3504,6 +3507,15 @@ pub const Store = struct {
         result.file.retirement_work_pages = opts.reclamation.retirement_work_pages;
         result.file.reserve_retirement_capacity = true;
         result.file.vacuum_target_indexed = opts.reclamation.page_reuse;
+        if (opts.require_versioned_text and !opts.read_only and (!result.file.header.versioned_text_required or result.file.header.versioned_text_fence_pending)) {
+            var workspace = try result.reserveGenerationWorkspace();
+            defer workspace.deinit();
+            const limit = workspace.options.max_storage_bytes;
+            result.file.vacuum_workspace_limit = if (limit == 0) null else limit;
+            defer result.file.vacuum_workspace_limit = null;
+            result.file.redo_log_budget_bytes = opts.reclamation.max_storage_bytes;
+            try result.file.requireVersionedTextFormat();
+        }
         if (!opts.read_only and !opts.externally_locked) {
             if (opts.reclamation.page_reuse and !result.file.header.indexed_reclamation) {
                 _ = try result.vacuumWithCancel(null);
@@ -3521,6 +3533,7 @@ pub const Store = struct {
     pub fn createWithOptions(allocator: Allocator, path: []const u8, opts: CreateOptions) !Store {
         const policy = try reclamation.Policy.init(opts.reclamation);
         const native_opts = native.CreateOptions{
+            .versioned_text_required = opts.require_versioned_text,
             .exclusive = opts.exclusive,
             .no_sync = opts.no_sync,
             .resource_manager = opts.resource_manager,
@@ -4342,6 +4355,16 @@ pub const Store = struct {
         try self.file.adoptIndexPublicationHeader(header);
         self.assessment_cache = null;
         self.publishReadCheckpointAssumeLocked();
+    }
+
+    pub fn prepareWriterFromReadCut(self: *Store, sequence: u64) !bool {
+        lockStoreExclusive(self);
+        defer self.mutex.unlock();
+        if (self.secret_store_uncertain or self.write_target != null) return false;
+        if (!try self.file.prepareWriterFromReadCut(sequence)) return false;
+        self.assessment_cache = null;
+        self.publishReadCheckpointAssumeLocked();
+        return true;
     }
 
     pub fn backendStore(self: *Store) NativeBackendStore {
@@ -5651,6 +5674,10 @@ pub const Store = struct {
     pub const MutationPlan = struct {
         context: *anyopaque,
         apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void,
+        /// The queue leader calls this once in enqueue order before waking
+        /// tickets. Callbacks run outside the store and queue mutexes and
+        /// must not wait for this coordinator or submit to it synchronously.
+        complete: ?Completion = null,
         durable: bool = true,
         index_only: bool = false,
         artifact_lease: bool = false,
@@ -5662,6 +5689,8 @@ pub const Store = struct {
         /// formation (`group_max_bytes`); never required to be exact. Also
         /// what `stageRideAlong` tracks against `ride_along_byte_threshold`.
         estimated_bytes: usize = 0,
+
+        pub const Completion = *const fn (*anyopaque, anyerror!u64) void;
     };
 
     pub const Ticket = struct {
@@ -5818,6 +5847,7 @@ pub const Store = struct {
         request.* = .{
             .context = plan.context,
             .apply = plan.apply,
+            .complete = plan.complete,
             // A ride-along member is never itself the reason a group
             // becomes durable; it only ever rides a foreground member's
             // durability, or `forceDrainDurable`'s forced one (WS2).
@@ -6480,28 +6510,21 @@ pub const Store = struct {
                 _ = self.test_group_members_total.fetchAdd(batch.size, .monotonic);
             }
             const result = self.applyMutationGroup(head, force_durable);
+            var completed: ?*MutationRequest = head;
+            while (completed) |item| : (completed = item.next) {
+                // A group failure supersedes every per-member result.
+                result catch |err| {
+                    item.result = err;
+                };
+                if (item.complete) |complete| {
+                    const outcome: anyerror!u64 = if (item.result) |_| item.committed_sequence else |err| err;
+                    complete(item.context, outcome);
+                }
+            }
 
             self.commit_mutex.lockUncancelable(io);
             var current: ?*MutationRequest = head;
-            if (result) |_| {
-                // A member that failed its own apply already has its
-                // specific error in `item.result`; one that was admitted
-                // keeps its default success. Nothing to overwrite.
-            } else |err| {
-                // The shared commit (admission, transaction open, or the
-                // final fsync) failed: every member's durability is equally
-                // unknown, including one that had already failed its own
-                // apply and rolled back.
-                while (current) |item| {
-                    item.result = err;
-                    current = item.next;
-                }
-                current = head;
-            }
-            while (current) |item| {
-                item.done = true;
-                current = item.next;
-            }
+            while (current) |item| : (current = item.next) item.done = true;
             // `own_request` is a member of some batch this same call
             // already drained (this one, or an earlier iteration's), since
             // it was queued before this call was ever entered -- so by the
@@ -6647,29 +6670,35 @@ pub const Store = struct {
         return self.submitIndexPlanForScope(scope, .{ .context = context, .apply = apply, .durable = durable, .index_only = true });
     }
 
+    pub fn submitIndexMutationForScopes(self: *Store, scopes: []const []const u8, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void) !void {
+        return self.submitIndexPlanForScopes(scopes, .{ .context = context, .apply = apply, .index_only = true });
+    }
+
     fn submitIndexPlanForScope(self: *Store, scope: []const u8, plan: MutationPlan) !void {
+        return self.submitIndexPlanForScopes(&.{scope}, plan);
+    }
+
+    fn submitIndexPlanForScopes(self: *Store, scopes: []const []const u8, plan: MutationPlan) !void {
         if (self.write_target == null) return self.submitScopedMutation(plan);
         const admission = self.writer_admission orelse return self.submitScopedMutation(plan);
         try admission.enter(admission.ptr, .index);
         defer admission.leave(admission.ptr);
         const io = self.file.runtime();
-        // A physical catalog change admission found under this scope
-        // (`markChangedIndexScopes`), in every redo mode: a file without a
-        // redo log publishes every index commit that way.
-        if (self.indexScopeStale(scope)) {
-            self.index_fence_refused.store(true, .release);
-            return error.EnrichmentWaitCanceled;
+        const shared = if (self.file.redo) |*redo| redo.shared else null;
+        // Both physical and redo-only catalog changes fence stale mirrors.
+        for (scopes) |scope| {
+            if (self.indexScopeStale(scope) or
+                (shared != null and shared.?.scopeLatestSequence(io, scope) > self.indexScopeFence(scope)))
+            {
+                self.index_fence_refused.store(true, .release);
+                return error.EnrichmentWaitCanceled;
+            }
         }
-        const shared = if (self.file.redo) |*redo| redo.shared else return self.submitScopedMutation(plan);
-        if (shared.scopeLatestSequence(io, scope) > self.indexScopeFence(scope)) {
-            self.index_fence_refused.store(true, .release);
-            return error.EnrichmentWaitCanceled;
-        }
-        // Reserved before publishing: recording the commit afterwards must
-        // not fail once storage has changed.
-        try self.reserveIndexScope(scope);
+        // Reserve before publication so updating the fences cannot fail
+        // once the storage transaction has committed.
+        if (shared != null) for (scopes) |scope| try self.reserveIndexScope(scope);
         try self.submitScopedMutation(plan);
-        self.noteIndexScopeCommit(scope, shared.scopeLatestSequence(io, scope));
+        if (shared) |overlay| for (scopes) |scope| self.noteIndexScopeCommit(scope, overlay.scopeLatestSequence(io, scope));
     }
 
     fn indexScopeStale(self: *Store, scope: []const u8) bool {
@@ -6868,7 +6897,7 @@ pub const Store = struct {
                 .empty => if (head.scope_delete_only) {
                     // An earlier ride-along may be the reason this scope
                     // is empty. Honor the durable request even without edits.
-                    if (force_durable or head.durable or self.writer_admission != null) try self.file.sync();
+                    if (force_durable or head.durable or head.complete != null or self.writer_admission != null) try self.file.sync();
                     head.committed_sequence = self.file.committedSequence();
                     return;
                 },
@@ -6892,7 +6921,7 @@ pub const Store = struct {
         var durable = force_durable or self.writer_admission != null;
         var admitted_any = false;
         while (current) |item| {
-            durable = durable or item.durable;
+            durable = durable or item.durable or item.complete != null;
             const savepoint = try self.file.beginTransactionSavepoint();
             if (item.apply(item.context, &self.file)) |_| {
                 self.file.releaseTransactionSavepoint(savepoint);
@@ -7510,6 +7539,7 @@ const PendingMutation = struct {
 };
 
 pub const Txn = struct {
+    queued_participant: ?@import("../commit_participant.zig").Queued = null,
     allocator: Allocator,
     store: ?*Store = null,
     pending: std.ArrayListUnmanaged(PendingMutation) = .empty,
@@ -7777,6 +7807,34 @@ pub const Txn = struct {
         // `Txn.putIndexCatalogBatch`.
         index_catalog_mutations: []const native.CatalogMutation = &.{},
         index_catalog_delete_prefix: ?[]const u8 = null,
+        queued: ?@import("../commit_participant.zig").Queued = null,
+
+        prefix: []const u8 = "",
+
+        const ApplyView = struct {
+            alloc: Allocator,
+            file: *native.NativeFile,
+            prefix: []const u8,
+
+            fn physicalKey(self: *ApplyView, key: []const u8) ![]const u8 {
+                return if (self.prefix.len == 0) key else try std.mem.concat(self.alloc, u8, &.{ self.prefix, key });
+            }
+
+            pub fn get(self: *ApplyView, key: []const u8) ![]const u8 {
+                return (try self.file.getDocumentAlloc(self.alloc, try self.physicalKey(key))) orelse error.NotFound;
+            }
+
+            pub fn put(self: *ApplyView, key: []const u8, value: []const u8) !void {
+                try self.file.putDocument(try self.physicalKey(key), value);
+            }
+        };
+
+        fn complete(ptr: *anyopaque, outcome: anyerror!u64) void {
+            const context: *@This() = @ptrCast(@alignCast(ptr));
+            const queued = context.queued.?;
+            queued.complete(queued.ptr, outcome);
+        }
+
         fn scopeDeleteRedoBytes(ptr: *anyopaque, file: *const native.NativeFile) usize {
             const context: *const @This() = @ptrCast(@alignCast(ptr));
             return file.indexScopeCompanionRedoBytes(context.mutations, context.index_catalog_mutations);
@@ -7784,7 +7842,16 @@ pub const Txn = struct {
 
         fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
             const context: *@This() = @ptrCast(@alignCast(ptr));
+            errdefer if (context.queued) |queued| queued.reject(queued.ptr);
+            if (context.queued) |queued| try queued.validate(queued.ptr);
             try file.putDocumentBatch(context.mutations);
+            if (context.queued) |queued| if (queued.apply) |apply_member| {
+                var arena = std.heap.ArenaAllocator.init(context.allocator);
+                defer arena.deinit();
+                var view: ApplyView = .{ .alloc = arena.allocator(), .file = file, .prefix = context.prefix };
+                try apply_member(queued.ptr, @import("../commit_participant.zig").View.from(&view));
+            };
+
             for (context.index_resolvers) |scoped| try @import("native_catalog_sink.zig").applyResolver(context.allocator, file, scoped.scope, scoped.resolver);
             if (context.index_catalog_mutations.len != 0) try file.putIndexCatalogBatch(context.index_catalog_mutations);
             if (context.index_catalog_delete_prefix) |prefix| try file.deleteIndexCatalogPrefix(prefix, null);
@@ -7884,7 +7951,7 @@ pub const Txn = struct {
         // Metadata probes may use a write transaction without staging changes.
         // Release their admission and snapshot directly: entering publication
         // would unnecessarily run retirement pressure and allocator proof work.
-        if (self.pending_count == 0 and self.index_catalog_pending.items.len == 0 and self.index_catalog_resolvers.items.len == 0 and self.index_catalog_delete_prefix == null) {
+        if (self.pending_count == 0 and self.index_catalog_pending.items.len == 0 and self.index_catalog_resolvers.items.len == 0 and self.index_catalog_delete_prefix == null and self.queued_participant == null) {
             self.abort();
             return .{};
         }
@@ -7924,7 +7991,7 @@ pub const Txn = struct {
         // `StagedCommit.wait()`/`abort()`, both of which run after the
         // group's `apply` callback has already consumed it, mirroring how
         // `mutations` above borrows `self.pending`'s own buffers.
-        context.* = .{ .mutations = mutations, .index_catalog_mutations = self.index_catalog_pending.items, .allocator = allocator, .index_resolvers = self.index_catalog_resolvers.items, .index_catalog_delete_prefix = self.index_catalog_delete_prefix };
+        context.* = .{ .mutations = mutations, .index_catalog_mutations = self.index_catalog_pending.items, .allocator = allocator, .index_resolvers = self.index_catalog_resolvers.items, .index_catalog_delete_prefix = self.index_catalog_delete_prefix, .queued = self.queued_participant, .prefix = self.prefix };
         errdefer {
             if (self.writer_reserved) {
                 store.releaseWriterSlot();
@@ -7968,6 +8035,7 @@ pub const Txn = struct {
         const plan = Store.MutationPlan{
             .context = context,
             .apply = PrimaryCommitContext.apply,
+            .complete = if (context.queued != null) PrimaryCommitContext.complete else null,
             .estimated_bytes = estimated_bytes,
             .scope_delete_redo_bytes = if (self.index_catalog_delete_prefix != null) PrimaryCommitContext.scopeDeleteRedoBytes else null,
             .scope_delete_prefix = self.index_catalog_delete_prefix,
@@ -8734,6 +8802,11 @@ pub const Txn = struct {
     /// `Sink.submit` normally takes. This is what lets a synchronous
     /// `full_text` write publish its segment/range/active-set records in
     /// the same commit as the documents it indexes.
+    pub fn setQueuedParticipant(self: *Txn, queued: @import("../commit_participant.zig").Queued) !void {
+        if (self.read_only or self.queued_participant != null) return error.InvalidTransactionState;
+        self.queued_participant = queued;
+    }
+
     pub fn putIndexCatalogBatch(self: *Txn, scope: []const u8, mutations: []const @import("../native_catalog_backend.zig").Mutation) !void {
         if (self.read_only) return error.ReadOnly;
         if (mutations.len == 0) return;
@@ -20093,4 +20166,166 @@ test "lite native docstore retires a planned replay prefix across hint lanes" {
     const ledger = internal_keys.JournalCreditLedger.decode(journal_credit) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u64, 2), ledger.records);
     try std.testing.expectEqual(@as(u64, 2 * internal_keys.replay_key_len + second.len), ledger.bytes);
+}
+
+test "lite group commit completes members in queue order before tickets resolve" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "ordered-completion.aflite");
+    defer alloc.free(path);
+    var store = try Store.create(alloc, path, true);
+    defer store.close();
+    const Recorder = struct {
+        calls: [2]usize = undefined,
+        count: usize = 0,
+        sequence: u64 = 0,
+        saw_failure: bool = false,
+    };
+    const Member = struct {
+        recorder: *Recorder,
+        id: usize,
+
+        fn apply(ctx: *anyopaque, file: *native.NativeFile) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.id == 1) return error.InjectedMemberFailure;
+            try file.putDocument("first", "value");
+        }
+
+        fn complete(ctx: *anyopaque, outcome: anyerror!u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.recorder.calls[self.recorder.count] = self.id;
+            self.recorder.count += 1;
+            if (outcome) |sequence| {
+                self.recorder.sequence = sequence;
+            } else |err| {
+                self.recorder.saw_failure = err == error.InjectedMemberFailure;
+            }
+        }
+
+        fn plan(self: *@This()) Store.MutationPlan {
+            return .{ .context = self, .apply = apply, .complete = complete };
+        }
+    };
+    var recorder: Recorder = .{};
+    var first: Member = .{ .recorder = &recorder, .id = 0 };
+    var second: Member = .{ .recorder = &recorder, .id = 1 };
+    const staged_first = try store.enqueue(first.plan());
+    const staged_second = try store.enqueue(second.plan());
+    staged_first.drive();
+    const sequence = try staged_first.ticket().waitSequence();
+    try std.testing.expectError(error.InjectedMemberFailure, staged_second.ticket().wait());
+    try std.testing.expectEqual(@as(usize, 2), recorder.count);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, &recorder.calls);
+    try std.testing.expectEqual(sequence, recorder.sequence);
+    try std.testing.expect(recorder.saw_failure);
+}
+
+test "lite group commit rejects primary writes that depend on a rejected member" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "rejected-dependency.aflite");
+    defer alloc.free(path);
+    var store = try Store.create(alloc, path, true);
+    defer store.close();
+
+    const State = struct { rejected: bool = false, completions: usize = 0 };
+    const Member = struct {
+        state: *State,
+        fail: bool,
+
+        fn validate(ptr: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.fail) return error.InjectedMemberFailure;
+            if (self.state.rejected) return error.QueuedDependencyRejected;
+        }
+
+        fn reject(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.state.rejected = true;
+        }
+
+        fn complete(ptr: *anyopaque, outcome: anyerror!u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (outcome) |_| unreachable else |_| self.state.completions += 1;
+        }
+
+        fn participant(self: *@This()) @import("../commit_participant.zig").Queued {
+            return .{ .ptr = self, .validate = validate, .reject = reject, .complete = complete };
+        }
+    };
+    var shared: State = .{};
+    var first: Member = .{ .state = &shared, .fail = true };
+    var second: Member = .{ .state = &shared, .fail = false };
+    var first_txn = try store.beginWrite();
+    defer first_txn.abort();
+    try first_txn.put("first", "value");
+    try first_txn.setQueuedParticipant(first.participant());
+    const first_staged = try first_txn.commitStaged();
+    var second_txn = try store.beginWrite();
+    defer second_txn.abort();
+    try second_txn.put("second", "value");
+    try second_txn.setQueuedParticipant(second.participant());
+    const second_staged = try second_txn.commitStaged();
+    try std.testing.expectError(error.InjectedMemberFailure, first_staged.wait());
+    try std.testing.expectError(error.QueuedDependencyRejected, second_staged.wait());
+    try std.testing.expectEqual(@as(usize, 2), shared.completions);
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectError(error.NotFound, read.get("first"));
+    try std.testing.expectError(error.NotFound, read.get("second"));
+}
+
+test "lite group commit queued metadata reads the preceding member at the tip" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "queued-counter.aflite");
+    defer alloc.free(path);
+    var store = try Store.create(alloc, path, true);
+    defer store.close();
+    const key = try @import("../internal_keys.zig").derivedCoverageOutcomeCountKeyAlloc(alloc, "vec", 1, "produced");
+    defer alloc.free(key);
+
+    const Callback = struct {
+        key: []const u8,
+
+        fn validate(_: *anyopaque) anyerror!void {}
+        fn reject(_: *anyopaque) void {}
+        fn complete(_: *anyopaque, _: anyerror!u64) void {}
+
+        fn apply(ptr: *anyopaque, view: @import("../commit_participant.zig").View) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const previous = view.get(self.key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            const count = if (previous) |bytes| try @import("../internal_keys.zig").decodeDerivedCoverageOutcomeCount(bytes) else 0;
+            var encoded: [8]u8 = undefined;
+            _ = @import("../internal_keys.zig").encodeDerivedCoverageOutcomeCount(&encoded, count + 1);
+            try view.putReplay(self.key, &encoded);
+        }
+    };
+
+    var callback = Callback{ .key = key };
+    const participant: @import("../commit_participant.zig").Queued = .{
+        .ptr = &callback,
+        .validate = Callback.validate,
+        .apply = Callback.apply,
+        .reject = Callback.reject,
+        .complete = Callback.complete,
+    };
+    var first = try store.beginWrite();
+    try first.setQueuedParticipant(participant);
+    const first_ticket = try first.commitStaged();
+    var second = try store.beginWrite();
+    try second.setQueuedParticipant(participant);
+    const second_ticket = try second.commitStaged();
+    try first_ticket.wait();
+    try second_ticket.wait();
+
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqual(@as(u64, 2), try @import("../internal_keys.zig").decodeDerivedCoverageOutcomeCount(try read.get(key)));
 }

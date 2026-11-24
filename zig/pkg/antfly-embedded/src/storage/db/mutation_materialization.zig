@@ -72,7 +72,7 @@ const native_catalog_backend = @import("../native_catalog_backend.zig");
 const roaring = @import("../../encoding/roaring.zig");
 const persistent_mod = @import("../persistent.zig");
 const projection_seal = @import("../projection_seal.zig");
-const relational_store = @import("relational_store.zig");
+const relational_store = @import("relational/rows/store.zig");
 const resolver_lib = @import("antfly_resolver");
 const resource_manager_mod = @import("../resource_manager.zig");
 const result_collectors = @import("result_collectors.zig");
@@ -3437,32 +3437,29 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             /// the level-0 segments to the writer snapshot and marks the
             /// versions this write made dead. Takes the index's apply guard
             /// for just this, not across the commit.
-            pub fn install(self: *InlineTextPublication) void {
+            pub fn install(self: *InlineTextPublication) !void {
+                defer self.finish();
+                errdefer self.index_manager.index_publication_reopen_required.store(true, .release);
                 if (!self.index_locked) {
                     self.apply_guard.relockIndex();
                     self.index_locked = true;
                 }
-                if (self.mutationsAlloc(self.alloc)) |mutations| {
-                    defer self.alloc.free(mutations);
-                    self.entry.persistent.applyExternallyCommittedMutationsIfNativeCatalog(mutations) catch |err| {
-                        std.log.err("inline text publication install: native_catalog mirror sync failed index={s} err={s}", .{ self.entry.config.name, @errorName(err) });
+
+                const mutations = try self.mutationsAlloc(self.alloc);
+                defer self.alloc.free(mutations);
+                try self.entry.persistent.applyExternallyCommittedMutationsIfNativeCatalog(mutations);
+                try self.entry.persistent.reconcileInlineCommittedMutations(self.resolution.decidedMutations());
+                // Consume every segment, including after a failed install.
+                var install_error: ?anyerror = null;
+                for (self.segments[0..self.segment_count]) |*seg| {
+                    self.entry.persistent.installInlineSegmentPublication(seg) catch |err| {
+                        if (install_error == null) install_error = err;
                     };
-                } else |err| {
-                    std.log.err("inline text publication install: rebuilding mutations failed index={s} err={s}", .{ self.entry.config.name, @errorName(err) });
                 }
-                self.entry.persistent.applyExternallyCommittedMutationsIfNativeCatalog(self.resolution.decidedMutations()) catch |err| {
-                    std.log.err("inline text publication install: native_catalog mirror sync failed index={s} err={s}", .{ self.entry.config.name, @errorName(err) });
-                };
-                for (self.segments[0..self.segment_count]) |*seg| self.entry.persistent.installInlineSegmentPublication(seg);
                 self.segment_count = 0;
-                // Durable now: only from here may queries see the deletes.
-                self.resolution.install();
-                // Inline writes publish level-0 segments that only merges
-                // fold away: mark the index for its merge scheduler.
-                self.index_manager.noteInlineTextPublicationSegments(self.entry) catch |err| {
-                    std.log.err("inline text publication install: merge-need check failed index={s} err={s}", .{ self.entry.config.name, @errorName(err) });
-                };
-                self.finish();
+                try self.resolution.installChecked();
+                try self.index_manager.noteInlineTextPublicationSegments(self.entry);
+                if (install_error) |err| return err;
             }
 
             /// The mutations were never committed (preparation succeeded but
@@ -3704,6 +3701,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             forward_scope: []const u8,
             reverse_scope: []const u8,
             progress: apply_state.Progress,
+            enqueued: bool = false,
+            install_error: ?anyerror = null,
 
             fn reset(_: *anyopaque) void {}
             fn observe(_: *anyopaque, _: []const u8, _: ?[]const u8) void {}
@@ -3716,33 +3715,67 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 _ = try apply_state.contributeProgressTxn(view, self.progress);
             }
 
-            /// Call only once the host transaction's commit has actually
-            /// returned successfully (see `InlineTextPublication.install`'s
-            /// identical warning).
-            pub fn participant(self: *InlineGraphPublication) commit_participant.Participant {
-                return .{ .ptr = self, .reset = reset, .observe = observe, .stage = stage };
+            fn validate(ptr: *anyopaque) anyerror!void {
+                const self: *InlineGraphPublication = @ptrCast(@alignCast(ptr));
+                try self.entry.inline_writer.validate();
             }
 
-            pub fn install(self: *InlineGraphPublication) void {
-                std.debug.assert(self.apply_guard.locked());
-                self.entry.index.installInlineEdgePublication(&self.publication) catch |err| {
-                    std.log.err("inline graph publication install: mirror sync failed index={s} err={s}", .{ self.entry.config.name, @errorName(err) });
+            fn reject(ptr: *anyopaque) void {
+                const self: *InlineGraphPublication = @ptrCast(@alignCast(ptr));
+                self.entry.inline_writer.reject();
+            }
+
+            fn complete(ptr: *anyopaque, outcome: anyerror!u64) void {
+                const self: *InlineGraphPublication = @ptrCast(@alignCast(ptr));
+                self.apply_guard.relockIndex();
+                defer self.apply_guard.unlockIndex();
+                if (outcome) |_| {
+                    self.entry.index.applyInlinePublicationToServing(&self.publication) catch |err| {
+                        self.install_error = err;
+                        self.apply_guard.manager.index_publication_reopen_required.store(true, .release);
+                        self.entry.inline_writer.reject();
+                    };
+                    self.entry.invalidateNeighborSource();
+                } else |_| {}
+                self.entry.inline_writer.completed(outcome);
+            }
+
+            pub fn participant(self: *InlineGraphPublication) commit_participant.Participant {
+                return .{
+                    .ptr = self,
+                    .reset = reset,
+                    .observe = observe,
+                    .stage = stage,
+                    .queued = .{ .ptr = self, .validate = validate, .reject = reject, .complete = complete },
                 };
-                // Matches `applyGraphMutationsEntryMode`'s own
-                // `entry.invalidateNeighborSource()` call whenever a write
-                // actually lands -- purely in-memory bookkeeping (not part
-                // of `publication`'s durable mutations), safe to run here
-                // unconditionally since this type only ever represents
-                // exactly one edge write.
-                self.entry.invalidateNeighborSource();
-                self.apply_guard.unlock();
-                self.alloc.destroy(self);
+            }
+
+            /// Called immediately after the primary ticket is returned. The
+            /// completion callback can only advance the serving state after
+            /// acquiring the index guard that is released here.
+            pub fn markEnqueued(self: *InlineGraphPublication) void {
+                const queue = &self.entry.inline_writer;
+                queue.enqueued();
+                self.enqueued = true;
+                queue.view.?.advance(&self.publication) catch queue.reject();
+                self.apply_guard.unlockIndex();
+            }
+
+            pub fn install(self: *InlineGraphPublication) !void {
+                std.debug.assert(self.enqueued);
+                const install_error = self.install_error;
+                self.abort();
+                if (install_error) |err| return err;
             }
 
             pub fn abort(self: *InlineGraphPublication) void {
-                std.debug.assert(self.apply_guard.locked());
                 self.publication.abort();
-                self.apply_guard.unlock();
+                if (self.enqueued) {
+                    self.apply_guard.unlockCatalog();
+                } else {
+                    self.entry.inline_writer.discardIdle();
+                    self.apply_guard.unlock();
+                }
                 self.alloc.destroy(self);
             }
         };
@@ -3776,7 +3809,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var apply_guard = try index_manager.lockManagedIndexApply(index_ref);
             errdefer apply_guard.unlock();
 
-            const publication = entry.index.prepareInlineEdgePublication(.{
+            const queue = &entry.inline_writer;
+            try queue.validate();
+            if (queue.view == null) queue.start(try entry.index.forkInlineWriter());
+            errdefer queue.discardIdle();
+            var publication = entry.index.prepareInlineEdgePublicationFrom(&queue.view.?, .{
                 .source = write.source,
                 .target = write.target,
                 .edge_type = write.edge_type,
@@ -3793,6 +3830,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 else => return err,
             };
 
+            errdefer publication.abort();
             const result = try alloc.create(InlineGraphPublication);
             result.* = .{
                 .alloc = alloc,
@@ -3826,8 +3864,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const InlineCoveragePlan = struct {
             marker_key: []u8,
             produced_counter_key: []u8,
-            produced_counter_value: [8]u8,
-            previous_counter: ?struct { key: []u8, value: [8]u8 } = null,
+            produced_count_at_prepare: u64,
+            previous_counter: ?struct { outcome: DerivedCoverageOutcome, key: []u8, count_at_prepare: u64 } = null,
 
             fn deinit(self: *const InlineCoveragePlan, alloc: Allocator) void {
                 alloc.free(self.marker_key);
@@ -3835,10 +3873,35 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (self.previous_counter) |pc| alloc.free(pc.key);
             }
 
+            fn countAtTip(view: commit_participant.View, key: []const u8, fallback: u64) !u64 {
+                const bytes = view.get(key) catch |err| switch (err) {
+                    error.NotFound => return fallback,
+                    else => return err,
+                };
+                return internal_keys.decodeDerivedCoverageOutcomeCount(bytes);
+            }
+
             fn stage(self: *const InlineCoveragePlan, view: commit_participant.View) !void {
+                const marker = view.get(self.marker_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                if (marker) |value| {
+                    const previous = std.meta.stringToEnum(DerivedCoverageOutcome, value) orelse return error.InvalidDerivedCoverageOutcome;
+                    if (previous == .produced) return;
+                    const counter = self.previous_counter orelse return error.QueuedDependencyRejected;
+                    if (counter.outcome != previous) return error.QueuedDependencyRejected;
+                    const count = try countAtTip(view, counter.key, counter.count_at_prepare);
+                    if (count == 0) return error.InvalidDerivedCoverageCounter;
+                    var stored: [8]u8 = undefined;
+                    _ = internal_keys.encodeDerivedCoverageOutcomeCount(&stored, count - 1);
+                    try view.putReplay(counter.key, &stored);
+                }
+                const count = try countAtTip(view, self.produced_counter_key, self.produced_count_at_prepare);
+                var stored: [8]u8 = undefined;
+                _ = internal_keys.encodeDerivedCoverageOutcomeCount(&stored, count +| 1);
+                try view.putReplay(self.produced_counter_key, &stored);
                 try view.putReplay(self.marker_key, @tagName(DerivedCoverageOutcome.produced));
-                try view.putReplay(self.produced_counter_key, &self.produced_counter_value);
-                if (self.previous_counter) |pc| try view.putReplay(pc.key, &pc.value);
             }
         };
 
@@ -3883,16 +3946,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     existing_outcome = std.meta.stringToEnum(DerivedCoverageOutcome, value) orelse return error.InvalidDerivedCoverageOutcome;
                 }
             }
-            if (existing_outcome == DerivedCoverageOutcome.produced) {
-                alloc.free(marker_key);
-                return null;
-            }
-
             const produced_key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, index_name, generation, @tagName(DerivedCoverageOutcome.produced));
             errdefer alloc.free(produced_key);
             var previous_key: ?[]u8 = null;
             errdefer if (previous_key) |k| alloc.free(k);
-            if (existing_outcome) |prev| {
+            if (existing_outcome != null and existing_outcome.? != .produced) {
+                const prev = existing_outcome.?;
                 previous_key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, index_name, generation, @tagName(prev));
             }
 
@@ -3925,23 +3984,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 previous_count = try scanDerivedCoverageOutcomeFromStore(alloc, store, index_name, generation, @tagName(existing_outcome.?));
             }
 
-            if (existing_outcome != null) {
-                if (previous_count == 0) return error.InvalidDerivedCoverageCounter;
-                previous_count -= 1;
-            }
-            produced_count +|= 1;
-
             var plan: InlineCoveragePlan = .{
                 .marker_key = marker_key,
                 .produced_counter_key = produced_key,
-                .produced_counter_value = undefined,
-                .previous_counter = null,
+                .produced_count_at_prepare = produced_count,
             };
-            _ = internal_keys.encodeDerivedCoverageOutcomeCount(&plan.produced_counter_value, produced_count);
             if (previous_key) |pk| {
-                var previous_value: [8]u8 = undefined;
-                _ = internal_keys.encodeDerivedCoverageOutcomeCount(&previous_value, previous_count);
-                plan.previous_counter = .{ .key = pk, .value = previous_value };
+                plan.previous_counter = .{ .outcome = existing_outcome.?, .key = pk, .count_at_prepare = previous_count };
             }
             return plan;
         }
@@ -3997,6 +4046,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             scope: []const u8,
             progress: apply_state.Progress,
             coverage_plan: ?InlineCoveragePlan = null,
+            enqueued: bool = false,
+            install_error: ?anyerror = null,
 
             fn reset(_: *anyopaque) void {}
             fn observe(_: *anyopaque, _: []const u8, _: ?[]const u8) void {}
@@ -4005,31 +4056,74 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const mutations = self.publication.pendingMutations();
                 if (mutations.len != 0) try view.putIndexCatalog(self.scope, mutations);
                 _ = try apply_state.contributeProgressTxn(view, self.progress);
+            }
+
+            fn applyQueued(ptr: *anyopaque, view: commit_participant.View) anyerror!void {
+                const self: *InlineSparsePublication = @ptrCast(@alignCast(ptr));
                 if (self.coverage_plan) |*plan| try plan.stage(view);
             }
 
-            /// Call only once the host transaction's commit has actually
-            /// returned successfully (see `InlineTextPublication.install`'s
-            /// identical warning).
-            pub fn participant(self: *InlineSparsePublication) commit_participant.Participant {
-                return .{ .ptr = self, .reset = reset, .observe = observe, .stage = stage };
+            fn validate(ptr: *anyopaque) anyerror!void {
+                const self: *InlineSparsePublication = @ptrCast(@alignCast(ptr));
+                try self.entry.inline_writer.validate();
             }
 
-            pub fn install(self: *InlineSparsePublication) void {
-                std.debug.assert(self.apply_guard.locked());
-                self.entry.index.installInlineSparsePublication(&self.publication) catch |err| {
-                    std.log.err("inline sparse publication install: mirror sync failed index={s} err={s}", .{ self.entry.config.name, @errorName(err) });
+            fn reject(ptr: *anyopaque) void {
+                const self: *InlineSparsePublication = @ptrCast(@alignCast(ptr));
+                self.entry.inline_writer.reject();
+            }
+
+            fn complete(ptr: *anyopaque, outcome: anyerror!u64) void {
+                const self: *InlineSparsePublication = @ptrCast(@alignCast(ptr));
+                self.apply_guard.relockIndex();
+                defer self.apply_guard.unlockIndex();
+                if (outcome) |_| {
+                    self.entry.index.applyInlinePublicationToView(&self.publication) catch |err| {
+                        self.install_error = err;
+                        self.apply_guard.manager.index_publication_reopen_required.store(true, .release);
+                        self.entry.inline_writer.reject();
+                    };
+                } else |_| {}
+                self.entry.inline_writer.completed(outcome);
+            }
+
+            pub fn participant(self: *InlineSparsePublication) commit_participant.Participant {
+                return .{
+                    .ptr = self,
+                    .reset = reset,
+                    .observe = observe,
+                    .stage = stage,
+                    .queued = .{ .ptr = self, .validate = validate, .apply = applyQueued, .reject = reject, .complete = complete },
                 };
-                if (self.coverage_plan) |*plan| plan.deinit(self.alloc);
-                self.apply_guard.unlock();
-                self.alloc.destroy(self);
+            }
+
+            /// Called immediately after the primary ticket is returned. The
+            /// completion callback can only advance the serving state after
+            /// acquiring the index guard that is released here.
+            pub fn markEnqueued(self: *InlineSparsePublication) void {
+                const queue = &self.entry.inline_writer;
+                queue.enqueued();
+                self.enqueued = true;
+                queue.view.?.applyInlinePublicationToView(&self.publication) catch queue.reject();
+                self.apply_guard.unlockIndex();
+            }
+
+            pub fn install(self: *InlineSparsePublication) !void {
+                std.debug.assert(self.enqueued);
+                const install_error = self.install_error;
+                self.abort();
+                if (install_error) |err| return err;
             }
 
             pub fn abort(self: *InlineSparsePublication) void {
-                std.debug.assert(self.apply_guard.locked());
                 self.publication.abort();
                 if (self.coverage_plan) |*plan| plan.deinit(self.alloc);
-                self.apply_guard.unlock();
+                if (self.enqueued) {
+                    self.apply_guard.unlockCatalog();
+                } else {
+                    self.entry.inline_writer.discardIdle();
+                    self.apply_guard.unlock();
+                }
                 self.alloc.destroy(self);
             }
         };
@@ -4092,11 +4186,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .doc_num = doc_num,
             };
 
-            const publication = entry.index.prepareInlineSparsePublication(&.{sparse_write}, &.{}) catch |err| switch (err) {
+            const queue = &entry.inline_writer;
+            try queue.validate();
+            if (queue.view == null) queue.start(try entry.index.forkInlineWriter());
+            errdefer queue.discardIdle();
+            var publication = queue.view.?.prepareInlineSparsePublication(&.{sparse_write}, &.{}) catch |err| switch (err) {
                 error.InlineSparsePublicationUnsupported => return error.InlineSparsePublicationUnsupported,
                 else => return err,
             };
 
+            errdefer publication.abort();
             const result = try alloc.create(InlineSparsePublication);
             result.* = .{
                 .alloc = alloc,
@@ -4170,6 +4269,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             vector: []const f32,
             progress: apply_state.Progress,
             coverage_plan: ?InlineCoveragePlan = null,
+            enqueued: bool = false,
+            install_error: ?anyerror = null,
 
             fn reset(_: *anyopaque) void {}
             fn observe(_: *anyopaque, _: []const u8, _: ?[]const u8) void {}
@@ -4194,33 +4295,79 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     }
                     try view.putIndexCatalog(self.scope, converted);
                 }
-                try self.index_manager.writeDenseVectorMappingForInlinePublicationTxn(view, self.index_name, self.doc_key, self.vector_id, self.vector);
                 _ = try apply_state.contributeProgressTxn(view, self.progress);
+            }
+
+            fn applyQueued(ptr: *anyopaque, view: commit_participant.View) anyerror!void {
+                const self: *InlineDensePublication = @ptrCast(@alignCast(ptr));
+                try self.index_manager.writeDenseVectorMappingForInlinePublicationTxn(view, self.index_name, self.doc_key, self.vector_id, self.vector);
                 if (self.coverage_plan) |*plan| try plan.stage(view);
             }
 
-            /// Call only once the host transaction's commit has actually
-            /// returned successfully (see `InlineTextPublication.install`'s
-            /// identical warning).
-            pub fn participant(self: *InlineDensePublication) commit_participant.Participant {
-                return .{ .ptr = self, .reset = reset, .observe = observe, .stage = stage };
+            fn validate(ptr: *anyopaque) anyerror!void {
+                const self: *InlineDensePublication = @ptrCast(@alignCast(ptr));
+                try self.entry.inline_writer.validate();
             }
 
-            pub fn install(self: *InlineDensePublication) void {
-                std.debug.assert(self.apply_guard.locked());
-                self.entry.index.installStagedWrite(&self.staged) catch |err| {
-                    std.log.err("inline dense publication install: mirror sync failed index={s} err={s}", .{ self.entry.config.name, @errorName(err) });
+            fn reject(ptr: *anyopaque) void {
+                const self: *InlineDensePublication = @ptrCast(@alignCast(ptr));
+                self.entry.inline_writer.reject();
+            }
+
+            fn complete(ptr: *anyopaque, outcome: anyerror!u64) void {
+                const self: *InlineDensePublication = @ptrCast(@alignCast(ptr));
+                self.apply_guard.relockIndex();
+                defer self.apply_guard.unlockIndex();
+                if (outcome) |_| {
+                    self.entry.index.publishQueuedStagedWrite(&self.staged, self.vector_id) catch |err| {
+                        self.install_error = err;
+                        self.apply_guard.manager.index_publication_reopen_required.store(true, .release);
+                        self.entry.inline_writer.reject();
+                    };
+                } else |_| {}
+                const queue = &self.entry.inline_writer;
+                if (queue.pending == 1 and self.entry.index.parkInlineWriter(&queue.view.?)) queue.view = null;
+                self.entry.inline_writer.completed(outcome);
+            }
+
+            pub fn participant(self: *InlineDensePublication) commit_participant.Participant {
+                return .{
+                    .ptr = self,
+                    .reset = reset,
+                    .observe = observe,
+                    .stage = stage,
+                    .queued = .{ .ptr = self, .validate = validate, .apply = applyQueued, .reject = reject, .complete = complete },
                 };
-                if (self.coverage_plan) |*plan| plan.deinit(self.alloc);
-                self.apply_guard.unlock();
-                self.alloc.destroy(self);
+            }
+
+            /// Called immediately after the primary ticket is returned. The
+            /// completion callback can only advance the serving state after
+            /// acquiring the index guard that is released here.
+            pub fn markEnqueued(self: *InlineDensePublication) void {
+                const queue = &self.entry.inline_writer;
+                queue.enqueued();
+                self.enqueued = true;
+                queue.view.?.advancePrivateStagedWrite(&self.staged) catch queue.reject();
+                self.apply_guard.unlockIndex();
+            }
+
+            pub fn install(self: *InlineDensePublication) !void {
+                std.debug.assert(self.enqueued);
+                const install_error = self.install_error;
+                self.abort();
+                if (install_error) |err| return err;
             }
 
             pub fn abort(self: *InlineDensePublication) void {
-                std.debug.assert(self.apply_guard.locked());
-                self.entry.index.abortStagedWrite(&self.staged);
+                const owner = if (self.enqueued) self.entry.index else &self.entry.inline_writer.view.?;
+                owner.abortStagedWrite(&self.staged);
                 if (self.coverage_plan) |*plan| plan.deinit(self.alloc);
-                self.apply_guard.unlock();
+                if (self.enqueued) {
+                    self.apply_guard.unlockCatalog();
+                } else {
+                    self.entry.inline_writer.discardIdle();
+                    self.apply_guard.unlock();
+                }
                 self.alloc.destroy(self);
             }
         };
@@ -4275,11 +4422,24 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const assignment = (try index_manager.assignDenseVectorIdInlineTxn(&probe_txn, entry, index_ref.name, write.doc_key)) orelse
                 return error.InlineDensePublicationUnsupported;
 
-            const staged = entry.index.insertWithMetadataStaged(assignment.vector_id, write.vector, write.doc_key) catch |err| switch (err) {
+            const queue = &entry.inline_writer;
+            try queue.validate();
+            if (queue.view == null) queue.start(try entry.index.forkInlineWriter());
+            errdefer queue.discardIdle();
+            const queued_owner = queue.view.?.getMetadata(assignment.vector_id) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (queued_owner) |owner| {
+                defer queue.view.?.alloc.free(owner);
+                if (!std.mem.eql(u8, owner, write.doc_key)) return error.InlineDensePublicationUnsupported;
+            }
+            var staged = queue.view.?.insertWithMetadataStaged(assignment.vector_id, write.vector, write.doc_key) catch |err| switch (err) {
                 error.StagedPublicationUnsupported => return error.InlineDensePublicationUnsupported,
                 else => return err,
             };
 
+            errdefer queue.view.?.abortStagedWrite(&staged);
             const result = try alloc.create(InlineDensePublication);
             result.* = .{
                 .alloc = alloc,
@@ -5028,7 +5188,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 },
                 .algebraic => {
                     if (ctx.projection_only) return error.InvalidShadowIndexKind;
-                    try ctx.index_manager.applyAlgebraicBatchByNameWithOptions(ctx.store, index_ref.name, batch, .{ .mode = .bulk_ingest });
+                    // Journal replay carries logical keys, not inline JSON.
+                    // Resolve the profile-specific primary namespace and pin
+                    // the row's declared layout through the shared collector.
+                    // A missing live row must not advance the index checkpoint.
+                    var writes = try collectDocumentWritesProfiled(ctx.alloc, ctx.store, ctx.index_manager, batch.documents, ctx.index_manager.byte_range, .{
+                        .prefer_inline_when_store_tip_matches_sequence = batch.sequence,
+                        .relational_base_rows = ctx.relational_base_rows,
+                    }, null);
+                    defer writes.deinit();
+                    if (writes.missing_required != 0) return error.ReplayDocumentNotVisible;
+                    const documents = try ctx.alloc.alloc(derived_types.DerivedDocument, writes.items.len);
+                    defer ctx.alloc.free(documents);
+                    for (writes.items, documents) |write, *document| document.* = .{ .key = write.key, .action = .upsert, .cleaned_value = write.value };
+                    var prepared = batch;
+                    prepared.documents = documents;
+                    try ctx.index_manager.applyAlgebraicBatchByNameWithOptions(ctx.store, index_ref.name, prepared, .{ .mode = .bulk_ingest });
                 },
             }
             if (!ctx.projection_only) try clearPublishedAssetArtifactRepairIssuesContext(ctx, index_ref.name, batch.changed_artifact_keys, batch.sequence);

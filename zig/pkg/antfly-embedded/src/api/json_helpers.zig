@@ -129,6 +129,9 @@ pub fn cloneJsonValue(alloc: Allocator, value: json.Value) !json.Value {
                 for (out.items) |*item| deinitJsonValue(alloc, item);
                 out.deinit();
             }
+            // The source cardinality is known. Reserve before cloning so
+            // arena callers do not retain discarded growth buffers.
+            try out.ensureTotalCapacity(arr.items.len);
             for (arr.items) |item| {
                 var cloned = try cloneJsonValue(alloc, item);
                 errdefer deinitJsonValue(alloc, &cloned);
@@ -147,6 +150,7 @@ pub fn cloneJsonValue(alloc: Allocator, value: json.Value) !json.Value {
                 }
                 out.deinit(alloc);
             }
+            try out.ensureTotalCapacity(alloc, obj.count());
             var it = obj.iterator();
             while (it.next()) |entry| {
                 const key = try alloc.dupe(u8, entry.key_ptr.*);

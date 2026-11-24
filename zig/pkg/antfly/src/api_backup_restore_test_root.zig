@@ -14,7 +14,7 @@
 // limitations under the License.
 
 const api_integration_tests = @import("api/integration_test.zig");
-const sql_catalog = @import("api/sql_catalog.zig");
+const sql_catalog = @import("api/sql/catalog/catalog.zig");
 const httpx_handler = @import("api/httpx_handler.zig");
 const schema_ddl = @import("antfly_local_sources").sql_schema_ddl;
 const table_schema_impl = @import("antfly_local_sources").schema_table_schema_impl;

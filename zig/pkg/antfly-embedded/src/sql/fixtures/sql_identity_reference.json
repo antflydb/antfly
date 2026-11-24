@@ -1,0 +1,1741 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL original serial and identity lifecycles",
+  "entries": [
+    {
+      "id": "sql-0318",
+      "sql": "CREATE TABLE usage_records (id bigserial PRIMARY KEY, status text)",
+      "steps": [
+        {
+          "sql": "CREATE TABLE usage_records (id bigserial PRIMARY KEY, status text)",
+          "sqlstate": null,
+          "tag": "CREATE TABLE",
+          "output": {
+            "columns": [],
+            "column_oids": [],
+            "rows": []
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(status) VALUES('a'),('b') RETURNING id,status",
+          "sqlstate": null,
+          "tag": "INSERT 0 2",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                1,
+                "a"
+              ],
+              [
+                2,
+                "b"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(id,status) VALUES(DEFAULT,'default') RETURNING id,status",
+          "sqlstate": null,
+          "tag": "INSERT 0 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                3,
+                "default"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(id,status) VALUES(42,'explicit') RETURNING id,status",
+          "sqlstate": null,
+          "tag": "INSERT 0 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                42,
+                "explicit"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(id,status) OVERRIDING SYSTEM VALUE VALUES(43,'system') RETURNING id,status",
+          "sqlstate": null,
+          "tag": "INSERT 0 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                43,
+                "system"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(id,status) OVERRIDING USER VALUE VALUES(44,'user') RETURNING id,status",
+          "sqlstate": null,
+          "tag": "INSERT 0 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                44,
+                "user"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(id,status) OVERRIDING SYSTEM VALUE VALUES(NULL,'null')",
+          "sqlstate": "23502",
+          "tag": null,
+          "output": null
+        },
+        {
+          "sql": "UPDATE usage_records SET id=DEFAULT WHERE status='a' RETURNING id,status",
+          "sqlstate": null,
+          "tag": "UPDATE 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                4,
+                "a"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "UPDATE usage_records SET id=99 WHERE status='b' RETURNING id,status",
+          "sqlstate": null,
+          "tag": "UPDATE 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                99,
+                "b"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "ALTER TABLE usage_records ADD CONSTRAINT status_check CHECK(status <> 'bad')",
+          "sqlstate": null,
+          "tag": "ALTER TABLE",
+          "output": {
+            "columns": [],
+            "column_oids": [],
+            "rows": []
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(status) VALUES('bad')",
+          "sqlstate": "23514",
+          "tag": null,
+          "output": null
+        },
+        {
+          "sql": "INSERT INTO usage_records(status) VALUES('after_failure') RETURNING id,status",
+          "sqlstate": null,
+          "tag": "INSERT 0 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                6,
+                "after_failure"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "BEGIN",
+          "sqlstate": null,
+          "tag": "BEGIN",
+          "output": {
+            "columns": [],
+            "column_oids": [],
+            "rows": []
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(status) VALUES('rolled_back') RETURNING id,status",
+          "sqlstate": null,
+          "tag": "INSERT 0 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                7,
+                "rolled_back"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "ROLLBACK",
+          "sqlstate": null,
+          "tag": "ROLLBACK",
+          "output": {
+            "columns": [],
+            "column_oids": [],
+            "rows": []
+          }
+        },
+        {
+          "sql": "SELECT currval('usage_records_id_seq') AS current_value,lastval() AS last_value",
+          "sqlstate": null,
+          "tag": "SELECT 1",
+          "output": {
+            "columns": [
+              "current_value",
+              "last_value"
+            ],
+            "column_oids": [
+              20,
+              20
+            ],
+            "rows": [
+              [
+                7,
+                7
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(status) VALUES('after_rollback') RETURNING id,status",
+          "sqlstate": null,
+          "tag": "INSERT 0 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                8,
+                "after_rollback"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "SELECT id,status FROM usage_records ORDER BY id",
+          "sqlstate": null,
+          "tag": "SELECT 8",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                3,
+                "default"
+              ],
+              [
+                4,
+                "a"
+              ],
+              [
+                6,
+                "after_failure"
+              ],
+              [
+                8,
+                "after_rollback"
+              ],
+              [
+                42,
+                "explicit"
+              ],
+              [
+                43,
+                "system"
+              ],
+              [
+                44,
+                "user"
+              ],
+              [
+                99,
+                "b"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "TRUNCATE usage_records CONTINUE IDENTITY",
+          "sqlstate": null,
+          "tag": "TRUNCATE TABLE",
+          "output": {
+            "columns": [],
+            "column_oids": [],
+            "rows": []
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(status) VALUES('continued') RETURNING id,status",
+          "sqlstate": null,
+          "tag": "INSERT 0 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                9,
+                "continued"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "TRUNCATE usage_records RESTART IDENTITY",
+          "sqlstate": null,
+          "tag": "TRUNCATE TABLE",
+          "output": {
+            "columns": [],
+            "column_oids": [],
+            "rows": []
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(status) VALUES('restarted') RETURNING id,status",
+          "sqlstate": null,
+          "tag": "INSERT 0 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                1,
+                "restarted"
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0319",
+      "sql": "CREATE TABLE usage_records (id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, status text)",
+      "steps": [
+        {
+          "sql": "CREATE TABLE usage_records (id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, status text)",
+          "sqlstate": null,
+          "tag": "CREATE TABLE",
+          "output": {
+            "columns": [],
+            "column_oids": [],
+            "rows": []
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(status) VALUES('a'),('b') RETURNING id,status",
+          "sqlstate": null,
+          "tag": "INSERT 0 2",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                1,
+                "a"
+              ],
+              [
+                2,
+                "b"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(id,status) VALUES(DEFAULT,'default') RETURNING id,status",
+          "sqlstate": null,
+          "tag": "INSERT 0 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                3,
+                "default"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(id,status) VALUES(42,'explicit') RETURNING id,status",
+          "sqlstate": null,
+          "tag": "INSERT 0 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                42,
+                "explicit"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(id,status) OVERRIDING SYSTEM VALUE VALUES(43,'system') RETURNING id,status",
+          "sqlstate": null,
+          "tag": "INSERT 0 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                43,
+                "system"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(id,status) OVERRIDING USER VALUE VALUES(44,'user') RETURNING id,status",
+          "sqlstate": null,
+          "tag": "INSERT 0 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                4,
+                "user"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(id,status) OVERRIDING SYSTEM VALUE VALUES(NULL,'null')",
+          "sqlstate": "23502",
+          "tag": null,
+          "output": null
+        },
+        {
+          "sql": "UPDATE usage_records SET id=DEFAULT WHERE status='a' RETURNING id,status",
+          "sqlstate": null,
+          "tag": "UPDATE 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                5,
+                "a"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "UPDATE usage_records SET id=99 WHERE status='b' RETURNING id,status",
+          "sqlstate": null,
+          "tag": "UPDATE 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                99,
+                "b"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "ALTER TABLE usage_records ADD CONSTRAINT status_check CHECK(status <> 'bad')",
+          "sqlstate": null,
+          "tag": "ALTER TABLE",
+          "output": {
+            "columns": [],
+            "column_oids": [],
+            "rows": []
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(status) VALUES('bad')",
+          "sqlstate": "23514",
+          "tag": null,
+          "output": null
+        },
+        {
+          "sql": "INSERT INTO usage_records(status) VALUES('after_failure') RETURNING id,status",
+          "sqlstate": null,
+          "tag": "INSERT 0 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                7,
+                "after_failure"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "BEGIN",
+          "sqlstate": null,
+          "tag": "BEGIN",
+          "output": {
+            "columns": [],
+            "column_oids": [],
+            "rows": []
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(status) VALUES('rolled_back') RETURNING id,status",
+          "sqlstate": null,
+          "tag": "INSERT 0 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                8,
+                "rolled_back"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "ROLLBACK",
+          "sqlstate": null,
+          "tag": "ROLLBACK",
+          "output": {
+            "columns": [],
+            "column_oids": [],
+            "rows": []
+          }
+        },
+        {
+          "sql": "SELECT currval('usage_records_id_seq') AS current_value,lastval() AS last_value",
+          "sqlstate": null,
+          "tag": "SELECT 1",
+          "output": {
+            "columns": [
+              "current_value",
+              "last_value"
+            ],
+            "column_oids": [
+              20,
+              20
+            ],
+            "rows": [
+              [
+                8,
+                8
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(status) VALUES('after_rollback') RETURNING id,status",
+          "sqlstate": null,
+          "tag": "INSERT 0 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                9,
+                "after_rollback"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "SELECT id,status FROM usage_records ORDER BY id",
+          "sqlstate": null,
+          "tag": "SELECT 8",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                3,
+                "default"
+              ],
+              [
+                4,
+                "user"
+              ],
+              [
+                5,
+                "a"
+              ],
+              [
+                7,
+                "after_failure"
+              ],
+              [
+                9,
+                "after_rollback"
+              ],
+              [
+                42,
+                "explicit"
+              ],
+              [
+                43,
+                "system"
+              ],
+              [
+                99,
+                "b"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "TRUNCATE usage_records CONTINUE IDENTITY",
+          "sqlstate": null,
+          "tag": "TRUNCATE TABLE",
+          "output": {
+            "columns": [],
+            "column_oids": [],
+            "rows": []
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(status) VALUES('continued') RETURNING id,status",
+          "sqlstate": null,
+          "tag": "INSERT 0 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                10,
+                "continued"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "TRUNCATE usage_records RESTART IDENTITY",
+          "sqlstate": null,
+          "tag": "TRUNCATE TABLE",
+          "output": {
+            "columns": [],
+            "column_oids": [],
+            "rows": []
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(status) VALUES('restarted') RETURNING id,status",
+          "sqlstate": null,
+          "tag": "INSERT 0 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                1,
+                "restarted"
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0320",
+      "sql": "CREATE TABLE usage_records (id bigint GENERATED ALWAYS AS IDENTITY (START WITH 100 INCREMENT BY 10 NO MINVALUE NO MAXVALUE CACHE 4 NO CYCLE) PRIMARY KEY, status text)",
+      "steps": [
+        {
+          "sql": "CREATE TABLE usage_records (id bigint GENERATED ALWAYS AS IDENTITY (START WITH 100 INCREMENT BY 10 NO MINVALUE NO MAXVALUE CACHE 4 NO CYCLE) PRIMARY KEY, status text)",
+          "sqlstate": null,
+          "tag": "CREATE TABLE",
+          "output": {
+            "columns": [],
+            "column_oids": [],
+            "rows": []
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(status) VALUES('a'),('b') RETURNING id,status",
+          "sqlstate": null,
+          "tag": "INSERT 0 2",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                100,
+                "a"
+              ],
+              [
+                110,
+                "b"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(id,status) VALUES(DEFAULT,'default') RETURNING id,status",
+          "sqlstate": null,
+          "tag": "INSERT 0 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                120,
+                "default"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(id,status) VALUES(42,'explicit') RETURNING id,status",
+          "sqlstate": "428C9",
+          "tag": null,
+          "output": null
+        },
+        {
+          "sql": "INSERT INTO usage_records(id,status) OVERRIDING SYSTEM VALUE VALUES(43,'system') RETURNING id,status",
+          "sqlstate": null,
+          "tag": "INSERT 0 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                43,
+                "system"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(id,status) OVERRIDING USER VALUE VALUES(44,'user') RETURNING id,status",
+          "sqlstate": null,
+          "tag": "INSERT 0 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                130,
+                "user"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(id,status) OVERRIDING SYSTEM VALUE VALUES(NULL,'null')",
+          "sqlstate": "23502",
+          "tag": null,
+          "output": null
+        },
+        {
+          "sql": "UPDATE usage_records SET id=DEFAULT WHERE status='a' RETURNING id,status",
+          "sqlstate": null,
+          "tag": "UPDATE 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                140,
+                "a"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "UPDATE usage_records SET id=99 WHERE status='b' RETURNING id,status",
+          "sqlstate": "428C9",
+          "tag": null,
+          "output": null
+        },
+        {
+          "sql": "ALTER TABLE usage_records ADD CONSTRAINT status_check CHECK(status <> 'bad')",
+          "sqlstate": null,
+          "tag": "ALTER TABLE",
+          "output": {
+            "columns": [],
+            "column_oids": [],
+            "rows": []
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(status) VALUES('bad')",
+          "sqlstate": "23514",
+          "tag": null,
+          "output": null
+        },
+        {
+          "sql": "INSERT INTO usage_records(status) VALUES('after_failure') RETURNING id,status",
+          "sqlstate": null,
+          "tag": "INSERT 0 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                160,
+                "after_failure"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "BEGIN",
+          "sqlstate": null,
+          "tag": "BEGIN",
+          "output": {
+            "columns": [],
+            "column_oids": [],
+            "rows": []
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(status) VALUES('rolled_back') RETURNING id,status",
+          "sqlstate": null,
+          "tag": "INSERT 0 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                170,
+                "rolled_back"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "ROLLBACK",
+          "sqlstate": null,
+          "tag": "ROLLBACK",
+          "output": {
+            "columns": [],
+            "column_oids": [],
+            "rows": []
+          }
+        },
+        {
+          "sql": "SELECT currval('usage_records_id_seq') AS current_value,lastval() AS last_value",
+          "sqlstate": null,
+          "tag": "SELECT 1",
+          "output": {
+            "columns": [
+              "current_value",
+              "last_value"
+            ],
+            "column_oids": [
+              20,
+              20
+            ],
+            "rows": [
+              [
+                170,
+                170
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(status) VALUES('after_rollback') RETURNING id,status",
+          "sqlstate": null,
+          "tag": "INSERT 0 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                180,
+                "after_rollback"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "SELECT id,status FROM usage_records ORDER BY id",
+          "sqlstate": null,
+          "tag": "SELECT 7",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                43,
+                "system"
+              ],
+              [
+                110,
+                "b"
+              ],
+              [
+                120,
+                "default"
+              ],
+              [
+                130,
+                "user"
+              ],
+              [
+                140,
+                "a"
+              ],
+              [
+                160,
+                "after_failure"
+              ],
+              [
+                180,
+                "after_rollback"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "TRUNCATE usage_records CONTINUE IDENTITY",
+          "sqlstate": null,
+          "tag": "TRUNCATE TABLE",
+          "output": {
+            "columns": [],
+            "column_oids": [],
+            "rows": []
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(status) VALUES('continued') RETURNING id,status",
+          "sqlstate": null,
+          "tag": "INSERT 0 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                190,
+                "continued"
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "TRUNCATE usage_records RESTART IDENTITY",
+          "sqlstate": null,
+          "tag": "TRUNCATE TABLE",
+          "output": {
+            "columns": [],
+            "column_oids": [],
+            "rows": []
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(status) VALUES('restarted') RETURNING id,status",
+          "sqlstate": null,
+          "tag": "INSERT 0 1",
+          "output": {
+            "columns": [
+              "id",
+              "status"
+            ],
+            "column_oids": [
+              20,
+              25
+            ],
+            "rows": [
+              [
+                100,
+                "restarted"
+              ]
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "sessions": [
+    {
+      "sql": "SELECT currval('first_seq')",
+      "connection": "first",
+      "sqlstate": "55000",
+      "output": null
+    },
+    {
+      "sql": "SELECT lastval()",
+      "connection": "first",
+      "sqlstate": "55000",
+      "output": null
+    },
+    {
+      "sql": "SELECT nextval('first_seq')",
+      "connection": "first",
+      "sqlstate": null,
+      "output": {
+        "columns": [
+          "nextval"
+        ],
+        "column_oids": [
+          20
+        ],
+        "rows": [
+          [
+            100
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT nextval('first_seq')",
+      "connection": "second",
+      "sqlstate": null,
+      "output": {
+        "columns": [
+          "nextval"
+        ],
+        "column_oids": [
+          20
+        ],
+        "rows": [
+          [
+            140
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT nextval('first_seq')",
+      "connection": "first",
+      "sqlstate": null,
+      "output": {
+        "columns": [
+          "nextval"
+        ],
+        "column_oids": [
+          20
+        ],
+        "rows": [
+          [
+            110
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT setval('second_seq',500,true)",
+      "connection": "first",
+      "sqlstate": null,
+      "output": {
+        "columns": [
+          "setval"
+        ],
+        "column_oids": [
+          20
+        ],
+        "rows": [
+          [
+            500
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT currval('second_seq'),lastval()",
+      "connection": "first",
+      "sqlstate": null,
+      "output": {
+        "columns": [
+          "currval",
+          "lastval"
+        ],
+        "column_oids": [
+          20,
+          20
+        ],
+        "rows": [
+          [
+            500,
+            110
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT setval('first_seq',900,false)",
+      "connection": "first",
+      "sqlstate": null,
+      "output": {
+        "columns": [
+          "setval"
+        ],
+        "column_oids": [
+          20
+        ],
+        "rows": [
+          [
+            900
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT currval('first_seq'),lastval()",
+      "connection": "first",
+      "sqlstate": null,
+      "output": {
+        "columns": [
+          "currval",
+          "lastval"
+        ],
+        "column_oids": [
+          20,
+          20
+        ],
+        "rows": [
+          [
+            110,
+            110
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT nextval('first_seq')",
+      "connection": "second",
+      "sqlstate": null,
+      "output": {
+        "columns": [
+          "nextval"
+        ],
+        "column_oids": [
+          20
+        ],
+        "rows": [
+          [
+            150
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT nextval('first_seq')",
+      "connection": "first",
+      "sqlstate": null,
+      "output": {
+        "columns": [
+          "nextval"
+        ],
+        "column_oids": [
+          20
+        ],
+        "rows": [
+          [
+            900
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "ALTER SEQUENCE first_seq INCREMENT 7",
+      "connection": "first",
+      "sqlstate": null,
+      "output": {
+        "columns": [],
+        "column_oids": [],
+        "rows": []
+      }
+    },
+    {
+      "sql": "SELECT nextval('first_seq')",
+      "connection": "second",
+      "sqlstate": null,
+      "output": {
+        "columns": [
+          "nextval"
+        ],
+        "column_oids": [
+          20
+        ],
+        "rows": [
+          [
+            937
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT nextval('first_seq')",
+      "connection": "first",
+      "sqlstate": null,
+      "output": {
+        "columns": [
+          "nextval"
+        ],
+        "column_oids": [
+          20
+        ],
+        "rows": [
+          [
+            965
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "DISCARD SEQUENCES",
+      "connection": "first",
+      "sqlstate": null,
+      "output": {
+        "columns": [],
+        "column_oids": [],
+        "rows": []
+      }
+    },
+    {
+      "sql": "SELECT currval('first_seq')",
+      "connection": "first",
+      "sqlstate": "55000",
+      "output": null
+    },
+    {
+      "sql": "SELECT lastval()",
+      "connection": "first",
+      "sqlstate": "55000",
+      "output": null
+    },
+    {
+      "sql": "CREATE SEQUENCE retired_seq",
+      "connection": "first",
+      "sqlstate": null,
+      "output": {
+        "columns": [],
+        "column_oids": [],
+        "rows": []
+      }
+    },
+    {
+      "sql": "SELECT nextval('retired_seq')",
+      "connection": "first",
+      "sqlstate": null,
+      "output": {
+        "columns": [
+          "nextval"
+        ],
+        "column_oids": [
+          20
+        ],
+        "rows": [
+          [
+            1
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "DROP SEQUENCE retired_seq",
+      "connection": "first",
+      "sqlstate": null,
+      "output": {
+        "columns": [],
+        "column_oids": [],
+        "rows": []
+      }
+    },
+    {
+      "sql": "SELECT lastval()",
+      "connection": "first",
+      "sqlstate": "55000",
+      "output": null
+    },
+    {
+      "sql": "CREATE SEQUENCE retired_seq START 10",
+      "connection": "first",
+      "sqlstate": null,
+      "output": {
+        "columns": [],
+        "column_oids": [],
+        "rows": []
+      }
+    },
+    {
+      "sql": "SELECT currval('retired_seq')",
+      "connection": "first",
+      "sqlstate": "55000",
+      "output": null
+    },
+    {
+      "sql": "SELECT nextval('retired_seq')",
+      "connection": "first",
+      "sqlstate": null,
+      "output": {
+        "columns": [
+          "nextval"
+        ],
+        "column_oids": [
+          20
+        ],
+        "rows": [
+          [
+            10
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "DROP SEQUENCE retired_seq",
+      "connection": "first",
+      "sqlstate": null,
+      "output": {
+        "columns": [],
+        "column_oids": [],
+        "rows": []
+      }
+    },
+    {
+      "sql": "SELECT lastval()",
+      "connection": "first",
+      "sqlstate": "55000",
+      "output": null
+    },
+    {
+      "sql": "CREATE SEQUENCE ordered_seq CACHE 8",
+      "connection": "first",
+      "sqlstate": null,
+      "output": {
+        "columns": [],
+        "column_oids": [],
+        "rows": []
+      }
+    },
+    {
+      "sql": "MERGE INTO sequence_anchor AS t USING (VALUES ('a'),('b')) AS s(id) ON t.id=s.id WHEN MATCHED AND nextval('ordered_seq')>0 THEN UPDATE SET n=currval('ordered_seq')",
+      "connection": "first",
+      "sqlstate": null,
+      "output": {
+        "columns": [],
+        "column_oids": [],
+        "rows": []
+      }
+    },
+    {
+      "sql": "SELECT n FROM sequence_anchor ORDER BY n",
+      "connection": "first",
+      "sqlstate": null,
+      "output": {
+        "columns": [
+          "n"
+        ],
+        "column_oids": [
+          20
+        ],
+        "rows": [
+          [
+            1
+          ],
+          [
+            2
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT nextval('ordered_seq'),currval('ordered_seq') FROM sequence_anchor ORDER BY id",
+      "connection": "first",
+      "sqlstate": null,
+      "output": {
+        "columns": [
+          "nextval",
+          "currval"
+        ],
+        "column_oids": [
+          20,
+          20
+        ],
+        "rows": [
+          [
+            3,
+            3
+          ],
+          [
+            4,
+            4
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT nextval('ordered_seq'),currval('ordered_seq') FROM sequence_anchor ORDER BY n",
+      "connection": "first",
+      "sqlstate": null,
+      "output": {
+        "columns": [
+          "nextval",
+          "currval"
+        ],
+        "column_oids": [
+          20,
+          20
+        ],
+        "rows": [
+          [
+            5,
+            5
+          ],
+          [
+            6,
+            6
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "CREATE SEQUENCE strict_seq",
+      "connection": "first",
+      "sqlstate": null,
+      "output": {
+        "columns": [],
+        "column_oids": [],
+        "rows": []
+      }
+    },
+    {
+      "sql": "SELECT setval(NULL,nextval('strict_seq'),true)",
+      "connection": "first",
+      "sqlstate": null,
+      "output": {
+        "columns": [
+          "setval"
+        ],
+        "column_oids": [
+          20
+        ],
+        "rows": [
+          [
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "sql": "SELECT nextval('strict_seq')",
+      "connection": "first",
+      "sqlstate": null,
+      "output": {
+        "columns": [
+          "nextval"
+        ],
+        "column_oids": [
+          20
+        ],
+        "rows": [
+          [
+            1
+          ]
+        ]
+      }
+    }
+  ],
+  "document_truncate": {
+    "id": "sql-1103",
+    "sql": "TRUNCATE docs RESTART IDENTITY",
+    "tag": "TRUNCATE TABLE",
+    "empty": {
+      "columns": [
+        "_id",
+        "title"
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "rows": []
+    },
+    "final": {
+      "columns": [
+        "_id",
+        "title"
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "after"
+        ]
+      ]
+    }
+  },
+  "runtime_null": {
+    "output": {
+      "columns": [
+        "setval"
+      ],
+      "column_oids": [
+        20
+      ],
+      "rows": [
+        [
+          null
+        ]
+      ]
+    },
+    "last_value": 1,
+    "is_called": true
+  },
+  "permission_contract": {
+    "identity_insert": "INSERT 0 1",
+    "denied": {
+      "serial_default": "42501",
+      "explicit_identity_sequence": "42501"
+    },
+    "copy_rows": {
+      "columns": [
+        "id",
+        "status"
+      ],
+      "column_oids": [
+        20,
+        25
+      ],
+      "rows": [
+        [
+          1,
+          "identity"
+        ],
+        [
+          99,
+          "explicit"
+        ]
+      ]
+    }
+  }
+}

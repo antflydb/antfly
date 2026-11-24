@@ -47,8 +47,8 @@ pub fn encodedColumnsWithPhysical(a: A, values: []const @import("execution_batch
         defer numeric_scratch.deinit();
         const decimal = try column.decimalColumnSelected(numeric_scratch.allocator(), 0, null);
         for (states, result, 0..) |*state, *valid, index| {
-            var fixed: @import("numeric_value.zig").ScaledInteger = undefined;
-            var number: @import("numeric_value.zig").Value = undefined;
+            var fixed: @import("numeric/value.zig").ScaledInteger = undefined;
+            var number: @import("numeric/value.zig").Value = undefined;
             const cell = if (native) |view| try view.cell(index) else if (decimal) |view| try view.cell(index, &fixed, &number) else try column.cell(a, index, 0);
             if (!grouped and cell.sql_null) valid.* = null;
             if (valid.* == null) continue;

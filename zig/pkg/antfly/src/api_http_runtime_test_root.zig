@@ -18,6 +18,16 @@
 //! changes from forcing code generation for every storage and search test.
 
 const http_server = @import("api/http_server.zig");
+test {
+    _ = @import("system_catalog/sql_notifications.zig");
+    _ = @import("api/sql/notifications/hub.zig");
+    _ = @import("api/sql/notifications/maintenance.zig");
+    _ = @import("api/relational_expression_contract.zig");
+    _ = @import("api/row_policy_publication_coordinator.zig");
+    _ = @import("api/retained_read_rpc.zig");
+    _ = @import("api/replication_subscription_apply.zig");
+    _ = @import("antfly_local_sources").api_batch;
+}
 const httpx_handler = @import("api/httpx_handler.zig");
 const indexes = @import("api/indexes.zig");
 const kernel_abi = @import("api/kernel_abi.zig");
@@ -38,17 +48,24 @@ test {
     _ = @import("api/resolvers.zig");
     _ = @import("api/managed_sources.zig");
     _ = @import("api/protected_future.zig");
-    _ = @import("api/sql_graph_overlay_test.zig");
+    _ = @import("api/sql/testing/graph_overlay_test.zig");
     _ = @import("api/graph_execution.zig");
     _ = @import("api/graph_statement_source.zig");
     _ = @import("api/retained_read_client.zig").consumer_tests;
-    _ = @import("api/sql_connection_record.zig");
-    _ = @import("api/sql_connections.zig");
+    _ = @import("api/sql/session/connection_record.zig");
+    _ = @import("api/sql/session/connections.zig");
+    _ = @import("api/sql/testing/command_producer_test.zig");
+    _ = @import("api/native_sql_lock_read.zig");
+    _ = @import("api/sql/session/data_locks.zig");
+    _ = @import("api/sql/testing/ordinary_catalog_test.zig");
+    _ = @import("api/sql/execution/execution.zig");
     _ = @import("api/kernel_owner_source.zig");
-    _ = @import("api/sql_execution.zig");
+    _ = @import("api/sql/execution/execution.zig");
     _ = @import("api/lake_row_payloads.zig");
     _ = @import("api/lake_expiring_objects.zig");
-    _ = @import("api/sql_pgwire.zig");
+    _ = @import("api/sql/transport/pgwire.zig");
+    _ = @import("api/sql/testing/catalog_campaign_test.zig");
+    _ = @import("api/sql/testing/conflict_scope_test.zig");
     _ = @import("api/table_catalog.zig");
     _ = @import("api/table_reads.zig");
     _ = @import("api/table_reads.zig").document_hydration_tests;
@@ -89,6 +106,15 @@ test "system catalog routing and transport discovery" {
     _ = @import("api/distributed_entity_sink.zig");
 }
 
+test "system catalog schema validation submission discovery" {
+    _ = @import("api/schema_validation/recovery.zig");
+    _ = @import("api/schema_validation/admission.zig");
+    _ = @import("metadata/http_client.zig");
+    _ = @import("metadata/http_server.zig");
+    _ = @import("system_catalog/operations.zig");
+    _ = @import("system_catalog/server_call.zig");
+}
+
 /// Server fixtures retain this compilation root's source and type identity.
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
 test {
@@ -103,7 +129,7 @@ test {
     _ = @import("serverless/build/lake_build_limits.zig");
     _ = @import("api/lake_index_coordinator.zig");
     _ = @import("api/lake_index_sql_rows.zig");
-    _ = @import("api/sql_memory_owner.zig");
+    _ = @import("api/sql/execution/memory_owner.zig");
     _ = @import("api/lake_artifact_ranges.zig");
     _ = @import("api/lake_index_text_statistics.zig");
     _ = @import("api/lake_index_page_mutations.zig");
@@ -123,7 +149,7 @@ test {
 
 // Schema admission is part of the public lake SQL binding contract.
 test "external lake SQL schema cache discovery" {
-    _ = @import("api/sql_schema_cache.zig");
+    _ = @import("api/sql/execution/schema_cache.zig");
 }
 
 // Filtered roots must reach the mounted transport tests through a named anchor.
@@ -195,6 +221,6 @@ test "source checkpoint observation discovery" {
 }
 
 test "index alias object runtime discovery" {
-    _ = @import("api/sql_execution.zig");
+    _ = @import("api/sql/execution/execution.zig");
     _ = @import("api/object_table_runtime.zig");
 }

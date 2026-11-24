@@ -20,6 +20,8 @@ class NamespaceCatalogRecord:
         database_id (int): Parent database identifier. Example: 22.
         database_name (str): Parent database name. Example: tenant_ops.
         name (str): Namespace name. Example: analytics.
+        description (None | str | Unset): SQL COMMENT annotation. NULL or an empty string removes the annotation without
+            changing the object's identity or data schema.
         tablespace_name (None | str | Unset): Optional durable tablespace binding inherited by new table placement
             policy in this namespace. Example: fastspace.
     """
@@ -28,6 +30,7 @@ class NamespaceCatalogRecord:
     database_id: int
     database_name: str
     name: str
+    description: None | str | Unset = UNSET
     tablespace_name: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -39,6 +42,12 @@ class NamespaceCatalogRecord:
         database_name = self.database_name
 
         name = self.name
+
+        description: None | str | Unset
+        if isinstance(self.description, Unset):
+            description = UNSET
+        else:
+            description = self.description
 
         tablespace_name: None | str | Unset
         if isinstance(self.tablespace_name, Unset):
@@ -56,6 +65,8 @@ class NamespaceCatalogRecord:
                 "name": name,
             }
         )
+        if description is not UNSET:
+            field_dict["description"] = description
         if tablespace_name is not UNSET:
             field_dict["tablespace_name"] = tablespace_name
 
@@ -72,6 +83,15 @@ class NamespaceCatalogRecord:
 
         name = d.pop("name")
 
+        def _parse_description(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        description = _parse_description(d.pop("description", UNSET))
+
         def _parse_tablespace_name(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -86,6 +106,7 @@ class NamespaceCatalogRecord:
             database_id=database_id,
             database_name=database_name,
             name=name,
+            description=description,
             tablespace_name=tablespace_name,
         )
 

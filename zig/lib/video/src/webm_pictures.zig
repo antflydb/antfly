@@ -257,6 +257,7 @@ pub fn index(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options)
         .backing = a,
         .reservation = if (options.decoder.admission_pool) |pool| try pool.acquire(.{}) else .{},
         .limit = std.math.maxInt(usize),
+        .reclaimer = reader.input.reclaimer,
     };
     errdefer memory.reservation.deinit();
     const metadata = memory.allocator();

@@ -191,6 +191,10 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         return false;
     }
 
+    pub fn adoptDurableProgress(_: *@This(), _: []const u8, _: u64) bool {
+        return false;
+    }
+
     pub fn snapshotStats(_: *@This()) types.DerivedWorkerStats {
         return .{};
     }
@@ -695,6 +699,22 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
             if (!std.mem.eql(u8, worker.name, name)) continue;
             if (worker.applied_sequence != expected or sequence < expected) return false;
             worker.applied_sequence = sequence;
+            worker.target_sequence = @max(worker.target_sequence, sequence);
+            return true;
+        }
+        return false;
+    }
+
+    pub fn adoptDurableProgress(self: *DerivedRuntime, name: []const u8, sequence: u64) bool {
+        const io = self.ioContext();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        for (self.workers.items) |worker| {
+            if (!std.mem.eql(u8, worker.name, name)) continue;
+            if (worker.dispatch_active or worker.catch_up_open or worker.paused or
+                worker.applied_sequence > sequence or worker.persisted_sequence > sequence) return false;
+            worker.applied_sequence = sequence;
+            worker.persisted_sequence = sequence;
             worker.target_sequence = @max(worker.target_sequence, sequence);
             return true;
         }

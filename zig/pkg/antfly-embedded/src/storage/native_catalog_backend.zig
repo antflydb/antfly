@@ -93,6 +93,11 @@ pub const Pending = struct {
 /// `scope` disambiguates which index's records a call addresses, so the
 /// sink's own durable keys never collide across indexes sharing one `.aflite`
 /// file's native index-catalog root.
+pub const ScopedMutations = struct {
+    scope: []const u8,
+    mutations: []const Mutation,
+};
+
 pub const Sink = struct {
     ptr: *anyopaque,
     /// Apply every mutation in `mutations`, in order, as ONE native
@@ -101,6 +106,8 @@ pub const Sink = struct {
     /// `NamespaceTxn.setDurable`), or none of them on failure. `mutations`
     /// is only valid for the duration of the call.
     submit: *const fn (ptr: *anyopaque, scope: []const u8, mutations: []const Mutation, durable: bool) anyerror!void,
+    /// Commits every supplied scope in one durable transaction.
+    submitTogether: ?*const fn (*anyopaque, *const [2]ScopedMutations) anyerror!void = null,
     /// Loads every entry currently committed under this sink's scope, to
     /// seed the in-memory mirror on open. Called once, synchronously, from
     /// `Backend.init`. The returned slice and every entry's bytes are
@@ -111,8 +118,11 @@ pub const Sink = struct {
     /// this backend's mirror. With it, the `tip_namespace` records stay out of
     /// the mirror and are always read this way (see `tip_namespace`).
     loadOneAlloc: ?*const fn (ptr: *anyopaque, allocator: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) anyerror!?[]u8 = null,
-    /// With `loadOneAlloc`: every committed `tip_namespace` entry of `scope`
-    /// (which `loadAllAlloc` leaves out), for removing them all.
+    /// Reads all keys at one durable checkpoint. Results use the supplied arena.
+    loadMany: ?*const fn (ptr: *anyopaque, allocator: Allocator, scope: []const u8, keys: []const Mutation, values: []?[]const u8) anyerror!void = null,
+    /// With `loadOneAlloc`: every committed `tip_namespace` key of `scope`
+    /// (which `loadAllAlloc` leaves out), for removing them all. Values may
+    /// be empty because deletion only consumes the keys.
     loadTipAlloc: ?*const fn (ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]Entry = null,
     /// Whether `submit` runs a commit's `Resolver`s itself, while applying
     /// the commit at the file's tip. When false, the backend resolves them
@@ -375,6 +385,12 @@ pub const Backend = struct {
     scope: []const u8,
     open_options: backend_types.OpenOptions,
     state: *RcState,
+    /// The index apply guard serializes creation with ordinary writers.
+    /// Once created, the reservation also fences other write entry points
+    /// until the coordinator has completed every dependent publication.
+    writer_view_active: std.atomic.Value(bool) = .init(false),
+    writer_view_parent: ?*Backend = null,
+    writer_view_parked: bool = false,
     mutex: std.atomic.Mutex = .unlocked,
     /// Set when an externally committed write could not be applied to the
     /// in-memory mirror (`invalidateMirror`): the mirror no longer matches
@@ -411,6 +427,63 @@ pub const Backend = struct {
             .open_options = options.backend,
             .state = rc,
         };
+    }
+
+    /// Fork the durable mirror for ordered preparation. The immutable tree
+    /// nodes are shared with the serving backend until a write changes them.
+    /// Only the host transaction may submit mutations to disk.
+    pub fn forkWriterView(self: *Backend) !Backend {
+        if (self.writer_view_parent != null) return error.IndexApplyBusy;
+        if (self.writer_view_active.swap(true, .acq_rel)) return error.IndexApplyBusy;
+        errdefer self.writer_view_active.store(false, .release);
+        const scope = try self.allocator.dupe(u8, self.scope);
+        errdefer self.allocator.free(scope);
+        const rc = try self.allocator.create(RcState);
+        errdefer self.allocator.destroy(rc);
+        lockBackend(self);
+        defer self.mutex.unlock();
+        if (self.mirror_invalid.load(.acquire)) return error.IndexMirrorInvalid;
+        rc.* = .{ .refs = 1, .state = self.state.state.clone() };
+        const PrivateSink = struct {
+            fn submit(_: *anyopaque, _: []const u8, _: []const Mutation, _: bool) anyerror!void {
+                return error.WriterViewCannotCommit;
+            }
+        };
+        var sink = self.sink;
+        sink.submit = PrivateSink.submit;
+        sink.submitDeferred = null;
+        sink.deleteScope = null;
+        return .{
+            .allocator = self.allocator,
+            .sink = sink,
+            .scope = scope,
+            .open_options = self.open_options,
+            .state = rc,
+            .writer_view_parent = self,
+        };
+    }
+
+    /// Discard the private tree while retaining the runtime allocations.
+    /// The index apply guard excludes preparation and durable publication.
+    pub fn parkWriterView(self: *Backend) void {
+        const parent = self.writer_view_parent.?;
+        std.debug.assert(!self.writer_view_parked and self.state.refs == 1);
+        self.state.state.deinit(self.allocator);
+        self.writer_view_parked = true;
+        parent.writer_view_active.store(false, .release);
+    }
+
+    pub fn resumeWriterView(self: *Backend) !void {
+        const parent = self.writer_view_parent.?;
+        std.debug.assert(self.writer_view_parked and self.state.refs == 1);
+        if (parent.writer_view_active.swap(true, .acq_rel)) return error.IndexApplyBusy;
+        errdefer parent.writer_view_active.store(false, .release);
+        lockBackend(parent);
+        defer parent.mutex.unlock();
+        if (parent.mirror_invalid.load(.acquire)) return error.IndexMirrorInvalid;
+        self.state.state = parent.state.state.clone();
+        self.mirror_invalid.store(false, .release);
+        self.writer_view_parked = false;
     }
 
     fn loadTree(allocator: Allocator, sink: Sink, scope: []const u8) !ordered.Tree {
@@ -474,6 +547,9 @@ pub const Backend = struct {
         releaseState(self.allocator, self.state);
         self.mutex.unlock();
         self.allocator.free(self.scope);
+        if (self.writer_view_parent) |parent| {
+            if (!self.writer_view_parked) parent.writer_view_active.store(false, .release);
+        }
         self.* = undefined;
     }
 
@@ -573,6 +649,27 @@ pub const Backend = struct {
         return try backend_erased.storeFrom(allocator, BoundStore{ .backend = self, .namespace = namespace });
     }
 
+    pub fn canCommitTogether(self: *const Backend, other: *const Backend) bool {
+        return self != other and !self.open_options.read_only and !other.open_options.read_only and
+            self.sink.ptr == other.sink.ptr and self.sink.submitTogether != null and
+            self.sink.submitTogether == other.sink.submitTogether;
+    }
+
+    /// The caller holds both write admissions and publishes both mirrors
+    /// under its reader barrier after the durable submission succeeds.
+    pub fn submitTogether(first: *BoundTxn, second: *BoundTxn) !void {
+        const a = &first.inner;
+        const b = &second.inner;
+        std.debug.assert(a.backend.canCommitTogether(b.backend));
+        std.debug.assert(!a.closed and !b.closed and !a.read_only and !b.read_only);
+        if (a.hasResolver() or b.hasResolver()) return error.UnsupportedOperation;
+        try a.backend.sink.submitTogether.?(a.backend.sink.ptr, &.{
+            .{ .scope = a.backend.scope, .mutations = a.pending.items },
+            .{ .scope = b.backend.scope, .mutations = b.pending.items },
+        });
+        wal_trace.recordCommit();
+    }
+
     /// Like `runtimeStore(...).beginWrite()`, but returns the concrete
     /// (unerased) write handle instead of `backend_erased.WriteTxn`. For a
     /// caller that needs to inspect this transaction's own staged
@@ -581,8 +678,7 @@ pub const Backend = struct {
     /// transaction -- see `graph/graph.zig`'s `prepareInlineEdgePublication`,
     /// mirroring `persistent.zig`'s `prepareInlineSegmentPublication`),
     /// `backend_erased.Batch`'s vtable has no such accessor, so this bypasses
-    /// erasure entirely. The caller must `abort()` (never `commit()`) once
-    /// it has harvested what it needs -- this never talks to `sink`.
+    /// erasure entirely. The caller owns the transaction and must close it.
     pub fn boundWrite(self: *Backend, namespace: backend_types.Namespace) !BoundTxn {
         return .{ .inner = try NamespaceTxn.open(self, false), .namespace = namespace };
     }
@@ -627,7 +723,7 @@ pub const Backend = struct {
 
     /// Namespace-bound write/read handle, composing `NamespaceTxn`. Backs
     /// `BoundStore`'s `backend_erased.Store`/`Batch` erasure.
-    const BoundTxn = struct {
+    pub const BoundTxn = struct {
         inner: NamespaceTxn,
         namespace: backend_types.Namespace,
 
@@ -644,6 +740,28 @@ pub const Backend = struct {
 
         pub fn commit(self: *@This()) !void {
             try self.inner.commit();
+        }
+
+        pub fn publishDurable(self: *@This()) void {
+            self.inner.publishMirror();
+        }
+
+        pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
+            for (keys, values) |key, *value| {
+                value.* = self.get(key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+            }
+        }
+
+        pub fn containsManySorted(self: *@This(), keys: []const []const u8, present: []bool) !void {
+            for (keys, present) |key, *exists| {
+                exists.* = if (self.get(key)) |_| true else |err| switch (err) {
+                    error.NotFound => false,
+                    else => return err,
+                };
+            }
         }
 
         /// See `NamespaceTxn.setDurable`'s WS2/§3.2a ride-along note.
@@ -716,11 +834,33 @@ pub const Backend = struct {
         return try load_one(self.sink.ptr, allocator, self.scope, namespace, key);
     }
 
-    /// Every committed `tip_namespace` entry (empty without tip reads).
+    /// Keys of committed `tip_namespace` entries (empty without tip reads).
     /// Free with `freeEntries`.
     pub fn loadTipEntriesAlloc(self: *const Backend, allocator: Allocator) ![]Entry {
         const load_tip = self.sink.loadTipAlloc orelse return try allocator.alloc(Entry, 0);
         return try load_tip(self.sink.ptr, allocator, self.scope);
+    }
+
+    pub fn loadCommittedValues(self: *Backend, allocator: Allocator, keys: []const Mutation, values: []?[]const u8) !void {
+        std.debug.assert(keys.len == values.len);
+        if (keys.len == 0) return;
+        if (self.sink.loadMany) |load| return load(self.sink.ptr, allocator, self.scope, keys, values);
+        if (self.sink.loadOneAlloc) |load| {
+            for (keys, values) |key, *value| value.* = try load(self.sink.ptr, allocator, self.scope, key.namespace, key.key);
+            return;
+        }
+        var txn = try self.beginRead();
+        defer txn.abort();
+        for (keys, values) |key, *value| {
+            const bytes = txn.get(.{ .name = key.namespace }, key.key) catch |err| switch (err) {
+                error.NotFound => {
+                    value.* = null;
+                    continue;
+                },
+                else => return err,
+            };
+            value.* = try allocator.dupe(u8, bytes);
+        }
     }
 
     pub fn freeEntries(allocator: Allocator, entries: []Entry) void {
@@ -731,15 +871,42 @@ pub const Backend = struct {
         self.mirror_invalid.store(true, .release);
     }
 
-    pub fn applyExternallyCommittedMutations(self: *Backend, mutations: []const Mutation) !void {
-        if (mutations.len == 0) return;
-        // A failure below leaves the mirror behind a durable commit.
-        errdefer self.invalidateMirror();
+    pub const PreparedMirror = struct {
+        backend: *Backend,
+        replacement: ?*RcState = null,
+
+        pub fn deinit(self: *PreparedMirror) void {
+            if (self.replacement) |rc| {
+                lockBackend(self.backend);
+                releaseState(self.backend.allocator, rc);
+                self.backend.mutex.unlock();
+            }
+            self.replacement = null;
+        }
+
+        /// The caller holds mutation admission for this backend.
+        pub fn get(self: *const PreparedMirror, namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
+            const state = self.replacement orelse self.backend.state;
+            return state.state.get(namespace, key);
+        }
+
+        pub fn publish(self: *PreparedMirror) void {
+            const replacement = self.replacement orelse return;
+            lockBackend(self.backend);
+            const old = self.backend.state;
+            self.backend.state = replacement;
+            self.replacement = old;
+            self.backend.mutex.unlock();
+        }
+    };
+
+    /// The caller serializes mirror mutations from preparation through publication.
+    pub fn prepareExternalMirror(self: *Backend, mutations: []const Mutation) !PreparedMirror {
+        if (mutations.len == 0) return .{ .backend = self };
         lockBackend(self);
-        const current = self.state;
+        var cloned = self.state.state.clone();
         self.mutex.unlock();
 
-        var cloned = current.state.clone();
         errdefer cloned.deinit(self.allocator);
         for (mutations) |m| {
             if ((self.tipReads() and isTipNamespace(m.namespace)) or isStagedOnly(m.namespace)) continue;
@@ -758,11 +925,14 @@ pub const Backend = struct {
         const new_rc = try self.allocator.create(RcState);
         new_rc.* = .{ .refs = 1, .state = cloned };
 
-        lockBackend(self);
-        const old = self.state;
-        self.state = new_rc;
-        releaseState(self.allocator, old);
-        self.mutex.unlock();
+        return .{ .backend = self, .replacement = new_rc };
+    }
+
+    pub fn applyExternallyCommittedMutations(self: *Backend, mutations: []const Mutation) !void {
+        errdefer self.invalidateMirror();
+        var prepared = try self.prepareExternalMirror(mutations);
+        defer prepared.deinit();
+        prepared.publish();
     }
 
     const NamespaceTxn = struct {
@@ -792,6 +962,7 @@ pub const Backend = struct {
             if (backend.mirror_invalid.load(.acquire)) return error.IndexMirrorInvalid;
             lockBackend(backend);
             defer backend.mutex.unlock();
+            if (!read_only and backend.writer_view_active.load(.acquire)) return error.IndexApplyBusy;
             const current = backend.state;
             const rc: *RcState = if (read_only) blk: {
                 retainState(current);
@@ -889,7 +1060,7 @@ pub const Backend = struct {
         pub fn commit(self: *NamespaceTxn) !void {
             if (self.closed) return error.ReadOnly;
             if (self.read_only) return error.ReadOnly;
-            const rc = self.rc orelse return error.ReadOnly;
+            if (self.rc == null) return error.ReadOnly;
 
             // Durable-first (when durable): readers (via the backend-state
             // swap below) must never observe a mutation this backend has not
@@ -957,6 +1128,11 @@ pub const Backend = struct {
                 try self.mirrorResolved(try resolverOf(m));
             };
 
+            self.publishMirror();
+        }
+
+        fn publishMirror(self: *NamespaceTxn) void {
+            const rc = self.rc.?;
             lockBackend(self.backend);
             const old = self.backend.state;
             self.backend.state = rc;
@@ -1796,4 +1972,28 @@ test "native catalog backend beginBatchWithOptions on the NamespaceStore surface
     }
     try std.testing.expectEqual(@as(usize, 0), test_sink.durable_submit_calls);
     try std.testing.expectEqual(@as(usize, 1), test_sink.non_durable_submit_calls);
+}
+
+test "native catalog writer view isolates queued mutations from the serving root" {
+    const a = std.testing.allocator;
+    var backing = TestSink{ .allocator = a };
+    defer backing.deinit();
+    var serving = try Backend.init(a, .{ .sink = backing.sink(), .scope = "index" });
+    defer serving.close();
+    var writer = try serving.forkWriterView();
+    defer writer.close();
+
+    try std.testing.expectError(error.IndexApplyBusy, serving.beginWrite());
+
+    try writer.applyExternallyCommittedMutations(&.{.{ .namespace = null, .key = "key", .value = "queued" }});
+    var next = try writer.beginWrite();
+    defer next.abort();
+    try std.testing.expectEqualStrings("queued", try next.get(.{}, "key"));
+    try next.put(.{}, "key", "second");
+    try std.testing.expectError(error.WriterViewCannotCommit, next.commit());
+
+    var query = try serving.beginRead();
+    defer query.abort();
+    try std.testing.expectError(error.NotFound, query.get(.{}, "key"));
+    try std.testing.expectEqual(@as(usize, 0), backing.entries.items.len);
 }

@@ -731,12 +731,22 @@ pub const ProbeTxn = struct {
         get_leased: ?*const fn (*anyopaque, []const u8) anyerror![]const u8 = null,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
         get_many_sorted_with_block_cache_admission: ?*const fn (*anyopaque, []const []const u8, []?[]const u8, backend_types.Namespace.BlockCacheAdmission) anyerror!void = null,
+        release_results: ?*const fn (*anyopaque) void = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub fn abort(self: *ProbeTxn) void {
         self.vtable.abort(self.allocator, self.ptr);
         self.* = undefined;
+    }
+
+    /// Invalidate prior read results and release their resources, while
+    /// retaining the probe's view and reusable scratch. Returns false when
+    /// the backend requires closing the probe to release its results.
+    pub fn releaseResults(self: *ProbeTxn) !bool {
+        const release = self.vtable.release_results orelse return false;
+        try BoundaryAbi.call("release_results", self.boundary_dispatch, release, .{self.ptr});
+        return true;
     }
 
     pub fn get(self: *ProbeTxn, key: []const u8) ![]const u8 {
@@ -1142,6 +1152,7 @@ pub const Batch = struct {
         delete: *const fn (*anyopaque, []const u8) anyerror!void,
         open_cursor: ?*const fn (Allocator, *anyopaque) anyerror!Cursor = null,
         set_replay_opaque: ?*const fn (*anyopaque, u64, []const u8) anyerror!void = null,
+        set_queued_participant: ?*const fn (*anyopaque, @import("commit_participant.zig").Queued) anyerror!void = null,
         set_commit_participant: ?*const fn (*anyopaque, @import("commit_participant.zig").Participant) anyerror!void = null,
         contains_many_sorted: ?*const fn (*anyopaque, []const []const u8, []bool) anyerror!void = null,
         /// WS4 phase 2: optional second write surface into this handle's
@@ -1298,6 +1309,11 @@ pub const Batch = struct {
 
     /// Optional facade capability, not a raw-engine callback. Unsupported
     /// backends must fail rather than silently omit atomic acceptance work.
+    pub fn setQueuedParticipant(self: *Batch, participant: @import("commit_participant.zig").Queued) !void {
+        const attach = self.vtable.set_queued_participant orelse return error.Unsupported;
+        try BoundaryAbi.call("set_queued_participant", self.boundary_dispatch, attach, .{ self.ptr, participant });
+    }
+
     pub fn setCommitParticipant(self: *Batch, participant: @import("commit_participant.zig").Participant) !void {
         const attach = self.vtable.set_commit_participant orelse return error.Unsupported;
         try BoundaryAbi.call("set_commit_participant", self.boundary_dispatch, attach, .{ self.ptr, participant });
@@ -2065,6 +2081,10 @@ pub fn probeTxnFrom(allocator: Allocator, handle: anytype) !ProbeTxn {
             box_allocator.destroy(state);
         }
 
+        fn releaseResults(ptr: *anyopaque) void {
+            unbox(ptr).handle.releaseResults();
+        }
+
         fn get(ptr: *anyopaque, key: []const u8) anyerror![]const u8 {
             return try unbox(ptr).handle.get(key);
         }
@@ -2110,6 +2130,7 @@ pub fn probeTxnFrom(allocator: Allocator, handle: anytype) !ProbeTxn {
         .vtable = &.{
             .get_many_sorted_is_atomic = @hasDecl(Handle, "get_many_sorted_is_atomic") and Handle.get_many_sorted_is_atomic,
             .abort = vt.abort,
+            .release_results = if (@hasDecl(Handle, "releaseResults")) vt.releaseResults else null,
             .get = vt.get,
             .contains = if (@hasDecl(Handle, "contains")) vt.contains else null,
             .get_leased = vt.getLeased,
@@ -2551,6 +2572,10 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             return error.Unsupported;
         }
 
+        pub fn setQueuedParticipant(ptr: *anyopaque, participant: @import("commit_participant.zig").Queued) anyerror!void {
+            return unbox(ptr).handle.setQueuedParticipant(participant);
+        }
+
         pub fn setCommitParticipant(ptr: *anyopaque, participant: @import("commit_participant.zig").Participant) anyerror!void {
             return unbox(ptr).handle.setCommitParticipant(participant);
         }
@@ -2579,6 +2604,7 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             .delete = vt.delete,
             .open_cursor = if (@hasDecl(Handle, "openCursor")) vt.openCursor else null,
             .set_replay_opaque = if (@hasDecl(Handle, "setReplayOpaque")) vt.setReplayOpaque else null,
+            .set_queued_participant = if (@hasDecl(Handle, "setQueuedParticipant")) vt.setQueuedParticipant else null,
             .set_commit_participant = if (@hasDecl(Handle, "setCommitParticipant")) vt.setCommitParticipant else null,
             .contains_many_sorted = if (@hasDecl(Handle, "containsManySorted")) vt.containsManySorted else null,
             .put_index_catalog = if (@hasDecl(Handle, "putIndexCatalogBatch")) vt.putIndexCatalogBatch else null,

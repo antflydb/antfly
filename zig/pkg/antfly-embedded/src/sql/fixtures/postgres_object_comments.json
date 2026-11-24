@@ -1,0 +1,59 @@
+{
+  "format": 1,
+  "cases": [
+    {
+      "id": "sql-0144",
+      "steps": [
+        {
+          "sql": "COMMENT ON INDEX usage_records_status_idx IS 'status lookup';",
+          "description": "status lookup"
+        },
+        {
+          "sql": "COMMENT ON INDEX usage_records_status_idx IS 'a ''quoted'' Ω'",
+          "description": "a 'quoted' Ω"
+        },
+        {
+          "sql": "COMMENT ON INDEX usage_records_status_idx IS NULL",
+          "description": null
+        },
+        {
+          "sql": "COMMENT ON INDEX usage_records_status_idx IS ''",
+          "description": null
+        },
+        {
+          "sql": "COMMENT ON INDEX usage_records_status_idx IS 'status lookup';",
+          "description": "status lookup"
+        }
+      ],
+      "denied_sqlstate": "42501"
+    },
+    {
+      "id": "sql-0145",
+      "steps": [
+        {
+          "sql": "COMMENT ON CONSTRAINT usage_records_status_check ON usage_records IS 'valid status';",
+          "description": "valid status"
+        },
+        {
+          "sql": "COMMENT ON CONSTRAINT usage_records_status_check ON usage_records IS 'a ''quoted'' Ω'",
+          "description": "a 'quoted' Ω"
+        },
+        {
+          "sql": "COMMENT ON CONSTRAINT usage_records_status_check ON usage_records IS NULL",
+          "description": null
+        },
+        {
+          "sql": "COMMENT ON CONSTRAINT usage_records_status_check ON usage_records IS ''",
+          "description": null
+        },
+        {
+          "sql": "COMMENT ON CONSTRAINT usage_records_status_check ON usage_records IS 'valid status';",
+          "description": "valid status"
+        }
+      ],
+      "denied_sqlstate": "42501"
+    }
+  ],
+  "missing_index_sqlstate": "42P01",
+  "missing_constraint_sqlstate": "42704"
+}

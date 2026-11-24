@@ -1,0 +1,36 @@
+{
+  "format": 1,
+  "postgres_major": 18,
+  "cases": [
+    {
+      "id": "sql-0771",
+      "sql": "PREPARE TRANSACTION 'usage_batch';",
+      "command_tag": "PREPARE TRANSACTION"
+    },
+    {
+      "id": "sql-0772",
+      "sql": "COMMIT PREPARED 'usage_batch';",
+      "command_tag": "COMMIT PREPARED"
+    },
+    {
+      "id": "sql-0773",
+      "sql": "ROLLBACK PREPARED 'usage_batch';",
+      "command_tag": "ROLLBACK PREPARED"
+    }
+  ],
+  "preimage": [
+    [
+      10
+    ]
+  ],
+  "committed": [
+    [
+      11
+    ]
+  ],
+  "rolled_back": [
+    [
+      11
+    ]
+  ]
+}

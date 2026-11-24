@@ -78,8 +78,13 @@ pub const Index = union(enum) {
         };
     }
     pub fn initWebmSource(a: std.mem.Allocator, source: *media.source.Source, max_frames: usize, max_bytes: usize, admission: ?Admission) !Index {
-        var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = a, .limit = max_bytes };
-        const scratch = bounded.allocator();
+        var memory = media.admission.TrackedAllocator{
+            .backing = a,
+            .reservation = if (source.admission_pool) |pool| try pool.acquire(.{}) else .{},
+            .limit = max_bytes,
+        };
+        defer memory.reservation.deinit();
+        const scratch = memory.allocator();
         const read_limit = @min(source.limits.max_read_bytes, source.limits.max_retained_bytes);
         const coded_extent_limit = std.math.cast(usize, source.length()) orelse std.math.maxInt(usize);
         const directory = media.webm_audio.Directory.initWithFlacPacketLimit(scratch, source, .{
@@ -87,21 +92,32 @@ pub const Index = union(enum) {
             .max_metadata_bytes = @min(max_bytes, read_limit),
             .max_index_bytes = max_bytes,
             .max_packet_bytes = read_limit,
-        }, coded_extent_limit) catch |err| return if (err == error.OutOfMemory and bounded.denied) error.AudioTooLarge else err;
+        }, coded_extent_limit, error.AudioTooLarge) catch |err| return if (err == error.OutOfMemory and memory.denied != null) error.AudioTooLarge else err;
         defer directory.deinit();
-        if (directory.track.codec == .flac) return .{ .webm_flac = try WebmFlac.init(a, directory, source, max_bytes, bounded.live, admission) };
+        return initWebmDirectory(a, directory, source, max_frames, max_bytes, memory.live, admission);
+    }
+
+    pub fn initWebmDirectory(a: std.mem.Allocator, directory: media.webm_audio.Directory, source: *media.source.Source, max_frames: usize, max_bytes: usize, directory_bytes: usize, admission: ?Admission) !Index {
+        if (directory.track.codec == .flac) return .{ .webm_flac = try WebmFlac.init(a, directory, source, max_bytes, directory_bytes, admission) };
         const OpusSeek = @import("media_opus_seek.zig");
         if (directory.track.codec == .opus and directory.track.seek_pre_roll_ns > OpusSeek.max_webm_preroll_ns) return error.UnsupportedStreamingAudioProfile;
         const Progressive = OpusSeek.Index;
         const Webm = audio.webm.WindowIndexFor(Progressive);
         const temporary = Webm.directoryScratchBytes(directory);
-        if (temporary >= max_bytes - bounded.live) return error.AudioTooLarge;
-        const index_limit = max_bytes - bounded.live - temporary;
-        bounded.limit = max_bytes - index_limit;
+        const available = max_bytes -| directory_bytes;
+        if (temporary >= available) return error.AudioTooLarge;
+        const index_limit = available - temporary;
+        var memory = media.admission.TrackedAllocator{
+            .backing = a,
+            .reservation = if (source.admission_pool) |pool| try pool.acquire(.{}) else .{},
+            .limit = temporary,
+        };
+        defer memory.reservation.deinit();
+        const scratch = memory.allocator();
         const owner = try Progressive.createBounded(admission, index_limit);
         var initial = Progressive{ .owner = owner };
         errdefer initial.deinit();
-        var index = Webm.initDirectory(owner.arena.allocator(), scratch, directory, max_frames, Progressive.Builder{ .owner = owner, .range_backed = true }) catch |err| return if (err == error.OutOfMemory and (bounded.denied or owner.bound.?.denied)) error.AudioTooLarge else err;
+        var index = Webm.initDirectory(owner.arena.allocator(), scratch, directory, max_frames, Progressive.Builder{ .owner = owner, .range_backed = true }) catch |err| return if (err == error.OutOfMemory and (memory.denied != null or owner.bound.?.denied)) error.AudioTooLarge else err;
         if (index.codec == .vorbis) index.retained_owner = initial else initial.deinit();
         Progressive.refreshBytes(owner);
         return .{ .webm = index };
@@ -205,10 +221,23 @@ const WebmFlac = struct {
     tail_group_start: usize,
     working_bytes: usize,
     frame_directory: *FrameDirectory,
+    reservation: media.admission.Token = .{},
 
-    fn init(a: std.mem.Allocator, directory: media.webm_audio.Directory, input: *media.source.Source, budget: usize, temporary: usize, admission: ?Index.Admission) !WebmFlac {
+    fn init(backing: std.mem.Allocator, directory: media.webm_audio.Directory, input: *media.source.Source, budget: usize, temporary: usize, admission: ?Index.Admission) !WebmFlac {
         const retained = directory.packets.len *| @sizeOf(Extent) +| directory.padding.len *| @sizeOf(Cut) +| @sizeOf(FrameDirectory);
         if (retained > budget -| temporary) return error.AudioTooLarge;
+        var memory = media.admission.TrackedAllocator{
+            .backing = backing,
+            .reservation = if (input.admission_pool) |pool| try pool.acquire(.{}) else .{},
+            .limit = budget -| temporary,
+        };
+        errdefer memory.reservation.deinit();
+        return build(backing, &memory, directory, input, budget, temporary, retained, admission) catch |err|
+            return if (err == error.OutOfMemory and memory.denied != null) error.AudioTooLarge else err;
+    }
+
+    fn build(backing: std.mem.Allocator, memory: *media.admission.TrackedAllocator, directory: media.webm_audio.Directory, input: *media.source.Source, budget: usize, temporary: usize, retained: usize, admission: ?Index.Admission) !WebmFlac {
+        const a = memory.allocator();
         const parsed = try audio.flac.parseStream(directory.track.codec_private);
         if (parsed.data_offset != directory.track.codec_private.len) return error.UnsupportedAudioFormat;
         const info = parsed.stream_info;
@@ -292,7 +321,7 @@ const WebmFlac = struct {
         const owned_gaps = try gaps.toOwnedSlice(a);
         errdefer a.free(owned_gaps);
         const owned_cuts = try a.realloc(cuts, cut_count);
-        return .{ .allocator = a, .info = info, .extents = extents, .leading = leading, .gaps = owned_gaps, .sample_count = samples_with_gaps, .cuts = owned_cuts, .tail_trim = tail_trim, .tail_group_start = tail_group_start, .working_bytes = budget - retained - gap_bytes, .frame_directory = frame_directory };
+        return .{ .allocator = backing, .reservation = memory.reservation, .info = info, .extents = extents, .leading = leading, .gaps = owned_gaps, .sample_count = samples_with_gaps, .cuts = owned_cuts, .tail_trim = tail_trim, .tail_group_start = tail_group_start, .working_bytes = budget - retained - gap_bytes, .frame_directory = frame_directory };
     }
 
     fn rawAt(self: WebmFlac, playback: usize, comptime start: bool) usize {
@@ -389,6 +418,7 @@ const WebmFlac = struct {
     fn copy(self: WebmFlac, a: std.mem.Allocator) !WebmFlac {
         var result = self;
         result.allocator = a;
+        result.reservation = .{};
         result.extents = try a.dupe(Extent, self.extents);
         errdefer a.free(result.extents);
         result.cuts = try a.dupe(Cut, self.cuts);
@@ -403,6 +433,7 @@ const WebmFlac = struct {
         self.allocator.free(self.extents);
         self.allocator.free(self.cuts);
         self.allocator.free(self.gaps);
+        self.reservation.deinit();
     }
 
     fn rawSamples(self: WebmFlac) ?usize {
@@ -427,8 +458,13 @@ const WebmFlac = struct {
         if (capture) |session| if (out.len != 0) session.reset();
         const pcm_bytes = std.mem.sliceAsBytes(out).len;
         if (pcm_bytes > self.working_bytes) return error.AudioTooLarge;
-        var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = a, .limit = self.working_bytes - pcm_bytes };
-        const scratch = bounded.allocator();
+        var memory = media.admission.TrackedAllocator{
+            .backing = a,
+            .reservation = if (input.admission_pool) |pool| try pool.acquire(.{}) else .{},
+            .limit = self.working_bytes - pcm_bytes,
+        };
+        defer memory.reservation.deinit();
+        const scratch = memory.allocator();
         const last_clipped = if (self.finalSamples()) |final| @max(first, @min(last, final)) else last;
         if (last_clipped == first and lookahead <= first) return 0;
         const silence = @min(last_clipped, self.leading) -| first;
@@ -479,7 +515,7 @@ const WebmFlac = struct {
             defer buffer.bytes.deinit(scratch);
             while (at < extent.packet.size and position < stop_at) {
                 try control.check();
-                var frame = readFrame(scratch, self.info, input, extent.packet, at, &buffer, .{ .context = work.context, .check_fn = work.check_fn }) catch |err| return if (err == error.OutOfMemory and bounded.denied) error.AudioTooLarge else err;
+                var frame = readFrame(scratch, self.info, input, extent.packet, at, &buffer, .{ .context = work.context, .check_fn = work.check_fn }) catch |err| return if (err == error.OutOfMemory and memory.denied != null) error.AudioTooLarge else err;
                 defer frame.deinit();
                 if (capture) |session| if (out.len != 0 and position < end) {
                     if (std.math.cast(i64, extent.packet.offset + at)) |offset| session.observe(a, .{ .ordinal = position, .offset_ns = offset });
@@ -694,10 +730,10 @@ pub const Reader = struct {
         const tail = index.extents[index.extents.len - 1].first;
         const end = @min(lookahead, index.samples());
         if (end <= first or index.probeStop(end) <= tail) return null;
-        return try self.readUnknownFlac(a, first, @min(last, end), end);
+        return try self.readWebmFlac(a, first, @min(last, end), end);
     }
 
-    fn readUnknownFlac(self: *Reader, a: std.mem.Allocator, first: usize, last: usize, lookahead: usize) !providers.Lease {
+    fn readWebmFlac(self: *Reader, a: std.mem.Allocator, first: usize, last: usize, lookahead: usize) !providers.Lease {
         const lane = @import("media_opus_seek.zig").Lane.enter(self.lane);
         defer lane.deinit();
         try self.control.check();
@@ -705,10 +741,16 @@ pub const Reader = struct {
         const scope = audio.work_control.Scope.enter(.{ .context = check.context, .check_fn = check.check_fn });
         defer scope.deinit();
         if (last - first > self.index.webm_flac.working_bytes / @sizeOf(f32)) return error.AudioTooLarge;
+        const input = self.source orelse return error.UnsupportedAudioFormat;
+        var reservation = if (input.admission_pool) |pool|
+            try pool.acquire(.{ .host_bytes = (last - first) * @sizeOf(f32) })
+        else
+            media.admission.Token{};
+        errdefer reservation.deinit();
         const pcm = try a.alloc(f32, last - first);
         errdefer a.free(pcm);
-        const count = try self.index.webm_flac.read(a, first, last, lookahead, pcm, self.frame_snapshot, self.frame_capture, self.source orelse return error.UnsupportedAudioFormat, self.control);
-        return .{ .pcm = .{ .samples = pcm[0..count], .sample_rate = self.index.rate() }, .owned = pcm };
+        const count = try self.index.webm_flac.read(a, first, last, lookahead, pcm, self.frame_snapshot, self.frame_capture, input, self.control);
+        return .{ .pcm = .{ .samples = pcm[0..count], .sample_rate = self.index.rate() }, .owned = pcm, .reservation = reservation };
     }
 
     fn fork(raw: *anyopaque, a: std.mem.Allocator) !providers.Fork {
@@ -727,9 +769,14 @@ pub const Reader = struct {
     fn read(raw: *anyopaque, a: std.mem.Allocator, first: usize, last: usize) !providers.Lease {
         const self: *Reader = @ptrCast(@alignCast(raw));
         if (last < first) return error.InvalidAudioWindow;
-        if (self.index.* == .webm_flac and self.index.webm_flac.info.total_samples == 0) {
-            const end = @max(first, @min(last, self.index.samples()));
-            return self.readUnknownFlac(a, first, end, end);
+        if (self.index.* == .webm_flac) {
+            const end = if (self.index.webm_flac.info.total_samples == 0)
+                @max(first, @min(last, self.index.samples()))
+            else known: {
+                if (last > self.index.samples()) return error.InvalidAudioWindow;
+                break :known last;
+            };
+            return self.readWebmFlac(a, first, end, end);
         }
         const lane = @import("media_opus_seek.zig").Lane.enter(self.lane);
         defer lane.deinit();
@@ -738,7 +785,6 @@ pub const Reader = struct {
         const scope = audio.work_control.Scope.enter(.{ .context = check.context, .check_fn = check.check_fn });
         defer scope.deinit();
         if (last > self.index.samples()) return error.InvalidAudioWindow;
-        if (self.index.* == .webm_flac and last - first > self.index.webm_flac.working_bytes / @sizeOf(f32)) return error.AudioTooLarge;
         const samples = try a.alloc(f32, last - first);
         errdefer a.free(samples);
         switch (self.index.*) {
@@ -764,7 +810,7 @@ pub const Reader = struct {
                 if (capture.at != samples.len) return error.IncompleteAudioStream;
             },
             .flac => |*index| try index.read(a, first, last, samples, self.source, self.bytes, self.control),
-            .webm_flac => |*index| _ = try index.read(a, first, last, last, samples, self.frame_snapshot, self.frame_capture, self.source orelse return error.UnsupportedAudioFormat, self.control),
+            .webm_flac => unreachable,
         }
         return .{ .pcm = .{ .samples = samples, .sample_rate = self.index.rate() }, .owned = samples };
     }
@@ -1055,6 +1101,52 @@ test "model aware media range WebM audio skips unrelated payload and rebinds cac
     defer repeated.deinit(a);
     try std.testing.expectEqualSlices(f32, late.pcm.samples, repeated.pcm.samples);
 
+    const Cache = @import("media_index_cache.zig").Cache;
+    const RuntimeMemory = @import("../runtime/tier/memory.zig");
+    const TestAdmission = struct {
+        fn acquire(raw: *anyopaque, bytes: usize) !RuntimeMemory.AdmissionLease {
+            const owner: *RuntimeMemory.AdmissionController = @ptrCast(@alignCast(raw));
+            return owner.tryAcquire(.cpu, .{ .host_limit_bytes = Cache.max_bytes }, .{ .host_scratch_bytes = bytes }, false);
+        }
+    };
+    var controller: RuntimeMemory.AdmissionController = .{};
+    const admission: Cache.Admission = .{ .context = &controller, .acquire = TestAdmission.acquire };
+    var cache: Cache = .{};
+    defer cache.deinit();
+    source.storage.range.immutable_binding = @splat(42);
+    cache.remember(std.heap.smp_allocator, Cache.audioKey(&source, .embedded, 1024, 64 * 1024).?, .{ .audio = track.seek.? }, admission);
+    {
+        const entry = cache.get(Cache.audioKey(&source, .embedded, 1024, 64 * 1024).?).?;
+        try std.testing.expectEqual(@as(usize, 0), Cache.reclaim(&cache, Cache.max_bytes));
+        var pinned = @import("media_chunking_audio_source.zig").Track.fromCachedAudio(a, &source, .{}, &cache, entry);
+        defer pinned.deinit();
+        try std.testing.expectEqual(baseline.samples(), pinned.provider().samples);
+    }
+    var flights: [256]@import("media_speaker_flights.zig").Registry.Lease = undefined;
+    var acquired: usize = 0;
+    defer for (flights[0..acquired]) |flight| flight.deinit();
+    for (&flights, 0..) |*flight, i| {
+        var key: [32]u8 = @splat(0);
+        key[0] = @intCast(i);
+        flight.* = try cache.acquireBuild(key, .{});
+        acquired += 1;
+    }
+    var unavailable = media.webm_audio.DirectoryBuilder{ .allocator = a, .limits = .{}, .failure = error.AudioTooLarge };
+    defer unavailable.deinit();
+    const Track = @import("media_chunking_audio_source.zig").Track;
+    // Use an uncached key with the same source while every flight is busy.
+    try std.testing.expectError(error.AudioTooLarge, Track.initObservedWebm(a, &source, .{}, 64 * 1024, 1023, &cache, admission, &unavailable, 0, false));
+    var optional_source = source.view(a, null, .{});
+    optional_source.optional_range = true;
+    const optional_reads = source.reads;
+    try std.testing.expectError(error.OptionalAudioBudgetExceeded, Track.initCached(a, &optional_source, .{}, 64 * 1024, 1023, &cache, admission));
+    try std.testing.expectEqual(optional_reads, source.reads);
+    const reads = source.reads;
+    var warm = try @import("media_chunking_audio_source.zig").Track.initCached(a, &source, .{}, 64 * 1024, 1024, &cache, admission);
+    defer warm.deinit();
+    try std.testing.expect(warm.cached != null);
+    try std.testing.expectEqual(reads, source.reads);
+
     const over_limit = try audio.webm.buildOpusTestFileWithPrerollAlloc(a, ogg.packets[0].bytes, packets, 3 * std.time.ns_per_s);
     defer a.free(over_limit);
     var declared = media.source.Source{ .allocator = a, .identity = "opus-declared-preroll", .storage = .{ .borrowed = over_limit } };
@@ -1070,9 +1162,15 @@ test "model aware media range WebM audio preserves FLAC clocks with absent strea
     for ([_]bool{ false, true }) |unknown_total| {
         const webm = try audio.webm.buildFlacTestFileAlloc(a, encoded, unknown_total);
         defer a.free(webm);
-        var source = media.source.Source{ .allocator = a, .identity = "webm-flac", .storage = .{ .borrowed = webm } };
+        var pool = media.admission.Pool{ .limits = .{ .host_bytes = 1024 * 1024 } };
+        var source = media.source.Source{ .allocator = a, .identity = "webm-flac", .storage = .{ .borrowed = webm }, .admission_pool = &pool };
         var index = try Index.initWebmSource(a, &source, 1024, 1024 * 1024, null);
         defer index.deinit();
+        try std.testing.expect(pool.snapshot().host_bytes > 0);
+        try std.testing.expectEqual(index.webm_flac.reservation.resources.host_bytes, pool.snapshot().host_bytes);
+        var snapshot = try index.copy(a);
+        snapshot.deinit();
+        try std.testing.expectEqual(index.webm_flac.reservation.resources.host_bytes, pool.snapshot().host_bytes);
         try std.testing.expectEqual(expected.sample_rate, index.rate());
         if (!unknown_total) try std.testing.expectEqual(expected.samples.len, index.samples());
         var reader = Reader{ .index = &index, .source = &source };
@@ -1082,6 +1180,8 @@ test "model aware media range WebM audio preserves FLAC clocks with absent strea
         const before = source.total_bytes;
         var actual = try provider.read(provider.context, a, first, end);
         defer actual.deinit(a);
+        try std.testing.expectEqual(index.webm_flac.reservation.resources.host_bytes + 512 * @sizeOf(f32), pool.snapshot().host_bytes);
+        try std.testing.expect(pool.high_water.host_bytes > pool.snapshot().host_bytes);
         try std.testing.expectEqualSlices(f32, expected.samples[first..end], actual.pcm.samples);
         try std.testing.expectEqual(end, index.samples());
         try std.testing.expect(source.total_bytes - before < encoded.len / 2);

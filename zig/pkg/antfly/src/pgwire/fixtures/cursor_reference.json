@@ -1,0 +1,1212 @@
+{
+  "original_id": "sql-0049",
+  "original_sql": "DECLARE usage_scroll_cursor BINARY SCROLL CURSOR WITH HOLD FOR SELECT id FROM usage_records ORDER BY id",
+  "profiles": [
+    {
+      "binary": false,
+      "scroll": false,
+      "hold": false,
+      "steps": [
+        {
+          "sql": "BEGIN ISOLATION LEVEL READ COMMITTED",
+          "result_format": null,
+          "columns": [],
+          "oids": [],
+          "formats": [],
+          "rows": [],
+          "tag": "BEGIN"
+        },
+        {
+          "sql": "DECLARE usage_scroll_cursor NO SCROLL CURSOR WITHOUT HOLD FOR SELECT id FROM usage_records ORDER BY id",
+          "result_format": null,
+          "columns": [],
+          "oids": [],
+          "formats": [],
+          "rows": [],
+          "tag": "DECLARE CURSOR"
+        },
+        {
+          "sql": "FETCH FORWARD 2 FROM usage_scroll_cursor",
+          "result_format": null,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            0
+          ],
+          "rows": [
+            [
+              "30"
+            ],
+            [
+              "31"
+            ]
+          ],
+          "tag": "FETCH 2"
+        },
+        {
+          "sql": "FETCH NEXT FROM usage_scroll_cursor",
+          "result_format": 0,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            0
+          ],
+          "rows": [
+            [
+              "32"
+            ]
+          ],
+          "tag": "FETCH 1"
+        },
+        {
+          "sql": "FETCH NEXT FROM usage_scroll_cursor",
+          "result_format": 1,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            1
+          ],
+          "rows": [
+            [
+              "0000000000000003"
+            ]
+          ],
+          "tag": "FETCH 1"
+        },
+        {
+          "sql": "FETCH ALL FROM usage_scroll_cursor",
+          "result_format": null,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            0
+          ],
+          "rows": [
+            [
+              "34"
+            ]
+          ],
+          "tag": "FETCH 1"
+        },
+        {
+          "sql": "FETCH NEXT FROM usage_scroll_cursor",
+          "result_format": 1,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            1
+          ],
+          "rows": [],
+          "tag": "FETCH 0"
+        },
+        {
+          "sql": "CLOSE usage_scroll_cursor",
+          "result_format": null,
+          "columns": [],
+          "oids": [],
+          "formats": [],
+          "rows": [],
+          "tag": "CLOSE CURSOR"
+        },
+        {
+          "sql": "COMMIT",
+          "result_format": null,
+          "columns": [],
+          "oids": [],
+          "formats": [],
+          "rows": [],
+          "tag": "COMMIT"
+        }
+      ]
+    },
+    {
+      "binary": false,
+      "scroll": true,
+      "hold": false,
+      "steps": [
+        {
+          "sql": "BEGIN ISOLATION LEVEL READ COMMITTED",
+          "result_format": null,
+          "columns": [],
+          "oids": [],
+          "formats": [],
+          "rows": [],
+          "tag": "BEGIN"
+        },
+        {
+          "sql": "DECLARE usage_scroll_cursor SCROLL CURSOR WITHOUT HOLD FOR SELECT id FROM usage_records ORDER BY id",
+          "result_format": null,
+          "columns": [],
+          "oids": [],
+          "formats": [],
+          "rows": [],
+          "tag": "DECLARE CURSOR"
+        },
+        {
+          "sql": "FETCH FORWARD 2 FROM usage_scroll_cursor",
+          "result_format": null,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            0
+          ],
+          "rows": [
+            [
+              "30"
+            ],
+            [
+              "31"
+            ]
+          ],
+          "tag": "FETCH 2"
+        },
+        {
+          "sql": "FETCH NEXT FROM usage_scroll_cursor",
+          "result_format": 0,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            0
+          ],
+          "rows": [
+            [
+              "32"
+            ]
+          ],
+          "tag": "FETCH 1"
+        },
+        {
+          "sql": "FETCH NEXT FROM usage_scroll_cursor",
+          "result_format": 1,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            1
+          ],
+          "rows": [
+            [
+              "0000000000000003"
+            ]
+          ],
+          "tag": "FETCH 1"
+        },
+        {
+          "sql": "FETCH ABSOLUTE -1 FROM usage_scroll_cursor",
+          "result_format": null,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            0
+          ],
+          "rows": [
+            [
+              "34"
+            ]
+          ],
+          "tag": "FETCH 1"
+        },
+        {
+          "sql": "FETCH BACKWARD 2 FROM usage_scroll_cursor",
+          "result_format": 0,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            0
+          ],
+          "rows": [
+            [
+              "33"
+            ],
+            [
+              "32"
+            ]
+          ],
+          "tag": "FETCH 2"
+        },
+        {
+          "sql": "FETCH RELATIVE -1 FROM usage_scroll_cursor",
+          "result_format": 1,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            1
+          ],
+          "rows": [
+            [
+              "0000000000000001"
+            ]
+          ],
+          "tag": "FETCH 1"
+        },
+        {
+          "sql": "MOVE ABSOLUTE 0 FROM usage_scroll_cursor",
+          "result_format": 1,
+          "columns": [],
+          "oids": [],
+          "formats": [],
+          "rows": [],
+          "tag": "MOVE 0"
+        },
+        {
+          "sql": "FETCH FORWARD 0 FROM usage_scroll_cursor",
+          "result_format": null,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            0
+          ],
+          "rows": [],
+          "tag": "FETCH 0"
+        },
+        {
+          "sql": "FETCH ALL FROM usage_scroll_cursor",
+          "result_format": null,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            0
+          ],
+          "rows": [
+            [
+              "30"
+            ],
+            [
+              "31"
+            ],
+            [
+              "32"
+            ],
+            [
+              "33"
+            ],
+            [
+              "34"
+            ]
+          ],
+          "tag": "FETCH 5"
+        },
+        {
+          "sql": "FETCH NEXT FROM usage_scroll_cursor",
+          "result_format": 1,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            1
+          ],
+          "rows": [],
+          "tag": "FETCH 0"
+        },
+        {
+          "sql": "CLOSE usage_scroll_cursor",
+          "result_format": null,
+          "columns": [],
+          "oids": [],
+          "formats": [],
+          "rows": [],
+          "tag": "CLOSE CURSOR"
+        },
+        {
+          "sql": "COMMIT",
+          "result_format": null,
+          "columns": [],
+          "oids": [],
+          "formats": [],
+          "rows": [],
+          "tag": "COMMIT"
+        }
+      ]
+    },
+    {
+      "binary": false,
+      "scroll": true,
+      "hold": true,
+      "steps": [
+        {
+          "sql": "BEGIN ISOLATION LEVEL READ COMMITTED",
+          "result_format": null,
+          "columns": [],
+          "oids": [],
+          "formats": [],
+          "rows": [],
+          "tag": "BEGIN"
+        },
+        {
+          "sql": "DECLARE usage_scroll_cursor SCROLL CURSOR WITH HOLD FOR SELECT id FROM usage_records ORDER BY id",
+          "result_format": null,
+          "columns": [],
+          "oids": [],
+          "formats": [],
+          "rows": [],
+          "tag": "DECLARE CURSOR"
+        },
+        {
+          "sql": "COMMIT",
+          "result_format": null,
+          "columns": [],
+          "oids": [],
+          "formats": [],
+          "rows": [],
+          "tag": "COMMIT"
+        },
+        {
+          "sql": "FETCH FORWARD 2 FROM usage_scroll_cursor",
+          "result_format": null,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            0
+          ],
+          "rows": [
+            [
+              "30"
+            ],
+            [
+              "31"
+            ]
+          ],
+          "tag": "FETCH 2"
+        },
+        {
+          "sql": "FETCH NEXT FROM usage_scroll_cursor",
+          "result_format": 0,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            0
+          ],
+          "rows": [
+            [
+              "32"
+            ]
+          ],
+          "tag": "FETCH 1"
+        },
+        {
+          "sql": "FETCH NEXT FROM usage_scroll_cursor",
+          "result_format": 1,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            1
+          ],
+          "rows": [
+            [
+              "0000000000000003"
+            ]
+          ],
+          "tag": "FETCH 1"
+        },
+        {
+          "sql": "FETCH ABSOLUTE -1 FROM usage_scroll_cursor",
+          "result_format": null,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            0
+          ],
+          "rows": [
+            [
+              "34"
+            ]
+          ],
+          "tag": "FETCH 1"
+        },
+        {
+          "sql": "FETCH BACKWARD 2 FROM usage_scroll_cursor",
+          "result_format": 0,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            0
+          ],
+          "rows": [
+            [
+              "33"
+            ],
+            [
+              "32"
+            ]
+          ],
+          "tag": "FETCH 2"
+        },
+        {
+          "sql": "FETCH RELATIVE -1 FROM usage_scroll_cursor",
+          "result_format": 1,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            1
+          ],
+          "rows": [
+            [
+              "0000000000000001"
+            ]
+          ],
+          "tag": "FETCH 1"
+        },
+        {
+          "sql": "MOVE ABSOLUTE 0 FROM usage_scroll_cursor",
+          "result_format": 1,
+          "columns": [],
+          "oids": [],
+          "formats": [],
+          "rows": [],
+          "tag": "MOVE 0"
+        },
+        {
+          "sql": "FETCH FORWARD 0 FROM usage_scroll_cursor",
+          "result_format": null,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            0
+          ],
+          "rows": [],
+          "tag": "FETCH 0"
+        },
+        {
+          "sql": "FETCH ALL FROM usage_scroll_cursor",
+          "result_format": null,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            0
+          ],
+          "rows": [
+            [
+              "30"
+            ],
+            [
+              "31"
+            ],
+            [
+              "32"
+            ],
+            [
+              "33"
+            ],
+            [
+              "34"
+            ]
+          ],
+          "tag": "FETCH 5"
+        },
+        {
+          "sql": "FETCH NEXT FROM usage_scroll_cursor",
+          "result_format": 1,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            1
+          ],
+          "rows": [],
+          "tag": "FETCH 0"
+        },
+        {
+          "sql": "CLOSE usage_scroll_cursor",
+          "result_format": null,
+          "columns": [],
+          "oids": [],
+          "formats": [],
+          "rows": [],
+          "tag": "CLOSE CURSOR"
+        }
+      ]
+    },
+    {
+      "binary": true,
+      "scroll": false,
+      "hold": false,
+      "steps": [
+        {
+          "sql": "BEGIN ISOLATION LEVEL READ COMMITTED",
+          "result_format": null,
+          "columns": [],
+          "oids": [],
+          "formats": [],
+          "rows": [],
+          "tag": "BEGIN"
+        },
+        {
+          "sql": "DECLARE usage_scroll_cursor BINARY NO SCROLL CURSOR WITHOUT HOLD FOR SELECT id FROM usage_records ORDER BY id",
+          "result_format": null,
+          "columns": [],
+          "oids": [],
+          "formats": [],
+          "rows": [],
+          "tag": "DECLARE CURSOR"
+        },
+        {
+          "sql": "FETCH FORWARD 2 FROM usage_scroll_cursor",
+          "result_format": null,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            1
+          ],
+          "rows": [
+            [
+              "0000000000000000"
+            ],
+            [
+              "0000000000000001"
+            ]
+          ],
+          "tag": "FETCH 2"
+        },
+        {
+          "sql": "FETCH NEXT FROM usage_scroll_cursor",
+          "result_format": 0,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            0
+          ],
+          "rows": [
+            [
+              "32"
+            ]
+          ],
+          "tag": "FETCH 1"
+        },
+        {
+          "sql": "FETCH NEXT FROM usage_scroll_cursor",
+          "result_format": 1,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            1
+          ],
+          "rows": [
+            [
+              "0000000000000003"
+            ]
+          ],
+          "tag": "FETCH 1"
+        },
+        {
+          "sql": "FETCH ALL FROM usage_scroll_cursor",
+          "result_format": null,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            1
+          ],
+          "rows": [
+            [
+              "0000000000000004"
+            ]
+          ],
+          "tag": "FETCH 1"
+        },
+        {
+          "sql": "FETCH NEXT FROM usage_scroll_cursor",
+          "result_format": 1,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            1
+          ],
+          "rows": [],
+          "tag": "FETCH 0"
+        },
+        {
+          "sql": "CLOSE usage_scroll_cursor",
+          "result_format": null,
+          "columns": [],
+          "oids": [],
+          "formats": [],
+          "rows": [],
+          "tag": "CLOSE CURSOR"
+        },
+        {
+          "sql": "COMMIT",
+          "result_format": null,
+          "columns": [],
+          "oids": [],
+          "formats": [],
+          "rows": [],
+          "tag": "COMMIT"
+        }
+      ]
+    },
+    {
+      "binary": true,
+      "scroll": true,
+      "hold": false,
+      "steps": [
+        {
+          "sql": "BEGIN ISOLATION LEVEL READ COMMITTED",
+          "result_format": null,
+          "columns": [],
+          "oids": [],
+          "formats": [],
+          "rows": [],
+          "tag": "BEGIN"
+        },
+        {
+          "sql": "DECLARE usage_scroll_cursor BINARY SCROLL CURSOR WITHOUT HOLD FOR SELECT id FROM usage_records ORDER BY id",
+          "result_format": null,
+          "columns": [],
+          "oids": [],
+          "formats": [],
+          "rows": [],
+          "tag": "DECLARE CURSOR"
+        },
+        {
+          "sql": "FETCH FORWARD 2 FROM usage_scroll_cursor",
+          "result_format": null,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            1
+          ],
+          "rows": [
+            [
+              "0000000000000000"
+            ],
+            [
+              "0000000000000001"
+            ]
+          ],
+          "tag": "FETCH 2"
+        },
+        {
+          "sql": "FETCH NEXT FROM usage_scroll_cursor",
+          "result_format": 0,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            0
+          ],
+          "rows": [
+            [
+              "32"
+            ]
+          ],
+          "tag": "FETCH 1"
+        },
+        {
+          "sql": "FETCH NEXT FROM usage_scroll_cursor",
+          "result_format": 1,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            1
+          ],
+          "rows": [
+            [
+              "0000000000000003"
+            ]
+          ],
+          "tag": "FETCH 1"
+        },
+        {
+          "sql": "FETCH ABSOLUTE -1 FROM usage_scroll_cursor",
+          "result_format": null,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            1
+          ],
+          "rows": [
+            [
+              "0000000000000004"
+            ]
+          ],
+          "tag": "FETCH 1"
+        },
+        {
+          "sql": "FETCH BACKWARD 2 FROM usage_scroll_cursor",
+          "result_format": 0,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            0
+          ],
+          "rows": [
+            [
+              "33"
+            ],
+            [
+              "32"
+            ]
+          ],
+          "tag": "FETCH 2"
+        },
+        {
+          "sql": "FETCH RELATIVE -1 FROM usage_scroll_cursor",
+          "result_format": 1,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            1
+          ],
+          "rows": [
+            [
+              "0000000000000001"
+            ]
+          ],
+          "tag": "FETCH 1"
+        },
+        {
+          "sql": "MOVE ABSOLUTE 0 FROM usage_scroll_cursor",
+          "result_format": 1,
+          "columns": [],
+          "oids": [],
+          "formats": [],
+          "rows": [],
+          "tag": "MOVE 0"
+        },
+        {
+          "sql": "FETCH FORWARD 0 FROM usage_scroll_cursor",
+          "result_format": null,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            1
+          ],
+          "rows": [],
+          "tag": "FETCH 0"
+        },
+        {
+          "sql": "FETCH ALL FROM usage_scroll_cursor",
+          "result_format": null,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            1
+          ],
+          "rows": [
+            [
+              "0000000000000000"
+            ],
+            [
+              "0000000000000001"
+            ],
+            [
+              "0000000000000002"
+            ],
+            [
+              "0000000000000003"
+            ],
+            [
+              "0000000000000004"
+            ]
+          ],
+          "tag": "FETCH 5"
+        },
+        {
+          "sql": "FETCH NEXT FROM usage_scroll_cursor",
+          "result_format": 1,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            1
+          ],
+          "rows": [],
+          "tag": "FETCH 0"
+        },
+        {
+          "sql": "CLOSE usage_scroll_cursor",
+          "result_format": null,
+          "columns": [],
+          "oids": [],
+          "formats": [],
+          "rows": [],
+          "tag": "CLOSE CURSOR"
+        },
+        {
+          "sql": "COMMIT",
+          "result_format": null,
+          "columns": [],
+          "oids": [],
+          "formats": [],
+          "rows": [],
+          "tag": "COMMIT"
+        }
+      ]
+    },
+    {
+      "binary": true,
+      "scroll": true,
+      "hold": true,
+      "steps": [
+        {
+          "sql": "BEGIN ISOLATION LEVEL READ COMMITTED",
+          "result_format": null,
+          "columns": [],
+          "oids": [],
+          "formats": [],
+          "rows": [],
+          "tag": "BEGIN"
+        },
+        {
+          "sql": "DECLARE usage_scroll_cursor BINARY SCROLL CURSOR WITH HOLD FOR SELECT id FROM usage_records ORDER BY id",
+          "result_format": null,
+          "columns": [],
+          "oids": [],
+          "formats": [],
+          "rows": [],
+          "tag": "DECLARE CURSOR"
+        },
+        {
+          "sql": "COMMIT",
+          "result_format": null,
+          "columns": [],
+          "oids": [],
+          "formats": [],
+          "rows": [],
+          "tag": "COMMIT"
+        },
+        {
+          "sql": "FETCH FORWARD 2 FROM usage_scroll_cursor",
+          "result_format": null,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            1
+          ],
+          "rows": [
+            [
+              "0000000000000000"
+            ],
+            [
+              "0000000000000001"
+            ]
+          ],
+          "tag": "FETCH 2"
+        },
+        {
+          "sql": "FETCH NEXT FROM usage_scroll_cursor",
+          "result_format": 0,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            0
+          ],
+          "rows": [
+            [
+              "32"
+            ]
+          ],
+          "tag": "FETCH 1"
+        },
+        {
+          "sql": "FETCH NEXT FROM usage_scroll_cursor",
+          "result_format": 1,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            1
+          ],
+          "rows": [
+            [
+              "0000000000000003"
+            ]
+          ],
+          "tag": "FETCH 1"
+        },
+        {
+          "sql": "FETCH ABSOLUTE -1 FROM usage_scroll_cursor",
+          "result_format": null,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            1
+          ],
+          "rows": [
+            [
+              "0000000000000004"
+            ]
+          ],
+          "tag": "FETCH 1"
+        },
+        {
+          "sql": "FETCH BACKWARD 2 FROM usage_scroll_cursor",
+          "result_format": 0,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            0
+          ],
+          "rows": [
+            [
+              "33"
+            ],
+            [
+              "32"
+            ]
+          ],
+          "tag": "FETCH 2"
+        },
+        {
+          "sql": "FETCH RELATIVE -1 FROM usage_scroll_cursor",
+          "result_format": 1,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            1
+          ],
+          "rows": [
+            [
+              "0000000000000001"
+            ]
+          ],
+          "tag": "FETCH 1"
+        },
+        {
+          "sql": "MOVE ABSOLUTE 0 FROM usage_scroll_cursor",
+          "result_format": 1,
+          "columns": [],
+          "oids": [],
+          "formats": [],
+          "rows": [],
+          "tag": "MOVE 0"
+        },
+        {
+          "sql": "FETCH FORWARD 0 FROM usage_scroll_cursor",
+          "result_format": null,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            1
+          ],
+          "rows": [],
+          "tag": "FETCH 0"
+        },
+        {
+          "sql": "FETCH ALL FROM usage_scroll_cursor",
+          "result_format": null,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            1
+          ],
+          "rows": [
+            [
+              "0000000000000000"
+            ],
+            [
+              "0000000000000001"
+            ],
+            [
+              "0000000000000002"
+            ],
+            [
+              "0000000000000003"
+            ],
+            [
+              "0000000000000004"
+            ]
+          ],
+          "tag": "FETCH 5"
+        },
+        {
+          "sql": "FETCH NEXT FROM usage_scroll_cursor",
+          "result_format": 1,
+          "columns": [
+            "id"
+          ],
+          "oids": [
+            20
+          ],
+          "formats": [
+            1
+          ],
+          "rows": [],
+          "tag": "FETCH 0"
+        },
+        {
+          "sql": "CLOSE usage_scroll_cursor",
+          "result_format": null,
+          "columns": [],
+          "oids": [],
+          "formats": [],
+          "rows": [],
+          "tag": "CLOSE CURSOR"
+        }
+      ]
+    }
+  ]
+}

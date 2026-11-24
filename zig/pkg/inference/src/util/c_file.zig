@@ -564,7 +564,29 @@ pub fn readRegionInto(allocator: std.mem.Allocator, path: []const u8, offset: u6
     try readRegionFromFd(fd, buf, offset);
 }
 
-fn readRegionFromFd(fd: std.posix.fd_t, buf: []u8, offset: u64) !void {
+/// Compare open filesystem objects, including the device so that unrelated
+/// files with the same inode number on different mounts stay distinct.
+pub fn sameOpenFile(a: std.posix.fd_t, b: std.posix.fd_t) !bool {
+    if (a == b) return true;
+    if (comptime !builtin.link_libc) {
+        var first: [std.fs.max_path_bytes]u8 = undefined;
+        var second: [std.fs.max_path_bytes]u8 = undefined;
+        const af: std.Io.File = .{ .handle = a, .flags = .{ .nonblocking = false } };
+        const bf: std.Io.File = .{ .handle = b, .flags = .{ .nonblocking = false } };
+        const io = std.Options.debug_io;
+        return std.mem.eql(u8, first[0..try af.realPath(io, &first)], second[0..try bf.realPath(io, &second)]);
+    }
+    var first: c.struct_stat = undefined;
+    var second: c.struct_stat = undefined;
+    if (c.fstat(a, &first) != 0 or c.fstat(b, &second) != 0) return error.StatFailed;
+    if (comptime @hasField(c.struct_stat, "st_dev")) {
+        return first.st_dev == second.st_dev and first.st_ino == second.st_ino;
+    } else {
+        return first.dev == second.dev and first.ino == second.ino;
+    }
+}
+
+pub fn readRegionFromFd(fd: std.posix.fd_t, buf: []u8, offset: u64) !void {
     var total: usize = 0;
     while (total < buf.len) {
         const read_off = try std.math.add(u64, offset, total);

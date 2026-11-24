@@ -21,6 +21,9 @@ const admission = @import("admission.zig");
 pub const Control = struct {
     context: ?*const anyopaque = null,
     check_fn: ?*const fn (?*const anyopaque) anyerror!void = null,
+    /// A range callback can report the valid prefix when it returns an error.
+    failed_prefix: ?*usize = null,
+    optional_range: bool = false,
     pub fn check(self: Control) !void {
         if (self.check_fn) |callback| try callback(self.context);
     }
@@ -64,6 +67,8 @@ pub const Range = struct {
     /// RemoteReadBudgetExceeded rejects a request before transferring bytes.
     /// A provider that transferred a prefix can report it as a short read.
     read_at: *const fn (*anyopaque, u64, []u8, Control) anyerror!usize,
+    /// Copy an already validated prefix without I/O or provider accounting.
+    peek_at: ?*const fn (*anyopaque, u64, []u8) usize = null,
     sparse_read_at: ?*const fn (*anyopaque, u64, []u8, Control) anyerror!usize = null,
     /// Accept optional output capacity beyond a caller's required prefix.
     sparse_read_preferring: ?*const fn (*anyopaque, u64, []u8, usize, Control) anyerror!usize = null,
@@ -107,6 +112,7 @@ pub const Source = struct {
     limits: Limits = .{},
     control: Control = .{},
     admission_pool: ?*admission.Pool = null,
+    reclaimer: ?admission.Reclaimer = null,
     retained_bytes: usize = 0,
     total_bytes: u64 = 0,
     reads: usize = 0,
@@ -116,6 +122,7 @@ pub const Source = struct {
     allocator_gate: Gate = .{},
     physical: ?*Source = null,
     upstream_control: ?*const Source = null,
+    optional_range: bool = false,
     mutex: std.Io.Mutex = .init,
 
     /// A worker keeps its allocator, cancellation and local statistics. All
@@ -126,7 +133,7 @@ pub const Source = struct {
         // Preserve adapter synchronization when a worker passes the same raw
         // backing allocator. A distinct worker allocator keeps its own ownership.
         const a = RangeAllocator.forWorker(root.allocator, allocator);
-        return .{ .allocator = a, .storage = self.storage, .identity = self.identity, .limits = self.limits, .control = control, .admission_pool = pool, .physical = self.physical orelse self };
+        return .{ .allocator = a, .storage = self.storage, .identity = self.identity, .limits = self.limits, .control = control, .admission_pool = pool, .physical = self.physical orelse self, .optional_range = self.optional_range };
     }
     /// Check cancellation even when a consumer can serve from cached data.
     pub fn checkControl(self: *const Source) !void {
@@ -151,6 +158,35 @@ pub const Source = struct {
     pub fn readControlled(self: *Source, offset: u64, size: usize, caller: Control) !Lease {
         return self.readWithControl(offset, size, caller, null, .normal);
     }
+    /// Copy resident bytes without consuming the logical or transport budget.
+    pub fn peek(self: *Source, offset: u64, out: []u8) !usize {
+        try self.checkControl();
+        if (offset > self.length() or out.len > self.length() - offset) return error.UnexpectedEndOfSource;
+        switch (self.storage) {
+            .borrowed => |bytes| {
+                @memcpy(out, bytes[@intCast(offset)..][0..out.len]);
+                return out.len;
+            },
+            .range => |range| {
+                const copy = range.peek_at orelse return 0;
+                const owner = self.physical orelse self;
+                const control: Control = .{ .context = self, .check_fn = checkPeekControl };
+                if (!range.concurrent) try owner.provider_gate.lock(control);
+                defer if (!range.concurrent) owner.provider_gate.unlock();
+                try control.check();
+                const n = copy(range.context, offset, out);
+                try control.check();
+                if (n > out.len) return error.InvalidSourceRead;
+                return n;
+            },
+        }
+    }
+
+    fn checkPeekControl(context: ?*const anyopaque) anyerror!void {
+        const self: *const Source = @ptrCast(@alignCast(context.?));
+        try self.checkControl();
+    }
+
     /// Reads a small or isolated span without the transport's normal read-ahead.
     pub fn readSparse(self: *Source, offset: u64, size: usize) !Lease {
         return self.readSparseControlled(offset, size, .{});
@@ -177,18 +213,23 @@ pub const Source = struct {
         if (!self.supportsPreferredSparseRead()) return self.readSparseControlled(offset, required, control);
         const limits = self.remaining();
         const size: usize = if (limits.max_reads <= 1) required else @intCast(@max(required, @min(preferred, self.length() - offset, limits.max_read_bytes, limits.max_retained_bytes, limits.max_total_bytes)));
-        return self.readSpanWithControl(offset, required, size, control, null, .sparse) catch |err| {
-            if (size == required or (err != error.ResourceLimitExceeded and err != error.OutOfMemory)) return err;
-            return self.readSparseControlled(offset, required, control);
+        var started_io = false;
+        return self.readSpanWithControl(offset, required, size, control, null, .sparse, &started_io) catch |err| {
+            if (started_io or size == required) return err;
+            switch (err) {
+                error.ResourceLimitExceeded, error.OutOfMemory, error.SharedAdmissionExceeded, error.OptionalAudioBudgetExceeded => return self.readSparseControlled(offset, required, control),
+                else => return err,
+            }
         };
     }
 
     const ReadMode = enum { normal, sparse, isolated };
 
     fn readWithControl(self: *Source, offset: u64, size: usize, caller: Control, reclaimer: ?admission.Reclaimer, mode: ReadMode) !Lease {
-        return self.readSpanWithControl(offset, size, size, caller, reclaimer, mode);
+        return self.readSpanWithControl(offset, size, size, caller, reclaimer, mode, null);
     }
-    fn readSpanWithControl(self: *Source, offset: u64, minimum: usize, size: usize, caller: Control, reclaimer: ?admission.Reclaimer, mode: ReadMode) !Lease {
+    fn readSpanWithControl(self: *Source, offset: u64, minimum: usize, size: usize, caller: Control, explicit_reclaimer: ?admission.Reclaimer, mode: ReadMode, started_io: ?*bool) !Lease {
+        const reclaimer = explicit_reclaimer orelse self.reclaimer;
         const owner = self.physical orelse self;
         const io = std.Io.Threaded.global_single_threaded.io();
         const controls = ReadControl{ .source = owner.control, .worker = self.control };
@@ -203,6 +244,7 @@ pub const Source = struct {
             owner.mutex.lockUncancelable(io);
             defer owner.mutex.unlock(io);
             if (!self.canRead(size) or !owner.canRead(size)) return error.ResourceLimitExceeded;
+            if (self.optional_range and !owner.canSpendOptional(size)) return error.OptionalAudioBudgetExceeded;
             self.chargeBorrowed(size);
             if (owner != self) owner.chargeBorrowed(size);
             return .{ .bytes = self.storage.borrowed[@intCast(offset)..][0..size], .source = self, .reservation = token };
@@ -232,6 +274,7 @@ pub const Source = struct {
             if (serial) try owner.provider_gate.lock(control);
             defer if (serial) owner.provider_gate.unlock();
             const result = borrow(range.context, offset, size, control) catch |err| {
+                if (started_io) |started| started.* = true;
                 first_call_used = true;
                 return err;
             };
@@ -256,11 +299,19 @@ pub const Source = struct {
             try control.check();
             if (first_call_used) try self.chargeCall(owner);
             first_call_used = true;
+            if (started_io) |started| started.* = true;
+            var failed_prefix: usize = 0;
+            var range_control = control;
+            range_control.failed_prefix = &failed_prefix;
+            range_control.optional_range = self.optional_range;
             const read_result = if (mode == .sparse and range.sparse_read_preferring != null and target > minimum)
-                range.sparse_read_preferring.?(range.context, offset + done, owned[done..target], minimum - done, control)
+                range.sparse_read_preferring.?(range.context, offset + done, owned[done..target], minimum - done, range_control)
             else
-                read_at(range.context, offset + done, owned[done..target], control);
+                read_at(range.context, offset + done, owned[done..target], range_control);
             const n = read_result catch |err| {
+                if (failed_prefix > target - done) return error.InvalidSourceRead;
+                done += failed_prefix;
+                if (failed_prefix != 0) return err;
                 if (err != error.RemoteReadBudgetExceeded or target == minimum) return err;
                 target = minimum;
                 continue;
@@ -337,6 +388,7 @@ pub const Source = struct {
         owner.mutex.lockUncancelable(io);
         defer owner.mutex.unlock(io);
         if (!self.canRead(size) or !owner.canRead(size)) return error.ResourceLimitExceeded;
+        if (self.optional_range and !owner.canSpendOptional(size)) return error.OptionalAudioBudgetExceeded;
         self.pending_bytes += size;
         self.reads += 1;
         self.retained_bytes += size;
@@ -351,6 +403,7 @@ pub const Source = struct {
         owner.mutex.lockUncancelable(io);
         defer owner.mutex.unlock(io);
         if (self.reads >= self.limits.max_reads or owner.reads >= owner.limits.max_reads) return error.ResourceLimitExceeded;
+        if (self.optional_range and !owner.canSpendOptional(0)) return error.OptionalAudioBudgetExceeded;
         self.reads += 1;
         if (owner != self) owner.reads += 1;
     }
@@ -377,10 +430,15 @@ pub const Source = struct {
         return .{
             .max_read_bytes = @min(self.limits.max_read_bytes, owner.limits.max_read_bytes),
             .max_retained_bytes = @min(self.limits.max_retained_bytes -| self.retained_bytes, owner.limits.max_retained_bytes -| owner.retained_bytes),
-            .max_total_bytes = @min(self.limits.max_total_bytes -| self.total_bytes -| self.pending_bytes, owner.limits.max_total_bytes -| owner.total_bytes -| owner.pending_bytes),
-            .max_reads = @min(self.limits.max_reads -| self.reads, owner.limits.max_reads -| owner.reads),
+            .max_total_bytes = @min(self.limits.max_total_bytes -| self.total_bytes -| self.pending_bytes, owner.limits.max_total_bytes -| owner.total_bytes -| owner.pending_bytes -| (if (self.optional_range) @max(1, owner.limits.max_total_bytes / 4) else 0)),
+            .max_reads = @min(self.limits.max_reads -| self.reads, owner.limits.max_reads -| owner.reads -| (if (self.optional_range) @max(1, owner.limits.max_reads / 4) else 0)),
         };
     }
+    fn canSpendOptional(self: *const Source, size: usize) bool {
+        return self.limits.max_reads -| self.reads > @max(1, self.limits.max_reads / 4) and
+            size <= self.limits.max_total_bytes -| self.total_bytes -| self.pending_bytes -| @max(1, self.limits.max_total_bytes / 4);
+    }
+
     fn canRead(self: *const Source, size: usize) bool {
         return size <= self.limits.max_read_bytes and size <= self.limits.max_retained_bytes -| self.retained_bytes and
             size <= self.limits.max_total_bytes -| self.total_bytes -| self.pending_bytes and self.reads < self.limits.max_reads;
@@ -719,6 +777,32 @@ test "preferred sparse reads keep a short reply and account for its owned alloca
     try std.testing.expectEqual(@as(usize, 0), source.retained_bytes);
 }
 
+test "preferred sparse reads retry exact demand after preflight memory pressure" {
+    const Provider = struct {
+        calls: usize = 0,
+        fn read(raw: *anyopaque, _: u64, out: []u8, _: Control) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            @memset(out, 42);
+            return out.len;
+        }
+    };
+    var provider = Provider{};
+    var pool = admission.Pool{ .limits = .{ .host_bytes = 2 } };
+    var source = Source{
+        .allocator = std.testing.allocator,
+        .identity = "preferred-preflight",
+        .storage = .{ .range = .{ .context = &provider, .read_at = Provider.read, .length = 16, .accepts_full_read_size = true } },
+        .admission_pool = &pool,
+    };
+    var lease = try source.readSparsePreferring(0, 2, 8, .{});
+    defer lease.deinit();
+    try std.testing.expectEqualSlices(u8, &.{ 42, 42 }, lease.bytes);
+    try std.testing.expectEqual(@as(usize, 1), provider.calls);
+    try std.testing.expectEqual(@as(usize, 1), source.reads);
+    try std.testing.expectEqual(@as(usize, 2), source.retained_bytes);
+}
+
 test "preferred sparse reads send only demand to a legacy adapter with one attempt" {
     const Provider = struct {
         used: bool = false,
@@ -737,4 +821,60 @@ test "preferred sparse reads send only demand to a legacy adapter with one attem
     defer lease.deinit();
     try std.testing.expectEqualSlices(u8, &.{ 42, 42 }, lease.bytes);
     try std.testing.expectEqual(@as(usize, 1), source.reads);
+}
+
+test "optional views preserve physical read and byte reserves" {
+    const Provider = struct {
+        fn read(_: *anyopaque, _: u64, out: []u8, _: Control) !usize {
+            @memset(out, 0);
+            return out.len;
+        }
+    };
+    var marker: u8 = 0;
+    var physical = Source{
+        .allocator = std.testing.allocator,
+        .identity = "shared-budget",
+        .storage = .{ .range = .{ .context = &marker, .read_at = Provider.read, .length = 32 } },
+        .limits = .{ .max_reads = 4, .max_total_bytes = 8 },
+    };
+    for (0..3) |_| {
+        var required = try physical.read(0, 2);
+        required.deinit();
+    }
+    var optional = physical.view(std.testing.allocator, null, .{});
+    optional.optional_range = true;
+    try std.testing.expectError(error.OptionalAudioBudgetExceeded, optional.read(0, 1));
+    try std.testing.expectEqual(@as(usize, 3), physical.reads);
+    var required = try physical.read(0, 2);
+    required.deinit();
+}
+
+test "resident peek observes physical cancellation while the provider is contended" {
+    const Fixture = struct {
+        checks: usize = 0,
+        fn check(raw: ?*const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.checks += 1;
+            if (self.checks >= 2) return error.Cancelled;
+        }
+        fn read(_: *anyopaque, _: u64, _: []u8, _: Control) !usize {
+            return error.UnexpectedRead;
+        }
+        fn peek(_: *anyopaque, _: u64, _: []u8) usize {
+            unreachable;
+        }
+    };
+    var fixture = Fixture{};
+    var owner = Source{
+        .allocator = std.testing.allocator,
+        .identity = "peek-cancellation",
+        .storage = .{ .range = .{ .context = &fixture, .read_at = Fixture.read, .peek_at = Fixture.peek, .length = 1 } },
+        .control = .{ .context = &fixture, .check_fn = Fixture.check },
+    };
+    var worker = owner.view(std.testing.allocator, null, .{});
+    try owner.provider_gate.lock(null);
+    defer owner.provider_gate.unlock();
+    var out: [1]u8 = undefined;
+    try std.testing.expectError(error.Cancelled, worker.peek(0, &out));
+    try std.testing.expectEqual(@as(usize, 0), owner.reads);
 }

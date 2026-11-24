@@ -1,0 +1,1239 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL exact SQL",
+  "cases": [
+    {
+      "id": "sql-0734",
+      "table": "usage_records",
+      "constraint_collection": "foreign_keys",
+      "check_name": "usage_records_user_id_fkey",
+      "preserve_ddl_primary": true,
+      "verify_primary_identity": true,
+      "setup": [
+        {
+          "statement": "CREATE TABLE users(id TEXT PRIMARY KEY)",
+          "table": "users"
+        },
+        {
+          "statement": "CREATE TABLE usage_records(id UUID PRIMARY KEY,user_id TEXT,status TEXT)",
+          "table": "usage_records"
+        },
+        {
+          "statement": "INSERT INTO users(id) VALUES ('known')"
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,user_id,status) VALUES ('00000000-0000-0000-0000-000000000001','legacy-orphan','old'),('00000000-0000-0000-0000-000000000002','known','valid'),('00000000-0000-0000-0000-000000000005','deleted-orphan','old'),('00000000-0000-0000-0000-000000000004','cold-orphan','retained-history')"
+        }
+      ],
+      "read_sql": "SELECT id::text AS id,user_id,status FROM usage_records ORDER BY id",
+      "ddl_sqlstate": null,
+      "probes": [
+        {
+          "statement": "UPDATE usage_records SET user_id='missing' WHERE id='00000000-0000-0000-0000-000000000001'",
+          "sqlstate": "23503",
+          "after": {
+            "id": "sql-0734",
+            "columns": [
+              "id",
+              "user_id",
+              "status"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "legacy-orphan",
+                "old"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000002",
+                "known",
+                "valid"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000004",
+                "cold-orphan",
+                "retained-history"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000005",
+                "deleted-orphan",
+                "old"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM users ORDER BY id",
+              "output": {
+                "id": "sql-0734",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "known"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ],
+          "declared_not_valid": true
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,user_id,status) VALUES ('00000000-0000-0000-0000-000000000003','missing','new')",
+          "sqlstate": "23503",
+          "after": {
+            "id": "sql-0734",
+            "columns": [
+              "id",
+              "user_id",
+              "status"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "legacy-orphan",
+                "old"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000002",
+                "known",
+                "valid"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000004",
+                "cold-orphan",
+                "retained-history"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000005",
+                "deleted-orphan",
+                "old"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM users ORDER BY id",
+              "output": {
+                "id": "sql-0734",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "known"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ],
+          "declared_not_valid": true
+        },
+        {
+          "statement": "UPDATE usage_records SET status='untouched-key' WHERE id='00000000-0000-0000-0000-000000000001'",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-0734",
+            "columns": [
+              "id",
+              "user_id",
+              "status"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "legacy-orphan",
+                "untouched-key"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000002",
+                "known",
+                "valid"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000004",
+                "cold-orphan",
+                "retained-history"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000005",
+                "deleted-orphan",
+                "old"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM users ORDER BY id",
+              "output": {
+                "id": "sql-0734",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "known"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ],
+          "declared_not_valid": true
+        },
+        {
+          "statement": "DELETE FROM usage_records WHERE id='00000000-0000-0000-0000-000000000005'",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-0734",
+            "columns": [
+              "id",
+              "user_id",
+              "status"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "legacy-orphan",
+                "untouched-key"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000002",
+                "known",
+                "valid"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000004",
+                "cold-orphan",
+                "retained-history"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM users ORDER BY id",
+              "output": {
+                "id": "sql-0734",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "known"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ],
+          "declared_not_valid": true
+        },
+        {
+          "statement": "INSERT INTO users(id) VALUES ('legacy-orphan')",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-0734",
+            "columns": [
+              "id",
+              "user_id",
+              "status"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "legacy-orphan",
+                "untouched-key"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000002",
+                "known",
+                "valid"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000004",
+                "cold-orphan",
+                "retained-history"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM users ORDER BY id",
+              "output": {
+                "id": "sql-0734",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "known"
+                  ],
+                  [
+                    "legacy-orphan"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ],
+          "declared_not_valid": true
+        },
+        {
+          "statement": "DELETE FROM users WHERE id='legacy-orphan'",
+          "sqlstate": "23503",
+          "after": {
+            "id": "sql-0734",
+            "columns": [
+              "id",
+              "user_id",
+              "status"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "legacy-orphan",
+                "untouched-key"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000002",
+                "known",
+                "valid"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000004",
+                "cold-orphan",
+                "retained-history"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM users ORDER BY id",
+              "output": {
+                "id": "sql-0734",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "known"
+                  ],
+                  [
+                    "legacy-orphan"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ],
+          "declared_not_valid": true,
+          "reopen": {
+            "sqlstate": null
+          }
+        },
+        {
+          "statement": "DELETE FROM users WHERE id='known'",
+          "sqlstate": "23503",
+          "after": {
+            "id": "sql-0734",
+            "columns": [
+              "id",
+              "user_id",
+              "status"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "legacy-orphan",
+                "untouched-key"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000002",
+                "known",
+                "valid"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000004",
+                "cold-orphan",
+                "retained-history"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM users ORDER BY id",
+              "output": {
+                "id": "sql-0734",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "known"
+                  ],
+                  [
+                    "legacy-orphan"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ],
+          "declared_not_valid": true
+        },
+        {
+          "statement": "UPDATE usage_records SET user_id='known' WHERE id='00000000-0000-0000-0000-000000000001'",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-0734",
+            "columns": [
+              "id",
+              "user_id",
+              "status"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "known",
+                "untouched-key"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000002",
+                "known",
+                "valid"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000004",
+                "cold-orphan",
+                "retained-history"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM users ORDER BY id",
+              "output": {
+                "id": "sql-0734",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "known"
+                  ],
+                  [
+                    "legacy-orphan"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ],
+          "declared_not_valid": true
+        },
+        {
+          "statement": "DELETE FROM users WHERE id='legacy-orphan'",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-0734",
+            "columns": [
+              "id",
+              "user_id",
+              "status"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "known",
+                "untouched-key"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000002",
+                "known",
+                "valid"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000004",
+                "cold-orphan",
+                "retained-history"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM users ORDER BY id",
+              "output": {
+                "id": "sql-0734",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "known"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ],
+          "declared_not_valid": true
+        },
+        {
+          "statement": "DELETE FROM usage_records WHERE id='00000000-0000-0000-0000-000000000002'",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-0734",
+            "columns": [
+              "id",
+              "user_id",
+              "status"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "known",
+                "untouched-key"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000004",
+                "cold-orphan",
+                "retained-history"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM users ORDER BY id",
+              "output": {
+                "id": "sql-0734",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "known"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ],
+          "declared_not_valid": true
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,user_id,status) VALUES ('00000000-0000-0000-0000-000000000003',NULL,'nullable')",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-0734",
+            "columns": [
+              "id",
+              "user_id",
+              "status"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "known",
+                "untouched-key"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000003",
+                null,
+                "nullable"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000004",
+                "cold-orphan",
+                "retained-history"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                true,
+                false
+              ],
+              [
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM users ORDER BY id",
+              "output": {
+                "id": "sql-0734",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "known"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ],
+          "declared_not_valid": true
+        },
+        {
+          "statement": "DELETE FROM usage_records WHERE id='00000000-0000-0000-0000-000000000003'",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-0734",
+            "columns": [
+              "id",
+              "user_id",
+              "status"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "known",
+                "untouched-key"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000004",
+                "cold-orphan",
+                "retained-history"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM users ORDER BY id",
+              "output": {
+                "id": "sql-0734",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "known"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ],
+          "declared_not_valid": true
+        },
+        {
+          "statement": "INSERT INTO users(id) VALUES ('cold-orphan')",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-0734",
+            "columns": [
+              "id",
+              "user_id",
+              "status"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "known",
+                "untouched-key"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000004",
+                "cold-orphan",
+                "retained-history"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM users ORDER BY id",
+              "output": {
+                "id": "sql-0734",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "cold-orphan"
+                  ],
+                  [
+                    "known"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ],
+          "declared_not_valid": true
+        },
+        {
+          "statement": "DELETE FROM users WHERE id='cold-orphan'",
+          "sqlstate": "23503",
+          "after": {
+            "id": "sql-0734",
+            "columns": [
+              "id",
+              "user_id",
+              "status"
+            ],
+            "rows": [
+              [
+                "00000000-0000-0000-0000-000000000001",
+                "known",
+                "untouched-key"
+              ],
+              [
+                "00000000-0000-0000-0000-000000000004",
+                "cold-orphan",
+                "retained-history"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM users ORDER BY id",
+              "output": {
+                "id": "sql-0734",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "cold-orphan"
+                  ],
+                  [
+                    "known"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ],
+          "declared_not_valid": true
+        }
+      ],
+      "after_ddl": {
+        "id": "sql-0734",
+        "columns": [
+          "id",
+          "user_id",
+          "status"
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "legacy-orphan",
+            "old"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000002",
+            "known",
+            "valid"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000004",
+            "cold-orphan",
+            "retained-history"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000005",
+            "deleted-orphan",
+            "old"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ]
+        ],
+        "column_oids": [
+          25,
+          25,
+          25
+        ],
+        "affected": 0
+      },
+      "related_after_ddl": [
+        {
+          "statement": "SELECT id FROM users ORDER BY id",
+          "output": {
+            "id": "sql-0734",
+            "columns": [
+              "id"
+            ],
+            "rows": [
+              [
+                "known"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false
+              ]
+            ],
+            "column_oids": [
+              25
+            ],
+            "affected": 0
+          }
+        }
+      ],
+      "declared_not_valid": true
+    }
+  ]
+}
