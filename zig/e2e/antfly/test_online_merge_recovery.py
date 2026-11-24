@@ -809,6 +809,11 @@ class CdcUploadFault(OwnerLinkFault):
         with self.lock:
             if not self.armed or self.healed or self.original is not None:
                 return False
+            accepted = body.get("_observed_committed_upload")
+            if accepted is not None:
+                self.original = accepted
+                self.reply_dropped.set()
+                return True
             confirmed_chunk = body.get("_observed_first_chunk")
             if confirmed_chunk is not None:
                 self.original = confirmed_chunk
@@ -879,9 +884,22 @@ class CdcUploadFault(OwnerLinkFault):
                     and record.get("status") == "committed"
                     and record.get("source_scope")
                 ):
-                    token = int(record["source_scope"]["token"])
+                    scope = record["source_scope"]
+                    token = int(scope["token"])
                     identity = self.wire_bytes(body["transaction_id"]).hex()
                     self.committed_transactions.setdefault(token, set()).add(identity)
+                    accepted = self.acceptance_upload
+                    if (
+                        self.window == "cdc_accepted"
+                        and self.original is None
+                        and accepted is not None
+                        and token == self.upload_token(accepted)
+                        and self.wire_bytes(scope["binding"])
+                        == self.wire_bytes(accepted["command"]["spec"]["binding"])
+                    ):
+                        # The coordinator's qualified COMMIT read also proves
+                        # acceptance when participant publication stays local.
+                        body["_observed_committed_upload"] = accepted
         if command is None:
             return
         applied = (response.json().get("outcome") or {}).get("applied")
@@ -923,6 +941,52 @@ def test_cdc_chunk_fault_blocks_second_chunk_after_unconfirmed_reply():
     assert fault.block(0, second)
     assert fault.reply_dropped.is_set()
     assert fault.original is first
+
+
+def test_cdc_accepted_fault_matches_committed_upload_without_forwarded_publish():
+    fault = CdcUploadFault("cdc_accepted")
+    fault.armed = True
+    token = 9
+    upload = {
+        "_fault_path": "/internal/groups/7/source-plan/control-v1",
+        "operation": "submit",
+        "source_owner": {"group_id": 7},
+        "command": {
+            "action": "begin",
+            "spec": {
+                "attempt": list(token.to_bytes(8, "big") + bytes(24)),
+                "binding": [1] * 32,
+                "chunk_hashes": ["first", "second"],
+            },
+        },
+    }
+    assert not fault.block(0, upload)
+
+    def observe(status, binding):
+        decision = {
+            "_fault_path": "/internal/groups/7/history/decision-v1",
+            "transaction_id": [3] * 16,
+        }
+        response = requests.Response()
+        response.status_code = 200
+        response._content = json.dumps(
+            {
+                "decision": {
+                    "record": {
+                        "status": status,
+                        "source_scope": {"token": token, "binding": binding},
+                    }
+                }
+            }
+        ).encode()
+        fault.observe_response(0, decision, response)
+        return fault.drop_reply(0, decision)
+
+    assert not observe("pending", [1] * 32)
+    assert not observe("committed", [2] * 32)
+    assert observe("committed", [1] * 32)
+    assert fault.reply_dropped.is_set()
+    assert fault.original is upload
 
 
 @pytest.fixture
