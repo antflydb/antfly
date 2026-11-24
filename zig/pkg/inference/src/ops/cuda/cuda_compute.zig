@@ -99,8 +99,9 @@ pub const CudaTensor = struct {
     // Constant snapshots bypass the temporary pool. The last borrower owns
     // both the direct allocation and its retained shared-admission lease.
     model_constant: bool = false,
-    model_constant_quota: CacheQuota = .none,
-    retained_output_quota: CacheQuota = .none,
+    // Model constants and retained audio output roots never share a header.
+    // Both hold the same quota type and retire it only after SDK storage dies.
+    retained_quota: CacheQuota = .none,
     cache_retirement_slot: ?*@import("cache_retirement.zig").PreparedQuotas.Slot = null,
     gemma4_projector_constant: bool = false,
     gemma4_projector_weight: bool = false,
@@ -3085,7 +3086,7 @@ pub const CudaCompute = struct {
         const root = self.embedding_gemma2_constants.get(request.constant.name.slice()) orelse return true;
         if (!root.model_constant or root.dtype != .f32 or root.buffer.len != request.constant.bytes) return error.PreparedCacheAmountChanged;
         if (desired) |policy| {
-            const lease = root.model_constant_quota.peek() orelse return error.MissingCacheRetirementLease;
+            const lease = root.retained_quota.peek() orelse return error.MissingCacheRetirementLease;
             if (lease.controller != policy.controller) return error.ForeignAdmissionDomain;
         }
         return false;
@@ -6634,7 +6635,7 @@ pub const CudaCompute = struct {
         var iterator = self.embedding_gemma2_constants.iterator();
         while (iterator.next()) |entry| {
             const root = entry.value_ptr.*;
-            if (root.cache_retirement_slot) |slot| try slot.validateCleanup(current) else try root.model_constant_quota.validateCleanup(current);
+            if (root.cache_retirement_slot) |slot| try slot.validateCleanup(current) else try root.retained_quota.validateCleanup(current);
         }
     }
     fn clearEmbeddingGemma2ConstantsWithCleanup(self: *CudaCompute, context_destroyed: bool, current: CacheCleanup) !void {
@@ -6763,7 +6764,7 @@ pub const CudaCompute = struct {
         if (self.physical_execution_storage != null or self.capturing_physical_storage.values.items.len != 0) return false;
         const input = tensorFromCt(value);
         if (input.resident_owner) |owner| if (owner != self) return false;
-        if (!input.owned_by_tensor or !input.owns_buffer or !input.owns_shape or input.resident_references.load(.acquire) != 1 or input.resident_parent != null or input.storage_retirement != null or input.foreign_payload_owner != null or input.foreign_clone_owner != null or input.foreign_header_allocator != null or input.physical_lease != null or input.physical_storage_base or input.model_constant or input.model_constant_quota.hasLease() or input.immutable_cache_backing or input.strict_resident_training or input.quant_type != null or input.tc_quant != null or input.resident_indices != null or input.training_upload_host.ptr != null or input.training_upload_generation != null) return false;
+        if (!input.owned_by_tensor or !input.owns_buffer or !input.owns_shape or input.resident_references.load(.acquire) != 1 or input.resident_parent != null or input.storage_retirement != null or input.foreign_payload_owner != null or input.foreign_clone_owner != null or input.foreign_header_allocator != null or input.physical_lease != null or input.physical_storage_base or input.model_constant or input.retained_quota.hasLease() or input.immutable_cache_backing or input.strict_resident_training or input.quant_type != null or input.tc_quant != null or input.resident_indices != null or input.training_upload_host.ptr != null or input.training_upload_generation != null) return false;
         for (input.auxiliary_leases) |lease| if (lease != null) return false;
         if (input.dtype != .f32 and input.dtype != .bf16) return false;
         const primary = try input.dtype.byteCount(input.elem_count);
@@ -6952,7 +6953,7 @@ pub const CudaCompute = struct {
                 var index: usize = 0;
                 while (iterator.next()) |entry| {
                     const root = entry.value_ptr.*;
-                    if (root.model_constant_quota.peek()) |lease| root.cache_retirement_slot = self.quotas.?.reserve(lease) catch unreachable;
+                    if (root.retained_quota.peek()) |lease| root.cache_retirement_slot = self.quotas.?.reserve(lease) catch unreachable;
                     self.constant_entries[index] = .{ .root = root, .key = entry.key_ptr.* };
                     index += 1;
                 }
@@ -7102,7 +7103,7 @@ pub const CudaCompute = struct {
                 hash.update(entry.key_ptr.*);
                 CacheRetirement.word(&hash, @intFromPtr(root));
                 CacheRetirement.buffer(&hash, root.buffer);
-                leases += try CacheRetirement.leaseWord(&hash, root.model_constant_quota.peek(), &controller);
+                leases += try CacheRetirement.leaseWord(&hash, root.retained_quota.peek(), &controller);
             }
         }
         if (selection.video()) {
@@ -7225,7 +7226,7 @@ pub const CudaCompute = struct {
                     if (!value.model_constant or value.dtype != .f32 or value.buffer.len != span.bytes) return error.PreparedCacheAmountChanged;
                     var root = value;
                     while (root.resident_parent) |parent| root = parent;
-                    return .{ .quota = &root.model_constant_quota };
+                    return .{ .quota = &root.retained_quota };
                 }
                 if (span.bytes == 0 or span.bytes > constant_policy.prepared_max_bytes -| self.embedding_gemma2_constant_bytes.load(.acquire) or self.embedding_gemma2_constant_count.load(.acquire) >= constant_policy.prepared_max_entries) return .{};
                 return .{ .miss = true, .amounts = .{ .backend_scratch_bytes = span.bytes } };
@@ -7833,7 +7834,7 @@ pub const CudaCompute = struct {
         // This compatibility producer owns an independently acquired raw
         // weight lease. Managed callers use the prepared constant publisher;
         // they must never acquire raw quota inside an execution boundary.
-        source.model_constant_quota = CacheQuota.fromRawAdmission(lease);
+        source.retained_quota = CacheQuota.fromRawAdmission(lease);
         _ = source.resident_references.fetchAdd(1, .acq_rel);
         self.gemma4_projector_weight_bytes += bytes;
         self.gemma4_projector_weight_count += 1;
@@ -7858,7 +7859,7 @@ pub const CudaCompute = struct {
 
     fn validateProjectorConstantCleanup(self: *const CudaCompute, current: CacheCleanup) !void {
         var it = self.gemma4_projector_weights.valueIterator();
-        while (it.next()) |root| try root.*.model_constant_quota.validateCleanup(current);
+        while (it.next()) |root| try root.*.retained_quota.validateCleanup(current);
     }
 
     fn clearGemma4ProjectorWeightsWithCleanup(self: *CudaCompute, context_destroyed: bool, current: CacheCleanup) !void {
@@ -13010,7 +13011,7 @@ fn freeCudaTensorStorage(self: *CudaCompute, cuda_tensor: *CudaTensor, current: 
     if (cuda_tensor.cache_retirement_slot) |slot| {
         slot.validateCleanup(current) catch platform.inference_process_supervisor.restartWorker();
     } else if (cuda_tensor.model_constant) {
-        if (legacy_projector) cuda_tensor.model_constant_quota.validateLegacyRaw() catch platform.inference_process_supervisor.restartWorker() else cuda_tensor.model_constant_quota.validateCleanup(current) catch platform.inference_process_supervisor.restartWorker();
+        if (legacy_projector) cuda_tensor.retained_quota.validateLegacyRaw() catch platform.inference_process_supervisor.restartWorker() else cuda_tensor.retained_quota.validateCleanup(current) catch platform.inference_process_supervisor.restartWorker();
     }
     if (cuda_tensor.physical_storage_base) {
         freePhysicalRootChecked(self, cuda_tensor) catch platform.inference_process_supervisor.restartWorker();
@@ -13033,12 +13034,12 @@ fn freeCudaTensorStorage(self: *CudaCompute, cuda_tensor: *CudaTensor, current: 
             slot.validateCleanup(current) catch platform.inference_process_supervisor.restartWorker();
             _ = cuda_tensor.buffer.freeChecked(&self.ctx) catch platform.inference_process_supervisor.restartWorker();
             noteModelConstantRetirement(self, cuda_tensor);
-            cuda_tensor.model_constant_quota.finishRetainedAfterSdkDeath(slot, current) catch platform.inference_process_supervisor.restartWorker();
+            cuda_tensor.retained_quota.finishRetainedAfterSdkDeath(slot, current) catch platform.inference_process_supervisor.restartWorker();
             cuda_tensor.cache_retirement_slot = null;
         } else {
             _ = cuda_tensor.buffer.freeChecked(&self.ctx) catch platform.inference_process_supervisor.restartWorker();
             noteModelConstantRetirement(self, cuda_tensor);
-            if (legacy_projector) cuda_tensor.model_constant_quota.releaseLegacyRawAfterSdkDeath() catch platform.inference_process_supervisor.restartWorker() else cuda_tensor.model_constant_quota.releaseAfterSdkDeath(current) catch platform.inference_process_supervisor.restartWorker();
+            if (legacy_projector) cuda_tensor.retained_quota.releaseLegacyRawAfterSdkDeath() catch platform.inference_process_supervisor.restartWorker() else cuda_tensor.retained_quota.releaseAfterSdkDeath(current) catch platform.inference_process_supervisor.restartWorker();
         }
     } else if (cuda_tensor.owns_buffer) releaseDeviceBuffer(self, &cuda_tensor.buffer);
     if (cuda_tensor.owns_shape) self.allocator.free(cuda_tensor.shape);
@@ -18076,13 +18077,13 @@ fn modelConstantOp(ctx: *anyopaque, key: []const u8, value: ?CT) anyerror!?CT {
     // runs on a cache hit and cannot pin a request's temporary allocation.
     try buffer.copyFromDevice(&self.ctx, source.buffer, bytes);
     try self.ctx.synchronize();
-    snapshot.* = .{ .buffer = buffer, .dtype = source.dtype, .shape = shape, .elem_count = source.elem_count, .model_constant = true, .model_constant_quota = .none };
+    snapshot.* = .{ .buffer = buffer, .dtype = source.dtype, .shape = shape, .elem_count = source.elem_count, .model_constant = true, .retained_quota = .none };
     const result = try borrowModelConstant(self, snapshot);
     if (self.bounded_decode_graph.active) if (self.captured_cache_roots) |roots| roots.selected(self, key, snapshot) catch |err| {
         freeTensor(self, result);
         return err;
     };
-    snapshot.model_constant_quota = lease.publishQuota();
+    snapshot.retained_quota = lease.publishQuota();
     _ = self.embedding_gemma2_constant_bytes.fetchAdd(bytes, .release);
     _ = self.embedding_gemma2_constant_count.fetchAdd(1, .release);
     self.lockConstantMetadata();
@@ -18116,7 +18117,7 @@ fn freeTensorWithCleanup(ctx: *anyopaque, tensor: CT, cleanup: @import("../../ex
     if (retirement) |owner| {
         const physical_lease = cuda_tensor.physical_lease;
         const auxiliary_leases = cuda_tensor.auxiliary_leases;
-        if (cuda_tensor.retained_output_quota.hasLease()) {
+        if (!cuda_tensor.model_constant and cuda_tensor.retained_quota.hasLease()) {
             freeRetainedAudioOutput(cuda_tensor, cleanup);
             return;
         }
@@ -18154,8 +18155,7 @@ fn borrowedSlotTensor(tensor: *const CudaTensor) CudaTensor {
     borrowed.resident_parent = null;
     borrowed.resident_references = .init(1);
     borrowed.model_constant = false;
-    borrowed.model_constant_quota = .none;
-    borrowed.retained_output_quota = .none;
+    borrowed.retained_quota = .none;
     borrowed.cache_retirement_slot = null;
     borrowed.owns_buffer = false;
     borrowed.owns_tc_quant = false;
@@ -20518,8 +20518,9 @@ fn stageAudioGraphInputs(self: *CudaCompute, input_bank: buffer_mod.DeviceBuffer
 }
 
 fn freeRetainedAudioOutput(tensor: *CudaTensor, cleanup: CacheCleanup) void {
+    std.debug.assert(!tensor.model_constant);
     const owner = tensor.storage_retirement.?;
-    const quota = &tensor.retained_output_quota;
+    const quota = &tensor.retained_quota;
     const slot = tensor.cache_retirement_slot;
     if (slot) |value| {
         value.validateCleanup(cleanup) catch platform.inference_process_supervisor.restartWorker();
@@ -20552,7 +20553,7 @@ fn retainAudioGraphBacking(self: *CudaCompute, bank: *buffer_mod.DeviceBuffer, q
     retirement.retain();
     tensor.* = .{
         .storage_retirement = retirement,
-        .retained_output_quota = quota.*,
+        .retained_quota = quota.*,
         .immutable_cache_backing = true,
         .buffer = bank.*,
         .dtype = .f32,
@@ -20564,7 +20565,7 @@ fn retainAudioGraphBacking(self: *CudaCompute, bank: *buffer_mod.DeviceBuffer, q
     bank.* = .{ .ptr = bank.ptr, .len = bank.len, .borrowed = true };
     return .{
         .owner = tensor,
-        .quota = &tensor.retained_output_quota,
+        .quota = &tensor.retained_quota,
         .retirement_slot = &tensor.cache_retirement_slot,
         .release = dropAudioGraphOutput,
     };
@@ -40811,7 +40812,7 @@ fn storageOwnershipOp(ctx: *anyopaque, tensor: CT, visitor: @import("../../execu
     };
     if (physical) |lease| {
         if (lease.admission) |reserved| span.charged = .{ .identity = reserved.identity, .bytes = lease.admittedBytes() };
-    } else if (owner.model_constant_quota.peek()) |lease| {
+    } else if (owner.retained_quota.peek()) |lease| {
         if (lease.controller) |controller| span.charged = .{ .identity = .{ .controller = controller, .backend_class = .gpu }, .bytes = lease.amounts.backendTotalBytes() };
     }
     try visitor.emit(.{ .backing = span });
@@ -47976,7 +47977,7 @@ fn pinCachedStorageRoot(self: *CudaCompute, source: *CudaTensor) !?*CudaTensor {
     if (source.resident_parent) |parent| return parent;
     if (!source.immutable_cache_backing or source.resident_owner != self or !source.owns_buffer or source.buffer.borrowed or source.strict_resident_training or source.model_constant or source.physical_lease != null or source.training_upload_host.ptr != null) return null;
     for (source.auxiliary_leases) |lease| if (lease != null) return null;
-    if (source.model_constant_quota.hasLease() or (source.bf16_mirror.ptr != 0 and !source.owns_bf16_mirror) or (source.tc_quant != null and !source.owns_tc_quant) or (source.resident_indices != null and !source.owns_resident_indices)) return null;
+    if (source.retained_quota.hasLease() or (source.bf16_mirror.ptr != 0 and !source.owns_bf16_mirror) or (source.tc_quant != null and !source.owns_tc_quant) or (source.resident_indices != null and !source.owns_resident_indices)) return null;
     if (source.buffer.ptr != 0 and source.buffer.allocation_bytes == 0) return null;
     if (source.owns_bf16_mirror and (source.bf16_mirror.borrowed or (source.bf16_mirror.ptr != 0 and source.bf16_mirror.allocation_bytes == 0))) return null;
     if (source.owns_tc_quant) if (source.tc_quant) |quant| {
@@ -48954,7 +48955,7 @@ test "CUDA RMS direct route keeps live auxiliary policy invocation scoped" {
 /// Planned banks have one direct allocation. Confirm physical retirement before
 /// any header/Lease reservation can disappear; uncertainty restarts the worker.
 fn freePhysicalRootChecked(self: *CudaCompute, tensor: *CudaTensor) !void {
-    if (!tensor.physical_storage_base or !tensor.owns_buffer or tensor.buffer.borrowed or tensor.physical_lease != null or tensor.resident_parent != null or tensor.model_constant or tensor.model_constant_quota.hasLease() or tensor.storage_retirement != null or tensor.tc_quant != null or tensor.bf16_mirror.ptr != 0 or tensor.training_upload_host.ptr != null or tensor.resident_indices != null) return error.InvalidPhysicalStorageRoot;
+    if (!tensor.physical_storage_base or !tensor.owns_buffer or tensor.buffer.borrowed or tensor.physical_lease != null or tensor.resident_parent != null or tensor.model_constant or tensor.retained_quota.hasLease() or tensor.storage_retirement != null or tensor.tc_quant != null or tensor.bf16_mirror.ptr != 0 or tensor.training_upload_host.ptr != null or tensor.resident_indices != null) return error.InvalidPhysicalStorageRoot;
     for (tensor.auxiliary_leases) |lease| if (lease != null) return error.InvalidPhysicalStorageRoot;
     if (tensor.buffer.ptr != 0) {
         self.stats.device_free_calls += 1;
@@ -50146,7 +50147,7 @@ const ForeignCloneOwner = struct {
 fn detachedEncoderRoot(view: *CudaTensor) ?*CudaTensor {
     var root = view;
     for (0..64) |_| {
-        if (!root.owned_by_tensor or root.resident_references.load(.acquire) != 1 or root.storage_retirement != null or root.resident_owner != null or root.foreign_clone_owner != null or root.physical_lease != null or root.model_constant or root.model_constant_quota.hasLease() or root.immutable_cache_backing or root.strict_resident_training or root.quant_type != null or root.tc_quant != null or root.bf16_mirror.ptr != 0 or root.training_upload_host.ptr != null or root.training_upload_generation != null or root.resident_indices != null or root.physical_storage_base) return null;
+        if (!root.owned_by_tensor or root.resident_references.load(.acquire) != 1 or root.storage_retirement != null or root.resident_owner != null or root.foreign_clone_owner != null or root.physical_lease != null or root.model_constant or root.retained_quota.hasLease() or root.immutable_cache_backing or root.strict_resident_training or root.quant_type != null or root.tc_quant != null or root.bf16_mirror.ptr != 0 or root.training_upload_host.ptr != null or root.training_upload_generation != null or root.resident_indices != null or root.physical_storage_base) return null;
         for (root.auxiliary_leases) |auxiliary| if (auxiliary != null) return null;
         if (root.owns_buffer) {
             if (root.resident_parent != null or root.buffer.borrowed) return null;
@@ -50183,7 +50184,7 @@ fn prepareAsyncForeignTensorCopyPolicy(comptime failure_policy: ColdCopyFailureP
     if (logical_view.shape.len > 8) return null;
     if (source.run_budget != null or source.execution_scope != null) return null;
     if (tensor.elem_count > std.math.maxInt(usize) / 4 or tensor.buffer.len != tensor.elem_count * 4) return null;
-    if (tensor.dtype != .f32 or tensor.quant_type != null or tensor.buffer.len == 0 or tensor.buffer.allocation_bytes != tensor.buffer.len or tensor.buffer.borrowed or !tensor.owned_by_tensor or !tensor.owns_buffer or tensor.resident_references.load(.acquire) != 1 or tensor.resident_parent != null or tensor.resident_owner != null or tensor.storage_retirement != null or tensor.foreign_clone_owner != null or tensor.physical_lease != null or tensor.model_constant or tensor.model_constant_quota.hasLease() or tensor.immutable_cache_backing or tensor.strict_resident_training or tensor.tc_quant != null or tensor.bf16_mirror.ptr != 0 or tensor.training_upload_host.ptr != null or tensor.resident_indices != null) return null;
+    if (tensor.dtype != .f32 or tensor.quant_type != null or tensor.buffer.len == 0 or tensor.buffer.allocation_bytes != tensor.buffer.len or tensor.buffer.borrowed or !tensor.owned_by_tensor or !tensor.owns_buffer or tensor.resident_references.load(.acquire) != 1 or tensor.resident_parent != null or tensor.resident_owner != null or tensor.storage_retirement != null or tensor.foreign_clone_owner != null or tensor.physical_lease != null or tensor.model_constant or tensor.retained_quota.hasLease() or tensor.immutable_cache_backing or tensor.strict_resident_training or tensor.tc_quant != null or tensor.bf16_mirror.ptr != 0 or tensor.training_upload_host.ptr != null or tensor.resident_indices != null) return null;
     // Metadata was prefunded using exclusive source/base lease borrows before
     // any model/provider gate. Only exact declared logical spans can consume it.
     if (funded.bytes != tensor.buffer.len) return null;
