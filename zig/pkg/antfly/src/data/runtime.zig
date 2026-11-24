@@ -52731,9 +52731,9 @@ fn consumerTests() type {
             try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_exact_prepare_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
 
             const ClockHarness = struct {
-                noinline fn run(allocator: std.mem.Allocator, node: *DataServer, kernel: *antfly.public_api.ProvisionedKernelOwnerSource, captured: antfly.metadata_api.CatalogRouteFence, consumer: control.Reference) !void {
+                noinline fn run(allocator: std.mem.Allocator, node: *DataServer, captured: antfly.metadata_api.CatalogRouteFence, consumer: control.Reference) !void {
                     const group = captured.route.group_id;
-                    var before = try kernel.orderedHistoryPageRouted(allocator, captured, "docs", .{ .reference = consumer, .after = .{}, .now_seconds = 100 });
+                    var before = try node.historyLocalRead(allocator, captured, "docs", .page, .{ .version = 1, .request = .{ .reference = consumer, .after = .{}, .now_seconds = 100 } }, .{});
                     defer before.deinit();
                     const earliest = node.dataRaftRealtimeNs();
                     try node.proposeRaftBatchGroupWithLeaderWait(allocator, group, "docs", .{
@@ -52742,7 +52742,7 @@ fn consumerTests() type {
                         .writes = &.{.{ .key = "timestamped-history-row", .value = "{\"clock\":true}" }},
                     }, .{ .discovery = .cached, .allow_remote_forward = false, .write_route_fence = captured }, 5 * std.time.ns_per_s);
                     const latest = node.dataRaftRealtimeNs();
-                    var page = try kernel.orderedHistoryPageRouted(allocator, captured, "docs", .{ .reference = consumer, .after = .{ .sequence = before.observed_latest }, .now_seconds = 100 });
+                    var page = try node.historyLocalRead(allocator, captured, "docs", .page, .{ .version = 1, .request = .{ .reference = consumer, .after = .{ .sequence = before.observed_latest }, .now_seconds = 100 } }, .{});
                     defer page.deinit();
                     try std.testing.expectEqual(@as(usize, 1), page.events.len);
                     try std.testing.expectEqualStrings("{\"clock\":true}", page.events[0].after.?);
@@ -52750,7 +52750,7 @@ fn consumerTests() type {
                     try std.testing.expect(clock >= earliest and clock <= latest);
                 }
             };
-            try ClockHarness.run(a, server, &owner, route.fence().?, ref);
+            try ClockHarness.run(a, server, route.fence().?, ref);
             try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_exact_prepare_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
             const OrdinaryRetention = struct {
                 noinline fn run(allocator: std.mem.Allocator, node: *DataServer, captured: antfly.metadata_api.CatalogRouteFence, original_owner: @import("antfly_local_sources").storage_transaction_completion.RoutedOwner) !void {
