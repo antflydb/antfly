@@ -28,6 +28,11 @@ const shared_lock_region = @import("../storage/lite/shared_lock_region.zig");
 const antfly_platform = @import("antfly_platform");
 const alloc = std.heap.c_allocator;
 
+/// A maintenance turn can replace the runtime, opening the database under a
+/// write turn. Debug frames on that path are megabytes each (`DB.open` and
+/// `IndexManager.openConfiguredIndexDetached` alone take about 7.5 MiB).
+const maintenance_stack_size: usize = if (@import("builtin").mode == .debug) 32 * 1024 * 1024 else 8 * 1024 * 1024;
+
 const memo_mod = @import("antfly_inference_query_embedding_cache");
 const cache_budget = @import("antfly_cache_budget");
 const wal_trace = @import("../storage/write_amplification_trace.zig");
@@ -5830,7 +5835,7 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
         };
         if (comptime h.builtin.os.tag != .freestanding and !h.builtin.single_threaded) {
             if (options.profile == .native and h.liteOpenModeCanWrite(options.open_mode))
-                owner.worker = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Owner.maintenanceLoop, .{owner});
+                owner.worker = try std.Thread.spawn(.{ .stack_size = maintenance_stack_size }, Owner.maintenanceLoop, .{owner});
         }
         gate.owners.appendAssumeCapacity(owner);
     }
