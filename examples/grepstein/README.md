@@ -455,7 +455,7 @@ install Playwright in your development environment, then additionally set
 module search path, set `ANTFLY_GREPSTEIN_PLAYWRIGHT_MODULE` to its package path.
 `ANTFLY_GREPSTEIN_BROWSER_EXECUTABLE` optionally selects an existing Chromium
 executable. Set `ANTFLY_GREPSTEIN_E2E_ARTIFACTS` to an absolute directory to retain
-screenshots. The browser checks PDF/audio search, original delivery, citations,
+screenshots. The browser checks PDF/audio/image search, original delivery, citations,
 audio metadata/playback interaction, empty results, and visible search failures.
 It does not qualify semantic or graph model output.
 

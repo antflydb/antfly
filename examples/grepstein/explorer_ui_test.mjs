@@ -124,3 +124,16 @@ test("native hierarchy provenance supplies audio timing when document projection
   assert.equal(player.currentTime, 0.5);
   assert.equal(player.playCount, 1);
 });
+
+test("image evidence links retain image semantics without PDF page controls", async () => {
+  const imageCollection = { id: "images", label: "Image records", profile: "images" };
+  const f = fixture(async () => reply({ responses: [{ collection: imageCollection, hits: { hits: [hit("Image fixture", [{ page_number: 1 }], { page_number: 2 })] } }] }));
+  await flush();
+  await f.submit();
+  const nodes = descendants(f.ids.get("#results").children[0]);
+  const link = nodes.find(x => x.tagName === "a");
+  assert.equal(link.textContent, "Open original image");
+  assert.match(link.href, /collection=images$/);
+  assert.equal(nodes.find(x => x.tagName === "summary").textContent, "Source and image evidence");
+  assert.equal(nodes.some(x => x.tagName === "audio"), false);
+});

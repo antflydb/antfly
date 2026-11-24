@@ -431,9 +431,7 @@ func testLocalNativeGCSExtraction(t *testing.T, options nativeCorpusSmokeOptions
 			t.Log("native default extraction and explicit chunk grep passed without reacquisition")
 		}
 	}
-	if !pictures {
-		testNativeExplorerBrowser(t, ctx, client, tableURL, profile, provider.URL)
-	}
+	testNativeExplorerBrowser(t, ctx, client, tableURL, profile, provider.URL)
 	// Exercise owner-side policy failures and immutable-version rejection without
 	// contaminating the successfully qualified source inventory.
 	badURL := endpoint + "/tables/gcs_e2e_rejections"

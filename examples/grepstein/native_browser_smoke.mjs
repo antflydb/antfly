@@ -22,6 +22,8 @@ import {writeFile} from 'node:fs/promises';
 const require = createRequire(import.meta.url);
 const {chromium} = require(process.env.ANTFLY_GREPSTEIN_PLAYWRIGHT_MODULE || 'playwright');
 const [url, profile, artifacts] = process.argv.slice(2);
+assert.ok(['pdf', 'transcription', 'images'].includes(profile));
+const query = profile === 'images' ? 'A red vehicle' : 'Native GCS extraction';
 const browser = await chromium.launch({headless:true, executablePath:process.env.ANTFLY_GREPSTEIN_BROWSER_EXECUTABLE || undefined});
 try {
  const page = await browser.newPage();
@@ -29,22 +31,23 @@ try {
  page.on('pageerror', e => errors.push(e.message));
  await page.goto(url);
  await page.getByRole('combobox', {name:'Record collection'}).selectOption('fixture');
- await page.getByRole('textbox', {name:'Search records'}).fill('Native GCS extraction');
+ await page.getByRole('textbox', {name:'Search records'}).fill(query);
  const firstSearch = page.waitForResponse(r => new URL(r.url()).pathname === '/api/search');
  await page.getByRole('button', {name:'Search',exact:true}).click();
  await writeFile(join(artifacts, 'search.json'), await (await firstSearch).text());
  await page.waitForFunction(() => document.querySelector('#status').textContent.includes('results.'));
  const cards = page.locator('#results article');
  assert.ok(await cards.count() >= 2, 'search must include both native records');
- assert.ok((await cards.first().textContent()).includes('Native GCS extraction'));
+ assert.ok((await cards.first().textContent()).includes(query));
  const link = cards.first().getByRole('link', {name:/Open original/});
  const href = await link.getAttribute('href');
  assert.ok(href.includes('collection=fixture'));
- assert.ok(href.includes(profile === 'transcription' ? '#t=' : '#page='));
+ if (profile === 'images') assert.equal(await link.textContent(), 'Open original image');
+ else assert.ok(href.includes(profile === 'transcription' ? '#t=' : '#page='));
  const original = await page.request.get(new URL(href, url).href);
  assert.equal(original.status(),200);
  assert.ok((await original.body()).length > 0);
- assert.match(original.headers()['content-type'], profile === 'transcription' ? /^audio\// : /^application\/pdf/);
+ assert.match(original.headers()['content-type'], profile === 'transcription' ? /^audio\// : profile === 'images' ? /^image\// : /^application\/pdf/);
  if(profile === 'transcription') {
   const player = cards.first().locator('audio');
   assert.equal(await player.getAttribute('preload'),'none');
@@ -62,7 +65,7 @@ try {
  assert.equal(await cards.count(),0);
  for (const mode of ['semantic', 'graph']) {
   await page.getByRole('combobox', {name:'Search mode'}).selectOption(mode);
-  await page.getByRole('textbox', {name:'Search records'}).fill('Native GCS extraction');
+  await page.getByRole('textbox', {name:'Search records'}).fill(query);
   await page.getByRole('button', {name:'Search',exact:true}).click();
   await page.waitForFunction(()=> {const s=document.querySelector('#status').textContent;return s!=='Searching…';});
   assert.ok(!(await page.locator('#status').textContent()).includes('results.'), 'unconfigured '+mode+' search must show error');
