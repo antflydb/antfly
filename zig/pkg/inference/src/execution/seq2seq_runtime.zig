@@ -259,7 +259,7 @@ pub const State = struct {
                 const value = outputs.outputs[past.output_index];
                 const length = std.math.cast(i64, if (past.cross) self.mask.len else end) orelse return error.InvalidDecoderOutput;
                 const want = [_]i64{ 1, past.empty_shape[1], length, past.empty_shape[3] };
-                const bytes = (try residentCacheBytes(outputs.backend, value, &want, if (!fresh and past.cross) &past.empty_shape else null, self.allocator)) orelse continue;
+                const bytes = (try residentCacheBytes(outputs.backend, value, &want, if (!fresh and past.cross) &past.empty_shape else null)) orelse continue;
                 slot.* = .{
                     .pin = try outputs.retainResources(self.allocator),
                     .input = .{ .value = value, .backend = outputs.backend, .estimated_bytes = bytes },
@@ -433,7 +433,7 @@ pub const State = struct {
 
     /// The output contract already supplies the full shape. Ordinary
     /// Native, Metal and CUDA tensors can attest it without a shape copy.
-    fn residentCacheBytes(backend: *const ops.ComputeBackend, value: ops.CT, expected: *const [4]i64, omitted: ?*const [4]i64, allocator: std.mem.Allocator) !?usize {
+    fn residentCacheBytes(backend: *const ops.ComputeBackend, value: ops.CT, expected: *const [4]i64, omitted: ?*const [4]i64) !?usize {
         if (try backend.tensorDType(value) != .f32) return error.InvalidDecoderOutput;
         if (try backend.tensorShapeMatches(value, expected)) |matches| {
             if (matches) {
@@ -447,12 +447,10 @@ pub const State = struct {
 
         // Compatibility providers and noncanonical empty cross outputs retain
         // the prior rank, extent and emptiness checks.
-        const shape = try backend.tensorShape(value, allocator);
-        defer allocator.free(shape);
-        if (shape.len != expected.len) return error.InvalidDecoderOutput;
-        const elements = try cacheElements(shape);
+        const shape = (try backend.tensorShapeFixed(4, value)) orelse return error.InvalidDecoderOutput;
+        const elements = try cacheElements(&shape);
         if (omitted != null and elements == 0) return null;
-        if (!std.mem.eql(i64, shape, expected)) return error.InvalidDecoderOutput;
+        if (!std.mem.eql(i64, &shape, expected)) return error.InvalidDecoderOutput;
         return try std.math.mul(usize, elements, @sizeOf(f32));
     }
 
@@ -491,17 +489,15 @@ test "resident seq2seq cache validates exact and omitted cross shapes without al
     const value: ops.CT = @ptrFromInt(8);
     const expected = [4]i64{ 1, 2, 3, 4 };
     const omitted = [4]i64{ 1, 2, 0, 4 };
-    const a = std.testing.allocator;
-    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
-    try std.testing.expectEqual(@as(?usize, 96), try State.residentCacheBytes(&backend, value, &expected, null, failing.allocator()));
+    try std.testing.expectEqual(@as(?usize, 96), try State.residentCacheBytes(&backend, value, &expected, null));
     probe.shape = omitted;
-    try std.testing.expectError(error.InvalidDecoderOutput, State.residentCacheBytes(&backend, value, &expected, null, failing.allocator()));
-    try std.testing.expectEqual(@as(?usize, null), try State.residentCacheBytes(&backend, value, &expected, &omitted, failing.allocator()));
+    try std.testing.expectError(error.InvalidDecoderOutput, State.residentCacheBytes(&backend, value, &expected, null));
+    try std.testing.expectEqual(@as(?usize, null), try State.residentCacheBytes(&backend, value, &expected, &omitted));
     probe.shape = .{ 1, 0, 3, 4 };
-    try std.testing.expectEqual(@as(?usize, null), try State.residentCacheBytes(&backend, value, &expected, &omitted, a));
+    try std.testing.expectEqual(@as(?usize, null), try State.residentCacheBytes(&backend, value, &expected, &omitted));
     table.tensorShapeMatches = null;
     probe.shape = expected;
-    try std.testing.expectEqual(@as(?usize, 96), try State.residentCacheBytes(&backend, value, &expected, null, a));
+    try std.testing.expectEqual(@as(?usize, 96), try State.residentCacheBytes(&backend, value, &expected, null));
 }
 
 const fixture_inputs = [_]backends.TensorInfo{

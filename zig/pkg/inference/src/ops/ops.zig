@@ -6323,6 +6323,19 @@ pub const ComputeBackend = struct {
         return error.UnsupportedShape;
     }
 
+    /// Read fixed-rank metadata without a request allocator. A provider
+    /// returning another rank cannot publish into this handoff contract.
+    pub fn tensorShapeFixed(self: *const ComputeBackend, comptime rank: usize, tensor: CT) !?[rank]i64 {
+        var storage: [rank * @sizeOf(i64)]u8 align(@alignOf(i64)) = undefined;
+        var bounded = std.heap.FixedBufferAllocator.init(&storage);
+        const dimensions = self.tensorShape(tensor, bounded.allocator()) catch |err| switch (err) {
+            error.OutOfMemory => return null,
+            else => return err,
+        };
+        if (dimensions.len != rank) return null;
+        return dimensions[0..rank].*;
+    }
+
     pub fn tensorShapeMatches(self: *const ComputeBackend, tensor: CT, shape: []const i64) !?bool {
         if (self.vtable.tensorShapeMatches) |tensor_shape_matches| {
             return tensor_shape_matches(self.ptr, tensor, shape);
