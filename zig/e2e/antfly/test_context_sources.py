@@ -471,9 +471,18 @@ def test_distributed_context_source_admission(stateful_api, echo_generator):
         f"/tables/{left}/artifacts/cited/enrichment", _enrichment(echo_generator, traversal({}))
     )
     assert registered["context_sources"]["cited"] == {"kind": "query", "tracking": "live"}, registered
+    # The query engine runs a filtered walk as a snapshot whose members are
+    # its graph results; a top-level filter does not scope those, so it is
+    # refused rather than silently ignored.
+    filtered_walk = traversal({"edge_filter": {"types": ["cites"]}})
+    response = stateful_api._request(
+        "PUT", f"/tables/{left}/artifacts/cited/enrichment", _enrichment(echo_generator, filtered_walk)
+    )
+    assert _status(response) == 400, getattr(response, "text", response)
+    del filtered_walk["cited"]["query"]["filter_query"]
     registered = stateful_api.put(
         f"/tables/{left}/artifacts/cited/enrichment",
-        _enrichment(echo_generator, traversal({"edge_filter": {"types": ["cites"]}})),
+        _enrichment(echo_generator, filtered_walk),
     )
     assert registered["context_sources"]["cited"] == {
         "kind": "query",

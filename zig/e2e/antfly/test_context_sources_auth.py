@@ -44,14 +44,18 @@ def _as(api: AuthApi, user: str, password: str) -> None:
     api.s.headers["Authorization"] = _basic_auth(user, password)
 
 
-def _create_user(api: AuthApi, name: str, policies: list[tuple[str, str]]) -> None:
+def _create_user(api: AuthApi, name: str, policies: list[tuple[str, ...]]) -> None:
     api.post(
         f"/auth/v1/users/{name}",
         {
             "password": name,
             "initial_policies": [
-                {"resource": table, "resource_type": "table", "type": kind}
-                for table, kind in policies
+                {
+                    "resource": policy[0],
+                    "resource_type": policy[2] if len(policy) > 2 else "table",
+                    "type": policy[1],
+                }
+                for policy in policies
             ],
         },
     )
@@ -78,7 +82,9 @@ def test_context_sources_honor_auth_and_row_policies(
 
     # The declarer may administer `people` and read `orgs`, but only the
     # gold tier of it.
-    _create_user(api, "writer", [("people", "admin"), ("orgs", "read")])
+    _create_user(
+        api, "writer", [("people", "admin"), ("orgs", "read"), ("org_graph", "read", "graph")]
+    )
     api.put("/auth/v1/users/writer/row-filters/orgs", {"term": {"tier": "gold"}})
     # A reader that sees every org but no person.
     _create_user(api, "auditor", [("people", "read"), ("orgs", "read")])
@@ -139,6 +145,55 @@ def test_context_sources_honor_auth_and_row_policies(
     assert "Acme Silver" not in brief, brief
     assert not echo_generator.errors, echo_generator.errors
     assert not any("Acme Silver" in value for value in echo_generator.inputs)
+
+    # A Cypher source runs as its declarer too: graph execution applies the
+    # writer's row policy, so the silver org is never a member.
+    api.post(
+        "/graphs/org_graph",
+        {"labels": [{"name": "Org", "table": "orgs"}], "relationships": []},
+    )
+    _as(api, "writer", "writer")
+    registered = api.put(
+        "/tables/people/artifacts/org_card/enrichment",
+        _enrichment(
+            echo_generator,
+            {
+                "orgs": {
+                    "query": {
+                        "table": "orgs",
+                        "cypher": {
+                            "graph": "org_graph",
+                            "query": "MATCH (o:Org) WHERE o.org = $org RETURN o",
+                            "parameters": {"org": {"$source": "/org"}},
+                        },
+                    },
+                    "fields": ["title"],
+                }
+            },
+        ),
+    )
+    assert registered["context_sources"]["orgs"] == {
+        "kind": "query",
+        "tracking": "snapshot",
+        "reason": "cypher",
+    }, registered
+    _as(api, "admin", AUTH_BOOTSTRAP_PASSWORD)
+    api.batch_write(
+        "people",
+        {
+            "inserts": {"person:2": {"org": "acme", "body": "person two"}},
+            "sync_level": "enrichments",
+        },
+    )
+
+    def gold_card():
+        statement = _statement(api, "people", "person:2", "org_card")
+        return statement if statement and "Acme Gold" in statement else None
+
+    card = _wait_until(gold_card, timeout=60)
+    assert card is not None, _statement(api, "people", "person:2", "org_card")
+    assert "Acme Silver" not in card, card
+    assert not echo_generator.errors, echo_generator.errors
 
     # Dependency state and impact are readable under auth.
     _as(api, "writer", "writer")
