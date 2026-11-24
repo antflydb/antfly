@@ -53261,9 +53261,9 @@ test "complete CUDA payload service vetoes copied custom tables before any conte
     try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(&vtable));
     copied.kernels = &kernel_backend_impl;
     const backend = ops.ComputeBackend{ .ptr = @ptrFromInt(8), .vtable = &copied };
-    try std.testing.expect(@import("../../execution/cuda_owned_coverage.zig").services(backend) == null);
+    try std.testing.expect(@import("../../execution/device_owned_coverage.zig").cudaServices(backend) == null);
     const unused_pool: @import("../../execution/physical_buffers.zig").Pool = undefined;
-    const result = @import("../../execution/cuda_owned_coverage.zig").assess(&unused_pool, backend, null);
+    const result = @import("../../execution/device_owned_coverage.zig").assess(&unused_pool, backend, null);
     try std.testing.expectEqual(@import("../../execution/owned_coverage.zig").Coverage{ .compatibility = .execution_path }, result);
 }
 
@@ -61502,7 +61502,7 @@ test "CUDA replay retains packed model weights across lookup relocation without 
     compute.tuned_route_gates.linear_q8_1_dp4a = false;
     compute.tuned_route_gates.q8_1_prefill_rows = false;
     const cb = compute.computeBackend();
-    try std.testing.expect(@import("../../execution/cuda_owned_coverage.zig").services(cb) == null);
+    try std.testing.expect(@import("../../execution/device_owned_coverage.zig").cudaServices(cb) == null);
     const width = 32;
     var identity: [width * width]f32 = @splat(0);
     for (0..width) |i| identity[i * width + i] = -1;
@@ -61561,7 +61561,7 @@ test "CUDA replay retains packed model weights across lookup relocation without 
         const actual = try held.backend(0).toFloat32(held.result.outputs[0], a);
         defer a.free(actual);
         try std.testing.expectEqualSlices(f32, &values, actual);
-        try std.testing.expect(@import("../../execution/cuda_owned_coverage.zig").services(cb) == null);
+        try std.testing.expect(@import("../../execution/device_owned_coverage.zig").cudaServices(cb) == null);
     }
     try std.testing.expect(captures > 0 and replays > 0);
 }

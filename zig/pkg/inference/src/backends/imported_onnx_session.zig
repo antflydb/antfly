@@ -901,7 +901,7 @@ fn prepareInvocationIntoWithCleanup(session: *const Session, shapes: session_mod
     prepared.backend_cookie = events;
     if (comptime !build_options.enable_wasm) {
         if (target.executable.runtime.physical_pool) |root_pool| {
-            if (!InvocationInputFacts.needsResidentStorage(shapes) and (@import("../execution/cuda_owned_coverage.zig").services(target.cb) != null or root_pool.metal_frame_dispatch))
+            if (!InvocationInputFacts.needsResidentStorage(shapes) and (@import("../execution/device_owned_coverage.zig").cudaServices(target.cb) != null or root_pool.metal_frame_dispatch))
                 try prepareDevicePhysicalInvocation(prepared, session, target, root_pool, shapes, allocator, cleanup, if (control) |*value| value else null)
             else
                 try preparePhysicalInvocationWithCleanup(prepared, session, target, root_pool, shapes, allocator, cleanup, control);
@@ -5460,7 +5460,7 @@ fn frozenOwnedHostFacts(target: *const ImportedOnnxSession, inputs: []const Tens
 }
 
 fn validatePreparedRouteFacts(target: *ImportedOnnxSession, routes: *const PreparedRoutes, inputs: prepared_mod.Inputs, allocator: std.mem.Allocator, claims: ?*const @import("../execution/region_claims.zig").Set) !void {
-    if (inputs == .host and @import("../execution/cuda_owned_coverage.zig").services(target.cb) != null)
+    if (inputs == .host and @import("../execution/device_owned_coverage.zig").cudaServices(target.cb) != null)
         return validateCudaPreparedFacts(target, routes, inputs, allocator, claims);
     return validatePreparedRouteFactsImpl(target, routes, inputs, allocator, claims);
 }

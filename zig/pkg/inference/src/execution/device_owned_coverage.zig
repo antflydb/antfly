@@ -32,6 +32,11 @@ pub fn services(backend: ops.ComputeBackend) ?*const services_type {
     if (!value.available(backend.ptr)) return null;
     return value;
 }
+pub fn cudaServices(backend: ops.ComputeBackend) ?*const services_type {
+    if (backend.kind() != .cuda) return null;
+    return services(backend);
+}
+
 fn bytes(shape: ml.graph.Shape) ?usize {
     if (shape.dtype != .f32 and shape.dtype != .i32 and shape.dtype != .i64) return null;
     const count = shape.numElements() orelse return null;

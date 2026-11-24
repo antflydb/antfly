@@ -2967,7 +2967,7 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
     }
     // CUDA's ordinary per-node branch calls interpreter.executeNode and its
     // Frame first. No compiled executor/fusion may bypass the selected route.
-    if (@import("cuda_owned_coverage.zig").services(executable.runtime.default_backend.*) != null) {
+    if (@import("device_owned_coverage.zig").cudaServices(executable.runtime.default_backend.*) != null) {
         const plan = executable.runtime.plan orelse return;
         const mesh = executable.runtime.mesh orelse return;
         if (!attestOwnedDeviceSchedule(pool, &plan, &mesh, executable.runtime.default_backend, analysis.reachable)) return;

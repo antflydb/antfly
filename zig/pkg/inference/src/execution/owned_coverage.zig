@@ -217,7 +217,7 @@ pub fn outputsArePublished(pool: *const physical.Pool, graph: *const ml.graph.Gr
 pub fn assess(pool: *const physical.Pool) Coverage {
     const selected = if (pool.selection) |*value| value else return .{ .compatibility = .no_selected_routes };
     const target_backend = pool.coverage_backend orelse return .{ .compatibility = .execution_path };
-    if (@import("cuda_owned_coverage.zig").services(target_backend) != null) return @import("cuda_owned_coverage.zig").assess(pool, target_backend, null);
+    if (@import("device_owned_coverage.zig").cudaServices(target_backend) != null) return @import("device_owned_coverage.zig").assess(pool, target_backend, null);
     if (!canonical(target_backend)) return .{ .compatibility = .execution_path };
     const graph = pool.coverage_graph orelse return .{ .compatibility = .execution_path };
     const reachable = pool.coverage_reachable orelse return .{ .compatibility = .execution_path };
