@@ -201,13 +201,25 @@ fn encodeOptions(allocator: std.mem.Allocator, encoder: backends.Session, decode
             values.resource_lease = owner.lease;
             owner.lease = null;
         };
-        if (values.outputs.len != 1) return error.InvalidEncoderOutput;
-        const shape = try values.backend.tensorShape(values.outputs[0], allocator);
-        defer allocator.free(shape);
-        if (shape.len != 3 or shape[0] != 1 or shape[1] <= 0 or shape[2] <= 0) return error.InvalidEncoderOutput;
-        return .{ .resident = .{ .values = values, .shape = .{ shape[0], shape[1], shape[2] }, .incremental_receiver = incremental } };
+        const shape = try residentEncoderShape(allocator, encoder.outputInfo(), &values);
+        return .{ .resident = .{ .values = values, .shape = shape, .incremental_receiver = incremental } };
     }
     return encodeHost(allocator, encoder, inputs, dispatch, control, supplied);
+}
+
+fn residentEncoderShape(allocator: std.mem.Allocator, outputs: []const backends.TensorInfo, values: *const session_mod.ResidentOutputs) ![3]i64 {
+    if (values.outputs.len != 1) return error.InvalidEncoderOutput;
+    const value = values.outputs[0];
+    if (outputs.len == 1) {
+        const declared = outputs[0].shape;
+        if (declared.len == 3 and declared[0] == 1 and declared[1] > 0 and declared[2] > 0) {
+            if ((try values.backend.tensorShapeMatches(value, declared)) orelse false) return declared[0..3].*;
+        }
+    }
+    const actual = try values.backend.tensorShape(value, allocator);
+    defer allocator.free(actual);
+    if (actual.len != 3 or actual[0] != 1 or actual[1] <= 0 or actual[2] <= 0) return error.InvalidEncoderOutput;
+    return actual[0..3].*;
 }
 
 fn observePlacement(encoder: backends.Session, decoder: backends.Session, reason: PlacementReason) void {
@@ -491,6 +503,9 @@ test "encoder decoder resident stages retain hidden state and materialize only t
             try std.testing.expect(permit.lease == null);
             try std.testing.expect(result.resident.values.resource_lease != null);
             try std.testing.expect(result == .resident);
+            try std.testing.expectEqual([3]i64{ 1, 2, 4 }, try residentEncoderShape(std.testing.failing_allocator, encoder.outputInfo(), &result.resident.values));
+            const dynamic = [_]backends.TensorInfo{.{ .name = encoder.outputInfo()[0].name, .dtype = .f32, .shape = &.{ 1, -1, 4 } }};
+            try std.testing.expectEqual(result.resident.shape, try residentEncoderShape(a, &dynamic, &result.resident.values));
             try std.testing.expectEqual(@as(u64, 0), audit.download_bytes);
             try std.testing.expectEqual(@as(u64, 0), audit.host_access_bytes);
             break :blk result;
