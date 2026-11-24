@@ -2185,7 +2185,9 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
     if (!cohort and cb.kind() == .metal and gemma4AudioEncoderFrameEnabled() and !cb.decoderRuntimeHasActiveFrame()) {
         frame_active = try cb.decoderRuntimeBeginFrame();
     }
-    errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
+    errdefer if (frame_active and cb.decoderRuntimeHasActiveFrame()) cb.decoderRuntimeCancelFrame() catch {
+        if (cb.decoderRuntimeHasActiveFrame()) platform.inference_process_supervisor.restartWorker();
+    };
 
     var subsampled = try audioSubsampleCohort(cb, allocator, store, cfg, features_list);
     defer subsampled.deinit(allocator);
@@ -2248,13 +2250,19 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
     }
     const pipelined = grouped_frames and frame_plan.in_flight == 2 and cb.decoderRuntimeSetWhisperPipelinedFrames(true);
     var pending_frame = false;
-    // Drain before layer inputs, hidden outputs, and cached weights leave scope.
+    var frame_snapshot: ?CT = null;
+    errdefer if (frame_snapshot) |snapshot| cb.free(snapshot);
+    // Drain before publishing or releasing a snapshot, layer inputs, or cached weights.
     defer {
         if (frame_active) {
-            cb.decoderRuntimeCancelFrame() catch {};
+            if (cb.decoderRuntimeHasActiveFrame()) cb.decoderRuntimeCancelFrame() catch {
+                if (cb.decoderRuntimeHasActiveFrame()) platform.inference_process_supervisor.restartWorker();
+            };
             frame_active = false;
         }
-        if (pending_frame) cb.decoderRuntimeWaitSubmittedFrame() catch {};
+        if (pending_frame) cb.decoderRuntimeWaitSubmittedFrame() catch {
+            if (cb.decoderRuntimeHasSubmittedFrame()) platform.inference_process_supervisor.restartWorker();
+        };
         if (pipelined) _ = cb.decoderRuntimeSetWhisperPipelinedFrames(false);
     }
 
@@ -2318,6 +2326,17 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
         try cb.linearNoBias(normed, projection_w, subsampled.seq_len, cfg.output_hidden, cfg.text_hidden);
     defer cb.free(projected);
     audioProfileMark(.tail);
+    const valid_count = countTrue(subsampled.valid_mask);
+    // A contiguous copy owns its destination independently of the frame.
+    // Encode it before submitting the last Metal frame to share its fence.
+    const contiguous_first = if (valid_count != 0 and (cb.kind() == .metal or cb.kind() == .cuda) and
+        cb.supportsCopyRows2D() and try cb.tensorDType(projected) == .f32)
+        contiguousValidAudioRows(subsampled.valid_mask, valid_count)
+    else
+        null;
+    if (frame_active and cb.kind() == .metal) {
+        if (contiguous_first) |first| frame_snapshot = try cb.snapshotRows2D(allocator, projected, first, valid_count, cfg.text_hidden);
+    }
     if (pending_frame) {
         if (frame_active) try @import("../ops/metal_compute.zig").MetalCompute.detachEmbeddingGemma2ActivationViews(cb);
         try cb.decoderRuntimeWaitSubmittedFrame();
@@ -2330,7 +2349,6 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
     }
 
     if (@import("builtin").is_test) try embeddingGemma2StageTensor(cb, allocator, "audio_projected", projected);
-    const valid_count = countTrue(subsampled.valid_mask);
     if (lengths) |counts| {
         var offset: usize = 0;
         for (counts, if (subsampled.segments.len == 0) &[_]usize{subsampled.seq_len} else subsampled.segments) |*count, span| {
@@ -2340,17 +2358,11 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
         }
     }
     if (valid_count == 0) return error.EmptyEmbeddingInput;
-    // Ordinary clips often have only leading or trailing padding. Publish a
-    // contiguous span without uploading a gather map, into independent storage.
-    if ((cb.kind() == .metal or cb.kind() == .cuda) and cb.supportsCopyRows2D() and
-        try cb.tensorDType(projected) == .f32)
-    {
-        if (contiguousValidAudioRows(subsampled.valid_mask, valid_count)) |first| {
-            const snapshot = try cb.snapshotRows2D(allocator, projected, first, valid_count, cfg.text_hidden);
-            audioProfileMark(.readback);
-            if (profile_enabled) profile.finish(subsampled.seq_len);
-            return .{ .embeddings = snapshot, .tokens = valid_count };
-        }
+    if (contiguous_first) |first| {
+        const snapshot = frame_snapshot orelse try cb.snapshotRows2D(allocator, projected, first, valid_count, cfg.text_hidden);
+        audioProfileMark(.readback);
+        if (profile_enabled) profile.finish(subsampled.seq_len);
+        return .{ .embeddings = snapshot, .tokens = valid_count };
     }
     const valid_rows = try allocator.alloc(u32, valid_count);
     defer allocator.free(valid_rows);
@@ -8019,6 +8031,8 @@ test "gemma4 real mmproj audio device ops match the host encoder" {
                 var prompt = try encodeProjectedAudioForPrompt(&cb, allocator, projector, inputs[0..clip_count]);
                 defer prompt.deinit();
                 const resident = prompt.resident orelse return error.MissingResidentAudioProjection;
+                try std.testing.expect(!cb.decoderRuntimeHasActiveFrame());
+                try std.testing.expect(!cb.decoderRuntimeHasSubmittedFrame());
                 try std.testing.expect(metal_compute_mod.MetalCompute.debugHasDeviceTensor(&cb, resident.rows));
                 try std.testing.expectEqual(@as(usize, 0), prompt.embeddings.len);
                 try std.testing.expectEqual(clip_count, prompt.tokens_per_audio.len);
