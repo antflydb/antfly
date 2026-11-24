@@ -41958,7 +41958,7 @@ fn consumerTests() type {
                 try std.testing.expectError(err, TestBoundary.call("apply", &Callbacks.foreign, &Callbacks.apply, .{&err}));
             }
         }
-        test "native index claims data receiver rejects canceled and incompatible authority before owner acquisition" {
+        test "native index claims data receiver rejects canceled or misrouted requests before owner acquisition" {
             var server: DataServer = undefined;
             const control: antfly.public_api.relational_index_owner_execution.Request = .{ .table_id = 1, .group_id = 7, .id = @splat(3), .operation = .fence };
             const request: antfly.public_api.relational_index_owner_execution.ClaimRequest = .{ .table_id = 1, .group_id = 7, .id = @splat(3), .claims = &.{.{ .tuple = "claim", .parent_table = "docs", .parent_key = "row", .schema_version = 2 }} };
@@ -41968,10 +41968,7 @@ fn consumerTests() type {
             try std.testing.expectError(error.GenerationPublicationChanged, DataServer.nativeIndexOwnerControl(&server, std.testing.allocator, "docs", 8, control, .{}));
             try std.testing.expectError(error.Canceled, server.relationalIndexClaimPort().execute(std.testing.allocator, "docs", 7, request, .{ .cancellation = .fromAtomic(&signal) }));
             try std.testing.expectError(error.DeadlineExceeded, DataServer.nativeIndexClaimsControl(&server, std.testing.allocator, "docs", 7, request, .{ .deadline_ns = 0 }));
-            server.api_server_cfg = .{ .deployment_mode = .standalone };
-            server.data_raft = @ptrFromInt(4096);
-            try std.testing.expectError(error.UnsupportedNativeIndexOwner, DataServer.nativeIndexOwnerControl(&server, std.testing.allocator, "docs", 7, control, .{}));
-            try std.testing.expectError(error.UnsupportedNativeIndexOwner, DataServer.nativeIndexClaimsControl(&server, std.testing.allocator, "docs", 7, request, .{}));
+            try std.testing.expectError(error.GenerationPublicationChanged, DataServer.nativeIndexClaimsControl(&server, std.testing.allocator, "docs", 8, request, .{}));
         }
 
         test "data raft source scope metadata authorization captures fresh phase and cut" {
@@ -42351,6 +42348,19 @@ fn consumerTests() type {
                 observations: std.atomic.Value(usize) = .init(0),
                 reject_next: std.atomic.Value(bool) = .init(false),
                 cancellation: ?*const antfly.raft.transport.http_common.RequestCancellation = null,
+                accepted_basis: ?@import("../metadata/sql/relation_lifecycle/boots.zig").ReportBasis = null,
+
+                fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+                    return error.UnsupportedOperation;
+                }
+
+                fn systemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try context.ensureActive();
+                    if (input != .store_report_basis or input.store_report_basis != 20) return error.UnsupportedOperation;
+                    return std.json.Stringify.valueAlloc(alloc, self.accepted_basis, .{});
+                }
+
                 fn dispatch(server: *DataServer, kind: StoreStatusReportKind) !void {
                     const deadline = platform_time.monotonicNs() + 10 * std.time.ns_per_s;
                     while (true) {
@@ -42389,11 +42399,18 @@ fn consumerTests() type {
                     defer update.deinit();
                     var digest: [32]u8 = undefined;
                     std.crypto.hash.sha2.Sha256.hash(request.body, &digest, .{});
-                    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, store_report_update.Cursor{
+                    const cursor: store_report_update.Cursor = .{
                         .reporter_incarnation = update.value.report.reporter_incarnation,
                         .sequence = update.value.sequence,
                         .digest = digest,
-                    }, .{}) };
+                    };
+                    self.accepted_basis = .{
+                        .reporter_incarnation = cursor.reporter_incarnation,
+                        .status_generation = update.value.report.status_generation,
+                        .cursor = cursor,
+                        .header_digest = digest,
+                    };
+                    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, cursor, .{}) };
                 }
             };
             var fake: Fake = .{};
@@ -42418,7 +42435,7 @@ fn consumerTests() type {
                 .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(a),
                 .read_source = antfly.public_api.ProvisionedTableReadSource.init("/tmp/unused-report-worker", antfly.public_api.table_catalog.emptyCatalogSource(), antfly.raft.read_gate.alreadyReadSafeBarrier()),
                 .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-report-worker", antfly.public_api.table_catalog.emptyCatalogSource()),
-                .status_source = undefined,
+                .status_source = .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.systemCatalog } },
                 .api_server_cfg = .{},
                 .query_async_limit = .nothing,
                 .listener_cfg = undefined,
@@ -43256,6 +43273,8 @@ fn consumerTests() type {
             try std.testing.expectEqualStrings("newly_created", updated.tables[0].name);
             try std.testing.expectEqual(@as(u64, 1), source.cached_snapshot.?.status.metadata_epoch);
 
+            // Change the immutable catalog cut to fence this in-flight reply.
+            tables[0].name = "newly_published";
             const ticket = source.beginLinearizableSnapshot();
             try std.testing.expectEqual(RemoteMetadataSource.LinearizableSnapshotAcceptance.published, try source.acceptLinearizableSnapshot(try cloneAdminSnapshotOwned(alloc, old), ticket));
             old.tables = &.{};
@@ -43263,6 +43282,7 @@ fn consumerTests() type {
             var superseded = try source.acceptObservedSnapshot(try cloneAdminSnapshotOwned(alloc, old), head, 0, 3);
             defer freeAdminSnapshotOwned(alloc, &superseded);
             try std.testing.expectEqual(@as(usize, 1), superseded.tables.len);
+            try std.testing.expectEqualStrings("newly_published", superseded.tables[0].name);
             source.invalidateCache();
             try std.testing.expectError(error.MetadataSnapshotHeadMismatch, source.acceptObservedSnapshot(try cloneAdminSnapshotOwned(alloc, old), head, 0, 4));
             try std.testing.expect(source.cached_snapshot == null);
@@ -46197,7 +46217,12 @@ fn consumerTests() type {
             defer a.free(frame);
             var apply = try RaftTableApplyStateMachine.init(a, "/unused-schema-control", antfly.public_api.table_catalog.emptyCatalogSource(), null);
             defer apply.deinit();
-            try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, RaftTableApplyStateMachine.applyReady(&apply, 72, null, &.{.{ .term = 1, .index = 1, .entry_type = .normal, .data = frame }}, &.{}));
+            const expected = if (linked_storage and
+                @import("../common/data_raft_protocol.zig").batch_protocol_version >= @import("../common/data_raft_protocol.zig").batch_schema_owner_control_protocol_version)
+                error.StorageKernelOwnerUnavailable
+            else
+                error.UnsupportedRaftBatchProtocolVersion;
+            try std.testing.expectError(expected, RaftTableApplyStateMachine.applyReady(&apply, 72, null, &.{.{ .term = 1, .index = 1, .entry_type = .normal, .data = frame }}, &.{}));
             try std.testing.expectEqual(@as(u64, 0), apply.appliedIndex(72));
             try std.testing.expectEqual(@as(u64, 0), apply.retry_apply_checkpoints.get(72).?.completed_index);
         }
@@ -51313,7 +51338,9 @@ fn consumerTests() type {
                 };
                 try peers.groups.put(a, 601, .{ .leader = 1 });
                 try peers.groups.getPtr(601).?.nodes.append(a, 1);
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                // Route against this fixed fixture cut even when a preceding
+                // native effect outlasts the normal peer-view cache TTL.
+                metadata_source.control_read_generation_at_ms = std.math.maxInt(u64);
                 const origin = try a.create(DataServer);
                 defer a.destroy(origin);
                 origin.* = .{ .alloc = a, .backend_runtime = runtime.ptr(), .remote_metadata = &metadata_source, .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(a), .read_source = antfly.public_api.ProvisionedTableReadSource.init(root, catalog, antfly.raft.read_gate.unavailableReadSafetyBarrier()), .write_source = antfly.public_api.ProvisionedTableWriteSource.init(root, catalog), .status_source = undefined, .api_server_cfg = .{ .internal_service_secret = secret, .internal_service_issuer = "history-runtime" }, .query_async_limit = .nothing, .listener_cfg = undefined };
@@ -51340,7 +51367,6 @@ fn consumerTests() type {
                 try std.testing.expectEqual(before_remote, after_remote);
                 const page_contract = @import("../api/history_page_operations.zig");
                 const page_input: page_contract.Request = .{ .version = 1, .request = .{ .reference = ref, .after = .{}, .now_seconds = 100 } };
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 var first_page = try origin.historyPagePort().read(a, route.fence().?, "docs", page_input, .{});
                 defer first_page.deinit();
                 try std.testing.expectEqual(@as(usize, 1), first_page.events.len);
@@ -51349,23 +51375,19 @@ fn consumerTests() type {
                 try std.testing.expect(!first_page.caught_up);
                 var next_page_input = page_input;
                 next_page_input.request.after = first_page.next;
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 var second_page = try origin.historyPagePort().read(a, route.fence().?, "docs", next_page_input, .{});
                 defer second_page.deinit();
                 try std.testing.expectEqualStrings("{\"v\":1}", second_page.events[0].before.?);
                 try std.testing.expectEqualStrings("{\"v\":2}", second_page.events[0].after.?);
                 try std.testing.expect(second_page.caught_up);
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 var replay_page = try origin.historyPagePort().read(a, route.fence().?, "docs", page_input, .{});
                 defer replay_page.deinit();
                 try std.testing.expectEqualDeep(first_page.events, replay_page.events);
                 // Reads do not ACK; the original page remains replayable.
                 var small_page_input = page_input;
                 small_page_input.request.max_bytes = 1;
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 try std.testing.expectError(error.HistoryTooLarge, origin.historyPagePort().read(a, route.fence().?, "docs", small_page_input, .{}));
                 const missing_snapshot: page_contract.Bootstrap.Request = .{ .version = 1, .request = .{ .reference = ref, .digest = @splat(77), .now_seconds = 100 } };
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 try std.testing.expectError(error.HistoryResynchronizationRequired, origin.historyBootstrapPagePort().read(a, route.fence().?, "docs", missing_snapshot, .{}));
                 var remote_input: ingress.wire.Request = .{ .version = 1, .operation = .submit, .command = .{ .inspect = ref } };
                 const submit_body = try std.json.Stringify.valueAlloc(a, remote_input, .{});
@@ -51378,7 +51400,6 @@ fn consumerTests() type {
                 const unknown_remote = blk: {
                     server.data_request_lifecycle_hook = .{ .ptr = server, .reach_fn = Loss.reach };
                     defer server.data_request_lifecycle_hook = null;
-                    metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                     break :blk try ingress.execute(origin.historyControlPort(), a, 601, "docs", submit_body, .{ .catalog_route_fence_json = encoded_fence });
                 };
                 try std.testing.expect(!unknown_remote.confirmed());
@@ -51386,12 +51407,10 @@ fn consumerTests() type {
                 try std.testing.expectEqual(after_remote + 1, unknown_remote.receipt.?.index);
                 const grant_operations = @import("../api/history_grant_operations.zig");
                 const grant_input: grant_operations.Request = .{ .version = 1, .identity = control.GrantIdentity.fromGrant(grant) };
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 const actual_grant = try origin.historyGrantPort().read(a, route.fence().?, "docs", grant_input, .{});
                 try std.testing.expectEqual(@as(u64, 1), actual_grant.active.consumer.epoch);
                 var absent_grant = grant_input;
                 absent_grant.identity.consumer = @splat(4);
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 try std.testing.expectEqual(@as(u64, 0), (try origin.historyGrantPort().read(a, route.fence().?, "docs", absent_grant, .{})).absent);
                 const resolution_operations = @import("../api/history_resolution_operations.zig");
                 const resolution_input: resolution_operations.Request = .{ .version = 1, .authority = .raft, .namespace = namespace, .transaction_id = @splat(91), .owner_fence = @splat(92), .manifest_digest = @splat(93), .commit_version = 94, .minimum_applied_index = 1 };
@@ -51400,7 +51419,6 @@ fn consumerTests() type {
                     defer server.data_raft_mutex.unlock();
                     break :blk managed.host.http_host.host.raftStatus(601).?.last_index;
                 };
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 const remote_resolution = try origin.historyResolutionPort().read(a, route.fence().?, "docs", resolution_input, .{});
                 try remote_resolution.validate(resolution_input.binding());
                 try std.testing.expect(remote_resolution.resolution == null);
@@ -51414,7 +51432,6 @@ fn consumerTests() type {
                 remote_input.receipt = unknown_remote.receipt;
                 const recover_body = try std.json.Stringify.valueAlloc(a, remote_input, .{});
                 defer a.free(recover_body);
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 const confirmed_remote = try ingress.execute(origin.historyControlPort(), a, 601, "docs", recover_body, .{ .catalog_route_fence_json = encoded_fence });
                 try std.testing.expect(confirmed_remote.confirmed());
                 try std.testing.expectEqualDeep(unknown_remote.receipt, confirmed_remote.receipt);
@@ -51544,7 +51561,6 @@ fn consumerTests() type {
                         try std.testing.expectEqualStrings(pulled.body, repeated.body);
                     }
                 };
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 try RoutedFeedHarness.run(a, &feed_svc, origin.historyRootsSource());
                 const final_driver_index = blk: {
                     lockAtomic(&server.data_raft_mutex);
@@ -51943,11 +51959,6 @@ fn consumerTests() type {
                             result.* = PublicFeedHarness.run(allocator, svc, source, table, node, fence, false);
                         }
                     };
-                    // This fixture supplies one immutable peer generation and
-                    // has no metadata HTTP server. Password checks can exceed
-                    // the production cache TTL within the test workflow.
-                    metadata_source.control_read_generation_at_ms = std.math.maxInt(u64);
-                    defer metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                     var outcome: anyerror!void = undefined;
                     const thread = try std.Thread.spawn(.{ .stack_size = 32 * 1024 * 1024 }, Worker.run, .{ &outcome, a, &feed_svc, origin.historyRootsSource(), feed_table, server, route.fence().? });
                     thread.join();
@@ -51963,8 +51974,6 @@ fn consumerTests() type {
                             result.* = PublicFeedHarness.run(allocator, svc, source, table, node, fence, true);
                         }
                     };
-                    metadata_source.control_read_generation_at_ms = std.math.maxInt(u64);
-                    defer metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                     var outcome: anyerror!void = undefined;
                     const thread = try std.Thread.spawn(.{ .stack_size = 32 * 1024 * 1024 }, Worker.run, .{ &outcome, a, &feed_svc, origin.historyRootsSource(), feed_table, server, route.fence().? });
                     thread.join();
@@ -52084,12 +52093,10 @@ fn consumerTests() type {
                 try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_exact_prepare_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
 
                 const positive_input: resolution_operations.Request = .{ .version = 1, .authority = .raft, .namespace = namespace, .transaction_id = txn_id, .owner_fence = current_owner.digest(), .manifest_digest = (try plan.manifest(1001)).digest(), .commit_version = 1001, .minimum_applied_index = 1 };
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 const positive = try origin.historyResolutionPort().read(a, route.fence().?, "docs", positive_input, .{});
                 try positive.validate(positive_input.binding());
                 try std.testing.expect(positive.resolution != null);
                 try std.testing.expect(positive.resolution.?.outcome.effects.sequence > 0);
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 const positive_retry = try origin.historyResolutionPort().read(a, route.fence().?, "docs", positive_input, .{});
                 try std.testing.expectEqualDeep(positive.resolution, positive_retry.resolution);
                 const decision_wire = @import("antfly_local_sources").storage_history_decision_wire;
@@ -52253,11 +52260,9 @@ fn consumerTests() type {
                 try idle_resolution.validate(positive_input.binding());
                 try std.testing.expectEqualDeep(positive.resolution, idle_resolution.resolution);
                 try std.testing.expect(idle_resolution.cut.index < idle_barrier_index);
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 var idle_page = try origin.historyPagePort().read(a, route.fence().?, "docs", page_input, .{});
                 defer idle_page.deinit();
                 try std.testing.expectEqualDeep(first_page.events, idle_page.events);
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 const idle_grant = try origin.historyGrantPort().read(a, route.fence().?, "docs", grant_input, .{});
                 try std.testing.expectEqualDeep(actual_grant, idle_grant);
                 // All recovery operations remain reads: no Raft entry was
@@ -52267,7 +52272,6 @@ fn consumerTests() type {
                     defer server.data_raft_mutex.unlock();
                     try std.testing.expectEqual(idle_barrier_index, host.raftStatus(601).?.last_index);
                 }
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 const remote_publication = try origin.historyPublicationPort().read(a, route.fence().?, "docs", publication_input, .{});
                 try remote_publication.validate(publication_query);
                 try std.testing.expectEqualDeep(observed_publication.publication, remote_publication.publication);
@@ -52414,7 +52418,6 @@ fn consumerTests() type {
                         try @import("../api/source_scope_native_test.zig").verifyRetirementRpc(source_alloc, origin_server.sourceRetirementControlPort(), origin_server.sourceScopeObservationPort(), source_fence, source_binding);
                     }
                 };
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 try SourceCompletion.run(a, origin, current_owner, route.fence().?, remote_participant, server.kernel_owner_source.?, server);
                 const HostedAdmission = struct {
                     noinline fn run(alloc: std.mem.Allocator, endpoint_uri: []const u8, source_catalog: antfly.public_api.table_catalog.CatalogSource, executor: antfly.common.http.RequestExecutor, root_path: []const u8, credential: []const u8) !void {
@@ -52465,7 +52468,6 @@ fn consumerTests() type {
                 };
                 var found_completion = false;
                 for (0..64) |_| {
-                    metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                     var qualified_page = origin.historyPagePort().read(a, route.fence().?, "docs", qualified_input, .{}) catch |err| {
                         std.debug.print("coordinated frame proof read after sequence {d} failed: {s}\n", .{ qualified_input.request.after.sequence, @errorName(err) });
                         return err;
@@ -56310,7 +56312,7 @@ fn consumerTests() type {
                 try std.testing.expectEqual(forwarding_clone_count, source.test_faults.snapshot_result_clones);
             }
             var pinned: DataServer.PinnedReadPeerRouter = .{ .server = &server, .peers = retained };
-            var route = (try antfly.public_api.table_router.resolveGroupRoute(alloc, undefined, pinned.router(), 77, .prefer_leader)).?;
+            var route = (try antfly.public_api.table_router.resolveGroupRoute(alloc, antfly.public_api.table_catalog.emptyCatalogSource(), pinned.router(), 77, .prefer_leader)).?;
             defer route.deinit(alloc);
             try std.testing.expectEqualStrings("http://new", route.remote.base_uri);
             try std.testing.expectEqual(@as(u64, 2), route.remote.node_id);
@@ -56319,7 +56321,7 @@ fn consumerTests() type {
             const failed_leader = try ControlReadGeneration.create(alloc, snapshot);
             defer failed_leader.release();
             pinned.peers = failed_leader;
-            var fallback = (try antfly.public_api.table_router.resolveGroupRoute(alloc, undefined, pinned.router(), 77, .prefer_leader)).?;
+            var fallback = (try antfly.public_api.table_router.resolveGroupRoute(alloc, antfly.public_api.table_catalog.emptyCatalogSource(), pinned.router(), 77, .prefer_leader)).?;
             defer fallback.deinit(alloc);
             try std.testing.expectEqual(@as(u64, 2), fallback.remote.node_id);
             try std.testing.expect(failed_leader.groups.get(77).?.leader == null);
@@ -56934,7 +56936,6 @@ fn consumerTests() type {
                 clock: *VoprIo,
                 reads: usize = 0,
                 writes: usize = 0,
-                previous_remaining: ?u64 = null,
                 fn execute(raw: *anyopaque, allocator: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
                     const self: *@This() = @ptrCast(@alignCast(raw));
                     if (std.mem.endsWith(u8, request.uri, routes.Routes.head)) return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(allocator, antfly.metadata_api.MetadataHead{ .metadata_group_id = 77, .metadata_incarnation = "11111111111111111111111111111111".*, .metadata_epoch = 1 }, .{}) };
@@ -56943,9 +56944,12 @@ fn consumerTests() type {
                     defer input.deinit();
                     try std.testing.expectEqual(@as(u64, 77), input.value.metadata_group_id);
                     const remaining = try std.fmt.parseUnsigned(u64, request.header(routes.routing_remaining_ms_header).?, 10);
-                    try std.testing.expect(remaining > 0 and remaining <= 100);
-                    if (self.previous_remaining) |previous| try std.testing.expect(remaining < previous);
-                    self.previous_remaining = remaining;
+                    const original_deadline = std.time.ns_per_s + 100 * std.time.ns_per_ms;
+                    const available_ms = (original_deadline - self.clock.monotonic_ns) / std.time.ns_per_ms;
+                    // Read attempt zero gets a share, then the retry gets the
+                    // remainder of the same request budget.
+                    const divisor: u64 = if (input.value.action != .mutate and self.reads != 1) 2 else 1;
+                    try std.testing.expectEqual(available_ms / divisor, remaining);
                     self.clock.monotonic_ns += std.time.ns_per_ms;
                     var result: feeds.Reply = .{ .action = input.value.action, .metadata_group_id = input.value.metadata_group_id, .metadata_incarnation = input.value.metadata_incarnation };
                     if (input.value.action == .mutate) {
@@ -57342,15 +57346,6 @@ fn consumerTests() type {
         }
 
         test "remote metadata source retries fenced snapshot generations until success" {
-            var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
-            defer backend_runtime.deinit();
-            var source = try RemoteMetadataSource.init(
-                std.testing.allocator,
-                &.{"http://metadata.invalid"},
-                backend_runtime.ptr().apiIoImpl().?,
-            );
-            defer source.deinit();
-
             const incarnation: antfly.metadata_api.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
             const snapshot = antfly.metadata_api.AdminSnapshot{
                 .status = .{ .metadata_group_id = 9, .metadata_incarnation = incarnation, .metadata_epoch = 1, .metrics = .{} },
@@ -57361,12 +57356,25 @@ fn consumerTests() type {
                 .split_transitions = &.{},
                 .merge_transitions = &.{},
             };
-            source.cached_snapshot = try cloneAdminSnapshotOwned(std.testing.allocator, snapshot);
+            const Fake = struct {
+                snapshot: antfly.metadata_api.AdminSnapshot,
+                reads: usize = 0,
+
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    const routes = @import("../metadata/http_routes.zig").Routes;
+                    if (std.mem.endsWith(u8, request.uri, @import("../metadata/snapshot_transfer.zig").path)) return error.UnsupportedOperation;
+                    try std.testing.expectEqual(.GET, request.method);
+                    try std.testing.expect(std.mem.endsWith(u8, request.uri, routes.admin_snapshot));
+                    self.reads += 1;
+                    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, self.snapshot, .{}) };
+                }
+            };
+            var fake: Fake = .{ .snapshot = snapshot };
+            var source = try RemoteMetadataSource.initWithRequestExecutors(std.testing.allocator, &.{"http://metadata.invalid"}, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, std.testing.io);
+            defer source.deinit();
             source.cached_head = RemoteMetadataSource.snapshotHead(&snapshot);
-            const now_ms = source.awakeMs();
-            source.cached_snapshot_at_ms = now_ms;
-            source.cached_head_at_ms = now_ms;
-            source.test_faults.force_snapshot_cache_miss = true;
+            source.cached_head_at_ms = std.math.maxInt(u64);
             source.test_faults.fetch_head_mismatches_remaining = 3;
 
             var fetched = try source.fetchSnapshot();
@@ -57374,6 +57382,7 @@ fn consumerTests() type {
 
             try std.testing.expectEqual(@as(u64, 9), fetched.status.metadata_group_id);
             try std.testing.expectEqual(@as(usize, 0), source.test_faults.fetch_head_mismatches_remaining);
+            try std.testing.expectEqual(@as(usize, 1), fake.reads);
         }
 
         test "remote metadata source bounds repeated fenced snapshot generations" {
