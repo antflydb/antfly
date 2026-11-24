@@ -3445,12 +3445,21 @@ test "cached Metal pipelined runtime settles each real request before Engine epo
         defer cleanup.finishAfterUnlock();
         var backend = try session_factory.getComputeBackend(session, a);
         const current: @import("../execution/cleanup_context.zig").Context = .{ .boundary = cleanup.epoch(), .operation = backend.operationToken() };
-        defer backend.deinitWithCleanup(current);
+        defer {
+            const closer = backend.retainCleanupFinish();
+            backend.deinitWithCleanup(current);
+            if (closer) |pin| pin.releaseLocalWithBoundary(current.boundary) catch platform.inference_process_supervisor.restartWorker();
+        }
         try std.testing.expect(try cleanup.bindBackend(&backend));
-        _ = try cleanup.retainThroughBackend(&backend);
+        try std.testing.expect(try cleanup.retainThroughBackend(&backend));
         // On every later assertion/allocation failure, pending numerical work
         // still retires through this same current owner before Engine cleanup.
-        defer instance.finishRequestWithCleanup(current) catch platform.inference_process_supervisor.restartWorker();
+        defer instance.finishRequestWithCleanup(current) catch |err| {
+            std.debug.print("Metal fixture cleanup failed in mode {d}: {s}\n", .{ mode, @errorName(err) });
+            platform.inference_process_supervisor.restartWorker();
+        };
+        errdefer std.debug.print("Metal fixture mode {d} failed before cleanup\n", .{mode});
+
         try instance.resetWithCleanup(current);
         try std.testing.expect(physical.pipelined_kv_advanced_for == null);
         _ = try instance.prepare(a, .{ .kv_tokens_hint = 16, .cleanup_epoch = current.boundary, .backend_operation = current.operation });
