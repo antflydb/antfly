@@ -40809,7 +40809,14 @@ pub const DB = struct {
                 try waitForManagedIndexesApplied(self, sequence, sync_targets.full_text_indexes);
             },
             .full_index => {
-                if (has_groups) {
+                // Every index served this write inline (its publication rode
+                // in the primary commit) and no enrichment or group source
+                // owes it anything: it is already visible. Catching every
+                // derived worker up to this sequence, and chasing writes that
+                // committed meanwhile, only delays the ack.
+                const served_inline = sync_targets.served_inline and !has_groups and sync_targets.all_indexes.len == 0 and
+                    (self.enrichment_runtime == null or skip_enrichment_runtime_wait);
+                if (served_inline) {} else if (has_groups) {
                     if (wait_primary_enrichments) try self.runEnrichmentUntilWithVisibilityDeadlineRetrying(sequence, cancellation, deadline_ns, wait);
                     // Own grouped publications have been accepted before
                     // this cut. Include them once without chasing unrelated

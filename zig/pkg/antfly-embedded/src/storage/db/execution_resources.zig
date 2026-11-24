@@ -744,6 +744,10 @@ pub const ManagedSyncTargets = struct {
     // parallel allocation solely to manage name lifetime.
     target_identities: []const IndexTargetVisibility = &.{},
     target_scope_known: bool = false,
+    /// A batch's inline publications served the indexes filtered out of
+    /// these lists: with none left, its `full_index` wait has nothing to
+    /// catch up (`DB.waitForSyncLevelWithPublicationCut`).
+    served_inline: bool = false,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.full_text_indexes) |name| alloc.free(@constCast(name));

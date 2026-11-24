@@ -4224,6 +4224,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // stay in `all_indexes` whether handled or not), so its
                 // remaining count needs the handled ones subtracted back
                 // out explicitly.
+                sync_targets.served_inline = inline_text_publication_count != 0 or inline_graph_publication != null or
+                    inline_sparse_publication != null or inline_dense_publication != null or inline_algebraic_publication_count != 0;
                 const suppress_full_text = inline_text_publication_count != 0 and
                     sync_targets.full_text_indexes.len == 0;
                 var suppress_graph = false;
