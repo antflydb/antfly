@@ -8353,8 +8353,6 @@ pub const NativeGenerationPipeline = struct {
         wants_last_logits: bool,
         allow_shared_kv_prefill: bool,
     ) !?[]f32 {
-        var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
-        const decode_ctx = decode_runtime.makeDecodeContext(seq_len, query_seq_len);
         var work = PendingPrefillBatchWork{
             .allocator = self.allocator,
             .decode_state = decode_state,
@@ -8365,24 +8363,20 @@ pub const NativeGenerationPipeline = struct {
             .allow_shared_kv_prefill = allow_shared_kv_prefill,
         };
         defer if (work.logits) |logits| work.allocator.free(logits);
-        var pending_options = pendingWorkOptionsFromState(decode_state, query_seq_len);
-        if (self.execution_lock != null) {
-            // CUDA row-batched prefill is not response-equivalent yet. Keep
-            // prefill as a singleton; decode remains continuously batchable.
-            pending_options.exclusive_step = true;
-        }
-        try scheduler.enqueuePrefillWork(lease.*, @ptrCast(&work), seq_len, query_seq_len, decode_ctx.kv_sequence_len, decode_ctx.kv_position_offset, pending_options);
-        defer if (!work.ready.load(.acquire)) scheduler.cancelPrefillWork(@ptrCast(&work));
-
-        var driver = PrefillStepDriver{
-            .pipeline = self,
+        var executor = self.stepExecutor();
+        defer self.mergeStepExecutor(&executor);
+        var publication = StepPublication{ .scheduler = scheduler, .lease = lease, .vocab_size = self.gpt_config.vocab_size };
+        try (decoder_prefill.ScheduledStep{
             .scheduler = scheduler,
-            .work = &work,
-            .decode_state = decode_state,
-        };
-        try runStepLoop(self.allocator, scheduler, lease, @ptrCast(&work), .prefill, io, null, &driver);
+            .lease = lease,
+            .io = io,
+            .execution_control = self.execution_control,
+            .executor = &executor,
+            .publication = publication.interface(),
+            // CUDA token prefill uses singleton scheduling.
+            .exclusive = self.execution_lock != null,
+        }).run(&work);
 
-        if (work.failure) |err| return err;
         const logits = work.logits;
         work.logits = null;
         return logits;
@@ -8810,34 +8804,6 @@ const DecodeStepDriver = struct {
 
     pub fn execute(
         self: *DecodeStepDriver,
-        scheduler: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
-        lease: *runtime.scheduler.native_generate.Lease,
-        claimed: []const runtime.scheduler.native_generate.StepItem,
-    ) void {
-        self.pipeline.executeClaimedStep(scheduler, lease, claimed);
-    }
-};
-
-const PrefillStepDriver = struct {
-    pipeline: *NativeGenerationPipeline,
-    scheduler: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
-    work: *NativeGenerationPipeline.PendingPrefillBatchWork,
-    decode_state: *NativeDecodeState,
-
-    pub fn checkControl(self: *PrefillStepDriver) !void {
-        if (self.pipeline.execution_control) |control| try control.check();
-    }
-
-    pub fn isReady(self: *const PrefillStepDriver) bool {
-        return self.work.ready.load(.acquire);
-    }
-
-    pub fn stepBudget(self: *const PrefillStepDriver) runtime.scheduler.native_generate.StepBudget {
-        return stepBudgetFromState(self.scheduler, self.decode_state);
-    }
-
-    pub fn execute(
-        self: *PrefillStepDriver,
         scheduler: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
         lease: *runtime.scheduler.native_generate.Lease,
         claimed: []const runtime.scheduler.native_generate.StepItem,

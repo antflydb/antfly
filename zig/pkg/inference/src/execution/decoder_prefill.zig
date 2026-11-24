@@ -1359,6 +1359,53 @@ pub const PositionedEmbeddingBatchItem = struct {
     sequence_length: usize,
 };
 
+/// Owns the queue borrow until publication or synchronous cancellation.
+pub const ScheduledStep = struct {
+    const scheduler_api = runtime.scheduler.native_generate;
+    const Executor = graph_mod.decoder_step_executor.Executor;
+
+    scheduler: *scheduler_api.NativeGenerateCoordinator,
+    lease: *scheduler_api.Lease,
+    io: std.Io,
+    execution_control: ?control.InferenceExecutionControl,
+    executor: *Executor,
+    publication: Executor.Publication,
+    exclusive: bool = false,
+
+    pub fn run(self: ScheduledStep, work: *graph_mod.decoder_work.Prefill) !void {
+        var decode_runtime = BorrowedDecodeStateRuntime.init(work.decode_state);
+        const context = decode_runtime.makeDecodeContext(work.seq_len, work.query_seq_len);
+        var options = graph_mod.decoder_work.pendingOptions(work.decode_state, work.query_seq_len);
+        options.exclusive_step = options.exclusive_step or self.exclusive;
+        try self.scheduler.enqueuePrefillWork(self.lease.*, work, work.seq_len, work.query_seq_len, context.kv_sequence_len, context.kv_position_offset, options);
+        defer if (!work.ready.load(.acquire)) self.scheduler.cancelPrefillWork(work);
+        var driver = Driver{ .step = self, .work = work };
+        try @import("../runtime/scheduler/step_wait.zig").run(work.allocator, self.scheduler, self.lease, work, .prefill, self.io, null, &driver);
+        if (work.failure) |err| return err;
+    }
+
+    const Driver = struct {
+        step: ScheduledStep,
+        work: *graph_mod.decoder_work.Prefill,
+
+        pub fn checkControl(self: *@This()) !void {
+            if (self.step.execution_control) |active| try active.check();
+        }
+
+        pub fn isReady(self: *const @This()) bool {
+            return self.work.ready.load(.acquire);
+        }
+
+        pub fn stepBudget(self: *const @This()) scheduler_api.StepBudget {
+            return graph_mod.decoder_work.stepBudget(self.step.scheduler, self.work.decode_state);
+        }
+
+        pub fn execute(self: *@This(), scheduler: *scheduler_api.NativeGenerateCoordinator, _: *scheduler_api.Lease, claimed: []const scheduler_api.StepItem) void {
+            self.step.executor.execute(claimed, scheduler.usesStepEvents(), self.step.publication);
+        }
+    };
+};
+
 /// One borrowed positioned-prefix request. Queue work and its prefix remain
 /// stack-owned until the existing wait protocol publishes ready or drains it.
 /// Physical execution never borrows a task pipeline or tokenizer.
@@ -1392,17 +1439,16 @@ pub const PositionedRequest = struct {
             const query = @min(chunk_rows, seq - processed);
             const end = processed + query;
             const final = end == seq;
-            var decode_runtime = BorrowedDecodeStateRuntime.init(state);
-            // This context describes queued KV geometry only. The executor
-            // binds cleanup when it acquires the actual physical forward lane.
-            const context = decode_runtime.makeDecodeContext(end, query);
             var work = graph_mod.decoder_work.Prefill{ .allocator = self.item.allocator, .decode_state = state, .token_ids = &.{}, .seq_len = end, .query_seq_len = query, .wants_last_logits = final, .wants_greedy = final and wants_greedy, .prepared_prefix = self.prefix };
             defer if (work.logits) |logits| work.allocator.free(logits);
-            try scheduler.enqueuePrefillWork(lease.*, @ptrCast(&work), end, query, context.kv_sequence_len, context.kv_position_offset, graph_mod.decoder_work.pendingOptions(state, query));
-            defer if (!work.ready.load(.acquire)) scheduler.cancelPrefillWork(@ptrCast(&work));
-            var driver = Driver{ .request = self, .work = &work };
-            try @import("../runtime/scheduler/step_wait.zig").run(self.item.allocator, scheduler, lease, @ptrCast(&work), .prefill, io, null, &driver);
-            if (work.failure) |err| return err;
+            try (ScheduledStep{
+                .scheduler = scheduler,
+                .lease = lease,
+                .io = io,
+                .execution_control = self.control,
+                .executor = &self.executor,
+                .publication = self.publication,
+            }).run(&work);
             // The forward reserved exactly this prefix before mutating its KV
             // and recurrent histories. Never restart a partially consumed prefix.
             if (state.total_tokens != end) return error.InvalidBatchDecodeState;
@@ -1420,22 +1466,6 @@ pub const PositionedRequest = struct {
         }
         return error.InvalidPreparedPrompt;
     }
-    const Driver = struct {
-        request: *PositionedRequest,
-        work: *graph_mod.decoder_work.Prefill,
-        pub fn checkControl(self: *@This()) !void {
-            if (self.request.control) |active| try active.check();
-        }
-        pub fn isReady(self: *const @This()) bool {
-            return self.work.ready.load(.acquire);
-        }
-        pub fn stepBudget(self: *const @This()) runtime.scheduler.native_generate.StepBudget {
-            return graph_mod.decoder_work.stepBudget(self.request.scheduler, self.work.decode_state);
-        }
-        pub fn execute(self: *@This(), scheduler: *runtime.scheduler.native_generate.NativeGenerateCoordinator, _: *runtime.scheduler.native_generate.Lease, claimed: []const runtime.scheduler.native_generate.StepItem) void {
-            self.request.executor.execute(claimed, scheduler.usesStepEvents(), self.request.publication);
-        }
-    };
 };
 
 pub fn forwardPositionedEmbeddingBatch(items: []const PositionedEmbeddingBatchItem) ![][]f32 {
