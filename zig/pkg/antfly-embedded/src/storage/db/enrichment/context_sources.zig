@@ -814,6 +814,24 @@ fn traversalTargetAlloc(a: Allocator, query: std.json.ObjectMap) Error!std.json.
     return target;
 }
 
+/// Clauses that make a ranked request return scored hits. A request with
+/// `graph_queries` and none of these is graph-only: its members are the
+/// nodes its graph operations return, not the request's hits.
+const hit_clauses = [_][]const u8{ "full_text_search", "semantic_search", "embeddings" };
+
+pub fn graphOnlyRequestValue(request: std.json.ObjectMap) bool {
+    if (request.get("graph_queries") == null) return false;
+    inline for (hit_clauses) |clause| if (request.get(clause) != null) return false;
+    return true;
+}
+
+/// Same, over a stored request's JSON (as executed by hosts).
+pub fn graphOnlyRequest(alloc: Allocator, request_json: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, request_json, .{}) catch return false;
+    defer parsed.deinit();
+    return parsed.value == .object and graphOnlyRequestValue(parsed.value.object);
+}
+
 /// Public `query` with ranking clauses, as the internal ranked-retrieval
 /// target: the shorthands as they are, otherwise every clause but `table`
 /// as one QueryRequest (`filter_query` included). A live `order_by` has no
@@ -1157,6 +1175,10 @@ fn parseSearchField(a: Allocator, s: *SearchSpec, key: []const u8, field: std.js
         inline for (.{ "table", "offset", "search_after", "search_before", "count", "aggregations" }) |forbidden| {
             if (field.object.get(forbidden) != null) return error.UnsupportedContextPredicate;
         }
+        // A graph-only request's members are its graph results; a top-level
+        // filter does not scope graph operations, so it would silently not
+        // apply. Put constraints on the graph operation instead.
+        if (graphOnlyRequestValue(field.object) and field.object.get("filter_query") != null) return error.UnsupportedContextPredicate;
         if (field.object.get("limit")) |limit| s.k = @intCast(try uintField(limit, 1, max_search_k));
         s.request = try stringifyAlloc(a, field);
     } else return error.InvalidContextSourcesConfig;

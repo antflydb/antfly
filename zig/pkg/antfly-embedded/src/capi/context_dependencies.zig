@@ -147,11 +147,24 @@ fn executeRequest(ptr: *anyopaque, alloc: std.mem.Allocator, db: *db_mod.DB, req
         }
         rows.deinit(alloc);
     }
-    for (result.hits) |hit| {
+    // A graph-only request's members are the nodes its graph operations
+    // return (in operation and result order, each once), not its hits.
+    const graph_only = ctx.graphOnlyRequest(alloc, request_json);
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+    const groups: []const []const db_mod.types.SearchHit = if (graph_only) blk: {
+        const lists = try alloc.alloc([]const db_mod.types.SearchHit, result.graph_results.len);
+        for (result.graph_results, lists) |graph, *list| list.* = graph.hits;
+        break :blk lists;
+    } else &.{result.hits};
+    defer if (graph_only) alloc.free(groups);
+    for (groups) |hits| for (hits) |hit| {
+        if (rows.items.len >= k) break;
+        if ((try seen.getOrPut(alloc, hit.id)).found_existing) continue;
         const value = if (hit.stored_data) |data| try alloc.dupe(u8, data) else (try db.get(alloc, hit.id)) orelse continue;
         errdefer alloc.free(value);
         try rows.append(alloc, .{ .key = try alloc.dupe(u8, hit.id), .value = value });
-    }
+    };
     return .{ .rows = try rows.toOwnedSlice(alloc), .exhausted = true };
 }
 

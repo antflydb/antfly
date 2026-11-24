@@ -485,6 +485,13 @@ pub const Host = struct {
                 if (req.limit == 0 or req.limit > body.k) req.limit = body.k;
                 const response = (try p.reads_fn(p.ptr).query(alloc, name, req, .read_index)) orelse return error.ContextSearchUnavailable;
                 defer alloc.free(response.json);
+                // A graph-only request's members are its graph results' nodes,
+                // hydrated through the routed read fence in exact-ID batches.
+                if (ctx.graphOnlyRequest(a, body.request)) {
+                    const keys = try graphResultKeysAlloc(a, response.json, body.k);
+                    const rows = try hydrateRows(p, alloc, a, name, keys);
+                    return host_json.encodePageAlloc(alloc, rows, true);
+                }
                 return hitsPageAlloc(alloc, a, response.json);
             },
             .topology => {
@@ -565,6 +572,56 @@ fn hydrateRows(p: Primitives, alloc: Allocator, a: Allocator, table: []const u8,
 }
 
 /// `{"responses":[{"hits":{"hits":[{"_id","_source"}]}}]}` to a page.
+/// Node keys of a query response's graph results, in operation and result
+/// order, each once, at most `limit`: node results' nodes, path results'
+/// endpoints, and every node bound in a binding row. Nodes owned by another
+/// table are not members of this table's source. Aggregates name no rows.
+fn graphResultKeysAlloc(a: Allocator, body: []const u8, limit: u32) ![]const []const u8 {
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{});
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    const responses = (if (parsed == .object) parsed.object.get("responses") else null) orelse return keys.items;
+    if (responses != .array or responses.array.items.len == 0 or responses.array.items[0] != .object) return keys.items;
+    const results = responses.array.items[0].object.get("graph_results") orelse return keys.items;
+    if (results != .object) return keys.items;
+    const Add = struct {
+        fn node(al: Allocator, out: *std.ArrayListUnmanaged([]const u8), s: *std.StringHashMapUnmanaged(void), value: std.json.Value, max: u32) !void {
+            if (out.items.len >= max or value != .object) return;
+            if (value.object.get("table")) |t| if (t == .string and t.string.len != 0) return;
+            const key = value.object.get("key") orelse return;
+            if (key != .string) return;
+            if ((try s.getOrPut(al, key.string)).found_existing) return;
+            try out.append(al, key.string);
+        }
+    };
+    var it = results.object.iterator();
+    while (it.next()) |entry| {
+        const result = entry.value_ptr.*;
+        if (result != .object) continue;
+        const kind = result.object.get("kind") orelse continue;
+        if (kind != .string) continue;
+        if (std.mem.eql(u8, kind.string, "nodes")) {
+            const nodes = result.object.get("nodes") orelse continue;
+            if (nodes == .array) for (nodes.array.items) |n| try Add.node(a, &keys, &seen, n, limit);
+        } else if (std.mem.eql(u8, kind.string, "paths")) {
+            const paths = result.object.get("paths") orelse continue;
+            if (paths == .array) for (paths.array.items) |path| {
+                if (path != .object) continue;
+                const nodes = path.object.get("nodes") orelse continue;
+                if (nodes == .array and nodes.array.items.len != 0) try Add.node(a, &keys, &seen, nodes.array.items[nodes.array.items.len - 1], limit);
+            };
+        } else if (std.mem.eql(u8, kind.string, "bindings")) {
+            const rows = result.object.get("rows") orelse continue;
+            if (rows == .array) for (rows.array.items) |row| {
+                if (row != .object) continue;
+                var bit = row.object.iterator();
+                while (bit.next()) |binding| try Add.node(a, &keys, &seen, binding.value_ptr.*, limit);
+            };
+        } else if (std.mem.eql(u8, kind.string, "aggregates")) return error.UnsupportedContextPredicate;
+    }
+    return keys.items;
+}
+
 fn hitsPageAlloc(alloc: Allocator, a: Allocator, body: []const u8) ![]u8 {
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{});
     var rows = std.ArrayListUnmanaged(local.storage_db_enrichment_context_resolution.Row).empty;
@@ -845,4 +902,24 @@ test "distributed admission refuses snapshot searches that need a query embeddin
             alloc.free(stored);
         } else try std.testing.expectError(error.UnsupportedContextPredicate, admitAlloc(alloc, &tables, collect, "docs", "brief", value, null, null));
     }
+}
+
+test "graph-only snapshot members come from graph results" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body =
+        \\{"responses":[{"hits":{"hits":[{"_id":"ignored"}]},"graph_results":{
+        \\ "walk":{"kind":"nodes","nodes":[{"key":"n1","depth":1},{"key":"far","table":"other","depth":1},{"key":"n2","depth":2}]},
+        \\ "route":{"kind":"paths","paths":[{"nodes":[{"key":"dep"},{"key":"n3"}]}]},
+        \\ "pairs":{"kind":"bindings","rows":[{"a":{"key":"n1"},"b":{"key":"n4"}}]}}}]}
+    ;
+    const keys = try graphResultKeysAlloc(a, body, 10);
+    try std.testing.expectEqual(@as(usize, 4), keys.len);
+    for ([_][]const u8{ "n1", "n2", "n3", "n4" }, keys) |want, got| try std.testing.expectEqualStrings(want, got);
+    // The member bound is honored.
+    try std.testing.expectEqual(@as(usize, 2), (try graphResultKeysAlloc(a, body, 2)).len);
+    try std.testing.expectError(error.UnsupportedContextPredicate, graphResultKeysAlloc(a,
+        \\{"responses":[{"graph_results":{"n":{"kind":"aggregates","rows":[]}}}]}
+    , 10));
 }
