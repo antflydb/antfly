@@ -3843,8 +3843,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         S.ownerField(self, "core").*.index_manager,
                         materialized_derived_batch.?,
                         index_ref,
+                        // `max_pending_segments` is where a writer starts merging
+                        // (`mergeAtCapBeforeWrite`); while a merge already in flight
+                        // elsewhere catches up, writes stay inline up to twice it.
                         if (S.ownerField(self, "text_merge_runtime").*) |runtime|
-                            (if (runtime.config.enabled) runtime.config.max_pending_segments else 0)
+                            (if (runtime.config.enabled) runtime.config.max_pending_segments *| 2 else 0)
                         else
                             0,
                     ) catch {

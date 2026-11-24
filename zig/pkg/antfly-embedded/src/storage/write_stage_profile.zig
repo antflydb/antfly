@@ -32,6 +32,10 @@ pub const Stage = enum(u8) {
     write,
     /// Inline full-text preparation (tokenize, build level-0).
     inline_text_prepare,
+    /// Within it: projection and analysis of the documents.
+    text_project,
+    /// Within it: encoding the level-0 segment.
+    text_segment_build,
     /// Staging the primary write into the group commit.
     primary_stage,
     /// The primary write's ticket wait: group apply plus durability.
@@ -44,6 +48,10 @@ pub const Stage = enum(u8) {
     frontier_sync,
     /// Installing inline publications after the wait.
     inline_install,
+    /// Within a text install: syncing the catalog mirror.
+    text_install_mirror,
+    /// Within a text install: publishing the level-0 segment.
+    text_install_segment,
     /// `waitForSyncLevel` after the commit.
     wait_sync_level,
     /// One merge task (`runOnceTask`).

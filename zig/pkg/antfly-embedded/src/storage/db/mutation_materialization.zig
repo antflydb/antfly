@@ -17,6 +17,7 @@
 //! Receivers borrow local resources; lifetime and scheduling remain with DB.
 
 const CollectSparseFieldWritesProfile = @import("replay_vector_collectors.zig").CollectSparseFieldWritesProfile;
+const write_stage_profile = @import("../write_stage_profile.zig");
 const GraphTtlSha256 = @import("antfly_hash").Sha256;
 pub const IndexTargetVisibility = @import("query_visibility.zig").IndexTargetVisibility;
 const OwnedDenseEmbeddingWrites = @import("replay_vector_collectors.zig").OwnedDenseEmbeddingWrites;
@@ -3497,10 +3498,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
 
             fn installBody(self: *InlineTextPublication) !void {
+                const mirror_span = write_stage_profile.begin(.text_install_mirror);
                 const mutations = try self.mutationsAlloc(self.alloc);
                 defer self.alloc.free(mutations);
                 try self.entry.persistent.applyExternallyCommittedMutationsIfNativeCatalog(mutations);
                 try self.entry.persistent.reconcileInlineCommittedMutations(self.resolution.decidedMutations());
+                mirror_span.end();
+                const segment_span = write_stage_profile.begin(.text_install_segment);
+                defer segment_span.end();
                 // Consume every segment, including after a failed install.
                 var install_error: ?anyerror = null;
                 for (self.segments[0..self.segment_count]) |*seg| {

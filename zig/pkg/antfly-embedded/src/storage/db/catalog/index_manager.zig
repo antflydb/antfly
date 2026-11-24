@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const write_stage_profile = @import("../../write_stage_profile.zig");
 const ordinal_core = @import("storage_ordinals");
 const builtin = @import("builtin");
 const is_hostless = builtin.os.tag == .freestanding or builtin.os.tag == .wasi;
@@ -21851,6 +21852,7 @@ pub const IndexManager = struct {
                     filtered.items[start..end],
                     projection_options,
                 );
+                const project_span = write_stage_profile.begin(.text_project);
                 const source_docs_with_ordinals = try self.textProjectionSourceDocsWithOrdinals(arena, store, entry, source_batch.docs);
                 var chunk_observed = std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer).empty;
                 defer chunk_observed.deinit(arena);
@@ -21861,10 +21863,13 @@ pub const IndexManager = struct {
                     &chunk_observed,
                     null,
                 );
+                project_span.end();
                 try appendOwnedObservedFieldAnalyzers(alloc, &observed, projection_batch.observed_field_analyzers);
 
                 const runtime_index_sort = if (entry.runtime_schema) |schema| schema.index_sort else &.{};
                 const index_sort = try textIndexSortFieldsForSegmentAlloc(arena, runtime_index_sort);
+                const build_span = write_stage_profile.begin(.text_segment_build);
+                defer build_span.end();
                 const built = try mapper.buildTextSegmentsFromProjectionBatch(
                     segment_alloc,
                     projection_batch,
