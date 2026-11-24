@@ -3299,7 +3299,7 @@ pub const TypedReadScope = struct {
     pub fn retainSegment(self: *TypedReadScope, lease: anytype) !void {
         if (lease.snapshot == null) return;
         self.age +%= 1;
-        const segment = &lease.entry.reader;
+        const segment = lease.entry.reader.encoded();
         var victim: usize = 0;
         for (&self.owners, 0..) |*slot, i| {
             if (slot.*) |*owner| {
@@ -9262,7 +9262,7 @@ test "segment native facade queries typed values and merges both orders without 
         defer merged_text.deinit();
         try std.testing.expectEqual(@as(u32, 256), (try merged_text.lookup("alpha")).?.docFreq());
     }
-    entry.reader.native.?.range.paged_source.?.cached_page = null;
+    entry.reader.encoded().native.?.range.paged_source.?.cached_page = null;
     state.fail = true;
     try std.testing.expectError(error.TestReadFailure, (query.TermFilter{ .field = "body", .term = "alpha" }).execute(a, entry));
     state.fail = false;

@@ -55,7 +55,7 @@ index at the cap on its own thread before it takes the apply lock
 write stays inline. Debug: the full_index wait went from 400 to 1.4 µs per
 write and merges from 157 to 56 per 2,000 writes.
 
-### 2. One fsync per commit
+### 2. One fsync per commit (done)
 
 Today: append records, fsync, write the next frontier slot, fsync. Recovery
 replays only to the newest frontier, so the second fsync is what makes an
@@ -72,11 +72,21 @@ A commit whose previous slot is in another log generation (rotation, reset)
 keeps the two-fsync order, so verification only ever spans one contiguous
 range.
 
-Cost: the disk frontier is read in about nine places (cold recovery, reader
-seals, writer tail resync, folds, compaction, checks), and each must stop
-treating an unverified newest slot as durable. It saves about 35 µs of a
-commit; group commit (3) would divide every per-commit cost instead, so it
-waits for 3.
+Every production read of the disk frontier (cold recovery, reader seals,
+writer tail resync, folds, crashed-writer recovery) goes through
+`NativeFile.readDurableFrontier`, which runs that verification; the slot
+carries `combined` and its log segment under its checksum. A failed fsync,
+or a failed write of the slot itself, writes the previous frontier back into
+the staged slot, so the commit fails like a plain record sync failure and
+the next one proceeds; only a failure of that write leaves the frontier
+uncertain. Commits after a rotation, reset or frontier baseline keep the
+two-fsync order. In Debug, 82 of 6,314 commits of an 8-thread full-text run
+took the two-fsync path.
+
+Trade-off: damage to the newest commit's records is indistinguishable from
+a crash inside its fsync, so cold recovery drops that commit instead of
+failing as corrupt (SQLite's WAL truncates at a bad frame the same way).
+Damage below the older slot still fails recovery.
 
 Readers must not treat the slot as a visibility signal before the fsync: the
 shared region's durable watermark, published after the fsync, stays the live
@@ -102,6 +112,29 @@ its group after another file took the lease). Fixed by:
 - a level-0 soft cap where writers merge (`max_pending_segments`) and a hard
   cap twice that for inline writes, so a write at the cap whose merge is
   already running elsewhere stays inline instead of paying the replay path.
+
+### 4a. Level-0 encoding (measured, small)
+
+Sampled in Debug (8 threads, full text, `sample(1)`): building a write's
+level-0 segment is about 7% of the write's commit path; the group commit's
+ticket wait is 47%. The `text_segment_build` span had looked far larger only
+because enabling the build profile also took six resident-memory samples per
+segment; the profile now leaves those off and splits the span into analysis,
+typed values, inverted sections and assembly.
+
+Within the build, 65% of assembly was `combineSectionCrc` shifting a zero
+checksum through GF(2) matrices: every section of a small segment is a
+single first block. The shift is linear, so a zero left checksum returns the
+right one unchanged, which is exact. A separate small-segment encoder is not
+worth its second format path at this size.
+
+### 4b. A segment interface for queries
+
+`SegmentEntry.reader` is a `SegmentView` (`segment_view.zig`): the
+operations queries, deletions and merge planning use, with the encoded
+`SegmentReader` as its only implementation. Code that works on encoded bytes
+(merges, cursors, native navigation, integrity checks) asks for `encoded()`.
+A level-0 buffer reader (4) becomes a second variant. No behavior change.
 
 ### 4. Level-0 as a memtable
 
@@ -147,8 +180,10 @@ record by record, a refresh costs what changed, and writes can use it.
 | change | state |
 |---|---|
 | 1. full_index fast path, merging at the cap | committed |
-| 2. one fsync per commit | designed; after 4 |
+| 2. one fsync per commit | committed |
 | 3. indexed writes overlap their wait (group commit) | committed |
+| 4a. level-0 encoding: CRC shortcut, profile split | committed |
+| 4b. `SegmentView` interface | committed |
 | 4. level-0 memtable | designed |
 | 5. bounded merges outside the lease | after 4 (the flush is the bounded merge) |
 | 6. incremental writer refresh | after 4 (the buffer rebuild is the refresh) |

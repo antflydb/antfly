@@ -7790,7 +7790,7 @@ fn nativeSortValueFromTextDocValuesAlloc(
     defer segment_lease.deinit();
     const segment = segment_lease.entry;
     try reads.retainSegment(segment_lease);
-    const reader = (try reads.get(&segment.reader, field)) orelse {
+    const reader = (try reads.get(segment.reader.encoded(), field)) orelse {
         if (try segment.reader.provesNullIndexSortField(field)) return .null_value;
         logNativeDocValueLoadFailure(field, "missing_doc_values_section");
         return error.UnsupportedExactSort;
@@ -9533,7 +9533,7 @@ fn nextSortedSegmentHeadAlloc(
         if (executor.is_expired_key) |is_expired| {
             if (try is_expired(executor.ctx, alloc, stored.id)) continue;
         }
-        const ordinal = try sortedCandidateOrdinal(identity_scratch.allocator(), req, executor, constraints, &segment.reader, local_doc_id, &stored.id);
+        const ordinal = try sortedCandidateOrdinal(identity_scratch.allocator(), req, executor, constraints, segment.reader.encoded(), local_doc_id, &stored.id);
         const candidate = MatchAllCandidate{
             .id = @constCast(stored.id),
             .ordinal = ordinal,
@@ -9625,7 +9625,7 @@ fn countSortedSegmentVisibleCandidatesWithoutSortValuesAlloc(
             if (executor.is_expired_key) |is_expired| {
                 if (try is_expired(executor.ctx, alloc, stored.id)) continue;
             }
-            const ordinal = try sortedCandidateOrdinal(identity_scratch.allocator(), req, executor, constraints, &segment.reader, local_doc_id, &stored.id);
+            const ordinal = try sortedCandidateOrdinal(identity_scratch.allocator(), req, executor, constraints, segment.reader.encoded(), local_doc_id, &stored.id);
             const candidate = MatchAllCandidate{
                 .id = @constCast(stored.id),
                 .ordinal = ordinal,
@@ -9695,7 +9695,7 @@ fn countSortedSegmentVisibleCandidatesFromSeekAlloc(
             if (executor.is_expired_key) |is_expired| {
                 if (try is_expired(executor.ctx, alloc, stored.id)) continue;
             }
-            const ordinal = try sortedCandidateOrdinal(identity_scratch.allocator(), req, executor, constraints, &segment.reader, local_doc_id, &stored.id);
+            const ordinal = try sortedCandidateOrdinal(identity_scratch.allocator(), req, executor, constraints, segment.reader.encoded(), local_doc_id, &stored.id);
             const candidate = MatchAllCandidate{
                 .id = @constCast(stored.id),
                 .ordinal = ordinal,
@@ -11534,7 +11534,7 @@ const IndexedPredicateEvaluator = struct {
             }
             var lease = try self.snapshot.leaseSegment(segment_index);
             defer lease.deinit();
-            var ordinals = try segment_mod.DocOrdinalCursor.init(&lease.entry.reader);
+            var ordinals = try segment_mod.DocOrdinalCursor.init(lease.entry.reader.encoded());
             while (next) |doc| {
                 if (doc >= upper) break;
                 try self.control.check();
@@ -16602,7 +16602,7 @@ const TextLiveVisibilityProducer = struct {
         defer segment.deinit();
         if (resolved.local_id != 0 or segment.entry.reader.doc_count != count) return error.InvalidQueryRequest;
         segment.entry.noteAccess();
-        var ordinal_cursor = try segment_mod.DocOrdinalCursor.init(&segment.entry.reader);
+        var ordinal_cursor = try segment_mod.DocOrdinalCursor.init(segment.entry.reader.encoded());
         var iterator = if (candidates) |bitmap| bitmap.iterator() else null;
         var position: u32 = 0;
         var docs: [64]u32 = undefined;
@@ -22197,7 +22197,7 @@ fn snapshotSegmentsHaveIndexSortAlloc(
         defer segment_lease.deinit();
         const segment = segment_lease.entry;
         covered_live_segments = true;
-        if (!try segmentIndexSortMatchesSchemaAlloc(alloc, &segment.reader, schema)) return false;
+        if (!try segmentIndexSortMatchesSchemaAlloc(alloc, segment.reader.encoded(), schema)) return false;
     }
     return covered_live_segments;
 }
@@ -39985,7 +39985,7 @@ test "native text stats fallback supports range-backed segments and filters" {
     try std.testing.expectEqual(@as(u32, 1), stats.term_doc_freqs[0].doc_freq);
     try std.testing.expectEqual(@as(u32, 1), stats.term_doc_freqs[1].doc_freq);
     try std.testing.expectEqual(@as(u32, 0), stats.term_doc_freqs[2].doc_freq);
-    try std.testing.expectEqual(@as(usize, 0), writer.snapshot().segments[0].reader.native.?.identity_bytes);
+    try std.testing.expectEqual(@as(usize, 0), writer.snapshot().segments[0].reader.encoded().native.?.identity_bytes);
 }
 
 test "query reader reuse shares native sort navigation and decoded chunks" {
@@ -41187,7 +41187,7 @@ test "text live visibility refines posting candidates and skips an all-visible f
     var candidates = roaring.RoaringBitmap.init(a);
     defer candidates.deinit();
     try candidates.addRange(0, 512);
-    const cache = &pinned.segments[0].reader.native.?.metadata_cache.?;
+    const cache = &pinned.segments[0].reader.encoded().native.?.metadata_cache.?;
     const before = cache.cache.clock;
     var selected = try TextLiveVisibilityProducer.produce(&producer, a, 0, 5000, &candidates);
     defer selected.deinit();

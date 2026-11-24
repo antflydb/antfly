@@ -137794,7 +137794,7 @@ test "db text compaction preserves index sort acceleration" {
     const snapshot = text_index.snapshot();
     try std.testing.expect(snapshot.segments.len <= index_manager_mod.default_text_merge_max_segments_per_tier);
     for (snapshot.segments) |segment| {
-        const fields = (try segment.reader.indexSortFieldsAlloc(alloc)) orelse return error.TestUnexpectedResult;
+        const fields = (try segment.reader.encoded().indexSortFieldsAlloc(alloc)) orelse return error.TestUnexpectedResult;
         defer segment_mod.freeIndexSortFields(alloc, fields);
         try std.testing.expectEqual(@as(usize, 2), fields.len);
         try std.testing.expectEqualStrings("price", fields[0].field);

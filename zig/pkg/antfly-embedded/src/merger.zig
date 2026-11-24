@@ -215,7 +215,7 @@ pub fn mergeSegments(
         const seg = &snap.segments[si];
         deleted_docs[i] = try seg.cloneDeleted(alloc);
         inputs[i] = .{
-            .reader = &seg.reader,
+            .reader = seg.reader.encoded(),
             .deleted = deleted_docs[i],
         };
     }
@@ -259,7 +259,7 @@ pub fn mergeSegmentsBounded(
         total_input_bytes += seg.data.len();
         if (options.deleted_docs == null) owned_deleted_docs[i] = try seg.cloneDeleted(alloc);
         inputs[i] = .{
-            .reader = &seg.reader,
+            .reader = seg.reader.encoded(),
             .deleted = if (options.deleted_docs) |deleted_docs| deleted_docs[i] else owned_deleted_docs[i],
         };
     }
@@ -919,7 +919,7 @@ test "merge mapper-built multi-field text segments" {
     var seg_entry: index_mod.SegmentEntry = .{
         .id = 0,
         .data = index_mod.SegmentData.fromOwnedHeap(try alloc.dupe(u8, merged)),
-        .reader = reader,
+        .reader = .fromEncoded(reader),
         .shared = &seg_shared,
     };
     defer seg_entry.data.deinit(alloc);

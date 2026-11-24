@@ -365,8 +365,8 @@ test "external lake overlapping text generations share every physical segment on
             defer selective.deinit();
             try std.testing.expectEqual(@as(usize, 0), selective.snapshot.bound_segments.count());
             for (selective.snapshot.segments) |segment| {
-                try std.testing.expect(segment.reader.deferred != null);
-                try std.testing.expect(segment.reader.native == null);
+                try std.testing.expect(segment.reader.encoded().deferred != null);
+                try std.testing.expect(segment.reader.encoded().native == null);
             }
             try std.testing.expectEqual(@as(u32, 1), (try selective.snapshot.readSegment(0)).reader.doc_count);
             try std.testing.expectEqual(@as(usize, 1), selective.snapshot.bound_segments.count());

@@ -27864,7 +27864,7 @@ pub const IndexManager = struct {
                 break;
             }
             if (is_source) continue;
-            total_fields = try addTextMergeEstimate(total_fields, @intCast(segment.reader.fields.len));
+            total_fields = try addTextMergeEstimate(total_fields, @intCast(segment.reader.encoded().fields.len));
         }
         if (result.prepared_segments.len > 0) {
             for (result.prepared_segments) |*prepared| {
@@ -50418,7 +50418,7 @@ test "text merge file provenance resolves deletion races off lock and retries re
     var output = segment_mod.MemorySegmentSink.init(a);
     defer output.deinit();
     var sink = output.sink();
-    const inputs = [_]segment_mod.MergeInput{ .{ .reader = &snap.segments[0].reader }, .{ .reader = &snap.segments[1].reader } };
+    const inputs = [_]segment_mod.MergeInput{ .{ .reader = snap.segments[0].reader.encoded() }, .{ .reader = snap.segments[1].reader.encoded() } };
     try segment_mod.writeMergedSegmentToSinkWithOptions(alloc, &sink, &inputs, .{ .index_sort = &sort, .source_map = &provenance, .scratch = .{ .io = std.testing.io, .directory = path, .in_memory_plan_bytes = 0 } });
     try provenance.finishOutput(4);
     result.source_map.?.deinit();
