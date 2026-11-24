@@ -2337,7 +2337,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "httpx inference connection propagates failures after stream commit",
         "httpx retrieval SSE",
         "httpx retrieval read failures preserve retryable JSON and conflict status",
-        "httpx agent generation output failures",
+        "httpx agent generation",
         "query builder incomplete generation",
         "retrieval agent sse",
         "retrieval agent streaming emits go-shaped tree",
@@ -2478,13 +2478,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("install-api-http-runtime-tests", "Install the API runtime unit suite for cross-platform qualification")
         .dependOn(&b.addInstallArtifact(api_http_runtime_tests, .{ .dest_sub_path = "api-http-runtime-tests" }).step);
 
-    const agent_generation_filters = &.{ "httpx agent generation output failures", "query builder incomplete generation" };
+    const agent_generation_filters = &.{ "httpx agent generation", "query builder incomplete generation" };
     const agent_generation_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
         .filters = agent_generation_filters,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
-    b.step("antfly-agent-generation-test", "Verify public agent incomplete-output HTTP responses")
+    b.step("antfly-agent-generation-test", "Verify public agent generation routing, controls and HTTP failures")
         .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, agent_generation_tests, agent_generation_filters).step);
 
     const lake_api_default_filters = [_][]const u8{ "lake SQL", "external lake", "httpx SQL executes one relational page with exact integer parameters" };
