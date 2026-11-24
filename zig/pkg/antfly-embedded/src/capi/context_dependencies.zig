@@ -132,6 +132,7 @@ fn executeRequest(ptr: *anyopaque, alloc: std.mem.Allocator, db: *db_mod.DB, req
     const root: *h.Handle = @ptrCast(@alignCast(ptr));
     const name = tableNameForDb(root, db) orelse return error.ContextSourceTableUnavailable;
     if (ctx.cypherRequest(alloc, request_json)) return executeCypher(alloc, root, db, name, request_json, k);
+    if (ctx.sqlRequest(alloc, request_json)) return executeSql(alloc, root, db, request_json, k);
     var semantic = @import("db.zig").LiteSemanticResolver{ .handle = root };
     var owned = try h.query_api.parsePublicQueryRequest(alloc, if (root.lite_profile == .native) semantic.resolver() else null, name, request_json);
     defer owned.deinit(alloc);
@@ -197,6 +198,52 @@ fn executeCypher(alloc: std.mem.Allocator, root: *h.Handle, db: *db_mod.DB, name
     defer @import("db.zig").antfly_buffer_free(&out);
     const result: []const u8 = if (out.ptr) |ptr| ptr[0..out.len] else "";
     const keys = try ctx.cypherResultKeysAlloc(a, result, name, k);
+    var rows = std.ArrayListUnmanaged(resolution.Row).empty;
+    errdefer {
+        for (rows.items) |row| {
+            alloc.free(row.key);
+            alloc.free(row.value);
+        }
+        rows.deinit(alloc);
+    }
+    for (keys) |key| {
+        const value = (try db.get(alloc, key)) orelse continue;
+        errdefer alloc.free(value);
+        try rows.append(alloc, .{ .key = try alloc.dupe(u8, key), .value = value });
+    }
+    return .{ .rows = try rows.toOwnedSlice(alloc), .exhausted = true };
+}
+
+/// A SQL source on Lite: the read-only SELECT runs against the handle's
+/// tables; its members are the source table's rows its `_id` column names,
+/// read back as stored documents.
+/// The SQL result admission bound (the statement fails past it, never
+/// truncates); members are capped at the source's `limit` afterwards.
+const max_sql_result_rows: usize = 4096;
+
+fn executeSql(alloc: std.mem.Allocator, root: *h.Handle, db: *db_mod.DB, request_json: []const u8, k: u32) !resolution.Page {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const request = try std.json.parseFromSliceLeaky(std.json.Value, a, request_json, .{});
+    const spec = request.object.get("sql").?;
+    if (spec != .object) return error.InvalidContextSourcesConfig;
+    const statement = spec.object.get("statement") orelse return error.InvalidContextSourcesConfig;
+    if (statement != .string) return error.InvalidContextSourcesConfig;
+    // Lite resolves every name in its one catalog.
+    if (spec.object.get("database") != null or spec.object.get("namespace") != null) return error.UnsupportedContextPredicate;
+    {
+        var compiled = try @import("sql.zig").compiler.compile(a, statement.string, .{});
+        defer compiled.deinit();
+        if (compiled.statement != .select) return error.UnsupportedContextPredicate;
+    }
+    const parameters = spec.object.get("parameters") orelse std.json.Value{ .array = .init(a) };
+    const body = try std.json.Stringify.valueAlloc(a, .{ .statement = statement.string, .parameters = parameters, .limit = max_sql_result_rows }, .{});
+    var out: h.capi.Buffer = .{};
+    try @import("db.zig").executeEmbeddedSql(root, "default", body, &out);
+    defer @import("db.zig").antfly_buffer_free(&out);
+    const result: []const u8 = if (out.ptr) |ptr| ptr[0..out.len] else "";
+    const keys = try ctx.sqlResultKeysAlloc(a, result, k);
     var rows = std.ArrayListUnmanaged(resolution.Row).empty;
     errdefer {
         for (rows.items) |row| {

@@ -732,6 +732,7 @@ pub const ranking_clauses = [_][]const u8{
     "full_text_search", "semantic_search", "embeddings",   "indexes",     "merge_config",
     "reranker",         "exclusion_query", "graph_queries", "limit",       "text",
     "text_field",       "vector",          "vector_index",  "k",           "cypher",
+    "sql",
 };
 const search_shorthands = [_][]const u8{ "text", "text_field", "vector", "vector_index", "k" };
 
@@ -828,7 +829,7 @@ pub fn graphOnlyRequestValue(request: std.json.ObjectMap) bool {
 /// Reserved member of a stored `cypher` request: the principal the
 /// statement runs as and the server's MAC over it. Admission always
 /// overwrites it, so a declaration cannot name another principal.
-pub const cypher_grant_field = "_antfly_execution_grant_v1";
+pub const statement_grant_field = "_antfly_execution_grant_v1";
 
 /// A stored request that runs a read-only Cypher statement against a graph
 /// instead of a QueryRequest: `{"cypher":{graph,query,parameters?},
@@ -836,6 +837,77 @@ pub const cypher_grant_field = "_antfly_execution_grant_v1";
 /// returns, in result order, each once.
 pub fn cypherRequestValue(request: std.json.ObjectMap) bool {
     return request.get("cypher") != null;
+}
+
+/// A stored request that runs a read-only SQL `SELECT`:
+/// `{"sql":{statement,parameters?,database?,namespace?},"limit"?}`. Its
+/// members are the source table's rows named by the result's `_id` column
+/// (every table exposes its document key as `_id`), in result order, each
+/// once.
+pub fn sqlRequestValue(request: std.json.ObjectMap) bool {
+    return request.get("sql") != null;
+}
+
+pub fn sqlRequest(alloc: Allocator, request_json: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, request_json, .{}) catch return false;
+    defer parsed.deinit();
+    return parsed.value == .object and sqlRequestValue(parsed.value.object);
+}
+
+fn validateSqlRequest(request: std.json.ObjectMap) Error!void {
+    var it = request.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (!std.mem.eql(u8, key, "sql") and !std.mem.eql(u8, key, "limit")) return error.UnsupportedContextPredicate;
+    }
+    const spec = request.get("sql").?;
+    if (spec != .object) return error.InvalidContextSourcesConfig;
+    var sit = spec.object.iterator();
+    while (sit.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const value = entry.value_ptr.*;
+        if (std.mem.eql(u8, key, "statement")) {
+            if (value != .string or value.string.len == 0 or value.string.len > max_cypher_statement) return error.InvalidContextSourcesConfig;
+        } else if (std.mem.eql(u8, key, "parameters")) {
+            if (value != .array or value.array.items.len > 1024) return error.InvalidContextSourcesConfig;
+        } else if (std.mem.eql(u8, key, "database") or std.mem.eql(u8, key, "namespace")) {
+            if (value != .string or !validName(value.string)) return error.InvalidContextSourcesConfig;
+        } else if (std.mem.eql(u8, key, statement_grant_field)) {
+            if (value != .object) return error.InvalidContextSourcesConfig;
+        } else return error.InvalidContextSourcesConfig;
+    }
+    if (spec.object.get("statement") == null) return error.InvalidContextSourcesConfig;
+}
+
+/// Members of a SQL source: the string values of the result's `_id` column
+/// (`{"columns":[name | {"name":...}],"rows":[[...]]}`), in row order, each
+/// once, at most `limit`. A result without an `_id` column cannot name
+/// members and is an error.
+pub fn sqlResultKeysAlloc(a: Allocator, result_json: []const u8, limit: u32) ![]const []const u8 {
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a, result_json, .{});
+    if (root != .object) return error.InvalidContextSourcesConfig;
+    const columns = root.object.get("columns") orelse return error.InvalidContextSourcesConfig;
+    const rows = root.object.get("rows") orelse return error.InvalidContextSourcesConfig;
+    if (columns != .array or rows != .array) return error.InvalidContextSourcesConfig;
+    const index = for (columns.array.items, 0..) |column, i| {
+        const name = switch (column) {
+            .string => |text| text,
+            .object => |object| if (object.get("name")) |n| (if (n == .string) n.string else continue) else continue,
+            else => continue,
+        };
+        if (std.mem.eql(u8, name, "_id")) break i;
+    } else return error.ContextSqlResultWithoutId;
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    for (rows.array.items) |row| {
+        if (keys.items.len >= limit) break;
+        if (row != .array or index >= row.array.items.len) continue;
+        const value = row.array.items[index];
+        if (value != .string) continue;
+        if ((try seen.getOrPut(a, value.string)).found_existing) continue;
+        try keys.append(a, value.string);
+    }
+    return keys.items;
 }
 
 pub fn cypherRequest(alloc: Allocator, request_json: []const u8) bool {
@@ -862,7 +934,7 @@ fn validateCypherRequest(request: std.json.ObjectMap) Error!void {
             if (value != .string or value.string.len == 0 or value.string.len > max_cypher_statement) return error.InvalidContextSourcesConfig;
         } else if (std.mem.eql(u8, key, "parameters")) {
             if (value != .object) return error.InvalidContextSourcesConfig;
-        } else if (std.mem.eql(u8, key, cypher_grant_field)) {
+        } else if (std.mem.eql(u8, key, statement_grant_field)) {
             if (value != .object) return error.InvalidContextSourcesConfig;
         } else return error.InvalidContextSourcesConfig;
     }
@@ -1274,6 +1346,7 @@ fn parseSearchField(a: Allocator, s: *SearchSpec, key: []const u8, field: std.js
         // apply. Put constraints on the graph operation instead.
         if (graphOnlyRequestValue(field.object) and field.object.get("filter_query") != null) return error.UnsupportedContextPredicate;
         if (cypherRequestValue(field.object)) try validateCypherRequest(field.object);
+        if (sqlRequestValue(field.object)) try validateSqlRequest(field.object);
         if (field.object.get("limit")) |limit| s.k = @intCast(try uintField(limit, 1, max_search_k));
         s.request = try stringifyAlloc(a, field);
     } else return error.InvalidContextSourcesConfig;
@@ -4352,6 +4425,55 @@ test "cypher result members are the source table's nodes, in order, once" {
     try testing.expectEqual(@as(usize, 1), capped.len);
     const people = try cypherResultKeysAlloc(arena.allocator(), result, "people", 10);
     try testing.expectEqualStrings("p:1", people[0]);
+}
+
+test "sql query sources are snapshots whose members come from the _id column" {
+    const alloc = testing.allocator;
+    var config = try parsePublicJson(alloc,
+        \\{"s":{"query":{"table":"orgs","sql":{"statement":"SELECT o._id FROM orgs o JOIN people p ON p.org = o.org WHERE p._id = $1","parameters":[{"$source":"/person"}]},"limit":5},"fields":["title"]}}
+    , "");
+    defer config.deinit();
+    const source = config.sources[0];
+    try testing.expectEqual(SourceKind.search, source.kind);
+    try testing.expectEqual(Tracking.snapshot, source.tracking);
+    try testing.expectEqual(@as(u32, 5), source.search.k);
+    try testing.expect(sqlRequest(alloc, source.search.request));
+    var bindings = try bindTest(alloc, &config, "{\"person\":\"p:1\"}");
+    defer bindings.deinit();
+    try testing.expect(std.mem.indexOf(u8, bindings.items[0].search_request, "\"parameters\":[\"p:1\"]") != null);
+    const summary_value = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"s":{"query":{"sql":{"statement":"SELECT _id FROM t"}},"fields":["t"]}}
+    , .{});
+    defer summary_value.deinit();
+    const summary = try trackingSummaryJsonAlloc(alloc, summary_value.value);
+    defer alloc.free(summary);
+    try testing.expectEqualStrings(
+        \\{"s":{"kind":"query","tracking":"snapshot","reason":"sql"}}
+    , summary);
+    try testing.expectError(error.ContextSourceRequiresSnapshot, parsePublicJson(alloc,
+        \\{"s":{"query":{"sql":{"statement":"SELECT _id FROM t"}},"fields":["t"],"tracking":"live"}}
+    , ""));
+    try testing.expectError(error.UnsupportedContextPredicate, parsePublicJson(alloc,
+        \\{"s":{"query":{"sql":{"statement":"SELECT _id FROM t"},"filter_query":{"field":"k","term":"v"}},"fields":["t"]}}
+    , ""));
+    try testing.expectError(error.InvalidContextSourcesConfig, parsePublicJson(alloc,
+        \\{"s":{"query":{"sql":{"statement":"SELECT _id FROM t","parameters":{"a":1}}},"fields":["t"]}}
+    , ""));
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const keys = try sqlResultKeysAlloc(arena.allocator(),
+        \\{"columns":[{"name":"title","type":"text"},{"name":"_id","type":"text"}],"rows":[["A","o:2"],["B","o:1"],["A","o:2"],["C",null]]}
+    , 10);
+    try testing.expectEqual(@as(usize, 2), keys.len);
+    try testing.expectEqualStrings("o:2", keys[0]);
+    try testing.expectEqualStrings("o:1", keys[1]);
+    try testing.expectEqual(@as(usize, 1), (try sqlResultKeysAlloc(arena.allocator(),
+        \\{"columns":["_id"],"rows":[["a"],["b"]]}
+    , 1)).len);
+    try testing.expectError(error.ContextSqlResultWithoutId, sqlResultKeysAlloc(arena.allocator(),
+        \\{"columns":[{"name":"title"}],"rows":[["A"]]}
+    , 10));
 }
 
 test "pinned analyzer tokenizes deterministically" {

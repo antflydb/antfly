@@ -9342,6 +9342,75 @@ pub const AntflyApiHandler = struct {
         _ = encoder.encode(encoded, raw);
         try response.headers.set("X-Antfly-SQL-Completion", encoded);
     }
+    /// Run one read-only SQL statement for background work (context
+    /// sources) as `identity`, without a request: the same SQLJob as the
+    /// `/sql` endpoint, run synchronously on the caller's thread, with that
+    /// identity's table permissions and row policies and no write authority.
+    /// Returns the `/sql` response JSON (`{columns, rows, ...}`).
+    pub fn executeContextSqlRead(server: *ApiHttpServer, alloc: std.mem.Allocator, identity: *?AuthenticatedIdentity, deadline_ns: u64, statement: []const u8, parameters: []const std.json.Value, database: []const u8, namespace: []const u8, limit: usize) ![]u8 {
+        {
+            var compiled = sql_compiler.compile(alloc, statement, .{}) catch return error.InvalidContextSourcesConfig;
+            defer compiled.deinit();
+            if (compiled.statement != .select) return error.UnsupportedContextPredicate;
+        }
+        const io = server.sharedApiIo() orelse return error.SqlConnectionUnavailable;
+        var preparation = server.sql_preparation_admission.tryAcquireLease() orelse return error.SqlWriteCapacityUnavailable;
+        var context: operation_contract.RequestContext = .{};
+        context.deadline_ns = deadline_ns;
+        context.row_policy_credential = identity;
+        context.table_read_authorization = .{
+            .ptr = identity,
+            .allows = struct {
+                fn allowed(ptr: *const anyopaque, table: []const u8) bool {
+                    const admitted: *const ?AuthenticatedIdentity = @ptrCast(@alignCast(ptr));
+                    const authenticated = admitted.* orelse return true;
+                    return http_server_mod.permissionsAllow(authenticated.permissions, .table, table, .read);
+                }
+            }.allowed,
+        };
+        context.table_write_authorization = .{
+            .ptr = identity,
+            .allows = struct {
+                fn denied(_: *const anyopaque, _: []const u8) bool {
+                    return false;
+                }
+            }.denied,
+        };
+        var completion: @import("../pgwire/completion.zig").Completion = .{};
+        defer completion.deinit(alloc);
+        var job = SQLJob{
+            .statement_start_ns = platform_time.monotonicNs(),
+            .adapter = .{ .durable_http_session = true, .read_requirements = .{}, .lake_visibility = .committed, .server = server, .identity = identity, .context = context, .database = database, .namespace = namespace, .session_id = null, .connection_id = null, .inherit_session_database = false, .inherit_session_namespace = false },
+            .statement = statement,
+            .prepared_mode = .statement,
+            .prepared_id = null,
+            .principal = if (identity.*) |value| value.credential_principal else "anonymous",
+            .database = database,
+            .namespace = namespace,
+            .parameters = parameters,
+            .limit = limit,
+            .completion_io = io,
+            .completion = &completion,
+            .completion_alloc = alloc,
+            .cache_io = server.sqlPlanCacheIo(),
+            .cache = server.sqlPlanCache(),
+            .preparation = &preparation,
+        };
+        defer if (job.notice_buffer) |buffer| job.prepared_response_budget.allocator().destroy(buffer);
+        job.run();
+        defer if (job.result) |*owned| owned.deinit();
+        defer if (job.prepared_response) |encoded| job.prepared_response_budget.allocator().free(encoded);
+        defer if (job.encoded_read) |encoded| job.prepared_response_budget.allocator().free(encoded);
+        if (job.failure) |err| return err;
+        if (job.is_write) return error.UnsupportedContextPredicate;
+        if (job.encoded_read) |encoded| return alloc.dupe(u8, encoded);
+        const output = (job.result orelse return error.InvalidContextSourcesConfig).output;
+        const names = try alloc.alloc([]const u8, output.columns.len);
+        defer alloc.free(names);
+        for (output.columns, names) |column, *name| name.* = column.name;
+        return std.json.Stringify.valueAlloc(alloc, .{ .columns = names, .rows = output.rows }, .{});
+    }
+
     fn executeSQLMode(self: *AntflyApiHandler, ctx: *httpx.Context, mode: SQLPreparedMode, resource_id: ?[]const u8) !httpx.Response {
         if (mode != .statement) {
             if (try self.admitCompletion(ctx)) |response| return response;

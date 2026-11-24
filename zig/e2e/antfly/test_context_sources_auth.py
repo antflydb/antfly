@@ -195,6 +195,43 @@ def test_context_sources_honor_auth_and_row_policies(
     assert "Acme Silver" not in card, card
     assert not echo_generator.errors, echo_generator.errors
 
+    # So does a SQL source: the writer's row policy on `orgs` applies to
+    # the statement, so the silver org's `_id` is never returned.
+    _as(api, "writer", "writer")
+    registered = api.put(
+        "/tables/people/artifacts/org_rows/enrichment",
+        _enrichment(
+            echo_generator,
+            {
+                "orgs": {
+                    "query": {
+                        "table": "orgs",
+                        "sql": {"statement": "SELECT _id FROM orgs ORDER BY _id"},
+                    },
+                    "fields": ["title"],
+                }
+            },
+        ),
+    )
+    assert registered["context_sources"]["orgs"]["reason"] == "sql", registered
+    _as(api, "admin", AUTH_BOOTSTRAP_PASSWORD)
+    api.batch_write(
+        "people",
+        {
+            "inserts": {"person:3": {"org": "acme", "body": "person three"}},
+            "sync_level": "enrichments",
+        },
+    )
+
+    def gold_rows():
+        statement = _statement(api, "people", "person:3", "org_rows")
+        return statement if statement and "Acme Gold" in statement else None
+
+    rows = _wait_until(gold_rows, timeout=60)
+    assert rows is not None, _statement(api, "people", "person:3", "org_rows")
+    assert "Acme Silver" not in rows, rows
+    assert not echo_generator.errors, echo_generator.errors
+
     # Dependency state and impact are readable under auth.
     _as(api, "writer", "writer")
     def current_deps():

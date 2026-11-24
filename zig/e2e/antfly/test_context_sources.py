@@ -657,3 +657,77 @@ def test_cypher_writes_rebuild_and_cypher_sources_resolve(
     )
     assert widened is not None, _statement(stateful_api, notes, "note:1", "brief")
     assert not echo_generator.errors, echo_generator.errors
+
+
+def test_sql_sources_resolve_members_from_the_id_column(stateful_api, echo_generator):
+    """A `sql` query source runs a read-only SELECT as its declarer; its
+    members are the source table's rows its `_id` column names."""
+    suffix = uuid4().hex[:8]
+    orgs = f"ctx_sql_orgs_{suffix}"
+    people = f"ctx_sql_people_{suffix}"
+
+    def sql(statement: str, parameters: list | None = None) -> dict:
+        body: dict = {"statement": statement}
+        if parameters is not None:
+            body["parameters"] = parameters
+        return stateful_api.post("/sql", body)
+
+    sql(f"CREATE TABLE {orgs} (org TEXT, title TEXT)")
+    for key, org, title in (
+        ("org:1", "acme", "Acme Alpha"),
+        ("org:2", "acme", "Acme Beta"),
+        ("org:3", "globex", "Globex One"),
+    ):
+        sql(f"INSERT INTO {orgs} (_id, org, title) VALUES ($1, $2, $3)", [key, org, title])
+    stateful_api.create_table(people, num_shards=NUM_SHARDS)
+
+    peers = {
+        "peers": {
+            "query": {
+                "table": orgs,
+                "sql": {
+                    "statement": f"SELECT _id FROM {orgs} WHERE org = $1 ORDER BY _id DESC",
+                    "parameters": [{"$source": "/org"}],
+                },
+                "limit": 10,
+            },
+            "fields": ["title"],
+        }
+    }
+    # Context statements only read.
+    writing = {
+        "peers": {
+            **peers["peers"],
+            "query": {"table": orgs, "sql": {"statement": f"DELETE FROM {orgs}"}},
+        }
+    }
+    response = stateful_api._request(
+        "PUT", f"/tables/{people}/artifacts/peers/enrichment", _enrichment(echo_generator, writing)
+    )
+    assert _status(response) == 400, getattr(response, "text", response)
+    registered = stateful_api.put(
+        f"/tables/{people}/artifacts/peers/enrichment", _enrichment(echo_generator, peers)
+    )
+    assert registered["context_sources"]["peers"] == {
+        "kind": "query",
+        "tracking": "snapshot",
+        "reason": "sql",
+    }, registered
+
+    stateful_api.batch_write(
+        people,
+        inserts={"person:1": {"org": "acme", "body": "person one"}},
+        sync_level="enrichments",
+    )
+    statement = wait_until(
+        _statement_containing(
+            stateful_api, people, "person:1", "peers", "person one", "Acme Alpha", "Acme Beta"
+        ),
+        timeout_s=60,
+        interval_s=0.25,
+    )
+    assert statement is not None, _statement(stateful_api, people, "person:1", "peers")
+    assert "Globex" not in statement, statement
+    # Result order is member order.
+    assert statement.index("Acme Beta") < statement.index("Acme Alpha"), statement
+    assert not echo_generator.errors, echo_generator.errors

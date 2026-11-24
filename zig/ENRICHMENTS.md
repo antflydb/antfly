@@ -892,8 +892,8 @@ public form of the declaration is kept verbatim for reads.
 
 A `query` with any ranking clause (`full_text_search`, `semantic_search`,
 `embeddings`, `indexes`, `merge_config`, `reranker`, `exclusion_query`,
-`limit`, `cypher`, the `text`/`vector` shorthands, or `graph_queries` beyond
-one plain bounded traverse) is a ranked
+`limit`, `cypher`, `sql`, the `text`/`vector` shorthands, or `graph_queries`
+beyond one plain bounded traverse) is a ranked
 retrieval: the whole query is a public `QueryRequest` with `$source` bindings
 anywhere, run by the host's query engine; members render in rank order. Its
 membership depends on the whole corpus, so it is a snapshot and publishes
@@ -928,6 +928,18 @@ inside paths, lists, and maps), in result order, each once, read back as
 stored rows. A statement's result depends on rows it does not return, so a
 Cypher source is a snapshot (reported with reason `cypher`). Writes and
 `EXPLAIN` are rejected at admission and again at execution.
+
+A `query` can likewise hold `sql: {statement, parameters, database,
+namespace}`: one read-only `SELECT` with positional parameters that may be
+`$source` bindings. It runs as the declarer under the same sealed grant
+(scoped to the database and namespace instead of a graph), so the
+declarer's table permissions and row policies apply. Members are the rows of
+the source `table` named by the result's `_id` column, which every table
+exposes as its document key; alias another key column `AS _id` when joining.
+The result is admitted up to 4096 rows and a larger one fails instead of
+truncating, so bound it with `LIMIT`; members are then capped at the
+source's `limit`. Any statement other than a `SELECT` is rejected at
+admission and at execution. A SQL source is a snapshot with reason `sql`.
 
 Cypher writes are ordinary writes for context tracking. A `SET` on a row,
 or a relationship `CREATE`/`DELETE` that changes a node's adjacency, emits
@@ -1144,9 +1156,9 @@ not a decision explanation.
 | Runtime | Context sources |
 | --- | --- |
 | Embedded single DB | own-table document and query sources: live filters (all live predicates, top-N), live traversals with filters, and ranked snapshots |
-| Embedded Lite (multi-table) | cross-table sources, `cypher` sources over the handle's graph catalog, `lite:<id>` identities, persisted inbound topology, C ABI inspection/impact/refresh |
+| Embedded Lite (multi-table) | cross-table sources, `cypher` sources over the handle's graph catalog, `sql` sources, `lite:<id>` identities, persisted inbound topology, C ABI inspection/impact/refresh |
 | Ordered (Raft) publication | dependency state commits with the artifact through replicated publish intents |
-| Distributed server tables | document and query sources (live filters with all predicates and top-N, live traversals with filters, `_artifacts` fields, ranked queries without `semantic_search`, `cypher` sources run as the declarer), own table and across tables; declared through the enrichment endpoint; HTTP dependency state, `require_current` barrier, and impact |
+| Distributed server tables | document and query sources (live filters with all predicates and top-N, live traversals with filters, `_artifacts` fields, ranked queries without `semantic_search`, `cypher` and `sql` sources run as the declarer), own table and across tables; declared through the enrichment endpoint; HTTP dependency state, `require_current` barrier, and impact |
 
 ### Distributed tables
 

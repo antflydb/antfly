@@ -196,11 +196,11 @@ const OpaqueApiHttpServer = struct {
         try callFallible(@import("../common/runtime_lifecycle.zig").ShutdownDeadline, void, self.functions.drain_sql_connections, self.opaque_handle, &deadline, null);
     }
 
-    pub fn executeContextCypher(self: *OpaqueApiHttpServer, alloc: std.mem.Allocator, owner_table_id: u64, request: []const u8) ![]u8 {
-        if (!abi.validFunctionTable(self.functions, abi.Capability.context_cypher)) return error.ContextSearchUnavailable;
-        const in: abi.ContextCypherInput = .{ .allocator = alloc, .owner_table_id = owner_table_id, .request = request };
-        var out: abi.ContextCypherOutput = .{};
-        try callFallible(abi.ContextCypherInput, abi.ContextCypherOutput, self.functions.context_cypher, self.opaque_handle, &in, &out);
+    pub fn executeContextStatement(self: *OpaqueApiHttpServer, alloc: std.mem.Allocator, owner_table_id: u64, request: []const u8) ![]u8 {
+        if (!abi.validFunctionTable(self.functions, abi.Capability.context_statement)) return error.ContextSearchUnavailable;
+        const in: abi.ContextStatementInput = .{ .allocator = alloc, .owner_table_id = owner_table_id, .request = request };
+        var out: abi.ContextStatementOutput = .{};
+        try callFallible(abi.ContextStatementInput, abi.ContextStatementOutput, self.functions.context_statement, self.opaque_handle, &in, &out);
         return out.result;
     }
 
