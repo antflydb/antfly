@@ -348,7 +348,7 @@ pub const RequestFinish = struct {
         if (self.runtime == null) return;
         var scope = if (access) |lane| lane.acquireCleanupScope() else null;
         defer if (scope) |*held| held.deinit();
-        const operation = backend.operationToken();
+        const operation = backend.operationToken() orelse if (backend.call_context) |invocation| invocation.cleanup.operation else null;
         var inherited = if (owner == null)
             (if (operation) |held| try held.retainCleanupEpoch() else null)
         else
@@ -1565,13 +1565,15 @@ fn modelRequestFinishCase(a: std.mem.Allocator) !void {
     var operation_owner: @import("../execution/operation_owner.zig").Owner = .{};
     compute.shared_operation_owner = &operation_owner;
     defer compute.shared_operation_owner = null;
-    const backend = compute.computeBackend();
+    var backend = compute.computeBackend();
     var scope: operation.Scope = undefined;
     try operation.enterInto(&backend, null, null, .managed, &scope);
     defer scope.deinitChecked() catch @panic("request finish fixture operation teardown failed");
     _ = try scope.bindCleanupEpoch(&epoch);
     const token = scope.token() orelse return error.ExpectedActualNativeOperation;
     const current: CleanupContext = .{ .boundary = &epoch, .operation = token };
+    const invocation = @import("../execution/invocation_context.zig").Context{ .cleanup = current };
+    backend.call_context = &invocation;
     const Probe = struct {
         backend: ops.ComputeBackend,
         boundary: *const sink.Epoch,
