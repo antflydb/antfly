@@ -945,6 +945,22 @@ test "db replicated transaction commits each raft receipt atomically" {
     defer alloc.free(raw);
     try std.testing.expectEqualStrings("{\"title\":\"newer\"}", raw);
     try std.testing.expectEqual(@as(u64, 16_000), try db.getTimestamp(alloc, "doc:receipt"));
+
+    // Transaction cleanup may commit ahead of the replicated apply checkpoint.
+    // Recovery must replay through the dispatcher even after it loses all
+    // participant state for the original decision.
+    const cleanup_entry: OrderedApplyReceipt = .{ .term = 3, .index = 14 };
+    try std.testing.expect(try db.cleanupReplicatedTransactionAtOrderedReceipt(txn_id, std.math.maxInt(u64), std.math.maxInt(u64), cleanup_entry));
+    try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(txn_id));
+    const resolve: types.BatchRequest = .{ .transaction = .{ .resolve = .{
+        .txn_id = txn_id,
+        .status = .committed,
+        .commit_version = 15_000,
+    } } };
+    const dispatch = @import("server_transaction_dispatch.zig");
+    try dispatch.applyReplicatedTransactionMutationAtRaftEntry(alloc, &db, "table:receipts", 7, resolve, resolve_entry);
+    try std.testing.expectEqualDeep(cleanup_entry, (try db.orderedApplyReceipt()).?);
+    try std.testing.expectError(error.ConflictingOrderedApplyReceipt, dispatch.applyReplicatedTransactionMutationAtRaftEntry(alloc, &db, "table:receipts", 7, resolve, .{ .term = 4, .index = cleanup_entry.index }));
 }
 
 test "storage.hot_standby merge proof adoption certifies receiver-local absent output" {
@@ -4543,9 +4559,15 @@ test "server Cypher producer catalog activation is replicated and idempotent" {
             const request: types.BatchRequest = .{ .artifact_catalog = retirement, .online_source = .{ .admit = .{ .scope = scope, .artifact_catalog = retirement.binding } } };
             var complete = false;
             for (0..256) |_| {
-                server_test_adapter.applyOrdered(db, request, .{ .term = 1, .index = 5 }) catch |err| {
-                    if (err != error.ArtifactCatalogDrift) return err;
-                    continue;
+                server_test_adapter.applyOrdered(db, request, .{ .term = 1, .index = 5 }) catch |err| switch (err) {
+                    error.ArtifactCatalogDrift => continue,
+                    error.RaftApplyWriterUnavailable => {
+                        // Raft retries this entry when background maintenance
+                        // yields the owner apply lock.
+                        @import("antfly_platform").time.sleepNs(std.time.ns_per_ms);
+                        continue;
+                    },
+                    else => return err,
                 };
                 complete = true;
                 break;

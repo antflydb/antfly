@@ -44,6 +44,8 @@ pub const State = struct {
     bootstrap_complete: bool = false,
     bootstrap_applied_index: u64 = 0,
     copy_attempt: db_types.MergeCopyAttempt = .{},
+    /// Donor retirement and receiver admission release have both been proven.
+    cutover_qualified: bool = false,
     /// Terminal identities remain fenced even after another merge takes over.
     retired_transition_ids: []const u64 = &.{},
 
@@ -113,6 +115,7 @@ pub fn encode(
         try list.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToLittle(u64, id)));
     try list.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToLittle(u64, state.copy_attempt.donor_term)));
     try list.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToLittle(u64, state.copy_attempt.sequence)));
+    if (state.cutover_qualified) try list.append(alloc, 1);
 }
 
 pub fn decodeAlloc(alloc: std.mem.Allocator, data: []const u8) !State {
@@ -211,10 +214,15 @@ pub fn decodeAlloc(alloc: std.mem.Allocator, data: []const u8) !State {
     }
     var copy_attempt: db_types.MergeCopyAttempt = .{};
     if (pos < data.len) {
-        if (data.len - pos != 16) return error.InvalidMergeState;
+        if (data.len - pos != 16 and data.len - pos != 17) return error.InvalidMergeState;
         copy_attempt.donor_term = std.mem.readInt(u64, data[pos..][0..8], .little);
         copy_attempt.sequence = std.mem.readInt(u64, data[pos + 8 ..][0..8], .little);
         pos += 16;
+    }
+    const cutover_qualified = pos < data.len;
+    if (cutover_qualified) {
+        if (data[pos] != 1 or phase != .finalized or transition_id == 0) return error.InvalidMergeState;
+        pos += 1;
     }
     if (pos != data.len or donor_group_id == 0 or receiver_group_id == 0 or
         donor_group_id == receiver_group_id)
@@ -232,6 +240,7 @@ pub fn decodeAlloc(alloc: std.mem.Allocator, data: []const u8) !State {
         .bootstrap_applied_index = bootstrap_applied_index,
         .retired_transition_ids = retired,
         .copy_attempt = copy_attempt,
+        .cutover_qualified = cutover_qualified,
     };
 }
 
@@ -293,7 +302,7 @@ pub fn planCheckpointApply(
         !validRange(base) or !validRange(merged) or !rangeContains(merged, base) or
         rangesEqual(base, merged))
         return error.InvalidMergeCheckpoint;
-    if ((checkpoint.kind == .accept or checkpoint.kind == .begin_copy or checkpoint.kind == .rollback) and
+    if ((checkpoint.kind == .accept or checkpoint.kind == .begin_copy or checkpoint.kind == .rollback or checkpoint.kind == .qualify_cutover) and
         checkpoint.bootstrap_applied_index != 0)
         return error.InvalidMergeCheckpoint;
     if ((checkpoint.kind == .bootstrap_complete or checkpoint.kind == .finalize) and
@@ -346,6 +355,15 @@ pub fn planCheckpointApply(
         ))
         return error.ConflictingMergeTransition;
 
+    if (checkpoint.kind == .qualify_cutover) {
+        if (prior.phase != .finalized or prior.transition_id != checkpoint.transition_id or
+            checkpoint.copy_attempt.order(prior.copy_attempt) != .eq or prior.cutover_qualified)
+            return .{ .state = prior.*, .range = current_range, .applies_checkpoint = false };
+        var qualified = prior.*;
+        qualified.cutover_qualified = true;
+        return .{ .state = qualified, .range = current_range };
+    }
+
     // An exact terminal identity is a durable no-op for delayed controls, not
     // a command error that can wedge replay at an already committed index.
     // A subsequent split may have changed the live range; only the historical
@@ -378,7 +396,7 @@ pub fn planCheckpointApply(
         return .{ .state = prior.*, .range = current_range, .applies_checkpoint = false };
 
     switch (checkpoint.kind) {
-        .begin_copy => unreachable,
+        .begin_copy, .qualify_cutover => unreachable,
         .accept => switch (prior.phase) {
             .accepting, .finalized => return preserveAdvanced(prior, checkpoint, expected_current),
             .rolling_back, .rolled_back => return preserveAdvanced(prior, checkpoint, expected_current),
@@ -440,6 +458,59 @@ pub fn planCheckpointApply(
             .none => unreachable,
         },
     }
+}
+
+test "merge cutover qualification binds to the finalized copy attempt" {
+    const alloc = std.testing.allocator;
+    const base: db_types.ByteRange = .{ .start = "m", .end = "" };
+    const merged: db_types.ByteRange = .{ .start = "a", .end = "" };
+    var prior: State = .{
+        .transition_id = 10,
+        .donor_group_id = 20,
+        .receiver_group_id = 30,
+        .phase = .accepting,
+        .receiver_base_range = base,
+        .merged_range = merged,
+        .bootstrap_complete = true,
+        .bootstrap_applied_index = 42,
+        .copy_attempt = .{ .donor_term = 2, .sequence = 3 },
+    };
+    var checkpoint: db_types.MergeReplicationCheckpoint = .{
+        .kind = .qualify_cutover,
+        .transition_id = 10,
+        .donor_group_id = 20,
+        .receiver_group_id = 30,
+        .receiver_base_start = base.start,
+        .receiver_base_end = base.end,
+        .merged_start = merged.start,
+        .merged_end = merged.end,
+        .copy_attempt = prior.copy_attempt,
+    };
+    var plan = try planCheckpointApply(alloc, &prior, merged, checkpoint);
+    try std.testing.expect(!plan.applies_checkpoint);
+    prior.phase = .finalized;
+    checkpoint.copy_attempt.sequence -= 1;
+    plan = try planCheckpointApply(alloc, &prior, merged, checkpoint);
+    try std.testing.expect(!plan.applies_checkpoint);
+    checkpoint.copy_attempt = prior.copy_attempt;
+    plan = try planCheckpointApply(alloc, &prior, merged, checkpoint);
+    try std.testing.expect(plan.applies_checkpoint and plan.state.cutover_qualified);
+    try std.testing.expectEqual(prior.bootstrap_applied_index, plan.state.bootstrap_applied_index);
+    try std.testing.expect(rangesEqual(merged, plan.range));
+
+    var encoded: std.ArrayListUnmanaged(u8) = .empty;
+    defer encoded.deinit(alloc);
+    try encode(&encoded, alloc, prior);
+    var legacy = try decodeAlloc(alloc, encoded.items);
+    defer legacy.deinit(alloc);
+    try std.testing.expect(!legacy.cutover_qualified);
+    encoded.clearRetainingCapacity();
+    try encode(&encoded, alloc, plan.state);
+    var reopened = try decodeAlloc(alloc, encoded.items);
+    defer reopened.deinit(alloc);
+    try std.testing.expect(reopened.cutover_qualified);
+    const duplicate = try planCheckpointApply(alloc, &reopened, merged, checkpoint);
+    try std.testing.expect(!duplicate.applies_checkpoint and duplicate.state.cutover_qualified);
 }
 
 test "rolled back merge receiver admits only a fresh accept transition" {

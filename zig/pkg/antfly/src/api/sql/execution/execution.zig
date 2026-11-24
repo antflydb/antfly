@@ -3437,7 +3437,9 @@ pub const Adapter = struct {
         const stages = @import("../../../metadata/restore_staging.zig");
         var context = self.context;
         context.setting_admin = true;
-        var routing = (try table_catalog.authoritativeTableRoutingSnapshot(scratch, self.server.catalogSource(), input.table, input.opts.execution_deadline_ns)) orelse return null;
+        const routing_source = self.server.catalogSource();
+        const deadline = routing_source.deadlineFrom(.{ .deadline_ns = input.opts.execution_deadline_ns });
+        var routing = (try table_catalog.authoritativeTableRoutingSnapshot(scratch, routing_source, input.table, deadline)) orelse return null;
         defer routing.deinit(scratch);
         if (routing.table_id != table_id or routing.ranges.len == 0 or routing.ranges.len > 256) return error.CatalogGenerationChanged;
         var bindings: std.ArrayList(@import("antfly_local_sources").api_table_read_source.FrozenBinding) = .empty;

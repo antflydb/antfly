@@ -1242,6 +1242,12 @@ const LocalStandaloneMetadata = struct {
             .ptr = self,
             .standalone_hot_standby = if (self.lifecycle_store != null) .{ .ptr = self, .vtable = &.{ .bind_mirror = bindHotStandbyMetadata, .apply_record = applyHotStandbyMetadata, .prepare_checkpoint = prepareHotStandbyMetadataCheckpoint, .capture_checkpoint = captureHotStandbyMetadataCheckpoint, .capture_catalog_checkpoint = captureHotStandbyCatalogCheckpoint, .capture_private = captureHotStandbyPrivateMetadata } } else null,
             .routing = self.catalogSource().routingSource() catch unreachable,
+            .changefeeds = if (durable) .{
+                .ptr = self,
+                .read_fn = readChangefeedControl,
+                .mutate_fn = mutateChangefeedControl,
+                .authority_fn = readChangefeedAuthority,
+            } else null,
             .vtable = &.{
                 .status = status,
                 .privacy_authority_term = privacyAuthorityTerm,
@@ -1478,6 +1484,53 @@ const LocalStandaloneMetadata = struct {
         // owner and rehydrates durable attempts before enabling dispatch.
         try server.prepareRestoreLeadership(term);
         self.prepared_restore_term = term;
+    }
+
+    const ChangefeedControl = @import("../metadata/changefeed_control.zig");
+
+    fn readChangefeedControl(ptr: *anyopaque, a: std.mem.Allocator, id: ChangefeedControl.Id, request: LifecycleRequest) ![]u8 {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        try lockAtomicForRequest(&self.mutex, request);
+        defer self.mutex.unlock();
+        return (self.lifecycle_store orelse return error.MissingMetadataStore).getChangefeedControl(a, group_ids.main_metadata_group_id, id);
+    }
+
+    fn readChangefeedAuthority(ptr: *anyopaque, a: std.mem.Allocator, request: LifecycleRequest) !?ChangefeedControl.Stamp {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        try lockAtomicForRequest(&self.mutex, request);
+        defer self.mutex.unlock();
+        return (self.lifecycle_store orelse return error.MissingMetadataStore).getChangefeedAuthority(a, group_ids.main_metadata_group_id);
+    }
+
+    fn mutateChangefeedControl(ptr: *anyopaque, a: std.mem.Allocator, write: ChangefeedControl.Write, request: LifecycleRequest) !void {
+        if (write.mutation == .finish_bootstrap) return error.InvalidChangefeed;
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        if (!self.coordinated_lifecycle_allowed) return error.CoordinatedStandaloneHAMetadataRequired;
+        var locked = try self.lockMutationWithRequest(request);
+        defer locked.deinit();
+        const store = self.lifecycle_store orelse return error.MissingMetadataStore;
+        const group = group_ids.main_metadata_group_id;
+        const catalog_authority = try @import("../api/history_policy_provisioning.zig").authorityForCatalog(group, self.metadata_incarnation);
+        if (!std.mem.eql(u8, &catalog_authority, &write.authority)) return error.ChangefeedConflict;
+        const current = try store.getChangefeedAuthority(a, group);
+        if (current) |stamp| {
+            if (!std.mem.eql(u8, &stamp.incarnation, &write.authority)) return error.ChangefeedConflict;
+        }
+        const sequence = if (current) |stamp| std.math.add(u64, stamp.sequence, 1) catch return error.ChangefeedConflict else 1;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const before = try ChangefeedControl.parse(scratch, try store.getChangefeedControl(scratch, group, write.id));
+        const expected = try write.apply(scratch, before.value, sequence);
+        if (expected.revision == before.value.revision) return;
+        const command = try ChangefeedControl.encodeWrite(scratch, write);
+        try request.ensureActive();
+        store.applyStandaloneCommand(group, .{ .apply_changefeed_control = command }) catch return error.MetadataMutationOutcomeUnknown;
+        self.refreshLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
+        const observed_bytes = store.getChangefeedControl(scratch, group, write.id) catch return error.MetadataMutationOutcomeUnknown;
+        const observed = ChangefeedControl.parse(scratch, observed_bytes) catch return error.MetadataMutationOutcomeUnknown;
+        if (!std.mem.eql(u8, &ChangefeedControl.hash(expected), &ChangefeedControl.hash(observed.value)))
+            return error.MetadataMutationOutcomeUnknown;
     }
 
     fn getLakeIndexLifecycle(ptr: *anyopaque, alloc: std.mem.Allocator, table_id: u64, request: LifecycleRequest) ![]u8 {
@@ -4463,6 +4516,7 @@ const LocalStandaloneMetadata = struct {
                 const previous = try store.sqlCatalogOutcome(alloc, group_ids.main_metadata_group_id, observation);
                 defer alloc.free(previous);
                 if (!std.mem.eql(u8, previous, "null")) return alloc.dupe(u8, previous);
+                try @import("../system_catalog/operations.zig").preflightPublicationEnrollment(store, alloc, group_ids.main_metadata_group_id, command);
                 const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
                 defer alloc.free(bytes);
                 if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;

@@ -43,7 +43,7 @@ pub const Authority = struct {
         budget.cancellation = context.cancellation;
         var session = try catalog.RoutingSession.initWithBudget(a, self.catalog_source, budget);
         defer session.deinit();
-        const fence = try @import("completion_recovery.zig").routeRetainedOwner(&session, intent.coordinator.owner, coordinator_locator, budget, context);
+        const fence = try @import("completion_recovery.zig").routeRetainedOwnerForCleanup(&session, intent.coordinator.owner, coordinator_locator, budget, context);
         const locator = local.api_local_transaction_contract.parseParticipantRef(coordinator_locator) orelse return error.InvalidParticipant;
         const query = intent.coordinator;
         var observation = try self.decision_port.read(a, fence, locator.table_name, .{ .version = query.version, .owner = query.owner, .transaction_id = query.transaction_id, .minimum_applied_index = query.minimum_applied_index }, context);

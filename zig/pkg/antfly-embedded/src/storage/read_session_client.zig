@@ -235,6 +235,7 @@ pub fn QueryReadLease(comptime DB: type, comptime SearchResult: type) type {
         const Self = @This();
         pub const Result = SearchResult;
         pub const Protocol = Types.query_lease.Protocol(SearchResult);
+        pub const PolicyLease = Types.query_lease.PolicyLease;
         handle: Protocol.Handle,
         pub fn fromHandle(handle: Protocol.Handle) !Self {
             try handle.validate();
@@ -249,6 +250,9 @@ pub fn QueryReadLease(comptime DB: type, comptime SearchResult: type) type {
         }
         pub fn documentRows(self: *const Self, alloc: A, version: u32) !DB.DocumentRows {
             return DB.DocumentRows.fromHandle(try Protocol.call("documents", self.handle, .{ self.handle, alloc, version }));
+        }
+        pub fn retainPolicy(self: *const Self) !PolicyLease {
+            return Protocol.call("retain_policy", self.handle, .{self.handle});
         }
         pub fn search(self: Self, alloc: A, req: Types.types.SearchRequest) !SearchResult {
             return Protocol.call("search", self.handle, .{ self.handle, alloc, req });

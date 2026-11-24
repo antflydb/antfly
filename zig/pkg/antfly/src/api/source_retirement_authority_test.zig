@@ -123,9 +123,33 @@ pub fn run() !void {
     try std.testing.expectError(error.SourceTransactionIdentityConflict, port.capture(a, changed, locator, .{}));
     fixture.members[0].locator = locator;
     fake.reply.decision.?.admission.digest = admission_digest;
-    const calls_before = fake.calls;
     changed = fixture.command.intent;
     changed.coordinator.owner.topology_epoch += 1;
+    try std.testing.expectError(error.HistoryCorrupt, port.capture(a, changed, locator, .{}));
+
+    var changed_ranges = [_]tables.RangeRecord{
+        ranges[0],
+        .{ .table_id = 7, .group_id = 602, .range_id = 14, .start_key = "m", .end_key = null, .doc_identity_shard_id = 12, .doc_identity_range_id = 14 },
+    };
+    changed_ranges[0].end_key = "m";
+    const refreshed = try catalog.RoutingGeneration.create(a, .{
+        .metadata_group_id = 1,
+        .metadata_incarnation = owner.metadata_incarnation,
+        .catalog_revision = 11,
+        .tables = &records,
+        .ranges = &changed_ranges,
+    }, .{});
+    defer refreshed.release();
+    try std.testing.expect((try refreshed.indexed.tableRoutingView("docs", .{})).topology_epoch != owner.topology_epoch);
+    fake.generation = refreshed;
+    var recovered = try port.capture(a, fixture.command.intent, locator, .{});
+    defer recovered.deinit();
+    try std.testing.expectEqualDeep(owner, recovered.command.intent.coordinator.owner);
+    _ = try recovered.command.proof();
+
+    const calls_before = fake.calls;
+    changed = fixture.command.intent;
+    changed.coordinator.owner.namespace[23] ^= 1;
     try std.testing.expectError(error.TopologyChanged, port.capture(a, changed, locator, .{}));
     var cancelled: std.atomic.Value(bool) = .init(true);
     try std.testing.expectError(error.Canceled, port.capture(a, fixture.command.intent, locator, .{ .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&cancelled) }));

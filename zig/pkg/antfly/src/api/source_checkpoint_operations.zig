@@ -37,7 +37,7 @@ pub fn execute(port: ?Port, a: A, group: u64, table: []const u8, body: []const u
     defer parsed.deinit();
     const input = parsed.value;
     try input.validate();
-    var route = try @import("source_owner_scope.zig").Scope.init(a, group, table, input.source_owner, context);
+    var route = try @import("source_owner_scope.zig").Scope.initWithEpoch(a, group, table, input.source_owner, true, context);
     defer route.deinit();
     var request_scope = try @import("history_publication_operations.zig").Scope.init(route.fence, context);
     const bounded = request_scope.context();
@@ -83,6 +83,12 @@ test "source checkpoint observation ingress binds owner routes and withholds can
     try std.testing.expectError(error.ChangefeedCapabilityUnsupported, execute(null, a, 17, "docs", body, context));
     const observed = try execute(port, a, 17, "docs", body, context);
     try std.testing.expectEqual(.absent, observed.disposition);
+    var later = fence;
+    later.topology_epoch += 1;
+    const later_json = try std.json.Stringify.valueAlloc(a, later, .{});
+    defer a.free(later_json);
+    const observed_later = try execute(port, a, 17, "docs", body, .{ .catalog_route_fence_json = later_json });
+    try std.testing.expectEqual(observed, observed_later);
     fake.forge = true;
     try std.testing.expectError(error.SourceAdmissionCorrupt, execute(port, a, 17, "docs", body, context));
     fake.forge = false;

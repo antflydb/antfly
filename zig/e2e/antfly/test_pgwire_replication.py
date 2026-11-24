@@ -60,7 +60,116 @@ class PgwireFailoverCluster(ThreeByThreeBackupCluster):
     def _data_command(self, index):
         command = super()._data_command(index)
         command[command.index("--config") + 1] = str(self.data_configs[index])
-        return command
+        return [*command, "--auth", "true"]
+
+
+@pytest.mark.e2e_resource("antfly_process")
+def test_journal_publication_requires_enrolled_root():
+    binary = harness.resolve_binary_path(
+        os.environ.get("ANTFLY_BIN", str(harness.DEFAULT_ANTFLY_BIN))
+    )
+    psql = os.environ.get("ANTFLY_TEST_PSQL_BIN") or shutil.which("psql")
+    if not psql:
+        pytest.skip("requires psql")
+    port = find_free_port()
+    server = harness.StatefulAntflyServer(
+        binary,
+        "127.0.0.1",
+        0,
+        auth_enabled=True,
+        data_config={"pgwire": {"enabled": True, "bind_port": port}},
+    )
+    env = {
+        **os.environ,
+        "PGPASSWORD": harness.AUTH_BOOTSTRAP_PASSWORD,
+        "PGSSLMODE": "disable",
+        "PGGSSENCMODE": "disable",
+        "PGCONNECT_TIMEOUT": "5",
+    }
+
+    def sql(statement):
+        return subprocess.run(
+            [
+                psql,
+                "-XAt",
+                "--dbname",
+                f"host=127.0.0.1 port={port} user=admin dbname=default",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-v",
+                "VERBOSITY=verbose",
+                "-c",
+                statement,
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+
+    def eventually(statement):
+        def ready():
+            result = sql(statement)
+            if result.returncode == 0:
+                return True
+            # Roster activation changes the write's catalog cut. Only a
+            # definite pre-commit rejection may retry this fixture write.
+            assert (
+                "ERROR:  53300:" in result.stderr
+                or "ERROR:  40001: The table or policy definition changed"
+                in result.stderr
+            ), result.stderr
+            return False
+
+        wait_until(ready, timeout_s=30)
+
+    try:
+        eventually("CREATE TABLE publication_probe (id BIGINT PRIMARY KEY)")
+        eventually("INSERT INTO publication_probe VALUES (1)")
+        ddl = "CREATE PUBLICATION changes FOR TABLE publication_probe"
+        rejected = sql(ddl)
+        assert rejected.returncode != 0
+        assert "ERROR:  55000:" in rejected.stderr
+        assert "physical store root is not enrolled" in rejected.stderr
+        eventually("INSERT INTO publication_probe VALUES (2)")
+
+        status = requests.get(
+            f"{server.metadata_admin_url}/metadata/v1/status", timeout=5
+        )
+        status.raise_for_status()
+        proof = subprocess.check_output(
+            [
+                binary,
+                "internal",
+                "store-root",
+                "proof",
+                "--replica-root-dir",
+                str(server.replica_root),
+                "--metadata-incarnation",
+                status.json()["metadata_incarnation"],
+                "--node-id",
+                "2",
+                "--store-id",
+                "2",
+            ],
+            timeout=10,
+        )
+        enrollment = requests.post(
+            f"{server.api_url}/store-roots/enroll",
+            data=proof,
+            headers={"content-type": "application/json"},
+            auth=("admin", harness.AUTH_BOOTSTRAP_PASSWORD),
+            timeout=15,
+        )
+        enrollment.raise_for_status()
+        admitted = sql(ddl)
+        if admitted.returncode != 0:
+            assert "ERROR:  40003:" in admitted.stderr, admitted.stderr
+        eventually("INSERT INTO publication_probe VALUES (3)")
+        duplicate = sql(ddl)
+        assert duplicate.returncode != 0 and "ERROR:  42710:" in duplicate.stderr
+    finally:
+        server.stop()
 
 
 @pytest.mark.e2e_resource("antfly_process")
@@ -115,10 +224,21 @@ def test_pg_recvlogical_resume_after_restart(
     }
     connection = ["-h", "127.0.0.1", "-p", str(port), "-U", "admin", "-d", "default"]
 
-    def sql(*statements, retry_uncommitted=False):
+    def writer_connection():
+        return [*connection[:5], "admin", *connection[6:]]
+
+    def writer_env():
+        return {**env, "PGPASSWORD": harness.AUTH_BOOTSTRAP_PASSWORD}
+
+    def sql(
+        *statements,
+        retry_uncommitted=False,
+        publication_owner=False,
+        wait_for_catalog=False,
+    ):
         args = [
             psql,
-            *connection,
+            *(connection if publication_owner else writer_connection()),
             "-X",
             "-v",
             "ON_ERROR_STOP=1",
@@ -129,14 +249,29 @@ def test_pg_recvlogical_resume_after_restart(
         expires = time.monotonic() + 12
         while True:
             result = subprocess.run(
-                args, env=env, text=True, capture_output=True, timeout=40
+                args,
+                env=env if publication_owner else writer_env(),
+                text=True,
+                capture_output=True,
+                timeout=40,
             )
             if result.returncode == 0:
                 return
             if (
+                wait_for_catalog
+                and len(statements) == 1
+                and "ERROR:  53300: The relation catalog publication is not ready to authorize this DDL. No schema change was admitted."
+                in result.stderr
+                and time.monotonic() < expires
+            ):
+                time.sleep(0.2)
+                continue
+            if (
                 retry_uncommitted
                 and (
                     "ERROR:  53300: A consistent SQL statement read" in result.stderr
+                    or "ERROR:  55P03: The database was busy with competing work; the statement was not applied."
+                    in result.stderr
                     or (
                         len(statements) == 1
                         and "ERROR:  40001: The mutation conflicted with a concurrent change and was not committed."
@@ -246,6 +381,9 @@ def test_pg_recvlogical_resume_after_restart(
     if cross_node:
         secret = "pgwire-failover-principal-authority-secret-v1"
         issuer = "pgwire-failover"
+        monkeypatch.setenv(
+            "ANTFLY_BOOTSTRAP_ADMIN_PASSWORD", harness.AUTH_BOOTSTRAP_PASSWORD
+        )
         monkeypatch.setenv("ANTFLY_TRUSTED_PRINCIPAL_SECRET", secret)
         monkeypatch.setenv("ANTFLY_TRUSTED_PRINCIPAL_ISSUER", issuer)
         server = PgwireFailoverCluster(binary, spool_config)
@@ -381,7 +519,7 @@ def test_pg_recvlogical_resume_after_restart(
             "int4|f|b||23",
             "23|int4|0|0|-1|N|",
             "1007|_int4|23|0|-1|A|",
-            '{"public"}|{"pg_catalog","public"}|',
+            "{public}|{pg_catalog,public}|",
             "public",
             "public",
             "app",
@@ -393,7 +531,8 @@ def test_pg_recvlogical_resume_after_restart(
             check_catalog_discovery()
         sql(
             "CREATE TABLE smoke (id BIGINT PRIMARY KEY, content TEXT, "
-            "computed BIGINT GENERATED ALWAYS AS (id + 314159265) STORED)"
+            "computed BIGINT GENERATED ALWAYS AS (id + 314159265) STORED)",
+            wait_for_catalog=True,
         )
         if multi_table:
             sql("CREATE TABLE smoke_other (id BIGINT PRIMARY KEY, content TEXT)")
@@ -402,7 +541,7 @@ def test_pg_recvlogical_resume_after_restart(
         replica_identity = subprocess.check_output(
             [
                 psql,
-                *connection,
+                *writer_connection(),
                 "-XAt",
                 "-v",
                 "ON_ERROR_STOP=1",
@@ -411,7 +550,7 @@ def test_pg_recvlogical_resume_after_restart(
                 "JOIN pg_catalog.pg_namespace n ON c.relnamespace=n.oid "
                 "WHERE n.nspname='public' AND c.relname='smoke'",
             ],
-            env=env,
+            env=writer_env(),
             text=True,
             timeout=40,
         )
@@ -419,7 +558,7 @@ def test_pg_recvlogical_resume_after_restart(
         names = subprocess.check_output(
             [
                 psql,
-                *connection,
+                *writer_connection(),
                 "-XAt",
                 "-v",
                 "ON_ERROR_STOP=1",
@@ -431,13 +570,13 @@ def test_pg_recvlogical_resume_after_restart(
                 "WHERE n.nspname = 'public' AND c.relname = 'smoke'",
             ],
             text=True,
-            env=env,
+            env=writer_env(),
             timeout=40,
         ).splitlines()
         columns = subprocess.check_output(
             [
                 psql,
-                *connection,
+                *writer_connection(),
                 "-XAt",
                 "-v",
                 "ON_ERROR_STOP=1",
@@ -450,7 +589,7 @@ def test_pg_recvlogical_resume_after_restart(
                 "WHERE c.relname = 'smoke' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
             ],
             text=True,
-            env=env,
+            env=writer_env(),
             timeout=40,
         ).splitlines()
         assert columns == [
@@ -466,7 +605,7 @@ def test_pg_recvlogical_resume_after_restart(
         primary_key = subprocess.check_output(
             [
                 psql,
-                *connection,
+                *writer_connection(),
                 "-XAt",
                 "-v",
                 "ON_ERROR_STOP=1",
@@ -477,14 +616,14 @@ def test_pg_recvlogical_resume_after_restart(
                 "WHERE ct.relname = 'catalog_key_order' AND i.indisprimary",
             ],
             text=True,
-            env=env,
+            env=writer_env(),
             timeout=40,
         ).splitlines()
         assert primary_key == ["ordered_primary|i|2|2|1"]
         jdbc_keys = subprocess.check_output(
             [
                 psql,
-                *connection,
+                *writer_connection(),
                 "-XAt",
                 "-v",
                 "ON_ERROR_STOP=1",
@@ -500,7 +639,7 @@ def test_pg_recvlogical_resume_after_restart(
                 "WHERE r.a_attnum = (r.keys).x AND r.key_seq <= key_count ORDER BY r.key_seq",
             ],
             text=True,
-            env=env,
+            env=writer_env(),
             timeout=40,
         ).splitlines()
         assert jdbc_keys == [
@@ -509,7 +648,7 @@ def test_pg_recvlogical_resume_after_restart(
         ]
         assert catalog_publication() == []
         published = "smoke, smoke_other" if multi_table else "smoke"
-        sql(f"CREATE PUBLICATION changes FOR TABLE {published}")
+        sql(f"CREATE PUBLICATION changes FOR TABLE {published}", publication_owner=True)
         assert catalog_publication() == ["f|t|t|t|f"]
         assert catalog_slot() == []
         if export_snapshot:
@@ -635,7 +774,7 @@ def test_pg_recvlogical_resume_after_restart(
                     timeout=15,
                 )
                 assert rejected.returncode != 0
-                assert "ERROR:  0A000: UnsupportedReplicationOption" in rejected.stderr
+                assert "ERROR:  0A000:" in rejected.stderr, rejected.stderr
                 assert catalog_slot() == [created]
         first = tmp_path / "first.bin"
         with stream(first, expect_disconnect=cross_node and not topology) as reader:
@@ -644,7 +783,28 @@ def test_pg_recvlogical_resume_after_restart(
             )
             # pgoutput text tuple field for the stored generated value of id 7.
             markers = [b"retained-stream-smoke", b"t\x00\x00\x00\x09314159272"]
-            if multi_table:
+            mixed_ingress = not (
+                export_snapshot or multi_table or cross_node or topology
+            )
+            if mixed_ingress:
+                # The last row also detects a stalled retained-history frontier.
+                def http_insert(row_id, marker):
+                    reply = requests.post(
+                        f"{server.api_url}/sql",
+                        json={
+                            "statement": f"INSERT INTO smoke (id, content) VALUES "
+                            f"({row_id}, '{marker}')"
+                        },
+                        auth=("admin", harness.AUTH_BOOTSTRAP_PASSWORD),
+                        timeout=40,
+                    )
+                    assert reply.ok, reply.text
+                    markers.append(marker.encode())
+
+                http_insert(70, "retained-http-before")
+                sql(insert)
+                http_insert(71, "retained-http-after")
+            elif multi_table:
                 sql(
                     "BEGIN",
                     "INSERT INTO smoke (id, content) VALUES (8, 'retained-rolled-back-transaction')",
@@ -660,7 +820,7 @@ def test_pg_recvlogical_resume_after_restart(
                 )
                 markers.append(b"retained-stream-other")
             else:
-                sql(insert)
+                sql(insert, retry_uncommitted=True)
             deadline = time.monotonic() + 30
             payload = b""
             while time.monotonic() < deadline and reader.poll() is None:
@@ -669,7 +829,15 @@ def test_pg_recvlogical_resume_after_restart(
                     if all(marker in payload for marker in markers):
                         break
                 time.sleep(0.2)
-            assert all(payload.count(marker) == 1 for marker in markers)
+            assert all(payload.count(marker) == 1 for marker in markers), {
+                marker: payload.count(marker) for marker in markers
+            }
+            if mixed_ingress:
+                assert (
+                    payload.index(b"retained-http-before")
+                    < payload.index(b"retained-stream-smoke")
+                    < payload.index(b"retained-http-after")
+                )
             if multi_table:
                 assert b"retained-rolled-back-" not in payload
             if export_snapshot:
@@ -716,10 +884,19 @@ def test_pg_recvlogical_resume_after_restart(
                 timeout=10,
             )
             assert wrong_owner.returncode != 0
-            assert "forbidden" in wrong_owner.stderr.lower()
+            assert "Permission denied for this SQL operation." in wrong_owner.stderr
             env["PGPASSWORD"] = _token(
                 secret, issuer=issuer, subject="admin", admin=True
             )
+        elif mixed_ingress:
+            sql(
+                "BEGIN",
+                "INSERT INTO smoke (id, content) VALUES (72, 'retained-prepared-after-crash')",
+                "PREPARE TRANSACTION 'retained_spool_restart'",
+            )
+            assert b"retained-prepared-after-crash" not in first.read_bytes()
+            server.pause(crash=True)
+            server.resume()
         else:
             server.restart()
         assert catalog_publication() == ["f|t|t|t|f"]
@@ -768,6 +945,15 @@ def test_pg_recvlogical_resume_after_restart(
             assert reader.poll() is None
             assert resumed.is_file()
             assert resumed.read_bytes() == b""
+            if mixed_ingress:
+                sql("COMMIT PREPARED 'retained_spool_restart'")
+                marker = b"retained-prepared-after-crash"
+                wait_until(
+                    lambda: resumed.read_bytes().count(marker) == 1,
+                    timeout_s=30,
+                    interval_s=0.2,
+                )
+                assert all(previous not in resumed.read_bytes() for previous in markers)
             if cross_node:
                 sql(
                     "BEGIN",
@@ -923,12 +1109,12 @@ def test_pg_recvlogical_resume_after_restart(
                 timeout=20,
             )
             assert rejected.returncode != 0
-            assert "ChangefeedResynchronizationRequired" in rejected.stderr
+            assert "The retained position is no longer available." in rejected.stderr
             assert not rejected_output.exists() or not rejected_output.read_bytes()
             slot("--drop-slot")
             assert catalog_slot() == []
-            sql("DROP PUBLICATION changes")
-            sql("CREATE PUBLICATION changes FOR TABLE smoke")
+            sql("DROP PUBLICATION changes", publication_owner=True)
+            sql("CREATE PUBLICATION changes FOR TABLE smoke", publication_owner=True)
             recreation_errors = set()
 
             def recreate_slot():
@@ -950,8 +1136,8 @@ def test_pg_recvlogical_resume_after_restart(
                     assert any(
                         reason in result.stderr
                         for reason in (
-                            "ReplicationSlotActive",
-                            "HistoryPreparedTransactionsPresent",
+                            "The replication slot is active in another operation.",
+                            "Prepared transactions still own history required by this replication operation.",
                         )
                     ), result.stderr
                     return False
@@ -973,7 +1159,7 @@ def test_pg_recvlogical_resume_after_restart(
                 timeout=20,
             )
             assert stale.returncode != 0
-            assert "ChangefeedResynchronizationRequired" in stale.stderr
+            assert "The retained position is no longer available." in stale.stderr
             assert not stale_output.exists() or not stale_output.read_bytes()
             sql("INSERT INTO smoke (id, content) VALUES (16, 'pre-schema-value')")
             sql("ALTER TABLE smoke ADD COLUMN additional TEXT")
@@ -1002,7 +1188,7 @@ def test_pg_recvlogical_resume_after_restart(
                     "CREATE PUBLICATION truncates FOR TABLE smoke WITH (publish = 'truncate')"
                 )
             with pytest.raises(
-                AssertionError, match="0A000.*durable generation coordinator"
+                AssertionError, match="42501.*durable credential no longer authorizes"
             ):
                 sql("TRUNCATE TABLE smoke")
 
@@ -1060,11 +1246,11 @@ def test_pg_recvlogical_resume_after_restart(
                 timeout=20,
             )
             assert invalidated.returncode != 0
-            assert "ChangefeedResynchronizationRequired" in invalidated.stderr
+            assert "The retained position is no longer available." in invalidated.stderr
             assert not discarded.exists() or not discarded.read_bytes()
             slot("--drop-slot")
-            sql("DROP PUBLICATION changes")
-            sql("CREATE PUBLICATION changes FOR TABLE smoke")
+            sql("DROP PUBLICATION changes", publication_owner=True)
+            sql("CREATE PUBLICATION changes FOR TABLE smoke", publication_owner=True)
             recreation_errors.clear()
             assert wait_until(recreate_slot, timeout_s=60), sorted(recreation_errors)
             replacement = tmp_path / "replacement-generation.bin"
@@ -1102,7 +1288,7 @@ def test_pg_recvlogical_resume_after_restart(
                     timeout=20,
                 )
                 assert filtered.returncode != 0
-                assert "forbidden" in filtered.stderr.lower()
+                assert "Permission denied for this SQL operation." in filtered.stderr
                 assert not filtered_output.exists() or not filtered_output.read_bytes()
             finally:
                 if filter_installed:
@@ -1111,7 +1297,7 @@ def test_pg_recvlogical_resume_after_restart(
                     ).raise_for_status()
         slot("--drop-slot")
         assert catalog_slot() == []
-        sql("DROP PUBLICATION changes")
+        sql("DROP PUBLICATION changes", publication_owner=True)
         assert catalog_publication() == []
     except Exception:
         print(server.debug_logs())

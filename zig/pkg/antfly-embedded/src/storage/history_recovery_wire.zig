@@ -26,6 +26,7 @@ pub const Request = struct {
     /// Zero preserves accepted source-purpose work instead of auto-aborting it.
     abort_before_ns: u64 = 0,
     resolution_timestamp_ns: u64,
+    collect_ordinary: bool = false,
     pub fn validate(self: Request) !void {
         try self.owner.validate();
         if (self.version != 1 or self.resolution_timestamp_ns == 0 or

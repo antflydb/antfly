@@ -54,6 +54,8 @@ pub const Record = struct {
     retain_terminal: bool = true,
     /// A fresh coordinator read can prove that no recovery acknowledgments remain.
     acknowledgments_pending: bool = true,
+    /// The metadata coordinator retains exclusive decision and handoff custody.
+    externally_owned: bool = false,
     /// Retained source ownership, independent of ordinary expiry/recovery jobs.
     source_purpose: ?[32]u8 = null,
     source_scope: ?@import("source_scope.zig").Reference = null,
@@ -62,7 +64,12 @@ pub const Record = struct {
         inline for (@typeInfo(Record).@"struct".field_names) |name| {
             const value = @field(self, name);
             const write_field = switch (@TypeOf(value)) {
-                bool => if (comptime std.mem.eql(u8, name, "retain_terminal") or std.mem.eql(u8, name, "acknowledgments_pending")) !value else true,
+                bool => if (comptime std.mem.eql(u8, name, "retain_terminal") or std.mem.eql(u8, name, "acknowledgments_pending"))
+                    !value
+                else if (comptime std.mem.eql(u8, name, "externally_owned"))
+                    value
+                else
+                    true,
                 ?[32]u8, ?@import("source_scope.zig").Reference => value != null,
                 else => true,
             };
@@ -75,6 +82,7 @@ pub const Record = struct {
     }
     pub fn validate(self: Record) !void {
         if (self.begin_timestamp == 0 or self.created_at_ns == 0 or std.mem.allEqual(u8, &self.digest, 0)) return error.HistoryCorrupt;
+        if (self.externally_owned and (!self.retain_terminal or self.source_purpose != null or self.source_scope != null)) return error.HistoryCorrupt;
         if (self.source_purpose) |purpose| if (std.mem.allEqual(u8, &purpose, 0)) return error.HistoryCorrupt;
         if (self.source_scope) |scope| {
             scope.validate() catch return error.HistoryCorrupt;

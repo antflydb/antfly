@@ -14,6 +14,31 @@ authenticated commit hooks, and managed archive publication is described in
 It builds on this subsystem's canonical apply, metadata ownership, and durable
 checkpoint contracts; it does not imply those additional source APIs exist today.
 
+## Recoverable native CDC intake
+
+For native CDC intake with exact cutover or automatic handoff, configure the
+same provisioned replication spool on every metadata node that can lead the
+catalog. Run `antfly storage provision-pgwire-spool DIRECTORY` on the shared
+mount, then set `pgwire.replication_spool.directory` and
+`pgwire.replication_spool.namespace` in those nodes' config. The intake worker
+uses the spool even when the pgwire listener is disabled.
+
+An existing scoped source can continue using its original delivery path during
+a rolling upgrade or until a shared spool is configured. An attempt already
+retained in a spool requires that same namespace for recovery.
+
+Keep the payload and fencing inventory on the same mount. The filesystem must
+support cross-node advisory locking, atomic rename, and durable file and
+directory synchronization. The metadata worker writes the frozen delivery
+before it reserves the destination upload. A successor can then inspect the
+original attempt and recover without rereading provider rows.
+
+If a catalog epoch changes while a retained transaction is enlisted, the
+source can recover across refreshed routes to the same physical owners. It
+checks the coordinator’s durable decision first. If the attempt is still
+pending, it orders an abort, retires the followers, and fences the old attempt
+before rebuilding the delivery from the retained payload.
+
 ## Outbound PostgreSQL logical replication
 
 A native data node can serve a configured Antfly publication over pgwire. The
@@ -45,6 +70,17 @@ The topology case uses the same slot through a live range split and merge. It
 verifies writes to both split participants, confirmed LSN advancement, and
 continuation after the merge and serving-node failover. These fixtures use
 three metadata nodes and three data nodes on a single host.
+
+For an ordinary replicated merge, physical copy and donor finalization can
+finish while the donor is still routed. The donor's frozen history cut must
+have no active grants or outstanding reservations. Its retention floor must
+reach the cut, and ordinary transaction completion certificates must finish
+collection. The data worker then releases any coordinated integrity fence on
+the receiver and commits a cutover receipt there. Metadata observes the
+replicated receipt before publishing the merged route. After a restart or
+leader change, an unfinished merge resumes qualification from the existing
+physical checkpoints. Writing the receipt requires protocol support from
+every applying member of the receiver's Raft group.
 Changing replica identity invalidates the old slot binding and returns a
 resynchronization error before streaming. Recreate the publication and slot
 when the binding changes. The same owner can reuse a slot name once the

@@ -105,7 +105,7 @@ fn applyInner(svc: anytype, alloc: std.mem.Allocator, command_json: []const u8, 
     var command = try staging.parseCommand(alloc, command_json);
     defer command.deinit();
     try metadata_service.ensureQueryPopulationDecoderWithContext(svc, command_json, request);
-    try metadata_service.ensureRestoreStagingDecoderWithContext(svc, command_json, request);
+    try metadata_service.ensureRestoreStagingDecoderWithContext(svc, command.value.action, command_json, request);
     if (compact and !staging.Command.isProgressOnly(command.value.action)) return error.InvalidRestoreStaging;
     request.markSQLSubmission();
     const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_restore_staging = command_json });

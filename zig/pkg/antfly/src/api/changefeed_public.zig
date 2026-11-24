@@ -331,6 +331,10 @@ const Policy = struct {
         return self.imagesFor(a, std.mem.readInt(u64, header.namespace[0..8], .big), key, before, after, request);
     }
 
+    pub fn requiresRowImages(self: *const Policy, table_id: u64) !bool {
+        return (try self.accessFor(table_id)).filter != null;
+    }
+
     pub fn imagesFor(self: *Policy, a: A, table_id: u64, key: []const u8, before: ?std.json.Value, after: ?std.json.Value, request: Context) !native.Images {
         try request.ensureActive();
         const access = try self.accessFor(table_id);

@@ -3329,6 +3329,9 @@ pub fn appendOperationEffects(
                 );
             },
             .merge_receiver_checkpoint => |owned_checkpoint| {
+                if (owned_checkpoint.checkpoint.kind == .qualify_cutover and
+                    raft_batch_protocol_version < data_raft_protocol.batch_merge_cutover_receipt_protocol_version)
+                    return error.RaftBatchMergeProtocolNotActivated;
                 if (owned_checkpoint.checkpoint.page_source) |source| if (source.retention != null and
                     raft_batch_protocol_version < data_raft_protocol.batch_source_scope_protocol_version)
                     return error.RaftBatchMergeProtocolNotActivated;

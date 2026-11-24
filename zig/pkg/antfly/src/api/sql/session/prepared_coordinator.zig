@@ -45,7 +45,7 @@ pub const Registry = struct {
     anchor: ?struct { incarnation: [16]u8, standalone: bool, head: u64 } = null,
 
     pub fn authority(self: *@This()) distributed.ExternalAuthority {
-        return .{ .ptr = self, .read = read, .admit = admit, .advance = advance, .next_version = nextVersion, .prepare_locks = prepareLocks, .resolve_locks = resolveLocks, .retire_native = retireNative, .reserve_capture = reserveCapture, .observe_capture = observeCapture, .observe_terminal = observeTerminal, .drive_catalog = driveCatalog };
+        return .{ .ptr = self, .read = read, .admit = admit, .advance = advance, .next_version = nextVersion, .prepare_locks = prepareLocks, .resolve_locks = resolveLocks, .retire_native = retireNative, .reserve_capture = reserveCapture, .observe_capture = observeCapture, .observe_terminal = observeTerminal, .drive_catalog = driveCatalog, .publish_history = publishHistory, .dispatch_history = dispatchHistory };
     }
 
     const Publication = @import("../../logical_replication_capture_worker.zig");
@@ -69,6 +69,55 @@ pub const Registry = struct {
         defer a.free(bytes);
         const bindings = try std.json.parseFromSliceLeaky([]const ?installation.DemandBinding, a, bytes, .{ .allocate = .alloc_always });
         try cohort.bindPublication(a, transaction, bindings);
+    }
+
+    fn historyTransport(self: *@This(), fallback: *@import("../../table_router.zig").CatalogBackedGroupRouter) !@import("../../hosted_completion.zig").Hosted {
+        const server = self.server;
+        fallback.* = @import("../../table_router.zig").CatalogBackedGroupRouter.init(server.catalogSource(), server.localSessionNodeId());
+        return .{
+            .catalog = server.catalogSource(),
+            .router = server.cfg.session_router orelse fallback.router(),
+            .executor = server.cfg.session_executor orelse return error.ChangefeedCapabilityUnsupported,
+            .secret = server.cfg.internal_service_secret,
+            .issuer = server.cfg.internal_service_issuer,
+        };
+    }
+
+    fn bindHistory(self: *@This(), a: A, cut: registry.Snapshot, transaction_id: [16]u8, begin_timestamp: u64, cohort: *distributed.ExternalPreparation) !void {
+        if (cut.standalone or self.server.cfg.native_history_owner == null or cohort.manifest.len == 0) return;
+        var fallback: @import("../../table_router.zig").CatalogBackedGroupRouter = undefined;
+        var transport = try self.historyTransport(&fallback);
+        try cohort.bindHistory(a, transport.coordinator(), transaction_id, begin_timestamp, self.publicationContext());
+    }
+
+    fn dispatchHistory(raw: *anyopaque, a: A, member: @import("../../completion_plan.zig").completion.Participant, participant: registry.Participant, request: local.storage_db_types.BatchRequest, deadline: ?u64) anyerror!void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        var context = try self.publicationContext().platformDeadline();
+        if (deadline) |limit| context.deadline_ns = @min(context.deadline_ns orelse limit, limit);
+        var fallback: @import("../../table_router.zig").CatalogBackedGroupRouter = undefined;
+        var transport = try self.historyTransport(&fallback);
+        const recovery = transport.coordinator().recovery;
+        const fence = if (request.transaction.? == .publish_completion) blk: {
+            const owner = member.routed_owner orelse return error.InvalidParticipant;
+            var budget = recovery.catalog.budget(null);
+            budget.deadline_ns = budget.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io });
+            budget.cancellation = context.cancellation;
+            var session = try @import("../../table_catalog.zig").RoutingSession.initWithBudget(a, recovery.catalog, budget);
+            defer session.deinit();
+            break :blk try @import("../../completion_recovery.zig").routeRetainedOwnerForCleanup(&session, owner, member.locator, budget, context);
+        } else participant.route;
+        try recovery.participants.submitExternal(a, member, fence, request, context);
+    }
+
+    fn publishHistory(raw: *anyopaque, a: A, record: registry.Record) anyerror!?@import("../../completion_plan.zig").completion.Digest {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const admission = record.identity.history_completion orelse return error.InvalidCatalogRecord;
+        const decision = record.decision orelse return error.InvalidPreparedTransactionPhase;
+        if (record.phase != .resolved or decision.status != .committed or record.resolutions != record.mask())
+            return error.InvalidPreparedTransactionPhase;
+        var fallback: @import("../../table_router.zig").CatalogBackedGroupRouter = undefined;
+        var transport = try self.historyTransport(&fallback);
+        return transport.coordinator().recovery.publishExternal(a, admission, decision.version, self.publicationContext());
     }
 
     fn reserveCapture(raw: *anyopaque, a: A, part: registry.Participant, request: Publication.Capacity.Request) anyerror!Publication.Proofs.CapacityReceipt {
@@ -1261,6 +1310,7 @@ fn completeScoped(server: *http.ApiHttpServer, user: ?http.AuthenticatedIdentity
     try server.embedding_provider_runtime.io.randomSecure(&operation_id);
     const cut = try source.snapshot(a, .{ .operation = operation_id });
     if (cut.standalone != frame.standalone or !std.mem.eql(u8, &cut.incarnation, &frame.backend.incarnation)) return error.CatalogGenerationChanged;
+    if (!abort and !retire_read) try source.bindHistory(a, cut, id, info.begin_timestamp, &cohort);
     try source.bindPublication(a, cut, id, &cohort);
     const now = @import("antfly_platform").time.realtimeNs();
     const pending = &state.metadata.catalog_generations;
@@ -1311,6 +1361,7 @@ fn completeScoped(server: *http.ApiHttpServer, user: ?http.AuthenticatedIdentity
         .catalog_participant = if (generation_cohort) |owned| owned.participant else null,
         .notification_plan = notification_plan,
         .kind = .session_commit,
+        .history_completion = if (cohort.history) |history| history.plan.admission else null,
         .lock_scope = .{ .backend = frame.backend, .command = frame.command },
         .commit_sync_level = if (info.sync_level == .propose) .write else info.sync_level,
         .session = .{ .owner_node_id = state.owner_node_id, .connection_id = connection_id, .standalone = cut.standalone },
@@ -1552,12 +1603,13 @@ pub fn execute(root: *execution.Adapter, session: *sql_session.Session, coordina
     defer server.alloc.free(encoded);
     var source: Registry = .{ .server = server, .context = root.context, .database_id = try databaseIdentity(root, scratch) };
     const cut = try source.snapshot(scratch, .{ .gid = command.gid });
+    try source.bindHistory(scratch, cut, id, info.begin_timestamp, &cohort);
     try source.bindPublication(scratch, cut, id, &cohort);
     const actor = try @import("../recovery/authorization_recovery.zig").actor(server, root.identity.*);
     var operation_id: [16]u8 = undefined;
     try server.embedding_provider_runtime.io.randomSecure(&operation_id);
     const now = @import("antfly_platform").time.realtimeNs();
-    const identity: registry.Identity = .{ .lock_scope = if (root.context.sql_command_fence) |fence| .{ .backend = fence.backend, .command = fence.command } else null, .session = .{ .owner_node_id = server.localSessionNodeId(), .connection_id = state.connection_id, .standalone = cut.standalone }, .gid = command.gid, .database_id = source.database_id, .native_service = root.context.native_service, .principal = actor.principal(), .txn_id = id, .operation_id = operation_id, .metadata_incarnation = std.fmt.bytesToHex(cut.incarnation, .lower), .begin_timestamp = info.begin_timestamp, .expires_at_unix_ns = try std.math.add(u64, now, 5 * std.time.ns_per_min), .plan_digest = try registry.planDigest(encoded), .manifest_digest = try registry.manifestDigest(scratch, cohort.manifest, std.fmt.bytesToHex(cut.incarnation, .lower)) };
+    const identity: registry.Identity = .{ .history_completion = if (cohort.history) |history| history.plan.admission else null, .lock_scope = if (root.context.sql_command_fence) |fence| .{ .backend = fence.backend, .command = fence.command } else null, .session = .{ .owner_node_id = server.localSessionNodeId(), .connection_id = state.connection_id, .standalone = cut.standalone }, .gid = command.gid, .database_id = source.database_id, .native_service = root.context.native_service, .principal = actor.principal(), .txn_id = id, .operation_id = operation_id, .metadata_incarnation = std.fmt.bytesToHex(cut.incarnation, .lower), .begin_timestamp = info.begin_timestamp, .expires_at_unix_ns = try std.math.add(u64, now, 5 * std.time.ns_per_min), .plan_digest = try registry.planDigest(encoded), .manifest_digest = try registry.manifestDigest(scratch, cohort.manifest, std.fmt.bytesToHex(cut.incarnation, .lower)) };
     const seal: transactions.ExternalPreparationSeal = .{ .admission_head = cut.head, .admitted_at_ns = now, .standalone = cut.standalone, .identity = identity, .actor = actor, .participants = cohort.manifest };
     var plan = (try server.txn_sessions.sealExternalEncodedExecutionPlan(server.alloc, id, seal, encoded)) orelse return error.SqlTransactionNotActive;
     defer plan.deinit();

@@ -1308,6 +1308,13 @@ pub const DocStore = struct {
             return error.ReadOnly;
         }
 
+        /// The history collector already applied the certificate charge and
+        /// consumer-floor checks. This internal sidecar has no intent credit.
+        pub fn deleteCollectedCompletionPlan(self: *Txn, id: [16]u8) !void {
+            const key = @import("transaction_completion.zig").admission_prefix.* ++ id;
+            try self.write.?.delete(&key);
+        }
+
         pub fn delete(self: *Txn, key: []const u8) anyerror!void {
             try updateGraphEndpointCleanupAdmission(self, self.alloc, key, null);
             try removeGraphRetirementReference(self, self.alloc, key, &self.graph_retirements_maybe);
@@ -1611,6 +1618,11 @@ pub const DocStore = struct {
                     try row_heap.put(self.runtime.?, key, primary);
                 } else try self.runtime.?.appendPut(key, primary);
                 if (self.payload_session) |session| try session.recordOwnership(self.runtime.?, key, stored);
+            }
+
+            pub fn deleteCollectedCompletionPlan(self: @This(), id: [16]u8) !void {
+                const key = @import("transaction_completion.zig").admission_prefix.* ++ id;
+                try self.runtime.?.delete(&key);
             }
 
             pub fn delete(self: @This(), key: []const u8) anyerror!void {
