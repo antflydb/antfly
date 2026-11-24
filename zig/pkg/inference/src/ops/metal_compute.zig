@@ -49025,27 +49025,42 @@ test "metal_compute: compact DeBERTa relative rows match expanded native attenti
     defer metal_cb.free(metal_q_r);
     const metal_k_r = try metal_cb.fromFloat32Shape(compact_k_r, &compact_rel_shape);
     defer metal_cb.free(metal_k_r);
-    const metal_out = (try metal_compute.tryDisentangledRelativeAttentionResident(
-        metal_q,
-        metal_k,
-        metal_v,
-        metal_q_r,
-        metal_k_r,
-        relative_index,
-        unique_rows,
-        mask,
-        batch,
-        seq_len,
-        num_heads,
-        head_dim,
-    )) orelse return error.MissingCompactMetalAttentionOutput;
-    defer metal_cb.free(metal_out);
-    var baseline: ?[]f32 = null;
-    defer if (baseline) |first| allocator.free(first);
-    try expectMetalRepeatsStable(allocator, &metal_cb, expected, 1e-4, &baseline, metal_out);
-    const timing = metal_cb.debugTimingSnapshot();
-    try std.testing.expectEqual(@as(u64, 1), timing.provider.metal_runtime_deberta_attention_gemm_calls);
-    try std.testing.expectEqual(@as(u64, 0), timing.provider.metal_runtime_deberta_attention_flash_calls);
+    const runtime = metal_compute.provider_impl.raw_decode_runtime;
+    const packed_bytes = 32 * 1024 * 1024;
+    const visible_scratch = (seq_len * seq_len + seq_len * unique_rows +
+        2 * seq_len * head_dim + unique_rows * head_dim) * batch * num_heads * @sizeOf(f32);
+    // This provider's cold graph-plan capacity grows each plane by 2x.
+    const cold_capacity = 2 * visible_scratch;
+    const Case = enum { below_budget, exact_budget, reuse };
+    const before = metal_runtime_mod.runtimeMemorySnapshot(runtime);
+    for ([_]Case{ .below_budget, .exact_budget, .reuse }) |case| {
+        try metal_runtime_mod.configureDebertaCacheLimits(runtime, packed_bytes, if (case == .below_budget) cold_capacity - 1 else cold_capacity);
+        const metal_out = (try metal_compute.tryDisentangledRelativeAttentionResident(
+            metal_q,
+            metal_k,
+            metal_v,
+            metal_q_r,
+            metal_k_r,
+            relative_index,
+            unique_rows,
+            mask,
+            batch,
+            seq_len,
+            num_heads,
+            head_dim,
+        )) orelse return error.MissingCompactMetalAttentionOutput;
+        defer metal_cb.free(metal_out);
+        var baseline: ?[]f32 = null;
+        defer if (baseline) |first| allocator.free(first);
+        try expectMetalRepeatsStable(allocator, &metal_cb, expected, 1e-4, &baseline, metal_out);
+        const timing = metal_cb.debugTimingSnapshot();
+        const memory = metal_runtime_mod.runtimeMemorySnapshot(runtime);
+        try std.testing.expectEqual(@as(u64, 1), timing.provider.metal_runtime_deberta_attention_flash_calls);
+        try std.testing.expectEqual(@as(u64, @backingInt(case)), timing.provider.metal_runtime_deberta_attention_gemm_calls);
+        const allocated = case != .below_budget;
+        try std.testing.expectEqual(before.graph_plan_allocations + @as(u64, if (allocated) 5 else 0), memory.graph_plan_allocations);
+        try std.testing.expectEqual(before.graph_plan_bytes + @as(u64, if (allocated) cold_capacity else 0), memory.graph_plan_bytes);
+    }
 }
 
 test "metal_compute: legacy threadgroup disentangled relative attention matches native at multi-simdgroup threadgroup width" {
