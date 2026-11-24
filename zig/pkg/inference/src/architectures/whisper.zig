@@ -1321,6 +1321,10 @@ pub const PreparedSingleToken = struct {
             return result;
         }
     };
+    pub fn supportsInitialRows(config: Config, query_rows: usize) bool {
+        return query_rows != 0 and query_rows <= config.max_target_positions and query_rows <= 2048;
+    }
+
     pub fn specSource(cb: *const ComputeBackend, data: *const anyopaque, config: Config, rows: usize, weights: *const PreparedDecoderWeights, query_rows: usize, initial: bool) !?SpecSource {
         if (!dense_backend.available(cb) or weights.cross == null or weights.weights.layers.len != config.decoder_layers or weights.cross.?.len != config.decoder_layers) return null;
         if (cb.kind() != .metal) for (weights.weights.layers) |w| if (w.qkv_slots != null) return null;
@@ -1329,7 +1333,9 @@ pub const PreparedSingleToken = struct {
         if (embed.descriptor.shape.rank() != 2 or position.descriptor.shape.rank() != 2 or embed.descriptor.shape.dims[1] != config.d_model or position.descriptor.shape.dims[1] != config.d_model or embed.descriptor.shape.dims[0] <= 0 or position.descriptor.shape.dims[0] <= 0) return null;
         const geometry = try CacheGeometry.init(config, rows);
         if (config.decoder_attention_heads == 0 or config.d_model % config.decoder_attention_heads != 0 or rows > std.math.maxInt(i32) or geometry.capacity > std.math.maxInt(i32) or config.d_model > std.math.maxInt(i32) or config.decoder_ffn_dim > std.math.maxInt(i32) or config.vocab_size > std.math.maxInt(i32)) return null;
-        if (query_rows == 0 or (!initial and query_rows != 1) or (initial and (query_rows > config.max_target_positions or query_rows > 2048))) return error.UnsupportedDenseSchedule;
+        if (initial) {
+            if (!supportsInitialRows(config, query_rows) or query_rows > @as(u64, @intCast(position.descriptor.shape.dims[0]))) return null;
+        } else if (query_rows != 1) return error.UnsupportedDenseSchedule;
         var count: usize = 7;
         for (weights.weights.layers) |layer| count = try std.math.add(usize, count, SpecSource.layerCount(layer, initial));
         return .{ .cb = cb, .data = data, .config = config, .rows = rows, .weights = weights, .query_rows = query_rows, .initial = initial, .parameter_count = count };
@@ -1408,7 +1414,7 @@ pub const PreparedSingleToken = struct {
         return .{ .schedule = try schedule_mod.Schedule.create(&b), .token_node = nodes.token_node, .position_node = nodes.position_node };
     }
     pub fn initInitial(self: *PreparedSingleToken, config: Config, rows: usize, weights: *const PreparedDecoderWeights, preparation: ?*schedule_mod.Preparation, query_rows: usize, spec: *const schedule_mod.ProgramSpec, storage: ?*schedule_mod.ProgramSpecStorage) !void {
-        if (self.initial != null or query_rows == 0 or query_rows > config.max_target_positions or query_rows > 2048) return error.UnsupportedDenseSchedule;
+        if (self.initial != null or !supportsInitialRows(config, query_rows) or query_rows > self.position_rows) return error.UnsupportedDenseSchedule;
         if (spec.phase != .initial or spec.geometry.query_rows != query_rows) return error.DenseDefinitionChanged;
         const tokens = try self.allocator.alloc(i64, query_rows);
         errdefer self.allocator.free(tokens);

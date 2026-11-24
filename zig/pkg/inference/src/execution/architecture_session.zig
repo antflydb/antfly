@@ -5731,7 +5731,7 @@ fn denseWhisperPreparationModelData(session: Session) ?*const anyopaque {
 
 fn prepareColdNativeWhisperWithInitial(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, config: whisper_mod.Config, geometry: whisper_arch.CacheGeometry, base: *const @import("../backends/session.zig").RunPermit, encoder: ColdWhisperEncoder, declared_initial_rows: ?usize) !?*ColdNativeWhisper {
     const initial_rows = if (declared_initial_rows) |rows|
-        if (rows > 0 and rows <= config.max_target_positions and rows <= 2048) rows else null
+        if (whisper_arch.PreparedSingleToken.supportsInitialRows(config, rows)) rows else null
     else
         null;
     // A declined optional phase retires before the constructor retries.

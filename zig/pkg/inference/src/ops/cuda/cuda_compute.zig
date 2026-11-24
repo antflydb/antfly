@@ -19903,11 +19903,11 @@ fn cudaGraphReplayArenaStatusUnlocked(self: *CudaCompute, slot: *const CudaGraph
     // Matching lengths do not imply matching addresses. Check the captured
     // physical ordinal and the live occupants of that interval.
     if (slot.captured_temp_allocation_count != 0) {
-        const current_start = pinnedTempSlotIndex(self, self.temp_trace_seq);
+        // The ordinary scratch cache cannot attest a stable address, even
+        // when both the recorded and current pinned ordinals are absent.
+        const current_start = pinnedTempSlotIndex(self, self.temp_trace_seq) orelse return .stale;
         if (slot.captured_temp_slot_start != current_start) return .stale;
-        if (current_start) |start| {
-            if (!pinnedTempReplayRangeIdle(self, start, slot.captured_temp_allocation_count)) return .borrowed;
-        }
+        if (!pinnedTempReplayRangeIdle(self, current_start, slot.captured_temp_allocation_count)) return .borrowed;
     }
     if (check_trace and self.temp_slot_config.autoplan_enabled and !self.temp_arena_planner.canGraphReplay(
         self.temp_trace_seq,
@@ -20070,6 +20070,11 @@ test "CUDA replay retains input storage while retiring an exec at its addressabl
     try std.testing.expectEqual(.stale, cudaGraphReplayArenaStatus(&compute, slot));
     compute.temp_slot_config = previous_config;
     compute.temp_trace_seq = previous_seq;
+    slot.captured_temp_slot_start = null;
+    compute.temp_slot_config.configured_period = 0;
+    compute.temp_slot_config.autoplan_enabled = false;
+    try std.testing.expectEqual(.stale, cudaGraphReplayArenaStatus(&compute, slot));
+    compute.temp_slot_config = previous_config;
     slot.captured_temp_allocation_count = 0;
     slot.captured_temp_slot_start = null;
     var unowned_input = borrowedSlotTensor(tensorFromCt(prepared));

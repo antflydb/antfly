@@ -127,6 +127,7 @@ const ResidentSlot = struct {
     input: sessions.ResidentInput,
     shape: [4]i64,
     independent: bool = false,
+    copy_rejected: bool = false,
 };
 
 pub const State = struct {
@@ -406,29 +407,33 @@ pub const State = struct {
             backend.decoderRuntimeCancelFrame() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         const completion = if (kernels.createPhysicalCompletion) |create| try create(backend.ptr) else null;
         defer if (completion) |event| event.deinit();
-        const copied = copies: {
+        {
             // An error can follow command submission. Keep every staged
             // target and its previous source alive until the stream drains.
             defer if (completion) |event| {
                 event.record() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
                 event.wait() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
             };
-            for (self.roles, previous, updated) |role, old, target| switch (role) {
+            for (self.roles, previous, updated) |role, old, *target| switch (role) {
                 .past => |past| if (past.cross) {
-                    if (target) |value| if (value.independent) copy(backend.ptr, value.input.value, old.?.input.value) catch |err| switch (err) {
-                        error.InvalidPhysicalTransferSize => break :copies false,
+                    if (target.*) |*value| if (value.independent) copy(backend.ptr, value.input.value, old.?.input.value) catch |err| switch (err) {
+                        error.InvalidPhysicalTransferSize, error.InvalidShape => value.copy_rejected = true,
                         else => return err,
                     };
                 },
                 else => {},
             };
-            break :copies true;
-        };
-        if (metal_frame) {
-            if (copied) try backend.decoderRuntimeSubmitAndWaitFrame() else try backend.decoderRuntimeCancelFrame();
         }
+        if (metal_frame) try backend.decoderRuntimeSubmitAndWaitFrame();
         try scope.finish();
-        if (!copied) self.discardStagedCrossCaches(updated);
+        // A rejected column keeps its previous owner. Completed siblings can
+        // still retire their producer outputs after the common completion.
+        for (updated) |*target| {
+            if (target.*) |value| if (value.copy_rejected) {
+                value.pin.release();
+                target.* = null;
+            };
+        }
     }
 
     fn discardStagedCrossCaches(self: *const State, updated: []?ResidentSlot) void {
@@ -823,6 +828,21 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
                 const detached = targets[0] orelse return error.MissingIndependentResidentCache;
                 const other = targets[1] orelse return error.MissingIndependentResidentCache;
                 try std.testing.expect(other.independent and other.input.value != detached.input.value);
+
+                // A stale tensor extent in one column must leave its source
+                // authoritative without discarding a completed sibling.
+                const malformed = try source.input.backend.fromFloat32Shape(&.{99}, &.{1});
+                defer source.input.backend.free(malformed);
+                var mixed = previous;
+                mixed[1].?.input.value = malformed;
+                var partial_targets: [2]?ResidentSlot = @splat(null);
+                defer for (partial_targets) |target| if (target) |value| value.pin.release();
+                try copy_state.migrateOmittedCrossCaches(&mixed, &partial_targets, copy_control);
+                try std.testing.expect(partial_targets[0] != null and partial_targets[1] == null);
+                const partial_cache = try partial_targets[0].?.input.backend.toFloat32(partial_targets[0].?.input.value, a);
+                defer a.free(partial_cache);
+                try std.testing.expectEqualSlices(f32, expected_cache, partial_cache);
+
                 const other_cache = try other.input.backend.toFloat32(other.input.value, a);
                 defer a.free(other_cache);
                 try std.testing.expectEqualSlices(f32, expected_cache, other_cache);
