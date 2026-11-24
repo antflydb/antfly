@@ -20385,6 +20385,38 @@ fn debugCudaGraphCaptureEnd(ctx: *anyopaque, replay: bool) !void {
     }
 }
 
+test "CUDA decoder capture executes ordinary scratch once without publishing an exec" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    var compute = try CudaCompute.testing.init(std.testing.allocator);
+    defer compute.deinit();
+    compute.capture_gates.update_exec = true;
+    compute.temp_slot_config.configured_period = 0;
+    compute.temp_slot_config.autoplan_enabled = false;
+    var warm = try allocDeviceBufferOrdinary(&compute, 16);
+    const address = warm.ptr;
+    releaseDeviceBuffer(&compute, &warm);
+    try std.testing.expect(compute.temp_buffers.buffers.items.len != 0);
+
+    try compute.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED);
+    compute.debug_cuda_graph_capture_active = true;
+    compute.debug_cuda_graph_active_slot = 0;
+    compute.debug_cuda_graph_capture_temp_seq_begin = compute.temp_trace_seq;
+    compute.debug_cuda_graph_prepared_attention_topology = generatedGqaAttentionTopology(&compute, compute.debug_cuda_graph_decode_kv_seq_len);
+    errdefer debugCudaGraphCaptureEnd(&compute, false) catch {};
+    var scratch = try allocDeviceBufferOrdinary(&compute, 16);
+    defer releaseDeviceBuffer(&compute, &scratch);
+    try std.testing.expectEqual(address, scratch.ptr);
+    try compute.kernels.launchFillF32(&compute.ctx, scratch, 4, 7);
+    try debugCudaGraphCaptureEnd(&compute, true);
+    try std.testing.expectEqual(@as(usize, 1), compute.stats.cuda_graph_capture_replays);
+    try std.testing.expect(compute.debug_cuda_graph_slots[0].exec == null);
+    try std.testing.expect(!compute.debug_cuda_graph_slots[0].valid);
+    var values: [4]f32 = undefined;
+    try scratch.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&values));
+    try compute.ctx.synchronize();
+    try std.testing.expectEqualSlices(f32, &.{ 7, 7, 7, 7 }, &values);
+}
+
 fn fromFloat32Op(ctx: *anyopaque, data: []const f32) anyerror!CT {
     var shape = [_]i32{@intCast(data.len)};
     return fromFloat32ShapeOp(ctx, data, &shape);

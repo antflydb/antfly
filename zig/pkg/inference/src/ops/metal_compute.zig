@@ -23982,6 +23982,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!fused) {
             var owned_scratch: ?MetalTensor = null;
             defer if (owned_scratch) |*tensor| self.retireTemporaryWorkspaceValue(tensor);
+            // Outside a caller-owned frame, submit the dependent clamp and
+            // projection kernels together instead of waiting after each one.
+            var owns_frame = false;
+            errdefer if (owns_frame) metal_runtime.cancelFrame(runtime) catch {};
+            if (clip) |p| {
+                if (p.flags & 31 != 0 and !metal_runtime.hasActiveFrame(runtime) and !metal_runtime.hasSubmittedFrame(runtime)) {
+                    try metal_runtime.beginFrame(runtime);
+                    owns_frame = true;
+                }
+            }
             var operand = x;
             if (clip) |p| if (p.flags & 3 != 0) {
                 const bytes = try std.math.mul(usize, input_elements, @sizeOf(f32));
@@ -24007,6 +24017,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (clip) |p| if (p.flags & 28 != 0) {
                 if (!metal_runtime.decoderRuntimeAudioClampInto(self.provider_impl, mt, mt, (p.flags >> 2) & 3, p.output_min, p.output_max, p.flags & 16 != 0)) return error.AudioScheduleRouteChanged;
             };
+            if (owns_frame) {
+                try metal_runtime.submitFrame(runtime);
+                owns_frame = false;
+                try metal_runtime.waitFrame(runtime);
+            }
         }
         published = true;
         return result;
@@ -63136,8 +63151,10 @@ test "Metal prepared audio projection consumes disjoint clamp workspace after fu
     }
     request.output = null;
     request.input_workspace = null;
+    const frames_before = metal_runtime_mod.frameCommandBufferCount(runtime);
     const eager = (try compute.encodeAudioLinear(&compute, source, &request, .staged)) orelse return error.MissingAudioProjection;
     defer cb.free(eager);
+    try std.testing.expectEqual(frames_before + 1, metal_runtime_mod.frameCommandBufferCount(runtime));
     const eager_values = try cb.toFloat32(eager, a);
     defer a.free(eager_values);
     try std.testing.expectEqualSlices(f32, expected, eager_values);
