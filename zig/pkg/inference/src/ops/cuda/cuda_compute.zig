@@ -2364,7 +2364,7 @@ pub const CudaCompute = struct {
         generation: u64 = 0,
 
         pub fn init(slots: []Slot, requests: []const @import("prepared_cache.zig").Request) !CapturedCacheRoots {
-            if (slots.len < requests.len) return error.CapturedCacheRootCapacity;
+            if (slots.len != requests.len) return error.CapturedCacheRootCapacity;
             for (requests) |request| switch (request) {
                 .constant => |named| if (!std.mem.startsWith(u8, named.name.slice(), "lighton.norm_weight.")) return error.InvalidCapturedCacheRequest,
                 else => return error.InvalidCapturedCacheRequest,
@@ -2399,20 +2399,21 @@ pub const CudaCompute = struct {
             const graph = &compute.bounded_decode_graph;
             if (!graph.active) return;
             if (graph.captured_roots_identity != self.identity() or self.epoch != graph.epoch_id or self.generation != graph.invalidations) return error.CapturedCacheOwnerChanged;
-            const bytes = blk: {
-                for (self.requests) |request| if (std.mem.eql(u8, request.constant.name.slice(), key)) break :blk request.constant.bytes;
-                return error.UnownedCapturedCacheKey;
-            };
-            if (!tensor.model_constant or tensor.resident_parent != null or !tensor.owned_by_tensor or !tensor.owns_buffer or tensor.dtype != .f32 or tensor.buffer.len < bytes or try checkedMul(tensor.elem_count, 4) != bytes) return error.CapturedCacheRootChanged;
-            var empty: ?*Slot = null;
-            for (self.slots) |*slot| {
-                if (slot.* == tensor) return;
-                if (slot.* == null and empty == null) empty = slot;
+            for (self.requests, self.slots) |request, *slot| {
+                const constant = request.constant;
+                if (!std.mem.eql(u8, constant.name.slice(), key)) continue;
+                if (!tensor.model_constant or tensor.resident_parent != null or !tensor.owned_by_tensor or !tensor.owns_buffer or tensor.dtype != .f32 or tensor.buffer.len < constant.bytes or try checkedMul(tensor.elem_count, 4) != constant.bytes) return error.CapturedCacheRootChanged;
+                if (slot.*) |owner| {
+                    if (owner != tensor) return error.CapturedCacheRootChanged;
+                } else {
+                    retainResidentTensor(tensor);
+                    slot.* = tensor;
+                }
+                return;
             }
-            const target = empty orelse return error.CapturedCacheRootCapacity;
-            retainResidentTensor(tensor);
-            target.* = tensor;
+            return error.UnownedCapturedCacheKey;
         }
+
         pub fn bind(self: *CapturedCacheRoots, cb: *const ops.ComputeBackend, expected: *CudaCompute) !void {
             if (!acceptsPhysicalImplementation(cb.vtable) or cb.ptr != @as(*anyopaque, @ptrCast(expected))) return error.UnsupportedReaderEpochBackend;
             if (expected.captured_cache_roots != null) return error.CapturedCacheOwnerAlreadyBound;
@@ -55738,6 +55739,29 @@ test "CUDA auxiliary cache uses prepared backing and retires only after current 
     guard.finish();
     try std.testing.expectEqualDeep(@import("../../runtime/tier/memory.zig").AdmissionAmounts{}, domain.controller.snapshot());
     try std.testing.expect(!probe.under_gate);
+}
+
+test "captured norm cache retains one immutable backing per declared key" {
+    const Cache = @import("prepared_cache.zig");
+    const keys = [_][]const u8{ "lighton.norm_weight.first", "lighton.norm_weight.second" };
+    const requests = [_]Cache.Request{ try Cache.Request.constantSpan(keys[0], 16), try Cache.Request.constantSpan(keys[1], 16) };
+    var slots: [requests.len]CudaCompute.CapturedCacheRoots.Slot = undefined;
+    try std.testing.expectError(error.CapturedCacheRootCapacity, CudaCompute.CapturedCacheRoots.init(slots[0..1], &requests));
+    var roots = try CudaCompute.CapturedCacheRoots.init(&slots, &requests);
+    var compute = metadataOnlyTestCompute();
+    compute.bounded_decode_graph = .{ .active = true, .captured_roots_identity = roots.identity() };
+    var dims = [_]i64{4};
+    var first: CudaTensor = .{ .buffer = .{ .ptr = 16, .len = 16 }, .dtype = .f32, .shape = &dims, .elem_count = 4, .model_constant = true };
+    var second: CudaTensor = .{ .buffer = .{ .ptr = 32, .len = 16 }, .dtype = .f32, .shape = &dims, .elem_count = 4, .model_constant = true };
+    try roots.selected(&compute, keys[1], &second);
+    try roots.selected(&compute, keys[1], &second);
+    try std.testing.expectError(error.CapturedCacheRootChanged, roots.selected(&compute, keys[1], &first));
+    try std.testing.expectError(error.UnownedCapturedCacheKey, roots.selected(&compute, "other", &first));
+    try roots.selected(&compute, keys[0], &first);
+    try std.testing.expectEqual(@as(?*CudaTensor, &first), slots[0]);
+    try std.testing.expectEqual(@as(?*CudaTensor, &second), slots[1]);
+    try std.testing.expectEqual(@as(usize, 2), first.resident_references.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), second.resident_references.load(.acquire));
 }
 
 test "captured graph funding rejects copied backend tables before invalid context SDK or scope access" {

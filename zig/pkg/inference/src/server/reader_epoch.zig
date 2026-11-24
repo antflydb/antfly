@@ -320,10 +320,6 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             // Keep the latency-oriented default; bulk-throughput profiles can
             // prioritize runnable prefills to fill the physical decode batch.
             ctx.coordinator.max_decode_streak_before_prefill = factory.features.prefill_decode_streak;
-            if (comptime build_options.enable_cuda) if (factory.model.session.backend() == .cuda) {
-                ctx.captured_root_slots = try a.alloc(@import("../ops/cuda/cuda_compute.zig").CudaCompute.CapturedCacheRoots.Slot, try std.math.add(usize, 2, try std.math.mul(usize, factory.cfg.num_hidden_layers, 4)));
-                @memset(ctx.captured_root_slots, null);
-            };
             if (comptime build_options.enable_metal) if (factory.model.session.backend() == .metal) {
                 ctx.metal_park = try @import("../ops/metal_compute.zig").MetalCompute.ReaderEpochPark.prepare();
                 // Exact authored metadata declaration (two C arrays + process
@@ -371,7 +367,11 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                 if (comptime build_options.enable_cuda) if (cleanup.epoch() != null) {
                     norms = try factory.prepareNorm();
                     if (norms) |value| {
-                        ctx.captured_roots = try @import("../ops/cuda/cuda_compute.zig").CudaCompute.CapturedCacheRoots.init(ctx.captured_root_slots, value.normRequests());
+                        const Roots = @import("../ops/cuda/cuda_compute.zig").CudaCompute.CapturedCacheRoots;
+                        const requests = value.normRequests();
+                        if (ctx.captured_root_slots.len != requests.len)
+                            ctx.captured_root_slots = try a.realloc(ctx.captured_root_slots, requests.len);
+                        ctx.captured_roots = try Roots.init(ctx.captured_root_slots, requests);
                     }
                 };
                 lane = try factory.model.native_reader_execution_lane.acquire(factory.control);
