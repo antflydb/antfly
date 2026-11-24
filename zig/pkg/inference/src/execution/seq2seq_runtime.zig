@@ -160,14 +160,20 @@ pub const State = struct {
         }
         const roles = try allocator.alloc(InputRole, input_info.len);
         errdefer allocator.free(roles);
-        for (input_info, roles) |info, *role| {
+        const past_indices = try allocator.alloc(usize, output_info.len);
+        errdefer allocator.free(past_indices);
+        @memset(past_indices, std.math.maxInt(usize));
+        for (input_info, roles, 0..) |info, *role, input_index| {
             role.* = if (kv.pastInputSuffix(info.name)) |suffix| cache: {
                 for (output_info, 0..) |output, index| {
-                    if (kv.presentNameMatchesPastInput(info.name, output.name)) break :cache .{ .past = .{
-                        .output_index = index,
-                        .empty_shape = .{ 1, info.shape[1], 0, info.shape[3] },
-                        .cross = kv.isCrossCacheSuffix(suffix),
-                    } };
+                    if (kv.presentNameMatchesPastInput(info.name, output.name)) {
+                        past_indices[index] = input_index;
+                        break :cache .{ .past = .{
+                            .output_index = index,
+                            .empty_shape = .{ 1, info.shape[1], 0, info.shape[3] },
+                            .cross = kv.isCrossCacheSuffix(suffix),
+                        } };
+                    }
                 }
                 unreachable; // The immutable qualified signature has an exact match.
             } else if (std.mem.eql(u8, info.name, "input_ids")) .tokens else if (std.mem.eql(u8, info.name, "encoder_hidden_states")) .encoder else if (std.mem.eql(u8, info.name, "encoder_attention_mask")) .mask else .cache_branch;
@@ -178,7 +184,7 @@ pub const State = struct {
             break;
         };
         var planned = session;
-        planned.cached_decoder_geometry = .{ .vocab_size = vocab_size };
+        planned.cached_decoder_geometry = .{ .vocab_size = vocab_size, .past_input_indices = past_indices };
         planned.broadcast_inputs = &.{"use_cache_branch"};
         return .{
             .allocator = allocator,
@@ -200,6 +206,7 @@ pub const State = struct {
             self.allocator.free(slots);
             self.allocator.free(self.stage_inputs);
         }
+        self.allocator.free(self.session.cached_decoder_geometry.?.past_input_indices);
         self.allocator.free(self.roles);
     }
 

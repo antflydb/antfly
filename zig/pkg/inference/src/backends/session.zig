@@ -959,6 +959,25 @@ pub const SequenceOutputGeometry = struct {
 /// self-attention time grows, while cross-attention time is encoder-context time.
 pub const CachedDecoderGeometry = struct {
     vocab_size: usize,
+    /// Indices in the cold qualified input signature. A caller may still
+    /// supply the same bindings in a different order.
+    past_input_indices: []const usize = &.{},
+
+    fn findPastInput(inputs: ShapeInputs, suffix: []const u8, preferred: ?usize) ?TensorInfo {
+        if (preferred) |index| {
+            if (index < inputs.len()) {
+                const input = inputs.get(index);
+                if (onnx_cache.pastInputSuffix(input.name)) |actual| {
+                    if (std.mem.eql(u8, actual, suffix)) return input;
+                }
+            }
+        }
+        for (0..inputs.len()) |index| {
+            const input = inputs.get(index);
+            if (std.mem.eql(u8, onnx_cache.pastInputSuffix(input.name) orelse continue, suffix)) return input;
+        }
+        return null;
+    }
 
     fn resolve(self: @This(), inputs: ShapeInputs, outputs: []const TensorInfo, batch: usize) !RunGeometry {
         const ids = inputs.named("input_ids") orelse return error.MissingInputs;
@@ -969,21 +988,14 @@ pub const CachedDecoderGeometry = struct {
         var bytes: usize = 0;
         var cache_bytes: usize = 0;
         var sequence = @max(tokens, context);
-        for (outputs) |output| {
+        for (outputs, 0..) |output, index| {
             if (std.mem.eql(u8, output.name, "logits")) {
                 bytes = try addBytes(bytes, try mulBytes(try mulBytes(try mulBytes(batch, tokens), self.vocab_size), output.dtype.byteSize()));
             } else {
                 const suffix = onnx_cache.presentOutputSuffix(output.name) orelse return error.UnresolvedOutputGeometry;
                 if (output.shape.len != 4) return error.UnresolvedOutputGeometry;
-                var past: ?TensorInfo = null;
-                for (0..inputs.len()) |i| {
-                    const input = inputs.get(i);
-                    if (std.mem.eql(u8, onnx_cache.pastInputSuffix(input.name) orelse continue, suffix)) {
-                        past = input;
-                        break;
-                    }
-                }
-                const cached = past orelse return error.MissingInputs;
+                const preferred = if (index < self.past_input_indices.len) self.past_input_indices[index] else null;
+                const cached = findPastInput(inputs, suffix, preferred) orelse return error.MissingInputs;
                 if (cached.shape.len != 4 or cached.shape[1] <= 0 or cached.shape[2] < 0 or cached.shape[3] <= 0) return error.InvalidInputShape;
                 const cross = onnx_cache.isCrossCacheSuffix(suffix);
                 const time = if (cross) context else try addBytes(@intCast(cached.shape[2]), tokens);

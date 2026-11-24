@@ -477,7 +477,8 @@ fn runMode(comptime placement: OutputPlacement, broker: *micro.Broker, allocator
     try signature.writer.print("{s};{s};", .{ @tagName(placement), if (stage != null) "stage" else "tensor" });
     try signature.writer.print("{d}:{d};", .{ @intFromPtr(session.vtable), @intFromPtr(gate) });
     try std.json.Stringify.value(session.output_geometry, .{}, &signature.writer);
-    try std.json.Stringify.value(session.cached_decoder_geometry, .{}, &signature.writer);
+    const vocabulary = if (session.cached_decoder_geometry) |geometry| @as(?usize, geometry.vocab_size) else null;
+    try std.json.Stringify.value(vocabulary, .{}, &signature.writer);
     try std.json.Stringify.value(session.broadcast_inputs, .{}, &signature.writer);
     try std.json.Stringify.value(if (control) |active| active.native_call_policy else @import("../execution_control.zig").NativeCallPolicy.require_supervision, .{}, &signature.writer);
     // A fused native call must stay inside the same supervising boundary.
