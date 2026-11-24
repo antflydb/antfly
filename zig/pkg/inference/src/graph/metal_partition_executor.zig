@@ -16004,43 +16004,32 @@ fn executeRuntimeScaledAddFromDeferredMul(
     if (inputs.len < 2) return null;
     const lhs_pending = pendingDeferredScaleMul(graph, values, inputs[0], output_shape);
     const rhs_pending = pendingDeferredScaleMul(graph, values, inputs[1], output_shape);
-    if (lhs_pending) |lhs_scaled| {
-        if (rhs_pending) |rhs_scaled| {
-            const lhs_input = valueFor(values, lhs_scaled.source_id) orelse return null;
-            const rhs_input = valueFor(values, rhs_scaled.source_id) orelse return null;
-            const fused = try executeDecoderWithOutputHint(cb, ComputeBackend.decoderRuntimeApplyScaledAddScale, ops_mod.DecoderRuntimeApplyScaledAddScaleRequest{
-                .output = output_hint,
-                .lhs = lhs_input,
-                .rhs = rhs_input,
-                .dim = dim,
-                .lhs_scale = lhs_scaled.scale,
-                .rhs_scale = rhs_scaled.scale,
-                .output_scale = 1,
-            });
-            if (try promoteMetalOutputIfNeeded(cb, fused, output_hint)) |result| return result;
-            const lhs = (try executeDeferredScaleMulValue(cb, values, lhs_scaled)) orelse return null;
-            defer cb.free(lhs);
-            const rhs = (try executeDeferredScaleMulValue(cb, values, rhs_scaled)) orelse return null;
-            defer cb.free(rhs);
-            const output = cb.add(lhs, rhs) catch |err| switch (err) {
-                error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
-                else => return err,
-            };
-            return try promoteMetalOutputIfNeeded(cb, output, null);
-        }
-    }
     const scaled = lhs_pending orelse rhs_pending orelse return null;
+    const second = if (lhs_pending != null) rhs_pending else null;
     const scaled_input = valueFor(values, scaled.source_id) orelse return null;
-    const residual = valueFor(values, inputs[if (lhs_pending != null) 1 else 0]) orelse return null;
+    const residual_id = if (second) |term| term.source_id else inputs[if (lhs_pending != null) 1 else 0];
+    const residual = valueFor(values, residual_id) orelse return null;
     const output = try executeDecoderWithOutputHint(cb, ComputeBackend.decoderRuntimeApplyScaledAddScale, ops_mod.DecoderRuntimeApplyScaledAddScaleRequest{
         .output = output_hint,
         .lhs = scaled_input,
         .rhs = residual,
         .dim = dim,
         .lhs_scale = scaled.scale,
-        .output_scale = 1.0,
+        .rhs_scale = if (second) |term| term.scale else null,
+        .output_scale = 1,
     });
     if (try promoteMetalOutputIfNeeded(cb, output, output_hint)) |result| return result;
+    if (second) |term| {
+        const lhs = (try executeDeferredScaleMulValue(cb, values, scaled)) orelse return null;
+        defer cb.free(lhs);
+        const rhs = (try executeDeferredScaleMulValue(cb, values, term)) orelse return null;
+        defer cb.free(rhs);
+        const fallback = cb.add(lhs, rhs) catch |err| switch (err) {
+            error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
+            else => return err,
+        };
+        return try promoteMetalOutputIfNeeded(cb, fallback, null);
+    }
     return try executeDeferredScaleAddFallback(cb, values, scaled, residual);
 }
 
