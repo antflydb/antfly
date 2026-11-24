@@ -21,12 +21,13 @@ const platform = @import("antfly_platform");
 const ops = @import("../ops/ops.zig");
 const ComputeBackend = ops.ComputeBackend;
 const gpt_arch = @import("../architectures/gpt.zig");
+const decoder_step_executor = @import("decoder_step_executor.zig");
 const graph_mod = @import("../graph/root.zig");
 const metal_runtime = @import("../backends/metal_runtime.zig");
 const decoder_gated_runtime = @import("../backends/decoder_gated_runtime.zig");
 const BorrowedDecodeStateRuntime = graph_mod.decode_state_runtime.BorrowedDecodeStateRuntime;
 const NativeDecodeState = @import("../graph/decode_state_runtime.zig").NativeDecodeState;
-const runWithDecoderRuntimeResetBoundary = graph_mod.decoder_step_executor.runWithDecoderRuntimeResetBoundary;
+const runWithDecoderRuntimeResetBoundary = decoder_step_executor.runWithDecoderRuntimeResetBoundary;
 
 pub const ForwardAllWithHiddenHost = struct {
     allocator: std.mem.Allocator,
@@ -947,7 +948,7 @@ pub const Runtime = struct {
 
     fn forwardAllLogits(self: *Runtime, input_ids: []const i64, batch: usize, seq_len: usize, decode_context: *const gpt_arch.DecodeContext) ![]f32 {
         var fallback_count: u64 = 0;
-        return graph_mod.decoder_step_executor.forwardAll(&self.context, self.graph_cache, input_ids, batch, seq_len, decode_context, self.replay_fallbacks orelse &fallback_count);
+        return decoder_step_executor.forwardAll(&self.context, self.graph_cache, input_ids, batch, seq_len, decode_context, self.replay_fallbacks orelse &fallback_count);
     }
 
     /// Reserve the real predictor verify suffix before deriving its query.

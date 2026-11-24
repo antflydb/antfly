@@ -73,6 +73,7 @@ const BoundedRequestAllocator = @import("../runtime/bounded_allocator.zig").Boun
 const image_pipeline = @import("../pipelines/image.zig");
 const sparse_embedding_mod = @import("../pipelines/sparse_embedding.zig");
 const generation = @import("../pipelines/generation.zig");
+const decoder_checkpoint = @import("../execution/decoder_checkpoint.zig");
 const decoder_storage = @import("../execution/decoder_storage.zig");
 const context_management = @import("context_management.zig");
 const native_kv_wire = @import("native_kv_wire.zig");
@@ -16977,7 +16978,7 @@ pub const Node = struct {
     const NativeCheckpointTransfer = struct {
         metadata: []const u8,
         lease: ?*NativeCheckpointLease = null,
-        prepare: ?*generation.NativeCheckpointPrepare = null,
+        prepare: ?*decoder_checkpoint.PrepareRequest = null,
         resume_request: ?*generation.NativeCheckpointResume = null,
         reader: ?*httpx.Context.RequestBodyReader = null,
         checkpoint_bytes: usize = 0,
@@ -17016,7 +17017,7 @@ pub const Node = struct {
         if (metadata.len > 2 * 1024 * 1024) return nativeCheckpointErrorResponse(ctx, error.NativeKvFrameLimit);
         const encoding = runtime.kv.attention_match_checkpoint.Encoding.parse(ctx.header("X-Antfly-KV-Encoding") orelse "f16") catch |err|
             return nativeCheckpointErrorResponse(ctx, err);
-        var prepare: generation.NativeCheckpointPrepare = .{ .encoding = encoding };
+        var prepare: decoder_checkpoint.PrepareRequest = .{ .encoding = encoding };
         defer prepare.deinit();
         var transfer: NativeCheckpointTransfer = .{ .metadata = metadata, .lease = &lease, .prepare = &prepare };
         return self.completeNativeOrOrdinaryGeneration(ctx, &transfer);
@@ -17052,7 +17053,7 @@ pub const Node = struct {
         return self.completeNativeOrOrdinaryGeneration(ctx, &transfer);
     }
 
-    fn nativeCheckpointResponse(ctx: *httpx.Context, request: *generation.NativeCheckpointPrepare, model: []const u8, execution: InferenceExecutionControl, completion: *?DeferredGenerationCompletion) !httpx.Response {
+    fn nativeCheckpointResponse(ctx: *httpx.Context, request: *decoder_checkpoint.PrepareRequest, model: []const u8, execution: InferenceExecutionControl, completion: *?DeferredGenerationCompletion) !httpx.Response {
         const result = if (request.result) |*result| result else return error.InvalidNativeCheckpointResult;
         const export_started_ns = embedTimingNowNs();
         const checkpoint = runtime.kv.attention_match_checkpoint;
@@ -18284,7 +18285,7 @@ pub const Node = struct {
         var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
         const native_host_reservation: usize = if (native_transfer) |transfer|
             if (transfer.prepare) |request| blk: {
-                const plan = generation.NativeCheckpointPrepare.hostPlan(gpt_config, prompt_tokens, request.encoding) catch |err| return nativeCheckpointErrorResponse(ctx, err);
+                const plan = decoder_checkpoint.PrepareRequest.hostPlan(gpt_config, prompt_tokens, request.encoding) catch |err| return nativeCheckpointErrorResponse(ctx, err);
                 request.planned_fit_host_bytes = plan.fit_bytes;
                 request.planned_fit_workers = plan.workers;
                 std.log.info("native_checkpoint_host_plan source_tokens={d} source_bytes={d} head_workspace_bytes={d} fit_bytes={d} reservation_bytes={d} workers={d}", .{ prompt_tokens, plan.source_bytes, plan.head_workspace_bytes, plan.fit_bytes, plan.reservation_bytes, plan.workers });
@@ -34660,7 +34661,7 @@ test "native checkpoint terminal callbacks observe retired owners and can acquir
         gate: *std.atomic.Value(bool),
         controller: *runtime.tier.memory.AdmissionController,
         old_lease: *Node.NativeCheckpointLease,
-        prepare: *generation.NativeCheckpointPrepare,
+        prepare: *decoder_checkpoint.PrepareRequest,
         resume_request: *generation.NativeCheckpointResume,
         next: ?Node.NativeCheckpointLease = null,
         writes: usize = 0,
@@ -34699,7 +34700,7 @@ test "native checkpoint terminal callbacks observe retired owners and can acquir
         var gate: std.atomic.Value(bool) = .init(false);
         var lease = Node.NativeCheckpointLease.acquire(&gate) orelse return error.TestUnexpectedResult;
         defer lease.release();
-        var prepare: generation.NativeCheckpointPrepare = .{};
+        var prepare: decoder_checkpoint.PrepareRequest = .{};
         defer prepare.deinit();
         var resumed: generation.NativeCheckpointResume = .{};
         defer resumed.deinit();
@@ -57198,8 +57199,8 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
     const Harness = struct {
         const Context = Node.LightOnStreamContext;
         const C = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
-        const Executor = @import("../graph/decoder_step_executor.zig").Executor;
-        const Work = @import("../graph/decoder_work.zig");
+        const Executor = @import("../execution/decoder_step_executor.zig").Executor;
+        const Work = @import("../execution/decoder_work.zig");
         const Item = runtime.scheduler.native_generate.StepItem;
         const PoolLease = @import("../execution/reader_pool.zig").Pool.Lease;
         const original_tokens_per_page = 13; // Keep the maintained control unchanged.

@@ -533,7 +533,7 @@ test "independent Native recurrent workers publish copied baselines only from th
             const context = @import("../graph/execution.zig").Context{ .allocator = std.testing.allocator, .cb = &cb, .gpt_config = &self.config, .cleanup_owner = self.host.cleanupOwner(), .diagnostics_binding = .{ .diagnostics = &self.diagnostics } };
             const decode = Gpt.DecodeContext{ .total_sequence_len = 4, .query_sequence_len = 4, .kv_sequence_len = 4, .qwen35_linear_cache = &self.state.qwen35_linear_cache.? };
             var fallbacks: u64 = 0;
-            self.result = try @import("../graph/decoder_step_executor.zig").forwardAll(&context, null, &.{ 1, 2, 3, 4 }, 1, 4, &decode, &fallbacks);
+            self.result = try @import("decoder_step_executor.zig").forwardAll(&context, null, &.{ 1, 2, 3, 4 }, 1, 4, &decode, &fallbacks);
         }
     };
     var workers: [2]Worker = undefined;

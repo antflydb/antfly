@@ -1444,7 +1444,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
         /// runtime harness. This metadata assignment grants no execution or
         /// outside authority: caller must still use the real step/cohort and
         /// satisfy the callback's exact backend/Model proof before SDK work.
-        pub fn configureGraphAdmission(ctx: *LightOnStreamContext, executor: *@import("../graph/decoder_step_executor.zig").Executor) void {
+        pub fn configureGraphAdmission(ctx: *LightOnStreamContext, executor: *@import("../execution/decoder_step_executor.zig").Executor) void {
             executor.context.cleanup_owner = &ctx.cleanup_owner;
             executor.context.before_owned_forward = if (comptime build_options.enable_cuda) .{ .ptr = ctx, .prepare_fn = preparePackedHost } else null;
             executor.context.graph_preparation = if (comptime build_options.enable_cuda) .{ .ptr = ctx, .prepare_fn = prepareCapturedGraph } else null;
@@ -1455,7 +1455,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             const io = ctx.worker_io.?.io();
             // Physical execution borrows the epoch's backend/state. Task
             // publication is a separate adapter and retains no request pipeline.
-            var executor = @import("../graph/decoder_step_executor.zig").Executor{
+            var executor = @import("../execution/decoder_step_executor.zig").Executor{
                 .context = .{
                     .allocator = ctx.allocator,
                     .cb = &ctx.cb.?,
@@ -1691,7 +1691,7 @@ fn coldCreatorPageCase(a: std.mem.Allocator, cancel_after_reserve: bool, transie
         // its one worker/harness configuration seam. With no actual backend
         // yet, the prefill callback must refuse before touching phase/Model
         // metadata, reserving anything, or changing the active epoch.
-        var configured: @import("../graph/decoder_step_executor.zig").Executor = undefined;
+        var configured: @import("../execution/decoder_step_executor.zig").Executor = undefined;
         ctx.configureGraphAdmission(&configured);
         try std.testing.expect(configured.context.cleanup_owner == &ctx.cleanup_owner);
         if (comptime build_options.enable_cuda) {

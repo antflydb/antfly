@@ -17,7 +17,7 @@
 //! Uniform, mixed prefill/decode and packed queries share one assembly path.
 const std = @import("std");
 const gpt_arch = @import("../architectures/gpt.zig");
-const state_runtime = @import("decode_state_runtime.zig");
+const state_runtime = @import("../graph/decode_state_runtime.zig");
 const NativeDecodeState = state_runtime.NativeDecodeState;
 const BorrowedDecodeStateRuntime = state_runtime.BorrowedDecodeStateRuntime;
 

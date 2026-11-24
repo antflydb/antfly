@@ -34,6 +34,9 @@ pub const model_candidate = @import("model_candidate.zig");
 pub const ModelCandidate = model_candidate.Candidate;
 pub const transfer_audit = @import("transfer_audit.zig");
 
+pub const decode_batch = @import("decode_batch.zig");
+pub const decoder_work = @import("decoder_work.zig");
+pub const decoder_step_executor = @import("decoder_step_executor.zig");
 pub const decoder_forward = @import("decoder_forward.zig");
 pub const native_decoder_program = @import("native_decoder_program.zig");
 pub const decoder_storage = @import("decoder_storage.zig");

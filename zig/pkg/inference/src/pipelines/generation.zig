@@ -56,6 +56,9 @@ const qwen3vl_projector = @import("../architectures/qwen3vl_projector.zig");
 const qwen2vl_mm = @import("qwen2vl_multimodal.zig");
 const projector_format_mod = @import("../architectures/projector_format.zig");
 const hf_tokenizer = tokenizer_mod.hf;
+const decode_batch = @import("../execution/decode_batch.zig");
+const decoder_work = @import("../execution/decoder_work.zig");
+const decoder_step_executor = @import("../execution/decoder_step_executor.zig");
 const graph_mod = @import("../graph/root.zig");
 
 fn setWorkloadProfileRegime(cb: *const ComputeBackend, regime: ops.WorkloadRegime) !void {
@@ -750,10 +753,6 @@ pub const ChatTemplate = struct {
     }
 };
 
-/// The native checkpoint request owns its output until the transport finishes.
-/// A savings rejection returns an exact checkpoint with an explicit outcome.
-pub const NativeCheckpointPrepare = decoder_checkpoint.PrepareRequest;
-
 test "native checkpoint exact host plan sizes Gemma4 E4B and preserves the release ceiling" {
     if (comptime !build_options.enable_cuda) return error.SkipZigTest;
     const config: gpt_mod.Config = .{
@@ -770,17 +769,17 @@ test "native checkpoint exact host plan sizes Gemma4 E4B and preserves the relea
         .vocab_size = 262144,
         .max_position_embeddings = 131072,
     };
-    const small = try NativeCheckpointPrepare.hostPlan(config, 8189, .f16);
-    const large = try NativeCheckpointPrepare.hostPlan(config, 32752, .f16);
-    const boundary = try NativeCheckpointPrepare.hostPlan(config, 32768, .f16);
+    const small = try decoder_checkpoint.PrepareRequest.hostPlan(config, 8189, .f16);
+    const large = try decoder_checkpoint.PrepareRequest.hostPlan(config, 32752, .f16);
+    const boundary = try decoder_checkpoint.PrepareRequest.hostPlan(config, 32768, .f16);
     for ([_]usize{ 8189, 32752, 32768 }) |tokens| {
-        const fp16 = try NativeCheckpointPrepare.hostPlan(config, tokens, .f16);
-        const rotated = try NativeCheckpointPrepare.hostPlan(config, tokens, .rotated4);
+        const fp16 = try decoder_checkpoint.PrepareRequest.hostPlan(config, tokens, .f16);
+        const rotated = try decoder_checkpoint.PrepareRequest.hostPlan(config, tokens, .rotated4);
         try std.testing.expectEqual(fp16.source_bytes, rotated.source_bytes);
         try std.testing.expect(rotated.head_workspace_bytes > fp16.head_workspace_bytes);
-        try std.testing.expect(rotated.fit_bytes <= NativeCheckpointPrepare.max_transient_host_bytes);
+        try std.testing.expect(rotated.fit_bytes <= decoder_checkpoint.PrepareRequest.max_transient_host_bytes);
         try std.testing.expect(rotated.workers <= fp16.workers);
-        try std.testing.expectEqual(rotated.fit_bytes + NativeCheckpointPrepare.auxiliary_host_bytes, rotated.reservation_bytes);
+        try std.testing.expectEqual(rotated.fit_bytes + decoder_checkpoint.PrepareRequest.auxiliary_host_bytes, rotated.reservation_bytes);
     }
     // Independently counted exact f32 host state: 24 donors, 48 heads,
     // eight global heads and forty local heads, including all metadata.
@@ -791,19 +790,19 @@ test "native checkpoint exact host plan sizes Gemma4 E4B and preserves the relea
     try std.testing.expectEqual(source, large.source_bytes);
     try std.testing.expect(small.fit_bytes < large.fit_bytes);
     try std.testing.expect(large.fit_bytes < boundary.fit_bytes);
-    try std.testing.expect(boundary.fit_bytes <= NativeCheckpointPrepare.max_transient_host_bytes);
+    try std.testing.expect(boundary.fit_bytes <= decoder_checkpoint.PrepareRequest.max_transient_host_bytes);
     try std.testing.expectEqual(@as(usize, 4), small.workers);
-    try std.testing.expect(large.workers > 0 and large.workers < NativeCheckpointPrepare.fit_workers);
+    try std.testing.expect(large.workers > 0 and large.workers < decoder_checkpoint.PrepareRequest.fit_workers);
     // Another worst-case retry worker would exceed the unchanged ceiling.
-    try std.testing.expect(large.fit_bytes + large.head_workspace_bytes > NativeCheckpointPrepare.max_transient_host_bytes);
+    try std.testing.expect(large.fit_bytes + large.head_workspace_bytes > decoder_checkpoint.PrepareRequest.max_transient_host_bytes);
     // The live-host capacity observed in the failed campaign remains unchanged.
     try std.testing.expect(large.reservation_bytes < 4_153_092_096);
-    try std.testing.expectEqual(large.fit_bytes + NativeCheckpointPrepare.auxiliary_host_bytes, large.reservation_bytes);
-    try std.testing.expectError(error.CompactionQueryLimit, NativeCheckpointPrepare.hostPlan(config, 32769, .f16));
-    try std.testing.expectError(error.CompactionQueryLimit, NativeCheckpointPrepare.hostPlan(config, 1, .f16));
+    try std.testing.expectEqual(large.fit_bytes + decoder_checkpoint.PrepareRequest.auxiliary_host_bytes, large.reservation_bytes);
+    try std.testing.expectError(error.CompactionQueryLimit, decoder_checkpoint.PrepareRequest.hostPlan(config, 32769, .f16));
+    try std.testing.expectError(error.CompactionQueryLimit, decoder_checkpoint.PrepareRequest.hostPlan(config, 1, .f16));
     var wider = config;
     wider.num_key_value_heads = 4;
-    try std.testing.expectError(error.KvCheckpointLimit, NativeCheckpointPrepare.hostPlan(wider, 32752, .f16));
+    try std.testing.expectError(error.KvCheckpointLimit, decoder_checkpoint.PrepareRequest.hostPlan(wider, 32752, .f16));
     std.debug.print("native_checkpoint_host_plan_fixture tokens=32752 source_bytes={d} head_workspace_bytes={d} fit_bytes={d} reservation_bytes={d} workers={d}\n", .{ large.source_bytes, large.head_workspace_bytes, large.fit_bytes, large.reservation_bytes, large.workers });
 }
 
@@ -2337,12 +2336,12 @@ const prefillFinalChunkNeedsDirectExecution = decoder_routes.prefillFinalChunkNe
 
 const shouldUseMetalGemmaTargetLastLogits = decoder_routes.shouldUseMetalGemmaTargetLastLogits;
 
-const shouldUseSingletonScheduledGemmaPrefillFrame = graph_mod.decoder_step_executor.shouldUseSingletonScheduledGemmaPrefillFrame;
+const shouldUseSingletonScheduledGemmaPrefillFrame = decoder_step_executor.shouldUseSingletonScheduledGemmaPrefillFrame;
 
 /// A scheduled prefill chunk may be followed by a generic final-hidden/logits
 /// forward or by another request. Keep the direct runtime's gathered KV span
 /// strictly inside this attempt; paged KV storage remains the handoff boundary.
-const runWithDecoderRuntimeResetBoundary = graph_mod.decoder_step_executor.runWithDecoderRuntimeResetBoundary;
+const runWithDecoderRuntimeResetBoundary = decoder_step_executor.runWithDecoderRuntimeResetBoundary;
 
 const batchKvMutationMutex = decoder_routes.batchKvMutationMutex;
 
@@ -2455,12 +2454,10 @@ const reserveSpeculativeTargetVerification = decoder_forward.reserveSpeculativeT
 
 const retryDirectPrefillAfterMemoryBudgetExceeded = decoder_prefill.retryAfterMemoryBudgetExceeded;
 
-pub const buildOwnedBatchDecodeContext = graph_mod.decode_batch.buildUniform;
-pub const buildOwnedMixedBatchDecodeContext = graph_mod.decode_batch.buildMixed;
-const MixedBatchDecodeItem = graph_mod.decode_batch.Item;
-const buildOwnedMixedBatchDecodeContextWithMrope = graph_mod.decode_batch.buildWithPositions;
-const buildOwnedMixedBatchDecodeContextLayout = graph_mod.decode_batch.buildLayout;
-const buildOwnedLightOnGraphDecodeContext = graph_mod.decode_batch.buildPackedDecode;
+const MixedBatchDecodeItem = decode_batch.Item;
+const buildOwnedMixedBatchDecodeContextWithMrope = decode_batch.buildWithPositions;
+const buildOwnedMixedBatchDecodeContextLayout = decode_batch.buildLayout;
+const buildOwnedLightOnGraphDecodeContext = decode_batch.buildPackedDecode;
 
 const Qwen3VlParityImageJson = struct {
     source_width: usize,
@@ -2596,7 +2593,6 @@ pub const QwenVisionBatchHook = struct {
 pub const DecoderStepPublication = NativeGenerationPipeline.StepPublication;
 
 const ExecutionScope = @import("../ops/execution_scope.zig").Scope;
-
 pub const selectPjrtDecoderCache = @import("../execution/resident_decoder.zig").select;
 
 pub const NativeGenerationPipeline = struct {
@@ -2629,7 +2625,7 @@ pub const NativeGenerationPipeline = struct {
     kv_dtype: ?runtime.kv.pool.KvDType = null,
     /// Content-bound identity of this loaded model generation.
     attention_match_identity: ?runtime.kv.attention_match_checkpoint.Identity = null,
-    checkpoint_prepare: ?*NativeCheckpointPrepare = null,
+    checkpoint_prepare: ?*decoder_checkpoint.PrepareRequest = null,
     checkpoint_resume: ?*NativeCheckpointResume = null,
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache = null,
     tokenizer: tokenizer_mod.Tokenizer,
@@ -2858,7 +2854,7 @@ pub const NativeGenerationPipeline = struct {
         return self.executePrefill(tokens[restored_tokens..], tokens.len, restored_tokens, state, append_config, false, false);
     }
 
-    fn prepareNativeCheckpoint(self: *NativeGenerationPipeline, request: *NativeCheckpointPrepare, tokens: []const i64, logits: []const f32, source: *const NativeDecodeState) !void {
+    fn prepareNativeCheckpoint(self: *NativeGenerationPipeline, request: *decoder_checkpoint.PrepareRequest, tokens: []const i64, logits: []const f32, source: *const NativeDecodeState) !void {
         var executor = self.checkpointRuntime();
         return executor.prepareNativeCheckpoint(request, tokens, logits, source);
     }
@@ -2982,10 +2978,10 @@ pub const NativeGenerationPipeline = struct {
         };
     }
 
-    pub const PendingDecodeBatchWork = graph_mod.decoder_work.Decode;
-    pub const PendingPrefillBatchWork = graph_mod.decoder_work.Prefill;
+    pub const PendingDecodeBatchWork = decoder_work.Decode;
+    pub const PendingPrefillBatchWork = decoder_work.Prefill;
 
-    fn preparedPrefix(prompt: *const qwen3vl_projector.PreparedPrompt) graph_mod.decoder_work.Prefix {
+    fn preparedPrefix(prompt: *const qwen3vl_projector.PreparedPrompt) decoder_work.Prefix {
         return .{ .token_count = prompt.plan.tokenCount(), .positions = prompt.plan.mrope_positions, .embeddings = prompt.input_embeddings, .intermediate_layer_count = prompt.deepstack_layer_count };
     }
 
@@ -6414,7 +6410,7 @@ pub const NativeGenerationPipeline = struct {
     }
 
     fn forwardAllLogits(self: *NativeGenerationPipeline, input_ids: []const i64, batch: usize, seq_len: usize, decode_context: *const gpt_arch.DecodeContext) ![]f32 {
-        return graph_mod.decoder_step_executor.forwardAll(&self.graphExecutionContext(), self.graph_cache, input_ids, batch, seq_len, decode_context, &decoder_runtime_debug_stats.replay_last_logits_fallbacks);
+        return decoder_step_executor.forwardAll(&self.graphExecutionContext(), self.graph_cache, input_ids, batch, seq_len, decode_context, &decoder_runtime_debug_stats.replay_last_logits_fallbacks);
     }
 
     const ForwardAllWithHiddenHost = decoder_forward.ForwardAllWithHiddenHost;
@@ -8074,7 +8070,7 @@ pub const NativeGenerationPipeline = struct {
     }
 
     pub fn deinit(self: *NativeGenerationPipeline) void {
-        graph_mod.decoder_step_executor.endDecodeEpoch(&self.cb, self.lighton_cuda_execution_id, self.lighton_graph_attempts, self.lighton_graph_declines);
+        decoder_step_executor.endDecodeEpoch(&self.cb, self.lighton_cuda_execution_id, self.lighton_graph_attempts, self.lighton_graph_declines);
         // ComputeBackend and tokenizer are borrowed — caller manages their lifetime.
     }
 
@@ -8304,7 +8300,7 @@ pub const NativeGenerationPipeline = struct {
 
     /// Queue a resident visual prefix alongside ordinary decode work. The
     /// scheduler owns the stack-backed work until it publishes completion.
-    fn positionedRequest(self: *NativeGenerationPipeline, prepared: *qwen3vl_projector.PreparedPrompt, state: *NativeDecodeState, seq: usize, wants_greedy: bool, publication: graph_mod.decoder_step_executor.Executor.Publication) !decoder_prefill.PositionedRequest {
+    fn positionedRequest(self: *NativeGenerationPipeline, prepared: *qwen3vl_projector.PreparedPrompt, state: *NativeDecodeState, seq: usize, wants_greedy: bool, publication: decoder_step_executor.Executor.Publication) !decoder_prefill.PositionedRequest {
         return .{
             .item = self.positionedBatchItem(prepared, state, seq),
             .prefix = preparedPrefix(prepared),
@@ -8322,13 +8318,13 @@ pub const NativeGenerationPipeline = struct {
     /// Output of a successful step forward pass: the heap-allocated logits row
     /// buffer and the maximum query sequence length used to size each row.
     /// Caller owns the logits buffer.
-    const packed_head_rows = graph_mod.decoder_step_executor.packed_head_rows;
+    const packed_head_rows = decoder_step_executor.packed_head_rows;
     const PrefixLogitsLayout = packed_head_rows.PrefixLogitsLayout;
-    const prefillHasHostRow = graph_mod.decoder_step_executor.Executor.prefillHasHostRow;
-    const StepForwardResult = graph_mod.decoder_step_executor.Result;
+    const prefillHasHostRow = decoder_step_executor.Executor.prefillHasHostRow;
+    const StepForwardResult = decoder_step_executor.Result;
 
-    const preparedQwenPrefillStart = graph_mod.decoder_work.preparedPrefixStart;
-    const copyPreparedQwenChunkPositions = graph_mod.decoder_work.copyPrefixPositions;
+    const preparedQwenPrefillStart = decoder_work.preparedPrefixStart;
+    const copyPreparedQwenChunkPositions = decoder_work.copyPrefixPositions;
 
     fn continuationControl(self: *const NativeGenerationPipeline) InferenceExecutionControl {
         const Continue = struct {
@@ -8347,7 +8343,7 @@ pub const NativeGenerationPipeline = struct {
         try self.continuationControl().check();
     }
 
-    fn stepExecutor(self: *NativeGenerationPipeline) graph_mod.decoder_step_executor.Executor {
+    fn stepExecutor(self: *NativeGenerationPipeline) decoder_step_executor.Executor {
         var context = self.graphExecutionContext();
         context.weights = null;
         return .{
@@ -8464,7 +8460,7 @@ pub const NativeGenerationPipeline = struct {
         lease: *runtime.scheduler.native_generate.Lease,
         vocab_size: usize,
 
-        pub fn interface(self: *StepPublication) graph_mod.decoder_step_executor.Executor.Publication {
+        pub fn interface(self: *StepPublication) decoder_step_executor.Executor.Publication {
             return .{ .ptr = self, .publish_fn = publish };
         }
 
@@ -8487,7 +8483,7 @@ pub const NativeGenerationPipeline = struct {
         }
     };
 
-    fn mergeStepExecutor(self: *NativeGenerationPipeline, executor: *const graph_mod.decoder_step_executor.Executor) void {
+    fn mergeStepExecutor(self: *NativeGenerationPipeline, executor: *const decoder_step_executor.Executor) void {
         self.lighton_graph_attempts += executor.lighton_graph_attempts;
         for (&self.lighton_graph_declines, executor.lighton_graph_declines) |*sum, count| sum.* += count;
         decoder_runtime_debug_stats.replay_last_logits_fallbacks += executor.replay_last_logits_fallbacks;
@@ -8501,11 +8497,11 @@ pub const NativeGenerationPipeline = struct {
         executor.execute(claimed, scheduler.usesStepEvents(), publication.interface());
     }
 
-    const reserveScheduledPrefillState = graph_mod.decoder_step_executor.Executor.reserveScheduledPrefillState;
-    const reserveAndRefreshScheduledPrefill = graph_mod.decoder_step_executor.Executor.reserveAndRefreshScheduledPrefill;
-    const refreshReservedPrefillGeometry = graph_mod.decoder_step_executor.Executor.refreshReservedPrefillGeometry;
-    const rollbackScheduledPrefillState = graph_mod.decoder_step_executor.Executor.rollbackScheduledPrefillState;
-    const rollbackPrefillReservations = graph_mod.decoder_step_executor.Executor.rollbackPrefillReservations;
+    const reserveScheduledPrefillState = decoder_step_executor.Executor.reserveScheduledPrefillState;
+    const reserveAndRefreshScheduledPrefill = decoder_step_executor.Executor.reserveAndRefreshScheduledPrefill;
+    const refreshReservedPrefillGeometry = decoder_step_executor.Executor.refreshReservedPrefillGeometry;
+    const rollbackScheduledPrefillState = decoder_step_executor.Executor.rollbackScheduledPrefillState;
+    const rollbackPrefillReservations = decoder_step_executor.Executor.rollbackPrefillReservations;
 
     /// Surface a step-level failure as a per-item failure on every claimed
     /// work, marking each ready so its caller's wait loop unblocks. Used when
@@ -8730,7 +8726,7 @@ const DecodeStepDriver = struct {
 /// `max_kv_blocks` stays unset and the scheduler treats the pool as
 /// unbounded. When a cap is configured, we shave a single-block safety margin
 /// so a step never admits the very last block under contention.
-const stepBudgetFromState = graph_mod.decoder_work.stepBudget;
+const stepBudgetFromState = decoder_work.stepBudget;
 
 /// Tag the just-enqueued pending work with its KV-block cost so the scheduler
 /// can apply per-step KV admission against pool headroom. A no-op when the
@@ -8746,7 +8742,7 @@ fn notePendingKvBlocksFromState(
     scheduler.notePendingKvBlocks(work_ptr, phase, est);
 }
 
-const pendingWorkOptionsFromState = graph_mod.decoder_work.pendingOptions;
+const pendingWorkOptionsFromState = decoder_work.pendingOptions;
 
 fn notePendingExclusiveStepFromState(
     scheduler: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
@@ -11914,7 +11910,7 @@ test "owned batch decode context captures per-item kv bindings" {
     try std.testing.expect(first.kvView().?.allow_swa_ring);
     try std.testing.expect(second.kvView().?.allow_swa_ring);
 
-    var owned = try buildOwnedBatchDecodeContext(allocator, &.{ &first, &second }, 6, 1);
+    var owned = try decode_batch.buildUniform(allocator, &.{ &first, &second }, 6, 1);
     defer owned.deinit();
 
     try std.testing.expectEqual(gpt_arch.DecodeContext.AttentionMode.paged_decode, owned.context.attention_mode);
@@ -11964,7 +11960,7 @@ test "mixed batch decode context captures per-item overrides" {
     try prefill.notePrefill(8);
     try decode.notePrefill(6);
 
-    var owned = try buildOwnedMixedBatchDecodeContext(allocator, &.{
+    var owned = try decode_batch.buildMixed(allocator, &.{
         .{
             .state = &decode,
             .total_sequence_len = 7,
@@ -12014,7 +12010,7 @@ test "mixed batch decode context keeps single item on direct kv cache path" {
 
     try decode.notePrefill(6);
 
-    var owned = try buildOwnedMixedBatchDecodeContext(allocator, &.{
+    var owned = try decode_batch.buildMixed(allocator, &.{
         .{
             .state = &decode,
             .total_sequence_len = 7,
@@ -13733,7 +13729,7 @@ test "LightOnOCR3 decoder cohorts preserve page caches and heterogeneous image p
     second.qwen3vl_mrope_position_delta = -6;
     first.qwen35_linear_cache.?.layers[0].recurrent[0] = 42;
     second.qwen35_linear_cache.?.layers[0].recurrent[0] = 99;
-    var cohort = try buildOwnedMixedBatchDecodeContext(allocator, &.{
+    var cohort = try decode_batch.buildMixed(allocator, &.{
         .{ .state = &first, .total_sequence_len = 7, .query_sequence_len = 1, .kv_sequence_len = 6, .kv_position_offset = 0, .attention_mode = .paged_decode },
         .{ .state = &second, .total_sequence_len = 11, .query_sequence_len = 1, .kv_sequence_len = 10, .kv_position_offset = 0, .attention_mode = .paged_decode },
     });
@@ -13757,7 +13753,7 @@ test "LightOnOCR3 decoder cohorts preserve page caches and heterogeneous image p
     try std.testing.expectEqual(&first.qwen35_linear_cache.?, prefill.context.qwen35_linear_batch.?[0].?);
     try std.testing.expectEqual(&second.qwen35_linear_cache.?, prefill.context.qwen35_linear_batch.?[1].?);
     try std.testing.expectError(error.InvalidQwen3VlMropeShape, buildOwnedMixedBatchDecodeContextWithMrope(allocator, &prefill_items, complete_positions[0..17]));
-    try std.testing.expectError(error.Qwen3VlMixedBatchMropeUnsupported, buildOwnedMixedBatchDecodeContext(allocator, &prefill_items));
+    try std.testing.expectError(error.Qwen3VlMixedBatchMropeUnsupported, decode_batch.buildMixed(allocator, &prefill_items));
     const packed_items = [_]MixedBatchDecodeItem{
         .{ .state = &first, .total_sequence_len = 9, .query_sequence_len = 3, .kv_sequence_len = 6, .kv_position_offset = 0, .attention_mode = .paged_prefill },
         .{ .state = &second, .total_sequence_len = 12, .query_sequence_len = 1, .kv_sequence_len = 11, .kv_position_offset = 0, .attention_mode = .paged_decode },
@@ -13774,7 +13770,7 @@ test "LightOnOCR3 decoder cohorts preserve page caches and heterogeneous image p
     try std.testing.expectEqual(@as(?usize, 1), packed_context.context.kv_batch.?[1].per_item_query_len);
     try std.testing.expectError(error.InvalidPackedQueryShape, buildOwnedMixedBatchDecodeContextLayout(allocator, &packed_items, &packed_positions, &.{ 2, 2 }));
     try std.testing.expectError(error.InvalidQwen3VlMropeShape, buildOwnedMixedBatchDecodeContextLayout(allocator, &packed_items, packed_positions[0..11], &packed_lengths));
-    var tail = try buildOwnedMixedBatchDecodeContext(allocator, &.{
+    var tail = try decode_batch.buildMixed(allocator, &.{
         .{ .state = &second, .total_sequence_len = 12, .query_sequence_len = 1, .kv_sequence_len = 11, .kv_position_offset = 0, .attention_mode = .paged_decode },
     });
     defer tail.deinit();
@@ -13786,7 +13782,7 @@ test "LightOnOCR3 decoder cohorts preserve page caches and heterogeneous image p
     try peer.ensureQwen35LinearCache(cfg);
     try peer.notePrefill(6);
     peer.qwen3vl_mrope_position_delta = -1;
-    var uniform = try buildOwnedBatchDecodeContext(allocator, &.{ &first, &peer }, 7, 1);
+    var uniform = try decode_batch.buildUniform(allocator, &.{ &first, &peer }, 7, 1);
     defer uniform.deinit();
     try std.testing.expectEqualSlices(u32, &.{ 3, 5, 3, 5, 3, 5 }, uniform.context.mrope_positions.?);
     try std.testing.expectEqual(&peer.qwen35_linear_cache.?, uniform.context.qwen35_linear_batch.?[1].?);
@@ -14736,7 +14732,7 @@ test "LightOnOCR3 CUDA burst readback releases the execution lane and reacquires
         defer execution_scope.deinit();
         pipeline.execution_control = .{ .check_fn = Fake.cancel };
         var pending = Fake{ .mutex = &mutex, .fail = fail };
-        var executor = graph_mod.decoder_step_executor.Executor{ .context = undefined, .access = pipeline.executionAccess(&mutex), .claimed_execution_scope = &execution_scope };
+        var executor = decoder_step_executor.Executor{ .context = undefined, .access = pipeline.executionAccess(&mutex), .claimed_execution_scope = &execution_scope };
         if (fail) {
             try std.testing.expectError(error.Cancelled, executor.waitOutsideLightOnExecution(&pending));
         } else try executor.waitOutsideLightOnExecution(&pending);

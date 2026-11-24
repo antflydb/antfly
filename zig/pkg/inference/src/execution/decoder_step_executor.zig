@@ -25,19 +25,18 @@ const gpt_mod = @import("../models/gpt.zig");
 const ops = @import("../ops/ops.zig");
 const ComputeBackend = ops.ComputeBackend;
 const decoder_gated_runtime = @import("../backends/decoder_gated_runtime.zig");
-const execution = @import("execution.zig");
+const execution = @import("../graph/execution.zig");
 const work_mod = @import("decoder_work.zig");
 const PendingDecodeBatchWork = work_mod.Decode;
 const PendingPrefillBatchWork = work_mod.Prefill;
-const state_runtime = @import("decode_state_runtime.zig");
+const state_runtime = @import("../graph/decode_state_runtime.zig");
 const NativeDecodeState = state_runtime.NativeDecodeState;
 const BorrowedDecodeStateRuntime = state_runtime.BorrowedDecodeStateRuntime;
 const decode_batch = @import("decode_batch.zig");
 const MixedBatchDecodeItem = decode_batch.Item;
-const buildOwnedMixedBatchDecodeContext = decode_batch.buildMixed;
 const buildOwnedMixedBatchDecodeContextLayout = decode_batch.buildLayout;
 const buildOwnedLightOnGraphDecodeContext = decode_batch.buildPackedDecode;
-pub const packed_head_rows = @import("packed_head_rows.zig");
+pub const packed_head_rows = @import("../graph/packed_head_rows.zig");
 const max_gpu_token_burst_width = 8;
 pub const Result = Executor.StepForwardResult;
 
@@ -92,19 +91,19 @@ pub fn runWithDecoderRuntimeResetBoundary(
 /// Common eager/replay/compiled forward for sampled and scheduled decoding.
 pub fn forwardAll(
     context: *const execution.Context,
-    graph_cache: ?*@import("cache.zig").GraphCache,
+    graph_cache: ?*@import("../graph/cache.zig").GraphCache,
     input_ids: []const i64,
     batch_size: usize,
     seq_len: usize,
     decode_context: *const gpt_arch.DecodeContext,
     replay_fallbacks: *u64,
 ) ![]f32 {
-    return @import("../execution/invocation_observation.zig").callContextOperation(context, .forward, forwardAllUnobserved, .{ context, graph_cache, input_ids, batch_size, seq_len, decode_context, replay_fallbacks });
+    return @import("invocation_observation.zig").callContextOperation(context, .forward, forwardAllUnobserved, .{ context, graph_cache, input_ids, batch_size, seq_len, decode_context, replay_fallbacks });
 }
 
 fn forwardAllUnobserved(
     context: *const execution.Context,
-    graph_cache: ?*@import("cache.zig").GraphCache,
+    graph_cache: ?*@import("../graph/cache.zig").GraphCache,
     input_ids: []const i64,
     batch_size: usize,
     seq_len: usize,
@@ -139,7 +138,7 @@ fn forwardAllUnobserved(
 /// One entry-time registration copies immutable ownership facts. Disabled code
 /// never dereferences the provider/cache or allocates observation metadata.
 fn observeNativeStateOwnership(context: *const execution.Context, decode: *const gpt_arch.DecodeContext) void {
-    if (!@import("../execution/allocation_registry.zig").enabled()) return;
+    if (!@import("allocation_registry.zig").enabled()) return;
     if (context.cb.kind() != .native) return;
     if (decode.qwen35_linear_cache) |cache| cache.registerOwnershipObservation();
     if (decode.qwen35_linear_batch) |caches| for (caches) |maybe| if (maybe) |cache| cache.registerOwnershipObservation();
@@ -148,10 +147,10 @@ fn observeNativeStateOwnership(context: *const execution.Context, decode: *const
 pub fn endDecodeEpoch(cb: *const ComputeBackend, execution_id: u64, attempts: u64, declines: [8]u64) void {
     return endDecodeEpochUsing(cb, execution_id, attempts, declines, null);
 }
-pub fn endDecodeEpochWithCleanup(cb: *const ComputeBackend, execution_id: u64, attempts: u64, declines: [8]u64, current: @import("../execution/cleanup_context.zig").Context) void {
+pub fn endDecodeEpochWithCleanup(cb: *const ComputeBackend, execution_id: u64, attempts: u64, declines: [8]u64, current: @import("cleanup_context.zig").Context) void {
     return endDecodeEpochUsing(cb, execution_id, attempts, declines, current);
 }
-fn endDecodeEpochUsing(cb: *const ComputeBackend, execution_id: u64, attempts: u64, declines: [8]u64, current: ?@import("../execution/cleanup_context.zig").Context) void {
+fn endDecodeEpochUsing(cb: *const ComputeBackend, execution_id: u64, attempts: u64, declines: [8]u64, current: ?@import("cleanup_context.zig").Context) void {
     if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3") and execution_id != 0 and
         platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_MODEL_GRAPH"))
         std.debug.print("LIGHTONOCR3 cuda_model_graph_attempts={d} declines={any}\n", .{ attempts, declines });
@@ -169,9 +168,9 @@ pub const Executor = struct {
     claimed_batch_rows: usize = 0,
     /// Borrowed model sink, independent of context so pre-acquisition errors
     /// never dereference the backend, work or borrowed numerical context.
-    batch_diagnostics: ?@import("../execution/invocation_observation.zig").Binding = null,
+    batch_diagnostics: ?@import("invocation_observation.zig").Binding = null,
     context: execution.Context,
-    graph_cache: ?*@import("cache.zig").GraphCache = null,
+    graph_cache: ?*@import("../graph/cache.zig").GraphCache = null,
     pad_token: i64 = 0,
     continuation: ?execution_control.InferenceExecutionControl = null,
     access: execution_control.ExecutionAccess = .{},
@@ -242,7 +241,7 @@ pub const Executor = struct {
         }
         defer self.access = original_access;
         var execution_scope = self.access.acquireScope() catch |err| {
-            @import("../execution/shared_batch_observation.zig").acquisitionFailure(self.batchBinding(), .scheduled_step, claimed, describeParticipant, err);
+            @import("shared_batch_observation.zig").acquisitionFailure(self.batchBinding(), .scheduled_step, claimed, describeParticipant, err);
             publication.publish(claimed, err);
             return;
         };
@@ -291,7 +290,7 @@ pub const Executor = struct {
     }
 
     fn executePooled(self: *Executor, claimed: []const runtime.scheduler.native_generate.StepItem, publication: Publication) void {
-        var result = @import("../execution/shared_batch_observation.zig").call(self.batchBinding(), self.context.cb.*, .scheduled_step, claimed, describeParticipant, @This().forwardOwnedCohort, .{ self, claimed }) catch |err| {
+        var result = @import("shared_batch_observation.zig").call(self.batchBinding(), self.context.cb.*, .scheduled_step, claimed, describeParticipant, @This().forwardOwnedCohort, .{ self, claimed }) catch |err| {
             if (self.claimed_execution_scope) |scope| scope.drainBatch();
             publication.publish(claimed, err);
             return;
@@ -301,10 +300,10 @@ pub const Executor = struct {
         publication.publish(claimed, result);
     }
 
-    fn batchBinding(self: *const Executor) ?@import("../execution/invocation_observation.zig").Binding {
+    fn batchBinding(self: *const Executor) ?@import("invocation_observation.zig").Binding {
         return self.batch_diagnostics;
     }
-    fn describeParticipant(item: runtime.scheduler.native_generate.StepItem) @import("../execution/diagnostics.zig").Batch.Participant {
+    fn describeParticipant(item: runtime.scheduler.native_generate.StepItem) @import("diagnostics.zig").Batch.Participant {
         return .{ .request_id = item.request_id, .phase = switch (item.phase) {
             .prefill => .prefill,
             .decode => .decode,
@@ -359,12 +358,12 @@ pub const Executor = struct {
         max_query_seq_len: usize,
         last_rows_only: bool = false,
         host_permit: ?@import("../backends/session.zig").RunPermit = null,
-        host_loan: ?@import("../execution/packed_host_loan.zig").Loan = null,
+        host_loan: ?@import("packed_host_loan.zig").Loan = null,
 
         pub fn deinit(self: *StepForwardResult, allocator: std.mem.Allocator) void {
             self.deinitWithCleanup(allocator, .{}) catch platform.inference_process_supervisor.restartWorker();
         }
-        pub fn deinitWithCleanup(self: *StepForwardResult, allocator: std.mem.Allocator, current: @import("../execution/cleanup_context.zig").Context) !void {
+        pub fn deinitWithCleanup(self: *StepForwardResult, allocator: std.mem.Allocator, current: @import("cleanup_context.zig").Context) !void {
             if (self.host_loan) |*loan| try loan.validateCleanup(current);
             if (self.second_greedy_tokens) |values| allocator.free(values);
             self.second_greedy_tokens = null;
@@ -510,7 +509,7 @@ pub const Executor = struct {
             const metadata_bytes = 64 * (@sizeOf(gpt_arch.DecodeContext.KvBatchView) + @sizeOf(?*gpt_arch.Qwen35LinearCache) + 3 * @sizeOf(u32)) + 128;
             var metadata: [metadata_bytes]u8 align(@alignOf(gpt_arch.DecodeContext.KvBatchView)) = undefined;
             var fba = std.heap.FixedBufferAllocator.init(&metadata);
-            var owned = try buildOwnedMixedBatchDecodeContext(fba.allocator(), items);
+            var owned = try decode_batch.buildMixed(fba.allocator(), items);
             try self.context.bindDecoderCleanup(&owned.context);
             defer owned.deinit();
             owned.context.prepared_lighton_decode = true;
@@ -700,10 +699,10 @@ pub const Executor = struct {
         if (self.claimed_batch_budget) |budget| scope.bindDecodeBatch(budget, self.claimed_batch_rows);
     }
 
-    fn preparePackedHostLoan(self: *Executor, bytes: usize) !@import("../execution/packed_host_loan.zig").Loan {
+    fn preparePackedHostLoan(self: *Executor, bytes: usize) !@import("packed_host_loan.zig").Loan {
         const before = self.context.before_owned_forward orelse return error.MissingPackedHostPreparation;
         const control: execution_control.InferenceExecutionControl = self.context.execution_control orelse .{};
-        var wait: ?@import("../execution/reader_pool.zig").AdmissionWait = null;
+        var wait: ?@import("reader_pool.zig").AdmissionWait = null;
         while (true) {
             try control.check();
             return before.prepare_fn(before.ptr, self.context.cb, bytes, control) catch |err| switch (err) {
@@ -1220,7 +1219,7 @@ pub const Executor = struct {
         };
         const session = self.context.session orelse return error.InvalidBatchDecodeState;
         var host_lease: @import("../backends/session.zig").RunPermit = .{ .session = session, .lease = null };
-        var host_loan: ?@import("../execution/packed_host_loan.zig").Loan = null;
+        var host_loan: ?@import("packed_host_loan.zig").Loan = null;
         errdefer {
             if (host_loan) |*loan| loan.finishWithCleanup(.{ .boundary = self.context.cleanupEpoch(), .operation = cb.operationToken() }) catch platform.inference_process_supervisor.restartWorker();
             host_lease.deinit();
@@ -1576,7 +1575,7 @@ pub const Executor = struct {
         const metadata_bytes = 64 * (@sizeOf(gpt_arch.DecodeContext.KvBatchView) + @sizeOf(?*gpt_arch.Qwen35LinearCache) + 3 * @sizeOf(u32)) + 128;
         var metadata: [metadata_bytes]u8 align(@alignOf(gpt_arch.DecodeContext.KvBatchView)) = undefined;
         var metadata_allocator = std.heap.FixedBufferAllocator.init(&metadata);
-        var owned_ctx = try buildOwnedMixedBatchDecodeContext(if (prepared_decode) metadata_allocator.allocator() else self.context.allocator, items);
+        var owned_ctx = try decode_batch.buildMixed(if (prepared_decode) metadata_allocator.allocator() else self.context.allocator, items);
         try self.context.bindDecoderCleanup(&owned_ctx.context);
         defer owned_ctx.deinit();
         if (self.prepared_lighton_decode and max_query_seq_len == 1) {
@@ -1731,7 +1730,7 @@ pub const Executor = struct {
     pub fn reserveScheduledPrefillState(decode_state: *NativeDecodeState, target_total_seq_len: usize) !usize {
         return reserveScheduledPrefillStateWithCleanup(decode_state, target_total_seq_len, .{});
     }
-    pub fn reserveScheduledPrefillStateWithCleanup(decode_state: *NativeDecodeState, target_total_seq_len: usize, current: @import("../execution/cleanup_context.zig").Context) !usize {
+    pub fn reserveScheduledPrefillStateWithCleanup(decode_state: *NativeDecodeState, target_total_seq_len: usize, current: @import("cleanup_context.zig").Context) !usize {
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         return decode_runtime.reservePrefillToWithCleanup(target_total_seq_len, current);
     }
@@ -1739,7 +1738,7 @@ pub const Executor = struct {
     pub fn reserveAndRefreshScheduledPrefill(item: *MixedBatchDecodeItem, target_total_seq_len: usize) !usize {
         return reserveAndRefreshScheduledPrefillWithCleanup(item, target_total_seq_len, .{});
     }
-    pub fn reserveAndRefreshScheduledPrefillWithCleanup(item: *MixedBatchDecodeItem, target_total_seq_len: usize, current: @import("../execution/cleanup_context.zig").Context) !usize {
+    pub fn reserveAndRefreshScheduledPrefillWithCleanup(item: *MixedBatchDecodeItem, target_total_seq_len: usize, current: @import("cleanup_context.zig").Context) !usize {
         const reserved = try reserveScheduledPrefillStateWithCleanup(item.state, target_total_seq_len, current);
         // The scheduler item captures KV geometry before this chunk is
         // reserved. Refresh it from the now-current state so paged KV writes
@@ -1758,7 +1757,7 @@ pub const Executor = struct {
     pub fn rollbackScheduledPrefillState(decode_state: *NativeDecodeState, reserved: usize) !void {
         return rollbackScheduledPrefillStateWithCleanup(decode_state, reserved, .{});
     }
-    pub fn rollbackScheduledPrefillStateWithCleanup(decode_state: *NativeDecodeState, reserved: usize, current: @import("../execution/cleanup_context.zig").Context) !void {
+    pub fn rollbackScheduledPrefillStateWithCleanup(decode_state: *NativeDecodeState, reserved: usize, current: @import("cleanup_context.zig").Context) !void {
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         try decode_runtime.rollbackReservedPrefillWithCleanup(reserved, current);
     }
@@ -1776,7 +1775,7 @@ pub const Executor = struct {
     ) void {
         return rollbackPrefillReservationsWithCleanup(claimed, reserved, reserved_count, .{});
     }
-    pub fn rollbackPrefillReservationsWithCleanup(claimed: []const runtime.scheduler.native_generate.StepItem, reserved: []const usize, reserved_count: usize, current: @import("../execution/cleanup_context.zig").Context) void {
+    pub fn rollbackPrefillReservationsWithCleanup(claimed: []const runtime.scheduler.native_generate.StepItem, reserved: []const usize, reserved_count: usize, current: @import("cleanup_context.zig").Context) void {
         if (reserved_count == 0) return;
         const limit = @min(reserved_count, claimed.len);
         var idx: usize = 0;
@@ -1789,7 +1788,7 @@ pub const Executor = struct {
 };
 
 test "packed host preparation retries only reader contention under the claimed step" {
-    const Loan = @import("../execution/packed_host_loan.zig").Loan;
+    const Loan = @import("packed_host_loan.zig").Loan;
     const Probe = struct {
         gate: *const execution_control.ExecutionLane,
         calls: usize = 0,
@@ -1882,8 +1881,8 @@ test "physical decoder step cancellation publishes once before borrowing backend
 
 fn checkSharedNativeCohort(actual: ComputeBackend, reference: ComputeBackend) !void {
     const a = std.testing.allocator;
-    const fixture = @import("../execution/testing/decoder.zig");
-    const diagnostics_mod = @import("../execution/diagnostics.zig");
+    const fixture = @import("testing/decoder.zig");
+    const diagnostics_mod = @import("diagnostics.zig");
     const cfg = fixture.config();
     const ids = [_]i64{ 0, 1 };
     const expected = try fixture.eager(reference, cfg, &ids);
@@ -1906,7 +1905,7 @@ fn checkSharedNativeCohort(actual: ComputeBackend, reference: ComputeBackend) !v
                 try std.testing.expectEqual(@as(usize, 2), sampled.batch.?.participant_count);
                 for (peers, 0..) |peer, index| try std.testing.expectEqual(peer.request_id, sampled.batch.?.participants[index].request_id);
             } else try std.testing.expect(self.owner.snapshot() == null);
-            try std.testing.expect(!@import("../execution/allocation_registry.zig").enabled());
+            try std.testing.expect(!@import("allocation_registry.zig").enabled());
             const logits = values.logits orelse return error.MissingSharedNativeLogits;
             for (peers, 0..) |_, index| {
                 const last = logits[(index * values.max_query_seq_len + values.max_query_seq_len - 1) * self.expected.len ..][0..self.expected.len];
@@ -1951,7 +1950,7 @@ fn checkSharedNativeCohort(actual: ComputeBackend, reference: ComputeBackend) !v
 
 test "actual Native shared prefill cohort publishes exact model-owned participants before task publication" {
     const helper = @import("../ops/media_residency_test.zig");
-    try helper.onNative(@import("../execution/testing/decoder.zig").populate, checkSharedNativeCohort);
+    try helper.onNative(@import("testing/decoder.zig").populate, checkSharedNativeCohort);
 }
 
 test "captured graph recipe compares every rebuilt key word without a second key buffer" {
