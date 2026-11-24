@@ -139,6 +139,10 @@ nav { display: grid; gap: 2px; }
 .account { margin-top: auto; display: grid; grid-template-columns: minmax(0, 1fr); gap: 0.15rem; padding: 1rem 0.6rem 0; border-top: 1px solid var(--border); }
 .account .label { font-size: 12px; color: var(--faint); }
 .address { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.address-row { display: flex; align-items: center; gap: 0.25rem; min-width: 0; }
+.address-row .address { min-width: 0; }
+button.icon-only { padding: 0.3rem; flex: none; }
+button.icon-only .icon { width: 16px; height: 16px; }
 .signed-in { display: flex; justify-content: space-between; gap: 0.5rem; align-items: center; margin-top: 0.5rem; font-size: 13px; color: var(--muted); }
 .signed-in span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .signed-in button { flex: none; white-space: nowrap; font-size: 13px; }
@@ -273,7 +277,7 @@ pre { font: 15px/1.7 var(--font-sans); white-space: pre-wrap; overflow-wrap: any
   nav { display: flex; }
   .compose { padding: 0.5rem 0.85rem; border-radius: var(--radius); }
   .account { margin: 0 0 0 auto; padding: 0; border: 0; }
-  .account .label, .address { display: none; }
+  .account .label, .address-row { display: none; }
   .signed-in { margin: 0; }
 }
 @media (max-width: 700px) {

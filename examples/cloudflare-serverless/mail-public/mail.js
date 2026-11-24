@@ -617,6 +617,24 @@ $("login").onsubmit = guarded(async (event) => {
   await refresh();
   status(me ? "Signed in." : "Check your email to verify your account, then sign in.");
 });
+$("copy-address").onclick = async () => {
+  const button = $("copy-address");
+  const use = button.querySelector("use");
+  try {
+    await navigator.clipboard.writeText($("address").textContent);
+  } catch {
+    status("Couldn't copy. Select the address and copy it instead.", true);
+    return;
+  }
+  status("Address copied.");
+  use.setAttribute("href", "#i-check");
+  button.setAttribute("aria-label", "Copied");
+  clearTimeout(button.reset);
+  button.reset = setTimeout(() => {
+    use.setAttribute("href", "#i-copy");
+    button.setAttribute("aria-label", "Copy address");
+  }, 2000);
+};
 $("logout").onclick = guarded(async () => {
   let wipeError = null;
   if (local || Object.keys(localFlags()).length) await wipeLocal().catch((error) => (wipeError = error));
