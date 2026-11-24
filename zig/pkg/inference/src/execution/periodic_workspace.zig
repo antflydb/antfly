@@ -250,9 +250,7 @@ pub const TempArenaPlanner = struct {
         }
         const phase = self.current_lengths.items.len;
         const end = phase + allocation_count;
-        for (self.candidate_lengths.items[phase..end]) |byte_len| {
-            self.current_lengths.appendAssumeCapacity(byte_len);
-        }
+        self.current_lengths.appendSliceAssumeCapacity(self.candidate_lengths.items[phase..end]);
         return true;
     }
 
