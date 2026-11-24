@@ -1011,6 +1011,21 @@ pub const CachedDecoderGeometry = struct {
     }
 };
 
+test "ONNX cache geometry prebinds exact names across reordered inputs and outputs" {
+    const ids: TensorInfo = .{ .name = "input_ids", .dtype = .i64, .shape = &.{ 2, 2 } };
+    const encoder: TensorInfo = .{ .name = "encoder_hidden_states", .dtype = .f32, .shape = &.{ 2, 4, 8 } };
+    const self_cache: TensorInfo = .{ .name = "past_key_values.0.decoder.key", .dtype = .f32, .shape = &.{ 2, 2, 5, 3 } };
+    const cross_cache: TensorInfo = .{ .name = "past_key_values.0.encoder.key", .dtype = .f32, .shape = &.{ 2, 1, 0, 2 } };
+    const logits: TensorInfo = .{ .name = "logits", .dtype = .f32, .shape = &.{ -1, -1, 11 } };
+    const self_output: TensorInfo = .{ .name = "present.0.decoder.key", .dtype = .f32, .shape = &.{ -1, 2, -1, 3 } };
+    const cross_output: TensorInfo = .{ .name = "present.0.encoder.key", .dtype = .f32, .shape = &.{ -1, 1, -1, 2 } };
+    const geometry: CachedDecoderGeometry = .{ .vocab_size = 11, .past_input_indices = &.{ std.math.maxInt(usize), 2, 3 } };
+    const expected: RunGeometry = .{ .sequence = 7, .output_bytes = 664, .output_kv_bytes = 464 };
+    try std.testing.expectEqual(expected, try geometry.resolve(.{ .shapes = &.{ ids, encoder, self_cache, cross_cache } }, &.{ logits, self_output, cross_output }, 2));
+    try std.testing.expectEqual(expected, try geometry.resolve(.{ .shapes = &.{ cross_cache, encoder, ids, self_cache } }, &.{ self_output, logits, cross_output }, 2));
+    try std.testing.expectError(error.MissingInputs, geometry.resolve(.{ .shapes = &.{ ids, encoder, cross_cache } }, &.{ logits, self_output, cross_output }, 2));
+}
+
 test "imported sequence geometry resolves transformed audio axes without native hooks" {
     const Probe = struct {
         fn info(_: *anyopaque) []const TensorInfo {
