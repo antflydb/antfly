@@ -123,14 +123,20 @@ pub const Port = struct {
         return self.writeRequest(a, fence, owner, locator.table_name, request, context, scope.deadline_ns);
     }
 
-    /// Settle participant tracking after recovery confirms publication on every
-    /// committed owner or rollback on every aborted owner.
+    /// Execute a phase owned by the durable metadata transaction.
     pub fn submitExternal(self: Port, a: A, member: completion.Participant, fence: metadata.CatalogRouteFence, request: types.BatchRequest, original: operation.RequestContext) !void {
         var scope = try @import("history_publication_operations.zig").Scope.init(fence, original);
         const context = scope.context();
         const owner = member.routed_owner orelse return error.InvalidParticipant;
         const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
-        try validateParticipantFence(owner, locator.group_id, fence);
+        var routed = owner;
+        if (request.transaction) |mutation| if (mutation == .publish_completion) {
+            // Only the transport epoch changes. The ordered reducer still
+            // checks the original owner against the retained receipt.
+            if (!std.meta.eql(mutation.publish_completion.completion_owner, owner)) return error.InvalidParticipant;
+            routed.topology_epoch = fence.topology_epoch;
+        };
+        try validateParticipantFence(routed, locator.group_id, fence);
         return self.writeRequest(a, fence, owner, locator.table_name, request, context, scope.deadline_ns);
     }
 

@@ -160,7 +160,7 @@ pub const Recovery = struct {
             try self.checkpoint(context);
             const owner = member.routed_owner orelse return error.InvalidParticipant;
             const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
-            fence.* = try routeRetainedOwner(&session, owner, member.locator, budget, context);
+            fence.* = try routeRetainedOwnerForCleanup(&session, owner, member.locator, budget, context);
             const request: resolution_ops.Request = .{
                 .version = 1,
                 .authority = .raft,
@@ -745,7 +745,23 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     fake.lose_publication = true;
     try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, recovery.publishExternal(a, frozen.admission, 20, .{}));
     try std.testing.expectEqual(before_external_publishes + 1, fake.publishes);
+    // A routing revision can move range boundaries while preserving both
+    // physical owners and their receipts. Recover the same certificate.
+    var publication_ranges = ranges;
+    publication_ranges[0].end_key = "n";
+    publication_ranges[1].start_key = "n";
+    const publication_generation = try catalog_api.RoutingGeneration.create(a, .{
+        .metadata_group_id = 1,
+        .metadata_incarnation = owners[0].metadata_incarnation,
+        .catalog_revision = 11,
+        .tables = &records,
+        .ranges = &publication_ranges,
+    }, .{});
+    defer publication_generation.release();
+    try std.testing.expect((try publication_generation.indexed.tableRoutingView("docs", .{})).topology_epoch != owners[0].topology_epoch);
+    fake.generation = publication_generation;
     const recovered_certificate = (try recovery.publishExternal(a, frozen.admission, 20, .{})).?;
+    fake.generation = generation;
     try std.testing.expectEqualDeep(recovered_certificate, fake.publication_digest);
     try std.testing.expectEqual(before_external_publishes + 2, fake.publishes);
     try std.testing.expectEqual(before_external_resolves, fake.resolves);

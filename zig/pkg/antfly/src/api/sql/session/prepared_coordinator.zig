@@ -96,7 +96,17 @@ pub const Registry = struct {
         if (deadline) |limit| context.deadline_ns = @min(context.deadline_ns orelse limit, limit);
         var fallback: @import("../../table_router.zig").CatalogBackedGroupRouter = undefined;
         var transport = try self.historyTransport(&fallback);
-        try transport.coordinator().recovery.participants.submitExternal(a, member, participant.route, request, context);
+        const recovery = transport.coordinator().recovery;
+        const fence = if (request.transaction.? == .publish_completion) blk: {
+            const owner = member.routed_owner orelse return error.InvalidParticipant;
+            var budget = recovery.catalog.budget(null);
+            budget.deadline_ns = budget.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io });
+            budget.cancellation = context.cancellation;
+            var session = try @import("../../table_catalog.zig").RoutingSession.initWithBudget(a, recovery.catalog, budget);
+            defer session.deinit();
+            break :blk try @import("../../completion_recovery.zig").routeRetainedOwnerForCleanup(&session, owner, member.locator, budget, context);
+        } else participant.route;
+        try recovery.participants.submitExternal(a, member, fence, request, context);
     }
 
     fn publishHistory(raw: *anyopaque, a: A, record: registry.Record) anyerror!?@import("../../completion_plan.zig").completion.Digest {
