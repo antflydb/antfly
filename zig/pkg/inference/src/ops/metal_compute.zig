@@ -23622,7 +23622,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const elapsed = @import("antfly_platform").time.monotonicNs() -| start;
             plan.selection.record(replay, elapsed);
             if (replay) plan.replay_ns = elapsed else plan.eager_ns = elapsed;
-            @import("../execution/runtime_observation.zig").metalSerialWorkspace(replay, .{
+            const observation = @import("../execution/runtime_observation.zig");
+            if (observation.kernelObservationActive()) observation.metalSerialWorkspace(replay, metal_runtime.hasActiveFrame(p.raw_decode_runtime) or metal_runtime.hasSubmittedFrame(p.raw_decode_runtime), .{
                 .planned_output_bytes = plan.arena_recipe.outputs_bytes,
                 .planned_scratch_bytes = plan.arena_recipe.input_workspace_bytes,
                 .arena_backing_bytes = plan.arena_size,
@@ -53245,6 +53246,7 @@ test "embeddinggemma2 Metal audio instruction schedule binds fresh inputs and re
             try std.testing.expect(scope.metal_serial_workspace != null);
             const measured = scope.metal_serial_workspace.?;
             try std.testing.expectEqual(@as(u64, 1), measured.successful_replays + measured.successful_eager_calls);
+            try std.testing.expectEqual(@as(u64, 1), measured.callbacks_with_pending_frame);
             try std.testing.expect(measured.latest.arena_backing_bytes >= measured.latest.planned_output_bytes);
             try std.testing.expect(measured.latest.charged_backend_bytes >= measured.latest.arena_backing_bytes);
         }

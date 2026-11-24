@@ -247,8 +247,10 @@ extern fn termite_metal_observation_exchange_dispatch_sink(sink: ?MetalDispatchS
 /// thread. The bank gauges describe the latest selected plan, not a request peak.
 pub const SerialWorkspaceObservation = struct {
     scope: enum { metal_ready_serial_schedule_callbacks } = .metal_ready_serial_schedule_callbacks,
+    /// Successful host callbacks. Device retirement is outside this observation.
     successful_replays: u64 = 0,
     successful_eager_calls: u64 = 0,
+    callbacks_with_pending_frame: u64 = 0,
     latest: Banks,
 
     pub const Banks = struct {
@@ -260,18 +262,18 @@ pub const SerialWorkspaceObservation = struct {
     };
 };
 
-pub inline fn metalSerialWorkspace(replayed: bool, banks: SerialWorkspaceObservation.Banks) void {
-    if (active_kernels == null) return;
-    metalSerialWorkspaceEnabled(replayed, banks);
+pub inline fn kernelObservationActive() bool {
+    return active_kernels != null;
 }
 
-noinline fn metalSerialWorkspaceEnabled(replayed: bool, banks: SerialWorkspaceObservation.Banks) void {
+pub noinline fn metalSerialWorkspace(replayed: bool, pending_frame: bool, banks: SerialWorkspaceObservation.Banks) void {
     var active = active_kernels;
     while (active) |scope| : (active = scope.previous) {
         if (scope.metal_serial_workspace == null) scope.metal_serial_workspace = .{ .latest = banks };
         const value = &scope.metal_serial_workspace.?;
         value.latest = banks;
         if (replayed) value.successful_replays +|= 1 else value.successful_eager_calls +|= 1;
+        if (pending_frame) value.callbacks_with_pending_frame +|= 1;
     }
 }
 
