@@ -45,11 +45,23 @@ pub fn run(a: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !
             if (cli.output.isAgent()) {
                 cli.output.emitError(@errorName(err), .command, null, .{ .string = hint });
             } else cli.output.notice("{s}", .{hint});
+        } else if (err == error.SyncReceiptDeliveryFailed) {
+            return receiptDeliveryFailed();
         }
         return err;
     };
     defer a.free(report);
-    try cli.output.writeJsonArtifact(a, io, report);
+    const stdout = std.Io.File.stdout();
+    stdout.writeStreamingAll(io, report) catch return receiptDeliveryFailed();
+    if (!std.mem.endsWith(u8, report, "\n")) stdout.writeStreamingAll(io, "\n") catch return receiptDeliveryFailed();
+}
+
+fn receiptDeliveryFailed() error{SyncReceiptDeliveryFailed} {
+    const hint = "Sync published --out, but could not deliver the JSON receipt.";
+    if (cli.output.isAgent()) {
+        cli.output.emitError("SyncReceiptDeliveryFailed", .delivery, null, .{ .string = hint });
+    } else cli.output.notice("{s}", .{hint});
+    return error.SyncReceiptDeliveryFailed;
 }
 
 fn parse(args: *std.process.Args.Iterator) !Args {
@@ -151,4 +163,9 @@ test "sync bridge preserves publication outcomes" {
     try std.testing.expectError(error.PathAlreadyExists, staging.checkSyncStatus(staging.syncErrorStatus(error.PathAlreadyExists)));
     try std.testing.expectError(error.OutOfMemory, staging.checkSyncStatus(staging.syncErrorStatus(error.OutOfMemory)));
     try std.testing.expectError(error.InvalidBackupRequest, staging.checkSyncStatus(staging.syncErrorStatus(error.InvalidBackupRequest)));
+    for ([_]anyerror{
+        error.TableNotFound,                   error.WriterLocked,              error.BackupInputLimitExceeded,
+        error.BackupExpansionLimitExceeded,    error.SyncMutationLimitExceeded, error.IdentityNamespaceMismatch,
+        error.UnsupportedBackupMigrationState,
+    }) |err| try std.testing.expectError(err, staging.checkSyncStatus(staging.syncErrorStatus(err)));
 }
