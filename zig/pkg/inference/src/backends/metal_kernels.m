@@ -69237,6 +69237,13 @@ void antfly_metal_audio_storage_admission(termite_metal_decode_runtime *r, void 
 static void antfly_audio_storage_uncharge(termite_metal_decode_runtime *r, size_t bytes) {
     if (r->audio_storage_release) r->audio_storage_release(r->audio_storage_context,bytes);
 }
+static void antfly_audio_storage_detach(termite_metal_decode_runtime *r, size_t slot) {
+    const size_t charge = antfly_audio_buffer_charge(r->audio_reuse_buffers[slot]);
+    r->audio_reuse_buffers[slot] = nil;
+    r->audio_reuse_fences[slot] = nil;
+    r->audio_reuse_bytes -= charge;
+    antfly_audio_storage_uncharge(r, charge);
+}
 static void antfly_audio_storage_retire(termite_metal_decode_runtime *r, id<MTLBuffer> buffer,
                                         id<MTLCommandBuffer> fence) {
     const size_t limit = 128u * 1024u * 1024u, charge = antfly_audio_buffer_charge(buffer);
@@ -69244,17 +69251,19 @@ static void antfly_audio_storage_retire(termite_metal_decode_runtime *r, id<MTLB
         return;
     size_t empty = 128;
     for (size_t i = 0; i < 128; i++) {
+        if (r->audio_reuse_buffers[i] == buffer) {
+            // An independently retained view can retire the same allocation.
+            // A second slot would lend concurrent callers the same storage.
+            if (fence != nil) r->audio_reuse_fences[i] = fence;
+            return;
+        }
         if (r->audio_reuse_buffers[i] == nil)
             empty = i;
     }
     // Evict only completed, dead storage. In-flight generations remain protected.
     for (size_t i = 0; i < 128 && (empty == 128 || r->audio_reuse_bytes > limit - charge); i++)
         if (r->audio_reuse_buffers[i] && antfly_audio_fence_complete(r->audio_reuse_fences[i])) {
-            const size_t removed=antfly_audio_buffer_charge(r->audio_reuse_buffers[i]);
-            r->audio_reuse_bytes -= removed;
-            antfly_audio_storage_uncharge(r,removed);
-            r->audio_reuse_buffers[i] = nil;
-            r->audio_reuse_fences[i] = nil;
+            antfly_audio_storage_detach(r, i);
             empty = i;
         }
     if (empty == 128 || r->audio_reuse_bytes > limit - charge)
@@ -70958,10 +70967,26 @@ void *termite_metal_buffer_alloc(termite_metal_decode_runtime *runtime, size_t l
             }
         }
     }
-    if(storage_mode==1 && runtime->audio_reuse_scope && runtime->active_frame_cb!=nil) {
-        size_t best=128,best_len=SIZE_MAX;
-        for(size_t i=0;i<128;i++) {id<MTLBuffer> b=runtime->audio_reuse_buffers[i];if(b && (size_t)b.length>=length && (size_t)b.length<best_len && antfly_audio_fence_complete(runtime->audio_reuse_fences[i])) {best=i;best_len=(size_t)b.length;}}
-        if(best!=128) {id<MTLBuffer> b=runtime->audio_reuse_buffers[best];runtime->audio_reuse_bytes-=antfly_audio_buffer_charge(b);antfly_audio_storage_uncharge(runtime,antfly_audio_buffer_charge(b));runtime->audio_reuse_buffers[best]=nil;runtime->audio_reuse_fences[best]=nil;runtime->audio_reuse_hits++;return (__bridge_retained void *)b;}
+    if (storage_mode == 1 && runtime->audio_reuse_scope && runtime->active_frame_cb != nil) {
+        size_t best = 128, best_len = SIZE_MAX;
+        // An admitted checkout refunds retained storage. The live workspace
+        // reservation covers a buffer of the requested size.
+        const bool admitted = runtime->audio_storage_admit != NULL;
+        for (size_t i = 0; i < 128; ++i) {
+            id<MTLBuffer> buffer = runtime->audio_reuse_buffers[i];
+            if (buffer == nil || !antfly_audio_fence_complete(runtime->audio_reuse_fences[i])) continue;
+            const size_t candidate = buffer.length;
+            if (candidate < length || (admitted && candidate != length) || candidate >= best_len) continue;
+            best = i;
+            best_len = candidate;
+            if (candidate == length) break;
+        }
+        if (best != 128) {
+            void *handle = (__bridge_retained void *)runtime->audio_reuse_buffers[best];
+            antfly_audio_storage_detach(runtime, best);
+            runtime->audio_reuse_hits++;
+            return handle;
+        }
     }
     return termite_metal_buffer_alloc_new(runtime, length, storage_mode);
 }

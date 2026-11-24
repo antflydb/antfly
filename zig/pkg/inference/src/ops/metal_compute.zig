@@ -53199,6 +53199,29 @@ test "embeddinggemma2 Metal audio storage admission survives wrappers and yields
                 try std.testing.expect(if (limit < 16384) retained == 0 else retained > 0 and retained < limit);
                 try std.testing.expectEqual(retained, controller.snapshot().backend_weight_bytes);
                 try std.testing.expectEqual(retained, compute.provider_impl.embeddinggemma2_audio_storage_bytes);
+                if (limit >= 16 * 1024 * 1024) {
+                    const raw = compute.provider_impl.raw_decode_runtime.?;
+                    try std.testing.expect(try cb.audioStorage(true));
+                    defer _ = cb.audioStorage(false) catch false;
+                    try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+                    var warm = try MetalTensor.deviceAllocate(raw, 8192, .private, &.{2048});
+                    const bytes: [8192]u8 = @splat(0);
+                    warm.uploadBytes(&bytes) catch |err| {
+                        warm.deinit();
+                        return err;
+                    };
+                    warm.deinit();
+                    try cb.decoderRuntimeSubmitAndWaitFrame();
+                    const hits = metal_runtime_mod.antfly_metal_audio_storage_hits(raw);
+                    try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+                    var smaller = try MetalTensor.deviceAllocate(raw, 4096, .private, &.{1024});
+                    defer smaller.deinit();
+                    try std.testing.expectEqual(hits, metal_runtime_mod.antfly_metal_audio_storage_hits(raw));
+                    var matching = try MetalTensor.deviceAllocate(raw, 8192, .private, &.{2048});
+                    defer matching.deinit();
+                    try std.testing.expectEqual(hits + 1, metal_runtime_mod.antfly_metal_audio_storage_hits(raw));
+                    try cb.decoderRuntimeCancelFrame();
+                }
             }
         }
         const provider = store.shared_metal_native_provider.?;
