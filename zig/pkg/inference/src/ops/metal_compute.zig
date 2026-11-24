@@ -1604,6 +1604,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     const OcrCarrierKind = enum { query, key, value, norm, head, attention_output, ffn_output, ple_output, ple_layer, hidden_front, hidden_back, ple_vectors };
 
+    const IntegerBounds = struct { minimum: i64, maximum: i64 };
+
     const Buf = struct {
         // Each immutable value descriptor has a non-address identity. Zero is
         // reserved for private stack test probes, which are never cache proof.
@@ -1652,8 +1654,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         native_dense_host_cache: ?CT = null,
         /// Physical integer storage; float primitives must not reinterpret it.
         integer_storage: bool = false,
-        integer_bounds: ?struct { minimum: i64, maximum: i64 } = null,
-        integer_upload_version: ?u64 = null,
+        integer_bounds: ?struct {
+            range: IntegerBounds,
+            version: u64,
+            ingress: bool,
+        } = null,
 
         resident_index_bounds: ?ops.resident_training.IndexBounds = null,
         resident_index_storage: ?*ResidentIndexStorage = null,
@@ -9777,7 +9782,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             errdefer self.retireTemporaryWorkspaceValue(&copied);
             if (source.deviceByteLen() != 0) try source.copyInto(&copied);
             const result = try self.ctFromOwnedMetalTensor(copied);
-            toBuf(result).integer_bounds = src_buf.integer_bounds;
+            setIntegerBounds(toBuf(result), currentIntegerBounds(src_buf), false);
             toBuf(result).resident_index_bounds = src_buf.resident_index_bounds;
             toBuf(result).resident_index_storage = if (src_buf.resident_index_storage) |storage| storage.retain() else null;
             return result;
@@ -10002,8 +10007,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         errdefer self.retireTemporaryWorkspaceValue(&device);
         if (data.len != 0) try device.uploadBytes(data);
         const result = try self.ctFromOwnedMetalTensor(device);
-        if (bounds) |range| toBuf(result).integer_bounds = .{ .minimum = range.min, .maximum = range.max };
-        if (bounds != null and (physical == .i32 or physical == .i64)) toBuf(result).integer_upload_version = device.storageVersion();
+        if (bounds) |range| setIntegerBounds(toBuf(result), .{ .minimum = range.min, .maximum = range.max }, physical == .i32 or physical == .i64);
 
         return result;
     }
@@ -10044,7 +10048,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         device.dtype = if (T == i32) .i32 else .f32;
         try device.uploadBytes(std.mem.sliceAsBytes(values));
         const result = try self.ctFromOwnedMetalTensor(device);
-        if (bounds) |proof| toBuf(result).integer_bounds = .{ .minimum = proof.minimum, .maximum = proof.maximum };
+        if (bounds) |proof| setIntegerBounds(toBuf(result), .{ .minimum = proof.minimum, .maximum = proof.maximum }, false);
         toBuf(result).resident_index_bounds = bounds;
         toBuf(result).resident_index_storage = indices;
         return result;
@@ -10090,7 +10094,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         } else try source.retainedView(0, source.deviceByteLen(), shape);
         errdefer self.retireTemporaryWorkspaceValue(&output);
         const result = try self.ctFromOwnedMetalTensor(output);
-        toBuf(result).integer_bounds = toBuf(input).integer_bounds;
+        setIntegerBounds(toBuf(result), currentIntegerBounds(toBuf(input)), false);
         toBuf(result).resident_index_bounds = toBuf(input).resident_index_bounds;
         toBuf(result).resident_index_storage = if (toBuf(input).resident_index_storage) |storage| storage.retain() else null;
         return result;
@@ -10110,7 +10114,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         } else try source.retainedView(0, count * 4, shape);
         errdefer self.retireTemporaryWorkspaceValue(&output);
         const result = try self.ctFromOwnedMetalTensor(output);
-        toBuf(result).integer_bounds = toBuf(input).integer_bounds;
+        setIntegerBounds(toBuf(result), currentIntegerBounds(toBuf(input)), false);
         toBuf(result).resident_index_bounds = toBuf(input).resident_index_bounds;
         toBuf(result).resident_index_storage = if (toBuf(input).resident_index_storage) |storage| storage.retain() else null;
         return result;
@@ -11565,9 +11569,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         else
             (try metal_runtime.decoderRuntimeCastTypedDevice(self.provider_impl, source, physical)) orelse return null;
         const result = try self.ctFromOwnedMetalTensor(output);
-        if (buf.integer_bounds) |bounds| {
+        if (currentIntegerBounds(buf)) |bounds| {
             if (physical == .i64 or (physical == .i32 and bounds.minimum >= std.math.minInt(i32) and bounds.maximum <= std.math.maxInt(i32)))
-                toBuf(result).integer_bounds = bounds;
+                setIntegerBounds(toBuf(result), bounds, false);
         }
         return result;
     }
@@ -11770,14 +11774,29 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         try input.copyInto(target);
     }
 
+    fn currentIntegerBounds(buf: *const Buf) ?IntegerBounds {
+        const proof = buf.integer_bounds orelse return null;
+        const tensor = buf.metal_tensor orelse return null;
+        return if (tensor.storageVersion() == proof.version) proof.range else null;
+    }
+
+    fn setIntegerBounds(buf: *Buf, range: ?IntegerBounds, ingress: bool) void {
+        buf.integer_bounds = null;
+        const bounds = range orelse return;
+        const tensor = buf.metal_tensor orelse return;
+        const version = tensor.storageVersion() orelse return;
+        buf.integer_bounds = .{ .range = bounds, .version = version, .ingress = ingress };
+    }
+
     fn uploadedIndexBounds(self: *MetalCompute, source: CT) !@import("index_metadata.zig").Bounds {
         const buf = toBuf(source);
         const tensor = buf.metal_tensor orelse return error.MissingCurrentHostIndexProof;
-        const version = buf.integer_upload_version orelse return error.MissingCurrentHostIndexProof;
-        const bounds = buf.integer_bounds orelse return error.MissingCurrentHostIndexProof;
+        const proof = buf.integer_bounds orelse return error.MissingCurrentHostIndexProof;
+        if (!proof.ingress) return error.MissingCurrentHostIndexProof;
+        const bounds = currentIntegerBounds(buf) orelse return error.MissingCurrentHostIndexProof;
         const runtime = self.provider_impl.raw_decode_runtime orelse return error.MissingCurrentHostIndexProof;
         const device = tensor.device orelse return error.MissingCurrentHostIndexProof;
-        if (device.ref.runtime != @as(*anyopaque, @ptrCast(runtime)) or tensor.storageVersion() != version) return error.MissingCurrentHostIndexProof;
+        if (device.ref.runtime != @as(*anyopaque, @ptrCast(runtime))) return error.MissingCurrentHostIndexProof;
         if (tensor.dtype != .i32 and tensor.dtype != .i64) return error.MissingCurrentHostIndexProof;
 
         return .{ .min = bounds.minimum, .max = bounds.maximum };
@@ -14712,7 +14731,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     minimum = @min(minimum, value);
                     maximum = @max(maximum, value);
                 }
-                buf.integer_bounds = .{ .minimum = minimum, .maximum = maximum };
+                setIntegerBounds(buf, .{ .minimum = minimum, .maximum = maximum }, false);
             }
             return host_tensor;
         }
@@ -17635,7 +17654,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const plan = try @import("binary_broadcast.zig").SelectionPlan.broadcast(input_buf.logical_shape orelse shape[0..mt.shape().len], target_shape, broadcast_axes);
             const output = try metal_runtime.decoderRuntimeSelectTypedDevice(self.provider_impl, .{ mt, mt, mt }, plan, true) orelse return error.UnsupportedTensorType;
             const result = try self.ctFromOwnedMetalTensor(output);
-            toBuf(result).integer_bounds = input_buf.integer_bounds;
+            setIntegerBounds(toBuf(result), currentIntegerBounds(input_buf), false);
             return result;
         }
         if (input_buf.quantized_storage != null) return error.UnsupportedTensorType;
@@ -17874,8 +17893,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (toBuf(indices).integer_storage or toBuf(input).integer_storage) {
             const index = toBuf(indices);
-            const current = if (index.integer_upload_version) |version| index.metal_tensor.?.storageVersion() == version else true;
-            if (if (current) index.integer_bounds else null) |bounds| {
+            if (currentIntegerBounds(index)) |bounds| {
                 const resolved = try resolveConcreteShape(toBuf(input), input_shape);
                 if (axis >= input_shape.len) return error.InvalidTensorShape;
                 const extent = resolved[axis];
@@ -18010,7 +18028,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const plan = try @import("slice_plan.zig").Plan.init(shape[0..mt.shape().len], starts, limits, strides, input_shape);
             const output = try metal_runtime.decoderRuntimeSliceTypedDevice(self.provider_impl, mt, plan) orelse return error.UnsupportedTensorType;
             const result = try self.ctFromOwnedMetalTensor(output);
-            toBuf(result).integer_bounds = input_buf.integer_bounds;
+            setIntegerBounds(toBuf(result), currentIntegerBounds(input_buf), false);
             return result;
         }
         if (input_buf.quantized_storage != null) return error.UnsupportedTensorType;
@@ -18263,9 +18281,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const output = (try metal_runtime.decoderRuntimeIntegerBinaryDevice(self.provider_impl, lhs, rhs, kind)) orelse return error.UnsupportedTensorType;
         const result = try self.ctFromOwnedMetalTensor(output);
         if (kind == 3) {
-            toBuf(result).integer_bounds = .{ .minimum = 0, .maximum = 1 };
-        } else if (toBuf(a).integer_bounds) |left| {
-            if (toBuf(b).integer_bounds) |right| {
+            setIntegerBounds(toBuf(result), .{ .minimum = 0, .maximum = 1 }, false);
+        } else if (currentIntegerBounds(toBuf(a))) |left| {
+            if (currentIntegerBounds(toBuf(b))) |right| {
                 const range: ?@TypeOf(left) = checked: {
                     const minimum: i64, const maximum: i64 = switch (kind) {
                         0 => .{ std.math.add(i64, left.minimum, right.minimum) catch break :checked null, std.math.add(i64, left.maximum, right.maximum) catch break :checked null },
@@ -18287,7 +18305,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     if (output.dtype != .i32 and output.dtype != .i64) break :checked null;
                     break :checked .{ .minimum = minimum, .maximum = maximum };
                 };
-                toBuf(result).integer_bounds = range;
+                setIntegerBounds(toBuf(result), range, false);
             }
         }
         return result;
@@ -19806,8 +19824,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (count > std.math.maxInt(u32) / (lhs.dtype.byteSize() / @sizeOf(u32))) return null;
         var dims: [metal_tensor_mod.max_dims]i32 = undefined;
         for (shape, 0..) |dim, i| dims[i] = std.math.cast(i32, dim) orelse return null;
-        const left_bounds = self.uploadedIndexBounds(a) catch null;
-        const right_bounds = self.uploadedIndexBounds(b) catch null;
+        const left_bounds = currentIntegerBounds(left);
+        const right_bounds = currentIntegerBounds(right);
         var output = try MetalTensor.deviceAllocateTyped(self.allocator, @ptrCast(runtime), lhs.dtype, .private, dims[0..shape.len]);
         errdefer self.retireTemporaryWorkspaceValue(&output);
         if (!try metal_runtime.decoderRuntimeConcatWordsInto(self.provider_impl, lhs, rhs, geometry.outer, a_chunk, b_chunk, output)) {
@@ -19816,8 +19834,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         const result = try self.ctFromOwnedMetalTensor(output);
         if (left_bounds) |lb| if (right_bounds) |rb| {
-            toBuf(result).integer_bounds = .{ .minimum = @min(lb.min, rb.min), .maximum = @max(lb.max, rb.max) };
-            toBuf(result).integer_upload_version = output.storageVersion();
+            setIntegerBounds(toBuf(result), .{ .minimum = @min(lb.minimum, rb.minimum), .maximum = @max(lb.maximum, rb.maximum) }, left.integer_bounds.?.ingress and right.integer_bounds.?.ingress);
         };
         return result;
     }
@@ -20298,7 +20315,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const dim: usize = @intCast(input_shape[1]);
         const out_rows: usize = @intCast(indices_shape[0]);
         if (toBuf(indices).integer_storage) {
-            const bounds = toBuf(indices).integer_bounds orelse return error.UnsupportedResidentTrainingIndexProof;
+            const bounds = currentIntegerBounds(toBuf(indices)) orelse return error.UnsupportedResidentTrainingIndexProof;
             if (bounds.minimum < -indices_shape[0] or bounds.maximum >= indices_shape[0]) return error.IndexOutOfBounds;
         }
 
@@ -20475,10 +20492,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const source = toBuf(weight);
         const index = toBuf(indices);
-        if (!index.integer_storage or index.integer_bounds == null or source.integer_storage or source.quantized_storage != null or source.runtime_quantized_storage != null) return null;
+        if (!index.integer_storage or source.integer_storage or source.quantized_storage != null or source.runtime_quantized_storage != null) return null;
         if (dim == 0 or bufElemCount(index) != total or bufElemCount(source) % dim != 0) return error.InvalidTensorShape;
         const rows = std.math.cast(i64, bufElemCount(source) / dim) orelse return error.InvalidTensorShape;
-        const bounds = index.integer_bounds.?;
+        const bounds = currentIntegerBounds(index) orelse return null;
         if (bounds.minimum < 0 or bounds.maximum >= rows) return error.IndexOutOfBounds;
         const shape = [_]i64{ rows, @intCast(dim) };
         const stored = source.logical_shape orelse return null;
@@ -54627,7 +54644,7 @@ test "embeddinggemma2 Metal stage handoff preserves independent tensors across p
     for (changed) |value| try std.testing.expectEqual(@as(f32, 0), value);
 }
 
-test "metal_compute: GatherND coordinate concat preserves exact i64 bytes" {
+test "metal_compute: GatherND coordinate concat preserves exact integer bytes" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -54667,6 +54684,15 @@ test "metal_compute: GatherND coordinate concat preserves exact i64 bytes" {
     defer a.free(mixed_bytes.payload.bytes);
     try std.testing.expectEqual(.i64, mixed_bytes.dtype);
     try std.testing.expectEqualSlices(u8, actual.payload.bytes, mixed_bytes.payload.bytes);
+
+    const alias = try cb.primReshape(lhs, &.{2});
+    defer cb.free(alias);
+    try std.testing.expect(MetalCompute.currentIntegerBounds(MetalCompute.toBuf(alias)) != null);
+    var writer = try MetalCompute.toBuf(lhs).metal_tensor.?.retainedCopy();
+    defer writer.deinit();
+    try writer.uploadBytes(std.mem.sliceAsBytes(&rhs_values));
+    try std.testing.expect(MetalCompute.currentIntegerBounds(MetalCompute.toBuf(alias)) == null);
+    try std.testing.expectError(error.MissingCurrentHostIndexProof, compute.uploadedIndexBounds(lhs));
 }
 
 test "metal_compute: ClipClap attention masks promote boolean integer and float arithmetic" {
