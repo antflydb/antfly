@@ -3475,6 +3475,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     self.install_error = err;
                     self.index_manager.index_publication_reopen_required.store(true, .release);
                 };
+                // The installed snapshot now owns this debt. A delayed
+                // ticket waiter should not keep it reserved a second time.
+                if (self.install_error == null) {
+                    if (self.merge_permit) |*permit| permit.release();
+                }
                 self.completed = true;
             }
 
