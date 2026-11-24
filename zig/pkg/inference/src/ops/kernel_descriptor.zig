@@ -49,6 +49,7 @@ pub const F32ScaledAdd = struct {
     product: ml.graph.NodeId,
     source: ml.graph.NodeId,
     addend: ml.graph.NodeId,
+    scalar: ml.graph.NodeId,
     scale: f32,
 
     pub fn match(graph: *const ml.graph.Graph, inputs: []const ml.graph.NodeId, shape: ml.graph.Shape, deferred: [2]bool) ?F32ScaledAdd {
@@ -59,7 +60,7 @@ pub const F32ScaledAdd = struct {
             const addend = inputs[1 - index];
             if (addend >= graph.nodeCount() or !graph.node(addend).output_shape.eq(shape)) continue;
             if (mul.source_id < graph.nodeCount() and graph.node(mul.source_id).output_shape.eq(shape)) {
-                return .{ .product = id, .source = mul.source_id, .addend = addend, .scale = mul.scale };
+                return .{ .product = id, .source = mul.source_id, .addend = addend, .scalar = mul.scalar_id, .scale = mul.scale };
             }
         }
         return null;
