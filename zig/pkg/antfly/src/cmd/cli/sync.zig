@@ -39,7 +39,15 @@ pub fn run(a: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !
     validate(opts) catch return cli.argumentError("sync requires --input, a new --out path, and --definition; use at most one table selector", .{});
     const definition = try cli.readFileAlloc(io, a, opts.definition.?, 1024 * 1024);
     defer a.free(definition);
-    const report = try staging.syncDataJsonAlloc(a, opts.input.?, opts.output.?, opts.table orelse opts.tables orelse "", definition, opts.max_input_bytes, opts.max_expanded_bytes);
+    const report = staging.syncDataJsonAlloc(a, opts.input.?, opts.output.?, opts.table orelse opts.tables orelse "", definition, opts.max_input_bytes, opts.max_expanded_bytes) catch |err| {
+        if (err == error.DurabilityOutcomeUnknown) {
+            const hint = "Sync output may already have been published, but its durability could not be confirmed. Inspect --out before retrying; do not assume publication failed.";
+            if (cli.output.isAgent()) {
+                cli.output.emitError(@errorName(err), .command, null, .{ .string = hint });
+            } else cli.output.notice("{s}", .{hint});
+        }
+        return err;
+    };
     defer a.free(report);
     try cli.output.writeJsonArtifact(a, io, report);
 }
@@ -131,4 +139,12 @@ test "sync rejects backup recovery and remote destination flags" {
     var duplicate = [_][*:0]const u8{ "--out", "a", "--out", "b" };
     var args = std.process.Args.Iterator.init(.{ .vector = &duplicate });
     try std.testing.expectError(error.DuplicateArgument, parse(&args));
+}
+
+test "sync bridge preserves publication outcomes" {
+    try staging.checkSyncStatus(staging.Status.ok);
+    try std.testing.expectError(error.DurabilityOutcomeUnknown, staging.checkSyncStatus(staging.syncErrorStatus(error.DurabilityOutcomeUnknown)));
+    try std.testing.expectError(error.PathAlreadyExists, staging.checkSyncStatus(staging.syncErrorStatus(error.PathAlreadyExists)));
+    try std.testing.expectError(error.OutOfMemory, staging.checkSyncStatus(staging.syncErrorStatus(error.OutOfMemory)));
+    try std.testing.expectError(error.InvalidBackupRequest, staging.checkSyncStatus(staging.syncErrorStatus(error.InvalidBackupRequest)));
 }

@@ -341,6 +341,13 @@ only part of a larger instance must not replace that instance with this output.
 
 `--out` must be a new path. The input and any existing output are never
 overwritten. All selected tables must succeed before the output is published.
+An existing directory entry (including a dangling symlink) is rejected before
+reading the source. A final atomic publication check also prevents concurrent
+publishers from overwriting each other. If publication succeeds but confirming
+filesystem durability fails, the command returns `DurabilityOutcomeUnknown`:
+**the output may already exist**. Inspect it before retrying or activating it;
+a nonzero exit in this case does not mean nothing was published.
+
 The source is opened read-only through native storage readers; its server is
 never started. Use a stable `antfly lite snapshot` or an offline source, not a
 concurrent copy of a running file.

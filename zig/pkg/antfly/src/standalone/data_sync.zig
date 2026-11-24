@@ -64,6 +64,7 @@ pub fn syncJsonAlloc(a: Allocator, input: []const u8, output: []const u8, select
     var io_impl = std.Io.Threaded.init(a, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
+    try requireAbsentOutput(io, output);
     var source = try std.Io.Dir.cwd().openFile(io, input, .{});
     defer source.close(io);
     if (!try source.tryLock(io, .shared)) return error.WriterLocked;
@@ -83,27 +84,33 @@ pub fn syncJsonAlloc(a: Allocator, input: []const u8, output: []const u8, select
     const projection = try catalog.captureInspectionCatalog(a, local.common_group_ids.main_metadata_group_id, 4096, 16 * 1024 * 1024, .none);
     defer catalog.freeTables(a, projection.tables);
     defer catalog.freeRanges(a, projection.ranges);
-    defer if (selection.len == 0) {
-        for (names.items) |name| a.free(name);
-    };
-    if (names.items.len == 0) {
-        if (projection.tables.len == 0 or projection.tables.len > 256) return error.UnsupportedLiteInspectionLayout;
-        // Use logical bindings rather than guessing from storage names. Reject
-        // unsupported namespaces instead of silently omitting source tables.
+    // Read each primary binding once. Do not consult/rebuild a potentially old
+    // derived name index in the source. The map owns names until staging ends.
+    var logical_tables: std.StringHashMap(usize) = .init(a);
+    defer {
+        var keys = logical_tables.keyIterator();
+        while (keys.next()) |key| a.free(key.*);
+        logical_tables.deinit();
+    }
+    const select_all = names.items.len == 0;
+    if (select_all and (projection.tables.len == 0 or projection.tables.len > 256)) return error.UnsupportedLiteInspectionLayout;
+    {
         var txn = try catalog.store.beginReadTxn();
         defer txn.abort();
-        for (projection.tables) |table| {
+        for (projection.tables, 0..) |table, index| {
             var binding = try @import("../system_catalog/storage.zig").getByIdLimited(a, &txn, local.common_group_ids.main_metadata_group_id, .table, table.table_id, 1024 * 1024);
             defer if (binding) |*value| value.deinit();
             const name = if (binding) |value| bound: {
-                if (value.value.parent_id != local.system_catalog_domain.default_namespace_id or value.value.native_service != null) return error.UnsupportedLiteInspectionLayout;
                 if (!std.mem.eql(u8, value.value.storage_name, table.name)) return error.InvalidCatalogRecord;
+                if (value.value.parent_id != local.system_catalog_domain.default_namespace_id) {
+                    if (select_all) return error.UnsupportedLiteInspectionLayout;
+                    continue;
+                }
+                if (value.value.native_service != null) return error.UnsupportedLiteInspectionLayout;
                 break :bound value.value.name;
             } else table.name;
-            // Bindings own their strings; keep this name until the restore ends.
-            const owned = try a.dupe(u8, name);
-            errdefer a.free(owned);
-            try names.append(a, owned);
+            const owned = try insertLogicalTable(a, &logical_tables, name, index);
+            if (select_all) try names.append(a, owned);
         }
     }
     if (named == null and names.items.len != 1) return error.InvalidBackupRequest;
@@ -136,27 +143,7 @@ pub fn syncJsonAlloc(a: Allocator, input: []const u8, output: []const u8, select
         defer output_indexes.deinit();
         var table_options = options;
         table_options.max_documents -= documents;
-        const table = selected: {
-            // Resolve the primary logical bindings. A released snapshot may have an
-            // older derived name-index version, which must not be rebuilt in source.
-            var txn = try catalog.store.beginReadTxn();
-            defer txn.abort();
-            var selected: ?@TypeOf(projection.tables[0]) = null;
-            for (projection.tables) |table| {
-                var binding = try @import("../system_catalog/storage.zig").getByIdLimited(a, &txn, local.common_group_ids.main_metadata_group_id, .table, table.table_id, 1024 * 1024);
-                defer if (binding) |*value| value.deinit();
-                const name = if (binding) |value| bound: {
-                    if (!std.mem.eql(u8, value.value.storage_name, table.name)) return error.InvalidCatalogRecord;
-                    if (value.value.parent_id != local.system_catalog_domain.default_namespace_id) continue;
-                    if (value.value.native_service != null) return error.InvalidBackupRequest;
-                    break :bound value.value.name;
-                } else table.name;
-                if (!std.mem.eql(u8, name, table_name)) continue;
-                if (selected != null) return error.UnsupportedLiteInspectionLayout;
-                selected = table;
-            }
-            break :selected selected orelse return error.TableNotFound;
-        };
+        const table = projection.tables[logical_tables.get(table_name) orelse return error.TableNotFound];
         if (table.storage.engine != .local or table.storage_migration != null or table.lake_index_catalog_json.len != 0) return error.UnsupportedLiteInspectionLayout;
         if (!try jsonEqual(a, table.schema_json, schema_json) or !try emptyArray(a, table.replication_sources_json)) return error.InvalidBackupRequest;
         try requireIndexes(a, table.indexes_json, definition.indexes);
@@ -257,9 +244,32 @@ pub fn syncJsonAlloc(a: Allocator, input: []const u8, output: []const u8, select
         .inventory = .{ .documents = documents, .artifact_records = vectors, .shards = names.items.len },
     }, .{});
     errdefer a.free(json);
-    try std.Io.Dir.hardLink(.cwd(), temporary, .cwd(), output, io, .{});
-    staging.confirmPublishedFileDurability(io, output) catch return error.DurabilityOutcomeUnknown;
+    try publishOutput(io, temporary, output, staging.confirmPublishedFileDurability);
     return json;
+}
+
+// Inspect the directory entry itself: a dangling symlink also occupies --out.
+// This is only an early rejection; the final hard link arbitrates publication.
+fn requireAbsentOutput(io: std.Io, output: []const u8) !void {
+    _ = std.Io.Dir.cwd().statFile(io, output, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    return error.PathAlreadyExists;
+}
+
+fn publishOutput(io: std.Io, temporary: []const u8, output: []const u8, comptime confirmDurability: anytype) !void {
+    try std.Io.Dir.hardLink(.cwd(), temporary, .cwd(), output, io, .{});
+    confirmDurability(io, output) catch return error.DurabilityOutcomeUnknown;
+}
+
+fn insertLogicalTable(a: Allocator, tables: *std.StringHashMap(usize), name: []const u8, index: usize) ![]const u8 {
+    const entry = try tables.getOrPut(name);
+    if (entry.found_existing) return error.UnsupportedLiteInspectionLayout;
+    errdefer _ = tables.remove(name);
+    entry.key_ptr.* = try a.dupe(u8, name);
+    entry.value_ptr.* = index;
+    return entry.key_ptr.*;
 }
 
 fn destinationIdentity(index: usize) @TypeOf(connection.embeddedRootIdentity()) {
@@ -633,14 +643,15 @@ test "data sync rejects hidden producers and never replaces an existing output" 
     const output = try std.fs.path.join(a, &.{ root, "previous.aflite" });
     defer a.free(output);
     try createTestSource(a, input, true);
+    try std.testing.expectError(error.InvalidBackupRequest, syncJsonAlloc(a, input, output, "records", test_definition, .{}));
+    try std.testing.expectError(error.BackupInputLimitExceeded, syncJsonAlloc(a, input, output, "records", test_definition, .{ .max_input_bytes = 1 }));
     var previous = try std.Io.Dir.cwd().createFile(io, output, .{ .read = true, .exclusive = true });
     defer previous.close(io);
     try previous.writePositionalAll(io, "previous generation", 0);
-    try std.testing.expectError(error.InvalidBackupRequest, syncJsonAlloc(a, input, output, "records", test_definition, .{}));
+    try std.testing.expectError(error.PathAlreadyExists, syncJsonAlloc(a, input, output, "records", test_definition, .{}));
     var bytes: [19]u8 = undefined;
     try std.testing.expectEqual(@as(usize, bytes.len), try previous.readPositionalAll(io, &bytes, 0));
     try std.testing.expectEqualStrings("previous generation", &bytes);
-    try std.testing.expectError(error.BackupInputLimitExceeded, syncJsonAlloc(a, input, output, "records", test_definition, .{ .max_input_bytes = 1 }));
 }
 
 test "data sync fails closed on limits corruption and existing outputs" {
@@ -741,4 +752,93 @@ test "data sync stages all or selected tables atomically with aggregate limits" 
     const missing = "{\"tables\":{\"records\":" ++ test_definition ++ "}}";
     try std.testing.expectError(error.InvalidBackupRequest, syncJsonAlloc(a, input, output, "records,other", missing, .{}));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(io, output, .{}));
+}
+
+test "data sync rejects occupied output entries before opening the source" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const missing = try std.fs.path.join(a, &.{ root, "missing-source.aflite" });
+    defer a.free(missing);
+    const output = try std.fs.path.join(a, &.{ root, "occupied.aflite" });
+    defer a.free(output);
+    {
+        const file = try tmp.dir.createFile(io, "occupied.aflite", .{});
+        defer file.close(io);
+        try file.writePositionalAll(io, "existing generation", 0);
+    }
+    try std.testing.expectError(error.PathAlreadyExists, syncJsonAlloc(a, missing, output, "records", test_definition, .{}));
+    try tmp.dir.deleteFile(io, "occupied.aflite");
+    try tmp.dir.createDir(io, "occupied.aflite", .default_dir);
+    try std.testing.expectError(error.PathAlreadyExists, syncJsonAlloc(a, missing, output, "records", test_definition, .{}));
+    try tmp.dir.deleteDir(io, "occupied.aflite");
+    try tmp.dir.symLink(io, "missing-target.aflite", "occupied.aflite", .{});
+    try std.testing.expectError(error.PathAlreadyExists, syncJsonAlloc(a, missing, output, "records", test_definition, .{}));
+    try std.testing.expectEqual(.sym_link, (try tmp.dir.statFile(io, "occupied.aflite", .{ .follow_symlinks = false })).kind);
+    try tmp.dir.deleteFile(io, "occupied.aflite");
+    try std.testing.expectError(error.FileNotFound, syncJsonAlloc(a, missing, output, "records", test_definition, .{}));
+}
+
+test "data sync retains published output on durability failure and rejects a racing publisher" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const temporary = try std.fs.path.join(a, &.{ root, "temporary.aflite" });
+    defer a.free(temporary);
+    const output = try std.fs.path.join(a, &.{ root, "published.aflite" });
+    defer a.free(output);
+    {
+        const file = try tmp.dir.createFile(io, "temporary.aflite", .{});
+        defer file.close(io);
+        try file.writePositionalAll(io, "complete generation", 0);
+    }
+    const Failure = struct {
+        fn confirm(_: std.Io, _: []const u8) !void {
+            return error.InputOutput;
+        }
+    };
+    try requireAbsentOutput(io, output);
+    try std.testing.expectError(error.DurabilityOutcomeUnknown, publishOutput(io, temporary, output, Failure.confirm));
+    // Staging cleanup must not remove the published name, even without success.
+    try tmp.dir.deleteFile(io, "temporary.aflite");
+    const file = try tmp.dir.openFile(io, "published.aflite", .{});
+    defer file.close(io);
+    var bytes: [19]u8 = undefined;
+    try std.testing.expectEqual(bytes.len, try file.readPositionalAll(io, &bytes, 0));
+    try std.testing.expectEqualStrings("complete generation", &bytes);
+    try std.testing.expectError(error.PathAlreadyExists, requireAbsentOutput(io, output));
+    {
+        const competing = try tmp.dir.createFile(io, "temporary.aflite", .{});
+        defer competing.close(io);
+        try competing.writePositionalAll(io, "competing generation", 0);
+    }
+    // A publisher that passed its earlier check still cannot replace this file.
+    try std.testing.expectError(error.PathAlreadyExists, publishOutput(io, temporary, output, Failure.confirm));
+    try std.testing.expectEqual(bytes.len, try file.readPositionalAll(io, &bytes, 0));
+    try std.testing.expectEqualStrings("complete generation", &bytes);
+}
+
+test "data sync logical name map owns names and rejects duplicate bindings" {
+    const a = std.testing.allocator;
+    var tables: std.StringHashMap(usize) = .init(a);
+    defer {
+        var keys = tables.keyIterator();
+        while (keys.next()) |key| a.free(key.*);
+        tables.deinit();
+    }
+    for (0..256) |index| {
+        const transient = try std.fmt.allocPrint(a, "table-{d}", .{index});
+        defer a.free(transient);
+        _ = try insertLogicalTable(a, &tables, transient, index);
+    }
+    try std.testing.expectEqual(@as(usize, 255), tables.get("table-255").?);
+    try std.testing.expectError(error.UnsupportedLiteInspectionLayout, insertLogicalTable(a, &tables, "table-0", 256));
+    try std.testing.expectEqual(@as(usize, 0), tables.get("table-0").?);
+    try std.testing.expectEqual(@as(u32, 256), tables.count());
 }

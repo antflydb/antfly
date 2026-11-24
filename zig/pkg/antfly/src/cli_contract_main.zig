@@ -41,6 +41,11 @@ export fn antfly_backup_preflight(_: *const anyopaque) callconv(.c) c_int {
     return 3;
 }
 export fn antfly_backup_preflight_free(_: [*]u8, _: usize) callconv(.c) void {}
-export fn antfly_data_sync(_: *const anyopaque) callconv(.c) c_int {
-    return 3;
+export fn antfly_data_sync(context: *const @import("standalone/restore_staging_bridge.zig").DataSyncContext) callconv(.c) c_int {
+    const bridge = @import("standalone/restore_staging_bridge.zig");
+    const input = context.input_ptr[0..context.input_len];
+    // Exercise the real linked CLI's error handling without starting storage.
+    if (std.mem.eql(u8, input, "fixture-durability-unknown.aflite")) return bridge.Status.durability_outcome_unknown;
+    if (std.mem.eql(u8, input, "fixture-path-exists.aflite")) return bridge.Status.path_already_exists;
+    return bridge.Status.failed;
 }

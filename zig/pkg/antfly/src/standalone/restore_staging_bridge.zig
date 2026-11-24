@@ -37,6 +37,8 @@ pub const Status = struct {
     pub const unsupported_index: c_int = 4;
     pub const unsupported_schema: c_int = 5;
     pub const unsupported_migration: c_int = 6;
+    pub const durability_outcome_unknown: c_int = 7;
+    pub const path_already_exists: c_int = 8;
 };
 
 pub const Result = extern struct {
@@ -218,8 +220,28 @@ pub fn syncDataJsonAlloc(allocator: std.mem.Allocator, input: []const u8, output
         .result_ptr = &ptr,
         .result_len = &len,
     });
-    if (status != Status.ok) return if (status == Status.out_of_memory) error.OutOfMemory else error.InvalidBackupRequest;
+    try checkSyncStatus(status);
     const bytes = (ptr orelse return error.InvalidBackupRequest)[0..len];
     defer antfly_backup_preflight_free(bytes.ptr, bytes.len);
     return allocator.dupe(u8, bytes);
+}
+
+/// Keep publication outcomes distinct across the storage/CLI codegen boundary.
+pub fn syncErrorStatus(err: anyerror) c_int {
+    return switch (err) {
+        error.OutOfMemory => Status.out_of_memory,
+        error.DurabilityOutcomeUnknown => Status.durability_outcome_unknown,
+        error.PathAlreadyExists => Status.path_already_exists,
+        else => Status.failed,
+    };
+}
+
+pub fn checkSyncStatus(status: c_int) !void {
+    return switch (status) {
+        Status.ok => {},
+        Status.out_of_memory => error.OutOfMemory,
+        Status.durability_outcome_unknown => error.DurabilityOutcomeUnknown,
+        Status.path_already_exists => error.PathAlreadyExists,
+        else => error.InvalidBackupRequest,
+    };
 }
