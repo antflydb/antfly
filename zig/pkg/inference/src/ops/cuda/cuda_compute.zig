@@ -19894,6 +19894,10 @@ const ReplayArenaStatus = enum { ready, stale, borrowed };
 fn cudaGraphReplayArenaStatus(self: *CudaCompute, slot: *const CudaGraphReplaySlot) ReplayArenaStatus {
     while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
     defer self.temp_buffer_mutex.unlock();
+    return cudaGraphReplayArenaStatusUnlocked(self, slot, true);
+}
+
+fn cudaGraphReplayArenaStatusUnlocked(self: *CudaCompute, slot: *const CudaGraphReplaySlot, comptime check_trace: bool) ReplayArenaStatus {
     if (slot.temp_arena_generation == 0 or slot.temp_arena_generation != self.temp_arena_generation) return .stale;
 
     // Matching lengths do not imply matching addresses. Check the captured
@@ -19905,35 +19909,30 @@ fn cudaGraphReplayArenaStatus(self: *CudaCompute, slot: *const CudaGraphReplaySl
             if (!pinnedTempReplayRangeIdle(self, start, slot.captured_temp_allocation_count)) return .borrowed;
         }
     }
-    if (self.temp_slot_config.autoplan_enabled and !self.temp_arena_planner.canGraphReplay(
+    if (check_trace and self.temp_slot_config.autoplan_enabled and !self.temp_arena_planner.canGraphReplay(
         self.temp_trace_seq,
         slot.captured_temp_allocation_count,
     )) return .stale;
     return .ready;
 }
 
-fn noteCapturedTempAllocationsReplayed(self: *CudaCompute, allocation_count: usize) !void {
-    // Host allocation calls inside the graph do not run during replay. Advance
-    // the logical sequence and reconstruct their learned lengths so uncaptured
-    // tail work maps to the same pinned slots and the complete iteration is
-    // validated at its next boundary.
-    while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
-    defer self.temp_buffer_mutex.unlock();
-    if (self.temp_slot_config.autoplan_enabled and
-        !self.temp_arena_planner.markGraphReplay(self.temp_trace_seq, allocation_count))
-    {
-        return error.InvalidCudaState;
-    }
-    self.temp_trace_seq +%= allocation_count;
-}
-
 fn launchPersistentDecodeGraph(self: *CudaCompute, slot: *CudaGraphReplaySlot, exec: driver_mod.CUgraphExec) !void {
-    // Submission and replay accounting are one publication boundary. Any
-    // failure retires the exec and propagates without replaying eager work.
+    // Any failure retires the exec and propagates without replaying eager work.
     errdefer resetCudaGraphReplaySlotMetadata(self, slot);
-    try self.ctx.launchGraph(exec);
+    {
+        while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.temp_buffer_mutex.unlock();
+        // Recheck physical custody at submission and account for the host
+        // allocation calls skipped by replay before the graph can write.
+        if (cudaGraphReplayArenaStatusUnlocked(self, slot, false) != .ready) return error.InvalidCudaState;
+        const count = slot.captured_temp_allocation_count;
+        if (self.temp_slot_config.autoplan_enabled and
+            !self.temp_arena_planner.markGraphReplay(self.temp_trace_seq, count)) return error.InvalidCudaState;
+        errdefer if (self.temp_slot_config.autoplan_enabled) self.temp_arena_planner.markPinnedValidationFailure();
+        try self.ctx.launchGraph(exec);
+        self.temp_trace_seq +%= count;
+    }
     self.debug_cuda_graph_prepared_output_kind = .tensor;
-    try noteCapturedTempAllocationsReplayed(self, slot.captured_temp_allocation_count);
     if (slot.decode_scalars_auto_advance) markDecodeScalarsDeviceMatchesHost(self);
     self.stats.cuda_graph_capture_replays += 1;
     self.stats.cuda_graph_capture_persistent_replays += 1;
@@ -19982,11 +19981,11 @@ test "CUDA replay retains input storage while retiring an exec at its addressabl
     try std.testing.expectEqualSlices(f32, &.{ 7, 7, 7, 7 }, &actual);
     try std.testing.expectEqual(@as(usize, 1), compute.stats.cuda_graph_capture_capacity_skips);
 
-    // The graph submits successfully, then the learned address trace rejects
-    // its interval. Retire the exec before the caller can reuse the slot.
+    // A rejected learned trace must retire the exec without submitting it.
     try compute.kernels.launchFillF32(&compute.ctx, slot.inputStorage(), 4, 0);
     slot.exec = try compute.ctx.instantiateGraph(graph);
     slot.valid = true;
+    slot.temp_arena_generation = compute.temp_arena_generation;
     compute.temp_slot_config.autoplan_enabled = true;
     const successful_replays = compute.stats.cuda_graph_capture_persistent_replays;
     try std.testing.expectError(error.InvalidCudaState, launchPersistentDecodeGraph(&compute, slot, slot.exec));
@@ -19994,7 +19993,7 @@ test "CUDA replay retains input storage while retiring an exec at its addressabl
     try std.testing.expectEqual(successful_replays, compute.stats.cuda_graph_capture_persistent_replays);
     try slot.inputStorage().copyToHost(&compute.ctx, std.mem.sliceAsBytes(&actual));
     try compute.ctx.synchronize();
-    try std.testing.expectEqualSlices(f32, &.{ 7, 7, 7, 7 }, &actual);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0, 0, 0 }, &actual);
 
     const FailSecondAllocation = struct {
         var original_alloc: @FieldType(driver_mod.CudaDriver.Table, "cuMemAlloc") = undefined;
