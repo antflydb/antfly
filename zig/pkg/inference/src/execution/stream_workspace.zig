@@ -174,7 +174,10 @@ pub const Scope = struct {
             (pointer >= self.base and pointer - self.base < peak));
     }
     pub fn allocate(self: *Scope, bytes: usize) !DevicePointer {
-        if (!self.valid or self.cursor == self.plan.event_count) return error.AudioPlanChanged;
+        if (!self.valid or self.cursor == self.plan.event_count) {
+            self.valid = false;
+            return error.AudioPlanChanged;
+        }
         if (self.requires_published_output and self.published_ptr == 0) {
             self.valid = false;
             return error.AudioPlanChanged;
@@ -230,6 +233,8 @@ test "LightOnOCR3 CUDA closed execution arena rejects live buffers and event dri
     scope.release(b);
     scope.release(c);
     try std.testing.expect(scope.complete());
+    try std.testing.expectError(error.AudioPlanChanged, scope.allocate(256));
+    try std.testing.expect(!scope.complete());
     var changed = Scope{ .plan = p, .base = 10000 };
     _ = try changed.allocate(256);
     try std.testing.expectError(error.AudioPlanChanged, changed.allocate(256));
