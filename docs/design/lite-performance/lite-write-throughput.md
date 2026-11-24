@@ -82,37 +82,49 @@ Readers must not treat the slot as a visibility signal before the fsync: the
 shared region's durable watermark, published after the fsync, stays the live
 signal; the slot is read only by cold opens, which run the verification.
 
-### 3. Lease release before the durability wait for indexed writes (blocked)
+### 3. Indexed writes overlap their durability wait (done)
 
-The lease is held across the wait because the full-text install runs after
-it on the writer's runtime, and the group leader stages commit participants
-(full-text `stage`) inside `Ticket.wait`.
+#1793 made graph, sparse and dense writes yield the writer lane during the
+wait and complete through the group leader (`commit_participant.Queued`).
+It stalled under runtime replacement: a maintenance turn's forwarded writes
+mark the serving runtime stale, the next lane holder replaced it, and a
+resuming write failed with `EnrichmentSourceChanged` (or, tolerated, drove
+its group after another file took the lease). Fixed by:
 
-Tried: the leader installs each member's text publication once the group is
-durable (a thread-local after-commit list opened by
-`driveMutationCoordinator`, entries dropped for members whose apply failed),
-and the writer releases the lease before waiting when every index served it
-inline. The leader install alone passes. With the release, an 8-thread run
-retired a root while a write's derived backlog admission was still reserved
-(fixed by not committing the admission for inline-served writes), and then
-still failed: 2 of 5 thread runs returned one stale search result, dense hit
-`InvalidNativeAllocator`, and throughput fell (Debug 247-334 vs 463 writes/s).
-Something else on the post-wait path still depends on holding the lease;
-finding it comes before another attempt.
+- draining the outgoing store before the replacement opens, so the
+  replacement loads every queued group from the file;
+- letting a write with nothing left on its runtime return without taking
+  the lane back (taking it back cost thread mode a second lane crossing);
+- full-text joining the queued participants: the leader installs the text
+  publication once durable, only try-locking the index guard (the leader may
+  hold it further up its own stack), and the writer releases the guard as
+  soon as the publication is prepared;
+- a level-0 soft cap where writers merge (`max_pending_segments`) and a hard
+  cap twice that for inline writes, so a write at the cap whose merge is
+  already running elsewhere stays inline instead of paying the replay path.
 
-### 4. Cheap level-0 records
+### 4. Level-0 as a memtable
 
-Today a level-0 record (`l0/<first version>`) is a complete segment: built by
-the full segment writer (term dictionary, postings, doc values, versions,
-sections), then installed as a new `SegmentReader`, and later merged with
-the others.
+Measured (Debug, 8 threads): of ~340 µs of inline preparation per write,
+~200 µs encodes the level-0 segment and ~57 µs analyzes the text; install
+adds ~90 µs of catalog-mirror sync and ~90 µs publishing the segment; and
+every write's segment is merged again later.
 
-New: a level-0 record is postings only: per field, sorted terms with
-`(doc, version, frequency, positions)`, plus the copies' keys and versions.
-An index keeps its level-0 records in one in-memory level-0 set; queries read
-it beside the segments; the merge scheduler folds the set into a segment
-when it reaches a size or count bound, in one bounded step. Install appends
-to the set instead of publishing a new segment.
+Design (the LSM memtable, as FTS5's pending-terms buffer):
+
+- Per full-text index, an in-memory mutable buffer of postings
+  (term -> (doc, version, frequency, positions)) and stored-field refs.
+  A write tokenizes into it: no segment is encoded.
+- The commit records only `l0/<version> -> (key, version)` lists. Recovery
+  and cross-process refresh rebuild the buffer from them, re-analyzing each
+  listed document from the primary store when its version is still current
+  at the tip (an overwritten version is dead and skipped).
+- Queries read the buffer beside the segments: a buffer reader implementing
+  the segment reader interface over the mutable postings, snapshotted per
+  query by a generation counter.
+- A bounded flush (size or count) encodes the buffer into one segment and
+  deletes the records it covers in the same commit, replacing per-write
+  level-0 segments and most merges.
 
 ### 5. Bounded merges outside the lease
 
@@ -135,8 +147,8 @@ record by record, a refresh costs what changed, and writes can use it.
 | change | state |
 |---|---|
 | 1. full_index fast path, merging at the cap | committed |
-| 2. one fsync per commit | designed; after 3 |
-| 3. lease release for indexed writes | tried, stale results; blocked |
-| 4. cheap level-0 records | planned |
-| 5. bounded merges outside the lease | planned |
-| 6. incremental writer refresh | after 4 |
+| 2. one fsync per commit | designed; after 4 |
+| 3. indexed writes overlap their wait (group commit) | committed |
+| 4. level-0 memtable | designed |
+| 5. bounded merges outside the lease | after 4 (the flush is the bounded merge) |
+| 6. incremental writer refresh | after 4 (the buffer rebuild is the refresh) |
