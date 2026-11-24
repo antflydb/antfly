@@ -20304,6 +20304,8 @@ fn debugCudaGraphCaptureEnd(ctx: *anyopaque, replay: bool) !void {
         self.temp_trace_seq - self.debug_cuda_graph_capture_temp_seq_begin
     else
         0;
+    const captured_temp_slot_start = pinnedTempSlotIndex(self, self.debug_cuda_graph_capture_temp_seq_begin);
+    const scratch_can_persist = captured_temp_allocation_count == 0 or captured_temp_slot_start != null;
     const captured_attention_topology = generatedGqaAttentionTopology(self, self.debug_cuda_graph_decode_kv_seq_len);
     const attention_topology_stable = std.mem.eql(
         u8,
@@ -20348,10 +20350,12 @@ fn debugCudaGraphCaptureEnd(ctx: *anyopaque, replay: bool) !void {
     if (replay) {
         if (!capture_was_disabled) {
             const slot = &self.debug_cuda_graph_slots[slot_idx];
-            if (cudaDebugGraphPersistentReplayEnabled(self) or cudaDebugGraphCaptureUpdateExecEnabled(self)) {
+            // An ordinary-cache scratch address can finish this recorded
+            // invocation, but cannot become a persistent graph dependency.
+            if (scratch_can_persist and (cudaDebugGraphPersistentReplayEnabled(self) or cudaDebugGraphCaptureUpdateExecEnabled(self))) {
                 slot.temp_arena_generation = self.temp_arena_generation;
                 slot.captured_temp_allocation_count = captured_temp_allocation_count;
-                slot.captured_temp_slot_start = pinnedTempSlotIndex(self, self.debug_cuda_graph_capture_temp_seq_begin);
+                slot.captured_temp_slot_start = captured_temp_slot_start;
                 try replayCapturedDebugGraphWithUpdate(self, slot_idx, graph);
                 // Updating an exec may replace all of its addresses. Retire
                 // previous owners only after their last launch has completed.
