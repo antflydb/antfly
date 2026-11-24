@@ -21,7 +21,7 @@ const ComputeBackend = ops.ComputeBackend;
 const gpt_mod = @import("../models/gpt.zig");
 const gpt_arch = @import("../architectures/gpt.zig");
 const decoder_forward = @import("decoder_forward.zig");
-const state_mod = @import("../graph/decode_state_runtime.zig");
+const state_mod = @import("decode_state_runtime.zig");
 const NativeDecodeState = state_mod.NativeDecodeState;
 const BorrowedDecodeStateRuntime = state_mod.BorrowedDecodeStateRuntime;
 

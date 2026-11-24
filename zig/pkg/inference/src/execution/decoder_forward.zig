@@ -26,7 +26,7 @@ const graph_mod = @import("../graph/root.zig");
 const metal_runtime = @import("../backends/metal_runtime.zig");
 const decoder_gated_runtime = @import("../backends/decoder_gated_runtime.zig");
 const BorrowedDecodeStateRuntime = graph_mod.decode_state_runtime.BorrowedDecodeStateRuntime;
-const NativeDecodeState = @import("../graph/decode_state_runtime.zig").NativeDecodeState;
+const NativeDecodeState = @import("decode_state_runtime.zig").NativeDecodeState;
 const runWithDecoderRuntimeResetBoundary = decoder_step_executor.runWithDecoderRuntimeResetBoundary;
 
 pub const ForwardAllWithHiddenHost = struct {

@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const gpt_arch = @import("../architectures/gpt.zig");
-const model_runtime = @import("../graph/model_runtime.zig");
+const model_runtime = @import("../execution/model_runtime.zig");
 const gpt_mod = @import("../models/gpt.zig");
 const ops = @import("../ops/ops.zig");
 const c_std = std.c;

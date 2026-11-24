@@ -14,8 +14,8 @@
 // limitations under the License.
 
 const std = @import("std");
-const Cleanup = @import("../execution/cleanup_context.zig").Context;
-const cache_mod = @import("cache.zig");
+const Cleanup = @import("cleanup_context.zig").Context;
+const cache_mod = @import("../graph/cache.zig");
 const gpt_arch = @import("../architectures/gpt.zig");
 const gpt_mod = @import("../models/gpt.zig");
 const platform = @import("antfly_platform");
@@ -709,7 +709,7 @@ pub const NativeDecodeState = struct {
                 // This function will own KV/graph mutexes below. Its genuine
                 // local B is reserved before either lock and seals only after
                 // the recursive typed teardown has released ALL those locks.
-                var local = try @import("../execution/cleanup_owner.zig").Owner.beginOutsideCleanup();
+                var local = try @import("cleanup_owner.zig").Owner.beginOutsideCleanup();
                 defer local.finishAfterUnlock();
                 const kv_current: Cleanup = .{ .boundary = try local.outsideCleanupEpoch() };
                 // Only our KV/graph critical section needs this local B. Raw

@@ -22,7 +22,7 @@ const compiled_backend = @import("compiled_backend.zig");
 const metal_capabilities = @import("metal_capabilities.zig");
 const metal_executor = if (build_options.enable_metal) @import("metal_executor.zig") else struct {};
 const metal_partition_executor = @import("metal_partition_executor.zig");
-const model_runtime = @import("model_runtime.zig");
+const model_runtime = @import("../execution/model_runtime.zig");
 const multi_executor = @import("multi_executor.zig");
 const partition_mod = @import("partition.zig");
 

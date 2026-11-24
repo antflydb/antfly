@@ -14,15 +14,15 @@
 // limitations under the License.
 
 const std = @import("std");
-const cache_mod = @import("cache.zig");
+const cache_mod = @import("../graph/cache.zig");
 const activations = @import("../backends/activations.zig");
 const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const Interruption = @import("../execution_control.zig").Interruption;
 const UninterruptibleGuard = @import("../execution_control.zig").UninterruptibleGuard;
 const ops = @import("../ops/ops.zig");
-const contracts = @import("backend_contracts.zig");
+const contracts = @import("../graph/backend_contracts.zig");
 const CloseScope = @import("../backends/session.zig").Session.CloseScope;
-const CleanupContext = @import("../execution/cleanup_context.zig").Context;
+const CleanupContext = @import("cleanup_context.zig").Context;
 
 /// Backend-owned model runtime state.
 ///
@@ -153,13 +153,13 @@ pub const ModelRuntime = struct {
         if (backend) |target| if (current.operation != null) {
             _ = try current.operationFor(&target);
         };
-        try @import("../execution/backend_operation.zig").callOpaque(backend, current.operation, finish, .{ self.ptr, current });
+        try @import("backend_operation.zig").callOpaque(backend, current.operation, finish, .{ self.ptr, current });
     }
 
     pub fn resetWithCleanup(self: *ModelRuntime, current: CleanupContext) !void {
         if (self.vtable.cold_cleanup_services) |services| {
             if (services.accepts(self.vtable)) if (services.reset) |reset_fn| {
-                return @import("../execution/backend_operation.zig").callOpaque(self.operationBackend(), current.operation, reset_fn, .{ self.ptr, current });
+                return @import("backend_operation.zig").callOpaque(self.operationBackend(), current.operation, reset_fn, .{ self.ptr, current });
             };
         }
         return self.resetWithOperation(current.operation);
@@ -167,8 +167,8 @@ pub const ModelRuntime = struct {
     pub fn reset(self: *ModelRuntime) !void {
         return self.resetWithOperation(null);
     }
-    pub fn resetWithOperation(self: *ModelRuntime, borrowed: ?@import("../execution/backend_operation.zig").Borrowed) !void {
-        if (self.vtable.reset) |reset_fn| try @import("../execution/backend_operation.zig").callOpaque(self.operationBackend(), borrowed, reset_fn, .{self.ptr});
+    pub fn resetWithOperation(self: *ModelRuntime, borrowed: ?@import("backend_operation.zig").Borrowed) !void {
+        if (self.vtable.reset) |reset_fn| try @import("backend_operation.zig").callOpaque(self.operationBackend(), borrowed, reset_fn, .{self.ptr});
     }
 
     pub fn prepare(
@@ -183,7 +183,7 @@ pub const ModelRuntime = struct {
         else
             UninterruptibleGuard{};
         defer hard_cancellation.deinit();
-        const prepared = try @import("../execution/backend_operation.zig").callOpaque(self.operationBackend(), request.backend_operation, prepare_fn, .{ self.ptr, allocator, request });
+        const prepared = try @import("backend_operation.zig").callOpaque(self.operationBackend(), request.backend_operation, prepare_fn, .{ self.ptr, allocator, request });
         try request.check();
         return prepared;
     }
@@ -219,7 +219,7 @@ pub const ModelRuntime = struct {
         else
             UninterruptibleGuard{};
         defer hard_cancellation.deinit();
-        var output = try @import("../execution/backend_operation.zig").callOpaque(self.operationBackend(), request.backend_operation, self.vtable.prefill, .{ self.ptr, allocator, request });
+        var output = try @import("backend_operation.zig").callOpaque(self.operationBackend(), request.backend_operation, self.vtable.prefill, .{ self.ptr, allocator, request });
         self.retainOutputOwner(&output);
         errdefer output.deinitWithCleanup(allocator, .{ .boundary = request.cleanup_epoch, .operation = request.backend_operation });
         try request.check();
@@ -238,7 +238,7 @@ pub const ModelRuntime = struct {
         else
             UninterruptibleGuard{};
         defer hard_cancellation.deinit();
-        var output = try @import("../execution/backend_operation.zig").callOpaque(self.operationBackend(), request.backend_operation, decode_fn, .{ self.ptr, allocator, request });
+        var output = try @import("backend_operation.zig").callOpaque(self.operationBackend(), request.backend_operation, decode_fn, .{ self.ptr, allocator, request });
         self.retainOutputOwner(&output);
         errdefer output.deinitWithCleanup(allocator, .{ .boundary = request.cleanup_epoch, .operation = request.backend_operation });
         try request.check();
@@ -257,7 +257,7 @@ pub const ModelRuntime = struct {
         else
             UninterruptibleGuard{};
         defer hard_cancellation.deinit();
-        var output = try @import("../execution/backend_operation.zig").callOpaque(self.operationBackend(), request.backend_operation, decode_greedy_fn, .{ self.ptr, allocator, request });
+        var output = try @import("backend_operation.zig").callOpaque(self.operationBackend(), request.backend_operation, decode_greedy_fn, .{ self.ptr, allocator, request });
         if (output.token_tensor != null and output.owner == null) {
             if (self.vtable.retain_output_owner) |retain| output.owner = retain(self.ptr);
         }
@@ -278,7 +278,7 @@ pub const ModelRuntime = struct {
         else
             UninterruptibleGuard{};
         defer hard_cancellation.deinit();
-        const output = try @import("../execution/backend_operation.zig").callOpaque(self.operationBackend(), request.decode.backend_operation, decode_sample_fn, .{ self.ptr, allocator, request });
+        const output = try @import("backend_operation.zig").callOpaque(self.operationBackend(), request.decode.backend_operation, decode_sample_fn, .{ self.ptr, allocator, request });
         try request.decode.check();
         return output;
     }
@@ -295,7 +295,7 @@ pub const ModelRuntime = struct {
     pub fn deinit(self: *ModelRuntime) void {
         self.deinitWithCleanup(.{ .outside_execution = true });
     }
-    pub fn deinitWithBoundary(self: *ModelRuntime, boundary: ?*const @import("../execution/retirement_sink.zig").Epoch) void {
+    pub fn deinitWithBoundary(self: *ModelRuntime, boundary: ?*const @import("retirement_sink.zig").Epoch) void {
         self.deinitWithCleanup(.{ .boundary = boundary });
     }
     pub fn deinitWithCleanup(self: *ModelRuntime, cleanup_context: CleanupContext) void {
@@ -343,7 +343,7 @@ pub const RequestFinish = struct {
         self: *RequestFinish,
         backend: *const ops.ComputeBackend,
         access: ?@import("../execution_control.zig").ExecutionAccess,
-        owner: ?*const @import("../execution/cleanup_owner.zig").Owner,
+        owner: ?*const @import("cleanup_owner.zig").Owner,
     ) !void {
         if (self.runtime == null) return;
         var scope = if (access) |lane| lane.acquireCleanupScope() else null;
@@ -462,7 +462,7 @@ pub const OutputOwner = struct {
     };
 
     /// Explicit owned capability; no epoch is retained for a later release.
-    pub fn releaseWithBoundary(self: OutputOwner, boundary: ?*const @import("../execution/retirement_sink.zig").Epoch) void {
+    pub fn releaseWithBoundary(self: OutputOwner, boundary: ?*const @import("retirement_sink.zig").Epoch) void {
         self.releaseWithCleanup(.{ .boundary = boundary });
     }
     pub fn releaseWithCleanup(self: OutputOwner, cleanup_context: CleanupContext) void {
@@ -552,7 +552,7 @@ pub const ModelOutput = struct {
         pub fn deinit(self: *PreparedTail) void {
             self.deinitWithCleanup(.{ .outside_execution = true });
         }
-        pub fn deinitWithBoundary(self: *PreparedTail, boundary: ?*const @import("../execution/retirement_sink.zig").Epoch) void {
+        pub fn deinitWithBoundary(self: *PreparedTail, boundary: ?*const @import("retirement_sink.zig").Epoch) void {
             self.deinitWithCleanup(.{ .boundary = boundary });
         }
         pub fn deinitWithCleanup(self: *PreparedTail, cleanup_context: CleanupContext) void {
@@ -579,7 +579,7 @@ pub const ModelOutput = struct {
     pub fn hostLogits(self: *ModelOutput, allocator: std.mem.Allocator) ![]const f32 {
         return self.hostLogitsWithCleanup(allocator, .{ .outside_execution = true });
     }
-    pub fn hostLogitsWithBoundary(self: *ModelOutput, allocator: std.mem.Allocator, boundary: ?*const @import("../execution/retirement_sink.zig").Epoch) ![]const f32 {
+    pub fn hostLogitsWithBoundary(self: *ModelOutput, allocator: std.mem.Allocator, boundary: ?*const @import("retirement_sink.zig").Epoch) ![]const f32 {
         return self.hostLogitsWithCleanup(allocator, .{ .boundary = boundary });
     }
     pub fn hostLogitsWithCleanup(self: *ModelOutput, allocator: std.mem.Allocator, cleanup_context: CleanupContext) ![]const f32 {
@@ -661,7 +661,7 @@ pub const ModelOutput = struct {
     pub fn deinit(self: *ModelOutput, allocator: std.mem.Allocator) void {
         self.deinitWithCleanup(allocator, .{ .outside_execution = true });
     }
-    pub fn deinitWithBoundary(self: *ModelOutput, allocator: std.mem.Allocator, boundary: ?*const @import("../execution/retirement_sink.zig").Epoch) void {
+    pub fn deinitWithBoundary(self: *ModelOutput, allocator: std.mem.Allocator, boundary: ?*const @import("retirement_sink.zig").Epoch) void {
         self.deinitWithCleanup(allocator, .{ .boundary = boundary });
     }
     pub fn deinitWithCleanup(self: *ModelOutput, allocator: std.mem.Allocator, cleanup_context: CleanupContext) void {
@@ -686,8 +686,8 @@ fn applyFinalLogitSoftcapInPlace(logits: []f32, softcap: f32) void {
 }
 
 pub const PrepareRequest = struct {
-    cleanup_epoch: ?*const @import("../execution/retirement_sink.zig").Epoch = null,
-    backend_operation: ?@import("../execution/backend_operation.zig").Borrowed = null,
+    cleanup_epoch: ?*const @import("retirement_sink.zig").Epoch = null,
+    backend_operation: ?@import("backend_operation.zig").Borrowed = null,
     execution_control: ?InferenceExecutionControl = null,
     /// Best-effort prompt/KV length hint. Backends may use this to prebuild
     /// shape-specific resources without mutating logical generation state.
@@ -699,13 +699,13 @@ pub const PrepareRequest = struct {
 };
 
 pub const PrefillRequest = struct {
-    cleanup_epoch: ?*const @import("../execution/retirement_sink.zig").Epoch = null,
-    backend_operation: ?@import("../execution/backend_operation.zig").Borrowed = null,
+    cleanup_epoch: ?*const @import("retirement_sink.zig").Epoch = null,
+    backend_operation: ?@import("backend_operation.zig").Borrowed = null,
     execution_control: ?InferenceExecutionControl = null,
     input_ids: []const i64,
     /// Synchronous device-row borrow, already scaled by the model adapter.
     /// IDs still carry PLE/position semantics. Providers explicitly opt in.
-    prepared_rows: ?@import("../execution/resident_rows.zig").Rows = null,
+    prepared_rows: ?@import("resident_rows.zig").Rows = null,
     seq_len: usize,
     query_seq_len: usize,
     attention_mode: cache_mod.AttentionMode,
@@ -757,8 +757,8 @@ pub const DecodeContinuation = struct {
 };
 
 pub const DecodeRequest = struct {
-    cleanup_epoch: ?*const @import("../execution/retirement_sink.zig").Epoch = null,
-    backend_operation: ?@import("../execution/backend_operation.zig").Borrowed = null,
+    cleanup_epoch: ?*const @import("retirement_sink.zig").Epoch = null,
+    backend_operation: ?@import("backend_operation.zig").Borrowed = null,
     execution_control: ?InferenceExecutionControl = null,
     token_id: i64,
     input_token_tensor: ?ops.CT = null,
@@ -792,7 +792,7 @@ pub const GreedyDecodeOutput = struct {
     pub fn deinit(self: *GreedyDecodeOutput) void {
         self.deinitWithCleanup(.{ .outside_execution = true });
     }
-    pub fn deinitWithBoundary(self: *GreedyDecodeOutput, boundary: ?*const @import("../execution/retirement_sink.zig").Epoch) void {
+    pub fn deinitWithBoundary(self: *GreedyDecodeOutput, boundary: ?*const @import("retirement_sink.zig").Epoch) void {
         self.deinitWithCleanup(.{ .boundary = boundary });
     }
     pub fn deinitWithCleanup(self: *GreedyDecodeOutput, cleanup_context: CleanupContext) void {
@@ -949,7 +949,7 @@ pub const ModelExecutor = struct {
     pub fn deinit(self: *ModelExecutor) void {
         self.deinitWithCleanup(.{ .outside_execution = true });
     }
-    pub fn deinitWithBoundary(self: *ModelExecutor, boundary: ?*const @import("../execution/retirement_sink.zig").Epoch) void {
+    pub fn deinitWithBoundary(self: *ModelExecutor, boundary: ?*const @import("retirement_sink.zig").Epoch) void {
         self.deinitWithCleanup(.{ .boundary = boundary });
     }
     pub fn deinitWithCleanup(self: *ModelExecutor, cleanup_context: CleanupContext) void {
@@ -1318,7 +1318,7 @@ test "ModelRuntime and ModelExecutor cold cleanup services preserve copied wrapp
             self.raw += 1;
         }
     };
-    var sink = try @import("../execution/retirement_sink.zig").Ref.create();
+    var sink = try @import("retirement_sink.zig").Ref.create();
     defer sink.release();
     var guard = try sink.enter();
     defer guard.finish();
@@ -1375,7 +1375,7 @@ test "OutputOwner forwards exact current cleanup epoch with ordinary release fal
             self.nonce = if (boundary) |value| value.nonce else 0;
         }
     };
-    var sink = try @import("../execution/retirement_sink.zig").Ref.create();
+    var sink = try @import("retirement_sink.zig").Ref.create();
     defer sink.release();
     var guard = try sink.enter();
     defer guard.finish();
@@ -1462,7 +1462,7 @@ fn modelOutputBoundaryCase(allocator: std.mem.Allocator) !void {
             return .{ .ptr = self, .release = releaseRaw, .cleanup_services = &owner_services, .begin_cleanup = begin };
         }
     };
-    var sink = try @import("../execution/retirement_sink.zig").Ref.create();
+    var sink = try @import("retirement_sink.zig").Ref.create();
     defer sink.release();
     var old = try sink.enter();
     old.finish();
@@ -1521,7 +1521,7 @@ test "Model runtime exported logits sanitize request header before parent stack 
         fn close(_: *anyopaque) void {}
         fn execute(allocator: std.mem.Allocator, backend: ops.ComputeBackend) !ModelOutput {
             var budget = @import("../runtime/tier/memory.zig").RunBudget.init(.{});
-            const context = @import("../execution/invocation_context.zig").Context{ .cleanup = .{} };
+            const context = @import("invocation_context.zig").Context{ .cleanup = .{} };
             var parent = @This(){ .backend = backend };
             parent.backend.call_context = &context;
             parent.backend.execution_budget = &budget;
@@ -1533,7 +1533,7 @@ test "Model runtime exported logits sanitize request header before parent stack 
     };
     Parent.callbacks = 0;
     var output = try Parent.execute(a, canonical);
-    var owner = try @import("../execution/cleanup_owner.zig").Owner.beginOutsideCleanup();
+    var owner = try @import("cleanup_owner.zig").Owner.beginOutsideCleanup();
     defer owner.finishAfterUnlock();
     const current = CleanupContext{ .boundary = owner.epoch() };
     defer output.deinitWithCleanup(a, current);
@@ -1549,8 +1549,8 @@ test "Model runtime exported logits sanitize request header before parent stack 
 
 fn modelRequestFinishCase(a: std.mem.Allocator) !void {
     const native = @import("../ops/native_compute.zig");
-    const operation = @import("../execution/backend_operation.zig");
-    const sink = @import("../execution/retirement_sink.zig");
+    const operation = @import("backend_operation.zig");
+    const sink = @import("retirement_sink.zig");
     var stable = try sink.Ref.create();
     defer stable.release();
     var guard = try stable.enter();
@@ -1562,7 +1562,7 @@ fn modelRequestFinishCase(a: std.mem.Allocator) !void {
     defer weights.lazy_weights.deinit(a);
     var compute = native.NativeCompute.init(a, &weights, null);
     defer compute.deinit();
-    var operation_owner: @import("../execution/operation_owner.zig").Owner = .{};
+    var operation_owner: @import("operation_owner.zig").Owner = .{};
     compute.shared_operation_owner = &operation_owner;
     defer compute.shared_operation_owner = null;
     var backend = compute.computeBackend();
@@ -1572,7 +1572,7 @@ fn modelRequestFinishCase(a: std.mem.Allocator) !void {
     _ = try scope.bindCleanupEpoch(&epoch);
     const token = scope.token() orelse return error.ExpectedActualNativeOperation;
     const current: CleanupContext = .{ .boundary = &epoch, .operation = token };
-    const invocation = @import("../execution/invocation_context.zig").Context{ .cleanup = current };
+    const invocation = @import("invocation_context.zig").Context{ .cleanup = current };
     backend.call_context = &invocation;
     const Probe = struct {
         backend: ops.ComputeBackend,

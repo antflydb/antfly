@@ -17,7 +17,7 @@
 //! sampling, token publication, EOS, grammar, streaming and scheduler progress.
 const std = @import("std");
 const ops = @import("../ops/ops.zig");
-const state_mod = @import("../graph/decode_state_runtime.zig");
+const state_mod = @import("decode_state_runtime.zig");
 const gated = @import("../backends/decoder_gated_runtime.zig");
 const model_mod = @import("../models/gpt.zig");
 const control_mod = @import("../execution_control.zig");

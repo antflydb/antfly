@@ -18,7 +18,7 @@
 //! retain its sequence state, prefix tensor and positions for that whole borrow.
 const std = @import("std");
 const CT = @import("../ops/ops.zig").CT;
-const State = @import("../graph/decode_state_runtime.zig").NativeDecodeState;
+const State = @import("decode_state_runtime.zig").NativeDecodeState;
 const StepItem = @import("../runtime/scheduler/native_generate.zig").StepItem;
 
 /// Resident projected prefix with axis-major three-axis rotary positions.

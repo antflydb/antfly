@@ -18030,9 +18030,9 @@ fn nativeAuthoredSourceFormatCase(cfg: gpt_arch.Config, packed_singles: bool, pa
     var manager = runtime.kv.manager.KvManager.init(a);
     defer manager.deinit();
     const pool = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 4, .num_kv_heads = @intCast(cfg.effectiveKVHeads()), .head_dim = @intCast(cfg.headDim()), .num_layers_packed = @intCast(cfg.num_hidden_layers) });
-    var state = @import("../graph/decode_state_runtime.zig").NativeDecodeState.initPaged(a, &manager, pool, null);
+    var state = @import("decode_state_runtime.zig").NativeDecodeState.initPaged(a, &manager, pool, null);
     defer state.deinit();
-    var logical = @import("../graph/decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&state);
+    var logical = @import("decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&state);
     try logical.appendPrefillChunk(1);
     var decode = logical.makeDecodeContext(1, 1);
     var input = try Tensor.initInt64(a, "input_ids", &.{ 1, 1 }, &.{2});
@@ -18054,9 +18054,9 @@ fn nativeAuthoredSourceFormatCase(cfg: gpt_arch.Config, packed_singles: bool, pa
     source = .{}; // Failed constructor was fully retired; start a new final-address owner.
     session.run_admission.?.limits.host_limit_bytes = host_peak;
     try call.prepareSourceInto(&source, session, &.{input}, a, .{ .native_call_policy = .in_process });
-    var reference = @import("../graph/decode_state_runtime.zig").NativeDecodeState.initPaged(a, &manager, pool, null);
+    var reference = @import("decode_state_runtime.zig").NativeDecodeState.initPaged(a, &manager, pool, null);
     defer reference.deinit();
-    var reference_logical = @import("../graph/decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&reference);
+    var reference_logical = @import("decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&reference);
     try reference_logical.appendPrefillChunk(1);
     const reference_decode = reference_logical.makeDecodeContext(1, 1);
     const expected = try gpt_arch.forward(cb, a, cfg, &.{2}, 1, 1, &reference_decode);
@@ -18205,7 +18205,7 @@ fn nativeAuthoredSourceFormatCase(cfg: gpt_arch.Config, packed_singles: bool, pa
     // evidence of a registered Native compiled serving provider.
     var raw = session;
     raw.run_admission = null;
-    const live = @import("../graph/live_model_executor.zig");
+    const live = @import("live_model_executor.zig");
     var executor = try live.createModelExecutor(a, raw, cfg, .f32, null);
     defer executor.deinit();
     var decoder = try executor.createRuntime(a);
@@ -18228,9 +18228,9 @@ fn nativeAuthoredSourceFormatCase(cfg: gpt_arch.Config, packed_singles: bool, pa
     // The public Runtime owns sixteen-token pages. Cross that independent
     // physical boundary too, using a new original-GPT reference sequence.
     if (cfg.family == .llama) {
-        var runtime_reference = @import("../graph/decode_state_runtime.zig").NativeDecodeState.initPaged(a, &manager, pool, null);
+        var runtime_reference = @import("decode_state_runtime.zig").NativeDecodeState.initPaged(a, &manager, pool, null);
         defer runtime_reference.deinit();
-        var runtime_logical = @import("../graph/decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&runtime_reference);
+        var runtime_logical = @import("decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&runtime_reference);
         try runtime_logical.appendPrefillChunk(1);
         var ref_decode = runtime_logical.makeDecodeContext(1, 1);
         const seed = try gpt_arch.forward(cb, a, cfg, &.{2}, 1, 1, &ref_decode);
@@ -19670,9 +19670,9 @@ test "native authored trace missing q k norm queries refuse maintained insertion
     var manager = runtime.kv.manager.KvManager.init(a);
     defer manager.deinit();
     const pool_id = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 4, .num_kv_heads = 1, .head_dim = 4 });
-    var state = @import("../graph/decode_state_runtime.zig").NativeDecodeState.initPaged(a, &manager, pool_id, null);
+    var state = @import("decode_state_runtime.zig").NativeDecodeState.initPaged(a, &manager, pool_id, null);
     defer state.deinit();
-    var logical = @import("../graph/decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&state);
+    var logical = @import("decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&state);
     try logical.appendPrefillChunk(1);
     const decode = logical.makeDecodeContext(1, 1);
     const before = try manager.gatherLayerKv(a, decode.kv_cache.?.sequence_id, 0, 1);
@@ -20041,7 +20041,7 @@ fn nativeDefinitionRuntimes148(a: std.mem.Allocator, expect_shared: bool) !void 
     var session = archSessionHandle(owner);
     var session_live = true;
     defer if (session_live) session.close();
-    const live = @import("../graph/live_model_executor.zig");
+    const live = @import("live_model_executor.zig");
     var executor = try live.createModelExecutor(a, session, cfg, .f32, null);
     var executor_live = true;
     defer if (executor_live) executor.deinit();
@@ -20053,7 +20053,7 @@ fn nativeDefinitionRuntimes148(a: std.mem.Allocator, expect_shared: bool) !void 
     const second_program = live.Testing.program(second).?;
     try std.testing.expectEqual(expect_shared, first_program.template == second_program.template);
     try std.testing.expect(first_program.selected.pool != second_program.selected.pool);
-    const definition: *@import("../graph/session_decoder.zig").Definition = @ptrCast(@alignCast(executor.ptr));
+    const definition: *@import("session_decoder.zig").Definition = @ptrCast(@alignCast(executor.ptr));
     try std.testing.expectEqual(@as(u64, if (expect_shared) 1 else 0), definition.native_template.stats.builds);
     try std.testing.expectEqual(@as(u64, if (expect_shared) 1 else 0), definition.native_template.stats.hits);
     var first_output = try first.prefill(a, .{ .input_ids = &.{2}, .seq_len = 1, .query_seq_len = 1, .attention_mode = .paged_prefill });
@@ -20175,14 +20175,14 @@ test "Native default large resident Q8 Runtime preserves original dispatcher fal
     var manager = runtime.kv.manager.KvManager.init(a);
     defer manager.deinit();
     const pool = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 4, .num_layers_packed = @intCast(cfg.num_hidden_layers), .num_kv_heads = @intCast(cfg.effectiveKVHeads()), .head_dim = @intCast(cfg.headDim()) });
-    var reference = @import("../graph/decode_state_runtime.zig").NativeDecodeState.initPaged(a, &manager, pool, null);
+    var reference = @import("decode_state_runtime.zig").NativeDecodeState.initPaged(a, &manager, pool, null);
     defer reference.deinit();
-    var logical = @import("../graph/decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&reference);
+    var logical = @import("decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&reference);
     try logical.appendPrefillChunk(1);
     const decode = logical.makeDecodeContext(1, 1);
     const expected = try gpt_arch.forward(cb, a, cfg, &.{2}, 1, 1, &decode);
     defer a.free(expected);
-    const live = @import("../graph/live_model_executor.zig");
+    const live = @import("live_model_executor.zig");
     var executor = try live.createModelExecutor(a, session, cfg, .f32, null);
     defer executor.deinit();
     var decoder = try executor.createRuntime(a);

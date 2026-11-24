@@ -225,7 +225,7 @@ pub const NativeHostState = struct {
     const Session = @import("../backends/session.zig").Session;
     const Config = @import("../models/gpt.zig").Config;
     const Geometry = @import("../models/qwen35_state_layout.zig").Layout;
-    const State = @import("../graph/decode_state_runtime.zig").NativeDecodeState;
+    const State = @import("decode_state_runtime.zig").NativeDecodeState;
     const Owner = @import("cleanup_owner.zig").Owner;
     const Control = @import("../execution_control.zig").InferenceExecutionControl;
     const Alignment = std.mem.Alignment.of(Gpt.Qwen35LinearLayerState);
@@ -387,7 +387,7 @@ test "Native recurrent cold backing keeps exact child pointers across reset and 
     defer if (live) owner.destroyAfterUnlock() catch unreachable;
     var other = try @import("cleanup_owner.zig").Owner.beginOutsideCleanup();
     defer other.finishAfterUnlock();
-    var state = @import("../graph/decode_state_runtime.zig").NativeDecodeState.initContiguous(a);
+    var state = @import("decode_state_runtime.zig").NativeDecodeState.initContiguous(a);
     var state_live = true;
     defer if (state_live) state.deinitWithCleanup(.{ .boundary = owner.cleanupOwner().epoch() }) catch unreachable;
     try std.testing.expectError(error.ForeignRecurrentStateCleanup, owner.adopt(&state, native_host_test_config, .{ .boundary = other.epoch() }));

@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const backends = @import("../backends/backends.zig");
-const cache_mod = @import("cache.zig");
+const cache_mod = @import("../graph/cache.zig");
 const decode_state_runtime = @import("decode_state_runtime.zig");
 const session_factory = @import("../architectures/session_factory.zig");
 const gpt_arch = @import("../architectures/gpt.zig");
@@ -23,8 +23,8 @@ const gpt_mod = @import("../models/gpt.zig");
 const ops = @import("../ops/ops.zig");
 const runtime = @import("../runtime/root.zig");
 const model_runtime = @import("model_runtime.zig");
-const decoder_forward = @import("../execution/decoder_forward.zig");
-const decoder_storage = @import("../execution/decoder_storage.zig");
+const decoder_forward = @import("decoder_forward.zig");
+const decoder_storage = @import("decoder_storage.zig");
 const session_decoder = @import("session_decoder.zig");
 
 /// Live whole-model executor for native sessions.
@@ -37,7 +37,7 @@ const session_decoder = @import("session_decoder.zig");
 const RuntimeContext = struct {
     allocator: std.mem.Allocator,
     cb: ops.ComputeBackend,
-    native_program: ?*@import("../execution/native_decoder_program.zig").Program = null,
+    native_program: ?*@import("native_decoder_program.zig").Program = null,
     native_program_attempted: bool = false,
     native_program_decline: ?anyerror = null,
     definition: *session_decoder.Definition,
@@ -99,9 +99,9 @@ const RuntimeContext = struct {
         errdefer ctx.decode_runtime.deinit();
         try ctx.decode_runtime.state.ensureQwen35LinearCache(gpt_config);
         if (cb.kind() == .native and kv_dtype == .f32) {
-            const program_context = @import("execution.zig").Context{ .allocator = allocator, .cb = &ctx.cb, .gpt_config = &ctx.definition.configuration.value, .session = session };
+            const program_context = @import("../graph/execution.zig").Context{ .allocator = allocator, .cb = &ctx.cb, .gpt_config = &ctx.definition.configuration.value, .session = session };
             ctx.native_program_attempted = true;
-            switch (try @import("../execution/native_decoder_program.zig").Program.prepareWithTemplate(allocator, &program_context, definition.nativeTemplateSlot(source))) {
+            switch (try @import("native_decoder_program.zig").Program.prepareWithTemplate(allocator, &program_context, definition.nativeTemplateSlot(source))) {
                 .prepared => |value| ctx.native_program = value,
                 .declined => |reason| ctx.native_program_decline = reason,
             }
@@ -112,7 +112,7 @@ const RuntimeContext = struct {
     fn resetState(self: *RuntimeContext) !void {
         return self.resetStateWithCleanup(.{});
     }
-    fn resetStateWithCleanup(self: *RuntimeContext, current: @import("../execution/cleanup_context.zig").Context) !void {
+    fn resetStateWithCleanup(self: *RuntimeContext, current: @import("cleanup_context.zig").Context) !void {
         if (comptime @import("build_options").enable_cuda) if (self.cb.kind() == .cuda) {
             const C = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
             if (current.boundary != null or current.outside_execution) try C.invalidateLightOnDecodeGraphWithCleanup(&self.cb, current) else C.invalidateLightOnDecodeGraph(&self.cb);
@@ -139,11 +139,11 @@ const RuntimeContext = struct {
     pub fn deinit(self: *RuntimeContext) void {
         self.deinitWithCleanup(.{ .outside_execution = true });
     }
-    pub fn deinitWithCleanup(self: *RuntimeContext, current: @import("../execution/cleanup_context.zig").Context) void {
+    pub fn deinitWithCleanup(self: *RuntimeContext, current: @import("cleanup_context.zig").Context) void {
         // The public raw outside close has no enclosing B. Create its actual
         // local owner before cleanup guards; seal only after those guards end.
         if (self.native_program != null and current.boundary == null and current.outside_execution) {
-            var owner = @import("../execution/cleanup_owner.zig").Owner.beginOutsideCleanup() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+            var owner = @import("cleanup_owner.zig").Owner.beginOutsideCleanup() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
             defer owner.finishAfterUnlock();
             self.deinitWithCleanup(.{ .boundary = owner.epoch() });
             return;
@@ -228,11 +228,11 @@ fn operationBackend(raw: *anyopaque) *const ops.ComputeBackend {
     const self: *RuntimeContext = @ptrCast(@alignCast(raw));
     return &self.cb;
 }
-fn runtimeDeinitWithCleanup(raw: *anyopaque, current: @import("../execution/cleanup_context.zig").Context) void {
+fn runtimeDeinitWithCleanup(raw: *anyopaque, current: @import("cleanup_context.zig").Context) void {
     const ctx: *RuntimeContext = @ptrCast(@alignCast(raw));
     ctx.deinitWithCleanup(current);
 }
-fn runtimeResetWithCleanup(raw: *anyopaque, current: @import("../execution/cleanup_context.zig").Context) !void {
+fn runtimeResetWithCleanup(raw: *anyopaque, current: @import("cleanup_context.zig").Context) !void {
     const ctx: *RuntimeContext = @ptrCast(@alignCast(raw));
     try ctx.resetStateWithCleanup(current);
 }
@@ -259,7 +259,7 @@ fn supportsBackend(backend: backends.BackendType) bool {
 
 /// Exact maintained runtime metadata; copied/custom tables are declined before
 /// any context cast. The owning caller excludes runtime destruction.
-pub fn authoredProgramStatistics(model: model_runtime.ModelRuntime) ?@import("../execution/native_decoder_program.zig").Program.Statistics {
+pub fn authoredProgramStatistics(model: model_runtime.ModelRuntime) ?@import("native_decoder_program.zig").Program.Statistics {
     if (model.vtable != &runtime_vtable) return null;
     const context: *RuntimeContext = @ptrCast(@alignCast(model.ptr));
     const program = context.native_program orelse return null;
@@ -268,19 +268,19 @@ pub fn authoredProgramStatistics(model: model_runtime.ModelRuntime) ?@import("..
 
 /// Explicit nonblocking metadata query on the ACTUAL retaining Definition.
 /// A Program retains only Template, never a caller-owned TemplateSlot pointer.
-fn constructionSnapshot(context: *const RuntimeContext) @import("../execution/diagnostics.zig").NativeProgramConstruction {
-    return .{ .outcome = if (context.native_program != null) .prepared else if (context.native_program_attempted) .declined else .not_attempted, .error_name = if (context.native_program_decline) |err| @import("../execution/diagnostics.zig").Text.init(@errorName(err)) else null };
+fn constructionSnapshot(context: *const RuntimeContext) @import("diagnostics.zig").NativeProgramConstruction {
+    return .{ .outcome = if (context.native_program != null) .prepared else if (context.native_program_attempted) .declined else .not_attempted, .error_name = if (context.native_program_decline) |err| @import("diagnostics.zig").Text.init(@errorName(err)) else null };
 }
 /// Explicit metadata query: actual retained Runtime constructor result, never
 /// a numerical invocation hit or a guessed reason for a coarse absence.
-pub fn authoredProgramConstruction(model: model_runtime.ModelRuntime) ?@import("../execution/diagnostics.zig").NativeProgramConstruction {
+pub fn authoredProgramConstruction(model: model_runtime.ModelRuntime) ?@import("diagnostics.zig").NativeProgramConstruction {
     if (model.vtable != &runtime_vtable) return null;
     const context: *RuntimeContext = @ptrCast(@alignCast(model.ptr));
     if (context.cb.kind() != .native) return null;
     return constructionSnapshot(context);
 }
 
-pub fn authoredDefinitionTemplateStatistics(model: model_runtime.ModelRuntime) ?@import("../execution/diagnostics.zig").NativeDefinitionTemplates {
+pub fn authoredDefinitionTemplateStatistics(model: model_runtime.ModelRuntime) ?@import("diagnostics.zig").NativeDefinitionTemplates {
     if (model.vtable != &runtime_vtable) return null;
     const context: *RuntimeContext = @ptrCast(@alignCast(model.ptr));
     if (context.cb.kind() != .native) return null;
@@ -419,7 +419,7 @@ fn forwardLastLogits(
     seq_len: usize,
     query_seq_len: usize,
     decode_context: *const gpt_arch.DecodeContext,
-    operation: @import("../execution/diagnostics.zig").Operation,
+    operation: @import("diagnostics.zig").Operation,
 ) ![]f32 {
     const selected = runtime_ctx.definition.session.invocation_diagnostics;
     if (selected) |binding| if (binding.diagnostics.isEnabled()) {
@@ -432,7 +432,7 @@ fn forwardLastLogits(
             const value = runtime_ctx.definition.native_template.tryStatistics();
             actual.native_definition_templates = .{ .availability = if (value != null) .sampled else .busy, .stats = value };
         }
-        return @import("../execution/invocation_observation.zig").callOperation(actual, operation, forwardLastLogitsUnobserved, .{ runtime_ctx, allocator, input_ids, seq_len, query_seq_len, decode_context });
+        return @import("invocation_observation.zig").callOperation(actual, operation, forwardLastLogitsUnobserved, .{ runtime_ctx, allocator, input_ids, seq_len, query_seq_len, decode_context });
     };
     return forwardLastLogitsUnobserved(runtime_ctx, allocator, input_ids, seq_len, query_seq_len, decode_context);
 }
@@ -554,7 +554,7 @@ test "native whole model recurrent state preserves chunked prefill decode and wa
 }
 
 pub const Testing = if (@import("builtin").is_test) struct {
-    pub fn program(instance: model_runtime.ModelRuntime) ?*@import("../execution/native_decoder_program.zig").Program {
+    pub fn program(instance: model_runtime.ModelRuntime) ?*@import("native_decoder_program.zig").Program {
         if (instance.vtable != &runtime_vtable) return null;
         const context: *RuntimeContext = @ptrCast(@alignCast(instance.ptr));
         return context.native_program;

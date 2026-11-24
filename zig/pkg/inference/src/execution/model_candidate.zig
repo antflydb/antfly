@@ -16,7 +16,7 @@
 //! Prepared opaque whole-model candidates share request, output and commit
 //! semantics while retaining each target's model executor and kernel schedules.
 const std = @import("std");
-const model_runtime = @import("../graph/model_runtime.zig");
+const model_runtime = @import("model_runtime.zig");
 
 pub const SessionExecutorOptions = struct {
     config: ?@import("../models/gpt.zig").Config = null,
@@ -37,7 +37,7 @@ pub fn createSessionExecutor(allocator: std.mem.Allocator, session: @import("../
         if (prefersSpecializedSession(session) and specialized.supportsSession(session))
             return try specialized.createModelExecutor(allocator, session, config, options.kv_dtype, options.shared_moe_cache);
     }
-    const live = @import("../graph/live_model_executor.zig");
+    const live = @import("live_model_executor.zig");
     if (!live.supportsSession(session)) return null;
     return try live.createModelExecutor(allocator, session, config, options.kv_dtype, options.shared_moe_cache);
 }

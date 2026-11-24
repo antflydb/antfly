@@ -43,7 +43,7 @@ const Partition = partition_mod.Partition;
 const DeviceId = @import("device_mesh.zig").DeviceId;
 
 const compiler = @import("pjrt_compiler.zig");
-const model_runtime = @import("model_runtime.zig");
+const model_runtime = @import("../execution/model_runtime.zig");
 
 fn pjrtExecDebugEnabled() bool {
     return std.c.getenv("TERMITE_PJRT_EXEC_DEBUG") != null;

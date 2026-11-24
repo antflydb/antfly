@@ -27,7 +27,7 @@ pub const CreateRuntime = *const fn (*Definition, std.mem.Allocator) anyerror!mo
 pub const Definition = struct {
     allocator: std.mem.Allocator,
     references: std.atomic.Value(usize) = .init(1),
-    native_template: @import("../execution/native_decoder_program.zig").TemplateSlot = .{},
+    native_template: @import("native_decoder_program.zig").TemplateSlot = .{},
     session: Session,
     configuration: gpt.OwnedConfig,
     kv_dtype: ?runtime.kv.pool.KvDType,
@@ -48,7 +48,7 @@ pub const Definition = struct {
     /// Share within one allocator lifetime; otherwise clone into the runtime's
     /// owner before retiring any request-scoped metadata or allocator state.
     pub fn acquireForRuntime(self: *Definition, allocator: std.mem.Allocator) !*Definition {
-        if (@import("../execution/program.zig").knownSameMetadataAllocator(allocator, self.allocator)) {
+        if (@import("program.zig").knownSameMetadataAllocator(allocator, self.allocator)) {
             const previous = self.references.fetchAdd(1, .acq_rel);
             std.debug.assert(previous != 0);
             return self;
@@ -59,12 +59,12 @@ pub const Definition = struct {
     /// Equality with a request allocator is not lifetime provenance. Only
     /// globally stable metadata allocators and an independently retained Model
     /// may share; clones and unknown wrappers keep original private preparation.
-    pub fn nativeTemplateSlot(self: *Definition, source: *Definition) ?*@import("../execution/native_decoder_program.zig").TemplateSlot {
+    pub fn nativeTemplateSlot(self: *Definition, source: *Definition) ?*@import("native_decoder_program.zig").TemplateSlot {
         if (self != source or self.model_retention == null) return null;
-        if (@import("../execution/program.zig").processMetadataAllocator(self.allocator)) return &self.native_template;
+        if (@import("program.zig").processMetadataAllocator(self.allocator)) return &self.native_template;
         if (comptime @import("builtin").is_test) {
             const allocator = std.testing.allocator;
-            if (@import("../execution/program.zig").knownSameMetadataAllocator(allocator, self.allocator)) return &self.native_template;
+            if (@import("program.zig").knownSameMetadataAllocator(allocator, self.allocator)) return &self.native_template;
         }
         return null;
     }
@@ -76,7 +76,7 @@ pub const Definition = struct {
     pub fn release(self: *Definition) void {
         self.releaseWithCleanup(.{ .outside_execution = true });
     }
-    pub fn releaseWithCleanup(self: *Definition, current: @import("../execution/cleanup_context.zig").Context) void {
+    pub fn releaseWithCleanup(self: *Definition, current: @import("cleanup_context.zig").Context) void {
         const previous = self.references.fetchSub(1, .acq_rel);
         std.debug.assert(previous != 0);
         if (previous != 1) return;
@@ -109,7 +109,7 @@ fn deinitExecutor(raw: *anyopaque) void {
 fn acceptsExecutorCleanup(table: *const model.ModelExecutor.VTable) bool {
     return table == &executor_vtable;
 }
-fn deinitExecutorWithCleanup(raw: *anyopaque, current: @import("../execution/cleanup_context.zig").Context) void {
+fn deinitExecutorWithCleanup(raw: *anyopaque, current: @import("cleanup_context.zig").Context) void {
     const self: *Definition = @ptrCast(@alignCast(raw));
     self.releaseWithCleanup(current);
 }

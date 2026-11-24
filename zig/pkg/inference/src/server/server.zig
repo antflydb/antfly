@@ -57579,7 +57579,7 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
                 {
                     var prefix = Work.Prefill{ .allocator = allocator, .decode_state = &state[1], .token_ids = &.{}, .seq_len = prefix_tokens, .query_seq_len = prefix_tokens, .wants_last_logits = true, .wants_greedy = true, .prepared_prefix = .{ .token_count = prefix_tokens, .positions = text_plan.?.mrope_positions, .embeddings = embeddings, .intermediate_layer_count = 0 } };
                     state[0].appendGeneratedTokenWithCleanup(.{ .boundary = actual.cleanup_owner.epoch(), .operation = cb.operationToken() }) catch |err| return failure(err, graph_enabled, "mixed_text_advance");
-                    var borrowed = @import("../graph/decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&state[0]);
+                    var borrowed = @import("../execution/decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&state[0]);
                     const context = borrowed.makeDecodeContext(state[0].total_tokens, 1);
                     var decode = Work.Decode{ .allocator = allocator, .decode_state = &state[0], .token_id = result.tokens[0][0], .seq_len = state[0].total_tokens, .wants_greedy = true, .remaining_tokens = tokens_per_page - 1, .continuation_context = &result };
                     const items = [_]Item{
@@ -57604,7 +57604,7 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
                     // legitimately bursts up to remaining_tokens. Both pages then rejoin
                     // the separate two-page17-choice decode/replay schedule.
                     state[1].appendGeneratedTokenWithCleanup(.{ .boundary = actual.cleanup_owner.epoch(), .operation = cb.operationToken() }) catch |err| return failure(err, graph_enabled, "text_peer_advance");
-                    var borrowed = @import("../graph/decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&state[1]);
+                    var borrowed = @import("../execution/decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&state[1]);
                     const context = borrowed.makeDecodeContext(state[1].total_tokens, 1);
                     var work = Work.Decode{ .allocator = allocator, .decode_state = &state[1], .token_id = result.tokens[1][0], .seq_len = state[1].total_tokens, .wants_greedy = true, .remaining_tokens = 1, .continuation_context = &result };
                     const items = [_]Item{.{ .work_ptr = &work, .phase = .decode, .query_sequence_len = 1, .total_sequence_len = state[1].total_tokens, .kv_sequence_len = context.kv_sequence_len, .kv_position_offset = context.kv_position_offset }};
@@ -57645,7 +57645,7 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
                     probe.phase = .advance;
                     probe.row = row;
                     state[row].appendGeneratedTokenWithCleanup(.{ .boundary = actual.cleanup_owner.epoch(), .operation = cb.operationToken() }) catch |err| return failure(err, graph_enabled, "advance");
-                    var borrowed = @import("../graph/decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&state[row]);
+                    var borrowed = @import("../execution/decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&state[row]);
                     const context = borrowed.makeDecodeContext(state[row].total_tokens, 1);
                     work[row] = .{ .allocator = allocator, .decode_state = &state[row], .token_id = result.tokens[row][count - 1], .seq_len = state[row].total_tokens, .wants_greedy = true, .remaining_tokens = tokens_per_page - count, .continuation_context = &result };
                     items[row] = .{ .work_ptr = &work[row], .phase = .decode, .query_sequence_len = 1, .total_sequence_len = state[row].total_tokens, .kv_sequence_len = context.kv_sequence_len, .kv_position_offset = context.kv_position_offset };

@@ -56275,7 +56275,7 @@ test "CUDA actual nonempty managed graph outside State cleanup refunds only afte
     const Memory = @import("../../runtime/tier/memory.zig");
     const Domain = @import("../../runtime/tier/admission_domain.zig").Domain;
     const Session = @import("../../backends/session.zig").Session;
-    const NativeState = @import("../../graph/decode_state_runtime.zig").NativeDecodeState;
+    const NativeState = @import("../../execution/decode_state_runtime.zig").NativeDecodeState;
     const Manager = @import("../../runtime/kv/manager.zig").KvManager;
     const Sink = @import("../../execution/retirement_sink.zig");
     var compute = try CudaCompute.testing.init(std.testing.allocator);
@@ -56376,7 +56376,7 @@ test "CUDA actual nonempty managed graph outside State cleanup refunds only afte
 
 test "CUDA NativeState teardown publishes KV retirement and preserves host owners until failed recurrent SDK root retries" {
     if (comptime !cuda_enabled) return error.SkipZigTest;
-    const StateRuntime = @import("../../graph/decode_state_runtime.zig");
+    const StateRuntime = @import("../../execution/decode_state_runtime.zig");
     const Manager = @import("../../runtime/kv/manager.zig").KvManager;
     const Sink = @import("../../execution/retirement_sink.zig");
     const a = std.testing.allocator;
@@ -56440,7 +56440,7 @@ test "CUDA NativeState teardown publishes KV retirement and preserves host owner
 
 test "CUDA persistent host-capable cache with actual raw recurrent producer keeps explicit outside NativeState cleanup available" {
     if (comptime !cuda_enabled) return error.SkipZigTest;
-    const NativeState = @import("../../graph/decode_state_runtime.zig").NativeDecodeState;
+    const NativeState = @import("../../execution/decode_state_runtime.zig").NativeDecodeState;
     const Manager = @import("../../runtime/kv/manager.zig").KvManager;
     const Memory = @import("../../runtime/tier/memory.zig");
     const a = std.testing.allocator;

@@ -20,7 +20,7 @@ Paths below are relative to `zig/pkg/inference/src/`.
 | `execution/executable.zig` | Preparation, reusable execution, output placement and optional diagnostics |
 | `execution/model_candidate.zig` | Admission and dispatch of specialized whole-model implementations |
 | `execution/physical_buffers.zig` | Assigned outputs, transfers, workspace and bounded invocation frames |
-| `graph/decode_state_runtime.zig` | KV/recurrent/paged state ownership and advancement |
+| `execution/decode_state_runtime.zig` | KV/recurrent/paged state ownership and advancement |
 
 `execution/root.zig` exposes the common `ModelProgram`, `prepare`, `Executable`
 and `BackendContext` boundary. Imported, directly constructed and traced graphs
@@ -478,7 +478,7 @@ preparation API do not by themselves complete these remaining requirements:
   model configuration is borrowed, avoiding a full metadata copy per step;
   cache keys canonicalize semantic fields, ignoring struct padding and prefix
   allocation addresses while hashing prefix bytes. Native and Metal whole-model
-  executors share `graph/session_decoder.zig` for immutable definition ownership.
+  executors share `execution/session_decoder.zig` for immutable definition ownership.
   Definitions own configuration slices and survive executor retirement. Runtimes
   share metadata within the same allocator lifetime or clone it into their own
   allocator before request allocator retirement; failed migration preserves the

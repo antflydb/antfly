@@ -144,7 +144,7 @@ const metal_tensor_mod = if (build_options.enable_metal) @import("../backends/me
 const tensor_mod = @import("../backends/tensor.zig");
 const weight_source_mod = @import("../models/weight_source.zig");
 const runtime_root = @import("../runtime/root.zig");
-const model_runtime = @import("../graph/model_runtime.zig");
+const model_runtime = @import("../execution/model_runtime.zig");
 const backend_contracts = @import("../graph/backend_contracts.zig");
 const metal_command_planner = @import("../graph/metal_command_planner.zig");
 const kernel_jit = @import("../graph/kernel_jit.zig");
@@ -55618,7 +55618,7 @@ test "metal_compute: checkpoint gated FFN matches CPU across prefill row counts"
     var gpu_runtime = try gpu_executor.createRuntime(a);
     defer gpu_runtime.deinit();
     _ = try gpu_runtime.prepare(a, .{ .kv_tokens_hint = 16 });
-    const request = @import("../graph/model_runtime.zig").PrefillRequest{ .input_ids = &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, .seq_len = 8, .query_seq_len = 8, .attention_mode = .paged_prefill, .force_host_logits = true };
+    const request = @import("../execution/model_runtime.zig").PrefillRequest{ .input_ids = &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, .seq_len = 8, .query_seq_len = 8, .attention_mode = .paged_prefill, .force_host_logits = true };
     var reference_output = try cpu_runtime.prefill(a, request);
     defer reference_output.deinit(a);
     var actual_output = try gpu_runtime.prefill(a, request);

@@ -48,7 +48,7 @@ const compiler = @import("pjrt_compiler.zig");
 const pjrt_executor = @import("pjrt_executor.zig");
 const pjrt_mesh = @import("pjrt_mesh.zig");
 const device_mesh_mod = @import("device_mesh.zig");
-const model_runtime_mod = @import("model_runtime.zig");
+const model_runtime_mod = @import("../execution/model_runtime.zig");
 
 const Tensor = @import("../backends/tensor.zig").Tensor;
 const LoadedWeight = @import("../models/weight_source.zig").LoadedWeight;
