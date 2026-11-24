@@ -8278,6 +8278,13 @@ fn archEmbeddingProgramForward(ptr: *anyopaque, cb: *const ops.ComputeBackend, a
 
 fn createProgramFrame(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror!ops.ComputeBackend {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    if (self.backend_type == .pjrt) {
+        // These frames load provider operands. XLA owns the matrix schedule.
+        return @import("../backends/compute_factory.zig").createNative(allocator, &self.backend_data.pjrt.native, null, self.io, .{
+            .observe_allocations = self.diagnostics.enabled.load(.acquire),
+            .prepare_native_weight_matrices = false,
+        });
+    }
     return makeComputeBackend(self, allocator, null);
 }
 fn importProgramInput(_: *anyopaque, cb: *const ops.ComputeBackend, input: *const Tensor, _: std.mem.Allocator) anyerror!ops.CT {

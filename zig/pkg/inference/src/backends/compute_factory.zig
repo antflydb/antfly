@@ -34,6 +34,7 @@ pub const NativePolicy = struct {
     borrow_bf16_linear_weights: bool = false,
     decoder_weight_prefix: []const u8 = "model",
     cache_bf16_weight_mirrors: bool = false,
+    prepare_native_weight_matrices: bool = true,
 };
 
 pub fn createNative(allocator: std.mem.Allocator, weights: *native.WeightStore, budget: ?*memory.RunBudget, io: ?std.Io, policy: NativePolicy) !ops.ComputeBackend {
@@ -73,6 +74,7 @@ pub fn createNative(allocator: std.mem.Allocator, weights: *native.WeightStore, 
     compute.* = if (io) |handle| native.NativeCompute.initWithIo(effective_allocator, weights, budget, handle) else native.NativeCompute.init(effective_allocator, weights, budget);
     compute.allocation_observer_enable_failed = observation_failed;
     compute.quantized_activation_policy = policy.quantized_activations;
+    compute.prepare_native_weight_matrices = policy.prepare_native_weight_matrices;
     compute.borrow_bf16_linear_weights = policy.borrow_bf16_linear_weights;
     compute.decoder_weight_prefix = policy.decoder_weight_prefix;
     compute.cache_embeddinggemma2_bf16_weights = policy.cache_bf16_weight_mirrors;

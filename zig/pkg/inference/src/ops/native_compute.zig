@@ -4080,6 +4080,7 @@ pub const NativeCompute = struct {
     data: *WeightStore,
     run_budget: ?*run_memory.RunBudget = null,
     quantized_activation_policy: QuantizedActivationPolicy = .automatic,
+    prepare_native_weight_matrices: bool = true,
     weight_reservations: std.StringHashMapUnmanaged(ReservationState) = .empty,
     /// Opt in only for qualified model families whose projection consumers
     /// accept typed weights. Other native/PJRT callers keep their load policy.
@@ -8475,7 +8476,8 @@ fn deinitWeightHandles(self: *NativeCompute) void {
 }
 
 fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
-    return getWeightForPreparation(@ptrCast(@alignCast(ctx)), name, true);
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    return getWeightForPreparation(self, name, self.prepare_native_weight_matrices);
 }
 fn getWeightForPreparation(self: *NativeCompute, name: []const u8, prepare_matrix: bool) !CT {
     return getWeightForPreparedLazy(self, name, prepare_matrix, false);
@@ -61931,4 +61933,41 @@ test "native BF16 narrowing preserves ties signed zero NaNs shape and source own
     const original = try cb.toFloat32(input, a);
     defer a.free(original);
     try std.testing.expectEqual(@as(u32, 0x3f808000), @as(u32, @bitCast(original[0])));
+}
+
+test "provider weight transport borrows packed weights without preparing Native matrices" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.deinitOwned();
+    const dims = [_]i64{ 16, 256 };
+    const raw: [16 * 8 * 18]u8 = @splat(0);
+    {
+        const name = try a.dupe(u8, "provider.weight");
+        errdefer a.free(name);
+        const shape = try a.dupe(i64, &dims);
+        errdefer a.free(shape);
+        try store.resident_weights.put(a, name, .{
+            .tensor = .{ .data = &.{}, .shape = &dims, .dtype = .f32, .name = name, .allocator = a, .owns_data = false, .owns_shape = false },
+            .quantized = true,
+            .quantized_storage = .{ .tensor_type = .{ .known = .Q4_0 }, .raw_bytes = &raw, .shape = shape, .raw_owned = false, .allocator = a },
+        });
+    }
+    var transport = NativeCompute.init(a, &store, null);
+    defer transport.deinit();
+    transport.prepare_native_weight_matrices = false;
+    const provider = transport.computeBackend();
+    const value = try provider.getWeight("provider.weight");
+    defer provider.free(value);
+    const storage = &store.resident_weights.getPtr("provider.weight").?.quantized_storage.?;
+    try std.testing.expectEqual(@as(usize, 0), storage.prepared.ownedBytes());
+    const dense = try provider.toFloat32(value, a);
+    defer a.free(dense);
+    try std.testing.expectEqual(@as(usize, 16 * 256), dense.len);
+
+    var native_receiver = NativeCompute.init(a, &store, null);
+    defer native_receiver.deinit();
+    const compute = native_receiver.computeBackend();
+    const prepared = try compute.getWeight("provider.weight");
+    defer compute.free(prepared);
+    try std.testing.expect(storage.prepared.ownedBytes() > 0);
 }
