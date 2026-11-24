@@ -15,14 +15,20 @@
 
 const std = @import("std");
 
+/// Resolve a nonempty append without exposing a wrapped cache position.
+pub fn appendEnd(position: usize, rows: usize) !usize {
+    if (rows == 0) return error.InvalidDecoderPosition;
+    return std.math.add(usize, position, rows) catch error.InvalidDecoderPosition;
+}
+
 /// Borrowed new tokens for an append-only decoder. Positions are zero-based.
 pub const Suffix = struct {
     position: usize,
     tokens: []const i64,
 
     pub fn endAt(self: Suffix, committed: usize) !usize {
-        if (self.position != committed or self.tokens.len == 0) return error.InvalidDecoderPosition;
-        return std.math.add(usize, self.position, self.tokens.len) catch error.InvalidDecoderPosition;
+        if (self.position != committed) return error.InvalidDecoderPosition;
+        return appendEnd(self.position, self.tokens.len);
     }
 };
 

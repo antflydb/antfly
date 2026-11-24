@@ -988,7 +988,7 @@ pub const CachedDecoderGeometry = struct {
         var bytes: usize = 0;
         var cache_bytes: usize = 0;
         var sequence = @max(tokens, context);
-        var self_position: ?usize = null;
+        var self_cache: ?struct { previous: usize, end: usize } = null;
         for (outputs, 0..) |output, index| {
             if (std.mem.eql(u8, output.name, "logits")) {
                 bytes = try addBytes(bytes, try mulBytes(try mulBytes(try mulBytes(batch, tokens), self.vocab_size), output.dtype.byteSize()));
@@ -1003,10 +1003,13 @@ pub const CachedDecoderGeometry = struct {
                     if (past_length != 0 and past_length != context) return error.InvalidDecoderPosition;
                     break :cross context;
                 } else self: {
-                    if (self_position) |position| {
-                        if (past_length != position) return error.InvalidDecoderPosition;
-                    } else self_position = past_length;
-                    break :self try addBytes(past_length, tokens);
+                    if (self_cache) |span| {
+                        if (past_length != span.previous) return error.InvalidDecoderPosition;
+                        break :self span.end;
+                    }
+                    const end = try @import("../execution/decoder_position.zig").appendEnd(past_length, tokens);
+                    self_cache = .{ .previous = past_length, .end = end };
+                    break :self end;
                 };
                 sequence = @max(sequence, time);
                 const elements = try mulBytes(try mulBytes(try mulBytes(batch, @intCast(cached.shape[1])), time), @intCast(cached.shape[3]));
