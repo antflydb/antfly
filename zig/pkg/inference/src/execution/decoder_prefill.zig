@@ -168,8 +168,47 @@ pub const EmbeddingReplacement = struct {
 pub const ProjectedInputRows = struct {
     rows_per_item: []const usize,
     width: usize,
-    source: EmbeddingSource,
+    source: union(enum) {
+        host: []const f32,
+        resident: Resident,
+    },
+
+    pub const Resident = struct { backend: *const ComputeBackend, rows: ops.CT };
+
+    pub fn validateFor(self: ProjectedInputRows, backend: *const ComputeBackend, width: usize) !void {
+        if (self.width != width or width == 0) return error.InvalidTensorShape;
+        switch (self.source) {
+            .resident => |value| {
+                if (value.backend.ptr != backend.ptr or value.backend.vtable != backend.vtable)
+                    return error.InvalidPhysicalStorageBackend;
+            },
+            .host => |values| {
+                var rows: usize = 0;
+                for (self.rows_per_item) |count| rows = try std.math.add(usize, rows, count);
+                if (values.len != try std.math.mul(usize, rows, width)) return error.InvalidTensorShape;
+            },
+        }
+    }
 };
+
+test "projected media rows reject foreign custody and inconsistent host spans" {
+    const native = @import("../ops/native_compute.zig");
+    var producer: u8 = 0;
+    var consumer: u8 = 0;
+    const source: ComputeBackend = .{ .ptr = &producer, .vtable = &native.vtable_impl };
+    const target: ComputeBackend = .{ .ptr = &consumer, .vtable = &native.vtable_impl };
+    var projected: ProjectedInputRows = .{
+        .rows_per_item = &.{1},
+        .width = 2,
+        .source = .{ .resident = .{ .backend = &source, .rows = &producer } },
+    };
+    try projected.validateFor(&source, 2);
+    try std.testing.expectError(error.InvalidPhysicalStorageBackend, projected.validateFor(&target, 2));
+    projected.source = .{ .host = &.{1} };
+    try std.testing.expectError(error.InvalidTensorShape, projected.validateFor(&target, 2));
+    projected.source = .{ .host = &.{ 1, 2 } };
+    try projected.validateFor(&target, 2);
+}
 
 /// Borrow a contiguous host producer without allocating an image-span array.
 pub const EmbeddingReplacements = union(enum) {

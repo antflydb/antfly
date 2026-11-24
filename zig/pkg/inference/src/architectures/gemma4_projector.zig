@@ -85,7 +85,7 @@ pub const ResidentProjectedImages = struct {
     output_ownership: OutputOwnership = .unknown,
 
     pub fn promptRows(self: *const ResidentProjectedImages) prompt_rows.ProjectedInputRows {
-        return .{ .rows_per_item = self.tokens_per_image, .width = self.hidden_size, .source = .{ .resident = self.embeddings } };
+        return .{ .rows_per_item = self.tokens_per_image, .width = self.hidden_size, .source = .{ .resident = .{ .backend = self.backend, .rows = self.embeddings } } };
     }
 
     pub fn deinit(self: *ResidentProjectedImages) void {
@@ -153,7 +153,15 @@ pub const ProjectedAudio = struct {
     embeddings: []f32,
     tokens_per_audio: []usize,
     hidden_size: usize,
-    resident: ?struct { backend: *const ComputeBackend, rows: CT } = null,
+    resident: ?prompt_rows.ProjectedInputRows.Resident = null,
+
+    pub fn promptRows(self: *const ProjectedAudio) prompt_rows.ProjectedInputRows {
+        return .{
+            .rows_per_item = self.tokens_per_audio,
+            .width = self.hidden_size,
+            .source = if (self.resident) |value| .{ .resident = value } else .{ .host = self.embeddings },
+        };
+    }
 
     pub fn deinit(self: *ProjectedAudio) void {
         if (self.resident) |resident| resident.backend.free(resident.rows);

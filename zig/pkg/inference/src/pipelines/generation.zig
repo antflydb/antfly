@@ -3501,7 +3501,7 @@ pub const NativeGenerationPipeline = struct {
                         self.gpt_config,
                         expanded_encoded.ids[0..expanded_prompt_tokens],
                         image_rows,
-                        if (projected_audio) |*audio| audio else null,
+                        if (projected_audio) |*audio| audio.promptRows() else null,
                     );
                 }
             } else {
