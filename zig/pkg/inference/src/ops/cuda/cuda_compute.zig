@@ -6018,6 +6018,7 @@ pub const CudaCompute = struct {
     temp_buffers: @import("buffer_cache.zig").Cache(buffer_mod.DeviceBuffer) = .empty,
     temp_pinned_slots: std.ArrayListUnmanaged(TempPinnedSlot) = .empty,
     temp_pinned_slots_in_use: usize = 0,
+    temp_pinned_slot_by_address: std.AutoHashMapUnmanaged(driver_mod.CUdeviceptr, u16) = .empty,
     temp_arena_planner: periodic_workspace.TempArenaPlanner = .{},
     temp_arena_generation: u64 = 1,
     deferred_device_frees: std.ArrayListUnmanaged(buffer_mod.DeviceBuffer) = .empty,
@@ -8885,6 +8886,7 @@ pub const CudaCompute = struct {
         if (self.florence_image_projection_t_f32) |tensor| freeTensor(self, tensor);
         for (self.temp_pinned_slots.items) |*slot| slot.buffer.free(&self.ctx);
         self.temp_pinned_slots.deinit(self.allocator);
+        self.temp_pinned_slot_by_address.deinit(self.allocator);
         self.temp_arena_planner.deinit(self.allocator);
         self.generated_gqa_score_prework_templates.deinit(self.allocator);
         for (self.temp_buffers.buffers.items) |*buffer| _ = buffer.freeChecked(&self.ctx) catch platform.inference_process_supervisor.restartWorker();
@@ -17186,7 +17188,7 @@ fn cudaGraphExecUpdateResultName(result: driver_mod.CUgraphExecUpdateResult) []c
 fn traceCudaTempAlloc(
     self: *CudaCompute,
     seq: usize,
-    comptime event: []const u8,
+    event: []const u8,
     requested_len: usize,
     buffer: buffer_mod.DeviceBuffer,
 ) void {
@@ -17254,6 +17256,7 @@ fn allocPinnedTempSlot(
     seq: usize,
     len: usize,
 ) !?buffer_mod.DeviceBuffer {
+    if (len == 0) return null;
     const slot_index = pinnedTempSlotIndex(self, seq) orelse return null;
     try ensureTempPinnedSlots(self, cudaEffectiveTempSlotPeriod(self));
     const slot = &self.temp_pinned_slots.items[slot_index];
@@ -17269,49 +17272,46 @@ fn allocPinnedTempSlot(
         traceCudaTempAlloc(self, seq, "alloc_slot_shape_fallback", len, .{});
         return null;
     }
-    if (slot.buffer.ptr == 0) {
-        // Every captured slot was bound by a completed ordinary validation
-        // iteration. An empty slot means the plan changed before recording.
-        if (self.debug_cuda_graph_capture_active) return null;
-        if (findExactTempBufferIndex(self, len)) |i| {
-            slot.buffer = self.temp_buffers.orderedRemove(i);
-            slot.requested_len = len;
+    const source: []const u8 = source: {
+        if (slot.buffer.ptr != 0) {
             self.stats.temp_buffer_hits += 1;
-            slot.in_use = true;
-            self.temp_pinned_slots_in_use += 1;
-            traceCudaTempAlloc(self, seq, "alloc_slot_seed", len, slot.buffer);
-            return slot.buffer;
+            break :source "alloc_slot_hit";
         }
-        self.stats.temp_buffer_misses += 1;
-        slot.buffer = try allocFreshTempBufferUnlocked(self, len, .required);
+        // Register a new physical address before returning it to the caller.
+        // Capture may only borrow slots fully registered during eager work.
+        if (self.debug_cuda_graph_capture_active) return null;
+        try self.temp_pinned_slot_by_address.ensureUnusedCapacity(self.allocator, 1);
+        const tag = if (findExactTempBufferIndex(self, len)) |i| seed: {
+            slot.buffer = self.temp_buffers.orderedRemove(i);
+            self.stats.temp_buffer_hits += 1;
+            break :seed "alloc_slot_seed";
+        } else allocate: {
+            self.stats.temp_buffer_misses += 1;
+            slot.buffer = try allocFreshTempBufferUnlocked(self, len, .required);
+            self.noteDeviceBytes(len);
+            self.stats.device_alloc_calls += 1;
+            break :allocate "alloc_slot_miss";
+        };
+        self.temp_pinned_slot_by_address.putAssumeCapacityNoClobber(slot.buffer.ptr, @intCast(slot_index));
         slot.requested_len = len;
-        self.noteDeviceBytes(len);
-        self.stats.device_alloc_calls += 1;
-        slot.in_use = true;
-        self.temp_pinned_slots_in_use += 1;
-        traceCudaTempAlloc(self, seq, "alloc_slot_miss", len, slot.buffer);
-        return slot.buffer;
-    }
+        break :source tag;
+    };
     slot.in_use = true;
     self.temp_pinned_slots_in_use += 1;
-    self.stats.temp_buffer_hits += 1;
-    traceCudaTempAlloc(self, seq, "alloc_slot_hit", len, slot.buffer);
+    traceCudaTempAlloc(self, seq, source, len, slot.buffer);
     return slot.buffer;
 }
 
 fn releasePinnedTempSlot(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer) bool {
-    if (buffer.ptr == 0 or self.temp_pinned_slots.items.len == 0) return false;
-    for (self.temp_pinned_slots.items) |*slot| {
-        if (slot.buffer.ptr == buffer.ptr) {
-            if (slot.in_use) {
-                self.temp_pinned_slots_in_use -= 1;
-                slot.in_use = false;
-            }
-            buffer.* = .{};
-            return true;
-        }
+    const index = self.temp_pinned_slot_by_address.get(buffer.ptr) orelse return false;
+    const slot = &self.temp_pinned_slots.items[index];
+    std.debug.assert(slot.buffer.ptr == buffer.ptr);
+    if (slot.in_use) {
+        slot.in_use = false;
+        self.temp_pinned_slots_in_use -= 1;
     }
-    return false;
+    buffer.* = .{};
+    return true;
 }
 
 fn resetTempPinnedSlotsForRequest(self: *CudaCompute) !void {
@@ -17366,6 +17366,7 @@ fn recycleTempPinnedSlotsUnlocked(self: *CudaCompute, reuse: TempSlotReuse) !voi
             continue;
         }
         if (slot.buffer.ptr != 0) {
+            _ = self.temp_pinned_slot_by_address.remove(slot.buffer.ptr);
             var buffer = slot.buffer;
             if (self.temp_buffers.buffers.items.len < max_buffers and
                 buffer.len <= cache_budget and
@@ -63521,6 +63522,8 @@ test "Gemma4 CUDA learned scratch backing survives requests without retaining th
     try resetTempPinnedSlotsForRequest(&compute);
     try std.testing.expectEqual(@as(usize, 0), compute.temp_buffers.buffers.items.len);
     try std.testing.expectEqual(@as(usize, 0), compute.temp_pinned_slots.items[0].requested_len);
+    try std.testing.expectEqual(@as(?u16, 0), compute.temp_pinned_slot_by_address.get(first_ptr));
+    try std.testing.expectEqual(@as(?u16, 1), compute.temp_pinned_slot_by_address.get(second_ptr));
     const lengths = [_]usize{ 64, 128 };
     try recycleTempPinnedSlotsUnlocked(&compute, .{ .plan = &lengths });
     first = (try allocPinnedTempSlot(&compute, 0, 64)).?;
@@ -63541,6 +63544,7 @@ test "Gemma4 CUDA learned scratch backing survives requests without retaining th
     try resetTempPinnedSlotsForRequest(&compute);
     for (compute.temp_pinned_slots.items) |slot| try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0), slot.buffer.ptr);
     try std.testing.expectEqual(@as(usize, 0), observePeriodicWorkspace(&compute).?.live_backing_bytes);
+    try std.testing.expectEqual(@as(u32, 0), compute.temp_pinned_slot_by_address.count());
     try std.testing.expectEqual(@as(usize, 0), compute.temp_buffers.buffers.items.len);
     try synchronizeAndDrainDeferredDeviceFrees(&compute);
     try std.testing.expect(compute.stats.device_free_calls >= frees + 2);
