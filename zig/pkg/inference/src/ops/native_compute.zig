@@ -58739,15 +58739,28 @@ fn copyAffineF32Into(data: []const f32, base: usize, shape: []const i64, strides
         }
         if (last >= data.len) return error.InvalidTensorShape;
     }
-    for (output, 0..) |*value, index| {
+    if (count == 0) return;
+    // Copy the contiguous suffix as a span. Cache views typically retain
+    // dense channels, so recalculate affine coordinates only once per row.
+    var axes = shape.len;
+    var span: usize = 1;
+    while (axes != 0) {
+        const axis = axes - 1;
+        const extent: usize = @intCast(shape[axis]);
+        if (extent > 1 and strides[axis] != span) break;
+        span *= extent;
+        axes = axis;
+    }
+    var index: usize = 0;
+    while (index < count) : (index += span) {
         var remainder = index;
         var source = base;
-        for (strides, dense[0..shape.len]) |stride, divisor| {
+        for (strides[0..axes], dense[0..axes]) |stride, divisor| {
             const coordinate = remainder / divisor;
             remainder %= divisor;
             source += coordinate * stride; // bounded by the validated footprint
         }
-        value.* = data[source];
+        if (span == 1) output[index] = data[source] else @memcpy(output[index..][0..span], data[source..][0..span]);
     }
 }
 
@@ -58800,6 +58813,9 @@ fn nativeAffineMetadataParity(a: std.mem.Allocator) !void {
 
 test "Native affine metadata and direct export preserve retained backing without materialization" {
     try nativeAffineMetadataParity(std.testing.allocator);
+    var spans: [4]f32 = undefined;
+    try copyAffineF32Into(&.{ 0, 1, 2, 3, 4, 5, 6 }, 1, &.{ 2, 1, 2 }, &.{ 4, 99, 1 }, &spans);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 5, 6 }, &spans);
 }
 test "Native affine metadata and export unwind every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, nativeAffineMetadataParity, .{});
