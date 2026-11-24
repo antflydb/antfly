@@ -844,6 +844,28 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
                 defer a.free(partial_cache);
                 try std.testing.expectEqualSlices(f32, expected_cache, partial_cache);
 
+                const CancelBeforePublication = struct {
+                    checks: usize = 0,
+                    fn check(raw: ?*anyopaque) !void {
+                        const probe: *@This() = @ptrCast(@alignCast(raw.?));
+                        probe.checks += 1;
+                        // Two reservation checks and one check before entering
+                        // the provider. The fourth follows copy completion.
+                        if (probe.checks == 4) return error.Cancelled;
+                    }
+                };
+                var cancellation = CancelBeforePublication{};
+                var cancelled_targets: [2]?ResidentSlot = @splat(null);
+                defer for (cancelled_targets) |target| if (target) |value| value.pin.release();
+                const before_cancel = controller.snapshot();
+                try std.testing.expectError(error.Cancelled, copy_state.migrateOmittedCrossCaches(&previous, &cancelled_targets, .{
+                    .ptr = &cancellation,
+                    .check_fn = CancelBeforePublication.check,
+                    .native_call_policy = .in_process,
+                }));
+                try std.testing.expect(cancelled_targets[0] == null and cancelled_targets[1] == null);
+                try std.testing.expectEqualDeep(before_cancel, controller.snapshot());
+
                 const other_cache = try other.input.backend.toFloat32(other.input.value, a);
                 defer a.free(other_cache);
                 try std.testing.expectEqualSlices(f32, expected_cache, other_cache);
