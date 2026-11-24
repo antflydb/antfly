@@ -369,56 +369,65 @@ test "raft batch scoped source attempts require protocol 39 before every phase" 
         try @import("std").testing.expectEqual(@as(?u16, 39), try completionProtocolVersion(a, request));
 }
 
-test "data raft ordered history ordinary producer requires its own activation floor" {
-    const std = @import("std");
-    const Mutation = union(enum) {
-        begin: struct { ordinary_producer: bool = false, completion_admission: ?[]const u8 = null, completion_owner: ?u8 = null, source_purpose: ?[32]u8 = null },
-        prepare: struct { ordinary_producer: bool = false, completion_owner: ?u8 = null, source_purpose: ?[32]u8 = null },
-        resolve: struct { completion_owner: ?u8 = null, source_purpose: ?[32]u8 = null },
-        publish_completion: struct { certificate: []const u8 },
-        other,
-    };
-    const Request = struct { transaction: ?Mutation };
-    try std.testing.expectEqual(@as(?u16, 42), try completionProtocolVersion(std.testing.allocator, Request{ .transaction = .{ .begin = .{ .ordinary_producer = true, .completion_owner = 1 } } }));
-    const begin: Request = .{ .transaction = .{ .begin = .{
-        .ordinary_producer = true,
-        .completion_owner = 1,
-        .completion_admission = "{\"admission\":{\"version\":4}}",
-    } } };
-    try std.testing.expectEqual(@as(?u16, batch_physical_completion_protocol_version), try completionProtocolVersion(std.testing.allocator, begin));
-    try std.testing.expectEqual(@as(?u16, batch_physical_completion_protocol_version), withExactEnvelopeFloor(try completionProtocolVersion(std.testing.allocator, begin), true));
-    try std.testing.expectEqual(@as(?u16, batch_exact_prepare_protocol_version), withExactEnvelopeFloor(42, true));
-    const publish: Request = .{ .transaction = .{ .publish_completion = .{
-        .certificate = "{\"certificate\":{\"manifest\":{\"version\":4}}}",
-    } } };
-    try std.testing.expectEqual(@as(?u16, batch_physical_completion_protocol_version), try completionProtocolVersion(std.testing.allocator, publish));
-    try std.testing.expectEqual(@as(?u16, 42), try completionProtocolVersion(std.testing.allocator, Request{ .transaction = .{ .prepare = .{ .ordinary_producer = true, .completion_owner = 1 } } }));
-    try std.testing.expectEqual(@as(?u16, 31), try completionProtocolVersion(std.testing.allocator, Request{ .transaction = .{ .prepare = .{ .completion_owner = 1 } } }));
-}
-
-test "data raft ordered history row producer envelope requires separate activation" {
-    const Request = @import("antfly_local_sources").storage_db_selected_root.db.types.BatchRequest;
-    const a = @import("std").testing.allocator;
-    const expect = @import("std").testing.expectEqual;
-    try expect(@as(?u16, 43), try completionProtocolVersion(a, Request{ .source_producer = .ordinary }));
-    try expect(@as(?u16, 43), try completionProtocolVersion(a, Request{ .source_producer = .legacy_cdc }));
-    try expect(@as(?u16, null), try completionProtocolVersion(a, Request{}));
-}
-
-test "data raft ordered history nonhistory producer requires version 45 without completion admission" {
-    const Mutation = union(enum) {
-        begin: struct { ordinary_producer: bool = false, legacy_producer: bool = false, completion_admission: ?[]const u8 = null, completion_owner: ?u8 = null, source_purpose: ?[32]u8 = null },
-        prepare: struct { ordinary_producer: bool = false, legacy_producer: bool = false, completion_owner: ?u8 = null, source_purpose: ?[32]u8 = null },
-        resolve: struct { completion_owner: ?u8 = null, source_purpose: ?[32]u8 = null },
-        publish_completion: struct { certificate: []const u8 },
-        other,
-    };
-    const Request = struct { transaction: ?Mutation };
-    const std = @import("std");
-    for ([_]bool{ false, true }) |legacy| {
-        const begin: Request = .{ .transaction = .{ .begin = .{ .ordinary_producer = !legacy, .legacy_producer = legacy } } };
-        const prepare: Request = .{ .transaction = .{ .prepare = .{ .ordinary_producer = !legacy, .legacy_producer = legacy } } };
-        try std.testing.expectEqual(@as(?u16, 45), try completionProtocolVersion(std.testing.allocator, begin));
-        try std.testing.expectEqual(@as(?u16, 45), try completionProtocolVersion(std.testing.allocator, prepare));
+// These shared modules are also reachable from the physical implementation
+// root. Keep the protocol and coordinator tests with the consumer.
+const consumer_tests = if (@hasDecl(@import("antfly_source_root"), "implementation_tests_only") and
+    @import("antfly_source_root").implementation_tests_only) struct {} else struct {
+    test "data raft ordered history ordinary producer requires its own activation floor" {
+        const std = @import("std");
+        const Mutation = union(enum) {
+            begin: struct { ordinary_producer: bool = false, completion_admission: ?[]const u8 = null, completion_owner: ?u8 = null, source_purpose: ?[32]u8 = null },
+            prepare: struct { ordinary_producer: bool = false, completion_owner: ?u8 = null, source_purpose: ?[32]u8 = null },
+            resolve: struct { completion_owner: ?u8 = null, source_purpose: ?[32]u8 = null },
+            publish_completion: struct { certificate: []const u8 },
+            other,
+        };
+        const Request = struct { transaction: ?Mutation };
+        try std.testing.expectEqual(@as(?u16, 42), try completionProtocolVersion(std.testing.allocator, Request{ .transaction = .{ .begin = .{ .ordinary_producer = true, .completion_owner = 1 } } }));
+        const begin: Request = .{ .transaction = .{ .begin = .{
+            .ordinary_producer = true,
+            .completion_owner = 1,
+            .completion_admission = "{\"admission\":{\"version\":4}}",
+        } } };
+        try std.testing.expectEqual(@as(?u16, batch_physical_completion_protocol_version), try completionProtocolVersion(std.testing.allocator, begin));
+        try std.testing.expectEqual(@as(?u16, batch_physical_completion_protocol_version), withExactEnvelopeFloor(try completionProtocolVersion(std.testing.allocator, begin), true));
+        try std.testing.expectEqual(@as(?u16, batch_exact_prepare_protocol_version), withExactEnvelopeFloor(42, true));
+        const publish: Request = .{ .transaction = .{ .publish_completion = .{
+            .certificate = "{\"certificate\":{\"manifest\":{\"version\":4}}}",
+        } } };
+        try std.testing.expectEqual(@as(?u16, batch_physical_completion_protocol_version), try completionProtocolVersion(std.testing.allocator, publish));
+        try std.testing.expectEqual(@as(?u16, 42), try completionProtocolVersion(std.testing.allocator, Request{ .transaction = .{ .prepare = .{ .ordinary_producer = true, .completion_owner = 1 } } }));
+        try std.testing.expectEqual(@as(?u16, 31), try completionProtocolVersion(std.testing.allocator, Request{ .transaction = .{ .prepare = .{ .completion_owner = 1 } } }));
     }
+
+    test "data raft ordered history row producer envelope requires separate activation" {
+        const Request = @import("antfly_local_sources").storage_db_selected_root.db.types.BatchRequest;
+        const a = @import("std").testing.allocator;
+        const expect = @import("std").testing.expectEqual;
+        try expect(@as(?u16, 43), try completionProtocolVersion(a, Request{ .source_producer = .ordinary }));
+        try expect(@as(?u16, 43), try completionProtocolVersion(a, Request{ .source_producer = .legacy_cdc }));
+        try expect(@as(?u16, null), try completionProtocolVersion(a, Request{}));
+    }
+
+    test "data raft ordered history nonhistory producer requires version 45 without completion admission" {
+        const Mutation = union(enum) {
+            begin: struct { ordinary_producer: bool = false, legacy_producer: bool = false, completion_admission: ?[]const u8 = null, completion_owner: ?u8 = null, source_purpose: ?[32]u8 = null },
+            prepare: struct { ordinary_producer: bool = false, legacy_producer: bool = false, completion_owner: ?u8 = null, source_purpose: ?[32]u8 = null },
+            resolve: struct { completion_owner: ?u8 = null, source_purpose: ?[32]u8 = null },
+            publish_completion: struct { certificate: []const u8 },
+            other,
+        };
+        const Request = struct { transaction: ?Mutation };
+        const std = @import("std");
+        for ([_]bool{ false, true }) |legacy| {
+            const begin: Request = .{ .transaction = .{ .begin = .{ .ordinary_producer = !legacy, .legacy_producer = legacy } } };
+            const prepare: Request = .{ .transaction = .{ .prepare = .{ .ordinary_producer = !legacy, .legacy_producer = legacy } } };
+            try std.testing.expectEqual(@as(?u16, 45), try completionProtocolVersion(std.testing.allocator, begin));
+            try std.testing.expectEqual(@as(?u16, 45), try completionProtocolVersion(std.testing.allocator, prepare));
+        }
+    }
+};
+
+comptime {
+    if (@import("builtin").is_test) _ = consumer_tests;
 }

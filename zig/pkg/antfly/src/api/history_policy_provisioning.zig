@@ -141,105 +141,114 @@ pub const Provisioner = struct {
     }
 };
 
-test "data raft ordered history policy provisioning confirms configuration before admission and preserves uncertainty" {
-    const Fake = struct {
-        configured: bool = false,
-        revision: u64 = 1,
-        limit: u64 = local.storage_committed_history.default_limit,
-        index: u64 = 10,
-        inspections: usize = 0,
-        configurations: usize = 0,
-        owner_reads: usize = 0,
-        generation: u64 = 0,
-        mode: enum { normal, unknown_inspect, lost_configuration, conflicting_authority, lagged_owner } = .normal,
-        fn control(ptr: *anyopaque, _: A, _: metadata.CatalogRouteFence, _: []const u8, input: controls.wire.Request, _: Context) !controls.wire.Response {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.index += 1;
-            const receipt: local.api_local_table_writes.table_write_source.history_ordered.Entry = .{ .term = 1, .index = self.index };
-            if (input.command == .inspect_policy) {
-                self.inspections += 1;
-                if (self.mode == .unknown_inspect) return .{ .version = 1, .receipt = receipt };
-                if (!self.configured or self.mode == .conflicting_authority) return .{ .version = 1, .receipt = receipt, .outcome = .{ .rejected = .resynchronization } };
-            } else {
-                try std.testing.expect(input.command == .configure_policy);
-                try std.testing.expectEqual(@as(u64, 0), input.command.configure_policy.previous_revision);
-                try std.testing.expectEqual(@as(u64, 1), input.command.configure_policy.revision);
-                self.configurations += 1;
-                if (self.mode == .conflicting_authority) return .{ .version = 1, .receipt = receipt, .outcome = .{ .rejected = .resynchronization } };
-                self.configured = true;
-                self.revision = 1;
-                self.limit = input.command.configure_policy.limit;
-                if (self.mode == .lost_configuration) return .{ .version = 1, .receipt = receipt };
+// These shared modules are also reachable from the physical implementation
+// root. Keep the protocol and coordinator tests with the consumer.
+const consumer_tests = if (@hasDecl(@import("antfly_source_root"), "implementation_tests_only") and
+    @import("antfly_source_root").implementation_tests_only) struct {} else struct {
+    test "data raft ordered history policy provisioning confirms configuration before admission and preserves uncertainty" {
+        const Fake = struct {
+            configured: bool = false,
+            revision: u64 = 1,
+            limit: u64 = local.storage_committed_history.default_limit,
+            index: u64 = 10,
+            inspections: usize = 0,
+            configurations: usize = 0,
+            owner_reads: usize = 0,
+            generation: u64 = 0,
+            mode: enum { normal, unknown_inspect, lost_configuration, conflicting_authority, lagged_owner } = .normal,
+            fn control(ptr: *anyopaque, _: A, _: metadata.CatalogRouteFence, _: []const u8, input: controls.wire.Request, _: Context) !controls.wire.Response {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.index += 1;
+                const receipt: local.api_local_table_writes.table_write_source.history_ordered.Entry = .{ .term = 1, .index = self.index };
+                if (input.command == .inspect_policy) {
+                    self.inspections += 1;
+                    if (self.mode == .unknown_inspect) return .{ .version = 1, .receipt = receipt };
+                    if (!self.configured or self.mode == .conflicting_authority) return .{ .version = 1, .receipt = receipt, .outcome = .{ .rejected = .resynchronization } };
+                } else {
+                    try std.testing.expect(input.command == .configure_policy);
+                    try std.testing.expectEqual(@as(u64, 0), input.command.configure_policy.previous_revision);
+                    try std.testing.expectEqual(@as(u64, 1), input.command.configure_policy.revision);
+                    self.configurations += 1;
+                    if (self.mode == .conflicting_authority) return .{ .version = 1, .receipt = receipt, .outcome = .{ .rejected = .resynchronization } };
+                    self.configured = true;
+                    self.revision = 1;
+                    self.limit = input.command.configure_policy.limit;
+                    if (self.mode == .lost_configuration) return .{ .version = 1, .receipt = receipt };
+                }
+                return .{ .version = 1, .receipt = receipt, .outcome = .{ .applied = .{ .policy = .{ .revision = self.revision, .limit = self.limit } } } };
             }
-            return .{ .version = 1, .receipt = receipt, .outcome = .{ .applied = .{ .policy = .{ .revision = self.revision, .limit = self.limit } } } };
-        }
-        fn owner(ptr: *anyopaque, _: A, fence: metadata.CatalogRouteFence, _: []const u8, input: owners.Request, _: Context) !owners.Reply {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.owner_reads += 1;
-            if (!self.configured) return error.ChangefeedCapabilityUnsupported;
-            var ns: [24]u8 = undefined;
-            std.mem.writeInt(u64, ns[0..8], 7, .big);
-            std.mem.writeInt(u64, ns[8..16], 9, .big);
-            std.mem.writeInt(u64, ns[16..24], 9, .big);
-            const binding: @FieldType(owners.Reply, "owner") = .{ .metadata_group_id = 1, .metadata_incarnation = fence.metadata_incarnation.?, .namespace = ns, .table_binding = input.expected_table_binding, .root_generation = self.generation, .group_id = 9, .topology_epoch = 1 };
-            return .{ .owner = binding, .observation = try owners.wire.Reply.init(.{ .owner = binding }, .{ .term = 1, .index = if (self.mode == .lagged_owner) 1 else self.index }, self.limit) };
-        }
-        fn deny(_: *anyopaque, _: Context) !void {
-            return error.NotLeader;
-        }
-    };
-    const a = std.testing.allocator;
-    const fence: metadata.CatalogRouteFence = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .catalog_revision = 1, .table_id = 7, .topology_epoch = 1, .route = .{ .group_id = 9, .range_id = 9, .identity_namespace = .{ .table_id = 7, .shard_id = 9, .range_id = 9 } } };
-    var fake: Fake = .{};
-    var provisioner: Provisioner = .{ .controls = .{ .ptr = &fake, .execute_fn = Fake.control }, .owners = .{ .ptr = &fake, .read_fn = Fake.owner } };
-    const input: owners.Request = .{ .version = 1, .expected_table_binding = @splat(2) };
-    _ = try provisioner.ensure(a, fence, "docs", input, .{});
-    try std.testing.expectEqual(@as(usize, 1), fake.configurations);
-    fake.revision = 3;
-    fake.limit /= 2;
-    const administrative = try provisioner.ensure(a, fence, "docs", input, .{});
-    try std.testing.expectEqual(fake.limit, administrative.observation.retention_limit_bytes);
-    try std.testing.expectEqual(@as(usize, 1), fake.configurations);
-    const owner_reads = fake.owner_reads;
-    fake.mode = .unknown_inspect;
-    try std.testing.expectError(error.ReadUnavailable, provisioner.ensure(a, fence, "docs", input, .{}));
-    try std.testing.expectEqual(@as(usize, 1), fake.configurations);
-    try std.testing.expectEqual(owner_reads, fake.owner_reads);
-    fake.configured = false;
-    fake.mode = .lost_configuration;
-    try std.testing.expectError(error.ReadUnavailable, provisioner.ensure(a, fence, "docs", input, .{}));
-    try std.testing.expectEqual(@as(usize, 2), fake.configurations);
-    try std.testing.expectEqual(owner_reads, fake.owner_reads);
-    fake.mode = .normal;
-    _ = try provisioner.ensure(a, fence, "docs", input, .{});
-    try std.testing.expectEqual(@as(usize, 2), fake.configurations);
-    fake.mode = .lagged_owner;
-    try std.testing.expectError(error.ReadUnavailable, provisioner.ensure(a, fence, "docs", input, .{}));
-    fake.mode = .conflicting_authority;
-    try std.testing.expectError(error.HistoryResynchronizationRequired, provisioner.ensure(a, fence, "docs", input, .{}));
-    const inspections = fake.inspections;
-    provisioner.guard = .{ .ptr = &fake, .check_fn = Fake.deny };
-    try std.testing.expectError(error.NotLeader, provisioner.ensure(a, fence, "docs", input, .{}));
-    try std.testing.expectEqual(inspections, fake.inspections);
-    provisioner.guard = null;
-    fake.mode = .normal;
-    var cache: Cache = .{};
-    provisioner.cache = &cache;
-    _ = try provisioner.ensure(a, fence, "docs", input, .{});
-    const cached_inspections = fake.inspections;
-    _ = try provisioner.ensure(a, fence, "docs", input, .{});
-    try std.testing.expectEqual(cached_inspections, fake.inspections);
-    fake.generation += 1;
-    _ = try provisioner.ensure(a, fence, "docs", input, .{});
-    try std.testing.expectEqual(cached_inspections + 1, fake.inspections);
-    fake.limit /= 2;
-    _ = try provisioner.ensure(a, fence, "docs", input, .{});
-    try std.testing.expectEqual(cached_inspections + 2, fake.inspections);
-    try std.testing.expect(cache.mutex.tryLock());
-    {
-        defer cache.mutex.unlock();
-        // Cache contention must not block admission or hold a lock over IO.
+            fn owner(ptr: *anyopaque, _: A, fence: metadata.CatalogRouteFence, _: []const u8, input: owners.Request, _: Context) !owners.Reply {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.owner_reads += 1;
+                if (!self.configured) return error.ChangefeedCapabilityUnsupported;
+                var ns: [24]u8 = undefined;
+                std.mem.writeInt(u64, ns[0..8], 7, .big);
+                std.mem.writeInt(u64, ns[8..16], 9, .big);
+                std.mem.writeInt(u64, ns[16..24], 9, .big);
+                const binding: @FieldType(owners.Reply, "owner") = .{ .metadata_group_id = 1, .metadata_incarnation = fence.metadata_incarnation.?, .namespace = ns, .table_binding = input.expected_table_binding, .root_generation = self.generation, .group_id = 9, .topology_epoch = 1 };
+                return .{ .owner = binding, .observation = try owners.wire.Reply.init(.{ .owner = binding }, .{ .term = 1, .index = if (self.mode == .lagged_owner) 1 else self.index }, self.limit) };
+            }
+            fn deny(_: *anyopaque, _: Context) !void {
+                return error.NotLeader;
+            }
+        };
+        const a = std.testing.allocator;
+        const fence: metadata.CatalogRouteFence = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .catalog_revision = 1, .table_id = 7, .topology_epoch = 1, .route = .{ .group_id = 9, .range_id = 9, .identity_namespace = .{ .table_id = 7, .shard_id = 9, .range_id = 9 } } };
+        var fake: Fake = .{};
+        var provisioner: Provisioner = .{ .controls = .{ .ptr = &fake, .execute_fn = Fake.control }, .owners = .{ .ptr = &fake, .read_fn = Fake.owner } };
+        const input: owners.Request = .{ .version = 1, .expected_table_binding = @splat(2) };
         _ = try provisioner.ensure(a, fence, "docs", input, .{});
-        try std.testing.expectEqual(cached_inspections + 3, fake.inspections);
+        try std.testing.expectEqual(@as(usize, 1), fake.configurations);
+        fake.revision = 3;
+        fake.limit /= 2;
+        const administrative = try provisioner.ensure(a, fence, "docs", input, .{});
+        try std.testing.expectEqual(fake.limit, administrative.observation.retention_limit_bytes);
+        try std.testing.expectEqual(@as(usize, 1), fake.configurations);
+        const owner_reads = fake.owner_reads;
+        fake.mode = .unknown_inspect;
+        try std.testing.expectError(error.ReadUnavailable, provisioner.ensure(a, fence, "docs", input, .{}));
+        try std.testing.expectEqual(@as(usize, 1), fake.configurations);
+        try std.testing.expectEqual(owner_reads, fake.owner_reads);
+        fake.configured = false;
+        fake.mode = .lost_configuration;
+        try std.testing.expectError(error.ReadUnavailable, provisioner.ensure(a, fence, "docs", input, .{}));
+        try std.testing.expectEqual(@as(usize, 2), fake.configurations);
+        try std.testing.expectEqual(owner_reads, fake.owner_reads);
+        fake.mode = .normal;
+        _ = try provisioner.ensure(a, fence, "docs", input, .{});
+        try std.testing.expectEqual(@as(usize, 2), fake.configurations);
+        fake.mode = .lagged_owner;
+        try std.testing.expectError(error.ReadUnavailable, provisioner.ensure(a, fence, "docs", input, .{}));
+        fake.mode = .conflicting_authority;
+        try std.testing.expectError(error.HistoryResynchronizationRequired, provisioner.ensure(a, fence, "docs", input, .{}));
+        const inspections = fake.inspections;
+        provisioner.guard = .{ .ptr = &fake, .check_fn = Fake.deny };
+        try std.testing.expectError(error.NotLeader, provisioner.ensure(a, fence, "docs", input, .{}));
+        try std.testing.expectEqual(inspections, fake.inspections);
+        provisioner.guard = null;
+        fake.mode = .normal;
+        var cache: Cache = .{};
+        provisioner.cache = &cache;
+        _ = try provisioner.ensure(a, fence, "docs", input, .{});
+        const cached_inspections = fake.inspections;
+        _ = try provisioner.ensure(a, fence, "docs", input, .{});
+        try std.testing.expectEqual(cached_inspections, fake.inspections);
+        fake.generation += 1;
+        _ = try provisioner.ensure(a, fence, "docs", input, .{});
+        try std.testing.expectEqual(cached_inspections + 1, fake.inspections);
+        fake.limit /= 2;
+        _ = try provisioner.ensure(a, fence, "docs", input, .{});
+        try std.testing.expectEqual(cached_inspections + 2, fake.inspections);
+        try std.testing.expect(cache.mutex.tryLock());
+        {
+            defer cache.mutex.unlock();
+            // Cache contention must not block admission or hold a lock over IO.
+            _ = try provisioner.ensure(a, fence, "docs", input, .{});
+            try std.testing.expectEqual(cached_inspections + 3, fake.inspections);
+        }
     }
+};
+
+comptime {
+    if (@import("builtin").is_test) _ = consumer_tests;
 }

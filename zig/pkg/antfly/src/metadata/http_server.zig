@@ -2388,6 +2388,8 @@ pub const MetadataHttpServer = struct {
         self.source.preflightTableMutationAuthority() catch |err| return metadataMutationError(ctx, err);
         var submitted = false;
         context.sql_completion_submission = &submitted;
+        var scope_supersession_ready = false;
+        if (input == .sql_prepared_read) context.sql_scope_supersession_ready = &scope_supersession_ready;
         // Default to unknown before invoking an owner. Any later allocation
         // failure must not preserve a stale not-proposed response header.
         try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_unknown);
@@ -2408,6 +2410,7 @@ pub const MetadataHttpServer = struct {
             var group_buf: [20]u8 = undefined;
             try ctx.setHeader("x-antfly-catalog-metadata-group", try std.fmt.bufPrint(&group_buf, "{d}", .{after.metadata_group_id}));
             try ctx.setHeader("x-antfly-catalog-metadata-incarnation", &incarnation);
+            if (scope_supersession_ready) try ctx.setHeader(@import("http_client.zig").MetadataHttpClient.sql_scope_supersession_header, "1");
         }
         try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_committed);
         try ctx.setHeader("content-type", input.responseContentType());
@@ -6032,6 +6035,7 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
         schema_command: ?[]const u8 = null,
         schema_error: ?anyerror = null,
         schema_effect: bool = false,
+        scope_supersession_ready: bool = false,
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return error.TestUnexpectedResult;
         }
@@ -6052,6 +6056,11 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
         }
         fn catalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             try context.ensureActive();
+            if (call == .sql_prepared_read) {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                try std.testing.expect(context.setting_admin);
+                context.sql_scope_supersession_ready.?.* = self.scope_supersession_ready;
+            }
             if (call == .schema_validation_submit) {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 self.schema_submits += 1;
@@ -6121,6 +6130,39 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
             try std.testing.expectEqualStrings("{}", response.body.?);
             try std.testing.expectEqualStrings("11111111111111111111111111111111", response.headers.get("x-antfly-catalog-metadata-incarnation").?);
         }
+    }
+    {
+        const authority = @import("../system_catalog/setting_authority.zig");
+        const header = @import("http_client.zig").MetadataHttpClient.sql_scope_supersession_header;
+        const prepared = try std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/server_call.zig").Call{ .sql_prepared_read = .{ .operation = @splat(1) } }, .{});
+        defer alloc.free(prepared);
+        const grant = try authority.sign(alloc, "separate-setting-authority-secret", "cluster-a", .admin, prepared, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
+        defer alloc.free(grant);
+        vtable.catalog_identity = Fixture.identity;
+        fixture.replace_identity = false;
+        for ([_]bool{ false, true }) |ready| {
+            fixture.scope_supersession_ready = ready;
+            var request = try httpx.Request.init(alloc, .POST, "/internal/v1/system-catalog");
+            defer request.deinit();
+            try request.setBody(prepared);
+            try request.headers.append(routes.Routes.raft_mutation_remaining_ms_header, "5000");
+            try request.headers.append(routes.Routes.raft_mutation_forwards_remaining_header, "0");
+            try request.headers.append(routes.Routes.raft_mutation_campaign_allowed_header, "false");
+            try request.headers.append(@import("../api/internal_service_auth.zig").header_name, "host-verified-service-token");
+            try request.headers.append(authority.header_name, grant);
+            var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try server.metadataSystemCatalog(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 200), response.status.code);
+            try std.testing.expectEqualStrings("{}", response.body.?);
+            if (ready) {
+                try std.testing.expectEqualStrings("1", response.headers.get(header).?);
+            } else {
+                try std.testing.expect(response.headers.get(header) == null);
+            }
+        }
+        vtable.catalog_identity = null;
     }
     // The principal-independent publication stamp needs a service token, but
     // no body-bound setting grant. A tokenless legacy-migration request cannot

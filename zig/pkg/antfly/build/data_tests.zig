@@ -263,6 +263,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "system catalog read peer routing retains healthy relocation views across publication and invalidation",
         "system catalog remote reads survive elections without skipping peers or extending budgets",
         "system catalog remote reads spend one caller budget across bounded RPC attempts",
+        "system catalog remote recovery preserves plain fallback budget after selector rejection",
         "system catalog report failover preserves repair signals and stable peer order",
         "metadata capability client distinguishes advertised routing from N-1 absence",
         "data server wires configured HA executors into API server",

@@ -211,6 +211,55 @@ pub const EncodedImageInfo = struct {
     }
 };
 
+/// Inspect dimensions from a bounded container prefix before admitting decode work.
+pub fn inspectWebpPrefix(bytes: []const u8) !EncodedImageInfo {
+    if (bytes.len < 12 or !std.mem.eql(u8, bytes[0..4], "RIFF") or !std.mem.eql(u8, bytes[8..12], "WEBP"))
+        return error.WebpDecodeFailed;
+    const riff_end = @as(u64, std.mem.readInt(u32, bytes[4..8], .little)) + 8;
+    const end: usize = @intCast(@min(riff_end, bytes.len));
+    var cursor: usize = 12;
+    while (cursor < end) {
+        if (end - cursor < 8) return error.WebpDecodeFailed;
+        const kind = bytes[cursor..][0..4];
+        const size = std.mem.readInt(u32, bytes[cursor + 4 ..][0..4], .little);
+        const start = cursor + 8;
+        if (size > riff_end - start) return error.WebpDecodeFailed;
+        const payload = bytes[start..][0..@min(size, end - start)];
+        if (std.mem.eql(u8, kind, "VP8X")) {
+            if (payload.len != 10 or size != 10) return error.WebpDecodeFailed;
+            if ((payload[0] & 0xc1) != 0 or !std.mem.allEqual(u8, payload[1..4], 0)) return error.UnsupportedWebpFormat;
+            return .{
+                .width = 1 + @as(u32, std.mem.readInt(u24, payload[4..7], .little)),
+                .height = 1 + @as(u32, std.mem.readInt(u24, payload[7..10], .little)),
+            };
+        }
+        if (std.mem.eql(u8, kind, "VP8 ")) {
+            if (payload.len < 10 or (payload[0] & 1) != 0 or !std.mem.eql(u8, payload[3..6], &.{ 0x9d, 1, 0x2a }))
+                return error.WebpDecodeFailed;
+            const width = std.mem.readInt(u16, payload[6..8], .little) & 0x3fff;
+            const height = std.mem.readInt(u16, payload[8..10], .little) & 0x3fff;
+            if (width == 0 or height == 0) return error.WebpDecodeFailed;
+            return .{ .width = width, .height = height };
+        }
+        if (std.mem.eql(u8, kind, "VP8L")) {
+            if (payload.len < 5 or payload[0] != 0x2f) return error.WebpDecodeFailed;
+            const header = std.mem.readInt(u32, payload[1..5], .little);
+            if (header >> 29 != 0) return error.UnsupportedWebpFormat;
+            return .{ .width = 1 + (header & 0x3fff), .height = 1 + ((header >> 14) & 0x3fff) };
+        }
+        if (size > end - start) return error.WebpDecodeFailed;
+        cursor = start + size;
+        if (cursor < end and size % 2 != 0) cursor += 1;
+    }
+    return error.WebpDecodeFailed;
+}
+
+test "WebP prefix reports dimensions without reading image payload" {
+    const bytes = "RIFF\x64\x00\x00\x00WEBPVP8L\x58\x00\x00\x00\x2f\x01\x80\x00\x00";
+    try std.testing.expectEqual(EncodedImageInfo{ .width = 2, .height = 3 }, try inspectWebpPrefix(bytes));
+    try std.testing.expectError(error.WebpDecodeFailed, inspectWebpPrefix(bytes[0 .. bytes.len - 1]));
+}
+
 pub const DecodedRgba = struct {
     rgba: []u8,
     width: u32,

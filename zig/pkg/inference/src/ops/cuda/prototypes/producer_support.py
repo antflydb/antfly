@@ -14,6 +14,7 @@
 # limitations under the License.
 
 """Pinned offline compiler and resource contracts from the native catalog."""
+
 import hashlib
 import json
 from pathlib import Path
@@ -24,7 +25,9 @@ LIBDEVICE_SHA256 = "91334d6e12748f6cb5bbf0a1cd965a56bcd93dc4f496d2e5c5f8c6e52309
 
 
 def profiles(family):
-    rows = [p for p in json.loads(CATALOG.read_text()) if p["family"].startswith(family)]
+    rows = [
+        p for p in json.loads(CATALOG.read_text()) if p["family"].startswith(family)
+    ]
     if not rows:
         raise ValueError("Unknown native program family: " + family)
     return rows
@@ -41,16 +44,28 @@ def compile_program(fn, signature, constants, aligned, spec, options=None):
     opts = dict(options or {})
     opts.update(num_warps=spec["threads"] // 32, ptx_version=90)
     compiled = triton.compile(
-        ASTSource(fn, signature, constexprs=constants,
-                  attrs={(i,): [["tt.divisibility", 16]] for i in aligned}),
-        target=GPUTarget("cuda", spec["target"], 32), options=opts)
+        ASTSource(
+            fn,
+            signature,
+            constexprs=constants,
+            attrs={(i,): [["tt.divisibility", 16]] for i in aligned},
+        ),
+        target=GPUTarget("cuda", spec["target"], 32),
+        options=opts,
+    )
     meta = compiled.metadata
-    if (meta.global_scratch_size != 0 or meta.profile_scratch_size != 0
-            or meta.num_ctas != 1 or meta.shared != spec["shared"]
-            or meta.num_warps * 32 != spec["threads"]):
+    if (
+        meta.global_scratch_size != 0
+        or meta.profile_scratch_size != 0
+        or meta.num_ctas != 1
+        or meta.shared != spec["shared"]
+        or meta.num_warps * 32 != spec["threads"]
+    ):
         raise RuntimeError("Native program resource contract changed: " + spec["file"])
     data = compiled.asm["ptx"].encode()
-    if not re.search(rb"\.visible\s+\.entry\s+" + re.escape(spec["entry"].encode()) + rb"\s*\(", data):
+    if not re.search(
+        rb"\.visible\s+\.entry\s+" + re.escape(spec["entry"].encode()) + rb"\s*\(", data
+    ):
         raise RuntimeError("Native program export contract changed: " + spec["file"])
     return data
 
@@ -59,8 +74,12 @@ def emit(output, spec, data):
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     (output / spec["file"]).write_bytes(data)
-    return dict(file=spec["file"], sha256=hashlib.sha256(data).hexdigest(),
-                shared=spec["shared"], threads=spec["threads"])
+    return dict(
+        file=spec["file"],
+        sha256=hashlib.sha256(data).hexdigest(),
+        shared=spec["shared"],
+        threads=spec["threads"],
+    )
 
 
 def write_manifest(output, records, **metadata):

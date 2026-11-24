@@ -634,7 +634,8 @@ def test_unrelated_busy_index_does_not_starve_maintenance(tmp_path: Path) -> Non
         busy.add_index({"name": "busy_text", "type": "full_text", "config_json": {"field": "a"}})
         for i in range(30):
             db.batch_json({"inserts": {f"b{i}": {"b": f"quietdoc{i} " + "w " * 200}}, "sync_level": "full_index"})
-        assert text_merge(db.stats())["active_segments"] == 30
+        initial = text_merge(db.stats())
+        assert initial is not None and initial["active_segments"] == 30
         writes = [0]
 
         def write_busy() -> None:
@@ -652,9 +653,11 @@ def test_unrelated_busy_index_does_not_starve_maintenance(tmp_path: Path) -> Non
         try:
             deadline = time.monotonic() + 30
             merged = text_merge(db.stats())
+            assert merged is not None
             while time.monotonic() < deadline and merged["active_segments"] > 4:
                 time.sleep(0.1)
                 merged = text_merge(db.stats())
+                assert merged is not None
             still_busy = writer.is_alive()
         finally:
             stop.set()
