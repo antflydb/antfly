@@ -1024,10 +1024,6 @@ pub const Pool = struct {
         return id;
     }
 
-    pub fn allocationForNode(self: *const Pool, node: NodeId) ?buffers.AllocationId {
-        const slot = self.plan.slotForNode(node) orelse return null;
-        return if (self.plan.allocationForSlot(slot.id)) |allocation| allocation.id else null;
-    }
     fn isDenseTransferPlane(plane: @import("storage_ownership.zig").Plane, backend: ops.BackendKind, shape: ml.graph.Shape, bytes: u64, epoch: u64) bool {
         const expected_storage: @FieldType(@TypeOf(plane.descriptor), "storage") = switch (backend) {
             .native => .host_f32,
@@ -1152,11 +1148,6 @@ pub const Pool = struct {
             },
         }
         return coverage;
-    }
-
-    pub fn preparedAlignment(self: *const Pool, node: NodeId) ?u32 {
-        const selected = self.preparedKernelRoute(node) orelse return null;
-        return selected.requirements.primary_alignment;
     }
 
     fn deviceInputIndex(self: *const Pool, node: NodeId) ?usize {
@@ -1756,13 +1747,8 @@ pub const Pool = struct {
 
     /// Exact admitted handoff. Legacy acquisition is forbidden for variants with
     /// selected regions: it cannot silently omit the pre-admission payload pins.
-    pub fn acquirePreparedWithRegions(self: *Pool, capability: ?admission.Capability, warm: ?*FrameClaim, pending: ?*@import("region_claims.zig").Set) !?*Frame {
-        return self.acquirePreparedWithRegionsImpl(capability, warm, pending, null);
-    }
     pub fn acquirePreparedWithRegionsAndOperation(self: *Pool, capability: ?admission.Capability, warm: ?*FrameClaim, pending: ?*@import("region_claims.zig").Set, graph: *const Graph, operation: ?@import("backend_operation.zig").Borrowed) !?*Frame {
-        return self.acquirePreparedWithRegionsImpl(capability, warm, pending, if (operation) |token| .{ .graph = graph, .operation = token } else null);
-    }
-    fn acquirePreparedWithRegionsImpl(self: *Pool, capability: ?admission.Capability, warm: ?*FrameClaim, pending: ?*@import("region_claims.zig").Set, terminal: ?TerminalBinding) !?*Frame {
+        const terminal: ?TerminalBinding = if (operation) |token| .{ .graph = graph, .operation = token } else null;
         if (self.regions.len == 0) {
             if (pending != null) return error.InvalidPreparedRegionClaim;
             return self.acquirePrepared(capability, warm);
