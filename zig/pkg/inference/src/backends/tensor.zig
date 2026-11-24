@@ -225,7 +225,7 @@ pub const Tensor = struct {
     /// The caller owns the returned slice. Adopt compatible output storage.
     pub fn takeOrCopyFloat32(self: *Tensor, allocator: std.mem.Allocator) ![]f32 {
         if (self.dtype != .f32 or self.data.len % @sizeOf(f32) != 0 or !self.isAlignedFor(f32)) return error.InvalidTensorData;
-        if (self.owns_data and self.data_alignment == .of(f32) and
+        if (self.owns_data and self.data_alignment == std.mem.Alignment.of(f32) and
             self.allocator.ptr == allocator.ptr and self.allocator.vtable == allocator.vtable)
         {
             self.owns_data = false;
