@@ -3775,6 +3775,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.endPlannedGraphScopeForSelf(scope);
     }
 
+    pub fn abortPlannedGraphScope(cb: *const ops.ComputeBackend, scope: PlannedGraphScope) void {
+        if (cb.kind() != .metal or !scope.active) return;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const runtime = self.provider_impl.raw_decode_runtime;
+        if (scope.owns_frame) {
+            var active = metal_runtime.hasActiveFrame(runtime);
+            self.cancelDecoderRuntimeFrame(runtime, &active);
+        } else metal_runtime.endPlannedComputeScope(runtime) catch {};
+    }
+
     fn endPlannedGraphScopeForSelf(self: *MetalCompute, scope: PlannedGraphScope) !void {
         if (!scope.active and !scope.owns_frame) return;
         const runtime = self.provider_impl.raw_decode_runtime orelse return;
@@ -42521,6 +42531,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     pub fn endPlannedGraphScope(_: *const ops.ComputeBackend, _: PlannedGraphScope) !void {}
+
+    pub fn abortPlannedGraphScope(_: *const ops.ComputeBackend, _: PlannedGraphScope) void {}
 };
 
 /// Metal-native prefetch queue installation. Uses the simple synchronous

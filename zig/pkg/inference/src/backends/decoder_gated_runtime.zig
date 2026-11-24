@@ -1262,23 +1262,40 @@ fn applyPleDirect(
     })) orelse cb.add(hidden, normed);
 }
 
+const PleTokenSource = union(enum) { host: []const i64, device: ops.CT };
+
 fn computePleVectorsDirect(
     cb: *const ops.ComputeBackend,
     gpt_config: gpt_mod.Config,
     configured_layer_count: usize,
-    input_ids: []const i64,
+    tokens: PleTokenSource,
     hidden: ops.CT,
     total: usize,
 ) !?ops.CT {
     if (gpt_config.family != .gemma or !gpt_config.hasPle()) return null;
     if (total == 0) return null;
 
+    const planned_scope = try metal_compute_mod.MetalCompute.beginPlannedGraphScope(cb, .ple);
+    var finished = false;
+    defer if (!finished) metal_compute_mod.MetalCompute.abortPlannedGraphScope(cb, planned_scope);
+    const output = (try encodePleVectors(cb, gpt_config, configured_layer_count, tokens, hidden, total)) orelse return null;
+    errdefer cb.free(output);
+    finished = true;
+    try metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope);
+    return output;
+}
+
+fn encodePleVectors(
+    cb: *const ops.ComputeBackend,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    tokens: PleTokenSource,
+    hidden: ops.CT,
+    total: usize,
+) !?ops.CT {
     const ple_dim: usize = gpt_config.ple_hidden_size;
     const num_layers: usize = gpt_config.num_hidden_layers;
     const ple_total_dim = ple_dim * num_layers;
-
-    const planned_scope = try metal_compute_mod.MetalCompute.beginPlannedGraphScope(cb, .ple);
-    defer metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope) catch {};
 
     var started_at = monotonicNowNs();
     const token_w = gpt_arch.getModelEmbeddingWeight(cb, gpt_config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
@@ -1290,7 +1307,10 @@ fn computePleVectorsDirect(
     defer cb.free(token_w);
 
     started_at = monotonicNowNs();
-    const token_embd_raw = try cb.embeddingLookup(token_w, input_ids, total, ple_total_dim);
+    const token_embd_raw = switch (tokens) {
+        .host => |ids| try cb.embeddingLookup(token_w, ids, total, ple_total_dim),
+        .device => |tensor| (try cb.embeddingLookupTensor(token_w, tensor, total, ple_total_dim)) orelse return null,
+    };
     finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.prefill_ple_embedding_nanos += finished_at - started_at;
     defer cb.free(token_embd_raw);
@@ -1338,6 +1358,8 @@ fn computePleVectorsDirect(
         if (finished_at > started_at) timing_stats.prefill_ple_combine_nanos += finished_at - started_at;
         return combined_scaled;
     }
+
+    if (tokens == .device) return null;
 
     const scale_shape = [_]i32{1};
     const embed_scale_ct = try cb.fromFloat32Shape(&[_]f32{embed_scale_val}, &scale_shape);
@@ -1356,86 +1378,6 @@ fn computePleVectorsDirect(
     finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.prefill_ple_combine_nanos += finished_at - started_at;
     return combined_scaled;
-}
-
-fn computePleVectorsDirectFromTokenTensor(
-    cb: *const ops.ComputeBackend,
-    gpt_config: gpt_mod.Config,
-    configured_layer_count: usize,
-    input_token: ops.CT,
-    hidden: ops.CT,
-    total: usize,
-) !?ops.CT {
-    if (gpt_config.family != .gemma or !gpt_config.hasPle()) return null;
-    if (total == 0) return null;
-
-    const ple_dim: usize = gpt_config.ple_hidden_size;
-    const num_layers: usize = gpt_config.num_hidden_layers;
-    const ple_total_dim = ple_dim * num_layers;
-
-    const planned_scope = try metal_compute_mod.MetalCompute.beginPlannedGraphScope(cb, .ple);
-    defer metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope) catch {};
-
-    var started_at = monotonicNowNs();
-    const token_w = gpt_arch.getModelEmbeddingWeight(cb, gpt_config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
-        error.MissingWeight => try gpt_arch.getModelEmbeddingWeight(cb, gpt_config, "model.embed_tokens_per_layer.weight"),
-        else => return err,
-    };
-    var finished_at = monotonicNowNs();
-    if (finished_at > started_at) timing_stats.prefill_ple_lookup_nanos += finished_at - started_at;
-    defer cb.free(token_w);
-
-    started_at = monotonicNowNs();
-    const token_embd_raw = (try cb.embeddingLookupTensor(token_w, input_token, total, ple_total_dim)) orelse return null;
-    finished_at = monotonicNowNs();
-    if (finished_at > started_at) timing_stats.prefill_ple_embedding_nanos += finished_at - started_at;
-    defer cb.free(token_embd_raw);
-
-    started_at = monotonicNowNs();
-    const projection_epsilon = try gpt_arch.gemmaPleProjectionEpsilon(cb, hidden, total, gpt_config);
-    const model_proj_raw = (try cb.decoderRuntimeApplyLinear(&.{
-        .slot = pleModelProjSlot(configured_layer_count),
-        .input = hidden,
-        .in_dim = gpt_config.hidden_size,
-        .out_dim = ple_total_dim,
-    })) orelse return null;
-    finished_at = monotonicNowNs();
-    if (finished_at > started_at) timing_stats.prefill_ple_model_proj_nanos += finished_at - started_at;
-    defer cb.free(model_proj_raw);
-
-    started_at = monotonicNowNs();
-    const reshaped = (try cb.reshape2d(model_proj_raw, total * num_layers, ple_dim)) orelse return null;
-    defer cb.free(reshaped);
-
-    const normed_flat = (try cb.decoderRuntimeApplyRmsNorm(&.{
-        .slot = pleProjNormSlot(configured_layer_count),
-        .input = reshaped,
-        .hidden_size = ple_dim,
-        .eps = projection_epsilon,
-    })) orelse return null;
-    defer cb.free(normed_flat);
-
-    const normed_proj = (try cb.reshape2d(normed_flat, total, ple_total_dim)) orelse return null;
-    finished_at = monotonicNowNs();
-    if (finished_at > started_at) timing_stats.prefill_ple_norm_nanos += finished_at - started_at;
-    defer cb.free(normed_proj);
-
-    started_at = monotonicNowNs();
-    const embed_scale_val = @sqrt(@as(f32, @floatFromInt(ple_dim)));
-    const combine_scale_val: f32 = 1.0 / @sqrt(2.0);
-    if (try cb.decoderRuntimeApplyScaledAddScale(&.{
-        .lhs = token_embd_raw,
-        .rhs = normed_proj,
-        .dim = total * ple_total_dim,
-        .lhs_scale = embed_scale_val,
-        .output_scale = combine_scale_val,
-    })) |combined_scaled| {
-        finished_at = monotonicNowNs();
-        if (finished_at > started_at) timing_stats.prefill_ple_combine_nanos += finished_at - started_at;
-        return combined_scaled;
-    }
-
-    return null;
 }
 
 pub fn preparedLayers(configured_layers: usize) usize {
@@ -5959,7 +5901,7 @@ pub fn forwardGreedyToken(
         cb,
         gpt_config,
         configured_layer_count,
-        &ple_input_ids,
+        .{ .host = &ple_input_ids },
         hidden,
         1,
     )) |direct_ple|
@@ -6328,11 +6270,11 @@ pub fn forwardGreedyTokenFromTokenTensor(
     if (finished_at > started_at) timing_stats.greedy_embed_nanos += finished_at - started_at;
 
     started_at = monotonicNowNs();
-    const ple_vectors = if (try computePleVectorsDirectFromTokenTensor(
+    const ple_vectors = if (try computePleVectorsDirect(
         cb,
         gpt_config,
         configured_layer_count,
-        token_tensor,
+        .{ .device = token_tensor },
         hidden,
         1,
     )) |direct_ple|
@@ -6458,11 +6400,11 @@ pub fn forwardGreedyTokenTensorOnlyFromTokenTensor(
     if (finished_at > started_at) timing_stats.greedy_embed_nanos += finished_at - started_at;
 
     started_at = monotonicNowNs();
-    const ple_vectors = if (try computePleVectorsDirectFromTokenTensor(
+    const ple_vectors = if (try computePleVectorsDirect(
         cb,
         gpt_config,
         configured_layer_count,
-        token_tensor,
+        .{ .device = token_tensor },
         hidden,
         1,
     )) |direct_ple|
@@ -6612,7 +6554,7 @@ pub fn forwardPrefillLastPreparedTail(
         cb,
         gpt_config,
         configured_layer_count,
-        input_ids,
+        .{ .host = input_ids },
         hidden,
         input_ids.len,
     );
@@ -6903,7 +6845,7 @@ fn forwardFinalHiddenRowsFromHidden(
         cb,
         gpt_config,
         configured_layer_count,
-        ple_ids,
+        .{ .host = ple_ids },
         hidden,
         ple_ids.len,
     );
