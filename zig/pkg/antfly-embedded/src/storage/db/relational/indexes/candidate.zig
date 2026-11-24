@@ -1685,7 +1685,7 @@ fn testCancellationIntent(comptime Backend: type, comptime prior_phase: enum { a
         // fixture. Cancellation must be independent of that inventory: fail
         // immediately if it ever tries to scan the queue. This avoids building
         // 8,192 unrelated retirement records in every physical-owner scenario.
-        const PointOnly = struct {
+        const QueueGuard = struct {
             inner: *@import("../../../docstore.zig").DocStore.Txn,
             pub fn get(self: *@This(), key: []const u8) ![]const u8 {
                 return self.inner.get(key);
@@ -1696,12 +1696,29 @@ fn testCancellationIntent(comptime Backend: type, comptime prior_phase: enum { a
             pub fn delete(self: *@This(), key: []const u8) !void {
                 try self.inner.delete(key);
             }
-            pub fn openCursor(_: *@This()) !@import("../../../docstore.zig").DocStore.Txn.CursorAdapter {
-                return error.UnexpectedCancellationAdmissionScan;
+            const Cursor = struct {
+                inner: @import("../../../docstore.zig").DocStore.Txn.CursorAdapter,
+
+                pub fn close(self: *Cursor) void {
+                    self.inner.close();
+                }
+
+                pub fn seekAtOrAfter(self: *Cursor, key: []const u8) @TypeOf(self.inner.seekAtOrAfter(key)) {
+                    if (std.mem.startsWith(u8, key, gc.prefix)) return error.UnexpectedCancellationAdmissionScan;
+                    return self.inner.seekAtOrAfter(key);
+                }
+
+                pub fn next(self: *Cursor) @TypeOf(self.inner.next()) {
+                    return self.inner.next();
+                }
+            };
+
+            pub fn openCursor(self: *@This()) !Cursor {
+                return .{ .inner = try self.inner.openCursor() };
             }
         };
-        var points: PointOnly = .{ .inner = &txn };
-        const queued = try jobs.stageCancellationCleanupWithReplay(&points, &manager, binding, null);
+        var guarded: QueueGuard = .{ .inner = &txn };
+        const queued = try jobs.stageCancellationCleanupWithReplay(&guarded, &manager, binding, null);
         try std.testing.expectEqual(sequence + 1, queued.position.sequence);
     }
     var queued: jobs.CancellationCleanup = undefined;
