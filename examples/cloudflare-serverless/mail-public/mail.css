@@ -254,8 +254,9 @@ pre { font: 15px/1.65 var(--font-sans); white-space: pre-wrap; overflow-wrap: an
 .attachment span:last-child { font: 12px var(--font-mono); color: var(--muted-foreground); white-space: nowrap; }
 .editor-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.25rem; }
 .editor-head h2 { font-size: 1.2rem; font-weight: 600; margin: 0; }
-.field { display: grid; grid-template-columns: 4.5rem 1fr; align-items: center; border-bottom: 1px solid var(--border); }
+.field { margin: 0; display: grid; grid-template-columns: 4.5rem 1fr; align-items: center; border-bottom: 1px solid var(--border); }
 .field input { border: 0; border-radius: 0; background: none; padding: 0.7rem 0; outline: 0; }
+.field .from-value { padding: 0.7rem 0; color: var(--muted-foreground); overflow-wrap: anywhere; }
 .field input[readonly] { color: var(--muted-foreground); }
 #editor textarea { border: 0; border-radius: 0; background: none; outline: 0; padding: 1rem 0; resize: vertical; line-height: 1.65; }
 .editor-actions { display: flex; gap: 0.5rem; padding: 0.75rem 0 1.5rem; border-top: 1px solid var(--border); }

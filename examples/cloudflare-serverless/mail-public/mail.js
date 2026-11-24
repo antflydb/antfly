@@ -400,6 +400,10 @@ function edit(message) {
       (message.received_at ? fullDate(message.received_at) + " · " : "") + message.from;
     $("quote-text").textContent = message.text ?? "";
   }
+  // The server sends as "Name <mailbox>" unless the name is empty or an address.
+  const name = (me?.user.name ?? "").trim();
+  $("editor-from").textContent =
+    name && !name.includes("@") ? name + " <" + me.mailbox.address + ">" : me?.mailbox.address ?? "";
   $("editor").elements.to.value = message?.from ?? "";
   $("editor").elements.to.readOnly = !!message;
   $("editor").elements.subject.value = message

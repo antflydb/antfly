@@ -231,7 +231,13 @@ export default {
           Object.keys(body).some((k) => !["id", "to", "subject", "text", "reply_to"].includes(k))
         )
           return reply({ error: "InvalidOutgoingMail" }, 400);
-        const mail = { to: body.to, subject: body.subject, text: body.text, from: mailbox.address };
+        const mail = {
+          to: body.to,
+          subject: body.subject,
+          text: body.text,
+          from: mailbox.address,
+          from_name: session.user?.name,
+        };
         if (body.reply_to) {
           const prior = await takeRpcData(stub.message(mailbox.id, body.reply_to));
           if (!prior) return reply({ error: "NotFound" }, 404);

@@ -81,6 +81,7 @@
     <article id="message"><div class="empty"><svg class="mark" aria-hidden="true"><use href="#mark"/></svg><p>Select a message to read it.</p></div></article>
     <form id="editor" hidden>
       <div class="editor-head"><h2 id="editor-title">New message</h2><button type="button" id="cancel" class="link">Discard</button></div>
+      <p class="field"><span class="label">From</span><span id="editor-from" class="from-value"></span></p>
       <label class="field"><span class="label">To</span><input name="to" type="email" required></label>
       <label class="field"><span class="label">Subject</span><input name="subject" maxlength="998" required></label>
       <textarea name="text" rows="12" required maxlength="16384" aria-label="Message"></textarea>
