@@ -70,19 +70,8 @@ fn groups(a: std.mem.Allocator, model: *const onnx.Model, graph: *const Graph) !
     defer index.deinit(a);
     var result: std.ArrayList(Group) = .empty;
     defer result.deinit(a);
-    const reachable = try a.alloc(bool, graph.nodeCount());
+    const reachable = try ml.graph.passes.dce.computeReachable(a, graph);
     defer a.free(reachable);
-    @memset(reachable, false);
-    for (graph.outputs.items) |output| reachable[output] = true;
-    var reverse = graph.nodeCount();
-    while (reverse > 0) {
-        reverse -= 1;
-        if (reachable[reverse]) {
-            for (graph.node(reverse).getInputs()) |input| {
-                if (input != ml.graph.null_node) reachable[input] = true;
-            }
-        }
-    }
     for (graph.nodes.items, 0..) |node, raw| {
         if (!reachable[raw]) continue;
         if (node.op != .dot_general or node.num_inputs != 2) continue;

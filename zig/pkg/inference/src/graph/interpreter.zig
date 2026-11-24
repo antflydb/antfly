@@ -552,53 +552,8 @@ fn currentResidentBytes() usize {
     return platform.time.residentBytes();
 }
 
-/// Compute which nodes are reachable from graph outputs (walking
-/// backward through inputs). Unreachable nodes (e.g. decomposed
-/// primitive subgraphs stored in vjp_alternate) are skipped during
-/// execution.
-pub fn computeReachable(allocator: std.mem.Allocator, graph: *const Graph) ![]bool {
-    const count = graph.nodeCount();
-    const reachable = try allocator.alloc(bool, count);
-    @memset(reachable, false);
-
-    // Seed with output nodes
-    for (graph.outputs.items) |out_id| {
-        markReachable(graph, reachable, out_id);
-    }
-
-    return reachable;
-}
-
-/// Compute which nodes are reachable from an explicit target set. This is used
-/// by debug/artifact capture paths that should not execute the full model tail.
-pub fn computeReachableFromNodes(
-    allocator: std.mem.Allocator,
-    graph: *const Graph,
-    target_node_ids: []const NodeId,
-) ![]bool {
-    const count = graph.nodeCount();
-    const reachable = try allocator.alloc(bool, count);
-    @memset(reachable, false);
-
-    for (target_node_ids) |node_id| {
-        markReachable(graph, reachable, node_id);
-    }
-
-    return reachable;
-}
-
-fn markReachable(graph: *const Graph, reachable: []bool, id: NodeId) void {
-    if (id == null_node or id >= reachable.len) return;
-    if (reachable[id]) return; // already visited
-
-    reachable[id] = true;
-
-    const n = graph.node(id);
-    for (n.getInputs()) |input_id| {
-        markReachable(graph, reachable, input_id);
-    }
-    // Note: we do NOT follow vjp_alternate — those are for autograd only.
-}
+pub const computeReachable = ml.graph.passes.dce.computeReachable;
+pub const computeReachableFromNodes = ml.graph.passes.dce.computeReachableFromNodes;
 
 /// Compute the last node index that uses each node as an input.
 /// Used for liveness-based tensor freeing.

@@ -79,12 +79,8 @@ pub fn fuse(allocator: std.mem.Allocator, graph: *const Graph) !FuseResult {
     // already-fused op. Without this, builders that emit a fused node
     // alongside its decomposed shadow (e.g. `Builder.softmax`) would
     // spuriously re-fuse the shadow on every fuse() call.
-    const reachable_anchor = try allocator.alloc(bool, orig_count);
+    const reachable_anchor = try @import("dce.zig").computeReachable(allocator, &work);
     defer allocator.free(reachable_anchor);
-    @memset(reachable_anchor, false);
-    for (work.outputs.items) |out_id| {
-        markReachableForFuse(&work, reachable_anchor, out_id);
-    }
 
     // Phase 1: Multi-node patterns (may add nodes to work).
     //
@@ -455,19 +451,6 @@ fn skipShapeOps(graph: *const Graph, id: NodeId) NodeId {
 fn isConstScalarValue(graph: *const Graph, id: NodeId, value: f32) bool {
     const v = extractScalarConstValue(graph, id) orelse return false;
     return v == value;
-}
-
-/// Mark every node reachable from `id` via inputs only (NOT via
-/// vjp_alternate). Used by primitive→fused matchers in Phase 1 so they
-/// skip dead vjp shadow subgraphs.
-fn markReachableForFuse(graph: *const Graph, reachable: []bool, id: NodeId) void {
-    if (id == null_node or id >= reachable.len) return;
-    if (reachable[id]) return;
-    reachable[id] = true;
-    const n = graph.node(id);
-    for (n.getInputs()) |inp| {
-        if (inp != null_node) markReachableForFuse(graph, reachable, inp);
-    }
 }
 
 fn shapesEqual(a: Shape, b: Shape) bool {

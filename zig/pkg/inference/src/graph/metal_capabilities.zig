@@ -2270,7 +2270,7 @@ test "gemma4 graph planner keeps real qkv projection layout on metal" {
     });
     defer plan.deinit();
 
-    const reachable = try allocReachableFromOutputs(allocator, &g);
+    const reachable = try ml.graph.passes.dce.computeReachable(allocator, &g);
     defer allocator.free(reachable);
 
     try expectReachableNamedWeightLinearConsumersOnMetal(&g, &plan, reachable, "model.layers.0.self_attn.q_proj.weight", .mul_mv_ext);
@@ -2541,26 +2541,6 @@ fn expectNodePlannedOnMetal(
         });
     }
     try std.testing.expectEqual(contracts.BackendKind.metal, backend);
-}
-
-fn allocReachableFromOutputs(allocator: std.mem.Allocator, graph: *const Graph) ![]bool {
-    const reachable = try allocator.alloc(bool, graph.nodeCount());
-    @memset(reachable, false);
-    for (graph.outputs.items) |output| {
-        markReachable(graph, reachable, output);
-    }
-    return reachable;
-}
-
-fn markReachable(graph: *const Graph, reachable: []bool, node_id: NodeId) void {
-    if (node_id == null_node) return;
-    const idx: usize = @intCast(node_id);
-    if (idx >= reachable.len or reachable[idx]) return;
-    reachable[idx] = true;
-    const node = graph.node(node_id);
-    for (node.getInputs()) |input_id| {
-        markReachable(graph, reachable, input_id);
-    }
 }
 
 fn expectSeededQ8LinearRoutesToMetal(rows: usize, expected_operator: operator_plan.Operator) !void {
