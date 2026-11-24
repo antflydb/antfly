@@ -199,7 +199,8 @@ pub const Selection = struct {
                     if (consumer < self.routes.len) {
                         if (self.routes[consumer] != null) continue;
                         if (pool.regionForNode(consumer)) |installed| {
-                            if (std.mem.indexOfScalar(NodeId, installed.owner.input_nodes, literal.node) != null) continue;
+                            if (std.mem.indexOfScalar(NodeId, installed.owner.input_nodes, literal.node) != null or
+                                std.mem.indexOfScalar(NodeId, installed.owner.literal_nodes, literal.node) != null) continue;
                         }
                     }
                     self.literal_enabled[index] = false;
