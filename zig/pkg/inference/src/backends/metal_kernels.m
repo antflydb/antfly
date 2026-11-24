@@ -33466,6 +33466,37 @@ static size_t termite_metal_graph_plan_slot_capacity(
         termite_metal_decode_runtime_graph_plan_allocation_bytes(current, requested_bytes);
 }
 
+// A failed growth leaves every published buffer and counter untouched.
+static bool termite_metal_graph_plan_publish_capacities(
+    termite_metal_decode_runtime *runtime, const size_t *slots,
+    const size_t *capacities, size_t count, size_t *allocations, size_t *reuses
+) {
+    id<MTLBuffer> replacements[TERMITE_METAL_GRAPH_PLAN_SLOT_CAPACITY] = { nil };
+    size_t allocated = 0;
+    size_t reused = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (capacities[i] == 0) continue;
+        const size_t slot = slots == NULL ? i : slots[i];
+        if (runtime->graph_plan_buffers[slot] != nil && runtime->graph_plan_capacities[slot] >= capacities[i]) {
+            ++reused;
+            continue;
+        }
+        if (capacities[i] > runtime->device.maxBufferLength) return false;
+        replacements[i] = termite_metal_workspace_buffer(runtime, capacities[i], MTLResourceStorageModePrivate);
+        if (replacements[i] == nil) return false;
+        ++allocated;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (replacements[i] == nil) continue;
+        const size_t slot = slots == NULL ? i : slots[i];
+        runtime->graph_plan_buffers[slot] = replacements[i];
+        runtime->graph_plan_capacities[slot] = capacities[i];
+    }
+    *allocations = allocated;
+    *reuses = reused;
+    return true;
+}
+
 int termite_metal_decode_runtime_commit_graph_plan(termite_metal_decode_runtime *runtime) {
     if (runtime == NULL || runtime->device == nil) return -1;
     @autoreleasepool {
@@ -33475,26 +33506,18 @@ int termite_metal_decode_runtime_commit_graph_plan(termite_metal_decode_runtime 
         size_t trace_bytes = 0;
         size_t trace_allocations = 0;
         size_t trace_reuses = 0;
+        size_t capacities[TERMITE_METAL_GRAPH_PLAN_SLOT_CAPACITY] = { 0 };
         for (size_t slot = 0; slot < TERMITE_METAL_GRAPH_PLAN_SLOT_CAPACITY; ++slot) {
             const size_t bytes = runtime->graph_plan_requested_bytes[slot];
             if (bytes == 0) continue;
             trace_slots += 1;
             trace_bytes += bytes;
-            if (runtime->graph_plan_buffers[slot] != nil &&
-                runtime->graph_plan_capacities[slot] >= bytes)
-            {
-                runtime->graph_plan_reuses += 1;
-                trace_reuses += 1;
-                continue;
-            }
-            const size_t allocation_bytes = termite_metal_graph_plan_slot_capacity(runtime, slot, bytes);
-            id<MTLBuffer> buffer = termite_metal_workspace_buffer(runtime, allocation_bytes, MTLResourceStorageModePrivate);
-            if (buffer == nil) return -2;
-            runtime->graph_plan_buffers[slot] = buffer;
-            runtime->graph_plan_capacities[slot] = allocation_bytes;
-            runtime->graph_plan_allocations += 1;
-            trace_allocations += 1;
+            capacities[slot] = termite_metal_graph_plan_slot_capacity(runtime, slot, bytes);
         }
+        if (!termite_metal_graph_plan_publish_capacities(runtime, NULL, capacities, TERMITE_METAL_GRAPH_PLAN_SLOT_CAPACITY,
+                &trace_allocations, &trace_reuses)) return -2;
+        runtime->graph_plan_allocations += trace_allocations;
+        runtime->graph_plan_reuses += trace_reuses;
         runtime->graph_plan_active = 1;
         runtime->graph_plan_count += 1;
         if (trace_enabled) {
@@ -55290,26 +55313,15 @@ static bool termite_metal_deberta_attention_scratch_plan(
 static bool termite_metal_deberta_attention_reserve_scratch(
     termite_metal_decode_runtime *runtime, const size_t *slots, const size_t *capacities
 ) {
-    id<MTLBuffer> replacements[TERMITE_DEBERTA_MPS_SCRATCH_PLANES] = { nil };
     size_t grown = 0;
-    for (size_t i = 0; i < TERMITE_DEBERTA_MPS_SCRATCH_PLANES; ++i) {
-        const size_t slot = slots[i];
-        if (runtime->graph_plan_buffers[slot] != nil && runtime->graph_plan_capacities[slot] >= capacities[i]) continue;
-        replacements[i] = termite_metal_workspace_buffer(runtime, capacities[i], MTLResourceStorageModePrivate);
-        if (replacements[i] == nil) return false;
-        ++grown;
+    size_t reused = 0;
+    if (!termite_metal_graph_plan_publish_capacities(runtime, slots, capacities, TERMITE_DEBERTA_MPS_SCRATCH_PLANES, &grown, &reused))
+        return false;
+    if (grown != 0) {
+        runtime->graph_plan_allocations += grown;
+        runtime->graph_plan_reuses += reused;
+        runtime->graph_plan_count += 1;
     }
-    if (grown == 0) return true;
-    // Publish all planes together. A failed allocation leaves the original
-    // slot set usable by the next request.
-    for (size_t i = 0; i < TERMITE_DEBERTA_MPS_SCRATCH_PLANES; ++i) {
-        if (replacements[i] == nil) continue;
-        runtime->graph_plan_buffers[slots[i]] = replacements[i];
-        runtime->graph_plan_capacities[slots[i]] = capacities[i];
-    }
-    runtime->graph_plan_allocations += grown;
-    runtime->graph_plan_reuses += TERMITE_DEBERTA_MPS_SCRATCH_PLANES - grown;
-    runtime->graph_plan_count += 1;
     return true;
 }
 

@@ -50077,6 +50077,35 @@ test "planned attention helpers reject stale command records" {
     try std.testing.expect(!plannedContractAllowsPagedAttention(stale_linear));
 }
 
+test "metal native graph planner preserves published slots after failed growth" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    const runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer termite_metal_decode_runtime_destroy(runtime);
+
+    try beginGraphPlan(runtime);
+    try reserveGraphPlanSlot(runtime, 0, 4096);
+    try commitGraphPlan(runtime);
+    const original = runtimeMemorySnapshot(runtime);
+
+    try reserveGraphPlanSlot(runtime, 0, 16384);
+    try reserveGraphPlanSlot(runtime, 1, std.math.maxInt(usize));
+    try std.testing.expectError(error.AllocationFailed, commitGraphPlan(runtime));
+    const failed = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(original.graph_plan_allocations, failed.graph_plan_allocations);
+    try std.testing.expectEqual(original.graph_plan_reuses, failed.graph_plan_reuses);
+    try std.testing.expectEqual(original.graph_plan_bytes, failed.graph_plan_bytes);
+    try std.testing.expectEqual(original.graph_plan_count, failed.graph_plan_count);
+    try std.testing.expectEqual(original.graph_plan_active, failed.graph_plan_active);
+
+    try beginGraphPlan(runtime);
+    try reserveGraphPlanSlot(runtime, 0, 4096);
+    try commitGraphPlan(runtime);
+    const retried = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(original.graph_plan_allocations, retried.graph_plan_allocations);
+    try std.testing.expectEqual(original.graph_plan_bytes, retried.graph_plan_bytes);
+    try std.testing.expectEqual(original.graph_plan_reuses + 1, retried.graph_plan_reuses);
+}
+
 test "metal native graph planner reserves sampled tail scratch up front" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
