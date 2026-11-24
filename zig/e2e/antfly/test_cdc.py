@@ -3795,14 +3795,30 @@ def test_public_changefeed_bootstraps_and_streams_native_sql_rows():
             feeds = f"{server.api_url}/changefeeds"
             amount = "12345678901234567890.12345678"
 
-            def sql(statement):
-                reply = client.post(
-                    f"{server.api_url}/sql", json={"statement": statement}, timeout=40
-                )
-                assert reply.ok, reply.text
+            def sql(statement, *, wait_for_catalog=False):
+                def execute():
+                    reply = client.post(
+                        f"{server.api_url}/sql",
+                        json={"statement": statement},
+                        timeout=40,
+                    )
+                    if (
+                        wait_for_catalog
+                        and reply.status_code == 503
+                        and "No schema change was admitted." in reply.text
+                    ):
+                        return False
+                    assert reply.ok, reply.text
+                    return True
+
+                if wait_for_catalog:
+                    wait_until(execute, timeout_s=45, interval_s=0.25)
+                else:
+                    execute()
 
             sql(
-                "CREATE TABLE cdc_rows (id BIGINT PRIMARY KEY, amount NUMERIC(38,8), label TEXT)"
+                "CREATE TABLE cdc_rows (id BIGINT PRIMARY KEY, amount NUMERIC(38,8), label TEXT)",
+                wait_for_catalog=True,
             )
             sql(
                 f"INSERT INTO cdc_rows (id, amount, label) VALUES (1, {amount}, 'before')"

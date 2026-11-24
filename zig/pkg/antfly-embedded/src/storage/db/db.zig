@@ -8914,7 +8914,7 @@ pub const DB = struct {
             var view = self.core.acquireSchemaView();
             defer if (view) |*pinned| pinned.release();
             if (hasCoordinatedConstraints(view)) {
-                var read = try self.core.store.beginProbeTxn();
+                var read = try self.core.store.beginReadTxn();
                 defer read.abort();
                 const topology = @import("relational/integrity/topology.zig");
                 const fence = (try topology.current(&read)) orelse return error.CoordinatedConstraintTopologyUnsupported;
@@ -26372,7 +26372,7 @@ pub const DB = struct {
         profile.next("checkpoint_pin");
         if (!seal_only) try self.ensureSnapshotStorageLocked(include_generated) else try self.requireQueryCutStorage();
         if (expected_topology_fence) |expected| {
-            var read = try self.core.store.beginProbeTxn();
+            var read = try self.core.store.beginReadTxn();
             defer read.abort();
             var manager = try self.core.initTxnManager();
             defer manager.deinit();
@@ -33937,7 +33937,7 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("relationalHandoffManifest", .{ self, alloc, source, destination, lower, upper, primary_sequence });
         self.core.lockApplyShared();
         defer self.core.unlockApplyShared();
-        var read = try self.core.store.beginProbeTxn();
+        var read = try self.core.store.beginReadTxn();
         defer read.abort();
         var manager = try self.core.initTxnManager();
         defer manager.deinit();
@@ -33966,7 +33966,7 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("relationalHandoffPage", .{ self, alloc, manifest, progress });
         self.core.lockApplyShared();
         defer self.core.unlockApplyShared();
-        var read = try self.core.store.beginProbeTxn();
+        var read = try self.core.store.beginReadTxn();
         defer read.abort();
         var manager = try self.core.initTxnManager();
         defer manager.deinit();
