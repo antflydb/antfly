@@ -1515,9 +1515,12 @@ pub const Pool = struct {
                 _ = self.baked_region_literals.remove(input);
             }
         }
-        for (self.regions) |installed| for (installed.owner.requirements.literals) |node| {
-            _ = self.baked_region_literals.remove(node);
-        };
+        for (self.regions) |installed| {
+            // Prepared callbacks may also declare provider operands that are
+            // not direct inputs of any individual covered graph operation.
+            for (installed.owner.input_nodes) |node| _ = self.baked_region_literals.remove(node);
+            for (installed.owner.requirements.literals) |node| _ = self.baked_region_literals.remove(node);
+        }
     }
 
     pub fn regionForNode(self: *const Pool, node: NodeId) ?*const @import("region_binding.zig").Installed {
