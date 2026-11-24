@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.dependency_impact_row_via_item import DependencyImpactRowViaItem
+
 
 T = TypeVar("T", bound="DependencyImpactRow")
 
@@ -19,11 +23,13 @@ class DependencyImpactRow:
         key (str):
         artifact (str):
         freshness (str):
-        path (list[str]):
+        path (list[str]): Same-document artifact chain from the consumed input to this output.
         table (str | Unset): Public name of the dependent table, when visible to the caller.
         version (int | Unset):
         historical (bool | Unset):
         live_candidate (bool | Unset):
+        via (list[DependencyImpactRowViaItem] | Unset): Transitive rows only, the generated outputs (in other rows or
+            tables) this dependent consumed on the way from the input, nearest the input first.
     """
 
     table_id: str
@@ -35,6 +41,7 @@ class DependencyImpactRow:
     version: int | Unset = UNSET
     historical: bool | Unset = UNSET
     live_candidate: bool | Unset = UNSET
+    via: list[DependencyImpactRowViaItem] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -56,6 +63,13 @@ class DependencyImpactRow:
 
         live_candidate = self.live_candidate
 
+        via: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.via, Unset):
+            via = []
+            for via_item_data in self.via:
+                via_item = via_item_data.to_dict()
+                via.append(via_item)
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -75,11 +89,15 @@ class DependencyImpactRow:
             field_dict["historical"] = historical
         if live_candidate is not UNSET:
             field_dict["live_candidate"] = live_candidate
+        if via is not UNSET:
+            field_dict["via"] = via
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.dependency_impact_row_via_item import DependencyImpactRowViaItem
+
         d = dict(src_dict)
         table_id = d.pop("table_id")
 
@@ -99,6 +117,15 @@ class DependencyImpactRow:
 
         live_candidate = d.pop("live_candidate", UNSET)
 
+        _via = d.pop("via", UNSET)
+        via: list[DependencyImpactRowViaItem] | Unset = UNSET
+        if _via is not UNSET:
+            via = []
+            for via_item_data in _via:
+                via_item = DependencyImpactRowViaItem.from_dict(via_item_data)
+
+                via.append(via_item)
+
         dependency_impact_row = cls(
             table_id=table_id,
             key=key,
@@ -109,6 +136,7 @@ class DependencyImpactRow:
             version=version,
             historical=historical,
             live_candidate=live_candidate,
+            via=via,
         )
 
         dependency_impact_row.additional_properties = d

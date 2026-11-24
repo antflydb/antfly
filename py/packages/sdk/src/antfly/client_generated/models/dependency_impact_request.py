@@ -18,8 +18,10 @@ class DependencyImpactRequest:
     Attributes:
         key (str): Source document key whose dependents are requested.
         revision (str | Unset): Optional hex input revision; only outputs that consumed that revision are returned.
-        traversal (DependencyImpactRequestTraversal | Unset): `transitive` also lists same-document artifacts that
-            consume each dependent (live candidates with their path). Default: DependencyImpactRequestTraversal.DIRECT.
+        traversal (DependencyImpactRequestTraversal | Unset): `transitive` follows every dependent output onward: same-
+            document artifacts that consume it (live candidates with their path) and rows of any table whose declarations
+            read it as `_artifacts.<name>` (with `via`), up to `max_depth` hops. Default:
+            DependencyImpactRequestTraversal.DIRECT.
         max_depth (int | Unset):  Default: 8.
         limit (int | Unset):  Default: 100.
     """

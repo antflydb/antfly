@@ -9266,7 +9266,7 @@ export interface components {
             /** @description Optional hex input revision; only outputs that consumed that revision are returned. */
             revision?: string;
             /**
-             * @description `transitive` also lists same-document artifacts that consume each dependent (live candidates with their path).
+             * @description `transitive` follows every dependent output onward: same-document artifacts that consume it (live candidates with their path) and rows of any table whose declarations read it as `_artifacts.<name>` (with `via`), up to `max_depth` hops.
              * @default direct
              * @enum {string}
              */
@@ -9287,7 +9287,14 @@ export interface components {
             historical?: boolean;
             live_candidate?: boolean;
             freshness: string;
+            /** @description Same-document artifact chain from the consumed input to this output. */
             path: string[];
+            /** @description Transitive rows only, the generated outputs (in other rows or tables) this dependent consumed on the way from the input, nearest the input first. */
+            via?: {
+                table?: string;
+                key?: string;
+                artifact?: string;
+            }[];
         };
         /**
          * @description Reverse lineage of one source document: dependent artifact versions that

@@ -3558,7 +3558,7 @@ pub const DependencyImpactRequest = struct {
     key: []const u8,
     /// Optional hex input revision; only outputs that consumed that revision are returned.
     revision: ?[]const u8 = null,
-    /// `transitive` also lists same-document artifacts that consume each dependent (live candidates with their path).
+    /// `transitive` follows every dependent output onward: same-document artifacts that consume it (live candidates with their path) and rows of any table whose declarations read it as `_artifacts.<name>` (with `via`), up to `max_depth` hops.
     traversal: ?[]const u8 = null,
     max_depth: ?i64 = null,
     limit: ?i64 = null,
@@ -3657,7 +3657,10 @@ pub const DependencyImpactRow = struct {
     historical: ?bool = null,
     live_candidate: ?bool = null,
     freshness: []const u8,
+    /// Same-document artifact chain from the consumed input to this output.
     path: []const []const u8,
+    /// Transitive rows only, the generated outputs (in other rows or tables) this dependent consumed on the way from the input, nearest the input first.
+    via: ?[]const std.json.Value = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -3670,6 +3673,7 @@ pub const DependencyImpactRow = struct {
         .{ "live_candidate", "live_candidate", true },
         .{ "freshness", "freshness", false },
         .{ "path", "path", false },
+        .{ "via", "via", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -3708,6 +3712,10 @@ pub const DependencyImpactRow = struct {
         try jw.write(self.freshness);
         try jw.objectField("path");
         try jw.write(self.path);
+        if (self.via) |value| {
+            try jw.objectField("via");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };

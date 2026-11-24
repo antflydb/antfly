@@ -354,6 +354,7 @@ from .dependency_impact_request_traversal import DependencyImpactRequestTraversa
 from .dependency_impact_response import DependencyImpactResponse
 from .dependency_impact_response_input import DependencyImpactResponseInput
 from .dependency_impact_row import DependencyImpactRow
+from .dependency_impact_row_via_item import DependencyImpactRowViaItem
 from .derived_coverage_observation_incomplete_reason import DerivedCoverageObservationIncompleteReason
 from .derived_coverage_policy import DerivedCoveragePolicy
 from .derived_coverage_status import DerivedCoverageStatus
@@ -3102,6 +3103,7 @@ __all__ = (
     "DependencyImpactResponse",
     "DependencyImpactResponseInput",
     "DependencyImpactRow",
+    "DependencyImpactRowViaItem",
     "DerivedCoverageObservationIncompleteReason",
     "DerivedCoveragePolicy",
     "DerivedCoverageStatus",
