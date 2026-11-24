@@ -167,13 +167,10 @@ pub const Prefix = struct {
         if (self.axis_positions) |positions| if (positions.len != try mul(usize, prefix_rows, 3)) return error.InvalidPreparedPrompt;
         if (self.visibility) |mask| if (mask.len != try mul(usize, prefix_rows, prefix_rows)) return error.InvalidPreparedPrompt;
         const pad_embeddings = cached and prefix_rows == prompt_rows and rows != prefix_rows;
-        var elements = try mul(usize, rows, 2 + @as(usize, if (self.ple_ids != null) 1 else 0));
-        if (self.axis_positions != null) elements = try add(usize, elements, try mul(usize, rows, 6));
-        var staging = try mul(usize, elements, @sizeOf(i64));
+        var staging: usize = if (rows != prompt_rows) try mul(usize, rows, @sizeOf(i64)) else 0;
         var input = try add(usize, try mul(usize, rows, @sizeOf(i64)), try mul(usize, try mul(usize, if (pad_embeddings) rows else prefix_rows, width), @sizeOf(f32)));
         var metadata: usize = 6 * @sizeOf(Tensor) + 2 * @sizeOf(i64);
         if (cached or self.bucket_rows != 0) {
-            staging = try add(usize, staging, @sizeOf(i64));
             input = try add(usize, input, @sizeOf(i64));
             metadata = try add(usize, metadata, @sizeOf(i64));
         }
@@ -182,11 +179,15 @@ pub const Prefix = struct {
             metadata = try add(usize, metadata, 3 * @sizeOf(i64));
         }
         if (self.ple_ids != null) {
-            input = try add(usize, input, try mul(usize, rows, @sizeOf(i64)));
+            const ids = try mul(usize, rows, @sizeOf(i64));
+            if (rows != prefix_rows) staging = try add(usize, staging, ids);
+            input = try add(usize, input, ids);
             metadata = try add(usize, metadata, 2 * @sizeOf(i64));
         }
         if (self.axis_positions != null) {
-            input = try add(usize, input, try mul(usize, rows, 3 * @sizeOf(i64)));
+            const positions = try mul(usize, rows, 3 * @sizeOf(i64));
+            staging = try add(usize, staging, positions);
+            input = try add(usize, input, positions);
             metadata = try add(usize, metadata, 2 * @sizeOf(i64));
         }
         if (self.visibility != null) {
@@ -236,8 +237,12 @@ pub const Prefix = struct {
         var packet: [6]Tensor = undefined;
         var inputs = std.ArrayList(Tensor).initBuffer(&packet);
         defer for (inputs.items) |*input| input.deinit();
-        inputs.appendAssumeCapacity(try Tensor.initInt64(a, "input_ids", &.{ 1, @intCast(rows) }, padded_ids));
-        if (self.bucket_rows != 0 or decoder != null) inputs.appendAssumeCapacity(try Tensor.initInt64(a, "logits_row", &.{1}, &.{@intCast(history.len - 1)}));
+        const ids_shape = [2]i64{ 1, @intCast(rows) };
+        const logits_row = [1]i64{@intCast(history.len - 1)};
+        const positions_shape = [2]i64{ 3, @intCast(rows) };
+        inputs.appendAssumeCapacity(Tensor.borrowInt64(a, "input_ids", &ids_shape, padded_ids));
+        if (self.bucket_rows != 0 or decoder != null)
+            inputs.appendAssumeCapacity(Tensor.borrowInt64(a, "logits_row", &.{1}, &logits_row));
         if (pad_embeddings) {
             const width: usize = @intCast(self.embeddings.shape[2]);
             const values = try a.alloc(f32, try std.math.mul(usize, rows, width));
@@ -249,21 +254,25 @@ pub const Prefix = struct {
             };
             inputs.appendAssumeCapacity(imported);
         } else inputs.appendAssumeCapacity(self.embeddings.borrowedView("input_embeddings"));
+        const staged_ple = if (self.ple_ids != null and rows != prefix_rows) try a.alloc(i64, rows) else null;
+        defer if (staged_ple) |values| a.free(values);
         if (self.ple_ids) |prefix| {
-            if (prefix.len != prefix_rows) return error.InvalidPreparedPrompt;
-            const ids = try Tensor.initInt64(a, "ple_input_ids", &.{ 1, @intCast(rows) }, padded_ids);
-            @memcpy(std.mem.bytesAsSlice(i64, @as([]align(@alignOf(i64)) u8, @alignCast(ids.data)))[0..prefix_rows], prefix);
-            inputs.appendAssumeCapacity(ids);
+            if (staged_ple) |values| {
+                @memcpy(values[0..prefix_rows], prefix);
+                @memcpy(values[prefix_rows..], padded_ids[prefix_rows..]);
+            }
+            inputs.appendAssumeCapacity(Tensor.borrowInt64(a, "ple_input_ids", &ids_shape, staged_ple orelse prefix));
         }
+        const positions = if (self.axis_positions != null) try a.alloc(i64, rows * 3) else null;
+        defer if (positions) |values| a.free(values);
         if (self.axis_positions) |prefix| {
             if (prefix.len != prefix_rows * 3) return error.InvalidPreparedPrompt;
-            const positions = try a.alloc(i64, rows * 3);
-            defer a.free(positions);
+            const values = positions.?;
             for (0..3) |axis| {
-                for (0..prefix_rows) |row| positions[axis * rows + row] = prefix[axis * prefix_rows + row];
-                for (prefix_rows..rows) |row| positions[axis * rows + row] = std.math.add(i64, @intCast(row), self.position_delta) catch return error.InvalidInputShape;
+                for (0..prefix_rows) |row| values[axis * rows + row] = prefix[axis * prefix_rows + row];
+                for (prefix_rows..rows) |row| values[axis * rows + row] = std.math.add(i64, @intCast(row), self.position_delta) catch return error.InvalidInputShape;
             }
-            inputs.appendAssumeCapacity(try Tensor.initInt64(a, "position_ids", &.{ 3, @intCast(rows) }, positions));
+            inputs.appendAssumeCapacity(Tensor.borrowInt64(a, "position_ids", &positions_shape, values));
         }
         if (self.visibility) |prefix| {
             if (prefix.len != prefix_rows * prefix_rows) return error.InvalidPreparedPrompt;
@@ -281,7 +290,7 @@ pub const Prefix = struct {
         defer a.free(outputs);
         defer for (outputs) |*output| output.deinit();
         if (outputs.len != 1 or !std.mem.eql(u8, outputs[0].name, "logits") or outputs[0].dtype != .f32) return error.InvalidModelProgramOutput;
-        return a.dupe(f32, outputs[0].asFloat32());
+        return outputs[0].takeOrCopyFloat32(a);
     }
 };
 
@@ -299,7 +308,7 @@ test "media prefix cached admission includes padded embeddings positions PLE vis
     // IDs 32 + row 8 + padded embeddings 32 + PLE 32 + axes 96 + mask 16.
     try std.testing.expectEqual(@as(usize, 216), cached.input_bytes);
     try std.testing.expectEqual(layout.staging_bytes, cached.host_staging_bytes);
-    try std.testing.expect(cached.host_staging_bytes >= 9 * 4 * @sizeOf(i64) + 32 + 16 + 8 + 6 * @sizeOf(Tensor));
+    try std.testing.expectEqual(6 * @sizeOf(Tensor) + 12 * @sizeOf(i64) + 5 * 4 * @sizeOf(i64) + 32 + 16, cached.host_staging_bytes);
     const ordinary = try prefix.layout(3, 3, false);
     try std.testing.expect(!ordinary.pad_embeddings);
     try std.testing.expect(cached.host_staging_bytes > ordinary.staging_bytes);

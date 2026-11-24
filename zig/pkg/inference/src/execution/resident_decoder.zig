@@ -275,9 +275,9 @@ pub const Decoder = struct {
         for (positions, 0..) |*position, index| position.* = @intCast(self.position + index);
         const suffix_shape = [_]i64{ 1, @intCast(ids.len) };
         const mask_shape = [_]i64{ 1, @intCast(mask.len) };
-        const input = borrowInt64(a, "input_ids", &suffix_shape, ids);
-        const pos = borrowInt64(a, "position_ids", &suffix_shape, positions);
-        const attention = borrowInt64(a, "encoder_attention_mask", &mask_shape, mask);
+        const input = Tensor.borrowInt64(a, "input_ids", &suffix_shape, ids);
+        const pos = Tensor.borrowInt64(a, "position_ids", &suffix_shape, positions);
+        const attention = Tensor.borrowInt64(a, "encoder_attention_mask", &mask_shape, mask);
         const hidden = encoder.borrowedView("encoder_hidden_states");
         if (hidden.dtype != .f32 or hidden.shape.len != 3 or hidden.shape[0] != 1 or hidden.shape[1] != self.encoder_rows or hidden.shape[2] != cfg.d_model) return error.InvalidInputShape;
         const outputs = try self.run(&.{ input, pos, hidden, attention }, a, control);
@@ -372,17 +372,17 @@ pub const Decoder = struct {
         const positions = if (position_count != 0) try a.alloc(i64, position_count) else null;
         defer if (positions) |values| a.free(values);
         var declared: [3]Tensor = undefined;
-        declared[0] = borrowInt64(a, "input_ids", &input_shape, padded orelse ids);
+        declared[0] = Tensor.borrowInt64(a, "input_ids", &input_shape, padded orelse ids);
         var count: usize = 1;
         if (positions) |values| {
             for (0..3) |axis| for (0..rows) |row| {
                 values[axis * rows + row] = try std.math.add(i64, @intCast(self.position + row), self.position_delta);
             };
-            declared[count] = borrowInt64(a, "position_ids", &position_shape, values);
+            declared[count] = Tensor.borrowInt64(a, "position_ids", &position_shape, values);
             count += 1;
         }
         if (self.position == 0 or ids.len > 1) {
-            declared[count] = borrowInt64(a, "logits_row", &.{1}, &logits_row);
+            declared[count] = Tensor.borrowInt64(a, "logits_row", &.{1}, &logits_row);
             count += 1;
         }
         const outputs = try self.run(declared[0..count], a, control);
@@ -391,29 +391,9 @@ pub const Decoder = struct {
         if (!publish_logits) return &.{};
         if (outputs.len != 1 or outputs[0].dtype != .f32 or outputs[0].data.len % @sizeOf(f32) != 0 or
             !outputs[0].isAlignedFor(f32)) return error.InvalidResidentDecoderOutput;
-        const output = &outputs[0];
-        if (output.owns_data and output.data_alignment == std.mem.Alignment.of(f32) and
-            output.allocator.ptr == a.ptr and output.allocator.vtable == a.vtable)
-        {
-            output.owns_data = false;
-            return output.asFloat32Mut();
-        }
-        return a.dupe(f32, output.asFloat32());
+        return outputs[0].takeOrCopyFloat32(a);
     }
 };
-
-/// Resident decoder providers consume these immutable operands synchronously.
-fn borrowInt64(a: std.mem.Allocator, name: []const u8, shape: []const i64, values: []const i64) Tensor {
-    return .{
-        .data = @constCast(std.mem.sliceAsBytes(values)),
-        .dtype = .i64,
-        .shape = shape,
-        .name = name,
-        .allocator = a,
-        .owns_data = false,
-        .owns_shape = false,
-    };
-}
 
 /// Share the optional transaction between decoder families. Speculative
 /// denial details never escape a successful compatibility fallback, and the

@@ -209,6 +209,31 @@ pub const Tensor = struct {
         return std.mem.bytesAsSlice(f32, aligned);
     }
 
+    /// Synchronous consumers may borrow an immutable payload and its shape.
+    pub fn borrowInt64(allocator: std.mem.Allocator, name: []const u8, shape: []const i64, values: []const i64) Tensor {
+        return .{
+            .data = @constCast(std.mem.sliceAsBytes(values)),
+            .dtype = .i64,
+            .shape = shape,
+            .name = name,
+            .allocator = allocator,
+            .owns_data = false,
+            .owns_shape = false,
+        };
+    }
+
+    /// The caller owns the returned slice. Adopt compatible output storage.
+    pub fn takeOrCopyFloat32(self: *Tensor, allocator: std.mem.Allocator) ![]f32 {
+        if (self.dtype != .f32 or self.data.len % @sizeOf(f32) != 0 or !self.isAlignedFor(f32)) return error.InvalidTensorData;
+        if (self.owns_data and self.data_alignment == .of(f32) and
+            self.allocator.ptr == allocator.ptr and self.allocator.vtable == allocator.vtable)
+        {
+            self.owns_data = false;
+            return self.asFloat32Mut();
+        }
+        return allocator.dupe(f32, self.asFloat32());
+    }
+
     pub fn asInt64(self: *const Tensor) []const i64 {
         const aligned: []align(@alignOf(i64)) const u8 = @alignCast(self.data);
         return std.mem.bytesAsSlice(i64, aligned);
