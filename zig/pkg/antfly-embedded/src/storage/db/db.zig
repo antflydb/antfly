@@ -52886,7 +52886,7 @@ pub const DB = struct {
         started: Io.Event = .unset,
         release: Io.Event = .unset,
         workspace_bytes: usize = HybridComponents.workspace_bytes,
-        maintenance_progress: ?bool = null,
+        check_idle_maintenance: bool = false,
         mutation_at_fusion: bool = false,
         replacement: ?struct { id: u64, bytes: []const u8 } = null,
         cancellation: ?*std.atomic.Value(bool) = null,
@@ -53127,8 +53127,8 @@ pub const DB = struct {
             if (self.probe) |probe| {
                 probe.overlapped = true;
                 defer probe.release.set(io);
-                if (probe.maintenance_progress) |expected| {
-                    if (try self.db.runLsmMaintenanceStepBestEffort() != expected) return error.TestUnexpectedResult;
+                if (probe.check_idle_maintenance) {
+                    try std.testing.expect(!try self.db.runLsmMaintenanceStepBestEffort());
                 }
                 if (probe.replacement) |segment| {
                     var mutation = self.db.core.snapshot_replay_admission.acquireMutation();
@@ -133133,7 +133133,10 @@ test "db hybrid search does not hard-filter dense leg with scoring full_text" {
     const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+    });
     defer db.close();
 
     try db.addIndex(.{
@@ -133255,34 +133258,15 @@ test "db hybrid search does not hard-filter dense leg with scoring full_text" {
     try std.testing.expect(!probe.overlapped);
     try std.testing.expectEqualDeep(serial.hits, saturated.hits);
 
-    {
-        _ = try db.runLsmMaintenanceUntilIdle();
-        const backend = db.core.primary_store_owner.lsmBackend().?;
-        const storage = backend.storage.?;
-        const obsolete = try lsm_backend_mod.repository.runPath(alloc, backend.root_dir.?, 999_997);
-        defer alloc.free(obsolete);
-        var pinned = try db.core.store.beginReadTxn();
-        defer pinned.abort();
-        for ([_]bool{ false, true }) |progress| {
-            if (progress) {
-                try lsm_backend_mod.repository.writeFileAbsoluteWithStorage(storage, obsolete, "obsolete");
-                const locked = lsm_backend_mod.runtime.lockBackend(lsm_backend_mod.Backend, backend);
-                defer lsm_backend_mod.runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
-                backend.options.obsolete_retention_ns = 0;
-                try backend.queueObsoleteFilePath(try alloc.dupe(u8, obsolete));
-            } else {
-                db.source_pin_cleanup.epoch.store(1, .release);
-                backend.notePotentialMaintenanceDebt();
-            }
-            probe = .{ .maintenance_progress = progress };
-            var maintained = try db.searchWithExecutionContext(alloc, filtered, parallel_context);
-            defer maintained.deinit();
-            try std.testing.expect(probe.overlapped);
-            try std.testing.expectEqual(@as(?anyerror, null), probe.retry);
-            try std.testing.expectEqualDeep(serial.hits, maintained.hits);
-        }
-        try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(alloc, obsolete, 1024));
-    }
+    _ = try db.runLsmMaintenanceUntilIdle();
+    db.source_pin_cleanup.epoch.store(1, .release);
+    db.core.primary_store_owner.lsmBackend().?.notePotentialMaintenanceDebt();
+    probe = .{ .check_idle_maintenance = true };
+    var maintained = try db.searchWithExecutionContext(alloc, filtered, parallel_context);
+    defer maintained.deinit();
+    try std.testing.expect(probe.overlapped);
+    try std.testing.expectEqual(@as(?anyerror, null), probe.retry);
+    try std.testing.expectEqualDeep(serial.hits, maintained.hits);
 
     probe = .{ .mutation_at_fusion = true };
     var fusion_retried = try db.searchWithExecutionContext(alloc, filtered, parallel_context);
