@@ -2724,6 +2724,12 @@ pub const Owner = struct {
             if (file.redo != null and !file.header.protected_redo) try file.refreshCrossProcessRedoOverlay();
         }
         if (fast_only) return null;
+        // Queued and in-flight groups on the serving store commit before the
+        // replacement opens, so it loads them from the file. Draining after
+        // the open (as below, for the handoff) let a replacement miss the
+        // last commits of writers waiting with their lane yielded, whose
+        // installs then went to the outgoing runtime.
+        if (self.current) |outgoing| if (outgoing.owned_lite_backend.?.native_docstore) |outgoing_store| outgoing_store.ensureDurableForReuse();
         var options = self.options;
         options.externally_locked = true;
         options.redo_recovery_base = self.redo_recovery_cursor;

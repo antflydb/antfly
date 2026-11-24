@@ -8074,6 +8074,9 @@ pub const DB = struct {
         // and explicit maintenance retain complete cleanup guarantees.
         const max_pages: usize = if (req.sync_level == .full_index) std.math.maxInt(usize) else 1;
         const drained = try self.drainStandaloneGraphEndpointCleanupWithOptions(opts, max_pages);
+        // Without a graph index there is no endpoint cleanup to include, and
+        // the write already waited for its own sync level.
+        if (!drained and !self.core.hasGraphIndexes()) return;
         // A resident worker can finish before the foreground queue probe.
         // Deletes/transforms must still include its newly committed replay cut.
         if (req.sync_level == .full_index and (drained or req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0))

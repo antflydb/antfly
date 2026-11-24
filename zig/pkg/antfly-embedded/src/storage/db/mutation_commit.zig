@@ -4892,7 +4892,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // cleanup. DDL may already own the lane and be waiting for them.
             if (indexed_lane_yielded) {
                 const hook = opts.writer_lane_release_before_wait.?;
-                try hook.resume_after_indexed_wait.?(hook.ptr);
+                // Nothing below owes the write's own runtime anything when
+                // every index served it inline and no replication, child
+                // range or split work follows: it may finish on a newer one.
+                const finished_at_commit = sync_targets.served_inline and sync_targets.all_indexes.len == 0 and
+                    sync_targets.full_text_indexes.len == 0 and split_shadow_ticket == null and
+                    opts.document_child_range_dispatcher == null and opts.transaction_resolution == null and
+                    durable_replication_batch_payload == null and durable_replication_replay_payload == null and
+                    deferred_replication_gates.gate_count == 0 and
+                    !(queued_index_publication and pending_identity_visibility_summary != null) and
+                    // The caller's graph endpoint cleanup still runs on this
+                    // write's runtime (`finishBatchGraphEndpointCleanup`).
+                    !S.ownerField(self, "core").*.hasGraphIndexes();
+                if (!try hook.resume_after_indexed_wait.?(hook.ptr, finished_at_commit)) return;
             }
             if (queued_index_publication and pending_identity_visibility_summary != null) {
                 try self.lockApplyForPortableRuntime();

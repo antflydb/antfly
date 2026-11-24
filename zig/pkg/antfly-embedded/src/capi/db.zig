@@ -946,7 +946,7 @@ pub const HandleGuard = struct {
         return true;
     }
 
-    fn resumeWriterLaneAfterIndexedWait(self: *HandleGuard) !void {
+    fn resumeWriterLaneAfterIndexedWait(self: *HandleGuard, allow_new_runtime: bool) !bool {
         std.debug.assert(self.lane_managed and self.writer_lane_released);
         const connection = self.connection.?;
         const io = handleLockIo();
@@ -956,12 +956,18 @@ pub const HandleGuard = struct {
         const root = try lane.checkout(connection, .mutation);
         // checkout acquired another pin; the original stays with this guard.
         defer _ = root.lane_pins.fetchSub(1, .release);
-        if (root != self.lane_pinned_root.?) {
+        const same_runtime = root == self.lane_pinned_root.?;
+        // A maintenance turn's forwarded writes, among others, replace the
+        // serving runtime while this write waits. Its commit is durable and
+        // every later entry refreshes past it; only work still owed to the
+        // old runtime makes that a failure.
+        if (!same_runtime and !allow_new_runtime) {
             lane.checkin(connection, root.owned_lite_backend.?.native_docstore.?);
             return error.EnrichmentSourceChanged;
         }
         self.connection_gate_held = true;
         self.writer_lane_released = false;
+        return same_runtime;
     }
 
     pub fn releaseWriterLaneBeforeWait(self: *HandleGuard) void {
@@ -1230,9 +1236,9 @@ pub fn writerLaneHookFromGuard(guard: *HandleGuard) @import("../storage/db/execu
             }
         }.run,
         .resume_after_indexed_wait = struct {
-            fn run(ptr: *anyopaque) anyerror!void {
+            fn run(ptr: *anyopaque, allow_new_runtime: bool) anyerror!bool {
                 const typed: *HandleGuard = @ptrCast(@alignCast(ptr));
-                return typed.resumeWriterLaneAfterIndexedWait();
+                return typed.resumeWriterLaneAfterIndexedWait(allow_new_runtime);
             }
         }.run,
     };

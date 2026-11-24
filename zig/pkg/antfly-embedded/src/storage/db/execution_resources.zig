@@ -1107,7 +1107,10 @@ pub const WriterLaneReleaseHook = struct {
     ptr: *anyopaque,
     release: *const fn (ptr: *anyopaque) void,
     release_for_indexed_wait: ?*const fn (ptr: *anyopaque) bool = null,
-    resume_after_indexed_wait: ?*const fn (ptr: *anyopaque) anyerror!void = null,
+    /// Takes the lane back after an indexed wait. False when it came back on
+    /// a newer runtime than the write ran on, which `allow_new_runtime`
+    /// permits only for a write with nothing left to do on its own runtime.
+    resume_after_indexed_wait: ?*const fn (ptr: *anyopaque, allow_new_runtime: bool) anyerror!bool = null,
 };
 
 /// One synchronous prepared attempt's irreversible disposition. It is separate
