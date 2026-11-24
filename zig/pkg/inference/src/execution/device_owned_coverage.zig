@@ -377,8 +377,10 @@ fn assessDeviceNodes(
                 const kernel = pool.kernels[id] orelse return operationDeclined(graph, id, "missing descriptor");
                 if (kernel.backend_index >= pool.backends.len) return .backend_region;
                 const backend = pool.backends[kernel.backend_index];
-                if (backend.ptr != target.ptr or backend.vtable != target.vtable or !service.route(target.ptr, &owned) or
-                    !coverage.kernelOutputMatches(kernel, owned, backend, slot, size)) return operationDeclined(graph, id, "route attestation or output geometry");
+                if (backend.ptr != target.ptr or backend.vtable != target.vtable or
+                    !coverage.kernelOutputMatches(kernel, owned, backend, slot, size)) return operationDeclined(graph, id, "implementation or output geometry");
+                if (owned.requirements.opaque_workspace) return .opaque_workspace;
+                if (!service.route(target.ptr, &owned)) return operationDeclined(graph, id, "route attestation");
                 if (!coverage.kernelInputsMatch(graph, reachable, @intCast(id), kernel)) return operationDeclined(graph, id, "input binding or shape");
                 if (!resources(pool, kernel, owned)) return .workspace;
                 result.operations += 1;

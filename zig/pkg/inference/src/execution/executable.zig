@@ -4544,18 +4544,45 @@ test "prepared Metal F32 MPS projection uses the assigned graph output" {
         .{ .name = "bias", .node_id = bn, .kind = .weight },
     });
     defer program.deinit();
-    var raw_inputs = [_]interpreter.RuntimeInput{
-        .{ .node_id = xn, .value = x, .source_backend = &cb },
-        .{ .node_id = wn, .value = w, .source_backend = &cb },
-        .{ .node_id = bn, .value = b, .source_backend = &cb },
+    const route = @import("kernel_route.zig");
+    const implementation: route.Implementation = .{ .context = cb.ptr, .table = cb.vtable };
+    const weight_inputs = [_]interpreter.RuntimeInput{
+        .{ .node_id = program.id_map[wn], .value = w, .source_backend = &cb },
+        .{ .node_id = program.id_map[bn], .value = b, .source_backend = &cb },
     };
-    const inputs = try program.remapInputs(&raw_inputs);
-    var executable = try prepareWithOptions(a, &program, &cb, .partitioned, .{ .input_bindings = inputs, .physical_replay = false });
+    const immutable = [_]route.InputBinding{
+        .{ .node_id = program.id_map[wn], .value = .{ .tensor = .{ .value = w, .implementation = implementation } } },
+        .{ .node_id = program.id_map[bn], .value = .{ .tensor = .{ .value = b, .implementation = implementation } } },
+    };
+    var executable = try prepareWithOptions(a, &program, &cb, .partitioned, .{ .input_bindings = &weight_inputs, .immutable_input_bindings = &immutable, .physical_replay = false });
     defer executable.deinit();
+    executable.configureExecutionDiagnostics(true);
+    const x_node = program.id_map[xn];
+    const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    const routes = (try pool.prepareRoutes(&.{.{ .node_id = x_node, .value = .{ .imported_host = .{
+        .target = .metal,
+        .logical = program.graph.node(x_node).output_shape,
+        .owned_ingress = true,
+    } } }})) orelse return error.MissingPreparedRoutes;
+    defer routes.release();
+    const Tensor = @import("../backends/tensor.zig").Tensor;
+    var host_input = try Tensor.initFloat32(a, "x", &.{ rows, width }, &data);
+    defer host_input.deinit();
     const before = metal.runtimeMemorySnapshot(runtime);
-    var result = try executable.run(a, .{ .runtime_inputs = inputs, .output_placement = .producer, .collect_partition_stats = true, .activation_readbacks = .forbidden });
+    var result = try executable.run(a, .{
+        .runtime_inputs = &weight_inputs,
+        .host_inputs = &.{.{ .node_id = x_node, .value = &host_input }},
+        .prepared_routes = routes,
+        .output_placement = .producer,
+        .collect_partition_stats = true,
+        .activation_readbacks = .forbidden,
+    });
     defer result.deinit(&executable.runtime);
     try std.testing.expectEqual(@as(u64, 1), result.stats.assigned_kernel_dispatches);
+    const coverage = result.stats.prepared_payload_coverage orelse return error.MissingPreparedCoverage;
+    try std.testing.expectEqual(@import("owned_coverage.zig").Reason.opaque_workspace, coverage.compatibility);
+    const report = executable.diagnostics.snapshot().?.report.?;
+    try std.testing.expectEqualDeep(coverage, report.payload_admission_coverage.?.value);
     try std.testing.expectEqual(before.mps_dense_linear_active_frame_calls + 1, metal.runtimeMemorySnapshot(runtime).mps_dense_linear_active_frame_calls);
     try std.testing.expectEqual(@as(u64, 0), result.stats.device_host_accesses);
     const output = try cb.toFloat32(result.outputs[0], a);

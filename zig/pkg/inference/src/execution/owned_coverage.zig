@@ -23,7 +23,7 @@ const ownership = @import("storage_ownership.zig");
 const ops = @import("../ops/ops.zig");
 const native = @import("../ops/native_compute.zig");
 const ml = @import("ml");
-pub const Reason = enum { no_selected_routes, execution_path, backend_region, deferred_producer, transfer, input_representation, literal, alias, output_publication, operation, workspace };
+pub const Reason = enum { no_selected_routes, execution_path, backend_region, deferred_producer, transfer, input_representation, literal, alias, output_publication, operation, workspace, opaque_workspace };
 pub const Complete = struct { accounting_class: enum { host, device } = .host, epoch: u64, operations: usize = 0, aliases: usize = 0, literals: usize = 0 };
 pub const Coverage = union(enum) { compatibility: Reason, complete: Complete };
 

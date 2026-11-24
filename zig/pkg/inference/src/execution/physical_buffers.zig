@@ -1445,6 +1445,16 @@ pub const Pool = struct {
             .{ .compatibility = reason }
         else
             @import("owned_coverage.zig").assess(child);
+        // The compatibility executor can use selected routes even when its
+        // partition schedule cannot provide a complete frame witness.
+        if (child.payload_coverage == .compatibility and child.payload_coverage.compatibility == .no_selected_routes) {
+            if (child.selection) |selection| for (selection.routes) |selected_route| {
+                if (selected_route) |owned| if (owned.requirements.opaque_workspace) {
+                    child.payload_coverage = .{ .compatibility = .opaque_workspace };
+                    break;
+                };
+            };
+        }
         if (child.metal_frame_dispatch and child.device_input_plans.len != 0 and (child.payload_coverage != .complete or (profile == .synchronous and child.regions.len != 0))) return null;
 
         if (profile == .unknown and child.metal_frame_dispatch and child.regions.len != 0 and child.payload_coverage != .complete) return null;

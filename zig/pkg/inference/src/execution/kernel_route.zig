@@ -93,6 +93,8 @@ pub const Requirements = struct {
     /// A backend-owned static physical precision/layout/schedule profile.
     profile: u32,
     workspace: descriptor.WorkspaceRequirement = .{},
+    /// Provider scratch exists outside the supplied workspace planes.
+    opaque_workspace: bool = false,
     host_alignment: u32 = 1,
     /// Cold algorithm probes run before capture with owned assigned slots.
     /// Reuse normal scratch only when the lifetimes are provably disjoint;

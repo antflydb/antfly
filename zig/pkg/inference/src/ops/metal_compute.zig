@@ -12443,7 +12443,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (comptime !build_options.enable_metal) return null;
             const key = bindingKey(compute, request.descriptor, request.inputs) orelse return null;
             const slot = compute.assignedDenseLinearSlot(key) orelse return null;
-            if (direct and !assignedRowsReady(compute, slot, request.descriptor.operation.linear)) return null;
+            const linear = request.descriptor.operation.linear;
+            const needs_vendor = direct and !directRowsReady(compute, slot, linear);
+            if (needs_vendor and !assignedMpsRowsReady(compute, slot, linear)) return null;
             var facts: [3]route.Binding = undefined;
             var host_planes: [2]@import("../execution/storage_ownership.zig").Plane = undefined;
             var checked = request;
@@ -12481,7 +12483,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
             owner.* = .{ .allocator = request.allocator, .compute = compute, .direct = checked_route, .descriptor = request.descriptor.*, .output_slot = output_slot, .slot = slot, .key = key, .host_sources = host_sources, .payload = payload, .declaration = declaration };
             committed = true;
-            return .{ .context = owner, .implementation = checked_route.implementation, .key = checked_route.key, .requirements = checked_route.requirements, .output_plane_metadata = .assigned_dense, .vtable = &vtable };
+            var requirements = checked_route.requirements;
+            requirements.opaque_workspace = needs_vendor;
+            return .{ .context = owner, .implementation = checked_route.implementation, .key = checked_route.key, .requirements = requirements, .output_plane_metadata = .assigned_dense, .vtable = &vtable };
         }
         fn matches(raw: *anyopaque, request: route.Validate) bool {
             const self: *PreparedDenseLinear = @ptrCast(@alignCast(raw));
@@ -12505,9 +12509,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         fn directRowsReady(compute: *MetalCompute, slot: usize, linear: ops.kernel_descriptor.Linear) bool {
             return linear.rows == 1 or metal_runtime.antfly_metal_dense_linear_direct_rows_ready(compute.provider_impl.raw_decode_runtime, slot, linear.rows) != 0;
         }
-        fn assignedRowsReady(compute: *MetalCompute, slot: usize, linear: ops.kernel_descriptor.Linear) bool {
-            return directRowsReady(compute, slot, linear) or
-                metal_runtime.antfly_metal_dense_linear_assigned_mps_ready(compute.provider_impl.raw_decode_runtime, slot, linear.rows) != 0;
+        fn assignedMpsRowsReady(compute: *MetalCompute, slot: usize, linear: ops.kernel_descriptor.Linear) bool {
+            return metal_runtime.antfly_metal_dense_linear_assigned_mps_ready(compute.provider_impl.raw_decode_runtime, slot, linear.rows) != 0;
         }
         fn pinValid(self: *const PreparedDenseLinear) bool {
             if (comptime !build_options.enable_metal) return false;
@@ -12521,7 +12524,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             try @import("../execution/assigned_kernel_route.zig").validateDescriptor(&self.direct, request.descriptor);
             const linear = request.descriptor.operation.linear;
             const key = compute.assignedDenseLinearKey(linear, request.inputs[1], if (linear.bias) request.inputs[2] else null) orelse return error.PreparedKernelBindingChanged;
-            if (!std.meta.eql(key, self.key) or request.auxiliaries.len != 0 or !assignedRowsReady(compute, self.slot, linear)) return error.PreparedKernelBindingChanged;
+            const ready = if (owned.requirements.opaque_workspace)
+                assignedMpsRowsReady(compute, self.slot, linear)
+            else
+                directRowsReady(compute, self.slot, linear);
+            if (!std.meta.eql(key, self.key) or request.auxiliaries.len != 0 or !ready) return error.PreparedKernelBindingChanged;
             return self.slot;
         }
         fn matchesInputs(self: *PreparedDenseLinear, inputs: []const route.Binding) bool {
