@@ -24813,7 +24813,10 @@ fn linearBiasInto(self: *CudaCompute, device: buffer_mod.DeviceBuffer, input_ten
         return;
     }
 
-    var prefill_profile_scope = beginPrefillProfile(self, prefillProfileCategoryForLinearNoBias(weight_tensor, rows, in_dim, out_dim), rows);
+    var prefill_profile_scope = if (self.runtime_policy.prefill_profile)
+        beginPrefillProfile(self, prefillProfileCategoryForLinearNoBias(weight_tensor, rows, in_dim, out_dim), rows)
+    else
+        null;
     defer if (prefill_profile_scope) |*scope| scope.end();
     if (weight_tensor.quant_type) |quant_type| {
         switch (quant_type) {
@@ -25399,7 +25402,10 @@ fn linearNoBiasInto(self: *CudaCompute, device: buffer_mod.DeviceBuffer, input_t
         return error.InvalidShape;
     }
 
-    var prefill_profile_scope = beginPrefillProfile(self, prefillProfileCategoryForLinearNoBias(weight_tensor, rows, in_dim, out_dim), rows);
+    var prefill_profile_scope = if (self.runtime_policy.prefill_profile)
+        beginPrefillProfile(self, prefillProfileCategoryForLinearNoBias(weight_tensor, rows, in_dim, out_dim), rows)
+    else
+        null;
     defer if (prefill_profile_scope) |*scope| scope.end();
     if (isF16Weight(weight_tensor) and reducedRowPairProjection(self)) {
         errdefer self.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
