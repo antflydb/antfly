@@ -59134,6 +59134,7 @@ int antfly_metal_decoder_output_available(termite_metal_decode_runtime *runtime,
         case 3: return runtime->multiply_add_pipeline != nil;
         case 4: return runtime->multiply_add2_pipeline != nil;
         case 5: return runtime->precise_library_safe && runtime->add_mul_scalar_pipeline != nil;
+        case 6: return runtime->gather_axis0_add_bias_f32_2d_pipeline != nil;
         default: return 0;
     }
 }

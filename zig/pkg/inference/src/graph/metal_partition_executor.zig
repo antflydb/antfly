@@ -1642,10 +1642,14 @@ pub const MetalPartitionExecutor = struct {
             }
             if (descriptor) |value| switch (value.operation) {
                 .gather => {
-                    // The selected route requires checked host or immutable indices. Keep
-                    // the tuned gather-after-bias owner for composite graphs.
-                    if (value.input_shapes[1].dtype == .f32) return .input_representation;
-                    if (graph.node(node.inputs[0]).op == .add) return .backend_region;
+                    if (value.input_shapes[1].dtype == .f32) {
+                        // F32 indices retain the generated kernel's conversion
+                        // and invalid-row behavior under an exact region owner.
+                        const gather = ops_mod.kernel_descriptor.GatherAddBias.match(graph, id) orelse return .input_representation;
+                        const pending = required_deferrals orelse return .deferred_producer;
+                        try pending.append(.{ .producer = gather.producer, .consumer = id });
+                    }
+                    if (value.input_shapes[1].dtype != .f32 and graph.node(node.inputs[0]).op == .add) return .backend_region;
                 },
                 .dot => {
                     if (transposes) |seen| if (seen.isSet(node.inputs[1])) continue;
@@ -1658,7 +1662,7 @@ pub const MetalPartitionExecutor = struct {
                     saw_dot = true;
                 },
                 else => {},
-            } else if (@import("../execution/metadata_alias.zig").Plan.lower(graph, id, .metal) == null) return .operation;
+            };
             // These exact heuristics run ahead of the physical branch. Even
             // a supported descriptor cannot claim a producer they defer.
             if (shouldDeferScaleMulForAdd(graph, id, reachable, last_use, null)) return .deferred_producer;
@@ -1695,7 +1699,14 @@ pub const MetalPartitionExecutor = struct {
         };
         for (nodes, 0..) |id, position| {
             if (!reachable[id] or graph.node(id).op == .parameter or graph.node(id).op == .constant) continue;
-            if (plan.descriptorAt(position) == null and @import("../execution/metadata_alias.zig").Plan.lower(graph, id, .metal) == null) return .operation;
+            if (plan.descriptorAt(position) != null or @import("../execution/metadata_alias.zig").Plan.lower(graph, id, .metal) != null) continue;
+            // Neither the broadcast add nor the F32-index gather needs a
+            // standalone route when the prepared region proves the exact edge.
+            if (required_deferrals) |pending| {
+                for (pending.items) |edge| {
+                    if (edge.producer == id or edge.consumer == id) break;
+                } else return .operation;
+            } else return .operation;
         }
         return null;
     }
@@ -15864,40 +15875,11 @@ fn executeRuntimeGather(
     }
 
     if (!promote_output and attrs.axis == 0) gather_add_bias: {
-        const input_node = graph.node(inputs[0]);
-        if (input_node.op != .add) break :gather_add_bias;
-        const add_inputs = input_node.getInputs();
-        if (add_inputs.len != 2) break :gather_add_bias;
-
-        const lhs = add_inputs[0];
-        const rhs = add_inputs[1];
-        if (lhs == null_node or rhs == null_node) break :gather_add_bias;
-
-        var lhs_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
-        var rhs_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
-        const lhs_shape = try fillShapeDims(graph.node(lhs).output_shape, &lhs_shape_buf);
-        const rhs_shape = try fillShapeDims(graph.node(rhs).output_shape, &rhs_shape_buf);
-
-        var matrix_id: NodeId = null_node;
-        var bias_id: NodeId = null_node;
+        const biased = ops_mod.kernel_descriptor.MatrixColumnBias.match(graph, inputs[0]) orelse break :gather_add_bias;
         var matrix_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
-        var matrix_shape: []const i64 = &.{};
-        if (lhs_shape.len == 2 and rhs_shape.len == 1 and lhs_shape[1] == rhs_shape[0]) {
-            matrix_id = lhs;
-            bias_id = rhs;
-            @memcpy(matrix_shape_buf[0..lhs_shape.len], lhs_shape);
-            matrix_shape = matrix_shape_buf[0..lhs_shape.len];
-        } else if (rhs_shape.len == 2 and lhs_shape.len == 1 and rhs_shape[1] == lhs_shape[0]) {
-            matrix_id = rhs;
-            bias_id = lhs;
-            @memcpy(matrix_shape_buf[0..rhs_shape.len], rhs_shape);
-            matrix_shape = matrix_shape_buf[0..rhs_shape.len];
-        } else {
-            break :gather_add_bias;
-        }
-
-        const matrix = valueFor(values, matrix_id) orelse break :gather_add_bias;
-        const bias = valueFor(values, bias_id) orelse break :gather_add_bias;
+        const matrix_shape = try fillShapeDims(biased.matrix_shape, &matrix_shape_buf);
+        const matrix = valueFor(values, biased.matrix) orelse break :gather_add_bias;
+        const bias = valueFor(values, biased.bias) orelse break :gather_add_bias;
         const fused = cb.primGatherAddBiasAxis0(matrix, bias, indices.value, matrix_shape) catch |err| switch (err) {
             error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedTensorType, error.UnsupportedShape, error.ShapeMismatch, error.InvalidTensorShape => null,
             else => return err,

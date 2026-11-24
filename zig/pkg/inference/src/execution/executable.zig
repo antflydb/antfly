@@ -3595,6 +3595,82 @@ test "planned Metal elementwise product-add publishes into the assigned region o
     }
 }
 
+test "planned Metal gather-add-bias publishes directly into its assigned output" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    const metal = @import("../backends/metal_runtime.zig");
+    if (!metal.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    const Tensor = @import("../backends/tensor.zig").Tensor;
+    const context = try @import("../backends/compute_context.zig").SharedBackendContext.init(a, .metal, std.testing.io);
+    defer context.release();
+    const cb = context.computeBackend();
+    if (!metal.antfly_metal_host_input_shared_supported(context.ctx.metal_hosted.compute.provider_impl.raw_decode_runtime)) return error.SkipZigTest;
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const shapes = [_]ml.graph.Shape{
+        ml.graph.Shape.init(.f32, &.{ 3, 5 }),
+        ml.graph.Shape.init(.f32, &.{5}),
+        ml.graph.Shape.init(.f32, &.{4}),
+    };
+    const names = [_][]const u8{ "matrix", "bias", "indices" };
+    var bindings: [3]@import("program.zig").Binding = undefined;
+    for (names, shapes, &bindings) |name, shape, *binding| {
+        binding.* = .{ .name = name, .node_id = try builder.parameter(name, shape), .kind = .input };
+    }
+    const biased = try graph.addNode(.{
+        .op = .add,
+        .output_shape = shapes[0],
+        .inputs = .{ bindings[0].node_id, bindings[1].node_id, ml.graph.null_node, ml.graph.null_node },
+        .num_inputs = 2,
+    });
+    try graph.markOutput(try builder.gather(biased, bindings[2].node_id, ml.graph.Shape.init(.f32, &.{ 4, 5 })));
+    var program = try ModelProgram.initWithPipeline(a, &graph, &bindings, .cleanup);
+    defer program.deinit();
+    var executable = try prepare(a, &program, &cb, .partitioned);
+    defer executable.deinit();
+    const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    const data = [_][]const f32{ &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 }, &.{ 10, 20, 30, 40, 50 }, &.{ 1, -1, 3, -4 } };
+    var facts: [3]@import("kernel_route.zig").InputBinding = undefined;
+    var values: [3]Tensor = undefined;
+    var inputs: [3]@import("host_ingress.zig").Input = undefined;
+    var initialized: usize = 0;
+    defer for (values[0..initialized]) |*value| value.deinit();
+    for (bindings, shapes, data, &facts, &values, &inputs) |binding, shape, elements, *fact, *value, *input| {
+        const id = program.id_map[binding.node_id];
+        fact.* = .{ .node_id = id, .value = .{ .imported_host = .{ .target = .metal, .logical = shape, .owned_ingress = true } } };
+        value.* = try Tensor.initFloat32(a, binding.name, shape.dims[0..shape.rank()], elements);
+        initialized += 1;
+        input.* = .{ .node_id = id, .value = value };
+    }
+    const routes = (try pool.prepareRoutes(&facts)) orelse return error.MissingPreparedKernelRoute;
+    defer routes.release();
+    if (routes.pool.completeOwnedPayload() == null) {
+        std.debug.print("Metal gather-add-bias coverage {any}, cold decline {any}, required producers {any}, regions {d}\n", .{
+            routes.pool.payload_coverage, pool.cold_coverage_decline, pool.metal_required_deferrals, routes.pool.regions.len,
+        });
+        return error.MissingGatherAddBiasCoverage;
+    }
+    const slot = routes.pool.plan.slotForNode(program.id_map[biased]) orelse return error.MissingPhysicalPool;
+    try std.testing.expectEqual(.region_internal, slot.kind);
+    if (routes.pool.plan.allocationForSlot(slot.id) != null) return error.GatherProducerAllocated;
+    var claims = switch (try routes.claimRegions(a, null, &facts)) {
+        .ready => |owned| owned,
+        .no_regions, .reprepare => return error.MissingPreparedRegionClaims,
+    };
+    defer claims.releaseUnsubmitted();
+    var result = try executable.run(a, .{ .host_inputs = &inputs, .prepared_routes = routes, .region_claims = &claims, .output_placement = .producer, .collect_partition_stats = true, .activation_readbacks = .forbidden });
+    defer result.deinit(&executable.runtime);
+    const dispatch = result.stats.assigned_regions orelse return error.MissingRegionDispatch;
+    try std.testing.expectEqual(@as(u64, 1), dispatch.accepted_callbacks);
+    try std.testing.expectEqual(@as(u64, 2), dispatch.covered_callback_nodes);
+    if (result.stats.metal_region_policy_observed) return error.LegacyGatherPolicyObserved;
+    const output = try cb.toFloat32(result.outputs[0], a);
+    defer a.free(output);
+    try std.testing.expectEqualSlices(f32, &.{ 15, 26, 37, 48, 59, 20, 31, 42, 53, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, output);
+}
+
 test "Native planned integer concat slice and gather use assigned buffers and preserve full width" {
     if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
     const a = std.testing.allocator;

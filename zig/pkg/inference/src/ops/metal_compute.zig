@@ -11945,7 +11945,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     const owned_payload_services: @import("kernel_backend.zig").OwnedPayloadServices = .{ .accepts = acceptsPhysicalImplementation, .available = ownedPayloadAvailable, .input = ownedPayloadInput, .route = ownedPayloadRoute, .region = ownedPayloadRegion };
     fn ownedPayloadRegion(ctx: *anyopaque, owned: *const @import("../execution/region_route.zig").Owned) bool {
         if (owned.implementation.context != ctx or !acceptsPhysicalImplementation(owned.implementation.table)) return false;
-        if (owned.vtable == &ElementwiseProductAddRegion.table) return ElementwiseProductAddRegion.attests(ctx, owned);
+        if (owned.vtable == &DenseFusedRegion.table) return DenseFusedRegion.attests(ctx, owned);
         if (owned.vtable == &TransposedRightDotRegion.table) return TransposedRightDotRegion.attests(ctx, owned);
         if (owned.vtable != &DenseProjectionRegion.table) return false;
         const self: *const DenseProjectionRegion = @ptrCast(@alignCast(owned.context));
@@ -13078,7 +13078,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
     }
 
-    const ElementwiseProductAddRegion = struct {
+    const DenseFusedRegion = struct {
         const region = @import("../execution/region_route.zig");
         const route = @import("../execution/kernel_route.zig");
         const NodeId = ml.graph.NodeId;
@@ -13092,6 +13092,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         operand_indices: [4]usize = undefined,
         operand_count: usize,
         elements: usize,
+        gather: ?ops.kernel_descriptor.GatherAddBias = null,
+        gather_inputs: [3]struct { shape: ml.graph.Shape, bytes: usize } = undefined,
 
         fn accepts(self: *const @This(), binding: route.Binding, implementation: route.Implementation) bool {
             const output = self.outputs[0];
@@ -13108,13 +13110,21 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 need.dispatch_workspace.byte_size != 0 or need.dispatch_workspace.host_byte_size != 0 or
                 need.preparation_workspace.byte_size != 0 or need.preparation_workspace.host_byte_size != 0 or
                 need.requires_execution_profile) return false;
-            return metal_runtime.assignedProductAddAvailable(self.compute.provider_impl, self.operand_count == 4);
+            return if (self.gather != null)
+                metal_runtime.assignedGatherAddBiasAvailable(self.compute.provider_impl)
+            else
+                metal_runtime.assignedProductAddAvailable(self.compute.provider_impl, self.operand_count == 4);
         }
 
         fn matches(raw: *anyopaque, request: region.Validate) bool {
             const self: *const @This() = @ptrCast(@alignCast(raw));
             if (request.policy_key != 1 or request.inputs.len != self.input_count) return false;
-            for (request.inputs) |input| if (!self.accepts(input, request.implementation)) return false;
+            for (request.inputs, 0..) |input, index| {
+                if (self.gather != null) {
+                    const metadata = self.gather_inputs[index];
+                    if (!acceptsDenseRegionInput(self.compute, input, request.implementation, metadata.shape, metadata.bytes)) return false;
+                } else if (!self.accepts(input, request.implementation)) return false;
+            }
             return true;
         }
 
@@ -13129,6 +13139,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const destination = toBuf(request.outputs[0].tensor);
             _ = denseDeviceF32(request.outputs[0].tensor) orelse return error.PreparedRegionOutputMismatch;
             const output = &destination.metal_tensor.?;
+            if (self.gather) |gather| {
+                try self.compute.validateProjectionOutput(output.*, request.outputs[0].authority orelse return error.InvalidPhysicalStorageAuthority);
+                if (!try metal_runtime.gatherAddBiasDeviceInto(self.compute.provider_impl, inputs[0..3].*, gather.rows, gather.cols, gather.index_count, output))
+                    return .declined_before_submission;
+                return .completed;
+            }
             var result = (if (self.operand_count == 4)
                 try metal_runtime.decoderRuntimeApplyMultiplyAdd2(self.compute.provider_impl, .{
                     .lhs0 = inputs[0],
@@ -13162,6 +13178,51 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return index < partition_nodes.len and partition_nodes[index] == node;
         }
 
+        fn appendGather(compute: *MetalCompute, request: region.Prepare, positions: []const u32, uses: []const u8, entry: NodeId, gather: ops.kernel_descriptor.GatherAddBias, result: *std.ArrayList(region.Owned)) !void {
+            const graph = request.graph;
+            if (!metal_runtime.assignedGatherAddBiasAvailable(compute.provider_impl) or
+                !isPartitionMember(gather.producer, request.partition_nodes, positions) or uses[gather.producer] != 1 or
+                std.mem.indexOfScalar(NodeId, graph.outputs.items, gather.producer) != null) return;
+            const elements = std.math.cast(u32, gather.output_shape.numElements() orelse return) orelse return;
+            var draft: @This() = .{
+                .allocator = request.allocator,
+                .compute = compute,
+                .outputs = .{.{ .node = entry, .logical = gather.output_shape, .bytes = @as(usize, elements) * @sizeOf(f32) }},
+                .nodes = .{ entry, gather.producer, ml.graph.null_node },
+                .operand_count = 3,
+                .elements = elements,
+                .gather = gather,
+            };
+            for (gather.inputs, 0..) |input, operand| {
+                if (input >= request.node_facts.len) return;
+                const shape = graph.node(input).output_shape;
+                const count = std.math.cast(usize, shape.numElements() orelse return) orelse return;
+                const bytes = std.math.mul(usize, count, @sizeOf(f32)) catch return;
+                if (!acceptsDenseRegionInput(compute, request.node_facts[input], request.implementation, shape, bytes)) return;
+                const known = std.mem.indexOfScalar(NodeId, draft.inputs[0..draft.input_count], input);
+                draft.operand_indices[operand] = known orelse draft.input_count;
+                if (known == null) {
+                    draft.inputs[draft.input_count] = input;
+                    draft.gather_inputs[draft.input_count] = .{ .shape = shape, .bytes = bytes };
+                    draft.input_count += 1;
+                }
+            }
+            const owner = try request.allocator.create(@This());
+            errdefer request.allocator.destroy(owner);
+            owner.* = draft;
+            try result.append(request.allocator, .{
+                .context = owner,
+                .implementation = request.implementation,
+                .key = entry,
+                .policy_key = request.policy_key,
+                .covered_nodes = owner.nodes[0..2],
+                .input_nodes = owner.inputs[0..owner.input_count],
+                .entry_node = entry,
+                .requirements = .{ .outputs = &owner.outputs, .requires_execution_profile = false, .uncovered = .{} },
+                .vtable = &table,
+            });
+        }
+
         fn append(compute: *MetalCompute, request: region.Prepare, positions: []const u32, result: *std.ArrayList(region.Owned)) !void {
             const schedule = @import("../execution/region_schedule.zig");
             const descriptor = ops.kernel_descriptor;
@@ -13169,6 +13230,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const allocator = request.allocator;
             for (request.partition_nodes) |id| {
                 const node = graph.node(id);
+                if (node.op == .gather and descriptor.GatherAddBias.match(graph, id) != null) break;
                 if ((node.op == .add or node.op == .fused_elem_add) and node.num_inputs == 2 and
                     (descriptor.sameShapeF32Product(graph, node.inputs[0], node.output_shape) != null or
                         descriptor.sameShapeF32Product(graph, node.inputs[1], node.output_shape) != null)) break;
@@ -13178,6 +13240,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const uses = try schedule.computeReachableUseCountsCapped(allocator, graph, request.reachable);
             defer allocator.free(uses);
             for (request.partition_nodes) |add| {
+                if (descriptor.GatherAddBias.match(graph, add)) |gather| {
+                    try appendGather(compute, request, positions, uses, add, gather, result);
+                    continue;
+                }
                 const node = graph.node(add);
                 if ((node.op != .add and node.op != .fused_elem_add) or node.num_inputs != 2) continue;
                 const shape = node.output_shape;
@@ -13312,7 +13378,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
             for (request.partition_nodes) |node| {
                 const dot = descriptor.TransposedRightDot.match(graph, node) orelse continue;
-                if (!ElementwiseProductAddRegion.isPartitionMember(dot.transpose, request.partition_nodes, positions)) continue;
+                if (!DenseFusedRegion.isPartitionMember(dot.transpose, request.partition_nodes, positions)) continue;
                 if (!directRouteSupported(compute, &dot.descriptor)) continue;
                 const lhs_shape = dot.descriptor.input_shapes[0];
                 const rhs_shape = dot.descriptor.input_shapes[1];
@@ -13423,7 +13489,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer result.deinit(request.allocator);
         errdefer for (result.items) |*owner| owner.deinit();
         if (ordinary) {
-            try ElementwiseProductAddRegion.append(self, request, positions, &result);
+            try DenseFusedRegion.append(self, request, positions, &result);
             try TransposedRightDotRegion.append(self, request, positions, &result);
         }
         var watched: std.ArrayList(DenseRegionReadiness.Entry) = .empty;

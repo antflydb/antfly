@@ -7585,9 +7585,48 @@ pub fn decoderRuntimeGatherAxis0AddBiasF32_2DDevice(
     if (rows == 0 or cols == 0 or index_count == 0) return null;
     if (rows > std.math.maxInt(usize) / cols or index_count > std.math.maxInt(usize) / cols) return null;
     if (input.elemCount() != rows * cols or bias.elemCount() != cols or indices.elemCount() != index_count) return null;
-    var output_device = try MetalTensor.deviceAllocate(runtime, index_count * cols * @sizeOf(f32), .private, output_shape);
-    errdefer output_device.deinit();
-    const rc = termite_metal_decode_runtime_gather_axis0_add_bias_f32_2d_device(
+    const bytes = try std.math.mul(usize, index_count * cols, @sizeOf(f32));
+    var output_device = try MetalTensor.deviceAllocate(runtime, bytes, .private, output_shape);
+    const rc = gatherAddBiasDevice(runtime, input, bias, indices, rows, cols, index_count, output_device);
+    if (rc != 0) {
+        output_device.deinit();
+        return null;
+    }
+    return output_device;
+}
+
+pub fn assignedGatherAddBiasAvailable(self: anytype) bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    return antfly_metal_decoder_output_available(runtime, @backingInt(DecoderOutputKind.gather_add_bias)) != 0;
+}
+
+pub fn gatherAddBiasDeviceInto(self: anytype, inputs: [3]MetalTensor, rows: usize, cols: usize, index_count: usize, output: *MetalTensor) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (!assignedGatherAddBiasAvailable(self)) return false;
+    if (!output.isDevice() or output.isReadOnlyPhysical() or output.dtype != .f32) return error.InvalidPhysicalStorageAuthority;
+    const runtime_identity: *anyopaque = @ptrCast(runtime);
+    const output_device = output.device.?;
+    if (output_device.ref.runtime != runtime_identity) return error.InvalidPhysicalStorageAuthority;
+    for (inputs) |input| {
+        if (!input.isDevice() or input.dtype != .f32) return error.PreparedRegionBindingChanged;
+        const source = input.device.?;
+        if (source.ref.runtime != runtime_identity) return error.PreparedRegionBindingChanged;
+        if (source.ref.handle == output_device.ref.handle and @import("../ops/kernel_geometry.zig").byteRangesOverlap(
+            @intCast(source.byte_offset),
+            source.byte_len,
+            @intCast(output_device.byte_offset),
+            output_device.byte_len,
+        )) return error.InvalidAssignedAlias;
+    }
+    if (inputs[0].elemCount() != try std.math.mul(usize, rows, cols) or inputs[1].elemCount() != cols or
+        inputs[2].elemCount() != index_count or output.elemCount() != try std.math.mul(usize, index_count, cols)) return error.InvalidTensorShape;
+    output.invalidateHostMirror();
+    if (gatherAddBiasDevice(runtime, inputs[0], inputs[1], inputs[2], rows, cols, index_count, output.*) != 0) return error.CommandBufferFailed;
+    return true;
+}
+
+fn gatherAddBiasDevice(runtime: *RawMetalDecodeRuntime, input: MetalTensor, bias: MetalTensor, indices: MetalTensor, rows: usize, cols: usize, index_count: usize, output: MetalTensor) c_int {
+    return termite_metal_decode_runtime_gather_axis0_add_bias_f32_2d_device(
         runtime,
         input.deviceHandle(),
         input.deviceByteOffset(),
@@ -7598,14 +7637,9 @@ pub fn decoderRuntimeGatherAxis0AddBiasF32_2DDevice(
         rows,
         cols,
         index_count,
-        output_device.deviceHandle(),
-        output_device.deviceByteOffset(),
+        output.deviceHandle(),
+        output.deviceByteOffset(),
     );
-    if (rc != 0) {
-        output_device.deinit();
-        return null;
-    }
-    return output_device;
 }
 
 pub fn decoderRuntimeGlinerWordEmbeddingsF32Device(
@@ -9829,7 +9863,7 @@ fn decoderRequestOutput(request: anytype) ?*MetalTensor {
     return if (@hasField(@TypeOf(request), "output")) request.output else null;
 }
 
-const DecoderOutputKind = enum(c_int) { add, add_scale, scaled_add_scale, multiply_add, multiply_add2, add_mul_scalar };
+const DecoderOutputKind = enum(c_int) { add, add_scale, scaled_add_scale, multiply_add, multiply_add2, add_mul_scalar, gather_add_bias };
 extern fn antfly_metal_decoder_output_available(runtime: *RawMetalDecodeRuntime, kind: c_int) c_int;
 
 fn decoderOutputBuffer(runtime: *RawMetalDecodeRuntime, request: anytype, inputs: []const MetalTensor, dim: usize, kind: DecoderOutputKind) !?MetalTensor {

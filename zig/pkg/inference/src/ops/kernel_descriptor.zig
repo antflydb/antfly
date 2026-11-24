@@ -227,6 +227,61 @@ pub const Gather = struct {
         return std.mem.eql(i64, expected[0..rank], output_dims);
     }
 };
+/// Rank-two input plus a column bias, independent of add operand order.
+pub const MatrixColumnBias = struct {
+    matrix: ml.graph.NodeId,
+    bias: ml.graph.NodeId,
+    matrix_shape: ml.graph.Shape,
+
+    pub fn match(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?MatrixColumnBias {
+        if (id >= graph.nodeCount()) return null;
+        const node = graph.node(id);
+        if (node.op != .add or node.num_inputs != 2) return null;
+        const lhs = node.inputs[0];
+        const rhs = node.inputs[1];
+        if (lhs >= graph.nodeCount() or rhs >= graph.nodeCount()) return null;
+        const lhs_shape = graph.node(lhs).output_shape;
+        const rhs_shape = graph.node(rhs).output_shape;
+        if (lhs_shape.rank() == 2 and rhs_shape.rank() == 1 and lhs_shape.dims[1] == rhs_shape.dims[0])
+            return .{ .matrix = lhs, .bias = rhs, .matrix_shape = lhs_shape };
+        if (rhs_shape.rank() == 2 and lhs_shape.rank() == 1 and rhs_shape.dims[1] == lhs_shape.dims[0])
+            return .{ .matrix = rhs, .bias = lhs, .matrix_shape = rhs_shape };
+        return null;
+    }
+};
+
+/// The generated F32 kernel adds the bias only for valid gathered rows.
+pub const GatherAddBias = struct {
+    producer: ml.graph.NodeId,
+    inputs: [3]ml.graph.NodeId,
+    rows: usize,
+    cols: usize,
+    index_count: usize,
+    output_shape: ml.graph.Shape,
+
+    pub fn match(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?GatherAddBias {
+        if (id >= graph.nodeCount()) return null;
+        const node = graph.node(id);
+        if (node.op != .gather or node.num_inputs != 2 or node.op.gather.axis != 0) return null;
+        const descriptor = lower(graph, id) orelse return null;
+        const biased = MatrixColumnBias.match(graph, node.inputs[0]) orelse return null;
+        const shape = biased.matrix_shape;
+        if (shape.dtype != .f32 or graph.node(biased.bias).output_shape.dtype != .f32 or
+            !descriptor.input_shapes[0].eq(shape) or descriptor.input_shapes[1].dtype != .f32 or
+            descriptor.output_shape.dtype != .f32 or shape.dims[0] <= 0 or shape.dims[0] > std.math.maxInt(i32) or shape.dims[1] <= 0 or
+            (shape.numElements() orelse return null) > std.math.maxInt(u32)) return null;
+        const count = std.math.cast(u32, descriptor.input_shapes[1].numElements() orelse return null) orelse return null;
+        if (count == 0) return null;
+        return .{
+            .producer = node.inputs[0],
+            .inputs = .{ biased.matrix, biased.bias, node.inputs[1] },
+            .rows = @intCast(shape.dims[0]),
+            .cols = @intCast(shape.dims[1]),
+            .index_count = count,
+            .output_shape = descriptor.output_shape,
+        };
+    }
+};
 /// Cold, value-only geometry authored only by the complete Native decoder.
 /// Generic lower() deliberately never constructs this operation: ordinary
 /// causal attention must preserve its original target route.
