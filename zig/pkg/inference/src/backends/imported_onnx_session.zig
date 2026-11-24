@@ -7590,7 +7590,7 @@ fn qualifyT5CachedRows(a: std.mem.Allocator, session: Session, selected: []const
                             else => {},
                         };
                         std.debug.print("t5 cache prefix={d} step={d} independent_self={d} independent_cross={d}\n", .{ case.prefix, offset, independent_self, independent_cross });
-                        if (offset != 0 and (session.backend() == .native or session.backend() == .metal)) {
+                        if (offset != 0) {
                             try std.testing.expectEqual(@as(usize, 12), independent_self);
                             try std.testing.expectEqual(@as(usize, 12), independent_cross);
                         }
