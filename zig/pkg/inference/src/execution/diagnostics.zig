@@ -141,6 +141,9 @@ pub const PendingInterval = struct {
     counters_scope: enum { synchronous_phase_only } = .synchronous_phase_only,
     whole_interval_counters: enum { unavailable } = .unavailable,
     callback_wall_ns: ?u64 = null,
+    /// Host elapsed time from the start of this pending observation through this phase.
+    /// Includes inter-phase time and makes no claim about device execution.
+    elapsed_host_wall_ns: ?u64 = null,
     observed_phases: ?ObservedPhases = null,
 };
 pub const PublicationScope = enum { program_execution, session_numerical_dispatch, shared_batch_numerical_dispatch, session_preparation };

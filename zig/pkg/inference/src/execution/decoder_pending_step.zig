@@ -669,6 +669,7 @@ test "pending readback observations retain publication only and separate submiss
                 const joined = ready.pending_interval.?.observed_phases.?;
                 try std.testing.expectEqual(@as(u64, 2), joined.count);
                 try std.testing.expect(joined.callback_wall_ns.? >= ready.pending_interval.?.callback_wall_ns.?);
+                try std.testing.expect(ready.pending_interval.?.elapsed_host_wall_ns.? >= joined.callback_wall_ns.?);
                 try std.testing.expectEqual(@as(u64, 1), joined.uploads);
                 try std.testing.expectEqual(@as(u64, 8), joined.upload_bytes);
                 try std.testing.expectEqual(@as(u64, 1), joined.downloads);
@@ -726,6 +727,7 @@ fn checkCudaPendingObservation(actual: ops.ComputeBackend, _: ops.ComputeBackend
     const ready = diagnostics.snapshot().?;
     try std.testing.expect(ready.outcome == .success and ready.pending_interval.?.completion == .readback_returned);
     try std.testing.expectEqual(submitted.pending_interval.?.identity, ready.pending_interval.?.identity);
+    try std.testing.expect(ready.pending_interval.?.elapsed_host_wall_ns.? >= submitted.pending_interval.?.elapsed_host_wall_ns.?);
     const waits = ready.pending_interval.?.observed_phases.?.cuda_host_waits.?;
     try std.testing.expectEqual(@as(u64, 1), waits.event);
     try std.testing.expectEqual(@as(u64, 0), waits.failed);
