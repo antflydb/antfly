@@ -24,6 +24,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -35,6 +36,7 @@ LAUNCH_PAGES = (
     REPO / "docs" / "downloads.mdx",
     REPO / "docs" / "guides" / "inference.mdx",
     REPO / "docs" / "guides" / "hybrid-search.mdx",
+    REPO / "docs" / "guides" / "cloud-migration.mdx",
 )
 DOCS_DIR = REPO / "docs"
 # Terminology is fixed, not decorative. Prose must not use these forms.
@@ -93,14 +95,18 @@ def check_shell(block: str, index: object) -> None:
 
 
 def check_json_payloads(source: str) -> None:
-    payloads = re.findall(r"\s-d '(\{.*?\})'", source, re.DOTALL)
+    payloads = re.findall(
+        r"(?:\s-d|--(?:embedder|chunker|reranker|pruner|generator|index|schema|filter-query|aggregations)) '(\{.*?\})'",
+        source,
+        re.DOTALL,
+    )
     if not payloads:
-        fail("no cURL JSON payloads found")
+        fail("no request JSON payloads found")
     for index, payload in enumerate(payloads, start=1):
         try:
             json.loads(payload)
         except json.JSONDecodeError as error:
-            fail(f"cURL JSON payload {index} is invalid: {error}")
+            fail(f"request JSON payload {index} is invalid: {error}")
 
 
 def check_page_blocks(path: Path) -> None:
@@ -120,7 +126,53 @@ def check_page_blocks(path: Path) -> None:
         try:
             json.loads(payload)
         except json.JSONDecodeError as error:
-            fail(f"{path.name} cURL JSON payload {index} is invalid: {error}")
+            fail(f"{path.name} request JSON payload {index} is invalid: {error}")
+
+
+def check_export_preserves_files() -> None:
+    source = (DOCS_DIR / "guides" / "cloud-migration.mdx").read_text()
+    blocks = [
+        block
+        for language, block in fenced_blocks(source)
+        if language in {"bash", "sh", "shell"} and "cp downloaded.aflite" in block
+    ]
+    if len(blocks) != 1:
+        fail("the migration guide must have one export-copy example")
+    # Execute the documented shell flow with a stub server, including failures.
+    # A syntax-only check cannot catch an overwrite after a failed mkdir.
+    script = (
+        '_quickstart_test_started="$PWD/server-started"\n'
+        'antfly() { printf started > "$_quickstart_test_started"; }\n' + blocks[0]
+    )
+    for case in ("existing-directory", "missing-download", "fresh-copy"):
+        with tempfile.TemporaryDirectory(prefix="antfly-doc-export-") as directory:
+            root = Path(directory)
+            download = root / "downloaded.aflite"
+            copied = root / "returned-lite" / "database.aflite"
+            if case != "missing-download":
+                download.write_bytes(b"downloaded snapshot")
+            if case == "existing-directory":
+                copied.parent.mkdir()
+                copied.write_bytes(b"previous working database")
+            result = subprocess.run(
+                ["bash", "-c", script], cwd=root, capture_output=True, text=True
+            )
+            started = (root / "server-started").exists()
+            if case == "fresh-copy":
+                if result.returncode != 0 or not started or not copied.exists():
+                    fail("the export example must serve a successful fresh copy")
+                if copied.read_bytes() != download.read_bytes():
+                    fail("the export example must preserve the downloaded snapshot")
+            else:
+                if result.returncode == 0 or started:
+                    fail(f"the export example must stop after {case}")
+                if (
+                    case == "existing-directory"
+                    and copied.read_bytes() != b"previous working database"
+                ):
+                    fail("the export example must not overwrite an existing database")
+                if case == "missing-download" and copied.exists():
+                    fail("a missing download must not create a working database")
 
 
 def check_terminology() -> None:
@@ -220,6 +272,7 @@ def check_recording_coverage_wait(tape: str) -> None:
 def main() -> int:
     for page in LAUNCH_PAGES:
         check_page_blocks(page)
+    check_export_preserves_files()
     check_terminology()
 
     source = QUICKSTART.read_text(encoding="utf-8")
@@ -275,7 +328,6 @@ def main() -> int:
             fail(f"{message}: found {token!r}")
 
     required = (
-        'export PATH="$HOME/.local/bin:$PATH"',
         "wiki-articles.jsonl",
         "2,446 of the 10,000",
         "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0 --tasks rerank",
