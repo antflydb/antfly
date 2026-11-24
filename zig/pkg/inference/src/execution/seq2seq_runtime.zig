@@ -393,7 +393,21 @@ pub const State = struct {
         const operation = @import("backend_operation.zig");
         var scope = try operation.enter(backend.*, null, backend.operationToken(), .legacy_unknown_frame);
         defer scope.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
-        if (backend.kind() == .metal and (backend.decoderRuntimeHasActiveFrame() or backend.decoderRuntimeHasSubmittedFrame())) return error.InvalidDecoderOutput;
+        if (backend.kind() == .metal and (backend.decoderRuntimeHasActiveFrame() or backend.decoderRuntimeHasSubmittedFrame())) {
+            // Another invocation owns the frame. The old cache remains
+            // authoritative, so retire only these unsubmitted replacements.
+            try scope.finish();
+            for (self.roles, updated) |role, *target| switch (role) {
+                .past => |past| if (past.cross) {
+                    if (target.*) |value| if (value.independent) {
+                        value.pin.release();
+                        target.* = null;
+                    };
+                },
+                else => {},
+            };
+            return;
+        }
         const completion = if (kernels.createPhysicalCompletion) |create| try create(backend.ptr) else null;
         defer if (completion) |event| event.deinit();
         {
