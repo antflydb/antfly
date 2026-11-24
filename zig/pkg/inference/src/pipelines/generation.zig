@@ -5133,31 +5133,21 @@ pub const NativeGenerationPipeline = struct {
             try cursor.finish();
         } else {
             if (prefilled_tokens != 0) return error.UnsupportedShape;
-            if (self.scheduler) |scheduler| {
-                if (self.scheduler_lease) |lease| {
-                    if (self.io) |io| {
-                        prefill_last_logits = try self.runScheduledPrefillBatch(scheduler, lease, io, decode_state, prompt_ids, seq_len, seq_len, true, allow_shared_kv_prefill);
-                        scheduler.notePrefillProgress(lease, seq_len, seq_len);
-                    } else {
-                        var eager_prefill = self.prefillRuntime(decode_state, null);
-                        try eager_prefill.prepareWholePrompt(seq_len);
-                    }
-                } else {
-                    var eager_prefill = self.prefillRuntime(decode_state, null);
-                    try eager_prefill.prepareWholePrompt(seq_len);
-                }
-            } else {
+            const scheduled = scheduled: {
+                const scheduler = self.scheduler orelse break :scheduled false;
+                const lease = self.scheduler_lease orelse break :scheduled false;
+                const io = self.io orelse break :scheduled false;
+                prefill_last_logits = try self.runScheduledPrefillBatch(scheduler, lease, io, decode_state, prompt_ids, seq_len, seq_len, true, allow_shared_kv_prefill);
+                scheduler.notePrefillProgress(lease, seq_len, seq_len);
+                break :scheduled true;
+            };
+            if (!scheduled) {
                 var eager_prefill = self.prefillRuntime(decode_state, null);
                 try eager_prefill.prepareWholePrompt(seq_len);
-            }
-
-            if (self.scheduler) |scheduler| {
-                if (self.scheduler_lease) |lease| {
-                    if (self.io == null) {
-                        scheduler.notePrefillProgress(lease, seq_len, seq_len);
-                        scheduler.finishTurn(lease, .prefill);
-                    }
-                }
+                if (self.scheduler) |scheduler| if (self.scheduler_lease) |lease| {
+                    scheduler.notePrefillProgress(lease, seq_len, seq_len);
+                    scheduler.finishTurn(lease, .prefill);
+                };
             }
         }
 
@@ -5234,15 +5224,11 @@ pub const NativeGenerationPipeline = struct {
         try numerical.resetRecurrentPrompt();
         const direct_prefill_turn_acquired = try self.beginPreparedPrefillTurn(seq_len);
         defer if (direct_prefill_turn_acquired) self.scheduler.?.finishTurn(self.scheduler_lease.?, .prefill);
-        if (plan.reserve_whole_prompt) try numerical.prepareWholePrompt(seq_len);
-
-        if (prepared.input_embeddings == null) return error.InvalidPreparedPrompt;
         const logits = try numerical.runEmbeddingsOwned(.{
             .owner = &prepared.input_embeddings,
             .token_ids = prepared.ple_token_ids orelse prepared.token_ids,
             .sequence_length = seq_len,
-            .output_intent = plan.output_intent,
-            .chunk_rows = plan.chunk_rows,
+            .plan = plan,
             .attention_mask = prepared.attn_or_mask,
         });
         errdefer if (logits.last_logits) |values| self.allocator.free(values);
@@ -5333,9 +5319,6 @@ pub const NativeGenerationPipeline = struct {
         };
         const direct_prefill_turn_acquired = try self.beginPreparedPrefillTurn(seq_len);
         defer if (direct_prefill_turn_acquired) self.scheduler.?.finishTurn(self.scheduler_lease.?, .prefill);
-        try numerical.prepareWholePrompt(seq_len);
-
-        if (prepared.input_embeddings == null) return error.InvalidPreparedPrompt;
         const work_trace = enableGenerationStageDebug();
         var work_complete = true;
         if (work_trace) {

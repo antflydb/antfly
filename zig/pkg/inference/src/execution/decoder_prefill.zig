@@ -1225,9 +1225,7 @@ pub const Runtime = struct {
         owner: *?ops.CT,
         token_ids: []const i64,
         sequence_length: usize,
-        output_intent: PreparedEmbeddingOutput = .last_logits,
-        /// Nonzero rows are the caller's existing admitted scratch envelope.
-        chunk_rows: usize = 0,
+        plan: EmbeddingPromptPlan = .{ .chunk_rows = 0, .output_intent = .last_logits, .reserve_whole_prompt = true },
         ensure_device_resident: bool = true,
         route: EmbeddingRoute = .prepared_last_row,
         attention_mask: ?[]const u8 = null,
@@ -1237,9 +1235,11 @@ pub const Runtime = struct {
         deepstack_layer_count: usize = 0,
     };
 
-    /// The caller owns its admitted scheduler turn. Physical state was prepared
-    /// before acquiring the model lane, preserving prepared-prefix lock order.
+    /// The caller owns its admitted scheduler turn. Apply the planned KV
+    /// reservation before acquiring the model lane.
     pub fn runEmbeddingsOwned(self: *Runtime, request: EmbeddingRequest) !Output {
+        if (request.plan.reserve_whole_prompt) try self.prepareWholePrompt(request.sequence_length);
+        if (request.owner.* == null) return error.InvalidPreparedPrompt;
         var execution_scope = try self.acquireForObservation();
         defer if (execution_scope) |*scope| scope.deinit();
         const phase_timer = @import("antfly_readers").pipeline_metrics.start(.prefill);
@@ -1248,7 +1248,7 @@ pub const Runtime = struct {
     }
 
     fn runEmbeddingsOwnedUnobserved(self: *Runtime, request: EmbeddingRequest) !Output {
-        if (request.output_intent == .kv_only or (request.route == .ordinary_last_row and request.output_intent != .last_logits)) return error.InvalidPreparedPrompt;
+        if (request.plan.output_intent == .kv_only or (request.route == .ordinary_last_row and request.plan.output_intent != .last_logits)) return error.InvalidPreparedPrompt;
         const original = request.owner.* orelse return error.InvalidPreparedPrompt;
         request.owner.* = null;
         const cb = self.forward.context.cb;
@@ -1256,17 +1256,17 @@ pub const Runtime = struct {
         var owned = true;
         errdefer if (owned) cb.free(embeddings);
         if (self.usesCompiledEmbeddings(request.route)) {
-            if (request.output_intent.capturesHidden() or request.attention_mask != null or request.positions != null or request.visual_mask != null or request.deepstack_embeddings != null or request.token_ids.len != request.sequence_length) return error.UnsupportedPreparedRows;
-            const rows = if (request.chunk_rows == 0) compiled_embedding_chunk_limit else @min(compiled_embedding_chunk_limit, request.chunk_rows);
+            if (request.plan.output_intent.capturesHidden() or request.attention_mask != null or request.positions != null or request.visual_mask != null or request.deepstack_embeddings != null or request.token_ids.len != request.sequence_length) return error.UnsupportedPreparedRows;
+            const rows = if (request.plan.chunk_rows == 0) compiled_embedding_chunk_limit else @min(compiled_embedding_chunk_limit, request.plan.chunk_rows);
             owned = false;
             defer cb.free(embeddings);
             return self.runEmbeddingChunks(embeddings, request, rows);
         }
-        if (request.route == .prepared_last_row and !request.output_intent.capturesHidden() and request.attention_mask == null and
+        if (request.route == .prepared_last_row and !request.plan.output_intent.capturesHidden() and request.attention_mask == null and
             request.positions == null and request.visual_mask == null and request.deepstack_embeddings == null and
             self.state.isPaged())
         {
-            const rows = nativeChunkRows(cb, self.forward.context.gpt_config.*, request.sequence_length, request.chunk_rows);
+            const rows = nativeChunkRows(cb, self.forward.context.gpt_config.*, request.sequence_length, request.plan.chunk_rows);
             if (rows) |bounded_rows| if (request.sequence_length > bounded_rows) {
                 owned = false;
                 defer cb.free(embeddings);
@@ -1284,7 +1284,7 @@ pub const Runtime = struct {
         var numerical = Forward{ .forward = self.forward };
         owned = false;
         return switch (request.route) {
-            .prepared_last_row => try numerical.forwardPreparedEmbeddingsOutput(embeddings, request.token_ids, request.sequence_length, &decode, request.output_intent),
+            .prepared_last_row => try numerical.forwardPreparedEmbeddingsOutput(embeddings, request.token_ids, request.sequence_length, &decode, request.plan.output_intent),
             .ordinary_last_row => .{ .last_logits = try gpt_arch.forwardLastLogitsLastRowFromEmbeddingsWithLayer0Overrides(cb, self.forward.context.allocator, self.forward.context.gpt_config.*, embeddings, .{}, 1, request.sequence_length, &decode, null) },
         };
     }
@@ -1316,7 +1316,7 @@ pub const Runtime = struct {
                     .token_ids = ids,
                     .prepared_rows = .{ .source = cb, .tensor = part, .rows = count, .width = config.hidden_size },
                     .total_sequence_length = end,
-                    .output = if (!chunk.final) .kv_only else if (request.output_intent.isGreedy()) .greedy_token else .last_logits,
+                    .output = if (!chunk.final) .kv_only else if (request.plan.output_intent.isGreedy()) .greedy_token else .last_logits,
                 }, self.forward.graph_cache.?, graph_mod.execution.graphForwardCompiledModelOutputWithInputs);
                 if (chunk.final) return result;
                 continue;
@@ -1328,7 +1328,7 @@ pub const Runtime = struct {
             if (chunk.final) {
                 var numerical = Forward{ .forward = self.forward };
                 owns_part = false;
-                return numerical.forwardPreparedEmbeddingsOutput(part, ids, end, &decode, request.output_intent);
+                return numerical.forwardPreparedEmbeddingsOutput(part, ids, end, &decode, request.plan.output_intent);
             }
             if (cb.kind() == .metal and count > 1) {
                 var framed = Forward{ .forward = self.forward };
