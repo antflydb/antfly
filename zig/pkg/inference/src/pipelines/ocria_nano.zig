@@ -1368,9 +1368,13 @@ fn looksSideways(boxes: []const Quad) bool {
 /// The quad in the original image, corners in reading order.
 fn readingFrame(q: Quad, flip: bool, sideways: bool, w0: usize) Quad {
     var p = q;
-    if (flip) p = .{ p[2], p[3], p[0], p[1] };
+    if (flip) {
+        const old = p;
+        p = .{ old[2], old[3], old[0], old[1] };
+    }
     if (sideways) for (&p) |*pt| {
-        pt.* = .{ @floatCast(@as(f64, @floatFromInt(w0)) - 1.0 - pt[1]), pt[0] };
+        const old = pt.*;
+        pt.* = .{ @floatCast(@as(f64, @floatFromInt(w0)) - 1.0 - old[1]), old[0] };
     };
     return p;
 }
@@ -2338,4 +2342,10 @@ test "ocria reading frame maps a quarter turn back" {
     const r = readingFrame(q, false, true, 100);
     try std.testing.expectEqual([2]f32{ 99, 0 }, r[0]);
     try std.testing.expectEqual([2]f32{ 99, 10 }, r[1]);
+}
+
+test "ocria reading frame swaps corners of an upside-down page" {
+    const q = Quad{ .{ 0, 0 }, .{ 10, 0 }, .{ 10, 2 }, .{ 0, 2 } };
+    const r = readingFrame(q, true, false, 100);
+    try std.testing.expectEqual(Quad{ .{ 10, 2 }, .{ 0, 2 }, .{ 0, 0 }, .{ 10, 0 } }, r);
 }
