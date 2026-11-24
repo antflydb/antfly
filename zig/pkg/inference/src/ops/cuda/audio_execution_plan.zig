@@ -42,15 +42,7 @@ pub const Owner = struct {
     pub fn seal(self: *Owner, output: u64, key: u64, input_bytes: usize) bool {
         if (!self.plan.finish(output)) return false;
         const storage = self.plan.layoutWithExternalOutput(input_bytes) catch self.plan.layout(input_bytes) catch return false;
-        var hash = std.hash.Wyhash.init(key);
-        for (self.plan.events[0..self.plan.event_count]) |event| {
-            const encoded: u16 = @bitCast(event);
-            hash.update(std.mem.asBytes(&encoded));
-            const allocation = self.plan.allocations[event.slot];
-            hash.update(std.mem.asBytes(&allocation.bytes));
-            hash.update(std.mem.asBytes(&allocation.offset));
-        }
-        self.executable = .{ .key = hash.final(), .storage = storage };
+        self.executable = .{ .key = self.plan.fingerprint(key), .storage = storage };
         return true;
     }
 

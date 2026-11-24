@@ -133,6 +133,20 @@ pub const Plan = struct {
         return self.layoutImpl(prefix_bytes, false);
     }
 
+    /// Identify the sealed event schedule independently of its backing addresses.
+    pub fn fingerprint(self: *const Plan, seed: u64) u64 {
+        std.debug.assert(self.sealed);
+        var hash = std.hash.Wyhash.init(seed);
+        for (self.events[0..self.event_count]) |entry| {
+            const encoded: u16 = @bitCast(entry);
+            hash.update(std.mem.asBytes(&encoded));
+            const allocation = self.allocations[entry.slot];
+            hash.update(std.mem.asBytes(&allocation.bytes));
+            hash.update(std.mem.asBytes(&allocation.offset));
+        }
+        return hash.final();
+    }
+
     pub fn layoutWithExternalOutput(self: *const Plan, prefix_bytes: usize) !Layout {
         return self.layoutImpl(prefix_bytes, true);
     }
@@ -269,6 +283,21 @@ test "stream workspace rejects duplicate live addresses and accepts retired addr
     plan.release(1024);
     plan.allocate(256, 1024);
     try std.testing.expect(plan.finish(1024));
+}
+
+test "sealed workspace identity excludes learning addresses and distinguishes geometry" {
+    var plan: Plan = .{};
+    plan.allocate(256, 1024);
+    try std.testing.expect(plan.finish(1024));
+    const identity = plan.fingerprint(17);
+    plan = .{};
+    plan.allocate(256, 2048);
+    try std.testing.expect(plan.finish(2048));
+    try std.testing.expectEqual(identity, plan.fingerprint(17));
+    plan = .{};
+    plan.allocate(512, 2048);
+    try std.testing.expect(plan.finish(2048));
+    try std.testing.expect(identity != plan.fingerprint(17));
 }
 
 test "CUDA arena preserves device addresses wider than a 32-bit host pointer" {
