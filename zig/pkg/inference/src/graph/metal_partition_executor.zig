@@ -1600,7 +1600,7 @@ pub const MetalPartitionExecutor = struct {
     /// Cold canonical-executor proof. The caller owns the actual provider's
     /// metadata operation before touching the cached region plan. This reuses
     /// the plan and reachability authority already used by real execution.
-    pub fn ownedFrameDispatchDecline(actual: *const PartitionExecutor, graph: *const Graph, backend: *const ComputeBackend, nodes: []const NodeId, reachable: []const bool, last_use: []const u32) !?@import("../execution/owned_coverage.zig").Reason {
+    pub fn ownedFrameDispatchDecline(actual: *const PartitionExecutor, graph: *const Graph, backend: *const ComputeBackend, nodes: []const NodeId, reachable: []const bool, last_use: []const u32, required_products: ?*std.array_list.Managed(region_schedule.DeferredProducer)) !?@import("../execution/owned_coverage.zig").Reason {
         if (!ownsPartition(actual, graph, backend) or reachable.len != graph.nodeCount() or last_use.len != graph.nodeCount()) return .execution_path;
         const self: *MetalPartitionExecutor = @ptrCast(@alignCast(actual.ptr));
         var saw_dot = false;
@@ -1658,7 +1658,12 @@ pub const MetalPartitionExecutor = struct {
             } else if (@import("../execution/metadata_alias.zig").Plan.lower(graph, id, .metal) == null) return .operation;
             // These exact heuristics run ahead of the physical branch. Even
             // a supported descriptor cannot claim a producer they defer.
-            if (shouldDeferScaleMulForAdd(graph, id, reachable, last_use, null) or shouldDeferElementwiseMulForAdd(graph, id, reachable, last_use, null) or shouldDeferTransposeForLinearDot(graph, id, reachable, last_use)) return .deferred_producer;
+            if (shouldDeferScaleMulForAdd(graph, id, reachable, last_use, null) or
+                shouldDeferTransposeForLinearDot(graph, id, reachable, last_use)) return .deferred_producer;
+            if (shouldDeferElementwiseMulForAdd(graph, id, reachable, last_use, null)) {
+                const pending = required_products orelse return .deferred_producer;
+                try pending.append(.{ .producer = id, .consumer = last_use[id] });
+            }
         }
         var transient: ?RuntimeRegionPlan = null;
         defer if (transient) |*plan| plan.deinit(self.allocator);
@@ -15938,10 +15943,9 @@ const DeferredScaleMul = struct {
     scale: f32,
 };
 
-const DeferredElementwiseMul = struct {
-    lhs_id: NodeId,
-    rhs_id: NodeId,
-};
+const DeferredElementwiseMul = ops_mod.kernel_descriptor.F32Product;
+const deferredElementwiseMul = ops_mod.kernel_descriptor.sameShapeF32Product;
+const scalarConstantF32 = ops_mod.kernel_descriptor.scalarConstantF32;
 
 const RuntimeBinaryOperand = struct {
     value: CT,
@@ -16041,19 +16045,15 @@ fn executeRuntimeMultiplyAddFromDeferredMul(
     dim: usize,
     output_hint: ?CT,
 ) !?CT {
-    if (inputs.len < 2) return null;
-    if (pendingDeferredElementwiseMul(graph, values, inputs[0], output_shape)) |mul| {
-        if (pendingDeferredElementwiseMul(graph, values, inputs[1], output_shape)) |rhs_mul| {
-            return try executeDeferredElementwiseMultiplyAdd2(cb, values, mul, rhs_mul, dim, output_hint);
-        }
-        const addend = valueFor(values, inputs[1]) orelse return null;
-        return try executeDeferredElementwiseMultiplyAdd(cb, values, mul, addend, dim, output_hint);
-    }
-    if (pendingDeferredElementwiseMul(graph, values, inputs[1], output_shape)) |mul| {
-        const addend = valueFor(values, inputs[0]) orelse return null;
-        return try executeDeferredElementwiseMultiplyAdd(cb, values, mul, addend, dim, output_hint);
-    }
-    return null;
+    if (inputs.len != 2) return null;
+    const recipe = ops_mod.kernel_descriptor.F32ProductAdd.match(graph, inputs, output_shape, .{
+        valueFor(values, inputs[0]) == null,
+        valueFor(values, inputs[1]) == null,
+    }) orelse return null;
+    return switch (recipe) {
+        .pair => |products| try executeDeferredElementwiseMultiplyAdd2(cb, values, products[0], products[1], dim, output_hint),
+        .single => |single| try executeDeferredElementwiseMultiplyAdd(cb, values, single.product, valueFor(values, single.addend) orelse return null, dim, output_hint),
+    };
 }
 
 fn executeDeferredElementwiseMultiplyAdd2(
@@ -16190,11 +16190,6 @@ fn pendingDeferredScaleMul(graph: *const Graph, values: []?CT, node_id: NodeId, 
     return deferredScaleMul(graph, node_id, output_shape);
 }
 
-fn pendingDeferredElementwiseMul(graph: *const Graph, values: []?CT, node_id: NodeId, output_shape: ml.graph.Shape) ?DeferredElementwiseMul {
-    if (valueFor(values, node_id) != null) return null;
-    return deferredElementwiseMul(graph, node_id, output_shape);
-}
-
 fn deferredScaleMul(graph: *const Graph, node_id: NodeId, output_shape: ml.graph.Shape) ?DeferredScaleMul {
     if (node_id == null_node or node_id >= graph.nodeCount()) return null;
     const node = graph.node(node_id);
@@ -16211,36 +16206,6 @@ fn deferredScaleMul(graph: *const Graph, node_id: NodeId, output_shape: ml.graph
         return .{ .source_id = node.inputs[0], .scalar_id = node.inputs[1], .scale = scale };
     }
     return null;
-}
-
-fn deferredElementwiseMul(graph: *const Graph, node_id: NodeId, output_shape: ml.graph.Shape) ?DeferredElementwiseMul {
-    if (node_id == null_node or node_id >= graph.nodeCount()) return null;
-    const node = graph.node(node_id);
-    switch (node.op) {
-        .mul, .fused_elem_multiply => {},
-        else => return null,
-    }
-    if (!shapesEqual(node.output_shape, output_shape)) return null;
-    if (node.output_shape.dtype != .f32 or node.num_inputs < 2) return null;
-    if (deferredScaleMul(graph, node_id, output_shape) != null) return null;
-    const lhs_id = node.inputs[0];
-    const rhs_id = node.inputs[1];
-    if (lhs_id == null_node or rhs_id == null_node or lhs_id >= graph.nodeCount() or rhs_id >= graph.nodeCount()) return null;
-    if (!shapesEqual(graph.node(lhs_id).output_shape, output_shape)) return null;
-    if (!shapesEqual(graph.node(rhs_id).output_shape, output_shape)) return null;
-    if (isSameShapeElementwiseMul(graph, lhs_id, output_shape)) return null;
-    if (isSameShapeElementwiseMul(graph, rhs_id, output_shape)) return null;
-    return .{ .lhs_id = lhs_id, .rhs_id = rhs_id };
-}
-
-fn isSameShapeElementwiseMul(graph: *const Graph, node_id: NodeId, output_shape: ml.graph.Shape) bool {
-    if (node_id == null_node or node_id >= graph.nodeCount()) return false;
-    const node = graph.node(node_id);
-    switch (node.op) {
-        .mul, .fused_elem_multiply => {},
-        else => return false,
-    }
-    return shapesEqual(node.output_shape, output_shape);
 }
 
 fn binaryBroadcastResultMatches(
@@ -16277,147 +16242,21 @@ fn binaryBroadcastResultMatches(
     return true;
 }
 
-fn shouldDeferScaleMulForAdd(
-    graph: *const Graph,
-    node_id: NodeId,
-    reachable: []const bool,
-    last_use: []const u32,
-    use_counts: ?[]const u8,
-) bool {
-    const node_index: usize = @intCast(node_id);
-    if (node_index >= reachable.len or !reachable[node_index]) return false;
-    if (node_index >= last_use.len) return false;
-    const consumer_id: NodeId = @intCast(last_use[node_index]);
-    if (consumer_id == null_node or consumer_id >= graph.nodeCount()) return false;
-    const consumer_index: usize = @intCast(consumer_id);
-    if (consumer_index >= reachable.len or !reachable[consumer_index]) return false;
-    const consumer = graph.node(consumer_id);
-    switch (consumer.op) {
-        .add, .fused_elem_add => {},
-        else => return false,
-    }
-    if (consumer.num_inputs < 2 or (consumer.inputs[0] != node_id and consumer.inputs[1] != node_id)) return false;
-    if (!hasSingleReachableConsumer(graph, node_id, reachable, use_counts)) return false;
-    if (deferredScaleMul(graph, node_id, consumer.output_shape) == null) return false;
-    return deferredProducerInputsLiveUntilConsumer(graph, node_id, consumer_id, last_use);
+const region_schedule = @import("../execution/region_schedule.zig");
+const deferredProducerInputsLiveUntilConsumer = region_schedule.deferredProducerInputsLiveUntilConsumer;
+const reachableUseCount = region_schedule.reachableUseCount;
+const computeReachableUseCountsCapped = region_schedule.computeReachableUseCountsCapped;
+
+fn shouldDeferScaleMulForAdd(graph: *const Graph, node_id: NodeId, reachable: []const bool, last_use: []const u32, use_counts: ?[]const u8) bool {
+    const consumer = region_schedule.deferredAddConsumer(graph, node_id, reachable, last_use, use_counts) orelse return false;
+    return deferredScaleMul(graph, node_id, graph.node(consumer).output_shape) != null and
+        deferredProducerInputsLiveUntilConsumer(graph, node_id, consumer, last_use);
 }
 
-fn shouldDeferElementwiseMulForAdd(
-    graph: *const Graph,
-    node_id: NodeId,
-    reachable: []const bool,
-    last_use: []const u32,
-    use_counts: ?[]const u8,
-) bool {
-    const node_index: usize = @intCast(node_id);
-    if (node_index >= reachable.len or !reachable[node_index]) return false;
-    if (node_index >= last_use.len) return false;
-    const consumer_id: NodeId = @intCast(last_use[node_index]);
-    if (consumer_id == null_node or consumer_id >= graph.nodeCount()) return false;
-    const consumer_index: usize = @intCast(consumer_id);
-    if (consumer_index >= reachable.len or !reachable[consumer_index]) return false;
-    const consumer = graph.node(consumer_id);
-    switch (consumer.op) {
-        .add, .fused_elem_add => {},
-        else => return false,
-    }
-    if (consumer.num_inputs < 2 or (consumer.inputs[0] != node_id and consumer.inputs[1] != node_id)) return false;
-    if (!hasSingleReachableConsumer(graph, node_id, reachable, use_counts)) return false;
-    if (deferredElementwiseMul(graph, node_id, consumer.output_shape) == null) return false;
-    if (!deferredProducerInputsLiveUntilConsumer(graph, node_id, consumer_id, last_use)) return false;
-    return true;
-}
-
-fn deferredProducerInputsLiveUntilConsumer(
-    graph: *const Graph,
-    producer_id: NodeId,
-    consumer_id: NodeId,
-    last_use: []const u32,
-) bool {
-    if (producer_id == null_node or producer_id >= graph.nodeCount()) return false;
-    const producer_index: usize = @intCast(producer_id);
-    const consumer_index: usize = @intCast(consumer_id);
-    const producer = graph.node(producer_id);
-    for (producer.getInputs()) |input_id| {
-        if (input_id == null_node or input_id >= graph.nodeCount()) return false;
-        const input_index: usize = @intCast(input_id);
-        if (input_index >= last_use.len) return false;
-        // Pre-materialized constants (scalar/tensor consts, zero tensors) are
-        // re-materialized every execution and never recycled by buffer reuse, so
-        // their last-use position does not constrain deferral — a deferred mul can
-        // safely read them at the consumer even if a sibling consumed them earlier.
-        // Exempting them recovers fusion for the common `(x*s) + (y*s)` pattern
-        // where a shared scalar's last use is the sibling multiply.
-        if (isPreMaterializedConstantOp(graph.node(input_id).op)) continue;
-        const input_last_use = last_use[input_index];
-        if (input_last_use == std.math.maxInt(u32)) continue;
-        const input_last_use_index: usize = @intCast(input_last_use);
-        if (input_last_use_index == producer_index) continue;
-        if (input_last_use_index >= consumer_index) continue;
-        return false;
-    }
-    return true;
-}
-
-fn reachableUseCount(graph: *const Graph, node_id: NodeId, reachable: []const bool, stop_after: usize) usize {
-    var count: usize = 0;
-    var candidate: NodeId = 0;
-    while (candidate < graph.nodeCount()) : (candidate += 1) {
-        const candidate_index: usize = @intCast(candidate);
-        if (candidate_index >= reachable.len or !reachable[candidate_index]) continue;
-        const node = graph.node(candidate);
-        for (node.getInputs()) |input_id| {
-            if (input_id != node_id) continue;
-            count += 1;
-            if (count >= stop_after) return count;
-        }
-    }
-    return count;
-}
-
-/// Per-node count of reachable consumers, capped at 2 (callers only need to tell
-/// "exactly one consumer" from "more than one"). Built once in O(edges) so the
-/// per-node execution loop can answer the deferral use-count query in O(1)
-/// instead of an O(nodes) `reachableUseCount` scan per candidate — the fix for
-/// the O(nodes^2) term on the hot path. Caller owns the returned slice.
-fn computeReachableUseCountsCapped(allocator: std.mem.Allocator, graph: *const Graph, reachable: []const bool) ![]u8 {
-    const counts = try allocator.alloc(u8, graph.nodeCount());
-    @memset(counts, 0);
-    var candidate: NodeId = 0;
-    while (candidate < graph.nodeCount()) : (candidate += 1) {
-        const candidate_index: usize = @intCast(candidate);
-        if (candidate_index >= reachable.len or !reachable[candidate_index]) continue;
-        for (graph.node(candidate).getInputs()) |input_id| {
-            if (input_id == null_node or input_id >= graph.nodeCount()) continue;
-            const input_index: usize = @intCast(input_id);
-            if (counts[input_index] < 2) counts[input_index] += 1;
-        }
-    }
-    return counts;
-}
-
-/// True when `node_id` has exactly one reachable consumer. Uses the precomputed
-/// capped use-count array when supplied (O(1)); otherwise falls back to the
-/// O(nodes) scan (fine for the small graphs in unit tests).
-fn hasSingleReachableConsumer(graph: *const Graph, node_id: NodeId, reachable: []const bool, use_counts: ?[]const u8) bool {
-    if (use_counts) |counts| {
-        const idx: usize = @intCast(node_id);
-        if (idx < counts.len) return counts[idx] == 1;
-    }
-    return reachableUseCount(graph, node_id, reachable, 2) == 1;
-}
-
-fn scalarConstantF32(graph: *const Graph, node_id: NodeId) ?f32 {
-    if (node_id == null_node or node_id >= graph.nodeCount()) return null;
-    const node = graph.node(node_id);
-    const attrs = switch (node.op) {
-        .constant => |constant_attrs| constant_attrs,
-        else => return null,
-    };
-    if (node.output_shape.dtype != .f32 or node.output_shape.rank() != 0 or attrs.data_len != 1) return null;
-    const values = graph.constantDataAs(f32, attrs.data_offset, attrs.data_len);
-    if (values.len != 1) return null;
-    return values[0];
+fn shouldDeferElementwiseMulForAdd(graph: *const Graph, node_id: NodeId, reachable: []const bool, last_use: []const u32, use_counts: ?[]const u8) bool {
+    const consumer = region_schedule.deferredAddConsumer(graph, node_id, reachable, last_use, use_counts) orelse return false;
+    return deferredElementwiseMul(graph, node_id, graph.node(consumer).output_shape) != null and
+        deferredProducerInputsLiveUntilConsumer(graph, node_id, consumer, last_use);
 }
 
 fn shapesEqual(lhs: ml.graph.Shape, rhs: ml.graph.Shape) bool {
@@ -18745,7 +18584,7 @@ test "metal partition executor defers same shape multiply for multiply-add" {
         const executor = try MetalPartitionExecutor.create(allocator, &g, &backend);
         const pe = executor.partitionExecutor();
         defer pe.deinitExecutor();
-        const reason = try MetalPartitionExecutor.ownedFrameDispatchDecline(pe, &g, &backend, &.{ x, y, z, multiplied, out }, reachable, last_use);
+        const reason = try MetalPartitionExecutor.ownedFrameDispatchDecline(pe, &g, &backend, &.{ x, y, z, multiplied, out }, reachable, last_use, null);
         try std.testing.expectEqual(@as(?@import("../execution/owned_coverage.zig").Reason, .deferred_producer), reason);
     }
 }
@@ -18943,6 +18782,12 @@ test "metal partition executor defers both same shape multiply add inputs" {
     const out = try b.add(lhs, rhs);
     try g.markOutput(out);
 
+    const ProductAdd = ops_mod.kernel_descriptor.F32ProductAdd;
+    const both = ProductAdd.match(&g, g.node(out).getInputs(), shape, .{ true, true }).?;
+    try std.testing.expectEqualDeep(ProductAdd{ .pair = .{ .{ .lhs_id = x, .rhs_id = y }, .{ .lhs_id = z, .rhs_id = w } } }, both);
+    const right = ProductAdd.match(&g, g.node(out).getInputs(), shape, .{ false, true }).?;
+    try std.testing.expectEqualDeep(ProductAdd{ .single = .{ .product = .{ .lhs_id = z, .rhs_id = w }, .addend = lhs } }, right);
+
     const reachable = try interpreter.computeReachable(allocator, &g);
     defer allocator.free(reachable);
     const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
@@ -18954,6 +18799,8 @@ test "metal partition executor defers both same shape multiply add inputs" {
     try std.testing.expect(deferredElementwiseMul(&g, rhs, g.node(out).output_shape) != null);
     try std.testing.expect(shouldDeferElementwiseMulForAdd(&g, lhs, reachable, last_use, null));
     try std.testing.expect(shouldDeferElementwiseMulForAdd(&g, rhs, reachable, last_use, null));
+    try g.markOutput(lhs);
+    try std.testing.expect(!shouldDeferElementwiseMulForAdd(&g, lhs, reachable, last_use, null));
 }
 
 test "metal partition executor only treats unmaterialized mul inputs as deferred" {
@@ -19006,7 +18853,7 @@ test "metal partition executor only treats unmaterialized mul inputs as deferred
     try std.testing.expect(pendingDeferredScaleMul(&g, values, materialized_mul, out_shape) == null);
     // ...while the skipped (null-valued) mul is still eligible for fusion.
     try std.testing.expect(pendingDeferredScaleMul(&g, values, deferred_mul, out_shape) != null);
-    try std.testing.expect(pendingDeferredElementwiseMul(&g, values, materialized_mul, out_shape) == null);
+    try std.testing.expect(ops_mod.kernel_descriptor.F32ProductAdd.match(&g, g.node(out).getInputs(), out_shape, .{ false, true }) == null);
 }
 
 test "metal partition executor does not defer nested same shape multiply add input" {

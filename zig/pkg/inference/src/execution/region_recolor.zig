@@ -54,7 +54,7 @@ pub fn applyWithLastUse(plan: *buffers.BufferPlan, first_use: []const u32, last_
         const first = first_use[slot.node_id];
         const last = if (last_use[slot.node_id] == none) slot.last_use else @max(slot.last_use, last_use[slot.node_id]);
         if (first != none and first > last) return error.InvalidRegionOrder;
-        changed = changed or last != slot.last_use;
+        changed = changed or slot.kind == .region_internal or last != slot.last_use;
         changed = changed or (first != none and first < slot.first_use);
     }
     if (!changed) return;

@@ -202,6 +202,7 @@ pub const Pool = struct {
     /// synchronous region. The root grants no primitive Frame credit.
     metal_projection_region_candidate: bool = false,
     coverage_backend: ?ops.ComputeBackend = null,
+    metal_required_products: []const @import("region_schedule.zig").DeferredProducer = &.{},
     cold_coverage_decline: ?@import("owned_coverage.zig").Reason = null,
     payload_coverage: @import("owned_coverage.zig").Coverage = .{ .compatibility = .no_selected_routes },
     route_owner: ?*prepared_routes.PreparedRoutes = null,
@@ -770,6 +771,7 @@ pub const Pool = struct {
             cache.deinitWithCleanup(cleanup);
             self.allocator.destroy(cache);
         }
+        self.allocator.free(self.metal_required_products);
         for (self.frames.items) |frame| frame.deinitWithCleanup(cleanup);
         self.deinitRegions();
         if (self.selection) |*selected| selected.deinitWithCleanup(cleanup);
@@ -1139,6 +1141,7 @@ pub const Pool = struct {
                 },
                 .view => if (!self.attestsTransferView(slot.*, edge.byte_size)) return false,
                 .runtime_input => if (!self.attestsTransferIngress(slot.*, source, edge.byte_size)) return false,
+                .region_internal => return false,
             }
         }
         return has_copy;
@@ -1594,6 +1597,7 @@ pub const Pool = struct {
         }
         var lifetimes = try @import("region_lifetimes.zig").createWithBindings(self.allocator, graph, reachable, &self.plan, owned.owners, facts);
         defer lifetimes.deinit();
+        try @import("reachable_projection.zig").retireRegionInternals(self, owned.owners);
         try @import("region_recolor.zig").applyWithLastUse(&self.plan, lifetimes.first_use, lifetimes.input_last_use);
         try self.rebindRegionKernelSlots();
         const installed = try self.allocator.alloc(region_binding.Installed, owned.owners.len);

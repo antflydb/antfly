@@ -41,6 +41,8 @@ pub const SlotKind = enum {
     view,
     runtime_input,
     constant,
+    /// Live graph node executed inside a selected region without publication.
+    region_internal,
 };
 
 pub const SlotRoles = packed struct {
@@ -280,6 +282,7 @@ pub const BufferPlan = struct {
         const source_id = slot.source_slot orelse return error.InvalidBufferPlan;
         if (source_id >= self.slots.len) return error.InvalidBufferPlan;
         const source = self.slotForNode(self.slots[source_id].node_id) orelse return error.InvalidBufferPlan;
+        if (source.kind == .region_internal) return error.InvalidBufferPlan;
         if (source.backend == slot.backend) return source.allocation;
         const index = self.transfer_index.get(transferKey(source.node_id, slot.partition_index)) orelse return error.MissingViewTransfer;
         return self.transfers[index].allocation;
@@ -446,6 +449,10 @@ pub const BufferPlan = struct {
                 }
                 if (allocation.backend != slot.backend or allocation.storage != slot.storage) return error.InvalidBufferPlan;
                 if (allocation.byte_size < tensorByteSize(slot.desc.shape)) return error.InvalidBufferPlan;
+            } else if (slot.kind == .region_internal) {
+                if (self.execution_reachable == null or slot.allocation != invalid_allocation or slot.reusable or
+                    slot.source_slot != null or slot.roles.graph_output or slot.roles.partition_output or
+                    slot.roles.transfer_source or slot.roles.transfer_target) return error.InvalidBufferPlan;
             } else if (slot.allocation != invalid_allocation) {
                 return error.InvalidBufferPlan;
             }
@@ -793,6 +800,7 @@ fn slotRolesForNode(graph: *const Graph, node_id: NodeId, kind: SlotKind, graph_
         },
         .view => roles.view = true,
         .allocation => {},
+        .region_internal => unreachable,
     }
     if (graph_output) roles.partition_output = true;
     _ = graph;

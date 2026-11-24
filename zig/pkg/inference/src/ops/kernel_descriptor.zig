@@ -28,6 +28,72 @@ pub const NativeMatrixScratchGeometry = struct {
 
 pub const Unary = enum { negate, sqrt, rsqrt, exp, log, sin, cos, tanh, erf, abs, gelu, gelu_exact, relu, silu };
 pub const Binary = enum { add, subtract, multiply, divide };
+pub const F32Product = struct { node: ml.graph.NodeId, lhs_id: ml.graph.NodeId, rhs_id: ml.graph.NodeId };
+
+pub const F32ProductAdd = union(enum) {
+    single: struct { product: F32Product, addend: ml.graph.NodeId },
+    pair: [2]F32Product,
+
+    /// The caller supplies which products it has proved safe to elide. The
+    /// original add order determines the order of the two-product kernel.
+    pub fn match(graph: *const ml.graph.Graph, inputs: []const ml.graph.NodeId, shape: ml.graph.Shape, deferred: [2]bool) ?F32ProductAdd {
+        if (inputs.len != 2) return null;
+        const left = if (deferred[0]) sameShapeF32Product(graph, inputs[0], shape) else null;
+        const right = if (deferred[1]) sameShapeF32Product(graph, inputs[1], shape) else null;
+        if (left) |product| {
+            if (right) |other| return .{ .pair = .{ product, other } };
+            return .{ .single = .{ .product = product, .addend = inputs[1] } };
+        }
+        if (right) |product| return .{ .single = .{ .product = product, .addend = inputs[0] } };
+        return null;
+    }
+};
+
+/// Dense product geometry for the elementwise multiply-add schedules. Scalar
+/// constants and nested products are handled by their separate schedules.
+pub fn sameShapeF32Product(graph: *const ml.graph.Graph, node_id: ml.graph.NodeId, output_shape: ml.graph.Shape) ?F32Product {
+    if (node_id == ml.graph.null_node or node_id >= graph.nodeCount()) return null;
+    const node = graph.node(node_id);
+    switch (node.op) {
+        .mul, .fused_elem_multiply => {},
+        else => return null,
+    }
+    if (!ml.graph.Shape.eq(node.output_shape, output_shape)) return null;
+    if (node.output_shape.dtype != .f32 or node.num_inputs < 2) return null;
+    const lhs_id = node.inputs[0];
+    const rhs_id = node.inputs[1];
+    if (lhs_id == ml.graph.null_node or rhs_id == ml.graph.null_node or lhs_id >= graph.nodeCount() or rhs_id >= graph.nodeCount()) return null;
+    if (scalarConstantF32(graph, lhs_id) != null or scalarConstantF32(graph, rhs_id) != null) return null;
+    if (!ml.graph.Shape.eq(graph.node(lhs_id).output_shape, output_shape)) return null;
+    if (!ml.graph.Shape.eq(graph.node(rhs_id).output_shape, output_shape)) return null;
+    if (isSameShapeElementwiseMul(graph, lhs_id, output_shape)) return null;
+    if (isSameShapeElementwiseMul(graph, rhs_id, output_shape)) return null;
+    return .{ .node = node_id, .lhs_id = lhs_id, .rhs_id = rhs_id };
+}
+
+fn isSameShapeElementwiseMul(graph: *const ml.graph.Graph, node_id: ml.graph.NodeId, output_shape: ml.graph.Shape) bool {
+    if (node_id == ml.graph.null_node or node_id >= graph.nodeCount()) return false;
+    const node = graph.node(node_id);
+    switch (node.op) {
+        .mul, .fused_elem_multiply => {},
+        else => return false,
+    }
+    return ml.graph.Shape.eq(node.output_shape, output_shape);
+}
+
+pub fn scalarConstantF32(graph: *const ml.graph.Graph, node_id: ml.graph.NodeId) ?f32 {
+    if (node_id == ml.graph.null_node or node_id >= graph.nodeCount()) return null;
+    const node = graph.node(node_id);
+    const attrs = switch (node.op) {
+        .constant => |constant_attrs| constant_attrs,
+        else => return null,
+    };
+    if (node.output_shape.dtype != .f32 or node.output_shape.rank() != 0 or attrs.data_len != 1) return null;
+    const values = graph.constantDataAs(f32, attrs.data_offset, attrs.data_len);
+    if (values.len != 1) return null;
+    return values[0];
+}
+
 pub const Linear = struct {
     rows: u32,
     in_dim: u32,

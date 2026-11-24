@@ -6473,7 +6473,7 @@ test "complete Imported Metal Frame encoder owns shared ingress aliases outputs 
         for (dispatch.base.partitions, 0..) |part, part_index| {
             std.debug.print("METAL_ATTEST_PART index={d} backend={s} executor={} device={d} nodes={any}\n", .{ part_index, @tagName(part.backend), part.executor != null, dispatch.device_assignment[part_index], part.node_ids });
             if (part.backend == .metal) if (part.executor) |actual| {
-                const decline = try @import("../graph/metal_partition_executor.zig").MetalPartitionExecutor.ownedFrameDispatchDecline(actual, impl.executable.graph, &impl.cb, part.node_ids, impl.executable.analysis.reachable, impl.executable.analysis.last_use);
+                const decline = try @import("../graph/metal_partition_executor.zig").MetalPartitionExecutor.ownedFrameDispatchDecline(actual, impl.executable.graph, &impl.cb, part.node_ids, impl.executable.analysis.reachable, impl.executable.analysis.last_use, null);
                 std.debug.print("METAL_ATTEST_POST_CONSTRUCTION part={d} decline={s}\n", .{ part_index, if (decline) |reason| @tagName(reason) else "none" });
             };
             for (part.node_ids) |id| {

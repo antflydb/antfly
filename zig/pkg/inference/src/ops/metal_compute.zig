@@ -11944,8 +11944,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     const owned_payload_services: @import("kernel_backend.zig").OwnedPayloadServices = .{ .accepts = acceptsPhysicalImplementation, .available = ownedPayloadAvailable, .input = ownedPayloadInput, .route = ownedPayloadRoute, .region = ownedPayloadRegion };
     fn ownedPayloadRegion(ctx: *anyopaque, owned: *const @import("../execution/region_route.zig").Owned) bool {
-        if (owned.implementation.context != ctx or !acceptsPhysicalImplementation(owned.implementation.table) or
-            owned.vtable != &DenseProjectionRegion.table) return false;
+        if (owned.implementation.context != ctx or !acceptsPhysicalImplementation(owned.implementation.table)) return false;
+        if (owned.vtable == &ElementwiseProductAddRegion.table) return ElementwiseProductAddRegion.attests(ctx, owned);
+        if (owned.vtable != &DenseProjectionRegion.table) return false;
         const self: *const DenseProjectionRegion = @ptrCast(@alignCast(owned.context));
         if (@as(*anyopaque, @ptrCast(self.compute)) != ctx or self.count < 2 or self.count > 3 or
             owned.entry_node != self.nodes[0]) return false;
@@ -13052,6 +13053,173 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return .{ .allocator = request.allocator, .items = items };
     }
 
+    const ElementwiseProductAddRegion = struct {
+        const region = @import("../execution/region_route.zig");
+        const route = @import("../execution/kernel_route.zig");
+        const NodeId = ml.graph.NodeId;
+
+        allocator: std.mem.Allocator,
+        compute: *MetalCompute,
+        outputs: [1]region.Output,
+        nodes: [3]NodeId,
+        inputs: [4]NodeId = undefined,
+        input_count: usize = 0,
+        operand_indices: [4]usize = undefined,
+        operand_count: usize,
+        elements: usize,
+
+        fn accepts(self: *const @This(), binding: route.Binding, implementation: route.Implementation) bool {
+            const logical = self.outputs[0].logical;
+            switch (binding) {
+                .imported_host => |source| return source.target == .metal and source.owned_ingress and source.logical.eq(logical),
+                .imported_device => |source| return source.implementation.context == implementation.context and source.implementation.table == implementation.table and source.logical.eq(logical),
+                .resident => return ownedPayloadInput(self.compute, binding, logical) catch false,
+                .planned => |planned| {
+                    if (!planned.logical.eq(logical)) return false;
+                    for (planned.planes) |plane| {
+                        if (plane.role == .primary and plane.descriptor.shape.eq(logical) and plane.readable_bytes >= self.outputs[0].bytes and
+                            std.meta.eql(plane.descriptor.strides, @import("../graph/backend_contracts.zig").TensorStrides.dense(logical))) return true;
+                    }
+                    return false;
+                },
+                .tensor => |source| {
+                    if (source.implementation.context != implementation.context or source.implementation.table != implementation.table) return false;
+                    const tensor = denseDeviceF32(source.value) orelse return false;
+                    const runtime = self.compute.provider_impl.raw_decode_runtime orelse return false;
+                    if (tensor.device.?.ref.runtime != @as(*anyopaque, @ptrCast(runtime))) return false;
+                    return (tensorShapeMatchesOp(self.compute, source.value, logical.dims[0..logical.rank()]) catch return false) orelse false;
+                },
+                .unknown => return false,
+            }
+        }
+
+        fn attests(ctx: *anyopaque, owned: *const region.Owned) bool {
+            const self: *const @This() = @ptrCast(@alignCast(owned.context));
+            const need = owned.requirements;
+            if (@as(*anyopaque, @ptrCast(self.compute)) != ctx or owned.policy_key != 1 or
+                owned.entry_node != self.nodes[0] or owned.covered_nodes.ptr != &self.nodes or
+                owned.covered_nodes.len != self.operand_count - 1 or owned.input_nodes.ptr != &self.inputs or
+                owned.input_nodes.len != self.input_count or need.outputs.ptr != &self.outputs or need.outputs.len != 1 or
+                need.dispatch_workspace.byte_size != 0 or need.dispatch_workspace.host_byte_size != 0 or
+                need.preparation_workspace.byte_size != 0 or need.preparation_workspace.host_byte_size != 0 or
+                need.requires_execution_profile) return false;
+            return metal_runtime.assignedProductAddAvailable(self.compute.provider_impl, self.operand_count == 4);
+        }
+
+        fn matches(raw: *anyopaque, request: region.Validate) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (request.policy_key != 1 or request.inputs.len != self.input_count) return false;
+            for (request.inputs) |input| if (!self.accepts(input, request.implementation)) return false;
+            return true;
+        }
+
+        fn validate(_: *anyopaque, _: region.Validate) !void {}
+
+        fn dispatch(raw: *anyopaque, request: region.Invocation) !region.Outcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var inputs: [4]MetalTensor = undefined;
+            for (self.operand_indices[0..self.operand_count], inputs[0..self.operand_count]) |index, *tensor| {
+                tensor.* = denseDeviceF32(request.inputs[index]) orelse return error.PreparedRegionBindingChanged;
+            }
+            const destination = toBuf(request.outputs[0].tensor);
+            _ = denseDeviceF32(request.outputs[0].tensor) orelse return error.PreparedRegionOutputMismatch;
+            const output = &destination.metal_tensor.?;
+            var result = (if (self.operand_count == 4)
+                try metal_runtime.decoderRuntimeApplyMultiplyAdd2(self.compute.provider_impl, .{
+                    .lhs0 = inputs[0],
+                    .rhs0 = inputs[1],
+                    .lhs1 = inputs[2],
+                    .rhs1 = inputs[3],
+                    .dim = self.elements,
+                    .output = output,
+                }, &self.compute.timing_stats)
+            else
+                try metal_runtime.decoderRuntimeApplyMultiplyAdd(self.compute.provider_impl, .{
+                    .lhs = inputs[0],
+                    .rhs = inputs[1],
+                    .addend = inputs[2],
+                    .dim = self.elements,
+                    .output = output,
+                }, &self.compute.timing_stats)) orelse return .declined_before_submission;
+            result.deinit();
+            return .completed;
+        }
+
+        fn destroyRegion(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.allocator.destroy(self);
+        }
+
+        const table: region.Owned.VTable = .{ .matches = matches, .validate = validate, .dispatch = dispatch, .deinit = destroyRegion };
+
+        fn isPartitionMember(node: NodeId, partition_nodes: []const NodeId, positions: []const u32) bool {
+            const index = std.math.sub(u32, positions[node], positions[partition_nodes[0]]) catch return false;
+            return index < partition_nodes.len and partition_nodes[index] == node;
+        }
+
+        fn append(compute: *MetalCompute, request: region.Prepare, positions: []const u32, result: *std.ArrayList(region.Owned)) !void {
+            const schedule = @import("../execution/region_schedule.zig");
+            const descriptor = ops.kernel_descriptor;
+            const graph = request.graph;
+            const allocator = request.allocator;
+            for (request.partition_nodes) |id| {
+                const node = graph.node(id);
+                if ((node.op == .add or node.op == .fused_elem_add) and node.num_inputs == 2 and
+                    (descriptor.sameShapeF32Product(graph, node.inputs[0], node.output_shape) != null or
+                        descriptor.sameShapeF32Product(graph, node.inputs[1], node.output_shape) != null)) break;
+            } else return;
+            const last_use = try @import("../graph/interpreter.zig").computeLastUse(allocator, graph, request.reachable);
+            defer allocator.free(last_use);
+            const uses = try schedule.computeReachableUseCountsCapped(allocator, graph, request.reachable);
+            defer allocator.free(uses);
+            for (request.partition_nodes) |add| {
+                const node = graph.node(add);
+                if ((node.op != .add and node.op != .fused_elem_add) or node.num_inputs != 2) continue;
+                const shape = node.output_shape;
+                const elements = std.math.cast(u32, shape.numElements() orelse continue) orelse continue;
+                if (elements == 0 or shape.dtype != .f32) continue;
+                var deferred: [2]bool = undefined;
+                for (node.getInputs(), &deferred) |input, *allow| {
+                    allow.* = schedule.deferredAddConsumer(graph, input, request.reachable, last_use, uses) == add and
+                        schedule.deferredProducerInputsLiveUntilConsumer(graph, input, add, last_use);
+                }
+                const recipe = descriptor.F32ProductAdd.match(graph, node.getInputs(), shape, deferred) orelse continue;
+                const both = recipe == .pair;
+                if (!metal_runtime.assignedProductAddAvailable(compute.provider_impl, both)) continue;
+                var operands: [4]NodeId = undefined;
+                var covered_nodes: [3]NodeId = .{ add, ml.graph.null_node, ml.graph.null_node };
+                if (both) {
+                    const pair = recipe.pair;
+                    operands = .{ pair[0].lhs_id, pair[0].rhs_id, pair[1].lhs_id, pair[1].rhs_id };
+                    covered_nodes[1..3].* = .{ pair[0].node, pair[1].node };
+                } else {
+                    const single = recipe.single;
+                    operands[0..3].* = .{ single.product.lhs_id, single.product.rhs_id, single.addend };
+                    covered_nodes[1] = single.product.node;
+                }
+                if (!isPartitionMember(covered_nodes[1], request.partition_nodes, positions) or
+                    (both and !isPartitionMember(covered_nodes[2], request.partition_nodes, positions))) continue;
+                const owner = try allocator.create(@This());
+                var published = false;
+                defer if (!published) allocator.destroy(owner);
+                owner.* = .{ .allocator = allocator, .compute = compute, .outputs = .{.{ .node = add, .logical = shape, .bytes = @as(usize, elements) * @sizeOf(f32) }}, .nodes = covered_nodes, .operand_count = if (both) 4 else 3, .elements = elements };
+                for (operands[0..owner.operand_count], owner.operand_indices[0..owner.operand_count]) |input, *index| {
+                    if (input >= request.node_facts.len or !owner.accepts(request.node_facts[input], request.implementation)) break;
+                    const known = std.mem.indexOfScalar(NodeId, owner.inputs[0..owner.input_count], input);
+                    index.* = known orelse owner.input_count;
+                    if (known == null) {
+                        owner.inputs[owner.input_count] = input;
+                        owner.input_count += 1;
+                    }
+                } else {
+                    const covered = owner.nodes[0..if (both) @as(usize, 3) else 2];
+                    try result.append(allocator, .{ .context = owner, .implementation = request.implementation, .key = add, .policy_key = request.policy_key, .covered_nodes = covered, .input_nodes = owner.inputs[0..owner.input_count], .entry_node = add, .requirements = .{ .outputs = &owner.outputs, .requires_execution_profile = false, .uncovered = .{} }, .vtable = &table });
+                    published = true;
+                }
+            }
+        }
+    };
+
     fn prepareDenseProjectionRegions(ctx: *anyopaque, request: @import("../execution/region_route.zig").Prepare) !?@import("../execution/region_route.zig").OwnedList {
         const region = @import("../execution/region_route.zig");
         const route = @import("../execution/kernel_route.zig");
@@ -13076,6 +13244,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var result: std.ArrayList(region.Owned) = .empty;
         defer result.deinit(request.allocator);
         errdefer for (result.items) |*owner| owner.deinit();
+        if (ordinary) try ElementwiseProductAddRegion.append(self, request, positions, &result);
         var watched: std.ArrayList(DenseRegionReadiness.Entry) = .empty;
         defer watched.deinit(request.allocator);
         var packs: std.ArrayList(DenseRegionReadiness.Pack) = .empty;

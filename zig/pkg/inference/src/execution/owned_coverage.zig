@@ -259,6 +259,7 @@ pub fn assessNativeNodes(pool: *const physical.Pool, graph: *const ml.graph.Grap
         const node = graph.node(@intCast(id));
         if (!slot.desc.shape.eq(node.output_shape)) return .operation;
         switch (slot.kind) {
+            .region_internal => return .operation,
             .runtime_input => {
                 if (node.op != .parameter) return .input_representation;
                 if (slot.roles.graph_output) return .output_publication;

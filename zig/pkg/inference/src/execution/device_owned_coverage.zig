@@ -255,6 +255,13 @@ pub fn assess(pool: *const physical.Pool, target: ops.ComputeBackend, metadata: 
         .metal => pool.metal_frame_dispatch,
         else => false,
     }) or reachable.len != graph.nodeCount() or pool.plan.node_slots.len != graph.nodeCount() or graph.outputs.items.len == 0) return .{ .compatibility = .execution_path };
+    if (target.kind() == .metal) {
+        for ((pool.root_pool orelse pool).metal_required_products) |required| {
+            const installed = pool.regionForNode(required.producer) orelse return .{ .compatibility = .deferred_producer };
+            if (installed.owner.entry_node != required.consumer or pool.regionForNode(required.consumer) != installed)
+                return .{ .compatibility = .deferred_producer };
+        }
+    }
     const mixed = pool.mixed_frame_dispatch;
     if (mixed) {
         if (!pool.attestsOwnedTransfers(reachable)) return .{ .compatibility = .transfer };
@@ -324,6 +331,7 @@ fn assessDeviceNodes(
         }
         const size = bytes(slot.desc.shape) orelse return .input_representation;
         switch (slot.kind) {
+            .region_internal => return .backend_region,
             .runtime_input => {
                 if (node.op != .parameter or slot.roles.graph_output) return inputDeclined(graph, @intCast(id), null);
                 if (selected.inputs.find(@intCast(id))) |binding| {

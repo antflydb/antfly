@@ -9940,7 +9940,6 @@ pub fn decoderRuntimeApplyMultiplyAdd(self: anytype, request: anytype, stats: an
     if (!request.lhs.isDevice() or !request.rhs.isDevice() or !request.addend.isDevice()) return null;
     if (request.lhs.elemCount() != request.dim or request.rhs.elemCount() != request.dim or request.addend.elemCount() != request.dim) return null;
     var output_device = (try decoderOutputBuffer(runtime, request, &.{ request.addend, request.lhs, request.rhs }, request.dim, .multiply_add)) orelse return null;
-    errdefer output_device.deinit();
     stats.decoder_runtime_apply_add_calls += 1;
     const device_rc = termite_metal_decode_runtime_apply_multiply_add_device(
         runtime,
@@ -9958,6 +9957,12 @@ pub fn decoderRuntimeApplyMultiplyAdd(self: anytype, request: anytype, stats: an
     output_device.deinit();
     if (decoderRequestOutput(request) != null and device_rc != -2) return error.CommandBufferFailed;
     return null;
+}
+
+pub fn assignedProductAddAvailable(self: anytype, pair: bool) bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    const kind: DecoderOutputKind = if (pair) .multiply_add2 else .multiply_add;
+    return antfly_metal_decoder_output_available(runtime, @backingInt(kind)) != 0;
 }
 
 pub fn assignedAddMulScalarAvailable(self: anytype) bool {
@@ -9997,7 +10002,6 @@ pub fn decoderRuntimeApplyMultiplyAdd2(self: anytype, request: anytype, stats: a
         return null;
     }
     var output_device = (try decoderOutputBuffer(runtime, request, &.{ request.lhs0, request.rhs0, request.lhs1, request.rhs1 }, request.dim, .multiply_add2)) orelse return null;
-    errdefer output_device.deinit();
     stats.decoder_runtime_apply_add_calls += 1;
     const device_rc = termite_metal_decode_runtime_apply_multiply_add2_device(
         runtime,
