@@ -17,6 +17,7 @@
 //! text publication; this owner keeps hidden activations in a shared context.
 const std = @import("std");
 const backends = @import("../backends/backends.zig");
+const ops = @import("../ops/ops.zig");
 const session_mod = @import("../backends/session.zig");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const Incremental = @import("architecture_session.zig").IncrementalDecoderAdapter;
@@ -227,16 +228,21 @@ fn residentEncoderShape(outputs: []const backends.TensorInfo, values: *const ses
         }
     }
 
-    // This handoff accepts exactly three dimensions. Keep the descriptor on
-    // the stack even when the encoder declares one or more dynamic dimensions.
+    const actual = try residentShape3(values.backend, value, error.InvalidEncoderOutput);
+    if (actual[0] != 1 or actual[1] <= 0 or actual[2] <= 0) return error.InvalidEncoderOutput;
+    if (!compatibleResidentEncoderShape(&actual, declared)) return error.InvalidEncoderOutput;
+    return actual;
+}
+
+/// Shape metadata is bounded by the stage ABI and never leaves this call.
+fn residentShape3(backend: *const ops.ComputeBackend, value: ops.CT, comptime invalid: anyerror) ![3]i64 {
     var storage: [3 * @sizeOf(i64)]u8 align(@alignOf(i64)) = undefined;
     var shape_allocator = std.heap.FixedBufferAllocator.init(&storage);
-    const actual = values.backend.tensorShape(value, shape_allocator.allocator()) catch |err| switch (err) {
-        error.OutOfMemory => return error.InvalidEncoderOutput,
+    const actual = backend.tensorShape(value, shape_allocator.allocator()) catch |err| switch (err) {
+        error.OutOfMemory => return invalid,
         else => return err,
     };
-    if (actual.len != 3 or actual[0] != 1 or actual[1] <= 0 or actual[2] <= 0) return error.InvalidEncoderOutput;
-    if (!compatibleResidentEncoderShape(actual, declared)) return error.InvalidEncoderOutput;
+    if (actual.len != 3) return invalid;
     return actual[0..3].*;
 }
 
@@ -416,9 +422,8 @@ pub fn residentVocabularyRow(allocator: std.mem.Allocator, decoder: backends.Ses
     if (try outputs.backend.tensorShapeMatches(logits, &expected)) |matches| {
         if (!matches) return error.InvalidDecoderOutput;
     } else {
-        const actual = try outputs.backend.tensorShape(logits, allocator);
-        defer allocator.free(actual);
-        if (!std.mem.eql(i64, &expected, actual)) return error.InvalidDecoderOutput;
+        const actual = try residentShape3(outputs.backend, logits, error.InvalidDecoderOutput);
+        if (!std.mem.eql(i64, &expected, &actual)) return error.InvalidDecoderOutput;
     }
     if (control) |active| try active.check();
     const values = readback: {
