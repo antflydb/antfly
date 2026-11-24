@@ -1887,8 +1887,8 @@ const CudaGraphReplaySlot = struct {
     physical_storage: ops.physical_storage.CapturedLeases = .{},
     exec: driver_mod.CUgraphExec = null,
     replay_key: u64 = 0,
-    input_storage: buffer_mod.DeviceBuffer = .{},
-    aux_input_storage: buffer_mod.DeviceBuffer = .{},
+    input_bank: ?*ops.physical_storage.Lease = null,
+    aux_input_bank: ?*ops.physical_storage.Lease = null,
     output_bank: ?*ops.physical_storage.Lease = null,
     input: buffer_mod.DeviceBuffer = .{},
     aux_input: buffer_mod.DeviceBuffer = .{},
@@ -1910,8 +1910,28 @@ const CudaGraphReplaySlot = struct {
     temp_arena_generation: u64 = 0,
     captured_temp_allocation_count: usize = 0,
 
+    fn bankStorage(bank: ?*ops.physical_storage.Lease) buffer_mod.DeviceBuffer {
+        return if (bank) |lease| tensorFromCt(lease.tensor).buffer else .{};
+    }
+
+    fn inputStorage(self: *const CudaGraphReplaySlot) buffer_mod.DeviceBuffer {
+        return bankStorage(self.input_bank);
+    }
+
+    fn auxInputStorage(self: *const CudaGraphReplaySlot) buffer_mod.DeviceBuffer {
+        return bankStorage(self.aux_input_bank);
+    }
+
     fn outputStorage(self: *const CudaGraphReplaySlot) buffer_mod.DeviceBuffer {
-        return if (self.output_bank) |bank| tensorFromCt(bank.tensor).buffer else .{};
+        return bankStorage(self.output_bank);
+    }
+
+    fn inputAvailable(bank: ?*ops.physical_storage.Lease) bool {
+        return if (bank) |lease| tensorFromCt(lease.tensor).resident_references.load(.acquire) == 1 else true;
+    }
+
+    fn reusable(self: *const CudaGraphReplaySlot) bool {
+        return self.outputAvailable() and inputAvailable(self.input_bank) and inputAvailable(self.aux_input_bank);
     }
 
     fn outputAvailable(self: *const CudaGraphReplaySlot) bool {
@@ -6759,7 +6779,7 @@ pub const CudaCompute = struct {
         for (self.embedding_gemma2_execution.arenas) |arena| for (arena.buffers) |buffer| if (stageBufferOverlap(plane, buffer)) return false;
         for (self.embedding_gemma2_resize.plans) |entry| if (entry) |plan| for (plan.device) |buffer| if (stageBufferOverlap(plane, buffer)) return false;
         for (self.debug_cuda_graph_slots) |slot| {
-            const spans = [_]buffer_mod.DeviceBuffer{ slot.input_storage, slot.aux_input_storage, slot.outputStorage(), slot.input, slot.aux_input, slot.output };
+            const spans = [_]buffer_mod.DeviceBuffer{ slot.inputStorage(), slot.auxInputStorage(), slot.outputStorage(), slot.input, slot.aux_input, slot.output };
             for (spans) |span| if (stageBufferOverlap(plane, span)) return false;
         }
         return true;
@@ -18971,12 +18991,10 @@ fn resetCudaGraphReplaySlotMetadataKeepExec(self: *CudaCompute, slot: *CudaGraph
 
 fn deinitCudaGraphReplaySlot(self: *CudaCompute, slot: *CudaGraphReplaySlot, current: CacheCleanup) void {
     resetCudaGraphReplaySlotMetadataWithCleanup(self, slot, current);
-    slot.input_storage.free(&self.ctx);
-    slot.aux_input_storage.free(&self.ctx);
-    if (slot.output_bank) |bank| bank.releaseWithCleanup(current);
-    slot.input_storage = .{};
-    slot.aux_input_storage = .{};
-    slot.output_bank = null;
+    for ([_]*?*ops.physical_storage.Lease{ &slot.input_bank, &slot.aux_input_bank, &slot.output_bank }) |field| {
+        if (field.*) |bank| bank.releaseWithCleanup(current);
+        field.* = null;
+    }
 }
 
 fn invalidateDebugFinalHiddenGraph(self: *CudaCompute) void {
@@ -19539,36 +19557,43 @@ test "CUDA graph topology retains score route and consumer masks" {
 
 fn findCudaGraphReplaySlotForByteLen(self: *CudaCompute, replay_key: u64, byte_len: usize) ?usize {
     for (&self.debug_cuda_graph_slots, 0..) |*slot, idx| {
-        if (slot.input_storage.ptr != 0 and slot.input_storage.len == byte_len and slot.replay_key == replay_key and slot.outputAvailable()) return idx;
+        if (slot.inputStorage().ptr != 0 and slot.inputStorage().len == byte_len and slot.replay_key == replay_key and slot.reusable()) return idx;
     }
     for (&self.debug_cuda_graph_slots, 0..) |*slot, idx| {
-        if (slot.input_storage.ptr == 0 and slot.outputAvailable()) return idx;
+        if (slot.inputStorage().ptr == 0 and slot.reusable()) return idx;
     }
     for (&self.debug_cuda_graph_slots, 0..) |*slot, idx| {
-        if (!slot.valid and slot.outputAvailable()) return idx;
+        if (!slot.valid and slot.reusable()) return idx;
     }
     for (0..max_cuda_graph_replay_slots) |offset| {
         const idx = (self.debug_cuda_graph_next_evict_slot + offset) % max_cuda_graph_replay_slots;
-        if (!self.debug_cuda_graph_slots[idx].outputAvailable()) continue;
+        if (!self.debug_cuda_graph_slots[idx].reusable()) continue;
         self.debug_cuda_graph_next_evict_slot = (idx + 1) % max_cuda_graph_replay_slots;
         return idx;
     }
-    if (self.ctx.observation.load(.acquire)) |observation| observation.decodeOutputBankUnavailable();
+    if (self.ctx.observation.load(.acquire)) |observation| {
+        for (&self.debug_cuda_graph_slots) |*slot| {
+            if (!slot.outputAvailable()) {
+                observation.decodeOutputBankUnavailable();
+                break;
+            }
+        }
+    }
     return null;
 }
 
 fn findExistingCudaGraphReplaySlotForByteLen(self: *CudaCompute, replay_key: u64, byte_len: usize) ?usize {
     var held = false;
     for (&self.debug_cuda_graph_slots, 0..) |*slot, idx| {
-        if (slot.input_storage.ptr != 0 and
-            slot.input_storage.len == byte_len and
+        if (slot.inputStorage().ptr != 0 and
+            slot.inputStorage().len == byte_len and
             slot.replay_key == replay_key and
             slot.valid and
             slot.exec != null and
             slot.temp_arena_generation == self.temp_arena_generation)
         {
-            if (slot.outputAvailable()) return idx;
-            held = true;
+            if (slot.reusable()) return idx;
+            held = held or !slot.outputAvailable();
         }
     }
     if (held) {
@@ -19577,55 +19602,42 @@ fn findExistingCudaGraphReplaySlotForByteLen(self: *CudaCompute, replay_key: u64
     return null;
 }
 
-fn allocCudaGraphReplayStorage(self: *CudaCompute, byte_len: usize, name: []const u8) !buffer_mod.DeviceBuffer {
-    const buffer = try buffer_mod.DeviceBuffer.alloc(&self.ctx, byte_len);
-    self.noteDeviceBytes(byte_len);
-    self.stats.device_alloc_calls += 1;
-    if (cudaDebugGraphCaptureProbeTraceEnabled()) {
-        std.log.info("cuda_graph_capture_probe: persistent_{s}_alloc ptr=0x{x} len={d}", .{ name, buffer.ptr, buffer.len });
-    }
-    return buffer;
-}
-
-fn retireCudaGraphReplayStorage(self: *CudaCompute, storage: *buffer_mod.DeviceBuffer) void {
-    if (storage.ptr == 0) return;
-    self.stats.device_free_calls += 1;
-    _ = storage.freeChecked(&self.ctx) catch platform.inference_process_supervisor.restartWorker();
+fn allocCudaGraphReplayBank(self: *CudaCompute, byte_len: usize) !*ops.physical_storage.Lease {
+    return (ops.physical_storage.Lease.createTracked(self.allocator, self.computeBackend(), byte_len, null, .activation) catch |err| switch (err) {
+        error.ResourceLimitExceeded => return error.CudaMemoryLimitExceeded,
+        else => return err,
+    }) orelse error.InvalidCudaState;
 }
 
 fn ensureCudaGraphReplaySlotStorage(self: *CudaCompute, slot: *CudaGraphReplaySlot, byte_len: usize) !void {
-    const replace_input = slot.input_storage.ptr == 0 or slot.input_storage.len != byte_len;
-    if (!slot.outputAvailable()) return error.InvalidCudaState;
+    if (!slot.reusable()) return error.InvalidCudaState;
+    const replace_input = slot.inputStorage().len != byte_len;
     const replace_output = slot.outputStorage().len < byte_len;
     if (!replace_input and !replace_output) return;
 
-    var input = if (replace_input) try allocCudaGraphReplayStorage(self, byte_len, "input") else buffer_mod.DeviceBuffer{};
-    errdefer retireCudaGraphReplayStorage(self, &input);
-    const output = if (replace_output)
-        (ops.physical_storage.Lease.createTracked(self.allocator, self.computeBackend(), byte_len, null, .activation) catch |err| switch (err) {
-            error.ResourceLimitExceeded => return error.CudaMemoryLimitExceeded,
-            else => return err,
-        }) orelse return error.InvalidCudaState
-    else
-        null;
+    const input = if (replace_input) try allocCudaGraphReplayBank(self, byte_len) else null;
+    errdefer if (input) |bank| bank.releaseWithCleanup(physicalScopeCleanup(self));
+    const output = if (replace_output) try allocCudaGraphReplayBank(self, byte_len) else null;
 
     resetCudaGraphReplaySlotMetadata(self, slot);
-    if (replace_input) {
-        retireCudaGraphReplayStorage(self, &slot.input_storage);
-        slot.input_storage = input;
+    const cleanup = physicalScopeCleanup(self);
+    if (input) |bank| {
+        if (slot.input_bank) |prior| prior.releaseWithCleanup(cleanup);
+        slot.input_bank = bank;
     }
     if (output) |bank| {
-        if (slot.output_bank) |prior| prior.releaseWithCleanup(physicalScopeCleanup(self));
+        if (slot.output_bank) |prior| prior.releaseWithCleanup(cleanup);
         slot.output_bank = bank;
     }
 }
 
 fn ensureCudaGraphReplayAuxInputStorage(self: *CudaCompute, slot: *CudaGraphReplaySlot, byte_len: usize) !void {
-    if (slot.aux_input_storage.ptr != 0 and slot.aux_input_storage.len == byte_len) return;
-    const storage = try allocCudaGraphReplayStorage(self, byte_len, "aux_input");
+    if (!CudaGraphReplaySlot.inputAvailable(slot.aux_input_bank)) return error.InvalidCudaState;
+    if (slot.auxInputStorage().len == byte_len) return;
+    const storage = try allocCudaGraphReplayBank(self, byte_len);
     resetCudaGraphReplaySlotMetadata(self, slot);
-    retireCudaGraphReplayStorage(self, &slot.aux_input_storage);
-    slot.aux_input_storage = storage;
+    if (slot.aux_input_bank) |prior| prior.releaseWithCleanup(physicalScopeCleanup(self));
+    slot.aux_input_bank = storage;
 }
 
 fn debugCudaGraphPrepareReplayInput(
@@ -19691,12 +19703,15 @@ fn debugCudaGraphPrepareReplayInput(
     const tensor = try self.allocator.create(CudaTensor);
     errdefer self.allocator.destroy(tensor);
 
-    try copyFromDeviceTracked(self, slot.input_storage, input_tensor.buffer, byte_len);
+    try copyFromDeviceTracked(self, slot.inputStorage(), input_tensor.buffer, byte_len);
     self.debug_cuda_graph_prepared_attention_topology = attention_topology;
     self.debug_cuda_graph_prepared_slot = slot_idx;
     self.debug_cuda_graph_prepared_output_kind = output_kind;
+    const root = tensorFromCt(slot.input_bank.?.tensor);
+    _ = root.resident_references.fetchAdd(1, .acq_rel);
     tensor.* = .{
-        .buffer = slot.input_storage,
+        .resident_parent = root,
+        .buffer = slot.inputStorage(),
         .dtype = .f32,
         .shape = shape,
         .elem_count = input_tensor.elem_count,
@@ -19740,10 +19755,13 @@ fn debugCudaGraphPrepareFinalHiddenReplayAuxInput(ctx: *anyopaque, input: CT) !?
         resetCudaGraphReplaySlotMetadata(self, slot);
     }
     try ensureCudaGraphReplayAuxInputStorage(self, slot, byte_len);
-    try copyFromDeviceTracked(self, slot.aux_input_storage, input_tensor.buffer, byte_len);
+    try copyFromDeviceTracked(self, slot.auxInputStorage(), input_tensor.buffer, byte_len);
     slot.aux_input_prepared = true;
+    const root = tensorFromCt(slot.aux_input_bank.?.tensor);
+    _ = root.resident_references.fetchAdd(1, .acq_rel);
     tensor.* = .{
-        .buffer = slot.aux_input_storage,
+        .resident_parent = root,
+        .buffer = slot.auxInputStorage(),
         .dtype = .f32,
         .shape = shape,
         .elem_count = input_tensor.elem_count,
@@ -19901,9 +19919,9 @@ test "CUDA replay retains input storage while retiring an exec at its addressabl
     defer compute.deinit();
     const slot = &compute.debug_cuda_graph_slots[0];
     try ensureCudaGraphReplaySlotStorage(&compute, slot, 16);
-    const original = slot.input_storage.ptr;
+    const original = slot.inputStorage().ptr;
     try compute.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED);
-    try compute.kernels.launchFillF32(&compute.ctx, slot.input_storage, 4, 7);
+    try compute.kernels.launchFillF32(&compute.ctx, slot.inputStorage(), 4, 7);
     const graph = try compute.ctx.endStreamCapture();
     defer compute.ctx.destroyGraph(graph);
     slot.exec = try compute.ctx.instantiateGraph(graph);
@@ -19918,16 +19936,16 @@ test "CUDA replay retains input storage while retiring an exec at its addressabl
     compute.debug_cuda_graph_decode_kv_seq_len = 33;
     try std.testing.expect(!cudaGraphReplayCapacityReady(&compute, 0));
     try std.testing.expect(slot.exec == null and slot.shape == null and !slot.valid and !slot.kv_replay_capacity_valid);
-    try std.testing.expectEqual(original, slot.input_storage.ptr);
+    try std.testing.expectEqual(original, slot.inputStorage().ptr);
     var actual: [4]f32 = undefined;
-    try slot.input_storage.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&actual));
+    try slot.inputStorage().copyToHost(&compute.ctx, std.mem.sliceAsBytes(&actual));
     try compute.ctx.synchronize();
     try std.testing.expectEqualSlices(f32, &.{ 7, 7, 7, 7 }, &actual);
     try std.testing.expectEqual(@as(usize, 1), compute.stats.cuda_graph_capture_capacity_skips);
 
     // The graph submits successfully, then the learned address trace rejects
     // its interval. Retire the exec before the caller can reuse the slot.
-    try compute.kernels.launchFillF32(&compute.ctx, slot.input_storage, 4, 0);
+    try compute.kernels.launchFillF32(&compute.ctx, slot.inputStorage(), 4, 0);
     slot.exec = try compute.ctx.instantiateGraph(graph);
     slot.valid = true;
     compute.temp_slot_config.autoplan_enabled = true;
@@ -19935,7 +19953,7 @@ test "CUDA replay retains input storage while retiring an exec at its addressabl
     try std.testing.expectError(error.InvalidCudaState, launchPersistentDecodeGraph(&compute, slot, slot.exec));
     try std.testing.expect(slot.exec == null and !slot.valid);
     try std.testing.expectEqual(successful_replays, compute.stats.cuda_graph_capture_persistent_replays);
-    try slot.input_storage.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&actual));
+    try slot.inputStorage().copyToHost(&compute.ctx, std.mem.sliceAsBytes(&actual));
     try compute.ctx.synchronize();
     try std.testing.expectEqualSlices(f32, &.{ 7, 7, 7, 7 }, &actual);
 
@@ -19961,7 +19979,7 @@ test "CUDA replay retains input storage while retiring an exec at its addressabl
         try std.testing.expect(FailSecondAllocation.calls >= 2);
     }
     try std.testing.expect(slot.valid and slot.exec == prior_exec);
-    try std.testing.expectEqual(original, slot.input_storage.ptr);
+    try std.testing.expectEqual(original, slot.inputStorage().ptr);
     try std.testing.expectEqual(live_before, compute.ctx.device_allocations.snapshot().physical_live);
 
     // Equal byte counts alone cannot reuse a graph with different logical
@@ -19972,12 +19990,15 @@ test "CUDA replay retains input storage while retiring an exec at its addressabl
     slot.temp_arena_generation = compute.temp_arena_generation;
     slot.input_shape = try a.dupe(i64, &.{4});
     compute.capture_gates.persistent_replay = true;
+    try compute.kernels.launchFillF32(&compute.ctx, slot.outputStorage(), 4, 19);
     var changed_shape = [_]i64{ 2, 2 };
     var changed = CudaTensor{ .buffer = slot.outputStorage(), .shape = &changed_shape, .dtype = .f32, .elem_count = 4, .owns_buffer = false };
     const prepared = (try debugCudaGraphPrepareReplayInput(&compute, .tensor, label, &changed, 32)) orelse return error.ExpectedCudaReplayPreparation;
-    freeTensor(&compute, prepared);
+    defer freeTensor(&compute, prepared);
+    try std.testing.expect(!slot.reusable());
+    try std.testing.expectEqual(@as(?usize, 1), findCudaGraphReplaySlotForByteLen(&compute, slot.replay_key, 16));
     try std.testing.expect(slot.exec == null and slot.input_shape == null);
-    try std.testing.expectEqual(original, slot.input_storage.ptr);
+    try std.testing.expectEqual(original, slot.inputStorage().ptr);
     slot.exec = try compute.ctx.instantiateGraph(graph);
     slot.valid = true;
 
@@ -20003,6 +20024,9 @@ test "CUDA replay retains input storage while retiring an exec at its addressabl
     try backing.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&retained));
     try compute.ctx.synchronize();
     try std.testing.expectEqual(@as(f32, 11), retained[0]);
+    try tensorFromCt(prepared).buffer.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&actual));
+    try compute.ctx.synchronize();
+    try std.testing.expectEqualSlices(f32, &.{ 19, 19, 19, 19 }, &actual);
 }
 
 fn qualifiedPersistentDecodeGraph(self: *CudaCompute, input: CT) !?usize {
@@ -20054,13 +20078,13 @@ fn findCompatibleDecodeReplaySlot(self: *CudaCompute, input: CT) !?usize {
     if (slot.aux_input_required != slot.aux_input_prepared) return null;
     if (slot.aux_input_required) {
         if (!slot.aux_input_valid or slot.aux_input_shape == null) return null;
-        if (slot.aux_input_storage.ptr != slot.aux_input.ptr or slot.aux_input_storage.len != slot.aux_input.len) {
+        if (slot.auxInputStorage().ptr != slot.aux_input.ptr or slot.auxInputStorage().len != slot.aux_input.len) {
             std.log.warn("cuda_graph_capture_probe: persistent_replay_aux_input_mismatch slot={d} expected=0x{x}/{d} actual=0x{x}/{d}", .{
                 slot_idx,
                 slot.aux_input.ptr,
                 slot.aux_input.len,
-                slot.aux_input_storage.ptr,
-                slot.aux_input_storage.len,
+                slot.auxInputStorage().ptr,
+                slot.auxInputStorage().len,
             });
             return null;
         }
@@ -50245,7 +50269,7 @@ fn prepareAsyncForeignTensorCopyPolicy(comptime failure_policy: ColdCopyFailureP
         if (slot.buffer.ptr != 0 and tensor.buffer.ptr < end and slot.buffer.ptr < root_end) return null;
     }
     for (source.debug_cuda_graph_slots) |slot| {
-        const spans = [_]buffer_mod.DeviceBuffer{ slot.input_storage, slot.aux_input_storage, slot.outputStorage(), slot.input, slot.aux_input, slot.output };
+        const spans = [_]buffer_mod.DeviceBuffer{ slot.inputStorage(), slot.auxInputStorage(), slot.outputStorage(), slot.input, slot.aux_input, slot.output };
         for (spans) |span| {
             const end = std.math.add(u64, span.ptr, @intCast(span.len)) catch return null;
             if (span.ptr != 0 and tensor.buffer.ptr < end and span.ptr < root_end) return null;
