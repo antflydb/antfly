@@ -1920,7 +1920,9 @@ pub const AudioStorageScope = struct {
     }
 
     pub fn resumeAfterPark(self: *AudioStorageScope, parked: bool) !void {
-        if (parked) self.active = try self.backend.audioStorage(true);
+        if (!parked) return;
+        self.active = try self.backend.audioStorage(true);
+        if (!self.active) return error.AudioStorageScopeUnavailable;
     }
 
     pub fn close(self: *AudioStorageScope) void {
@@ -8235,4 +8237,26 @@ test "source scalar publication refuses copied canonical table before opaque cal
     try std.testing.expectEqual(@as(?CT, null), try cb.tryBf16SourceOperation(&request));
     try std.testing.expect(try cb.audioStorage(true));
     try std.testing.expectEqual(@as(usize, 3), Fixture.calls);
+}
+
+test "parked audio storage scope surfaces provider reopen decline" {
+    const Fixture = struct {
+        allow_begin: bool = true,
+        fn audio(raw: *anyopaque, begin: bool) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return !begin or self.allow_begin;
+        }
+    };
+    var fixture = Fixture{};
+    var table = @import("native_compute.zig").vtable_impl;
+    table.operation_services = null;
+    table.audioStorage = Fixture.audio;
+    const cb = ComputeBackend{ .ptr = &fixture, .vtable = &table };
+    var scope = try AudioStorageScope.begin(&cb);
+    defer scope.close();
+    const parked = try scope.park();
+    try std.testing.expect(parked);
+    fixture.allow_begin = false;
+    try std.testing.expectError(error.AudioStorageScopeUnavailable, scope.resumeAfterPark(parked));
+    try std.testing.expect(!scope.active);
 }

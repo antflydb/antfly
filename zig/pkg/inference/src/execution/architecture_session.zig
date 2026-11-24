@@ -13812,7 +13812,7 @@ pub const StagedExecution = struct {
             value.* = Metal.fundAudioScratch(cb, request, pin) catch |err| switch (err) {
                 error.MemoryBudgetExceeded, error.ResourceTemporarilyUnavailable, error.OutOfMemory, error.MetalBufferAllocFailed, error.PreparedCacheGrowthChanged, error.MissingCacheRetirementDomain => continue,
                 else => {
-                    try acquire(self);
+                    cleanup(self);
                     return err;
                 },
             };
@@ -13827,8 +13827,11 @@ pub const StagedExecution = struct {
                 };
                 value.* = null;
             };
+            if (settlement) |err| {
+                cleanup(self);
+                return err;
+            }
             try acquire(self);
-            if (settlement) |err| return err;
             try boundary.storage.resumeAfterPark(reopen_storage);
             return true;
         };
