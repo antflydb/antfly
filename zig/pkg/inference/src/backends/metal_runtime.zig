@@ -9886,6 +9886,12 @@ fn decoderOutputBuffer(runtime: *RawMetalDecodeRuntime, request: anytype, inputs
     return try MetalTensor.deviceAllocate(runtime, try std.math.mul(usize, dim, @sizeOf(f32)), .private, inputs[0].shape());
 }
 
+fn finishDecoderOutput(output: *MetalTensor, status: c_int, assigned: bool) !?MetalTensor {
+    const completed = finishDeviceOutput(output, status);
+    if (assigned and status != 0 and status != -2) return error.CommandBufferFailed;
+    return completed;
+}
+
 pub fn decoderRuntimeApplyAddScale(self: anytype, request: anytype, stats: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
@@ -9900,7 +9906,6 @@ pub fn decoderRuntimeApplyAddScale(self: anytype, request: anytype, stats: anyty
     if (request.lhs.elemCount() == request.rhs.elemCount() and request.lhs.elemCount() > 0 and request.lhs.isDevice() and request.rhs.isDevice()) {
         const elem_count = request.lhs.elemCount();
         var output_device = (try decoderOutputBuffer(runtime, request, &.{ request.lhs, request.rhs }, elem_count, if (std.math.approxEqAbs(f32, request.scale, 1.0, 1e-6)) .add else .add_scale)) orelse return null;
-        errdefer output_device.deinit();
         stats.decoder_runtime_apply_add_calls += 1;
         const device_rc = if (std.math.approxEqAbs(f32, request.scale, 1.0, 1e-6))
             termite_metal_decode_runtime_apply_add_device(
@@ -9925,9 +9930,7 @@ pub fn decoderRuntimeApplyAddScale(self: anytype, request: anytype, stats: anyty
                 output_device.deviceHandle(),
                 output_device.deviceByteOffset(),
             );
-        if (device_rc == 0) return output_device;
-        output_device.deinit();
-        if (decoderRequestOutput(request) != null and device_rc != -2) return error.CommandBufferFailed;
+        if (try finishDecoderOutput(&output_device, device_rc, decoderRequestOutput(request) != null)) |output| return output;
     }
     if (decoderRequestOutput(request) != null) return null;
     var added = (try decoderRuntimeApplyAdd(self, .{
@@ -9946,7 +9949,6 @@ pub fn decoderRuntimeApplyScaledAddScale(self: anytype, request: anytype, stats:
     if (request.lhs.elemCount() == request.rhs.elemCount() and request.lhs.elemCount() > 0 and request.lhs.isDevice() and request.rhs.isDevice()) {
         const elem_count = request.lhs.elemCount();
         var output_device = (try decoderOutputBuffer(runtime, request, &.{ request.lhs, request.rhs }, elem_count, .scaled_add_scale)) orelse return null;
-        errdefer output_device.deinit();
         stats.decoder_runtime_apply_add_calls += 1;
         const device_rc = termite_metal_decode_runtime_apply_scaled_add_scale_device(
             runtime,
@@ -9960,9 +9962,7 @@ pub fn decoderRuntimeApplyScaledAddScale(self: anytype, request: anytype, stats:
             output_device.deviceHandle(),
             output_device.deviceByteOffset(),
         );
-        if (device_rc == 0) return output_device;
-        output_device.deinit();
-        if (decoderRequestOutput(request) != null and device_rc != -2) return error.CommandBufferFailed;
+        if (try finishDecoderOutput(&output_device, device_rc, decoderRequestOutput(request) != null)) |output| return output;
     }
     if (decoderRequestOutput(request) != null) return null;
 
@@ -9996,10 +9996,7 @@ pub fn decoderRuntimeApplyMultiplyAdd(self: anytype, request: anytype, stats: an
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (device_rc == 0) return output_device;
-    output_device.deinit();
-    if (decoderRequestOutput(request) != null and device_rc != -2) return error.CommandBufferFailed;
-    return null;
+    return finishDecoderOutput(&output_device, device_rc, decoderRequestOutput(request) != null);
 }
 
 pub fn assignedScaledAddAvailable(self: anytype) bool {
@@ -10065,10 +10062,7 @@ pub fn decoderRuntimeApplyMultiplyAdd2(self: anytype, request: anytype, stats: a
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (device_rc == 0) return output_device;
-    output_device.deinit();
-    if (decoderRequestOutput(request) != null and device_rc != -2) return error.CommandBufferFailed;
-    return null;
+    return finishDecoderOutput(&output_device, device_rc, decoderRequestOutput(request) != null);
 }
 
 extern fn termite_metal_decode_runtime_apply_q4_0_linear_rms_add_rows_device(
