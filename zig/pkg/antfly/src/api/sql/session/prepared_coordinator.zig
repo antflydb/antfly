@@ -87,7 +87,12 @@ pub const Registry = struct {
     }
 
     pub fn snapshot(self: *@This(), a: A, lookup: registry.Read) !registry.Snapshot {
+        return self.snapshotWithScopeCapability(a, lookup, null);
+    }
+
+    fn snapshotWithScopeCapability(self: *@This(), a: A, lookup: registry.Read, scope_supersession_ready: ?*bool) !registry.Snapshot {
         var private = self.context;
+        private.sql_scope_supersession_ready = scope_supersession_ready;
         private.setting_admin = true;
         // The identity embeds the command scope. Independent decision delivery
         // must keep the sealed admission hash unchanged across client death.
@@ -756,22 +761,32 @@ pub const Registry = struct {
         return query;
     }
 
-    fn observeRecoveryScope(self: *@This(), a: A, context: local.api_operation.RequestContext, query: @import("../../../system_catalog/lock_authority.zig").Query) !@import("../../../system_catalog/lock_authority.zig").Snapshot {
+    const ScopeProof = enum { unknown, ready, unavailable };
+
+    fn recoveryScopeSnapshot(self: *@This(), a: A, context: local.api_operation.RequestContext, query: @import("../../../system_catalog/lock_authority.zig").Query) !@import("../../../system_catalog/lock_authority.zig").Snapshot {
         const types = @import("../../../system_catalog/lock_authority.zig");
-        const bytes = self.server.source.systemCatalog(a, context, .{ .sql_lock_read = query }) catch |err| switch (err) {
-            // Older receivers can reject the selector at decode or require
-            // activation before reading it. A plain read proves presence only.
-            error.UnknownField, error.UnsupportedOperation, error.TableTopologyProtocolUpgradeRequired => fallback: {
-                if (query.retired_connection == null) return err;
-                try context.ensureActive();
-                var plain = query;
-                plain.retired_connection = null;
-                break :fallback try self.server.source.systemCatalog(a, context, .{ .sql_lock_read = plain });
+        const bytes = try self.server.source.systemCatalog(a, context, .{ .sql_lock_read = query });
+        defer a.free(bytes);
+        return std.json.parseFromSliceLeaky(types.Snapshot, a, bytes, .{ .allocate = .alloc_always });
+    }
+
+    fn observeRecoveryScope(self: *@This(), a: A, context: local.api_operation.RequestContext, query: @import("../../../system_catalog/lock_authority.zig").Query, proof: *ScopeProof) !@import("../../../system_catalog/lock_authority.zig").Snapshot {
+        if (query.retired_connection == null) return self.recoveryScopeSnapshot(a, context, query);
+        var plain = query;
+        plain.retired_connection = null;
+        const original = if (proof.* != .ready) try self.recoveryScopeSnapshot(a, context, plain) else null;
+        if (original) |scope| if (scope.scope != null or proof.* == .unavailable) return scope;
+
+        // A leader predating the hint can still supply proof on demand.
+        // If leadership changes mid-quantum, retain the plain observation or
+        // retry once without the optional selector on the new leader.
+        var result = self.recoveryScopeSnapshot(a, context, query) catch |err| switch (err) {
+            error.UnknownField, error.UnsupportedOperation, error.TableTopologyProtocolUpgradeRequired => {
+                proof.* = .unavailable;
+                return original orelse try self.recoveryScopeSnapshot(a, context, plain);
             },
             else => return err,
         };
-        defer a.free(bytes);
-        var result = try std.json.parseFromSliceLeaky(types.Snapshot, a, bytes, .{ .allocate = .alloc_always });
         if (result.scope != null) result.superseded = null;
         return result;
     }
@@ -782,14 +797,16 @@ pub const Registry = struct {
     fn releaseUnadmittedScope(self: *@This(), a: A, seal: transactions.ExternalPreparationSeal) !bool {
         const ref = seal.identity.lock_scope orelse return true;
         const types = @import("../../../system_catalog/lock_authority.zig");
-        const anchor = try self.snapshot(a, .{ .operation = seal.identity.operation_id });
+        var ready = false;
+        const anchor = try self.snapshotWithScopeCapability(a, .{ .operation = seal.identity.operation_id }, &ready);
+        var proof: ScopeProof = if (ready) .ready else .unknown;
         var context = self.context;
         context.setting_admin = true;
         context.sql_command_fence = null;
         context.sql_completion = null;
         context.sql_completion_submission = null;
         const query = scopeRecoveryQuery(anchor, seal.identity, ref);
-        const before = try self.observeRecoveryScope(a, context, query);
+        const before = try self.observeRecoveryScope(a, context, query, &proof);
         const scope = before.scope orelse return if (before.superseded == true) true else error.InvalidSqlBackendResponse;
         if (scope.next_command > ref.command.sequence or scope.transaction == null) return true;
         if (!std.meta.eql(scope.transaction, @as(?types.scopes.Transaction, .{ .id = seal.identity.txn_id }))) return error.ExternalTransactionDecisionChanged;
@@ -802,7 +819,7 @@ pub const Registry = struct {
         _ = try result.result();
         self.anchor = null;
         // One bounded cleanup quantum, then yield to the existing supervisor.
-        const after = try self.observeRecoveryScope(a, context, query);
+        const after = try self.observeRecoveryScope(a, context, query, &proof);
         return after.superseded == true or after.scope != null and after.scope.?.transaction == null;
     }
 
@@ -811,14 +828,16 @@ pub const Registry = struct {
     fn releaseScopeQuantum(self: *@This(), a: A, identity: registry.Identity) !bool {
         const ref = identity.lock_scope orelse return true;
         const types = @import("../../../system_catalog/lock_authority.zig");
-        const anchor = try self.snapshot(a, .{ .operation = identity.operation_id });
+        var ready = false;
+        const anchor = try self.snapshotWithScopeCapability(a, .{ .operation = identity.operation_id }, &ready);
+        var proof: ScopeProof = if (ready) .ready else .unknown;
         if (identity.kind == .named) for (anchor.receipts) |receipt| {
             if (receipt.status == .prepared and receipt.owner.eql(try identity.owner(a))) return true;
         };
         var context = self.context;
         context.setting_admin = true;
         const query = scopeRecoveryQuery(anchor, identity, ref);
-        const before = try self.observeRecoveryScope(a, context, query);
+        const before = try self.observeRecoveryScope(a, context, query, &proof);
         const scope = before.scope orelse return if (before.superseded == true) true else error.InvalidSqlBackendResponse;
         // A completed sealed command is a permanent cleanup witness, even if
         // later transactions have replaced the single recent release marker.
@@ -837,7 +856,7 @@ pub const Registry = struct {
         _ = try result.result();
         self.server.sql_lock_work_pending.store(true, .release);
         self.anchor = null; // Scope progress advances the shared admission head.
-        const after = try self.observeRecoveryScope(a, context, query);
+        const after = try self.observeRecoveryScope(a, context, query, &proof);
         return after.superseded == true or after.scope != null and after.scope.?.transaction == null and std.meta.eql(after.scope.?.released_transaction, @as(?types.scopes.Transaction, expected));
     }
     pub fn acknowledgeReceipt(self: *@This(), a: A, identity: registry.Identity) !void {

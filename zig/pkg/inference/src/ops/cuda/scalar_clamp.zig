@@ -17,7 +17,9 @@ const std = @import("std");
 const context = @import("context.zig");
 const driver = @import("driver.zig");
 
-const Program = @import("embedded_module.zig").EmbeddedModule(@embedFile("scalar_clamp.ptx"), .{ .clamp = "scalar_clamp", .widen = "widen_16bit", .split = "split_bf16_terms", .split_rounded = "split_rounded_terms", .finish_projection = "finish_projection" });
+const Program = @import("embedded_module.zig").EmbeddedModule(struct {
+    pub const image = @embedFile("scalar_clamp.ptx");
+}, .{ .clamp = "scalar_clamp", .widen = "widen_16bit", .split = "split_bf16_terms", .split_rounded = "split_rounded_terms", .finish_projection = "finish_projection" });
 
 pub const Kernel = struct {
     program: Program = .{},

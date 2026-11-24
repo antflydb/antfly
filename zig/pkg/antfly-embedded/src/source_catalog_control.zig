@@ -1026,3 +1026,30 @@ pub const storage_source_plan_control = @import("storage/source_plan_control.zig
 pub const storage_source_checkpoint_read = @import("storage/source_checkpoint_read.zig");
 
 pub const storage_source_plan_wire = @import("storage/source_plan_wire.zig");
+
+pub const storage_committed_frame = @import("storage/committed_frame.zig");
+pub const storage_history_grant_wire = @import("storage/history_grant_wire.zig");
+pub const storage_history_ordered = @import("storage/history_ordered.zig");
+pub const storage_history_page_wire = @import("storage/history_page_wire.zig");
+pub const storage_history_resolution_wire = @import("storage/history_resolution_wire.zig");
+pub const storage_source_admission = @import("storage/source_admission.zig");
+pub const storage_source_effects = @import("storage/source_effects.zig");
+pub const storage_source_scope_rebind_test = @import("storage/source_scope_rebind_test.zig");
+pub const storage_source_transaction = @import("storage/source_transaction.zig");
+
+pub const storage_db_enrichment_execution_policy = @import("storage/db/enrichment/execution_policy.zig");
+pub const storage_db_foreign_key_validation = @import("storage/db/foreign_key_validation.zig");
+pub const storage_db_native_empty_image_attempt = @import("storage/db/native_empty_image_attempt.zig");
+pub const storage_db_raw_graph_read_lease = @import("storage/db/raw_graph_read_lease.zig");
+pub const storage_db_relational_rows_enum_test = @import("storage/db/relational/rows/enum_test.zig");
+pub const storage_db_relational_rows_frozen_key = @import("storage/db/relational/rows/frozen_key.zig");
+pub const storage_db_temporal_integrity_contract = @import("storage/db/temporal_integrity_contract.zig");
+pub const storage_document_revision_control = @import("storage/document_revision_control.zig");
+pub const storage_graph_read_snapshot = @import("storage/graph_read_snapshot.zig");
+pub const storage_pessimistic_lock_native_test = @import("storage/pessimistic_lock/native_test.zig");
+pub const storage_raw_graph_read_lease = @import("storage/raw_graph_read_lease.zig");
+pub const storage_row_heap = @import("storage/row_heap.zig");
+pub const storage_row_heap_benchmark = @import("storage/row_heap_benchmark.zig");
+pub const storage_row_heap_restore_test = @import("storage/row_heap_restore_test.zig");
+pub const storage_row_heap_scope = @import("storage/row_heap_scope.zig");
+pub const storage_transaction_decision_owner = @import("storage/transaction_decision_owner.zig");

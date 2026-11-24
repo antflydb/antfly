@@ -33,6 +33,260 @@ from helpers import wait_until
 pytestmark = pytest.mark.e2e_resource("antfly_process")
 
 
+def sync_definition():
+    return {
+        "schema": {
+            "version": 0,
+            "default_type": "doc",
+            "enforce_types": False,
+            "document_schemas": {
+                "doc": {
+                    "schema": {
+                        "type": "object",
+                        "additionalProperties": True,
+                        "x-antfly-dynamic-indexing": {"mode": "infer_types"},
+                    }
+                }
+            },
+        },
+        "indexes": {
+            "full_text_index_v0": {"name": "full_text_index_v0", "type": "full_text"},
+            "vectors": {
+                "name": "vectors",
+                "type": "embeddings",
+                "external": True,
+                "dimension": 768,
+                "distance_metric": "cosine",
+            },
+        },
+    }
+
+
+@pytest.mark.parametrize("vector_count", [0, 1, 2])
+def test_sync_serves_partial_vectors_after_restart(tmp_path, vector_count):
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StandaloneAntflyServer(binary, "127.0.0.1", 0, storage_engine="lite")
+    definition = sync_definition()
+    vector = [1.0] + [0.0] * 767
+    failed = True
+    try:
+        response = requests.post(
+            server.api_url + "/tables/records",
+            json={
+                "schema": {
+                    k: v for k, v in definition["schema"].items() if k != "version"
+                },
+                "indexes": {"vectors": definition["indexes"]["vectors"]},
+            },
+            timeout=30,
+        )
+        assert response.ok, response.text
+        records = {
+            name: {
+                "content": "alpha searchable" if i == 0 else "beta searchable",
+                **({"_embeddings": {"vectors": vector}} if i < vector_count else {}),
+            }
+            for i, name in enumerate(("a", "b"))
+        }
+        response = requests.post(
+            server.api_url + "/tables/records/batch",
+            json={"inserts": records, "sync_level": "full_index"},
+            timeout=30,
+        )
+        assert response.ok, response.text
+        server.pause()
+        source = server.root / "db.aflite"
+        source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+        trusted = tmp_path / "definition.json"
+        trusted.write_text(json.dumps(definition))
+        output = tmp_path / "prepared.aflite"
+        result = subprocess.run(
+            [
+                binary,
+                "--no-agent",
+                "sync",
+                "--input",
+                str(source),
+                "--out",
+                str(output),
+                "--table",
+                "records",
+                "--definition",
+                str(trusted),
+            ],
+            env={
+                **os.environ,
+                "ANTFLY_URL": "://invalid-server-url",
+                "ANTFLY_TOKEN": "unused-offline-token",
+                "ANTFLY_USERNAME": "unused-offline-user",
+                "ANTFLY_PASSWORD": "unused-offline-password",
+                "ANTFLY_DATABASE": "unused-offline-database",
+                "ANTFLY_NAMESPACE": "unused-offline-namespace",
+            },
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        report = json.loads(result.stdout)
+        assert report["operation"] == "sync"
+        assert report["mode"] == "replace"
+        assert report["inventory"] == {
+            "documents": 2,
+            "artifact_records": vector_count,
+            "shards": 1,
+        }
+        assert report["source"]["sha256"] == source_hash
+        assert hashlib.sha256(source.read_bytes()).hexdigest() == source_hash
+        assert (
+            hashlib.sha256(output.read_bytes()).hexdigest()
+            == report["output"]["sha256"]
+        )
+        os.replace(output, source)
+        server.resume()
+
+        for reopen in range(2):
+            if reopen:
+                server.restart()
+            last = {}
+
+            def ready():
+                response = requests.get(
+                    server.api_url + "/tables/records/indexes/vectors", timeout=10
+                )
+                last["index"] = (response.status_code, response.text)
+                if response.status_code in (404, 503):
+                    return False
+                assert response.ok, response.text
+                status = response.json()["status"]
+                return (
+                    status["total_indexed"] == vector_count
+                    and not status["backfill_active"]
+                    and not status["rebuilding"]
+                    and not status.get("dense_publish_pending", False)
+                )
+
+            assert wait_until(ready, timeout_s=30, interval_s=0.2), last
+            for query, expected in (
+                ({"full_text_search": {"match": "searchable", "field": "content"}}, 2),
+                (
+                    {"embeddings": {"vectors": vector}, "indexes": ["vectors"]},
+                    vector_count,
+                ),
+            ):
+                response = requests.post(
+                    server.api_url + "/tables/records/query", json=query, timeout=10
+                )
+                assert response.ok, response.text
+                hits = response.json()["responses"][0]["hits"]["hits"]
+                assert len(hits) == expected, response.text
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
+
+
+@pytest.mark.parametrize("selection", [None, "notes", "records,notes"])
+def test_sync_stages_multiple_tables(tmp_path, selection):
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StandaloneAntflyServer(binary, "127.0.0.1", 0, storage_engine="lite")
+    definition = sync_definition()
+    vector = [1.0] + [0.0] * 767
+    failed = True
+    try:
+        for table in ("records", "notes"):
+            response = requests.post(
+                server.api_url + f"/tables/{table}",
+                json={
+                    "schema": {
+                        k: v for k, v in definition["schema"].items() if k != "version"
+                    },
+                    "indexes": {"vectors": definition["indexes"]["vectors"]},
+                },
+                timeout=30,
+            )
+            assert response.ok, response.text
+            response = requests.post(
+                server.api_url + f"/tables/{table}/batch",
+                json={
+                    "inserts": {
+                        "same-key": {
+                            "content": table + " searchable",
+                            "_embeddings": {"vectors": vector},
+                        }
+                    },
+                    "sync_level": "full_index",
+                },
+                timeout=30,
+            )
+            assert response.ok, response.text
+        server.pause()
+        source = server.root / "db.aflite"
+        before = hashlib.sha256(source.read_bytes()).hexdigest()
+        trusted = tmp_path / "definition.json"
+        trusted.write_text(
+            json.dumps({"tables": {name: definition for name in ("records", "notes")}})
+        )
+        output = tmp_path / "prepared.aflite"
+        args = [
+            binary,
+            "--no-agent",
+            "sync",
+            "--input",
+            str(source),
+            "--out",
+            str(output),
+            "--definition",
+            str(trusted),
+        ]
+        if selection is not None:
+            args += ["--tables" if "," in selection else "--table", selection]
+        result = subprocess.run(args, capture_output=True, text=True, timeout=120)
+        assert result.returncode == 0, result.stdout + result.stderr
+        report = json.loads(result.stdout)
+        assert report["operation"] == "sync"
+        assert report["mode"] == "replace"
+        selected = set(selection.split(",")) if selection else {"records", "notes"}
+        assert set(report["output"]["tables"]) == selected
+        assert report["inventory"] == {
+            "documents": len(selected),
+            "artifact_records": len(selected),
+            "shards": len(selected),
+        }
+        assert hashlib.sha256(source.read_bytes()).hexdigest() == before
+        os.replace(output, source)
+        server.resume()
+        for reopen in range(2):
+            if reopen:
+                server.restart()
+            response = requests.get(server.api_url + "/tables", timeout=10)
+            assert response.ok, response.text
+            assert {item["name"] for item in response.json()} == selected
+            for table in selected:
+                response = requests.get(
+                    server.api_url + f"/tables/{table}/documents/same-key", timeout=10
+                )
+                assert (
+                    response.ok and response.json()["content"] == table + " searchable"
+                ), response.text
+                for query in (
+                    {"full_text_search": {"match": "searchable", "field": "content"}},
+                    {"embeddings": {"vectors": vector}, "indexes": ["vectors"]},
+                ):
+                    response = requests.post(
+                        server.api_url + f"/tables/{table}/query",
+                        json=query,
+                        timeout=10,
+                    )
+                    assert response.ok, response.text
+                    hits = response.json()["responses"][0]["hits"]["hits"]
+                    assert len(hits) == 1 and hits[0]["_id"] == "same-key", (
+                        response.text
+                    )
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
+
+
 @pytest.mark.parametrize(
     "schema_version,direct_sparse", [(0, False), (3, False), (0, True)]
 )

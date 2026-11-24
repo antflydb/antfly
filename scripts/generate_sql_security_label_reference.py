@@ -42,7 +42,9 @@ from psycopg import sql
 
 if args.provider_library is None:
     provider_dir = TemporaryDirectory(prefix="antfly-sql-label-provider-")
-    args.provider_library = Path(provider_dir.name) / "antfly_security_label_provider.so"
+    args.provider_library = (
+        Path(provider_dir.name) / "antfly_security_label_provider.so"
+    )
     pg_config = postgres_binary_dir() / "pg_config"
     includes = [
         subprocess.check_output([pg_config, option], text=True).strip()

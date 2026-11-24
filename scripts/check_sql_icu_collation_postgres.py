@@ -66,7 +66,9 @@ def main():
             lambda notice: notices.append((notice.sqlstate, notice.message_primary))
         )
         assert db.execute(originals["sql-0132"]).statusmessage == "DROP COLLATION"
-        assert notices == [("00000", 'collation "ci_text" does not exist, skipping')], notices
+        assert notices == [("00000", 'collation "ci_text" does not exist, skipping')], (
+            notices
+        )
     print("Verified four original ICU collation cases on PostgreSQL")
 
 
