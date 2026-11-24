@@ -4491,6 +4491,79 @@ test "CUDA owned dispatch permits unused Native catalog and declines active fall
     try std.testing.expect(!state_executable.runtime.physical_pool.?.cuda_frame_dispatch);
 }
 
+test "prepared Metal F32 MPS projection uses the assigned graph output" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    const metal = @import("../backends/metal_runtime.zig");
+    if (!metal.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    const Env = struct {
+        extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+        extern "c" fn unsetenv([*:0]const u8) c_int;
+    };
+    const enable_mps = "TERMITE_METAL_ENABLE_DENSE_MPS_LINEAR";
+    const previous = if (std.c.getenv(enable_mps)) |value| try a.dupeSentinel(u8, std.mem.span(value), 0) else null;
+    defer if (previous) |value| {
+        _ = Env.setenv(enable_mps, value.ptr, 1);
+        a.free(value);
+    } else {
+        _ = Env.unsetenv(enable_mps);
+    };
+    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(enable_mps, "1", 1));
+
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, std.testing.io);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    const runtime = context.metal_hosted.compute.provider_impl.raw_decode_runtime;
+    const rows = 128;
+    const width = 64;
+    var data: [rows * width]f32 = undefined;
+    for (&data, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i % 23)) * 0.125;
+    var weights: [width * width]f32 = @splat(0);
+    for (0..width) |i| weights[i * width + i] = 1;
+    const bias: [width]f32 = @splat(0.25);
+    const x = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&data, &.{ rows, width }));
+    defer cb.free(x);
+    const w = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&weights, &.{ width, width }));
+    defer cb.free(w);
+    const b = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&bias, &.{width}));
+    defer cb.free(b);
+    const warm = try cb.linear(x, w, b, rows, width, width);
+    cb.free(warm);
+
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const xn = try builder.parameter("x", ml.graph.Shape.init(.f32, &.{ rows, width }));
+    const wn = try builder.parameter("weight", ml.graph.Shape.init(.f32, &.{ width, width }));
+    const bn = try builder.parameter("bias", ml.graph.Shape.init(.f32, &.{width}));
+    try graph.markOutput(try builder.linear(xn, wn, bn, rows, width, width));
+    var program = try ModelProgram.init(a, &graph, &.{
+        .{ .name = "x", .node_id = xn, .kind = .input },
+        .{ .name = "weight", .node_id = wn, .kind = .weight },
+        .{ .name = "bias", .node_id = bn, .kind = .weight },
+    });
+    defer program.deinit();
+    var raw_inputs = [_]interpreter.RuntimeInput{
+        .{ .node_id = xn, .value = x, .source_backend = &cb },
+        .{ .node_id = wn, .value = w, .source_backend = &cb },
+        .{ .node_id = bn, .value = b, .source_backend = &cb },
+    };
+    const inputs = try program.remapInputs(&raw_inputs);
+    var executable = try prepareWithOptions(a, &program, &cb, .partitioned, .{ .input_bindings = inputs, .physical_replay = false });
+    defer executable.deinit();
+    const before = metal.runtimeMemorySnapshot(runtime);
+    var result = try executable.run(a, .{ .runtime_inputs = inputs, .output_placement = .producer, .collect_partition_stats = true, .activation_readbacks = .forbidden });
+    defer result.deinit(&executable.runtime);
+    try std.testing.expectEqual(@as(u64, 1), result.stats.assigned_kernel_dispatches);
+    try std.testing.expectEqual(before.mps_dense_linear_active_frame_calls + 1, metal.runtimeMemorySnapshot(runtime).mps_dense_linear_active_frame_calls);
+    try std.testing.expectEqual(@as(u64, 0), result.stats.device_host_accesses);
+    const output = try cb.toFloat32(result.outputs[0], a);
+    defer a.free(output);
+    try std.testing.expectEqual(data.len, output.len);
+    for (data, output) |expected, actual| try std.testing.expectEqual(expected + 0.25, actual);
+}
+
 test "Metal Frame coverage refuses input rooted aliases and keeps tuned linear executor ownership" {
     if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
     if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;

@@ -48444,7 +48444,7 @@ test "metal native decoder runtime bf16 matrix projections preserve tails offset
     }
 }
 
-test "metal native decoder runtime f16 MPS linear transitions from planned encoder" {
+test "metal native decoder runtime MPS linear transitions from planned encoder" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
 
@@ -48454,81 +48454,89 @@ test "metal native decoder runtime f16 MPS linear transitions from planned encod
     const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
-    const rows: usize = 3;
-    const hidden_size: usize = 128;
-    const slot: usize = 0;
+    const enable_mps = "TERMITE_METAL_ENABLE_DENSE_MPS_LINEAR";
+    const previous_mps = if (std.c.getenv(enable_mps)) |value| try allocator.dupeSentinel(u8, std.mem.span(value), 0) else null;
+    defer if (previous_mps) |value| {
+        _ = setenv(enable_mps, value.ptr, 1);
+        allocator.free(value);
+    } else {
+        _ = unsetenv(enable_mps);
+    };
+    try std.testing.expectEqual(@as(c_int, 0), setenv(enable_mps, "1", 1));
 
-    const f16_one: u16 = @bitCast(@as(f16, 1.0));
-    const f16_weights = try allocator.alloc(u16, hidden_size * hidden_size);
-    defer allocator.free(f16_weights);
-    @memset(f16_weights, 0);
-    for (0..hidden_size) |i| f16_weights[i * hidden_size + i] = f16_one;
-    const f16_weight_bytes = std.mem.sliceAsBytes(f16_weights);
+    inline for (.{ false, true }, 0..) |f32_weights, slot| {
+        const rows: usize = if (f32_weights) 128 else 3;
+        const hidden_size: usize = 128;
+        const Weight = if (f32_weights) f32 else f16;
+        const weights = try allocator.alloc(Weight, hidden_size * hidden_size);
+        defer allocator.free(weights);
+        @memset(weights, 0);
+        for (0..hidden_size) |i| weights[i * hidden_size + i] = 1.0;
+        const bias: [hidden_size]f32 = @splat(0.25);
+        if (f32_weights) {
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_linear(runtime, slot, weights.ptr, &bias, hidden_size, hidden_size));
+            try std.testing.expectEqual(@as(c_int, 1), antfly_metal_dense_linear_assigned_mps_ready(runtime, slot, rows));
+            try std.testing.expectEqual(@as(c_int, 0), antfly_metal_dense_linear_direct_rows_ready(runtime, slot, rows));
+        } else {
+            const bytes = std.mem.sliceAsBytes(weights);
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_linear_f16(runtime, slot, bytes.ptr, bytes.len, &bias, hidden_size, hidden_size));
+        }
 
-    const bias = try allocator.alloc(f32, hidden_size);
-    defer allocator.free(bias);
-    @memset(bias, 0);
-    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_linear_f16(
-        runtime,
-        slot,
-        f16_weight_bytes.ptr,
-        f16_weight_bytes.len,
-        bias.ptr,
-        hidden_size,
-        hidden_size,
-    ));
+        const input_data = try allocator.alloc(f32, rows * hidden_size);
+        defer allocator.free(input_data);
+        for (input_data, 0..) |*value, i| {
+            const centered: i32 = @intCast(i % 29);
+            value.* = @as(f32, @floatFromInt(centered - 14)) * 0.125;
+        }
+        const shape = [_]i32{ @intCast(rows), @intCast(hidden_size) };
+        var input = try testDeviceTensorFromSlice(runtime, input_data, &shape);
+        defer input.deinit();
+        var scratch = try MetalTensor.deviceAllocate(runtime, input_data.len * @sizeOf(f32), .private, &shape);
+        defer scratch.deinit();
+        var output = try MetalTensor.deviceAllocate(runtime, input_data.len * @sizeOf(f32), .private, &shape);
+        defer output.deinit();
 
-    const input_data = try allocator.alloc(f32, rows * hidden_size);
-    defer allocator.free(input_data);
-    for (input_data, 0..) |*value, i| {
-        const centered: i32 = @intCast(i % 29);
-        value.* = @as(f32, @floatFromInt(centered - 14)) * 0.125;
-    }
-    const shape = [_]i32{ @intCast(rows), @intCast(hidden_size) };
-    var input = try testDeviceTensorFromSlice(runtime, input_data, &shape);
-    defer input.deinit();
-    var scratch = try MetalTensor.deviceAllocate(runtime, input_data.len * @sizeOf(f32), .private, &shape);
-    defer scratch.deinit();
-    var output = try MetalTensor.deviceAllocate(runtime, input_data.len * @sizeOf(f32), .private, &shape);
-    defer output.deinit();
+        // Exercise the assigned path first so legacy cache entries cannot hide
+        // the lifetime of the views bound to the planned buffers.
+        inline for ([_]bool{ true, false }) |assigned| {
+            const before = runtimeMemorySnapshot(runtime);
+            const retained_before = termite_metal_decode_runtime_linear_view_bytes(runtime, slot + 1);
+            try beginFrame(runtime);
+            errdefer cancelFrame(runtime) catch {};
+            try beginPlannedComputeScope(runtime, @backingInt(ComputeSource.dense_linear), .ffn);
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_apply_add_device(
+                runtime,
+                input.deviceHandle(),
+                input.deviceByteOffset(),
+                input.deviceHandle(),
+                input.deviceByteOffset(),
+                input_data.len,
+                scratch.deviceHandle(),
+                scratch.deviceByteOffset(),
+            ));
+            const dispatch = if (assigned) antfly_metal_dense_linear_assigned_rows else termite_metal_decode_runtime_apply_linear_multi_row_device;
+            try std.testing.expectEqual(@as(c_int, 0), dispatch(
+                runtime,
+                slot,
+                input.deviceHandle(),
+                input.deviceByteOffset(),
+                rows,
+                hidden_size,
+                hidden_size,
+                output.deviceHandle(),
+                output.deviceByteOffset(),
+            ));
+            try endPlannedComputeScope(runtime);
+            try submitFrame(runtime);
+            try waitFrame(runtime);
+            try std.testing.expectEqual(before.mps_dense_linear_active_frame_calls + 1, runtimeMemorySnapshot(runtime).mps_dense_linear_active_frame_calls);
+            if (assigned) try std.testing.expectEqual(retained_before, termite_metal_decode_runtime_linear_view_bytes(runtime, slot + 1));
 
-    // Exercise the assigned path first so legacy cache entries cannot hide
-    // the lifetime of the views bound to the planned buffers.
-    inline for ([_]bool{ true, false }) |assigned| {
-        try beginFrame(runtime);
-        errdefer cancelFrame(runtime) catch {};
-        try beginPlannedComputeScope(runtime, @backingInt(ComputeSource.dense_linear), .ffn);
-        try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_apply_add_device(
-            runtime,
-            input.deviceHandle(),
-            input.deviceByteOffset(),
-            input.deviceHandle(),
-            input.deviceByteOffset(),
-            input_data.len,
-            scratch.deviceHandle(),
-            scratch.deviceByteOffset(),
-        ));
-        const dispatch = if (assigned) antfly_metal_dense_linear_assigned_rows else termite_metal_decode_runtime_apply_linear_multi_row_device;
-        try std.testing.expectEqual(@as(c_int, 0), dispatch(
-            runtime,
-            slot,
-            input.deviceHandle(),
-            input.deviceByteOffset(),
-            rows,
-            hidden_size,
-            hidden_size,
-            output.deviceHandle(),
-            output.deviceByteOffset(),
-        ));
-        try endPlannedComputeScope(runtime);
-        try submitFrame(runtime);
-        try waitFrame(runtime);
-        if (assigned) try std.testing.expectEqual(@as(u64, 0), termite_metal_decode_runtime_linear_view_bytes(runtime, slot + 1));
-
-        const actual = try output.toHostSlice();
-        try std.testing.expectEqual(input_data.len, actual.len);
-        for (input_data, actual) |expected, got| {
-            try std.testing.expectApproxEqAbs(expected, got, 2e-3);
+            const actual = try output.toHostSlice();
+            try std.testing.expectEqual(input_data.len, actual.len);
+            for (input_data, actual) |expected, got| {
+                try std.testing.expectApproxEqAbs(expected + 0.25, got, 2e-3);
+            }
         }
     }
 }
