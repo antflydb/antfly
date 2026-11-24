@@ -30823,6 +30823,7 @@ pub const RaftApplyStore = struct {
         const meta = try system_catalog_storage.readMeta(a, &txn, group_id);
         if (meta.revision != command.expected_revision) return error.CatalogGenerationChanged;
         if (command.sql_publication_ddl) |request| {
+            _ = try self.standbyRelationActivationTxn(&txn, group_id, topology_protocol.sql_publication_capture_version);
             const digest = try sql_catalog_mutations.boundDigest(a, try sql_catalog_mutations.observation(a, command));
             const planned = self.planSqlPublicationTxn(a, &txn, group_id, request, digest) catch |err| {
                 // The admitting reducer durably records semantic rejections.
