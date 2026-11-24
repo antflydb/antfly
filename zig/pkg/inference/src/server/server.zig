@@ -72,6 +72,7 @@ const decide_mod = @import("antfly_decisions").legacy;
 const BoundedRequestAllocator = @import("../runtime/bounded_allocator.zig").BoundedAllocator;
 const image_pipeline = @import("../pipelines/image.zig");
 const sparse_embedding_mod = @import("../pipelines/sparse_embedding.zig");
+const decoder_prefill = @import("../execution/decoder_prefill.zig");
 const generation = @import("../pipelines/generation.zig");
 const decoder_checkpoint = @import("../execution/decoder_checkpoint.zig");
 const decoder_storage = @import("../execution/decoder_storage.zig");
@@ -6863,7 +6864,7 @@ pub const Node = struct {
         };
         const direct_prefill_ceiling = @min(
             prompt_tokens,
-            generation.nativeGenerationPrefillChunkCeiling(
+            decoder_prefill.idleChunkCeiling(
                 backend_kind,
                 gpt_config,
                 self.config.generation_batching.schedulerPolicy().max_idle_prefill_chunk_size,
@@ -18000,7 +18001,7 @@ pub const Node = struct {
                 });
             }
         }
-        const idle_prefill_ceiling = generation.nativeGenerationPrefillChunkCeiling(
+        const idle_prefill_ceiling = decoder_prefill.idleChunkCeiling(
             backend_kind,
             gpt_config,
             self.config.generation_batching.schedulerPolicy().max_idle_prefill_chunk_size,
@@ -20640,7 +20641,7 @@ pub const Node = struct {
                     continue;
                 };
                 defer batch_generation_slot.release();
-                const idle_prefill_ceiling = generation.nativeGenerationPrefillChunkCeiling(
+                const idle_prefill_ceiling = decoder_prefill.idleChunkCeiling(
                     backend_kind,
                     gpt_config,
                     self.config.generation_batching.schedulerPolicy().max_idle_prefill_chunk_size,

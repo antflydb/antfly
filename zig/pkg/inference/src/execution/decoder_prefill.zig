@@ -32,6 +32,56 @@ const runtime = @import("../runtime/root.zig");
 const cuda_compute = if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig") else struct {};
 const BorrowedDecodeStateRuntime = graph_mod.decode_state_runtime.BorrowedDecodeStateRuntime;
 
+/// Bound idle prefill chunks only for geometries with qualified measurements.
+/// Keep the general scheduler ceiling intact for every other model and backend;
+/// explicit request limits and memory admission are applied separately.
+pub fn idleChunkCeiling(
+    backend: runtime.kv.pool.BackendKind,
+    config: gpt_arch.Config,
+    configured_ceiling: usize,
+) usize {
+    const ceiling = @max(configured_ceiling, 1);
+    if (backend == .cuda) {
+        if (@import("gemma4_native_plan.zig").Plan.resolve(config)) |plan|
+            return @min(ceiling, plan.geometry.prefillQueryLimit());
+    }
+    if (backend == .metal and
+        config.family == .gemma and
+        config.hasPle() and
+        config.num_attention_heads == 8 and
+        config.effectiveKVHeads() == 2 and
+        config.headDim() == 256 and
+        config.global_head_dim == 512 and
+        config.sliding_window == 512 and
+        !config.gemma4_mtp_assistant)
+    {
+        return @min(ceiling, 512);
+    }
+    // Gemma4 E2B CUDA evidence currently selects the fixed 512-row schedule.
+    // A forced 2051-row pass triggered a >2 GiB deferred-free drain, while
+    // balanced 411-row and 513-row candidates were both slower. Keep the
+    // fingerprint-specific winner until a new plan is promoted by paired E2E
+    // evidence.
+    if (backend == .cuda and
+        config.family == .gemma and
+        config.hidden_size == 1536 and
+        config.num_hidden_layers == 35 and
+        config.num_attention_heads == 8 and
+        config.effectiveKVHeads() == 1 and
+        config.headDim() == 256 and
+        config.global_head_dim == 512 and
+        config.intermediate_size == 6144 and
+        config.shared_layer_intermediate_size == 12288 and
+        config.num_kv_shared_layers == 20 and
+        config.sliding_window == 512 and
+        config.hasPle() and
+        !config.gemma4_mtp_assistant)
+    {
+        return @min(ceiling, 512);
+    }
+    return ceiling;
+}
+
 /// Resolve the native physical row bound for text and prepared embeddings.
 pub fn nativeChunkRows(cb: *const ComputeBackend, config: gpt_arch.Config, prompt_rows: usize, requested_rows: usize) ?usize {
     return switch (cb.kind()) {
@@ -2769,4 +2819,72 @@ fn checkBatchLastHeadRows(cb: ComputeBackend, _: ComputeBackend) !void {
 
 test "prefill compact Native vocabulary rows match full head at unequal actual query ends" {
     try @import("../ops/media_residency_test.zig").onNative(CompiledPrefillFixture.populate, checkBatchLastHeadRows);
+}
+
+test "idle prefill ceiling applies only to qualified Gemma4 geometries" {
+    const gemma4_target = gpt_arch.Config{
+        .family = .gemma,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .sliding_window = 512,
+        .ple_hidden_size = 2560,
+    };
+    try std.testing.expectEqual(
+        @as(usize, 512),
+        idleChunkCeiling(.metal, gemma4_target, 2048),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 64),
+        idleChunkCeiling(.metal, gemma4_target, 64),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 2048),
+        idleChunkCeiling(.cuda, gemma4_target, 2048),
+    );
+    const gemma4_e2b_cuda = gpt_arch.Config{
+        .family = .gemma,
+        .hidden_size = 1536,
+        .num_hidden_layers = 35,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .intermediate_size = 6144,
+        .shared_layer_intermediate_size = 12288,
+        .num_kv_shared_layers = 20,
+        .sliding_window = 512,
+        .ple_hidden_size = 256,
+    };
+    try std.testing.expectEqual(
+        @as(usize, 512),
+        idleChunkCeiling(.cuda, gemma4_e2b_cuda, 2048),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 256),
+        idleChunkCeiling(.cuda, gemma4_e2b_cuda, 256),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 2048),
+        idleChunkCeiling(.metal, .{ .family = .gemma }, 2048),
+    );
+    inline for (.{
+        gpt_arch.Config{ .family = .gemma, .num_attention_heads = 7, .num_key_value_heads = 2, .attention_head_dim = 256, .global_head_dim = 512, .sliding_window = 512, .ple_hidden_size = 2560 },
+        gpt_arch.Config{ .family = .gemma, .num_attention_heads = 8, .num_key_value_heads = 1, .attention_head_dim = 256, .global_head_dim = 512, .sliding_window = 512, .ple_hidden_size = 2560 },
+        gpt_arch.Config{ .family = .gemma, .num_attention_heads = 8, .num_key_value_heads = 2, .attention_head_dim = 128, .global_head_dim = 512, .sliding_window = 512, .ple_hidden_size = 2560 },
+        gpt_arch.Config{ .family = .gemma, .num_attention_heads = 8, .num_key_value_heads = 2, .attention_head_dim = 256, .global_head_dim = 256, .sliding_window = 512, .ple_hidden_size = 2560 },
+        gpt_arch.Config{ .family = .gemma, .num_attention_heads = 8, .num_key_value_heads = 2, .attention_head_dim = 256, .global_head_dim = 512, .sliding_window = 1024, .ple_hidden_size = 2560 },
+    }) |other_geometry| {
+        try std.testing.expectEqual(
+            @as(usize, 2048),
+            idleChunkCeiling(.metal, other_geometry, 2048),
+        );
+    }
+    var assistant = gemma4_target;
+    assistant.gemma4_mtp_assistant = true;
+    try std.testing.expectEqual(
+        @as(usize, 2048),
+        idleChunkCeiling(.metal, assistant, 2048),
+    );
 }

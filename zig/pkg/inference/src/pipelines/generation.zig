@@ -381,56 +381,6 @@ fn nativeGenerationImageCount(messages: []const Message) usize {
     return image_count;
 }
 
-/// Bound idle prefill chunks only for geometries with qualified measurements.
-/// Keep the general scheduler ceiling intact for every other model and backend;
-/// explicit request limits and memory admission are applied separately.
-pub fn nativeGenerationPrefillChunkCeiling(
-    backend: runtime.kv.pool.BackendKind,
-    config: gpt_mod.Config,
-    configured_ceiling: usize,
-) usize {
-    const ceiling = @max(configured_ceiling, 1);
-    if (backend == .cuda) {
-        if (@import("../execution/gemma4_native_plan.zig").Plan.resolve(config)) |plan|
-            return @min(ceiling, plan.geometry.prefillQueryLimit());
-    }
-    if (backend == .metal and
-        config.family == .gemma and
-        config.hasPle() and
-        config.num_attention_heads == 8 and
-        config.effectiveKVHeads() == 2 and
-        config.headDim() == 256 and
-        config.global_head_dim == 512 and
-        config.sliding_window == 512 and
-        !config.gemma4_mtp_assistant)
-    {
-        return @min(ceiling, 512);
-    }
-    // Gemma4 E2B CUDA evidence currently selects the fixed 512-row schedule.
-    // A forced 2051-row pass triggered a >2 GiB deferred-free drain, while
-    // balanced 411-row and 513-row candidates were both slower. Keep the
-    // fingerprint-specific winner until a new plan is promoted by paired E2E
-    // evidence.
-    if (backend == .cuda and
-        config.family == .gemma and
-        config.hidden_size == 1536 and
-        config.num_hidden_layers == 35 and
-        config.num_attention_heads == 8 and
-        config.effectiveKVHeads() == 1 and
-        config.headDim() == 256 and
-        config.global_head_dim == 512 and
-        config.intermediate_size == 6144 and
-        config.shared_layer_intermediate_size == 12288 and
-        config.num_kv_shared_layers == 20 and
-        config.sliding_window == 512 and
-        config.hasPle() and
-        !config.gemma4_mtp_assistant)
-    {
-        return @min(ceiling, 512);
-    }
-    return ceiling;
-}
-
 pub fn userFacingErrorMessage(err: anyerror) []const u8 {
     return switch (err) {
         error.AudioInputTooLong => "audio input is too long for the Gemma4 direct audio projector; trim the clip or raise clip.audio.max_tokens in the projector metadata",
@@ -9095,74 +9045,6 @@ test "Qwen3-VL media admission uses exact image geometry before scheduling" {
     try std.testing.expectEqual(
         @as(usize, 0),
         nativeGenerationPreliminaryMediaTokenAllowance(&messages, config),
-    );
-}
-
-test "native generation prefill ceiling only specializes Gemma4 Metal target" {
-    const gemma4_target = gpt_mod.Config{
-        .family = .gemma,
-        .num_attention_heads = 8,
-        .num_key_value_heads = 2,
-        .attention_head_dim = 256,
-        .global_head_dim = 512,
-        .sliding_window = 512,
-        .ple_hidden_size = 2560,
-    };
-    try std.testing.expectEqual(
-        @as(usize, 512),
-        nativeGenerationPrefillChunkCeiling(.metal, gemma4_target, 2048),
-    );
-    try std.testing.expectEqual(
-        @as(usize, 64),
-        nativeGenerationPrefillChunkCeiling(.metal, gemma4_target, 64),
-    );
-    try std.testing.expectEqual(
-        @as(usize, 2048),
-        nativeGenerationPrefillChunkCeiling(.cuda, gemma4_target, 2048),
-    );
-    const gemma4_e2b_cuda = gpt_mod.Config{
-        .family = .gemma,
-        .hidden_size = 1536,
-        .num_hidden_layers = 35,
-        .num_attention_heads = 8,
-        .num_key_value_heads = 1,
-        .attention_head_dim = 256,
-        .global_head_dim = 512,
-        .intermediate_size = 6144,
-        .shared_layer_intermediate_size = 12288,
-        .num_kv_shared_layers = 20,
-        .sliding_window = 512,
-        .ple_hidden_size = 256,
-    };
-    try std.testing.expectEqual(
-        @as(usize, 512),
-        nativeGenerationPrefillChunkCeiling(.cuda, gemma4_e2b_cuda, 2048),
-    );
-    try std.testing.expectEqual(
-        @as(usize, 256),
-        nativeGenerationPrefillChunkCeiling(.cuda, gemma4_e2b_cuda, 256),
-    );
-    try std.testing.expectEqual(
-        @as(usize, 2048),
-        nativeGenerationPrefillChunkCeiling(.metal, .{ .family = .gemma }, 2048),
-    );
-    inline for (.{
-        gpt_mod.Config{ .family = .gemma, .num_attention_heads = 7, .num_key_value_heads = 2, .attention_head_dim = 256, .global_head_dim = 512, .sliding_window = 512, .ple_hidden_size = 2560 },
-        gpt_mod.Config{ .family = .gemma, .num_attention_heads = 8, .num_key_value_heads = 1, .attention_head_dim = 256, .global_head_dim = 512, .sliding_window = 512, .ple_hidden_size = 2560 },
-        gpt_mod.Config{ .family = .gemma, .num_attention_heads = 8, .num_key_value_heads = 2, .attention_head_dim = 128, .global_head_dim = 512, .sliding_window = 512, .ple_hidden_size = 2560 },
-        gpt_mod.Config{ .family = .gemma, .num_attention_heads = 8, .num_key_value_heads = 2, .attention_head_dim = 256, .global_head_dim = 256, .sliding_window = 512, .ple_hidden_size = 2560 },
-        gpt_mod.Config{ .family = .gemma, .num_attention_heads = 8, .num_key_value_heads = 2, .attention_head_dim = 256, .global_head_dim = 512, .sliding_window = 1024, .ple_hidden_size = 2560 },
-    }) |other_geometry| {
-        try std.testing.expectEqual(
-            @as(usize, 2048),
-            nativeGenerationPrefillChunkCeiling(.metal, other_geometry, 2048),
-        );
-    }
-    var assistant = gemma4_target;
-    assistant.gemma4_mtp_assistant = true;
-    try std.testing.expectEqual(
-        @as(usize, 2048),
-        nativeGenerationPrefillChunkCeiling(.metal, assistant, 2048),
     );
 }
 
