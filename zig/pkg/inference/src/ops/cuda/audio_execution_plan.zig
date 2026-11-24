@@ -44,9 +44,8 @@ pub const Owner = struct {
         const storage = self.plan.layoutWithExternalOutput(input_bytes) catch self.plan.layout(input_bytes) catch return false;
         var hash = std.hash.Wyhash.init(key);
         for (self.plan.events[0..self.plan.event_count]) |event| {
-            hash.update(std.mem.asBytes(&event.slot));
-            const flag: u32 = @intFromBool(event.allocate);
-            hash.update(std.mem.asBytes(&flag));
+            const encoded: u16 = @bitCast(event);
+            hash.update(std.mem.asBytes(&encoded));
             const allocation = self.plan.allocations[event.slot];
             hash.update(std.mem.asBytes(&allocation.bytes));
             hash.update(std.mem.asBytes(&allocation.offset));

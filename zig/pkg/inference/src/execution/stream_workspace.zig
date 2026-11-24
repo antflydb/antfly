@@ -30,11 +30,25 @@ pub const Layout = struct {
     output: ?struct { offset: usize, bytes: usize },
     external_output: bool = false,
 };
-const Allocation = struct { bytes: usize, offset: usize, pointer: DevicePointer, live: bool = true };
-const Event = struct { slot: usize, allocate: bool };
+// A nonzero address denotes a live allocation during learning. The workspace limit bounds the geometry.
+
+const Allocation = struct { pointer: DevicePointer, bytes: u32, offset: u32 };
+// A trace is kept per cached shape. Slot indices fit in the fixed plan and
+// never need pointer-width storage or an independently padded flag.
+const max_allocations = 2048;
+const Event = packed struct(u16) {
+    slot: u15,
+    allocate: bool,
+};
+
+comptime {
+    if (limit > std.math.maxInt(u32)) @compileError("stream workspace geometry overflow");
+
+    if (max_allocations - 1 > std.math.maxInt(u15)) @compileError("stream workspace event slot overflow");
+}
 pub const Plan = struct {
-    allocations: [2048]Allocation = undefined,
-    events: [4096]Event = undefined,
+    allocations: [max_allocations]Allocation = undefined,
+    events: [max_allocations * 2]Event = undefined,
     count: usize = 0,
     event_count: usize = 0,
     peak: usize = 0,
@@ -47,7 +61,7 @@ pub const Plan = struct {
             self.valid = false;
             return;
         }
-        self.events[self.event_count] = .{ .slot = slot, .allocate = is_alloc };
+        self.events[self.event_count] = .{ .slot = @intCast(slot), .allocate = is_alloc };
         self.event_count += 1;
     }
     pub fn allocate(self: *Plan, bytes: usize, pointer: DevicePointer) void {
@@ -61,7 +75,7 @@ pub const Plan = struct {
         while (true) {
             var next = offset;
             for (self.allocations[0..self.count]) |a| {
-                if (!a.live) continue;
+                if (a.pointer == 0) continue;
                 if (a.pointer == pointer) {
                     self.valid = false;
                     return;
@@ -76,15 +90,14 @@ pub const Plan = struct {
             self.valid = false;
             return;
         }
-        self.allocations[self.count] = .{ .bytes = bytes, .offset = offset, .pointer = pointer };
+        self.allocations[self.count] = .{ .bytes = @intCast(bytes), .offset = @intCast(offset), .pointer = pointer };
         self.event(self.count, true);
         self.count += 1;
         self.peak = @max(self.peak, offset + extent);
     }
     pub fn release(self: *Plan, pointer: DevicePointer) void {
         if (!self.valid or self.sealed) return;
-        for (self.allocations[0..self.count], 0..) |*a, i| if (a.live and a.pointer == pointer) {
-            a.live = false;
+        for (self.allocations[0..self.count], 0..) |*a, i| if (pointer != 0 and a.pointer == pointer) {
             a.pointer = 0;
             self.event(i, false);
             return;
@@ -101,7 +114,7 @@ pub const Plan = struct {
     fn seal(self: *Plan, expected: ?DevicePointer) bool {
         if (self.sealed) return false;
         for (self.allocations[0..self.count], 0..) |*allocation, index| {
-            if (!allocation.live) continue;
+            if (allocation.pointer == 0) continue;
             if (expected != allocation.pointer or self.output != null) self.valid = false;
             // The published layout keeps slot geometry, never a learning-run address.
             allocation.pointer = 0;
