@@ -157,6 +157,8 @@ fn runConfigured(init: std.process.Init, command: []const u8, args: *std.process
             }
         }
     }
+    // Whole-file sync is offline and never reads server credentials or scope.
+    if (std.mem.eql(u8, command, "sync")) return cli.sync.run(init.gpa, io, args);
     if (helpRequested(args)) {
         var probe = args.*;
         while (probe.next()) |arg| {
