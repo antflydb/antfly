@@ -2301,17 +2301,15 @@ test "WS4-for-dense: a synchronous dense vector write lands in one native commit
     }
 }
 
-test "WS4-for-dense round 2: an update or a delete falls back and still lands correctly" {
-    // `prepareInlineDensePublication`'s own batch-level gate in
-    // `mutation_commit.zig` (`overwritten_doc_keys.len == 0`/
-    // `deleted_keys.len == 0`) excludes a document replacement or a
-    // delete from the inline fast path -- both must fall back to the
-    // existing `applyDenseEmbeddingWritesByNameWithOptions` path, which
-    // this proves still produces the correct final state (the replaced
-    // vector is gone, the new one is findable; a deleted vector is gone
-    // too) and costs strictly more than the single-commit insert case
-    // above, confirming the fallback -- not the inline path -- actually
-    // ran.
+test "WS4-for-dense round 2: an update stays inline, a delete falls back, and both land correctly" {
+    // `prepareInlineDensePublication`'s batch-level gate in
+    // `mutation_commit.zig` admits a document replacing only its own
+    // vector (`inlineVectorWriteOnlyTouchesItself`) and excludes deletes
+    // (`deleted_keys.len == 0`), which fall back to
+    // `applyDenseEmbeddingWritesByNameWithOptions`. Both must produce the
+    // correct final state (the replaced vector is gone, the new one is
+    // findable; a deleted vector is gone too), and the delete must cost
+    // more than one commit, confirming the fallback actually ran.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2333,15 +2331,11 @@ test "WS4-for-dense round 2: an update or a delete falls back and still lands co
         .{ .key = "dv-doc", .value = "{\"marker\":\"dv-doc-marker-v1\",\"_embeddings\":{\"dv_idx\":[1.0,0.0]}}" },
     }, .sync_level = .full_index });
 
-    // Update: a second write to the SAME key with a different vector.
-    // `overwritten_doc_keys` is non-empty for this write, so it must NOT
-    // take the one-commit inline path.
-    const before_update_sequence = store.file.activeCheckpoint().commit_sequence;
+    // Update: a second write to the SAME key with a different vector. It
+    // overwrites only its own document, so it may publish inline.
     try handle.db.batch(.{ .writes = &.{
         .{ .key = "dv-doc", .value = "{\"marker\":\"dv-doc-marker-v2\",\"_embeddings\":{\"dv_idx\":[0.0,1.0]}}" },
     }, .sync_level = .full_index });
-    const after_update_sequence = store.file.activeCheckpoint().commit_sequence;
-    try std.testing.expect(after_update_sequence - before_update_sequence > 1);
 
     // An exhaustive search (`search_effort: 1.0`) must prove the fallback's
     // functional result too (old vector gone, new one findable): HBC's
@@ -2364,8 +2358,10 @@ test "WS4-for-dense round 2: an update or a delete falls back and still lands co
     }
 
     // Delete: the dense-vector mapping and HBC posting entry must both be
-    // gone.
+    // gone. Deletes never take the inline path.
+    const before_delete_sequence = store.file.activeCheckpoint().commit_sequence;
     try handle.db.batch(.{ .deletes = &.{"dv-doc"}, .sync_level = .full_index });
+    try std.testing.expect(store.file.activeCheckpoint().commit_sequence - before_delete_sequence > 1);
     {
         var result = try handle.db.search(allocator, .{
             .index_name = "dv_idx",
@@ -2378,7 +2374,7 @@ test "WS4-for-dense round 2: an update or a delete falls back and still lands co
 
     // A fresh insert after the delete must still take the (now
     // unobstructed) inline fast path and cost exactly one commit, proving
-    // the update/delete fallback above left the index in a state the
+    // the inline update and delete fallback above left the index in a state the
     // inline path can resume from cleanly.
     try handle.db.runUntilIdle();
     // Deterministic settle: see "WS4-for-graph"'s identical note above.

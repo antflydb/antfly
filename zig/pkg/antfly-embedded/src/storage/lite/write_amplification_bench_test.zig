@@ -2251,6 +2251,54 @@ test "lite write amplification report: full_index with text index (sparse-text-i
     try expectAtMost(indexed.durableCommitsPerWrite(), 1.25, "full_index-with-text durable commits/write (workers on)");
 }
 
+// Inline full-text writes take no merge admission and, in Lite, which runs
+// no merge worker, drive no merges. Once nearly every write took the inline
+// path, level-0 segments grew by one per write and every query and reopen
+// visited them all. At the merge runtime's limit a write now leaves the
+// inline path, and its admission assists a merge; that merge's commit uses
+// the writer lease its waiting producer holds instead of timing out.
+test "lite write amplification: inline full-text writes stay within the merge runtime's pending segments" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var fixture = try Fixture.open(alloc, "lite-inline-text-merge-bound", .full_text);
+    defer fixture.close();
+    const max_pending_segments = 6;
+    {
+        const guard = api.enterHandle(fixture.handle, .write) orelse return error.TestUnexpectedResult;
+        defer guard.leave();
+        const root = guard.handle.parent_handle orelse guard.handle;
+        const workers = root.db.start_index_workers;
+        root.db.start_index_workers = true;
+        defer root.db.start_index_workers = workers;
+        try root.db.initOptionalTextMergeRuntime(.{
+            .enabled = true,
+            .manual_producer_assistance = true,
+            .max_pending_segments = max_pending_segments,
+            .resume_pending_segments = 3,
+            .max_pending_bytes = 0,
+            .backpressure_max_wait_ms = 2_000,
+        });
+    }
+
+    var buffer: [text_bytes]u8 = undefined;
+    var key_buffer: [32]u8 = undefined;
+    for (0..40) |i| {
+        const key = try std.fmt.bufPrint(&key_buffer, "doc-{d}", .{i % 8});
+        try insertOne(alloc, fixture.handle, key, payload(&buffer, 0, i), "full_index");
+        const guard = api.enterHandle(fixture.handle, .read) orelse return error.TestUnexpectedResult;
+        defer guard.leave();
+        const root = guard.handle.parent_handle orelse guard.handle;
+        try std.testing.expect(root.db.core.index_manager.textActiveSegmentCountSnapshot("full_text_index_v0") <= max_pending_segments);
+    }
+
+    const guard = api.enterHandle(fixture.handle, .read) orelse return error.TestUnexpectedResult;
+    defer guard.leave();
+    const root = guard.handle.parent_handle orelse guard.handle;
+    const runtime = root.db.text_merge_runtime orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 0), runtime.stats().backpressure_timeouts);
+    try std.testing.expect(root.db.core.index_manager.textMergeStatsSnapshot().completed_merges > 0);
+}
+
 // Steady-state counterpart to the `full_text` alternation regression test
 // above, but for `.full_index`: guards against the same class of bug
 // (a use-after-free or a stale filtered-name comparison) reappearing

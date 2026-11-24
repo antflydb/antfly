@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const write_stage_profile = @import("../../write_stage_profile.zig");
 const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -22,6 +23,39 @@ const index_manager_mod = @import("../catalog/index_manager.zig");
 const types = @import("../types.zig");
 const platform_clock = @import("antfly_platform").clock;
 const background_runtime_mod = @import("../../background_runtime.zig");
+
+/// The producer thread an assisted merge on this thread runs for. That
+/// producer is blocked on the merge until it finishes or is drained, so the
+/// merge may use what the producer holds: Lite lends it the producer's
+/// writer lease, which its commit needs and the producer cannot release
+/// mid-batch.
+pub threadlocal var assisting_producer: ?std.Thread.Id = null;
+
+/// The runtime whose merge task this thread runs, and the lending producer
+/// whose lease it borrowed (`mergeMayUseLeaseOf`).
+threadlocal var merge_runtime: ?*PlatformTextMergeRuntime = null;
+threadlocal var merge_borrowed_from: ?u64 = null;
+
+/// Whether this thread's merge may use the writer lease `holder` holds:
+/// `holder` is a producer blocked on this runtime's admission, which only
+/// merges can relieve (`TextMergeRuntime.lending_producers`). A merge that
+/// borrows keeps the lease until its task ends; the producer resumes only
+/// once no merge still borrows. Lite asks from `WriterLane`.
+pub fn mergeMayUseLeaseOf(holder: std.Thread.Id) bool {
+    if (builtin.os.tag == .freestanding) return false;
+    const id: u64 = @intCast(holder);
+    if (merge_borrowed_from) |lender| return lender == id;
+    const runtime = merge_runtime orelse return false;
+    // Count the borrow before looking, so a producer that stops lending
+    // either sees it and waits, or this sees the producer gone.
+    _ = runtime.lent_borrows.fetchAdd(1, .seq_cst);
+    for (&runtime.lending_producers) |*slot| if (slot.load(.seq_cst) == id) {
+        merge_borrowed_from = id;
+        return true;
+    };
+    _ = runtime.lent_borrows.fetchSub(1, .seq_cst);
+    return false;
+}
 const storage_io_mod = @import("../../lsm_backend/storage_io.zig");
 
 pub const Config = struct {
@@ -142,6 +176,10 @@ const UnsupportedTextMergeRuntime = struct {
         return .not_needed;
     }
 
+    pub fn mergeAtCapBeforeWrite(self: *@This()) void {
+        _ = self;
+    }
+
     pub const ProducerPermit = struct {
         pub fn release(_: *@This()) void {}
     };
@@ -213,12 +251,39 @@ const PlatformTextMergeRuntime = struct {
     producer_byte_reservations: u64 = 0,
     producer_release_epoch: u64 = 0,
     producer_wait_epoch: std.atomic.Value(u32) = .init(0),
+    /// Producers blocked on admission (by thread id, 0 when free). In Lite
+    /// such a producer can hold the writer lease mid-batch while a merge
+    /// that would admit it needs that lease to commit; see
+    /// `mergeMayUseLeaseOf`.
+    lending_producers: [max_lending_producers]std.atomic.Value(u64) = @splat(.init(0)),
+    /// Merges currently using a lending producer's lease.
+    lent_borrows: std.atomic.Value(u32) = .init(0),
     producer_admission_head: ?*ProducerAdmissionWaiter = null,
     producer_admission_tail: ?*ProducerAdmissionWaiter = null,
     admission_closed: bool = false,
     fd_retry_epoch: ?u32 = null,
     future: ?background_runtime_mod.MaintenanceScheduler.Handle = null,
     backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
+
+    const max_lending_producers = 8;
+
+    fn startLending(self: *TextMergeRuntime) ?usize {
+        const id: u64 = @intCast(std.Thread.getCurrentId());
+        for (&self.lending_producers, 0..) |*slot, i| {
+            if (slot.cmpxchgStrong(0, id, .seq_cst, .seq_cst) == null) return i;
+        }
+        return null;
+    }
+
+    /// Ends this producer's lending, then waits out every merge still using
+    /// a lent lease: this producer uses its lease again on return.
+    fn stopLending(self: *TextMergeRuntime, slot: usize) void {
+        self.lending_producers[slot].store(0, .seq_cst);
+        while (self.lent_borrows.load(.seq_cst) != 0) {
+            const io = self.io orelse return;
+            io.sleep(.fromMicroseconds(100), .awake) catch {};
+        }
+    }
 
     pub const ProducerPermit = struct {
         runtime: *TextMergeRuntime,
@@ -431,8 +496,12 @@ const PlatformTextMergeRuntime = struct {
         next: ?*AssistedMerge = null,
         done: Io.Event = .unset,
         result: anyerror!bool = undefined,
+        producer: std.Thread.Id,
 
         fn run(self: *@This()) void {
+            const previous = assisting_producer;
+            assisting_producer = self.producer;
+            defer assisting_producer = previous;
             self.result = self.runtime.runOnceTask();
             self.done.set(self.io);
         }
@@ -467,7 +536,7 @@ const PlatformTextMergeRuntime = struct {
                 previous.release();
             }
             const work = try self.alloc.create(AssistedMerge);
-            work.* = .{ .runtime = self, .alloc = self.alloc, .io = io, .next = self.assisted_merges };
+            work.* = .{ .runtime = self, .alloc = self.alloc, .io = io, .next = self.assisted_merges, .producer = std.Thread.getCurrentId() };
             (if (builtin.is_test and test_force_concurrency_unavailable.load(.acquire))
                 @as(anyerror!void, error.ConcurrencyUnavailable)
             else
@@ -548,6 +617,17 @@ const PlatformTextMergeRuntime = struct {
     }
 
     fn runOnceTask(self: *TextMergeRuntime) !bool {
+        const profile_span = write_stage_profile.begin(.merge);
+        defer profile_span.end();
+        const previous_runtime = merge_runtime;
+        const previous_borrow = merge_borrowed_from;
+        merge_runtime = self;
+        merge_borrowed_from = null;
+        defer {
+            if (merge_borrowed_from != null) _ = self.lent_borrows.fetchSub(1, .seq_cst);
+            merge_runtime = previous_runtime;
+            merge_borrowed_from = previous_borrow;
+        }
         var maybe_task: ?index_manager_mod.IndexManager.TextMergeTask = null;
         const io = self.io orelse return false;
         // A bare tryLockExclusive() has no writer-preference: under a
@@ -715,6 +795,25 @@ const PlatformTextMergeRuntime = struct {
         }
     }
 
+    /// Lite runs no merge worker, and inline writes take no merge
+    /// admission: an index at `max_pending_segments` sends writes down the
+    /// replay path until something merges it. A writer that finds one there
+    /// merges on its own thread first, before it takes the apply lock and
+    /// under the writer lease it already holds (a merge commit borrows it as
+    /// a nested lease), so its write stays inline.
+    pub fn mergeAtCapBeforeWrite(self: *TextMergeRuntime) void {
+        if (!self.config.enabled or !self.config.manual_producer_assistance or self.config.max_pending_segments == 0) return;
+        var rounds: usize = 0;
+        while (rounds < 4) : (rounds += 1) {
+            lockApplyShared(self.apply_mutex);
+            const largest = self.index_manager.textMergeStatsSnapshot().max_active_segments_per_index;
+            self.apply_mutex.unlockShared();
+            if (largest < self.config.max_pending_segments) return;
+            const merged = self.runOnce() catch return;
+            if (!merged) return;
+        }
+    }
+
     pub fn applyBackpressure(self: *TextMergeRuntime) BackpressureOutcome {
         if (!self.config.enabled) return .not_needed;
         if (self.config.max_pending_segments == 0 and self.config.max_pending_bytes == 0) return .not_needed;
@@ -822,6 +921,8 @@ const PlatformTextMergeRuntime = struct {
         const started_ns = self.backpressureNowNs();
         var wait_started_ns = started_ns;
         var recorded_wait = false;
+        var lending: ?usize = null;
+        defer if (lending) |slot| self.stopLending(slot);
         var waiter = ProducerAdmissionWaiter{ .index_name = index_name };
         defer self.removeProducerAdmissionWaiter(&waiter);
         defer if (recorded_wait) self.recordBackpressureElapsed(started_ns);
@@ -846,6 +947,7 @@ const PlatformTextMergeRuntime = struct {
                     return error.EnrichmentRetryInProgress;
                 }
                 if (!waiter.enqueued) self.enqueueProducerAdmissionWaiter(&waiter);
+                if (lending == null) lending = self.startLending();
                 if (!recorded_wait) {
                     self.backpressure_events += 1;
                     recorded_wait = true;
@@ -943,6 +1045,7 @@ const PlatformTextMergeRuntime = struct {
                 return error.EnrichmentRetryInProgress;
             }
             if (!waiter.enqueued) self.enqueueProducerAdmissionWaiter(&waiter);
+            if (lending == null) lending = self.startLending();
             // The shared byte dimension imposes cross-index FIFO whenever it
             // blocks this request, including when the per-index segment
             // dimension is blocked at the same time.

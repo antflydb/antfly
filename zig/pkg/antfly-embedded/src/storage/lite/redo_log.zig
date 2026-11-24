@@ -130,6 +130,13 @@ pub const Frontier = struct {
     generation: u64,
     sequence: u64,
     end_offset: u64,
+    /// Written before the fsync that also made its records durable, rather
+    /// than after it: a crash inside that fsync can keep this slot and lose
+    /// records it covers, so a reader verifies them (from the other slot's
+    /// end) before trusting it, and falls back to the other slot.
+    combined: bool = false,
+    /// The extent `end_offset` is relative to (`SegmentRotation.active`).
+    segment: u1 = 0,
 
     pub const encoded_len = 40;
     const signature = "AFRF\x01\x00\x00\x00";
@@ -140,6 +147,8 @@ pub const Frontier = struct {
         std.mem.writeInt(u64, raw[8..16], self.generation, .little);
         std.mem.writeInt(u64, raw[16..24], self.sequence, .little);
         std.mem.writeInt(u64, raw[24..32], self.end_offset, .little);
+        raw[32] = @intFromBool(self.combined);
+        raw[33] = self.segment;
         std.mem.writeInt(u32, raw[36..40], Crc32.hash(raw[0..36]), .little);
         return raw;
     }
@@ -147,10 +156,13 @@ pub const Frontier = struct {
     pub fn decode(raw: *const [encoded_len]u8) ?Frontier {
         if (!std.mem.eql(u8, raw[0..8], signature)) return null;
         if (std.mem.readInt(u32, raw[36..40], .little) != Crc32.hash(raw[0..36])) return null;
+        if (raw[32] > 1 or raw[33] > 1) return null;
         return .{
             .generation = std.mem.readInt(u64, raw[8..16], .little),
             .sequence = std.mem.readInt(u64, raw[16..24], .little),
             .end_offset = std.mem.readInt(u64, raw[24..32], .little),
+            .combined = raw[32] == 1,
+            .segment = @intCast(raw[33]),
         };
     }
 };
@@ -172,6 +184,27 @@ pub const FrontierSlots = struct {
     /// already contain the next group's frontier before that group is visible.
     pub fn readSequence(self: FrontierSlots, file: File, io: Io, sequence: u64) !?Published {
         return self.read(file, io, sequence);
+    }
+
+    /// Both logical slots, newest first (either may be absent).
+    pub fn readSlots(self: FrontierSlots, file: File, io: Io) !struct { newest: ?Published, other: ?Published } {
+        const newest = (try self.read(file, io, null)) orelse return .{ .newest = null, .other = null };
+        var other: ?Published = null;
+        for (self.offsets, 0..) |offset, page| {
+            var raw: [2 * Frontier.encoded_len]u8 = undefined;
+            const len = file.readPositionalAll(io, &raw, offset) catch |err| switch (err) {
+                error.InputOutput => continue,
+                else => return err,
+            };
+            for (0..len / Frontier.encoded_len) |copy| {
+                const slot: u1 = @intCast(page ^ copy);
+                if (slot == newest.slot) continue;
+                const frontier = Frontier.decode(raw[copy * Frontier.encoded_len ..][0..Frontier.encoded_len]) orelse continue;
+                if (frontier.sequence >= newest.frontier.sequence) continue;
+                if (other == null or frontier.sequence > other.?.frontier.sequence) other = .{ .slot = slot, .frontier = frontier };
+            }
+        }
+        return .{ .newest = newest, .other = other };
     }
 
     fn read(self: FrontierSlots, file: File, io: Io, sequence: ?u64) !?Published {

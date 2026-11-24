@@ -17,6 +17,7 @@
 //! Receivers borrow local resources; lifetime and scheduling remain with DB.
 
 const CollectSparseFieldWritesProfile = @import("replay_vector_collectors.zig").CollectSparseFieldWritesProfile;
+const write_stage_profile = @import("../write_stage_profile.zig");
 const GraphTtlSha256 = @import("antfly_hash").Sha256;
 pub const IndexTargetVisibility = @import("query_visibility.zig").IndexTargetVisibility;
 const OwnedDenseEmbeddingWrites = @import("replay_vector_collectors.zig").OwnedDenseEmbeddingWrites;
@@ -3395,6 +3396,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             /// in the group apply, last writer wins by version.
             resolution: persistent_mod.PersistentIndex.VersionResolution,
             progress: apply_state.Progress,
+            /// The group leader installed this publication once its commit
+            /// was durable (`complete`), with this outcome: the writer only
+            /// finishes it, needing nothing from its runtime after the wait.
+            completed: bool = false,
+            install_error: ?anyerror = null,
 
             fn mutationsAlloc(self: *InlineTextPublication, alloc: Allocator) ![]native_catalog_backend.Mutation {
                 var out = std.ArrayListUnmanaged(native_catalog_backend.Mutation).empty;
@@ -3415,8 +3421,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 defer self.alloc.free(mutations);
                 if (mutations.len != 0) try view.putIndexCatalog(scope, mutations);
                 _ = try apply_state.contributeProgressTxn(view, self.progress);
-                // Nothing staged depends on another writer of this index:
-                // other writes may prepare and join the same group commit.
+                // The writer released the index guard once prepared
+                // (`releaseIndexGuard`); the leader staging this must not
+                // touch it.
+            }
+
+            /// Called once prepared. Nothing staged depends on another writer
+            /// of this index (copies and deletes are decided at the tip,
+            /// level-0 ids come from versions), so others may prepare and
+            /// join the group. Held any longer, a writer blocked staging
+            /// behind the group leader kept the guard that leader's
+            /// `complete` needs.
+            pub fn releaseIndexGuard(self: *InlineTextPublication) void {
                 self.releaseGuard();
             }
 
@@ -3428,7 +3444,37 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             /// successfully (e.g. after `Ticket.wait()`), never from
             /// inside `stage` itself.
             pub fn participant(self: *InlineTextPublication) commit_participant.Participant {
-                return .{ .ptr = self, .reset = reset, .observe = observe, .stage = stage };
+                return .{
+                    .ptr = self,
+                    .reset = reset,
+                    .observe = observe,
+                    .stage = stage,
+                    .queued = .{ .ptr = self, .validate = validate, .reject = reject, .complete = complete },
+                };
+            }
+
+            // A text publication carries no state from an earlier queued
+            // member: its copies and deletes are decided at the tip.
+            fn validate(_: *anyopaque) anyerror!void {}
+            fn reject(_: *anyopaque) void {}
+
+            /// The group leader, once this member's commit is durable.
+            fn complete(ptr: *anyopaque, outcome: anyerror!u64) void {
+                const self: *InlineTextPublication = @ptrCast(@alignCast(ptr));
+                _ = outcome catch return;
+                // The writer's own `index_locked` is not touched here: it is
+                // false once prepared, and only the writer's thread sets it.
+                // Never wait for the guard: this leader may hold it itself,
+                // further up its stack (its own replay apply of this index),
+                // or wait on a holder that waits on this group. Busy, the
+                // writer installs after its wait instead.
+                if (!self.apply_guard.tryRelockIndex()) return;
+                defer self.apply_guard.unlockIndex();
+                self.installBody() catch |err| {
+                    self.install_error = err;
+                    self.index_manager.index_publication_reopen_required.store(true, .release);
+                };
+                self.completed = true;
             }
 
             /// Runs only after this publication is durable: syncs the
@@ -3439,16 +3485,27 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             /// for just this, not across the commit.
             pub fn install(self: *InlineTextPublication) !void {
                 defer self.finish();
+                if (self.completed) {
+                    if (self.install_error) |err| return err;
+                    return;
+                }
                 errdefer self.index_manager.index_publication_reopen_required.store(true, .release);
                 if (!self.index_locked) {
                     self.apply_guard.relockIndex();
                     self.index_locked = true;
                 }
+                try self.installBody();
+            }
 
+            fn installBody(self: *InlineTextPublication) !void {
+                const mirror_span = write_stage_profile.begin(.text_install_mirror);
                 const mutations = try self.mutationsAlloc(self.alloc);
                 defer self.alloc.free(mutations);
                 try self.entry.persistent.applyExternallyCommittedMutationsIfNativeCatalog(mutations);
                 try self.entry.persistent.reconcileInlineCommittedMutations(self.resolution.decidedMutations());
+                mirror_span.end();
+                const segment_span = write_stage_profile.begin(.text_install_segment);
+                defer segment_span.end();
                 // Consume every segment, including after a failed install.
                 var install_error: ?anyerror = null;
                 for (self.segments[0..self.segment_count]) |*seg| {
@@ -3528,6 +3585,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             index_manager: *index_manager_mod.IndexManager,
             batch: derived_types.DerivedBatch,
             index_ref: index_manager_mod.ManagedIndexRef,
+            max_pending_segments: u64,
         ) !*InlineTextPublication {
             if (index_ref.kind != .full_text) return error.InlineTextPublicationUnsupported;
 
@@ -3542,6 +3600,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 defer index_manager.catalog_mutex.unlockShared();
                 const precheck_entry = index_manager.textIndexEntry(index_ref.name) orelse return error.InlineTextPublicationUnsupported;
                 if (precheck_entry.persistent.main_backend != .native_catalog) return error.InlineTextPublicationUnsupported;
+                // Inline writes take no merge admission and drive no merges.
+                // At the merge runtime's limit, leave this write to the
+                // replay path: its admission assists a merge (Lite runs no
+                // merge worker), which bounds the level-0 segments every
+                // query and reopen visits.
+                if (max_pending_segments != 0) {
+                    const snap = precheck_entry.persistent.acquireSnapshot();
+                    defer snap.release();
+                    if (snap.segments.len >= max_pending_segments) return error.InlineTextPublicationUnsupported;
+                }
             }
 
             var publication_context = try index_manager.acquireTextPublicationContext(alloc, index_ref.name);
@@ -4643,6 +4711,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (collected.missing_required != 0) return error.ReplayDocumentNotVisible;
                 var replay_versions = try TextReplayVersions.init(ctx.alloc, batch, collected.docs.items);
                 defer replay_versions.deinit();
+                // Copies some process already published, or that a newer
+                // write superseded, would only be born dead, and a second
+                // copy of a published version lets a merge revive it
+                // (`PersistentIndex.versionCoveredAtTip`). Replays run under
+                // the writer lease, so the tip cannot move to an older
+                // version before this commit. A skipped key stays in
+                // `replay_versions.indexed`: whoever published its newer
+                // version already superseded its older copies.
+                try dropReplayCopiesCoveredAtTip(ctx, index_ref.name, &collected);
 
                 const reservation_limit = if (ctx.text_merge_runtime) |runtime| runtime.producerSegmentReservationLimit() else std.math.maxInt(usize);
                 var write_start: usize = 0;
@@ -7006,6 +7083,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         /// journal records: each copy and each delete takes its own record's
         /// sequence (`DerivedDocument.sequence`, `DerivedBatch.delete_sequences`),
         /// with positions counted per sequence.
+        fn dropReplayCopiesCoveredAtTip(ctx: *const AsyncContext, index_name: []const u8, collected: anytype) !void {
+            ctx.index_manager.catalog_mutex.lockShared();
+            defer ctx.index_manager.catalog_mutex.unlockShared();
+            const entry = ctx.index_manager.textIndexEntry(index_name) orelse return;
+            if (!entry.persistent.versioned) return;
+            var kept: usize = 0;
+            for (collected.docs.items) |doc| {
+                if (doc.doc_version) |version| if (try entry.persistent.versionCoveredAtTip(ctx.alloc, doc.key, version)) continue;
+                collected.docs.items[kept] = doc;
+                kept += 1;
+            }
+            collected.docs.shrinkRetainingCapacity(kept);
+        }
+
         pub const TextReplayVersions = struct {
             alloc: Allocator,
             batch: derived_types.DerivedBatch,
