@@ -65,6 +65,7 @@ pub fn failureStatus(code: []const u8, diagnostic: ?Value) []const u8 {
         }
     };
     if (std.mem.eql(u8, code, "PartialQueryExecution")) return "partial";
+    if (std.mem.eql(u8, code, "SyncReceiptDeliveryFailed")) return "complete";
     return "unconfirmed";
 }
 

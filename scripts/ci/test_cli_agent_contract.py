@@ -230,6 +230,9 @@ def check_sync_publication_errors(binary):
             for source, code in (
                 ("fixture-durability-unknown.aflite", "DurabilityOutcomeUnknown"),
                 ("fixture-path-exists.aflite", "PathAlreadyExists"),
+                ("fixture-writer-locked.aflite", "WriterLocked"),
+                ("fixture-expansion-limit.aflite", "BackupExpansionLimitExceeded"),
+                ("fixture-receipt-missing.aflite", "SyncReceiptDeliveryFailed"),
             ):
                 result, _ = invoke(
                     binary,
@@ -253,6 +256,11 @@ def check_sync_publication_errors(binary):
                     if code == "DurabilityOutcomeUnknown":
                         require(error["execution"] == "unconfirmed", str(error))
                         require(error["category"] != "argument", str(error))
+                    if code == "SyncReceiptDeliveryFailed":
+                        require(error["execution"] == "complete", str(error))
+                        require(error["category"] == "delivery", str(error))
+                if code == "SyncReceiptDeliveryFailed":
+                    require(b"published --out" in result.stderr, str(result.stderr))
                 if code == "DurabilityOutcomeUnknown":
                     require(
                         b"may already have been published" in result.stderr,
