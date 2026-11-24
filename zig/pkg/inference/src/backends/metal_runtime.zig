@@ -2043,14 +2043,6 @@ pub fn decoderRuntimePipelinedAwaitToken(cb: *const ops.ComputeBackend) !?i64 {
     return decoder_gated_runtime.pipelinedAwaitToken(cb);
 }
 
-pub fn decoderRuntimePipelinedSubmitPending(cb: *const ops.ComputeBackend) bool {
-    return decoder_gated_runtime.pipelinedSubmitPending(cb);
-}
-
-pub fn decoderRuntimePipelinedCancelPending(cb: *const ops.ComputeBackend) void {
-    decoder_gated_runtime.pipelinedCancelPending(cb);
-}
-
 pub fn forwardGreedyTokenFamily(
     cb: *const ops.ComputeBackend,
     allocator: std.mem.Allocator,

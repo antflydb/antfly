@@ -6190,10 +6190,6 @@ pub fn pipelinedAwaitToken(cb: *const ops.ComputeBackend) !?i64 {
     return decoderRuntimePipelinedControl(cb, .await_only);
 }
 
-pub fn pipelinedSubmitPending(cb: *const ops.ComputeBackend) bool {
-    return ((decoderRuntimePipelinedControl(cb, .submit_pending) catch null) != null);
-}
-
 pub fn pipelinedCancelPending(cb: *const ops.ComputeBackend) void {
     _ = decoderRuntimePipelinedControl(cb, .cancel_pending) catch {};
 }

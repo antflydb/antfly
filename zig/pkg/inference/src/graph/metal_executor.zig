@@ -2015,24 +2015,21 @@ const RuntimeContext = struct {
             next_step.seq_len,
             &next_step.decode_context,
         )) |token| {
+            self.pipelined_decode_armed = false;
+            self.pipelined_decode_mode = null;
+            self.pipelined_sampling = null;
+            errdefer decoder_gated_runtime.pipelinedCancelPending(&self.cb);
             if (token < 0) return error.InvalidModelOutput;
             if (try cancelStoppedPipelineToken(&self.cb, token, self.definition.configuration.value.vocab_size, request.continuation)) {
-                self.pipelined_decode_armed = false;
-                self.pipelined_decode_mode = null;
-                self.pipelined_sampling = null;
                 // Same metadata-only speculative append as the existing
                 // cancel path; B never executes or claims written KV rows.
                 self.pipelined_kv_advanced_for = request.position + 1;
-            } else if (metal_runtime.decoderRuntimePipelinedSubmitPending(&self.cb)) {
+            } else if ((try decoder_gated_runtime.decoderRuntimePipelinedControl(&self.cb, .submit_pending)) != null) {
                 self.pipelined_decode_armed = true;
                 self.pipelined_decode_mode = .greedy;
-                self.pipelined_sampling = null;
                 self.pipelined_next_position = request.position + 1;
             } else {
-                metal_runtime.decoderRuntimePipelinedCancelPending(&self.cb);
-                self.pipelined_decode_armed = false;
-                self.pipelined_decode_mode = null;
-                self.pipelined_sampling = null;
+                decoder_gated_runtime.pipelinedCancelPending(&self.cb);
                 self.pipelined_kv_advanced_for = request.position + 1;
             }
             self.noteDecoderRuntimeStateFromCurrentView();
@@ -2124,10 +2121,13 @@ const RuntimeContext = struct {
             request.sampling,
             request.token_history,
         )) orelse return error.ResidentSamplingFrameFailed;
-        if (try cancelStoppedPipelineToken(&self.cb, token, self.definition.configuration.value.vocab_size, request.decode.continuation)) {
-            self.pipelined_decode_armed = false;
-            self.pipelined_decode_mode = null;
-            self.pipelined_sampling = null;
+        self.pipelined_decode_armed = false;
+        self.pipelined_decode_mode = null;
+        self.pipelined_sampling = null;
+        if (cancelStoppedPipelineToken(&self.cb, token, self.definition.configuration.value.vocab_size, request.decode.continuation) catch |err| {
+            decoder_gated_runtime.pipelinedCancelPending(&self.cb);
+            return err;
+        }) {
             self.pipelined_kv_advanced_for = request.decode.position + 1;
             self.noteDecoderRuntimeStateFromCurrentView();
             return token;
@@ -3548,6 +3548,11 @@ test "actual Metal greedy arm rejects an already submitted frame without disturb
             try std.testing.expectError(error.FrameAlreadyActive, decoder_gated_runtime.decoderRuntimePipelinedControl(&cb, .submit_only));
             try std.testing.expect(metal_runtime.hasSubmittedFrame(runtime));
             try std.testing.expect(!metal_runtime.hasActiveFrame(runtime));
+            try metal_runtime.beginFrame(runtime);
+            defer if (metal_runtime.hasActiveFrame(runtime)) metal_runtime.cancelFrame(runtime) catch unreachable;
+            try std.testing.expectError(error.FrameAlreadyActive, decoder_gated_runtime.decoderRuntimePipelinedControl(&cb, .submit_pending));
+            try std.testing.expect(metal_runtime.hasSubmittedFrame(runtime));
+            try std.testing.expect(metal_runtime.hasActiveFrame(runtime));
         }
     };
     try @import("../ops/media_residency_test.zig").onMetal(Fixture.populate, Fixture.check);

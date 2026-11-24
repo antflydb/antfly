@@ -37354,7 +37354,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .full, .submit_only, .step => {},
             .submit_pending => {
                 if (!metal_runtime.hasActiveFrame(runtime)) return false;
-                metal_runtime.submitFrame(runtime) catch return false;
+                try metal_runtime.submitFrame(runtime);
                 return true;
             },
             .cancel_pending => {
