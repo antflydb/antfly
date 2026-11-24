@@ -514,18 +514,24 @@ pub fn encodeProjectedVideoWithSession(
 /// model-sized pixels. `project` runs afterward under the caller's execution lock.
 pub const PortableVideoFrames = struct {
     allocator: std.mem.Allocator,
-    weights: ProjectorWeights,
+    weights: ?ProjectorWeights = null,
     cfg: Config,
     resample: image.Resample,
     prepared: []?PreparedImage,
     resize: antfly_image.processing.PillowResizeCache = .{},
 
     pub fn init(cb: *const ComputeBackend, allocator: std.mem.Allocator, projector: *ProjectorStore, frames: usize) !PortableVideoFrames {
-        var cfg = try parseConfig(&projector.gguf.parsed);
+        var result = try initMetadata(cb, allocator, &projector.gguf.parsed, frames);
+        result.weights = ProjectorWeights.init(cb, allocator, projector.gguf, projector);
+        return result;
+    }
+
+    pub fn initMetadata(cb: *const ComputeBackend, allocator: std.mem.Allocator, metadata: *const gguf_format.File, frames: usize) !PortableVideoFrames {
+        var cfg = try parseConfig(metadata);
         cfg.max_image_tokens = video_tokens_per_frame;
         const prepared = try allocator.alloc(?PreparedImage, frames);
         @memset(prepared, null);
-        return .{ .allocator = allocator, .weights = ProjectorWeights.init(cb, allocator, projector.gguf, projector), .cfg = cfg, .resample = videoResample(cb, cfg), .prepared = prepared };
+        return .{ .allocator = allocator, .cfg = cfg, .resample = videoResample(cb, cfg), .prepared = prepared };
     }
     /// Retained CHW frames plus the largest projection batch and patch staging.
     /// The token bound covers variable presentation geometry within a clip.
@@ -539,7 +545,7 @@ pub const PortableVideoFrames = struct {
         self.resize.deinit();
         for (self.prepared) |item| if (item) |value| value.deinit();
         self.allocator.free(self.prepared);
-        self.weights.deinit();
+        if (self.weights) |*weights| weights.deinit();
     }
     /// Model geometry follows the presentation size, so one resample corrects
     /// non-square pixels without an intermediate stretched raster.
@@ -554,7 +560,8 @@ pub const PortableVideoFrames = struct {
     pub fn project(self: *PortableVideoFrames, timestamps_us: []i64, decoder_source_bytes: u64) !ProjectedVideo {
         self.resize.deinit();
         const a = self.allocator;
-        const cb = self.weights.cb;
+        const weights = if (self.weights) |*value| value else return error.MissingProjector;
+        const cb = weights.cb;
         if (timestamps_us.len != self.prepared.len) return error.InvalidVideoFrame;
         var frames: std.ArrayList(PreparedImage) = .empty;
         defer frames.deinit(a);
@@ -567,7 +574,7 @@ pub const PortableVideoFrames = struct {
         if (kept == 0) return error.EmptyVideo;
         const timestamps = try a.dupe(i64, timestamps_us[0..kept]);
         errdefer a.free(timestamps);
-        const images = try projectPreparedSequence(cb, a, &self.weights, self.cfg, frames.items, .{});
+        const images = try projectPreparedSequence(cb, a, weights, self.cfg, frames.items, .{});
         return .{ .images = images, .timestamps_us = timestamps, .stats = .{ .decoder_source_bytes = decoder_source_bytes, .selected_frames = kept } };
     }
 };
@@ -8751,7 +8758,9 @@ test "gemma4 video portable generation projects large edited AV1 and AVC transpo
     try std.testing.expectError(error.ResourceLimitExceeded, video_input.selectedPresentationUs(a, bytes, .{}, .{ .timestamps = .{} }, null));
     const reference = try video_input.selectedPresentationUs(a, bytes, .{}, .reference, null);
     defer a.free(reference);
-    try std.testing.expectEqualSlices(i64, &.{ 250000, 1250000 }, reference);
+    // The edit begins at 375 ms, inside the 250 ms picture. Reference
+    // sampling selects that picture and the 1250 ms picture in source time.
+    try std.testing.expectEqualSlices(i64, &.{ 0, 875000 }, reference);
     var projected = try @import("../pipelines/gemma4_video.zig").encode(&cb, .{}, a, projector, bytes);
     defer projected.deinit();
     try std.testing.expectEqualSlices(i64, &.{ 0, 1125000 }, projected.timestamps_us);

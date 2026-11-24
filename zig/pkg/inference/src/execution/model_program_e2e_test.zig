@@ -762,7 +762,7 @@ test "model program real companion video stage preserves frame projection and ti
     const session = try factory.createPjrtSessionWithOptions(a, model, try @import("testing/pjrt_qualification.zig").options(.f32, .generic));
     defer session.close();
     for (0..2) |_| {
-        var actual = try @import("../pipelines/gemma4_video.zig").encode(&cb, .{ .session = session }, a, oracle_store, clip);
+        var actual = try @import("../pipelines/gemma4_video.zig").encode(&cb, .{ .session = session }, a, null, clip);
         defer actual.deinit();
         try std.testing.expectEqualSlices(i64, expected.timestamps_us, actual.timestamps_us);
         try std.testing.expectEqualSlices(usize, expected.images.tokens_per_image, actual.images.tokens_per_image);

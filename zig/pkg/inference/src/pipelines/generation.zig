@@ -3481,23 +3481,33 @@ pub const NativeGenerationPipeline = struct {
                 } else {
                     var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
                     defer if (execution_scope) |*scope| scope.deinit();
-                    const request_projector = if (self.projector_store == null)
+                    const pjrt_session = if (self.usesPjrtSession()) self.session else null;
+                    const needs_host_projector = pjrt_session == null;
+                    const request_projector = if (needs_host_projector and self.projector_store == null)
                         try self.openRequestProjector(allocator, projector_path)
                     else
                         null;
                     defer if (request_projector) |store| store.close();
-                    const projector = self.projector_store orelse request_projector.?;
+                    const projector = if (self.projector_store != null) self.projector_store else request_projector;
                     var projected_video = if (video_bytes) |bytes| try gemma4_video.encode(&self.cb, .{ .session = self.session, .run_budget = self.media_run_budget, .explicit_scratch_limit = self.explicit_scratch_limit, .transport_inspection = self.transport_inspection }, allocator, projector, bytes) else null;
                     defer if (projected_video) |*video| video.deinit();
-                    var projected_images = if (self.usesPjrtSession() and images.len != 0) gemma4_projector.PromptImageInput{ .backend = &self.cb, .allocator = allocator, .projector = projector, .images = images, .data = .{ .host = try @import("../execution/media_projection.zig").companionImages(self.session.?, allocator, images, self.execution_control) } } else try gemma4_projector.PromptImageInput.begin(&self.cb, allocator, projector, images);
-                    defer projected_images.deinit();
+                    var compiled_images = if (pjrt_session != null and images.len != 0)
+                        try @import("../execution/media_projection.zig").companionImages(pjrt_session.?, allocator, images, self.execution_control)
+                    else
+                        null;
+                    defer if (compiled_images) |*projected| projected.deinit();
+                    var native_images = if (pjrt_session == null)
+                        try gemma4_projector.PromptImageInput.begin(&self.cb, allocator, projector.?, images)
+                    else
+                        null;
+                    defer if (native_images) |*projected| projected.deinit();
                     const video_prompt = if (projected_video) |*video| try gemma4_mm.expandVideoPromptText(allocator, prompt, video.timestamps_us) else null;
                     defer if (video_prompt) |text| allocator.free(text);
-                    try projected_images.prepareHost();
-                    defer projected_images.releaseHost();
-                    const image_rows: ?decoder_prefill.ProjectedInputRows = if (projected_video) |*video| video.images.promptRows() else try projected_images.rows();
+                    if (native_images) |*projected| try projected.prepareHost();
+                    defer if (native_images) |*projected| projected.releaseHost();
+                    const image_rows: ?decoder_prefill.ProjectedInputRows = if (projected_video) |*video| video.images.promptRows() else if (compiled_images) |*projected| projected.promptRows() else if (native_images) |*projected| try projected.rows() else null;
                     var projected_audio = if (audio_clips.len > 0)
-                        (if (self.usesPjrtSession()) try @import("../execution/media_projection.zig").companionAudio(self.session.?, allocator, audio_clips, self.execution_control) else try gemma4_projector.encodeProjectedAudioForPrompt(&self.cb, allocator, projector, audio_clips))
+                        (if (pjrt_session) |session| try @import("../execution/media_projection.zig").companionAudio(session, allocator, audio_clips, self.execution_control) else try gemma4_projector.encodeProjectedAudioForPrompt(&self.cb, allocator, projector.?, audio_clips))
                     else
                         null;
                     defer if (projected_audio) |*projected| projected.deinit();
