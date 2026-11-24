@@ -191,9 +191,16 @@ pub const LsmOptions = struct {
     native_catalog_sink: ?NativeCatalogSink = null,
     /// Catalog startup activates posting reads before publishing the index.
     retain_native_posting_startup_snapshot: bool = false,
+    /// A validated v2 catalog pointer selects posting authority regardless of the compatibility backend.
+    require_native_posting_authority: bool = false,
 };
 
 pub fn openBackendWithLsmOptions(alloc: Allocator, path: [*:0]const u8, config: anytype, lsm_options: LsmOptions) !OpenedBackend {
+    if (lsm_options.require_native_posting_authority) {
+        const native = (try NativeBackend.openIfAuthoritative(alloc, std.mem.span(path), lsm_options)) orelse
+            return error.InvalidHbcNativeAuthority;
+        return .{ .native = native };
+    }
     return switch (config.storage_backend) {
         .lsm => blk: {
             if (try NativeBackend.openIfAuthoritative(alloc, std.mem.span(path), lsm_options)) |native| {

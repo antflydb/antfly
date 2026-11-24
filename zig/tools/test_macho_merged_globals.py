@@ -23,6 +23,7 @@ from macho_merged_globals import (
     N_ALT_ENTRY,
     prepare_entry_object,
     restore_merged_global_aliases,
+    shorten_private_symbol_names,
 )
 
 
@@ -143,6 +144,23 @@ class MergedGlobals(unittest.TestCase):
         struct.pack_into("<I", bad, 36, 4)
         with self.assertRaisesRegex(ValueError, "command size"):
             restore_merged_global_aliases(bytes(bad))
+
+    def test_long_private_name_preserves_external_symbol_and_indices(self):
+        long_name = "_" + "x" * 20_000
+        original, symbols = macho(
+            [
+                (long_name, 0xE, 1, 0, 0x1040),
+                (long_name + "_export", 0xF, 1, 0, 0x1050),
+            ]
+        )
+        result = shorten_private_symbol_names(original)
+        strings = symbols + 32
+        actual_name = struct.unpack_from("<I", result, symbols)[0]
+        self.assertTrue(
+            result[strings + actual_name :].startswith(b"_antfly_private_0\0")
+        )
+        self.assertEqual(original[symbols + 4 :], result[symbols + 4 : len(original)])
+        self.assertIs(result, shorten_private_symbol_names(result))
 
     def test_staging_preserves_the_compiler_object(self):
         data, _ = macho(
