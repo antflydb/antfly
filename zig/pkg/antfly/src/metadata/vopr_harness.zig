@@ -6925,12 +6925,10 @@ pub const MetadataAdminVoprSource = struct {
             // publication/coordination protocols. Keep these explicit so a
             // newly added Call remains visible to exhaustive compilation.
             .resolver_authority_mutate,
-            .native_memory_create,
             .lake_source_owner_read,
             .lake_index_lifecycle_read,
             .sql_population_lineage,
             .sql_snapshot_cohort,
-            .resolver_authority_mutate,
             .scope_retirement_prepare,
             .store_report_basis,
             .sql_relation_boot_read,

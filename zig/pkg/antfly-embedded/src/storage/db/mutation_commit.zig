@@ -5872,11 +5872,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             participant: ?[]const u8,
             owner: transactions_mod.ExternalDecisionOwner,
             replication: ?transactions_mod.ReplicationOrderedPhase,
+            completion_owner: ?@import("../transaction_completion.zig").RoutedOwner,
         ) !void {
             var preparation: RequestPreparationContext = undefined;
             preparation.init(self);
             defer preparation.deinit();
-            resolveTransactionIntentsPreparedScopedWithLegacy(self, txn_id, status, commit_version, sync_level, cancellation, receipt, participant, null, null, &preparation.guard, null, null, null, owner, replication) catch |err| return preparation.mapError(err);
+            resolveTransactionIntentsPreparedScopedWithLegacy(self, txn_id, status, commit_version, sync_level, cancellation, receipt, participant, null, completion_owner, &preparation.guard, null, null, null, owner, replication) catch |err| return preparation.mapError(err);
         }
 
         pub fn resolveTransactionIntentsPrepared(

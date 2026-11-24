@@ -30823,7 +30823,15 @@ pub const RaftApplyStore = struct {
         const meta = try system_catalog_storage.readMeta(a, &txn, group_id);
         if (meta.revision != command.expected_revision) return error.CatalogGenerationChanged;
         if (command.sql_publication_ddl) |request| {
-            const planned = try self.planSqlPublicationTxn(a, &txn, group_id, request, try sql_catalog_mutations.boundDigest(a, try sql_catalog_mutations.observation(a, command)));
+            const digest = try sql_catalog_mutations.boundDigest(a, try sql_catalog_mutations.observation(a, command));
+            const planned = self.planSqlPublicationTxn(a, &txn, group_id, request, digest) catch |err| {
+                // The admitting reducer durably records semantic rejections.
+                // This read only reports physical enrollment readiness.
+                if (publicationAdmissionRejection(err)) |rejected|
+                    return std.json.Stringify.valueAlloc(alloc, rejected, .{});
+                return err;
+            };
+            if (planned) |work| try self.requirePublicationRootEnrollmentTxn(a, &txn, group_id, work.draft);
             return std.json.Stringify.valueAlloc(alloc, .{ .pending = planned != null }, .{});
         }
         if (command.mutation.kind == .subscription) {
@@ -32222,6 +32230,68 @@ pub const RaftApplyStore = struct {
         return planned;
     }
 
+    // Fail before journal admission when a physical owner cannot sign. Keep
+    // the same proof check at apply time to fence placement and root changes.
+    fn requirePublicationRootEnrollmentTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, draft: publication_installation.Draft) !void {
+        if (draft.members.len == 0) return;
+        var key: [256]u8 = undefined;
+        if (try stagingGet(txn, try standalone_native_owner.key(&key, group))) |data| {
+            const binding = try standalone_native_owner.decode(data);
+            try self.requirePublicationStoreEnrollmentTxn(txn, group, draft.scope.realm.incarnation, binding.store_id, binding.node_id, binding.root_incarnation);
+            return;
+        }
+
+        var checked_stores: std.AutoHashMapUnmanaged(u64, u64) = .empty;
+        defer checked_stores.deinit(a);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        for (draft.members) |member| {
+            const owner = member.request.owner_group_id;
+            const prefix = try std.fmt.bufPrint(&key, "\x00\x00__metadata__:metadata_placement:{d}:{d}:", .{ group, owner });
+            var found = false;
+            var entry = try cursor.seekAtOrAfter(prefix);
+            while (entry) |row| : (entry = try cursor.next()) {
+                if (!std.mem.startsWith(u8, row.key, prefix)) break;
+                const placement = try decodePlacementIntent(a, row.value);
+                defer raft_reconciler.freeIntentOwned(a, placement);
+                if (placement.serving_state != .serving) continue;
+                const checked = try checked_stores.getOrPut(a, placement.store_id);
+                const node = placement.record.local_node_id;
+                if (!checked.found_existing) {
+                    try self.requirePublicationStoreEnrollmentTxn(txn, group, draft.scope.realm.incarnation, placement.store_id, node, null);
+                    checked.value_ptr.* = node;
+                } else if (checked.value_ptr.* != node) return error.CatalogPublicationProofPending;
+                found = true;
+            }
+            if (!found) return error.CatalogPublicationProofPending;
+        }
+    }
+
+    fn requirePublicationStoreEnrollmentTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, incarnation: [32]u8, store_id: u64, node_id: u64, root_incarnation: ?u128) !void {
+        const current = (try self.loadStoreHeaderTxn(txn, group, store_id)) orelse return error.CatalogPublicationProofPending;
+        defer metadata_table_manager.freeStore(self.alloc, current);
+        if (current.node_id != node_id or !metadata_table_manager.storeServesTableData(current.role))
+            return error.CatalogPublicationProofPending;
+        if (root_incarnation) |expected| {
+            if (current.replica_root_incarnation != expected) return error.StoreRootEnrollmentChanged;
+        }
+        self.requireStoreRootEnrollmentTxn(txn, group, .{
+            .metadata_incarnation = incarnation,
+            .node_id = node_id,
+            .store_id = store_id,
+            .root_incarnation = current.replica_root_incarnation,
+            .public_key = current.replica_root_public_key,
+        }) catch |err| return if (err == error.InvalidStoreRootEnrollment) error.StoreRootEnrollmentChanged else err;
+    }
+
+    fn publicationAdmissionRejection(err: anyerror) ?sql_catalog_mutations.Outcome {
+        return switch (err) {
+            error.LogicalCapturePublicationPending, error.LogicalCaptureControlChanged => .{ .rejected = .TableTransitionActive },
+            error.UnsupportedReplicationType, error.InvalidLogicalReplicationRecord => .{ .rejected = .InvalidCatalogMutation },
+            else => sql_catalog_mutations.Outcome.fromError(err),
+        };
+    }
+
     fn applyPublicationAdmissionTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, command: SystemCatalogCommand, digest: [32]u8) !sql_catalog_mutations.Outcome {
         const request = command.sql_publication_ddl.?;
         const meta = try system_catalog_storage.readMeta(a, txn, group);
@@ -32230,11 +32300,9 @@ pub const RaftApplyStore = struct {
             @import("../../system_catalog/command_fence.zig").check(a, txn, group, request.incarnation, fence) catch |err|
                 return sql_catalog_mutations.Outcome.fromError(err) orelse return err;
         }
-        const planned = (self.planSqlPublicationTxn(a, txn, group, request, digest) catch |err| switch (err) {
-            error.LogicalCapturePublicationPending, error.LogicalCaptureControlChanged => return .{ .rejected = .TableTransitionActive },
-            error.UnsupportedReplicationType, error.InvalidLogicalReplicationRecord => return .{ .rejected = .InvalidCatalogMutation },
-            else => return sql_catalog_mutations.Outcome.fromError(err) orelse return err,
-        }) orelse return .{ .success = .{ .revision = meta.revision, .identity = null, .removed = 0, .no_op = true } };
+        const planned = (self.planSqlPublicationTxn(a, txn, group, request, digest) catch |err|
+            return publicationAdmissionRejection(err) orelse return err) orelse
+            return .{ .success = .{ .revision = meta.revision, .identity = null, .removed = 0, .no_op = true } };
         const view: system_catalog_storage.View = .{ .alloc = a, .txn = txn, .group_id = group, .meta = meta };
         const revision = std.math.add(u64, meta.revision, 1) catch return .{ .rejected = .CatalogRevisionExhausted };
         const address = try @import("../../system_catalog/replication/controller.zig").stage(a, view, planned);
@@ -78066,7 +78134,7 @@ test "SQL authorization catalog portable policy imports retain role dependencies
         }
         try std.testing.expect(try rows.hasDependencies(a, &txn, group, role.principal()));
         if (pass == 1) {
-            try system_catalog_storage.applyPolicyCommand(a, &txn, group, .{ .expected_revision = 1, .change = .{ .drop = .{ .id = 902, .generation = 1, .table_id = 901 } } }, @splat(2));
+            try system_catalog_storage.applyPolicyCommand(a, &txn, group, .{ .expected_revision = 1, .change = .{ .drop = .{ .id = 902, .generation = 1, .table_id = 901 } } }, @splat(2), .reject);
             try std.testing.expect(!try rows.hasDependencies(a, &txn, group, role.principal()));
         }
         try txn.commit();
@@ -79974,7 +80042,7 @@ test "generation replacement authorization preflight preserves grants and reject
         .roles = &.{"PUBLIC"},
         .using = .{ .root = 0, .instructions = &.{.{ .type = .{ .kind = .boolean }, .operation = .{ .literal = .{ .bool = true } } }} },
     };
-    try system_catalog_storage.applyPolicyCommand(a, &txn, group, .{ .expected_revision = (try system_catalog_storage.readMeta(a, &txn, group)).revision, .change = .{ .put = policy } }, @splat(0));
+    try system_catalog_storage.applyPolicyCommand(a, &txn, group, .{ .expected_revision = (try system_catalog_storage.readMeta(a, &txn, group)).revision, .change = .{ .put = policy } }, @splat(0), .reject);
     // A rename unlinks a name, not the durable identity. Retain the exact ACL
     // and RLS program instead of erasing them with the old spelling.
     var renamed = resource;

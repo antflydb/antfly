@@ -248,6 +248,7 @@ const completion = frame.completion;
 const completion_credit_prefix = "\x00\x00__committed_history__:completion_credit:";
 pub const completion_certificate_prefix = "\x00\x00__committed_history__:completion_certificate:";
 const completion_retained_prefix = "\x00\x00__committed_history__:completion_retained:";
+const completion_release_prefix = "\x00\x00__committed_history__:completion_release:";
 const publication_wire = @import("history_publication_wire.zig");
 pub const CompletionPublicationPosition = publication_wire.CompletionPublicationPosition;
 pub const CompletionPublication = publication_wire.CompletionPublication;
@@ -643,6 +644,14 @@ fn reclaimNext(txn: anytype, state: *State) !void {
     try txn.delete(&recordKey(sequence));
     state.retained_bytes = std.math.sub(u64, state.retained_bytes, stored) catch return error.HistoryCorrupt;
     state.reclaimed = sequence;
+    const released = completionReleaseKey(sequence);
+    if (try optional(txn, &released)) |raw| {
+        if (raw.len != 16) return error.HistoryCorrupt;
+        const id: [16]u8 = raw[0..16].*;
+        const retained = try RetainedCompletion.decode((try optional(txn, &completionRetainedKey(id))) orelse return error.HistoryCorrupt);
+        try reclaimReleasedCompletion(txn, state, id, retained);
+        try txn.delete(&released);
+    }
 }
 
 fn reclaimForCapacity(txn: anytype, state: *State, additional_bytes: u64) !void {
@@ -719,6 +728,82 @@ const RetainedCompletion = struct {
         return .{ .bytes = std.mem.readInt(u64, raw[4..12], .little), .plan_bytes = std.mem.readInt(u64, raw[12..20], .little), .receipt_bytes = std.mem.readInt(u64, raw[20..28], .little), .certificate_bytes = std.mem.readInt(u64, raw[28..36], .little), .position = .{ .term = std.mem.readInt(u64, raw[36..44], .little), .index = std.mem.readInt(u64, raw[44..52], .little) }, .admission_digest = raw[52..84].*, .certificate_digest = raw[84..116].* };
     }
 };
+
+fn completionReleaseKey(sequence: u64) [completion_release_prefix.len + 8]u8 {
+    var out: [completion_release_prefix.len + 8]u8 = undefined;
+    @memcpy(out[0..completion_release_prefix.len], completion_release_prefix);
+    std.mem.writeInt(u64, out[completion_release_prefix.len..], sequence, .big);
+    return out;
+}
+
+fn CompletionWriterType(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .pointer => |info| info.child,
+        else => T,
+    };
+}
+
+fn reclaimReleasedCompletion(txn: anytype, state: *State, id: [16]u8, retained: RetainedCompletion) !void {
+    const index_key = completionPublicationKey(retained.position.index);
+    const indexed = try CompletionPublicationRecord.decode((try optional(txn, &index_key)) orelse return error.HistoryCorrupt);
+    if (!std.mem.eql(u8, &id, &indexed.transaction_id) or
+        !std.mem.eql(u8, &retained.certificate_digest, &indexed.certificate_digest) or
+        !std.meta.eql(retained.position, indexed.position)) return error.HistoryCorrupt;
+    const plan_key = completion.admission_prefix.* ++ id;
+    const receipt_key = completion.resolutionKey(id);
+    const certificate_key = completionCertificateKey(id);
+    const retained_key = completionRetainedKey(id);
+    if (comptime @hasDecl(CompletionWriterType(@TypeOf(txn)), "deleteCollectedCompletionPlan"))
+        try txn.deleteCollectedCompletionPlan(id)
+    else
+        try txn.delete(&plan_key);
+    try txn.delete(&receipt_key);
+    try txn.delete(&certificate_key);
+    try txn.delete(&retained_key);
+    try txn.delete(&index_key);
+    state.retained_bytes = std.math.sub(u64, state.retained_bytes, retained.bytes) catch return error.HistoryCorrupt;
+}
+
+/// Ordered release after metadata has durably joined every publication. A
+/// consumer can still read its local frame until the acknowledged prefix is
+/// physically reclaimed. Guard-only members have no such frame to retain.
+pub fn releaseCompletion(a: A, txn: anytype, namespace: frame.Namespace, owner: completion.RoutedOwner, id: [16]u8, custody: @import("db/types.zig").CompletionRelease) !void {
+    var state = (try load(txn)) orelse return error.HistoryResynchronizationRequired;
+    try requireNamespace(txn, state, namespace);
+    if (!std.mem.eql(u8, &namespace, &owner.namespace)) return error.InvalidParticipant;
+    const raw = (try optional(txn, &completionRetainedKey(id))) orelse {
+        if (try optional(txn, &completionCertificateKey(id)) != null or
+            try optional(txn, &(completion.admission_prefix.* ++ id)) != null or
+            try optional(txn, &completion.resolutionKey(id)) != null) return error.SourceOutcomeUnresolved;
+        return;
+    };
+    const retained = try RetainedCompletion.decode(raw);
+    if (!std.mem.eql(u8, &retained.certificate_digest, &custody.certificate_digest)) return error.DecisionConflict;
+    const record = (try optional(txn, &(completion.record_prefix.* ++ id))) orelse return error.HistoryCorrupt;
+    try @import("transactions.zig").requireExternalCompletionRelease(record, custody.decision_owner);
+    const receipt_raw = (try optional(txn, &completion.resolutionKey(id))) orelse return error.HistoryCorrupt;
+    var receipt = try completion.parseStoredResolution(a, receipt_raw);
+    defer receipt.deinit();
+    const resolution = receipt.value.resolution;
+    if (!std.mem.eql(u8, &resolution.namespace, &namespace) or
+        !std.mem.eql(u8, &resolution.owner_fence, &owner.digest())) return error.InvalidParticipant;
+    const sequence = switch (resolution.outcome) {
+        .effects => |effects| effects.sequence,
+        .no_effect => 0,
+    };
+    if (sequence > state.latest) return error.HistoryCorrupt;
+    if (sequence > state.reclaimed) {
+        const key = completionReleaseKey(sequence);
+        if (try optional(txn, &key)) |prior| {
+            if (!std.mem.eql(u8, prior, &id)) return error.HistoryCorrupt;
+            return;
+        }
+        try txn.put(&key, &id);
+        return;
+    }
+    try reclaimReleasedCompletion(txn, &state, id, retained);
+    try save(txn, state);
+}
 
 /// Trusted ordered owner publication only. The caller must authenticate every
 /// remote receipt through qualified original-owner reads before this reducer.

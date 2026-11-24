@@ -185,7 +185,10 @@ pub const CatalogBinding = struct {
 
 pub const CatalogOutcome = enum { pending, published, canceled };
 
+const history = local.api_local_table_writes.table_write_source.history_resolution_wire.completion;
+
 pub const Identity = struct {
+    history_completion: ?history.Admission = null,
     catalog_participant: ?CatalogParticipant = null,
     notification_plan: ?local.sql_ast.notifications.Plan = null,
     kind: Kind = .named,
@@ -206,7 +209,9 @@ pub const Identity = struct {
     manifest_digest: [32]u8,
 
     pub fn minimumDecoderVersion(self: Identity) u16 {
-        if (self.catalog_participant != null) return @import("../metadata/topology_protocol.zig").sql_catalog_completion_version;
+        const protocol = @import("../metadata/topology_protocol.zig");
+        if (self.history_completion != null) return protocol.sql_external_completion_version;
+        if (self.catalog_participant != null) return protocol.sql_catalog_completion_version;
         return decoderFloor(self.requiresConnectionDecoder(), self.lock_scope != null, self.lock_scope != null and self.kind == .named, self.notification_plan != null);
     }
     pub fn preparedLockLease(self: Identity, a: A, group: u64) !local.storage_pessimistic_lock_ledger.Lease {
@@ -221,6 +226,17 @@ pub const Identity = struct {
     }
 
     pub fn validate(self: Identity) !void {
+        if (self.history_completion) |admission| {
+            if (self.kind == .replication or admission.version < 3 or
+                !std.mem.eql(u8, &admission.transaction_id, &self.txn_id)) return error.InvalidCatalogMutation;
+            try admission.validate();
+            if (admission.participants.len > max_participants) return error.CatalogCommandTooLarge;
+            for (admission.participants) |member| {
+                const routed = member.routed_owner orelse return error.InvalidCatalogMutation;
+                if (!std.mem.eql(u8, &routed.metadata_incarnation, &self.metadata_incarnation) or
+                    member.roles & history.Roles.checkpoint != 0) return error.InvalidCatalogMutation;
+            }
+        }
         if (self.catalog_participant) |catalog| {
             try catalog.validate();
             if (self.kind == .replication or self.lock_scope == null or self.session == null or
@@ -259,7 +275,7 @@ pub const Identity = struct {
     pub fn jsonStringify(self: Identity, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(Identity).@"struct".field_names) |field| {
-            if (comptime std.mem.eql(u8, field, "catalog_participant") or std.mem.eql(u8, field, "lock_scope") or std.mem.eql(u8, field, "notification_plan") or std.mem.eql(u8, field, "replication_source")) {
+            if (comptime std.mem.eql(u8, field, "catalog_participant") or std.mem.eql(u8, field, "lock_scope") or std.mem.eql(u8, field, "notification_plan") or std.mem.eql(u8, field, "replication_source") or std.mem.eql(u8, field, "history_completion")) {
                 if (@field(self, field) != null) {
                     try writer.objectField(field);
                     try writer.write(@field(self, field));
@@ -275,6 +291,33 @@ pub const Identity = struct {
             }
         }
         try writer.endObject();
+    }
+
+    fn validateHistoryCohort(self: Identity, participants: []const Participant) !void {
+        const admission = self.history_completion orelse return;
+        if (participants.len != admission.participants.len) return error.InvalidCatalogMutation;
+        const coordinator = try admission.coordinatorOwner();
+        if (participants[0].route.route.group_id != coordinator.group_id) return error.InvalidCatalogMutation;
+        var matched: u64 = 0;
+        for (admission.participants) |member| {
+            const routed = member.routed_owner orelse return error.InvalidCatalogMutation;
+            const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidCatalogMutation;
+            if (locator.group_id != routed.group_id or locator.restore_staging_scope != null or locator.restore_staging_plan_id != null)
+                return error.InvalidCatalogMutation;
+            for (participants, 0..) |participant, index| {
+                const fence = participant.route;
+                if (fence.route.group_id != routed.group_id) continue;
+                const ns = fence.route.identity_namespace;
+                const namespace = local.storage_db_online_source_contract.namespaceBytes(.{ .table_id = ns.table_id, .shard_id = ns.shard_id, .range_id = ns.range_id });
+                if (fence.route.execution != .raft or routed.metadata_group_id != fence.metadata_group_id or
+                    routed.topology_epoch != fence.topology_epoch or !std.mem.eql(u8, &routed.namespace, &namespace) or
+                    !std.mem.eql(u8, locator.table_name, participant.table_name)) return error.InvalidCatalogMutation;
+                const bit = @as(u64, 1) << @as(u6, @intCast(index));
+                if (matched & bit != 0) return error.InvalidCatalogMutation;
+                matched |= bit;
+                break;
+            } else return error.InvalidCatalogMutation;
+        }
     }
 
     pub fn owner(self: Identity, a: A) !Owner {
@@ -634,6 +677,8 @@ pub const Record = struct {
     visibility_repairs: u64 = 0,
     locks_released: bool = false,
     decision: ?Decision = null,
+    history_certificate: ?history.Digest = null,
+    history_released: u64 = 0,
     /// Irreversible image retirement is independent of the global decision.
     /// These metadata-verified facts never assert a native row/intent ACK.
     native_retirements: []const NativeRetirement = &.{},
@@ -645,6 +690,8 @@ pub const Record = struct {
     pub fn nativeJsonSkipField(self: Record, comptime field: []const u8) bool {
         return (std.mem.eql(u8, field, "catalog_outcome") and self.identity.catalog_participant == null) or
             (std.mem.eql(u8, field, "catalog_retired") and self.catalog_retired == 0) or
+            (std.mem.eql(u8, field, "history_certificate") and self.history_certificate == null) or
+            (std.mem.eql(u8, field, "history_released") and self.history_released == 0) or
             (std.mem.eql(u8, field, "replication_event") and self.replication_event == null) or
             (std.mem.eql(u8, field, "replication_intents") and self.replication_intents == null) or
             (std.mem.eql(u8, field, "replication_ack") and self.replication_ack == null) or
@@ -743,7 +790,8 @@ pub const Record = struct {
 
     pub fn commitProgress(self: Record) CommitProgress {
         if (self.phase == .decided or self.phase == .active or self.native_lock_releases != self.nativeLockMask() or
-            (self.identity.catalog_participant != null and self.phase != .retired)) return .resolving;
+            (self.identity.catalog_participant != null and self.phase != .retired) or
+            (self.identity.history_completion != null and (self.history_certificate == null or self.history_released != self.mask()))) return .resolving;
         if (self.visibility != self.visibilityMask()) return .indexing;
         return if (self.visibility_repairs != 0) .repair_required else .ready;
     }
@@ -807,6 +855,14 @@ pub const Record = struct {
 
     pub fn validate(self: Record, a: A) !void {
         try self.identity.validate();
+        try self.identity.validateHistoryCohort(self.participants);
+        if (self.history_released & ~self.mask() != 0 or (self.history_released != 0 and self.history_certificate == null))
+            return error.InvalidCatalogRecord;
+        if (self.history_certificate) |certificate| {
+            if (self.identity.history_completion == null or std.mem.allEqual(u8, &certificate, 0) or
+                (self.phase != .resolved and self.phase != .retired) or self.decision == null or self.decision.?.status != .committed)
+                return error.InvalidCatalogRecord;
+        }
         if (self.identity.kind == .replication) {
             const event = self.replication_event orelse return error.InvalidCatalogRecord;
             if (!std.mem.eql(u8, &try event.eventDigest(), &self.identity.replication_source.?.event_digest)) return error.InvalidCatalogRecord;
@@ -994,6 +1050,8 @@ pub const Action = union(enum) {
     catalog_complete: CatalogOutcome,
     resolve: u64,
     visibility: struct { complete: u64, repair: u64 = 0 },
+    history_published: history.Digest,
+    history_released: u64,
     handoff,
 };
 
@@ -1143,7 +1201,21 @@ pub fn advance(a: A, record: Record, expected_revision: u64, owner: Owner, actio
             next.visibility |= progress.complete;
             next.visibility_repairs |= progress.repair;
         },
+        .history_published => |digest_value| {
+            if (record.identity.history_completion == null or record.phase != .resolved or record.decision.?.status != .committed or std.mem.allEqual(u8, &digest_value, 0))
+                return error.InvalidPreparedTransactionPhase;
+            if (record.history_certificate) |prior| if (!std.mem.eql(u8, &prior, &digest_value))
+                return error.ExternalTransactionDecisionChanged;
+            next.history_certificate = digest_value;
+        },
+        .history_released => |members| {
+            if (record.phase != .resolved or record.history_certificate == null or members == 0 or members & ~all != 0)
+                return error.InvalidPreparedTransactionPhase;
+            next.history_released |= members;
+        },
         .handoff => {
+            if (record.identity.history_completion != null and record.decision != null and record.decision.?.status == .committed and
+                (record.history_certificate == null or record.history_released != all)) return error.CatalogPublicationProofPending;
             if (record.identity.catalog_participant != null and record.catalog_outcome == .pending) return error.InvalidPreparedTransactionPhase;
             if (record.publicationCaptureMask() != 0) {
                 const decision = record.decision orelse return error.CatalogPublicationProofPending;
@@ -1611,6 +1683,7 @@ fn validateAdmission(self: Mutation, request: AdmissionInput, actor: Actor) !voi
     try (Owner{ .metadata_incarnation = request.identity.metadata_incarnation, .operation_id = request.identity.operation_id, .admission_digest = @splat(1), .expires_at_unix_ns = request.identity.expires_at_unix_ns }).requireFreshVoteAt(request.admitted_at_ns);
     if (request.participants.len > max_participants) return error.CatalogCommandTooLarge;
     for (request.participants) |participant| try participant.validate(request.identity.metadata_incarnation);
+    try request.identity.validateHistoryCohort(request.participants);
 }
 
 /// Cancellation is an alternative execution of the exact same admission, not
@@ -2468,6 +2541,80 @@ test "SQL prepared transaction receipt work uses an explicit standalone realm wi
     try std.testing.expectError(error.InvalidCatalogMutation, (Read{ .receipt_work = .{ .owner_node_id = 0 } }).validate());
     try std.testing.expectError(error.InvalidCatalogMutation, (Read{ .receipt_work = .{ .standalone = true } }).validate());
     try std.testing.expectError(error.InvalidCatalogMutation, (Read{ .receipt_work = .{ .owner_node_id = 9, .standalone = true } }).validate());
+}
+
+test "prepared history requires a durable certificate before handoff" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const epoch: [32]u8 = @splat('1');
+    const participants = [_]Participant{.{
+        .table_name = "docs",
+        .route = .{
+            .metadata_group_id = 1,
+            .metadata_incarnation = epoch,
+            .catalog_revision = 2,
+            .table_id = 3,
+            .topology_epoch = 1,
+            .route = .{ .group_id = 7, .range_id = 8, .identity_namespace = .{ .table_id = 3, .shard_id = 7, .range_id = 8 } },
+        },
+    }};
+    const routed: history.RoutedOwner = .{
+        .metadata_group_id = 1,
+        .metadata_incarnation = epoch,
+        .namespace = local.storage_db_online_source_contract.namespaceBytes(.{ .table_id = 3, .shard_id = 7, .range_id = 8 }),
+        .table_binding = @splat(2),
+        .root_generation = 0,
+        .group_id = 7,
+        .topology_epoch = 1,
+    };
+    const members = [_]history.Participant{.{
+        .namespace = routed.namespace,
+        .owner_fence = routed.digest(),
+        .roles = history.Roles.effects,
+        .locator = try local.api_local_transaction_contract.participantIdForGroup(a, "docs", 7),
+        .input_digest = @splat(4),
+        .routed_owner = routed,
+    }};
+    const identity: Identity = .{
+        .gid = "prepared_history",
+        .database_id = 1,
+        .principal = .bootstrap,
+        .txn_id = @splat(2),
+        .operation_id = @splat(3),
+        .metadata_incarnation = epoch,
+        .begin_timestamp = 10,
+        .expires_at_unix_ns = 1000,
+        .plan_digest = try planDigest("[]"),
+        .manifest_digest = try manifestDigest(a, &participants, epoch),
+        .history_completion = .{
+            .version = 3,
+            .transaction_id = @splat(2),
+            .admission_digest = @splat(6),
+            .coordinator_namespace = routed.namespace,
+            .coordinator_fence = routed.digest(),
+            .participants = &members,
+        },
+    };
+    const owner = try identity.owner(a);
+    var record: Record = .{ .identity = identity, .participants = &participants, .phase = .prepared, .was_prepared = true, .votes = 1 };
+    record = try advance(a, record, record.revision, owner, .{ .commit = .{ .version = 20 } });
+    record = try advance(a, record, record.revision, owner, .{ .activate = 1 });
+    record = try advance(a, record, record.revision, owner, .{ .resolve = 1 });
+    try std.testing.expectEqual(CommitProgress.resolving, record.commitProgress());
+    try std.testing.expectError(error.CatalogPublicationProofPending, advance(a, record, record.revision, owner, .handoff));
+    const certificate: history.Digest = @splat(7);
+    record = try advance(a, record, record.revision, owner, .{ .history_published = certificate });
+    const encoded = try std.json.Stringify.valueAlloc(a, record, .{});
+    record = try std.json.parseFromSliceLeaky(Record, a, encoded, .{});
+    try std.testing.expectEqualDeep(certificate, record.history_certificate.?);
+    try std.testing.expectEqual(CommitProgress.resolving, record.commitProgress());
+    try std.testing.expectError(error.CatalogPublicationProofPending, advance(a, record, record.revision, owner, .handoff));
+    try std.testing.expectError(error.ExternalTransactionDecisionChanged, advance(a, record, record.revision, owner, .{ .history_published = @splat(8) }));
+    record = try advance(a, record, record.revision, owner, .{ .history_released = 1 });
+    try std.testing.expectEqual(CommitProgress.ready, record.commitProgress());
+    record = try advance(a, record, record.revision, owner, .handoff);
+    try std.testing.expectEqual(Phase.retired, record.phase);
 }
 
 test "SQL prepared native retirement preserves undecided identity and separates loss facts from global commit" {

@@ -99,6 +99,11 @@ fn pregrantIntent(request: types.TransactionIntentRequest) types.TransactionInte
     logical.publication_capture = null; // independently checked post-admission P grant, never a circular input
     logical.external_decision_owner = null;
     logical.external_activation = false;
+    if (logical.completion_owner != null) {
+        logical.completion_owner = null;
+        logical.completion_input_digest = null;
+        logical.document_version_scheme = .admit_current;
+    }
     logical.timestamp_ns = 0;
     logical.trigger_preparation_proof = "";
     logical.trigger_preparation_group_id = 0;

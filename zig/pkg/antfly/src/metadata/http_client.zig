@@ -1865,6 +1865,12 @@ pub const MetadataHttpClient = struct {
         }
         if (input.isRelationalIndexOwnerCall()) if (@import("relational_index/publication.zig").ownerAckHttpFailure(response.status, response.body)) |err| return err;
         if (system_catalog.definiteNamingError(response.status, response.body)) |err| return err;
+        if (input == .sql_catalog_mutate and input.sql_catalog_mutate.sql_publication_ddl != null) {
+            if (response.status == 409 and std.mem.eql(u8, response.body, "StoreRootEnrollmentChanged"))
+                return error.StoreRootEnrollmentChanged;
+            if (response.status == 503 and std.mem.eql(u8, response.body, "CatalogPublicationProofPending"))
+                return error.CatalogPublicationProofPending;
+        }
         return switch (response.status) {
             400 => if (input == .store_root_enroll and std.mem.eql(u8, response.body, "InvalidStoreRootEnrollment"))
                 error.InvalidStoreRootEnrollment

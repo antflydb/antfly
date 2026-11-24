@@ -191,6 +191,15 @@ pub fn graphTransactionProtocol(req: @import("antfly_local_sources").storage_db_
 }
 
 pub fn externalTransactionProtocol(req: @import("antfly_local_sources").storage_db_types.BatchRequest) ?u16 {
+    if (req.transaction) |transaction| {
+        const external_completion = switch (transaction) {
+            .begin => |begin| begin.external_decision_owner != null and begin.completion_admission != null,
+            .prepare => |prepare| prepare.external_decision_owner != null and prepare.completion_owner != null,
+            .resolve => |resolve| resolve.external_decision_owner != null and resolve.completion_owner != null,
+            else => false,
+        };
+        if (external_completion) return data_raft_protocol.batch_external_completion_protocol_version;
+    }
     if (req.replicationSourcePermit() != null) return data_raft_protocol.batch_replication_source_prepare_protocol_version;
     if (req.logical_publication_gc != null) return data_raft_protocol.batch_publication_collection_protocol_version;
     if (req.logical_publication_control != null) return data_raft_protocol.batch_publication_capture_protocol_version;

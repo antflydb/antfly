@@ -4928,6 +4928,7 @@ pub fn ensureSqlPreparedPublicationCapabilityWithContext(service: anytype, conte
         .cancel_admission => |canceled| @max(minimum, canceled.original.identity.minimumDecoderVersion()),
         .advance => |advance| switch (advance.action) {
             .catalog_complete => metadata_topology_protocol.sql_catalog_completion_version,
+            .history_published, .history_released => metadata_topology_protocol.sql_external_completion_version,
             .publication_capacity, .publication_vote, .publication_terminal, .publication_abort_fence => publisher,
             .commit => |decision| if (decision.commit_time_unix_us != null) publisher else minimum,
             else => minimum,

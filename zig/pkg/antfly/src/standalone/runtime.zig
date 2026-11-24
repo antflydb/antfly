@@ -4516,6 +4516,7 @@ const LocalStandaloneMetadata = struct {
                 const previous = try store.sqlCatalogOutcome(alloc, group_ids.main_metadata_group_id, observation);
                 defer alloc.free(previous);
                 if (!std.mem.eql(u8, previous, "null")) return alloc.dupe(u8, previous);
+                try @import("../system_catalog/operations.zig").preflightPublicationEnrollment(store, alloc, group_ids.main_metadata_group_id, command);
                 const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
                 defer alloc.free(bytes);
                 if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;

@@ -89,7 +89,7 @@ pub const Port = struct {
         const decision = observation.decision orelse return error.SourceOutcomeUnresolved;
         const admission = decision.admission.admission;
         try observation.validate(lookup);
-        if (decision.record.status == .pending) return error.SourceOutcomeUnresolved;
+        if (decision.record.status == .pending or decision.record.externally_owned) return error.SourceOutcomeUnresolved;
         if (index >= admission.participants.len) return error.InvalidParticipant;
         const member = admission.participants[index];
         const owner = member.routed_owner orelse return error.ChangefeedCapabilityUnsupported;
@@ -125,12 +125,21 @@ pub const Port = struct {
 
     /// Settle participant tracking after recovery confirms publication on every
     /// committed owner or rollback on every aborted owner.
+    pub fn submitExternal(self: Port, a: A, member: completion.Participant, fence: metadata.CatalogRouteFence, request: types.BatchRequest, original: operation.RequestContext) !void {
+        var scope = try @import("history_publication_operations.zig").Scope.init(fence, original);
+        const context = scope.context();
+        const owner = member.routed_owner orelse return error.InvalidParticipant;
+        const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
+        try validateParticipantFence(owner, locator.group_id, fence);
+        return self.writeRequest(a, fence, owner, locator.table_name, request, context, scope.deadline_ns);
+    }
+
     pub fn acknowledgeResolved(self: Port, a: A, lookup: @import("history_decision_operations.zig").wire.Query, observation: @import("history_decision_operations.zig").wire.Reply, fence: metadata.CatalogRouteFence, original: operation.RequestContext) !void {
         var scope = try @import("history_publication_operations.zig").Scope.init(fence, original);
         const context = scope.context();
         try observation.validate(lookup);
         const decision = observation.decision orelse return error.SourceOutcomeUnresolved;
-        if (decision.record.status == .pending) return error.SourceOutcomeUnresolved;
+        if (decision.record.status == .pending or decision.record.externally_owned) return error.SourceOutcomeUnresolved;
         if (!decision.record.acknowledgments_pending) return;
         const admission = decision.admission.admission;
         const owner = try admission.coordinatorOwner();
@@ -214,7 +223,7 @@ pub const Port = struct {
         try observation.validate(lookup);
         const decision = observation.decision orelse return error.SourceOutcomeUnresolved;
         if (cutoff_ns == 0 or timestamp_ns < cutoff_ns or decision.record.status != .pending or decision.record.created_at_ns >= cutoff_ns) return error.SourceOutcomeUnresolved;
-        if (decision.record.source_purpose != null) return error.SourceOutcomeUnresolved;
+        if (decision.record.source_purpose != null or decision.record.externally_owned) return error.SourceOutcomeUnresolved;
         const admission = decision.admission.admission;
         const member = try admission.coordinatorMember();
         const owner = member.routed_owner orelse return error.ChangefeedCapabilityUnsupported;
@@ -266,7 +275,7 @@ pub const HttpWriter = struct {
         const self: *HttpWriter = @ptrCast(@alignCast(ptr));
         if (authority != .catalog or authority.catalog.route.group_id != group) return error.InvalidCatalogRouteFence;
         try context.ensureActive();
-        const encoded = try batch.encodeBatchRequest(a, request);
+        const encoded = try batch.encodeRoutedBatchRequest(a, request);
         defer a.free(encoded);
         const fence = try std.json.Stringify.valueAlloc(a, authority.catalog, .{});
         defer a.free(fence);

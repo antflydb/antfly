@@ -30197,12 +30197,48 @@ pub const DB = struct {
             lock_bytes = try @import("../pessimistic_lock/transaction.zig").encode(self.alloc, .{ .ref = ref });
             try writes.append(self.alloc, .{ .key = &lock_key, .value = lock_bytes.? });
         }
-        return self.core.beginTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(request.txn_id, request.begin_timestamp, request.created_at_ns, request.participants, request.coordinator, true, .{
+        const extra: transactions_mod.MutationExtraBatch = .{
             .document_revision_scope = request.document_revision_scope,
             .external_decision_owner = request.owner,
             .native_pin = try self.relationPhysicalPin(),
             .writes = writes.items,
-        });
+            .completion_owner = request.completion_owner,
+            // A completion admission proves ordinary row provenance. The
+            // external owner still exclusively authorizes the decision.
+            .ordinary_producer = request.completion_admission != null,
+        };
+        if (request.completion_admission) |raw| {
+            const completion = @import("../transaction_completion.zig");
+            const binding = request.completion_owner orelse return error.InvalidHistoryAdmission;
+            if (request.ordered_receipt == null or request.restore_staging_scope != null or
+                self.local_execution.restore_staging_required.load(.acquire)) return error.ChangefeedCapabilityUnsupported;
+            if (!std.mem.eql(u8, &request.owner.metadata_incarnation, &binding.metadata_incarnation)) return error.InvalidHistoryAdmission;
+            var parsed = try completion.parseAdmission(self.alloc, raw);
+            defer parsed.deinit();
+            const plan = parsed.value.admission;
+            if (plan.version < 3 or parsed.value.local_owner_fence != null or
+                !std.mem.eql(u8, &plan.transaction_id, &request.txn_id)) return error.InvalidHistoryAdmission;
+            const member = try plan.memberForOwner(binding);
+            if (plan.isCoordinator(member) != request.coordinator) return error.InvalidParticipant;
+            const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+            if (!std.mem.eql(u8, &binding.namespace, &namespace) or binding.root_generation != self.core.root_generation)
+                return error.HistoryResynchronizationRequired;
+            {
+                var read = try self.core.store.beginReadTxn();
+                defer read.abort();
+                _ = try @import("../source_authority.zig").require(&read, .raft, namespace);
+                _ = (try @import("../committed_history.zig").load(&read)) orelse return error.HistoryResynchronizationRequired;
+            }
+            var manager = try self.core.initTxnManager();
+            defer manager.deinit();
+            if (request.coordinator)
+                try manager.initTransactionWithCompletionAdmission(plan, request.begin_timestamp, request.created_at_ns, true, extra)
+            else
+                try manager.initParticipantWithCompletionAdmission(plan, request.begin_timestamp, request.created_at_ns, true, extra);
+            return request.txn_id;
+        }
+        if (request.completion_owner != null) return error.InvalidHistoryAdmission;
+        return self.core.beginTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(request.txn_id, request.begin_timestamp, request.created_at_ns, request.participants, request.coordinator, true, extra);
     }
 
     pub fn beginTransactionScoped(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, scope: ?[32]u8) !transactions_mod.TxnId {
@@ -31042,6 +31078,31 @@ pub const DB = struct {
             txn_open = false;
             return outcome;
         }
+    }
+
+    /// Release metadata custody while retaining any frame still pinned by consumers.
+    pub fn releaseReplicatedCompletionCertificate(self: *DB, id: types.TxnId, owner: @import("../transaction_completion.zig").RoutedOwner, release: types.CompletionRelease, entry: OrderedApplyReceipt) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("releaseReplicatedCompletionCertificate", .{ self, id, owner, release, entry });
+        try release.validate(owner);
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (self.local_execution.replication_async_batch_mirror != null) return error.HistoryAuthorityRequired;
+        var admission = self.core.snapshot_admission.acquireMutation();
+        defer admission.release();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        if (owner.root_generation != self.core.root_generation or !std.mem.eql(u8, &owner.namespace, &namespace))
+            return error.HistoryResynchronizationRequired;
+        if (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry) == .already_applied) return;
+        var txn = try self.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try @import("../source_authority.zig").require(&txn, .raft, namespace);
+        try @import("../committed_history.zig").releaseCompletion(self.alloc, &txn, namespace, owner, id, release);
+        var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+        const marker = orderedApplyReceiptWrite(entry, &marker_bytes);
+        try txn.put(marker.key, marker.value);
+        try txn.commit();
     }
 
     /// Private ordered publication of a certificate assembled from qualified
@@ -33112,7 +33173,10 @@ pub const DB = struct {
                 return error.ReplicationCutoverAuthorityLost;
             break :blk .{ .permit = permit, .physical_root = self.root_incarnation, .position = .{ .raft = .{ .term = position.term, .index = position.index } } };
         } else null;
-        try local_mutation.resolveExternalTransactionIntents(self, request.txn_id, request.status, request.commit_version, request.sync_level, request.visibility_cancellation, request.ordered_receipt, request.resolved_participant, request.owner, replication_resolution);
+        if (request.completion_owner) |binding| {
+            if (request.ordered_receipt == null or !std.mem.eql(u8, &request.owner.metadata_incarnation, &binding.metadata_incarnation)) return error.InvalidHistoryAdmission;
+        }
+        try local_mutation.resolveExternalTransactionIntents(self, request.txn_id, request.status, request.commit_version, request.sync_level, request.visibility_cancellation, request.ordered_receipt, request.resolved_participant, request.owner, replication_resolution, request.completion_owner);
     }
 
     fn activateExternalTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest, ordered: ?OrderedApplyReceipt) !void {

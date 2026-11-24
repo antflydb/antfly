@@ -236,6 +236,7 @@ pub fn mutateSqlCatalog(svc: anytype, alloc: std.mem.Allocator, context: operati
     var locked = true;
     defer if (locked) svc.unlockCatalogMutation();
     try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    try preflightPublicationEnrollment(store, alloc, svc.metadata_group_id, command);
     try context.ensureActive();
     const receipt = try @import("../metadata/service.zig").proposeCatalogWithContext(svc, context, .{ .apply_system_catalog = bytes });
     svc.unlockCatalogMutation();
@@ -247,6 +248,16 @@ pub fn mutateSqlCatalog(svc: anytype, alloc: std.mem.Allocator, context: operati
         return error.MetadataMutationOutcomeUnknown;
     }
     return result;
+}
+
+pub fn preflightPublicationEnrollment(store: anytype, alloc: std.mem.Allocator, group: u64, command: storage.SystemCatalogCommand) !void {
+    if (command.sql_publication_ddl == null) return;
+    const preview = store.prepareSystemCatalogResult(alloc, group, command) catch |err| switch (err) {
+        // The reducer retains the nonce outcome for a stale catalog cut.
+        error.CatalogGenerationChanged => return,
+        else => return err,
+    };
+    alloc.free(preview);
 }
 
 pub fn mutateSqlNativeIndex(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("native_indexes.zig").Mutation) ![]u8 {

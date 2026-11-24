@@ -56,7 +56,10 @@ pub const batch_replication_source_prepare_protocol_version: u16 = 69;
 /// Version 70 orders CDC attempt retirement against the original native BEGIN.
 pub const batch_source_attempt_fence_protocol_version: u16 = 70;
 pub const batch_source_checkpoint_install_protocol_version: u16 = 71;
-pub const batch_protocol_version: u16 = batch_source_checkpoint_install_protocol_version;
+/// Carries a physical completion plan while preserving the independent
+/// metadata decision owner of a scoped SQL transaction.
+pub const batch_external_completion_protocol_version: u16 = 72;
+pub const batch_protocol_version: u16 = batch_external_completion_protocol_version;
 pub const maximum_decodable_batch_protocol_version: u16 = batch_protocol_version;
 pub const batch_split_origin_enrollment_protocol_version: u16 = 54;
 pub const batch_split_history_seed_protocol_version: u16 = 53;
@@ -168,6 +171,9 @@ pub fn completionProtocolVersion(a: @import("std").mem.Allocator, request: anyty
             }
         },
         .publish_completion => |value| {
+            if (comptime @hasField(@TypeOf(value), "release")) {
+                if (value.release != null) return batch_external_completion_protocol_version;
+            }
             if (try completionEnvelopeVersion(a, value.certificate, true) >= 4)
                 return batch_physical_completion_protocol_version;
         },

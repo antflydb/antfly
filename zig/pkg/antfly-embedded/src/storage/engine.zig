@@ -629,6 +629,7 @@ pub const VTable = struct {
     orderedHistoryOutcome: *const fn (*DB, std.mem.Allocator, @import("history_ordered.zig").Lookup) Outcome(@import("history_ordered.zig").Outcome),
     nativeHistoryGrant: *const fn (*DB, @import("history_consumer.zig").GrantIdentity) Outcome(@import("history_consumer.zig").GrantObservation),
     orderedHistoryGrant: *const fn (*DB, @import("history_consumer.zig").GrantIdentity, u64) Outcome(@import("history_consumer.zig").GrantObservation),
+    releaseReplicatedCompletionCertificate: *const fn (*DB, types.TxnId, @import("transaction_completion.zig").RoutedOwner, types.CompletionRelease, types.OrderedApplyReceipt) Outcome(void),
     publishReplicatedCompletionCertificate: *const fn (*DB, []const u8, @import("transaction_completion.zig").RoutedOwner, types.OrderedApplyReceipt) Outcome(@import("committed_history.zig").CompletionPublication),
     historyCompletionDecision: *const fn (*DB, Allocator, @import("history_decision_wire.zig").Query) Outcome([]u8),
     historyAdmission: *const fn (*DB, @import("history_admission_wire.zig").Query) Outcome(@import("history_admission_wire.zig").Reply),

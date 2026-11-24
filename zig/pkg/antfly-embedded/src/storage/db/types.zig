@@ -257,11 +257,12 @@ pub const TransactionMutation = union(enum) {
         commit_version: u64,
         external_decision_owner: ?@import("../transactions.zig").ExternalDecisionOwner = null,
     },
-    /// Private complete-certificate publication, isolated from row effects.
+    /// Private completion controls, isolated from row effects.
     publish_completion: struct {
         txn_id: TxnId,
         completion_owner: @import("../transaction_completion.zig").RoutedOwner,
-        certificate: []const u8,
+        certificate: []const u8 = "",
+        release: ?CompletionRelease = null,
     },
     /// Coordinator-side acknowledgement that one participant has durably
     /// learned the terminal decision. This must be ordered by coordinator
@@ -4796,7 +4797,21 @@ pub const IndexRepairWake = union(enum) {
 /// Exact ordered mutation receipt persisted atomically with primary effects.
 /// One borrowed, synchronous native resolution authority. Ordered replay
 /// supplies its own receipt; public commit bodies cannot construct this value.
+pub const CompletionRelease = struct {
+    decision_owner: @import("../transactions.zig").ExternalDecisionOwner,
+    certificate_digest: @import("../transaction_completion.zig").Digest,
+
+    pub fn validate(self: @This(), owner: @import("../transaction_completion.zig").RoutedOwner) !void {
+        try self.decision_owner.validate();
+        try owner.validate();
+        if (!std.mem.eql(u8, &self.decision_owner.metadata_incarnation, &owner.metadata_incarnation) or
+            std.mem.allEqual(u8, &self.certificate_digest, 0)) return error.InvalidHistoryAdmission;
+    }
+};
+
 pub const ExternalTransactionBegin = struct {
+    completion_admission: ?[]const u8 = null,
+    completion_owner: ?@import("../transaction_completion.zig").RoutedOwner = null,
     document_revision_scope: ?@import("../document_revision_reservation.zig").Scope = null,
     sql_locks: ?@import("../pessimistic_lock/transaction.zig").Ref = null,
     txn_id: TxnId,
@@ -4811,6 +4826,7 @@ pub const ExternalTransactionBegin = struct {
 };
 
 pub const ExternalTransactionResolution = struct {
+    completion_owner: ?@import("../transaction_completion.zig").RoutedOwner = null,
     replication_source_permit: ?@import("../../api/replication_source_apply.zig").Permit = null,
     txn_id: TxnId,
     owner: @import("../transactions.zig").ExternalDecisionOwner,

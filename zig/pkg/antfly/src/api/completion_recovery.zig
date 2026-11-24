@@ -103,7 +103,7 @@ pub const Recovery = struct {
         const decision = observed.value.decision orelse return;
         if (!std.mem.eql(u8, &decision.admission.digest, &job.admission_digest)) return error.SourceTransactionIdentityConflict;
         const expected_status: @TypeOf(decision.record.status) = if (terminal == .committed) .committed else .aborted;
-        if (decision.record.status != expected_status) return error.SourceOutcomeUnresolved;
+        if (decision.record.status != expected_status or decision.record.externally_owned) return error.SourceOutcomeUnresolved;
         try self.checkpoint(context);
         try self.participants.acknowledgeRetainedCoordinator(a, job.owner, fence, job.coordinator_locator, job.transaction_id, context);
     }
@@ -139,6 +139,72 @@ pub const Recovery = struct {
         try self.participants.acknowledgeRetainedCoordinator(a, routed, fence, member.locator, transaction_id, context);
     }
 
+    /// The caller supplies the durable metadata COMMIT after its entire
+    /// cohort has resolved. This lane only observes ordered owner receipts and
+    /// publishes their certificate. It cannot resolve or expire a decision.
+    pub fn publishExternal(self: Recovery, a: A, admission: completion.Admission, commit_version: u64, original: Context) !?completion.Digest {
+        const context = try original.platformDeadline();
+        try self.checkpoint(context);
+        const manifest = try admission.manifest(commit_version);
+        const manifest_digest = manifest.digest();
+        var budget = self.catalog.budget(null);
+        budget.deadline_ns = budget.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io });
+        budget.cancellation = context.cancellation;
+        var session = try catalog_api.RoutingSession.initWithBudget(a, self.catalog, budget);
+        defer session.deinit();
+        const fences = try a.alloc(metadata.CatalogRouteFence, admission.participants.len);
+        defer a.free(fences);
+        var assembly = try resolution_ops.wire.Assembly.init(a, manifest);
+        defer assembly.deinit();
+        for (admission.participants, fences) |member, *fence| {
+            try self.checkpoint(context);
+            const owner = member.routed_owner orelse return error.InvalidParticipant;
+            const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
+            fence.* = try routeRetainedOwner(&session, owner, member.locator, budget, context);
+            const request: resolution_ops.Request = .{
+                .version = 1,
+                .authority = .raft,
+                .namespace = member.namespace,
+                .transaction_id = admission.transaction_id,
+                .owner_fence = owner.digest(),
+                .manifest_digest = manifest_digest,
+                .commit_version = commit_version,
+                .minimum_applied_index = 1,
+            };
+            const receipt = try self.resolutions.read(a, fence.*, locator.table_name, request, context);
+            if (!try assembly.add(request.binding(), receipt)) return null;
+        }
+        const bytes = try assembly.encode(a);
+        defer a.free(bytes);
+        var parsed = try completion.parse(a, bytes);
+        defer parsed.deinit();
+        for (admission.participants, fences) |member, fence| {
+            try self.checkpoint(context);
+            const owner = member.routed_owner orelse return error.InvalidParticipant;
+            const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
+            const request: publication_ops.Request = .{
+                .version = 1,
+                .owner = owner,
+                .transaction_id = admission.transaction_id,
+                .manifest_digest = manifest_digest,
+                .commit_version = commit_version,
+                .minimum_applied_index = 1,
+            };
+            var observed = try self.publications.read(a, fence, locator.table_name, request, context);
+            try observed.validate(request.binding());
+            if (observed.publication == null) {
+                try self.participants.submitExternal(a, member, fence, .{ .sync_level = .write, .transaction = .{
+                    .publish_completion = .{ .txn_id = admission.transaction_id, .completion_owner = owner, .certificate = bytes },
+                } }, context);
+                observed = try self.publications.read(a, fence, locator.table_name, request, context);
+                try observed.validate(request.binding());
+            }
+            const evidence = observed.publication orelse return null;
+            if (!std.mem.eql(u8, &parsed.value.digest, &evidence.digest)) return error.DecisionConflict;
+        }
+        return parsed.value.digest;
+    }
+
     fn runBound(self: Recovery, a: A, coordinator: completion.RoutedOwner, coordinator_fence: metadata.CatalogRouteFence, table: []const u8, transaction_id: [16]u8, job: ?local.storage_history_recovery_wire.Request, source_expected: ?SourceExpectation, original: Context) !Outcome {
         var scope = try publication_ops.Scope.init(coordinator_fence, original);
         const context = scope.context();
@@ -151,6 +217,7 @@ pub const Recovery = struct {
         if (job) |expected| {
             const initial = observed.value.decision orelse return .unproven;
             if (!std.mem.eql(u8, &initial.admission.digest, &expected.admission_digest)) return error.SourceTransactionIdentityConflict;
+            if (initial.record.externally_owned) return .pending;
             if (initial.record.status == .pending and initial.record.source_purpose == null and expected.abort_before_ns != 0 and initial.record.created_at_ns < expected.abort_before_ns) {
                 try self.checkpoint(context);
                 self.participants.abortExpired(a, request.binding(), observed.value, coordinator_fence, expected.abort_before_ns, expected.resolution_timestamp_ns, context) catch |err| switch (err) {
@@ -166,6 +233,7 @@ pub const Recovery = struct {
             }
         }
         const decision = observed.value.decision orelse return .unproven;
+        if (decision.record.externally_owned) return .pending;
         if (source_expected) |expected| {
             if (!std.mem.eql(u8, &decision.admission.digest, &expected.admission_digest) or decision.record.begin_timestamp != expected.begin_timestamp or
                 !std.meta.eql(decision.record.source_scope, @as(?local.storage_source_scope.Reference, expected.scope)) or
@@ -627,6 +695,10 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     try std.testing.expectError(error.SourceOutcomeUnresolved, recovery.participants.abortExpired(a, source_query.binding(), source_observation.value, fence, 20, 30, .{}));
     try std.testing.expectEqual(@as(usize, 5), fake.resolves);
     fake.state.source_purpose = null;
+    fake.state.externally_owned = true;
+    try std.testing.expectEqual(.pending, try recovery.runRetained(a, retained, .{}));
+    try std.testing.expectEqual(@as(usize, 5), fake.resolves);
+    fake.state.externally_owned = false;
     try std.testing.expectEqual(.aborted, try recovery.runRetained(a, retained, .{}));
     try std.testing.expectEqual(@as(usize, 8), fake.resolves);
     try std.testing.expectEqual(@as(usize, 4), fake.publishes);
@@ -660,6 +732,25 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     fake.resolved = .{ true, true };
     fake.published = .{ false, false };
     fake.suppress_resolution = false;
+    // Metadata recovery must observe the entire roster before publishing.
+    // A lost reply leaves a durable partial publication, which a new pass
+    // joins without re-resolving or acknowledging any data transaction.
+    const before_external_resolves = fake.resolves;
+    const before_external_acks = fake.acknowledgments;
+    const before_external_publishes = fake.publishes;
+    fake.resolved[1] = false;
+    try std.testing.expectEqual(null, try recovery.publishExternal(a, frozen.admission, 20, .{}));
+    try std.testing.expectEqual(before_external_publishes, fake.publishes);
+    fake.resolved[1] = true;
+    fake.lose_publication = true;
+    try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, recovery.publishExternal(a, frozen.admission, 20, .{}));
+    try std.testing.expectEqual(before_external_publishes + 1, fake.publishes);
+    const recovered_certificate = (try recovery.publishExternal(a, frozen.admission, 20, .{})).?;
+    try std.testing.expectEqualDeep(recovered_certificate, fake.publication_digest);
+    try std.testing.expectEqual(before_external_publishes + 2, fake.publishes);
+    try std.testing.expectEqual(before_external_resolves, fake.resolves);
+    try std.testing.expectEqual(before_external_acks, fake.acknowledgments);
+    fake.published = .{ false, false };
     fake.visibility_errors = .{ error.EnrichmentWorkerFailed, error.EnrichmentRetryInProgress };
     const coordinator: admission_mod.Coordinator = .{ .owners = .{ .ptr = &fake, .read_fn = Fake.capture }, .recovery = recovery };
     const normal_inputs = [_]admission_mod.Input{

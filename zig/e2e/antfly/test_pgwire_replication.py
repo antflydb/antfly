@@ -64,6 +64,109 @@ class PgwireFailoverCluster(ThreeByThreeBackupCluster):
 
 
 @pytest.mark.e2e_resource("antfly_process")
+def test_journal_publication_requires_enrolled_root():
+    binary = harness.resolve_binary_path(
+        os.environ.get("ANTFLY_BIN", str(harness.DEFAULT_ANTFLY_BIN))
+    )
+    psql = os.environ.get("ANTFLY_TEST_PSQL_BIN") or shutil.which("psql")
+    if not psql:
+        pytest.skip("requires psql")
+    port = find_free_port()
+    server = harness.StatefulAntflyServer(
+        binary,
+        "127.0.0.1",
+        0,
+        auth_enabled=True,
+        data_config={"pgwire": {"enabled": True, "bind_port": port}},
+    )
+    env = {
+        **os.environ,
+        "PGPASSWORD": harness.AUTH_BOOTSTRAP_PASSWORD,
+        "PGSSLMODE": "disable",
+        "PGGSSENCMODE": "disable",
+        "PGCONNECT_TIMEOUT": "5",
+    }
+
+    def sql(statement):
+        return subprocess.run(
+            [
+                psql,
+                "-XAt",
+                "--dbname",
+                f"host=127.0.0.1 port={port} user=admin dbname=default",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-v",
+                "VERBOSITY=verbose",
+                "-c",
+                statement,
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+
+    def eventually(statement):
+        def ready():
+            result = sql(statement)
+            if result.returncode == 0:
+                return True
+            assert "ERROR:  53300:" in result.stderr, result.stderr
+            return False
+
+        wait_until(ready, timeout_s=30)
+
+    try:
+        eventually("CREATE TABLE publication_probe (id BIGINT PRIMARY KEY)")
+        eventually("INSERT INTO publication_probe VALUES (1)")
+        ddl = "CREATE PUBLICATION changes FOR TABLE publication_probe"
+        rejected = sql(ddl)
+        assert rejected.returncode != 0
+        assert "ERROR:  55000:" in rejected.stderr
+        assert "physical store root is not enrolled" in rejected.stderr
+        eventually("INSERT INTO publication_probe VALUES (2)")
+
+        status = requests.get(
+            f"{server.metadata_admin_url}/metadata/v1/status", timeout=5
+        )
+        status.raise_for_status()
+        proof = subprocess.check_output(
+            [
+                binary,
+                "internal",
+                "store-root",
+                "proof",
+                "--replica-root-dir",
+                str(server.replica_root),
+                "--metadata-incarnation",
+                status.json()["metadata_incarnation"],
+                "--node-id",
+                "2",
+                "--store-id",
+                "2",
+            ],
+            timeout=10,
+        )
+        enrollment = requests.post(
+            f"{server.api_url}/store-roots/enroll",
+            data=proof,
+            headers={"content-type": "application/json"},
+            auth=("admin", harness.AUTH_BOOTSTRAP_PASSWORD),
+            timeout=15,
+        )
+        enrollment.raise_for_status()
+        admitted = sql(ddl)
+        if admitted.returncode != 0:
+            assert "ERROR:  40003:" in admitted.stderr, admitted.stderr
+        eventually("INSERT INTO publication_probe VALUES (3)")
+        duplicate = sql(ddl)
+        assert duplicate.returncode != 0 and "ERROR:  42710:" in duplicate.stderr
+    finally:
+        server.stop()
+
+
+@pytest.mark.e2e_resource("antfly_process")
 @pytest.mark.parametrize(
     "export_snapshot, multi_table, cross_node, topology",
     [
@@ -672,7 +775,28 @@ def test_pg_recvlogical_resume_after_restart(
             )
             # pgoutput text tuple field for the stored generated value of id 7.
             markers = [b"retained-stream-smoke", b"t\x00\x00\x00\x09314159272"]
-            if multi_table:
+            mixed_ingress = not (
+                export_snapshot or multi_table or cross_node or topology
+            )
+            if mixed_ingress:
+                # The last row also detects a stalled retained-history frontier.
+                def http_insert(row_id, marker):
+                    reply = requests.post(
+                        f"{server.api_url}/sql",
+                        json={
+                            "statement": f"INSERT INTO smoke (id, content) VALUES "
+                            f"({row_id}, '{marker}')"
+                        },
+                        auth=("admin", harness.AUTH_BOOTSTRAP_PASSWORD),
+                        timeout=40,
+                    )
+                    assert reply.ok, reply.text
+                    markers.append(marker.encode())
+
+                http_insert(70, "retained-http-before")
+                sql(insert)
+                http_insert(71, "retained-http-after")
+            elif multi_table:
                 sql(
                     "BEGIN",
                     "INSERT INTO smoke (id, content) VALUES (8, 'retained-rolled-back-transaction')",
@@ -697,7 +821,15 @@ def test_pg_recvlogical_resume_after_restart(
                     if all(marker in payload for marker in markers):
                         break
                 time.sleep(0.2)
-            assert all(payload.count(marker) == 1 for marker in markers)
+            assert all(payload.count(marker) == 1 for marker in markers), {
+                marker: payload.count(marker) for marker in markers
+            }
+            if mixed_ingress:
+                assert (
+                    payload.index(b"retained-http-before")
+                    < payload.index(b"retained-stream-smoke")
+                    < payload.index(b"retained-http-after")
+                )
             if multi_table:
                 assert b"retained-rolled-back-" not in payload
             if export_snapshot:
@@ -748,6 +880,15 @@ def test_pg_recvlogical_resume_after_restart(
             env["PGPASSWORD"] = _token(
                 secret, issuer=issuer, subject="admin", admin=True
             )
+        elif mixed_ingress:
+            sql(
+                "BEGIN",
+                "INSERT INTO smoke (id, content) VALUES (72, 'retained-prepared-after-crash')",
+                "PREPARE TRANSACTION 'retained_spool_restart'",
+            )
+            assert b"retained-prepared-after-crash" not in first.read_bytes()
+            server.pause(crash=True)
+            server.resume()
         else:
             server.restart()
         assert catalog_publication() == ["f|t|t|t|f"]
@@ -796,6 +937,15 @@ def test_pg_recvlogical_resume_after_restart(
             assert reader.poll() is None
             assert resumed.is_file()
             assert resumed.read_bytes() == b""
+            if mixed_ingress:
+                sql("COMMIT PREPARED 'retained_spool_restart'")
+                marker = b"retained-prepared-after-crash"
+                wait_until(
+                    lambda: resumed.read_bytes().count(marker) == 1,
+                    timeout_s=30,
+                    interval_s=0.2,
+                )
+                assert all(previous not in resumed.read_bytes() for previous in markers)
             if cross_node:
                 sql(
                     "BEGIN",
