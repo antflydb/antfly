@@ -4405,7 +4405,7 @@ const InvocationInputFacts = struct {
 
     fn promoteOwnedDeviceInputs(self: *InvocationInputFacts, target: *const ImportedOnnxSession, selected: ?*const PreparedRoutes, stage: bool) void {
         const cuda = target.requested_strategy == .compiled_required and target.cb.kind() == .cuda;
-        const metal = target.cb.kind() == .metal and if (target.executable.runtime.physical_pool) |pool| pool.metal_frame_dispatch and !pool.mixed_frame_dispatch else false;
+        const metal = target.cb.kind() == .metal and if (target.executable.runtime.physical_pool) |pool| pool.metal_frame_dispatch and !pool.mixed_frame_dispatch and !pool.metal_projection_region_candidate else false;
         if (!cuda and !metal) return;
         for (self.inputs) |*input| {
             const logical = switch (input.value) {

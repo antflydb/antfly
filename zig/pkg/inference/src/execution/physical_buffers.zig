@@ -960,6 +960,8 @@ pub const Pool = struct {
     }
     pub fn requiresManagedExecution(self: *const Pool) bool {
         if (!self.metal_frame_dispatch) return false;
+        if (self.device_input_plans.len != 0) return true;
+
         if (self.region_execution_profile == .unknown and self.regions.len != 0) return true;
         for (self.host_input_plans) |plan| if (plan.requirements.requires_managed_operation) return true;
         return false;
@@ -1428,7 +1430,7 @@ pub const Pool = struct {
             @import("device_owned_coverage.zig").assess(child, child.coverage_backend.?, authority)
         else
             @import("owned_coverage.zig").assess(child);
-        if (child.metal_frame_dispatch and child.device_input_plans.len != 0 and child.payload_coverage != .complete) return null;
+        if (child.metal_frame_dispatch and child.device_input_plans.len != 0 and (child.payload_coverage != .complete or (profile == .synchronous and child.regions.len != 0))) return null;
 
         if (profile == .unknown and child.metal_frame_dispatch and child.regions.len != 0 and child.payload_coverage != .complete) return null;
         if (child.metal_projection_region_candidate and child.payload_coverage != .complete) child.metal_frame_dispatch = false;

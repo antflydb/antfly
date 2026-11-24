@@ -1972,6 +1972,8 @@ pub const MetalPartitionExecutor = struct {
         // numerical nodes. Validate the actual operation Claim and full cover
         // BEFORE changing the ordinary frame/fusion path or writing any output.
         if (synchronous_regions) {
+            if (options.physical_frame.?.metal_device_copy_pending) return error.PreparedMetalFrameDispatchChanged;
+
             try executeSynchronousPhysicalRegions(graph, cb, node_ids, reachable, values, value_device, device_id, options, exec_ctx.stats);
             return;
         }
