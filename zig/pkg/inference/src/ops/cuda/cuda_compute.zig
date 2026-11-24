@@ -19884,23 +19884,27 @@ fn pinnedTempReplayRangeIdle(self: *const CudaCompute, start: usize, count: usiz
     return true;
 }
 
-fn cudaGraphReplayArenaReady(self: *CudaCompute, slot: *const CudaGraphReplaySlot) bool {
-    if (slot.temp_arena_generation == 0 or slot.temp_arena_generation != self.temp_arena_generation) return false;
+const ReplayArenaStatus = enum { ready, stale, borrowed };
+
+fn cudaGraphReplayArenaStatus(self: *CudaCompute, slot: *const CudaGraphReplaySlot) ReplayArenaStatus {
     while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
     defer self.temp_buffer_mutex.unlock();
+    if (slot.temp_arena_generation == 0 or slot.temp_arena_generation != self.temp_arena_generation) return .stale;
+
     // Matching lengths do not imply matching addresses. Check the captured
     // physical ordinal and the live occupants of that interval.
     if (slot.captured_temp_allocation_count != 0) {
         const current_start = pinnedTempSlotIndex(self, self.temp_trace_seq);
-        if (slot.captured_temp_slot_start != current_start) return false;
+        if (slot.captured_temp_slot_start != current_start) return .stale;
         if (current_start) |start| {
-            if (!pinnedTempReplayRangeIdle(self, start, slot.captured_temp_allocation_count)) return false;
+            if (!pinnedTempReplayRangeIdle(self, start, slot.captured_temp_allocation_count)) return .borrowed;
         }
     }
-    return !self.temp_slot_config.autoplan_enabled or self.temp_arena_planner.canGraphReplay(
+    if (self.temp_slot_config.autoplan_enabled and !self.temp_arena_planner.canGraphReplay(
         self.temp_trace_seq,
         slot.captured_temp_allocation_count,
-    );
+    )) return .stale;
+    return .ready;
 }
 
 fn noteCapturedTempAllocationsReplayed(self: *CudaCompute, allocation_count: usize) !void {
@@ -20047,9 +20051,16 @@ test "CUDA replay retains input storage while retiring an exec at its addressabl
     slot.captured_temp_allocation_count = 1;
     slot.captured_temp_slot_start = 0;
     compute.temp_trace_seq = 12;
-    try std.testing.expect(cudaGraphReplayArenaReady(&compute, slot));
+    try std.testing.expectEqual(.ready, cudaGraphReplayArenaStatus(&compute, slot));
+    var busy_scratch = (try allocPinnedTempSlot(&compute, 12, 64)).?;
+    defer _ = releasePinnedTempSlot(&compute, &busy_scratch);
+    try std.testing.expectEqual(.borrowed, cudaGraphReplayArenaStatus(&compute, slot));
+    try std.testing.expect((try findCompatibleDecodeReplaySlot(&compute, prepared)) == null);
+    try std.testing.expect(slot.exec != null and slot.valid);
+    try std.testing.expect(releasePinnedTempSlot(&compute, &busy_scratch));
+    try std.testing.expectEqual(.ready, cudaGraphReplayArenaStatus(&compute, slot));
     compute.temp_trace_seq = 13;
-    try std.testing.expect(!cudaGraphReplayArenaReady(&compute, slot));
+    try std.testing.expectEqual(.stale, cudaGraphReplayArenaStatus(&compute, slot));
     compute.temp_slot_config = previous_config;
     compute.temp_trace_seq = previous_seq;
     slot.captured_temp_allocation_count = 0;
@@ -20101,7 +20112,9 @@ fn findCompatibleDecodeReplaySlot(self: *CudaCompute, input: CT) !?usize {
         if (self.ctx.observation.load(.acquire)) |observation| observation.decodeOutputBankUnavailable();
         return null;
     }
-    if (!cudaGraphReplayArenaReady(self, slot)) {
+    const arena_status = cudaGraphReplayArenaStatus(self, slot);
+    if (arena_status == .borrowed) return null;
+    if (arena_status == .stale) {
         if (slot.temp_arena_generation != self.temp_arena_generation) {
             std.log.warn("cuda_graph_capture_probe: stale_temp_arena_generation slot={d} captured={d} current={d}", .{
                 slot_idx,
