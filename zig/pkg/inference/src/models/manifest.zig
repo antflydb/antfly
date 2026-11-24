@@ -325,6 +325,9 @@ pub const ModelManifest = struct {
     onnx_logical_path: ?[]const u8 = null,
     safetensors_path: ?[]const u8 = null,
     safetensors_index_path: ?[]const u8 = null,
+    // Borrowed from the native construction snapshot's authenticated paths.
+    inkling2_shard_path: ?[]const u8 = null,
+    inkling2_draft_path: ?[]const u8 = null,
     gguf_path: ?[]const u8 = null,
     gguf_projector_path: ?[]const u8 = null,
     gliner_head_gguf_path: ?[]const u8 = null,
@@ -897,6 +900,10 @@ pub const ModelManifest = struct {
 
     pub fn isQwen3VlRerankerSafetensorsBundle(self: *const ModelManifest) bool {
         return std.mem.eql(u8, self.inference_bundle_family, qwen3_vl_reranker_safetensors_bundle_family);
+    }
+
+    pub fn isInkling2(self: *const ModelManifest) bool {
+        return std.mem.eql(u8, self.config_model_arch, @import("../architectures/inkling2_checkpoint.zig").architecture);
     }
 
     pub fn isQwen3VlGenerationSafetensorsBundle(self: *const ModelManifest) bool {
@@ -2333,7 +2340,7 @@ fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const
         manifest.model_type_origin == .config;
     if (architecture_may_select_role and
         manifest.config_model_arch.len > 0 and
-        gpt.isGenerativeModel(manifest.config_model_arch))
+        (manifest.isInkling2() or gpt.isGenerativeModel(manifest.config_model_arch)))
     {
         manifest.model_type = .generator;
         manifest.model_type_origin = .config;

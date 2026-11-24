@@ -807,6 +807,23 @@ pub const BoundDirectoryManifest = struct {
                 } else self.allocator.free(path);
             }
         }
+        if (result.manifest.isInkling2()) {
+            const inkling = @import("../architectures/inkling2_checkpoint.zig");
+            const index = result.manifest.safetensors_index_path orelse return error.NoModelFileFound;
+            try proof.artifacts().verifyPath(index);
+            var artifacts = try safetensors_mod.inspectArtifactDependencies(self.allocator, null, index);
+            defer artifacts.deinit();
+            if (artifacts.paths.len != 2 or !std.mem.eql(u8, std.fs.path.basename(artifacts.paths[1]), inkling.shard_name))
+                return error.UnsupportedInkling2Checkpoint;
+            result.manifest.inkling2_shard_path = try result.own(try proof.artifacts().constructionPath(artifacts.paths[1]));
+            const root = self.manifest.source_root orelse return error.NoModelFileFound;
+            const draft = try std.fs.path.join(self.allocator, &.{ root, inkling.draft_name });
+            defer self.allocator.free(draft);
+            if (try proof.artifacts().optionalConstructionPath(draft)) |path| {
+                result.manifest.inkling2_draft_path = try result.own(path);
+                try proof.artifacts().verifyPath(path);
+            }
+        }
         return result;
     }
 
@@ -940,6 +957,7 @@ pub const BoundModelSource = struct {
         if (self.kind != .directory) return self.view();
         const directory = &self.directory_manifest.?;
         const man = &directory.manifest;
+        if (man.isInkling2() and backend != .cuda) return null;
         if (backend == .wasm or !manifestHasNativeAssets(man.*)) {
             if (man.onnx_path) |selected| {
                 if (self.onnx_binding == null) {

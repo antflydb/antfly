@@ -189,20 +189,7 @@ fn inputToken(id: i32) !u32 {
 fn readImage(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !image.Image {
     const data = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(64 * 1024 * 1024));
     defer allocator.free(data);
-    _ = try image.inspectEncodedForInference(data, 4096);
-    const rgba = try image.decodeRgba(allocator, data);
-    defer rgba.deinit(allocator);
-    const rgb = try allocator.alloc(u8, @as(usize, rgba.width) * rgba.height * 3);
-    for (0..rgba.height) |y| for (0..rgba.width) |x| {
-        const i = y * rgba.width + x;
-        const alpha: u32 = rgba.data[4 * i + 3];
-        const checker: u32 = if ((x / 8 + y / 8) % 2 == 0) 204 else 153;
-        for (0..3) |channel| {
-            const color: u32 = rgba.data[4 * i + channel];
-            rgb[3 * i + channel] = @intCast((alpha * color + (255 - alpha) * checker + 127) / 255);
-        }
-    };
-    return .{ .data = rgb, .width = rgba.width, .height = rgba.height, .channels = 3 };
+    return @import("pipelines/inkling2_image.zig").decodeRgb(allocator, data);
 }
 
 fn milliseconds(ns: u64) f64 {

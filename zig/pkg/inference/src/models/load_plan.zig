@@ -789,6 +789,12 @@ pub fn estimateBaseModelLoadAdmission(
     laya_packed: bool,
 ) !ModelLoadAdmissionPlan {
     const weights = try estimateModelArtifactBytes(man);
+    if (man.isInkling2()) {
+        if (backend_runtime.backend != .cuda) return error.UnsupportedBackend;
+        var total = weights;
+        if (man.inkling2_draft_path) |path| try addArtifactBytes(&total, man.allocator, path);
+        return nativeModelLoadAdmission(total, .cuda, .{});
+    }
     if (!manifestHasNativeAssets(man)) return onnxModelLoadAdmission(weights, backend_runtime);
     if (backend_runtime.backend == .pjrt) return pjrtArtifactLoadAdmission(man, backend_runtime.pjrt_memory_policy);
     if (backend_runtime.backend == .metal) {

@@ -21483,6 +21483,12 @@ pub fn createSessionFromManifestWithCudaOptions(
     allow_unqualified_precision: bool,
     cuda_options: CudaLoadOptions,
 ) !Session {
+    if (manifest.isInkling2()) {
+        if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+        if (backend != .cuda or jit.qualified_profile_path != null or a4b != null or precision != null)
+            return error.UnsupportedBackend;
+        return @import("../architectures/inkling2_session.zig").Runtime.load(allocator, manifest);
+    }
     return switch (backend) {
         .native => openHostSessionFromManifest(allocator, model_path, manifest, null, .{}),
         .pjrt => createPjrtSessionFromManifestWithOptions(allocator, model_path, manifest, .{}),

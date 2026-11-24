@@ -73,12 +73,18 @@ pub fn generatorAcceptsVideo(manifest: *const manifest_mod.ModelManifest) bool {
         (manifest.gguf_generator_gemma4 or std.mem.eql(u8, manifest.config_model_arch, "gemma4"));
 }
 
+pub fn modelInputs(manifest: *const manifest_mod.ModelManifest) []const []const u8 {
+    if (manifest.inputs.len == 0 and manifest.isInkling2() and manifest.model_type == .generator)
+        return &.{ "text", "image" };
+    return manifest.inputs;
+}
+
 pub fn modelAcceptsInput(manifest: *const manifest_mod.ModelManifest, input: []const u8) bool {
     if (std.mem.eql(u8, input, "video")) return generatorAcceptsVideo(manifest) or manifest.embedding_style == .embedding_gemma2 and modelAcceptsInput(manifest, "image");
     return modelKindAcceptsInput(
         @tagName(manifest.model_type),
         manifest.gliner_model_type,
-        manifest.inputs,
+        modelInputs(manifest),
         manifest.visual_model_path != null or manifest.visual_projection_path != null,
         manifest.audio_model_path != null or manifest.audio_projection_path != null,
         input,

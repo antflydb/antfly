@@ -484,13 +484,6 @@ fn validateReaderWithControl(allocator: std.mem.Allocator, reader: *const MMapRe
     if (covered_end != data_bytes) return error.InvalidTensorLayout;
 }
 
-fn validateFileWithControl(allocator: std.mem.Allocator, path: []const u8, control: ExecutionControl) !void {
-    try control.check();
-    var reader = try MMapReader.openFileAbsolute(allocator, path);
-    defer reader.deinit();
-    return validateReaderWithControl(allocator, &reader, control);
-}
-
 fn validateShardPath(path: []const u8) !void {
     if (path.len == 0 or std.fs.path.isAbsolute(path)) return error.InvalidShardPath;
     if (std.mem.indexOfScalar(u8, path, 0) != null or
@@ -588,8 +581,16 @@ pub fn validateArtifactSet(
 }
 
 pub fn validateArtifactSetWithControl(allocator: std.mem.Allocator, single_path: ?[]const u8, index_path: ?[]const u8, control: ExecutionControl) !void {
+    return validateArtifactSetWithOptions(allocator, single_path, index_path, control, .{});
+}
+
+pub fn validateArtifactSetWithOptions(allocator: std.mem.Allocator, single_path: ?[]const u8, index_path: ?[]const u8, control: ExecutionControl, options: HeaderOptions) !void {
     try control.check();
-    if (single_path) |path| return validateFileWithControl(allocator, path, control);
+    if (single_path) |path| {
+        var reader = try MMapReader.openFileAbsoluteWithOptions(allocator, path, std.math.maxInt(usize), max_header_size, options);
+        defer reader.deinit();
+        return validateReaderWithControl(allocator, &reader, control);
+    }
     const path = index_path orelse return error.NoSafetensorsArtifact;
     const index_bytes = try c_file.readFileWithControl(allocator, control.io orelse std.Options.debug_io, path, control);
     defer allocator.free(index_bytes);
@@ -633,7 +634,7 @@ pub fn validateArtifactSetWithControl(allocator: std.mem.Allocator, single_path:
     var plan_it = plans.valueIterator();
     while (plan_it.next()) |plan| {
         try control.check();
-        var reader = try MMapReader.openFileAbsolute(allocator, plan.path);
+        var reader = try MMapReader.openFileAbsoluteWithOptions(allocator, plan.path, std.math.maxInt(usize), max_header_size, options);
         defer reader.deinit();
         try validateReaderWithControl(allocator, &reader, control);
         for (plan.tensor_names.items) |tensor_name| {

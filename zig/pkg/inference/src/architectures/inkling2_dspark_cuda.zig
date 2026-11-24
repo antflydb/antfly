@@ -122,7 +122,8 @@ pub const Draft = struct {
     window: u32,
     local: [num_layers]bool,
     taps: [3]u8,
-    capacity: u32,
+    capacity: u32 = 0,
+    max_capacity: u32,
     stage: [4]DeviceBuffer = @splat(.{}),
     mix_weights: [4][4]f32 = undefined,
     layers: [num_layers]Buffers(LayerWeight) = @splat(@splat(.{})),
@@ -148,12 +149,27 @@ pub const Draft = struct {
         capacity: u32,
         feature_rows: u32,
     ) !Draft {
+        const path = try std.fs.path.join(allocator, &.{ dir, checkpoint.draft_name });
+        defer allocator.free(path);
+        var self = try loadWeights(allocator, ctx, blas, path, config, shared);
+        errdefer self.deinit();
+        try self.beginRequest(capacity, feature_rows);
+        return self;
+    }
+
+    pub fn loadWeights(
+        allocator: std.mem.Allocator,
+        ctx: *Context,
+        blas: *Blas,
+        path: []const u8,
+        config: checkpoint.DraftConfig,
+        shared: SharedWeights,
+    ) !Draft {
         if (config.hidden_size != width or config.num_hidden_layers != num_layers or config.num_attention_heads != q_heads or
             config.num_key_value_heads != kv_heads or config.head_dim != dim or config.intermediate_size != inner or
             config.block_size != block_rows or config.markov_rank != rank or !std.mem.eql(u8, config.markov_head_type, "rnn_hidden") or
             config.sliding_window_size == 0 or !std.math.isFinite(config.rms_norm_eps) or config.rms_norm_eps <= 0 or
             !std.math.isFinite(config.rope_theta) or config.rope_theta <= 0 or
-            capacity == 0 or capacity > config.max_position_embeddings or feature_rows == 0 or
             config.target_layer_ids[3] != checkpoint.visit_count or shared.padded_vocab < shared.vocab or shared.vocab == 0 or
             !std.math.isFinite(shared.logit_cap) or shared.logit_cap <= 0)
             return error.UnsupportedInkling2DraftConfig;
@@ -173,12 +189,10 @@ pub const Draft = struct {
             .window = config.sliding_window_size,
             .local = local,
             .taps = config.target_layer_ids[0..3].*,
-            .capacity = capacity,
+            .max_capacity = config.max_position_embeddings,
         };
         errdefer self.deinit();
 
-        const path = try std.fs.path.join(allocator, &.{ dir, "mtp.safetensors" });
-        defer allocator.free(path);
         var reader = try safetensors.MMapReader.openFileAbsoluteWithOptions(allocator, path, 1024 * 1024 * 1024, safetensors.max_header_size, .{});
         defer reader.deinit();
         try safetensors.validateReader(allocator, &reader);
@@ -201,15 +215,13 @@ pub const Draft = struct {
             }
             for (weights) |*alpha| alpha.* /= total;
         }
-        for (&self.stage) |*plane| plane.* = try alloc(ctx, @as(usize, feature_rows) * width * 2);
-        for (&self.layers, &self.kv, 0..) |*layer, *kv, i| {
+        for (&self.layers, 0..) |*layer, i| {
             var name_buf: [96]u8 = undefined;
             for (std.enums.values(LayerWeight)) |key| {
                 var tensor = layer_tensors.get(key);
                 tensor.name = try std.fmt.bufPrint(&name_buf, "layers.{d}.{s}", .{ i, tensor.name });
                 layer[@backingInt(key)] = try arena.uploadWeight(ctx, try tensorBytes(&reader, tensor));
             }
-            for (kv) |*plane| plane.* = try DeviceBuffer.allocWithPurpose(ctx, (@as(usize, capacity) + block_rows) * kv_width * 2, .kv_state);
         }
         const head_tensors: std.EnumArray(HeadWeight, Tensor) = .init(.{
             .mask = .{ .name = "mask_embed", .shape = &.{width} },
@@ -231,7 +243,7 @@ pub const Draft = struct {
         }
         const vocab: usize = shared.padded_vocab;
         const work_bytes: std.EnumArray(Temp, usize) = .init(.{
-            .context_mix = @as(usize, feature_rows) * width * 2,
+            .context_mix = 0,
             .context_rnn = 2 * width * 2,
             .residual = block_rows * width * 2,
             .normed = block_rows * width * 2,
@@ -250,7 +262,9 @@ pub const Draft = struct {
             .token = 4 * block_rows,
             .blas = 8 * 1024 * 1024,
         });
-        for (std.enums.values(Temp)) |key| self.temps[@backingInt(key)] = try alloc(ctx, work_bytes.get(key));
+        for (std.enums.values(Temp)) |key| {
+            if (key != .context_mix) self.temps[@backingInt(key)] = try alloc(ctx, work_bytes.get(key));
+        }
         self.result = try buffer.HostBuffer.alloc(ctx, 4 * block_rows);
         self.folded = try DeviceBuffer.allocWithPurpose(ctx, vocab * rank * 2, .model_cache);
         self.fold_bias = try DeviceBuffer.allocWithPurpose(ctx, vocab * 2, .model_cache);
@@ -263,6 +277,33 @@ pub const Draft = struct {
         return self;
     }
 
+    pub fn beginRequest(self: *Draft, capacity: u32, feature_rows: u32) !void {
+        std.debug.assert(self.capacity == 0);
+        if (capacity == 0 or capacity > self.max_capacity or feature_rows == 0)
+            return error.InvalidInkling2Context;
+        const ctx = self.ctx;
+        errdefer self.endRequest();
+        for (&self.stage) |*plane| plane.* = try alloc(ctx, @as(usize, feature_rows) * width * 2);
+        self.temps[@backingInt(Temp.context_mix)] = try alloc(ctx, @as(usize, feature_rows) * width * 2);
+        for (&self.kv) |*layer| for (layer) |*plane| {
+            plane.* = try DeviceBuffer.allocWithPurpose(ctx, requestKvBytes(capacity) / (num_layers * 2), .kv_state);
+        };
+        self.capacity = capacity;
+    }
+
+    pub fn requestKvBytes(capacity: u32) usize {
+        return (@as(usize, capacity) + block_rows) * kv_width * 2 * num_layers * 2;
+    }
+
+    pub fn endRequest(self: *Draft) void {
+        for (&self.kv) |*layer| for (layer) |*plane| plane.free(self.ctx);
+        for (&self.stage) |*plane| plane.free(self.ctx);
+        self.temps[@backingInt(Temp.context_mix)].free(self.ctx);
+        self.capacity = 0;
+        self.position = 0;
+        self.rnn_side = 0;
+    }
+
     pub fn deinit(self: *Draft) void {
         const ctx = self.ctx;
         ctx.synchronize() catch {};
@@ -272,11 +313,10 @@ pub const Draft = struct {
         self.zero_state.free(ctx);
         self.fold_bias.free(ctx);
         self.folded.free(ctx);
+        self.endRequest();
         for (&self.temps) |*value| value.free(ctx);
         for (&self.head) |*value| value.free(ctx);
-        for (&self.kv) |*layer| for (layer) |*value| value.free(ctx);
         for (&self.layers) |*layer| for (layer) |*value| value.free(ctx);
-        for (&self.stage) |*value| value.free(ctx);
     }
 
     fn get(self: *const Draft, key: Temp) DeviceBuffer {

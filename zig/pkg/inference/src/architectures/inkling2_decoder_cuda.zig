@@ -247,6 +247,51 @@ const Temp = enum { stack, prelude, bank, inputs, mix, message, pair, rank, gain
 
 /// A request is bound to one CUDA stream. Initialize it in place and keep it
 /// at that address until deinit so the cache can retain its internal owners.
+fn requestCacheConfig(text: checkpoint.TextConfig, max_tokens: u32, chunk_rows: u32) cache.Config {
+    return .{
+        .layout = .{ .page_tokens = page_tokens, .window_tokens = text.sliding_window_size, .max_tokens = max_tokens, .max_append_tokens = chunk_rows },
+        .full_slots = checkpoint.full_slot_count,
+        .sliding_slots = checkpoint.sliding_slot_count,
+        .kv_heads = text.num_key_value_heads,
+        .head_dim = text.head_dim,
+    };
+}
+
+pub fn requestMemory(text: checkpoint.TextConfig, max_tokens: u32, chunk_rows: u32) !struct { host: usize, kv: usize, workspace: usize } {
+    const config = requestCacheConfig(text, max_tokens, chunk_rows);
+    const hidden_bytes = @as(usize, text.hidden_size) * 2;
+    const kv_row_bytes = @as(usize, text.num_key_value_heads) * text.head_dim * 2;
+    const history_bytes = 4 * checkpoint.visit_count * 6 * (hidden_bytes + kv_row_bytes);
+    const page_count = try std.math.divCeil(usize, max_tokens, page_tokens);
+    const relative_bytes = try relativeScratchBytes(text, max_tokens, chunk_rows);
+    const nv = try moe.scratchBytes(.nvfp4, text, chunk_rows);
+    const mx = try moe.scratchBytes(.mxfp8, text, chunk_rows);
+    return .{
+        .host = 128 * page_count + @as(usize, text.vocab_size) * 4,
+        .kv = try config.deviceBytes(.full) + try config.deviceBytes(.sliding) + history_bytes,
+        // Fixed allowance for BLAS, row-one plans, the vocabulary shortlist,
+        // page tables, and row-bounded attention and controller intermediates.
+        .workspace = 64 * 1024 * 1024 + 16 * page_count + relative_bytes +
+            @max(nv.logits, mx.logits) + @max(nv.routed, mx.routed),
+    };
+}
+
+fn relativeScratchBytes(text: checkpoint.TextConfig, max_tokens: u32, chunk_rows: u32) !usize {
+    var relative_bytes: usize = 0;
+    for (1..chunk_rows + 1) |count| {
+        const rows: u32 = @intCast(count);
+        relative_bytes = @max(relative_bytes, try relative.scratchBytes(.{
+            .rows = rows,
+            .start = max_tokens - rows,
+            .q_heads = text.num_attention_heads,
+            .kv_heads = text.num_key_value_heads,
+            .relative_extent = text.rel_extent,
+            .score_scale = 1,
+        }, 0, max_tokens));
+    }
+    return relative_bytes;
+}
+
 pub const Request = struct {
     model: *Decoder,
     kv: cache.Cache = undefined,
@@ -289,13 +334,7 @@ pub const Request = struct {
         };
         const ctx = model.ctx;
         const controller_rows: usize = @max(chunk_rows, if (supportsGroupedControllers(ctx)) @as(u32, 3) else 1);
-        try self.kv.init(allocator, ctx, .{
-            .layout = .{ .page_tokens = page_tokens, .window_tokens = text.sliding_window_size, .max_tokens = max_tokens, .max_append_tokens = chunk_rows },
-            .full_slots = checkpoint.full_slot_count,
-            .sliding_slots = checkpoint.sliding_slot_count,
-            .kv_heads = text.num_key_value_heads,
-            .head_dim = text.head_dim,
-        });
+        try self.kv.init(allocator, ctx, requestCacheConfig(text, max_tokens, chunk_rows));
         errdefer self.kv.deinit() catch {};
         self.workspace = try attention.Workspace.init(ctx, text, chunk_rows);
         self.workspace.rows = 1;
@@ -306,18 +345,7 @@ pub const Request = struct {
         const ids = (std.math.divCeil(usize, max_tokens, page_tokens) catch unreachable) * 4;
         const nv = try moe.scratchBytes(.nvfp4, text, chunk_rows);
         const mx = try moe.scratchBytes(.mxfp8, text, chunk_rows);
-        var relative_bytes: usize = 0;
-        for (1..chunk_rows + 1) |count| {
-            const rows: u32 = @intCast(count);
-            relative_bytes = @max(relative_bytes, try relative.scratchBytes(.{
-                .rows = rows,
-                .start = max_tokens - rows,
-                .q_heads = text.num_attention_heads,
-                .kv_heads = text.num_key_value_heads,
-                .relative_extent = text.rel_extent,
-                .score_scale = 1,
-            }, 0, max_tokens));
-        }
+        const relative_bytes = try relativeScratchBytes(text, max_tokens, chunk_rows);
         const activation_bytes = hidden * chunk_rows;
         self.history = try DeviceBuffer.allocWithPurpose(ctx, 2 * checkpoint.visit_count * 6 * (hidden + kv), .kv_state);
         self.pages = try HostBuffer.alloc(ctx, 2 * ids);
@@ -712,12 +740,17 @@ pub const Request = struct {
 
     /// Commit contiguous BF16 vision embeddings in decoder row order.
     pub fn appendEmbeddings(self: *Request, embeddings: DeviceBuffer, rows: u32) !void {
+        return self.appendEmbeddingsWithControl(embeddings, rows, null);
+    }
+
+    pub fn appendEmbeddingsWithControl(self: *Request, embeddings: DeviceBuffer, rows: u32, control: ?@import("../execution_control.zig").InferenceExecutionControl) !void {
         if (rows == 0) return;
         if (rows > self.max_tokens - self.position()) return error.InvalidInkling2Context;
         const row_bytes = @as(usize, self.model.text.hidden_size) * 2;
         try buffer.validateRegions(1, .{embeddings}, .{@as(usize, rows) * row_bytes}, .{2}, 1);
         var offset: u32 = 0;
         while (offset < rows) {
+            if (control) |active| try active.check();
             const count = @min(self.append_capacity, rows - offset);
             const chunk = sub(embeddings, @as(usize, offset) * row_bytes, @as(usize, count) * row_bytes);
             try self.run(.{ .embedding = chunk }, count, .none);

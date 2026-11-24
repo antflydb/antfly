@@ -6726,6 +6726,44 @@ pub const Node = struct {
         if (timing != null) {
             std.log.info("direct generator loaded model={s} backend={s}", .{ model_name, @tagName(model.session.backend()) });
         }
+        if (comptime build_options.enable_cuda) {
+            const inkling = @import("../architectures/inkling2_session.zig");
+            if (inkling.Runtime.fromSession(model.session)) |resident| {
+                if (a4b_request != null or prompt_cache_key != null or preflight.audio_transcription)
+                    return error.UnsupportedInkling2Request;
+                const slot = try model.generation_admission.acquire(execution_control, true, runtime.scheduler.generation_admission.Limits.forRequests(self.config.max_concurrent_requests, null));
+                defer slot.release();
+                const config: generation.GenerationConfig = .{ .max_tokens = max_tokens };
+                var pipeline = try inkling.Pipeline.init(allocator, resident, model.session, model.getTokenizer(), execution_control, messages, config, executor_contract.batch.max_input_tokens_per_item);
+                defer pipeline.deinit();
+                try execution_control.lock(model.nativeGenerationMutex());
+                defer model.nativeGenerationMutex().unlock();
+                const setup_at_ns = embedTimingNowNs();
+                var result = if (stream) |sink| blk: {
+                    pipeline.continue_ctx = sink.ctx;
+                    pipeline.continue_fn = sink.continue_fn;
+                    break :blk try pipeline.generateStreaming(messages, config, sink.ctx, sink.on_token);
+                } else try pipeline.generate(messages, config);
+                defer result.deinit();
+                const generated_at_ns = embedTimingNowNs();
+                if (timing) |report| report.* = .{
+                    .resolve_ms = elapsedMs(started_at_ns, resolved_at_ns),
+                    .load_ms = elapsedMs(resolved_at_ns, loaded_at_ns),
+                    .setup_ms = elapsedMs(loaded_at_ns, setup_at_ns),
+                    .generate_ms = elapsedMs(setup_at_ns, generated_at_ns),
+                    .total_ms = elapsedMs(started_at_ns, generated_at_ns),
+                };
+                const text = try caller_allocator.dupe(u8, result.text);
+                if (pin_after_success) model_handle.pin();
+                return .{
+                    .text = text,
+                    .prompt_tokens = result.prompt_tokens,
+                    .completion_tokens = result.tokens_used,
+                    .truncated = std.mem.eql(u8, result.finish_reason, "length"),
+                    .naturally_completed = std.mem.eql(u8, result.finish_reason, "stop"),
+                };
+            }
+        }
         const gpt_config = session_factory.getGptConfig(model.session) orelse return error.UnsupportedGeneratorProvider;
         // Preserve model resolution, capability checks, admission and cancellation
         // for silence, but do not ask a generative model to invent a transcript.
@@ -17485,9 +17523,11 @@ pub const Node = struct {
                 .message = "draft_model must not be empty",
             });
         }
+        const builtin_draft = admission_manifest.isInkling2() and requested_draft_model_name == null and
+            (body.speculation_policy != null or body.speculative_k != null);
         var speculation = parseGenerateSpeculationOptions(
-            requested_draft_model_name != null,
-            body.speculative_k,
+            requested_draft_model_name != null or builtin_draft,
+            if (builtin_draft) body.speculative_k orelse 7 else body.speculative_k,
             body.speculation_policy,
             body.speculation_calibration,
         ) catch |err| {
@@ -17507,7 +17547,7 @@ pub const Node = struct {
         var auto_draft_extra_units: usize = 0;
         if (native_transfer == null and requested_draft_model_name == null and
             speculation.policy == .auto and
-            gemma4MtpAutoDraftDiscoveryEnabled())
+            !admission_manifest.isInkling2() and gemma4MtpAutoDraftDiscoveryEnabled())
         {
             if (gemma4MtpAssistantSiblingPath(ctx.allocator, ctx.io, model_path)) |sibling| {
                 if (validateDiscoveredDraftDir(ctx.allocator, sibling)) {
@@ -17580,7 +17620,7 @@ pub const Node = struct {
                 .message = "cache_compaction_ratio is not supported by resident server generation",
             });
         }
-        if (requested_draft_model_name != null) self.metrics.incSpeculationRequested();
+        if (requested_draft_model_name != null or builtin_draft) self.metrics.incSpeculationRequested();
 
         const want_stream = body.stream orelse false;
         const include_stream_usage = want_stream and (if (body.stream_options) |options|
@@ -17612,7 +17652,7 @@ pub const Node = struct {
             .frequency_penalty = sampling.frequency_penalty,
             .presence_penalty = sampling.presence_penalty,
             .speculative_k = speculation.k,
-            .speculation_requested = generationSpeculationRequested(effective_draft_model_name, auto_draft_sibling),
+            .speculation_requested = builtin_draft or generationSpeculationRequested(effective_draft_model_name, auto_draft_sibling),
             .speculation_policy = speculation.policy,
             .speculation_calibration = speculation.calibration,
             .prefill_chunk_size = 0,
@@ -17788,6 +17828,30 @@ pub const Node = struct {
             .has_audio = owned_messages.decoded_audio.len > 0,
             .has_video = owned_messages.decoded_video.len > 0,
         }) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
+
+        if (comptime build_options.enable_cuda) {
+            const inkling = @import("../architectures/inkling2_session.zig");
+            if (inkling.Runtime.fromSession(model.session)) |resident| {
+                if (body.context_management != null or native_transfer != null or requested_draft_model_name != null or
+                    body.speculation_calibration != null or tool_parser != null or wants_logprobs or
+                    backend_selection.graph_mode_requested or backend_selection.compiled_partition_backend != null)
+                    return generationErrorResponse(ctx, error.UnsupportedInkling2Request);
+                const slot = model.generation_admission.acquire(execution_control, true, runtime.scheduler.generation_admission.Limits.forRequests(self.config.max_concurrent_requests, null)) catch |err| {
+                    if (err == error.GenerationQueueFull) return modelResourceBusyResponse(ctx);
+                    return inferenceFailureResponse(ctx, err);
+                };
+                defer slot.release();
+                var pipeline = inkling.Pipeline.init(ctx.allocator, resident, model.session, model.getTokenizer(), execution_control, messages.items, config, executor_contract.batch.max_input_tokens_per_item) catch |err|
+                    return generationErrorResponse(ctx, err);
+                defer pipeline.deinit();
+                execution_control.lock(model.nativeGenerationMutex()) catch |err| return inferenceFailureResponse(ctx, err);
+                defer model.nativeGenerationMutex().unlock();
+                if (want_stream) return self.streamGenerate(ctx, body.model, &pipeline, null, messages.items, config, null, include_stream_usage, null, completion);
+                var result = pipeline.generate(messages.items, config) catch |err| return generationErrorResponse(ctx, err);
+                defer result.deinit();
+                return self.finishGenerate(ctx, body, result, config, null, null, null);
+            }
+        }
 
         const gpt_config = session_factory.getGptConfig(model.session) orelse {
             // The session is not a decoder at all, which in practice means the
@@ -20572,6 +20636,53 @@ pub const Node = struct {
                     prompt_estimates[idx] = null;
                 };
 
+                if (comptime build_options.enable_cuda) {
+                    const inkling = @import("../architectures/inkling2_session.zig");
+                    if (inkling.Runtime.fromSession(model.session)) |resident| {
+                        for (group_indices.items) |idx| {
+                            pending[idx] = false;
+                            const item = body.requests[idx].body;
+                            const input = owned_messages[idx].messages;
+                            var grammar: ?[]u8 = null;
+                            defer if (grammar) |value| ctx.allocator.free(value);
+                            const cfg = generateConfigFromBody(ctx.allocator, item, &grammar) catch |err| {
+                                results[idx].@"error" = batchGenerationError(err);
+                                continue;
+                            };
+                            const slot = model.generation_admission.acquire(execution_control, true, runtime.scheduler.generation_admission.Limits.forRequests(self.config.max_concurrent_requests, null)) catch |err| {
+                                results[idx].@"error" = batchGenerationError(err);
+                                continue;
+                            };
+                            defer slot.release();
+                            var pipeline = inkling.Pipeline.init(ctx.allocator, resident, model.session, model.getTokenizer(), execution_control, input, cfg, executor_contract.batch.max_input_tokens_per_item) catch |err| {
+                                results[idx].@"error" = batchGenerationError(err);
+                                continue;
+                            };
+                            defer pipeline.deinit();
+                            execution_control.lock(model.nativeGenerationMutex()) catch |err| {
+                                results[idx].@"error" = batchGenerationError(err);
+                                continue;
+                            };
+                            defer model.nativeGenerationMutex().unlock();
+                            execution_attempted[idx] = true;
+                            var result = pipeline.generate(input, cfg) catch |err| {
+                                results[idx].@"error" = batchGenerationError(err);
+                                continue;
+                            };
+                            defer result.deinit();
+                            results[idx].response = try buildGenerateResponseValue(
+                                response_alloc,
+                                item.model,
+                                result.text,
+                                result.reasoning_text,
+                                result.finish_reason,
+                                result.prompt_tokens,
+                                result.tokens_used,
+                            );
+                        }
+                        continue;
+                    }
+                }
                 const gpt_config = session_factory.getGptConfig(model.session) orelse {
                     for (group_indices.items) |idx| {
                         results[idx].@"error" = .{ .code = "INVALID_MODEL", .message = "model does not support native generation", .retryable = false };
@@ -28682,7 +28793,7 @@ pub const Node = struct {
 
                 const capabilities = listing.manifest.capabilities;
                 const gliner_model_type = listing.manifest.gliner_model_type;
-                const inputs = listing.manifest.inputs;
+                const inputs = model_caps.modelInputs(&listing.manifest);
                 const has_visual = listing.manifest.visual_model_path != null or listing.manifest.visual_projection_path != null;
                 const has_audio = listing.manifest.audio_model_path != null or listing.manifest.audio_projection_path != null;
                 if (!manifestMatchesModelListingTask(task, listing.kind, &listing.manifest)) continue;
@@ -28784,7 +28895,7 @@ pub const Node = struct {
                     model_task,
                     model.manifest.gliner_model_type,
                     model.manifest.capabilities,
-                    model.manifest.inputs,
+                    model_caps.modelInputs(&model.manifest),
                     manifestSupportsZeroShotClassification(&model.manifest),
                     model.manifest.visual_model_path != null or model.manifest.visual_projection_path != null,
                     model.manifest.audio_model_path != null or model.manifest.audio_projection_path != null,
@@ -32644,6 +32755,7 @@ pub const ResolvedExecutorBatchImplementation = struct {
 /// loops cannot accidentally advertise native batching.
 pub const ResolvedExecutorKind = enum {
     native_generation,
+    inkling2_generation,
     compatibility,
     /// Ordered groups are executed serially, with one vector per group.
     grouped_dense_embedding,
@@ -32736,6 +32848,8 @@ pub fn resolvedExecutorKind(
     resolved_task: []const u8,
     manifest: *const manifest_mod.ModelManifest,
 ) ResolvedExecutorKind {
+    if (std.mem.eql(u8, resolved_task, "generate") and manifest.isInkling2())
+        return .inkling2_generation;
     if (std.mem.eql(u8, resolved_task, "generate") and
         (manifest.usesGgufWeights() or manifest.isQwen3VlGenerationSafetensorsBundle()) and
         !std.mem.eql(u8, manifest.config_model_arch, "moondream1")) return .native_generation;
@@ -32825,7 +32939,11 @@ pub fn resolvedExecutorBatchImplementation(
         .preferred_items = preferred_items,
         .max_items = max_items,
         .per_item_failures = std.mem.eql(u8, resolved_task, "generate") or executor_kind == .grouped_dense_embedding,
-        .max_media_parts_per_item = if (executor_kind == .grouped_dense_embedding) 64 else null,
+        .max_media_parts_per_item = switch (executor_kind) {
+            .grouped_dense_embedding => 64,
+            .inkling2_generation => 1,
+            else => null,
+        },
     };
 }
 
@@ -33159,7 +33277,8 @@ fn resolvedInferenceExecutorContract(
             manifest_video,
         );
     }
-    const max_images = if (modalities.image) executorMaxImages(resolved_task) else 0;
+    const inkling_generation = manifest.isInkling2() and std.mem.eql(u8, resolved_task, "generate");
+    const max_images: usize = if (!modalities.image) 0 else if (inkling_generation) 1 else executorMaxImages(resolved_task);
     var implementation = resolvedExecutorBatchImplementation(resolved_task, executor_kind);
     const cuda_decide_batch = build_options.enable_cuda and node.session_manager.required_backend == .cuda;
     const metal_decide_batch = build_options.enable_metal and node.session_manager.required_backend == .metal;
@@ -45967,6 +46086,10 @@ fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
         .retryable = true,
     };
     return switch (err) {
+        error.UnsupportedInkling2Request => .{ .status = 400, .code = "UNSUPPORTED_FEATURE", .message = "Inkling 2 serves text and single-image chat with thinking disabled, using its native KV cache", .retryable = false },
+        error.UnsupportedInkling2Speculation => .{ .status = 400, .code = "UNSUPPORTED_FEATURE", .message = "Inkling 2 speculation requires mtp.safetensors, greedy decoding and speculative_k between 1 and 7", .retryable = false },
+        error.InvalidInkling2Context, error.InferenceInputTokensExceeded => .{ .status = 400, .code = "INPUT_TOKENS_EXCEEDED", .message = "the generation request exceeds the input or model context limit", .retryable = false },
+        error.InvalidInkling2Image => .{ .status = 400, .code = "INVALID_MEDIA_LAYOUT", .message = "Inkling 2 accepts one valid user image up to 4096 pixels per side", .retryable = false },
         error.UnsupportedVideoBackend => .{ .status = 400, .code = "UNSUPPORTED_VIDEO_BACKEND", .message = "video input requires a Gemma 4 generator with its projector", .retryable = false },
         error.UnsupportedMixedVideoInput => .{ .status = 400, .code = "INVALID_MEDIA_LAYOUT", .message = "a request with video cannot also contain image or audio parts", .retryable = false },
         error.VideoLimitExceeded => .{ .status = 400, .code = "INVALID_MEDIA_LAYOUT", .message = "generation request may contain one video", .retryable = false },

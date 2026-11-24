@@ -19,7 +19,9 @@ const safetensors = @import("../models/safetensors.zig");
 const DType = @import("../backends/tensor.zig").DType;
 const Group = @import("../runtime/kv/hybrid_paged.zig").Group;
 
+pub const architecture = "inkling2_loop";
 pub const shard_name = "model-00001-of-00001.safetensors";
+pub const draft_name = "mtp.safetensors";
 pub const header_options: safetensors.HeaderOptions = .{ .allow_e4m3fn = true };
 pub const layer_count = 24;
 pub const visit_count = 48;
@@ -134,7 +136,7 @@ pub const Config = struct {
         const parsed = try std.json.parseFromSlice(Config, allocator, bytes, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
         errdefer parsed.deinit();
         const config = parsed.value;
-        if (!std.mem.eql(u8, config.model_type, "inkling2_loop") or
+        if (!std.mem.eql(u8, config.model_type, architecture) or
             !std.mem.eql(u8, config.quantization_config.quant_method, "modelopt") or
             !std.mem.eql(u8, config.quantization_config.quant_algo, "NVFP4") or
             config.eos_token_id >= config.text_config.unpadded_vocab_size)
@@ -312,12 +314,16 @@ pub const Checkpoint = struct {
     pub fn open(allocator: std.mem.Allocator, dir: []const u8) !Checkpoint {
         const config_path = try std.fs.path.join(allocator, &.{ dir, "config.json" });
         defer allocator.free(config_path);
+        const shard_path = try std.fs.path.join(allocator, &.{ dir, shard_name });
+        defer allocator.free(shard_path);
+        return openFiles(allocator, config_path, shard_path);
+    }
+
+    pub fn openFiles(allocator: std.mem.Allocator, config_path: []const u8, shard_path: []const u8) !Checkpoint {
         const bytes = try files.readFileMax(allocator, config_path, 64 * 1024);
         defer allocator.free(bytes);
         var config = try Config.parse(allocator, bytes);
         errdefer config.deinit();
-        const shard_path = try std.fs.path.join(allocator, &.{ dir, shard_name });
-        defer allocator.free(shard_path);
         var reader = try safetensors.MMapReader.openFileAbsoluteWithOptions(allocator, shard_path, std.math.maxInt(usize), safetensors.max_header_size, header_options);
         errdefer reader.deinit();
         try safetensors.validateReader(allocator, &reader);

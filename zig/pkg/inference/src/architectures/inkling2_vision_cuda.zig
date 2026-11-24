@@ -52,6 +52,14 @@ fn upload(ctx: *Context, source: *const checkpoint.Checkpoint, arena: *Arena, pa
     return arena.uploadWeight(ctx, try source.reader.rawTensorBytes(path));
 }
 
+pub fn requestWorkspaceBytes(merged_rows: usize, pixels: usize) usize {
+    const patch_rows = merged_rows * 4;
+    const token_rows = patch_rows + 1;
+    return pixels * 3 + patch_rows * (patch_features + width) * 2 +
+        token_rows * (8 * width + inner) * 2 + merged_rows * (width * 4 + text_width) * 2 +
+        8 * 1024 * 1024;
+}
+
 pub const Vision = struct {
     ctx: *Context,
     weights: Buffers(Weight) = @splat(.{}),
