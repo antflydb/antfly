@@ -2808,6 +2808,9 @@ const PageChecksumSink = struct {
 /// the reflected polynomial's zero-byte operator shifts the left checksum.
 fn combineSectionCrc(left: u32, right: u32, right_length: usize) u32 {
     if (right_length == 0) return left;
+    // The shift is linear in `left`, so a zero left checksum (a section's
+    // first block) shifts to zero. Small segments are all first blocks.
+    if (left == 0) return right;
     const Matrix = struct {
         fn times(matrix: *const [32]u32, vector: u32) u32 {
             var bits = vector;
@@ -9945,6 +9948,19 @@ test "sorted typed compaction streams fanin and preserves reordered sparse value
             }
         }
         std.mem.reverse(SortedMergeDoc, &records);
+    }
+}
+
+test "section CRC combination matches a checksum of the concatenation" {
+    var bytes: [8191 + 4096]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    prng.random().bytes(&bytes);
+    for ([_]usize{ 0, 1, 7, 64, 4095, 4096, 4097, 8191 }) |split| {
+        for ([_]usize{ 0, 1, 3, 100, 809, 4096 }) |right_len| {
+            const left = bytes[0..split];
+            const right = bytes[split .. split + right_len];
+            try std.testing.expectEqual(Crc32.hash(bytes[0 .. split + right_len]), combineSectionCrc(Crc32.hash(left), Crc32.hash(right), right.len));
+        }
     }
 }
 

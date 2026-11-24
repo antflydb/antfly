@@ -21873,6 +21873,9 @@ pub const IndexManager = struct {
                 const index_sort = try textIndexSortFieldsForSegmentAlloc(arena, runtime_index_sort);
                 const build_span = write_stage_profile.begin(.text_segment_build);
                 defer build_span.end();
+                var build_profile: introducer_mod.BuildTextProfile = .{};
+                const profiling = write_stage_profile.enabled();
+                defer if (profiling) noteTextBuildProfile(build_profile);
                 const built = try mapper.buildTextSegmentsFromProjectionBatch(
                     segment_alloc,
                     projection_batch,
@@ -21886,6 +21889,9 @@ pub const IndexManager = struct {
                         .target_build_memory_bytes = @max(@as(usize, 1), textBuildMemoryTargetBytes()),
                         .doc_scratch_retained_bytes = textDocScratchRetainedBytes(),
                         .index_sort = index_sort,
+                        .profile = if (profiling) &build_profile else null,
+                        .profile_timings = profiling,
+                        .profile_working_set = false,
                         .resource_manager = self.resource_manager,
                         .store_document_source = false,
                     },
@@ -21909,6 +21915,15 @@ pub const IndexManager = struct {
             .segments = try segments.toOwnedSlice(alloc),
             .observed_field_analyzers = try observed.toOwnedSlice(alloc),
         };
+    }
+
+    fn noteTextBuildProfile(profile: introducer_mod.BuildTextProfile) void {
+        write_stage_profile.add(.text_build_analyze, profile.analyzer_ns +| profile.term_accum_ns +| profile.hit_materialize_ns);
+        write_stage_profile.add(.text_build_typed, profile.typed_collect_ns +| profile.typed_build_ns);
+        write_stage_profile.add(.text_build_inverted, profile.inverted_build_ns);
+        write_stage_profile.add(.text_build_term_dict, profile.inverted_term_dict_ns);
+        write_stage_profile.add(.text_build_bloom, profile.inverted_bloom_finish_ns);
+        write_stage_profile.add(.text_build_assembly, profile.segment_assembly_ns -| profile.inverted_build_ns -| profile.typed_build_ns);
     }
 
     fn buildTextProjectionBatchForEntry(

@@ -988,6 +988,9 @@ pub const BuildTextSegmentsOptions = struct {
     doc_scratch_retained_bytes: ?usize = null,
     index_sort: []const segment_mod.SegmentIndexSortField = &.{},
     profile: ?*introducer_mod.BuildTextProfile = null,
+    profile_timings: bool = true,
+    /// Resident-memory samples around each phase; costly per segment.
+    profile_working_set: bool = true,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     store_document_source: bool = true,
     store_source_columns: bool = false,
@@ -1598,6 +1601,8 @@ fn buildTextOptionsFromSegmentOptions(options: BuildTextSegmentsOptions) introdu
     var build_options = introducer_mod.BuildTextOptions{
         .contribution_cache = options.contribution_cache,
         .profile = options.profile,
+        .profile_timings = options.profile_timings,
+        .profile_working_set = options.profile_working_set,
         .resource_manager = options.resource_manager,
         .postings_run_io = options.postings_run_io,
         .postings_run_directory = options.postings_run_directory,

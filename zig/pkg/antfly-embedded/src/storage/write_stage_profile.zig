@@ -58,6 +58,19 @@ pub const Stage = enum(u8) {
     merge,
     /// A merge commit waiting for the writer lease.
     merge_lease_wait,
+    /// Within `text_segment_build` (from `BuildTextProfile`): tokenizing
+    /// and accumulating terms.
+    text_build_analyze,
+    /// Typed doc values: collecting and encoding.
+    text_build_typed,
+    /// Inverted sections: postings, term dictionary, norms, bloom.
+    text_build_inverted,
+    /// Within it: the term dictionary.
+    text_build_term_dict,
+    /// Within it: the bloom filter.
+    text_build_bloom,
+    /// Stored documents, section index, page directory and footer.
+    text_build_assembly,
 };
 
 const stage_count = @typeInfo(Stage).@"enum".field_names.len;
@@ -95,6 +108,14 @@ pub const Span = struct {
         if (self.stage == .write and n % report_every == 0) report(n);
     }
 };
+
+/// Adds a time measured elsewhere to `stage`.
+pub fn add(stage: Stage, ns: u64) void {
+    if (!enabled()) return;
+    const i = @backingInt(stage);
+    _ = total_ns[i].fetchAdd(ns, .monotonic);
+    _ = counts[i].fetchAdd(1, .monotonic);
+}
 
 pub fn begin(stage: Stage) Span {
     return .{ .stage = stage, .start_ns = if (enabled()) nowNs() else 0 };
