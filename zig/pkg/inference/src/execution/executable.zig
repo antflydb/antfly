@@ -3563,6 +3563,8 @@ test "planned Metal elementwise product-add publishes into the assigned region o
         defer claims.releaseUnsubmitted();
         var result = try executable.run(a, .{ .host_inputs = inputs[0..count], .prepared_routes = routes, .region_claims = &claims, .output_placement = .producer, .collect_partition_stats = true, .activation_readbacks = .forbidden });
         defer result.deinit(&executable.runtime);
+        try std.testing.expect(!result.stats.metal_region_policy_observed);
+        try std.testing.expectEqual(@as(u64, 0), result.stats.graph_plan_slots_reserved);
         const dispatch = result.stats.assigned_regions orelse return error.MissingRegionDispatch;
         try std.testing.expectEqual(@as(u64, 1), dispatch.accepted_callbacks);
         try std.testing.expectEqual(@as(u64, if (pair) 3 else 2), dispatch.covered_callback_nodes);
@@ -4563,6 +4565,8 @@ test "planned Metal shared transpose publishes two assigned dot outputs" {
         return err;
     };
     defer assigned.deinit(&executable.runtime);
+    try std.testing.expect(!assigned.stats.metal_region_policy_observed);
+    try std.testing.expectEqual(@as(u64, 0), assigned.stats.graph_plan_slots_reserved);
     const dispatch = assigned.stats.assigned_regions orelse return error.MissingRegionDispatch;
     try std.testing.expectEqual(@as(u64, 1), dispatch.accepted_callbacks);
     try std.testing.expectEqual(@as(u64, 3), dispatch.covered_callback_nodes);

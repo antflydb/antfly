@@ -2034,7 +2034,7 @@ pub const MetalPartitionExecutor = struct {
         var transient_runtime_region_plan: ?RuntimeRegionPlan = null;
         defer if (transient_runtime_region_plan) |*plan| plan.deinit(allocator);
         const runtime_region_plan_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
-        const runtime_region_plan = try self.runtimeRegionPlan(
+        const runtime_region_plan = if (owned_frame) RuntimeRegionPlan{} else try self.runtimeRegionPlan(
             allocator,
             graph,
             node_ids,
@@ -2046,26 +2046,24 @@ pub const MetalPartitionExecutor = struct {
         );
         if (collect_loop_profile) loop_profile.runtime_region_plan_ns += metalPartitionElapsedNs(runtime_region_plan_start_ns, metalPartitionNowNs());
         if (trace_progress) std.debug.print("metal_partition_progress: phase=runtime_region_plan_ready partition={d} regions={d}\n", .{ partition_index, runtime_region_plan.region_count });
-        if (traceRuntimeRegionsEnabled()) printRuntimeRegionPlanSummary(graph, runtime_region_plan, partition_index);
+        if (traceRuntimeRegionsEnabled() and !owned_frame) printRuntimeRegionPlanSummary(graph, runtime_region_plan, partition_index);
         if (metalPartitionOpRunsEnabled()) printMetalPartitionOpRuns(graph, node_ids, reachable, last_use, partition_index);
-        if (exec_ctx.stats) |stats| {
-            if (!owned_frame) {
-                stats.runtime_region_plan_active_regions += runtime_region_plan.region_count;
-                stats.runtime_region_plan_covered_nodes += runtime_region_plan.covered_node_count;
-                stats.runtime_region_plan_elided_nodes += runtime_region_plan.elided_node_count;
-            }
+        if (!owned_frame) if (exec_ctx.stats) |stats| {
+            stats.runtime_region_plan_active_regions += runtime_region_plan.region_count;
+            stats.runtime_region_plan_covered_nodes += runtime_region_plan.covered_node_count;
+            stats.runtime_region_plan_elided_nodes += runtime_region_plan.elided_node_count;
             stats.runtime_region_pre_skip_declined_external_consumers += runtime_region_plan.pre_skip_declined_external_consumer_count;
             const frame_eligibility = analyzeRuntimeFrameEligibility(graph, runtime_region_plan);
             recordRuntimeFrameEligibilityStats(stats, frame_eligibility);
             if (frame_eligibility.eligible()) {
                 stats.runtime_frame_metadata_ready += 1;
             }
-        }
+        };
 
         if (trace_nodes) std.debug.print("graph_executor_node_trace: begin_frame_begin partition={d}\n", .{partition_index});
         if (trace_progress) std.debug.print("metal_partition_progress: phase=begin_frame_begin partition={d}\n", .{partition_index});
         const begin_frame_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
-        var frame_active = if (metalPartitionFrameDisabled() or (!planned_primitives and runtime_region_plan.region_count == 0)) false else try cb.decoderRuntimeBeginFrame();
+        var frame_active = if (metalPartitionFrameDisabled() or (!owned_frame and !planned_primitives and runtime_region_plan.region_count == 0)) false else try cb.decoderRuntimeBeginFrame();
         errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
         if (owned_frame and !frame_active) return error.PreparedMetalFrameDispatchChanged;
         if (options.physical_frame) |frame| try frame.encodeMetalDeviceInputs(cb);
@@ -2465,7 +2463,9 @@ pub const MetalPartitionExecutor = struct {
                         if (!frame_active) break :physical null;
                         if (metalPartitionRuntimeCommandsDisabled()) break :physical null;
                         const frame = options.physical_frame orelse break :physical null;
-                        if (runtime_region_plan.descriptorAt(node_pos) == null and !frame.hasPreparedMetadataAlias(node_id)) break :physical null;
+                        // Complete frames use the descriptor already bound to their
+                        // selected route. Compatibility still requires a legacy hint.
+                        if (!owned_frame and runtime_region_plan.descriptorAt(node_pos) == null and !frame.hasPreparedMetadataAlias(node_id)) break :physical null;
                         // Metal may intentionally leave a producer absent so
                         // the command path below can fold it into its consumer
                         // (broadcasts, scales and transposes, for example).
