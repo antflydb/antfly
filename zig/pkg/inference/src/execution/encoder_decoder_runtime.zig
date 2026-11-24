@@ -353,10 +353,7 @@ pub fn residentVocabularyRow(allocator: std.mem.Allocator, decoder: backends.Ses
     const logits = outputs.outputs[logits_index];
     var operation_scope: @import("backend_operation.zig").Scope = undefined;
     try @import("backend_operation.zig").enterInto(outputs.backend, null, outputs.backend.operationToken(), .legacy_unknown_frame, &operation_scope);
-    var operation_succeeded = false;
-    defer {
-        if (operation_succeeded) operation_scope.finish() catch @import("antfly_platform").inference_process_supervisor.restartWorker() else operation_scope.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
-    }
+    errdefer operation_scope.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
     if (try outputs.backend.tensorShapeMatches(logits, &expected)) |matches| {
         if (!matches) return error.InvalidDecoderOutput;
     } else {
@@ -365,16 +362,20 @@ pub fn residentVocabularyRow(allocator: std.mem.Allocator, decoder: backends.Ses
         if (!std.mem.eql(i64, &expected, actual)) return error.InvalidDecoderOutput;
     }
     if (control) |active| try active.check();
-    var guard = if (control) |active| try active.enterUninterruptible(decoder.interruption()) else null;
-    defer if (guard) |*scope| scope.deinit();
-    const slice = outputs.backend.vtable.sliceRows2D orelse return error.UnexpectedResidentStageDecline;
-    const row = try slice(outputs.backend.ptr, logits, query_rows - 1, 1, vocab);
-    defer outputs.backend.free(row);
-    const values = try outputs.backend.toFloat32(row, allocator);
+    const values = readback: {
+        var guard = if (control) |active| try active.enterUninterruptible(decoder.interruption()) else null;
+        defer if (guard) |*scope| scope.deinit();
+        const slice = outputs.backend.vtable.sliceRows2D orelse return error.UnexpectedResidentStageDecline;
+        const row = try slice(outputs.backend.ptr, logits, query_rows - 1, 1, vocab);
+        defer outputs.backend.free(row);
+        const result = try outputs.backend.toFloat32(row, allocator);
+        errdefer allocator.free(result);
+        if (result.len != vocab) return error.InvalidDecoderOutput;
+        if (control) |active| try active.check();
+        break :readback result;
+    };
     errdefer allocator.free(values);
-    if (values.len != vocab) return error.InvalidDecoderOutput;
-    if (control) |active| try active.check();
-    operation_succeeded = true;
+    try operation_scope.finish();
     return values;
 }
 
