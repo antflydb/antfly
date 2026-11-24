@@ -2430,19 +2430,18 @@ fn prepareGemma4RawAudioFramesPcm(allocator: std.mem.Allocator, decoded: audio.P
     const max_samples = std.math.mul(usize, samples_per_token, max_tokens) catch return error.InvalidTensorShape;
     const source_limit = try sourceSampleLimitForResample(max_samples, decoded.sample_rate, target_rate);
     if (decoded.samples.len > source_limit) return error.AudioInputTooLong;
-    const resampled = try audio.copyOrResample(allocator, decoded.samples, decoded.sample_rate, target_rate);
-    defer allocator.free(resampled);
-
-    if (resampled.len > max_samples) return error.AudioInputTooLong;
-    const real_samples = resampled.len;
-    const frames = if (real_samples == 0)
-        0
+    const resampled: ?[]f32 = if (decoded.sample_rate != target_rate)
+        try audio.copyOrResample(allocator, decoded.samples, decoded.sample_rate, target_rate)
     else
-        (real_samples + samples_per_token - 1) / samples_per_token;
+        null;
+    defer if (resampled) |owned| allocator.free(owned);
+    const samples: []const f32 = if (resampled) |owned| owned else decoded.samples;
+    if (samples.len > max_samples) return error.AudioInputTooLong;
+    const frames = std.math.divCeil(usize, samples.len, samples_per_token) catch return error.InvalidTensorShape;
     const out_len = std.math.mul(usize, frames, samples_per_token) catch return error.InvalidTensorShape;
     const out = try allocator.alloc(f32, out_len);
-    @memset(out, 0.0);
-    if (real_samples > 0) @memcpy(out[0..real_samples], resampled[0..real_samples]);
+    @memcpy(out[0..samples.len], samples);
+    @memset(out[samples.len..], 0.0);
     return out;
 }
 
@@ -2511,6 +2510,16 @@ test "gemma4 direct audio frames preserve raw waveform samples" {
     try std.testing.expectEqual(@as(f32, 0.0), frames[5]);
     try std.testing.expectEqual(@as(f32, 0.0), frames[6]);
     try std.testing.expectEqual(@as(f32, 0.0), frames[7]);
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
+    const frame_allocator = failing.allocator();
+    const from_pcm = try prepareGemma4RawAudioFramesPcm(frame_allocator, .{
+        .samples = &samples,
+        .sample_rate = 16_000,
+    }, 4, 4);
+    defer frame_allocator.free(from_pcm);
+    try std.testing.expectEqualSlices(f32, &samples, from_pcm[0..samples.len]);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0, 0 }, from_pcm[samples.len..]);
 }
 
 test "gemma4 audio source window is bounded before resampling" {
