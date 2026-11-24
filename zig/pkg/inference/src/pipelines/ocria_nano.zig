@@ -968,7 +968,6 @@ pub const Env = struct {
             const input = scratch.alloc(f32, count) catch |err| return preparation.failure(err);
             defer scratch.free(input);
             fill(ctx, input);
-            debugDump("in", shape, std.mem.sliceAsBytes(input));
             try preparation.trim();
             const input_name = if (session.inputInfo().len > 0) session.inputInfo()[0].name else "x";
             var tensor = try preparation.tensor(f32, input_name, shape, input);
@@ -985,30 +984,11 @@ pub const Env = struct {
         inline for (names, 0..) |name, slot| {
             const t = findOutput(outputs, name, slot) orelse return error.MissingModelOutput;
             result[slot] = try copyOutput(self.work, t);
-            debugDump(name, result[slot].shape, if (result[slot].f32s) |v| std.mem.sliceAsBytes(v) else std.mem.sliceAsBytes(result[slot].i64s.?));
             filled += 1;
         }
         return result;
     }
 };
-
-// TEMP debug: ANTFLY_OCRIA_DUMP=<dir> writes every model input/output.
-var debug_counter: usize = 0;
-fn debugDump(tag: []const u8, shape: []const i64, bytes: []const u8) void {
-    const dir = std.c.getenv("ANTFLY_OCRIA_DUMP") orelse return;
-    var buf: [512]u8 = undefined;
-    if (std.mem.eql(u8, tag, "in")) debug_counter += 1;
-    var dims: [64]u8 = undefined;
-    var w: usize = 0;
-    for (shape) |d| {
-        const part = std.fmt.bufPrint(dims[w..], "{d}x", .{d}) catch return;
-        w += part.len;
-    }
-    const path = std.fmt.bufPrintSentinel(&buf, "{s}/{d:0>4}_{s}_{s}.bin", .{ std.mem.span(dir), debug_counter, tag, dims[0..w] }, 0) catch return;
-    const f = std.c.fopen(path, "wb") orelse return;
-    defer _ = std.c.fclose(f);
-    _ = std.c.fwrite(bytes.ptr, 1, bytes.len, f);
-}
 
 fn findOutput(outputs: []backends.Tensor, name: []const u8, slot: usize) ?*backends.Tensor {
     for (outputs) |*t| if (std.mem.eql(u8, t.name, name)) return t;
@@ -1802,40 +1782,9 @@ fn readPage(env: *const Env, stages: *const Stages, img: Raster, boxes: []const 
     return .{ .reads = out, .flip = r.flip };
 }
 
-// TEMP debug: ANTFLY_OCRIA_PROBE=<model.onnx> ANTFLY_OCRIA_PROBE_IN=<f32 file>
-// ANTFLY_OCRIA_PROBE_SHAPE=NxCxHxW runs one graph natively and dumps outputs.
-fn debugProbe(allocator: std.mem.Allocator) !void {
-    const model = std.c.getenv("ANTFLY_OCRIA_PROBE") orelse return;
-    const in_path = std.mem.span(std.c.getenv("ANTFLY_OCRIA_PROBE_IN").?);
-    const shape_str = std.mem.span(std.c.getenv("ANTFLY_OCRIA_PROBE_SHAPE").?);
-    var shape: [4]i64 = undefined;
-    var it = std.mem.splitScalar(u8, shape_str, 'x');
-    var count: usize = 1;
-    for (&shape) |*d| {
-        d.* = try std.fmt.parseInt(i64, it.next().?, 10);
-        count *= @intCast(d.*);
-    }
-    const bytes = try @import("../util/c_file.zig").readFile(allocator, in_path);
-    defer allocator.free(bytes);
-    const session = try backends.imported_onnx_session.createSession(allocator, std.mem.span(model), .native);
-    defer session.close();
-    const t = backends.Tensor{ .data = bytes[0 .. count * 4], .dtype = .f32, .shape = &shape, .name = "x", .allocator = allocator, .owns_data = false, .owns_shape = false };
-    const outs = try session.run(&.{t}, allocator);
-    for (outs) |*o| {
-        var copied = try copyOutput(allocator, o);
-        defer copied.deinit(allocator);
-        debug_counter = 9000;
-        debugDump(o.name, copied.shape, if (copied.f32s) |v| std.mem.sliceAsBytes(v) else std.mem.sliceAsBytes(copied.i64s.?));
-        o.deinit();
-    }
-    allocator.free(outs);
-    std.process.exit(0);
-}
-
 /// OCR one decoded page. Lines are returned in detector order.
 pub fn runPage(env: *const Env, detector: backends.Session, stages: *const Stages, decoded: image.Image) ![]Line {
     const a = env.work;
-    try debugProbe(std.heap.page_allocator);
     const src_ch: usize = decoded.channels;
     if (src_ch == 0 or src_ch == 2 or src_ch > 4) return error.UnsupportedImageChannels;
     var img0 = Raster{ .w = decoded.width, .h = decoded.height, .ch = 3, .data = undefined };

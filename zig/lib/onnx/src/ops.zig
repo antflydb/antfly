@@ -2751,7 +2751,9 @@ fn convertReduceLogSumExp(builder: *Builder, node: *const NodeProto, inputs: []c
     var keep_node = node.*;
     keep_node.attributes = keep_attrs[0 .. node.attributes.len + 1];
     const shift = try convertReduce(builder, .reduce_max, &keep_node, inputs);
-    const centered = try builder.sub(inputs[0], shift);
+    // Explicit broadcast: a reduced operand may carry no runtime shape, and
+    // the flat fallback broadcast only aligns trailing axes.
+    const centered = try broadcastBinaryOp(builder, .sub, inputs[0], shift);
     const exps = try builder.expOp(centered);
     var sum_inputs_buf: [2]NodeId = .{ exps, null_node };
     if (inputs.len >= 2) sum_inputs_buf[1] = inputs[1];
@@ -3188,6 +3190,8 @@ fn convertConv(builder: *Builder, node: *const NodeProto, inputs: []const NodeId
     if (x_shape.rank() < 3 or w_shape.rank() < 3) return error.UnsupportedOp; // need at least [N, C, spatial...] and [O, I, spatial...]
     const num_spatial: u8 = w_shape.rank() - 2; // kernel rank defines conv dimensionality
     if (x_shape.rank() < num_spatial + 2) return error.UnsupportedOp;
+    if (num_spatial == 1 and x_shape.rank() == 3 and !conv1dFusable(node, x_shape, w_shape))
+        return convertConv1dAs2d(builder, node, inputs, x_shape, w_shape);
 
     // Extract attributes
     const strides_attr = getInts(node.attributes, "strides");
@@ -3254,6 +3258,51 @@ fn convertConv(builder: *Builder, node: *const NodeProto, inputs: []const NodeId
     }
 
     return decomposed;
+}
+
+/// Whether a 1-D Conv becomes `fused_conv1d` (see tryConvFused): ungrouped,
+/// undilated, symmetric padding and fully static shapes.
+fn conv1dFusable(node: *const NodeProto, x_shape: Shape, w_shape: Shape) bool {
+    if (getInt(node.attributes, "group", 1) != 1) return false;
+    const dilations = getInts(node.attributes, "dilations");
+    if (dilations.len > 0 and dilations[0] != 1) return false;
+    const pads = getInts(node.attributes, "pads");
+    if (pads.len >= 2 and pads[0] != pads[1]) return false;
+    for (0..x_shape.rank()) |i| if (x_shape.dim(@intCast(i)) <= 0) return false;
+    for (0..w_shape.rank()) |i| if (w_shape.dim(@intCast(i)) <= 0) return false;
+    return true;
+}
+
+/// Run a grouped or dynamically shaped 1-D Conv as a 2-D Conv over
+/// [N, C, 1, T]: the 2-D path supports groups and runtime spatial sizes, and
+/// its channel-axis bias add is the one every image model exercises.
+fn convertConv1dAs2d(builder: *Builder, node: *const NodeProto, inputs: []const NodeId, x_shape: Shape, w_shape: Shape) ConvertError!NodeId {
+    const x4 = try builder.reshape(inputs[0], Shape{ .dtype = x_shape.dtype, .dims = .{ x_shape.dim(0), x_shape.dim(1), 1, x_shape.dim(2), 0, 0, 0, 0 }, .rank_ = 4 });
+    const w4 = try builder.reshape(inputs[1], Shape{ .dtype = w_shape.dtype, .dims = .{ w_shape.dim(0), w_shape.dim(1), 1, w_shape.dim(2), 0, 0, 0, 0 }, .rank_ = 4 });
+
+    const strides = getInts(node.attributes, "strides");
+    const pads = getInts(node.attributes, "pads");
+    const dilations = getInts(node.attributes, "dilations");
+    const kernel = getInts(node.attributes, "kernel_shape");
+    var kernel2 = [_]i64{ 1, if (kernel.len > 0) kernel[0] else w_shape.dim(2) };
+    var strides2 = [_]i64{ 1, if (strides.len > 0) strides[0] else 1 };
+    var dilations2 = [_]i64{ 1, if (dilations.len > 0) dilations[0] else 1 };
+    var pads2 = [_]i64{ 0, if (pads.len > 0) pads[0] else 0, 0, if (pads.len > 1) pads[1] else 0 };
+    var attrs = [_]AttributeProto{
+        .{ .name = "kernel_shape", .ints = &kernel2, .attr_type = .ints },
+        .{ .name = "strides", .ints = &strides2, .attr_type = .ints },
+        .{ .name = "dilations", .ints = &dilations2, .attr_type = .ints },
+        .{ .name = "pads", .ints = &pads2, .attr_type = .ints },
+        .{ .name = "group", .i = getInt(node.attributes, "group", 1), .attr_type = .int },
+    };
+    var node2 = node.*;
+    node2.attributes = &attrs;
+    var inputs2_buf = [_]NodeId{ x4, w4, null_node };
+    const has_bias = inputs.len >= 3 and inputs[2] != null_node;
+    if (has_bias) inputs2_buf[2] = inputs[2];
+    const result4 = try convertConv(builder, &node2, inputs2_buf[0..if (has_bias) 3 else 2]);
+    const out4 = builder.graph.node(result4).output_shape;
+    return builder.reshape(result4, Shape{ .dtype = out4.dtype, .dims = .{ out4.dim(0), out4.dim(1), out4.dim(3), 0, 0, 0, 0, 0 }, .rank_ = 3 });
 }
 
 /// Add bias to a conv result. Bias is 1-D [out_channels]; reshape to [1, C, 1, ...] to
@@ -3715,7 +3764,7 @@ fn convertDequantizeLinear(builder: *Builder, node: *const NodeProto, inputs: []
         var zp = inputs[2];
         // For per-axis, reshape zero_point to broadcast along the quantization axis
         zp = try broadcastPerAxis(builder, zp, x_shape, axis_attr);
-        dequant = try builder.sub(dequant, zp);
+        dequant = try broadcastBinaryOp(builder, .sub, dequant, zp);
     }
     // Cast to float if needed (quantized input is typically int8/uint8)
     const scale_shape = builder.graph.node(scale).output_shape;
@@ -3731,8 +3780,9 @@ fn convertDequantizeLinear(builder: *Builder, node: *const NodeProto, inputs: []
     }
     // For per-axis, reshape scale to broadcast along the quantization axis
     scale = try broadcastPerAxis(builder, scale, builder.graph.node(dequant).output_shape, axis_attr);
-    // Multiply by scale
-    return builder.mul(dequant, scale);
+    // Multiply by scale. Explicit broadcasts keep per-axis parameters on
+    // their axis even where runtime operand shapes are not tracked.
+    return broadcastBinaryOp(builder, .mul, dequant, scale);
 }
 
 /// Block dequantization: reshape input so the quantization axis is split into
@@ -3771,7 +3821,7 @@ fn dequantizeBlock(builder: *Builder, x: NodeId, scale: NodeId, zp: ?NodeId, axi
         if (zp_shape.dtype != x_shape.dtype) {
             zp_bc = try castDType(builder, zp_bc, x_shape.dtype);
         }
-        blocked = try builder.sub(blocked, zp_bc);
+        blocked = try broadcastBinaryOp(builder, .sub, blocked, zp_bc);
     }
 
     // Cast to float
@@ -3789,7 +3839,7 @@ fn dequantizeBlock(builder: *Builder, x: NodeId, scale: NodeId, zp: ?NodeId, axi
 
     // Broadcast scale along the block axis (scale has shape [..., num_blocks, ...])
     const scale_bc = try broadcastPerAxis(builder, scale, builder.graph.node(blocked).output_shape, axis);
-    const result = try builder.mul(blocked, scale_bc);
+    const result = try broadcastBinaryOp(builder, .mul, blocked, scale_bc);
 
     // Reshape back to original shape
     const out_shape = Shape{ .dtype = scale_dtype, .dims = x_shape.dims, .rank_ = rank };
@@ -3814,7 +3864,7 @@ fn convertQuantizeLinear(builder: *Builder, node: *const NodeProto, inputs: []co
     scale = try broadcastPerAxis(builder, scale, x_shape, axis_attr);
 
     // y = x / scale
-    var result = try builder.div(x, scale);
+    var result = try broadcastBinaryOp(builder, .div, x, scale);
 
     // Add zero_point if provided
     if (inputs.len >= 3 and inputs[2] != null_node) {
@@ -3825,7 +3875,7 @@ fn convertQuantizeLinear(builder: *Builder, node: *const NodeProto, inputs: []co
             zp = try castDType(builder, zp, x_shape.dtype);
         }
         zp = try broadcastPerAxis(builder, zp, x_shape, axis_attr);
-        result = try builder.add(result, zp);
+        result = try broadcastBinaryOp(builder, .add, result, zp);
     }
 
     // Clamp to the output type range before rounding. Values outside the
@@ -6395,7 +6445,7 @@ test "convertNode Conv falls back to conv_general on asymmetric pads" {
     try std.testing.expectEqual(@as(u32, 0), countOpTag(&g, .fused_conv2d));
 }
 
-test "convertNode Conv 1D falls back to conv_general when grouped" {
+test "convertNode Conv 1D runs grouped convolutions as 2-D" {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
     defer g.deinit();
@@ -6409,9 +6459,46 @@ test "convertNode Conv 1D falls back to conv_general when grouped" {
     };
     const node = NodeProto{ .op_type = "Conv", .attributes = &attrs };
     const result = try convertNode(allocator, &b, &node, &.{ x, w }, null);
-    // fused_conv1d has no groups; must fall back.
-    try std.testing.expect(std.meta.activeTag(g.node(result).op) == .conv_general);
+    // fused_conv1d has no groups; the conv runs over [N, C, 1, T] instead.
     try std.testing.expectEqual(@as(u32, 0), countOpTag(&g, .fused_conv1d));
+    const out = g.node(result).output_shape;
+    try std.testing.expectEqual(@as(u8, 3), out.rank());
+    try std.testing.expectEqual(@as(i64, 16), out.dim(1));
+    try std.testing.expectEqual(@as(i64, 30), out.dim(2));
+    try std.testing.expect(countOpTag(&g, .fused_conv2d) + countOpTag(&g, .conv_general) >= 1);
+    for (0..g.nodeCount()) |i| switch (g.node(@intCast(i)).op) {
+        .conv_general => |conv| try std.testing.expectEqual(@as(u8, 2), conv.num_spatial),
+        else => {},
+    };
+}
+
+test "convertNode Conv 1D with dynamic time and bias keeps channel-axis bias" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const x = try b.parameter("x", Shape.init(.f32, &.{ -1, 8, -1 }));
+    const w = try b.parameter("w", Shape.init(.f32, &.{ 8, 1, 9 }));
+    const bias = try b.parameter("b", Shape.init(.f32, &.{8}));
+    var attrs = [_]AttributeProto{
+        .{ .name = "kernel_shape", .ints = @constCast(&[_]i64{9}) },
+        .{ .name = "pads", .ints = @constCast(&[_]i64{ 4, 4 }) },
+        .{ .name = "group", .i = 8 },
+    };
+    const node = NodeProto{ .op_type = "Conv", .attributes = &attrs };
+    const result = try convertNode(allocator, &b, &node, &.{ x, w, bias }, null);
+    const out = g.node(result).output_shape;
+    try std.testing.expectEqual(@as(u8, 3), out.rank());
+    try std.testing.expectEqual(@as(i64, 8), out.dim(1));
+    // The bias is added to the rank-4 conv result as [1, C, 1, 1].
+    var found_bias_add = false;
+    for (0..g.nodeCount()) |i| {
+        const n = g.node(@intCast(i));
+        if (n.op != .add) continue;
+        if (n.output_shape.rank() == 4) found_bias_add = true;
+    }
+    try std.testing.expect(found_bias_add);
 }
 
 fn countOpTag(g: *const Graph, tag: std.meta.Tag(ml.graph.node.OpCode)) u32 {
