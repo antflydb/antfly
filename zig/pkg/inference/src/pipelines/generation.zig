@@ -3795,9 +3795,9 @@ pub const NativeGenerationPipeline = struct {
             var input: ?@import("../execution/media_prefix.zig").Prefix.Prepared = null;
             if (prepared_qwen3vl_prompt) |*prepared| {
                 if (prepared.deepstack_layer_count != 0) return error.UnsupportedResidentQwenVision;
-                input = .{ .tensor = prepared.input_embeddings orelse return error.InvalidPreparedPrompt, .rows = prepared.token_ids.len, .width = self.gpt_config.hidden_size, .bucket_rows = self.pjrt_media_bucket_rows, .positions = prepared.plan.mrope_positions, .position_delta = prepared.plan.mrope_position_delta };
+                input = .{ .source = &prepared.input_embeddings, .rows = prepared.token_ids.len, .width = self.gpt_config.hidden_size, .bucket_rows = self.pjrt_media_bucket_rows, .positions = prepared.plan.mrope_positions, .position_delta = prepared.plan.mrope_position_delta };
             } else if (prepared_multimodal_prompt) |*prepared| {
-                input = .{ .tensor = prepared.input_embeddings orelse return error.InvalidPreparedPrompt, .rows = prepared.token_ids.len, .width = self.gpt_config.hidden_size, .bucket_rows = self.pjrt_media_bucket_rows, .ple = prepared.ple_token_ids, .visibility = prepared.attn_or_mask };
+                input = .{ .source = &prepared.input_embeddings, .rows = prepared.token_ids.len, .width = self.gpt_config.hidden_size, .bucket_rows = self.pjrt_media_bucket_rows, .ple = prepared.ple_token_ids, .visibility = prepared.attn_or_mask };
             }
             if (input) |prepared| {
                 const access = if (self.execution_lock) |mutex| self.executionAccess(mutex) else .{};

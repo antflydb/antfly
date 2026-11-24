@@ -71,7 +71,7 @@ pub const Prefix = struct {
     /// Session tensor ABI boundary for compiled generation. The request owns
     /// the materialized prefix and pays for it until the last consumer retires.
     pub const Prepared = struct {
-        tensor: ops.CT,
+        source: *?ops.CT,
         rows: usize,
         width: usize,
         bucket_rows: usize,
@@ -101,29 +101,36 @@ pub const Prefix = struct {
         }
 
         pub fn materialize(self: Prepared, a: std.mem.Allocator, session: Session, backend: *const ops.ComputeBackend, control: ?Control, access: ExecutionAccess) !Prefix {
+            const source = self.source.* orelse return error.InvalidPreparedPrompt;
             const bytes = try self.retainedBytes();
             const rows = std.math.cast(i64, self.rows) orelse return error.InvalidPreparedPrompt;
             const width = std.math.cast(i64, self.width) orelse return error.InvalidPreparedPrompt;
             var retained = try session.withAdmissionControl(control).admitRetainedMedia(bytes, 0);
             errdefer retained.deinit();
-            const embeddings = read: {
-                var scope = try access.acquireScope();
-                defer if (scope) |*held| held.deinit();
-                const values = try backend.toFloat32(self.tensor, a);
-                errdefer a.free(values);
-                if (values.len != self.rows * self.width) return error.InvalidPreparedPrompt;
-                break :read try Tensor.initFloat32Owned(a, "input_embeddings", &.{ 1, rows, width }, values);
+            const ple = if (self.ple) |ids| try a.dupe(i64, ids) else null;
+            errdefer if (ple) |ids| a.free(ids);
+            const positions = if (self.positions) |ids| try a.dupe(u32, ids) else null;
+            errdefer if (positions) |ids| a.free(ids);
+            const visibility = if (self.visibility) |mask| try a.dupe(u8, mask) else null;
+            errdefer if (visibility) |mask| a.free(mask);
+
+            var scope = try access.acquireScope();
+            defer if (scope) |*held| held.deinit();
+            const values = try backend.toFloat32(source, a);
+            errdefer a.free(values);
+            if (values.len != self.rows * self.width) return error.InvalidPreparedPrompt;
+            const embeddings = try Tensor.initFloat32Owned(a, "input_embeddings", &.{ 1, rows, width }, values);
+            backend.free(source);
+            self.source.* = null;
+            return .{
+                .embeddings = embeddings,
+                .bucket_rows = self.bucket_rows,
+                .retained = retained,
+                .ple_ids = ple,
+                .axis_positions = positions,
+                .position_delta = self.position_delta,
+                .visibility = visibility,
             };
-            var prefix = Prefix{ .embeddings = embeddings, .bucket_rows = self.bucket_rows, .retained = retained, .position_delta = self.position_delta };
-            errdefer {
-                // Refund once, after disposing of the partially built prefix.
-                prefix.retained = null;
-                prefix.deinit(a);
-            }
-            if (self.ple) |ids| prefix.ple_ids = try a.dupe(i64, ids);
-            if (self.positions) |ids| prefix.axis_positions = try a.dupe(u32, ids);
-            if (self.visibility) |mask| prefix.visibility = try a.dupe(u8, mask);
-            return prefix;
         }
     };
 
@@ -335,10 +342,17 @@ test "prepared media prefix materializes an owned typed packet from the Native b
     var compute = native.NativeCompute.init(a, &weights, null);
     defer compute.deinit();
     const cb = compute.computeBackend();
-    const source = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 });
-    defer cb.free(source);
+    var source: ?ops.CT = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 });
+    defer if (source) |tensor| cb.free(tensor);
     const session = Session{ .ptr = undefined, .vtable = undefined };
-    const input = Prefix.Prepared{ .tensor = source, .rows = 2, .width = 2, .bucket_rows = 4, .ple = &.{ 7, 9 }, .positions = &.{ 0, 1, 0, 1, 0, 1 }, .visibility = &.{ 0, 1, 1, 0 }, .position_delta = -1 };
+    const input = Prefix.Prepared{ .source = &source, .rows = 2, .width = 2, .bucket_rows = 4, .ple = &.{ 7, 9 }, .positions = &.{ 0, 1, 0, 1, 0, 1 }, .visibility = &.{ 0, 1, 1, 0 }, .position_delta = -1 };
+    var invalid = input;
+    invalid.visibility = &.{1};
+    try std.testing.expectError(error.InvalidPreparedPrompt, invalid.materialize(a, session, &cb, null, .{}));
+    invalid = input;
+    invalid.width = 3;
+    try std.testing.expectError(error.InvalidPreparedPrompt, invalid.materialize(a, session, &cb, null, .{}));
+    try std.testing.expect(source != null);
     var prefix = try input.materialize(a, session, &cb, null, .{});
     defer prefix.deinit(a);
     try std.testing.expectEqualSlices(i64, &.{ 1, 2, 2 }, prefix.embeddings.shape);
@@ -347,10 +361,5 @@ test "prepared media prefix materializes an owned typed packet from the Native b
     try std.testing.expectEqualSlices(u32, input.positions.?, prefix.axis_positions.?);
     try std.testing.expectEqualSlices(u8, input.visibility.?, prefix.visibility.?);
     try std.testing.expectEqual(@as(i64, -1), prefix.position_delta);
-    var invalid = input;
-    invalid.visibility = &.{1};
-    try std.testing.expectError(error.InvalidPreparedPrompt, invalid.materialize(a, session, &cb, null, .{}));
-    invalid = input;
-    invalid.width = 3;
-    try std.testing.expectError(error.InvalidPreparedPrompt, invalid.materialize(a, session, &cb, null, .{}));
+    try std.testing.expect(source == null);
 }
