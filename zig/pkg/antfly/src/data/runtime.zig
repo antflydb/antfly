@@ -6805,6 +6805,12 @@ pub const DataServer = struct {
         return antfly.public_api.indexes.collectArtifactEnrichmentsFromTableIndexesJson(a, indexes_json);
     }
 
+    fn contextCypher(ptr: *anyopaque, a: std.mem.Allocator, owner_table_id: u64, request: []const u8) anyerror![]u8 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        const server = if (self.http_server) |*server| server else return error.ContextSearchUnavailable;
+        return server.executeContextCypher(a, owner_table_id, request);
+    }
+
     fn contextParseQuery(_: *anyopaque, a: std.mem.Allocator, table_name: []const u8, body: []const u8) anyerror!antfly.db.types.SearchRequest {
         // Arena-owned: the parsed request lives as long as `a`.
         const owned = try @import("antfly_local_sources").api_query_contract.parseQueryRequest(a, null, table_name, body);
@@ -7370,6 +7376,7 @@ pub const DataServer = struct {
             .reads_fn = contextReads,
             .collect = .{ .collect_fn = contextCollect },
             .parse_query_fn = contextParseQuery,
+            .cypher_fn = contextCypher,
         } };
         _ = self.write_source.withContextHost(&self.context_host.?);
         if (self.data_raft_apply) |apply_sm| _ = apply_sm.write_source.withContextHost(&self.context_host.?);

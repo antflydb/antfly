@@ -731,7 +731,7 @@ fn uintField(field: std.json.Value, min: u64, max: u64) Error!u64 {
 pub const ranking_clauses = [_][]const u8{
     "full_text_search", "semantic_search", "embeddings",   "indexes",     "merge_config",
     "reranker",         "exclusion_query", "graph_queries", "limit",       "text",
-    "text_field",       "vector",          "vector_index",  "k",
+    "text_field",       "vector",          "vector_index",  "k",           "cypher",
 };
 const search_shorthands = [_][]const u8{ "text", "text_field", "vector", "vector_index", "k" };
 
@@ -823,6 +823,100 @@ pub fn graphOnlyRequestValue(request: std.json.ObjectMap) bool {
     if (request.get("graph_queries") == null) return false;
     inline for (hit_clauses) |clause| if (request.get(clause) != null) return false;
     return true;
+}
+
+/// Reserved member of a stored `cypher` request: the principal the
+/// statement runs as and the server's MAC over it. Admission always
+/// overwrites it, so a declaration cannot name another principal.
+pub const cypher_grant_field = "_antfly_execution_grant_v1";
+
+/// A stored request that runs a read-only Cypher statement against a graph
+/// instead of a QueryRequest: `{"cypher":{graph,query,parameters?},
+/// "limit"?}`. Its members are the source table's nodes the statement
+/// returns, in result order, each once.
+pub fn cypherRequestValue(request: std.json.ObjectMap) bool {
+    return request.get("cypher") != null;
+}
+
+pub fn cypherRequest(alloc: Allocator, request_json: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, request_json, .{}) catch return false;
+    defer parsed.deinit();
+    return parsed.value == .object and cypherRequestValue(parsed.value.object);
+}
+
+fn validateCypherRequest(request: std.json.ObjectMap) Error!void {
+    var it = request.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (!std.mem.eql(u8, key, "cypher") and !std.mem.eql(u8, key, "limit")) return error.UnsupportedContextPredicate;
+    }
+    const spec = request.get("cypher").?;
+    if (spec != .object) return error.InvalidContextSourcesConfig;
+    var sit = spec.object.iterator();
+    while (sit.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const value = entry.value_ptr.*;
+        if (std.mem.eql(u8, key, "graph")) {
+            if (value != .string or !validName(value.string)) return error.InvalidContextSourcesConfig;
+        } else if (std.mem.eql(u8, key, "query")) {
+            if (value != .string or value.string.len == 0 or value.string.len > max_cypher_statement) return error.InvalidContextSourcesConfig;
+        } else if (std.mem.eql(u8, key, "parameters")) {
+            if (value != .object) return error.InvalidContextSourcesConfig;
+        } else if (std.mem.eql(u8, key, cypher_grant_field)) {
+            if (value != .object) return error.InvalidContextSourcesConfig;
+        } else return error.InvalidContextSourcesConfig;
+    }
+    if (spec.object.get("graph") == null or spec.object.get("query") == null) return error.InvalidContextSourcesConfig;
+}
+
+const max_cypher_statement: usize = 16 * 1024;
+
+/// Members of a Cypher source: keys of the nodes of `table` a graph query
+/// result returns (`{"rows":[[value,...],...]}` in wire form), in row and
+/// column order, each once, at most `limit`. Nodes inside paths, lists,
+/// and maps count; nodes of other tables are context the statement used,
+/// not members.
+pub fn cypherResultKeysAlloc(a: Allocator, result_json: []const u8, table: []const u8, limit: u32) ![]const []const u8 {
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a, result_json, .{});
+    if (root != .object) return error.InvalidCypherWireValue;
+    const rows = root.object.get("rows") orelse return error.InvalidCypherWireValue;
+    if (rows != .array) return error.InvalidCypherWireValue;
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    for (rows.array.items) |row| {
+        if (keys.items.len >= limit) break;
+        try collectCypherNodes(a, row, table, limit, &keys, &seen, 0);
+    }
+    return keys.items;
+}
+
+fn collectCypherNodes(a: Allocator, value: std.json.Value, table: []const u8, limit: u32, keys: *std.ArrayListUnmanaged([]const u8), seen: *std.StringHashMapUnmanaged(void), depth: u8) !void {
+    if (keys.items.len >= limit or depth > 32) return;
+    switch (value) {
+        .array => |array| for (array.items) |item| try collectCypherNodes(a, item, table, limit, keys, seen, depth + 1),
+        .object => |object| {
+            const kind = object.get("type");
+            if (kind != null and kind.? == .string and std.mem.eql(u8, kind.?.string, "node")) {
+                const node = object.get("value") orelse return;
+                if (node != .object) return;
+                const identity = node.object.get("identity") orelse return;
+                if (identity != .object) return;
+                const node_table = identity.object.get("table") orelse return;
+                const key = identity.object.get("key") orelse return;
+                if (node_table != .string or key != .string) return;
+                if (!std.mem.eql(u8, node_table.string, table)) return;
+                if ((try seen.getOrPut(a, key.string)).found_existing) return;
+                try keys.append(a, key.string);
+                return;
+            }
+            // Relationships name their endpoints by identity only; their
+            // nodes are members when the statement returns them.
+            if (kind != null and kind.? == .string and std.mem.eql(u8, kind.?.string, "relationship")) return;
+            var it = object.iterator();
+            while (it.next()) |entry| try collectCypherNodes(a, entry.value_ptr.*, table, limit, keys, seen, depth + 1);
+        },
+        else => {},
+    }
 }
 
 /// Same, over a stored request's JSON (as executed by hosts).
@@ -1179,6 +1273,7 @@ fn parseSearchField(a: Allocator, s: *SearchSpec, key: []const u8, field: std.js
         // filter does not scope graph operations, so it would silently not
         // apply. Put constraints on the graph operation instead.
         if (graphOnlyRequestValue(field.object) and field.object.get("filter_query") != null) return error.UnsupportedContextPredicate;
+        if (cypherRequestValue(field.object)) try validateCypherRequest(field.object);
         if (field.object.get("limit")) |limit| s.k = @intCast(try uintField(limit, 1, max_search_k));
         s.request = try stringifyAlloc(a, field);
     } else return error.InvalidContextSourcesConfig;
@@ -4189,6 +4284,74 @@ test "graph and ranked query sources bind and validate" {
     try testing.expectError(error.UnsupportedContextPredicate, parsePublicJson(alloc,
         \\{"q":{"query":{"filter_query":{"disjuncts":[]}},"fields":["t"]}}
     , ""));
+}
+
+test "cypher query sources are snapshots with bound parameters" {
+    const alloc = testing.allocator;
+    var config = try parsePublicJson(alloc,
+        \\{"c":{"query":{"table":"orgs","cypher":{"graph":"social","query":"MATCH (p:Person {key: $k})-[:WORKS_AT]->(o:Org) RETURN o","parameters":{"k":{"$source":"/person"}}},"limit":5},"fields":["title"]}}
+    , "");
+    defer config.deinit();
+    const source = config.sources[0];
+    try testing.expectEqual(SourceKind.search, source.kind);
+    try testing.expectEqual(Tracking.snapshot, source.tracking);
+    try testing.expectEqual(@as(u32, 5), source.search.k);
+    try testing.expect(cypherRequest(alloc, source.search.request));
+    try testing.expect(!graphOnlyRequest(alloc, source.search.request));
+    var bindings = try bindTest(alloc, &config, "{\"person\":\"p:1\"}");
+    defer bindings.deinit();
+    try testing.expect(std.mem.indexOf(u8, bindings.items[0].search_request, "\"k\":\"p:1\"") != null);
+    const stored = try config.canonicalJsonAlloc(alloc);
+    defer alloc.free(stored);
+    var again = try parseStoredJson(alloc, stored);
+    defer again.deinit();
+    try testing.expectEqualSlices(u8, &config.digest(), &again.digest());
+    // The tracking summary names the clause.
+    const summary_value = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"c":{"query":{"cypher":{"graph":"g","query":"MATCH (n) RETURN n"}},"fields":["t"]}}
+    , .{});
+    defer summary_value.deinit();
+    const summary = try trackingSummaryJsonAlloc(alloc, summary_value.value);
+    defer alloc.free(summary);
+    try testing.expectEqualStrings(
+        \\{"c":{"kind":"query","tracking":"snapshot","reason":"cypher"}}
+    , summary);
+    // Live tracking cannot follow a statement; nothing but a limit may sit
+    // beside it; the spec needs a graph and a statement and nothing unknown.
+    try testing.expectError(error.ContextSourceRequiresSnapshot, parsePublicJson(alloc,
+        \\{"c":{"query":{"cypher":{"graph":"g","query":"MATCH (n) RETURN n"}},"fields":["t"],"tracking":"live"}}
+    , ""));
+    try testing.expectError(error.UnsupportedContextPredicate, parsePublicJson(alloc,
+        \\{"c":{"query":{"cypher":{"graph":"g","query":"MATCH (n) RETURN n"},"filter_query":{"field":"k","term":"v"}},"fields":["t"]}}
+    , ""));
+    try testing.expectError(error.InvalidContextSourcesConfig, parsePublicJson(alloc,
+        \\{"c":{"query":{"cypher":{"query":"MATCH (n) RETURN n"}},"fields":["t"]}}
+    , ""));
+    try testing.expectError(error.InvalidContextSourcesConfig, parsePublicJson(alloc,
+        \\{"c":{"query":{"cypher":{"graph":"g","query":"MATCH (n) RETURN n","mode":"write"}},"fields":["t"]}}
+    , ""));
+}
+
+test "cypher result members are the source table's nodes, in order, once" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result =
+        \\{"wire_version":1,"columns":["o","p","n"],"rows":[
+        \\ [{"type":"node","value":{"identity":{"table":"orgs","key":"o:2"},"labels":["Org"],"properties":{}}},
+        \\  {"type":"path","value":{"nodes":[{"type":"node","value":{"identity":{"table":"people","key":"p:1"},"labels":[],"properties":{}}},{"type":"node","value":{"identity":{"table":"orgs","key":"o:1"},"labels":[],"properties":{}}}],"relationships":[]}},
+        \\  {"type":"integer","value":"3"}],
+        \\ [{"type":"node","value":{"identity":{"table":"orgs","key":"o:2"},"labels":["Org"],"properties":{}}},
+        \\  {"type":"list","value":[{"type":"node","value":{"identity":{"table":"orgs","key":"o:3"},"labels":[],"properties":{}}}]},null]]}
+    ;
+    const keys = try cypherResultKeysAlloc(arena.allocator(), result, "orgs", 10);
+    try testing.expectEqual(@as(usize, 3), keys.len);
+    try testing.expectEqualStrings("o:2", keys[0]);
+    try testing.expectEqualStrings("o:1", keys[1]);
+    try testing.expectEqualStrings("o:3", keys[2]);
+    const capped = try cypherResultKeysAlloc(arena.allocator(), result, "orgs", 1);
+    try testing.expectEqual(@as(usize, 1), capped.len);
+    const people = try cypherResultKeysAlloc(arena.allocator(), result, "people", 10);
+    try testing.expectEqualStrings("p:1", people[0]);
 }
 
 test "pinned analyzer tokenizes deterministically" {

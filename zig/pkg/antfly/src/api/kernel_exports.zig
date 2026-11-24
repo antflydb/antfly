@@ -303,6 +303,13 @@ pub fn prepareRestoreLeadership(context: *const CallContext) callconv(.c) abi.St
     return .ok;
 }
 
+pub fn contextCypher(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateCall(abi.ContextCypherInput, abi.ContextCypherOutput, context)) |failure| return failure;
+    const in = input(abi.ContextCypherInput, context);
+    output(abi.ContextCypherOutput, context).result = serverState(context).server.executeContextCypher(in.allocator, in.owner_table_id, in.request) catch |err| return fail(err);
+    return .ok;
+}
+
 pub fn scheduleSessionMaintenance(context: *const CallContext) callconv(.c) abi.Status {
     if (validateCall(void, void, context)) |failure| return failure;
     serverState(context).server.scheduleSessionMaintenance() catch |err| return fail(err);
@@ -556,7 +563,8 @@ const function_table: abi.FunctionTable = .{
     .capabilities = abi.Capability.core |
         abi.Capability.route_manifest |
         abi.Capability.inference_admission_stats |
-        abi.Capability.internal_service_ingress,
+        abi.Capability.internal_service_ingress |
+        abi.Capability.context_cypher,
     .create = &create,
     .destroy = &destroy,
     .request_stats = &requestStats,
@@ -582,6 +590,7 @@ const function_table: abi.FunctionTable = .{
     .handler_destroy = &handlerDestroy,
     .inference_admission_stats = &inferenceAdmissionStats,
     .handler_authorize_internal_service = &handlerAuthorizeInternalService,
+    .context_cypher = &contextCypher,
 };
 
 pub fn getFunctionTable() callconv(.c) *const abi.FunctionTable {

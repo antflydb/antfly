@@ -480,3 +480,171 @@ def test_distributed_context_source_admission(stateful_api, echo_generator):
         "tracking": "snapshot",
         "reason": "graph_queries",
     }, registered
+
+
+def test_cypher_writes_rebuild_and_cypher_sources_resolve(
+    stateful_api, echo_generator
+):
+    """Graph statements are both writers and readers of context.
+
+    A Cypher `SET` on a row a live traversal reached, and a relationship
+    `CREATE` on a node it walks from, rebuild the dependent through the same
+    notices as document writes. A `cypher` query source runs a read-only
+    statement as its declarer; its members are the source table's nodes the
+    statement returns.
+    """
+    suffix = uuid4().hex[:8]
+    docs = f"ctx_docs_{suffix}"
+    notes = f"ctx_notes_{suffix}"
+    graph = f"ctx_graph_{suffix}"
+    stateful_api.create_table(docs, num_shards=NUM_SHARDS)
+    stateful_api.create_table(notes, num_shards=NUM_SHARDS)
+    stateful_api.post(
+        f"/tables/{docs}/indexes/links",
+        {"type": "graph", "edge_types": [{"name": "cites"}]},
+    )
+    stateful_api.batch_write(
+        docs,
+        inserts={
+            key: {"id": key, "title": title}
+            for key, title in (("a", "Alpha"), ("b", "Bravo"), ("c", "Charlie"))
+        },
+        sync_level="full_index",
+    )
+    stateful_api.post(
+        f"/graphs/{graph}",
+        {
+            "labels": [{"name": "Document", "table": docs}],
+            "relationships": [
+                {
+                    "name": "CITES",
+                    "index": "links",
+                    "source_label": "Document",
+                    "target_label": "Document",
+                    "stored_type": "cites",
+                }
+            ],
+        },
+    )
+
+    def cypher(statement: str) -> dict:
+        def run():
+            response = stateful_api._request(
+                "POST", f"/graphs/{graph}/query", {"query": statement}
+            )
+            if response.status_code in (409, 503):
+                return None
+            assert response.status_code == 200, response.text
+            return response.json()
+
+        result = wait_until(run, timeout_s=30, interval_s=0.2)
+        assert result is not None, statement
+        return result
+
+    cypher("MATCH (a:Document {id:'a'}), (b:Document {id:'b'}) CREATE (a)-[:CITES]->(b)")
+
+    traversal = {
+        "cited": {
+            "query": {
+                "table": docs,
+                "graph_queries": {
+                    "w": {
+                        "index": "links",
+                        "traverse": {
+                            "start": {"keys": [{"$source": "/doc"}]},
+                            "edge_types": ["cites"],
+                            "max_depth": 1,
+                        },
+                    }
+                },
+            },
+            "fields": ["title"],
+            "max_documents": 10,
+        }
+    }
+    registered = stateful_api.put(
+        f"/tables/{notes}/artifacts/brief/enrichment",
+        _enrichment(echo_generator, traversal),
+    )
+    assert registered["context_sources"]["cited"]["tracking"] == "live", registered
+
+    neighbors = {
+        "neighbors": {
+            "query": {
+                "table": docs,
+                "cypher": {
+                    "graph": graph,
+                    "query": "MATCH (:Document {id: $id})-[:CITES]->(n:Document) RETURN n",
+                    "parameters": {"id": {"$source": "/doc"}},
+                },
+            },
+            "fields": ["title"],
+        }
+    }
+    # Context statements only read.
+    writing = {
+        "neighbors": {
+            **neighbors["neighbors"],
+            "query": {
+                "table": docs,
+                "cypher": {
+                    "graph": graph,
+                    "query": "MATCH (n:Document) SET n.title = 'x' RETURN n",
+                },
+            },
+        }
+    }
+    response = stateful_api._request(
+        "PUT",
+        f"/tables/{notes}/artifacts/neighbors/enrichment",
+        _enrichment(echo_generator, writing),
+    )
+    assert _status(response) == 400, getattr(response, "text", response)
+    registered = stateful_api.put(
+        f"/tables/{notes}/artifacts/neighbors/enrichment",
+        _enrichment(echo_generator, neighbors),
+    )
+    assert registered["context_sources"]["neighbors"] == {
+        "kind": "query",
+        "tracking": "snapshot",
+        "reason": "cypher",
+    }, registered
+
+    stateful_api.batch_write(
+        notes,
+        inserts={"note:1": {"doc": "a", "body": "note one"}},
+        sync_level="enrichments",
+    )
+    first = wait_until(
+        _statement_containing(stateful_api, notes, "note:1", "brief", "note one", "Bravo"),
+        timeout_s=60,
+        interval_s=0.25,
+    )
+    assert first is not None, _statement(stateful_api, notes, "note:1", "brief")
+    assert "Charlie" not in first
+    via_cypher = wait_until(
+        _statement_containing(stateful_api, notes, "note:1", "neighbors", "note one", "Bravo"),
+        timeout_s=60,
+        interval_s=0.25,
+    )
+    assert via_cypher is not None, _statement(stateful_api, notes, "note:1", "neighbors")
+    assert "Alpha" not in via_cypher and "Charlie" not in via_cypher, via_cypher
+
+    # A Cypher SET on a reached row rebuilds the dependent.
+    cypher("MATCH (n:Document {id:'b'}) SET n.title = 'Bravo Two' RETURN n")
+    renamed = wait_until(
+        _statement_containing(stateful_api, notes, "note:1", "brief", "Bravo Two"),
+        timeout_s=60,
+        interval_s=0.25,
+    )
+    assert renamed is not None, _statement(stateful_api, notes, "note:1", "brief")
+
+    # A relationship created on the walked node changes its adjacency.
+    cypher("MATCH (a:Document {id:'a'}), (c:Document {id:'c'}) CREATE (a)-[:CITES]->(c)")
+    widened = wait_until(
+        _statement_containing(stateful_api, notes, "note:1", "brief", "Bravo Two", "Charlie"),
+        timeout_s=60,
+        interval_s=0.25,
+    )
+    assert widened is not None, _statement(stateful_api, notes, "note:1", "brief")
+    assert not echo_generator.errors, echo_generator.errors

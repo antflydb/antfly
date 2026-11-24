@@ -892,8 +892,8 @@ public form of the declaration is kept verbatim for reads.
 
 A `query` with any ranking clause (`full_text_search`, `semantic_search`,
 `embeddings`, `indexes`, `merge_config`, `reranker`, `exclusion_query`,
-`limit`, the `text`/`vector` shorthands, or `graph_queries` beyond one plain
-bounded traverse) is a ranked
+`limit`, `cypher`, the `text`/`vector` shorthands, or `graph_queries` beyond
+one plain bounded traverse) is a ranked
 retrieval: the whole query is a public `QueryRequest` with `$source` bindings
 anywhere, run by the host's query engine; members render in rank order. Its
 membership depends on the whole corpus, so it is a snapshot and publishes
@@ -912,6 +912,27 @@ Anything the walk cannot follow exactly (edge filters or weights, result
 limits, metric ordering, `match`, shortest paths, deeper traversals) runs in
 the query engine as a snapshot. Internally a live traversal is stored as the
 `graph` source kind, which is not public grammar.
+
+A `query` can also hold `cypher: {graph, query, parameters}`: a read-only
+Cypher statement against a graph, with `$source` bindings in its parameters
+(only `limit` may sit beside it). It runs as the principal that declared the
+enrichment. At admission the server stores that principal beside the
+statement with a MAC keyed by the credential's verifier over the dependent
+table's id, the graph, the statement, and the parameter template, replacing
+anything the client sent. Each run verifies the MAC, checks that the bound
+parameters differ from the template only at bindings, and rebuilds the
+principal's current permissions and row policies, so a grant copied into
+another declaration does not verify and a revoked credential stops rebuilds.
+Members are the nodes of the source `table` the result returns (bare, or
+inside paths, lists, and maps), in result order, each once, read back as
+stored rows. A statement's result depends on rows it does not return, so a
+Cypher source is a snapshot (reported with reason `cypher`). Writes and
+`EXPLAIN` are rejected at admission and again at execution.
+
+Cypher writes are ordinary writes for context tracking. A `SET` on a row,
+or a relationship `CREATE`/`DELETE` that changes a node's adjacency, emits
+the same source notices as a document or graph-edge write, so live filters
+and traversals over the graph's tables stay exact.
 
 `tracking` is the second knob. Left out, each source gets the strongest
 guarantee it supports (`live` for filters, `snapshot` for ranked queries) and
@@ -1123,9 +1144,9 @@ not a decision explanation.
 | Runtime | Context sources |
 | --- | --- |
 | Embedded single DB | own-table document and query sources: live filters (all live predicates, top-N), live traversals with filters, and ranked snapshots |
-| Embedded Lite (multi-table) | cross-table sources, `lite:<id>` identities, persisted inbound topology, C ABI inspection/impact/refresh |
+| Embedded Lite (multi-table) | cross-table sources, `cypher` sources over the handle's graph catalog, `lite:<id>` identities, persisted inbound topology, C ABI inspection/impact/refresh |
 | Ordered (Raft) publication | dependency state commits with the artifact through replicated publish intents |
-| Distributed server tables | document and query sources (live filters with all predicates and top-N, live traversals with filters, `_artifacts` fields, ranked queries without `semantic_search`), own table and across tables; declared through the enrichment endpoint; HTTP dependency state, `require_current` barrier, and impact |
+| Distributed server tables | document and query sources (live filters with all predicates and top-N, live traversals with filters, `_artifacts` fields, ranked queries without `semantic_search`, `cypher` sources run as the declarer), own table and across tables; declared through the enrichment endpoint; HTTP dependency state, `require_current` barrier, and impact |
 
 ### Distributed tables
 

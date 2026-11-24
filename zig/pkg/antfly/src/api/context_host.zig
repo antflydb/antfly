@@ -305,6 +305,9 @@ pub const Primitives = struct {
     collect: CollectEnrichments,
     /// Parses a public QueryRequest body for routed execution.
     parse_query_fn: *const fn (ptr: *anyopaque, alloc: Allocator, table_name: []const u8, body: []const u8) anyerror!db_types.SearchRequest,
+    /// Runs a bound Cypher context request for the dependent table
+    /// `owner_table_id` as its sealed principal; graph query result JSON.
+    cypher_fn: ?*const fn (ptr: *anyopaque, alloc: Allocator, owner_table_id: u64, request: []const u8) anyerror![]u8 = null,
 };
 
 pub const max_scan_rows: u32 = 100_000;
@@ -479,6 +482,16 @@ pub const Host = struct {
             .request => {
                 const body = try std.json.parseFromSliceLeaky(struct { table: []const u8, request: []const u8, k: u32 }, a, request, .{ .allocate = .alloc_always });
                 const name = try self.tableName(a, body.table, table_name);
+                // A Cypher source's members are the source table's nodes the
+                // statement returns, hydrated like graph results.
+                if (ctx.cypherRequest(a, body.request)) {
+                    const cypher_fn = p.cypher_fn orelse return error.ContextSearchUnavailable;
+                    const owner = findByName(try p.tables_fn(p.ptr, a), table_name) orelse return error.ContextSourceTableUnavailable;
+                    const result = try cypher_fn(p.ptr, a, owner.table_id, body.request);
+                    const keys = try ctx.cypherResultKeysAlloc(a, result, name, body.k);
+                    const rows = try hydrateRows(p, alloc, a, name, keys);
+                    return host_json.encodePageAlloc(alloc, rows, true);
+                }
                 var req = try p.parse_query_fn(p.ptr, a, name, body.request);
                 req.include_stored = true;
                 req.include_all_fields = true;

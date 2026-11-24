@@ -131,6 +131,7 @@ fn tableNameForDb(root: *h.Handle, db: *db_mod.DB) ?[]const u8 {
 fn executeRequest(ptr: *anyopaque, alloc: std.mem.Allocator, db: *db_mod.DB, request_json: []const u8, k: u32) anyerror!resolution.Page {
     const root: *h.Handle = @ptrCast(@alignCast(ptr));
     const name = tableNameForDb(root, db) orelse return error.ContextSourceTableUnavailable;
+    if (ctx.cypherRequest(alloc, request_json)) return executeCypher(alloc, root, db, name, request_json, k);
     var semantic = @import("db.zig").LiteSemanticResolver{ .handle = root };
     var owned = try h.query_api.parsePublicQueryRequest(alloc, if (root.lite_profile == .native) semantic.resolver() else null, name, request_json);
     defer owned.deinit(alloc);
@@ -165,6 +166,50 @@ fn executeRequest(ptr: *anyopaque, alloc: std.mem.Allocator, db: *db_mod.DB, req
         errdefer alloc.free(value);
         try rows.append(alloc, .{ .key = try alloc.dupe(u8, hit.id), .value = value });
     };
+    return .{ .rows = try rows.toOwnedSlice(alloc), .exhausted = true };
+}
+
+/// A Cypher source on Lite: the read-only statement runs against the
+/// handle's graph catalog; its members are the source table's nodes it
+/// returns, read back as stored documents.
+fn executeCypher(alloc: std.mem.Allocator, root: *h.Handle, db: *db_mod.DB, name: []const u8, request_json: []const u8, k: u32) !resolution.Page {
+    const cypher = @import("cypher");
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const request = try std.json.parseFromSliceLeaky(std.json.Value, a, request_json, .{});
+    const spec = request.object.get("cypher").?;
+    if (spec != .object) return error.InvalidContextSourcesConfig;
+    const graph = spec.object.get("graph") orelse return error.InvalidContextSourcesConfig;
+    const statement = spec.object.get("query") orelse return error.InvalidContextSourcesConfig;
+    if (graph != .string or statement != .string) return error.InvalidContextSourcesConfig;
+    {
+        var diagnostic: cypher.compiler.Diagnostic = .{};
+        var compiled = try cypher.compiler.compile(a, statement.string, .{}, &diagnostic);
+        defer compiled.deinit();
+        if (compiled.query.explain or cypher.runtime.queryHasWrites(compiled.query)) return error.UnsupportedContextPredicate;
+    }
+    const body = try std.json.Stringify.valueAlloc(a, .{ .query = statement.string, .parameters = spec.object.get("parameters") orelse std.json.Value{ .object = .empty } }, .{});
+    var out: h.capi.Buffer = .{};
+    var diagnostic: cypher.compiler.Diagnostic = .{};
+    var scope: @import("cypher_write.zig").Scope = .{};
+    try @import("cypher.zig").execute(root, graph.string, body, &out, &diagnostic, &scope);
+    defer @import("db.zig").antfly_buffer_free(&out);
+    const result: []const u8 = if (out.ptr) |ptr| ptr[0..out.len] else "";
+    const keys = try ctx.cypherResultKeysAlloc(a, result, name, k);
+    var rows = std.ArrayListUnmanaged(resolution.Row).empty;
+    errdefer {
+        for (rows.items) |row| {
+            alloc.free(row.key);
+            alloc.free(row.value);
+        }
+        rows.deinit(alloc);
+    }
+    for (keys) |key| {
+        const value = (try db.get(alloc, key)) orelse continue;
+        errdefer alloc.free(value);
+        try rows.append(alloc, .{ .key = try alloc.dupe(u8, key), .value = value });
+    }
     return .{ .rows = try rows.toOwnedSlice(alloc), .exhausted = true };
 }
 
@@ -594,6 +639,65 @@ test "capi Lite cross-table context sources: transitive impact and an unavailabl
         kept = true;
     };
     try std.testing.expect(kept);
+}
+
+test "capi Lite cross-table context sources: cypher members are the statement's nodes" {
+    const a = std.testing.allocator;
+    const asset_producer = @import("../storage/db/enrichment/asset_producer.zig");
+    const Producer = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        fn produce(ptr: *anyopaque, alloc: std.mem.Allocator, request: asset_producer.Request) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            return std.fmt.allocPrint(alloc, "summary:{s}", .{request.source_text});
+        }
+        fn memory(_: *anyopaque, _: std.mem.Allocator, _: []const asset_producer.Request) anyerror!@import("antfly_inference_work").InvocationMemoryPlan {
+            return .{ .attachment_transport = .borrowed_binary, .fixed_bytes = 8 << 20, .allocator_limit_bytes = 8 << 20, .max_result_bytes_per_item = 4 << 20, .max_result_bytes = 4 << 20 };
+        }
+        fn interface(self: *@This()) asset_producer.Producer {
+            return .{ .ptr = self, .vtable = &.{ .produce = produce, .invocation_memory_for_requests = memory } };
+        }
+    };
+    var producer = Producer{};
+    var tmp = try api.TestDirectory.init("lite-context-cypher");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    defer a.free(path);
+    const handle = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+    const id = try api.publishHandle(handle);
+    defer api.antfly_db_close(id);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, tables.antfly_db_create_table_json(id, .fromSlice("orgs"), .fromSlice("{}")));
+    const orgs = try tables.get(handle, "orgs");
+    try orgs.batch(.{ .writes = &.{
+        .{ .key = "org:1", .value = "{\"tier\":\"gold\",\"voice\":\"warm\"}" },
+        .{ .key = "org:2", .value = "{\"tier\":\"silver\",\"voice\":\"cold\"}" },
+    }, .sync_level = .write });
+    var output: h.capi.Buffer = .{};
+    const catalog_code = @import("cypher.zig").antfly_db_graph_catalog_json(id, .fromSlice("{\"action\":\"put\",\"name\":\"g\",\"definition\":{\"labels\":[{\"name\":\"Org\",\"table\":\"orgs\"}],\"relationships\":[]}}"), &output);
+    if (catalog_code != .ok) std.debug.print("graph catalog failed: {s}\n", .{if (output.ptr) |p| p[0..output.len] else ""});
+    api.antfly_buffer_free(&output);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, catalog_code);
+
+    const declaration =
+        \\{"name":"summary","kind":"asset","field":"body","content_type":"text/plain",
+        \\ "producer_json":"{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+        \\ "context_sources":{"peers":{"query":{"table":"orgs","cypher":{"graph":"g","query":"MATCH (o:Org) WHERE o.tier = $tier RETURN o","parameters":{"tier":{"$source":"/tier"}}}},"fields":["voice"]}}}
+    ;
+    const added = api.antfly_db_add_enrichment_json(id, .fromSlice(declaration));
+    if (added != .ok) std.debug.print("add enrichment failed: {s}\n", .{std.mem.span(h.capi.lastErrorDetail())});
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, added);
+    try handle.db.reconfigureEnrichmentRuntime(.{ .asset_producer = producer.interface() });
+    try sync(handle);
+
+    try handle.db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"hello\",\"tier\":\"gold\"}" }}, .sync_level = .write });
+    try handle.db.enrichment_runtime.?.catchUpUntilForDrain(handle.db.core.nextDerivedSequence());
+    try handle.db.runDerivedUntil(handle.db.core.nextDerivedSequence());
+    try std.testing.expect(producer.calls.load(.acquire) >= 1);
+    const json = try dependenciesJsonAlloc(a, &handle.db, "doc:a", "summary", 4);
+    defer a.free(json);
+    if (std.mem.indexOf(u8, json, "org:1") == null) std.debug.print("dependencies: {s}\n", .{json});
+    try std.testing.expect(std.mem.indexOf(u8, json, "org:1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "org:2") == null);
 }
 
 test "capi Lite cross-table context sources invalidate dependents in another table" {

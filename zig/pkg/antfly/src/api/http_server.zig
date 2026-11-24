@@ -19030,7 +19030,11 @@ pub const ApiHttpServer = struct {
                     else => return err,
                 };
                 _ = storage;
-                if (try resolveEffectiveRowFilterJson(a, declarer, public_name)) |row_filter_json| {
+                // A Cypher statement runs as the declarer, whose row policies
+                // graph execution applies to every table it reads.
+                const runs_as_declarer = std.mem.eql(u8, kind, "query") and target.object.get("cypher") != null;
+                const declarer_row_filter = if (runs_as_declarer) null else try resolveEffectiveRowFilterJson(a, declarer, public_name);
+                if (declarer_row_filter) |row_filter_json| {
                     const row_filter = try std.json.parseFromSliceLeaky(std.json.Value, a, row_filter_json, .{});
                     if (comptime std.mem.eql(u8, kind, "query")) {
                         // Live filters and ranked requests both narrow through
@@ -19052,6 +19056,105 @@ pub const ApiHttpServer = struct {
                 }
             };
         }
+    }
+
+    /// Bind each Cypher source to the principal declaring it: the server
+    /// stores `{principal, parameters, signature}` beside the statement, the
+    /// signature a MAC keyed by that credential's verifier over the
+    /// dependent table's immutable id, the graph, the statement, and the
+    /// parameter template. A client-supplied grant is always replaced, and a
+    /// grant copied into another declaration or table does not verify.
+    fn sealContextCypher(self: *ApiHttpServer, a: std.mem.Allocator, request: api_operation.RequestContext, owner_table_id: u64, sources: *std.json.Value) !void {
+        if (sources.* != .object) return;
+        const admitted: ?*const ?AuthenticatedIdentity = if (request.row_policy_credential) |ptr| @ptrCast(@alignCast(ptr)) else null;
+        const declarer: ?AuthenticatedIdentity = if (admitted) |ptr| ptr.* else null;
+        var it = sources.object.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* != .object) continue;
+            const target = entry.value_ptr.object.getPtr("query") orelse continue;
+            if (target.* != .object) continue;
+            const spec = target.object.getPtr("cypher") orelse continue;
+            if (spec.* != .object) return error.InvalidContextSourcesConfig;
+            _ = spec.object.orderedRemove(context_cypher_grant_field);
+            const graph = spec.object.get("graph") orelse return error.InvalidContextSourcesConfig;
+            const statement = spec.object.get("query") orelse return error.InvalidContextSourcesConfig;
+            if (graph != .string or statement != .string) return error.InvalidContextSourcesConfig;
+            try requireReadOnlyCypher(a, statement.string);
+            const principal: []const u8 = if (declarer) |identity| principal: {
+                if (!permissionsAllow(identity.permissions, .graph, graph.string, .read)) return error.Forbidden;
+                if (identity.credential_principal.len == 0) return error.Forbidden;
+                break :principal identity.credential_principal;
+            } else if (request.principal != null or self.cfg.auth_enabled) return error.Forbidden else stored_destination_authorization.auth_disabled_principal;
+            const template = try std.json.Stringify.valueAlloc(a, spec.object.get("parameters") orelse std.json.Value{ .object = .empty }, .{});
+            const payload = try contextCypherPayloadAlloc(a, owner_table_id, graph.string, statement.string, template);
+            const authorizer: stored_destination_authorization.Authorizer = .{ .manager = self.cfg.user_manager, .auth_enabled = self.cfg.auth_enabled };
+            const signature = authorizer.signatureAlloc(a, principal, payload) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.Forbidden,
+            };
+            var grant: std.json.ObjectMap = .empty;
+            try grant.put(a, "principal", .{ .string = principal });
+            try grant.put(a, "parameters", .{ .string = template });
+            try grant.put(a, "signature", .{ .string = signature });
+            try spec.object.put(a, context_cypher_grant_field, .{ .object = grant });
+        }
+    }
+
+    /// Run a bound Cypher context request (`{"cypher":{...},"limit"?}`) for
+    /// the dependent table `owner_table_id`, as the principal its verified
+    /// grant names; returns the graph query result JSON.
+    pub fn executeContextCypher(self: *ApiHttpServer, alloc: std.mem.Allocator, owner_table_id: u64, request_json: []const u8) ![]u8 {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const root = try std.json.parseFromSliceLeaky(std.json.Value, a, request_json, .{});
+        if (root != .object) return error.InvalidContextSourcesConfig;
+        const spec = root.object.get("cypher") orelse return error.InvalidContextSourcesConfig;
+        if (spec != .object) return error.InvalidContextSourcesConfig;
+        const graph = spec.object.get("graph") orelse return error.InvalidContextSourcesConfig;
+        const statement = spec.object.get("query") orelse return error.InvalidContextSourcesConfig;
+        const grant = spec.object.get(context_cypher_grant_field) orelse return error.StoredDestinationAuthorizationMissing;
+        if (graph != .string or statement != .string or grant != .object) return error.StoredDestinationAuthorizationInvalid;
+        const principal = grant.object.get("principal") orelse return error.StoredDestinationAuthorizationInvalid;
+        const template = grant.object.get("parameters") orelse return error.StoredDestinationAuthorizationInvalid;
+        const signature = grant.object.get("signature") orelse return error.StoredDestinationAuthorizationInvalid;
+        if (principal != .string or template != .string or signature != .string) return error.StoredDestinationAuthorizationInvalid;
+        const parameters = spec.object.get("parameters") orelse std.json.Value{ .object = .empty };
+        // Only `$source` bindings may differ from what was signed.
+        if (!instantiatesTemplate(try std.json.parseFromSliceLeaky(std.json.Value, a, template.string, .{}), parameters)) return error.StoredDestinationAuthorizationInvalid;
+        const payload = try contextCypherPayloadAlloc(a, owner_table_id, graph.string, statement.string, template.string);
+        const authorizer: stored_destination_authorization.Authorizer = .{ .manager = self.cfg.user_manager, .auth_enabled = self.cfg.auth_enabled };
+        try authorizer.authorize(a, principal.string, &.{}, payload, signature.string);
+        try requireReadOnlyCypher(a, statement.string);
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.alloc);
+        if (!std.mem.eql(u8, principal.string, stored_destination_authorization.auth_disabled_principal))
+            identity = try self.durablePrincipalIdentity(principal.string);
+        var context: api_operation.RequestContext = .{};
+        context.deadline_ns = platform_time.monotonicNs() +| context_cypher_timeout_ns;
+        context.row_policy_credential = &identity;
+        const body = try std.json.Stringify.valueAlloc(a, .{ .query = statement.string, .parameters = parameters }, .{});
+        var diagnostic: @import("cypher").compiler.Diagnostic = .{};
+        var outcome: @import("graph_execution.zig").WriteOutcome = .not_started;
+        return @import("graph_execution.zig").execute(alloc, self, &identity, context, graph.string, body, &diagnostic, &outcome);
+    }
+
+    /// The live identity of a durable `basic:` or `api-key:` principal:
+    /// current permissions, row policies, and (for users) roles.
+    fn durablePrincipalIdentity(self: *ApiHttpServer, principal: []const u8) !AuthenticatedIdentity {
+        const manager = self.cfg.user_manager orelse return error.StoredDestinationAuthorizationRevoked;
+        const basic = std.mem.startsWith(u8, principal, "basic:");
+        if (!basic and !std.mem.startsWith(u8, principal, "api-key:")) return error.StoredDestinationCredentialUnsupported;
+        const username = if (basic) principal["basic:".len..] else principal;
+        const permissions = if (basic) try manager.getPermissionsForUser(username) else try manager.effectiveApiKeyPermissions(principal["api-key:".len..]);
+        defer freePermissions(manager.alloc, permissions);
+        const filters = try manager.durableCredentialRowFilters(principal);
+        defer freeRowFilters(manager.alloc, filters);
+        const roles: []const []const u8 = if (basic) try manager.getRolesForUser(username) else &.{};
+        defer if (basic) freeOwnedStrings(manager.alloc, @constCast(roles));
+        var identity = try cloneAuthenticatedIdentity(self.alloc, username, principal, permissions, filters, "{}", roles);
+        if (basic) identity.live_user_manager = manager;
+        return identity;
     }
 
     fn conjoinJson(a: std.mem.Allocator, left: std.json.Value, right: std.json.Value) !std.json.Value {
@@ -19087,7 +19190,7 @@ pub const ApiHttpServer = struct {
         _ = parsed.value.object.orderedRemove("refresh");
         var sources_mut = sources;
         if (sources != .null) try self.applyContextRowPolicies(parsed.arena.allocator(), request, table_name, &sources_mut);
-        const sources_policy = sources_mut;
+        var sources_policy = sources_mut;
         if (sources != .null) {
             var snapshot = (try self.source.adminSnapshot()) orelse return error.MetadataUnavailable;
             defer self.source.freeAdminSnapshot(&snapshot);
@@ -19097,6 +19200,8 @@ pub const ApiHttpServer = struct {
             const context_host = @import("context_host.zig");
             const tables = try a.alloc(context_host.TableInfo, snapshot.tables.len);
             for (snapshot.tables, tables) |t, *o| o.* = .{ .table_id = t.table_id, .name = t.name, .indexes_json = t.indexes_json };
+            const owner = context_host.findByName(tables, table_name) orelse return error.ContextSourceTableUnavailable;
+            try self.sealContextCypher(parsed.arena.allocator(), request, owner.table_id, &sources_policy);
             var names = ContextSourceNames{ .server = self, .request = request };
             const stored = try context_host.admitResolvingAlloc(a, tables, .{ .collect_fn = collectContextEnrichments }, table_name, artifact_name, sources_policy, if (refresh) |r| (if (r == .null) null else r) else null, @import("antfly_local_sources").api_local_indexes.contextFilterLowering(), .{ .ptr = &names, .resolve_fn = ContextSourceNames.resolve }, source_artifact);
             try parsed.value.object.put(parsed.arena.allocator(), "context_sources_json", .{ .string = try parsed.arena.allocator().dupe(u8, stored) });
@@ -32579,6 +32684,71 @@ fn cloneRowFilters(alloc: std.mem.Allocator, row_filters: []const usermgr.RowFil
         cloned_owned = false;
     }
     return try out.toOwnedSlice(alloc);
+}
+
+const context_cypher_grant_field = @import("antfly_local_sources").storage_db_enrichment_context_sources.cypher_grant_field;
+const context_cypher_timeout_ns: u64 = 30 * std.time.ns_per_s;
+
+fn contextCypherPayloadAlloc(a: std.mem.Allocator, owner_table_id: u64, graph: []const u8, statement: []const u8, parameters_template: []const u8) ![]u8 {
+    return std.json.Stringify.valueAlloc(a, .{ .domain = "antfly.context-cypher.v1", .table_id = owner_table_id, .graph = graph, .query = statement, .parameters = parameters_template }, .{});
+}
+
+/// Context statements only read: a write or EXPLAIN is refused.
+fn requireReadOnlyCypher(a: std.mem.Allocator, statement: []const u8) !void {
+    const cypher = @import("cypher");
+    var diagnostic: cypher.compiler.Diagnostic = .{};
+    var compiled = cypher.compiler.compile(a, statement, .{}, &diagnostic) catch return error.InvalidContextSourcesConfig;
+    defer compiled.deinit();
+    if (compiled.query.explain or cypher.runtime.queryHasWrites(compiled.query)) return error.UnsupportedContextPredicate;
+}
+
+/// Whether `bound` equals `template` except where the template holds a
+/// `{"$source": ...}` binding.
+fn instantiatesTemplate(template: std.json.Value, bound: std.json.Value) bool {
+    switch (template) {
+        .object => |object| {
+            if (object.count() == 1 and object.get("$source") != null) return true;
+            if (bound != .object or bound.object.count() != object.count()) return false;
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                const other = bound.object.get(entry.key_ptr.*) orelse return false;
+                if (!instantiatesTemplate(entry.value_ptr.*, other)) return false;
+            }
+            return true;
+        },
+        .array => |array| {
+            if (bound != .array or bound.array.items.len != array.items.len) return false;
+            for (array.items, bound.array.items) |left, right| if (!instantiatesTemplate(left, right)) return false;
+            return true;
+        },
+        .string => |text| return bound == .string and std.mem.eql(u8, text, bound.string),
+        .number_string => |text| return bound == .number_string and std.mem.eql(u8, text, bound.number_string),
+        .integer => |value| return bound == .integer and bound.integer == value,
+        .float => |value| return bound == .float and bound.float == value,
+        .bool => |value| return bound == .bool and bound.bool == value,
+        .null => return bound == .null,
+    }
+}
+
+test "cypher context parameters may differ from the signed template only at bindings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const template = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"k":{"$source":"/person"},"tier":"gold","n":[1,{"$source":"/x"}]}
+    , .{});
+    const bound = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"k":"p:1","tier":"gold","n":[1,{"deep":true}]}
+    , .{});
+    try std.testing.expect(instantiatesTemplate(template, bound));
+    const tampered = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"k":"p:1","tier":"silver","n":[1,2]}
+    , .{});
+    try std.testing.expect(!instantiatesTemplate(template, tampered));
+    const extra = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"k":"p:1","tier":"gold","n":[1,2],"more":1}
+    , .{});
+    try std.testing.expect(!instantiatesTemplate(template, extra));
 }
 
 fn cloneAuthenticatedIdentity(

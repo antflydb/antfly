@@ -167,6 +167,14 @@ const OpaqueApiHttpServer = struct {
         try callFallible(u64, void, self.functions.prepare_restore_leadership, self.opaque_handle, &input, null);
     }
 
+    pub fn executeContextCypher(self: *OpaqueApiHttpServer, alloc: std.mem.Allocator, owner_table_id: u64, request: []const u8) ![]u8 {
+        if (!abi.validFunctionTable(self.functions, abi.Capability.context_cypher)) return error.ContextSearchUnavailable;
+        const in: abi.ContextCypherInput = .{ .allocator = alloc, .owner_table_id = owner_table_id, .request = request };
+        var out: abi.ContextCypherOutput = .{};
+        try callFallible(abi.ContextCypherInput, abi.ContextCypherOutput, self.functions.context_cypher, self.opaque_handle, &in, &out);
+        return out.result;
+    }
+
     pub fn scheduleSessionMaintenance(self: *OpaqueApiHttpServer) !void {
         try callFallible(void, void, self.functions.schedule_session_maintenance, self.opaque_handle, null, null);
     }
