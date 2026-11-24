@@ -20001,6 +20001,16 @@ test "CUDA replay retains input storage while retiring an exec at its addressabl
     try std.testing.expectEqual(original, slot.inputStorage().ptr);
     slot.exec = try compute.ctx.instantiateGraph(graph);
     slot.valid = true;
+    compute.temp_slot_config.autoplan_enabled = false;
+    slot.temp_arena_generation = compute.temp_arena_generation;
+    slot.shape = try a.dupe(i64, &changed_shape);
+    slot.input_shape = try a.dupe(i64, &changed_shape);
+    slot.input = tensorFromCt(prepared).buffer;
+    slot.output = slot.outputStorage();
+    try std.testing.expectEqual(@as(?usize, 0), try qualifiedPersistentDecodeGraph(&compute, prepared));
+    var unowned_input = borrowedSlotTensor(tensorFromCt(prepared));
+    unowned_input.resident_parent = null;
+    try std.testing.expectEqual(@as(?usize, null), try qualifiedPersistentDecodeGraph(&compute, &unowned_input));
 
     // A real device-backed token can outlive slot retirement. The cache may
     // neither select nor overwrite its bank while the caller holds the view.
@@ -20063,7 +20073,9 @@ fn findCompatibleDecodeReplaySlot(self: *CudaCompute, input: CT) !?usize {
     if (!cudaGraphReplayCapacityReady(self, slot_idx)) return null;
 
     const input_tensor = tensorFromCt(input);
-    if (input_tensor.buffer.ptr != slot.input.ptr or input_tensor.buffer.len != slot.input.len or
+    const input_bank = slot.input_bank orelse return null;
+    if (input_tensor.resident_parent != tensorFromCt(input_bank.tensor) or
+        input_tensor.buffer.ptr != slot.input.ptr or input_tensor.buffer.len != slot.input.len or
         !std.mem.eql(i64, slot.input_shape orelse &.{}, input_tensor.shape))
     {
         std.log.warn("cuda_graph_capture_probe: persistent_replay_input_mismatch slot={d} expected=0x{x}/{d} actual=0x{x}/{d}", .{
