@@ -7425,7 +7425,19 @@ test "imported ONNX If cached decoding matches full prefix on optional T5-small"
     const selected = platform.env.getenv("ANTFLY_ONNX_T5_BACKEND") orelse "native";
     const requested_backend = std.meta.stringToEnum(BackendType, selected) orelse return error.InvalidBackend;
     const setup_started = platform.time.monotonicNs();
-    const session = try createSession(a, path, requested_backend);
+    const memory = @import("../runtime/tier/memory.zig");
+    var controller = memory.AdmissionController{};
+    defer std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot()) catch @panic("T5 cache admission leak");
+    var session = try createSession(a, path, requested_backend);
+    if (platform.env.getenvBool("ANTFLY_ONNX_T5_CACHE_OWNERSHIP")) {
+        session.run_admission = .{
+            .controller = &controller,
+            .backend_class = if (requested_backend == .native) .cpu else .gpu,
+            .limits = .{},
+            .static_workspace_bytes = 1,
+            .check_live_memory = false,
+        };
+    }
     std.debug.print("t5 backend={s} model_setup_ns={d}\n", .{ selected, platform.time.monotonicNs() - setup_started });
     defer session.close();
     const root: *ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
@@ -7564,6 +7576,21 @@ fn qualifyT5CachedRows(a: std.mem.Allocator, session: Session, selected: []const
                 if (repeat == 0) {
                     rows[offset] = row;
                     row_count += 1;
+                    if (session.run_admission != null) {
+                        const slots = state.resident_slots orelse return error.MissingResidentT5Cache;
+                        var independent_self: usize = 0;
+                        var independent_cross: usize = 0;
+                        for (state.roles, slots) |role, slot| switch (role) {
+                            .past => |past| {
+                                const owner = slot orelse return error.MissingResidentT5Cache;
+                                if (owner.independent) {
+                                    if (past.cross) independent_cross += 1 else independent_self += 1;
+                                }
+                            },
+                            else => {},
+                        };
+                        std.debug.print("t5 cache prefix={d} step={d} independent_self={d} independent_cross={d}\n", .{ case.prefix, offset, independent_self, independent_cross });
+                    }
                 } else {
                     defer a.free(row);
                     try expectT5Logits(rows[offset], row);
