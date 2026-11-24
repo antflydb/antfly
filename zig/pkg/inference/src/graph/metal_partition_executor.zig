@@ -846,8 +846,10 @@ pub fn makeMetalDeviceResident(cb: *const ComputeBackend, tensor: CT) !?CT {
     return metal_compute_mod.MetalCompute.makeDeviceResident(cb, tensor);
 }
 
-fn promoteMetalOutputIfNeeded(cb: *const ComputeBackend, output: ?CT) !?CT {
+fn promoteMetalOutputIfNeeded(cb: *const ComputeBackend, output: ?CT, borrowed: ?CT) !?CT {
     const ct = output orelse return null;
+    if (ct == borrowed) return ct;
+    errdefer cb.free(ct);
     if (isMetalDeviceResident(cb, ct)) return ct;
     if (try makeMetalDeviceResident(cb, ct)) |device_ct| {
         if (device_ct != ct) cb.free(ct);
@@ -866,8 +868,9 @@ const TemporaryMetalResidentValue = struct {
 };
 
 fn temporaryMetalResidentValue(cb: *const ComputeBackend, tensor: CT) !TemporaryMetalResidentValue {
-    if (isMetalDeviceResident(cb, tensor)) return .{ .value = tensor };
-    if (try makeMetalDeviceResident(cb, tensor)) |device_ct| {
+    if (comptime !build_options.enable_metal) return .{ .value = tensor };
+    if (cb.kind() != .metal or metal_compute_mod.MetalCompute.debugHasDeviceTensor(cb, tensor)) return .{ .value = tensor };
+    if (try metal_compute_mod.MetalCompute.makeDeviceResident(cb, tensor)) |device_ct| {
         return .{ .value = device_ct, .owned = device_ct != tensor };
     }
     return .{ .value = tensor };
@@ -14343,15 +14346,7 @@ fn tryExecuteMetalCommand(
                 error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
                 else => return err,
             };
-            if (transposed) |ct| {
-                if (!preserve_host_view and !isMetalDeviceResident(cb, ct)) {
-                    if (try makeMetalDeviceResident(cb, ct)) |device_ct| {
-                        cb.free(ct);
-                        break :blk device_ct;
-                    }
-                }
-            }
-            break :blk transposed;
+            break :blk if (preserve_host_view) transposed else try promoteMetalOutputIfNeeded(cb, transposed, null);
         },
         .broadcast_in_dim => |attrs| try executeRuntimeBroadcast(cb, values, inputs, graph.node(inputs[0]).output_shape, attrs, output_hint),
         .neg, .sqrt, .rsqrt, .exp, .log, .sin, .cos, .tanh, .erf, .abs => try executeRuntimeUnary(cb, values, inputs, ops_mod.kernel_descriptor.unary(n.op).?, output_hint),
@@ -14469,14 +14464,7 @@ fn executeRuntimeZeroTensor(
     rows: usize,
     out_dim: usize,
 ) !?CT {
-    const ct = (try cb.zeroTensor(rows, out_dim)) orelse return null;
-    errdefer cb.free(ct);
-    if (isMetalDeviceResident(cb, ct)) return ct;
-    if (try makeMetalDeviceResident(cb, ct)) |device_ct| {
-        if (device_ct != ct) cb.free(ct);
-        return device_ct;
-    }
-    return ct;
+    return promoteMetalOutputIfNeeded(cb, try cb.zeroTensor(rows, out_dim), null);
 }
 
 fn executeRuntimeConstant(
@@ -14486,16 +14474,9 @@ fn executeRuntimeConstant(
     attrs: anytype,
 ) !?CT {
     const ct = try interpreter.materializeConstant(graph, cb, output_shape, attrs, true);
-    errdefer cb.free(ct);
-
-    // Empty values are shape-only sentinels. No device buffer is needed.
+    // Empty values are shape-only sentinels.
     if (attrs.data_len == 0) return ct;
-    if (isMetalDeviceResident(cb, ct)) return ct;
-    if (try makeMetalDeviceResident(cb, ct)) |device_ct| {
-        if (device_ct != ct) cb.free(ct);
-        return device_ct;
-    }
-    return ct;
+    return promoteMetalOutputIfNeeded(cb, ct, null);
 }
 
 fn executeRuntimeGqaCausalAttention(
@@ -14738,14 +14719,7 @@ fn executeRuntimeScatterAdd(
     }
 
     const out_shape = [_]i32{ @intCast(out_rows), @intCast(dim) };
-    const host_result = try cb.fromFloat32Shape(output, &out_shape);
-    errdefer cb.free(host_result);
-    if (isMetalDeviceResident(cb, host_result)) return host_result;
-    if (try makeMetalDeviceResident(cb, host_result)) |device_result| {
-        if (device_result != host_result) cb.free(host_result);
-        return device_result;
-    }
-    return host_result;
+    return promoteMetalOutputIfNeeded(cb, try cb.fromFloat32Shape(output, &out_shape), null);
 }
 
 fn executeRuntimeConvertDType(
@@ -14925,25 +14899,13 @@ fn executeRuntimeBinary(
         if (traceRuntimeCommandFallbacksEnabled()) traceRuntimeBinaryFallback(graph, node_id, op, "broadcast_mismatch", lhs_operand, rhs_operand, output_shape);
         return null;
     }
-    var lhs = lhs_operand.value;
-    var rhs = rhs_operand.value;
-    var owned_lhs: ?CT = null;
-    defer if (owned_lhs) |ct| cb.free(ct);
-    var owned_rhs: ?CT = null;
-    defer if (owned_rhs) |ct| cb.free(ct);
+    const left = try temporaryMetalResidentValue(cb, lhs_operand.value);
+    defer left.deinit(cb);
+    const right = try temporaryMetalResidentValue(cb, rhs_operand.value);
+    defer right.deinit(cb);
+    const lhs = left.value;
+    const rhs = right.value;
     if (cb.kind() == .metal) {
-        if (!isMetalDeviceResident(cb, lhs)) {
-            if (try makeMetalDeviceResident(cb, lhs)) |device_lhs| {
-                if (device_lhs != lhs) owned_lhs = device_lhs;
-                lhs = device_lhs;
-            }
-        }
-        if (!isMetalDeviceResident(cb, rhs)) {
-            if (try makeMetalDeviceResident(cb, rhs)) |device_rhs| {
-                if (device_rhs != rhs) owned_rhs = device_rhs;
-                rhs = device_rhs;
-            }
-        }
         // Slot-bound output: write a*b directly into the pooled buffer.
         // force_barrier guards reused pooled buffers against non-declaring
         // consumer reads (conservative: barrier on every pooled write).
@@ -15079,8 +15041,7 @@ fn executeRuntimeLinear(
         const rhs_shape = [_]i64{ @intCast(out_dim), @intCast(in_dim) };
         const output = try cb.primDotGeneral(input, weight, &lhs_shape, &rhs_shape, &.{1}, &.{1}, &.{}, &.{});
         if (!has_bias) {
-            errdefer cb.free(output);
-            return try promoteMetalOutputIfNeeded(cb, output);
+            return try promoteMetalOutputIfNeeded(cb, output, null);
         }
         defer cb.free(output);
         const bias = valueFor(values, inputs[2]) orelse return null;
@@ -15088,8 +15049,7 @@ fn executeRuntimeLinear(
         const expanded = try cb.primBroadcastInDim(bias, &shape, &.{1}, &.{@intCast(out_dim)});
         defer cb.free(expanded);
         const biased = try cb.add(output, expanded);
-        errdefer cb.free(biased);
-        return try promoteMetalOutputIfNeeded(cb, biased);
+        return try promoteMetalOutputIfNeeded(cb, biased, null);
     }
     try validatePlannedLinearOp(cb, weight, rows, in_dim, out_dim, op_plan);
     if (has_bias) {
@@ -15098,13 +15058,13 @@ fn executeRuntimeLinear(
             error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
             else => return err,
         };
-        return try promoteMetalOutputIfNeeded(cb, output);
+        return try promoteMetalOutputIfNeeded(cb, output, null);
     } else {
         const output = cb.linearNoBiasWithPlan(input, weight, rows, in_dim, out_dim, op_plan) catch |err| switch (err) {
             error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
             else => return err,
         };
-        return try promoteMetalOutputIfNeeded(cb, output);
+        return try promoteMetalOutputIfNeeded(cb, output, null);
     }
 }
 
@@ -15197,7 +15157,7 @@ fn executeRuntimeDotGeneral(
         error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
     };
-    return try promoteMetalOutputIfNeeded(cb, output);
+    return try promoteMetalOutputIfNeeded(cb, output, null);
 }
 
 fn executeRuntimeLinearDotFromDeferredTranspose(
@@ -15246,7 +15206,7 @@ fn executeRuntimeLinearDotFromDeferredTranspose(
             error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
             else => return err,
         };
-        return try promoteMetalOutputIfNeeded(cb, output);
+        return try promoteMetalOutputIfNeeded(cb, output, null);
     }
     // Unplanned dense weights: execute as `dot_general(input, weight)` with
     // the weight's second axis contracted (X @ Wᵀ) instead of routing through
@@ -15271,13 +15231,13 @@ fn executeRuntimeLinearDotFromDeferredTranspose(
             error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch, error.UnsupportedTensorType => null,
             else => return err,
         };
-        if (dot_output != null) return try promoteMetalOutputIfNeeded(cb, dot_output);
+        if (dot_output != null) return try promoteMetalOutputIfNeeded(cb, dot_output, null);
     }
     const output = cb.linearNoBiasWithPlan(input, weight, rows, in_dim, out_dim, op_plan) catch |err| switch (err) {
         error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
     };
-    return try promoteMetalOutputIfNeeded(cb, output);
+    return try promoteMetalOutputIfNeeded(cb, output, null);
 }
 
 /// Quantized weight descriptors must stay on the planned `linearNoBias`
@@ -15919,6 +15879,7 @@ fn executeRuntimeGather(
     if (promote_output) {
         if (gathered) |host_result| {
             if (!isMetalDeviceResident(cb, host_result)) {
+                errdefer cb.free(host_result);
                 const output_promotion_start_ns = metalPartitionNowNs();
                 if (try makeMetalDeviceResident(cb, host_result)) |device_result| {
                     if (stats) |s| {
@@ -16037,7 +15998,7 @@ fn executeRuntimeScaledAddFromDeferredMul(
                 error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
                 else => return err,
             };
-            return try promoteMetalOutputIfNeeded(cb, output);
+            return try promoteMetalOutputIfNeeded(cb, output, null);
         }
     }
     if (pendingDeferredScaleMul(graph, values, inputs[0], output_shape)) |scaled| {
@@ -16051,7 +16012,7 @@ fn executeRuntimeScaledAddFromDeferredMul(
             .lhs_scale = scaled.scale,
             .output_scale = 1.0,
         });
-        if (try promoteMetalOutputIfNeeded(cb, output)) |result| return result;
+        if (try promoteMetalOutputIfNeeded(cb, output, output_hint)) |result| return result;
         return try executeDeferredScaleAddFallback(cb, values, scaled, residual);
     }
     if (pendingDeferredScaleMul(graph, values, inputs[1], output_shape)) |scaled| {
@@ -16065,7 +16026,7 @@ fn executeRuntimeScaledAddFromDeferredMul(
             .lhs_scale = scaled.scale,
             .output_scale = 1.0,
         });
-        if (try promoteMetalOutputIfNeeded(cb, output)) |result| return result;
+        if (try promoteMetalOutputIfNeeded(cb, output, output_hint)) |result| return result;
         return try executeDeferredScaleAddFallback(cb, values, scaled, residual);
     }
     return null;
@@ -16103,60 +16064,34 @@ fn executeDeferredElementwiseMultiplyAdd2(
     dim: usize,
     output_hint: ?CT,
 ) !?CT {
-    var lhs0 = valueFor(values, lhs_mul.lhs_id) orelse return null;
-    var rhs0 = valueFor(values, lhs_mul.rhs_id) orelse return null;
-    var lhs1 = valueFor(values, rhs_mul.lhs_id) orelse return null;
-    var rhs1 = valueFor(values, rhs_mul.rhs_id) orelse return null;
-    var owned_lhs0: ?CT = null;
-    defer if (owned_lhs0) |ct| cb.free(ct);
-    var owned_rhs0: ?CT = null;
-    defer if (owned_rhs0) |ct| cb.free(ct);
-    var owned_lhs1: ?CT = null;
-    defer if (owned_lhs1) |ct| cb.free(ct);
-    var owned_rhs1: ?CT = null;
-    defer if (owned_rhs1) |ct| cb.free(ct);
-    if (cb.kind() == .metal) {
-        if (!isMetalDeviceResident(cb, lhs0)) {
-            if (try makeMetalDeviceResident(cb, lhs0)) |device_lhs0| {
-                if (device_lhs0 != lhs0) owned_lhs0 = device_lhs0;
-                lhs0 = device_lhs0;
-            }
-        }
-        if (!isMetalDeviceResident(cb, rhs0)) {
-            if (try makeMetalDeviceResident(cb, rhs0)) |device_rhs0| {
-                if (device_rhs0 != rhs0) owned_rhs0 = device_rhs0;
-                rhs0 = device_rhs0;
-            }
-        }
-        if (!isMetalDeviceResident(cb, lhs1)) {
-            if (try makeMetalDeviceResident(cb, lhs1)) |device_lhs1| {
-                if (device_lhs1 != lhs1) owned_lhs1 = device_lhs1;
-                lhs1 = device_lhs1;
-            }
-        }
-        if (!isMetalDeviceResident(cb, rhs1)) {
-            if (try makeMetalDeviceResident(cb, rhs1)) |device_rhs1| {
-                if (device_rhs1 != rhs1) owned_rhs1 = device_rhs1;
-                rhs1 = device_rhs1;
-            }
-        }
-    }
+    const lhs0 = valueFor(values, lhs_mul.lhs_id) orelse return null;
+    const rhs0 = valueFor(values, lhs_mul.rhs_id) orelse return null;
+    const lhs1 = valueFor(values, rhs_mul.lhs_id) orelse return null;
+    const rhs1 = valueFor(values, rhs_mul.rhs_id) orelse return null;
+    const left0 = try temporaryMetalResidentValue(cb, lhs0);
+    defer left0.deinit(cb);
+    const right0 = try temporaryMetalResidentValue(cb, rhs0);
+    defer right0.deinit(cb);
+    const left1 = try temporaryMetalResidentValue(cb, lhs1);
+    defer left1.deinit(cb);
+    const right1 = try temporaryMetalResidentValue(cb, rhs1);
+    defer right1.deinit(cb);
     const output = try executeDecoderWithOutputHint(cb, ComputeBackend.decoderRuntimeApplyMultiplyAdd2, ops_mod.DecoderRuntimeApplyMultiplyAdd2Request{
         .output = output_hint,
-        .lhs0 = lhs0,
-        .rhs0 = rhs0,
-        .lhs1 = lhs1,
-        .rhs1 = rhs1,
+        .lhs0 = left0.value,
+        .rhs0 = right0.value,
+        .lhs1 = left1.value,
+        .rhs1 = right1.value,
         .dim = dim,
     });
-    if (try promoteMetalOutputIfNeeded(cb, output)) |result| return result;
+    if (try promoteMetalOutputIfNeeded(cb, output, output_hint)) |result| return result;
 
-    const lhs_product = cb.multiply(lhs0, rhs0) catch |err| switch (err) {
+    const lhs_product = cb.multiply(left0.value, right0.value) catch |err| switch (err) {
         error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return null,
         else => return err,
     };
     defer cb.free(lhs_product);
-    const rhs_product = cb.multiply(lhs1, rhs1) catch |err| switch (err) {
+    const rhs_product = cb.multiply(left1.value, right1.value) catch |err| switch (err) {
         error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return null,
         else => return err,
     };
@@ -16165,7 +16100,7 @@ fn executeDeferredElementwiseMultiplyAdd2(
         error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return null,
         else => return err,
     };
-    return try promoteMetalOutputIfNeeded(cb, fallback);
+    return try promoteMetalOutputIfNeeded(cb, fallback, null);
 }
 
 fn executeDeferredElementwiseMultiplyAdd(
@@ -16176,54 +16111,33 @@ fn executeDeferredElementwiseMultiplyAdd(
     dim: usize,
     output_hint: ?CT,
 ) !?CT {
-    var lhs = valueFor(values, mul.lhs_id) orelse return null;
-    var rhs = valueFor(values, mul.rhs_id) orelse return null;
-    var residual = addend;
-    var owned_lhs: ?CT = null;
-    defer if (owned_lhs) |ct| cb.free(ct);
-    var owned_rhs: ?CT = null;
-    defer if (owned_rhs) |ct| cb.free(ct);
-    var owned_residual: ?CT = null;
-    defer if (owned_residual) |ct| cb.free(ct);
-    if (cb.kind() == .metal) {
-        if (!isMetalDeviceResident(cb, lhs)) {
-            if (try makeMetalDeviceResident(cb, lhs)) |device_lhs| {
-                if (device_lhs != lhs) owned_lhs = device_lhs;
-                lhs = device_lhs;
-            }
-        }
-        if (!isMetalDeviceResident(cb, rhs)) {
-            if (try makeMetalDeviceResident(cb, rhs)) |device_rhs| {
-                if (device_rhs != rhs) owned_rhs = device_rhs;
-                rhs = device_rhs;
-            }
-        }
-        if (!isMetalDeviceResident(cb, residual)) {
-            if (try makeMetalDeviceResident(cb, residual)) |device_residual| {
-                if (device_residual != residual) owned_residual = device_residual;
-                residual = device_residual;
-            }
-        }
-    }
+    const lhs = valueFor(values, mul.lhs_id) orelse return null;
+    const rhs = valueFor(values, mul.rhs_id) orelse return null;
+    const left = try temporaryMetalResidentValue(cb, lhs);
+    defer left.deinit(cb);
+    const right = try temporaryMetalResidentValue(cb, rhs);
+    defer right.deinit(cb);
+    const residual = try temporaryMetalResidentValue(cb, addend);
+    defer residual.deinit(cb);
     const output = try executeDecoderWithOutputHint(cb, ComputeBackend.decoderRuntimeApplyMultiplyAdd, ops_mod.DecoderRuntimeApplyMultiplyAddRequest{
         .output = output_hint,
-        .lhs = lhs,
-        .rhs = rhs,
-        .addend = residual,
+        .lhs = left.value,
+        .rhs = right.value,
+        .addend = residual.value,
         .dim = dim,
     });
-    if (try promoteMetalOutputIfNeeded(cb, output)) |result| return result;
+    if (try promoteMetalOutputIfNeeded(cb, output, output_hint)) |result| return result;
 
-    const multiplied = cb.multiply(lhs, rhs) catch |err| switch (err) {
+    const multiplied = cb.multiply(left.value, right.value) catch |err| switch (err) {
         error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return null,
         else => return err,
     };
     defer cb.free(multiplied);
-    const fallback = cb.add(multiplied, residual) catch |err| switch (err) {
+    const fallback = cb.add(multiplied, residual.value) catch |err| switch (err) {
         error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return null,
         else => return err,
     };
-    return try promoteMetalOutputIfNeeded(cb, fallback);
+    return try promoteMetalOutputIfNeeded(cb, fallback, null);
 }
 
 fn executeDeferredScaleMulValue(
@@ -16231,27 +16145,13 @@ fn executeDeferredScaleMulValue(
     values: []?CT,
     scaled: DeferredScaleMul,
 ) !?CT {
-    var lhs = valueFor(values, scaled.source_id) orelse return null;
-    var scalar = valueFor(values, scaled.scalar_id) orelse return null;
-    var owned_lhs: ?CT = null;
-    defer if (owned_lhs) |ct| cb.free(ct);
-    var owned_scalar: ?CT = null;
-    defer if (owned_scalar) |ct| cb.free(ct);
-    if (cb.kind() == .metal) {
-        if (!isMetalDeviceResident(cb, lhs)) {
-            if (try makeMetalDeviceResident(cb, lhs)) |device_lhs| {
-                if (device_lhs != lhs) owned_lhs = device_lhs;
-                lhs = device_lhs;
-            }
-        }
-        if (!isMetalDeviceResident(cb, scalar)) {
-            if (try makeMetalDeviceResident(cb, scalar)) |device_scalar| {
-                if (device_scalar != scalar) owned_scalar = device_scalar;
-                scalar = device_scalar;
-            }
-        }
-    }
-    return cb.multiply(lhs, scalar) catch |err| switch (err) {
+    const lhs = valueFor(values, scaled.source_id) orelse return null;
+    const scalar = valueFor(values, scaled.scalar_id) orelse return null;
+    const left = try temporaryMetalResidentValue(cb, lhs);
+    defer left.deinit(cb);
+    const right = try temporaryMetalResidentValue(cb, scalar);
+    defer right.deinit(cb);
+    return cb.multiply(left.value, right.value) catch |err| switch (err) {
         error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
     };
@@ -16263,24 +16163,15 @@ fn executeDeferredScaleAddFallback(
     scaled: DeferredScaleMul,
     residual: CT,
 ) !?CT {
-    var rhs = residual;
-    var owned_rhs: ?CT = null;
-    defer if (owned_rhs) |ct| cb.free(ct);
-    if (cb.kind() == .metal) {
-        if (!isMetalDeviceResident(cb, rhs)) {
-            if (try makeMetalDeviceResident(cb, rhs)) |device_rhs| {
-                if (device_rhs != rhs) owned_rhs = device_rhs;
-                rhs = device_rhs;
-            }
-        }
-    }
+    const rhs = try temporaryMetalResidentValue(cb, residual);
+    defer rhs.deinit(cb);
     const multiplied_ct = (try executeDeferredScaleMulValue(cb, values, scaled)) orelse return null;
     defer cb.free(multiplied_ct);
-    const output = cb.add(multiplied_ct, rhs) catch |err| switch (err) {
+    const output = cb.add(multiplied_ct, rhs.value) catch |err| switch (err) {
         error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
     };
-    return try promoteMetalOutputIfNeeded(cb, output);
+    return try promoteMetalOutputIfNeeded(cb, output, null);
 }
 
 /// A mul input may only be consumed as a "deferred" (fused) producer when its
@@ -20471,6 +20362,25 @@ test "metal partition executor runtime add keeps resident input device backed" {
     const raw = try cb.toFloat32(out, allocator);
     defer allocator.free(raw);
     try std.testing.expectEqualSlices(f32, &.{ 11.0, 22.0, 33.0, 44.0 }, raw);
+
+    const product: DeferredElementwiseMul = .{ .lhs_id = x, .rhs_id = y };
+    const fused = (try executeDeferredElementwiseMultiplyAdd2(&cb, values, product, product, dim, null)) orelse return error.UnsupportedPrimitiveOp;
+    defer cb.free(fused);
+    try std.testing.expect(isMetalDeviceResident(&cb, fused));
+    const products = try cb.toFloat32(fused, allocator);
+    defer allocator.free(products);
+    try std.testing.expectEqualSlices(f32, &.{ 20.0, 80.0, 180.0, 320.0 }, products);
+
+    const host_output = try cb.fromFloat32(&.{ 1.0, 2.0, 3.0, 4.0 });
+    var failure = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    metal_compute.allocator = failure.allocator();
+    defer metal_compute.allocator = allocator;
+    const promoted = promoteMetalOutputIfNeeded(&cb, host_output, null) catch |err| {
+        try std.testing.expect(err == error.OutOfMemory);
+        return;
+    };
+    if (promoted) |ct| cb.free(ct);
+    return error.MissingPromotionAllocationFailure;
 }
 
 test "metal partition executor runtime rms norm supports row-wise resident shapes" {
