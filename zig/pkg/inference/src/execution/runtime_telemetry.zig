@@ -200,6 +200,8 @@ pub const PeriodicWorkspace = struct {
     activations: usize,
     invalidations: usize,
     admission_denials: usize,
+    /// Recording declined because learned slots lacked exact owned backing.
+    capture_binding_denials: usize,
 };
 
 pub const Snapshot = struct {
@@ -227,6 +229,7 @@ pub const Snapshot = struct {
     cuda: ?Cuda = null,
     cuda_periodic_workspace: ?PeriodicWorkspace = null,
     metal_serial_workspace: ?@import("runtime_observation.zig").SerialWorkspaceObservation = null,
+    cuda_audio_workspace: ?@import("runtime_observation.zig").CudaAudioWorkspace = null,
     memory: Memory = .{},
     /// Invocation interval on its submitting thread, including CPU fallbacks.
     submission: ?@import("runtime_observation.zig").Counters = null,
@@ -254,6 +257,7 @@ pub const Snapshot = struct {
             .memory = self.memory,
             .cuda_periodic_workspace = self.cuda_periodic_workspace,
             .metal_serial_workspace = self.metal_serial_workspace,
+            .cuda_audio_workspace = self.cuda_audio_workspace,
             .cuda = if (self.cuda) |after| if (before.cuda) |start| after.since(start) else after else null,
             .native_allocations = if (self.native_allocations) |after| if (before.native_allocations) |start| after.since(start) else after else null,
             .process = if (self.process) |after| if (before.process) |start| after.since(start) else after else null,

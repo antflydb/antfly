@@ -290,6 +290,7 @@ pub const KernelScope = struct {
     native_programs: NativePrograms = .{},
     native_program_bank: ?NativeProgramBank = null,
     metal_serial_workspace: ?SerialWorkspaceObservation = null,
+    cuda_audio_workspace: ?CudaAudioWorkspace = null,
     attached: bool = false,
     /// Must be called only after the owner reaches final address-stable storage.
     pub fn begin(self: *KernelScope) void {
@@ -360,6 +361,22 @@ pub const CudaAudio = struct {
         return if (observed) result else null;
     }
 };
+
+/// Latest submitted learned audio workspace in the observing interval.
+/// Spans may alias one another and describe neither peak usage nor completion.
+pub const CudaAudioWorkspace = struct {
+    planned_arena_bytes: usize,
+    bound_arena_bytes: usize,
+    bound_input_bytes: usize,
+    planned_terminal_bytes: usize,
+    bound_terminal_bytes: usize,
+    terminal_outside_arena: bool,
+};
+
+pub inline fn cudaAudioWorkspace(workspace: CudaAudioWorkspace) void {
+    var active = active_kernels;
+    while (active) |scope| : (active = scope.previous) scope.cuda_audio_workspace = workspace;
+}
 
 threadlocal var cuda_audio: CudaAudio = .{};
 

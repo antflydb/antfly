@@ -18675,6 +18675,7 @@ fn debugCudaGraphCaptureBegin(ctx: *anyopaque, label: []const u8) !bool {
     // the autoplan branches above fail closed with CudaGraphReplayRequired.
     if (self.temp_trace_seq < min_alloc_seq) return false;
     if (self.temp_slot_config.configured_period == 0 and self.temp_slot_config.autoplan_enabled and !hasBoundLearnedTempWorkspace(self)) {
+        self.temp_arena_planner.capture_binding_denials +|= 1;
         self.temp_arena_planner.markPinnedValidationFailure();
         if (cudaRequestDecodeGraphReplayMode(self) == .required) return error.CudaGraphReplayRequired;
         return false;
@@ -19186,6 +19187,7 @@ test "CUDA request reset clears pinned temp slot ABI mappings" {
     try std.testing.expect(self.temp_arena_planner.pinned_validation_failed);
     _ = setenv("ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY", "required", 1);
     try std.testing.expectError(error.CudaGraphReplayRequired, debugCudaGraphCaptureBegin(&self, "unbound-workspace"));
+    try std.testing.expectEqual(@as(usize, 2), self.temp_arena_planner.capture_binding_denials);
     self.temp_arena_planner.resetForRequest();
     self.temp_pinned_slots.items[1] = .{ .buffer = .{ .ptr = 0x3000, .len = 256, .allocation_bytes = 256 }, .requested_len = 256 };
     try std.testing.expect(hasBoundLearnedTempWorkspace(&self));
@@ -20752,6 +20754,14 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     } else {
         observation.cudaAudioResult(.eager_assigned);
     }
+    observation.cudaAudioWorkspace(.{
+        .planned_arena_bytes = storage.bytes,
+        .bound_arena_bytes = arena.buffers[0].len,
+        .bound_input_bytes = input_bank.len,
+        .planned_terminal_bytes = output.bytes,
+        .bound_terminal_bytes = output_bank.len,
+        .terminal_outside_arena = published_directly or storage.external_output,
+    });
     // Report the logical tensor extent to callers. The allocation ledger and
     // temp pool still recover the full backing size from the buffer token.
     tensorFromCt(out).buffer.len = output_bytes;
@@ -36261,6 +36271,7 @@ fn observePeriodicWorkspace(self: *CudaCompute) ?@import("../../execution/runtim
         .activations = plan.activations,
         .invalidations = plan.invalidations,
         .admission_denials = plan.admission_denials,
+        .capture_binding_denials = plan.capture_binding_denials,
     };
 }
 
@@ -60136,7 +60147,10 @@ test "public source audio linear recreates input bank through actual learning ca
         }
         const before_calls = run.calls;
         var transfers = transfer_audit.Audit{};
+        var workspace_observation: @import("../../execution/runtime_observation.zig").KernelScope = .{};
         const output = observed: {
+            workspace_observation.begin();
+            defer _ = workspace_observation.finish();
             try transfer_audit.begin(&transfers);
             defer transfer_audit.end();
             break :observed (try cb.audioExecution(0x303, &.{ projected, identity }, &run, Run.call)) orelse return error.TestUnexpectedResult;
@@ -60145,6 +60159,13 @@ test "public source audio linear recreates input bank through actual learning ca
         defer if (!retain_output) cb.free(output);
         if (retain_output) held[iteration - 3] = output;
         try std.testing.expect(compute.source_linear_scratch.active);
+        if (iteration >= 2) {
+            const workspace = workspace_observation.cuda_audio_workspace orelse return error.TestUnexpectedResult;
+            try std.testing.expect(workspace.planned_arena_bytes <= workspace.bound_arena_bytes);
+            try std.testing.expect(workspace.planned_terminal_bytes <= workspace.bound_terminal_bytes);
+            if (iteration == 3 or iteration == 6) try std.testing.expect(workspace.bound_input_bytes != 0);
+            if (iteration == 4 or iteration == 5) try std.testing.expectEqual(@as(usize, 0), workspace.bound_input_bytes);
+        } else try std.testing.expect(workspace_observation.cuda_audio_workspace == null);
         if (iteration == 2) {
             try std.testing.expectEqual(ordinary_pointer, compute.source_linear_scratch.buffer.ptr);
             try std.testing.expectEqual(@as(u64, 1), compute.audio_arena_executes);

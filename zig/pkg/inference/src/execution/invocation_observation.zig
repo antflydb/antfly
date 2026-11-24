@@ -289,6 +289,7 @@ const Invocation = struct {
         snapshot.runtime.authored_native_programs = self.kernels.native_programs;
         snapshot.runtime.authored_native_program_bank = self.kernels.native_program_bank;
         snapshot.runtime.metal_serial_workspace = self.kernels.metal_serial_workspace;
+        snapshot.runtime.cuda_audio_workspace = self.kernels.cuda_audio_workspace;
         if (self.binding.native_definition_templates) |value| snapshot.native_definition_templates = value;
         if (self.binding.native_program_construction) |value| snapshot.native_program_construction = value;
         snapshot.runtime.owned_native_fallbacks = self.kernels.native_fallbacks;

@@ -140,6 +140,7 @@ pub const TempArenaPlanner = struct {
     peak_planned_physical_high_water_bytes: usize = 0,
     admission_budget_bytes: usize = 0,
     admission_denials: usize = 0,
+    capture_binding_denials: usize = 0,
     disabled: bool = false,
     pinned_validation_failed: bool = false,
     replay_validation_failed: bool = false,
