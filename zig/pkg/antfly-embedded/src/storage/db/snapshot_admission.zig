@@ -27,6 +27,13 @@ pub const SnapshotAdmission = struct {
     lock: apply_rw_lock_mod.ApplyRwLock = .{},
     mutation_revision: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
+    active_mutations: @import("antfly_platform").atomic.Value(u64) = .init(0),
+
+    fn markMutation(self: *SnapshotAdmission) void {
+        _ = self.active_mutations.fetchAdd(1, .acq_rel);
+        _ = self.mutation_revision.fetchAdd(1, .release);
+    }
+
     /// When sampled under capture, revisions bracket an interval free of
     /// mutation leases if both samples match. Retains share the original
     /// interval and need no additional increment.
@@ -35,10 +42,11 @@ pub const SnapshotAdmission = struct {
     }
 
     /// Observe a quiet admission without competing with other observers.
-    /// The lock covers the gap before a mutator increments its revision.
+    /// Physical maintenance shares capture exclusion without changing query
+    /// inputs. Logical writers mark their activity before accessing storage.
     pub fn quietRevision(self: *const @This()) ?u64 {
         const before = self.mutation_revision.load(.acquire);
-        if (self.lock.state.load(.acquire) != 0) return null;
+        if (self.active_mutations.load(.acquire) != 0 or self.lock.exclusiveAdmissionClosed()) return null;
         const after = self.mutation_revision.load(.acquire);
         return if (before == after) after else null;
     }
@@ -57,6 +65,7 @@ pub const SnapshotAdmission = struct {
             } else {
                 self.admission.lock.retainShared();
             }
+            _ = self.admission.active_mutations.fetchAdd(1, .acq_rel);
             return .{ .admission = self.admission, .capture = self.capture };
         }
 
@@ -70,6 +79,7 @@ pub const SnapshotAdmission = struct {
 
         pub fn release(self: *@This()) void {
             if (!self.active) return;
+            _ = self.admission.active_mutations.fetchSub(1, .acq_rel);
             if (self.capture) |capture| {
                 std.debug.assert(capture.active);
             } else {
@@ -89,7 +99,7 @@ pub const SnapshotAdmission = struct {
 
         pub fn borrowMutation(self: *const @This()) MutationLease {
             std.debug.assert(self.active);
-            _ = self.admission.mutation_revision.fetchAdd(1, .release);
+            self.admission.markMutation();
             return .{ .admission = self.admission, .capture = self };
         }
 
@@ -104,9 +114,42 @@ pub const SnapshotAdmission = struct {
         }
     };
 
+    /// Only operations that preserve logical records and index publications
+    /// may use this lease. Snapshot capture still excludes their physical I/O.
+    pub const PhysicalMaintenanceLease = struct {
+        admission: *SnapshotAdmission,
+
+        /// Promote a verified logical operation before its first write.
+        pub fn beginMutation(self: *const @This()) MutationLease {
+            self.admission.lock.retainShared();
+            self.admission.markMutation();
+            return .{ .admission = self.admission };
+        }
+
+        pub fn release(self: *@This()) void {
+            self.admission.lock.unlockShared();
+            self.* = undefined;
+        }
+    };
+
+    pub fn acquirePhysicalMaintenance(self: *@This()) PhysicalMaintenanceLease {
+        self.lock.lockShared();
+        return .{ .admission = self };
+    }
+
+    pub fn acquirePhysicalMaintenanceIo(self: *@This(), io: std.Io, cancellation: anytype) !PhysicalMaintenanceLease {
+        try self.lock.lockSharedIo(io, cancellation);
+        return .{ .admission = self };
+    }
+
+    pub fn tryAcquirePhysicalMaintenance(self: *@This()) ?PhysicalMaintenanceLease {
+        if (!self.lock.tryLockShared()) return null;
+        return .{ .admission = self };
+    }
+
     pub fn acquireMutation(self: *@This()) MutationLease {
         self.lock.lockShared();
-        _ = self.mutation_revision.fetchAdd(1, .release);
+        self.markMutation();
         return .{ .admission = self };
     }
 
@@ -114,13 +157,13 @@ pub const SnapshotAdmission = struct {
     /// while another operation owns or is waiting for a snapshot capture.
     pub fn tryAcquireMutation(self: *@This()) ?MutationLease {
         if (!self.lock.tryLockShared()) return null;
-        _ = self.mutation_revision.fetchAdd(1, .release);
+        self.markMutation();
         return .{ .admission = self };
     }
 
     pub fn acquireMutationIo(self: *@This(), io: std.Io, cancellation: anytype) !MutationLease {
         try self.lock.lockSharedIo(io, cancellation);
-        _ = self.mutation_revision.fetchAdd(1, .release);
+        self.markMutation();
         return .{ .admission = self };
     }
 
@@ -142,6 +185,22 @@ pub const SnapshotAdmission = struct {
         return .{ .admission = self };
     }
 };
+
+test "storage.db snapshot admission excludes capture during physical maintenance" {
+    var admission: SnapshotAdmission = .{};
+    const before = admission.quietRevision();
+    var physical = admission.tryAcquirePhysicalMaintenance().?;
+    try std.testing.expectEqual(before, admission.quietRevision());
+    try std.testing.expect(admission.tryAcquireCapture() == null);
+    var mutation = admission.tryAcquireMutation().?;
+    try std.testing.expect(admission.quietRevision() == null);
+    mutation.release();
+    try std.testing.expectEqual(@as(?u64, before.? + 1), admission.quietRevision());
+    physical.release();
+    var capture = admission.tryAcquireCapture().?;
+    defer capture.release();
+    try std.testing.expect(admission.tryAcquirePhysicalMaintenance() == null);
+}
 
 test "storage.db snapshot admission capture revisions include nonblocking mutations" {
     var admission: SnapshotAdmission = .{};
