@@ -4613,6 +4613,29 @@ test "prepared Metal F32 MPS projection uses the assigned graph output" {
     try std.testing.expectEqualDeep(coverage, report.payload_admission_coverage.?.value);
     try std.testing.expectEqual(before.mps_dense_linear_active_frame_calls + 1, metal.runtimeMemorySnapshot(runtime).mps_dense_linear_active_frame_calls);
     try std.testing.expectEqual(@as(u64, 0), result.stats.device_host_accesses);
+    // Hold the first assigned result across another submission. The vendor
+    // frame may retire its matrix wrappers, but it must not recycle a live
+    // result's backing into the second invocation.
+    var next_data: [rows * width]f32 = undefined;
+    for (data, &next_data) |value, *next| next.* = -value;
+    var next_input = try Tensor.initFloat32(a, "x", &.{ rows, width }, &next_data);
+    defer next_input.deinit();
+    var next = try executable.run(a, .{
+        .runtime_inputs = &weight_inputs,
+        .host_inputs = &.{.{ .node_id = x_node, .value = &next_input }},
+        .prepared_routes = routes,
+        .output_placement = .producer,
+        .collect_partition_stats = true,
+        .activation_readbacks = .forbidden,
+    });
+    defer next.deinit(&executable.runtime);
+    try std.testing.expectEqual(@as(u64, 1), next.stats.assigned_kernel_dispatches);
+    try std.testing.expectEqual(@as(u64, 0), next.stats.device_host_accesses);
+    try std.testing.expectEqual(before.mps_dense_linear_active_frame_calls + 2, metal.runtimeMemorySnapshot(runtime).mps_dense_linear_active_frame_calls);
+    const next_output = try cb.toFloat32(next.outputs[0], a);
+    defer a.free(next_output);
+    try std.testing.expectEqual(next_data.len, next_output.len);
+    for (next_data, next_output) |expected, actual| try std.testing.expectEqual(expected + 0.25, actual);
     const output = try cb.toFloat32(result.outputs[0], a);
     defer a.free(output);
     try std.testing.expectEqual(data.len, output.len);
