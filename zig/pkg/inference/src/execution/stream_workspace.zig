@@ -52,7 +52,7 @@ pub const Plan = struct {
     }
     pub fn allocate(self: *Plan, bytes: usize, pointer: DevicePointer) void {
         if (!self.valid or self.sealed) return;
-        if (self.count == self.allocations.len or bytes > limit) {
+        if (self.count == self.allocations.len or bytes == 0 or bytes > limit or pointer == 0) {
             self.valid = false;
             return;
         }
@@ -60,9 +60,15 @@ pub const Plan = struct {
         var offset: usize = 0;
         while (true) {
             var next = offset;
-            for (self.allocations[0..self.count]) |a| if (a.live and offset < a.offset + std.mem.alignForward(usize, a.bytes, alignment) and a.offset < offset + extent) {
-                next = @max(next, a.offset + std.mem.alignForward(usize, a.bytes, alignment));
-            };
+            for (self.allocations[0..self.count]) |a| {
+                if (!a.live) continue;
+                if (a.pointer == pointer) {
+                    self.valid = false;
+                    return;
+                }
+                const end = a.offset + std.mem.alignForward(usize, a.bytes, alignment);
+                if (offset < end and a.offset < offset + extent) next = @max(next, end);
+            }
             if (next == offset) break;
             offset = next;
         }
@@ -209,7 +215,7 @@ pub const Scope = struct {
     }
 };
 
-test "LightOnOCR3 CUDA closed execution arena rejects live buffers and event drift" {
+test "stream workspace rejects live buffers and event drift" {
     const p = try std.testing.allocator.create(Plan);
     defer std.testing.allocator.destroy(p);
     p.* = .{};
@@ -238,6 +244,18 @@ test "LightOnOCR3 CUDA closed execution arena rejects live buffers and event dri
     var changed = Scope{ .plan = p, .base = 10000 };
     _ = try changed.allocate(256);
     try std.testing.expectError(error.AudioPlanChanged, changed.allocate(256));
+}
+
+test "stream workspace rejects duplicate live addresses and accepts retired address reuse" {
+    var plan: Plan = .{};
+    plan.allocate(256, 1024);
+    plan.allocate(256, 1024);
+    try std.testing.expect(!plan.finish(1024));
+    plan = .{};
+    plan.allocate(256, 1024);
+    plan.release(1024);
+    plan.allocate(256, 1024);
+    try std.testing.expect(plan.finish(1024));
 }
 
 test "CUDA arena preserves device addresses wider than a 32-bit host pointer" {
