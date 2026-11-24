@@ -3610,6 +3610,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .optimize = optimize,
     });
     antfly_imports.configureCli(cmd_test_mod, true);
+    // The local source test partition checks optional template capabilities.
+    cmd_test_mod.addOptions("build_options", b.addOptions());
     cmd_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
     const cmd_tests = b.addTest(.{
         .root_module = cmd_test_mod,

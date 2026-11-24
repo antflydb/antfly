@@ -180,6 +180,8 @@ pub fn syncJsonAlloc(a: Allocator, input: []const u8, output: []const u8, select
         const spool = try std.Io.Dir.cwd().createFile(io, spool_path, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
         defer std.Io.Dir.cwd().deleteFile(io, spool_path) catch {};
         defer spool.close(io);
+        var spool_buffer: [64 * 1024]u8 = undefined;
+        var spool_writer = spool.writer(io, &spool_buffer);
         var expanded_bytes: u64 = 0;
 
         {
@@ -205,6 +207,7 @@ pub fn syncJsonAlloc(a: Allocator, input: []const u8, output: []const u8, select
                 .directory = arena.allocator(),
                 .io = io,
                 .spool = spool,
+                .spool_writer = &spool_writer.interface,
                 .target = &target,
                 .definition = definition,
                 .options = table_options,
@@ -219,6 +222,7 @@ pub fn syncJsonAlloc(a: Allocator, input: []const u8, output: []const u8, select
                 .max_document_bytes = options.max_document_bytes,
             }, &copy, Copy.visit);
             expanded_bytes = @max(inspection.size_bytes, inspection.logical_bytes);
+            try spool_writer.end();
             try copy.restoreDocuments();
             try target.db.runUntilIdle();
             try target.db.sync(true);
@@ -372,6 +376,7 @@ const Copy = struct {
     directory: Allocator,
     io: std.Io,
     spool: std.Io.File,
+    spool_writer: *std.Io.Writer,
     target: *connection.Connection,
     definition: Definition,
     options: Options,
@@ -386,7 +391,7 @@ const Copy = struct {
     fn stage(self: *Copy, bytes: []const u8) !Span {
         const offset = self.spool_size;
         self.spool_size = std.math.add(u64, offset, bytes.len) catch return error.BackupExpansionLimitExceeded;
-        try self.spool.writePositionalAll(self.io, bytes, offset);
+        try self.spool_writer.writeAll(bytes);
         return .{ .offset = offset, .len = bytes.len };
     }
 
@@ -595,7 +600,7 @@ fn fileDigest(io: std.Io, file: std.Io.File, size: u64) ![64]u8 {
     return std.fmt.bytesToHex(h.finalResult(), .lower);
 }
 
-const test_schema = "{\"version\":0,\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"properties\":{\"content\":{\"type\":\"string\",\"x-antfly-types\":[\"text\"]}}}}}}";
+const test_schema = "{\"version\":0,\"ttl_duration_ns\":4000000000000000000,\"ttl_field\":\"observed_at\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"properties\":{\"content\":{\"type\":\"string\",\"x-antfly-types\":[\"text\"]}}}}}}";
 const test_indexes = "{\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"},\"vectors\":{\"name\":\"vectors\",\"type\":\"embeddings\",\"external\":true,\"dimension\":2,\"distance_metric\":\"cosine\"},\"vectors_alt\":{\"name\":\"vectors_alt\",\"type\":\"embeddings\",\"external\":true,\"dimension\":2,\"distance_metric\":\"cosine\"}}";
 const test_definition = "{\"schema\":" ++ test_schema ++ ",\"indexes\":" ++ test_indexes ++ "}";
 
@@ -675,13 +680,15 @@ test "data sync preserves documents and partial external vectors without source 
     try std.testing.expectEqual(@as(?u64, 1234), try local.storage_ttl.readTimestamp(result.db.core.store, a, "one"));
     try std.testing.expectEqual(@as(?i128, -42), try local.storage_ttl.readSourceTimestamp(result.db.core.store, a, "one"));
     try std.testing.expectEqual(@as(?u64, null), try local.storage_ttl.readTimestamp(result.db.core.store, a, "two"));
-    try std.testing.expect(result.db.core.index_manager.vectorBlockReadyForDenseIndex("vectors"));
     const stats = try result.db.stats(a);
     defer local.storage_db_types.freeDBStats(a, stats);
     for (stats.indexes) |index| if (index.kind == .dense_vector) {
         try std.testing.expect(index.publication_target_ready);
         try std.testing.expectEqual(@as(u64, 1), index.publication_target_count);
         try std.testing.expectEqual(@as(u64, 1), index.doc_count);
+        const manager = result.db.core.index_manager;
+        if (manager.vectorBlockProjectionRequiredForDenseIndex(index.name))
+            try std.testing.expect(manager.vectorBlockReadyForDenseIndex(index.name));
     };
     var one = (try result.db.lookup(a, "one", .{})) orelse return error.MissingDocument;
     defer one.deinit(a);
@@ -824,7 +831,13 @@ test "data sync stages all or selected tables atomically with aggregate limits" 
             defer doc.deinit(a);
             const expected = if (std.mem.eql(u8, name.string, "other")) "independent second table" else "first searchable record";
             try std.testing.expect(std.mem.indexOf(u8, doc.json, expected) != null);
-            try std.testing.expect(target.db.core.index_manager.vectorBlockReadyForDenseIndex("vectors"));
+            var hits = try target.db.search(a, .{
+                .index_name = "vectors",
+                .dense = .{ .vector = &.{ 1, 0 }, .k = 1 },
+                .limit = 1,
+            });
+            defer hits.deinit();
+            try std.testing.expectEqual(@as(usize, 1), hits.hits.len);
         }
     }
     const output = try std.fs.path.join(a, &.{ root, "rejected.aflite" });
