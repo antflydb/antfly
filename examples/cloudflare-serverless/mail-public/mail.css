@@ -162,6 +162,7 @@ button.icon-only .icon { width: 16px; height: 16px; }
 }
 #search:focus-within { border-color: var(--foreground); color: var(--foreground); }
 #search input { border: 0; background: none; outline: 0; min-width: 0; flex: 1; padding: 0.6rem 0.2rem; }
+#search input:-webkit-autofill, #search input:autofill { -webkit-text-fill-color: var(--foreground); box-shadow: 0 0 0 100px var(--surface) inset; transition: background-color 9999s; }
 #search select { width: auto; border: 0; background: var(--hover); border-radius: 999px; font-size: 12px; padding: 0.3rem 0.5rem; color: var(--muted); }
 .search-go { border: 0; background: none; border-radius: 999px; padding: 0.4rem 0.75rem; font-size: 13px; color: var(--muted); }
 #search-note { padding: 0 1.25rem 0.75rem; }
