@@ -2181,12 +2181,13 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
 
     var profile = AudioProfile{ .cb = cb };
     const profile_enabled = gemma4AudioMetalProfileEnabled();
+    const previous_profile = active_audio_profile;
     if (profile_enabled) {
         profile.start();
         active_audio_profile = &profile;
     }
     defer if (profile_enabled) {
-        active_audio_profile = null;
+        active_audio_profile = previous_profile;
     };
 
     if (@import("builtin").is_test) {
@@ -4854,7 +4855,7 @@ const AudioProfile = struct {
     }
 };
 
-var active_audio_profile: ?*AudioProfile = null;
+threadlocal var active_audio_profile: ?*AudioProfile = null;
 
 fn audioProfileMark(bucket: AudioProfile.Bucket) void {
     if (active_audio_profile) |profile| profile.mark(bucket);
