@@ -17,6 +17,7 @@
 //! The input is only opened through storage/catalog readers. Its server state,
 //! producer definitions, identities and jobs never become destination authority.
 const std = @import("std");
+const builtin = @import("builtin");
 const local = @import("antfly_local_sources");
 const staging = local.storage_lite_restore_staging;
 const portable = local.storage_portable_backup;
@@ -120,12 +121,14 @@ pub fn syncJsonAlloc(a: Allocator, input: []const u8, output: []const u8, select
     if (named == null and names.items.len != 1) return error.InvalidBackupRequest;
     var nonce: [16]u8 = undefined;
     try io.randomSecure(&nonce);
-    const temporary = try std.fmt.allocPrint(a, "{s}.sync-{s}.aflite", .{ output, std.fmt.bytesToHex(nonce, .lower) });
+    const scratch_name = try std.fmt.allocPrint(a, ".antfly.sync-{s}", .{std.fmt.bytesToHex(nonce, .lower)});
+    defer a.free(scratch_name);
+    const scratch = try std.fs.path.join(a, &.{ std.fs.path.dirname(output) orelse ".", scratch_name });
+    defer a.free(scratch);
+    try std.Io.Dir.cwd().createDir(io, scratch, .fromMode(0o700));
+    defer std.Io.Dir.cwd().deleteTree(io, scratch) catch {};
+    const temporary = try std.fs.path.join(a, &.{ scratch, "generation.aflite" });
     defer a.free(temporary);
-    defer std.Io.Dir.cwd().deleteFile(io, temporary) catch {};
-    const lock = try std.fmt.allocPrint(a, "{s}.lock", .{temporary});
-    defer a.free(lock);
-    defer std.Io.Dir.cwd().deleteFile(io, lock) catch {};
     var documents: u64 = 0;
     var vectors: u64 = 0;
     var remaining_expanded = options.max_expanded_bytes;
@@ -151,35 +154,46 @@ pub fn syncJsonAlloc(a: Allocator, input: []const u8, output: []const u8, select
         if (table.storage.engine != .local or table.storage_migration != null or table.lake_index_catalog_json.len != 0) return error.UnsupportedLiteInspectionLayout;
         if (!try jsonEqual(a, table.schema_json, schema_json) or !try emptyArray(a, table.replication_sources_json)) return error.InvalidBackupRequest;
         try requireIndexes(a, table.indexes_json, definition.indexes);
-        var group: ?u64 = null;
+        if (table.read_schema_json.len != 0) return error.UnsupportedBackupMigrationState;
+        var selected_range: ?@TypeOf(projection.ranges[0]) = null;
         for (projection.ranges) |range| if (range.table_id == table.table_id) {
-            if (group != null or range.start_key.len != 0) return error.UnsupportedLiteInspectionLayout;
+            if (selected_range != null or range.start_key.len != 0) return error.UnsupportedLiteInspectionLayout;
             if (range.end_key) |end| if (end.len != 0) return error.UnsupportedLiteInspectionLayout;
-            group = range.group_id;
+            selected_range = range;
         };
-        const namespace = try std.fmt.allocPrint(a, "group-{d}/table-db", .{group orelse return error.UnsupportedLiteInspectionLayout});
+        const range = selected_range orelse return error.UnsupportedLiteInspectionLayout;
+        const namespace = try std.fmt.allocPrint(a, "group-{d}/table-db", .{range.group_id});
         defer a.free(namespace);
         var store = try local.storage_docstore.DocStore.openRuntime(a, try backend.runtimeStoreForNamespace(namespace));
         defer store.close();
+        const expected_identity: local.storage_db_doc_identity.Namespace = .{
+            .table_id = table.table_id,
+            .shard_id = if (range.doc_identity_shard_id != 0) range.doc_identity_shard_id else range.group_id,
+            .range_id = if (range.doc_identity_range_id != 0) range.doc_identity_range_id else if (range.range_id != 0) range.range_id else range.group_id,
+        };
+        try verifySourceNamespace(&backend, namespace, &store, expected_identity);
 
         const archive_path = try std.fmt.allocPrint(a, "{s}.afb", .{temporary});
         defer a.free(archive_path);
-        defer std.Io.Dir.cwd().deleteFile(io, archive_path) catch {};
         var archive = try std.Io.Dir.cwd().createFile(io, archive_path, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
+        defer std.Io.Dir.cwd().deleteFile(io, archive_path) catch {};
         defer archive.close(io);
-        var buffer: [64 * 1024]u8 = undefined;
-        var writer = archive.writer(io, &buffer);
-        var limited = staging.LimitedWriter.init(&writer.interface, remaining_expanded);
-        portable.exportPortableToWriter(a, &store, &limited.interface) catch |err| {
-            if (limited.exceeded) return error.BackupExpansionLimitExceeded;
-            return err;
-        };
-        try writer.end();
         const spool_path = try std.fmt.allocPrint(a, "{s}.spool", .{temporary});
         defer a.free(spool_path);
         const spool = try std.Io.Dir.cwd().createFile(io, spool_path, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
         defer std.Io.Dir.cwd().deleteFile(io, spool_path) catch {};
         defer spool.close(io);
+        var buffer: [64 * 1024]u8 = undefined;
+        var writer = archive.writer(io, &buffer);
+        var limited = staging.LimitedWriter.init(&writer.interface, remaining_expanded);
+        portable.exportPortableToWriterWithOptions(a, &store, &limited.interface, .{
+            .spool = .{ .io = io, .file = spool, .max_bytes = remaining_expanded },
+        }) catch |err| {
+            if (limited.exceeded) return error.BackupExpansionLimitExceeded;
+            return err;
+        };
+        try writer.end();
+        try spool.setLength(io, 0);
         var spool_buffer: [64 * 1024]u8 = undefined;
         var spool_writer = spool.writer(io, &spool_buffer);
         var expanded_bytes: u64 = 0;
@@ -249,18 +263,20 @@ pub fn syncJsonAlloc(a: Allocator, input: []const u8, output: []const u8, select
     var final_source = try std.Io.Dir.cwd().openFile(io, input, .{});
     defer final_source.close(io);
     if (!local.api_local_backups.localArtifactStatsEqual(initial, try final_source.stat(io)) or !std.mem.eql(u8, &source_digest, &try fileDigest(io, final_source, initial.size))) return error.SourceFileChanged;
-    var result = try std.Io.Dir.cwd().openFile(io, temporary, .{});
-    defer result.close(io);
-    const result_stat = try result.stat(io);
-    if (result_stat.size > options.max_expanded_bytes) return error.BackupExpansionLimitExceeded;
-    try result.sync(io);
-    const result_digest = try fileDigest(io, result, result_stat.size);
+    const result = result: {
+        const file = try std.Io.Dir.cwd().openFile(io, temporary, .{});
+        defer file.close(io);
+        const stat = try file.stat(io);
+        if (stat.size > options.max_expanded_bytes) return error.BackupExpansionLimitExceeded;
+        try file.sync(io);
+        break :result .{ .size = stat.size, .digest = try fileDigest(io, file, stat.size) };
+    };
     const json = try std.json.Stringify.valueAlloc(a, .{
         .report_version = 1,
         .operation = "sync",
         .mode = "replace",
         .source = .{ .sha256 = &source_digest, .size_bytes = initial.size, .tables = projection.tables.len },
-        .output = .{ .sha256 = &result_digest, .size_bytes = result_stat.size, .table = if (names.items.len == 1) names.items[0] else null, .tables = names.items },
+        .output = .{ .sha256 = &result.digest, .size_bytes = result.size, .table = if (names.items.len == 1) names.items[0] else null, .tables = names.items },
         .inventory = .{ .documents = documents, .artifact_records = vectors, .shards = names.items.len },
     }, .{});
     errdefer a.free(json);
@@ -268,8 +284,26 @@ pub fn syncJsonAlloc(a: Allocator, input: []const u8, output: []const u8, select
     return json;
 }
 
-// Inspect the directory entry itself: a dangling symlink also occupies --out.
-// This is only an early rejection; the final hard link arbitrates publication.
+fn verifySourceNamespace(backend: *backend_mod.Handle, namespace: []const u8, store: *local.storage_docstore.DocStore, expected: local.storage_db_doc_identity.Namespace) !void {
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    if (try local.storage_db_doc_identity.loadNamespaceTxn(&read)) |actual| {
+        if (!actual.eql(expected)) return error.IdentityNamespaceMismatch;
+        return;
+    }
+    // Lite persists document identity lazily on the first write. An empty
+    // namespace still needs a durable physical root for the catalog's group.
+    const root = if (backend.root_namespace_alias) |alias|
+        (if (std.mem.eql(u8, alias, namespace)) "root" else namespace)
+    else
+        namespace;
+    if (try backend.existingRootIncarnation(root) == null or
+        try read.hasPrefix(&.{local.storage_internal_keys.user_namespace}) or
+        try read.hasPrefix(&.{local.storage_internal_keys.identity_namespace}))
+        return error.IdentityNamespaceMismatch;
+}
+
+// A dangling symlink also occupies --out. The final rename arbitrates publication.
 fn requireAbsentOutput(io: std.Io, output: []const u8) !void {
     _ = std.Io.Dir.cwd().statFile(io, output, .{ .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound => return,
@@ -279,8 +313,16 @@ fn requireAbsentOutput(io: std.Io, output: []const u8) !void {
 }
 
 fn publishOutput(io: std.Io, temporary: []const u8, output: []const u8, comptime confirmDurability: anytype) !void {
-    try std.Io.Dir.hardLink(.cwd(), temporary, .cwd(), output, io, .{});
+    // Zig uses a link/unlink fallback on other hosts. Require a single rename.
+    switch (builtin.os.tag) {
+        .linux, .macos, .windows => try std.Io.Dir.renamePreserve(.cwd(), temporary, .cwd(), output, io),
+        else => return error.OperationUnsupported,
+    }
     confirmDurability(io, output) catch return error.DurabilityOutcomeUnknown;
+    const source_parent = std.fs.path.dirname(temporary) orelse ".";
+    const destination_parent = std.fs.path.dirname(output) orelse ".";
+    if (!std.mem.eql(u8, source_parent, destination_parent))
+        confirmDurability(io, temporary) catch return error.DurabilityOutcomeUnknown;
 }
 
 fn insertLogicalTable(a: Allocator, tables: *std.StringHashMap(usize), name: []const u8, index: usize) ![]const u8 {
@@ -366,10 +408,20 @@ const Copy = struct {
         }
     };
 
+    const max_batch_documents = 64;
+    const max_batch_bytes = 16 * 1024 * 1024;
+    // Bound the temporary JSON value tree independently of the encoded size.
+    const max_vector_components_per_document = 256 * 1024;
+
     const Vector = struct {
         name: []const u8,
         values: Span,
         next: ?*Vector,
+    };
+
+    const VectorGroup = struct {
+        first: ?*Vector = null,
+        components: usize = 0,
     };
 
     a: Allocator,
@@ -382,7 +434,7 @@ const Copy = struct {
     options: Options,
     decoder: portable.InspectionDocumentDecoder = .{},
     document_blocks: std.ArrayList(Span) = .empty,
-    pending_vectors: std.StringHashMapUnmanaged(*Vector) = .empty,
+    pending_vectors: std.StringHashMapUnmanaged(VectorGroup) = .empty,
     spool_size: u64 = 0,
     documents: u64 = 0,
     vectors: u64 = 0,
@@ -449,39 +501,34 @@ const Copy = struct {
         if (vector.len != dims.integer) return error.InvalidBackupRequest;
         for (vector) |v| if (!std.math.isFinite(v)) return error.InvalidBackupRequest;
         const group = try self.pending_vectors.getOrPut(self.directory, doc_key);
-        if (!group.found_existing) group.key_ptr.* = try self.directory.dupe(u8, doc_key);
+        if (!group.found_existing) {
+            group.key_ptr.* = try self.directory.dupe(u8, doc_key);
+            group.value_ptr.* = .{};
+        }
+        if (vector.len > max_vector_components_per_document - group.value_ptr.components)
+            return error.SyncMutationLimitExceeded;
         const record = try self.directory.create(Vector);
         record.* = .{
             .name = index.key_ptr.*,
             .values = try self.stage(std.mem.sliceAsBytes(vector)),
-            .next = if (group.found_existing) group.value_ptr.* else null,
+            .next = group.value_ptr.first,
         };
-        group.value_ptr.* = record;
+        group.value_ptr.first = record;
+        group.value_ptr.components += vector.len;
         self.vectors += 1;
     }
 
     fn restoreDocuments(self: *Copy) !void {
-        var versions: std.StringHashMapUnmanaged(u64) = .empty;
-        defer versions.deinit(self.a);
-        var ttl_sources: std.StringHashMapUnmanaged(i128) = .empty;
-        defer ttl_sources.deinit(self.a);
+        var batch = RestoreBatch.init(self.a);
+        defer batch.deinit();
         for (self.document_blocks.items) |span| {
             const payload = try span.read(u8, self.a, self.io, self.spool);
             defer self.a.free(payload);
             const entries = try codec.decodeDocumentBatchBorrowed(self.a, payload);
             defer self.a.free(entries);
-            for (entries) |entry| {
-                versions.clearRetainingCapacity();
-                ttl_sources.clearRetainingCapacity();
-                try versions.put(self.a, entry.key, entry.timestamp_ns);
-                if (entry.ttl_source_ns) |source| {
-                    try ttl_sources.put(self.a, entry.key, source);
-                } else if (entry.timestamp_ns != 0) {
-                    try ttl_sources.put(self.a, entry.key, entry.timestamp_ns);
-                }
-                try self.restoreDocument(entry, &versions, &ttl_sources);
-            }
+            for (entries) |entry| try self.restoreDocument(entry, &batch);
         }
+        try self.flushBatch(&batch);
         if (self.pending_vectors.count() != 0) return error.InvalidBackupRequest;
         // A table with only deleted rows can still carry a version floor.
         if (self.version_floor != 0) {
@@ -491,7 +538,42 @@ const Copy = struct {
         }
     }
 
-    fn restoreDocument(self: *Copy, entry: codec.DocumentEntry, versions: *const std.StringHashMapUnmanaged(u64), ttl_sources: *const std.StringHashMapUnmanaged(i128)) !void {
+    const RestoreBatch = struct {
+        arena: std.heap.ArenaAllocator,
+        writes: [max_batch_documents]local.storage_db_types.BatchWrite = undefined,
+        count: usize = 0,
+        bytes: usize = 0,
+        versions: std.StringHashMapUnmanaged(u64) = .empty,
+        sources: std.StringHashMapUnmanaged(i128) = .empty,
+
+        fn init(a: Allocator) RestoreBatch {
+            return .{ .arena = std.heap.ArenaAllocator.init(a) };
+        }
+
+        fn deinit(self: *RestoreBatch) void {
+            self.versions.deinit(self.arena.child_allocator);
+            self.sources.deinit(self.arena.child_allocator);
+            self.arena.deinit();
+        }
+    };
+
+    fn flushBatch(self: *Copy, batch: *RestoreBatch) !void {
+        if (batch.count == 0) return;
+        try self.target.db.batchInternal(.{ .writes = batch.writes[0..batch.count], .sync_level = .write }, null, .{
+            .restore_timestamps = &batch.versions,
+            .restore_ttl_sources = &batch.sources,
+            .restore_document_version_floor = self.version_floor,
+            .preserve_logical_values = true,
+        });
+        self.version_floor = 0;
+        batch.count = 0;
+        batch.bytes = 0;
+        batch.versions.clearRetainingCapacity();
+        batch.sources.clearRetainingCapacity();
+        _ = batch.arena.reset(.free_all);
+    }
+
+    fn restoreDocument(self: *Copy, entry: codec.DocumentEntry, batch: *RestoreBatch) !void {
         if (self.documents == self.options.max_documents or entry.value_flags & codec.doc_value_flag_relational_row != 0)
             return error.BackupInputLimitExceeded;
         var arena = std.heap.ArenaAllocator.init(self.a);
@@ -502,6 +584,7 @@ const Copy = struct {
         // Reserved write directives are only added from validated vector records.
         if (document != .object or document.object.contains("_edges") or document.object.contains("_embeddings"))
             return error.InvalidBackupRequest;
+        if (batch.versions.contains(entry.key)) return error.InvalidBackupRequest;
         const stored_key = try local.storage_internal_keys.documentKeyAlloc(a, entry.key);
         if (self.target.db.core.store.get(a, stored_key)) |_| {
             return error.InvalidBackupRequest;
@@ -513,7 +596,7 @@ const Copy = struct {
         var value = json;
         if (self.pending_vectors.fetchRemove(entry.key)) |group| {
             var embeddings: Value = .{ .object = .empty };
-            var next: ?*Vector = group.value;
+            var next = group.value.first;
             while (next) |vector| : (next = vector.next) {
                 if (embeddings.object.contains(vector.name)) return error.InvalidBackupRequest;
                 const values = try vector.values.read(f32, a, self.io, self.spool);
@@ -525,13 +608,18 @@ const Copy = struct {
             try document.object.put(a, "_embeddings", embeddings);
             value = try std.json.Stringify.valueAlloc(a, document, .{});
         }
-        try self.target.db.batchInternal(.{ .writes = &.{.{ .key = entry.key, .value = value }}, .sync_level = .write }, null, .{
-            .restore_timestamps = versions,
-            .restore_ttl_sources = ttl_sources,
-            .restore_document_version_floor = self.version_floor,
-            .preserve_logical_values = true,
-        });
-        self.version_floor = 0;
+        const bytes = entry.key.len +| value.len;
+        if (bytes > max_batch_bytes) return error.SyncMutationLimitExceeded;
+        if (batch.count == max_batch_documents or bytes > max_batch_bytes - batch.bytes)
+            try self.flushBatch(batch);
+        const owned = batch.arena.allocator();
+        const key = try owned.dupe(u8, entry.key);
+        batch.writes[batch.count] = .{ .key = key, .value = try owned.dupe(u8, value) };
+        try batch.versions.put(self.a, key, entry.timestamp_ns);
+        if (entry.ttl_source_ns orelse (if (entry.timestamp_ns != 0) @as(?i128, entry.timestamp_ns) else null)) |source|
+            try batch.sources.put(self.a, key, source);
+        batch.count += 1;
+        batch.bytes += bytes;
         self.documents += 1;
     }
 };
@@ -605,6 +693,12 @@ const test_indexes = "{\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\
 const test_definition = "{\"schema\":" ++ test_schema ++ ",\"indexes\":" ++ test_indexes ++ "}";
 
 fn createTestSource(a: Allocator, path: []const u8, producer: bool) !void {
+    return createTestSourceWithLayout(a, path, producer, .normal);
+}
+
+const TestLayout = enum { normal, missing_range, mismatched_identity, schema_migration, empty, multi_batch };
+
+fn createTestSourceWithLayout(a: Allocator, path: []const u8, producer: bool, layout: TestLayout) !void {
     var source = try connection.Connection.create(a, path, true);
     defer source.close();
     try source.db.setSchemaJson(a, test_schema);
@@ -614,18 +708,32 @@ fn createTestSource(a: Allocator, path: []const u8, producer: bool) !void {
         defer a.free(config.config_json);
         try source.db.addIndex(config);
     }
-    try source.db.batch(.{ .writes = &.{
-        .{ .key = "one", .value = "{\"content\":\"first searchable record\",\"_embeddings\":{\"vectors\":[1,0],\"vectors_alt\":[0,1]}}" },
-        .{ .key = "two", .value = "{\"content\":\"keyword only record\"}" },
-    }, .sync_level = .write });
-    try source.db.sync(true);
-    const ttl_one = try local.storage_internal_keys.ttlKeyAlloc(a, "one");
-    defer a.free(ttl_one);
-    const ttl_two = try local.storage_internal_keys.ttlKeyAlloc(a, "two");
-    defer a.free(ttl_two);
-    const historical = try local.storage_ttl.encodeTimestampAlloc(a, 1234, -42);
-    defer a.free(historical);
-    try source.db.core.store.putBatch(&.{.{ .key = ttl_one, .value = historical }}, &.{ttl_two});
+    if (layout != .empty) {
+        try source.db.batch(.{ .writes = &.{
+            .{ .key = "one", .value = "{\"content\":\"first searchable record\",\"_embeddings\":{\"vectors\":[1,0],\"vectors_alt\":[0,1]}}" },
+            .{ .key = "two", .value = "{\"content\":\"keyword only record\"}" },
+        }, .sync_level = .write });
+        try source.db.sync(true);
+        const ttl_one = try local.storage_internal_keys.ttlKeyAlloc(a, "one");
+        defer a.free(ttl_one);
+        const ttl_two = try local.storage_internal_keys.ttlKeyAlloc(a, "two");
+        defer a.free(ttl_two);
+        const historical = try local.storage_ttl.encodeTimestampAlloc(a, 1234, -42);
+        defer a.free(historical);
+        try source.db.core.store.putBatch(&.{.{ .key = ttl_one, .value = historical }}, &.{ttl_two});
+    }
+    if (layout == .multi_batch) {
+        var keys: [Copy.max_batch_documents + 1][16]u8 = undefined;
+        var writes: [keys.len]local.storage_db_types.BatchWrite = undefined;
+        for (&writes, &keys, 0..) |*write, *key, index| {
+            write.* = .{
+                .key = try std.fmt.bufPrint(key, "extra-{d:0>3}", .{index}),
+                .value = "{\"content\":\"batch boundary\"}",
+            };
+        }
+        try source.db.batch(.{ .writes = &writes, .sync_level = .write });
+        try source.db.sync(true);
+    }
     if (producer) try source.db.core.store.putBatch(&.{.{ .key = "\x00\x00__metadata__:enrichments", .value = "[{\"name\":\"hidden\",\"kind\":\"chunk\",\"source_field\":\"content\"}]" }}, &.{});
     const identity = connection.embeddedRootIdentity();
     const namespace = try std.fmt.allocPrint(a, "group-{d}/table-db", .{identity.shard_id});
@@ -637,8 +745,8 @@ fn createTestSource(a: Allocator, path: []const u8, producer: bool) !void {
         .replace = true,
         .auxiliary_json = "{}",
         .import_catalog = .{ .revision = 1, .next_id = identity.table_id + 1, .resources = &.{.{ .kind = .table, .id = identity.table_id, .parent_id = local.system_catalog_domain.default_namespace_id, .name = "records", .storage_name = "physical-records" }} },
-        .tables = &.{.{ .table_id = identity.table_id, .name = "physical-records", .schema_json = test_schema, .indexes_json = test_indexes, .desired_replica_count = 1 }},
-        .ranges = &.{.{ .table_id = identity.table_id, .group_id = identity.shard_id, .range_id = identity.range_id, .doc_identity_shard_id = identity.shard_id, .doc_identity_range_id = identity.range_id, .start_key = "" }},
+        .tables = &.{.{ .table_id = identity.table_id, .name = "physical-records", .schema_json = test_schema, .read_schema_json = if (layout == .schema_migration) test_schema else "", .indexes_json = test_indexes, .desired_replica_count = 1 }},
+        .ranges = &.{.{ .table_id = identity.table_id, .group_id = if (layout == .missing_range) identity.shard_id + 1 else identity.shard_id, .range_id = identity.range_id, .doc_identity_shard_id = identity.shard_id, .doc_identity_range_id = if (layout == .mismatched_identity) identity.range_id + 1 else identity.range_id, .start_key = "" }},
     });
     // This deliberately is not a runnable restore-job record. A full server
     // startup must not be used to inspect or admit this source.
@@ -871,6 +979,113 @@ test "data sync selects a literal table name containing a comma" {
     try std.testing.expectEqualStrings("records,other", parsed.value.object.get("output").?.object.get("table").?.string);
 }
 
+test "data sync restores across bounded batch boundaries" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const input = try std.fs.path.join(a, &.{ root, "source.aflite" });
+    defer a.free(input);
+    const output = try std.fs.path.join(a, &.{ root, "result.aflite" });
+    defer a.free(output);
+    try createTestSourceWithLayout(a, input, false, .multi_batch);
+    const report = try syncJsonAlloc(a, input, output, "records", test_definition, .{});
+    defer a.free(report);
+    var parsed = try std.json.parseFromSlice(Value, a, report, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, Copy.max_batch_documents + 3), parsed.value.object.get("inventory").?.object.get("documents").?.integer);
+    var result = try openDestination(a, output, false);
+    defer result.close();
+    var last = (try result.db.lookup(a, "extra-064", .{})) orelse return error.MissingDocument;
+    defer last.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, last.json, "batch boundary") != null);
+    try std.testing.expectEqual(@as(?i128, -42), try local.storage_ttl.readSourceTimestamp(result.db.core.store, a, "one"));
+}
+
+test "data sync bounds grouped vectors before building a document mutation" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const spool = try tmp.dir.createFile(io, "vectors", .{ .read = true });
+    defer spool.close(io);
+    var writer = spool.writer(io, &.{});
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const dimensions = 65535;
+    var indexes: Value = .{ .object = .empty };
+    const scratch = arena.allocator();
+    for ([_][]const u8{ "a", "b", "c", "d", "e" }) |name| {
+        var definition: Value = .{ .object = .empty };
+        try definition.object.put(scratch, "dimension", .{ .integer = dimensions });
+        try indexes.object.put(scratch, name, definition);
+    }
+    var copy: Copy = .{
+        .a = a,
+        .directory = scratch,
+        .io = io,
+        .spool = spool,
+        .spool_writer = &writer.interface,
+        .target = undefined,
+        .definition = .{ .schema = .null, .indexes = indexes },
+        .options = .{},
+    };
+    const values = try a.alloc(f32, dimensions);
+    defer a.free(values);
+    @memset(values, 1);
+    for ([_][]const u8{ "a", "b", "c", "d" }) |name| try copy.stageVector(name, "one", values);
+    try std.testing.expectError(error.SyncMutationLimitExceeded, copy.stageVector("e", "one", values));
+    try std.testing.expectEqual(@as(u64, 4), copy.vectors);
+}
+
+test "data sync requires an initialized physical identity and rejects schema migration" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const output = try std.fs.path.join(a, &.{ root, "result.aflite" });
+    defer a.free(output);
+    for ([_]TestLayout{ .missing_range, .mismatched_identity, .schema_migration, .empty }) |layout| {
+        const input = try std.fmt.allocPrint(a, "{s}/{s}.aflite", .{ root, @tagName(layout) });
+        defer a.free(input);
+        try createTestSourceWithLayout(a, input, false, layout);
+        if (layout == .empty) {
+            const report = try syncJsonAlloc(a, input, output, "records", test_definition, .{});
+            defer a.free(report);
+            var parsed = try std.json.parseFromSlice(Value, a, report, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(i64, 0), parsed.value.object.get("inventory").?.object.get("documents").?.integer);
+        } else {
+            const expected = if (layout == .schema_migration) error.UnsupportedBackupMigrationState else error.IdentityNamespaceMismatch;
+            try std.testing.expectError(expected, syncJsonAlloc(a, input, output, "records", test_definition, .{}));
+            try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, output, .{}));
+        }
+    }
+}
+
+test "data sync accepts a long destination filename" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const input = try std.fs.path.join(a, &.{ root, "source.aflite" });
+    defer a.free(input);
+    const stem: [240]u8 = @splat('a');
+    const output = try std.fs.path.join(a, &.{ root, &(stem ++ ".aflite".*) });
+    defer a.free(output);
+    try createTestSource(a, input, false);
+    const report = try syncJsonAlloc(a, input, output, "records", test_definition, .{});
+    defer a.free(report);
+    const stat = try std.Io.Dir.cwd().statFile(io, output, .{});
+    try std.testing.expect(stat.size != 0);
+}
+
 test "data sync rejects occupied output entries before opening the source" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -922,10 +1137,10 @@ test "data sync retains published output on durability failure and rejects a rac
     };
     try requireAbsentOutput(io, output);
     try std.testing.expectError(error.DurabilityOutcomeUnknown, publishOutput(io, temporary, output, Failure.confirm));
-    // Staging cleanup must not remove the published name, even without success.
-    try tmp.dir.deleteFile(io, "temporary.aflite");
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "temporary.aflite", .{}));
     const file = try tmp.dir.openFile(io, "published.aflite", .{});
     defer file.close(io);
+    try std.testing.expectEqual(@as(u64, 1), (try file.stat(io)).nlink);
     var bytes: [19]u8 = undefined;
     try std.testing.expectEqual(bytes.len, try file.readPositionalAll(io, &bytes, 0));
     try std.testing.expectEqualStrings("complete generation", &bytes);
