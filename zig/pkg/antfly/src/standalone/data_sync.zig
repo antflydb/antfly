@@ -672,7 +672,7 @@ fn createTestSource(a: Allocator, path: []const u8, producer: bool) !void {
     return createTestSourceWithLayout(a, path, producer, .normal);
 }
 
-const TestLayout = enum { normal, missing_range, mismatched_identity, schema_migration, empty };
+const TestLayout = enum { normal, missing_range, mismatched_identity, schema_migration, empty, multi_batch };
 
 fn createTestSourceWithLayout(a: Allocator, path: []const u8, producer: bool, layout: TestLayout) !void {
     var source = try connection.Connection.create(a, path, true);
@@ -697,6 +697,18 @@ fn createTestSourceWithLayout(a: Allocator, path: []const u8, producer: bool, la
         const historical = try local.storage_ttl.encodeTimestampAlloc(a, 1234, -42);
         defer a.free(historical);
         try source.db.core.store.putBatch(&.{.{ .key = ttl_one, .value = historical }}, &.{ttl_two});
+    }
+    if (layout == .multi_batch) {
+        var keys: [Copy.max_batch_documents + 1][16]u8 = undefined;
+        var writes: [keys.len]local.storage_db_types.BatchWrite = undefined;
+        for (&writes, &keys, 0..) |*write, *key, index| {
+            write.* = .{
+                .key = try std.fmt.bufPrint(key, "extra-{d:0>3}", .{index}),
+                .value = "{\"content\":\"batch boundary\"}",
+            };
+        }
+        try source.db.batch(.{ .writes = &writes, .sync_level = .write });
+        try source.db.sync(true);
     }
     if (producer) try source.db.core.store.putBatch(&.{.{ .key = "\x00\x00__metadata__:enrichments", .value = "[{\"name\":\"hidden\",\"kind\":\"chunk\",\"source_field\":\"content\"}]" }}, &.{});
     const identity = connection.embeddedRootIdentity();
@@ -941,6 +953,31 @@ test "data sync selects a literal table name containing a comma" {
     var parsed = try std.json.parseFromSlice(Value, a, report, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("records,other", parsed.value.object.get("output").?.object.get("table").?.string);
+}
+
+test "data sync restores across bounded batch boundaries" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const input = try std.fs.path.join(a, &.{ root, "source.aflite" });
+    defer a.free(input);
+    const output = try std.fs.path.join(a, &.{ root, "result.aflite" });
+    defer a.free(output);
+    try createTestSourceWithLayout(a, input, false, .multi_batch);
+    const report = try syncJsonAlloc(a, input, output, "records", test_definition, .{});
+    defer a.free(report);
+    var parsed = try std.json.parseFromSlice(Value, a, report, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, Copy.max_batch_documents + 3), parsed.value.object.get("inventory").?.object.get("documents").?.integer);
+    var result = try openDestination(a, output, false);
+    defer result.close();
+    var last = (try result.db.lookup(a, "extra-064", .{})) orelse return error.MissingDocument;
+    defer last.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, last.json, "batch boundary") != null);
+    try std.testing.expectEqual(@as(?i128, -42), try local.storage_ttl.readSourceTimestamp(result.db.core.store, a, "one"));
 }
 
 test "data sync bounds grouped vectors before building a document mutation" {
