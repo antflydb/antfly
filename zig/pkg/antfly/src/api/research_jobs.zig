@@ -715,8 +715,8 @@ fn transient(err: anyerror) bool {
 }
 
 /// Run up to `max_phases` phases of the stored request and produce the
-/// checkpoint to persist. Never returns request errors to the caller: they
-/// become a failed job with last_error.
+/// checkpoint to persist. Retryable errors leave the job queued. Other
+/// request errors fail the job. Both outcomes carry last_error.
 pub fn advance(
     arena: std.mem.Allocator,
     query_runner: research_agent.QueryRunner,
@@ -730,7 +730,12 @@ pub fn advance(
     };
     const current_phase: []const u8 = if (parsed.request.research_state) |state| @tagName(state.phase) else "plan";
     // The stored request's state is server-held, not client-carried.
-    const result = research_agent.run(arena, query_runner, generator, parsed, null, .{ .max_phases = max_phases, .deadline_ns = deadline_ns, .trusted_state = true }) catch |err| switch (err) {
+    const result = research_agent.run(arena, query_runner, generator, parsed, null, .{
+        .max_phases = max_phases,
+        .deadline_ns = deadline_ns,
+        .trusted_state = true,
+        .retry_connection_refusal = true,
+    }) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return .{
             .state = if (transient(err)) .queued else .failed,
@@ -779,7 +784,13 @@ pub fn advanceClaimed(
     var current = claimed;
     var phase: usize = 0;
     while (true) : (phase += 1) {
-        const outcome = try advance(arena, query_runner, generator, current.request, 1, deadline_ns);
+        var outcome = try advance(arena, query_runner, generator, current.request, 1, deadline_ns);
+        if (outcome.state == .queued and outcome.last_error != null) {
+            // A failed phase produced no result. Release the lease and keep
+            // the last completed checkpoint for the next explicit advance.
+            outcome.result = current.result orelse outcome.result;
+            return store.finish(arena, claimed, outcome);
+        }
         const expired = if (deadline_ns) |deadline| platform_time.monotonicNs() >= deadline else false;
         const last = phase + 1 >= max_phases or outcome.state != .queued or expired;
         if (last) return store.finish(arena, claimed, outcome);

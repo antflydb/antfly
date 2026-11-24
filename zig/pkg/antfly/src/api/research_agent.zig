@@ -65,6 +65,8 @@ pub const Options = struct {
     state_key: ?[32]u8 = null,
     /// The state is server-held (durable jobs), so it is not verified.
     trusted_state: bool = false,
+    /// Let durable jobs replay a phase whose researcher could not connect.
+    retry_connection_refusal: bool = false,
     /// Stop after this many phases and return status in_progress. Durable
     /// jobs advance one bounded phase at a time; null runs to completion.
     max_phases: ?usize = null,
@@ -471,6 +473,7 @@ const Run = struct {
     live: *Emitter,
     deadline_ns: u64,
     started_ns: u64,
+    retry_connection_refusal: bool,
 
     phase: Phase = .plan,
     round: usize = 0,
@@ -967,7 +970,7 @@ const Run = struct {
         self.llm_calls += outcome.llm_calls;
         self.tool_calls += outcome.tool_calls;
         const encoded = outcome.body catch |err| {
-            if (isRequestError(err)) return err;
+            if (isRequestError(err) or (self.retry_connection_refusal and err == error.ConnectionRefused)) return err;
             sub.status = "failed";
             const finding = Finding{
                 .sub_question_id = sub.id,
@@ -1703,6 +1706,7 @@ pub fn run(
         .live = &live,
         .deadline_ns = options.deadline_ns orelse started +| budget.deadline_ms *| std.time.ns_per_ms,
         .started_ns = started,
+        .retry_connection_refusal = options.retry_connection_refusal,
         .registry = .{ .max = budget.max_evidence },
         .single_table = if (tables == 1) single_table else null,
     };
@@ -2143,7 +2147,7 @@ test "research job connection refusal preserves its checkpoint for an explicit r
     defer store.deinit();
     a.free(try store.create(a, "rsj_connection", "alice", "synthetic", test_request));
     const claim = (try store.begin(arena, "rsj_connection", "alice", 60_000)).?.started;
-    const refused = try jobs.advanceClaimed(&store, arena, query, generator, claim, 1, null, 60_000);
+    const refused = try jobs.advanceClaimed(&store, arena, query, generator, claim, 10, null, 60_000);
     try std.testing.expectEqual(jobs.JobState.queued, refused.state);
     try std.testing.expectEqualStrings("plan", refused.phase);
     try std.testing.expectEqualStrings("ConnectionRefused", refused.last_error.?);
@@ -2156,6 +2160,24 @@ test "research job connection refusal preserves its checkpoint for an explicit r
     try std.testing.expectEqual(jobs.JobState.queued, advanced.state);
     try std.testing.expectEqualStrings("research", advanced.phase);
     try std.testing.expect(advanced.last_error == null);
+    try std.testing.expectEqual(@as(usize, 1), failing.fake.planner_calls.load(.monotonic));
+
+    // A refusal in a researcher also stops the pass and retains the
+    // completed planning checkpoint, including its public result.
+    failing.failure = error.ConnectionRefused;
+    const research_claim = (try store.begin(arena, "rsj_connection", "alice", 60_000)).?.started;
+    const research_refused = try jobs.advanceClaimed(&store, arena, query, generator, research_claim, 10, null, 60_000);
+    try std.testing.expectEqual(jobs.JobState.queued, research_refused.state);
+    try std.testing.expectEqualStrings("research", research_refused.phase);
+    try std.testing.expectEqualStrings("ConnectionRefused", research_refused.last_error.?);
+    try std.testing.expectEqualStrings(advanced.request, research_refused.request);
+    try std.testing.expectEqualStrings(advanced.result.?, research_refused.result.?);
+    try std.testing.expectEqual(advanced.advances + 1, research_refused.advances);
+
+    const research_retry = (try store.begin(arena, "rsj_connection", "alice", 60_000)).?.started;
+    const finished = try jobs.advanceClaimed(&store, arena, query, generator, research_retry, 10, null, 60_000);
+    try std.testing.expectEqual(jobs.JobState.succeeded, finished.state);
+    try std.testing.expect(finished.last_error == null);
     try std.testing.expectEqual(@as(usize, 1), failing.fake.planner_calls.load(.monotonic));
 
     // Refusal does not make unrelated authorization failures retryable.

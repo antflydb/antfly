@@ -861,6 +861,40 @@ def run(binary):
         "human retrieval requested streaming by default",
     )
 
+    # A queued phase failure leaves the job available for an explicit resume.
+    refused_job = {
+        "job_id": "job:1",
+        "state": "queued",
+        "phase": "research",
+        "query": "one",
+        "last_error": "ConnectionRefused",
+    }
+    for arguments in (
+        ["--resume-job", "job:1"],
+        [
+            "--job",
+            "--table",
+            "docs",
+            "--query",
+            "one",
+            "--generator",
+            '{"provider":"antfly","model":"fixture"}',
+        ],
+    ):
+        with server(refused_job, status=202) as (url, calls):
+            result, _ = invoke(
+                binary,
+                ["--output", "json", "agents", "research", *arguments],
+                environment(url),
+            )
+        require(result.returncode != 0, "queued phase failure reported CLI success")
+        require(len(calls) == 1, "CLI retried a refused connection")
+        require(json.loads(result.stdout) == refused_job, str(result.stdout))
+        require(
+            b"ConnectionRefused; resume with --resume-job job:1" in result.stderr,
+            str(result.stderr),
+        )
+
     # Workflow payloads share presentation budgets without discarding lifecycle
     # controls. Explicit JSON remains the unmodified transport response.
     generator = '{"provider":"antfly","model":"fixture"}'
