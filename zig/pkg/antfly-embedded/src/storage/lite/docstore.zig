@@ -14221,25 +14221,11 @@ test "lite replay cleanup propagates record corruption without deleting a partia
 /// comment), so any divergence is a real leak or double-release, not a
 /// benign timing difference.
 pub fn expectLedgerMatchesScanForTest(store: *Store) !void {
-    const Collector = struct {
-        bytes: u64 = 0,
-        records: u64 = 0,
-        fn collect(ptr: *anyopaque, _: u64, payload: []const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.bytes += internal_keys.replay_key_len + payload.len;
-            self.records += 1;
-        }
-    };
-    var collector = Collector{};
-    // Journal sharing: the "all" lane is the only lane with a physical,
-    // charged entry now -- a hint-specific `forEachReplayLane` call filters
-    // that same entry at read time instead of scanning a stored copy of
-    // its own, so iterating it here would double-count bytes the ledger
-    // was never charged for.
-    _ = try forEachReplayLaneRaw(store, "", internal_keys.replay_all_kind, 0, 0, &collector, Collector.collect);
-
     var read = try Txn.openReadWithPrefix(store, "");
     defer read.abort();
+    // The same scan journal upgrades charge from: the shared "all" lane's
+    // entries plus each hint lane's empty index entries.
+    const scanned = try scanReplayJournalLedger(&read);
     const ledger = blk: {
         const raw = read.get(internal_keys.journal_credit_ledger_key[0..]) catch |err| switch (err) {
             error.NotFound => break :blk internal_keys.JournalCreditLedger{},
@@ -14247,8 +14233,8 @@ pub fn expectLedgerMatchesScanForTest(store: *Store) !void {
         };
         break :blk internal_keys.JournalCreditLedger.decode(raw) orelse return error.TestUnexpectedResult;
     };
-    try std.testing.expectEqual(collector.bytes, ledger.bytes);
-    try std.testing.expectEqual(collector.records, ledger.records);
+    try std.testing.expectEqual(scanned.bytes, ledger.bytes);
+    try std.testing.expectEqual(scanned.records, ledger.records);
 }
 
 test "WS5 serviceRetirement retires every lane in exactly one native commit" {
