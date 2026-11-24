@@ -3493,6 +3493,13 @@ pub const IndexManager = struct {
             self.manager.lockAtomicWithBackoff(self.mutex);
         }
 
+        /// For a caller that may already hold this index's mutex further up
+        /// its own stack (a group leader completing members while its own
+        /// replay apply holds the guard): false instead of waiting.
+        pub fn tryRelockIndex(self: *ManagedIndexApplyGuard) bool {
+            return self.mutex.tryLock();
+        }
+
         pub fn unlockCatalog(self: *ManagedIndexApplyGuard) void {
             self.manager.catalog_mutex.unlockShared();
             self.* = undefined;

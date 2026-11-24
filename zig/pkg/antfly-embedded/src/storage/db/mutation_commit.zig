@@ -3862,6 +3862,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         return dup_err;
                     };
                     inline_text_publications[inline_text_publication_count] = prepared;
+                    prepared.releaseIndexGuard();
                     inline_text_handled_names[inline_text_publication_count] = handled_name;
                     inline_text_publication_count += 1;
                 }
@@ -4506,7 +4507,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     }
                 }
             }
-            const queued_index_publication = inline_graph_publication != null or inline_sparse_publication != null or inline_dense_publication != null;
+            const queued_index_publication = inline_text_publication_count != 0 or inline_graph_publication != null or
+                inline_sparse_publication != null or inline_dense_publication != null;
             const QueuedCommitCompletion = struct {
                 executor: *derived_executor_mod.Executor,
                 admission: *derived_executor_mod.BacklogAdmission,
@@ -4745,7 +4747,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (opts.writer_lane_release_before_wait) |hook| hook.release(hook.ptr);
             }
             var indexed_lane_yielded = false;
-            if (primary_ticket != null and (inline_graph_publication != null or inline_sparse_publication != null or inline_dense_publication != null)) {
+            if (primary_ticket != null and (inline_text_publication_count != 0 or inline_graph_publication != null or
+                inline_sparse_publication != null or inline_dense_publication != null))
+            {
                 if (opts.writer_lane_release_before_wait) |hook| {
                     if (hook.resume_after_indexed_wait != null) {
                         if (hook.release_for_indexed_wait) |release| indexed_lane_yielded = release(hook.ptr);
@@ -4904,7 +4908,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // The caller's graph endpoint cleanup still runs on this
                     // write's runtime (`finishBatchGraphEndpointCleanup`).
                     !S.ownerField(self, "core").*.hasGraphIndexes();
-                if (!try hook.resume_after_indexed_wait.?(hook.ptr, finished_at_commit)) return;
+                // Such a write is done: its installs ran (or just ran above),
+                // and what follows is a no-op for it. Taking the lane back only
+                // to return it made every write cross the lane twice.
+                if (finished_at_commit) return;
+                _ = try hook.resume_after_indexed_wait.?(hook.ptr, false);
             }
             if (queued_index_publication and pending_identity_visibility_summary != null) {
                 try self.lockApplyForPortableRuntime();

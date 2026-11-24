@@ -3395,6 +3395,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             /// in the group apply, last writer wins by version.
             resolution: persistent_mod.PersistentIndex.VersionResolution,
             progress: apply_state.Progress,
+            /// The group leader installed this publication once its commit
+            /// was durable (`complete`), with this outcome: the writer only
+            /// finishes it, needing nothing from its runtime after the wait.
+            completed: bool = false,
+            install_error: ?anyerror = null,
 
             fn mutationsAlloc(self: *InlineTextPublication, alloc: Allocator) ![]native_catalog_backend.Mutation {
                 var out = std.ArrayListUnmanaged(native_catalog_backend.Mutation).empty;
@@ -3415,8 +3420,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 defer self.alloc.free(mutations);
                 if (mutations.len != 0) try view.putIndexCatalog(scope, mutations);
                 _ = try apply_state.contributeProgressTxn(view, self.progress);
-                // Nothing staged depends on another writer of this index:
-                // other writes may prepare and join the same group commit.
+                // The writer released the index guard once prepared
+                // (`releaseIndexGuard`); the leader staging this must not
+                // touch it.
+            }
+
+            /// Called once prepared. Nothing staged depends on another writer
+            /// of this index (copies and deletes are decided at the tip,
+            /// level-0 ids come from versions), so others may prepare and
+            /// join the group. Held any longer, a writer blocked staging
+            /// behind the group leader kept the guard that leader's
+            /// `complete` needs.
+            pub fn releaseIndexGuard(self: *InlineTextPublication) void {
                 self.releaseGuard();
             }
 
@@ -3428,7 +3443,37 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             /// successfully (e.g. after `Ticket.wait()`), never from
             /// inside `stage` itself.
             pub fn participant(self: *InlineTextPublication) commit_participant.Participant {
-                return .{ .ptr = self, .reset = reset, .observe = observe, .stage = stage };
+                return .{
+                    .ptr = self,
+                    .reset = reset,
+                    .observe = observe,
+                    .stage = stage,
+                    .queued = .{ .ptr = self, .validate = validate, .reject = reject, .complete = complete },
+                };
+            }
+
+            // A text publication carries no state from an earlier queued
+            // member: its copies and deletes are decided at the tip.
+            fn validate(_: *anyopaque) anyerror!void {}
+            fn reject(_: *anyopaque) void {}
+
+            /// The group leader, once this member's commit is durable.
+            fn complete(ptr: *anyopaque, outcome: anyerror!u64) void {
+                const self: *InlineTextPublication = @ptrCast(@alignCast(ptr));
+                _ = outcome catch return;
+                // The writer's own `index_locked` is not touched here: it is
+                // false once prepared, and only the writer's thread sets it.
+                // Never wait for the guard: this leader may hold it itself,
+                // further up its stack (its own replay apply of this index),
+                // or wait on a holder that waits on this group. Busy, the
+                // writer installs after its wait instead.
+                if (!self.apply_guard.tryRelockIndex()) return;
+                defer self.apply_guard.unlockIndex();
+                self.installBody() catch |err| {
+                    self.install_error = err;
+                    self.index_manager.index_publication_reopen_required.store(true, .release);
+                };
+                self.completed = true;
             }
 
             /// Runs only after this publication is durable: syncs the
@@ -3439,12 +3484,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             /// for just this, not across the commit.
             pub fn install(self: *InlineTextPublication) !void {
                 defer self.finish();
+                if (self.completed) {
+                    if (self.install_error) |err| return err;
+                    return;
+                }
                 errdefer self.index_manager.index_publication_reopen_required.store(true, .release);
                 if (!self.index_locked) {
                     self.apply_guard.relockIndex();
                     self.index_locked = true;
                 }
+                try self.installBody();
+            }
 
+            fn installBody(self: *InlineTextPublication) !void {
                 const mutations = try self.mutationsAlloc(self.alloc);
                 defer self.alloc.free(mutations);
                 try self.entry.persistent.applyExternallyCommittedMutationsIfNativeCatalog(mutations);
