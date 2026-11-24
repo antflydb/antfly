@@ -308,7 +308,8 @@ pub fn validateReferences(root: V) !void {
     }
 }
 
-/// Alias-only catalog updates do not mutate an object table's physical recipe.
+/// Alias lifecycle and declaration execution updates do not mutate an object
+/// table's physical recipe. Provider configuration remains immutable.
 pub fn configurationEqual(a: A, left: []const u8, right: []const u8) !bool {
     if (std.mem.eql(u8, left, right)) return true;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -322,6 +323,8 @@ pub fn configurationEqual(a: A, left: []const u8, right: []const u8) !bool {
     _ = r.value.object.orderedRemove(key);
     _ = r.value.object.orderedRemove(receipts_key);
     _ = r.value.object.orderedRemove("_index_alias_epoch");
+    normalizeExecutionPolicies(l.value);
+    normalizeExecutionPolicies(r.value);
     return std.mem.eql(u8, try std.json.Stringify.valueAlloc(s, l.value, .{}), try std.json.Stringify.valueAlloc(s, r.value, .{}));
 }
 
@@ -379,6 +382,7 @@ pub fn validateDependencyMutation(out: A, before: []const u8, after: []const u8)
 // Execution policy governs future invocations, not the accepted recipe of a
 // surviving consumer. Normalize only declaration boundaries: provider config,
 // prompts and schemas may contain semantic fields also named "execution".
+// Retain remaining member order for frozen object-catalog byte comparisons.
 fn normalizeExecutionPolicies(root: V) void {
     if (root.object.getPtr("enrichments")) |definitions| removeDeclarationExecution(definitions);
     var entries = root.object.iterator();
@@ -390,14 +394,14 @@ fn normalizeExecutionPolicies(root: V) void {
         if (config.* != .object) continue;
         const kind = config.object.get("type") orelse continue;
         if (kind != .string) continue;
-        _ = config.object.swapRemove("execution");
+        _ = config.object.orderedRemove("execution");
         if (config.object.getPtr("enrichments")) |definitions| removeDeclarationExecution(definitions);
     }
 }
 fn removeDeclarationExecution(definitions: *V) void {
     if (definitions.* != .array) return;
     for (definitions.array.items) |*definition| if (definition.* == .object) {
-        _ = definition.object.swapRemove("execution");
+        _ = definition.object.orderedRemove("execution");
     };
 }
 
@@ -1078,4 +1082,23 @@ test "index alias dependency execution normalization retains same-named alias fe
     try validateDependencyMutation(a, before, try std.json.Stringify.valueAlloc(s, root, .{}));
     try root.object.getPtr("A").?.object.put(s, "field", .{ .string = "changed" });
     try std.testing.expectError(error.IndexReferencedByAlias, validateDependencyMutation(a, before, try std.json.Stringify.valueAlloc(s, root, .{})));
+}
+
+test "index alias physical configuration equality ignores only declaration execution policies" {
+    const a = std.testing.allocator;
+    const stable =
+        \\{"text":{"type":"full_text","field":"body","enrichments":[{"name":"chunks","kind":"chunk","source_artifact_name":"units","field":"text"}]},"enrichments":[{"name":"units","kind":"asset","field":"url","producer":{"config":{"execution":{"meaning":"semantic"}}}}]}
+    ;
+    const tuned =
+        \\{"text":{"type":"full_text","execution":{"batch_items":8},"field":"body","enrichments":[{"name":"chunks","execution":{"batch_items":4},"kind":"chunk","source_artifact_name":"units","field":"text"}]},"enrichments":[{"name":"units","execution":{"max_output_tokens_per_item":8192},"kind":"asset","field":"url","producer":{"config":{"execution":{"meaning":"semantic"}}}}]}
+    ;
+    try std.testing.expect(try configurationEqual(a, stable, tuned));
+    try std.testing.expect(try configurationEqual(a, tuned, stable));
+    var parsed = try std.json.parseFromSlice(V, a, tuned, .{});
+    defer parsed.deinit();
+    const producer = parsed.value.object.getPtr("enrichments").?.array.items[0].object.getPtr("producer").?;
+    try producer.object.getPtr("config").?.object.getPtr("execution").?.object.put(parsed.arena.allocator(), "meaning", .{ .string = "changed" });
+    const changed = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+    defer a.free(changed);
+    try std.testing.expect(!try configurationEqual(a, stable, changed));
 }
