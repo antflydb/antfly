@@ -33688,6 +33688,13 @@ static void termite_metal_bind_planned_hot_buffers(
     }
 }
 
+static void termite_metal_bind_planned_direct_hidden(termite_metal_decode_runtime *runtime, size_t hidden_bytes) {
+    for (size_t i = 0; i < TERMITE_METAL_DIRECT_BLOCK_HIDDEN_BUFFER_COUNT; ++i) {
+        runtime->direct_block_hidden_buffers[i] = runtime->graph_plan_buffers[TERMITE_METAL_GRAPH_PLAN_DIRECT_HIDDEN_SLOT_BASE + i];
+    }
+    runtime->direct_block_hidden_capacity = hidden_bytes;
+}
+
 static int termite_metal_reserve_decoder_scratch(
     termite_metal_decode_runtime *runtime, antfly_metal_prefill_scratch_sizes sizes
 ) {
@@ -33705,10 +33712,7 @@ static int termite_metal_reserve_decoder_scratch(
         runtime->active_layer_projection_buffers[i] = runtime->graph_plan_buffers[i];
         runtime->active_layer_projection_capacities[i] = runtime->graph_plan_capacities[i];
     }
-    for (size_t i = 0; i < TERMITE_METAL_DIRECT_BLOCK_HIDDEN_BUFFER_COUNT; ++i) {
-        runtime->direct_block_hidden_buffers[i] = runtime->graph_plan_buffers[TERMITE_METAL_GRAPH_PLAN_DIRECT_HIDDEN_SLOT_BASE + i];
-    }
-    runtime->direct_block_hidden_capacity = sizes.direct_hidden_bytes;
+    termite_metal_bind_planned_direct_hidden(runtime, sizes.direct_hidden_bytes);
     const size_t q_slot = TERMITE_METAL_GRAPH_PLAN_DIRECT_Q_SLOT;
     runtime->direct_block_q_buffer = runtime->graph_plan_buffers[q_slot];
     runtime->direct_block_q_capacity = runtime->graph_plan_capacities[q_slot];
@@ -38235,60 +38239,17 @@ static int termite_metal_decode_runtime_ensure_direct_block_hidden_buffers(
 ) {
     if (runtime == NULL) return -1;
     if (hidden_bytes == 0) return 0;
-    bool planned_ready = true;
+    size_t slots[TERMITE_METAL_DIRECT_BLOCK_HIDDEN_BUFFER_COUNT];
+    size_t bytes[TERMITE_METAL_DIRECT_BLOCK_HIDDEN_BUFFER_COUNT];
     for (size_t i = 0; i < TERMITE_METAL_DIRECT_BLOCK_HIDDEN_BUFFER_COUNT; ++i) {
-        const size_t slot = TERMITE_METAL_GRAPH_PLAN_DIRECT_HIDDEN_SLOT_BASE + i;
-        if (!termite_metal_decode_runtime_graph_slot_ready(runtime, slot, hidden_bytes)) {
-            planned_ready = false;
-            break;
-        }
+        slots[i] = TERMITE_METAL_GRAPH_PLAN_DIRECT_HIDDEN_SLOT_BASE + i;
+        bytes[i] = hidden_bytes;
+        if (runtime->active_frame_cb != nil &&
+            !termite_metal_decode_runtime_graph_slot_ready(runtime, slots[i], hidden_bytes)) return -5;
     }
-    if (!planned_ready) {
-        if (runtime->active_frame_cb != nil) return -5;
-        if (runtime->graph_plan_active == 0) {
-            if (termite_metal_decode_runtime_begin_graph_plan(runtime) != 0) return -2;
-        }
-        for (size_t i = 0; i < TERMITE_METAL_DIRECT_BLOCK_HIDDEN_BUFFER_COUNT; ++i) {
-            const size_t slot = TERMITE_METAL_GRAPH_PLAN_DIRECT_HIDDEN_SLOT_BASE + i;
-            if (termite_metal_decode_runtime_reserve_graph_plan_slot(runtime, slot, hidden_bytes) != 0) return -3;
-        }
-        if (termite_metal_decode_runtime_commit_graph_plan(runtime) != 0) return -4;
-    }
-    planned_ready = true;
-    for (size_t i = 0; i < TERMITE_METAL_DIRECT_BLOCK_HIDDEN_BUFFER_COUNT; ++i) {
-        const size_t slot = TERMITE_METAL_GRAPH_PLAN_DIRECT_HIDDEN_SLOT_BASE + i;
-        if (!termite_metal_decode_runtime_graph_slot_ready(runtime, slot, hidden_bytes)) {
-            planned_ready = false;
-            break;
-        }
-    }
-    if (planned_ready) {
-        for (size_t i = 0; i < TERMITE_METAL_DIRECT_BLOCK_HIDDEN_BUFFER_COUNT; ++i) {
-            const size_t slot = TERMITE_METAL_GRAPH_PLAN_DIRECT_HIDDEN_SLOT_BASE + i;
-            runtime->direct_block_hidden_buffers[i] = runtime->graph_plan_buffers[slot];
-        }
-        runtime->direct_block_hidden_capacity = hidden_bytes;
-        return 0;
-    }
-    @autoreleasepool {
-        if (hidden_bytes > runtime->direct_block_hidden_capacity) {
-            for (size_t i = 0; i < TERMITE_METAL_DIRECT_BLOCK_HIDDEN_BUFFER_COUNT; ++i) {
-                id<MTLBuffer> buffer = termite_metal_workspace_buffer(runtime, hidden_bytes, MTLResourceStorageModePrivate);
-                if (buffer == nil) return -2;
-                runtime->direct_block_hidden_buffers[i] = buffer;
-            }
-            runtime->direct_block_hidden_capacity = hidden_bytes;
-            return 0;
-        }
-        for (size_t i = 0; i < TERMITE_METAL_DIRECT_BLOCK_HIDDEN_BUFFER_COUNT; ++i) {
-            if (runtime->direct_block_hidden_buffers[i] == nil) {
-                id<MTLBuffer> buffer = termite_metal_workspace_buffer(runtime, hidden_bytes, MTLResourceStorageModePrivate);
-                if (buffer == nil) return -3;
-                runtime->direct_block_hidden_buffers[i] = buffer;
-            }
-        }
-        return 0;
-    }
+    if (termite_metal_decode_runtime_reserve_graph_plan_slots(runtime, slots, bytes, TERMITE_METAL_DIRECT_BLOCK_HIDDEN_BUFFER_COUNT) != 0) return -4;
+    termite_metal_bind_planned_direct_hidden(runtime, hidden_bytes);
+    return 0;
 }
 
 static int termite_metal_decode_runtime_ensure_direct_block_shared_buffer(
