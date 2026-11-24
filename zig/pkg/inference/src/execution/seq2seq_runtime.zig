@@ -127,7 +127,6 @@ const ResidentSlot = struct {
     input: sessions.ResidentInput,
     shape: [4]i64,
     independent: bool = false,
-    copy_rejected: bool = false,
 };
 
 pub const State = struct {
@@ -364,6 +363,15 @@ pub const State = struct {
 
     /// Prepare each independently admitted target before submitting the
     /// copies. One stream completion protects all sources and destinations.
+    const CrossCacheReservation = struct {
+        index: usize,
+        bound: usize,
+        dimensions: [4]i32,
+        permit: sessions.RunPermit,
+        output: ?sessions.ResidentOutputs = null,
+        rejected: bool = false,
+    };
+
     fn migrateOmittedCrossCaches(self: *State, previous: []const ?ResidentSlot, updated: []?ResidentSlot, control: ?Control) !void {
         const shared = self.session.shared_compute_context orelse return;
         const backend = shared.stableBackend();
@@ -374,33 +382,49 @@ pub const State = struct {
         if (kernels.physicalTensorView == null) return;
         if (backend.kind() != .native and backend.kind() != .metal and kernels.createPhysicalCompletion == null) return;
 
-        var staged = false;
-        for (self.roles, previous, updated) |role, old, *slot| switch (role) {
-            .past => |past| if (past.cross and slot.* == null) {
+        var reservations: std.ArrayList(CrossCacheReservation) = .empty;
+        defer {
+            for (reservations.items) |*item| {
+                if (item.output) |*output| output.deinit();
+                item.permit.deinit();
+            }
+            reservations.deinit(self.allocator);
+        }
+        for (self.roles, previous, updated, 0..) |role, old, slot, index| switch (role) {
+            .past => |past| if (past.cross and slot == null) {
                 const source = old orelse return error.InvalidDecoderOutput;
                 if (source.independent or source.input.backend.ptr != backend.ptr or source.input.backend.vtable != backend.vtable) continue;
-                slot.* = self.prepareCrossCache(backend, kernels, source, control) catch |err| switch (err) {
+                if (control) |active| try active.check();
+                const item = self.reserveCrossCache(backend, source, index) catch |err| switch (err) {
                     error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.QueueFull, error.InvalidPhysicalTransferSize => null,
                     else => return err,
                 };
-                staged = staged or slot.* != null;
+                if (item) |reservation| {
+                    var owned = reservation;
+                    errdefer owned.permit.deinit();
+                    try reservations.append(self.allocator, owned);
+                }
             },
             else => {},
         };
-        if (!staged) return;
+        if (reservations.items.len == 0) return;
         if (control) |active| try active.check();
         var protection = if (control) |active| try active.enterUninterruptible(self.session.interruption()) else null;
         defer if (protection) |*guard| guard.deinit();
         const operation = @import("backend_operation.zig");
         var scope = try operation.enter(backend.*, null, backend.operationToken(), .legacy_unknown_frame);
         defer scope.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
-        if (backend.kind() == .metal and (backend.decoderRuntimeHasActiveFrame() or backend.decoderRuntimeHasSubmittedFrame())) {
-            // Another invocation owns the frame. The old cache remains
-            // authoritative, so retire only these unsubmitted replacements.
-            try scope.finish();
-            self.discardStagedCrossCaches(updated);
-            return;
+        if (backend.kind() == .metal and (backend.decoderRuntimeHasActiveFrame() or backend.decoderRuntimeHasSubmittedFrame())) return scope.finish();
+
+        var staged = false;
+        for (reservations.items) |*item| {
+            item.output = self.prepareCrossCache(backend, kernels, previous[item.index].?, item) catch |err| switch (err) {
+                error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.QueueFull, error.InvalidPhysicalTransferSize => null,
+                else => return err,
+            };
+            staged = staged or item.output != null;
         }
+        if (!staged) return scope.finish();
         // Keep the Metal copies in one frame and publish only after retirement.
         const metal_frame = backend.kind() == .metal and try backend.decoderRuntimeBeginFrame();
         errdefer if (metal_frame and backend.decoderRuntimeHasActiveFrame())
@@ -414,81 +438,58 @@ pub const State = struct {
                 event.record() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
                 event.wait() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
             };
-            for (self.roles, previous, updated) |role, old, *target| switch (role) {
-                .past => |past| if (past.cross) {
-                    if (target.*) |*value| if (value.independent) copy(backend.ptr, value.input.value, old.?.input.value) catch |err| switch (err) {
-                        error.InvalidPhysicalTransferSize, error.InvalidShape => value.copy_rejected = true,
-                        else => return err,
-                    };
-                },
-                else => {},
-            };
+            for (reservations.items) |*item| {
+                const output = item.output orelse continue;
+                copy(backend.ptr, output.outputs[0], previous[item.index].?.input.value) catch |err| switch (err) {
+                    error.InvalidPhysicalTransferSize, error.InvalidShape => item.rejected = true,
+                    else => return err,
+                };
+            }
         }
         if (metal_frame) try backend.decoderRuntimeSubmitAndWaitFrame();
         try scope.finish();
-        // A rejected column keeps its previous owner. Completed siblings can
-        // still retire their producer outputs after the common completion.
-        for (updated) |*target| {
-            if (target.*) |value| if (value.copy_rejected) {
-                value.pin.release();
-                target.* = null;
-            };
+        // Promote only completed copies. Both rejection and promotion
+        // failure retire the staging owners after leaving the provider gate.
+        if (control) |active| try active.check();
+        for (reservations.items) |*item| {
+            if (item.rejected) continue;
+            if (item.output) |*output| {
+                const source = previous[item.index].?;
+                updated[item.index] = .{
+                    .pin = try output.retainResources(self.allocator),
+                    .input = .{ .value = output.outputs[0], .backend = backend, .estimated_bytes = source.input.estimated_bytes },
+                    .shape = source.shape,
+                    .independent = true,
+                };
+            }
         }
     }
 
-    fn discardStagedCrossCaches(self: *const State, updated: []?ResidentSlot) void {
-        for (self.roles, updated) |role, *target| switch (role) {
-            .past => |past| if (past.cross) {
-                if (target.*) |value| if (value.independent) {
-                    value.pin.release();
-                    target.* = null;
-                };
-            },
-            else => {},
-        };
-    }
-
-    fn prepareCrossCache(self: *State, backend: *const ops.ComputeBackend, kernels: *const @import("../ops/kernel_backend.zig").VTable, previous: ResidentSlot, control: ?Control) !?ResidentSlot {
+    fn reserveCrossCache(self: *State, backend: *const ops.ComputeBackend, previous: ResidentSlot, index: usize) !?CrossCacheReservation {
         const storage = @import("../ops/physical_storage.zig");
-        const operation = @import("backend_operation.zig");
-        const view = kernels.physicalTensorView.?;
-        if (control) |active| try active.check();
-        const bytes = previous.input.estimated_bytes;
         var dimensions: [4]i32 = undefined;
         for (&dimensions, previous.shape) |*dim, axis| dim.* = std.math.cast(i32, axis) orelse return null;
-        const bound = try storage.reservationBytes(backend.*, .{ .byte_size = bytes });
-        var admission = try self.session.admitRetainedState(0, bound);
-        defer admission.deinit();
-        var protection = if (control) |active| try active.enterUninterruptible(self.session.interruption()) else null;
-        defer if (protection) |*guard| guard.deinit();
+        const bound = try storage.reservationBytes(backend.*, .{ .byte_size = previous.input.estimated_bytes });
+        return .{ .index = index, .bound = bound, .dimensions = dimensions, .permit = try self.session.admitRetainedState(0, bound) };
+    }
 
-        const handles = try self.allocator.alloc(@import("../ops/ops.zig").CT, 1);
+    /// All bank creation and copies share the caller's provider operation.
+    /// Each target takes only the admission permit for its own bank.
+    fn prepareCrossCache(self: *State, backend: *const ops.ComputeBackend, kernels: *const @import("../ops/kernel_backend.zig").VTable, previous: ResidentSlot, reservation: *CrossCacheReservation) !?sessions.ResidentOutputs {
+        const storage = @import("../ops/physical_storage.zig");
+        const allocation = (try storage.Lease.create(self.allocator, backend.*, previous.input.estimated_bytes)) orelse return null;
+        defer allocation.release();
+        if ((allocation.backing_byte_size orelse return null) > reservation.bound) return error.PhysicalStorageExceededReservation;
+        const handles = try self.allocator.alloc(ops.CT, 1);
         var populated = false;
-        var copied: sessions.ResidentOutputs = .{ .outputs = handles, .backend = backend, .allocator = self.allocator };
-        defer if (populated) copied.deinit() else self.allocator.free(handles);
-        {
-            var scope = try operation.enter(backend.*, null, backend.operationToken(), .legacy_unknown_frame);
-            defer scope.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
-            // A standalone Metal blit completes synchronously. An open
-            // frame would require that frame's submission and retirement.
-            if (backend.kind() == .metal and (backend.decoderRuntimeHasActiveFrame() or backend.decoderRuntimeHasSubmittedFrame())) return null;
-            const allocation = (try storage.Lease.create(self.allocator, backend.*, bytes)) orelse return null;
-            defer allocation.release();
-            if ((allocation.backing_byte_size orelse return null) > bound) return error.PhysicalStorageExceededReservation;
-            handles[0] = (try view(backend.ptr, .{ .storage = allocation, .shape = &dimensions })) orelse return null;
-            populated = true;
-            self.session.pinResident(&copied);
-            copied.resource_lease = admission.lease;
-            admission.lease = null;
-            try scope.finish();
-        }
-        if (control) |active| try active.check();
-        return .{
-            .pin = try copied.retainResources(self.allocator),
-            .input = .{ .value = handles[0], .backend = backend, .estimated_bytes = bytes },
-            .shape = previous.shape,
-            .independent = true,
-        };
+        defer if (!populated) self.allocator.free(handles);
+        handles[0] = (try kernels.physicalTensorView.?(backend.ptr, .{ .storage = allocation, .shape = &reservation.dimensions })) orelse return null;
+        populated = true;
+        var output: sessions.ResidentOutputs = .{ .outputs = handles, .backend = backend, .allocator = self.allocator };
+        self.session.pinResident(&output);
+        output.resource_lease = reservation.permit.lease;
+        reservation.permit.lease = null;
+        return output;
     }
 
     /// The output contract already supplies the full shape. Ordinary
