@@ -24,6 +24,7 @@ pub const lite = @import("storage/lite/mod.zig");
 pub const lite_backend = lite.backend;
 pub const lite_native = lite.native;
 pub const host_environment = @import("storage/host_environment.zig");
+pub const host_file_storage = @import("storage/host_file_storage.zig");
 pub const object_storage = @import("storage/object_storage.zig");
 pub const background_runtime = @import("storage/background_runtime.zig");
 pub const db = @import("antfly_source_root").antfly_sources.physical_db;
@@ -54,6 +55,7 @@ test {
     _ = lite_backend;
     _ = lite_native;
     _ = host_environment;
+    _ = host_file_storage;
     _ = object_storage;
     _ = background_runtime;
     _ = db;

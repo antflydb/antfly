@@ -40,8 +40,10 @@ export type InferenceState = Readonly<{
     | "validate"
     | "extract"
     | "decide"
+    | "embed"
     | "validate-extraction"
     | "validate-decision"
+    | "validate-embedding"
     | null;
   recovery: "none" | "reload-on-next-run";
   error: Readonly<{ code: InferenceErrorCode; message: string }> | null;

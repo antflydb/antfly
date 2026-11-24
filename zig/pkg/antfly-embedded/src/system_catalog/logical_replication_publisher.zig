@@ -162,7 +162,7 @@ pub const RosterBudget = struct {
         const bytes = size.fullCount();
         const comma: usize = @intFromBool(self.count != 0);
         if (bytes > max_roster_bytes - self.encoded_relations or comma > max_roster_bytes - self.encoded_relations - bytes) return error.LogicalPublisherRosterTooLarge;
-        self.encoded_relations += bytes + comma;
+        self.encoded_relations += @as(usize, @intCast(bytes)) + comma;
         self.count += 1;
     }
 };

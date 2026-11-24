@@ -288,26 +288,27 @@ pub const Epochs = struct {
     retiring: ?u64 = null,
     fence: u64 = 0,
     pub fn acquire(self: *Epochs) !u64 {
-        const slot = self.current & 1;
+        const slot: usize = @intCast(self.current & 1);
         self.readers[slot] = std.math.add(usize, self.readers[slot], 1) catch return error.RowHeapReaderLimit;
         return self.current;
     }
     pub fn release(self: *Epochs, epoch: u64) void {
         std.debug.assert(epoch == self.current or self.retiring == epoch);
-        std.debug.assert(self.readers[epoch & 1] != 0);
-        self.readers[epoch & 1] -= 1;
+        const slot: usize = @intCast(epoch & 1);
+        std.debug.assert(self.readers[slot] != 0);
+        self.readers[slot] -= 1;
     }
     pub fn mark(self: *Epochs, committed_fence: u64) !void {
         if (self.retiring != null) return;
         const next = std.math.add(u64, self.current, 1) catch return error.RowHeapClockExhausted;
-        std.debug.assert(self.readers[next & 1] == 0);
+        std.debug.assert(self.readers[@intCast(next & 1)] == 0);
         self.retiring = self.current;
         self.current = next;
         self.fence = committed_fence;
     }
     pub fn collectible(self: *const Epochs) ?u64 {
         const old = self.retiring orelse return null;
-        return if (self.readers[old & 1] == 0) self.fence else null;
+        return if (self.readers[@intCast(old & 1)] == 0) self.fence else null;
     }
     pub fn finish(self: *Epochs, fence: u64) !void {
         if (self.collectible() != fence) return error.RowHeapCollectionFence;

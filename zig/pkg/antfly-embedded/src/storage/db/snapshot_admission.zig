@@ -25,7 +25,7 @@ const apply_rw_lock_mod = @import("apply_rw_lock.zig");
 
 pub const SnapshotAdmission = struct {
     lock: apply_rw_lock_mod.ApplyRwLock = .{},
-    mutation_revision: std.atomic.Value(u64) = .init(0),
+    mutation_revision: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
     /// When sampled under capture, revisions bracket an interval free of
     /// mutation leases if both samples match. Retains share the original
