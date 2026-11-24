@@ -3541,7 +3541,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lite_native_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const lite_native_tests = b.addTest(.{
         .root_module = lite_native_test_mod,
-        .filters = selectTestFilters(b, &.{ "storage.lite.", "standalone.backup_inspection." }),
+        .filters = selectTestFilters(b, &.{ "storage.lite.", "standalone.backup_inspection.", "standalone.data_sync." }),
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
@@ -3610,6 +3610,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .optimize = optimize,
     });
     antfly_imports.configureCli(cmd_test_mod, true);
+    // The local source test partition checks optional template capabilities.
+    cmd_test_mod.addOptions("build_options", b.addOptions());
     cmd_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
     const cmd_tests = b.addTest(.{
         .root_module = cmd_test_mod,
