@@ -4559,9 +4559,15 @@ test "server Cypher producer catalog activation is replicated and idempotent" {
             const request: types.BatchRequest = .{ .artifact_catalog = retirement, .online_source = .{ .admit = .{ .scope = scope, .artifact_catalog = retirement.binding } } };
             var complete = false;
             for (0..256) |_| {
-                server_test_adapter.applyOrdered(db, request, .{ .term = 1, .index = 5 }) catch |err| {
-                    if (err != error.ArtifactCatalogDrift) return err;
-                    continue;
+                server_test_adapter.applyOrdered(db, request, .{ .term = 1, .index = 5 }) catch |err| switch (err) {
+                    error.ArtifactCatalogDrift => continue,
+                    error.RaftApplyWriterUnavailable => {
+                        // Raft retries this entry when background maintenance
+                        // yields the owner apply lock.
+                        @import("antfly_platform").time.sleepNs(std.time.ns_per_ms);
+                        continue;
+                    },
+                    else => return err,
                 };
                 complete = true;
                 break;
