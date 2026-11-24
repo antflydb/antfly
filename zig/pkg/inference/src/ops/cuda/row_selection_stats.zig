@@ -20,7 +20,9 @@ const context = @import("context.zig");
 const driver = @import("driver.zig");
 const ops = @import("../ops.zig");
 const catalog = @import("../../tile/cuda_standalone.zig");
-const Program = @import("embedded_module.zig").EmbeddedModule(@import("embedded_module.zig").profile(catalog.row_selection_stats_f32).image, catalog.row_selection_stats_f32_entries);
+const Program = @import("embedded_module.zig").EmbeddedModule(struct {
+    pub const image = @import("embedded_module.zig").profile(catalog.row_selection_stats_f32).image;
+}, catalog.row_selection_stats_f32_entries);
 pub const Module = struct {
     program: Program = .{},
     completed: [2]?ops.WhisperLogitsStatsRaw = @splat(null),

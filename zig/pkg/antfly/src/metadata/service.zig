@@ -3831,12 +3831,15 @@ pub fn transitionRequiredCoordinatedDecoderVersion(a: std.mem.Allocator, command
             };
             // SQL catalog envelopes can carry an operation-specific command
             // without a generic resource mutation.
-            const Header = struct { mutation: ?Mutation = null };
+            const Header = struct { mutation: ?Mutation = null, topology: ?CatalogTopologyFeatures = null };
             var parsed = std.json.parseFromSlice(Header, a, bytes, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return metadata_topology_protocol.current_version,
             };
             defer parsed.deinit();
+            if (parsed.value.topology) |topology| if (topology.create) |create| {
+                required = @max(required, try tableDecoderVersion(a, create.table));
+            };
             if (parsed.value.mutation) |mutation| {
                 if (mutation.expected_parent_id != null) required = @max(required, metadata_topology_protocol.bound_create_parent_version);
                 if (mutation.expected_incarnation != null) required = @max(required, metadata_topology_protocol.bound_catalog_incarnation_version);
@@ -3911,9 +3914,22 @@ pub fn transitionRequiredCoordinatedDecoderVersion(a: std.mem.Allocator, command
     return required;
 }
 
+// Decode only table features relevant to admission. Field types come from the
+// durable record; unrelated schema/placement payloads remain unmaterialized.
+// Both native table commands and catalog envelopes use tableDecoderVersion.
+const TableDecoderFeatures = struct {
+    indexes_json: @FieldType(metadata_table_manager.TableRecord, "indexes_json") = "{}",
+    storage: @FieldType(metadata_table_manager.TableRecord, "storage") = .{},
+    lake_index_catalog_json: @FieldType(metadata_table_manager.TableRecord, "lake_index_catalog_json") = "",
+    schema_reader_requirements: @FieldType(metadata_table_manager.TableRecord, "schema_reader_requirements") = null,
+};
+const CatalogTopologyFeatures = struct {
+    create: ?struct { table: TableDecoderFeatures } = null,
+};
+
 // Table features compose: adding a lower-floor feature must never mask a
 // higher decoder requirement, including the prior definition in a CAS.
-fn tableDecoderVersion(a: std.mem.Allocator, table: metadata_table_manager.TableRecord) !u16 {
+fn tableDecoderVersion(a: std.mem.Allocator, table: anytype) !u16 {
     var required: u16 = 0;
     required = @max(required, try metadata_topology_protocol.indexAliasDecoderVersion(a, table.indexes_json, false));
     if (table.storage.engine == .object) required = @max(required, metadata_topology_protocol.object_table_engine_version);
@@ -3949,9 +3965,28 @@ test "relation mutation admission requires guarded plan decoders only for incarn
 test "index alias decoder floor composes with table features and preserves CAS history" {
     const aliases: metadata_table_manager.TableRecord = .{ .table_id = 1, .name = "docs", .indexes_json = "{\"_index_aliases\":{},\"_privacy\":{}}", .storage = .{ .engine = .object }, .lake_index_catalog_json = "{}" };
     const plain: metadata_table_manager.TableRecord = .{ .table_id = 1, .name = "docs" };
-    const floor = metadata_topology_protocol.index_aliases_version;
+    const floor = @max(metadata_topology_protocol.index_aliases_version, metadata_topology_protocol.privacy_version, metadata_topology_protocol.object_table_engine_version, metadata_topology_protocol.lake_index_catalog_version);
+    const cases = [_]struct { table: metadata_table_manager.TableRecord, floor: u16 }{
+        .{ .table = .{ .table_id = 1, .name = "docs", .indexes_json = "{\"_index_aliases\":{}}" }, .floor = metadata_topology_protocol.index_aliases_version },
+        .{ .table = .{ .table_id = 1, .name = "docs", .indexes_json = "{\"_privacy\":{}}" }, .floor = metadata_topology_protocol.privacy_version },
+        .{ .table = .{ .table_id = 1, .name = "docs", .storage = .{ .engine = .object } }, .floor = metadata_topology_protocol.object_table_engine_version },
+        .{ .table = .{ .table_id = 1, .name = "docs", .lake_index_catalog_json = "{}" }, .floor = metadata_topology_protocol.lake_index_catalog_version },
+        .{ .table = aliases, .floor = floor },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.floor, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .upsert_table = case.table }));
+        try std.testing.expectEqual(case.floor, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .compare_and_replace_table = .{ .expected = case.table, .replacement = plain } }));
+        const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .mutation = .{ .kind = "table" }, .topology = .{ .create = .{ .table = case.table } } }, .{});
+        defer std.testing.allocator.free(encoded);
+        try std.testing.expectEqual(case.floor, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_system_catalog = encoded }));
+    }
     try std.testing.expectEqual(floor, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .upsert_table = aliases })));
-    const envelope = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .topology = .{ .create = .{ .table = aliases } } }, .{});
+    // Malformed mutation headers retain fail-closed admission even when the
+    // surrounding topology contains recognizable lower-floor table features.
+    const invalid_envelope = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .mutation = .{ .kind = "not_a_kind" }, .topology = .{ .create = .{ .table = aliases } } }, .{});
+    defer std.testing.allocator.free(invalid_envelope);
+    try std.testing.expectEqual(metadata_topology_protocol.current_version, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_system_catalog = invalid_envelope }));
+    const envelope = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .mutation = .{ .kind = "table" }, .topology = .{ .create = .{ .table = aliases } } }, .{});
     defer std.testing.allocator.free(envelope);
     try std.testing.expectEqual(floor, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_system_catalog = envelope })));
     try std.testing.expectEqual(floor, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .compare_and_replace_table = .{ .expected = aliases, .replacement = plain } })));
