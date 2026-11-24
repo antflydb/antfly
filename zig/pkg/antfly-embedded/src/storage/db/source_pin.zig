@@ -372,6 +372,12 @@ pub fn reconcileReleased(db: *DB) !void {
 
 pub fn reconcileReleasedWithBudget(db: *DB, budget: CleanupBudget) !CleanupWork {
     if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("sourcePinReconcileReleasedWithBudget", .{ db, budget });
+    return reconcileReleasedWithAdmission(db, budget, null);
+}
+
+const PhysicalMaintenanceLease = @import("snapshot_admission.zig").SnapshotAdmission.PhysicalMaintenanceLease;
+
+pub fn reconcileReleasedWithAdmission(db: *DB, budget: CleanupBudget, physical: ?*const PhysicalMaintenanceLease) !CleanupWork {
     // Replica-local source pins are native filesystem artifacts.
     if (comptime @import("builtin").os.tag == .freestanding) return CleanupWork.init(.failing, budget);
     const io = db.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
@@ -444,7 +450,7 @@ pub fn reconcileReleasedWithBudget(db: *DB, budget: CleanupBudget) !CleanupWork 
             };
         } orelse continue;
         pending_seen = true;
-        cleanupLocatedWithBudget(db, pending, &work) catch |err| {
+        cleanupLocatedWithBudget(db, pending, &work, physical) catch |err| {
             if (first_error == null) first_error = err;
         };
     }
@@ -468,10 +474,10 @@ fn clearCleanupDebt(db: *DB, epoch: u64) void {
 
 fn cleanupLocated(db: *DB, found: ledger.Located) !void {
     var work = CleanupWork.init(db.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable, .{});
-    try cleanupLocatedWithBudget(db, found, &work);
+    try cleanupLocatedWithBudget(db, found, &work, null);
 }
 
-fn cleanupLocatedWithBudget(db: *DB, found: ledger.Located, work: *CleanupWork) !void {
+fn cleanupLocatedWithBudget(db: *DB, found: ledger.Located, work: *CleanupWork, physical: ?*const PhysicalMaintenanceLease) !void {
     if (@import("builtin").is_test and test_failure == .before_cleanup) return error.InjectedSourcePinFailure;
     const alloc = db.alloc;
     const io = db.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
@@ -485,6 +491,8 @@ fn cleanupLocatedWithBudget(db: *DB, found: ledger.Located, work: *CleanupWork) 
         const current = try ledger.pendingCleanupAt(&read, found.slot) orelse return;
         if (!std.mem.eql(u8, &current.progress.pin, &found.progress.pin) or !std.mem.eql(u8, &current.progress.namespace, &found.progress.namespace)) return;
     }
+    var mutation = if (physical) |lease| lease.beginMutation() else null;
+    defer if (mutation) |*lease| lease.release();
     if (!try cleanupTrees(db, found, .released_all, work)) return;
     var txn = try db.core.store.beginWriteTxn();
     var open = true;

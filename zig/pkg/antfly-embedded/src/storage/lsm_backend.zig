@@ -3014,24 +3014,19 @@ pub const Backend = struct {
 
         const soft_limit_l0_runs = self.effectiveL0SoftLimitRuns();
         const hard_limit_l0_runs = self.effectiveL0HardLimitRuns();
-        const tiered_l0 = self.options.run_partition_key == null and self.options.bulk_ingest_tiered_l0_fan_in >= 2;
-        const has_l0_tier = tiered_l0 and
-            compaction_mod.bulkDirectoryPlanningDue(self, .{ .fan_in = self.options.bulk_ingest_tiered_l0_fan_in, .max_bytes = self.options.max_compaction_input_bytes });
-        if (hard_limit_l0_runs > 0) {
-            const l0_runs = if (directory) |root| root.levelStats(0).count else countLevelRuns(&self.runs, 0);
-            if (l0_runs > hard_limit_l0_runs) {
-                score +|= (l0_runs - hard_limit_l0_runs) * 1_000_000;
-            } else if (l0_runs > soft_limit_l0_runs and (!tiered_l0 or has_l0_tier)) {
-                score +|= (l0_runs - soft_limit_l0_runs) * 10_000;
-            }
-            if (!tiered_l0 and l0_runs > self.options.compact_threshold_runs) {
-                score +|= (l0_runs - self.options.compact_threshold_runs) * 1_000;
-            }
-            if (!tiered_l0) score +|= self.largestL0OverlapRunCountLocked() * 2_000;
+        const leveled_l0_limit = self.leveledMaintenanceL0LimitLocked();
+        const tier_due = self.maintenanceL0TierDueLocked();
+        const l0_runs = self.runs.l0Files();
+        if (hard_limit_l0_runs > 0 and l0_runs > hard_limit_l0_runs) {
+            score +|= (l0_runs - hard_limit_l0_runs) *| 1_000_000;
+        } else if (l0_runs > soft_limit_l0_runs and (leveled_l0_limit != null or tier_due)) {
+            score +|= (l0_runs - soft_limit_l0_runs) *| 10_000;
         }
-        if (self.l0SoftPressureLocked() and has_l0_tier) {
-            score +|= 2_500;
+        if (leveled_l0_limit) |limit| {
+            if (l0_runs > limit) score +|= (l0_runs - limit) *| 1_000;
+            score +|= self.largestL0OverlapRunCountLocked() *| 2_000;
         }
+        if (tier_due) score +|= 2_500;
 
         var l0_bytes: u64 = 0;
         var level_overflow_runs: u64 = 0;
@@ -3075,10 +3070,10 @@ pub const Backend = struct {
         }
 
         if (self.options.l0_hard_limit_bytes > 0 and l0_bytes > self.options.l0_hard_limit_bytes) {
-            score +|= (l0_bytes - self.options.l0_hard_limit_bytes) / 1024;
+            score +|= @max(1, (l0_bytes - self.options.l0_hard_limit_bytes) / 1024);
         } else if (self.options.l0_soft_limit_bytes > 0 and
             l0_bytes > self.options.l0_soft_limit_bytes and
-            (!tiered_l0 or has_l0_tier))
+            (leveled_l0_limit != null or tier_due))
         {
             score +|= (l0_bytes - self.options.l0_soft_limit_bytes) / (16 * 1024);
         }
@@ -3440,7 +3435,6 @@ pub const Backend = struct {
                 immutable_flush_required;
             _ = try self.flushImmutableMemtableWindow(force_partial_window);
         } else {
-            const soft_l0_runs = self.effectiveL0SoftLimitRuns();
             const score = self.maintenanceScoreLocked();
             // Compare L0 pressure against every lower level even when L0 is
             // above its soft bound. The old L0-only branch bypassed normalized
@@ -3453,7 +3447,7 @@ pub const Backend = struct {
                 var compacted = self.pending_directory_closure == null and self.pending_l0_directory_closure == null and (required_gc or self.gc_maintenance_turn % 8 == 0) and (compaction_mod.nextTombstoneGcDelay(self) orelse 1) == 0 and
                     try compaction_mod.compactTombstonesScheduled(Backend, self, score);
                 if (!compacted) {
-                    compacted = if (self.l0SoftPressureLocked() and self.options.bulk_ingest_tiered_l0_fan_in >= 2)
+                    compacted = if (self.maintenanceL0TierDueLocked())
                         try compaction_mod.compactBulkL0TierScheduled(
                             Backend,
                             self,
@@ -3463,18 +3457,10 @@ pub const Backend = struct {
                     else
                         false;
                     if (!compacted) {
-                        const tier_owns_soft_l0 = self.options.bulk_ingest_tiered_l0_fan_in >= 2 and
-                            !self.l0HardPressureLocked();
-                        if (tier_owns_soft_l0) {
-                            compacted = try compaction_mod.maybeCompactLowerLevelsScheduled(Backend, self, score);
-                        } else {
-                            compacted = try compaction_mod.maybeCompactRunsScheduledWithL0Limit(
-                                Backend,
-                                self,
-                                if (soft_l0_runs > 0) soft_l0_runs else self.options.compact_threshold_runs,
-                                score,
-                            );
-                        }
+                        compacted = if (self.leveledMaintenanceL0LimitLocked()) |limit|
+                            try compaction_mod.maybeCompactRunsScheduledWithL0Limit(Backend, self, limit, score)
+                        else
+                            try compaction_mod.maybeCompactLowerLevelsScheduled(Backend, self, score);
                     }
                 }
                 if (!compacted and self.pending_directory_closure == null and self.pending_l0_directory_closure == null)
@@ -3497,6 +3483,20 @@ pub const Backend = struct {
             self.write_stats.manifest_writes != before_manifest_writes or
             self.obsolete_paths.count() != before_obsolete_paths or
             self.obsolete_reclaim_visits != reclaim_visits_before;
+    }
+
+    // The ordinary tiered lane owns L0 below hard pressure. The scheduler
+    // uses the same eligibility as the planner, including its cached negative
+    // discovery for the current run-directory generation.
+    fn maintenanceL0TierDueLocked(self: *const Backend) bool {
+        const fan_in = self.options.bulk_ingest_tiered_l0_fan_in;
+        if (fan_in < 2 or !self.l0SoftPressureLocked()) return false;
+        return compaction_mod.bulkDirectoryPlanningDue(self, .{ .fan_in = fan_in, .max_bytes = self.options.max_compaction_input_bytes });
+    }
+
+    fn leveledMaintenanceL0LimitLocked(self: *const Backend) ?usize {
+        if (self.options.bulk_ingest_tiered_l0_fan_in >= 2 and !self.l0HardPressureLocked()) return null;
+        return self.effectiveL0SoftLimitRuns();
     }
 
     fn bulkTieredL0MaintenanceDueLocked(self: *Backend) bool {
