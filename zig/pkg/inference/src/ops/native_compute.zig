@@ -6898,6 +6898,20 @@ pub const NativeCompute = struct {
         return error.ResourceTemporarilyUnavailable;
     }
 
+    /// Exact borrowing for synchronous provider uploads. The caller holds the
+    /// Native tensor until the provider releases its host-buffer lease.
+    pub fn borrowTypedHostBytes(backend: *const ops.ComputeBackend, tensor: CT, dtype: tensor_mod.DType) !?[]const u8 {
+        if (backend.vtable != &vtable_impl) return null;
+        const buf = toBuf(tensor);
+        if (buf.view_strides != null or buf.view_base_offset != 0 or buf.quantized_storage != null) return null;
+        const source = buf.source_tensor orelse return null;
+        if (source.dtype != dtype) return null;
+        if (buf.logical_shape) |shape| if (!std.mem.eql(i64, shape, source.shape)) return null;
+        const expected = tensorExpectedDenseByteLen(source) orelse return error.InvalidTensorShape;
+        if (source.data.len != expected) return error.InvalidTensorShape;
+        return source.data;
+    }
+
     pub fn importHostTensor(self: *NativeCompute, tensor: *const tensor_mod.Tensor) !CT {
         switch (tensor.dtype) {
             .i8, .i16, .i32, .i64, .u8, .bool_ => return copyDenseSourceTensorWithShape(self, tensor, tensor.shape),
@@ -62004,4 +62018,21 @@ test "provider weight transport borrows packed weights without preparing Native 
     const prepared = try compute.getWeight("provider.weight");
     defer compute.free(prepared);
     try std.testing.expect(storage.prepared.ownedBytes() > 0);
+}
+
+test "Native typed provider upload borrows exact integer storage" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.deinitOwned();
+    var receiver = NativeCompute.init(a, &store, null);
+    defer receiver.deinit();
+    const backend = receiver.computeBackend();
+    var host = try tensor_mod.Tensor.initInt64(a, "ids", &.{ 1, 2 }, &.{ 16777217, 9007199254740991 });
+    defer host.deinit();
+    const tensor = try receiver.importHostTensor(&host);
+    defer backend.free(tensor);
+    const bytes = (try NativeCompute.borrowTypedHostBytes(&backend, tensor, .i64)).?;
+    try std.testing.expectEqual(toBuf(tensor).source_tensor.?.data.ptr, bytes.ptr);
+    try std.testing.expectEqualSlices(u8, host.data, bytes);
+    try std.testing.expect((try NativeCompute.borrowTypedHostBytes(&backend, tensor, .i32)) == null);
 }

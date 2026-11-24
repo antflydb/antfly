@@ -186,6 +186,11 @@ pub const PjrtExecutor = struct {
             for (data, narrow) |element, *bits| bits.* = if (dtype == .bf16) @truncate(@as(u32, @bitCast(@import("antfly_tile").fexpr.roundBf16Value(element))) >> 16) else @bitCast(@as(f16, @floatCast(element)));
             return self.client.bufferFromHostBytes(std.mem.sliceAsBytes(narrow), bufferType(dtype), shape);
         }
+        if (comptime @import("build_options").enable_native) {
+            if (try @import("../ops/native_compute.zig").NativeCompute.borrowTypedHostBytes(backend, value, expected)) |bytes| {
+                return self.uploadTypedBytes(index, dtype, bytes, allocator);
+            }
+        }
         const exported = (try backend.exportTensorData(value, allocator)) orelse return error.UnsupportedPjrtInputType;
         const bytes = switch (exported.payload) {
             .bytes => |data| data,
@@ -196,7 +201,12 @@ pub const PjrtExecutor = struct {
             },
         };
         defer allocator.free(bytes);
-        if (exported.dtype != expected or bytes.len % dtype.byteSize() != 0) return error.UnsupportedPjrtInputType;
+        if (exported.dtype != expected) return error.UnsupportedPjrtInputType;
+        return self.uploadTypedBytes(index, dtype, bytes, allocator);
+    }
+
+    fn uploadTypedBytes(self: *PjrtExecutor, index: usize, dtype: ml.graph.DType, bytes: []const u8, allocator: Allocator) !pjrt_lib.pjrt.Buffer {
+        if (bytes.len % dtype.byteSize() != 0) return error.UnsupportedPjrtInputType;
         const shape = try resolveUploadShapeFromElementCount(allocator, self.input_shapes_[index], bytes.len / dtype.byteSize());
         defer allocator.free(shape);
         const kind = bufferType(dtype);
