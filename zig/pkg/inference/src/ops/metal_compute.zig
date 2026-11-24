@@ -13105,6 +13105,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         operand_count: usize,
         elements: usize,
         scale: ?f32 = null,
+        literal_node: [1]NodeId = .{ml.graph.null_node},
         gather: ?ops.kernel_descriptor.GatherAddBias = null,
         gather_inputs: [3]struct { shape: ml.graph.Shape, bytes: usize } = undefined,
 
@@ -13118,7 +13119,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const need = owned.requirements;
             if (@as(*anyopaque, @ptrCast(self.compute)) != ctx or owned.policy_key != 1 or
                 owned.entry_node != self.nodes[0] or owned.covered_nodes.ptr != &self.nodes or
-                owned.covered_nodes.len != self.operand_count - 1 or owned.input_nodes.ptr != &self.inputs or
+                owned.covered_nodes.len != (if (self.scale != null) @as(usize, 2) else self.operand_count - 1) or
+                (if (self.scale != null)
+                    owned.literal_nodes.len != 1 or owned.literal_nodes.ptr != &self.literal_node
+                else
+                    owned.literal_nodes.len != 0) or owned.input_nodes.ptr != &self.inputs or
                 owned.input_nodes.len != self.input_count or need.outputs.ptr != &self.outputs or need.outputs.len != 1 or
                 need.dispatch_workspace.byte_size != 0 or need.dispatch_workspace.host_byte_size != 0 or
                 need.preparation_workspace.byte_size != 0 or need.preparation_workspace.host_byte_size != 0 or
@@ -13138,9 +13143,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (self.gather != null) {
                     const metadata = self.gather_inputs[index];
                     if (!acceptsDenseRegionInput(self.compute, input, request.implementation, metadata.shape, metadata.bytes)) return false;
-                } else if (self.scale != null and index == self.operand_indices[2]) {
-                    const scalar = ml.graph.Shape.init(.f32, &.{});
-                    if (!acceptsDenseRegionInput(self.compute, input, request.implementation, scalar, @sizeOf(f32))) return false;
                 } else if (!self.accepts(input, request.implementation)) return false;
             }
             return true;
@@ -13292,7 +13294,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 var operands: [4]NodeId = undefined;
                 var covered_nodes: [3]NodeId = .{ add, ml.graph.null_node, ml.graph.null_node };
                 if (scaled) |scale| {
-                    operands[0..3].* = .{ scale.source, scale.addend, scale.scalar };
+                    operands[0..2].* = .{ scale.source, scale.addend };
                     covered_nodes[1] = scale.product;
                 } else if (both) {
                     const pair = recipe.?.pair;
@@ -13308,14 +13310,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 const owner = try allocator.create(@This());
                 var published = false;
                 defer if (!published) allocator.destroy(owner);
-                owner.* = .{ .allocator = allocator, .compute = compute, .outputs = .{.{ .node = add, .logical = shape, .bytes = @as(usize, elements) * @sizeOf(f32) }}, .nodes = covered_nodes, .operand_count = if (both) 4 else 3, .elements = elements, .scale = if (scaled) |value| value.scale else null };
+                owner.* = .{ .allocator = allocator, .compute = compute, .outputs = .{.{ .node = add, .logical = shape, .bytes = @as(usize, elements) * @sizeOf(f32) }}, .nodes = covered_nodes, .operand_count = if (scaled != null) 2 else if (both) 4 else 3, .elements = elements, .scale = if (scaled) |value| value.scale else null, .literal_node = .{if (scaled) |value| value.scalar else ml.graph.null_node} };
                 for (operands[0..owner.operand_count], owner.operand_indices[0..owner.operand_count]) |input, *index| {
-                    if (input >= request.node_facts.len) break;
-                    const binding = request.node_facts[input];
-                    if (scaled != null and input == scaled.?.scalar) {
-                        const scalar = ml.graph.Shape.init(.f32, &.{});
-                        if (!acceptsDenseRegionInput(compute, binding, request.implementation, scalar, @sizeOf(f32))) break;
-                    } else if (!owner.accepts(binding, request.implementation)) break;
+                    if (input >= request.node_facts.len or !owner.accepts(request.node_facts[input], request.implementation)) break;
                     const known = std.mem.indexOfScalar(NodeId, owner.inputs[0..owner.input_count], input);
                     index.* = known orelse owner.input_count;
                     if (known == null) {
@@ -13324,7 +13321,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     }
                 } else {
                     const covered = owner.nodes[0..if (both) @as(usize, 3) else 2];
-                    try result.append(allocator, .{ .context = owner, .implementation = request.implementation, .key = add, .policy_key = request.policy_key, .covered_nodes = covered, .input_nodes = owner.inputs[0..owner.input_count], .entry_node = add, .requirements = .{ .outputs = &owner.outputs, .requires_execution_profile = false, .uncovered = .{} }, .vtable = &table });
+                    try result.append(allocator, .{ .context = owner, .implementation = request.implementation, .key = add, .policy_key = request.policy_key, .covered_nodes = covered, .input_nodes = owner.inputs[0..owner.input_count], .literal_nodes = if (scaled != null) &owner.literal_node else &.{}, .entry_node = add, .requirements = .{ .outputs = &owner.outputs, .requires_execution_profile = false, .uncovered = .{} }, .vtable = &table });
                     published = true;
                 }
             }

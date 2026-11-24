@@ -158,6 +158,13 @@ pub fn validateReachableBoundaries(allocator: std.mem.Allocator, graph: *const m
             if (input >= owner_of.len or std.mem.indexOfScalar(NodeId, owner.covered_nodes, input) != null or std.mem.indexOfScalar(NodeId, owner.input_nodes[0..input_index], input) != null) return error.InvalidRegionBoundary;
         }
     }
+    for (owners) |owner| {
+        for (owner.literal_nodes, 0..) |literal, index| {
+            if (literal >= owner_of.len or !reachable[literal] or owner_of[literal] != none or
+                graph.node(literal).op != .constant or std.mem.indexOfScalar(NodeId, owner.input_nodes, literal) != null or
+                std.mem.indexOfScalar(NodeId, owner.literal_nodes[0..index], literal) != null) return error.InvalidRegionBoundary;
+        }
+    }
     // This is one graph-edge pass, not a whole-graph scan per region. Every
     // edge crossing a frozen boundary must have a declared publication/input.
     for (0..graph.nodeCount()) |raw| {
@@ -170,7 +177,9 @@ pub fn validateReachableBoundaries(allocator: std.mem.Allocator, graph: *const m
             const target = owner_of[node];
             if (source == target) continue;
             if (source != none and !publishes(owners[source], input)) return error.MissingRegionBoundaryOutput;
-            if (target != none and std.mem.indexOfScalar(NodeId, owners[target].input_nodes, input) == null) return error.MissingRegionBoundaryInput;
+            if (target != none and
+                std.mem.indexOfScalar(NodeId, owners[target].input_nodes, input) == null and
+                std.mem.indexOfScalar(NodeId, owners[target].literal_nodes, input) == null) return error.MissingRegionBoundaryInput;
         }
     }
     for (graph.outputs.items) |output| {
@@ -258,6 +267,9 @@ test "frozen region boundary proof preserves independent packed outputs and adva
     owner.requirements.outputs = &outputs;
     owner.input_nodes = &.{};
     try std.testing.expectError(error.MissingRegionBoundaryInput, validateBoundaries(a, &graph, &.{&owner}));
+    owner.literal_nodes = &.{input};
+    try std.testing.expectError(error.InvalidRegionBoundary, validateBoundaries(a, &graph, &.{&owner}));
+    owner.literal_nodes = &.{};
     owner.input_nodes = &.{input};
     try std.testing.expectError(error.OverlappingRegionBoundary, validateBoundaries(a, &graph, &.{ &owner, &owner }));
     try std.testing.expectError(error.InvalidRegionOrder, firstUseOverrides(a, &graph, &.{ input, right, left }, &.{&owner}));

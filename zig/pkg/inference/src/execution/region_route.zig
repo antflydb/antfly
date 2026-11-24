@@ -142,6 +142,8 @@ pub const Owned = struct {
     /// substitute for this ownership boundary in a replacement proof.
     covered_nodes: []const NodeId,
     input_nodes: []const NodeId,
+    /// Graph constants encoded directly in the prepared kernel arguments.
+    literal_nodes: []const NodeId = &.{},
     entry_node: NodeId,
     requirements: Requirements,
     vtable: *const VTable,
