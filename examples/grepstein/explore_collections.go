@@ -151,6 +151,9 @@ func explorerCollectionsHandler(cs []explorerCollection, client *http.Client, bu
 			work, ctx := errgroup.WithContext(r.Context())
 			for i, c := range selected {
 				work.Go(func() error {
+					if err := requireExplorerGraphIndex(ctx, client, c.tableURL, mode); err != nil {
+						return err
+					}
 					raw, err := corpusRequestWithContext(ctx, client, http.MethodPost, c.tableURL+"/query", payloads[i])
 					if err != nil {
 						return err
@@ -191,7 +194,7 @@ func explorerCollectionsHandler(cs []explorerCollection, client *http.Client, bu
 				})
 			}
 			if err := work.Wait(); err != nil {
-				http.Error(w, "Search unavailable; check index coverage and server logs", 502)
+				writeExplorerSearchError(w, err)
 				return
 			}
 			groups := []map[string]json.RawMessage{}

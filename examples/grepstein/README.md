@@ -486,8 +486,11 @@ GREPSTEIN_BUCKET=antfly-showcases-originals ./grepstein explore --url "$ANTFLY_U
 docker build -f examples/grepstein/Dockerfile -t grepstein .
 ```
 
-The explorer has full-text, semantic, and graph evidence modes. Graph nodes expose
-their documents/path evidence on selection. Original PDF requests are resolved
+The explorer has full-text, semantic, and graph evidence modes. Graph mode requires
+the graph enrichment and materialization stages above; a collection without its
+graph index reports the mode as unavailable. Graph searches anchor on the
+materialized graph-unit rows so their IDs match the stored edges. Graph nodes
+expose their documents/path evidence on selection. Original PDF requests are resolved
 from corpus rows and confined to the configured bucket; ADC storage credentials
 and the Antfly key never go to the browser. Cloud Run obtains its key from an
 explicit Secret Manager version. Search, OCR, and enrichment still require a live
