@@ -4494,6 +4494,42 @@ pub fn executeNode(
                 return result orelse error.UnsupportedPrimitiveOp;
             }
 
+            // Grouped (e.g. depthwise) 1-D convolution: [N, C, T] has the
+            // layout of [N, C, 1, T], so run it as a 2-D conv of height 1.
+            if (attrs.num_spatial == 1 and attrs.groups > 1 and
+                input_shape.rank() == 3 and weight_shape.rank() == 3 and
+                attrs.padding[0][0] == attrs.padding[0][1] and
+                attrs.dilations[0] == 1 and attrs.output_padding[0] == 0)
+            {
+                const batch = try positiveResolvedDim(input_actual, input_shape, 0);
+                const in_channels = try positiveResolvedDim(input_actual, input_shape, 1);
+                const time_steps = try positiveResolvedDim(input_actual, input_shape, 2);
+                const out_channels = try positiveShapeDim(weight_shape, 0);
+                const group_channels = try positiveShapeDim(weight_shape, 1);
+                const kernel_size = try positiveShapeDim(weight_shape, 2);
+                const stride = std.math.cast(usize, attrs.strides[0]) orelse return error.UnsupportedShape;
+                const padding = std.math.cast(usize, attrs.padding[0][0]) orelse return error.UnsupportedShape;
+                const groups = std.math.cast(usize, attrs.groups) orelse return error.UnsupportedShape;
+                if (stride == 0 or in_channels % groups != 0 or in_channels / groups != group_channels or
+                    out_channels % groups != 0 or time_steps + 2 * padding < kernel_size)
+                    return error.UnsupportedShape;
+                const out_steps = (time_steps + 2 * padding - kernel_size) / stride + 1;
+
+                const input4 = try cb.primReshape(V.get(ins[0]), &[_]i64{ @intCast(batch), @intCast(in_channels), 1, @intCast(time_steps) });
+                defer cb.free(input4);
+                const weight4 = try cb.primReshape(V.get(ins[1]), &[_]i64{ @intCast(out_channels), @intCast(group_channels), 1, @intCast(kernel_size) });
+                defer cb.free(weight4);
+                const tmp_alloc = std.heap.page_allocator;
+                const bias_data = try tmp_alloc.alloc(f32, out_channels);
+                defer tmp_alloc.free(bias_data);
+                @memset(bias_data, 0.0);
+                const bias = try cb.fromFloat32(bias_data);
+                defer cb.free(bias);
+                const output4 = try cb.conv2d(input4, weight4, bias, batch, in_channels, out_channels, 1, time_steps, 1, kernel_size, 1, stride, 0, padding, groups);
+                defer cb.free(output4);
+                return cb.primReshape(output4, &[_]i64{ @intCast(batch), @intCast(out_channels), @intCast(out_steps) });
+            }
+
             if (attrs.num_spatial == 1 and attrs.groups == 1 and
                 input_shape.rank() == 3 and weight_shape.rank() == 3 and
                 attrs.padding[0][0] == attrs.padding[0][1] and
