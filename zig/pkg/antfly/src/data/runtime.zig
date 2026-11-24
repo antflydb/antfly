@@ -51473,7 +51473,6 @@ fn consumerTests() type {
                     try feed_svc.mutate(a, .{ .plan_roots = plans });
                 }
                 const DriverPolicy = struct {
-                    source: *RemoteMetadataSource,
                     roots: @import("../api/history_roots.zig").Source,
                     base: feed_policy = .{},
                     pub fn authorizeRoot(self: *@This(), state: feed_control.State, ns: feed_control.Namespace, request: feed_fixture.Request) !void {
@@ -51482,7 +51481,6 @@ fn consumerTests() type {
                     pub fn validateRoot(self: *@This(), state: feed_control.State, ns: feed_control.Namespace, frozen: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: feed_fixture.Request) !void {
                         try self.base.validateRoot(state, ns, frozen, table, request);
                         try self.roots.validate(std.testing.allocator, state, ns, frozen, table, try self.base.context(request));
-                        self.source.control_read_generation_at_ms = self.source.awakeMs();
                     }
                     pub fn newAttempt(self: *@This(), state: feed_control.State, ns: feed_control.Namespace, request: feed_fixture.Request) !feed_control.Id {
                         return self.base.newAttempt(state, ns, request);
@@ -51491,7 +51489,7 @@ fn consumerTests() type {
                         return self.base.context(request);
                     }
                 };
-                var driver_policy: DriverPolicy = .{ .source = &metadata_source, .roots = origin.historyRootsSource() };
+                var driver_policy: DriverPolicy = .{ .roots = origin.historyRootsSource() };
                 {
                     var feed_state = try feed_svc.load(a);
                     defer feed_state.deinit();
@@ -52402,11 +52400,9 @@ fn consumerTests() type {
                                 try std.testing.expectError(if (gap) error.SourceCheckpointConflict else error.SourcePayloadConflict, source_participant.submit(source_alloc, &attempt_plan, 0, source_fence, .prepare, .{}));
                             } else try source_participant.submit(source_alloc, &attempt_plan, 0, source_fence, .prepare, .{});
                             try source_participant.submit(source_alloc, &attempt_plan, 0, source_fence, .{ .resolve = .{ .status = if (attempt_id == 128) .committed else .aborted, .commit_version = 4102 + @as(u64, attempt_id) } }, .{});
-                            origin_server.remote_metadata.?.control_read_generation_at_ms = origin_server.remote_metadata.?.awakeMs();
                             const attempt_recovery = try source_recovery.run(source_alloc, source_binding, source_fence, "docs", @splat(attempt_id), .{});
                             try std.testing.expectEqual(@as(@TypeOf(attempt_recovery), if (attempt_id == 128) .complete else .aborted), attempt_recovery);
                         }
-                        origin_server.remote_metadata.?.control_read_generation_at_ms = origin_server.remote_metadata.?.awakeMs();
                         try @import("../api/source_checkpoint_native_test.zig").verify(source_alloc, origin_server.sourceCheckpointObservationPort(), source_fence, .{ .version = 1, .source_owner = source_binding, .transaction_id = source_id, .command = source_prepare.transaction.?.prepare.source_checkpoint.?, .minimum_applied_index = 1 });
                         try @import("../api/source_scope_native_test.zig").verify(source_alloc, native_owner, source_fence, source_binding);
                         try @import("../api/source_scope_native_test.zig").verifyRouted(source_alloc, origin_server.sourceScopeObservationPort(), source_fence, source_binding);
