@@ -988,6 +988,7 @@ pub const CachedDecoderGeometry = struct {
         var bytes: usize = 0;
         var cache_bytes: usize = 0;
         var sequence = @max(tokens, context);
+        var self_position: ?usize = null;
         for (outputs, 0..) |output, index| {
             if (std.mem.eql(u8, output.name, "logits")) {
                 bytes = try addBytes(bytes, try mulBytes(try mulBytes(try mulBytes(batch, tokens), self.vocab_size), output.dtype.byteSize()));
@@ -997,8 +998,16 @@ pub const CachedDecoderGeometry = struct {
                 const preferred = if (index < self.past_input_indices.len) self.past_input_indices[index] else null;
                 const cached = findPastInput(inputs, suffix, preferred) orelse return error.MissingInputs;
                 if (cached.shape.len != 4 or cached.shape[1] <= 0 or cached.shape[2] < 0 or cached.shape[3] <= 0) return error.InvalidInputShape;
-                const cross = onnx_cache.isCrossCacheSuffix(suffix);
-                const time = if (cross) context else try addBytes(@intCast(cached.shape[2]), tokens);
+                const past_length: usize = @intCast(cached.shape[2]);
+                const time = if (onnx_cache.isCrossCacheSuffix(suffix)) cross: {
+                    if (past_length != 0 and past_length != context) return error.InvalidDecoderPosition;
+                    break :cross context;
+                } else self: {
+                    if (self_position) |position| {
+                        if (past_length != position) return error.InvalidDecoderPosition;
+                    } else self_position = past_length;
+                    break :self try addBytes(past_length, tokens);
+                };
                 sequence = @max(sequence, time);
                 const elements = try mulBytes(try mulBytes(try mulBytes(batch, @intCast(cached.shape[1])), time), @intCast(cached.shape[3]));
                 const size = try mulBytes(elements, output.dtype.byteSize());
@@ -1024,6 +1033,24 @@ test "ONNX cache geometry prebinds exact names across reordered inputs and outpu
     try std.testing.expectEqual(expected, try geometry.resolve(.{ .shapes = &.{ ids, encoder, self_cache, cross_cache } }, &.{ logits, self_output, cross_output }, 2));
     try std.testing.expectEqual(expected, try geometry.resolve(.{ .shapes = &.{ cross_cache, encoder, ids, self_cache } }, &.{ self_output, logits, cross_output }, 2));
     try std.testing.expectError(error.MissingInputs, geometry.resolve(.{ .shapes = &.{ ids, encoder, cross_cache } }, &.{ logits, self_output, cross_output }, 2));
+}
+
+test "ONNX cache geometry rejects inconsistent decoder positions before admission" {
+    const inputs: []const TensorInfo = &.{
+        .{ .name = "input_ids", .dtype = .i64, .shape = &.{ 1, 2 } },
+        .{ .name = "encoder_hidden_states", .dtype = .f32, .shape = &.{ 1, 4, 8 } },
+        .{ .name = "past_key_values.0.decoder.key", .dtype = .f32, .shape = &.{ 1, 2, 5, 3 } },
+        .{ .name = "past_key_values.0.decoder.value", .dtype = .f32, .shape = &.{ 1, 2, 4, 3 } },
+        .{ .name = "past_key_values.0.encoder.key", .dtype = .f32, .shape = &.{ 1, 2, 3, 3 } },
+    };
+    const outputs: []const TensorInfo = &.{
+        .{ .name = "present.0.decoder.key", .dtype = .f32, .shape = &.{ -1, 2, -1, 3 } },
+        .{ .name = "present.0.decoder.value", .dtype = .f32, .shape = &.{ -1, 2, -1, 3 } },
+        .{ .name = "present.0.encoder.key", .dtype = .f32, .shape = &.{ -1, 2, -1, 3 } },
+    };
+    const geometry: CachedDecoderGeometry = .{ .vocab_size = 11 };
+    try std.testing.expectError(error.InvalidDecoderPosition, geometry.resolve(.{ .shapes = inputs }, outputs[0..2], 1));
+    try std.testing.expectError(error.InvalidDecoderPosition, geometry.resolve(.{ .shapes = inputs }, outputs[2..], 1));
 }
 
 test "imported sequence geometry resolves transformed audio axes without native hooks" {
