@@ -1668,25 +1668,10 @@ fn embeddingGemma2AudioConfig() AudioConfig {
         .layer_norm_eps = 1e-6,
     };
 }
-pub fn encodeEmbeddingGemma2Audio(cb: *const ComputeBackend, allocator: std.mem.Allocator, bytes: []const u8) !EncodedAudio {
-    return encodeEmbeddingGemma2AudioBounded(cb, allocator, bytes, .{}, 64 * 1024 * 1024);
-}
 pub fn encodeEmbeddingGemma2AudioBounded(cb: *const ComputeBackend, allocator: std.mem.Allocator, bytes: []const u8, decode_options: audio.DecodeOptions, max_decode_working_bytes: usize) !EncodedAudio {
-    var weights = ProjectorWeights.initHuggingFace(cb, allocator);
-    defer weights.deinit();
-    var cfg = embeddingGemma2AudioConfig();
-    cfg.audio_decode_options = decode_options;
-    cfg.max_audio_decode_working_bytes = max_decode_working_bytes;
-    return encodeSingleAudio(cb, allocator, &weights, cfg, bytes);
-}
-
-/// Native PCM goes directly to preparation; no intermediate WAV allocation.
-pub fn encodeEmbeddingGemma2Pcm(cb: *const ComputeBackend, a: std.mem.Allocator, pcm: audio.PcmAudio) !EncodedAudio {
-    var prepared = try prepareAudioPcm(a, pcm, 128, true, !audioHostOps().features and supportsGemma4LogMel(cb));
-    defer prepared.deinit();
-    const result = try encodePreparedEmbeddingGemma2AudioResident(cb, a, &prepared);
+    const result = try encodeEmbeddingGemma2AudioResidentBounded(cb, allocator, bytes, decode_options, max_decode_working_bytes);
     defer cb.free(result.embeddings);
-    return .{ .embeddings = try cb.toFloat32(result.embeddings, a), .tokens = result.tokens };
+    return .{ .embeddings = try cb.toFloat32(result.embeddings, allocator), .tokens = result.tokens };
 }
 
 pub const ResidentEncodedAudio = struct { embeddings: CT, tokens: usize };
