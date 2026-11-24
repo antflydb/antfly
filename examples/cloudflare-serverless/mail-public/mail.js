@@ -527,6 +527,7 @@ const megabytes = (bytes) => (bytes / 1024 ** 2).toFixed(bytes < 10 * 1024 ** 2 
 function startLocal(confirmDownload) {
   localOpening ??= (async () => {
     const mailboxId = me.mailbox.id;
+    $("local-badge").textContent = "Setting up…";
     try {
       const module = await localModule();
       const config = await module.localConfig();
@@ -538,6 +539,7 @@ function startLocal(confirmDownload) {
         )
       ) {
         $("local-toggle").checked = false;
+        $("local-badge").textContent = "Off";
         return;
       }
       local = await module.LocalMailIndex.open(mailboxId, {
@@ -563,6 +565,7 @@ function startLocal(confirmDownload) {
       else localStatus("Offline. " + (local.state.messages ?? 0) + " messages available on this device.");
     } catch (error) {
       localStatus("On-device search is unavailable: " + error.message);
+      if (!local) $("local-badge").textContent = "Unavailable";
     } finally {
       localOpening = null;
     }
