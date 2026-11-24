@@ -7621,22 +7621,29 @@ pub const DB = struct {
         else
             null;
         defer if (replication_mutation) |*lease| lease.release();
-        var snapshot_replay = self.core.snapshot_replay_admission.tryAcquireMutation() orelse return false;
-        defer snapshot_replay.release();
-        if (self.source_pin_cleanup.takeTurn() and try self.runSourcePinCleanupStep()) return true;
+        var physical = self.core.snapshot_replay_admission.tryAcquirePhysicalMaintenance() orelse return false;
+        defer physical.release();
+        if (self.source_pin_cleanup.takeTurn() and try self.runSourcePinCleanupStepWithAdmission(&physical)) return true;
+        // The raw LSM runner preserves committed keys and values. Its read
+        // views retain the versions and files they reference. Text segments,
+        // dense topology and document mappings publish outside these steps.
         if (try self.core.index_manager.runLsmObsoleteReclaimDueBestEffort()) return true;
         if (try primary.runReadyLsmMaintenanceStepBestEffort()) return true;
         if (try self.core.index_manager.runLsmMaintenanceStepBestEffort()) return true;
-        return try self.runSourcePinCleanupStep();
+        return try self.runSourcePinCleanupStepWithAdmission(&physical);
     }
 
     /// Source-pin deletion shares the LSM maintenance lane; it never creates a
     /// dedicated thread or monopolizes compaction while the corpus is large.
     pub fn runSourcePinCleanupStep(self: *DB) !bool {
         if (comptime storage_engine.enabled) return storage_engine.call("runSourcePinCleanupStep", .{self});
+        return self.runSourcePinCleanupStepWithAdmission(null);
+    }
+
+    fn runSourcePinCleanupStepWithAdmission(self: *DB, physical: ?*const snapshot_admission_mod.SnapshotAdmission.PhysicalMaintenanceLease) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode) or !self.source_pin_cleanup.due(monotonicTimeNs())) return false;
         const units_before = self.source_pin_cleanup.work_units.load(.acquire);
-        const work = @import("source_pin.zig").reconcileReleasedWithBudget(self, .{}) catch |err| {
+        const work = @import("source_pin.zig").reconcileReleasedWithAdmission(self, .{}, physical) catch |err| {
             const progressed = self.source_pin_cleanup.work_units.load(.acquire) != units_before;
             self.recordSourcePinCleanupFailureWithProgress(err, progressed);
             return progressed;
@@ -7683,7 +7690,7 @@ pub const DB = struct {
         else
             null;
         defer if (replication_mutation) |*lease| lease.release();
-        var snapshot_replay = self.core.snapshot_replay_admission.tryAcquireMutation() orelse return false;
+        var snapshot_replay = self.core.snapshot_replay_admission.tryAcquirePhysicalMaintenance() orelse return false;
         defer snapshot_replay.release();
         return try primary.runReadyLsmMaintenanceStepBestEffort();
     }
@@ -7804,7 +7811,7 @@ pub const DB = struct {
                 worker = try std.Thread.spawn(.{}, Poll.run, .{&poll});
                 try poll.done.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
                 try std.testing.expect(!try poll.result);
-                try std.testing.expectEqual(revision + i, db.core.snapshot_replay_admission.mutationRevision());
+                try std.testing.expectEqual(revision, db.core.snapshot_replay_admission.mutationRevision());
             }
             const progressed = if (primary_only)
                 try db.runPrimaryLsmMaintenanceStepBestEffort()
@@ -7812,7 +7819,7 @@ pub const DB = struct {
                 try db.runLsmMaintenanceStepBestEffort();
             try std.testing.expect(progressed);
             try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(alloc, obsolete, 1024));
-            try std.testing.expectEqual(@as(?u64, revision + i + 1), db.core.snapshot_replay_admission.quietRevision());
+            try std.testing.expectEqual(@as(?u64, revision), db.core.snapshot_replay_admission.quietRevision());
         }
     }
 
@@ -7855,7 +7862,7 @@ pub const DB = struct {
             try std.testing.expectEqual(@as(?u64, revision), db.core.snapshot_replay_admission.quietRevision());
         }
         try std.testing.expect(!try db.runLsmMaintenanceStepBestEffort());
-        try std.testing.expectEqual(@as(?u64, revision + 1), db.core.snapshot_replay_admission.quietRevision());
+        try std.testing.expectEqual(@as(?u64, revision), db.core.snapshot_replay_admission.quietRevision());
         try std.testing.expectEqual(@as(u64, 0), backend.maintenanceDebtHint());
     }
 
@@ -52879,6 +52886,8 @@ pub const DB = struct {
         started: Io.Event = .unset,
         release: Io.Event = .unset,
         workspace_bytes: usize = HybridComponents.workspace_bytes,
+        maintenance_progress: ?bool = null,
+        mutation_at_fusion: bool = false,
         replacement: ?struct { id: u64, bytes: []const u8 } = null,
         cancellation: ?*std.atomic.Value(bool) = null,
         overlapped: bool = false,
@@ -53000,6 +53009,12 @@ pub const DB = struct {
         }
 
         fn cutMatches(self: *HybridComponents, comptime phase: []const u8) bool {
+            var test_mutation = if (builtin.is_test and (comptime std.mem.eql(u8, phase, "fusion")) and
+                self.probe != null and self.probe.?.mutation_at_fusion)
+                self.db.core.snapshot_replay_admission.acquireMutation()
+            else
+                null;
+            defer if (test_mutation) |*mutation| mutation.release();
             var reason: CutFailure = .changed;
             const failure = if (self.profile) &reason else null;
             const current = if (quietRevisions(self.db, failure)) |revisions| self.readCutFrom(revisions, failure) else null;
@@ -53112,6 +53127,9 @@ pub const DB = struct {
             if (self.probe) |probe| {
                 probe.overlapped = true;
                 defer probe.release.set(io);
+                if (probe.maintenance_progress) |expected| {
+                    if (try self.db.runLsmMaintenanceStepBestEffort() != expected) return error.TestUnexpectedResult;
+                }
                 if (probe.replacement) |segment| {
                     var mutation = self.db.core.snapshot_replay_admission.acquireMutation();
                     defer mutation.release();
@@ -133236,6 +133254,42 @@ test "db hybrid search does not hard-filter dense leg with scoring full_text" {
     defer saturated.deinit();
     try std.testing.expect(!probe.overlapped);
     try std.testing.expectEqualDeep(serial.hits, saturated.hits);
+
+    {
+        _ = try db.runLsmMaintenanceUntilIdle();
+        const backend = db.core.primary_store_owner.lsmBackend().?;
+        const storage = backend.storage.?;
+        const obsolete = try lsm_backend_mod.repository.runPath(alloc, backend.root_dir.?, 999_997);
+        defer alloc.free(obsolete);
+        var pinned = try db.core.store.beginReadTxn();
+        defer pinned.abort();
+        for ([_]bool{ false, true }) |progress| {
+            if (progress) {
+                try lsm_backend_mod.repository.writeFileAbsoluteWithStorage(storage, obsolete, "obsolete");
+                const locked = lsm_backend_mod.runtime.lockBackend(lsm_backend_mod.Backend, backend);
+                defer lsm_backend_mod.runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+                backend.options.obsolete_retention_ns = 0;
+                try backend.queueObsoleteFilePath(try alloc.dupe(u8, obsolete));
+            } else {
+                db.source_pin_cleanup.epoch.store(1, .release);
+                backend.notePotentialMaintenanceDebt();
+            }
+            probe = .{ .maintenance_progress = progress };
+            var maintained = try db.searchWithExecutionContext(alloc, filtered, parallel_context);
+            defer maintained.deinit();
+            try std.testing.expect(probe.overlapped);
+            try std.testing.expectEqual(@as(?anyerror, null), probe.retry);
+            try std.testing.expectEqualDeep(serial.hits, maintained.hits);
+        }
+        try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(alloc, obsolete, 1024));
+    }
+
+    probe = .{ .mutation_at_fusion = true };
+    var fusion_retried = try db.searchWithExecutionContext(alloc, filtered, parallel_context);
+    defer fusion_retried.deinit();
+    try std.testing.expect(probe.overlapped);
+    try std.testing.expectEqual(@as(?anyerror, error.HybridReadCutChanged), probe.retry);
+    try std.testing.expectEqualDeep(serial.hits, fusion_retried.hits);
 
     const published_index = db.core.textIndexEntry("ft_v1").?;
     const text_view = published_index.persistent.acquireSnapshot();
