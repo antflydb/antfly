@@ -20056,7 +20056,10 @@ test "CUDA replay retains input storage while retiring an exec at its addressabl
     var busy_scratch = (try allocPinnedTempSlot(&compute, 12, 64)).?;
     defer _ = releasePinnedTempSlot(&compute, &busy_scratch);
     try std.testing.expectEqual(.borrowed, cudaGraphReplayArenaStatus(&compute, slot));
+    compute.ctx.enableRuntimeObservation();
     try std.testing.expect((try findCompatibleDecodeReplaySlot(&compute, prepared)) == null);
+    try std.testing.expectEqual(@as(u64, 1), compute.ctx.runtimeObservation().?.counters.?.decode_replay_scratch_borrow_denials);
+    try std.testing.expectEqual(@as(u64, 0), compute.ctx.runtimeObservation().?.counters.?.decode_replay_stale_workspace_denials);
     try std.testing.expect(slot.exec != null and slot.valid);
     try std.testing.expect(releasePinnedTempSlot(&compute, &busy_scratch));
     try std.testing.expectEqual(.ready, cudaGraphReplayArenaStatus(&compute, slot));
@@ -20114,8 +20117,9 @@ fn findCompatibleDecodeReplaySlot(self: *CudaCompute, input: CT) !?usize {
         return null;
     }
     const arena_status = cudaGraphReplayArenaStatus(self, slot);
-    if (arena_status == .borrowed) return null;
-    if (arena_status == .stale) {
+    if (arena_status != .ready) {
+        if (self.ctx.observation.load(.acquire)) |observation| observation.decodeScratchUnavailable(arena_status == .stale);
+        if (arena_status == .borrowed) return null;
         if (slot.temp_arena_generation != self.temp_arena_generation) {
             std.log.warn("cuda_graph_capture_probe: stale_temp_arena_generation slot={d} captured={d} current={d}", .{
                 slot_idx,

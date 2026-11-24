@@ -143,6 +143,10 @@ pub const CudaCounters = struct {
     opaque_graph_submissions: u64 = 0,
     /// A legacy decode replay declined before submission because its output bank was still held.
     decode_replay_output_bank_denials: u64 = 0,
+    /// Pre-submission declines that preserve a warm exec until scratch is released.
+    decode_replay_scratch_borrow_denials: u64 = 0,
+    /// Pre-submission declines that retire an exec with obsolete scratch bindings.
+    decode_replay_stale_workspace_denials: u64 = 0,
     /// Explicit project-owned successful host wait APIs. These are not CPU
     /// blocking durations or implicit vendor/free synchronizations.
     host_stream_synchronizations: u64 = 0,
