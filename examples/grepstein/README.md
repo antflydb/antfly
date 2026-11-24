@@ -429,7 +429,7 @@ Build both binaries from the same checkout, then run the real PDF-to-grep path:
 (cd examples/grepstein && GOWORK=off GOEXPERIMENT=simd \
   ANTFLY_GREPSTEIN_E2E_BINARY="$PWD/../../zig/zig-out/bin/antfly" \
   ANTFLY_GREPSTEIN_E2E_GREP_BINARY="$PWD/../../zig/zig-out/bin/antfly-grep" \
-  go test -run '^TestLocalNativeGCS(Extraction|Transcription)$' -count=1 -v)
+  go test -run '^TestLocalNativeGCS(Extraction|Transcription|Images|ExecutionPolicy)$' -count=1 -v)
 ```
 
 This starts a standalone Antfly server and a loopback GCS protocol fixture,
@@ -439,6 +439,23 @@ source identity, no content reacquisition during grep, and rejection of
 out-of-scope or changed-generation objects. It does not qualify Cloud Workload
 Identity or GPU OCR, embeddings, or relationship extraction; those need a live
 sample on the deployed shared inference runtime.
+
+The smoke also forces one-record grep pages. The separate
+`TestLocalNativeGCSExecutionPolicy` case checks a 4K-truncated OCR response
+followed by an 8K execution-policy update and incomplete-only retry.
+Already completed extraction must retain its generation and avoid another OCR call.
+Inference responses are deterministic fixtures, so this verifies orchestration,
+not model accuracy or GPU throughput.
+
+To include real Chromium interaction checks against the running native server,
+install Playwright in your development environment, then additionally set
+`ANTFLY_GREPSTEIN_E2E_BROWSER=1`. If Playwright is installed outside Node’s normal
+module search path, set `ANTFLY_GREPSTEIN_PLAYWRIGHT_MODULE` to its package path.
+`ANTFLY_GREPSTEIN_BROWSER_EXECUTABLE` optionally selects an existing Chromium
+executable. Set `ANTFLY_GREPSTEIN_E2E_ARTIFACTS` to an absolute directory to retain
+screenshots. The browser checks PDF/audio/image search, original delivery, citations,
+audio metadata/playback interaction, empty results, and visible search failures.
+It does not qualify semantic or graph model output.
 
 ## Explorer and hosting
 
@@ -467,8 +484,11 @@ GREPSTEIN_BUCKET=antfly-showcases-originals ./grepstein explore --url "$ANTFLY_U
 docker build -f examples/grepstein/Dockerfile -t grepstein .
 ```
 
-The explorer has full-text, semantic, and graph evidence modes. Graph nodes expose
-their documents/path evidence on selection. Original PDF requests are resolved
+The explorer has full-text, semantic, and graph evidence modes. Graph mode requires
+the graph enrichment and materialization stages above; a collection without its
+graph index reports the mode as unavailable. Graph searches anchor on the
+materialized graph-unit rows so their IDs match the stored edges. Graph nodes
+expose their documents/path evidence on selection. Original PDF requests are resolved
 from corpus rows and confined to the configured bucket; ADC storage credentials
 and the Antfly key never go to the browser. Cloud Run obtains its key from an
 explicit Secret Manager version. Search, OCR, and enrichment still require a live

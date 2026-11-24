@@ -12464,7 +12464,7 @@ const SharedPdfWindowScheduler = struct {
             const text = job.text orelse return false;
             const err = job.err orelse return false;
             if (isGroupAbort(err) or err == error.QueueFull) return false;
-            if (isUnavailableOcrModelError(.ocr, err)) return true;
+            if (generatedTextBatchFailureIsAttributable(.ocr, err, text.requests.len)) return true;
             return text.rasters == null and (malformedGeneratedTextBatchAllowsSequentialIsolation(err) or
                 !shouldYieldRequestError(self.scheduler.runtime, err));
         }
@@ -24905,7 +24905,8 @@ fn flushRuntimeGeneratedTextBatch(
         assetProducerProduceBatchReportedGuarded(runtime, producer, working_alloc, requests)) catch |err| {
         if (runtime.shared_pdf_windows) |shared| if (try shared.drainOwnerAdmission(err))
             return flushRuntimeGeneratedTextBatch(runtime, alloc, working_alloc, producer, requests, borrowed_rasters, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, source_fingerprint, retry_fingerprint);
-        logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, unit_indices, requests.len, request_bytes, "serial_fallback", @errorName(err), started_ns);
+        const failure_execution = if (generatedTextBatchFailureIsAttributable(kind, err, requests.len)) "batch_failure" else "serial_fallback";
+        logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, unit_indices, requests.len, request_bytes, failure_execution, @errorName(err), started_ns);
         return recoverRuntimeGeneratedTextBatch(runtime, alloc, working_alloc, producer, requests, borrowed_rasters, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, source_fingerprint, err);
     };
     var batch_owned = true;
@@ -24934,6 +24935,15 @@ fn flushRuntimeGeneratedTextBatch(
 }
 
 /// Coordinator-only typed publication, shared by synchronous calls and jobs.
+// Whole-batch failures normally need serial isolation to identify the failed
+// page. A terminal singleton is already attributed, so another identical model
+// call cannot add information. Malformed envelopes retain compatibility recovery.
+fn generatedTextBatchFailureIsAttributable(kind: RuntimeGeneratedUnitTextKind, err: anyerror, items: usize) bool {
+    return isUnavailableOcrModelError(kind, err) or
+        (items == 1 and enrichmentErrorDisposition(err) == .terminal_request and
+            !malformedGeneratedTextBatchAllowsSequentialIsolation(err));
+}
+
 fn recoverRuntimeGeneratedTextBatch(
     runtime: *EnrichmentRuntime,
     alloc: Allocator,
@@ -24951,7 +24961,8 @@ fn recoverRuntimeGeneratedTextBatch(
     source_fingerprint: []const u8,
     err: anyerror,
 ) !void {
-    if (isUnavailableOcrModelError(kind, err)) {
+    if (requests.len != unit_indices.len) return error.InvalidAssetProducerResponse;
+    if (generatedTextBatchFailureIsAttributable(kind, err, requests.len)) {
         try markRuntimeGeneratedUnitFailuresTransactional(alloc, working_alloc, units, unit_indices, method, kind, err);
         clearRuntimeGeneratedTextBatchParts(working_alloc, parts_values);
         return;
@@ -25450,7 +25461,7 @@ fn markRuntimeGeneratedUnitTextFailureNamed(
         .transcript => "failed_transcription",
     };
     const hint = if (kind == .ocr and std.mem.eql(u8, error_name, "ReadOutputTruncated"))
-        "; OCR reached max_tokens before completing the page; increase ocr.reader.max_tokens within model and deployment limits, or inspect the output for repetition if already at the limit"
+        "; OCR reached max_tokens before completing the page; increase artifact execution.max_output_tokens_per_item within reader, model and deployment limits, or inspect the output for repetition if already at the limit"
     else
         "";
     const warning = try std.fmt.allocPrint(alloc, "{s} failed: {s}{s}", .{ method, error_name, hint });
@@ -41936,9 +41947,15 @@ test "document extraction rejects and records Florence prompt echoes" {
 
 test "document extraction missing model and truncated OCR are actionable terminal unit failures" {
     const alloc = std.testing.allocator;
+    try std.testing.expect(generatedTextBatchFailureIsAttributable(.ocr, error.ReadOutputTruncated, 1));
+    try std.testing.expect(!generatedTextBatchFailureIsAttributable(.ocr, error.ReadOutputTruncated, 2));
+    try std.testing.expect(!generatedTextBatchFailureIsAttributable(.ocr, error.InvalidExecutionReport, 1));
+    try std.testing.expect(!generatedTextBatchFailureIsAttributable(.ocr, error.ResourceTemporarilyUnavailable, 1));
     for ([_]anyerror{ error.ModelNotFound, error.ReadOutputTruncated }) |failure| {
         const FailedReaderProducer = struct {
             failure: anyerror,
+            batch_calls: usize = 0,
+            item_calls: usize = 0,
             fn producer(self: *@This()) asset_producer_mod.Producer {
                 return .{
                     .ptr = self,
@@ -41952,11 +41969,13 @@ test "document extraction missing model and truncated OCR are actionable termina
 
             fn produce(ptr: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.item_calls += 1;
                 return self.failure;
             }
 
             fn produceBatch(ptr: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) ![][]u8 {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.batch_calls += 1;
                 return self.failure;
             }
         };
@@ -42006,6 +42025,8 @@ test "document extraction missing model and truncated OCR are actionable termina
             .ocr,
         );
 
+        try std.testing.expectEqual(@as(usize, 1), fake.batch_calls);
+        try std.testing.expectEqual(@as(usize, 0), fake.item_calls);
         try std.testing.expectEqualStrings("failed_ocr", units[0].extraction_status.?);
         try std.testing.expect(!units[0].ocr_used);
         // Neither failure can recover without an operator changing the request;
@@ -42014,7 +42035,7 @@ test "document extraction missing model and truncated OCR are actionable termina
         try std.testing.expect(std.mem.indexOf(u8, units[0].extraction_warning.?, @errorName(failure)) != null);
         if (failure == error.ReadOutputTruncated) {
             try std.testing.expectEqualStrings("", units[0].text);
-            try std.testing.expect(std.mem.indexOf(u8, units[0].extraction_warning.?, "ocr.reader.max_tokens") != null);
+            try std.testing.expect(std.mem.indexOf(u8, units[0].extraction_warning.?, "execution.max_output_tokens_per_item") != null);
             try std.testing.expect(std.mem.indexOf(u8, units[0].extraction_warning.?, "repetition") != null);
         }
     }

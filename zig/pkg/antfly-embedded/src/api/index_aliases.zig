@@ -308,7 +308,8 @@ pub fn validateReferences(root: V) !void {
     }
 }
 
-/// Alias-only catalog updates do not mutate an object table's physical recipe.
+/// Alias lifecycle and declaration execution updates do not mutate an object
+/// table's physical recipe. Provider configuration remains immutable.
 pub fn configurationEqual(a: A, left: []const u8, right: []const u8) !bool {
     if (std.mem.eql(u8, left, right)) return true;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -322,6 +323,8 @@ pub fn configurationEqual(a: A, left: []const u8, right: []const u8) !bool {
     _ = r.value.object.orderedRemove(key);
     _ = r.value.object.orderedRemove(receipts_key);
     _ = r.value.object.orderedRemove("_index_alias_epoch");
+    normalizeExecutionPolicies(l.value);
+    normalizeExecutionPolicies(r.value);
     return std.mem.eql(u8, try std.json.Stringify.valueAlloc(s, l.value, .{}), try std.json.Stringify.valueAlloc(s, r.value, .{}));
 }
 
@@ -329,6 +332,8 @@ pub fn configurationEqual(a: A, left: []const u8, right: []const u8) !bool {
 /// upstream changes while that incarnation survives, including after an alias
 /// has moved away: already-bound requests can still carry its old fence. Rebuild
 /// dependent indexes under new incarnations before changing their producers.
+/// Declaration-level execution policies are prospective and do not change that
+/// recipe; provider configuration remains semantic, including same-named keys.
 /// This runs on catalog mutations, never on search paths.
 pub fn validateDependencyMutation(out: A, before: []const u8, after: []const u8) !void {
     if (std.mem.eql(u8, before, after)) return;
@@ -337,6 +342,8 @@ pub fn validateDependencyMutation(out: A, before: []const u8, after: []const u8)
     const a = arena.allocator();
     const old = try parse(a, if (before.len == 0) "{}" else before);
     const next = try parse(a, if (after.len == 0) "{}" else after);
+    normalizeExecutionPolicies(old.value);
+    normalizeExecutionPolicies(next.value);
     try normalizeInheritedEmbeddingRecipes(a, old.value);
     try normalizeInheritedEmbeddingRecipes(a, next.value);
     if (old.value.object.get(key)) |bindings| if (bindings == .object) {
@@ -370,6 +377,32 @@ pub fn validateDependencyMutation(out: A, before: []const u8, after: []const u8)
         // declarations change (these are absent from its runtime config hash).
         try prior.checkSources(a, replacement, config, &checked);
     }
+}
+
+// Execution policy governs future invocations, not the accepted recipe of a
+// surviving consumer. Normalize only declaration boundaries: provider config,
+// prompts and schemas may contain semantic fields also named "execution".
+// Retain remaining member order for frozen object-catalog byte comparisons.
+fn normalizeExecutionPolicies(root: V) void {
+    if (root.object.getPtr("enrichments")) |definitions| removeDeclarationExecution(definitions);
+    var entries = root.object.iterator();
+    while (entries.next()) |entry| {
+        // Control maps can contain aliases named "type" and "execution".
+        // They are not index declarations and must retain all their fences.
+        if (!validName(entry.key_ptr.*)) continue;
+        const config = entry.value_ptr;
+        if (config.* != .object) continue;
+        const kind = config.object.get("type") orelse continue;
+        if (kind != .string) continue;
+        _ = config.object.orderedRemove("execution");
+        if (config.object.getPtr("enrichments")) |definitions| removeDeclarationExecution(definitions);
+    }
+}
+fn removeDeclarationExecution(definitions: *V) void {
+    if (definitions.* != .array) return;
+    for (definitions.array.items) |*definition| if (definition.* == .object) {
+        _ = definition.object.orderedRemove("execution");
+    };
 }
 
 // Compare the effective producer contract. Registering an already inherited
@@ -1008,4 +1041,64 @@ test "index alias dependency recipes preserve inherited embedding identity regis
     try definition.object.put(scratch, "field", .{ .string = "body" });
     try definition.object.put(scratch, "producer_json", .{ .string = "{\"version\":2,\"model\":\"B\"}" });
     try std.testing.expectError(error.IndexReferencedByAlias, validateDependencyMutation(a, before, try std.json.Stringify.valueAlloc(scratch, next, .{})));
+}
+
+test "index alias dependency recipes permit only declaration execution policy changes" {
+    const a = std.testing.allocator;
+    const catalogs = [_][]const u8{
+        \\{"text":{"type":"full_text","_index_incarnation":1,"sources":[{"artifact":"units"}],"execution":{"batch_items":2}},"enrichments":[{"name":"units","kind":"asset","field":"url","execution":{"max_output_tokens_per_item":4096},"producer":{"type":"generator","config":{"model":"A","execution":{"meaning":"semantic"}}}}],"_index_aliases":{"live":{"index":"text"}}}
+        ,
+        \\{"text":{"type":"full_text","_index_incarnation":1,"sources":[{"artifact":"chunks"}],"enrichments":[{"name":"units","kind":"asset","field":"url","producer":{"type":"generator","config":{"model":"A","execution":{"meaning":"semantic"}}}},{"name":"chunks","kind":"chunk","source_artifact_name":"units"}]},"_index_aliases":{"live":{"index":"text"}}}
+    };
+    for (catalogs) |catalog| for ([_]bool{ false, true }) |aliased| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const s = arena.allocator();
+        var root = try std.json.parseFromSliceLeaky(V, s, catalog, .{});
+        if (!aliased) _ = root.object.swapRemove(key);
+        const before = try std.json.Stringify.valueAlloc(s, root, .{});
+        const definitions = root.object.getPtr("enrichments") orelse root.object.getPtr("text").?.object.getPtr("enrichments").?;
+        const declaration = &definitions.array.items[0];
+        try declaration.object.put(s, "execution", try std.json.parseFromSliceLeaky(V, s, "{\"max_output_tokens_per_item\":8192}", .{}));
+        try root.object.getPtr("text").?.object.put(s, "execution", try std.json.parseFromSliceLeaky(V, s, "{\"batch_items\":8}", .{}));
+        try validateDependencyMutation(a, before, try std.json.Stringify.valueAlloc(s, root, .{}));
+        // A same-named provider field remains part of the recipe. Stripping
+        // execution recursively would silently authorize different output.
+        try declaration.object.getPtr("producer").?.object.getPtr("config").?.object.getPtr("execution").?.object.put(s, "meaning", .{ .string = "changed" });
+        try std.testing.expectError(error.IndexReferencedByAlias, validateDependencyMutation(a, before, try std.json.Stringify.valueAlloc(s, root, .{})));
+    };
+}
+
+test "index alias dependency execution normalization retains same-named alias fences" {
+    const a = std.testing.allocator;
+    const before =
+        \\{"A":{"type":"full_text","_index_incarnation":1,"field":"body","execution":{"batch_items":1}},"B":{"type":"full_text","_index_incarnation":2,"field":"other"},"_index_aliases":{"type":{"index":"B"},"execution":{"index":"A"}}}
+    ;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const s = arena.allocator();
+    var root = try std.json.parseFromSliceLeaky(V, s, before, .{});
+    try root.object.getPtr("A").?.object.getPtr("execution").?.object.put(s, "batch_items", .{ .integer = 8 });
+    try validateDependencyMutation(a, before, try std.json.Stringify.valueAlloc(s, root, .{}));
+    try root.object.getPtr("A").?.object.put(s, "field", .{ .string = "changed" });
+    try std.testing.expectError(error.IndexReferencedByAlias, validateDependencyMutation(a, before, try std.json.Stringify.valueAlloc(s, root, .{})));
+}
+
+test "index alias physical configuration equality ignores only declaration execution policies" {
+    const a = std.testing.allocator;
+    const stable =
+        \\{"text":{"type":"full_text","field":"body","enrichments":[{"name":"chunks","kind":"chunk","source_artifact_name":"units","field":"text"}]},"enrichments":[{"name":"units","kind":"asset","field":"url","producer":{"config":{"execution":{"meaning":"semantic"}}}}]}
+    ;
+    const tuned =
+        \\{"text":{"type":"full_text","execution":{"batch_items":8},"field":"body","enrichments":[{"name":"chunks","execution":{"batch_items":4},"kind":"chunk","source_artifact_name":"units","field":"text"}]},"enrichments":[{"name":"units","execution":{"max_output_tokens_per_item":8192},"kind":"asset","field":"url","producer":{"config":{"execution":{"meaning":"semantic"}}}}]}
+    ;
+    try std.testing.expect(try configurationEqual(a, stable, tuned));
+    try std.testing.expect(try configurationEqual(a, tuned, stable));
+    var parsed = try std.json.parseFromSlice(V, a, tuned, .{});
+    defer parsed.deinit();
+    const producer = parsed.value.object.getPtr("enrichments").?.array.items[0].object.getPtr("producer").?;
+    try producer.object.getPtr("config").?.object.getPtr("execution").?.object.put(parsed.arena.allocator(), "meaning", .{ .string = "changed" });
+    const changed = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+    defer a.free(changed);
+    try std.testing.expect(!try configurationEqual(a, stable, changed));
 }
