@@ -11,7 +11,7 @@
 <script type="module" src="/mail.js"></script>
 </head>
 <body>
-<svg hidden><symbol id="mark" viewBox="0 0 40 40"><path d="M39.28 28.07c0 6.19-5.02 11.21-11.21 11.21H6.11c-.73 0-1.1-.88-.58-1.4l5.56-5.56h16.98a4.26 4.26 0 0 0 4.26-4.26V11.09l5.56-5.56c.52-.52 1.4-.15 1.4.58v21.96Z"/><path d="M27.27 24.5c0 .71-.86 1.07-1.36.56l-4.73-4.73a.8.8 0 0 1 0-1.13l4.76-4.76c.5-.5 1.37-.15 1.36.57l-.03 9.49Z"/><path d="M28.31 6.96H11.22a4.26 4.26 0 0 0-4.26 4.26v17.1L1.4 33.87c-.52.52-1.4.15-1.4-.58V11.22C0 5.02 5.02 0 11.22 0h22.08c.73 0 1.1.88.58 1.4l-5.57 5.56Z"/><path d="M11.88 15.12c0-.71.86-1.07 1.36-.56l4.62 4.62a.8.8 0 0 1 0 1.13l-4.65 4.65c-.5.5-1.37.15-1.36-.57l.03-9.27Z"/></symbol></svg>
+<svg hidden><symbol id="mark" viewBox="0 0 40 40"><path d="M39.28 28.07c0 6.19-5.02 11.21-11.21 11.21H6.11c-.73 0-1.1-.88-.58-1.4l5.56-5.56h16.98a4.26 4.26 0 0 0 4.26-4.26V11.09l5.56-5.56c.52-.52 1.4-.15 1.4.58v21.96Z"/><path d="M27.27 24.5c0 .71-.86 1.07-1.36.56l-4.73-4.73a.8.8 0 0 1 0-1.13l4.76-4.76c.5-.5 1.37-.15 1.36.57l-.03 9.49Z"/><path d="M28.31 6.96H11.22a4.26 4.26 0 0 0-4.26 4.26v17.1L1.4 33.87c-.52.52-1.4.15-1.4-.58V11.22C0 5.02 5.02 0 11.22 0h22.08c.73 0 1.1.88.58 1.4l-5.57 5.56Z"/><path d="M11.88 15.12c0-.71.86-1.07 1.36-.56l4.62 4.62a.8.8 0 0 1 0 1.13l-4.65 4.65c-.5.5-1.37.15-1.36-.57l.03-9.27Z"/></symbol><symbol id="i-inbox" viewBox="0 0 24 24"><path d="M3 13h5l1.5 2.5h5L16 13h5"/><path d="M5.5 5h13L21 13v6H3v-6z"/></symbol><symbol id="i-sent" viewBox="0 0 24 24"><path d="M21 3 3 10.5l7.5 3L13.5 21z"/><path d="M21 3 10.5 13.5"/></symbol><symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16"/><path d="M9.5 7V4h5v3"/><path d="M6 7l1 13h10l1-13"/></symbol><symbol id="i-pencil" viewBox="0 0 24 24"><path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M13 7l4 4"/></symbol><symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4.5 4.5"/></symbol><symbol id="i-reply" viewBox="0 0 24 24"><path d="M9 14 4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 6 6v4"/></symbol><symbol id="i-restore" viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.5-5.8"/><path d="M4 4v4.5h4.5"/></symbol><symbol id="i-clip" viewBox="0 0 24 24"><path d="M20 11.5 12 19.5a5 5 0 0 1-7-7l8.5-8.5a3.3 3.3 0 0 1 4.7 4.7L9.7 17.2a1.7 1.7 0 0 1-2.4-2.4L15 7"/></symbol><symbol id="i-back" viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></symbol></svg>
 <main>
 <section id="account" class="auth">
   <div class="auth-brand"><svg class="mark" aria-hidden="true"><use href="#mark"/></svg><span>Antfly Mail</span></div>
@@ -40,44 +40,46 @@
 <section id="mail" class="shell" hidden>
   <aside class="sidebar">
     <div class="brand"><svg class="mark" aria-hidden="true"><use href="#mark"/></svg><span>Antfly Mail</span></div>
-    <button id="compose" class="brand-action">Compose</button>
+    <button id="compose" class="primary compose"><svg class="icon" aria-hidden="true"><use href="#i-pencil"/></svg>Compose</button>
     <nav aria-label="Folders">
-      <button id="inbox" class="folder" aria-current="page">Inbox</button>
-      <button id="outbox" class="folder">Outbox</button>
-      <button id="trash" class="folder">Trash</button>
+      <button id="inbox" class="folder" aria-current="page"><svg class="icon" aria-hidden="true"><use href="#i-inbox"/></svg>Inbox</button>
+      <button id="outbox" class="folder"><svg class="icon" aria-hidden="true"><use href="#i-sent"/></svg>Outbox</button>
+      <button id="trash" class="folder"><svg class="icon" aria-hidden="true"><use href="#i-trash"/></svg>Trash</button>
     </nav>
     <details id="local" class="device" hidden>
       <summary><span class="dot" id="local-dot"></span><span>On-device search</span><small id="local-badge">Off</small></summary>
       <div class="sheet">
-        <p class="label">On-device search</p>
+        <p class="sheet-title">On-device search</p>
         <p>Keep a private copy of this mailbox's text in this browser and search it by meaning with EmbeddingGemma, running entirely on this device. Messages and their embeddings never leave it, and search keeps working offline. The model is a one-time download, shared by every mailbox on this device.</p>
         <label class="inline"><input type="checkbox" id="local-toggle"> Keep a searchable copy of this mailbox on this device</label>
         <progress id="local-progress" hidden></progress>
-        <p id="local-status" class="readout" role="status" aria-live="polite"></p>
+        <p id="local-status" class="quiet" role="status" aria-live="polite"></p>
+        <p class="credit"><svg class="mark" aria-hidden="true"><use href="#mark"/></svg>Search by Antfly</p>
         <div class="row-actions"><button type="button" id="local-sync" hidden>Sync now</button><button type="button" id="local-remove" class="danger" hidden>Remove from this device</button></div>
       </div>
     </details>
     <footer class="account">
-      <p class="label">Mailbox</p>
-      <p id="address" class="readout"></p>
+      <p class="label">Your address</p>
+      <p id="address" class="address"></p>
       <p class="signed-in"><span id="identity"></span><button id="logout" class="link" hidden>Sign out</button></p>
     </footer>
   </aside>
 
   <section class="list" aria-label="Messages">
     <form id="search" role="search">
-      <input name="query" type="search" aria-label="Search messages" placeholder="Search your mail" required maxlength="1024">
+      <svg class="icon" aria-hidden="true"><use href="#i-search"/></svg><input name="query" type="search" aria-label="Search messages" placeholder="Search your mail" required maxlength="1024">
       <select name="where" id="search-where" aria-label="Search location" hidden><option value="device">This device</option><option value="server">Server</option></select>
-      <button aria-label="Search">Search</button>
+      <button aria-label="Search" class="search-go">Search</button>
     </form>
-    <p id="list-title" class="label">Inbox</p>
+    <p id="search-note" class="credit"><svg class="mark" aria-hidden="true"><use href="#mark"/></svg><span id="search-note-text">Search by Antfly</span></p>
+    <h2 id="list-title">Inbox</h2>
     <p id="trash-banner" hidden><span id="trash-retention"></span> <button type="button" id="empty-trash" class="link danger">Empty Trash now</button></p>
     <div id="messages"></div>
     <button id="next" class="more" hidden>Older messages</button>
   </section>
 
   <section class="reader">
-    <button type="button" id="back" class="link back">← Back</button>
+    <button type="button" id="back" class="ghost back"><svg class="icon" aria-hidden="true"><use href="#i-back"/></svg>Back</button>
     <article id="message"><div class="empty"><svg class="mark" aria-hidden="true"><use href="#mark"/></svg><p>Select a message to read it.</p></div></article>
     <form id="editor" hidden>
       <div class="editor-head"><h2 id="editor-title">New message</h2><button type="button" id="cancel" class="link">Discard</button></div>
@@ -85,8 +87,8 @@
       <label class="field"><span class="label">To</span><input name="to" type="email" required></label>
       <label class="field"><span class="label">Subject</span><input name="subject" maxlength="998" required></label>
       <textarea name="text" rows="12" required maxlength="16384" aria-label="Message"></textarea>
-      <div class="editor-actions"><button class="primary">Send</button></div>
-      <div id="quote" hidden><p class="label">Replying to</p><p id="quote-meta" class="readout"></p><pre id="quote-text"></pre></div>
+      <div class="editor-actions"><button class="primary"><svg class="icon" aria-hidden="true"><use href="#i-sent"/></svg>Send</button></div>
+      <div id="quote" hidden><p class="label">Replying to</p><p id="quote-meta" class="quiet"></p><pre id="quote-text"></pre></div>
     </form>
   </section>
 </section>

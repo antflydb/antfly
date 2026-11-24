@@ -167,7 +167,7 @@ async function load(path = "/mail/messages") {
   const search = path.startsWith("/mail/search");
   showFolder(
     path.startsWith("/mail/outbox") ? "outbox" : path.startsWith("/mail/trash") ? "trash" : "inbox",
-    search ? "Results on the server" : undefined
+    search ? "Results" : undefined
   );
   const result = await api(path);
   cursor = result.cursor;
@@ -190,11 +190,10 @@ function render(messages) {
     const who = sender(outbound ? message.to : message.from);
     const when = document.createElement("time");
     when.textContent = shortDate(message.received_at ?? message.created_at);
-    const name = text("span", (outbound ? "To " : "") + (who.name || who.address));
-    name.className = "who";
+    const name = span("who", (outbound ? "To " : "") + (who.name || who.address));
     const subject = text("span", message.subject || "(No subject)");
     subject.className = "subject";
-    button.append(name, when, subject);
+    button.append(avatar(who.name || who.address), name, when, subject);
     const preview = (message.text ?? "").replace(/\s+/g, " ").trim().slice(0, 160);
     if (preview) {
       const snippet = text("span", preview);
@@ -209,7 +208,7 @@ function render(messages) {
     if (outbound && message.state)
       tag(outboundLabels[message.state] ?? message.state, outboundTone[message.state]);
     if (message.delete_at) tag("Deleted forever in " + daysLeft(message.delete_at) + " days", "warn");
-    if (message.local) tag("Found on this device");
+    if (message.local) tag("Matched by meaning");
     if (message.id === selected) button.setAttribute("aria-current", "true");
     button.onclick = guarded(async () => {
       if (!discardDraft()) return;
@@ -227,11 +226,33 @@ function render(messages) {
     $("messages").append(empty);
   }
 }
-function header(subject, metaRows) {
+// Subject, then a sender block: initials, name and address, date, recipient.
+function header(subject, person, when, line) {
   const meta = document.createElement("div");
   meta.className = "meta";
-  meta.append(...metaRows);
+  const who = span("who", "");
+  who.append(span("from", person.label));
+  if (person.address) who.append(span("addr", person.address));
+  const time = document.createElement("time");
+  time.textContent = when ? fullDate(when) : "";
+  meta.append(avatar(person.initialsFrom, true), who, time, span("to", line));
   return [text("h2", subject || "(No subject)"), meta];
+}
+// One or two initials from a display name, else the address's first letter.
+function avatar(value = "", large = false) {
+  const words = value.replace(/@.*/, "").split(/[\s._-]+/).filter((w) => /\p{L}|\p{N}/u.test(w));
+  const initials = (words.length > 1 && !value.includes("@") ? words[0][0] + words.at(-1)[0] : (words[0] ?? "?")[0]) ?? "?";
+  const element = span("avatar" + (large ? " large" : ""), initials.toUpperCase());
+  element.setAttribute("aria-hidden", "true");
+  return element;
+}
+function iconButton(label, icon, className = "ghost") {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = className;
+  button.innerHTML = '<svg class="icon" aria-hidden="true"><use href="#i-' + icon + '"/></svg>';
+  button.append(label);
+  return button;
 }
 function span(className, value) {
   const element = text("span", value);
@@ -242,14 +263,13 @@ function showOutbound(message) {
   closeEditor();
   reading(true);
   const to = sender(message.to);
-  const when = document.createElement("time");
-  when.textContent = fullDate(message.created_at ?? message.received_at);
   $("message").replaceChildren(
-    ...header(message.subject, [
-      span("from", "To " + (to.name || to.address)),
-      span("addr", to.name ? to.address : ""),
-      when,
-    ])
+    ...header(
+      message.subject,
+      { label: to.name || to.address, address: to.name ? to.address : "", initialsFrom: to.name || to.address },
+      message.created_at ?? message.received_at,
+      "Sent from your mailbox"
+    )
   );
   const notes = document.createElement("div");
   notes.className = "notes";
@@ -279,36 +299,31 @@ async function openMessage(id) {
   // Actions first: reply, then delete (or restore) — the last two need the server.
   const toolbar = document.createElement("div");
   toolbar.className = "toolbar";
-  const reply = text("button", "Reply");
-  reply.className = "primary";
+  const reply = iconButton("Reply", "reply", "primary");
   reply.onclick = () => edit(message);
   toolbar.append(reply, span("spacer", ""));
   if (!message.offline) {
     if (message.trashed_at != null) {
-      const restore = text("button", "Restore");
+      const restore = iconButton("Restore", "restore");
       restore.onclick = guarded(() => restoreMessage(id));
-      const forever = text("button", "Delete forever");
-      forever.className = "danger";
+      const forever = iconButton("Delete forever", "trash", "ghost danger");
       forever.onclick = guarded(() => deleteForever(id));
       toolbar.append(restore, forever);
     } else {
-      const remove = text("button", "Delete");
-      remove.className = "danger";
+      const remove = iconButton("Delete", "trash");
       remove.onclick = guarded(() => trashMessage(id));
       toolbar.append(remove);
     }
   }
   const from = sender(message.from);
-  const when = document.createElement("time");
-  if (message.received_at) when.textContent = fullDate(message.received_at);
   article.replaceChildren(
     toolbar,
-    ...header(message.subject, [
-      span("from", from.name || from.address),
-      span("addr", from.name ? from.address : ""),
-      when,
-      span("to", "To " + message.to),
-    ])
+    ...header(
+      message.subject,
+      { label: from.name || from.address, address: from.name ? from.address : "", initialsFrom: from.name || from.address },
+      message.received_at,
+      "To " + message.to
+    )
   );
   const notes = document.createElement("div");
   notes.className = "notes";
@@ -332,7 +347,8 @@ async function openMessage(id) {
       link.className = "attachment";
       link.href = "/mail/messages/" + id + "/attachments/" + part.index;
       link.download = part.filename;
-      link.append(text("span", part.filename), text("span", size(part.size) + " · Download"));
+      link.innerHTML = '<svg class="icon" aria-hidden="true"><use href="#i-clip"/></svg>';
+      link.append(text("span", part.filename), span("size", size(part.size)));
       list.append(link);
     }
     article.append(list);
@@ -504,6 +520,7 @@ function localStatus(message, progress) {
 function localReady(state) {
   $("local-badge").textContent = state ? (state.messages ?? 0) + " messages on this device" : "Off";
   $("local-dot").classList.toggle("on", !!state);
+  $("search-note-text").textContent = state ? "Search by meaning on this device, by Antfly" : "Search by Antfly";
   $("search-where").hidden = !state;
   $("local-sync").hidden = !state;
   $("local-remove").hidden = !state;
@@ -622,7 +639,7 @@ $("search").onsubmit = guarded(async (event) => {
   const e = event.currentTarget.elements,
     query = e.query.value;
   if (local && (e.where.value === "device" || !navigator.onLine)) {
-    showFolder("inbox", "Results on this device");
+    showFolder("inbox", "Results by meaning, on this device");
     $("trash-banner").hidden = true;
     cursor = null;
     render(await local.search(query));
