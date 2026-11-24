@@ -165,60 +165,6 @@ pub const Quota = union(enum) {
     }
 };
 
-/// Cold metadata for the SAME already-owned raw lease. The caller strongly
-/// retains its actual immutable payload and snapshots under real exclusion;
-/// prepare runs outside ALL numerical lanes using the actual OLD Domain.
-/// This never reserves, refunds, splits or reconstructs quota from byte totals.
-pub const RawUpgrade = struct {
-    expected: memory.AdmissionLease,
-    shell: retirement.PreparedCharge,
-    domain: ?admission.Pin,
-
-    pub fn prepare(expected: memory.AdmissionLease, old_domain: *const admission.Pin) !RawUpgrade {
-        try validateDomain(expected, old_domain);
-        var pin = old_domain.retain();
-        errdefer pin.release();
-        const shell = try retirement.PreparedCharge.prepare(0);
-        return .{ .expected = expected, .shell = shell, .domain = pin };
-    }
-    fn prepareForTest(allocator: std.mem.Allocator, expected: memory.AdmissionLease, old_domain: *const admission.Pin) !RawUpgrade {
-        try validateDomain(expected, old_domain);
-        var pin = old_domain.retain();
-        errdefer pin.release();
-        const shell = try retirement.PreparedCharge.prepareWithAllocatorForTest(allocator, 0);
-        return .{ .expected = expected, .shell = shell, .domain = pin };
-    }
-    fn validateDomain(expected: memory.AdmissionLease, old_domain: *const admission.Pin) !void {
-        const controller = expected.controller orelse return error.MissingResourceRetirementLease;
-        if (old_domain.controller() != controller) return error.ForeignAdmissionDomain;
-    }
-    /// The concrete owner revalidates key, SAME retained parent and backing
-    /// BEFORE this call under its actual cohort. All lease fields (including
-    /// external/shared token and settled/live epochs) must still match. Failed
-    /// arm leaves both this cold metadata and the original owner unchanged.
-    pub fn install(self: *RawUpgrade, target: *Quota) !bool {
-        const actual = target.peek() orelse return error.PreparedCachePlanChanged;
-        if (!std.meta.eql(actual, self.expected)) return error.PreparedCachePlanChanged;
-        if (target.* == .prepared) return false; // another exact upgrade won
-        if (target.* != .raw) return error.PreparedCachePlanChanged;
-        const domain = self.domain orelse return error.RawQuotaUpgradeConsumed;
-        if (self.shell.owner == null) return error.RawQuotaUpgradeConsumed;
-        var lease: ?memory.AdmissionLease = target.raw;
-        var pin: ?admission.Pin = domain;
-        const prepared = try Quota.arm(&self.shell, &lease, &pin);
-        target.* = prepared;
-        self.domain = null; // transferred, not copied ownership
-        return true;
-    }
-    /// Only inert unused metadata remains after successful arm. The expected
-    /// lease is a NON-owning identity snapshot and is never independently freed.
-    pub fn deinitOutsideExecution(self: *RawUpgrade) void {
-        self.shell.destroyUnused();
-        if (self.domain) |pin| pin.release();
-        self.domain = null;
-    }
-};
-
 test "CUDA cache quota prepared custody fits original optional lease and refuses raw current B before mutation" {
     try std.testing.expect(@sizeOf(Quota) <= @sizeOf(?memory.AdmissionLease));
     const domain = try admission.Domain.create();
@@ -255,63 +201,16 @@ test "CUDA legacy raw cache compatibility cannot consume prepared custody or min
     try std.testing.expectEqual(@as(usize, 16), owner.controller.snapshot().backend_scratch_bytes);
 }
 
-fn rawUpgradeAllocationCase(allocator: std.mem.Allocator) !void {
+test "CUDA prepared cache quota retires on actual later current B after old A sealed" {
     const owner = try admission.Domain.create();
     defer owner.release();
-    const pin = owner.pin();
-    defer pin.release();
-    var quota = Quota.fromRawAdmission(try owner.controller.tryAcquire(.gpu, .{}, .{ .backend_scratch_bytes = 32 }, false));
-    defer quota.releaseOutsideExecution();
-    const original = quota.peek().?;
-    errdefer {
-        std.testing.expect(quota == .raw) catch @panic("upgrade OOM mutated raw quota");
-        std.testing.expect(std.meta.eql(original, quota.peek().?)) catch @panic("upgrade OOM changed lease identity");
-        std.testing.expectEqual(@as(usize, 32), owner.controller.snapshot().backend_scratch_bytes) catch @panic("upgrade OOM refunded quota");
-    }
-    var upgrade = try RawUpgrade.prepareForTest(allocator, original, &pin);
-    defer upgrade.deinitOutsideExecution();
-    try std.testing.expect(try upgrade.install(&quota));
-    try std.testing.expect(quota == .prepared);
-    try std.testing.expect(std.meta.eql(original, quota.peek().?));
-    try std.testing.expectEqual(@as(usize, 32), owner.controller.snapshot().backend_scratch_bytes);
-}
-
-test "CUDA raw cache quota upgrade preserves exact lease through every cold metadata allocation failure" {
-    try rawUpgradeAllocationCase(std.testing.allocator);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, rawUpgradeAllocationCase, .{});
-}
-
-test "CUDA raw cache quota upgrade rejects foreign old Domain and changed full lease identity before mutation" {
-    const owner = try admission.Domain.create();
-    defer owner.release();
-    const other = try admission.Domain.create();
-    defer other.release();
-    const pin = owner.pin();
-    defer pin.release();
-    const foreign = other.pin();
-    defer foreign.release();
-    var quota = Quota.fromRawAdmission(try owner.controller.tryAcquire(.gpu, .{}, .{ .backend_scratch_bytes = 32 }, false));
-    defer quota.releaseOutsideExecution();
-    const original = quota.peek().?;
-    try std.testing.expectError(error.ForeignAdmissionDomain, RawUpgrade.prepareForTest(std.testing.allocator, original, &foreign));
-    var upgrade = try RawUpgrade.prepareForTest(std.testing.allocator, original, &pin);
-    defer upgrade.deinitOutsideExecution();
-    upgrade.expected.live_settled_epoch +%= 1;
-    try std.testing.expectError(error.PreparedCachePlanChanged, upgrade.install(&quota));
-    try std.testing.expect(quota == .raw);
-    try std.testing.expect(std.meta.eql(original, quota.peek().?));
-    upgrade.expected = original;
-    try std.testing.expect(try upgrade.install(&quota));
-    try std.testing.expect(!(try upgrade.install(&quota)));
-    try std.testing.expectEqual(@as(usize, 32), owner.controller.snapshot().backend_scratch_bytes);
-}
-
-test "CUDA raw cache quota upgrade retires on actual later current B after old A sealed" {
-    const owner = try admission.Domain.create();
-    defer owner.release();
-    const pin = owner.pin();
-    defer pin.release();
-    var quota = Quota.fromRawAdmission(try owner.controller.tryAcquire(.gpu, .{}, .{ .backend_scratch_bytes = 32 }, false));
+    var pin: ?admission.Pin = owner.pin();
+    defer if (pin) |held| held.release();
+    var lease: ?memory.AdmissionLease = try owner.controller.tryAcquire(.gpu, .{}, .{ .backend_scratch_bytes = 32 }, false);
+    defer if (lease) |*held| held.release();
+    var shell = try retirement.PreparedCharge.prepare(0);
+    defer shell.destroyUnused();
+    var quota = try Quota.arm(&shell, &lease, &pin);
     defer quota.releaseOutsideExecution();
     var sink = try @import("../../execution/retirement_sink.zig").Ref.create();
     defer sink.release();
@@ -324,9 +223,6 @@ test "CUDA raw cache quota upgrade retires on actual later current B after old A
     defer current.finish();
     var b = try current.retainEpoch();
     defer b.release();
-    var upgrade = try RawUpgrade.prepareForTest(std.testing.allocator, quota.peek().?, &pin);
-    defer upgrade.deinitOutsideExecution();
-    try std.testing.expect(try upgrade.install(&quota));
     try std.testing.expectError(error.RetirementEpochSealed, quota.releaseAfterSdkDeath(.{ .boundary = &a }));
     try std.testing.expect(quota == .prepared);
     try quota.releaseAfterSdkDeath(.{ .boundary = &b });

@@ -564,10 +564,6 @@ pub const Funding = struct {
             entry.lease = prepared.commit();
             entry.state = .ready;
         };
-        for (self.entries) |*entry| if (entry.upgrade_raw) {
-            if (entry.request != .auxiliary and entry.request != .derived_weight and entry.request != .external_prefill) return error.InvalidPreparedCacheState;
-            entry.upgrade = try retirement.PreparedCharge.prepare(0);
-        };
         // Preserve already accepted retention and norm banks. Each optional
         // workspace has its own original reservation and can decline alone.
         for (self.entries) |*entry| if (entry.miss and (entry.request == .auxiliary or entry.request == .derived_weight or entry.request == .external_prefill)) {
