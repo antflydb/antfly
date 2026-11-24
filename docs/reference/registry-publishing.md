@@ -127,3 +127,30 @@ Before publication, substitute the sealed candidate auth/SDK tarballs for those
 packages. Keep the embedded package from the qualified native release. The
 smoke test checks installed exports, private search, reopen persistence and
 logout; it does not measure human onboarding time or validate live OAuth/mail.
+
+## Browser inference client
+
+`@antfly/web` publishes from `ts/antfly/web/v<version>` tags through
+`ts-npm-publish.yml` in `antflydb/antfly`, using the `npm` environment. Its npm
+version is independent of the server release line. The package bundles browser
+runtime JavaScript, workers, shaders, and a compatibility manifest; consumers
+prepare matching WASM assets separately as described in its README.
+
+An authorized npm owner must publish the package once before configuring its
+trusted publisher. A `0.0.0` setup version under the `bootstrap` dist-tag can
+reserve the name without using the functional release version. Setup packages
+contain no runtime code. After the name exists, configure:
+
+```sh
+npm trust github @antfly/web --file ts-npm-publish.yml \
+  --repo antflydb/antfly --env npm --allow-publish --yes
+npm trust list @antfly/web
+```
+
+For the npmjs.com form, use GitHub organization `antflydb`, repository `antfly`,
+workflow filename `ts-npm-publish.yml`, environment `npm`, and allow direct
+publication. The GitHub `npm` environment must also allow the tag pattern
+`ts/antfly/web/v*`; retain its existing required reviewers and self-review
+prevention. Functional releases should be tagged only after the package
+version, bundled runtime identity, type checks, tests, and packed contents have
+been verified. Do not republish an existing package version.
