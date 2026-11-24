@@ -182,6 +182,7 @@ pub const MergeReplicationCheckpoint = struct {
         bootstrap_complete,
         finalize,
         rollback,
+        qualify_cutover,
     };
 
     kind: Kind,
@@ -240,6 +241,7 @@ pub const TransactionMutation = union(enum) {
         topology_epoch: u64,
         external_decision_owner: ?@import("../transactions.zig").ExternalDecisionOwner = null,
         external_activation: bool = false,
+        external_vote_admitted_at_ns: u64 = 0,
         ordinary_producer: bool = false,
         legacy_producer: bool = false,
         completion_owner: ?@import("../transaction_completion.zig").RoutedOwner = null,
@@ -257,11 +259,13 @@ pub const TransactionMutation = union(enum) {
         commit_version: u64,
         external_decision_owner: ?@import("../transactions.zig").ExternalDecisionOwner = null,
     },
-    /// Private complete-certificate publication, isolated from row effects.
+    /// Private completion controls, isolated from row effects.
     publish_completion: struct {
         txn_id: TxnId,
         completion_owner: @import("../transaction_completion.zig").RoutedOwner,
-        certificate: []const u8,
+        certificate: []const u8 = "",
+        release: ?CompletionRelease = null,
+        ordinary_release: ?@import("../transaction_completion.zig").OrdinaryRelease = null,
     },
     /// Coordinator-side acknowledgement that one participant has durably
     /// learned the terminal decision. This must be ordered by coordinator
@@ -462,6 +466,19 @@ pub const BatchRequest = struct {
         } orelse return null;
         if (!self.hasNoExternalControlEffects()) return null;
         return owner;
+    }
+
+    pub fn validateMergeCutoverReceipt(self: @This()) !bool {
+        const checkpoint = self.merge_checkpoint orelse return false;
+        if (checkpoint.kind != .qualify_cutover) return false;
+        var rest = self;
+        rest.merge_checkpoint = null;
+        rest.merge_replication = null;
+        if (self.transaction != null or !rest.hasNoExternalControlEffects() or
+            checkpoint.page_source != null or checkpoint.page_receiver_namespace != null or
+            checkpoint.page_source_catalogs != null)
+            return error.InvalidBatchRequest;
+        return true;
     }
 
     fn hasNoExternalControlEffects(self: @This()) bool {
@@ -1984,6 +2001,7 @@ pub const TransactionIntentRequest = struct {
     timestamp_ns: u64 = 0,
     external_decision_owner: ?@import("../transactions.zig").ExternalDecisionOwner = null,
     external_activation: bool = false,
+    external_vote_admitted_at_ns: u64 = 0,
     /// Trusted private origin. Missing labels on older requests stay absent.
     completion_ordinary_producer: bool = false,
     completion_legacy_producer: bool = false,
@@ -2048,10 +2066,10 @@ pub const TransactionIntentRequest = struct {
 
     /// new field lacks a mapping, exactly as the prepare transport does.
     pub fn asAtomicBatch(self: @This()) !BatchRequest {
-        if (self.replication_source_permit != null or self.document_revision_handoff != null or self.external_decision_owner != null or self.external_activation or self.publication_capture != null or self.completion_owner != null or self.completion_ordinary_producer or self.completion_legacy_producer or self.completion_source_purpose != null or self.completion_source_scope != null or self.completion_source_checkpoint != null or self.source_admission != null or self.completion_input_digest != null) return error.InvalidTxnRequest;
+        if (self.replication_source_permit != null or self.document_revision_handoff != null or self.external_decision_owner != null or self.external_activation or self.external_vote_admitted_at_ns != 0 or self.publication_capture != null or self.completion_owner != null or self.completion_ordinary_producer or self.completion_legacy_producer or self.completion_source_purpose != null or self.completion_source_scope != null or self.completion_source_checkpoint != null or self.source_admission != null or self.completion_input_digest != null) return error.InvalidTxnRequest;
         var batch: BatchRequest = .{};
         inline for (@typeInfo(@This()).@"struct".field_names) |name| {
-            if (comptime std.mem.eql(u8, name, "replication_source_permit") or std.mem.eql(u8, name, "external_decision_owner") or std.mem.eql(u8, name, "external_activation") or std.mem.eql(u8, name, "document_revision_handoff") or std.mem.eql(u8, name, "publication_capture") or std.mem.eql(u8, name, "completion_owner") or std.mem.eql(u8, name, "completion_ordinary_producer") or std.mem.eql(u8, name, "completion_legacy_producer") or std.mem.eql(u8, name, "completion_source_purpose") or std.mem.eql(u8, name, "completion_source_scope") or std.mem.eql(u8, name, "completion_source_checkpoint") or std.mem.eql(u8, name, "source_admission") or std.mem.eql(u8, name, "completion_input_digest")) continue;
+            if (comptime std.mem.eql(u8, name, "replication_source_permit") or std.mem.eql(u8, name, "external_decision_owner") or std.mem.eql(u8, name, "external_activation") or std.mem.eql(u8, name, "external_vote_admitted_at_ns") or std.mem.eql(u8, name, "document_revision_handoff") or std.mem.eql(u8, name, "publication_capture") or std.mem.eql(u8, name, "completion_owner") or std.mem.eql(u8, name, "completion_ordinary_producer") or std.mem.eql(u8, name, "completion_legacy_producer") or std.mem.eql(u8, name, "completion_source_purpose") or std.mem.eql(u8, name, "completion_source_scope") or std.mem.eql(u8, name, "completion_source_checkpoint") or std.mem.eql(u8, name, "source_admission") or std.mem.eql(u8, name, "completion_input_digest")) continue;
             if (!@hasField(BatchRequest, name)) @compileError("atomic intent field requires batch transport: " ++ name);
             @field(batch, name) = @field(self, name);
         }
@@ -2063,7 +2081,7 @@ pub const TransactionIntentRequest = struct {
         try batch.requireAtomicIntentShape();
         var request: @This() = .{};
         inline for (@typeInfo(@This()).@"struct".field_names) |name| {
-            if (comptime std.mem.eql(u8, name, "replication_source_permit") or std.mem.eql(u8, name, "external_decision_owner") or std.mem.eql(u8, name, "external_activation") or std.mem.eql(u8, name, "document_revision_handoff") or std.mem.eql(u8, name, "publication_capture") or std.mem.eql(u8, name, "completion_owner") or std.mem.eql(u8, name, "completion_ordinary_producer") or std.mem.eql(u8, name, "completion_legacy_producer") or std.mem.eql(u8, name, "completion_source_purpose") or std.mem.eql(u8, name, "completion_source_scope") or std.mem.eql(u8, name, "completion_source_checkpoint") or std.mem.eql(u8, name, "source_admission") or std.mem.eql(u8, name, "completion_input_digest")) continue;
+            if (comptime std.mem.eql(u8, name, "replication_source_permit") or std.mem.eql(u8, name, "external_decision_owner") or std.mem.eql(u8, name, "external_activation") or std.mem.eql(u8, name, "external_vote_admitted_at_ns") or std.mem.eql(u8, name, "document_revision_handoff") or std.mem.eql(u8, name, "publication_capture") or std.mem.eql(u8, name, "completion_owner") or std.mem.eql(u8, name, "completion_ordinary_producer") or std.mem.eql(u8, name, "completion_legacy_producer") or std.mem.eql(u8, name, "completion_source_purpose") or std.mem.eql(u8, name, "completion_source_scope") or std.mem.eql(u8, name, "completion_source_checkpoint") or std.mem.eql(u8, name, "source_admission") or std.mem.eql(u8, name, "completion_input_digest")) continue;
             if (!@hasField(BatchRequest, name)) @compileError("atomic intent field requires batch transport: " ++ name);
             @field(request, name) = @field(batch, name);
         }
@@ -2071,9 +2089,9 @@ pub const TransactionIntentRequest = struct {
     }
 
     pub fn asBatch(self: @This(), txn_id: TxnId, topology_epoch: u64) BatchRequest {
-        var batch: BatchRequest = .{ .transaction = .{ .prepare = .{ .replication_source_permit = self.replication_source_permit, .txn_id = txn_id, .topology_epoch = topology_epoch, .external_decision_owner = self.external_decision_owner, .external_activation = self.external_activation, .document_revision_handoff = self.document_revision_handoff, .publication_capture = self.publication_capture, .completion_owner = self.completion_owner, .ordinary_producer = self.completion_ordinary_producer, .legacy_producer = self.completion_legacy_producer, .source_purpose = self.completion_source_purpose, .source_scope = self.completion_source_scope, .source_checkpoint = self.completion_source_checkpoint } } };
+        var batch: BatchRequest = .{ .transaction = .{ .prepare = .{ .replication_source_permit = self.replication_source_permit, .txn_id = txn_id, .topology_epoch = topology_epoch, .external_decision_owner = self.external_decision_owner, .external_activation = self.external_activation, .external_vote_admitted_at_ns = self.external_vote_admitted_at_ns, .document_revision_handoff = self.document_revision_handoff, .publication_capture = self.publication_capture, .completion_owner = self.completion_owner, .ordinary_producer = self.completion_ordinary_producer, .legacy_producer = self.completion_legacy_producer, .source_purpose = self.completion_source_purpose, .source_scope = self.completion_source_scope, .source_checkpoint = self.completion_source_checkpoint } } };
         inline for (@typeInfo(@This()).@"struct".field_names) |name| {
-            if (comptime std.mem.eql(u8, name, "replication_source_permit") or std.mem.eql(u8, name, "external_decision_owner") or std.mem.eql(u8, name, "external_activation") or std.mem.eql(u8, name, "document_revision_handoff") or std.mem.eql(u8, name, "publication_capture") or std.mem.eql(u8, name, "completion_owner") or std.mem.eql(u8, name, "completion_ordinary_producer") or std.mem.eql(u8, name, "completion_legacy_producer") or std.mem.eql(u8, name, "completion_source_purpose") or std.mem.eql(u8, name, "completion_source_scope") or std.mem.eql(u8, name, "completion_source_checkpoint") or std.mem.eql(u8, name, "source_admission") or std.mem.eql(u8, name, "completion_input_digest")) continue;
+            if (comptime std.mem.eql(u8, name, "replication_source_permit") or std.mem.eql(u8, name, "external_decision_owner") or std.mem.eql(u8, name, "external_activation") or std.mem.eql(u8, name, "external_vote_admitted_at_ns") or std.mem.eql(u8, name, "document_revision_handoff") or std.mem.eql(u8, name, "publication_capture") or std.mem.eql(u8, name, "completion_owner") or std.mem.eql(u8, name, "completion_ordinary_producer") or std.mem.eql(u8, name, "completion_legacy_producer") or std.mem.eql(u8, name, "completion_source_purpose") or std.mem.eql(u8, name, "completion_source_scope") or std.mem.eql(u8, name, "completion_source_checkpoint") or std.mem.eql(u8, name, "source_admission") or std.mem.eql(u8, name, "completion_input_digest")) continue;
             if (!@hasField(BatchRequest, name)) @compileError("transaction intent field requires batch transport: " ++ name);
             @field(batch, name) = @field(self, name);
         }
@@ -2083,9 +2101,9 @@ pub const TransactionIntentRequest = struct {
     pub fn fromBatch(batch: BatchRequest) !@This() {
         const transaction = batch.transaction orelse return error.InvalidBatchRequest;
         if (transaction != .prepare) return error.InvalidBatchRequest;
-        var request: @This() = .{ .replication_source_permit = transaction.prepare.replication_source_permit, .external_decision_owner = transaction.prepare.external_decision_owner, .external_activation = transaction.prepare.external_activation, .document_revision_handoff = transaction.prepare.document_revision_handoff, .publication_capture = transaction.prepare.publication_capture, .completion_owner = transaction.prepare.completion_owner, .completion_ordinary_producer = transaction.prepare.ordinary_producer, .completion_legacy_producer = transaction.prepare.legacy_producer, .completion_source_purpose = transaction.prepare.source_purpose, .completion_source_scope = transaction.prepare.source_scope, .completion_source_checkpoint = transaction.prepare.source_checkpoint };
+        var request: @This() = .{ .replication_source_permit = transaction.prepare.replication_source_permit, .external_decision_owner = transaction.prepare.external_decision_owner, .external_activation = transaction.prepare.external_activation, .external_vote_admitted_at_ns = transaction.prepare.external_vote_admitted_at_ns, .document_revision_handoff = transaction.prepare.document_revision_handoff, .publication_capture = transaction.prepare.publication_capture, .completion_owner = transaction.prepare.completion_owner, .completion_ordinary_producer = transaction.prepare.ordinary_producer, .completion_legacy_producer = transaction.prepare.legacy_producer, .completion_source_purpose = transaction.prepare.source_purpose, .completion_source_scope = transaction.prepare.source_scope, .completion_source_checkpoint = transaction.prepare.source_checkpoint };
         inline for (@typeInfo(@This()).@"struct".field_names) |name| {
-            if (comptime std.mem.eql(u8, name, "replication_source_permit") or std.mem.eql(u8, name, "external_decision_owner") or std.mem.eql(u8, name, "external_activation") or std.mem.eql(u8, name, "document_revision_handoff") or std.mem.eql(u8, name, "publication_capture") or std.mem.eql(u8, name, "completion_owner") or std.mem.eql(u8, name, "completion_ordinary_producer") or std.mem.eql(u8, name, "completion_legacy_producer") or std.mem.eql(u8, name, "completion_source_purpose") or std.mem.eql(u8, name, "completion_source_scope") or std.mem.eql(u8, name, "completion_source_checkpoint") or std.mem.eql(u8, name, "source_admission") or std.mem.eql(u8, name, "completion_input_digest")) continue;
+            if (comptime std.mem.eql(u8, name, "replication_source_permit") or std.mem.eql(u8, name, "external_decision_owner") or std.mem.eql(u8, name, "external_activation") or std.mem.eql(u8, name, "external_vote_admitted_at_ns") or std.mem.eql(u8, name, "document_revision_handoff") or std.mem.eql(u8, name, "publication_capture") or std.mem.eql(u8, name, "completion_owner") or std.mem.eql(u8, name, "completion_ordinary_producer") or std.mem.eql(u8, name, "completion_legacy_producer") or std.mem.eql(u8, name, "completion_source_purpose") or std.mem.eql(u8, name, "completion_source_scope") or std.mem.eql(u8, name, "completion_source_checkpoint") or std.mem.eql(u8, name, "source_admission") or std.mem.eql(u8, name, "completion_input_digest")) continue;
             if (!@hasField(BatchRequest, name)) @compileError("transaction intent field requires batch transport: " ++ name);
             @field(request, name) = @field(batch, name);
         }
@@ -4830,7 +4848,32 @@ pub const IndexRepairWake = union(enum) {
 /// Exact ordered mutation receipt persisted atomically with primary effects.
 /// One borrowed, synchronous native resolution authority. Ordered replay
 /// supplies its own receipt; public commit bodies cannot construct this value.
+pub const CompletionRelease = struct {
+    decision_owner: @import("../transactions.zig").ExternalDecisionOwner,
+    certificate_digest: @import("../transaction_completion.zig").Digest,
+
+    pub fn validate(self: @This(), owner: @import("../transaction_completion.zig").RoutedOwner) !void {
+        try self.decision_owner.validate();
+        try owner.validate();
+        if (!std.mem.eql(u8, &self.decision_owner.metadata_incarnation, &owner.metadata_incarnation) or
+            std.mem.allEqual(u8, &self.certificate_digest, 0)) return error.InvalidHistoryAdmission;
+    }
+};
+
+pub const CompletionCollectionAuthority = union(enum) {
+    external: CompletionRelease,
+    ordinary: @import("../transaction_completion.zig").OrdinaryRelease,
+
+    pub fn validate(self: @This(), owner: @import("../transaction_completion.zig").RoutedOwner) !void {
+        switch (self) {
+            inline else => |binding| try binding.validate(owner),
+        }
+    }
+};
+
 pub const ExternalTransactionBegin = struct {
+    completion_admission: ?[]const u8 = null,
+    completion_owner: ?@import("../transaction_completion.zig").RoutedOwner = null,
     document_revision_scope: ?@import("../document_revision_reservation.zig").Scope = null,
     sql_locks: ?@import("../pessimistic_lock/transaction.zig").Ref = null,
     txn_id: TxnId,
@@ -4845,6 +4888,7 @@ pub const ExternalTransactionBegin = struct {
 };
 
 pub const ExternalTransactionResolution = struct {
+    completion_owner: ?@import("../transaction_completion.zig").RoutedOwner = null,
     replication_source_permit: ?@import("../../api/replication_source_apply.zig").Permit = null,
     txn_id: TxnId,
     owner: @import("../transactions.zig").ExternalDecisionOwner,

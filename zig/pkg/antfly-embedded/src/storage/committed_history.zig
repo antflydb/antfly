@@ -161,13 +161,28 @@ pub const MergeCut = struct {
         transition: u64,
         receiver_group: u64,
         root_generation: u64,
+        require_completion_drain: bool = false,
+
+        pub fn jsonStringify(self: Request, stream: anytype) @TypeOf(stream.*).Error!void {
+            try stream.beginObject();
+            inline for (.{ "namespace", "transition", "receiver_group", "root_generation" }) |field| {
+                try stream.objectField(field);
+                try stream.write(@field(self, field));
+            }
+            if (self.require_completion_drain) {
+                try stream.objectField("require_completion_drain");
+                try stream.write(true);
+            }
+            try stream.endObject();
+        }
 
         pub fn matches(self: Request, cut: MergeCut) bool {
             return cut.term != 0 and cut.index != 0 and cut.reclaimed <= cut.latest and
                 std.mem.eql(u8, &self.namespace, &cut.namespace) and self.transition == cut.transition and
                 self.receiver_group == cut.receiver_group and self.root_generation == cut.root_generation and
                 cut.floor != null and cut.floor.? <= cut.latest and cut.active_consumers != null and
-                cut.active_consumers.? <= max_consumers and cut.outstanding_reservations != null;
+                cut.active_consumers.? <= max_consumers and cut.outstanding_reservations != null and
+                self.require_completion_drain == (cut.ordinary_completion_drained != null);
         }
     };
     pub const OrderedRead = struct { request: Request, minimum_applied_index: u64 };
@@ -188,10 +203,23 @@ pub const MergeCut = struct {
     floor: ?u64 = null,
     active_consumers: ?u8 = null,
     outstanding_reservations: ?u64 = null,
+    ordinary_completion_drained: ?bool = null,
+
+    pub fn jsonStringify(self: MergeCut, stream: anytype) @TypeOf(stream.*).Error!void {
+        try stream.beginObject();
+        inline for (@typeInfo(MergeCut).@"struct".field_names) |field| {
+            if (!std.mem.eql(u8, field, "ordinary_completion_drained") or self.ordinary_completion_drained != null) {
+                try stream.objectField(field);
+                try stream.write(@field(self, field));
+            }
+        }
+        try stream.endObject();
+    }
 
     pub fn retirementReady(self: MergeCut) bool {
         return self.active_consumers == 0 and self.outstanding_reservations == 0 and
-            self.floor != null and self.floor.? >= self.latest;
+            self.floor != null and self.floor.? >= self.latest and
+            (self.ordinary_completion_drained orelse true);
     }
 
     pub fn admissionFenced(txn: anytype) !bool {
@@ -238,6 +266,47 @@ pub const MergeCut = struct {
     }
 };
 
+test "docstore committed history merge retirement requires a qualified ordinary completion drain" {
+    const a = std.testing.allocator;
+    var request: MergeCut.Request = .{ .namespace = @splat(1), .transition = 2, .receiver_group = 3, .root_generation = 4 };
+    var cut: MergeCut = .{
+        .namespace = request.namespace,
+        .transition = request.transition,
+        .receiver_group = request.receiver_group,
+        .root_generation = request.root_generation,
+        .term = 5,
+        .index = 6,
+        .latest = 7,
+        .reclaimed = 7,
+        .reserved_bytes = 0,
+        .floor = 7,
+        .active_consumers = 0,
+        .outstanding_reservations = 0,
+    };
+    try std.testing.expect(request.matches(cut));
+    try std.testing.expect(cut.retirementReady());
+    const legacy_request = try std.json.Stringify.valueAlloc(a, request, .{});
+    defer a.free(legacy_request);
+    const legacy_cut = try std.json.Stringify.valueAlloc(a, cut, .{});
+    defer a.free(legacy_cut);
+    try std.testing.expect(std.mem.indexOf(u8, legacy_request, "require_completion_drain") == null);
+    try std.testing.expect(std.mem.indexOf(u8, legacy_cut, "ordinary_completion_drained") == null);
+
+    request.require_completion_drain = true;
+    try std.testing.expect(!request.matches(cut));
+    cut.ordinary_completion_drained = false;
+    try std.testing.expect(request.matches(cut));
+    try std.testing.expect(!cut.retirementReady());
+    cut.ordinary_completion_drained = true;
+    try std.testing.expect(cut.retirementReady());
+    const encoded = try std.json.Stringify.valueAlloc(a, cut, .{});
+    defer a.free(encoded);
+    const parsed = try std.json.parseFromSlice(MergeCut, a, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expect(request.matches(parsed.value));
+    try std.testing.expect(parsed.value.retirementReady());
+}
+
 pub const consumer_authority_key = "\x00\x00__committed_history__:consumer_authority";
 const record_prefix = "\x00\x00__committed_history__:record:";
 const chunk_prefix = "\x00\x00__committed_history__:chunk:";
@@ -248,6 +317,8 @@ const completion = frame.completion;
 const completion_credit_prefix = "\x00\x00__committed_history__:completion_credit:";
 pub const completion_certificate_prefix = "\x00\x00__committed_history__:completion_certificate:";
 const completion_retained_prefix = "\x00\x00__committed_history__:completion_retained:";
+const ordinary_release_progress_prefix = "\x00\x00__committed_history__:ordinary_release_progress:";
+const completion_release_prefix = "\x00\x00__committed_history__:completion_release:";
 const publication_wire = @import("history_publication_wire.zig");
 pub const CompletionPublicationPosition = publication_wire.CompletionPublicationPosition;
 pub const CompletionPublication = publication_wire.CompletionPublication;
@@ -643,6 +714,14 @@ fn reclaimNext(txn: anytype, state: *State) !void {
     try txn.delete(&recordKey(sequence));
     state.retained_bytes = std.math.sub(u64, state.retained_bytes, stored) catch return error.HistoryCorrupt;
     state.reclaimed = sequence;
+    const released = completionReleaseKey(sequence);
+    if (try optional(txn, &released)) |raw| {
+        if (raw.len != 16) return error.HistoryCorrupt;
+        const id: [16]u8 = raw[0..16].*;
+        const retained = try RetainedCompletion.decode((try optional(txn, &completionRetainedKey(id))) orelse return error.HistoryCorrupt);
+        try reclaimReleasedCompletion(txn, state, id, retained);
+        try txn.delete(&released);
+    }
 }
 
 fn reclaimForCapacity(txn: anytype, state: *State, additional_bytes: u64) !void {
@@ -720,12 +799,176 @@ const RetainedCompletion = struct {
     }
 };
 
+fn completionReleaseKey(sequence: u64) [completion_release_prefix.len + 8]u8 {
+    var out: [completion_release_prefix.len + 8]u8 = undefined;
+    @memcpy(out[0..completion_release_prefix.len], completion_release_prefix);
+    std.mem.writeInt(u64, out[completion_release_prefix.len..], sequence, .big);
+    return out;
+}
+
+fn CompletionWriterType(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .pointer => |info| info.child,
+        else => T,
+    };
+}
+
+fn reclaimReleasedCompletion(txn: anytype, state: *State, id: [16]u8, retained: RetainedCompletion) !void {
+    const index_key = completionPublicationKey(retained.position.index);
+    const indexed = try CompletionPublicationRecord.decode((try optional(txn, &index_key)) orelse return error.HistoryCorrupt);
+    if (!std.mem.eql(u8, &id, &indexed.transaction_id) or
+        !std.mem.eql(u8, &retained.certificate_digest, &indexed.certificate_digest) or
+        !std.meta.eql(retained.position, indexed.position)) return error.HistoryCorrupt;
+    const plan_key = completion.admission_prefix.* ++ id;
+    const receipt_key = completion.resolutionKey(id);
+    const certificate_key = completionCertificateKey(id);
+    const retained_key = completionRetainedKey(id);
+    if (comptime @hasDecl(CompletionWriterType(@TypeOf(txn)), "deleteCollectedCompletionPlan"))
+        try txn.deleteCollectedCompletionPlan(id)
+    else
+        try txn.delete(&plan_key);
+    try txn.delete(&receipt_key);
+    try txn.delete(&certificate_key);
+    try txn.delete(&retained_key);
+    const progress_key = ordinary_release_progress_prefix.* ++ id;
+    if (try optional(txn, &progress_key) != null) try txn.delete(&progress_key);
+    try txn.delete(&index_key);
+    state.retained_bytes = std.math.sub(u64, state.retained_bytes, retained.bytes) catch return error.HistoryCorrupt;
+}
+
+pub const OrdinaryCompletionRelease = completion.OrdinaryRelease;
+
+/// Metadata ordered release after all original participants have published.
+pub fn releaseCompletion(a: A, txn: anytype, namespace: frame.Namespace, owner: completion.RoutedOwner, id: [16]u8, custody: @import("db/types.zig").CompletionRelease) !void {
+    try releaseCompletionWithCustody(a, txn, namespace, owner, id, .{ .external = custody });
+}
+
+/// A Raft caller must qualify the durable all-participant publication at the
+/// original coordinator before ordering this release at any recipient.
+pub fn releaseOrdinaryCompletion(a: A, txn: anytype, namespace: frame.Namespace, owner: completion.RoutedOwner, id: [16]u8, custody: OrdinaryCompletionRelease) !void {
+    try custody.validate(owner);
+    try releaseCompletionWithCustody(a, txn, namespace, owner, id, .{ .ordinary = custody });
+}
+
+fn releaseCompletionWithCustody(a: A, txn: anytype, namespace: frame.Namespace, owner: completion.RoutedOwner, id: [16]u8, custody: @import("db/types.zig").CompletionCollectionAuthority) !void {
+    var state = (try load(txn)) orelse return error.HistoryResynchronizationRequired;
+    try requireNamespace(txn, state, namespace);
+    if (!std.mem.eql(u8, &namespace, &owner.namespace)) return error.InvalidParticipant;
+    const raw = (try optional(txn, &completionRetainedKey(id))) orelse {
+        if (try optional(txn, &completionCertificateKey(id)) != null or
+            try optional(txn, &(completion.admission_prefix.* ++ id)) != null or
+            try optional(txn, &completion.resolutionKey(id)) != null) return error.SourceOutcomeUnresolved;
+        return;
+    };
+    const retained = try RetainedCompletion.decode(raw);
+    const expected_digest = switch (custody) {
+        inline else => |binding| binding.certificate_digest,
+    };
+    if (!std.mem.eql(u8, &retained.certificate_digest, &expected_digest)) return error.DecisionConflict;
+    const record = (try optional(txn, &(completion.record_prefix.* ++ id))) orelse return error.HistoryCorrupt;
+    const receipt_raw = (try optional(txn, &completion.resolutionKey(id))) orelse return error.HistoryCorrupt;
+    var receipt = try completion.parseStoredResolution(a, receipt_raw);
+    defer receipt.deinit();
+    const resolution = receipt.value.resolution;
+    if (!std.mem.eql(u8, &resolution.namespace, &namespace) or
+        !std.mem.eql(u8, &resolution.owner_fence, &owner.digest())) return error.InvalidParticipant;
+    const transactions = @import("transactions.zig");
+    switch (custody) {
+        .external => |binding| try transactions.requireExternalCompletionRelease(record, binding.decision_owner, resolution.commit_version),
+        .ordinary => |binding| {
+            const raw_admission = (try optional(txn, &(completion.admission_prefix.* ++ id))) orelse return error.HistoryCorrupt;
+            var parsed = try completion.parseAdmission(a, raw_admission);
+            defer parsed.deinit();
+            const admission = parsed.value.admission;
+            const local = try admission.memberForOwner(owner);
+            if (!std.mem.eql(u8, &admission.transaction_id, &id) or
+                !std.mem.eql(u8, &parsed.value.digest, &binding.admission_digest) or
+                !std.meta.eql(try admission.coordinatorOwner(), binding.coordinator)) return error.SourceTransactionIdentityConflict;
+            try resolution.validate(try admission.manifest(binding.commit_version));
+            const coordinator = admission.isCoordinator(local);
+            try transactions.requireOrdinaryCompletionRelease(a, txn, id, record, binding.commit_version, coordinator);
+            if (coordinator) {
+                const followers = admission.participants.len - 1;
+                const released = try ordinaryCompletionReleaseProgress(txn, id);
+                if (released > followers) return error.HistoryCorrupt;
+                if (binding.progress) |advance| {
+                    if (advance.released > followers) return error.InvalidHistoryAdmission;
+                    if (released >= advance.released) return;
+                    if (released != advance.expected) return error.SourceOutcomeUnresolved;
+                    const key = ordinary_release_progress_prefix.* ++ id;
+                    var value: [2]u8 = undefined;
+                    std.mem.writeInt(u16, &value, advance.released, .big);
+                    try txn.put(&key, &value);
+                    return;
+                }
+                if (released != followers) return error.SourceOutcomeUnresolved;
+            }
+        },
+    }
+    try stageCompletionCollection(txn, &state, id, retained, resolution.outcome);
+}
+
+fn ordinaryCompletionReleaseProgress(txn: anytype, id: [16]u8) !u16 {
+    const key = ordinary_release_progress_prefix.* ++ id;
+    const raw = (try optional(txn, &key)) orelse return 0;
+    if (raw.len != 2) return error.HistoryCorrupt;
+    return std.mem.readInt(u16, raw[0..2], .big);
+}
+
+/// A donor cannot lose its exact route while a retained ordinary certificate
+/// still depends on cohort release. A scheduled collection survives until
+/// the already qualified consumer floor permits physical reclamation.
+pub fn hasUnreleasedOrdinaryCompletions(a: A, txn: anytype) !bool {
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var next = try cursor.seekAtOrAfter(completion_retained_prefix);
+    while (next) |entry| : (next = try cursor.next()) {
+        if (!std.mem.startsWith(u8, entry.key, completion_retained_prefix)) break;
+        if (entry.key.len != completion_retained_prefix.len + 16) return error.HistoryCorrupt;
+        const id = entry.key[completion_retained_prefix.len..][0..16].*;
+        const record = (try optional(txn, &(completion.record_prefix.* ++ id))) orelse return error.HistoryCorrupt;
+        if (!try @import("transactions.zig").ordinaryCompletionOwnsCustody(record)) continue;
+        const raw = (try optional(txn, &completion.resolutionKey(id))) orelse return error.HistoryCorrupt;
+        var receipt = try completion.parseStoredResolution(a, raw);
+        defer receipt.deinit();
+        switch (receipt.value.resolution.outcome) {
+            .no_effect => return true,
+            .effects => |effects| {
+                const released = (try optional(txn, &completionReleaseKey(effects.sequence))) orelse return true;
+                if (!std.mem.eql(u8, released, &id)) return error.HistoryCorrupt;
+            },
+        }
+    }
+    return false;
+}
+
+fn stageCompletionCollection(txn: anytype, state: *State, id: [16]u8, retained: RetainedCompletion, outcome: completion.Outcome) !void {
+    const sequence = switch (outcome) {
+        .effects => |effects| effects.sequence,
+        .no_effect => 0,
+    };
+    if (sequence > state.latest) return error.HistoryCorrupt;
+    if (sequence > state.reclaimed) {
+        const key = completionReleaseKey(sequence);
+        if (try optional(txn, &key)) |prior| {
+            if (!std.mem.eql(u8, prior, &id)) return error.HistoryCorrupt;
+            return;
+        }
+        try txn.put(&key, &id);
+        return;
+    }
+    try reclaimReleasedCompletion(txn, state, id, retained);
+    try save(txn, state.*);
+}
+
 /// Trusted ordered owner publication only. The caller must authenticate every
 /// remote receipt through qualified original-owner reads before this reducer.
 /// The caller holds native apply admission and commits this transaction together
 /// with its ordered marker; failures require aborting the entire transaction.
 pub fn publishCompletion(a: A, txn: anytype, physical_namespace: frame.Namespace, physical_root_generation: u64, owner: completion.RoutedOwner, raw: []const u8, position: CompletionPublicationPosition, allow_create: bool) !CompletionPublication {
-    return completionPublication(a, txn, physical_namespace, physical_root_generation, owner, raw, position, allow_create, true);
+    var parsed = try completion.parse(a, raw);
+    defer parsed.deinit();
+    return completionPublication(a, txn, physical_namespace, physical_root_generation, owner, parsed.value, position, allow_create, true);
 }
 
 /// A read snapshot can verify the same immutable evidence without acquiring a
@@ -749,7 +992,24 @@ pub fn readCompletionPublication(a: A, txn: anytype, physical_namespace: frame.N
     defer certificate.deinit();
     const manifest = certificate.value.certificate.manifest;
     if (!std.mem.eql(u8, &manifest.transaction_id, &query.transaction_id) or !std.mem.eql(u8, &manifest.digest(), &query.manifest_digest) or manifest.commit_version != query.commit_version) return error.HistoryCorrupt;
-    return CompletionPublicationObservation.init(query, cut, try completionPublication(a, txn, physical_namespace, physical_root_generation, query.owner, raw, cut, false, false));
+    const published = try completionPublication(a, txn, physical_namespace, physical_root_generation, query.owner, certificate.value, cut, false, false);
+    if (query.version == 1) return CompletionPublicationObservation.init(query, cut, published);
+    const owner_fence = query.owner.digest();
+    const local = for (certificate.value.certificate.resolutions) |resolution| {
+        if (std.mem.eql(u8, &resolution.namespace, &query.owner.namespace) and
+            std.mem.eql(u8, &resolution.owner_fence, &owner_fence)) break resolution;
+    } else return error.HistoryCorrupt;
+    const staged = switch (local.outcome) {
+        .no_effect => false,
+        .effects => |effects| if (try optional(txn, &completionReleaseKey(effects.sequence))) |id|
+            std.mem.eql(u8, id, &query.transaction_id)
+        else
+            false,
+    };
+    return CompletionPublicationObservation.initWithRelease(query, cut, published, .{
+        .released_followers = try ordinaryCompletionReleaseProgress(txn, query.transaction_id),
+        .collection_staged = staged,
+    });
 }
 
 pub const FrameCompletion = struct {
@@ -826,16 +1086,14 @@ pub fn readProjectedFrameCompletion(a: A, txn: anytype, root_generation: u64, he
     return error.HistoryCorrupt;
 }
 
-fn completionPublication(a: A, txn: anytype, physical_namespace: frame.Namespace, physical_root_generation: u64, owner: completion.RoutedOwner, raw: []const u8, position: CompletionPublicationPosition, allow_create: bool, comptime writable: bool) !CompletionPublication {
+fn completionPublication(a: A, txn: anytype, physical_namespace: frame.Namespace, physical_root_generation: u64, owner: completion.RoutedOwner, parsed: completion.Envelope, position: CompletionPublicationPosition, allow_create: bool, comptime writable: bool) !CompletionPublication {
     try owner.validate();
     if (position.term == 0 or position.index == 0) return error.InvalidHistoryAdmission;
     if (!std.mem.eql(u8, &physical_namespace, &owner.namespace) or owner.root_generation != physical_root_generation) return error.HistoryResynchronizationRequired;
     var state = (try load(txn)) orelse return error.HistoryResynchronizationRequired;
     try requireNamespace(txn, state, physical_namespace);
     _ = try authority.require(txn, .raft, physical_namespace);
-    var parsed = try completion.parse(a, raw);
-    defer parsed.deinit();
-    const certificate = parsed.value.certificate;
+    const certificate = parsed.certificate;
     const manifest = certificate.manifest;
     try manifest.admission().requireRoutedOwner(owner);
     const id = manifest.transaction_id;
@@ -874,7 +1132,7 @@ fn completionPublication(a: A, txn: anytype, physical_namespace: frame.Namespace
     const publication_key = completionPublicationKey(position.index);
     const overhead = plan_key.len + receipt_key.len + certificate_key.len + retained_key.len + publication_key.len + CompletionPublicationRecord.encoded_len + RetainedCompletion.encoded_len + 128;
     const charge: u64 = std.math.add(u64, overhead, plan_raw.len + receipt_raw.len + canonical.len) catch return error.HistoryTooLarge;
-    const retained: RetainedCompletion = .{ .bytes = charge, .plan_bytes = plan_raw.len, .receipt_bytes = receipt_raw.len, .certificate_bytes = canonical.len, .position = position, .admission_digest = plan.value.digest, .certificate_digest = parsed.value.digest };
+    const retained: RetainedCompletion = .{ .bytes = charge, .plan_bytes = plan_raw.len, .receipt_bytes = receipt_raw.len, .certificate_bytes = canonical.len, .position = position, .admission_digest = plan.value.digest, .certificate_digest = parsed.digest };
     if (stored_certificate != null or stored_retained != null) {
         if (stored_certificate == null or stored_retained == null) return error.HistoryCorrupt;
         const previous = try RetainedCompletion.decode(stored_retained.?);

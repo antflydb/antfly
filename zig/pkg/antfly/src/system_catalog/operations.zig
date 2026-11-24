@@ -236,6 +236,7 @@ pub fn mutateSqlCatalog(svc: anytype, alloc: std.mem.Allocator, context: operati
     var locked = true;
     defer if (locked) svc.unlockCatalogMutation();
     try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    try preflightPublicationEnrollment(store, alloc, svc.metadata_group_id, command);
     try context.ensureActive();
     const receipt = try @import("../metadata/service.zig").proposeCatalogWithContext(svc, context, .{ .apply_system_catalog = bytes });
     svc.unlockCatalogMutation();
@@ -247,6 +248,16 @@ pub fn mutateSqlCatalog(svc: anytype, alloc: std.mem.Allocator, context: operati
         return error.MetadataMutationOutcomeUnknown;
     }
     return result;
+}
+
+pub fn preflightPublicationEnrollment(store: anytype, alloc: std.mem.Allocator, group: u64, command: storage.SystemCatalogCommand) !void {
+    if (command.sql_publication_ddl == null) return;
+    const preview = store.prepareSystemCatalogResult(alloc, group, command) catch |err| switch (err) {
+        // The reducer retains the nonce outcome for a stale catalog cut.
+        error.CatalogGenerationChanged => return,
+        else => return err,
+    };
+    alloc.free(preview);
 }
 
 pub fn mutateSqlNativeIndex(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("native_indexes.zig").Mutation) ![]u8 {
@@ -3159,7 +3170,7 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
         .sql_restore_progress => |command| {
             if (!context.setting_admin) return error.Forbidden;
             const control = @import("../metadata/restore_coordinator_control.zig");
-            try @import("../metadata/service.zig").ensureCatalogRestoreDecoderWithContext(svc, context, true);
+            try @import("../metadata/service.zig").ensureCatalogRestoreDecoderWithContext(svc, context, command.action);
 
             try control.acceptCatalogProgress(svc, alloc, command, context);
             return alloc.dupe(u8, "true");
@@ -3167,7 +3178,7 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
         .sql_restore_reserve => |request| {
             if (!context.setting_admin) return error.Forbidden;
             const control = @import("../metadata/restore_coordinator_control.zig");
-            try @import("../metadata/service.zig").ensureCatalogRestoreDecoderWithContext(svc, context, false);
+            try @import("../metadata/service.zig").ensureCatalogRestoreDecoderWithContext(svc, context, null);
 
             var job = try control.reserveCatalog(svc, alloc, request.plan, request.participant, context);
             defer job.deinit();

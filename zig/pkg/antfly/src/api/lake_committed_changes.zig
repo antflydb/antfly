@@ -46,10 +46,10 @@ pub fn read(a: A, committed: ingestion.CommittedWalGroup, metadata: CatalogTable
         const entry = try seen.getOrPut(identity);
         if (entry.found_existing) continue;
         const before = if (interval.parent) |parent|
-            try lookup(a, before_table.?, parent, metadata, batch.key_fields, change.row, context, options)
+            try lookup(a, before_table.?, parent, metadata, batch.key_fields, change.row, false, context, options)
         else
             null;
-        const after = try lookup(a, after_table, interval.snapshot, metadata, batch.key_fields, change.row, context, options);
+        const after = try lookup(a, after_table, interval.snapshot, metadata, batch.key_fields, change.row, false, context, options);
         if (before == null and after == null) continue;
         try output.append(a, .{ .key = try a.dupe(u8, identity), .before = before, .after = after });
     }
@@ -110,6 +110,8 @@ pub const GroupCache = struct {
         refs: std.atomic.Value(usize) = .init(1),
         arena: std.heap.ArenaAllocator,
         group: IndexedGroup,
+        row_window_hint: std.atomic.Value(usize) = .init(64),
+        key_window_hint: std.atomic.Value(usize) = .init(64),
         used: u64 = 0,
 
         fn release(self: *Owner) void {
@@ -542,12 +544,48 @@ pub fn Provider(comptime Schemas: type, comptime Policy: type) type {
         fn boundedPage(self: *Self, a: A, state: control.State, selector: control.Table, next: CommittedGroup, start: control.Position, bound: ?control.Position, limits: delivery.Limits, request: Context) !Page {
             const batch = next.indexed.committed.group.batch;
             const from = start.event / 2;
-            const stop = if (bound) |target|
+            var stop = if (bound) |target|
                 if (target.sequence == start.sequence) target.event / 2 else batch.changes.len
             else
                 @min(batch.changes.len, @as(usize, from) + @min(limits.events, 64));
             if (from > stop or stop > batch.changes.len or stop - from > 64)
                 return error.ChangefeedResynchronizationRequired;
+            const keys_only = if (comptime @hasDecl(Policy, "requiresRowImages"))
+                state.definition.?.projection != .rows and selector.predicates.len == 0 and
+                    !try self.policy.requiresRowImages(selector.table_id)
+            else
+                false;
+            const cache_hint = if (bound == null)
+                if (next.cached) |cached| (if (keys_only) &cached.key_window_hint else &cached.row_window_hint) else null
+            else
+                null;
+            const hint = if (cache_hint) |cached| cached.load(.monotonic) else 64;
+            stop = @min(stop, from + hint);
+            var reduced = false;
+            while (true) {
+                const rendered = self.boundedPageWindow(a, state, selector, next, start, from, stop, keys_only, bound != null, limits, request) catch |err| switch (err) {
+                    error.IcebergChangefeedImageBudgetExceeded => {
+                        if (bound != null or stop - from <= 1) return error.ChangefeedBackpressure;
+                        const smaller = (stop - from) / 2;
+                        if (cache_hint) |cached| _ = cached.fetchMin(smaller, .monotonic);
+                        stop = from + smaller;
+                        reduced = true;
+                        continue;
+                    },
+                    else => return err,
+                };
+                if (bound == null and !reduced and hint < 64 and stop - from == hint) {
+                    if (cache_hint) |cached| {
+                        const wider = @min(64, hint + @max(1, hint / 8));
+                        _ = cached.cmpxchgStrong(hint, wider, .monotonic, .monotonic);
+                    }
+                }
+                return rendered;
+            }
+        }
+
+        fn boundedPageWindow(self: *Self, a: A, state: control.State, selector: control.Table, next: CommittedGroup, start: control.Position, from: usize, stop: usize, keys_only: bool, replaying: bool, limits: delivery.Limits, request: Context) !Page {
+            const batch = next.indexed.committed.group.batch;
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
             const scratch = arena.allocator();
@@ -565,10 +603,16 @@ pub fn Provider(comptime Schemas: type, comptime Policy: type) type {
                 if (entry) |key| try keys.append(scratch, key);
             }
             const prior_images = if (next.indexed.committed.interval.parent) |parent|
-                try cursor.lookupSnapshotRows(scratch, next.before_table.?, parent, self.metadata, batch.key_fields, keys.items, request, self.options)
+                cursor.lookupSnapshotRows(scratch, next.before_table.?, parent, self.metadata, batch.key_fields, keys.items, keys_only, request, self.options) catch |err| switch (err) {
+                    error.IcebergChangefeedImageBudgetExceeded => if (replaying or stop - from == 1) null else return err,
+                    else => return err,
+                }
             else
                 null;
-            const committed_images = try cursor.lookupSnapshotRows(scratch, next.after_table, next.indexed.committed.interval.snapshot, self.metadata, batch.key_fields, keys.items, request, self.options);
+            const committed_images = cursor.lookupSnapshotRows(scratch, next.after_table, next.indexed.committed.interval.snapshot, self.metadata, batch.key_fields, keys.items, keys_only, request, self.options) catch |err| switch (err) {
+                error.IcebergChangefeedImageBudgetExceeded => if (replaying or stop - from == 1) null else return err,
+                else => return err,
+            };
 
             var events: std.ArrayList(wire_json.Raw) = .empty;
             var occupied = overhead;
@@ -584,13 +628,13 @@ pub fn Provider(comptime Schemas: type, comptime Policy: type) type {
                 const before = if (prior_images) |images|
                     images[index]
                 else if (next.indexed.committed.interval.parent) |parent|
-                    try lookup(row_alloc, next.before_table.?, parent, self.metadata, batch.key_fields, key.row, request, self.options)
+                    try lookup(row_alloc, next.before_table.?, parent, self.metadata, batch.key_fields, key.row, keys_only, request, self.options)
                 else
                     null;
                 const after = if (committed_images) |images|
                     images[index]
                 else
-                    try lookup(row_alloc, next.after_table, next.indexed.committed.interval.snapshot, self.metadata, batch.key_fields, key.row, request, self.options);
+                    try lookup(row_alloc, next.after_table, next.indexed.committed.interval.snapshot, self.metadata, batch.key_fields, key.row, keys_only, request, self.options);
                 const authorized = try self.policy.imagesFor(row_alloc, selector.table_id, identity, before, after, request);
                 const effect = (try projection.project(row_alloc, selector, mode, authorized.before, authorized.after)) orelse continue;
                 const event: native.Event = .{
@@ -607,13 +651,13 @@ pub fn Provider(comptime Schemas: type, comptime Policy: type) type {
                 const total = occupied +| bytes +| @as(u64, @intFromBool(events.items.len != 0));
                 if (total > limits.bytes or events.items.len == limits.events) {
                     if (ordinal == from and overhead +| bytes > delivery.max_page_bytes) return error.ChangefeedEventTooLarge;
-                    if (bound != null or ordinal == from) return error.ChangefeedBackpressure;
+                    if (replaying or ordinal == from) return error.ChangefeedBackpressure;
                     break;
                 }
                 try events.append(scratch, .{ .value = try std.json.Stringify.valueAlloc(scratch, event, .{}) });
                 occupied = total;
             }
-            if (bound != null and ordinal != stop) return error.ChangefeedBackpressure;
+            if (replaying and ordinal != stop) return error.ChangefeedBackpressure;
             const complete = ordinal == batch.changes.len;
             const visible = start.event % 2 != 0 or events.items.len != 0;
             const next_offset = @as(u32, @intCast(ordinal * 2)) + @intFromBool(visible);

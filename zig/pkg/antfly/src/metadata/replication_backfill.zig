@@ -2174,6 +2174,16 @@ pub const StreamingReplicationRunner = struct {
         if (state.closing or state.retired or (!bootstrap_phase and !handover_phase and !phaseAllowsStreaming(status.phase))) return;
         if (!std.meta.eql(scope.provider, try nativeSourceProviderBinding(status)))
             return error.ReplicationCutoverAuthorityLost;
+        if (state.pending_no_admission_receipt != null and state.artifact_control.?.current == null) {
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            var config = try parseReplicationSourceConfig(a, table.name, table.replication_sources_json, scope.source_ordinal, self.destination_authorizer);
+            defer config.deinit(a);
+            try self.checkpointWork();
+            try callCheckCutoverAuthority(service, table.replication_sources_json, status);
+            return @import("../api/source_destination_completion.zig").replanRetained(service, admission, a, state, control.digest(table.replication_sources_json), snapshot, context);
+        }
         if (state.accepted.sequence == 0 or control.isNativeSnapshotScopedCheckpoint(state.accepted.checkpoint)) {
             const checkpoint = state.native_bootstrap_checkpoint orelse return error.ReplicationCutoverAuthorityLost;
             const baseline = if (handover_phase) control.legacyHandoverCheckpoint(status) orelse return error.ReplicationCutoverAuthorityLost else status.prepared_checkpoint;

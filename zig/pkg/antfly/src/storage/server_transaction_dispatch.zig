@@ -55,8 +55,14 @@ pub fn applyReplicatedTransactionMutationAtRaftEntry(
     req: db_mod.types.BatchRequest,
     raft_entry: db_mod.OrderedApplyReceipt,
 ) !void {
+    const adapter = @import("server_db_adapter.zig");
+    if (req.transaction == null) return error.InvalidBatchRequest;
+    // The Raft entry is immutable. The native watermark can outlive the
+    // transaction record, participant ACKs, and completion certificate after
+    // history collection. Skip replay before dispatch consults any of them.
+    if (db.orderedMutationAlreadyApplied(raft_entry) catch |err| return adapter.normalizeOrderedApplyError(err)) return;
     applyReplicatedTransactionMutationInternal(alloc, db, table_name, group_id, req, .none, raft_entry) catch |err|
-        return @import("server_db_adapter.zig").normalizeOrderedApplyError(err);
+        return adapter.normalizeOrderedApplyError(err);
 }
 
 pub fn applyReplicatedTransactionMutationInternal(
@@ -105,6 +111,24 @@ pub fn applyReplicatedTransactionMutationInternal(
                 defer plan.deinit();
                 const member = try plan.value.admission.memberForOwner(binding);
                 if (!std.mem.eql(u8, member.locator, local_participant)) return error.InvalidParticipant;
+                if (begin.external_decision_owner) |owner| {
+                    if (!begin.retain_terminal or begin.source_purpose != null or begin.ordinary_producer or begin.legacy_producer) return error.InvalidBatchRequest;
+                    _ = try db.beginExternalTransaction(.{
+                        .completion_admission = raw,
+                        .completion_owner = binding,
+                        .txn_id = begin.txn_id,
+                        .owner = owner,
+                        .sql_locks = begin.sql_locks,
+                        .document_revision_scope = begin.document_revision_scope,
+                        .begin_timestamp = begin.begin_timestamp,
+                        .created_at_ns = begin.created_at_ns,
+                        .participants = begin.participants,
+                        .coordinator = plan.value.admission.isCoordinator(member),
+                        .ordered_receipt = entry,
+                        .admission_timestamp_ns = req.timestamp_ns,
+                    });
+                    return;
+                }
                 if (begin.source_purpose) |purpose| {
                     if (!begin.retain_terminal) return error.InvalidBatchRequest;
                     if (begin.source_scope) |scope|
@@ -176,13 +200,14 @@ pub fn applyReplicatedTransactionMutationInternal(
             if (prepare.replication_source_permit != null and raft_entry == null) return error.UnsupportedReplicationParticipant;
             var intents = try db_mod.types.TransactionIntentRequest.fromBatch(req);
             if (prepare.completion_owner != null) {
-                if (prepare.external_decision_owner != null or prepare.replication_source_permit != null) return error.InvalidBatchRequest;
+                if (prepare.replication_source_permit != null) return error.InvalidBatchRequest;
                 const wire = @import("antfly_local_sources").api_internal_batch;
                 const completion = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire.completion;
                 const encoded = try wire.completionPrepareInput(alloc, req);
                 defer alloc.free(encoded);
                 const namespace = @import("antfly_local_sources").storage_db_online_source_contract.namespaceBytes(db.core.identity_namespace);
                 intents.completion_input_digest = completion.preparedInputDigest(namespace, encoded);
+                if (prepare.external_decision_owner != null) intents.completion_ordinary_producer = true;
             }
             if (raft_entry) |entry|
                 try db.writeReplicatedTransactionAtOrderedReceipt(prepare.txn_id, intents, entry)
@@ -202,9 +227,22 @@ pub fn applyReplicatedTransactionMutationInternal(
                     else => return err,
                 };
                 if (resolve.completion_owner) |binding| {
-                    if (resolve.external_decision_owner != null) return error.InvalidBatchRequest;
                     try @import("antfly_local_sources").api_internal_batch.validateCompletionControlRequest(req);
                     if (req.restore_staging_scope != null or binding.group_id != group_id) return error.TopologyChanged;
+                    if (resolve.external_decision_owner) |owner| {
+                        if (resolve.source_purpose != null or resolve.source_scope != null) return error.InvalidBatchRequest;
+                        return db.resolveExternalTransaction(.{
+                            .completion_owner = binding,
+                            .txn_id = resolve.txn_id,
+                            .owner = owner,
+                            .status = resolve.status,
+                            .commit_version = resolve.commit_version,
+                            .sync_level = req.sync_level,
+                            .visibility_cancellation = visibility_cancellation,
+                            .ordered_receipt = entry,
+                            .resolved_participant = if (defer_coordinator_ack) null else local_participant,
+                        });
+                    }
                     if (resolve.source_purpose) |purpose| {
                         if (resolve.source_scope) |scope|
                             try db.resolveReplicatedScopedSourceCompletionTransactionAtOrderedReceipt(resolve.txn_id, resolve.status, resolve.commit_version, entry, if (defer_coordinator_ack) null else local_participant, binding, purpose, scope)
@@ -261,7 +299,15 @@ pub fn applyReplicatedTransactionMutationInternal(
             try @import("antfly_local_sources").api_internal_batch.validateCompletionControlRequest(req);
             const entry = raft_entry orelse return error.ChangefeedCapabilityUnsupported;
             if (publication.completion_owner.group_id != group_id) return error.TopologyChanged;
-            _ = try db.publishReplicatedCompletionCertificate(publication.certificate, publication.completion_owner, entry);
+            if (publication.ordinary_release) |release| {
+                if (publication.certificate.len != 0 or publication.release != null) return error.InvalidBatchRequest;
+                try db.releaseReplicatedCompletionCertificate(publication.txn_id, publication.completion_owner, .{ .ordinary = release }, entry);
+            } else if (publication.release) |release| {
+                if (publication.certificate.len != 0) return error.InvalidBatchRequest;
+                try db.releaseReplicatedCompletionCertificate(publication.txn_id, publication.completion_owner, .{ .external = release }, entry);
+            } else {
+                _ = try db.publishReplicatedCompletionCertificate(publication.certificate, publication.completion_owner, entry);
+            }
         },
         .acknowledge => |ack| (if (ack.external_decision_owner) |owner|
             db.markExternalTransactionParticipantsResolved(ack.txn_id, &.{ack.participant}, owner)

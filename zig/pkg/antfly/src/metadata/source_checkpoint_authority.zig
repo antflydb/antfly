@@ -52,7 +52,111 @@ pub const Spec = struct {
             !std.mem.eql(u8, &self.owner.namespace, &captured.namespace) or
             self.owner.group_id != captured.group_id or self.owner.root_generation != captured.root_generation) return error.SourceBindingConflict;
     }
+    pub fn requireSuccessor(self: Spec, successor: Spec) !void {
+        try self.validate();
+        try successor.validate();
+        const from = try native.Basis.fromOwner(self.owner);
+        const to = try native.Basis.fromOwner(successor.owner);
+        if (self.retirement != null or successor.retirement != null or std.meta.eql(from, to) or
+            from.metadata_group_id != to.metadata_group_id or !std.meta.eql(from.metadata_incarnation, to.metadata_incarnation) or
+            !std.meta.eql(self.binding, successor.binding) or !std.meta.eql(self.owner.table_binding, successor.owner.table_binding) or
+            !std.mem.eql(u8, self.table_name, successor.table_name)) return error.SourceBindingConflict;
+    }
+    pub fn samePhysicalAuthority(self: Spec, other: Spec) bool {
+        self.requireOwner(other.owner) catch return false;
+        return std.meta.eql(self.binding, other.binding) and
+            std.meta.eql(self.owner.table_binding, other.owner.table_binding) and
+            std.mem.eql(u8, self.table_name, other.table_name);
+    }
     pub fn sameAuthority(self: Spec, other: Spec) bool {
         return std.mem.eql(u8, &self.binding, &other.binding) and std.mem.eql(u8, self.table_name, other.table_name) and std.meta.eql(self.owner, other.owner);
+    }
+};
+
+const local = @import("antfly_local_sources");
+const native = local.storage_source_scope;
+const ordered = local.storage_source_scope_ordered;
+pub const successor_protocol_version: u16 = 256;
+
+pub const TransferIntent = struct {
+    target: Spec,
+    online_merge_id: ?u64 = null,
+
+    pub fn validate(self: TransferIntent) !void {
+        try self.target.validate();
+        if (self.online_merge_id == 0) return error.InvalidSourceControl;
+    }
+};
+
+/// Durable authorization to install a closed donor on one physical successor.
+pub const Preparation = struct {
+    successor: Spec,
+    transfer: ordered.control.InstallCheckpoint,
+
+    pub fn validate(self: Preparation) !void {
+        try self.successor.validate();
+        try self.transfer.validate();
+        const donor = self.transfer.donor;
+        const successor = try native.Basis.fromOwner(self.successor.owner);
+        if (self.successor.retirement != null or !std.meta.eql(self.successor.binding, donor.spec.binding) or
+            std.meta.eql(successor, donor.spec.checkpoint_owner) or successor.metadata_group_id != donor.spec.checkpoint_owner.metadata_group_id or
+            !std.meta.eql(successor.metadata_incarnation, donor.spec.checkpoint_owner.metadata_incarnation)) return error.SourceBindingConflict;
+    }
+
+    pub fn requirePrior(self: Preparation, prior: Spec) !void {
+        try self.validate();
+        if (prior.retirement != null or !std.meta.eql(try native.Basis.fromOwner(prior.owner), self.transfer.donor.spec.checkpoint_owner) or
+            !std.mem.eql(u8, prior.table_name, self.successor.table_name) or
+            !std.meta.eql(prior.owner.table_binding, self.successor.owner.table_binding)) return error.SourceBindingConflict;
+    }
+
+    pub fn matches(self: Preparation, other: Preparation) bool {
+        return self.successor.samePhysicalAuthority(other.successor) and std.meta.eql(self.transfer, other.transfer);
+    }
+};
+
+/// Captured through topology authority after the donor is closed and the
+/// successor has durably installed the exact checkpoint and scope fences.
+pub const Adoption = struct {
+    previous: Digest,
+    successor: Spec,
+    transfer: ordered.control.InstallCheckpoint,
+    installed: native.CheckpointInstallReceipt,
+
+    pub fn fromApplied(a: std.mem.Allocator, prior: Spec, successor: Spec, command: ordered.control.Command, entry: native.Cut, outcome: ordered.Outcome) !Adoption {
+        try ordered.validateOutcome(command, entry, outcome);
+        if (command.intent.action != .install_checkpoint or outcome != .applied or
+            !std.meta.eql(command.intent.owner, successor.owner)) return error.SourceOutcomeUnresolved;
+        const result: Adoption = .{
+            .previous = prior.digest(),
+            .successor = successor,
+            .transfer = command.intent.action.install_checkpoint,
+            .installed = outcome.applied.checkpoint_install orelse return error.SourceOutcomeUnresolved,
+        };
+        try result.requireTransfer(a, prior);
+        return result;
+    }
+
+    pub fn validate(self: Adoption) !void {
+        try self.successor.validate();
+        try self.transfer.validate();
+        try self.installed.validate();
+        if (std.mem.allEqual(u8, &self.previous, 0) or self.successor.retirement != null or
+            !std.meta.eql(self.successor.binding, self.transfer.donor.spec.binding) or
+            !std.meta.eql(self.installed.domain, self.transfer.donor.spec.domain()) or
+            !std.meta.eql(self.installed.donor, self.transfer.donor.spec.checkpoint_owner) or
+            !std.meta.eql(self.installed.successor, try native.Basis.fromOwner(self.successor.owner)) or
+            self.installed.authorization.index <= self.transfer.donor.close_metadata_index)
+            return error.SourceBindingConflict;
+    }
+
+    pub fn requireTransfer(self: Adoption, a: std.mem.Allocator, prior: Spec) !void {
+        try self.validate();
+        if (prior.retirement != null or !std.meta.eql(prior.digest(), self.previous) or
+            !std.meta.eql(try native.Basis.fromOwner(prior.owner), self.installed.donor) or
+            !std.mem.eql(u8, prior.table_name, self.successor.table_name) or
+            !std.meta.eql(prior.owner.table_binding, self.successor.owner.table_binding) or
+            !std.meta.eql(self.installed.handoff_digest, try self.transfer.handoff().digest(a)))
+            return error.SourceBindingConflict;
     }
 };

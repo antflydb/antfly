@@ -369,7 +369,9 @@ fn makePageCommand(server: *Server, a: A, input: admission.Attempt, signer: admi
     const destination = resolved.destination orelse return error.InvalidSqlBackendResponse;
     try requireDestinationCredential(server, resolved, insert);
     const routing_catalog = @import("table_catalog.zig");
-    var routing = (try routing_catalog.authoritativeTableRoutingSnapshot(a, server.catalogSource(), destination.storage_name, context.deadline_ns)) orelse return error.CatalogGenerationChanged;
+    const routing_source = server.catalogSource();
+    const deadline = routing_source.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io });
+    var routing = (try routing_catalog.authoritativeTableRoutingSnapshot(a, routing_source, destination.storage_name, deadline)) orelse return error.CatalogGenerationChanged;
     defer routing.deinit(a);
     var attempt = input;
     attempt.event = .{
@@ -1179,6 +1181,8 @@ fn planWalCommand(server: *Server, a: A, query: Query, progress: registry.Replic
         }
         entry.value_ptr.* |= bit;
     }
+    const routing_source = server.catalogSource();
+    const deadline = routing_source.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io });
     for (seen.keys(), seen.values()) |source_id, mask| {
         try context.ensureActive();
         const relation = origin.find(source_id) orelse return error.ForeignProviderIdentityMismatch;
@@ -1188,7 +1192,7 @@ fn planWalCommand(server: *Server, a: A, query: Query, progress: registry.Replic
         if (!sameWalCursor(current.progress, progress)) return error.ReplicationCutoverAuthorityLost;
         const destination = current.destination orelse return error.InvalidSqlBackendResponse;
         const reads = server.table_reads orelse return error.UnsupportedSqlExecution;
-        routing[count] = (try wal_catalog.authoritativeTableRoutingSnapshot(a, server.catalogSource(), destination.storage_name, context.deadline_ns)) orelse return error.CatalogGenerationChanged;
+        routing[count] = (try wal_catalog.authoritativeTableRoutingSnapshot(a, routing_source, destination.storage_name, deadline)) orelse return error.CatalogGenerationChanged;
         const route = &routing[count];
         if (route.table_id != destination.table_id or route.snapshot.value.metadata_group_id != query.realm.group_id or
             !std.meta.eql(route.snapshot.value.metadata_incarnation, @as(?[32]u8, query.realm.incarnation)) or

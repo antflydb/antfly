@@ -480,7 +480,7 @@ fn consumerTests() type {
             const Operation = @FieldType(rpc.Request, "operation");
             for (std.meta.tags(Operation)) |operation| {
                 const expected = switch (operation) {
-                    .admit, .capture, .validate, .snapshot, .open => true,
+                    .admit, .admit_graph, .capture, .validate, .snapshot, .open => true,
                     else => false,
                 };
                 try std.testing.expectEqual(expected, unpublishedAdmissionBusy(operation, 503, true, "ReadUnavailable"));

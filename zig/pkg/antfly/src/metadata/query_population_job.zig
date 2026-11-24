@@ -177,7 +177,7 @@ pub fn admit(server: anytype, a: A, context: operation.RequestContext, req: jobs
 /// A dropped response or a post-proposal error remains an unknown admission.
 pub fn definiteHttpFailure(status: u16, body: []const u8) ?anyerror {
     const domain = @import("antfly_local_sources").system_catalog_domain;
-    inline for (.{ error.IdempotencyConflict, error.InvalidGenerationPublication, error.Forbidden, error.NotFound, error.AsyncRestoreUnavailable, error.NotLeader, error.TableTopologyProtocolUpgradeRequired, error.RelationalTopologyProtocolUpgradeRequired }) |err| {
+    inline for (.{ error.IdempotencyConflict, error.InvalidGenerationPublication, error.Forbidden, error.StoredDestinationAuthorizationRevoked, error.NotFound, error.AsyncRestoreUnavailable, error.NotLeader, error.TableTopologyProtocolUpgradeRequired, error.RelationalTopologyProtocolUpgradeRequired }) |err| {
         if (status == domain.httpStatus(err) and std.mem.eql(u8, body, @errorName(err))) return err;
     }
     return null;

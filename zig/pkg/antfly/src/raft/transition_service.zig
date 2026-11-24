@@ -95,10 +95,16 @@ pub const TransitionStepResult = struct {
     merge_ready_to_finalize: usize = 0,
 };
 
+const OrdinaryMergeGuard = struct {
+    ptr: *anyopaque,
+    require: *const fn (*anyopaque, metadata.MergeTransitionRecord) anyerror!void,
+};
+
 pub const TransitionService = struct {
     /// Deliberately uninstalled in production until the whole source snapshot
     /// and authenticated transfer capability bundle is available.
     online_driver: ?@import("../metadata/online_merge.zig").Driver = null,
+    ordinary_merge_guard: ?OrdinaryMergeGuard = null,
     alloc: std.mem.Allocator,
     retry_clock: RetryClock,
     retry_jitter_salt: u64,
@@ -658,6 +664,14 @@ pub const TransitionService = struct {
                 _ = self.merge_retries.remove(record.transition_id);
                 result.stepped_merge += 1;
                 continue;
+            }
+            if (self.ordinary_merge_guard) |guard| {
+                if (record.rollback_reason == null) guard.require(guard.ptr, record.*) catch |err| {
+                    if (!self.pendingRecordMatches(expected)) continue;
+                    try recordRetry(self.alloc, &self.merge_retries, record.transition_id, now_ms, self.retry_jitter_salt);
+                    std.log.warn("ordinary merge admission pending transition_id={d} err={s}", .{ record.transition_id, @errorName(err) });
+                    continue;
+                };
             }
             const observation = runtime.observeMerge(record.*) catch |err| {
                 if (!self.pendingRecordMatches(expected)) continue;

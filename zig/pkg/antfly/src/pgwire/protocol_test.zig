@@ -137,6 +137,8 @@ const Mock = struct {
     path_log: [16]?@import("session_commands.zig").SearchPath = @splat(null),
     namespace_count: usize = 0,
     namespace_checks: usize = 0,
+    track_sql_connection_start: bool = false,
+    sql_connection_starts: usize = 0,
     saw_distinct_owner_namespace: bool = false,
     expected_cursor_namespace: ?[]const u8 = null,
     setting_generation: u64 = 1,
@@ -190,9 +192,19 @@ const Mock = struct {
         table.guarded_select_stream = true;
         break :blk table;
     };
+    const replication_source_with_sql_start = blk: {
+        var table = source_tables[0][1];
+        table.start_connection = startConnection;
+        break :blk table;
+    };
     fn source(self: *Mock) backend.Backend {
+        if (self.track_sql_connection_start) return .{ .context = self, .vtable = &replication_source_with_sql_start };
         if (self.guarded_select_stream) return .{ .context = self, .vtable = &guarded_source };
         return .{ .context = self, .vtable = &source_tables[@intFromBool(self.native_parameters)][@intFromBool(self.replication_enabled)] };
+    }
+    fn startConnection(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, _: backend.Request) !void {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        self.sql_connection_starts += 1;
     }
     fn openReplication(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, request: backend.Request) !backend.ReplicationSession {
         const self: *Mock = @ptrCast(@alignCast(raw));
@@ -2689,6 +2701,35 @@ test "pgwire unknown DDL admission never claims a committed declaration" {
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "job-1") != null);
 }
 
+test "pgwire emits both admission and activation receipts for table DDL" {
+    const admission = "{\"recovery_token\":\"admission\"}";
+    const activation = "{\"table_id\":\"activation\"}";
+    for ([_]?backend.MutationOutcome{ .committed, .committed_pending, null }) |outcome| {
+        const pending = outcome != .committed;
+        var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer input.deinit();
+        try startup(&input.writer);
+        try frame(&input.writer, 'Q', "CREATE TABLE docs (id bigint primary key)\x00");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .result_override = .{
+            .command_tag = if (pending) "DDL PENDING" else "CREATE TABLE",
+            .mutation_outcome = outcome,
+            .catalog_receipt_json = admission,
+            .ddl_receipt_json = activation,
+        } };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        const observed = try tags(std.testing.allocator, output.written());
+        defer std.testing.allocator.free(observed);
+        try std.testing.expectEqual(@as(usize, if (pending) 0 else 1), std.mem.count(u8, observed, "C"));
+        try std.testing.expectEqual(@as(usize, if (pending) 1 else 0), std.mem.count(u8, observed, "E"));
+        try std.testing.expectEqual(@as(usize, if (pending) 1 else 2), std.mem.count(u8, observed, "N"));
+        const admission_at = std.mem.indexOf(u8, output.written(), admission) orelse return error.TestExpectedEqual;
+        const activation_at = std.mem.indexOf(u8, output.written(), activation) orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(outcome == null, activation_at < admission_at);
+    }
+}
+
 test "pgwire catalog recovery receipt preserves exact identity and never completes uncertain DDL" {
     for ([_]bool{ false, true }) |unknown| {
         var input = std.Io.Writer.Allocating.init(std.testing.allocator);
@@ -4415,9 +4456,10 @@ test "pgwire logical startup authenticates and dispatches replication administra
     try frame(&input.writer, 'Q', "CREATE_REPLICATION_SLOT s LOGICAL pgoutput EXPORT_SNAPSHOT\x00");
     try frame(&input.writer, 'Q', "DROP_REPLICATION_SLOT s WAIT\x00");
     try frame(&input.writer, 'X', "");
-    var mock: Mock = .{ .replication_enabled = true };
+    var mock: Mock = .{ .replication_enabled = true, .track_sql_connection_start = true };
     var out = try run(&mock, input.written(), .{});
     defer out.deinit();
+    try std.testing.expectEqual(@as(usize, 0), mock.sql_connection_starts);
     try std.testing.expectEqual(@as(usize, 1), mock.authentications);
     try std.testing.expectEqual(@as(usize, 1), mock.replication_opens);
     try std.testing.expectEqual(@as(usize, 1), mock.replication_closes);
@@ -4546,9 +4588,10 @@ test "pgwire replication commands require logical startup while false preserves 
     try frame(&input.writer, 'Q', "IDENTIFY_SYSTEM\x00");
     try frame(&input.writer, 'Q', "SELECT 1\x00");
     try frame(&input.writer, 'X', "");
-    var mock: Mock = .{ .replication_enabled = true };
+    var mock: Mock = .{ .replication_enabled = true, .track_sql_connection_start = true };
     var out = try run(&mock, input.written(), .{});
     defer out.deinit();
+    try std.testing.expectEqual(@as(usize, 1), mock.sql_connection_starts);
     try std.testing.expectEqual(@as(usize, 0), mock.replication_opens);
     try std.testing.expectEqual(@as(usize, 1), mock.executions);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "0A000") != null);
@@ -5009,6 +5052,8 @@ test "pgwire logical walsender authenticates before CopyBoth and serializes feed
     var input = std.Io.Writer.Allocating.init(a);
     defer input.deinit();
     try startupOptions(&input.writer, "replication\x00database\x00");
+    try frame(&input.writer, 'Q', "SELECT pg_catalog.set_config('search_path', '', false);\x00");
+    try frame(&input.writer, 'Q', "SHOW data_directory_mode\x00");
     try frame(&input.writer, 'Q', "IDENTIFY_SYSTEM\x00");
     try frame(&input.writer, 'Q', "START_REPLICATION SLOT testslot LOGICAL 0/1 (proto_version '1', publication_names 'p')\x00");
     try frame(&input.writer, 'd', "feedback");
@@ -5023,6 +5068,10 @@ test "pgwire logical walsender authenticates before CopyBoth and serializes feed
         try session.run();
     }
     try std.testing.expectEqual(@as(usize, 2), fixture.actions);
+    try std.testing.expectEqual(@as(usize, 0), fixture.mock.executions);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "set_config\x00") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "data_directory_mode\x00") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "0700") != null);
     try std.testing.expect(fixture.stopped and fixture.closed);
     const messages = try tags(a, output.written());
     defer a.free(messages);
