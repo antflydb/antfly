@@ -17280,7 +17280,10 @@ fn allocPinnedTempSlot(
         // Register a new physical address before returning it to the caller.
         // Capture may only borrow slots fully registered during eager work.
         if (self.debug_cuda_graph_capture_active) return null;
-        try self.temp_pinned_slot_by_address.ensureUnusedCapacity(self.allocator, 1);
+        self.temp_pinned_slot_by_address.ensureUnusedCapacity(self.allocator, 1) catch {
+            if (self.temp_slot_config.autoplan_enabled) self.temp_arena_planner.markPinnedValidationFailure();
+            return null;
+        };
         const tag = if (findExactTempBufferIndex(self, len)) |i| seed: {
             slot.buffer = self.temp_buffers.orderedRemove(i);
             self.stats.temp_buffer_hits += 1;
@@ -17381,6 +17384,7 @@ fn recycleTempPinnedSlotsUnlocked(self: *CudaCompute, reuse: TempSlotReuse) !voi
         }
         slot.* = .{};
     }
+    if (self.temp_pinned_slot_by_address.count() == 0) self.temp_pinned_slot_by_address.clearAndFree(self.allocator);
     self.temp_arena_generation +%= 1;
     if (self.temp_arena_generation == 0) self.temp_arena_generation = 1;
 }
@@ -63494,6 +63498,22 @@ test "CUDA model constant retirement preserves physical dtype byte accounting" {
         try std.testing.expectEqual(@as(usize, 0), compute.embedding_gemma2_constant_count.load(.acquire));
         try std.testing.expectEqual(@as(usize, 0), compute.ctx.device_allocations.snapshot().live);
     }
+}
+
+test "Gemma4 CUDA learned scratch declines before allocation if its address index is unfunded" {
+    const a = std.testing.allocator;
+    var compute = metadataOnlyTestCompute();
+    defer compute.temp_pinned_slots.deinit(a);
+    defer compute.temp_pinned_slot_by_address.deinit(a);
+    compute.temp_slot_config = .{ .autoplan_enabled = true, .configured_period = 1 };
+    compute.temp_arena_planner.active = true;
+    try ensureTempPinnedSlots(&compute, 1);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    compute.allocator = failing.allocator();
+    try std.testing.expect((try allocPinnedTempSlot(&compute, 0, 64)) == null);
+    try std.testing.expect(compute.temp_arena_planner.pinned_validation_failed);
+    try std.testing.expect(!compute.temp_pinned_slots.items[0].in_use);
+    try std.testing.expectEqual(@as(u32, 0), compute.temp_pinned_slot_by_address.count());
 }
 
 test "Gemma4 CUDA learned scratch backing survives requests without retaining the allocation ABI" {
