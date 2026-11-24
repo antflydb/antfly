@@ -474,13 +474,13 @@ fn temporaryPreparationPath(allocator: Allocator, io: std.Io, prefix: []const u8
 }
 
 /// No archive-sized buffer, and the cap is checked before forwarding bytes.
-const LimitedWriter = struct {
+pub const LimitedWriter = struct {
     interface: std.Io.Writer,
     output: *std.Io.Writer,
     remaining: u64,
     exceeded: bool = false,
 
-    fn init(output: *std.Io.Writer, limit: u64) LimitedWriter {
+    pub fn init(output: *std.Io.Writer, limit: u64) LimitedWriter {
         return .{ .interface = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} }, .output = output, .remaining = limit };
     }
 

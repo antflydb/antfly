@@ -37,6 +37,8 @@ pub const Status = struct {
     pub const unsupported_index: c_int = 4;
     pub const unsupported_schema: c_int = 5;
     pub const unsupported_migration: c_int = 6;
+    pub const durability_outcome_unknown: c_int = 7;
+    pub const path_already_exists: c_int = 8;
 };
 
 pub const Result = extern struct {
@@ -182,4 +184,66 @@ pub fn inspectInputJsonAlloc(allocator: std.mem.Allocator, input: []const u8, de
     const bytes = (ptr orelse return error.InvalidPreflightResponse)[0..len];
     defer antfly_backup_preflight_free(bytes.ptr, bytes.len);
     return allocator.dupe(u8, bytes);
+}
+
+pub const DataSyncContext = extern struct {
+    input_ptr: [*]const u8,
+    input_len: usize,
+    output_ptr: [*]const u8,
+    output_len: usize,
+    table_ptr: [*]const u8,
+    table_len: usize,
+    selection_is_literal: bool,
+    definition_ptr: [*]const u8,
+    definition_len: usize,
+    max_input_bytes: u64,
+    max_expanded_bytes: u64,
+    result_ptr: *?[*]u8,
+    result_len: *usize,
+};
+extern fn antfly_data_sync(context: *const DataSyncContext) callconv(.c) c_int;
+
+pub fn syncDataJsonAlloc(allocator: std.mem.Allocator, input: []const u8, output: []const u8, table: []const u8, selection_is_literal: bool, definition: []const u8, max_input_bytes: u64, max_expanded_bytes: u64) ![]u8 {
+    if (comptime use_direct_implementation) return @import("data_sync.zig").syncJsonAlloc(allocator, input, output, table, definition, .{ .max_input_bytes = max_input_bytes, .max_expanded_bytes = max_expanded_bytes, .selection_is_literal = selection_is_literal });
+    var ptr: ?[*]u8 = null;
+    var len: usize = 0;
+    const status = antfly_data_sync(&.{
+        .input_ptr = input.ptr,
+        .input_len = input.len,
+        .output_ptr = output.ptr,
+        .output_len = output.len,
+        .table_ptr = table.ptr,
+        .table_len = table.len,
+        .selection_is_literal = selection_is_literal,
+        .definition_ptr = definition.ptr,
+        .definition_len = definition.len,
+        .max_input_bytes = max_input_bytes,
+        .max_expanded_bytes = max_expanded_bytes,
+        .result_ptr = &ptr,
+        .result_len = &len,
+    });
+    try checkSyncStatus(status);
+    const bytes = (ptr orelse return error.InvalidBackupRequest)[0..len];
+    defer antfly_backup_preflight_free(bytes.ptr, bytes.len);
+    return allocator.dupe(u8, bytes);
+}
+
+/// Keep publication outcomes distinct across the storage/CLI codegen boundary.
+pub fn syncErrorStatus(err: anyerror) c_int {
+    return switch (err) {
+        error.OutOfMemory => Status.out_of_memory,
+        error.DurabilityOutcomeUnknown => Status.durability_outcome_unknown,
+        error.PathAlreadyExists => Status.path_already_exists,
+        else => Status.failed,
+    };
+}
+
+pub fn checkSyncStatus(status: c_int) !void {
+    return switch (status) {
+        Status.ok => {},
+        Status.out_of_memory => error.OutOfMemory,
+        Status.durability_outcome_unknown => error.DurabilityOutcomeUnknown,
+        Status.path_already_exists => error.PathAlreadyExists,
+        else => error.InvalidBackupRequest,
+    };
 }
