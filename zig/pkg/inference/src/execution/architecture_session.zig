@@ -8290,6 +8290,15 @@ fn createProgramFrame(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror!op
 fn importProgramInput(_: *anyopaque, cb: *const ops.ComputeBackend, input: *const Tensor, _: std.mem.Allocator) anyerror!ops.CT {
     if (cb.kind() != .native) return error.UnsupportedProgramTransport;
     const native: *native_mod.NativeCompute = @ptrCast(@alignCast(cb.ptr));
+    // The capture invocation and the synchronous PJRT upload both retire
+    // before the caller can release its immutable prepared input.
+    if (input.dtype == .f32) if (input.asFloat32IfAligned()) |values| {
+        var dimensions: [@import("ml").graph.shape.max_rank]i32 = undefined;
+        if (input.shape.len > dimensions.len) return error.UnsupportedShape;
+        const shape = dimensions[0..input.shape.len];
+        for (input.shape, shape) |dim, *axis| axis.* = std.math.cast(i32, dim) orelse return error.UnsupportedShape;
+        return cb.fromBorrowedFloat32Shape(values, shape);
+    };
     return native.importHostTensor(input);
 }
 fn runCapturedProgram(self: *ArchSession, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) ![]Tensor {
@@ -22347,4 +22356,21 @@ test "Decide CUDA execution batches require a sealed session identity" {
         arch.gliner_decision_identity.?.weight.sha256[0] ^= 1;
         try std.testing.expect(getGlinerDecideExecutionBatchPolicy(session) == null);
     }
+}
+
+test "PJRT program import borrows immutable aligned f32 input" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var weights = native_mod.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer weights.deinitOwned();
+    var receiver = native_mod.NativeCompute.init(a, &weights, null);
+    defer receiver.deinit();
+    const backend = receiver.computeBackend();
+    var input = try Tensor.initFloat32(a, "pixels", &.{ 1, 2 }, &.{ 0.25, 0.75 });
+    defer input.deinit();
+    const imported = try importProgramInput(&receiver, &backend, &input, a);
+    defer backend.free(imported);
+    const data = (try backend.hostFloat32Read(imported)).?;
+    try std.testing.expectEqual(input.asFloat32().ptr, data.ptr);
+    try std.testing.expect((try backend.hostFloat32Write(imported)) == null);
 }
