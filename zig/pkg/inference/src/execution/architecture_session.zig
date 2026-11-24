@@ -14827,11 +14827,9 @@ test "actual Metal stage admits two learned audio arenas in one quiescent pause"
     const Metal = @import("../ops/metal_compute.zig").MetalCompute;
     const compute: *Metal = @ptrCast(@alignCast(cb.ptr));
     compute.require_f32_linears = true;
-    var storage = try cb.audioStorage(true);
-    try std.testing.expect(storage);
-    defer if (storage) {
-        _ = cb.audioStorage(false) catch unreachable;
-    };
+    var storage = try ops.AudioStorageScope.begin(cb);
+    try std.testing.expect(storage.active);
+    defer storage.close();
     const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 1, 4 }));
     defer cb.free(input);
     const audio = @import("audio_schedule.zig");
@@ -14870,7 +14868,7 @@ test "actual Metal stage admits two learned audio arenas in one quiescent pause"
     const yields = timings.stage_yields;
     try std.testing.expect(try prepare(hook.ptr, cb, &keys, &.{input}, .{ .storage = &storage }));
     try std.testing.expectEqual(yields + 1, timings.stage_yields);
-    try std.testing.expect(storage);
+    try std.testing.expect(storage.active);
     try std.testing.expectEqual(@as(usize, 8192), cache.backend_bytes);
     const before_warm = pin.controller().snapshot().backend_weight_bytes;
     for (compute.provider_impl.audio_schedules[0..keys.len]) |entry| {
