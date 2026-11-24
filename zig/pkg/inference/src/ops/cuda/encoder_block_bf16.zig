@@ -113,7 +113,9 @@ fn disjoint(a: buffer.DeviceBuffer, a_bytes: usize, b: buffer.DeviceBuffer, b_by
 
 // Historical device entry names are compatibility ABI, not model-specific ownership.
 const catalog = @import("../../tile/cuda_standalone.zig");
-const Program = @import("embedded_module.zig").EmbeddedModule(@import("embedded_module.zig").profileImage(catalog.encoder), catalog.encoder_entries);
+const Program = @import("embedded_module.zig").EmbeddedModule(struct {
+    pub const image = @import("embedded_module.zig").profile(catalog.encoder).image;
+}, catalog.encoder_entries);
 
 pub const Module = struct {
     program: Program = .{},

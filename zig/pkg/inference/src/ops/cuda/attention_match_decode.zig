@@ -55,11 +55,9 @@ pub const Request = struct {
     softcap: f32 = 0,
 };
 
-fn moduleImage() [:0]const u8 {
-    return @embedFile("artifacts/attention_match_decode.fatbin");
-}
-
-const Program = @import("embedded_module.zig").EmbeddedModule(moduleImage, .{
+const Program = @import("embedded_module.zig").EmbeddedModule(struct {
+    pub const image = @embedFile("artifacts/attention_match_decode.fatbin");
+}, .{
     .partial_f16 = "attention_match_partial_f16",
     .partial_f32 = "attention_match_partial_f32",
     .append_f16 = "attention_match_append_f16",

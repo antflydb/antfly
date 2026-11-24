@@ -1262,7 +1262,12 @@ pub fn create(b: *std.Build) ?Artifacts {
         // The large Debug server exceeds Zig's Mach-O relocation range. Use
         // the same native final linker as checked owners and storage probes.
         const native = @import("build_support/embedded/shared_library.zig");
-        const object = b.addObject(.{ .name = "antfly-debug-entry", .root_module = antfly_main.root_module, .use_llvm = true });
+        // Provider archives own these C/ObjC implementations. A relocatable
+        // entry must import only their declarations: bundling them again
+        // corrupts selector references during the final Mach-O link.
+        @import("build_support/embedded/source_owner.zig").finalizeExecutableLinks(b, antfly_main);
+        const entry_module = native.nativeExecutableEntryModule(b, antfly_main.root_module);
+        const object = b.addObject(.{ .name = "antfly-debug-entry", .root_module = entry_module, .use_llvm = true });
         object.entry = .enabled;
         object.bundle_compiler_rt = false;
         object.bundle_ubsan_rt = false;

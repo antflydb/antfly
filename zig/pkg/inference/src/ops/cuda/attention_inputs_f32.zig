@@ -78,7 +78,9 @@ pub fn validate(r: Request) !void {
 
 // Historical device entry names are compatibility ABI, not model-specific ownership.
 const catalog = @import("../../tile/cuda_standalone.zig");
-const Program = @import("embedded_module.zig").EmbeddedModule(@import("embedded_module.zig").profileImage(catalog.attention), .{
+const Program = @import("embedded_module.zig").EmbeddedModule(struct {
+    pub const image = @import("embedded_module.zig").profile(catalog.attention).image;
+}, .{
     .prepare = catalog.attention.entry,
 });
 

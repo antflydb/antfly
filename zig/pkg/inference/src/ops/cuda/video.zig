@@ -1342,11 +1342,9 @@ fn annexPacket(a: std.mem.Allocator, out: *std.ArrayList(u8), bytes: []const u8,
     }
 }
 
-fn moduleImage() [:0]const u8 {
-    return @embedFile("video_preprocess.ptx");
-}
-
-const PreprocessProgram = @import("embedded_module.zig").EmbeddedModule(moduleImage, .{ .patches = "video_patches", .rgb8 = "video_rgb8", .rgb8_swscale601 = "video_rgb8_swscale601" });
+const PreprocessProgram = @import("embedded_module.zig").EmbeddedModule(struct {
+    pub const image = @embedFile("video_preprocess.ptx");
+}, .{ .patches = "video_patches", .rgb8 = "video_rgb8", .rgb8_swscale601 = "video_rgb8_swscale601" });
 
 pub const Preprocessor = struct {
     ctx: *context.CudaContext,

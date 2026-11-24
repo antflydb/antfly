@@ -162,7 +162,9 @@ comptime {
 
 // Native export names remain the compatibility ABI of the qualified PTX.
 const catalog = @import("../../tile/cuda_standalone.zig");
-const Program = @import("embedded_module.zig").EmbeddedModule(@import("embedded_module.zig").profileImage(catalog.gated_delta), catalog.gated_delta_entries);
+const Program = @import("embedded_module.zig").EmbeddedModule(struct {
+    pub const image = @import("embedded_module.zig").profile(catalog.gated_delta).image;
+}, catalog.gated_delta_entries);
 
 /// Geometry implemented by the existing independent-page packet kernels.
 /// Generic recurrent shapes retain their established ordinary core path.
