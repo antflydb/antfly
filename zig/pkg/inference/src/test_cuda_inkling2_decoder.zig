@@ -17,6 +17,7 @@ const platform = @import("antfly_platform");
 const checkpoint = @import("architectures/inkling2_checkpoint.zig");
 const decoder = @import("architectures/inkling2_decoder_cuda.zig");
 const vision = @import("architectures/inkling2_vision_cuda.zig");
+const dspark = @import("architectures/inkling2_dspark_cuda.zig");
 const Context = @import("ops/cuda/context.zig").CudaContext;
 const buffer = @import("ops/cuda/buffer.zig");
 
@@ -95,10 +96,11 @@ fn exportQualificationLogits(allocator: std.mem.Allocator, model: *decoder.Decod
         }
         for (qualification_prompts) |prompt| {
             var heldout: decoder.Request = undefined;
-            try heldout.init(allocator, model, @intCast(prompt.tokens.len));
+            const chunk_rows = if (fast) @min(decoder.prefill_chunk_rows, prompt.tokens.len - 1) else 1;
+            try heldout.initWithPrefill(allocator, model, @intCast(prompt.tokens.len), @intCast(chunk_rows));
             defer heldout.deinit() catch @panic("unable to drain Inkling prompt");
             heldout.use_dense = fast;
-            for (prompt.tokens[0 .. prompt.tokens.len - 1]) |token| try heldout.append(token);
+            try heldout.appendTokens(prompt.tokens[0 .. prompt.tokens.len - 1]);
             const logits = try heldout.step(prompt.tokens[prompt.tokens.len - 1]);
             var filename: [48]u8 = undefined;
             const name = try std.fmt.bufPrint(&filename, "cuda-{s}-{s}.f32", .{ if (fast) "fast" else "default", prompt.name });
@@ -110,13 +112,104 @@ fn exportQualificationLogits(allocator: std.mem.Allocator, model: *decoder.Decod
 fn exportQualificationImage(allocator: std.mem.Allocator, model: *decoder.Decoder, image: vision.Embeddings, dir: std.Io.Dir) !void {
     for ([_]bool{ false, true }) |fast| {
         var request: decoder.Request = undefined;
-        try request.init(allocator, model, image.rows + 1);
+        try request.initWithPrefill(allocator, model, image.rows + 1, if (fast) image.rows else 1);
         defer request.deinit() catch @panic("unable to drain Inkling probe image");
         request.use_dense = fast;
-        for (0..image.rows) |i| try request.appendEmbedding(try image.row(@intCast(i)));
+        try request.appendEmbeddings(image.device, image.rows);
         const logits = try request.step(42);
         try dir.writeFile(std.testing.io, .{ .sub_path = if (fast) "cuda-fast-image.f32" else "cuda-image.f32", .data = std.mem.sliceAsBytes(logits) });
     }
+}
+
+fn verifyBatchedImagePrefill(allocator: std.mem.Allocator, model: *decoder.Decoder, encoder: *vision.Vision) !void {
+    const width = 201;
+    const height = 123;
+    var pixels: [width * height * 3]u8 = undefined;
+    for (&pixels, 0..) |*value, i| value.* = @truncate(i * 17);
+    var image = try encoder.encodeRgb(&model.blas, &pixels, width, height);
+    defer image.deinit(model.ctx);
+    try std.testing.expectEqual(@as(u32, 24), image.rows);
+    const prefix = head_tokens[0..3];
+    const suffix = head_tokens[3..];
+    const limit = prefix.len + 24 + suffix.len;
+    var eager: decoder.Request = undefined;
+    try eager.init(allocator, model, limit);
+    defer eager.deinit() catch @panic("unable to drain serial Inkling image prefill");
+    eager.use_dense = true;
+    var batched: decoder.Request = undefined;
+    try batched.initWithPrefill(allocator, model, limit, decoder.prefill_chunk_rows);
+    defer batched.deinit() catch @panic("unable to drain batched Inkling image prefill");
+    batched.use_dense = true;
+    try eager.appendTokens(prefix);
+    try batched.appendTokens(prefix);
+    try std.testing.expectError(error.InvalidShape, batched.appendEmbeddings(try image.row(0), image.rows));
+    try std.testing.expectEqual(@as(usize, prefix.len), batched.position());
+    try eager.appendEmbeddings(image.device, image.rows);
+    try batched.appendEmbeddings(image.device, image.rows);
+    try std.testing.expectEqual(@as(usize, prefix.len + image.rows), batched.position());
+    try eager.appendTokens(suffix[0..3]);
+    try batched.appendTokens(suffix[0..3]);
+    var max_difference: f32 = 0;
+    for (suffix[3..]) |token| {
+        const expected = try eager.step(token);
+        const actual = try batched.step(token);
+        try std.testing.expectEqual(try topToken(expected, model.text.final_logit_softcapping), try topToken(actual, model.text.final_logit_softcapping));
+        for (expected, actual) |a, b| max_difference = @max(max_difference, @abs(a - b));
+    }
+    try std.testing.expectEqual(@as(usize, limit), batched.position());
+    std.debug.print("Inkling batched image prefill matched serial greedy tokens with max logit difference {d:.5}\n", .{max_difference});
+    try std.testing.expect(max_difference <= 4.0);
+}
+
+fn verifyDSparkTransactions(allocator: std.mem.Allocator, model: *decoder.Decoder, model_dir: []const u8, config: checkpoint.DraftConfig) !void {
+    const limit = 64;
+    var draft = try dspark.Draft.load(allocator, model.ctx, &model.blas, model_dir, config, model.sharedDraftWeights(), limit, decoder.prefill_chunk_rows);
+    defer draft.deinit();
+    var reference: decoder.Request = undefined;
+    try reference.init(allocator, model, limit);
+    defer reference.deinit() catch @panic("unable to drain the serial Inkling request");
+    reference.use_dense = true;
+    var actual: decoder.Request = undefined;
+    try actual.initWithPrefill(allocator, model, limit, decoder.prefill_chunk_rows);
+    defer actual.deinit() catch @panic("unable to drain the speculative Inkling request");
+    actual.use_dense = true;
+    try actual.attachDraft(&draft);
+    for (0..14) |i| {
+        const token = head_tokens[i % head_tokens.len];
+        try reference.append(token);
+        try actual.append(token);
+    }
+    var anchor = try reference.stepGreedy(head_tokens[3]);
+    try std.testing.expectEqual(anchor, try actual.stepGreedy(head_tokens[3]));
+    for ([_]u32{ 0, 2, 7 }) |accepted| {
+        var guesses: [dspark.proposal_rows]u32 = @splat(42);
+        var expected: [dspark.block_rows]u32 = undefined;
+        var token = anchor;
+        for (expected[0 .. accepted + 1], 0..) |*id, i| {
+            token = try reference.stepGreedy(token);
+            id.* = token;
+            if (i < accepted) guesses[i] = token;
+        }
+        if (accepted < guesses.len) guesses[accepted] = (token + 1) % model.text.unpadded_vocab_size;
+        const checked = try actual.verifyDraft(anchor, &guesses);
+        try std.testing.expectEqual(accepted + 1, checked.count);
+        try std.testing.expectEqualSlices(u32, expected[0..checked.count], checked.ids[0..checked.count]);
+        try std.testing.expectEqual(reference.position(), actual.position());
+        try std.testing.expectEqual(actual.position(), draft.position);
+        if (accepted == 0) {
+            try std.testing.expectEqual(null, actual.kv.sequence.pageId(.full, 1));
+            try std.testing.expectEqual(@as(usize, 1), actual.kv.full.storage.hostPool().?.freeListBlocks());
+        }
+        anchor = token;
+    }
+    const proposals = try draft.propose(&model.blas, anchor, dspark.proposal_rows);
+    const checked = try actual.verifyDraft(anchor, &proposals);
+    for (checked.ids[0..checked.count]) |id| {
+        anchor = try reference.stepGreedy(anchor);
+        try std.testing.expectEqual(anchor, id);
+    }
+    try std.testing.expectEqual(reference.position(), actual.position());
+    std.debug.print("Inkling DSpark verified full, partial and zero acceptance across page boundaries\n", .{});
 }
 
 fn verifyLongContext(allocator: std.mem.Allocator, model: *decoder.Decoder) !void {
@@ -336,5 +429,9 @@ test "CUDA Inkling 2 runs the fixed loop with all released text weights" {
         width, height, image.rows, image_next, image_logits[image_next],
     });
     if (qualification_dir) |dir_handle| try exportQualificationImage(allocator, &model, image, dir_handle);
+    if (ctx.info.compute_major == 12 and ctx.info.compute_minor <= 1) try verifyBatchedImagePrefill(allocator, &model, &encoder);
+    if (ctx.info.compute_major == 12 and ctx.info.compute_minor == 1) {
+        if (source.config.value.mtp_config) |config| try verifyDSparkTransactions(allocator, &model, dir, config);
+    }
     if (long_qualification) try verifyLongContext(allocator, &model);
 }

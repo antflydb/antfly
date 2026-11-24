@@ -198,6 +198,34 @@ pub const PreparedAppend = struct {
         // The caller's deferred abort frees staging metadata only after every
         // participating commit and total/view publication has completed.
     }
+    /// Shrink a drained append whose logical table and staged pages are
+    /// privately owned. Retained rows keep the exact physical destinations
+    /// they were written to during verification.
+    pub fn retainPrivatePrefix(self: *@This(), rows: usize, window: ?usize) !void {
+        if (!self.active or rows == 0 or self.cow != null or self.old_reserved != 0 or
+            self.future_reserved != 0 or self.recycle_count != 0 or self.table.shared_prefix_blocks != 0 or
+            self.acquired != self.append_pages) return error.InvalidKvShape;
+        const page: usize = self.storage.config.page_size_tokens;
+        const before = if (self.old_blocks == 0) 0 else (self.old_blocks - 1) * page + self.table.tail_tokens;
+        const after = try std.math.add(usize, before, rows);
+        if (after > self.future_tokens + self.drop_pages * page) return error.InvalidKvShape;
+        const logical = (after - 1) / page + 1;
+        const tail = (after - 1) % page + 1;
+        const drop = if (window) |keep| @min((after -| keep) / page, after / page) else 0;
+        const retained = logical - self.old_blocks;
+        std.debug.assert(retained <= self.acquired and drop <= self.drop_pages);
+        for (self.retireItems()[0..drop], 0..) |*id, i| id.* = self.logicalAt(i);
+        const pool = self.storage.hostPool().?;
+        for (self.acquiredItems()[retained..self.acquired]) |id|
+            _ = pool.releaseRef(self.allocator, id) catch @panic("invalid rejected suffix ref");
+        self.acquired = retained;
+        self.append_pages = retained;
+        self.drop_pages = drop;
+        self.retire_count = drop;
+        self.tail = if (drop == logical) 0 else @intCast(tail);
+        self.future_tokens = after - drop * page;
+    }
+
     pub fn idsChanged(self: *const @This()) bool {
         return self.append_pages != 0 or self.drop_pages != 0 or self.cow != null or self.future_reserved != self.old_reserved;
     }

@@ -215,4 +215,17 @@ pub const dense_bf16_matvec_entries = .{
     .greedy_index = "antfly_projection_greedy_index",
 };
 pub const dense_bf16_matvec = nativeProfile("dense_bf16_matvec", "dense_bf16_matvec.ptx", "dense_bf16_matvec.cu", 80, dense_bf16_matvec_entries, &.{ "--fmad=false", "-std=c++17" });
-pub const profiles = [_]Profile{ attention, encoder } ++ gelu ++ residual ++ top1 ++ [_]Profile{ activation_bf16, paged_attention_bf16, gated_delta, vision_projection_bf16, encoder_decoder_f16, row_selection_stats_f32, routed_block_scaled_projection, paged_relative_attention, causal_depthwise4_bf16, head_norm_bf16, residual_block_mix, patch_transformer, routed_block_scaled_matvec, dense_bf16_matvec };
+pub const block_decoder_bf16_entries = .{
+    .mix_rms = "antfly_weighted_four_rows_rms_bf16",
+    .add_rms = "antfly_residual_add_rms_bf16",
+    .rope = "antfly_head_rms_neox_rope_d128_bf16",
+    .swiglu = "antfly_swiglu_separate_bf16",
+    .attention = "antfly_bshd_block_gqa_d128_bf16",
+    .recurrent = "antfly_low_rank_recurrent_gate_bf16",
+    .argmax_tiles = "antfly_softcapped_sum_argmax_bf16_tiles",
+    .target_argmax_tiles = "antfly_softcapped_argmax_rows_f32_tiles",
+    .argmax_merge = "antfly_argmax_merge_tiles_f32",
+};
+pub const block_decoder_bf16 = nativeProfile("block_decoder_bf16", "block_decoder_bf16.ptx", "block_decoder_bf16.cu", 80, block_decoder_bf16_entries, &.{ "--fmad=false", "-std=c++17" });
+
+pub const profiles = [_]Profile{ attention, encoder } ++ gelu ++ residual ++ top1 ++ [_]Profile{ activation_bf16, paged_attention_bf16, gated_delta, vision_projection_bf16, encoder_decoder_f16, row_selection_stats_f32, routed_block_scaled_projection, paged_relative_attention, causal_depthwise4_bf16, head_norm_bf16, residual_block_mix, patch_transformer, routed_block_scaled_matvec, dense_bf16_matvec, block_decoder_bf16 };

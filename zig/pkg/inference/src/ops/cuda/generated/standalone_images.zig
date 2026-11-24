@@ -41,4 +41,5 @@ pub const images = struct {
     pub const @"patch_transformer_bf16.ptx" = @embedFile("../patch_transformer_bf16.ptx") ++ "\x00";
     pub const @"routed_block_scaled_matvec_sm120.ptx" = @embedFile("../routed_block_scaled_matvec_sm120.ptx") ++ "\x00";
     pub const @"dense_bf16_matvec.ptx" = @embedFile("../dense_bf16_matvec.ptx") ++ "\x00";
+    pub const @"block_decoder_bf16.ptx" = @embedFile("../block_decoder_bf16.ptx") ++ "\x00";
 };

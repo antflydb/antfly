@@ -18,6 +18,7 @@ const checkpoint = @import("inkling2_checkpoint.zig");
 const MmapRegion = @import("../util/c_file.zig").MmapRegion;
 const attention = @import("inkling2_attention_cuda.zig");
 const moe = @import("inkling2_moe_cuda.zig");
+const dspark = @import("inkling2_dspark_cuda.zig");
 const buffer = @import("../ops/cuda/buffer.zig");
 const cuda_graph = @import("../ops/cuda/graph.zig");
 const Context = @import("../ops/cuda/context.zig").CudaContext;
@@ -35,6 +36,7 @@ const HostBuffer = buffer.HostBuffer;
 const streams = 4;
 const block_slots = 5;
 const page_tokens = 16;
+pub const prefill_chunk_rows = 16;
 const Stream = enum { attn, k, v, mlp };
 
 const ModelWeight = enum {
@@ -225,6 +227,17 @@ pub const Decoder = struct {
         self.blas.deinit();
     }
 
+    pub fn sharedDraftWeights(self: *const Decoder) dspark.SharedWeights {
+        return .{
+            .embed = self.weight(.embed),
+            .embed_norm = self.weight(.embed_norm),
+            .unembed = self.weight(.unembed),
+            .vocab = self.text.unpadded_vocab_size,
+            .padded_vocab = self.text.vocab_size,
+            .logit_cap = self.text.final_logit_softcapping,
+        };
+    }
+
     fn weight(self: *const Decoder, key: ModelWeight) DeviceBuffer {
         return self.weights[@backingInt(key)];
     }
@@ -238,13 +251,19 @@ pub const Request = struct {
     model: *Decoder,
     kv: cache.Cache = undefined,
     workspace: attention.Workspace = undefined,
+    append_capacity: u32 = 1,
+    max_tokens: u32 = 0,
     pages: HostBuffer = .{},
     replay_position: HostBuffer = .{},
     replay_graphs: [2]cuda_graph.CapturedGraph = @splat(.{}),
     replay_enabled: bool = false,
+    single_row_prepared: bool = false,
     logits: HostBuffer = .{},
     shortlist_workspace: DeviceBuffer = .{},
     history: DeviceBuffer = .{},
+    verification_history: DeviceBuffer = .{},
+    record_history: bool = false,
+    draft: ?*dspark.Draft = null,
     temps: Weights(Temp) = @splat(.{}),
     history_side: usize = 0,
     /// Opt in to a different BF16 dot-product reduction order.
@@ -254,39 +273,52 @@ pub const Request = struct {
     use_separate_controllers: bool = false,
 
     pub fn init(self: *Request, allocator: std.mem.Allocator, model: *Decoder, max_tokens: u32) !void {
+        try self.initWithPrefill(allocator, model, max_tokens, 1);
+    }
+
+    pub fn initWithPrefill(self: *Request, allocator: std.mem.Allocator, model: *Decoder, max_tokens: u32, chunk_rows: u32) !void {
         const text = model.text;
-        if (max_tokens == 0 or max_tokens > text.model_max_length) return error.InvalidInkling2Context;
+        if (max_tokens == 0 or max_tokens > text.model_max_length or chunk_rows == 0 or
+            chunk_rows > @min(prefill_chunk_rows, max_tokens)) return error.InvalidInkling2Context;
         self.* = .{
             .model = model,
+            .max_tokens = max_tokens,
+            .append_capacity = chunk_rows,
             .replay_enabled = model.ctx.info.compute_major == 12 and model.ctx.info.compute_minor <= 1 and
                 max_tokens >= 5 and max_tokens <= text.sliding_window_size,
         };
         const ctx = model.ctx;
-        const controller_rows: usize = if (supportsGroupedControllers(ctx)) 3 else 1;
+        const controller_rows: usize = @max(chunk_rows, if (supportsGroupedControllers(ctx)) @as(u32, 3) else 1);
         try self.kv.init(allocator, ctx, .{
-            .layout = .{ .page_tokens = page_tokens, .window_tokens = text.sliding_window_size, .max_tokens = max_tokens, .max_append_tokens = 1 },
+            .layout = .{ .page_tokens = page_tokens, .window_tokens = text.sliding_window_size, .max_tokens = max_tokens, .max_append_tokens = chunk_rows },
             .full_slots = checkpoint.full_slot_count,
             .sliding_slots = checkpoint.sliding_slot_count,
             .kv_heads = text.num_key_value_heads,
             .head_dim = text.head_dim,
         });
         errdefer self.kv.deinit() catch {};
-        self.workspace = try attention.Workspace.init(ctx, text, 1);
+        self.workspace = try attention.Workspace.init(ctx, text, chunk_rows);
+        self.workspace.rows = 1;
         errdefer self.workspace.deinit(ctx);
         errdefer self.freeBuffers();
         const hidden = @as(usize, text.hidden_size) * 2;
         const kv = @as(usize, text.num_key_value_heads) * text.head_dim * 2;
         const ids = (std.math.divCeil(usize, max_tokens, page_tokens) catch unreachable) * 4;
-        const nv = try moe.scratchBytes(.nvfp4, text, 1);
-        const mx = try moe.scratchBytes(.mxfp8, text, 1);
-        const relative_bytes = try relative.scratchBytes(.{
-            .rows = 1,
-            .start = max_tokens - 1,
-            .q_heads = text.num_attention_heads,
-            .kv_heads = text.num_key_value_heads,
-            .relative_extent = text.rel_extent,
-            .score_scale = 1,
-        }, 0, max_tokens);
+        const nv = try moe.scratchBytes(.nvfp4, text, chunk_rows);
+        const mx = try moe.scratchBytes(.mxfp8, text, chunk_rows);
+        var relative_bytes: usize = 0;
+        for (1..chunk_rows + 1) |count| {
+            const rows: u32 = @intCast(count);
+            relative_bytes = @max(relative_bytes, try relative.scratchBytes(.{
+                .rows = rows,
+                .start = max_tokens - rows,
+                .q_heads = text.num_attention_heads,
+                .kv_heads = text.num_key_value_heads,
+                .relative_extent = text.rel_extent,
+                .score_scale = 1,
+            }, 0, max_tokens));
+        }
+        const activation_bytes = hidden * chunk_rows;
         self.history = try DeviceBuffer.allocWithPurpose(ctx, 2 * checkpoint.visit_count * 6 * (hidden + kv), .kv_state);
         self.pages = try HostBuffer.alloc(ctx, 2 * ids);
         if (self.replay_enabled) {
@@ -295,10 +327,10 @@ pub const Request = struct {
         }
         self.logits = try HostBuffer.alloc(ctx, @as(usize, text.unpadded_vocab_size) * 4);
         for ([_]struct { Temp, usize }{
-            .{ .stack, block_slots * hidden },               .{ .prelude, hidden },                         .{ .bank, 2 * hidden },                   .{ .inputs, 3 * hidden },
+            .{ .stack, block_slots * activation_bytes },     .{ .prelude, activation_bytes },               .{ .bank, 2 * activation_bytes },         .{ .inputs, 3 * activation_bytes },
             .{ .mix, 2 * hidden * controller_rows },         .{ .message, 2 * hidden * controller_rows },   .{ .pair, 2 * hidden * controller_rows }, .{ .rank, @as(usize, text.loop_config.gate_rank) * 2 * controller_rows },
-            .{ .gain_forget, 4 * hidden * controller_rows }, .{ .raw, hidden },                             .{ .attn, hidden },                       .{ .mlp, hidden },
-            .{ .normalized, hidden },                        .{ .logits, @as(usize, text.vocab_size) * 4 }, .{ .blas, 8 * 1024 * 1024 },              .{ .relative, relative_bytes },
+            .{ .gain_forget, 4 * hidden * controller_rows }, .{ .raw, activation_bytes },                   .{ .attn, activation_bytes },             .{ .mlp, activation_bytes },
+            .{ .normalized, activation_bytes },              .{ .logits, @as(usize, text.vocab_size) * 4 }, .{ .blas, 8 * 1024 * 1024 },              .{ .relative, relative_bytes },
             .{ .router, @max(nv.logits, mx.logits) },        .{ .routed, @max(nv.routed, mx.routed) },      .{ .pages, 2 * ids },
         }) |item| self.temps[@backingInt(item[0])] = try DeviceBuffer.allocWithPurpose(ctx, item[1], .command_workspace);
         if (model.head_shortlist.workspaceBytes() != 0) {
@@ -322,10 +354,25 @@ pub const Request = struct {
         const ctx = self.model.ctx;
         for (&self.temps) |*temp| temp.free(ctx);
         self.history.free(ctx);
+        self.verification_history.free(ctx);
         self.shortlist_workspace.free(ctx);
         self.logits.free(ctx);
         self.pages.free(ctx);
         self.replay_position.free(ctx);
+    }
+
+    /// Attach before the first append so every prompt row can seed the
+    /// drafter. Request graphs borrow the drafter's feature staging planes.
+    pub fn attachDraft(self: *Request, draft: *dspark.Draft) !void {
+        if (self.position() != 0 or self.draft != null or draft.ctx != self.model.ctx or
+            draft.capacity != self.max_tokens or draft.position != 0) return error.InvalidInkling2DraftContext;
+        const text = self.model.text;
+        const widths = @as(usize, text.hidden_size) + @as(usize, text.num_key_value_heads) * text.head_dim;
+        for (draft.stage) |plane| {
+            if (plane.len < @as(usize, self.append_capacity) * text.hidden_size * 2) return error.InvalidInkling2DraftContext;
+        }
+        self.verification_history = try DeviceBuffer.allocWithPurpose(self.model.ctx, 4 * widths * checkpoint.visit_count * dspark.block_rows, .command_workspace);
+        self.draft = draft;
     }
 
     pub fn position(self: *const Request) usize {
@@ -337,11 +384,15 @@ pub const Request = struct {
     }
 
     fn shape(self: *const Request) residual.Shape {
-        return .{ .width = self.model.text.hidden_size };
+        return .{ .rows = self.workspace.rows, .width = self.model.text.hidden_size };
+    }
+
+    fn blockBytes(self: *const Request) usize {
+        return @as(usize, self.model.text.hidden_size) * 2 * self.workspace.rows;
     }
 
     fn block(self: *const Request, index: usize) DeviceBuffer {
-        return row(self.get(.stack), index, @as(usize, self.model.text.hidden_size) * 2);
+        return row(self.get(.stack), index, self.blockBytes());
     }
 
     fn pageTable(self: *const Request, group: cache.Group) DeviceBuffer {
@@ -369,9 +420,39 @@ pub const Request = struct {
         };
     }
 
+    fn verificationHistory(self: *const Request, visit: usize) [4]DeviceBuffer {
+        const text = self.model.text;
+        const kv = dspark.block_rows * @as(usize, text.num_key_value_heads) * text.head_dim * 2;
+        const hidden = dspark.block_rows * @as(usize, text.hidden_size) * 2;
+        const base = visit * 2 * (kv + hidden);
+        return .{
+            sub(self.verification_history, base, kv),
+            sub(self.verification_history, base + kv, kv),
+            sub(self.verification_history, base + 2 * kv, hidden),
+            sub(self.verification_history, base + 2 * kv + hidden, hidden),
+        };
+    }
+
+    fn retainHistoryPrefix(self: *Request, count: u32) !void {
+        const ctx = self.model.ctx;
+        for (0..checkpoint.visit_count) |visit| {
+            const old = self.histories(visit, self.history_side);
+            const next = self.histories(visit, 1 - self.history_side);
+            const projected = self.verificationHistory(visit);
+            for (old, next, projected) |before, after, source| {
+                const bytes = after.len / 3;
+                const newest = @min(count, 3);
+                const from_old = 3 - newest;
+                if (from_old != 0)
+                    try sub(after, 0, from_old * bytes).copyFromDevice(ctx, sub(before, newest * bytes, from_old * bytes), from_old * bytes);
+                try sub(after, from_old * bytes, newest * bytes).copyFromDevice(ctx, sub(source, (count - newest) * bytes, newest * bytes), newest * bytes);
+            }
+        }
+    }
+
     fn hiddenConv(self: *Request, weight: DeviceBuffer, old: DeviceBuffer, next: DeviceBuffer, output: DeviceBuffer) !void {
         try self.model.conv.run(self.model.ctx, .{
-            .rows = 1,
+            .rows = self.workspace.rows,
             .channels = self.model.text.hidden_size,
             .head_size = self.model.text.hidden_size,
             .input = self.get(.raw),
@@ -398,7 +479,7 @@ pub const Request = struct {
     fn projectControllerDown(self: *Request, layer: *const Layer, stream: Stream, pair: DeviceBuffer, hidden: DeviceBuffer) !void {
         const m = self.model;
         const weights = layer.controllers[@backingInt(stream)];
-        try m.blas.matmulBf16WeightBf16Out(m.ctx, hidden, pair, weights[@backingInt(ControllerWeight.down)], self.get(.blas), 1, 2 * @as(usize, m.text.hidden_size), m.text.loop_config.gate_rank);
+        try m.blas.matmulBf16WeightBf16Out(m.ctx, hidden, pair, weights[@backingInt(ControllerWeight.down)], self.get(.blas), self.workspace.rows, 2 * @as(usize, m.text.hidden_size), m.text.loop_config.gate_rank);
     }
 
     fn projectController(self: *Request, layer: *const Layer, stream: Stream, pair: DeviceBuffer, gate: DeviceBuffer) !void {
@@ -413,19 +494,20 @@ pub const Request = struct {
         const weights = layer.controllers[@backingInt(stream)];
         try self.projectControllerDown(layer, stream, pair, hidden);
         const gate_weight = weights[@backingInt(ControllerWeight.gain_forget)];
-        if (self.use_dense) {
+        if (self.use_dense and self.workspace.rows == 1) {
             if (!try m.matvec.tryRun(ctx, gate, hidden, gate_weight, rank, @as(u32, width) * 2, .f32))
                 try m.blas.matmulBf16WeightF32Out(ctx, gate, hidden, gate_weight, blas_space, 1, rank, @as(usize, width) * 2);
         } else {
             const weight_bytes = @as(usize, rank) * bytes;
-            try m.blas.matmulBf16WeightF32Out(ctx, row(gate, 0, bytes * 2), hidden, row(gate_weight, 0, weight_bytes), blas_space, 1, rank, width);
-            try m.blas.matmulBf16WeightF32Out(ctx, row(gate, 1, bytes * 2), hidden, row(gate_weight, 1, weight_bytes), blas_space, 1, rank, width);
+            const gate_bytes = self.blockBytes() * 2;
+            try m.blas.matmulBf16WeightF32Out(ctx, row(gate, 0, gate_bytes), hidden, row(gate_weight, 0, weight_bytes), blas_space, self.workspace.rows, rank, width);
+            try m.blas.matmulBf16WeightF32Out(ctx, row(gate, 1, gate_bytes), hidden, row(gate_weight, 1, weight_bytes), blas_space, self.workspace.rows, rank, width);
         }
     }
 
     fn controller(self: *Request, layer: *const Layer, layer_id: usize, stream: Stream, gamma: DeviceBuffer, output: DeviceBuffer) !void {
         const m = self.model;
-        const bytes = @as(usize, m.text.hidden_size) * 2;
+        const bytes = self.blockBytes();
         const bank = self.get(.bank);
         const input = self.get(.mix);
         const msg = self.get(.message);
@@ -501,9 +583,10 @@ pub const Request = struct {
         const layer = &m.layers[i];
         const looped = visit.pass > 0;
         const partial = self.block(stack_depth);
-        const width = @as(usize, text.hidden_size) * 2;
+        const bytes = self.blockBytes();
+        const query_bytes = @as(usize, text.hidden_size) * 4;
         const eps = text.rms_norm_eps;
-        const grouped = looped and !self.use_separate_controllers and supportsGroupedControllers(ctx);
+        const grouped = looped and self.workspace.rows == 1 and !self.use_separate_controllers and supportsGroupedControllers(ctx);
         var input: [3]DeviceBuffer = undefined;
         var gammas: [3]DeviceBuffer = undefined;
         for ([_]Stream{ .attn, .k, .v }, [_]LayerWeight{ .q_norm, .k_norm, .v_norm }, 0..) |stream, norm_key, channel| {
@@ -512,7 +595,7 @@ pub const Request = struct {
                 continue;
             }
             const gamma = layer.weight(if (layer.attn.local) .q_norm else norm_key);
-            input[channel] = row(self.get(.inputs), channel, width);
+            input[channel] = row(self.get(.inputs), channel, bytes);
             if (i == 0) {
                 try m.mix.norm(ctx, self.shape(), partial, .bf16, gamma, eps, input[channel]);
                 continue;
@@ -520,13 +603,13 @@ pub const Request = struct {
             if (looped) {
                 gammas[channel] = gamma;
                 if (!layer.attn.local or channel == 0) {
-                    const query = row(layer.weight(.attn_query), channel, width * 2);
-                    const mixed = if (grouped) row(self.get(.mix), channel, width * 2) else self.get(.mix);
+                    const query = row(layer.weight(.attn_query), channel, query_bytes);
+                    const mixed = if (grouped) row(self.get(.mix), channel, bytes * 2) else self.get(.mix);
                     try m.mix.mix(ctx, self.shape(), self.get(.stack), partial, .{}, @intCast(stack_depth + 1), query, mixed);
                 }
                 if (!grouped) try self.controller(layer, i, stream, gamma, input[channel]);
             } else {
-                const query = row(layer.weight(.attn_query), channel, width * 2);
+                const query = row(layer.weight(.attn_query), channel, query_bytes);
                 try m.mix.mixAndNorm(ctx, self.shape(), self.get(.stack), partial, .{}, @intCast(stack_depth + 1), query, gamma, eps, input[channel]);
             }
         }
@@ -548,6 +631,14 @@ pub const Request = struct {
             .old_history = .{ .key = old[0], .value = old[1] },
             .next_history = .{ .key = next[0], .value = next[1] },
         });
+        if (self.record_history) {
+            const stage = self.verificationHistory(ordinal);
+            const raw_kv = self.workspace.rawKv();
+            const kv_bytes = stage[0].len / dspark.block_rows * self.workspace.rows;
+            try stage[0].copyFromDevice(ctx, raw_kv.key, kv_bytes);
+            try stage[1].copyFromDevice(ctx, raw_kv.value, kv_bytes);
+            try stage[2].copyFromDevice(ctx, self.get(.raw), self.blockBytes());
+        }
         const attn = self.get(.attn);
         try self.hiddenConv(layer.weight(.attn_taps), old[2], next[2], attn);
         const boundary = i % text.n_layers_per_attn_res_block == 0;
@@ -560,12 +651,13 @@ pub const Request = struct {
         } else {
             try m.mix.mixAndNorm(ctx, self.shape(), self.get(.stack), attn, previous, @intCast(completed + 1), layer.weight(.mlp_query), layer.weight(.mlp_norm), eps, mlp_input);
         }
-        try m.ffn.run(ctx, &m.blas, text, &layer.ffn, 1, mlp_input, self.get(.raw), .{
+        try m.ffn.run(ctx, &m.blas, text, &layer.ffn, self.workspace.rows, mlp_input, self.get(.raw), .{
             .logits = self.get(.router),
             .blas = self.get(.blas),
             .routed = self.get(.routed),
             .activation_precision = m.expert_activation_precision,
         });
+        if (self.record_history) try self.verificationHistory(ordinal)[3].copyFromDevice(ctx, self.get(.raw), self.blockBytes());
         try self.hiddenConv(layer.weight(.mlp_taps), old[3], next[3], self.get(.mlp));
         try m.mix.sum(ctx, self.shape(), previous, attn, self.get(.mlp), self.block(completed));
         return completed;
@@ -573,12 +665,12 @@ pub const Request = struct {
 
     /// Commit prompt tokens whose logits will not be consumed.
     pub fn append(self: *Request, token: u32) !void {
-        try self.run(.{ .token = token }, .none);
+        try self.run(.{ .tokens = &.{token} }, 1, .none);
     }
 
     /// Run a token through all visits. The logit buffer is owned by the request.
     pub fn step(self: *Request, token: u32) ![]const f32 {
-        try self.run(.{ .token = token }, .logits);
+        try self.run(.{ .tokens = &.{token} }, 1, .logits);
         const bytes: []align(@alignOf(f32)) const u8 = @alignCast(self.logits.constBytes());
         return std.mem.bytesAsSlice(f32, bytes);
     }
@@ -595,7 +687,7 @@ pub const Request = struct {
             }
             return @intCast(best);
         }
-        try self.run(.{ .token = token }, .greedy);
+        try self.run(.{ .tokens = &.{token} }, 1, .greedy);
         const best = std.mem.readInt(u32, self.logits.constBytes()[0..4], .little);
         if (best >= self.model.text.unpadded_vocab_size) return error.NonFiniteInkling2Logit;
         return best;
@@ -603,19 +695,66 @@ pub const Request = struct {
 
     /// Append a projected vision row in the decoder's embedding space.
     pub fn appendEmbedding(self: *Request, embedding: DeviceBuffer) !void {
-        try self.run(.{ .embedding = embedding }, .none);
+        try self.run(.{ .embedding = embedding }, 1, .none);
     }
 
-    const Input = union(enum) { token: u32, embedding: DeviceBuffer };
-    const Output = enum { none, logits, greedy };
+    /// Commit prompt tokens in bounded chunks. A failed chunk leaves the
+    /// preceding committed prefix available.
+    pub fn appendTokens(self: *Request, tokens: []const u32) !void {
+        if (tokens.len > self.max_tokens - self.position()) return error.InvalidInkling2Context;
+        var offset: usize = 0;
+        while (offset < tokens.len) {
+            const rows: u32 = @intCast(@min(self.append_capacity, tokens.len - offset));
+            try self.run(.{ .tokens = tokens[offset..][0..rows] }, rows, .none);
+            offset += rows;
+        }
+    }
+
+    /// Commit contiguous BF16 vision embeddings in decoder row order.
+    pub fn appendEmbeddings(self: *Request, embeddings: DeviceBuffer, rows: u32) !void {
+        if (rows == 0) return;
+        if (rows > self.max_tokens - self.position()) return error.InvalidInkling2Context;
+        const row_bytes = @as(usize, self.model.text.hidden_size) * 2;
+        try buffer.validateRegions(1, .{embeddings}, .{@as(usize, rows) * row_bytes}, .{2}, 1);
+        var offset: u32 = 0;
+        while (offset < rows) {
+            const count = @min(self.append_capacity, rows - offset);
+            const chunk = sub(embeddings, @as(usize, offset) * row_bytes, @as(usize, count) * row_bytes);
+            try self.run(.{ .embedding = chunk }, count, .none);
+            offset += count;
+        }
+    }
+
+    const Input = union(enum) { tokens: []const u32, embedding: DeviceBuffer };
+    const Output = union(enum) { none, logits, greedy, verify: *Verification };
+
+    pub const Verification = struct {
+        ids: [dspark.block_rows]u32,
+        count: u32,
+    };
+
+    /// Verify the anchor and the proposed suffix in a single target pass.
+    /// The final returned token is the target's continuation after the last
+    /// accepted input. It has not been appended to the cache.
+    pub fn verifyDraft(self: *Request, anchor: u32, proposed: []const u32) !Verification {
+        if (self.draft == null or proposed.len == 0 or proposed.len >= dspark.block_rows or
+            proposed.len >= self.append_capacity) return error.InvalidInkling2DraftContext;
+        var tokens: [dspark.block_rows]u32 = undefined;
+        tokens[0] = anchor;
+        @memcpy(tokens[1..][0..proposed.len], proposed);
+        var result: Verification = undefined;
+        try self.run(.{ .tokens = tokens[0 .. proposed.len + 1] }, @intCast(proposed.len + 1), .{ .verify = &result });
+        return result;
+    }
 
     fn runVisits(self: *Request, replay: DeviceBuffer) !usize {
         const m = self.model;
         const text = m.text;
         const ctx = m.ctx;
-        const hidden = @as(usize, text.hidden_size) * 2;
+        const hidden = self.blockBytes();
         var depth: usize = 0;
         var prelude_depth: usize = undefined;
+        var tap: usize = 0;
         for (m.schedule, 0..) |visit, ordinal| {
             if (visit.weight_layer == text.loop_config.core_start) {
                 if (visit.pass == 0) {
@@ -626,6 +765,12 @@ pub const Request = struct {
                     try self.get(.bank).copyFromDevice(ctx, sub(self.get(.stack), (prelude_depth + 1) * hidden, 2 * hidden), 2 * hidden);
                     depth = prelude_depth;
                     try self.block(depth).copyFromDevice(ctx, self.get(.prelude), hidden);
+                }
+            }
+            if (self.draft) |draft| {
+                if (tap < draft.taps.len and ordinal == draft.taps[tap]) {
+                    try draft.stage[tap].copyFromDevice(ctx, self.block(depth), hidden);
+                    tap += 1;
                 }
             }
             depth = try self.runVisit(visit, ordinal, depth, replay);
@@ -648,7 +793,8 @@ pub const Request = struct {
     }
 
     fn replayVisits(self: *Request) !bool {
-        if (!self.replay_enabled or self.position() < 3) return false;
+        // Batched prefill may reach decoding before the row-one BLAS plans exist.
+        if (!self.replay_enabled or !self.single_row_prepared or self.workspace.rows != 1 or self.position() < 3) return false;
         const ctx = self.model.ctx;
         const owner = &self.replay_graphs[self.history_side];
         if (owner.exec == null) {
@@ -677,16 +823,23 @@ pub const Request = struct {
         try m.blas.matmulBf16WeightF32Out(ctx, logits, normalized, m.weight(.unembed), self.get(.blas), 1, text.hidden_size, text.vocab_size);
     }
 
-    fn run(self: *Request, input: Input, output: Output) !void {
+    fn run(self: *Request, input: Input, rows: u32, output: Output) !void {
         const m = self.model;
         const text = m.text;
         const ctx = m.ctx;
         const hidden = @as(usize, text.hidden_size) * 2;
+        std.debug.assert(rows > 0 and rows <= self.append_capacity and (rows == 1 or output == .none or output == .verify));
         switch (input) {
-            .token => |token| if (token >= text.unpadded_vocab_size) return error.InvalidInkling2Token,
-            .embedding => |embedding| try buffer.validateRegions(1, .{embedding}, .{hidden}, .{2}, 1),
+            .tokens => |tokens| for (tokens) |token| {
+                if (token >= text.unpadded_vocab_size) return error.InvalidInkling2Token;
+            },
+            .embedding => |embedding| try buffer.validateRegions(1, .{embedding}, .{hidden * rows}, .{2}, 1),
         }
-        try self.kv.prepareAppend(1);
+        self.workspace.rows = rows;
+        defer self.workspace.rows = 1;
+        self.record_history = output == .verify;
+        defer self.record_history = false;
+        try self.kv.prepareAppend(rows);
         errdefer {
             // Some work may have been enqueued before the first KV write.
             ctx.synchronize() catch {};
@@ -694,23 +847,40 @@ pub const Request = struct {
         }
         try self.publishPages();
         switch (input) {
-            .token => |token| try m.mix.norm(ctx, self.shape(), row(m.weight(.embed), token, hidden), .bf16, m.weight(.embed_norm), text.rms_norm_eps, self.block(0)),
-            .embedding => |embedding| try self.block(0).copyFromDevice(ctx, embedding, hidden),
+            .tokens => |tokens| for (tokens, 0..) |token, index| {
+                try m.mix.norm(ctx, .{ .width = text.hidden_size }, row(m.weight(.embed), token, hidden), .bf16, m.weight(.embed_norm), text.rms_norm_eps, row(self.block(0), index, hidden));
+            },
+            .embedding => |embedding| try self.block(0).copyFromDevice(ctx, embedding, hidden * rows),
         }
         const depth = if (try self.replayVisits()) block_slots - 1 else try self.runVisits(.{});
-        if (output != .none) {
-            const normalized = self.get(.normalized);
+        const normalized = self.get(.normalized);
+        if (output != .none or self.draft != null)
             try m.mix.mixAndNorm(ctx, self.shape(), self.get(.stack), self.block(depth), .{}, @intCast(depth + 1), m.weight(.output_query), m.weight(.final_norm), text.rms_norm_eps, normalized);
-            if (output == .greedy) {
-                try m.matvec.runGreedy(ctx, normalized, m.packed_head, m.head_shortlist, self.shortlist_workspace, self.logits.bytes()[0..4], text.final_logit_softcapping);
-            } else {
+        var committed = rows;
+        switch (output) {
+            .none => {},
+            .greedy => try m.matvec.runGreedy(ctx, normalized, m.packed_head, m.head_shortlist, self.shortlist_workspace, self.logits.bytes()[0..4], text.final_logit_softcapping),
+            .logits => {
                 const logits = self.get(.logits);
                 try self.projectLogits(logits, normalized);
                 try m.mix.softcap(ctx, logits, text.unpadded_vocab_size, text.final_logit_softcapping);
                 try logits.copyToHost(ctx, self.logits.bytes());
-            }
+            },
+            .verify => |verification| {
+                const best = try self.draft.?.selectTarget(&m.blas, normalized, rows);
+                committed = 1;
+                while (committed < rows and best[committed - 1] == input.tokens[committed]) : (committed += 1) {}
+                verification.* = .{ .ids = best, .count = committed };
+                if (committed < rows) try self.retainHistoryPrefix(committed);
+            },
         }
-        try self.kv.commit();
+        if (self.draft) |draft| {
+            try draft.stage[3].copyFromDevice(ctx, normalized, self.blockBytes());
+            try draft.stageContext(&m.blas, @intCast(self.position()), committed);
+        }
+        try self.kv.commitPrefix(committed);
+        if (self.draft) |draft| draft.commitContext(committed);
+        if (rows == 1) self.single_row_prepared = true;
         self.history_side = 1 - self.history_side;
     }
 };

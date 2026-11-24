@@ -156,6 +156,17 @@ pub const Append = struct {
         self.active = false;
     }
 
+    pub fn commitPrefix(self: *Append, rows: usize) !void {
+        if (!self.active or rows == 0 or rows > self.next_tokens - self.sequence.committed_tokens)
+            return error.InvalidKvRange;
+        if (rows < self.next_tokens - self.sequence.committed_tokens) {
+            try self.full.retainPrivatePrefix(rows, null);
+            try self.sliding.retainPrivatePrefix(rows, self.sequence.layout.window_tokens);
+            self.next_tokens = self.sequence.committed_tokens + rows;
+        }
+        self.commit();
+    }
+
     /// Defer after prepare, including on commit. Submitted writes must be
     /// drained before an uncommitted append returns its pages to the pools.
     pub fn abort(self: *Append) void {
@@ -211,6 +222,44 @@ test "hybrid paged KV bounds sliding pages through long and misaligned prefills"
     try std.testing.expect(sequence.pageId(.full, 0) != null);
     try std.testing.expectEqual(null, sequence.pageId(.sliding, 0));
     try std.testing.expectError(error.KvCapacityTooSmall, sequence.prepareAppend(1));
+}
+
+test "hybrid paged KV keeps an accepted prefix at a page and sliding-window boundary" {
+    const allocator = std.testing.allocator;
+    var full = try testPool(8);
+    defer full.deinit(allocator);
+    var sliding = try testPool(40);
+    defer sliding.deinit(allocator);
+    var sequence = try Sequence.init(allocator, inkling_test_layout, &full, &sliding);
+    defer sequence.deinit();
+    for ([_]usize{ 256, 256, 256, 256, 14 }) |rows| {
+        var append = try sequence.prepareAppend(rows);
+        defer append.abort();
+        append.commit();
+    }
+
+    const oldest = sequence.pageId(.sliding, 0);
+    const committed_tail = sequence.pageId(.full, 64);
+    {
+        var speculative = try sequence.prepareAppend(8);
+        defer speculative.abort();
+        const rejected_page = speculative.pageId(.full, 65);
+        try std.testing.expect(rejected_page != null);
+        try speculative.commitPrefix(1);
+        try std.testing.expectEqual(@as(usize, 1039), sequence.committed_tokens);
+        try std.testing.expectEqual(oldest, sequence.pageId(.sliding, 0));
+        try std.testing.expectEqual(committed_tail, sequence.pageId(.full, 64));
+        try std.testing.expectEqual(null, sequence.pageId(.full, 65));
+    }
+    {
+        var speculative = try sequence.prepareAppend(8);
+        defer speculative.abort();
+        const accepted_page = speculative.pageId(.full, 65);
+        try speculative.commitPrefix(3);
+        try std.testing.expectEqual(@as(usize, 1042), sequence.committed_tokens);
+        try std.testing.expectEqual(null, sequence.pageId(.sliding, 0));
+        try std.testing.expectEqual(accepted_page, sequence.pageId(.full, 65));
+    }
 }
 
 test "hybrid paged KV preserves both groups when prepare or append aborts" {

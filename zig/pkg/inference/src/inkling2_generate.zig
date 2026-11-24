@@ -18,6 +18,7 @@ const platform = @import("antfly_platform");
 const tokenizer = @import("inference_hf_tokenizer").HfTokenizer;
 const checkpoint = @import("architectures/inkling2_checkpoint.zig");
 const decoder = @import("architectures/inkling2_decoder_cuda.zig");
+const dspark = @import("architectures/inkling2_dspark_cuda.zig");
 const vision = @import("architectures/inkling2_vision_cuda.zig");
 const image = @import("pipelines/image.zig");
 const Context = @import("ops/cuda/context.zig").CudaContext;
@@ -40,6 +41,7 @@ pub fn main(init: std.process.Init) !void {
     var image_path: ?[]const u8 = null;
     var fast_matvec_override: ?bool = null;
     var quantized_experts = false;
+    var draft_enabled = false;
     while (arg) |option| : (arg = args.next()) {
         if (std.mem.eql(u8, option, "--image") and image_path == null) {
             image_path = args.next() orelse return error.InvalidArguments;
@@ -49,6 +51,8 @@ pub fn main(init: std.process.Init) !void {
             fast_matvec_override = false;
         } else if (std.mem.eql(u8, option, "--quantized-experts") and !quantized_experts) {
             quantized_experts = true;
+        } else if (std.mem.eql(u8, option, "--dspark") and !draft_enabled) {
+            draft_enabled = true;
         } else return error.InvalidArguments;
     }
     if (limit == 0) return error.InvalidArguments;
@@ -86,19 +90,36 @@ pub fn main(init: std.process.Init) !void {
     if (tokens - 1 > source.config.value.text_config.model_max_length) return error.InvalidInkling2Context;
     var ctx = try Context.initDefault();
     defer ctx.deinit();
-    const fast_matvec = fast_matvec_override orelse
-        (ctx.info.compute_major == 12 and ctx.info.compute_minor == 1);
+    const gb10 = ctx.info.compute_major == 12 and ctx.info.compute_minor == 1;
+    const fast_matvec = fast_matvec_override orelse gb10;
     const load_start = platform.time.monotonicNs();
     var model = try decoder.Decoder.load(allocator, &ctx, &source, .{
         .pack_attention_weights = fast_matvec,
         .prepare_greedy = true,
+        .retain_raw_head = draft_enabled,
         .quantized_expert_activations = quantized_experts,
     });
     defer model.deinit();
+    var draft: ?dspark.Draft = null;
+    defer if (draft) |*drafter| drafter.deinit();
     var request: decoder.Request = undefined;
-    try request.init(allocator, &model, @intCast(tokens - 1));
+    // Short prompts already use the same prepared row-one plans as decoding.
+    const batch_prompt = gb10 and fast_matvec and prompt_count > decoder.prefill_chunk_rows;
+    const chunk_rows: u32 = if (batch_prompt or draft_enabled) @intCast(@min(decoder.prefill_chunk_rows, tokens - 1)) else 1;
+    request.initWithPrefill(allocator, &model, @intCast(tokens - 1), chunk_rows) catch |err| switch (err) {
+        error.CudaMemoryLimitExceeded => {
+            if (chunk_rows == 1 or draft_enabled) return err;
+            try request.init(allocator, &model, @intCast(tokens - 1));
+        },
+        else => return err,
+    };
     request.use_dense = fast_matvec;
     defer request.deinit() catch @panic("unable to drain the Inkling CUDA stream");
+    if (draft_enabled) {
+        const config = source.config.value.mtp_config orelse return error.MissingInkling2DraftConfig;
+        draft = try dspark.Draft.load(allocator, &ctx, &model.blas, model_dir, config, model.sharedDraftWeights(), @intCast(tokens - 1), request.append_capacity);
+        try request.attachDraft(&draft.?);
+    }
     const prefill_start = platform.time.monotonicNs();
     if (pixels) |value| {
         var encoder = try vision.Vision.load(&ctx, &source);
@@ -106,20 +127,45 @@ pub fn main(init: std.process.Init) !void {
         var embeddings = try encoder.encodeRgb(&model.blas, value.data, value.width, value.height);
         defer embeddings.deinit(&ctx);
         for (prefix_ids.?) |id| try request.append(try inputToken(id));
-        for (0..embeddings.rows) |i| try request.appendEmbedding(try embeddings.row(@intCast(i)));
+        try request.appendEmbeddings(embeddings.device, embeddings.rows);
     }
-    for (prompt_ids[0 .. prompt_ids.len - 1]) |id| try request.append(try inputToken(id));
+    const text_prefill = try allocator.alloc(u32, prompt_ids.len - 1);
+    defer allocator.free(text_prefill);
+    for (text_prefill, prompt_ids[0 .. prompt_ids.len - 1]) |*token, id| token.* = try inputToken(id);
+    if (batch_prompt) try request.appendTokens(text_prefill) else for (text_prefill) |token| try request.append(token);
     var last = try request.stepGreedy(try inputToken(prompt_ids[prompt_ids.len - 1]));
     const decode_start = platform.time.monotonicNs();
     var generated: std.ArrayList(i32) = .empty;
     defer generated.deinit(allocator);
-    while (generated.items.len < limit) {
-        if (last == source.config.value.eos_token_id or (image_stop != null and last == image_stop.?)) break;
+    var verification_passes: usize = 0;
+    var total_proposed: usize = 0;
+    var total_accepted: usize = 0;
+    const eos = source.config.value.eos_token_id;
+    decode: while (generated.items.len < limit) {
+        if (last == eos or last == image_stop) break;
         try generated.append(allocator, @intCast(last));
-        if (generated.items.len == limit) break;
+        const remaining = limit - generated.items.len;
+        if (remaining == 0) break;
+        if (remaining > 1 and request.append_capacity > 1) {
+            if (draft) |*drafter| {
+                const count: u32 = @intCast(@min(dspark.proposal_rows, remaining - 1));
+                const proposals = try drafter.propose(&model.blas, last, count);
+                const verification = try request.verifyDraft(last, proposals[0..count]);
+                verification_passes += 1;
+                total_proposed += count;
+                total_accepted += verification.count - 1;
+                for (verification.ids[0 .. verification.count - 1]) |id| {
+                    if (id == eos or id == image_stop) break :decode;
+                    try generated.append(allocator, @intCast(id));
+                }
+                last = verification.ids[verification.count - 1];
+                continue;
+            }
+        }
         last = try request.stepGreedy(last);
     }
     const done = platform.time.monotonicNs();
+    if (draft_enabled) std.debug.print("dspark_passes={d} dspark_proposed={d} dspark_accepted={d}\n", .{ verification_passes, total_proposed, total_accepted });
     const text = try tok.decodeText(allocator, generated.items);
     defer allocator.free(text);
     const out = std.Io.File.stdout();
@@ -132,7 +178,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn usage(io: std.Io) !void {
-    try std.Io.File.stdout().writeStreamingAll(io, "Usage: antfly-inference-inkling2-cuda MODEL_DIR PROMPT [MAX_NEW_TOKENS] [--image PATH] [--fast-matvec | --no-fast-matvec] [--quantized-experts]\n" ++
+    try std.Io.File.stdout().writeStreamingAll(io, "Usage: antfly-inference-inkling2-cuda MODEL_DIR PROMPT [MAX_NEW_TOKENS] [--image PATH] [--fast-matvec | --no-fast-matvec] [--quantized-experts] [--dspark]\n" ++
         "Fast matvec is enabled by default on NVIDIA GB10 (SM121).\n");
 }
 

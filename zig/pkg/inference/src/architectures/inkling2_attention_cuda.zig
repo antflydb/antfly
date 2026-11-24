@@ -170,6 +170,13 @@ pub const Workspace = struct {
         self.backing.free(ctx);
     }
 
+    /// The multi-row path keeps the unconvolved K/V rows in their own
+    /// projection planes through the end of the visit.
+    pub fn rawKv(self: Workspace) cache.Planes {
+        std.debug.assert(self.rows > 1);
+        return .{ .key = self.get(.k), .value = self.get(.v) };
+    }
+
     fn get(self: Workspace, temp: Temp) DeviceBuffer {
         return self.slices[@backingInt(temp)];
     }

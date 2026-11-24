@@ -102,10 +102,29 @@ pub const Visit = struct {
     slot: u16,
 };
 
+pub const DraftConfig = struct {
+    hidden_size: u32,
+    num_hidden_layers: u32,
+    num_attention_heads: u32,
+    num_key_value_heads: u32,
+    head_dim: u32,
+    intermediate_size: u32,
+    max_position_embeddings: u32,
+    rms_norm_eps: f32,
+    rope_theta: f32,
+    local_layer_ids: [2]u8,
+    sliding_window_size: u32,
+    block_size: u32,
+    markov_rank: u32,
+    markov_head_type: []const u8,
+    target_layer_ids: [4]u8,
+};
+
 pub const Config = struct {
     model_type: []const u8,
     eos_token_id: u32,
     text_config: TextConfig,
+    mtp_config: ?DraftConfig = null,
     quantization_config: struct {
         quant_method: []const u8,
         quant_algo: []const u8,

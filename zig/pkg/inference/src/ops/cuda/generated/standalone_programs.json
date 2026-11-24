@@ -555,5 +555,32 @@
     "hidden": 0,
     "wide": 0,
     "bf16": false
+  },
+  {
+    "family": "block_decoder_bf16",
+    "file": "block_decoder_bf16.ptx",
+    "entry": "antfly_weighted_four_rows_rms_bf16",
+    "producer": "block_decoder_bf16.cu",
+    "exports": [
+      "antfly_weighted_four_rows_rms_bf16",
+      "antfly_residual_add_rms_bf16",
+      "antfly_head_rms_neox_rope_d128_bf16",
+      "antfly_swiglu_separate_bf16",
+      "antfly_bshd_block_gqa_d128_bf16",
+      "antfly_low_rank_recurrent_gate_bf16",
+      "antfly_softcapped_sum_argmax_bf16_tiles",
+      "antfly_softcapped_argmax_rows_f32_tiles",
+      "antfly_argmax_merge_tiles_f32"
+    ],
+    "nvcc_flags": [
+      "--fmad=false",
+      "-std=c++17"
+    ],
+    "target": 80,
+    "threads": 0,
+    "shared": 0,
+    "hidden": 0,
+    "wide": 0,
+    "bf16": false
   }
 ]

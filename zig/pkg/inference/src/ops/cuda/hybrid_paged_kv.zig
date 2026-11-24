@@ -278,7 +278,9 @@ pub const Cache = struct {
     /// position supplied for each append rather than the maximum visible end.
     pub fn replayBinding(self: *Cache, visit: Visit) !StagedView {
         const layout = self.sequence.layout;
-        if (layout.max_tokens > layout.window_tokens or layout.max_append_tokens != 1) return error.InvalidKvShape;
+        const pending = self.pending orelse return error.KvAppendMissing;
+        if (layout.max_tokens > layout.window_tokens or pending.append.next_tokens != self.committedTokens() + 1)
+            return error.InvalidKvShape;
         const selected = self.bank(visit.group);
         if (visit.slot >= selected.written.len) return error.InvalidKvRange;
         return .{
@@ -350,12 +352,17 @@ pub const Cache = struct {
     }
 
     pub fn commit(self: *Cache) !void {
+        const pending = self.pending orelse return error.KvAppendMissing;
+        try self.commitPrefix(pending.append.next_tokens - self.committedTokens());
+    }
+
+    pub fn commitPrefix(self: *Cache, rows: usize) !void {
         const pending = if (self.pending) |*value| value else return error.KvAppendMissing;
         if (pending.failed) return error.KvAppendFailed;
         if (pending.remaining_slots != 0) return error.IncompleteKvWriteSet;
         errdefer pending.failed = true;
         try self.ctx.synchronize();
-        pending.append.commit();
+        try pending.append.commitPrefix(rows);
         self.discardPending();
     }
 
