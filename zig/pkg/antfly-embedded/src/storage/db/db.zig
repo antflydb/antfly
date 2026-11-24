@@ -4084,6 +4084,10 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("open", .{ alloc, path, requested_opts });
         return blk: {
             var opts = requested_opts;
+            // Provider interfaces are move-only. Keep them in the mutable
+            // options until a runtime has adopted them so partial opens have
+            // exactly one cleanup owner.
+            errdefer if (opts.enrichment) |*cfg| deinitOwnedEnrichmentConfig(alloc, cfg);
             if (opts.sql_persistence) |descriptor| {
                 const context = opts.sql_persistence_context orelse return error.InvalidSqlRelationPersistence;
                 if (opts.identity_namespace == null) return error.InvalidSqlRelationPersistence;
@@ -4131,10 +4135,6 @@ pub const DB = struct {
                 if (opts.identity_namespace == null or !opts.identity_namespace.?.eql(bootstrap.namespace) or
                     opts.schema_before_index_load != null) return error.InvalidInitialChildPublication;
             }
-            // Provider interfaces are move-only. Keep them in the mutable
-            // options until a runtime has adopted them so partial opens have
-            // exactly one cleanup owner.
-            errdefer if (opts.enrichment) |*cfg| deinitOwnedEnrichmentConfig(alloc, cfg);
             if (opts._backend_configuration_resolution) |resolution| {
                 if (resolution.path_fingerprint != backendConfigurationPathFingerprint(path))
                     return error.BackendConfigurationPathMismatch;
@@ -6852,6 +6852,8 @@ pub const DB = struct {
             self.ttl_cleanup_context = null;
             self.enrichment_owner.deinit(self.runtime_alloc);
             publishEnrichmentOwner(self);
+            if (self.retained_recovery_config) |*config| deinitOwnedEnrichmentConfig(self.runtime_alloc, config);
+            self.retained_recovery_config = null;
             self.resolution_owner.deinitRuntime(self.runtime_alloc);
             self.resolution_runtime = null;
             self.async_context.resolution_runtime = null;
