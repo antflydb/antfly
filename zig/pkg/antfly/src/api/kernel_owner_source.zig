@@ -2936,7 +2936,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         // separate proof and must never be relabelled as a native mutation.
         // Return only after every final owner and quorum fence passes.
         if (comptime kind == .resolution) return table_write_source.history_resolution_wire.Reply.init(request, result.cut, result.resolution);
-        if (comptime kind == .publication) return completion_history.CompletionPublicationObservation.init(request, result.cut, result.publication);
+        if (comptime kind == .publication) return completion_history.CompletionPublicationObservation.initWithRelease(request, result.cut, result.publication, result.release);
         return result;
     }
 
