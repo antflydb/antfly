@@ -31,6 +31,7 @@ pub fn main(init: std.process.Init) !void {
     if (!engine.enabled) return error.ProbeRequiresSharedStorage;
     const descriptor = engine.descriptorForValidation();
     engine.validateDescriptor(descriptor) catch |err| {
+        if (descriptor.version != engine.descriptor_version) return err;
         inline for (@typeInfo(engine.Descriptor).@"struct".field_names, @typeInfo(engine.Descriptor).@"struct".field_types) |field, T| {
             if (comptime T == @TypeOf(engine.table_layout)) {
                 const actual = @field(descriptor, field);
@@ -62,14 +63,17 @@ pub fn main(init: std.process.Init) !void {
         }
         return err;
     };
-    var incompatible = engine.descriptorForValidation().*;
-    incompatible.db_layout.size += 1;
-    engine.validateDescriptor(&incompatible) catch |err| {
-        if (err != error.UnsupportedVersion) return err;
-        try exerciseBorrowedRuntime(alloc, root, init.io);
-        return exercise(alloc, root, physical, init.io);
-    };
-    return error.AcceptedIncompatibleStorageLayout;
+    inline for (.{ "db_layout", "external_transaction_begin_layout", "external_transaction_resolution_layout", "completion_release_layout" }) |field| {
+        var incompatible = descriptor.*;
+        @field(incompatible, field).size += 1;
+        if (engine.validateDescriptor(&incompatible)) |_| {
+            return error.AcceptedIncompatibleStorageLayout;
+        } else |err| {
+            if (err != error.UnsupportedVersion) return err;
+        }
+    }
+    try exerciseBorrowedRuntime(alloc, root, init.io);
+    return exercise(alloc, root, physical, init.io);
 }
 fn exercise(alloc: std.mem.Allocator, root: []const u8, physical: []const u8, io: std.Io) !void {
     const db = try db_mod.DB.openOwned(alloc, physical, .{ .start_optional_runtimes = false, .start_index_workers = false });

@@ -676,7 +676,8 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
 /// Version 74 combines committed history with staged producer durability.
 /// Version 75 adds snapshot-qualified artifact publication history reads.
 /// Version 76 also includes SQL native lifetime and publication owner ports.
-pub const descriptor_version: u32 = 76;
+/// Version 77 carries physical history ownership in SQL completion calls.
+pub const descriptor_version: u32 = 77;
 pub const Descriptor = extern struct {
     version: u32 = descriptor_version,
     table_layout: native.TypeContract,
@@ -693,6 +694,9 @@ pub const Descriptor = extern struct {
     row_policy_installed_layout: native.TypeContract,
     physical_row_layout: native.TypeContract,
     external_retention_layout: native.TypeContract,
+    external_transaction_begin_layout: native.TypeContract,
+    external_transaction_resolution_layout: native.TypeContract,
+    completion_release_layout: native.TypeContract,
     prepared_commit_disposition_layout: native.TypeContract,
     prepared_commit_disposition_state_layout: native.TypeContract,
     embedding_memo_layout: native.TypeContract,
@@ -884,6 +888,9 @@ pub fn validateDescriptor(descriptor: *const Descriptor) !void {
     try validatePhysicalRowLayoutContract(descriptor.version, descriptor.physical_row_layout);
     try validateExternalRetentionContract(descriptor.version, descriptor.external_retention_layout);
     if (!descriptor.table_layout.matches(table_layout) or
+        !descriptor.external_transaction_begin_layout.matches(external_transaction_begin_layout) or
+        !descriptor.external_transaction_resolution_layout.matches(external_transaction_resolution_layout) or
+        !descriptor.completion_release_layout.matches(completion_release_layout) or
         !descriptor.db_layout.matches(db_layout) or !descriptor.core_layout.matches(core_layout) or
         !descriptor.handle_layout.matches(handle_layout) or !descriptor.registry_layout.matches(registry_layout) or
         !descriptor.backend_runtime_layout.matches(backend_runtime_layout) or
@@ -960,6 +967,9 @@ pub const lookup_options_layout = blk: {
     @setEvalBranchQuota(100_000);
     break :blk native.TypeContract.of(types.LookupOptions);
 };
+pub const external_transaction_begin_layout = native.TypeContract.of(types.ExternalTransactionBegin);
+pub const external_transaction_resolution_layout = native.TypeContract.of(types.ExternalTransactionResolution);
+pub const completion_release_layout = native.TypeContract.of(types.CompletionRelease);
 pub const external_retention_layout = native.TypeContract.of(@import("transactions.zig").ExternalRetentionSnapshot);
 pub const physical_row_layout = native.TypeContract.of(@import("db/algebraic/relational_row_codec.zig").PhysicalLayout);
 pub const row_policy_installed_layout = native.TypeContract.of(@import("db/row_policy_bundle.zig").Installed);
