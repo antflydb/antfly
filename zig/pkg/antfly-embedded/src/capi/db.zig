@@ -939,6 +939,30 @@ pub const HandleGuard = struct {
     /// off an undurable tip. Only `leave`'s reacquire (which runs after the
     /// ticket this guard is shielding has resolved) may close or hand off
     /// the lease to someone else, exactly as it always has.
+    fn releaseWriterLaneForIndexedWait(self: *HandleGuard) bool {
+        if (!self.lane_managed or !self.connection_gate_held or self.writer_lane_released) return false;
+        self.releaseWriterLaneBeforeWait();
+        return true;
+    }
+
+    fn resumeWriterLaneAfterIndexedWait(self: *HandleGuard) !void {
+        std.debug.assert(self.lane_managed and self.writer_lane_released);
+        const connection = self.connection.?;
+        const io = handleLockIo();
+        connection.mutex.lockUncancelable(io);
+        errdefer connection.mutex.unlock(io);
+        const lane = &connection.owner.writer_lane;
+        const root = try lane.checkout(connection, .mutation);
+        // checkout acquired another pin; the original stays with this guard.
+        defer _ = root.lane_pins.fetchSub(1, .release);
+        if (root != self.lane_pinned_root.?) {
+            lane.checkin(connection, root.owned_lite_backend.?.native_docstore.?);
+            return error.EnrichmentSourceChanged;
+        }
+        self.connection_gate_held = true;
+        self.writer_lane_released = false;
+    }
+
     pub fn releaseWriterLaneBeforeWait(self: *HandleGuard) void {
         const connection = self.connection orelse return;
         if (!self.connection_gate_held or self.writer_lane_released) return;
@@ -1196,6 +1220,18 @@ pub fn writerLaneHookFromGuard(guard: *HandleGuard) @import("../storage/db/execu
             fn run(ptr: *anyopaque) void {
                 const typed: *HandleGuard = @ptrCast(@alignCast(ptr));
                 typed.releaseWriterLaneBeforeWait();
+            }
+        }.run,
+        .release_for_indexed_wait = struct {
+            fn run(ptr: *anyopaque) bool {
+                const typed: *HandleGuard = @ptrCast(@alignCast(ptr));
+                return typed.releaseWriterLaneForIndexedWait();
+            }
+        }.run,
+        .resume_after_indexed_wait = struct {
+            fn run(ptr: *anyopaque) anyerror!void {
+                const typed: *HandleGuard = @ptrCast(@alignCast(ptr));
+                return typed.resumeWriterLaneAfterIndexedWait();
             }
         }.run,
     };
@@ -11072,6 +11108,14 @@ test "WS3 writer lane: a slow fsync forces concurrent writers to share groups" {
 // it continue -- a deterministic window to assert both are actually free,
 // instead of racing real fsync timing.
 test "WS3 writer lane: capi connection locks are free during the primary write's durability wait" {
+    try testWriterLaneDurabilityWait(false);
+}
+
+test "WS3 writer lane: queued sparse publication releases and resumes admission" {
+    try testWriterLaneDurabilityWait(true);
+}
+
+fn testWriterLaneDurabilityWait(indexed: bool) !void {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var directory = try TestDirectory.init("ws3-writer-lane-lock-free-wait");
@@ -11083,6 +11127,12 @@ test "WS3 writer lane: capi connection locks are free during the primary write's
     const create_options: capi.OpenOptions = .{ .storage_kind = capi.storage_kind_lite };
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &create_options, &handle));
     defer antfly_db_close(handle);
+
+    if (indexed) {
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .fromSlice(
+            "{\"name\":\"vec\",\"kind\":\"sparse_vector\",\"config_json\":\"{\\\"field\\\":\\\"embedding\\\",\\\"external\\\":true}\"}",
+        )));
+    }
 
     const entry = HandleEntry.capture(handle).?;
     defer entry.release();
@@ -11104,8 +11154,10 @@ test "WS3 writer lane: capi connection locks are free during the primary write's
     const Probe = struct {
         released: std.Io.Event = .unset,
         proceed: std.Io.Event = .unset,
+        hook_seen: bool = false,
         fn notify(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.hook_seen = true;
             self.released.set(handleLockIo());
             self.proceed.waitUncancelable(handleLockIo());
         }
@@ -11116,16 +11168,21 @@ test "WS3 writer lane: capi connection locks are free during the primary write's
 
     const Writer = struct {
         handle: ?*anyopaque,
+        probe: *Probe,
+        indexed: bool,
         code: capi.ErrorCode = .invalid_argument,
         fn run(self: *@This()) void {
-            var request_buffer: [128]u8 = undefined;
-            const request = std.fmt.bufPrint(&request_buffer, "{{\"inserts\":{{\"k\":{{\"v\":\"probe\"}}}},\"sync_level\":\"write\"}}", .{}) catch unreachable;
+            defer self.probe.released.set(handleLockIo());
+            const request = if (self.indexed)
+                "{\"inserts\":{\"k\":{\"v\":\"probe\",\"_embeddings\":{\"vec\":{\"indices\":[3],\"values\":[1.0]}}}},\"sync_level\":\"full_index\"}"
+            else
+                "{\"inserts\":{\"k\":{\"v\":\"probe\"}},\"sync_level\":\"write\"}";
             var output: capi.Buffer = .{};
             defer antfly_buffer_free(&output);
             self.code = antfly_db_batch_json(self.handle, .{ .ptr = request.ptr, .len = request.len }, &output);
         }
     };
-    var writer: Writer = .{ .handle = handle };
+    var writer: Writer = .{ .handle = handle, .probe = &probe, .indexed = indexed };
     const thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});
 
     probe.released.waitUncancelable(handleLockIo());
@@ -11165,9 +11222,47 @@ test "WS3 writer lane: capi connection locks are free during the primary write's
     // free carries no priority-inversion risk the way it would have under
     // the old per-call retain/handoff design.
     const gate_mutex_free = LockProbe.acquirable(&connection.gate.mutex);
+    const CatalogChange = struct {
+        handle: ?*anyopaque,
+        code: capi.ErrorCode = .invalid_argument,
+
+        fn run(self: *@This()) void {
+            self.code = antfly_db_add_index_json(self.handle, .fromSlice(
+                "{\"name\":\"concurrent_text\",\"kind\":\"full_text\",\"config_json\":\"{}\"}",
+            ));
+        }
+    };
+    var change: CatalogChange = .{ .handle = handle };
+    const catalog_thread = if (indexed and probe.hook_seen)
+        std.Thread.spawn(.{}, CatalogChange.run, .{&change}) catch |err| {
+            probe.proceed.set(handleLockIo());
+            thread.join();
+            return err;
+        }
+    else
+        null;
+    var catalog_entered = false;
+    if (catalog_thread != null) {
+        // The catalog call must own connection admission before the writer
+        // resumes, so the test exercises the former reversed lock order.
+        for (0..1000) |_| {
+            if (!connection.mutex.tryLock()) {
+                catalog_entered = true;
+                break;
+            }
+            connection.mutex.unlock(handleLockIo());
+            handleLockIo().sleep(.fromMilliseconds(1), .awake) catch {};
+        }
+    }
     probe.proceed.set(handleLockIo());
     thread.join();
+    if (catalog_thread) |worker| {
+        worker.join();
+        try std.testing.expect(catalog_entered);
+        try std.testing.expectEqual(capi.ErrorCode.ok, change.code);
+    }
 
+    try std.testing.expect(probe.hook_seen);
     try std.testing.expect(connection_mutex_free);
     try std.testing.expect(gate_mutex_free);
     try std.testing.expectEqual(capi.ErrorCode.ok, writer.code);

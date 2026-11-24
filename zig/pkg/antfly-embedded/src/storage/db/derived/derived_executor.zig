@@ -66,6 +66,7 @@ pub const Executor = struct {
         resume_worker: *const fn (ptr: *anyopaque, name: []const u8) void,
         remove_worker: *const fn (ptr: *anyopaque, name: []const u8) void,
         applied_sequence: *const fn (ptr: *anyopaque, name: []const u8) ?u64,
+        adopt_durable_progress: *const fn (*anyopaque, []const u8, u64) bool,
         advance_applied_sequence_if_contiguous: *const fn (ptr: *anyopaque, name: []const u8, sequence: u64) bool,
         snapshot_stats: *const fn (ptr: *anyopaque) types.DerivedWorkerStats,
         request_sequence: *const fn (ptr: *anyopaque, sequence: u64) void,
@@ -143,6 +144,11 @@ pub const Executor = struct {
     /// no-op) whenever there is no worker for `name`, or the worker is
     /// not exactly caught up to `sequence - 1`, in which case its own
     /// catch-up path remains the only way forward for the gap.
+    /// Only for a proven durable peer publication of an installed index.
+    pub fn adoptDurableProgress(self: *Executor, name: []const u8, sequence: u64) bool {
+        return self.vtable.adopt_durable_progress(self.ptr, name, sequence);
+    }
+
     pub fn advanceAppliedSequenceIfContiguous(self: *Executor, name: []const u8, sequence: u64) bool {
         return self.vtable.advance_applied_sequence_if_contiguous(self.ptr, name, sequence);
     }
@@ -254,6 +260,7 @@ const ManualRuntime = struct {
     can_advance_to_target_fn: ?CanAdvanceToTargetFn,
     applied_sequence_advanced_fn: ?AppliedSequenceAdvancedFn,
     backlog: backlog_tracker_mod.Tracker,
+    backlog_mutex: std.atomic.Mutex = .unlocked,
     workers: std.ArrayListUnmanaged(ManualWorker) = .empty,
 
     pub fn deinit(self: *ManualRuntime) void {
@@ -329,6 +336,17 @@ const ManualRuntime = struct {
         return false;
     }
 
+    fn adoptDurableProgress(self: *ManualRuntime, name: []const u8, sequence: u64) bool {
+        for (self.workers.items) |*worker| {
+            if (!std.mem.eql(u8, worker.name, name)) continue;
+            if (worker.applied_sequence > sequence) return false;
+            worker.applied_sequence = sequence;
+            worker.target_sequence = @max(worker.target_sequence, sequence);
+            return true;
+        }
+        return false;
+    }
+
     fn snapshotStats(self: *ManualRuntime) types.DerivedWorkerStats {
         var stats = types.DerivedWorkerStats{
             .workers = @intCast(self.workers.items.len),
@@ -366,22 +384,32 @@ const ManualRuntime = struct {
     }
 
     fn trackBacklogBytes(self: *ManualRuntime, sequence: u64, bytes: u64) !void {
+        @import("antfly_platform").sync.lockYielding(&self.backlog_mutex);
+        defer self.backlog_mutex.unlock();
         return try self.backlog.track(self.alloc, sequence, bytes);
     }
 
     fn admitBacklogBytes(self: *ManualRuntime, bytes: u64) !BacklogAdmission {
+        @import("antfly_platform").sync.lockYielding(&self.backlog_mutex);
+        defer self.backlog_mutex.unlock();
         return try self.backlog.admit(self.alloc, bytes);
     }
 
     fn commitBacklogAdmission(self: *ManualRuntime, sequence: u64, admission: *BacklogAdmission) void {
+        @import("antfly_platform").sync.lockYielding(&self.backlog_mutex);
+        defer self.backlog_mutex.unlock();
         self.backlog.commitAdmission(sequence, admission);
     }
 
     fn backlogThrottleTargetSequence(self: *ManualRuntime) ?u64 {
+        @import("antfly_platform").sync.lockYielding(&self.backlog_mutex);
+        defer self.backlog_mutex.unlock();
         return self.backlog.throttleTargetSequence();
     }
 
     fn releaseBacklogThrough(self: *ManualRuntime, sequence: u64) void {
+        @import("antfly_platform").sync.lockYielding(&self.backlog_mutex);
+        defer self.backlog_mutex.unlock();
         self.backlog.releaseThrough(sequence);
     }
 
@@ -478,7 +506,7 @@ const ManualRuntime = struct {
         const min_applied = computeMinApplied(self.workers.items);
         if (min_applied > 0) {
             try self.truncate_fn(self.ctx, min_applied);
-            self.backlog.releaseThrough(min_applied);
+            self.releaseBacklogThrough(min_applied);
         }
     }
 
@@ -528,7 +556,7 @@ const ManualRuntime = struct {
         const min_applied = computeMinApplied(self.workers.items);
         if (min_applied > 0) {
             try self.truncate_fn(self.ctx, min_applied);
-            self.backlog.releaseThrough(min_applied);
+            self.releaseBacklogThrough(min_applied);
         }
     }
 };
@@ -600,6 +628,7 @@ const manual_vtable = Executor.VTable{
     .resume_worker = manualResumeWorker,
     .remove_worker = manualRemoveWorker,
     .applied_sequence = manualAppliedSequence,
+    .adopt_durable_progress = manualAdoptDurableProgress,
     .advance_applied_sequence_if_contiguous = manualAdvanceAppliedSequenceIfContiguous,
     .snapshot_stats = manualSnapshotStats,
     .request_sequence = manualNotifySequence,
@@ -658,6 +687,11 @@ fn manualRemoveWorker(ptr: *anyopaque, name: []const u8) void {
 fn manualAppliedSequence(ptr: *anyopaque, name: []const u8) ?u64 {
     const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
     return runtime.appliedSequence(name);
+}
+
+fn manualAdoptDurableProgress(ptr: *anyopaque, name: []const u8, sequence: u64) bool {
+    const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
+    return runtime.adoptDurableProgress(name, sequence);
 }
 
 fn manualAdvanceAppliedSequenceIfContiguous(ptr: *anyopaque, name: []const u8, sequence: u64) bool {
@@ -767,6 +801,7 @@ const io_threaded_vtable = Executor.VTable{
     .resume_worker = ioThreadedResumeWorker,
     .remove_worker = ioThreadedRemoveWorker,
     .applied_sequence = ioThreadedAppliedSequence,
+    .adopt_durable_progress = ioThreadedAdoptDurableProgress,
     .advance_applied_sequence_if_contiguous = ioThreadedAdvanceAppliedSequenceIfContiguous,
     .snapshot_stats = ioThreadedSnapshotStats,
     .request_sequence = ioThreadedRequestSequence,
@@ -828,6 +863,11 @@ fn ioThreadedRemoveWorker(ptr: *anyopaque, name: []const u8) void {
 fn ioThreadedAppliedSequence(ptr: *anyopaque, name: []const u8) ?u64 {
     const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
     return runtime.appliedSequence(name);
+}
+
+fn ioThreadedAdoptDurableProgress(ptr: *anyopaque, name: []const u8, sequence: u64) bool {
+    const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
+    return runtime.adoptDurableProgress(name, sequence);
 }
 
 fn ioThreadedAdvanceAppliedSequenceIfContiguous(ptr: *anyopaque, name: []const u8, sequence: u64) bool {
