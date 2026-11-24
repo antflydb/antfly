@@ -141,7 +141,7 @@ policies. Missing, duplicated or mismatched pinned files reject the bundle.
 | GLiNER boundary (including multilingual DeBERTa Decide) | extract, decide | DeBERTa and FP32 ModernBERT backbones, including the optional linear neck |
 | GLiNER marker-head Decide | extract, decide | DeBERTa and ModernBERT marker encoders; unused legacy heads are skipped |
 | Laya / OpenDecider | decide | ModernBERT vocabulary up to 262,144, including multilingual models; bounded geometry/sequence sizes |
-| EmbeddingGemma2 | decide | Text choice and multi-choice, exact artifact identity, prototypes and qualified calibrations; FP32/BF16 |
+| EmbeddingGemma2 | embed, decide | Retrieval embeddings; text choice and multi-choice, exact artifact identity, prototypes and qualified calibrations; FP32/BF16 |
 
 Support depends on configuration, declared capabilities, tensor layout, selected
 precision and request geometry. This table describes adapters, not qualification
@@ -152,9 +152,25 @@ choice and multi-choice with descriptions/examples, cosine scoring, abstention,
 model identity and optional qualified calibration files (`calibrations/<id>.json`).
 Multi-choice requires per-choice similarity thresholds or a matching calibration.
 Embedding validation tokenizes inputs/prototypes without running the encoder.
-The text adapter loads no media towers and does not expose an `embed` method.
-Embedding requests allow at most 128 encoded texts, 2,048 tokens per text and
-8,192 tokens in total. Source bundles/files are bounded to 3 GiB; model weights
+The text adapter loads no media towers. Decision requests allow at most 128
+encoded texts, 2,048 tokens per text and 8,192 tokens in total.
+
+`embed()` returns retrieval embeddings from the same encoder, with the same
+task prefixes, Matryoshka truncation and `model_identity` as decisions:
+
+```ts
+const docs = await client.embed({
+  inputs: ["Invoice from the plumber", "Team offsite agenda"],
+  task_type: "RETRIEVAL_DOCUMENT", // use RETRIEVAL_QUERY for queries
+  dimensions: 256,                 // 1-768; 768, 512, 256 and 128 are the trained sizes
+  max_tokens: 512,                 // per input, 8-2048; longer inputs are truncated
+});
+docs.value.embeddings; // number[][]
+```
+
+An embedding request holds at most 32 inputs and 16,384 encoded tokens. Unlike
+decisions, long inputs are truncated rather than rejected. `validateEmbedding()`
+tokenizes without running the encoder. Embeddings run on WASM CPU. Source bundles/files are bounded to 3 GiB; model weights
 and scratch share a 1.5 GiB host budget within WASM32's 2 GiB memory ceiling.
 Large FP32 checkpoints may need compact artifacts to fit that resident budget.
 BF16 stays packed and is converted to exact FP32 per matrix or embedding row.

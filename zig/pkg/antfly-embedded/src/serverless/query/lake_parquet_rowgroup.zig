@@ -16,6 +16,7 @@
 //! RowSource batch assembly for the first supported Parquet scan path.
 
 const std = @import("std");
+const cacheAllocator = @import("antfly_platform").allocator.concurrentFallback;
 const Allocator = std.mem.Allocator;
 const external_binding = @import("../external_source/catalog_binding.zig");
 const external_source = @import("../external_source/types.zig");
@@ -344,7 +345,7 @@ pub const PersistentObjectRangeCache = struct {
         try policy.validate();
         if (root_dir.len == 0) return error.InvalidPersistentObjectRangeCachePolicy;
 
-        const internal_alloc = std.heap.smp_allocator;
+        const internal_alloc = cacheAllocator();
         const state = try internal_alloc.create(PersistentObjectRangeCacheState);
         errdefer internal_alloc.destroy(state);
         const owned_root = try internal_alloc.dupe(u8, root_dir);
