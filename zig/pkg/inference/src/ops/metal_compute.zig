@@ -23935,10 +23935,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!metal_runtime.decoderRuntimeLinearSlotPrepared(self.provider_impl, request.slot, request.in_dim, request.out_dim)) return null;
         var x = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
         defer self.retireTemporaryWorkspaceValue(&x);
-        return self.encodeAudioLinear(ctx, x, request, false);
+        return self.encodeAudioLinear(ctx, x, request, .prefer_fused);
     }
 
-    fn encodeAudioLinear(self: *MetalCompute, ctx: *anyopaque, x: MetalTensor, request: *const ops.AudioPreparedLinearRequest, comptime fused_only: bool) !?CT {
+    const AudioLinearMode = enum { prefer_fused, fused_only, staged };
+
+    fn encodeAudioLinear(self: *MetalCompute, ctx: *anyopaque, x: MetalTensor, request: *const ops.AudioPreparedLinearRequest, comptime mode: AudioLinearMode) !?CT {
         const slot = request.slot;
         const rows = request.rows;
         const in_dim = request.in_dim;
@@ -23971,13 +23973,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer if (moved and !published) freeTemporaryWorkspaceCtOp(ctx, result);
         if (output) |ct| if (toBuf(ct).metal_tensor) |*tensor| tensor.invalidateHostMirror();
         var fused = false;
-        if (clip) |p| {
+        if (mode != .staged) if (clip) |p| {
             const rc = metal_runtime.antfly_metal_clipped_linear(runtime, x.deviceHandle(), x.deviceByteOffset(), slot, &p, mt.deviceHandle(), mt.deviceByteOffset());
             if (rc != 0 and rc != -1) return error.MetalKernelFailed;
             fused = rc == 0;
-        }
-        if (fused_only and !fused) return null;
-        if (!fused_only and !fused) {
+        };
+        if (mode == .fused_only and !fused) return null;
+        if (!fused) {
             var owned_scratch: ?MetalTensor = null;
             defer if (owned_scratch) |*tensor| self.retireTemporaryWorkspaceValue(tensor);
             var operand = x;
@@ -24373,7 +24375,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const runtime = self.provider_impl.raw_decode_runtime;
         var choice = metal_runtime.antfly_metal_clipped_linear_choice(runtime, &p);
         if (audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_FORCE_FUSED_LINEAR")) choice = 1;
-        if (choice == 0 or (choice < 0 and self.data.tier_cache == null)) return null;
+        if (choice < 0 and self.data.tier_cache == null) return null;
+        // The staged route consumes only an already-resident F32 activation.
+        // Leave host ingress and extended layouts to the ordinary provider.
+        if (choice == 0 and denseDeviceF32(input) == null) return null;
         var x = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
         defer self.retireTemporaryWorkspaceValue(&x);
         var bias_view: Buf = undefined;
@@ -24401,15 +24406,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             choice = metal_runtime.antfly_metal_clipped_linear_tune(runtime, slot, &p, self, audioTuneCancelled);
             try self.computeBackend().checkExecutionControl();
         }
-        if (choice != 1) return null;
-        return self.encodeAudioLinear(ctx, x, &.{
+        if (choice != 0 and choice != 1) return null;
+        const request = ops.AudioPreparedLinearRequest{
             .input = input,
             .slot = slot,
             .rows = p.rows,
             .in_dim = p.in_dim,
             .out_dim = p.out_dim,
             .clip = p,
-        }, true);
+        };
+        return if (choice == 1)
+            self.encodeAudioLinear(ctx, x, &request, .fused_only)
+        else
+            self.encodeAudioLinear(ctx, x, &request, .staged);
     }
     fn clampSiluOp(ctx: *anyopaque, input: CT, min_value: ?f32, max_value: ?f32) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
@@ -63121,12 +63130,19 @@ test "Metal prepared audio projection consumes disjoint clamp workspace after fu
             try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(actual));
         }
     }
+    request.output = null;
+    request.input_workspace = null;
+    const eager = (try compute.encodeAudioLinear(&compute, source, &request, .staged)) orelse return error.MissingAudioProjection;
+    defer cb.free(eager);
+    const eager_values = try cb.toFloat32(eager, a);
+    defer a.free(eager_values);
+    try std.testing.expectEqualSlices(f32, expected, eager_values);
     _ = observation.finish();
     const measured = observation.metal_serial_workspace orelse return error.MissingMetalAudioScratchObservation;
     try std.testing.expectEqual(@as(u64, 8), measured.planned_clamp_bindings);
     try std.testing.expectEqual(@as(u64, 8 * bytes), measured.planned_clamp_bytes);
-    try std.testing.expectEqual(@as(u64, 1), measured.temporary_clamp_bindings);
-    try std.testing.expectEqual(@as(u64, bytes), measured.temporary_clamp_bytes);
+    try std.testing.expectEqual(@as(u64, 2), measured.temporary_clamp_bindings);
+    try std.testing.expectEqual(@as(u64, 2 * bytes), measured.temporary_clamp_bytes);
     request.output = destination;
     request.input_workspace = input;
     try std.testing.expectError(error.InvalidPreparedProjectionWorkspace, MetalCompute.audioPreparedLinearOp(&compute, &request));
