@@ -1965,7 +1965,7 @@ const RuntimeContext = struct {
                     &arm_context,
                 );
             }
-            const armed = metal_runtime.forwardGreedyTokenPipelinedArmFamily(
+            const armed = try metal_runtime.forwardGreedyTokenPipelinedArmFamily(
                 &self.cb,
                 allocator,
                 self.definition.configuration.value,
@@ -1973,7 +1973,7 @@ const RuntimeContext = struct {
                 request.token_id,
                 arm_seq_len,
                 &arm_context,
-            ) catch false;
+            );
             if (!armed) {
                 return try metal_runtime.forwardGreedyTokenFamily(
                     &self.cb,

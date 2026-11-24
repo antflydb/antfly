@@ -37370,6 +37370,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             },
         }
         if (request.phase != .full and request.output_hidden != null) return false;
+        if (request.phase == .submit_only and metal_runtime.hasSubmittedFrame(runtime)) return error.FrameAlreadyActive;
         if (request.phase == .step and !metal_runtime.hasSubmittedFrame(runtime)) return false;
         if (request.items.len == 0 or request.items.len != request.output_token_ids.len) return false;
         if (request.input_token_ids) |token_ids| {
@@ -37526,10 +37527,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                         self.cancelDecoderRuntimeFrame(runtime, &active_frame);
                         return false;
                     }
-                    metal_runtime.submitFrame(runtime) catch {
-                        self.cancelDecoderRuntimeFrame(runtime, &active_frame);
-                        return false;
-                    };
+                    try metal_runtime.submitFrame(runtime);
                     active_frame = false;
                     self.timing_stats.active_decode_frame_successes += 1;
                     return true;
