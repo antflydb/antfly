@@ -271,9 +271,13 @@ const session_types_key = "read_session_types";
 pub fn configureReadSessionModules(module: *std.Build.Module) void {
     if (module.import_table.contains(session_backend_key)) return;
     const b = module.owner;
-    const file = b.addWriteFiles().add("read_session_unbound.zig", "pub const unbound = true;\n");
-    module.addImport(session_backend_key, b.createModule(.{ .root_source_file = file, .target = module.resolved_target, .optimize = module.optimize }));
-    module.addImport(session_types_key, b.createModule(.{ .root_source_file = file, .target = module.resolved_target, .optimize = module.optimize }));
+    // One file per marker: a file belongs to exactly one module, and a step
+    // whose graph never selects an owner keeps both markers.
+    const files = b.addWriteFiles();
+    const backend_file = files.add("read_session_backend_unbound.zig", "pub const unbound = true;\n");
+    const types_file = files.add("read_session_types_unbound.zig", "pub const unbound = true;\n");
+    module.addImport(session_backend_key, b.createModule(.{ .root_source_file = backend_file, .target = module.resolved_target, .optimize = module.optimize }));
+    module.addImport(session_types_key, b.createModule(.{ .root_source_file = types_file, .target = module.resolved_target, .optimize = module.optimize }));
 }
 
 const SessionCompileVisit = struct {

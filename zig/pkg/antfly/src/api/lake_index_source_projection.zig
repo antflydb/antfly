@@ -174,17 +174,17 @@ pub const Hydrator = struct {
             const end = base + segment.reader.doc_count;
             var next = planned + 1;
             while (next < docs.len and docs[next] < end) : (next += 1) {}
-            const physical = segment.reader.source();
+            const physical = segment.reader.encoded().source();
             if (physical == .ranges and physical.ranges.prefetch != null) {
                 for (fields[0..@min(fields.len, remaining_columns)]) |field| {
                     remaining_columns -= 1;
-                    var cursor = try self.column(&segment.reader, field);
+                    var cursor = try self.column(segment.reader.encoded(), field);
                     if (cursor == null) if (std.mem.indexOfScalar(u8, field, '.')) |dot| {
-                        cursor = try self.column(&segment.reader, field[0..dot]);
+                        cursor = try self.column(segment.reader.encoded(), field[0..dot]);
                     };
                     if (cursor) |value| _ = value.prefetchSelected(docs[planned..next], base, end);
                 }
-                try segment.reader.prefetchStoredIdentities(docs[planned..next], base, end);
+                try segment.reader.encoded().prefetchStoredIdentities(docs[planned..next], base, end);
             }
             planned = next;
         }
@@ -221,7 +221,7 @@ pub const Hydrator = struct {
             const id = (try segment.reader.storedIdScoped(row.allocator(), resolved.local_id)) orelse return error.InvalidNativeLakeTextCorpus;
             if (!std.mem.eql(u8, id, (try input.key(input.ptr, row.allocator(), i)))) return error.ExternalLakeSnapshotMismatch;
             const columnar = block: {
-                for (segment.reader.fields) |field| for (field.sections) |section| {
+                for (segment.reader.encoded().fields) |field| for (field.sections) |section| {
                     if (section.section_type == .columnar_stored) break :block true;
                 };
                 break :block false;
@@ -241,10 +241,10 @@ pub const Hydrator = struct {
             const resolved = snapshot.resolveDocId(entry.doc).?;
             const segment = try snapshot.readSegment(resolved.seg_idx);
             var tail: ?[]const u8 = null;
-            var cursor = try self.column(&segment.reader, field);
+            var cursor = try self.column(segment.reader.encoded(), field);
             if (cursor == null) if (std.mem.indexOfScalar(u8, field, '.')) |dot| {
                 tail = field[dot + 1 ..];
-                cursor = try self.column(&segment.reader, field[0..dot]);
+                cursor = try self.column(segment.reader.encoded(), field[0..dot]);
             };
             if (cursor) |value| value.control = .{ .ptr = &input, .check_fn = Input.checkToken };
             defer if (cursor) |value| {

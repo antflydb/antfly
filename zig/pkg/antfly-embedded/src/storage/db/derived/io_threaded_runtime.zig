@@ -183,6 +183,14 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         return false;
     }
 
+    pub fn fastForwardAppliedSequence(self: *@This(), name: []const u8, expected: u64, sequence: u64) bool {
+        _ = self;
+        _ = name;
+        _ = expected;
+        _ = sequence;
+        return false;
+    }
+
     pub fn adoptDurableProgress(_: *@This(), _: []const u8, _: u64) bool {
         return false;
     }
@@ -678,12 +686,18 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
     /// `applied_sequence > persisted_sequence` and flushes it later via
     /// `.advance` (max) semantics, which never regresses.
     pub fn advanceAppliedSequenceIfContiguous(self: *DerivedRuntime, name: []const u8, sequence: u64) bool {
+        if (sequence == 0) return false;
+        return self.fastForwardAppliedSequence(name, sequence - 1, sequence);
+    }
+
+    /// `Executor.fastForwardAppliedSequence`.
+    pub fn fastForwardAppliedSequence(self: *DerivedRuntime, name: []const u8, expected: u64, sequence: u64) bool {
         const io = self.ioContext();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         for (self.workers.items) |worker| {
             if (!std.mem.eql(u8, worker.name, name)) continue;
-            if (worker.applied_sequence + 1 != sequence) return false;
+            if (worker.applied_sequence != expected or sequence < expected) return false;
             worker.applied_sequence = sequence;
             worker.target_sequence = @max(worker.target_sequence, sequence);
             return true;

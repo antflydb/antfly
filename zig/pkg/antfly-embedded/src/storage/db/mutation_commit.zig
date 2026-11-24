@@ -17,6 +17,7 @@
 //! Receivers borrow local resources; lifetime and scheduling remain with DB.
 
 const DurableReplicationOutboxKind = @import("durable_outbox.zig").Kind;
+const write_stage_profile = @import("../write_stage_profile.zig");
 pub const IndexTargetVisibility = @import("query_visibility.zig").IndexTargetVisibility;
 pub const QueryVisibilityEvent = @import("query_visibility.zig").QueryVisibilityEvent;
 const apply_state = @import("derived/apply_state.zig");
@@ -3809,7 +3810,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // correctly forces catch-up (including the gap) before
                     // this write's own ack returns.
                     if (inline_executor_has_workers) {
-                        const worker_applied = S.ownerField(self, "executor").*.appliedSequence(target_name) orelse 0;
+                        var worker_applied = S.ownerField(self, "executor").*.appliedSequence(target_name) orelse 0;
+                        // Behind only by records with no full-text work (other
+                        // processes' inline publications drop their hint, and
+                        // unindexed writes never carry it): skip them rather
+                        // than send this write to a catch-up that has nothing
+                        // to apply. Across processes the worker is otherwise
+                        // always behind, and every write took the slow path.
+                        if (worker_applied != 0 and worker_applied + 1 < sequence) {
+                            const pending = S.ownerField(self, "core").*.store.replayHintRecordBetween(.full_text, worker_applied, sequence - 1) catch null;
+                            if (pending == false and
+                                S.ownerField(self, "executor").*.fastForwardAppliedSequence(target_name, worker_applied, sequence - 1))
+                                worker_applied = sequence - 1;
+                        }
                         // `worker_applied == 0` together with the contiguity
                         // check below (`worker_applied + 1 == sequence`)
                         // means `sequence == 1`: the very first write this
@@ -3835,13 +3848,27 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         if (worker_applied == 0 or worker_applied + 1 != sequence) continue;
                     }
                     const index_ref: index_manager_mod.ManagedIndexRef = .{ .name = target_name, .kind = .full_text };
+                    const prepare_span = write_stage_profile.begin(.inline_text_prepare);
                     const prepared = prepareInlineTextPublication(
                         S.ownerField(self, "alloc").*,
                         S.ownerField(self, "core").*.store,
                         S.ownerField(self, "core").*.index_manager,
                         materialized_derived_batch.?,
                         index_ref,
-                    ) catch continue;
+                        // `max_pending_segments` is where a writer starts merging
+                        // (`mergeAtCapBeforeWrite`); while a merge already in flight
+                        // elsewhere catches up, writes stay inline up to twice it.
+                        // Without writer merges nothing bounds that overshoot, so
+                        // the cap stays where merging starts.
+                        if (S.ownerField(self, "text_merge_runtime").*) |runtime|
+                            (if (!runtime.config.enabled) 0 else if (runtime.config.manual_producer_assistance) runtime.config.max_pending_segments *| 2 else runtime.config.max_pending_segments)
+                        else
+                            0,
+                    ) catch {
+                        prepare_span.end();
+                        continue;
+                    };
+                    prepare_span.end();
                     // Own a copy of the name now: `target_name` aliases
                     // `sync_targets.full_text_indexes`, whose "filter once"
                     // block below frees exactly this entry (it is now
@@ -3852,6 +3879,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         return dup_err;
                     };
                     inline_text_publications[inline_text_publication_count] = prepared;
+                    prepared.releaseIndexGuard();
                     inline_text_handled_names[inline_text_publication_count] = handled_name;
                     inline_text_publication_count += 1;
                 }
@@ -4385,6 +4413,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // stay in `all_indexes` whether handled or not), so its
                 // remaining count needs the handled ones subtracted back
                 // out explicitly.
+                sync_targets.served_inline = inline_text_publication_count != 0 or inline_graph_publication != null or
+                    inline_sparse_publication != null or inline_dense_publication != null or inline_algebraic_publication_count != 0;
                 const suppress_full_text = inline_text_publication_count != 0 and
                     sync_targets.full_text_indexes.len == 0;
                 var suppress_graph = false;
@@ -4494,7 +4524,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     }
                 }
             }
-            const queued_index_publication = inline_graph_publication != null or inline_sparse_publication != null or inline_dense_publication != null;
+            const queued_index_publication = inline_text_publication_count != 0 or inline_graph_publication != null or
+                inline_sparse_publication != null or inline_dense_publication != null;
             const QueuedCommitCompletion = struct {
                 executor: *derived_executor_mod.Executor,
                 admission: *derived_executor_mod.BacklogAdmission,
@@ -4601,6 +4632,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             } else blk: {
                 if (durable_replication_batch_outbox_key != null or durable_replication_replay_outbox_key != null)
                     S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.store(true, .release);
+                const stage_span = write_stage_profile.begin(.primary_stage);
                 primary_ticket = try S.ownerField(self, "core").*.store.putBatchWithHistoryTimeStaged(
                     S.ownerField(self, "backend_runtime").*.io(),
                     write_buffers.store_writes.items,
@@ -4613,6 +4645,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     else
                         opts.ordered_history_commit_time_ns,
                 );
+                stage_span.end();
                 schedule_replication_recovery_on_exit = durable_replication_batch_outbox_key != null or durable_replication_replay_outbox_key != null;
                 break :blk transactions_mod.ResolutionOutcome{ .applied = true, .replay_sequence = sequence };
             };
@@ -4731,7 +4764,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (opts.writer_lane_release_before_wait) |hook| hook.release(hook.ptr);
             }
             var indexed_lane_yielded = false;
-            if (primary_ticket != null and (inline_graph_publication != null or inline_sparse_publication != null or inline_dense_publication != null)) {
+            if (primary_ticket != null and (inline_text_publication_count != 0 or inline_graph_publication != null or
+                inline_sparse_publication != null or inline_dense_publication != null))
+            {
                 if (opts.writer_lane_release_before_wait) |hook| {
                     if (hook.resume_after_indexed_wait != null) {
                         if (hook.release_for_indexed_wait) |release| indexed_lane_yielded = release(hook.ptr);
@@ -4744,6 +4779,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // share a group with whatever other writers staged while this
             // one ran its own apply-lock-protected bookkeeping above.
             if (primary_ticket) |ticket| {
+                const ticket_span = write_stage_profile.begin(.ticket_wait);
+                defer ticket_span.end();
                 // Clear before waiting, not after: `wait` must run at most
                 // once. If it fails, the `errdefer` registered above this
                 // would otherwise see `primary_ticket` still set and call
@@ -4807,6 +4844,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // slot out so the top-of-function `defer` no longer aborts
             // it; from here, a later failure in this function must not
             // undo an already-durable, already-installed publication.
+            const install_span = write_stage_profile.begin(.inline_install);
             for (inline_text_publications[0..inline_text_publication_count], 0..) |maybe_prepared, i| {
                 if (maybe_prepared) |prepared| {
                     inline_text_publications[i] = null;
@@ -4824,6 +4862,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     }
                 }
             }
+            install_span.end();
             // `install()` above may have just flipped `compaction_pending`
             // on (see `IndexManager.noteInlineTextPublicationSegments`).
             // Wake the merge worker the same way
@@ -4874,7 +4913,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // cleanup. DDL may already own the lane and be waiting for them.
             if (indexed_lane_yielded) {
                 const hook = opts.writer_lane_release_before_wait.?;
-                try hook.resume_after_indexed_wait.?(hook.ptr);
+                // Nothing below owes the write's own runtime anything when
+                // every index served it inline and no replication, child
+                // range or split work follows: it may finish on a newer one.
+                const finished_at_commit = sync_targets.served_inline and sync_targets.all_indexes.len == 0 and
+                    sync_targets.full_text_indexes.len == 0 and split_shadow_ticket == null and
+                    opts.document_child_range_dispatcher == null and opts.transaction_resolution == null and
+                    durable_replication_batch_payload == null and durable_replication_replay_payload == null and
+                    deferred_replication_gates.gate_count == 0 and
+                    !(queued_index_publication and pending_identity_visibility_summary != null) and
+                    // The caller's graph endpoint cleanup still runs on this
+                    // write's runtime (`finishBatchGraphEndpointCleanup`).
+                    !S.ownerField(self, "core").*.hasGraphIndexes();
+                // Such a write is done: its installs ran (or just ran above),
+                // and what follows is a no-op for it. Taking the lane back only
+                // to return it made every write cross the lane twice.
+                if (finished_at_commit) return;
+                _ = try hook.resume_after_indexed_wait.?(hook.ptr, false);
             }
             if (queued_index_publication and pending_identity_visibility_summary != null) {
                 try self.lockApplyForPortableRuntime();
@@ -4973,7 +5028,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         completion.enrichment_fully_precomputed = enrichment_fully_precomputed;
                         completion.targets = sync_targets;
                         sync_targets = .{};
-                    } else try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation, enrichment_fully_precomputed);
+                    } else {
+                        const sync_span = write_stage_profile.begin(.wait_sync_level);
+                        defer sync_span.end();
+                        try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation, enrichment_fully_precomputed);
+                    }
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
                 }
             } else if (append_derived_replay) {
@@ -5044,7 +5103,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         completion.enrichment_fully_precomputed = enrichment_fully_precomputed;
                         completion.targets = sync_targets;
                         sync_targets = .{};
-                    } else try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation, enrichment_fully_precomputed);
+                    } else {
+                        const sync_span = write_stage_profile.begin(.wait_sync_level);
+                        defer sync_span.end();
+                        try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation, enrichment_fully_precomputed);
+                    }
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
                 }
             }

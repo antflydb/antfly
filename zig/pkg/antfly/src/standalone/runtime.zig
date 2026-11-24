@@ -15535,7 +15535,7 @@ fn exerciseStandaloneFkPublicationMode(ordinary: bool, truncate_after: bool, pub
                 };
                 command.child_receipt = receipt;
             },
-            .parent, .seal_support => return error.TestUnexpectedResult,
+            .parent, .seal_support, .partition => return error.TestUnexpectedResult,
             .publish_child => command.action = .publish_child,
         }
         const applied = try LocalStandaloneMetadata.systemCatalog(&metadata, alloc, context, .{ .fk_initial_create_mutate = command });
@@ -20308,7 +20308,8 @@ test "standalone SQL prepared transactions preserve node-zero ownership and row 
                 return;
             }
             var coordinator: @import("../api/sql/session/session.zig").Coordinator = .{ .server = api, .identity = &identity, .context = .{ .sql_command_fence = &frame }, .sync_level = .full_index };
-            const decision = try @import("../api/sql/session/session.zig").Coordinator.commit(&coordinator, .{ .principal = "", .database = "default", .namespace = "public" }, session.txn_id);
+            const owner = ((try api.txn_sessions.readInfo(session.txn_id)) orelse return error.SqlTransactionNotActive).version.owner;
+            const decision = try @import("../api/sql/session/session.zig").Coordinator.commit(&coordinator, .{ .principal = "", .database = "default", .namespace = "public" }, try api.txn_sessions.mutation(a, session.txn_id, owner));
             try std.testing.expectEqual(.committed, decision.outcome);
             var sql_state = (try api.txn_sessions.getSqlState(backing, session.txn_id)).?;
             defer sql_state.deinit(backing);

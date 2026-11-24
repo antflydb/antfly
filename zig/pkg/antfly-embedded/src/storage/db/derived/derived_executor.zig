@@ -68,6 +68,7 @@ pub const Executor = struct {
         applied_sequence: *const fn (ptr: *anyopaque, name: []const u8) ?u64,
         adopt_durable_progress: *const fn (*anyopaque, []const u8, u64) bool,
         advance_applied_sequence_if_contiguous: *const fn (ptr: *anyopaque, name: []const u8, sequence: u64) bool,
+        fast_forward_applied_sequence: *const fn (ptr: *anyopaque, name: []const u8, expected: u64, sequence: u64) bool,
         snapshot_stats: *const fn (ptr: *anyopaque) types.DerivedWorkerStats,
         request_sequence: *const fn (ptr: *anyopaque, sequence: u64) void,
         request_indexes: *const fn (ptr: *anyopaque, sequence: u64, index_names: []const []const u8) void,
@@ -151,6 +152,13 @@ pub const Executor = struct {
 
     pub fn advanceAppliedSequenceIfContiguous(self: *Executor, name: []const u8, sequence: u64) bool {
         return self.vtable.advance_applied_sequence_if_contiguous(self.ptr, name, sequence);
+    }
+
+    /// Moves a worker that has applied exactly `expected` straight to
+    /// `sequence`, when the caller proved no record in between has work
+    /// for it. False (no change) when the worker moved meanwhile.
+    pub fn fastForwardAppliedSequence(self: *Executor, name: []const u8, expected: u64, sequence: u64) bool {
+        return self.vtable.fast_forward_applied_sequence(self.ptr, name, expected, sequence);
     }
 
     pub fn snapshotStats(self: *Executor) types.DerivedWorkerStats {
@@ -326,9 +334,14 @@ const ManualRuntime = struct {
     /// See `DerivedRuntime.advanceAppliedSequenceIfContiguous` (io_threaded_runtime.zig)
     /// for the safety argument; this manual backend mirrors it exactly.
     fn advanceAppliedSequenceIfContiguous(self: *ManualRuntime, name: []const u8, sequence: u64) bool {
+        if (sequence == 0) return false;
+        return self.fastForwardAppliedSequence(name, sequence - 1, sequence);
+    }
+
+    fn fastForwardAppliedSequence(self: *ManualRuntime, name: []const u8, expected: u64, sequence: u64) bool {
         for (self.workers.items) |*worker| {
             if (!std.mem.eql(u8, worker.name, name)) continue;
-            if (worker.applied_sequence + 1 != sequence) return false;
+            if (worker.applied_sequence != expected or sequence < expected) return false;
             worker.applied_sequence = sequence;
             worker.target_sequence = @max(worker.target_sequence, sequence);
             return true;
@@ -630,6 +643,7 @@ const manual_vtable = Executor.VTable{
     .applied_sequence = manualAppliedSequence,
     .adopt_durable_progress = manualAdoptDurableProgress,
     .advance_applied_sequence_if_contiguous = manualAdvanceAppliedSequenceIfContiguous,
+    .fast_forward_applied_sequence = manualFastForwardAppliedSequence,
     .snapshot_stats = manualSnapshotStats,
     .request_sequence = manualNotifySequence,
     .request_indexes = manualNotifyIndexes,
@@ -697,6 +711,11 @@ fn manualAdoptDurableProgress(ptr: *anyopaque, name: []const u8, sequence: u64) 
 fn manualAdvanceAppliedSequenceIfContiguous(ptr: *anyopaque, name: []const u8, sequence: u64) bool {
     const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
     return runtime.advanceAppliedSequenceIfContiguous(name, sequence);
+}
+
+fn manualFastForwardAppliedSequence(ptr: *anyopaque, name: []const u8, expected: u64, sequence: u64) bool {
+    const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
+    return runtime.fastForwardAppliedSequence(name, expected, sequence);
 }
 
 fn manualSnapshotStats(ptr: *anyopaque) types.DerivedWorkerStats {
@@ -803,6 +822,7 @@ const io_threaded_vtable = Executor.VTable{
     .applied_sequence = ioThreadedAppliedSequence,
     .adopt_durable_progress = ioThreadedAdoptDurableProgress,
     .advance_applied_sequence_if_contiguous = ioThreadedAdvanceAppliedSequenceIfContiguous,
+    .fast_forward_applied_sequence = ioThreadedFastForwardAppliedSequence,
     .snapshot_stats = ioThreadedSnapshotStats,
     .request_sequence = ioThreadedRequestSequence,
     .request_indexes = ioThreadedRequestIndexes,
@@ -873,6 +893,11 @@ fn ioThreadedAdoptDurableProgress(ptr: *anyopaque, name: []const u8, sequence: u
 fn ioThreadedAdvanceAppliedSequenceIfContiguous(ptr: *anyopaque, name: []const u8, sequence: u64) bool {
     const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
     return runtime.advanceAppliedSequenceIfContiguous(name, sequence);
+}
+
+fn ioThreadedFastForwardAppliedSequence(ptr: *anyopaque, name: []const u8, expected: u64, sequence: u64) bool {
+    const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
+    return runtime.fastForwardAppliedSequence(name, expected, sequence);
 }
 
 fn ioThreadedSnapshotStats(ptr: *anyopaque) types.DerivedWorkerStats {

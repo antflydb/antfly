@@ -19,6 +19,7 @@
 //! External publications reopen that owner; SQL streams retain their pinned
 //! generations, and sessions and cursor IDs remain connection-local.
 const h = @import("handles.zig");
+const write_stage_profile = @import("../storage/write_stage_profile.zig");
 const api = @import("db.zig");
 const std = h.std;
 const native = h.lite_backend.native;
@@ -26,6 +27,11 @@ const inode_lock = @import("../storage/lite/inode_lock.zig");
 const shared_lock_region = @import("../storage/lite/shared_lock_region.zig");
 const antfly_platform = @import("antfly_platform");
 const alloc = std.heap.c_allocator;
+
+/// A maintenance turn can replace the runtime, opening the database under a
+/// write turn. Debug frames on that path are megabytes each (`DB.open` and
+/// `IndexManager.openConfiguredIndexDetached` alone take about 7.5 MiB).
+const maintenance_stack_size: usize = if (@import("builtin").mode == .debug) 32 * 1024 * 1024 else 8 * 1024 * 1024;
 
 const memo_mod = @import("antfly_inference_query_embedding_cache");
 const cache_budget = @import("antfly_cache_budget");
@@ -42,6 +48,7 @@ const StoreLease = @typeInfo(@typeInfo(std.meta.Child(@FieldType(PublicationPort
 const RuntimeStore = @FieldType(StoreLease, "store");
 const SourceRead = @typeInfo(@typeInfo(std.meta.Child(@FieldType(RuntimeStore.VTable, "begin_read"))).@"fn".return_type.?).error_union.payload;
 const keys = @import("../storage/internal_keys.zig");
+const text_merge_runtime = @import("../storage/db/maintenance/text_merge_runtime.zig");
 const ProducerLease = @FieldType(@FieldType(EnrichmentRuntime, "ownership"), "lease");
 const NativeStore = std.meta.Child(std.meta.Child(@FieldType(std.meta.Child(@FieldType(h.Handle, "owned_lite_backend")), "native_docstore")));
 const WriterAdmission = std.meta.Child(@FieldType(NativeStore, "writer_admission"));
@@ -1573,11 +1580,21 @@ pub const WriterLane = struct {
     /// applies derived work, and that work can host a maintenance turn which
     /// borrows the lane again on the same thread. It runs under the outer
     /// checkout: waiting would wait on this thread's own return.
+    /// Also true on a text merge's thread when the holder is a producer
+    /// blocked on that merge: its own assisted merge
+    /// (`text_merge_runtime.assisting_producer`), or any merge while it waits
+    /// on admission. The producer cannot release the lane mid-batch, so a
+    /// merge commit waiting for it could only end by timing out.
     fn heldByCurrentThread(self: *WriterLane) bool {
         const io = h.handleLockIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        return self.checked_out and self.holder == std.Thread.getCurrentId();
+        if (!self.checked_out) return false;
+        if (self.holder == std.Thread.getCurrentId()) return true;
+        if (text_merge_runtime.assisting_producer) |producer| if (self.holder == producer) return true;
+        // Any merge, while the holder waits on that merge runtime's
+        // admission (`text_merge_runtime.mergeMayUseLeaseOf`).
+        return text_merge_runtime.mergeMayUseLeaseOf(self.holder);
     }
 
     /// `PathWriterLock.ReturnTo.give_back` for the synthetic lease a nested
@@ -2560,6 +2577,8 @@ pub const Owner = struct {
     }
 
     fn refreshImpl(self: *Owner, fast_only: bool) !?*h.Handle {
+        const profile_span = write_stage_profile.begin(.refresh);
+        defer profile_span.end();
         wal_trace.recordOp(.serving_runtime_refresh);
         if (comptime h.builtin.is_test) _ = self.test_refresh_count.fetchAdd(1, .release);
         var known_maintenance: ?*h.Handle = null;
@@ -2710,6 +2729,12 @@ pub const Owner = struct {
             if (file.redo != null and !file.header.protected_redo) try file.refreshCrossProcessRedoOverlay();
         }
         if (fast_only) return null;
+        // Queued and in-flight groups on the serving store commit before the
+        // replacement opens, so it loads them from the file. Draining after
+        // the open (as below, for the handoff) let a replacement miss the
+        // last commits of writers waiting with their lane yielded, whose
+        // installs then went to the outgoing runtime.
+        if (self.current) |outgoing| if (outgoing.owned_lite_backend.?.native_docstore) |outgoing_store| outgoing_store.ensureDurableForReuse();
         var options = self.options;
         options.externally_locked = true;
         options.redo_recovery_base = self.redo_recovery_cursor;
@@ -3464,13 +3489,16 @@ pub const Owner = struct {
         const started = std.Io.Clock.awake.now(io).nanoseconds;
         const default_budget = 5 * std.time.ns_per_s;
         const budget = if (h.builtin.is_test) self.test_maintenance_wait_ns orelse default_budget else default_budget;
+        const lease_span = write_stage_profile.begin(.merge_lease_wait);
         var borrowed = self.writer_lane.borrowLease(self, &self.gate.mutex, started + budget, false, null) catch |err| {
+            lease_span.end();
             if (err == error.FileBusy) {
                 self.publication_stats.maintenance_queue_timeouts +|= 1;
                 stats.recordBusy(@intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
             }
             return err;
         };
+        lease_span.end();
         errdefer borrowed.lease.close();
         stats.recordAcquired(switch (borrowed.source) {
             .handoff => .handoff,
@@ -5807,7 +5835,7 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
         };
         if (comptime h.builtin.os.tag != .freestanding and !h.builtin.single_threaded) {
             if (options.profile == .native and h.liteOpenModeCanWrite(options.open_mode))
-                owner.worker = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Owner.maintenanceLoop, .{owner});
+                owner.worker = try std.Thread.spawn(.{ .stack_size = maintenance_stack_size }, Owner.maintenanceLoop, .{owner});
         }
         gate.owners.appendAssumeCapacity(owner);
     }
@@ -9077,11 +9105,15 @@ test "capi native separate writer processes refresh full-text in place" {
     try std.testing.expect(!try Search.found(id, "parentfirst", "\"doc-0\""));
     try std.testing.expect(owner.test_in_place_refresh_count.load(.acquire) > in_place_before);
     try std.testing.expect(owner.current.? == runtime_before);
-    // This runtime still writes, and its write supersedes the child's.
+    // This runtime still writes, and its write supersedes the child's. No
+    // version the child overwrote comes back.
     try Search.write(id, "doc-0", "parentagain");
     try std.testing.expect(owner.current.? == runtime_before);
     try std.testing.expect(try Search.found(id, "parentagain", "\"doc-0\""));
     try std.testing.expect(!try Search.found(id, "childwrote6", "\"doc-0\""));
+    try std.testing.expect(!try Search.found(id, "childwrote4", "\"doc-0\""));
+    try std.testing.expect(try Search.found(id, "childwrote7", "\"doc-1\""));
+    try std.testing.expect(!try Search.found(id, "childwrote5", "\"doc-1\""));
 }
 
 test "capi Lite physical v2 peer ANN refresh reuses the writer and survives cold reopen" {

@@ -29,6 +29,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const segment_mod = @import("segment.zig");
+const SegmentView = @import("segment_view.zig").SegmentView;
 const inverted = @import("section/inverted.zig");
 const typed_dv = @import("section/typed_doc_values.zig");
 const roaring = @import("encoding/roaring.zig");
@@ -640,7 +641,7 @@ pub fn isLevel0SegmentId(seg_id: u64) bool {
 pub const SegmentEntry = struct {
     id: u64,
     data: SegmentData,
-    reader: segment_mod.SegmentReader,
+    reader: SegmentView,
     // Range-backed readers compute diagnostics only when requested. Counting
     // dictionary terms at admission would turn a sparse cold query into a
     // scan of every term block in every segment.
@@ -648,7 +649,7 @@ pub const SegmentEntry = struct {
     shared: *SegmentShared,
     // Query-bound native readers borrow the same physical segment pin but own
     // their decoder/navigation state and capability-bound source separately.
-    query_base_reader: ?segment_mod.SegmentReader = null,
+    query_base_reader: ?SegmentView = null,
     query_source: ?SegmentSource = null,
     query_ordinal: ?usize = null,
     // Guarded by the query facade's bound_mu. Legacy pointer readers remain
@@ -826,7 +827,7 @@ pub const SegmentEntry = struct {
                         // query reader while the first-use scan runs.
                         self.beginAccess();
                         defer self.endAccess();
-                        try initializeTypedDocValuesFieldCoverage(self.reader.alloc, self.shared, &self.reader, coverage, validation);
+                        try initializeTypedDocValuesFieldCoverage(self.reader.encoded().alloc, self.shared, self.reader.encoded(), coverage, validation);
                     }
                     return .{ .status = coverage.status(), .value_type = coverage.value_type };
                 },
@@ -874,7 +875,7 @@ pub const SegmentEntry = struct {
     }
 
     fn checkDenseNumericNavigation(self: *const SegmentEntry, field: []const u8, control: query_mod.ExecutionControl) !bool {
-        var typed = (try self.reader.typedDocValuesScoped(self.reader.alloc, field)) orelse return false;
+        var typed = (try self.reader.typedDocValuesScoped(self.reader.encoded().alloc, field)) orelse return false;
         defer typed.deinit();
         if (typed.value_type != .numeric_val) return false;
         var next: u64 = 0;
@@ -921,8 +922,8 @@ pub const SegmentEntry = struct {
     }
 
     pub fn layoutStats(self: *const SegmentEntry, detailed_inverted: bool) segment_mod.SegmentLayoutStats {
-        if (!detailed_inverted) return self.layout_stats orelse self.reader.layoutStats();
-        return self.reader.layoutStatsWithInvertedDetails(true);
+        if (!detailed_inverted) return self.layout_stats orelse self.reader.encoded().layoutStats();
+        return self.reader.encoded().layoutStatsWithInvertedDetails(true);
     }
 
     fn admissionLayoutStats(data: SegmentData, reader: *const SegmentReader) ?segment_mod.SegmentLayoutStats {
@@ -1797,7 +1798,7 @@ pub const IndexSnapshot = struct {
                 continue;
             }
             const physical = self.segments[ordinal].physical();
-            if (physical.reader.postings_loader == null and !(physical.data == .native and physical.data.native == .ranges and physical.data.native.ranges.bind_read_context != null)) {
+            if (physical.reader.encoded().postings_loader == null and !(physical.data == .native and physical.data.native == .ranges and physical.data.native.ranges.bind_read_context != null)) {
                 mutable.bound_mu.unlock();
                 return &self.segments[ordinal];
             }
@@ -1852,16 +1853,16 @@ pub const IndexSnapshot = struct {
         errdefer self.alloc.destroy(entry);
         entry.* = physical;
         entry.query_ordinal = ordinal;
-        if (entry.reader.postings_loader) |*loader| loader.context = context;
+        if (entry.reader.encodedMut().postings_loader) |*loader| loader.context = context;
         if (entry.data == .native and entry.data.native == .ranges) {
             const range = entry.data.native.ranges;
             if (range.bind_read_context != null) {
                 var source = try entry.data.native.bindReadContext(self.alloc, context);
                 errdefer source.close();
-                const reader = try entry.reader.bindSource(self.alloc, source);
+                const reader = try entry.reader.encoded().bindSource(self.alloc, source);
                 entry.query_base_reader = entry.reader;
                 entry.query_source = source;
-                entry.reader = reader;
+                entry.reader = .fromEncoded(reader);
             }
         }
         entry.retain();
@@ -2400,20 +2401,20 @@ pub const IndexSnapshot = struct {
     /// The snapshot must remain pinned until the cache is destroyed.
     pub fn prefetchStoredDoc(self: *const IndexSnapshot, global_id: u32) !void {
         const resolved = self.resolveDocId(global_id) orelse return error.StoredDocMissing;
-        try self.segments[resolved.seg_idx].reader.prefetchStoredDoc(resolved.local_id);
+        try self.segments[resolved.seg_idx].reader.encoded().prefetchStoredDoc(resolved.local_id);
     }
 
     pub fn storedDocWithBlockCache(self: *const IndexSnapshot, cache: *StoredDocBlockCache, global_id: u32) !?segment_mod.SegmentReader.StoredDocRef {
         const resolved = self.resolveDocId(global_id) orelse return null;
         const segment = try self.readSegment(resolved.seg_idx);
         segment.noteAccess();
-        return cache.get(&segment.reader, resolved.local_id);
+        return cache.get(segment.reader.encoded(), resolved.local_id);
     }
 
     pub fn storedDocDecompressed(self: *const IndexSnapshot, alloc: Allocator, global_id: u32) !?DecompressedDoc {
         const resolved = self.resolveDocId(global_id) orelse return null;
         (try self.readSegment(resolved.seg_idx)).noteAccess();
-        const result = (try (try self.readSegment(resolved.seg_idx)).reader.storedDocDecompressed(alloc, resolved.local_id)) orelse return null;
+        const result = (try (try self.readSegment(resolved.seg_idx)).reader.encoded().storedDocDecompressed(alloc, resolved.local_id)) orelse return null;
         return DecompressedDoc{ .id = result.id, .data = result.data };
     }
 
@@ -2423,7 +2424,7 @@ pub const IndexSnapshot = struct {
         const resolved = self.resolveDocId(global_id) orelse return null;
         const segment = try self.readSegment(resolved.seg_idx);
         segment.noteAccess();
-        return cursor.get(&segment.reader, resolved.local_id);
+        return cursor.get(segment.reader.encoded(), resolved.local_id);
     }
 
     pub fn docNumsForOrdinalsAlloc(self: *const IndexSnapshot, alloc: Allocator, ordinals: []const u32) ![]u32 {
@@ -2494,7 +2495,7 @@ pub const IndexSnapshot = struct {
             try control.check();
             var lease = try self.leaseSegment(segment_index);
             defer lease.deinit();
-            var cursor = try segment_mod.DocOrdinalCursor.init(&lease.entry.reader);
+            var cursor = try segment_mod.DocOrdinalCursor.init(lease.entry.reader.encoded());
             for (0..segment.reader.doc_count) |local| {
                 if (local % 256 == 0) try control.check();
                 const ordinal = (try cursor.get(@intCast(local))) orelse {
@@ -2585,7 +2586,7 @@ pub const IndexSnapshot = struct {
         offset: u32,
         docs: *GraphFrontierDocs,
     ) !bool {
-        const inverse = (try segment_mod.InverseDocOrdinalReader.init(&segment.reader)) orelse return false;
+        const inverse = (try segment_mod.InverseDocOrdinalReader.init(segment.reader.encoded())) orelse return false;
         const live = LiveGraphFrontier{ .target = docs, .shared = segment.shared, .offset = offset, .control = control };
         var keys = frontier.keyIterator();
         while (keys.next()) |key| {
@@ -2979,7 +2980,7 @@ pub const IndexSnapshot = struct {
                 }
             }
             const live = LiveGraphFrontier{ .target = &out, .shared = lease.entry.shared, .offset = offset, .control = control };
-            var cursor = try segment_mod.DocOrdinalCursor.init(&lease.entry.reader);
+            var cursor = try segment_mod.DocOrdinalCursor.init(lease.entry.reader.encoded());
             for (0..segment.reader.doc_count) |doc| {
                 if (doc % 256 == 0) try control.check();
                 const local: u32 = @intCast(doc);
@@ -3213,7 +3214,7 @@ pub const IndexSnapshot = struct {
                     .control = control,
                     .newest_by_key = &newest_scanned,
                 };
-                var cursor = try segment_mod.DocOrdinalCursor.init(&lease.entry.reader);
+                var cursor = try segment_mod.DocOrdinalCursor.init(lease.entry.reader.encoded());
                 for (0..segment.reader.doc_count) |doc| {
                     if (doc % 256 == 0) try control.check();
                     const local: u32 = @intCast(doc);
@@ -3317,7 +3318,7 @@ pub const IndexSnapshot = struct {
             const manager = self.spillManager(alloc, snapshot, control);
             var sorter = spill.Sort.init(alloc, manager, &.{.{}}, 512 * 1024);
             defer sorter.deinit();
-            var cursor = try segment_mod.DocOrdinalCursor.init(&entry.reader);
+            var cursor = try segment_mod.DocOrdinalCursor.init(entry.reader.encoded());
             // Keep every physical mapping. Deletion visibility is
             // checked when a batch uses the spill, including after rollback.
             for (0..entry.reader.doc_count) |doc| {
@@ -3518,7 +3519,7 @@ pub const IndexSnapshot = struct {
             found: *GraphFrontierDocs,
             cached: *?segment_mod.InverseDocOrdinalReader.OrdinalBounds,
         ) !bool {
-            const inverse = (try segment_mod.InverseDocOrdinalReader.init(&entry.reader)) orelse return false;
+            const inverse = (try segment_mod.InverseDocOrdinalReader.init(entry.reader.encoded())) orelse return false;
             const bounds = cached.* orelse try inverse.ordinalBounds() orelse return true;
             cached.* = bounds;
             const start = firstAtLeast(sorted, bounds.min);
@@ -3592,7 +3593,7 @@ pub const IndexSnapshot = struct {
             // ordinal count. When the request can retain the complete
             // legacy frontier, cache it for subsequent clauses.
             const legacy_frontier = full_frontier orelse frontier;
-            var cursor = try segment_mod.DocOrdinalCursor.init(&lease.entry.reader);
+            var cursor = try segment_mod.DocOrdinalCursor.init(lease.entry.reader.encoded());
             const live = LiveGraphFrontier{ .target = &docs, .shared = lease.entry.shared, .offset = offset, .control = control };
             for (0..segment.reader.doc_count) |i| {
                 if (i % 256 == 0) try control.check();
@@ -3645,7 +3646,7 @@ pub const IndexSnapshot = struct {
                 if (local % 256 == 0) try control.check();
                 const doc: u32 = @intCast(local);
                 if (seg.shared.deleted) |deleted| if (deleted.contains(doc)) continue;
-                if (cursor == null) cursor = try segment_mod.DocOrdinalCursor.init(&seg.reader);
+                if (cursor == null) cursor = try segment_mod.DocOrdinalCursor.init(seg.reader.encoded());
                 const ordinal = (try cursor.?.get(doc)) orelse {
                     if (require_complete) {
                         out.deinit();
@@ -3687,7 +3688,7 @@ pub const IndexSnapshot = struct {
                     if (seg.shared.deleted) |deleted| {
                         if (deleted.contains(local_doc)) continue;
                     }
-                    if (ordinals_cursor == null) ordinals_cursor = try segment_mod.DocOrdinalCursor.init(&seg.reader);
+                    if (ordinals_cursor == null) ordinals_cursor = try segment_mod.DocOrdinalCursor.init(seg.reader.encoded());
                     const ordinal = (try ordinals_cursor.?.get(local_doc)) orelse continue;
                     if (!membership.contains(ordinal)) continue;
                     const global_doc = doc_offset + local_doc;
@@ -3715,20 +3716,20 @@ pub const IndexSnapshot = struct {
     pub fn hasDocOrdinalCoverage(self: *const IndexSnapshot) !bool {
         for (self.segments) |*seg| {
             if (seg.reader.doc_count == 0) continue;
-            if (seg.reader.deferred != null) {
+            if (seg.reader.encoded().deferred != null) {
                 if (!seg.reader.hasSection(segment_mod.doc_ordinals_field, .doc_ordinals)) return false;
-            } else if (seg.reader.native) |native| {
+            } else if (seg.reader.encoded().native) |native| {
                 if (native.range.findSection(segment_mod.doc_ordinals_field, .doc_ordinals) == null) return false;
-            } else if ((try seg.reader.sectionView(segment_mod.doc_ordinals_field, .doc_ordinals)) == null) return false;
+            } else if ((try seg.reader.encoded().sectionView(segment_mod.doc_ordinals_field, .doc_ordinals)) == null) return false;
         }
         return true;
     }
 
     pub fn hasInvertedField(self: *const IndexSnapshot, field: []const u8) !bool {
         for (self.segments) |*seg| {
-            if (seg.reader.deferred != null) {
+            if (seg.reader.encoded().deferred != null) {
                 if (seg.reader.hasSection(field, .inverted_text)) return true;
-            } else if (seg.reader.native) |native| {
+            } else if (seg.reader.encoded().native) |native| {
                 if (native.range.findSection(field, .inverted_text) != null) return true;
             } else if (try seg.reader.invertedIndex(field) != null) return true;
         }
@@ -4250,7 +4251,7 @@ pub const IndexWriter = struct {
             target.* = segment;
             target.id = source.target_id;
             next_id = @max(next_id, source.target_id + 1);
-            try addSegmentFieldLens(self.alloc, &totals, &segment.reader);
+            try addSegmentFieldLens(self.alloc, &totals, segment.reader.encoded());
         }
         // Validate IDs before publishing or retaining any physical reader.
         var ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
@@ -4287,7 +4288,7 @@ pub const IndexWriter = struct {
             const parent = try self.alloc.create(SegmentEntry);
             errdefer self.alloc.destroy(parent);
             parent.* = segment.*;
-            const shared = try SegmentEntry.createShared(self.alloc, segment.data, &segment.reader);
+            const shared = try SegmentEntry.createShared(self.alloc, segment.data, segment.reader.encoded());
             errdefer SegmentEntry.destroyShared(self.alloc, shared);
             shared.deleted = try mask.clone(self.alloc);
             shared.deleted_count.store(@intCast(mask.cardinality()), .release);
@@ -4608,7 +4609,7 @@ pub const IndexWriter = struct {
         new_segments[old.segments.len] = .{
             .id = seg_id,
             .data = data,
-            .reader = reader,
+            .reader = .fromEncoded(reader),
             .layout_stats = SegmentEntry.admissionLayoutStats(data, &reader),
             .shared = shared,
         };
@@ -4676,7 +4677,7 @@ pub const IndexWriter = struct {
         var global_field_lens = std.StringHashMapUnmanaged(u64).empty;
         errdefer global_field_lens.deinit(self.alloc);
         for (segments) |*seg| {
-            for (seg.reader.fields) |*fi| {
+            for (seg.reader.encoded().fields) |*fi| {
                 for (fi.sections) |*si| {
                     if (si.section_type != .inverted_text) continue;
                     const inv = (try seg.reader.invertedFieldStats(fi.name)) orelse continue;
@@ -4783,7 +4784,7 @@ pub const IndexWriter = struct {
         new_segments[old.segments.len] = .{
             .id = seg_id,
             .data = owned.?,
-            .reader = reader,
+            .reader = .fromEncoded(reader),
             .layout_stats = SegmentEntry.admissionLayoutStats(owned.?, &reader),
             .shared = shared,
         };
@@ -4946,7 +4947,7 @@ pub const IndexWriter = struct {
             new_segments[idx] = .{
                 .id = replacement.id,
                 .data = replacement.data,
-                .reader = replacement_readers[i],
+                .reader = .fromEncoded(replacement_readers[i]),
                 .layout_stats = SegmentEntry.admissionLayoutStats(replacement.data, &replacement_readers[i]),
                 .shared = shared,
             };
@@ -4964,7 +4965,7 @@ pub const IndexWriter = struct {
         for (retired[0..ret_idx]) |*segment| {
             var removed = std.StringHashMapUnmanaged(u64).empty;
             defer removed.deinit(self.alloc);
-            try addSegmentFieldLens(self.alloc, &removed, &segment.reader);
+            try addSegmentFieldLens(self.alloc, &removed, segment.reader.encoded());
             var iterator = removed.iterator();
             while (iterator.next()) |entry| {
                 const total = global_field_lens.getPtr(entry.key_ptr.*) orelse return error.InvalidSegment;
@@ -4975,7 +4976,7 @@ pub const IndexWriter = struct {
         if (ret_idx != 0) {
             var rebound = std.StringHashMapUnmanaged(u64).empty;
             errdefer rebound.deinit(self.alloc);
-            for (new_segments) |*segment| for (segment.reader.fields) |field| {
+            for (new_segments) |*segment| for (segment.reader.encoded().fields) |field| {
                 if (global_field_lens.get(field.name)) |total| try rebound.put(self.alloc, field.name, total);
             };
             global_field_lens.deinit(self.alloc);
@@ -6348,7 +6349,7 @@ fn boundNativeSnapshotScenario(a: Allocator) !void {
     var bound_open = true;
     defer if (bound_open) bound.release();
     try std.testing.expectEqual(admission_reads, state.reads);
-    try std.testing.expect(bound.segments[0].reader.fields.ptr == writer.snapshot().segments[0].reader.fields.ptr);
+    try std.testing.expect(bound.segments[0].reader.encoded().fields.ptr == writer.snapshot().segments[0].reader.encoded().fields.ptr);
     var composed = try IndexWriter.init(a);
     defer composed.deinit();
     try composed.shareImmutableSegments(&.{.{ .snapshot = bound, .ordinal = 0, .target_id = 2 }});
@@ -6698,7 +6699,7 @@ test "external lake explicit read capabilities bind only selected immutable segm
             var lease = try facade.leaseSegment(ordinal);
             defer lease.deinit();
             try typed_scope.retainSegment(lease);
-            try std.testing.expect((try typed_scope.get(&lease.entry.reader, "absent")) == null);
+            try std.testing.expect((try typed_scope.get(lease.entry.reader.encoded(), "absent")) == null);
             try std.testing.expect(typed_scope.entries.items.len <= 4);
             try std.testing.expect(facade.bound_segments.count() <= IndexSnapshot.idle_reader_limit + 7);
         }
@@ -6947,9 +6948,9 @@ test "external lake metadata navigation foreign corpora retain physical allocato
     {
         var decoder = segment_mod.SegmentReader.StoredDocCursor.init(a);
         defer decoder.deinit();
-        try std.testing.expectEqualStrings("second", (try decoder.get(&segment.reader, 1)).?.id);
-        try std.testing.expectEqualStrings("first", (try decoder.get(&segment.reader, 0)).?.id);
-        try std.testing.expectEqualStrings("second", (try decoder.get(&segment.reader, 1)).?.id);
+        try std.testing.expectEqualStrings("second", (try decoder.get(segment.reader.encoded(), 1)).?.id);
+        try std.testing.expectEqualStrings("first", (try decoder.get(segment.reader.encoded(), 0)).?.id);
+        try std.testing.expectEqualStrings("second", (try decoder.get(segment.reader.encoded(), 1)).?.id);
         try std.testing.expectEqual(@as(usize, 1), decoder.decode_count);
     }
     destination.deinit();
@@ -7027,7 +7028,7 @@ test "ordinal bitmap projection bounds native reads for a broad live population"
     try writer.addSegmentWithIdData(1, .fromNative(.{ .contiguous = bytes }));
     const snapshot_ref = writer.acquireSnapshot();
     defer snapshot_ref.release();
-    const cache = &snapshot_ref.segments[0].reader.native.?.metadata_cache.?;
+    const cache = &snapshot_ref.segments[0].reader.encoded().native.?.metadata_cache.?;
     // One non-visible identity makes the broad live population exclude it.
     // Physical segment rows still include it, just as with a lagging delete.
     var membership = roaring.RoaringBitmap.init(a);
