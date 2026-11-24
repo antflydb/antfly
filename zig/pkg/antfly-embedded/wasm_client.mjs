@@ -211,9 +211,44 @@ function createHostImports(module, options = {}) {
     }
     if (incompleteGpu) webgpuImports.gpu_is_available = () => 0;
 
+    // Host file system bridge (see wasm_opfs_fs.mjs). Pointers are wasm32
+    // numbers; 64-bit offsets and results cross as BigInt.
+    const fs = options.fileSystem;
+    const noFs = -5n;
+    // wasm32 usize arrives as a signed i32: addresses at or above 2 GiB are
+    // negative numbers. (wasm64 passes BigInt.)
+    const address = (value) => (typeof value === "bigint" ? Number(value) : value >>> 0);
+    const bytesAt = (ptr, len) => new Uint8Array(requireExports().memory.buffer, address(ptr), address(len));
+    const pathAt = (ptr, len) => textDecoder.decode(bytesAt(ptr, len));
+    const fsCall = (fn) => {
+        if (!fs) return noFs;
+        try {
+            return BigInt(fn());
+        } catch (error) {
+            fs.lastError = error;
+            return noFs;
+        }
+    };
+    const fileSystemImports = {
+        antfly_host_fs_size: (p, l) => fsCall(() => fs.size(pathAt(p, l))),
+        antfly_host_fs_read: (p, l, offset, out, outLen) => fsCall(() => fs.read(pathAt(p, l), Number(offset), bytesAt(out, outLen))),
+        antfly_host_fs_write: (p, l, ptr, len, append) => fsCall(() => fs.write(pathAt(p, l), bytesAt(ptr, len), append !== 0)),
+        antfly_host_fs_sync: (p, l) => fsCall(() => fs.sync(pathAt(p, l))),
+        antfly_host_fs_rename: (op, ol, np, nl) => fsCall(() => fs.rename(pathAt(op, ol), pathAt(np, nl))),
+        antfly_host_fs_remove: (p, l, tree) => fsCall(() => fs.remove(pathAt(p, l), tree !== 0)),
+        antfly_host_fs_list: (p, l, dirs, out, outLen) =>
+            fsCall(() => {
+                const joined = textEncoder.encode(fs.list(pathAt(p, l), dirs !== 0).map((name) => name + "\n").join(""));
+                if (joined.length <= Number(outLen)) bytesAt(out, joined.length).set(joined);
+                return joined.length;
+            }),
+        antfly_host_fs_now_ns: () => (fs ? BigInt(fs.nowNs()) : BigInt(Date.now()) * 1000000n),
+    };
+
     return {
         imports: {
             env: {
+                ...fileSystemImports,
                 antfly_platform_random_secure(ptr, len) {
                     const crypto = globalThis.crypto;
                     if (typeof crypto?.getRandomValues !== "function") return 1;
@@ -379,6 +414,20 @@ export function bindAntflyEmbeddedApi(exports) {
         close() {
             exports.antfly_embedded_close();
             return lastMessage();
+        },
+        /**
+         * Open a database stored in the host file system given to
+         * `instantiate*({ fileSystem })` (in browsers, an OPFS pool from
+         * wasm_opfs_fs.mjs). `path` is the database's root inside it.
+         */
+        openFileSystem(path = "/antfly") {
+            const input = writeInput(String(path));
+            try {
+                expectOk(exports.antfly_embedded_open_host_fs(input.ptr, input.len));
+                return lastMessage();
+            } finally {
+                freeInput(input);
+            }
         },
         batchJson(body) {
             return callJson(exports.antfly_embedded_batch_json, toJsonBody(body));

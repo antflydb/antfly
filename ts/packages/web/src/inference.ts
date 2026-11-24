@@ -6,6 +6,8 @@ import type {
   ExtractionResponseV2,
   DecisionRequest,
   DecisionResponse,
+  EmbeddingRequest,
+  EmbeddingResponse,
   ModelCapabilities,
   ModelInspection,
   ModelFamily,
@@ -53,7 +55,7 @@ type Runtime = {
     progress?: (p: InferenceProgress) => void
   ) => Promise<BundleInfo>;
   runExtraction: (
-    request: InferenceRequest | ExtensionInferenceRequest | DecisionRequest,
+    request: InferenceRequest | ExtensionInferenceRequest | DecisionRequest | EmbeddingRequest,
     validate: boolean,
     operation?: InferenceTask
   ) => Promise<Omit<RunResult<unknown>, "backend">>;
@@ -449,6 +451,13 @@ export class Inference {
   decide(request: DecisionRequest, options: RunOptions = {}): Promise<RunResult<DecisionResponse>> {
     return this.execute(request, options, false, "decide");
   }
+  /** Retrieval embeddings from a loaded EmbeddingGemma2 bundle (WASM CPU). */
+  embed(request: EmbeddingRequest, options: RunOptions = {}): Promise<RunResult<EmbeddingResponse>> {
+    return this.execute(request, options, false, "embed");
+  }
+  validateEmbedding(request: EmbeddingRequest, options: RunOptions = {}): Promise<ValidationResult> {
+    return this.execute(request, options, true, "embed");
+  }
   validateExtraction(
     request: ExtractionRequest,
     options: RunOptions = {}
@@ -481,7 +490,7 @@ export class Inference {
     return this.execute(request, options, true);
   }
   private async execute<T>(
-    request: InferenceRequest | ExtensionInferenceRequest | DecisionRequest,
+    request: InferenceRequest | ExtensionInferenceRequest | DecisionRequest | EmbeddingRequest,
     options: RunOptions,
     validateOnly: boolean,
     task?: InferenceTask
@@ -520,7 +529,9 @@ export class Inference {
         ? validateOnly
           ? task === "extract"
             ? "validate-extraction"
-            : "validate-decision"
+            : task === "embed"
+              ? "validate-embedding"
+              : "validate-decision"
           : task
         : validateOnly
           ? "validate"
