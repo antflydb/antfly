@@ -149,6 +149,8 @@ npm trust list @antfly/web
 
 For the npmjs.com form, use GitHub organization `antflydb`, repository `antfly`,
 workflow filename `ts-npm-publish.yml`, environment `npm`, and allow direct
-publication. Functional releases should be tagged only after the package
+publication. The GitHub `npm` environment must also allow the tag pattern
+`ts/antfly/web/v*`; retain its existing required reviewers and self-review
+prevention. Functional releases should be tagged only after the package
 version, bundled runtime identity, type checks, tests, and packed contents have
 been verified. Do not republish an existing package version.
