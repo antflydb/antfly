@@ -92,11 +92,11 @@ document.querySelector("#search").onsubmit = async (e) => {
         let first = matches[0] ? unitEvidence(matches[0]) : {};
         let page =
           first?.provenance?.page_number || first?.["provenance.page_number"];
-        if (!audioProfile && !page && source.metadata?.page_number) {
+        if (collection.profile === "pdf" && !page && source.metadata?.page_number) {
           link.href += "#page=" + source.metadata.page_number;
           link.textContent += " · page " + source.metadata.page_number;
         }
-        if (!audioProfile && page) {
+        if (collection.profile === "pdf" && page) {
           page += Math.max(1, source.metadata?.page_start || 1) - 1;
           link.href += "#page=" + page;
           link.textContent += " · page " + page;
@@ -134,7 +134,7 @@ document.querySelector("#search").onsubmit = async (e) => {
         let evidence = document.createElement("details"),
           summary = document.createElement("summary"),
           pre = document.createElement("pre");
-        summary.textContent = audioProfile ? "Source and timestamp evidence" : "Source and page evidence";
+        summary.textContent = audioProfile ? "Source and timestamp evidence" : collection.profile === "images" ? "Source and image evidence" : "Source and page evidence";
         pre.textContent = JSON.stringify(hit, null, 2);
         evidence.append(summary, pre);
         card.append(evidence);
