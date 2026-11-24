@@ -5693,6 +5693,7 @@ const ColdNativeWhisper = struct {
     encoder: ?ops.CT = null,
     encoder_owned: bool = false,
     borrowed_operation: bool = false,
+    initial_admission_declined: bool = false,
 
     fn destroy(self: *ColdNativeWhisper, current: @import("cleanup_context.zig").Context) void {
         const metadata = self.metadata;
@@ -5728,8 +5729,25 @@ fn denseWhisperPreparationModelData(session: Session) ?*const anyopaque {
     };
 }
 
-fn prepareColdNativeWhisperWithInitial(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, config: whisper_mod.Config, geometry: whisper_arch.CacheGeometry, base: *const @import("../backends/session.zig").RunPermit, encoder: ColdWhisperEncoder, initial_rows: ?usize) !?*ColdNativeWhisper {
-    if (initial_rows) |rows| if (rows == 0 or rows > config.max_target_positions or rows > 2048) return error.UnsupportedDenseSchedule;
+fn prepareColdNativeWhisperWithInitial(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, config: whisper_mod.Config, geometry: whisper_arch.CacheGeometry, base: *const @import("../backends/session.zig").RunPermit, encoder: ColdWhisperEncoder, declared_initial_rows: ?usize) !?*ColdNativeWhisper {
+    const initial_rows = if (declared_initial_rows) |rows|
+        if (rows > 0 and rows <= config.max_target_positions and rows <= 2048) rows else null
+    else
+        null;
+    // A declined optional phase retires before the constructor retries.
+    // Numerical prefill has not started, and the source remains with its caller.
+    return prepareColdWhisperPhases(session, allocator, control, config, geometry, base, encoder, initial_rows) catch |err| switch (err) {
+        error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.MemoryBudgetExceeded => retry: {
+            if (initial_rows == null) return err;
+            const cold = (try prepareColdWhisperPhases(session, allocator, control, config, geometry, base, encoder, null)) orelse return null;
+            cold.initial_admission_declined = true;
+            break :retry cold;
+        },
+        else => err,
+    };
+}
+
+fn prepareColdWhisperPhases(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, config: whisper_mod.Config, geometry: whisper_arch.CacheGeometry, base: *const @import("../backends/session.zig").RunPermit, encoder: ColdWhisperEncoder, initial_rows: ?usize) !?*ColdNativeWhisper {
     if (session.backend() != .native and session.backend() != .cuda and
         !(session.backend() == .metal and encoder != .resident)) return null;
     if (encoder == .shared_metal) if (encoder.shared_metal.backend.operationToken()) |token| {
@@ -5813,9 +5831,11 @@ fn buildColdNativeWhisper(self: *ColdNativeWhisper, session: Session, allocator:
     var initial_source: ?@TypeOf(source) = null;
     var initial_header: ?schedule.ProgramSpec = null;
     if (initial_rows) |query_rows| {
-        initial_source = (try whisper_arch.PreparedSingleToken.specSource(cb, data, config, geometry.encoder_rows, &self.weights.?, query_rows, true)) orelse return false;
-        initial_header = initial_source.?.header();
-        initial_preparation = try selectDensePreparationForSpec(if (shared_lookup) &arch.dense_decoder_initial_definitions else null, &initial_header.?, &initial_source.?, domain, current);
+        initial_source = try whisper_arch.PreparedSingleToken.specSource(cb, data, config, geometry.encoder_rows, &self.weights.?, query_rows, true);
+        if (initial_source) |*phase| {
+            initial_header = phase.header();
+            initial_preparation = try selectDensePreparationForSpec(if (shared_lookup) &arch.dense_decoder_initial_definitions else null, &initial_header.?, phase, domain, current);
+        }
     }
     // Full expected semantics, roles, names and Domain are compared without
     // allocation before either cached phase enters the mandatory denial floor.
@@ -5847,16 +5867,16 @@ fn buildColdNativeWhisper(self: *ColdNativeWhisper, session: Session, allocator:
     if (preparation.cached == null) if (definition.shared) |shared| {
         try shared.sealBeforeExecution();
     };
-    if (initial_rows) |query_rows| initial_phase: {
-        if (domain != null and schedule.sharedBackingSupported(arch.allocator) and initial_preparation.cached == null) initial_preparation.shared = try @import("cold_metadata.zig").Shared.create(arch.allocator, metadata);
+    if (initial_source) |*phase| initial_phase: {
+        if (shared_lookup and initial_preparation.cached == null) initial_preparation.shared = try @import("cold_metadata.zig").Shared.create(arch.allocator, metadata);
         var owned_initial_spec: ?schedule.ProgramSpecStorage = null;
         defer if (owned_initial_spec) |*storage| storage.deinit();
         const initial_spec = if (initial_preparation.cached) |cached_definition| try cached_definition.programSpec() else create: {
-            owned_initial_spec = try createDenseProgramSpecStorage(&initial_preparation, metadata.allocator(), &initial_header.?, &initial_source.?);
+            owned_initial_spec = try createDenseProgramSpecStorage(&initial_preparation, metadata.allocator(), &initial_header.?, phase);
             break :create &owned_initial_spec.?.value;
         };
-        self.program.?.initInitial(config, geometry.encoder_rows, &self.weights.?, &initial_preparation, query_rows, initial_spec, if (owned_initial_spec) |*storage| storage else null) catch |err| {
-            if (cb.kind() == .metal and err == error.UnsupportedDenseSchedule) break :initial_phase;
+        self.program.?.initInitial(config, geometry.encoder_rows, &self.weights.?, &initial_preparation, phase.query_rows, initial_spec, if (owned_initial_spec) |*storage| storage else null) catch |err| {
+            if (err == error.UnsupportedDenseSchedule) break :initial_phase;
             if (err == error.OutOfMemory) if (initial_preparation.shared) |shared| return shared.admissionError() orelse err;
             return err;
         };
@@ -5921,13 +5941,14 @@ const WhisperConstructionObservation = struct {
         const stats = owner.dense_decoder_definitions.trySnapshot();
         self.templates = .{ .scope = .model_whisper_cache_lifetime_at_constructor_observation, .phase = .decode_prefix, .availability = if (stats != null) .sampled else .busy, .stats = stats };
     }
-    fn prepared(self: *@This(), session: Session, cold: ?*ColdNativeWhisper) void {
+    fn prepared(self: *@This(), session: Session, cold: ?*ColdNativeWhisper, requested_initial: bool) void {
         self.program.outcome = if (cold != null) .prepared else .declined;
         if (enabled(session)) if (cold) |owner| {
             const program = &owner.program.?;
             const definition = program.schedule.definition;
             const decode_bytes: ?usize = if (definition.shared) |shared| shared.admittedAmounts().host_scratch_bytes else null;
             var initial_bytes: ?usize = null;
+            if (requested_initial) self.program.initial_outcome = if (owner.initial_admission_declined) .admission_pressure else if (program.initial != null) .prepared else .unsupported;
             if (program.initial) |initial| {
                 self.program.producer = .whisper_dense_decoder_schedule;
                 self.program.initial_query_rows = initial.tokens.len;
@@ -5982,7 +6003,7 @@ fn optionalColdNativeWhisper(session: Session, allocator: std.mem.Allocator, con
             },
         }
     };
-    observation.prepared(session, cold);
+    observation.prepared(session, cold, options.expected_initial_query_rows != null);
     return cold;
 }
 
@@ -21693,6 +21714,7 @@ fn nativeWhisperDeclaredInitialCase(a: std.mem.Allocator) !void {
         const report = observed.snapshot().?.report.?.native_program_construction.?;
         try std.testing.expectEqual(.whisper_dense_decoder_schedule, report.producer);
         try std.testing.expectEqual(rows, report.initial_query_rows.?);
+        try std.testing.expect(report.initial_outcome == .prepared);
         try std.testing.expectEqual(.initial_causal, report.initial_definition_templates.?.phase);
         try std.testing.expectEqual(try std.math.add(usize, report.metadata.?.decode_definition_host_scratch_bytes.?, report.metadata.?.initial_definition_host_scratch_bytes.?), report.metadata.?.shared_definition_host_scratch_bytes.?);
         // Exact independently produced per-class reservations: two distinct
@@ -21785,6 +21807,54 @@ test "Native Whisper declared initial causal rows and decode prefix use separate
     try nativeWhisperDeclaredInitialCase(std.testing.allocator);
 }
 
+test "Native Whisper declared initial causal rows yield their workspace under pressure while decode stays planned" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    defer std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot()) catch @panic("Whisper workspace admission leaked");
+    var session = try IncrementalFixture.session(a);
+    defer session.close();
+    try session.installOwnedExecutionGate(a);
+    session.model_lifetime.?.admission_domain = domain.pin();
+    session.run_admission = .{ .controller = &domain.controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 128 * 1024 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false };
+    const hidden = [_]f32{ 0.2, 0.4, -0.1, 0.7, 0.5, 0.6, -0.2, 0.3 };
+    var observed = @import("diagnostics.zig").Diagnostics{};
+    observed.configure(true);
+    session.invocation_diagnostics = .{ .diagnostics = &observed };
+    const options: IncrementalDecoderAdapter.PreparationOptions = .{ .expected_initial_query_rows = 2 };
+    const prefill_bytes = measure: {
+        var two_phase = (try IncrementalDecoderAdapter.fromHostPrepared(session, a, null, &hidden, 2, options)).?;
+        defer two_phase.deinit();
+        const initial = two_phase.cache.native_program.?.initial orelse return error.MissingInitialSchedule;
+        break :measure (try initial.schedule.selected.storageRequirement()).host_scratch_bytes;
+    };
+    if (prefill_bytes == 0) return error.MissingInitialWorkspace;
+    const decode_total = measure: {
+        var decode_only = (try IncrementalDecoderAdapter.fromHostPrepared(session, a, null, &hidden, 2, .{})).?;
+        defer decode_only.deinit();
+        if (decode_only.cache.native_program == null) return error.MissingDecodeSchedule;
+        break :measure domain.controller.snapshot().hostTotalBytes();
+    };
+    const limit = decode_total + prefill_bytes / 2;
+    session.run_admission.?.limits.host_limit_bytes = limit;
+    var decoder = (try IncrementalDecoderAdapter.fromHostPrepared(session, a, null, &hidden, 2, options)).?;
+    defer decoder.deinit();
+    const report = observed.snapshot().?.report.?.native_program_construction.?;
+    const program = if (decoder.cache.native_program) |*program| program else {
+        std.debug.print("decode admission lost at {d} bytes (decode {d}, prefill {d}): {s}\n", .{ limit, decode_total, prefill_bytes, if (report.error_name) |name| name.view() else "unavailable" });
+        return error.DecodeScheduleLostUnderPressure;
+    };
+    if (program.initial != null) return error.PrefillWorkspaceAdmissionUnexpectedlySucceeded;
+    if (report.initial_outcome != .admission_pressure) return error.MissingPrefillWorkspacePressure;
+    try std.testing.expect(domain.controller.snapshot().hostTotalBytes() <= limit);
+    const initial = try decoder.step(&.{ 0, 1 });
+    defer a.free(initial);
+    const next = try decoder.step(&.{2});
+    defer a.free(next);
+    try std.testing.expectEqual(program.schedule.steps.len, program.schedule.cursor);
+}
+
 test "Native Whisper two phase cold hits misses and Model close unwind every request allocation failure" {
     if (comptime !build_options.enable_native) return error.SkipZigTest;
     try std.testing.checkAllAllocationFailures(std.testing.allocator, nativeWhisperDeclaredInitialCase, .{});
@@ -21797,6 +21867,22 @@ test "Native Whisper wrong initial declaration declines before ingress while ini
     defer session.close();
     try session.installOwnedExecutionGate(a);
     const hidden = [_]f32{ 0.2, 0.4, -0.1, 0.7, 0.5, 0.6, -0.2, 0.3 };
+    {
+        var decode_only = (try IncrementalDecoderAdapter.fromHostPrepared(session, a, null, &hidden, 2, .{ .expected_initial_query_rows = 0 })).?;
+        defer decode_only.deinit();
+        const program = &decode_only.cache.native_program.?;
+        try std.testing.expect(program.initial == null);
+        var reference = try whisper_arch.DecodeCache.init(&decode_only.cb.backend, a, decode_only.config, decode_only.encoder_hidden, 2);
+        defer reference.deinit(&decode_only.cb.backend);
+        for ([_][]const i64{ &.{ 0, 1 }, &.{2} }) |tokens| {
+            const expected = try whisper_arch.decoderStepCachedLogits(&decode_only.cb.backend, a, decode_only.config, tokens, &reference);
+            defer a.free(expected);
+            const actual = try decode_only.step(tokens);
+            defer a.free(actual);
+            try std.testing.expectEqualSlices(f32, expected, actual);
+        }
+        try std.testing.expectEqual(program.schedule.steps.len, program.schedule.cursor);
+    }
     const Probe = struct {
         cancelled: bool = false,
         fn check(raw: ?*anyopaque) !void {

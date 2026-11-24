@@ -165,6 +165,8 @@ pub const NativeProgramConstruction = struct {
     producer: enum { decoder_runtime, whisper_single_token_schedule, whisper_dense_decoder_schedule } = .decoder_runtime,
     outcome: enum { not_attempted, declined, prepared, failed },
     error_name: ?Text = null,
+    /// Cold result for an explicitly requested causal prefill phase.
+    initial_outcome: ?enum { prepared, unsupported, admission_pressure } = null,
     initial_query_rows: ?usize = null,
     /// Independently sampled initial-phase cache; not an atomic two-cache view.
     initial_definition_templates: ?NativeDefinitionTemplates = null,
