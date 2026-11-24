@@ -183,8 +183,12 @@ pub const Scope = struct {
         return .{ .plan = plan, .base = backing + layout.scratch_offset, .bound_start = backing, .bound_end = backing + backing_bytes, .requires_published_output = layout.external_output };
     }
 
+    pub inline fn isBound(self: *const Scope) bool {
+        return self.base != 0;
+    }
+
     pub fn complete(self: *const Scope) bool {
-        return self.base != 0 and self.valid and self.cursor == self.plan.event_count;
+        return self.isBound() and self.valid and self.cursor == self.plan.event_count;
     }
 
     /// Bind the terminal write to disjoint storage before execution or capture.
@@ -203,7 +207,7 @@ pub const Scope = struct {
 
     pub fn owns(self: *const Scope, pointer: DevicePointer) bool {
         const peak = if (self.requires_published_output) self.plan.scratch_peak else self.plan.peak;
-        return self.base != 0 and ((self.published_ptr != 0 and pointer == self.published_ptr) or
+        return self.isBound() and ((self.published_ptr != 0 and pointer == self.published_ptr) or
             (pointer >= self.base and pointer - self.base < peak));
     }
     pub fn allocate(self: *Scope, bytes: usize) !DevicePointer {
@@ -225,7 +229,7 @@ pub const Scope = struct {
         return self.base + self.plan.allocations[e.slot].offset;
     }
     pub fn release(self: *Scope, pointer: DevicePointer) void {
-        if (self.base == 0) {
+        if (!self.isBound()) {
             self.plan.release(pointer);
             return;
         }

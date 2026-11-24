@@ -13575,7 +13575,7 @@ fn copyMappedWeightFromHostTracked(self: *CudaCompute, device: buffer_mod.Device
 }
 
 fn copyFromHostTracked(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes: []const u8) !void {
-    if (self.execution_scope) |scope| if (scope.base != 0) return error.CudaGraphCaptureUnsafeHostCopy;
+    if (self.execution_scope) |scope| if (scope.isBound()) return error.CudaGraphCaptureUnsafeHostCopy;
     if (self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) {
         self.debug_cuda_graph_capture_disabled = true;
         std.log.warn("cuda_graph_capture_probe: unsafe_h2d_copy bytes={d} disabled=1", .{bytes.len});
@@ -14892,7 +14892,7 @@ fn flushDeferredDecodeScalarUpload(self: *CudaCompute) !void {
 }
 
 fn copyToHostTracked(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes: []u8) !void {
-    if (self.execution_scope) |scope| if (scope.base != 0) return error.CudaGraphCaptureUnsafeHostCopy;
+    if (self.execution_scope) |scope| if (scope.isBound()) return error.CudaGraphCaptureUnsafeHostCopy;
     if (self.debug_cuda_graph_capture_active) {
         self.debug_cuda_graph_capture_disabled = true;
         std.log.warn("cuda_graph_capture_probe: unsafe_d2h_copy bytes={d} disabled=1", .{bytes.len});
@@ -14932,7 +14932,7 @@ fn copyToHostTrackedAndSync(self: *CudaCompute, device: buffer_mod.DeviceBuffer,
     if (bytes.len == 0) return;
     // Admission precedes every optional staging allocation and driver call.
     try @import("../../execution/transfer_audit.zig").checkDeviceHostAccess();
-    if (self.execution_scope) |scope| if (scope.base != 0) return error.CudaGraphCaptureUnsafeHostCopy;
+    if (self.execution_scope) |scope| if (scope.isBound()) return error.CudaGraphCaptureUnsafeHostCopy;
     const tried_pinned_scalar_download = pinnedScalarDownloadEligible(self, bytes);
     if (try copyToPinnedScalarDownloadAndSync(self, device, bytes)) return;
     if (tried_pinned_scalar_download) self.stats.pinned_scalar_download_fallbacks += 1;
@@ -17655,7 +17655,7 @@ test "CUDA greedy graph output lease remains armed for retry and consumes on ten
 fn allocDeviceBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
     if (len == 0) return .{};
     if (self.execution_scope) |scope| {
-        if (scope.base != 0) return .{ .ptr = try scope.allocate(len), .len = len, .borrowed = true };
+        if (scope.isBound()) return .{ .ptr = try scope.allocate(len), .len = len, .borrowed = true };
     }
     var result = try allocDeviceBufferOrdinary(self, len);
     if (self.execution_scope) |scope| {
@@ -17927,7 +17927,7 @@ fn releaseDeviceBuffer(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer) voi
 fn releaseDeviceBufferUsing(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer, comptime checked: bool) !void {
     if (buffer.ptr == 0) return;
     if (self.execution_scope) |scope| {
-        if (scope.base == 0) scope.release(buffer.ptr) else if (scope.owns(buffer.ptr)) {
+        if (!scope.isBound()) scope.release(buffer.ptr) else if (scope.owns(buffer.ptr)) {
             scope.release(buffer.ptr);
             buffer.* = .{};
             return;
@@ -21549,7 +21549,7 @@ const SourceLinearTemporary = struct {
     fn validateArenaCapture(self: *CudaCompute, scope: *const @import("../../execution/stream_workspace.zig").Scope) !void {
         if (self.source_linear_scratch.in_use) return error.SourceStorageInUse;
         const source = self.source_linear_scratch.buffer;
-        if (scope.base == 0 or (source.ptr != 0 and (!self.source_linear_scratch.active or
+        if (!scope.isBound() or (source.ptr != 0 and (!self.source_linear_scratch.active or
             !scope.disjointBacking(source.ptr, source.len)))) return error.CudaGraphCaptureUnsafeTempAlloc;
     }
     /// Query once, before any output, module or temporary allocation. The
@@ -21564,7 +21564,7 @@ const SourceLinearTemporary = struct {
         try validateCaptureStorage(self, actual_capture);
         if (self.execution_scope) |scope| {
             if (self.source_linear_scratch.in_use) return error.SourceStorageInUse;
-            if (scope.base != 0) {
+            if (scope.isBound()) {
                 return .{ .bank = .{ .ptr = try scope.allocate(bytes), .len = bytes, .borrowed = true }, .kind = .captured };
             }
             if (self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return error.CudaGraphCaptureUnsafeTempAlloc;
@@ -33581,7 +33581,7 @@ const lighton_mrope_position_capacity: usize = 2 * 16 * 4096;
 
 fn lightOnOwnedDecodeCapture(self: *const CudaCompute) bool {
     return self.bounded_decode_graph.active and self.bounded_decode_graph.epoch_id != 0 and
-        self.execution_scope != null and self.execution_scope.?.base != 0 and self.ctx.debug_graph_capture_active;
+        self.execution_scope != null and self.execution_scope.?.isBound() and self.ctx.debug_graph_capture_active;
 }
 
 fn cachedLightOnMropePositions(self: *CudaCompute, positions: []const u32) !?buffer_mod.DeviceBuffer {
@@ -40380,7 +40380,7 @@ fn validateAssignedGatherIndices(self: *CudaCompute, indices: *const CudaTensor,
     }
     const audit = @import("../../execution/transfer_audit.zig");
     try audit.checkIndexMetadataAccess();
-    if (self.execution_scope) |scope| if (scope.base != 0) return error.CudaGraphCaptureUnsafeHostCopy;
+    if (self.execution_scope) |scope| if (scope.isBound()) return error.CudaGraphCaptureUnsafeHostCopy;
     if (self.debug_cuda_graph_capture_active) {
         self.debug_cuda_graph_capture_disabled = true;
         return error.CudaGraphCaptureUnsafeHostCopy;
@@ -48611,7 +48611,7 @@ fn hostInputRequirementsOp(ctx: *anyopaque, logical: @import("ml").graph.Shape) 
         else => return null,
     };
     if (self.training_blas != null or self.resident_training_cache) return null;
-    if (self.execution_scope) |scope| if (scope.base != 0) return null;
+    if (self.execution_scope) |scope| if (scope.isBound()) return null;
     const elements = logical.numElements() orelse return null;
     if (elements <= 0 or self.ctx.driver.fns.cuMemAllocHost == null or self.ctx.driver.fns.cuMemFreeHost == null) return null;
     const bytes = try checkedMul(@intCast(elements), logical.dtype.byteSize());
@@ -48671,7 +48671,7 @@ const PreparedHostIngress = struct {
         const target = tensorFromCt(output);
         const bytes = values.len;
         if (self.compute.debug_cuda_graph_capture_active or self.compute.ctx.debug_graph_capture_active) return error.CudaHostIngressDuringCapture;
-        if (self.compute.execution_scope) |scope| if (scope.base != 0) return error.CudaHostIngressDuringCapture;
+        if (self.compute.execution_scope) |scope| if (scope.isBound()) return error.CudaHostIngressDuringCapture;
         if (!acceptsPhysicalImplementation(self.implementation.table) or self.implementation.context != @as(*anyopaque, @ptrCast(self.compute))) return error.PreparedKernelBindingChanged;
         if (!@import("../../execution/host_ingress.zig").rawDType(self.slot.logical.dtype)) return error.InvalidHostIngressBinding;
         const dtype: tensor_mod.DType = switch (self.slot.logical.dtype) {
