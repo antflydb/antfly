@@ -27,7 +27,7 @@ pub const SnapshotAdmission = struct {
     lock: apply_rw_lock_mod.ApplyRwLock = .{},
     mutation_revision: std.atomic.Value(u64) = .init(0),
 
-    active_mutations: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    active_mutations: std.atomic.Value(u64) = .init(0),
 
     fn markMutation(self: *SnapshotAdmission) void {
         _ = self.active_mutations.fetchAdd(1, .acq_rel);
