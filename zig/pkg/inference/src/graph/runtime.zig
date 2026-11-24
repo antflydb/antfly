@@ -636,6 +636,8 @@ pub const Runtime = struct {
                     output.outputs = try active.replayOutputs(allocator, options.execution_control);
                     output.owner_backend = durableBackend(self.default_backend.*);
                     errdefer output.deinitWithCleanup(self, physical_cleanup);
+                    if (active.metal_device_copy_pending) return error.PreparedMetalFrameDispatchChanged;
+
                     frame_finished = true;
                     addPhysicalStats(&output.stats, try active.finishWithCleanup(physical_cleanup));
                     return;
@@ -663,6 +665,8 @@ pub const Runtime = struct {
                 };
                 if (options.output_placement == .default_backend) try self.normalizeOutputsToDefaultDevice(allocator, &result);
                 if (frame) |active| {
+                    if (active.metal_device_copy_pending) return error.PreparedMetalFrameDispatchChanged;
+
                     frame_finished = true;
                     const physical_stats = try active.finishWithCleanup(physical_cleanup);
                     addPhysicalStats(&output.stats, physical_stats);

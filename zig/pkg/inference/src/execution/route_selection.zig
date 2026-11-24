@@ -556,7 +556,7 @@ pub const Selection = struct {
                 break :imported try densePlane(host.logical, backend, .primary, self.epoch);
             } else if (binding_value == .imported_device) imported: {
                 const device = binding_value.imported_device;
-                if (backend.kind() != .cuda or device.implementation.context != backend.ptr or device.implementation.table != @as(*const anyopaque, @ptrCast(backend.vtable)) or !device.logical.eq(source_slot.desc.shape) or device.logical.dtype != .f32) break :imported null;
+                if (device.logical.dtype != .f32 or !@import("assigned_kernel_route.zig").bindingDense(backend, binding_value, source_slot.desc.shape)) break :imported null;
                 break :imported try densePlane(device.logical, backend, .primary, self.epoch);
             } else try @import("dense_alias.zig").primary(binding_value, backend, source_slot.desc.shape);
             const primary = candidate orelse continue;

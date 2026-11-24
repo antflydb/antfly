@@ -4403,12 +4403,14 @@ const InvocationInputFacts = struct {
         return live;
     }
 
-    fn promoteStrictCudaDeviceInputs(self: *InvocationInputFacts, target: *const ImportedOnnxSession, selected: ?*const PreparedRoutes, stage: bool) void {
-        if (target.requested_strategy != .compiled_required or target.cb.kind() != .cuda) return;
+    fn promoteOwnedDeviceInputs(self: *InvocationInputFacts, target: *const ImportedOnnxSession, selected: ?*const PreparedRoutes, stage: bool) void {
+        const cuda = target.requested_strategy == .compiled_required and target.cb.kind() == .cuda;
+        const metal = target.cb.kind() == .metal and if (target.executable.runtime.physical_pool) |pool| pool.metal_frame_dispatch and !pool.mixed_frame_dispatch else false;
+        if (!cuda and !metal) return;
         for (self.inputs) |*input| {
             const logical = switch (input.value) {
                 .resident => |resident| resident.logical,
-                .imported_host => |host| if (stage and selected == null) host.logical else continue,
+                .imported_host => |host| if (cuda and stage and selected == null) host.logical else continue,
                 else => continue,
             };
             if (selected) |routes| {
@@ -4417,6 +4419,8 @@ const InvocationInputFacts = struct {
                 if (saved != .imported_device) continue;
             }
             if (logical.dtype != .f32 and logical.dtype != .i32 and logical.dtype != .i64) continue;
+            if (metal and logical.dtype != .f32) continue;
+
             if (!@import("../execution/assigned_kernel_route.zig").bindingDense(target.cb, input.value, logical)) continue;
             input.value = .{ .imported_device = .{ .logical = logical, .implementation = .{ .context = target.cb.ptr, .table = target.cb.vtable } } };
         }
@@ -5408,7 +5412,7 @@ noinline fn prepareDevicePhysicalInvocation(prepared: *prepared_mod.PreparedInvo
         try facts.init(target, shapes, allocator, null);
     }
     defer facts.deinit();
-    facts.promoteStrictCudaDeviceInputs(target, null, shapes == .stage_inputs);
+    facts.promoteOwnedDeviceInputs(target, null, shapes == .stage_inputs);
     return selectPhysicalInvocationControlled(prepared, session, target, root_pool, facts.inputs, allocator, cleanup, if (control) |active| active.* else null);
 }
 
@@ -5417,7 +5421,7 @@ fn preparePhysicalInvocationWithCleanup(prepared: *prepared_mod.PreparedInvocati
     var facts: InvocationInputFacts = undefined;
     try facts.init(target, shapes, allocator, null);
     defer facts.deinit();
-    facts.promoteStrictCudaDeviceInputs(target, null, shapes == .stage_inputs);
+    facts.promoteOwnedDeviceInputs(target, null, shapes == .stage_inputs);
     try selectPhysicalInvocationControlled(prepared, session, target, root_pool, facts.inputs, allocator, cleanup, control);
 }
 
@@ -5428,7 +5432,7 @@ noinline fn preparePhysicalResidentInvocationWithCleanup(prepared: *prepared_mod
     var facts: InvocationInputFacts = undefined;
     try facts.init(target, shapes, allocator, &storage);
     defer facts.deinit();
-    facts.promoteStrictCudaDeviceInputs(target, null, shapes == .stage_inputs);
+    facts.promoteOwnedDeviceInputs(target, null, shapes == .stage_inputs);
     try selectPhysicalInvocationControlled(prepared, session, target, root_pool, facts.inputs, allocator, cleanup, control);
 }
 
@@ -5510,7 +5514,7 @@ noinline fn validateFreshPreparedRouteFacts(target: *ImportedOnnxSession, routes
     var facts: InvocationInputFacts = undefined;
     try facts.init(target, shapes, allocator, if (InvocationInputFacts.needsResidentStorage(shapes)) &storage else null);
     defer facts.deinit();
-    facts.promoteStrictCudaDeviceInputs(target, routes, false);
+    facts.promoteOwnedDeviceInputs(target, routes, false);
     facts.satisfyImportedInputs(target, routes);
     try routes.validateWithClaims(facts.inputs, claims);
 }
@@ -6510,6 +6514,23 @@ test "complete Imported Metal Frame encoder owns shared ingress aliases outputs 
         try std.testing.expectEqual(misses, cache.stats.misses);
         try std.testing.expectEqual(count, impl.execution_count.load(.acquire));
         try std.testing.expectEqual(sdk.device_owned_buffers_created, @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_buffers_created);
+    }
+    {
+        const backend = impl.shared_backend_ctx.stableBackend();
+        const value = try backend.ensureDeviceResidentOwned(try backend.fromFloat32Shape(&values, &.{ rows, width }));
+        defer backend.free(value);
+        const device_input: session_mod.StageInput = .{ .resident = .{ .value = value, .backend = backend, .shape = &.{ rows, width }, .estimated_bytes = payload } };
+        var observation = @import("../execution/runtime_observation.zig").Scope.init();
+        defer observation.deinit();
+        var result = (try session.runStageInputsWithControl(&.{device_input}, a, .{ .native_call_policy = .in_process })) orelse return error.MissingResidentResult;
+        defer result.deinit();
+        const stats = session.executionDiagnostics().?.execution.?;
+        try std.testing.expectEqual(@as(u64, payload), stats.physical_input_copy_bytes);
+        try std.testing.expectEqual(@as(u64, 0), stats.actual_download_bytes);
+        try std.testing.expectEqual(@as(?u64, 1), observation.snapshot().metal_command_submissions);
+        const actual = try result.backend.toFloat32(result.outputs[0], a);
+        defer a.free(actual);
+        for (actual, values) |found, original| try std.testing.expectApproxEqAbs(@abs(original) + 5 * original, found, 0.00001);
     }
     session.run_admission.?.limits = .{ .host_limit_bytes = cap.hostTotalBytes(), .backend_limit_bytes = cap.backendTotalBytes(), .combined_limit_bytes = try std.math.add(usize, cap.hostTotalBytes(), cap.backendTotalBytes()) };
     const tensors = @import("../backends/metal_tensor.zig");

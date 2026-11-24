@@ -2028,6 +2028,8 @@ pub const MetalPartitionExecutor = struct {
         var frame_active = if (metalPartitionFrameDisabled() or (!planned_primitives and runtime_region_plan.region_count == 0)) false else try cb.decoderRuntimeBeginFrame();
         errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
         if (owned_frame and !frame_active) return error.PreparedMetalFrameDispatchChanged;
+        if (options.physical_frame) |frame| try frame.encodeMetalDeviceInputs(cb);
+
         if (collect_loop_profile) loop_profile.begin_frame_ns += metalPartitionElapsedNs(begin_frame_start_ns, metalPartitionNowNs());
         if (trace_progress) std.debug.print("metal_partition_progress: phase=begin_frame_end partition={d} active={}\n", .{ partition_index, frame_active });
         if (trace_nodes) std.debug.print("graph_executor_node_trace: begin_frame_end partition={d} active={}\n", .{ partition_index, frame_active });

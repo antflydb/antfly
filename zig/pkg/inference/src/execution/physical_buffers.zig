@@ -1173,7 +1173,9 @@ pub const Pool = struct {
             if ((device.logical.dtype != .f32 and device.logical.dtype != .i32 and device.logical.dtype != .i64) or count <= 0 or !device.logical.eq(slot.desc.shape) or self.hostInputIndex(input.node_id) != null) return error.InvalidDeviceIngressBinding;
             var backend_index: ?usize = null;
             for (self.backends, 0..) |backend, index| {
-                if (backend.kind() != .cuda or backend.ptr != device.implementation.context or @as(*const anyopaque, @ptrCast(backend.vtable)) != device.implementation.table) continue;
+                const supported = backend.kind() == .cuda or
+                    (backend.kind() == .metal and self.metal_frame_dispatch and !self.mixed_frame_dispatch and device.logical.dtype == .f32);
+                if (!supported or backend.ptr != device.implementation.context or @as(*const anyopaque, @ptrCast(backend.vtable)) != device.implementation.table) continue;
                 const functions = backend.vtable.kernels orelse continue;
                 if (!functions.accepts(backend.vtable) or functions.copyPhysicalInput == null or functions.physicalTensorView == null or
                     (device.logical.dtype != .f32 and functions.copyPhysicalIndexInput == null)) continue;
@@ -1181,13 +1183,14 @@ pub const Pool = struct {
                 break;
             }
             const index = backend_index orelse return error.UnsupportedDeviceIngress;
+            const kind = self.backends[index].kind();
             const bytes = try std.math.mul(usize, @intCast(count), device.logical.dtype.byteSize());
             const allocation_id = if (input.node_id < self.replay_input_indices.len and self.replay_input_indices[input.node_id] != ml.graph.null_node)
                 self.replay_inputs[self.replay_input_indices[input.node_id]].allocation orelse return error.InvalidDeviceIngressBinding
             else
-                try self.plan.addInputBinding(.cuda, bytes);
+                try self.plan.addInputBinding(kind, bytes);
             const allocation = self.plan.allocationById(allocation_id) orelse return error.InvalidDeviceIngressBinding;
-            if (allocation.kind != .input_binding or allocation.backend != .cuda or allocation.byte_size < bytes) return error.InvalidDeviceIngressBinding;
+            if (allocation.kind != .input_binding or allocation.backend != kind or allocation.byte_size < bytes) return error.InvalidDeviceIngressBinding;
             try plans.append(self.allocator, .{ .node = input.node_id, .shape = device.logical, .backend_index = index, .allocation = allocation_id, .epoch = selected.epoch });
         }
         self.device_input_plans = try plans.toOwnedSlice(self.allocator);
@@ -1414,7 +1417,7 @@ pub const Pool = struct {
         if (capture_supported and child.replay_backend == null) if (child.replay_config) |config| {
             var qualified = false;
             for (child.host_input_plans) |input| qualified = qualified or input.index_bounds != null;
-            if (qualified or child.cuda_frame_dispatch or child.device_input_plans.len != 0) {
+            if (qualified or child.cuda_frame_dispatch or (!child.metal_frame_dispatch and child.device_input_plans.len != 0)) {
                 // Root templates are immutable. This private variant owns its
                 // copied plan and publishes fresh templates only on success.
                 try child.prepareReplay(config.graph, &child.plan, config.bindings, config.costs);
@@ -1425,6 +1428,8 @@ pub const Pool = struct {
             @import("device_owned_coverage.zig").assess(child, child.coverage_backend.?, authority)
         else
             @import("owned_coverage.zig").assess(child);
+        if (child.metal_frame_dispatch and child.device_input_plans.len != 0 and child.payload_coverage != .complete) return null;
+
         if (profile == .unknown and child.metal_frame_dispatch and child.regions.len != 0 and child.payload_coverage != .complete) return null;
         if (child.metal_projection_region_candidate and child.payload_coverage != .complete) child.metal_frame_dispatch = false;
         const immutable = child.immutable_bindings orelse return error.MissingImmutableKernelBindings;
@@ -2174,6 +2179,8 @@ pub const Frame = struct {
     bound_host_input_count: usize = 0,
     host_input_generation: u64 = 0,
     device_bound_inputs: []interpreter.RuntimeInput = &.{},
+    metal_device_sources: []CT = &.{},
+    metal_device_copy_pending: bool = false,
     bound_device_input_count: usize = 0,
 
     fn create(pool: *Pool) !*Frame {
@@ -2196,6 +2203,8 @@ pub const Frame = struct {
         errdefer pool.allocator.free(host_inputs);
         const device_inputs = try pool.allocator.alloc(interpreter.RuntimeInput, pool.device_input_plans.len);
         errdefer pool.allocator.free(device_inputs);
+        const metal_device_sources = try pool.allocator.alloc(CT, if (pool.metal_frame_dispatch) pool.device_input_plans.len else 0);
+        errdefer pool.allocator.free(metal_device_sources);
         const bound_inputs = try pool.allocator.alloc(interpreter.RuntimeInput, pool.replay_inputs.len);
         errdefer pool.allocator.free(bound_inputs);
         const binding_states = try pool.allocator.alloc(ReplayBindingState, pool.replay_inputs.len);
@@ -2224,7 +2233,7 @@ pub const Frame = struct {
         @memset(region_assigned, null);
         const self = try pool.allocator.create(Frame);
         errdefer pool.allocator.destroy(self);
-        self.* = .{ .region_claims = region_claims, .region_started = region_started, .region_assigned = region_assigned, .host_input_resources = host_resources, .host_bound_inputs = host_inputs, .device_bound_inputs = device_inputs, .assigned = assigned, .storage_admission = capability, .host_workspace_admission = host_binding.reservation, .host_workspace_retirement_owner = if (host_binding.backing) |value| value.owner else null, .host_workspace = host_workspace, .host_workspace_allocator = host_workspace_allocator, .capture_pins = capture_pins, .pool = pool, .storages = leases, .completions = completions, .bound_inputs = bound_inputs, .binding_states = binding_states, .stats = .{ .replay_decision = pool.replay_decision } };
+        self.* = .{ .region_claims = region_claims, .region_started = region_started, .region_assigned = region_assigned, .host_input_resources = host_resources, .host_bound_inputs = host_inputs, .device_bound_inputs = device_inputs, .metal_device_sources = metal_device_sources, .assigned = assigned, .storage_admission = capability, .host_workspace_admission = host_binding.reservation, .host_workspace_retirement_owner = if (host_binding.backing) |value| value.owner else null, .host_workspace = host_workspace, .host_workspace_allocator = host_workspace_allocator, .capture_pins = capture_pins, .pool = pool, .storages = leases, .completions = completions, .bound_inputs = bound_inputs, .binding_states = binding_states, .stats = .{ .replay_decision = pool.replay_decision } };
         // This is the first stable Frame address. Register before publication,
         // claim transfer or any later adoption/assigned-resource callback.
         errdefer self.managed_terminal_evidence.deinit();
@@ -2416,6 +2425,7 @@ pub const Frame = struct {
         self.pool.allocator.free(self.host_input_resources);
         self.pool.allocator.free(self.host_bound_inputs);
         self.pool.allocator.free(self.device_bound_inputs);
+        self.pool.allocator.free(self.metal_device_sources);
         if (self.replay) |replay| replay.deinitWithCleanup(cleanup);
         for (self.assigned) |maybe| if (maybe) |resources| resources.deinit(resources.context);
         self.pool.allocator.free(self.assigned);
@@ -2833,21 +2843,38 @@ pub const Frame = struct {
             try lease.bindAllocationSlot(plan.allocation, plan.epoch, @intCast(self.pool.plan.allocations[plan.allocation].byte_size));
             const target = try self.viewForShape(backend, lease, plan.shape);
             const functions = backend.vtable.kernels.?;
-            const copy = if (plan.shape.dtype == .f32) functions.copyPhysicalInput.? else functions.copyPhysicalIndexInput.?;
-            copy(backend.ptr, target, input.value) catch |err| {
-                backend.free(target);
-                return err;
-            };
+            errdefer backend.free(target);
+            if (backend.kind() == .metal) {
+                self.metal_device_sources[index] = input.value;
+                self.metal_device_copy_pending = true;
+            } else {
+                const copy = if (plan.shape.dtype == .f32) functions.copyPhysicalInput.? else functions.copyPhysicalIndexInput.?;
+                try copy(backend.ptr, target, input.value);
+                self.stats.input_copies += 1;
+                self.stats.input_copy_bytes += @as(u64, @intCast(plan.shape.numElements().?)) * plan.shape.dtype.byteSize();
+            }
             self.device_bound_inputs[self.bound_device_input_count] = .{ .node_id = plan.node, .value = target, .source_backend = backend };
             self.bound_device_input_count += 1;
+        }
+        return self.device_bound_inputs[0..self.bound_device_input_count];
+    }
+    pub fn encodeMetalDeviceInputs(self: *Frame, backend: *const ops.ComputeBackend) !void {
+        if (!self.metal_device_copy_pending) return;
+        if (!self.pool.metal_frame_dispatch or backend.kind() != .metal or !backend.decoderRuntimeHasActiveFrame()) return error.UnsupportedDeviceIngress;
+        const copy = backend.vtable.kernels.?.copyPhysicalInput orelse return error.UnsupportedDeviceIngress;
+        for (self.device_bound_inputs[0..self.bound_device_input_count], self.metal_device_sources, self.pool.device_input_plans) |target, source, plan| {
+            const owner = target.source_backend.?;
+            if (owner.ptr != backend.ptr or owner.vtable != backend.vtable) return error.RuntimeInputBackendMismatch;
+            try copy(backend.ptr, target.value, source);
             self.stats.input_copies += 1;
             self.stats.input_copy_bytes += @as(u64, @intCast(plan.shape.numElements().?)) * plan.shape.dtype.byteSize();
         }
-        return self.device_bound_inputs[0..self.bound_device_input_count];
+        self.metal_device_copy_pending = false;
     }
     pub fn releaseDeviceInputs(self: *Frame) void {
         for (self.device_bound_inputs[0..self.bound_device_input_count]) |input| input.source_backend.?.free(input.value);
         self.bound_device_input_count = 0;
+        self.metal_device_copy_pending = false;
     }
     fn ownsDeviceInput(self: *const Frame, node: NodeId, value: CT) bool {
         for (self.device_bound_inputs[0..self.bound_device_input_count]) |input| if (input.node_id == node and input.value == value) return true;

@@ -64,7 +64,7 @@ fn ingress(pool: *const physical.Pool, node: ml.graph.NodeId, logical: ml.graph.
     const fact = selected.inputs.find(node) orelse return false;
     if (fact == .imported_device) {
         const device = fact.imported_device;
-        if (target.kind() != .cuda or device.implementation.context != target.ptr or device.implementation.table != @as(*const anyopaque, @ptrCast(target.vtable)) or !device.logical.eq(logical)) return false;
+        if ((target.kind() != .cuda and (target.kind() != .metal or logical.dtype != .f32 or pool.mixed_frame_dispatch)) or device.implementation.context != target.ptr or device.implementation.table != @as(*const anyopaque, @ptrCast(target.vtable)) or !device.logical.eq(logical)) return false;
         var found = false;
         for (pool.device_input_plans) |plan| if (plan.node == node) {
             if (found or plan.backend_index >= pool.backends.len or plan.epoch != selected.epoch or !plan.shape.eq(logical)) return false;
