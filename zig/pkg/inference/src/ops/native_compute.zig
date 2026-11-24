@@ -56299,7 +56299,21 @@ fn copyPhysicalInputOp(ctx: *anyopaque, destination: CT, source: CT) anyerror!vo
         if (dst.data.ptr != src.data.ptr) @memcpy(dst.data, src.data);
         return;
     }
-    if (target.physical_lease == null or target.data.len != input.data.len or input.source_tensor != null or input.quantized_storage != null or target.view_base_offset != input.view_base_offset) return error.InvalidPhysicalTransferSize;
+    if (target.physical_lease == null or input.source_tensor != null or input.quantized_storage != null) return error.InvalidPhysicalTransferSize;
+    if (target.view_strides == null and target.view_base_offset == 0) {
+        if (input.view_strides) |strides| {
+            const shape = input.logical_shape orelse return error.InvalidPhysicalTransferSize;
+            const destination_shape = target.logical_shape orelse return error.InvalidPhysicalTransferSize;
+            if ((input.declared_dtype orelse .f32) != .f32 or (target.declared_dtype orelse .f32) != .f32 or
+                !std.mem.eql(i64, shape, destination_shape)) return error.InvalidPhysicalTransferSize;
+            const src = @intFromPtr(input.data.ptr);
+            const dst = @intFromPtr(target.data.ptr);
+            if (src < dst + target.data.len * @sizeOf(f32) and dst < src + input.data.len * @sizeOf(f32))
+                return error.InvalidPhysicalTransferSize;
+            return copyAffineF32Into(input.data, input.view_base_offset, shape, strides, target.data) catch error.InvalidPhysicalTransferSize;
+        }
+    }
+    if (target.data.len != input.data.len or target.view_base_offset != input.view_base_offset) return error.InvalidPhysicalTransferSize;
     if ((target.view_strides == null) != (input.view_strides == null)) return error.InvalidPhysicalTransferSize;
     if (target.view_strides) |strides| if (!std.mem.eql(usize, strides, input.view_strides.?)) return error.InvalidPhysicalTransferSize;
     if (target.data.ptr != input.data.ptr) @memcpy(target.data, input.data);
@@ -58763,6 +58777,13 @@ fn nativeAffineMetadataParity(a: std.mem.Allocator) !void {
     // the retained affine alias or require a second numeric allocation.
     try std.testing.expect(toBuf(alias).view_strides != null);
     try std.testing.expect(!toBuf(alias).owned);
+    const lease = (try ops.physical_storage.Lease.create(a, cb, 24)) orelse return error.MissingPhysicalStorage;
+    defer lease.release();
+    const destination = (try physicalTensorViewOp(&compute, .{ .storage = lease, .shape = &.{ 3, 2 } })) orelse return error.MissingPhysicalStorage;
+    defer cb.free(destination);
+    try copyPhysicalInputOp(&compute, destination, alias);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 4, 2, 5, 3, 6 }, toBuf(destination).data);
+    try std.testing.expect(toBuf(alias).view_strides != null);
     var invalid = request;
     invalid.input.strides = Strides.init(&.{ 1, 2 });
     try std.testing.expect((try createMetadataAliasOp(&compute, alias, &invalid)) == null);
