@@ -23189,37 +23189,35 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const view_bytes = persistentTensorBytes(2);
             const output_headers = try std.math.add(usize, persistentTensorBytes(1), try std.math.mul(usize, request.output_views, view_bytes));
             const scratch_headers = try std.math.mul(usize, request.workspace_views, view_bytes);
-            var workspace_bytes = request.workspace_bytes;
-            var bytes = request.bytes;
+            var selected = request;
+            const output_only = request.outputOnly();
             const headers = try std.math.add(usize, output_headers, scratch_headers);
             var bank: ?MetalTensor = null;
             if (funded) |candidate| {
                 if (plan.arena != null or candidate.data != self.data) return error.AudioScheduleRouteChanged;
-                if (candidate.logical_bytes == bytes and candidate.wrapper_bytes == headers) {
-                    bank = try candidate.tensor.retainedCopy();
-                } else if (candidate.logical_bytes == request.output_only_bytes and candidate.wrapper_bytes == output_headers) {
-                    bytes = request.output_only_bytes;
-                    workspace_bytes = 0;
-                    bank = try candidate.tensor.retainedCopy();
-                } else return error.AudioScheduleRouteChanged;
+                if (candidate.logical_bytes != request.bytes or candidate.wrapper_bytes != headers) {
+                    const fallback = output_only orelse return error.AudioScheduleRouteChanged;
+                    if (candidate.logical_bytes != fallback.bytes or candidate.wrapper_bytes != output_headers) return error.AudioScheduleRouteChanged;
+                    selected = fallback;
+                }
+                bank = try candidate.tensor.retainedCopy();
                 plan.storage.drop_ct = dropMetalPersistentTensor;
             } else {
-                if (bytes != 0) bank = try self.metalAudioArenaBank(&plan.storage, bytes, headers);
-                if (bank == null and workspace_bytes != 0) {
-                    workspace_bytes = 0;
-                    bytes = request.output_only_bytes;
-                    if (bytes != 0) bank = try self.metalAudioArenaBank(&plan.storage, bytes, output_headers);
-                }
+                if (request.bytes != 0) bank = try self.metalAudioArenaBank(&plan.storage, request.bytes, headers);
+                if (bank == null) if (output_only) |fallback| {
+                    selected = fallback;
+                    bank = try self.metalAudioArenaBank(&plan.storage, selected.bytes, output_headers);
+                };
             }
             if (bank) |mt| {
                 plan.arena = try wrapOwnedMetalPersistentTensor(mt);
-                plan.arena_size = bytes;
-                plan.input_workspace_bytes = workspace_bytes;
+                plan.arena_size = selected.bytes;
+                plan.input_workspace_bytes = selected.workspace_bytes;
                 for (plan.nodes[0..plan.count], 0..) |*node, i| if (try recipe.outputView(node)) |region| {
                     if (plan.storage.outputs.len == 0 or plan.linear_only) continue;
                     plan.storage.outputs[i] = try wrapOwnedMetalPersistentTensor(try mt.retainedView(region.offset, region.bytes, &region.shape));
                 };
-                if (workspace_bytes != 0) for (plan.nodes[0..plan.count], 0..) |*node, i| if (try recipe.workspaceView(node, .combined)) |region| {
+                if (selected.workspace_bytes != 0) for (plan.nodes[0..plan.count], 0..) |*node, i| if (try recipe.workspaceView(node, .combined)) |region| {
                     plan.workspaces[i] = try wrapOwnedMetalPersistentTensor(try mt.retainedView(region.offset, region.bytes, &region.shape));
                 };
                 if (funded) |candidate| {
@@ -23450,9 +23448,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.fundAudioBankOutsideExecution(request.bytes, .private, wrappers, pin) catch |err| {
             const initial = request.initial orelse return err;
             if (err != error.MemoryBudgetExceeded and err != error.ResourceTemporarilyUnavailable) return err;
-            if (initial.output_only_bytes == 0 or initial.output_only_bytes == request.bytes) return err;
-            const output_wrappers = try std.math.add(usize, persistentTensorBytes(1), try std.math.mul(usize, initial.output_views, persistentTensorBytes(2)));
-            return self.fundAudioBankOutsideExecution(initial.output_only_bytes, .private, output_wrappers, pin);
+            const fallback = initial.outputOnly() orelse return err;
+            const output_wrappers = try std.math.add(usize, persistentTensorBytes(1), try std.math.mul(usize, fallback.output_views, persistentTensorBytes(2)));
+            return self.fundAudioBankOutsideExecution(fallback.bytes, .private, output_wrappers, pin);
         };
     }
 

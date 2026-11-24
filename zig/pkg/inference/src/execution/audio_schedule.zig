@@ -414,6 +414,17 @@ pub const Plan = struct {
         workspace_bytes: usize,
         workspace_views: usize,
         output_only_bytes: usize,
+
+        pub fn outputOnly(self: InitialArena) ?InitialArena {
+            if (self.output_only_bytes == 0 or self.workspace_bytes == 0) return null;
+            return .{
+                .bytes = self.output_only_bytes,
+                .output_views = self.output_views,
+                .workspace_bytes = 0,
+                .workspace_views = 0,
+                .output_only_bytes = self.output_only_bytes,
+            };
+        }
     };
 
     pub fn initialArena(self: *const Plan, bank_limit: usize) !?InitialArena {
@@ -1019,6 +1030,16 @@ test "audio arena recipe funds one disjoint maximum clipped projection workspace
     try std.testing.expectEqual(Plan.ArenaLayout.BankRequest{ .bytes = 16384, .workspace_bytes = 8192 }, recipe.initialBank(nodes.len, nodes.len, 8192).?);
     try std.testing.expectEqual(Plan.ArenaLayout.BankRequest{ .bytes = 8192, .workspace_bytes = 0 }, recipe.initialBank(0, nodes.len, 8192).?);
     try std.testing.expect(recipe.initialBank(nodes.len, nodes.len, 4096) == null);
+    var workspace_views: [nodes.len]?CT = @splat(null);
+    plan.workspaces = &workspace_views;
+    plan.arena_recipe = recipe;
+    const initial = (try plan.initialArena(8192)).?;
+    const fallback = initial.outputOnly().?;
+    try std.testing.expectEqual(recipe.outputs_bytes, fallback.bytes);
+    try std.testing.expectEqual(initial.output_views, fallback.output_views);
+    try std.testing.expectEqual(@as(usize, 0), fallback.workspace_bytes);
+    try std.testing.expectEqual(@as(usize, 0), fallback.workspace_views);
+    try std.testing.expect(fallback.outputOnly() == null);
     const output = (try recipe.outputView(&nodes[1])).?;
     const combined = (try recipe.workspaceView(&nodes[1], .combined)).?;
     const separate = (try recipe.workspaceView(&nodes[1], .separate)).?;
