@@ -17,6 +17,7 @@
 //! compiled graph an error, rather than reporting native fallback as PJRT.
 const std = @import("std");
 const inference = @import("inference_internal");
+const decoder_storage = inference.execution.decoder_storage;
 const factory = inference.architectures.session_factory;
 const generation = inference.pipelines.generation;
 
@@ -46,9 +47,9 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
             else => return error.GenerationBackendSelectionMismatch,
         };
         const dtype = factory.recommendedKvDTypeForSession(model.session, kind);
-        var pool_config = generation.kvPoolConfig(kind, dtype, config, false);
+        var pool_config = decoder_storage.poolPlan(kind, dtype, &config, .{});
         if (resident_metal) pool_config.store_cpu_bytes = false;
-        const pool_id = try kv.addPool(generation.requestKvManagerPoolConfig(pool_config));
+        const pool_id = try kv.addPool(decoder_storage.requestMetadataPool(pool_config));
         storage = try inference.runtime.kv.storage_runtime.KvStorageRuntime.init(a, pool_config);
         try cb.provisionKvDeviceWriteHook(&storage.?);
         request_pool = pool_id;

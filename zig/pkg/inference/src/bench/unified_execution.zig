@@ -17,6 +17,7 @@
 //! Use identical source on the base revision and candidate revision.
 const std = @import("std");
 const inference = @import("inference_internal");
+const decoder_storage = inference.execution.decoder_storage;
 const Tensor = inference.backends.Tensor;
 const backend_choice = inference.native_backend_choice;
 
@@ -516,10 +517,10 @@ fn runScheduledDecoder(init: std.process.Init, model: *inference.server.model_ma
         .cuda => .cuda,
         else => .native,
     };
-    const pool_config = generation.kvPoolConfig(kind, .f16, config, false);
+    const pool_config = decoder_storage.poolPlan(kind, .f16, &config, .{});
     var kv = inference.runtime.kv.manager.KvManager.init(a);
     defer kv.deinit();
-    const pool = try kv.addPool(generation.requestKvManagerPoolConfig(pool_config));
+    const pool = try kv.addPool(decoder_storage.requestMetadataPool(pool_config));
     var storage = try inference.runtime.kv.storage_runtime.KvStorageRuntime.init(a, pool_config);
     defer storage.deinit();
     try cb.provisionKvDeviceWriteHook(&storage);

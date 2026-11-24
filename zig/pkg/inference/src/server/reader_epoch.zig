@@ -24,6 +24,7 @@ const reader_execution_pool = @import("reader_execution_pool.zig");
 const execution_control_mod = @import("../execution_control.zig");
 const executor_microbatch = @import("executor_microbatch.zig");
 const generation = @import("../pipelines/generation.zig");
+const decoder_storage = @import("../execution/decoder_storage.zig");
 const session_factory = @import("../architectures/session_factory.zig");
 const metal_runtime = @import("../backends/metal_runtime.zig");
 const qwen3vl_projector = @import("../architectures/qwen3vl_projector.zig");
@@ -208,7 +209,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                 const policy = session.run_admission orelse return;
                 const model = session.model_lifetime orelse return;
                 if (self.control.native_call_policy == .require_supervision and model.close_protection == null) return;
-                const config = generation.requestKvManagerPoolConfig(generation.kvPoolConfig(if (session.backend() == .cuda) .cuda else .metal, dtype, self.cfg, Hooks.generationKvSlidingTrimForced()));
+                const config = decoder_storage.requestMetadataPool(decoder_storage.poolPlan(if (session.backend() == .cuda) .cuda else .metal, dtype, &self.cfg, .{ .force_sliding_trim = decoder_storage.slidingTrimForced() }));
                 // Cyclic/selected stores require separate proven owners. This
                 // path describes only full-history ordinary request storage.
                 if (config.sliding_window_size != null) return;
@@ -1542,7 +1543,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             }
             // The device hook owns CUDA KV bytes. Both epoch pools retain
             // logical pages without allocating a second pair of host mirrors.
-            const config = generation.requestKvManagerPoolConfig(generation.kvPoolConfig(if (ctx.model.session.backend() == .cuda) .cuda else .metal, kv_dtype, ctx.cfg, Hooks.generationKvSlidingTrimForced()));
+            const config = decoder_storage.requestMetadataPool(decoder_storage.poolPlan(if (ctx.model.session.backend() == .cuda) .cuda else .metal, kv_dtype, &ctx.cfg, .{ .force_sliding_trim = decoder_storage.slidingTrimForced() }));
             ctx.pool = try ctx.manager.addPool(config);
             ctx.storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(ctx.allocator, config);
             errdefer ctx.storage.deinitWithBoundary(ctx.cleanup_owner.epoch());

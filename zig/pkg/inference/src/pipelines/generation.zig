@@ -637,8 +637,6 @@ fn validateKvCachePolicy(config: GenerationConfig) !void {
     }
 }
 
-pub const kvSlidingTrimForced = decoder_storage.slidingTrimForced;
-
 pub const GenerationKvRoute = decoder_storage.Route;
 
 const generationKvCapacityPolicy = decoder_storage.capacityPolicy;
@@ -654,26 +652,6 @@ pub fn generationKvCapacityPolicyForRoute(
 ) runtime.tier.memory.GenerationKvCapacityPolicy {
     return decoder_storage.routeCapacityPolicy(route, model_config, decoderStorageRequest(generation_config), kv_dtype, exact_hybrid_sampled_ring_qualification_override);
 }
-
-pub fn kvPoolConfig(
-    backend: runtime.kv.pool.BackendKind,
-    dtype: runtime.kv.pool.KvDType,
-    config: gpt_mod.Config,
-    force_sliding_trim: bool,
-) runtime.kv.pool.KvPoolConfig {
-    return decoder_storage.poolPlan(backend, dtype, &config, .{ .force_sliding_trim = force_sliding_trim });
-}
-
-/// CUDA logical owners do not need host KV mirrors when their numerical
-/// storage uses a device hook. This applies to request managers and both
-/// shared reader-epoch pools. Shared prompt-cache pools retain their ownership.
-pub const requestKvManagerPoolConfig = decoder_storage.requestMetadataPool;
-
-/// Native checkpoint preparation and restore keep numerical KV on the device.
-/// Both request pools track only the original logical positions. Preparation
-/// snapshots through the CUDA reader; host mirrors are unnecessary on this
-/// route, and trimming logical positions would violate the checkpoint contract.
-pub const attentionMatchCheckpointPoolConfig = decoder_storage.checkpointPool;
 
 /// Parsed chat template for rendering messages via Jinja2.
 pub const ChatTemplate = struct {
@@ -1536,13 +1514,6 @@ fn replaceStreamingEmittedText(
     allocator.free(state.emitted_text);
     state.emitted_text = replacement;
 }
-
-// Compatibility exports; the model runtime owns execution state and KV metadata.
-pub const KvView = graph_mod.decode_state_runtime.KvView;
-pub const KvMetadataDelta = graph_mod.decode_state_runtime.KvMetadataDelta;
-pub const KvMutationResult = graph_mod.decode_state_runtime.KvMutationResult;
-
-pub const OwnedBatchDecodeContext = graph_mod.decode_batch.OwnedContext;
 
 const SamplingPenaltyState = struct {
     counts: std.AutoHashMapUnmanaged(u32, u32) = .empty,
@@ -10996,7 +10967,7 @@ test "CUDA prefill KV reservation keeps manager and storage counts aligned" {
 
 test "attention match checkpoint owner retains logical history without host KV mirrors" {
     const allocator = std.testing.allocator;
-    const config = attentionMatchCheckpointPoolConfig(.f16, .{
+    const config = decoder_storage.checkpointPool(.f16, .{
         .family = .gemma,
         .num_hidden_layers = 2,
         .num_attention_heads = 2,
@@ -11052,7 +11023,7 @@ test "attention match request CUDA metadata pool preserves storage through appen
     };
     var manager = runtime.kv.manager.KvManager.init(allocator);
     defer manager.deinit();
-    const pool_id = try manager.addPool(requestKvManagerPoolConfig(config));
+    const pool_id = try manager.addPool(decoder_storage.requestMetadataPool(config));
     var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, config);
     defer storage.deinit();
     var state = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
@@ -14112,11 +14083,11 @@ test "LightOnOCR3 compact KV storage and admission retain every attention layer 
             var cfg = try gpt_mod.parseConfig(std.testing.allocator, json);
             const original_count = cfg.num_hidden_layers;
             const original_recurrent = cfg.qwen35_linear_num_value_heads;
-            const original = kvPoolConfig(backend, dtype, cfg, false);
+            const original = decoder_storage.poolPlan(backend, dtype, &cfg, .{});
             const original_estimate = try runtime.tier.memory.estimateGptGeneration(backend, dtype, cfg, 662, 256, 662);
             try std.testing.expectEqual(@as(?usize, 3), cfg.compactQwen35KvStorageLayerIndex(3));
             cfg.compact_qwen35_kv = true;
-            const compact = kvPoolConfig(backend, dtype, cfg, false);
+            const compact = decoder_storage.poolPlan(backend, dtype, &cfg, .{});
             const compact_estimate = try runtime.tier.memory.estimateGptGeneration(backend, dtype, cfg, 662, 256, 662);
             try std.testing.expectEqual(original_count / 4, compact.num_layers_packed);
             try std.testing.expectEqual(original_estimate.kv_bytes, compact_estimate.kv_bytes * 4);
@@ -14695,13 +14666,13 @@ test "LightOnOCR3 CUDA final prefix logits layout skips intermediate rows and pr
 test "LightOnOCR3 CUDA reader epoch logical pools retain positions across growth and reset without host mirrors" {
     const allocator = std.testing.allocator;
     for ([_]runtime.kv.pool.BackendKind{ .cuda, .metal }) |backend| {
-        const config = requestKvManagerPoolConfig(kvPoolConfig(backend, .f16, .{
+        const config = decoder_storage.requestMetadataPool(decoder_storage.poolPlan(backend, .f16, &.{
             .family = .gemma,
             .num_hidden_layers = 2,
             .num_attention_heads = 2,
             .num_key_value_heads = 1,
             .attention_head_dim = 8,
-        }, false));
+        }, .{}));
         var manager = runtime.kv.manager.KvManager.init(allocator);
         defer manager.deinit();
         const pool = try manager.addPool(config);
@@ -15384,7 +15355,7 @@ test "Native full generation prefix reuse matches uncached cold warm and evicted
     try decoder_fixture.populate(&model.store);
     var model_config = decoder_fixture.config();
     model_config.eos_token_id = -1;
-    const storage_config = kvPoolConfig(.native, .f32, model_config, false);
+    const storage_config = decoder_storage.poolPlan(.native, .f32, &model_config, .{});
     var cache = runtime.kv.prompt_cache.PromptPrefixCache.init(a);
     var cache_owned = true;
     defer if (cache_owned) cache.deinit();
@@ -15405,7 +15376,7 @@ test "Native full generation prefix reuse matches uncached cold warm and evicted
         var manager = runtime.kv.manager.KvManager.init(a);
         defer manager.deinit();
         const active_manager = if (arm == 0) &manager else cache.managerPtr();
-        const pool_id = if (arm == 0) try manager.addPool(requestKvManagerPoolConfig(storage_config)) else cached_pool;
+        const pool_id = if (arm == 0) try manager.addPool(decoder_storage.requestMetadataPool(storage_config)) else cached_pool;
         // Exactly the Native server construction: ensurePool owns payloads,
         // each request owns a separate, initially empty metadata object.
         var metadata = try runtime.kv.storage_runtime.KvStorageRuntime.init(a, storage_config);

@@ -73,6 +73,7 @@ const BoundedRequestAllocator = @import("../runtime/bounded_allocator.zig").Boun
 const image_pipeline = @import("../pipelines/image.zig");
 const sparse_embedding_mod = @import("../pipelines/sparse_embedding.zig");
 const generation = @import("../pipelines/generation.zig");
+const decoder_storage = @import("../execution/decoder_storage.zig");
 const context_management = @import("context_management.zig");
 const native_kv_wire = @import("native_kv_wire.zig");
 const multimodal_reranker = @import("../pipelines/multimodal_reranker.zig");
@@ -979,10 +980,6 @@ test "radix prompt cache is opt in and excludes CUDA device storage" {
     try std.testing.expect(promptCacheBackendEligible(.radix, .native));
     try std.testing.expect(!promptCacheBackendEligible(.radix, .cuda));
     try std.testing.expect(promptCacheBackendEligible(.block_hash, .cuda));
-}
-
-fn generationKvSlidingTrimForced() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_KV_SLIDING_TRIM", false);
 }
 
 fn validateCacheCompactionRatio(ratio: ?f32) !void {
@@ -6959,7 +6956,7 @@ pub const Node = struct {
             } else cb.deinit();
         }
 
-        const kv_pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced());
+        const kv_pool_config = decoder_storage.poolPlan(backend_kind, kv_dtype, &gpt_config, .{ .force_sliding_trim = decoder_storage.slidingTrimForced() });
         // Prefix cache activation mirrors the HTTP generate route: the cache's
         // own KV manager and (on GPU backends) its device storage replace the
         // request-local pool so cached blocks are addressable by the decode.
@@ -7000,12 +6997,12 @@ pub const Node = struct {
                 pool_id = model.prompt_prefix_cache.pool_id.?;
                 prompt_cache = &model.prompt_prefix_cache;
             } else {
-                pool_id = try kv_manager.addPool(generation.requestKvManagerPoolConfig(kv_pool_config));
+                pool_id = try kv_manager.addPool(decoder_storage.requestMetadataPool(kv_pool_config));
                 generation_config.prompt_cache_enabled = false;
                 self.model_manager.cancelPromptCacheActivation(model, prompt_cache_config);
             }
         } else {
-            pool_id = try kv_manager.addPool(generation.requestKvManagerPoolConfig(kv_pool_config));
+            pool_id = try kv_manager.addPool(decoder_storage.requestMetadataPool(kv_pool_config));
         }
         var kv_storage: ?runtime.kv.storage_runtime.KvStorageRuntime = if (active_kv_storage == null)
             try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, kv_pool_config)
@@ -9503,7 +9500,6 @@ pub const Node = struct {
     const ReaderEpochHooks = struct {
         pub const effectiveLightOnReadRows = readerPhysicalRows;
         pub const cudaLightOnBatchProfileEnabled = readerCudaBatchEnabled;
-        pub const generationKvSlidingTrimForced = readerSlidingTrimForced;
     };
     const LightOnStreamContext = @import("reader_epoch.zig").Epoch(Node, ReaderEpochHooks);
 
@@ -10681,7 +10677,7 @@ pub const Node = struct {
         }
         var manager = runtime.kv.manager.KvManager.init(allocator);
         defer manager.deinit();
-        const pool_config = generation.kvPoolConfig(backend, kv_dtype, cfg, generationKvSlidingTrimForced());
+        const pool_config = decoder_storage.poolPlan(backend, kv_dtype, &cfg, .{ .force_sliding_trim = decoder_storage.slidingTrimForced() });
         const pool = try manager.addPool(pool_config);
         var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, pool_config);
         defer {
@@ -18008,7 +18004,7 @@ pub const Node = struct {
         // Queued callers own neither scheduler work nor device KV/scratch.
         // Exclusive requests fence the shared backend's cache/graph lifetime.
         const queued_cached_tokens = if (config.prompt_cache_enabled and prompt_estimate != null and config.prompt_cache_key != null and !generateMessagesHaveMedia(effective_messages) and prompt_tokens <= prompt_estimate.?.encoded.ids.len)
-            model.prompt_prefix_cache.peekLongestPrefixForPool(config.prompt_cache_key.?, prompt_estimate.?.encoded.ids[0..prompt_tokens], prompt_tokens -| 16, generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced()))
+            model.prompt_prefix_cache.peekLongestPrefixForPool(config.prompt_cache_key.?, prompt_estimate.?.encoded.ids[0..prompt_tokens], prompt_tokens -| 16, decoder_storage.poolPlan(backend_kind, kv_dtype, &gpt_config, .{ .force_sliding_trim = decoder_storage.slidingTrimForced() }))
         else
             0;
         const generation_slot = model.generation_admission.acquireWithWork(
@@ -18693,9 +18689,9 @@ pub const Node = struct {
         // and scheduler-batched ordinary generation keep their existing control.
         if (native_transfer != null) cb.execution_control = execution_control;
         var pool_config = if (native_transfer != null)
-            generation.attentionMatchCheckpointPoolConfig(kv_dtype, gpt_config)
+            decoder_storage.checkpointPool(kv_dtype, gpt_config)
         else
-            generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced());
+            decoder_storage.poolPlan(backend_kind, kv_dtype, &gpt_config, .{ .force_sliding_trim = decoder_storage.slidingTrimForced() });
 
         // The compiled runtime owns numerical KV. Outer request storage only
         // coordinates logical positions and must not allocate a second mirror.
@@ -18748,14 +18744,14 @@ pub const Node = struct {
                 pool_id = model.prompt_prefix_cache.pool_id.?;
                 prompt_cache = &model.prompt_prefix_cache;
             } else {
-                pool_id = kv_manager.addPool(generation.requestKvManagerPoolConfig(pool_config)) catch |err|
+                pool_id = kv_manager.addPool(decoder_storage.requestMetadataPool(pool_config)) catch |err|
                     return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
                 config.prompt_cache_enabled = false;
                 self.model_manager.cancelPromptCacheActivation(model, prompt_cache_config);
             }
         } else {
             config.prompt_cache_enabled = false;
-            pool_id = kv_manager.addPool(generation.requestKvManagerPoolConfig(pool_config)) catch |err|
+            pool_id = kv_manager.addPool(decoder_storage.requestMetadataPool(pool_config)) catch |err|
                 return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         }
 
@@ -18828,11 +18824,11 @@ pub const Node = struct {
         if (draft_cb != null) {
             if (draft_gpt_config) |draft_cfg| {
                 draft_kv_manager = runtime.kv.manager.KvManager.init(ctx.allocator);
-                const draft_pool_config = generation.kvPoolConfig(
+                const draft_pool_config = decoder_storage.poolPlan(
                     draft_backend_kind.?,
                     draft_kv_dtype.?,
-                    draft_cfg,
-                    generationKvSlidingTrimForced(),
+                    &draft_cfg,
+                    .{ .force_sliding_trim = decoder_storage.slidingTrimForced() },
                 );
                 const draft_pool_id = draft_kv_manager.?.addPool(draft_pool_config) catch |err|
                     return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
@@ -21035,8 +21031,8 @@ pub const Node = struct {
 
                 var kv_manager = runtime.kv.manager.KvManager.init(ctx.allocator);
                 defer kv_manager.deinit();
-                const kv_pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced());
-                const pool_id = kv_manager.addPool(generation.requestKvManagerPoolConfig(kv_pool_config)) catch |err| {
+                const kv_pool_config = decoder_storage.poolPlan(backend_kind, kv_dtype, &gpt_config, .{ .force_sliding_trim = decoder_storage.slidingTrimForced() });
+                const pool_id = kv_manager.addPool(decoder_storage.requestMetadataPool(kv_pool_config)) catch |err| {
                     for (group_indices.items) |idx| {
                         if (!pending[idx]) continue;
                         results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err), .retryable = true };
@@ -28094,7 +28090,7 @@ pub const Node = struct {
         try control.check();
         const dtype = if (body.cache_dtype) |name| runtime.kv.pool.parseKvDType(name) orelse return ctx.status(422).json(.{ .@"error" = "PLACEMENT_UNAVAILABLE" }) else session_factory.recommendedKvDTypeForSession(model.session, .cuda);
         const cached = if (self.config.prompt_cache.enabled and (body.prompt_cache orelse true) and body.prompt_cache_key != null and body.prompt_cache_key.?.len > 0)
-            model.prompt_prefix_cache.peekLongestPrefixForPool(body.prompt_cache_key.?, estimate.?.encoded.ids[0..tokens], tokens -| 16, generation.kvPoolConfig(.cuda, dtype, cfg, generationKvSlidingTrimForced()))
+            model.prompt_prefix_cache.peekLongestPrefixForPool(body.prompt_cache_key.?, estimate.?.encoded.ids[0..tokens], tokens -| 16, decoder_storage.poolPlan(.cuda, dtype, &cfg, .{ .force_sliding_trim = decoder_storage.slidingTrimForced() }))
         else
             0;
         const admission = model.generation_admission.snapshot();
@@ -35028,19 +35024,19 @@ test "generate draft resources follow the draft backend" {
 }
 
 test "generate draft KV pool uses safe model geometry" {
-    const mha = generation.kvPoolConfig(.native, .f16, .{
+    const mha = decoder_storage.poolPlan(.native, .f16, &.{
         .hidden_size = 1024,
         .num_hidden_layers = 2,
         .num_attention_heads = 8,
         .num_key_value_heads = 0,
         .position_encoding = .rope,
         .max_position_embeddings = 4096,
-    }, false);
+    }, .{});
     try std.testing.expectEqual(@as(u32, 8), mha.num_kv_heads);
     try std.testing.expectEqual(@as(u32, 128), mha.head_dim);
     try std.testing.expectEqual(@as(?u32, 4096), mha.sliding_window_size);
 
-    const gemma4 = generation.kvPoolConfig(.metal, .bf16, .{
+    const gemma4 = decoder_storage.poolPlan(.metal, .bf16, &.{
         .family = .gemma,
         .hidden_size = 512,
         .num_hidden_layers = 2,
@@ -35051,7 +35047,7 @@ test "generate draft KV pool uses safe model geometry" {
         .global_head_dim = 512,
         .position_encoding = .rope,
         .sliding_window = 1024,
-    }, false);
+    }, .{});
     try std.testing.expectEqual(@as(u32, 8), gemma4.num_kv_heads);
     try std.testing.expectEqual(@as(u32, 512), gemma4.head_dim);
     try std.testing.expectEqual(@as(?u32, 1024), gemma4.sliding_window_size);
@@ -35068,11 +35064,11 @@ test "generate draft KV pool uses safe model geometry" {
     };
     try std.testing.expectEqual(
         @as(?u32, null),
-        generation.kvPoolConfig(.metal, .bf16, mixed_gemma4_config, false).sliding_window_size,
+        decoder_storage.poolPlan(.metal, .bf16, &mixed_gemma4_config, .{}).sliding_window_size,
     );
     try std.testing.expectEqual(
         @as(?u32, 1024),
-        generation.kvPoolConfig(.metal, .bf16, mixed_gemma4_config, true).sliding_window_size,
+        decoder_storage.poolPlan(.metal, .bf16, &mixed_gemma4_config, .{ .force_sliding_trim = true }).sliding_window_size,
     );
 }
 
@@ -51578,7 +51574,6 @@ test "LightOnOCR3 CUDA sixteen prefix admission keeps all per page state and res
 
 const readerPhysicalRows = effectiveLightOnReadRows;
 const readerCudaBatchEnabled = cudaLightOnBatchProfileEnabled;
-const readerSlidingTrimForced = generationKvSlidingTrimForced;
 
 test "context checkpoint HTTP errors distinguish stale revisions from corrupt payloads" {
     const allocator = std.testing.allocator;
@@ -58119,8 +58114,8 @@ test "CUDA actual standalone generation original admission and optional attentio
             const before_calls = if (compute.lighton_recurrent.bf16_prefill) |*library| (if (library.attention) |*attention| attention.calls else return error.ActualOptionalAttentionLibraryMissing) else return error.ActualOptionalPrefillLibraryMissing;
             var manager = runtime.kv.manager.KvManager.init(allocator);
             defer manager.deinit();
-            const pool_config = generation.kvPoolConfig(.cuda, dtype, cfg, false);
-            const pool = try manager.addPool(generation.requestKvManagerPoolConfig(pool_config));
+            const pool_config = decoder_storage.poolPlan(.cuda, dtype, &cfg, .{});
+            const pool = try manager.addPool(decoder_storage.requestMetadataPool(pool_config));
             var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, pool_config);
             defer storage.deinitWithBoundary(current.boundary);
             try cb.provisionKvDeviceWriteHook(&storage);

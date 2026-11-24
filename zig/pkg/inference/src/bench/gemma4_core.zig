@@ -16,6 +16,7 @@
 //! Offline full-generation qualification, including encoded media read and decode.
 const std = @import("std");
 const inference = @import("inference_internal");
+const decoder_storage = inference.execution.decoder_storage;
 const factory = inference.architectures.session_factory;
 const generation = inference.pipelines.generation;
 const runtime = inference.runtime;
@@ -180,8 +181,8 @@ pub fn main(init: std.process.Init) !void {
     var manager = runtime.kv.manager.KvManager.init(a);
     defer manager.deinit();
     const kv_dtype: runtime.kv.pool.KvDType = if (suite.kv_dtype == .f32) .f32 else .f16;
-    const pool_config = generation.kvPoolConfig(.cuda, kv_dtype, cfg, false);
-    const pool = try manager.addPool(generation.requestKvManagerPoolConfig(pool_config));
+    const pool_config = decoder_storage.poolPlan(.cuda, kv_dtype, &cfg, .{});
+    const pool = try manager.addPool(decoder_storage.requestMetadataPool(pool_config));
     var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(a, pool_config);
     defer storage.deinit();
     try cb.provisionKvDeviceWriteHook(&storage);
