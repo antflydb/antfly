@@ -245,7 +245,7 @@ pub fn contiguousRange(value: *const Request, actual_shape: []const i64, availab
 
 /// Follow the existing planner's alias/root lifetime, never inventing a new
 /// root or recoloring a live source. External inputs/constants remain opaque.
-pub fn fullSpanRoot(plan: *const @import("../graph/buffer_plan.zig").BufferPlan, node: ml.graph.NodeId, backend: contracts.BackendKind) ?@import("../graph/buffer_plan.zig").LogicalSlot {
+pub fn fullSpanRoot(plan: *const @import("buffer_plan.zig").BufferPlan, node: ml.graph.NodeId, backend: contracts.BackendKind) ?@import("buffer_plan.zig").LogicalSlot {
     var current = (plan.slotForNode(node) orelse return null).*;
     var depth: usize = 0;
     while (current.kind == .view) : (depth += 1) {

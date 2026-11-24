@@ -257,7 +257,7 @@ becoming a separate device runtime.
 
 ### Graph Buffer Plan
 
-`src/graph/buffer_plan.zig` turns a graph, partition plan, tensor
+`src/execution/buffer_plan.zig` turns a graph, partition plan, tensor
 descriptors, and output nodes into logical buffer slots, liveness intervals,
 storage classes, and cross-partition transfer edges. Backends map logical
 slots to concrete allocations: native/cblas to host buffers, Metal to

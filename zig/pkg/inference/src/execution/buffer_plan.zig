@@ -16,8 +16,8 @@
 const std = @import("std");
 const ml = @import("ml");
 
-const contracts = @import("backend_contracts.zig");
-const partition_mod = @import("partition.zig");
+const contracts = @import("../graph/backend_contracts.zig");
+const partition_mod = @import("../graph/partition.zig");
 
 const Graph = ml.graph.Graph;
 const NodeId = ml.graph.NodeId;
@@ -1017,7 +1017,7 @@ test "buffer plan CUDA materialized layouts own storage and reshapes retain that
     const broadcast = try graph.addNode(.{ .op = .{ .broadcast_in_dim = attrs }, .output_shape = output_shape, .inputs = .{ reshape, null_node, null_node, null_node }, .num_inputs = 1 });
     try graph.markOutput(reshape);
     try graph.markOutput(broadcast);
-    const cuda = @import("cuda_capabilities.zig");
+    const cuda = @import("../graph/cuda_capabilities.zig");
     const caps = [_]partition_mod.Capability{
         .{ .backend = .cuda, .priority = 10, .supports = &cuda.supports, .decide = &cuda.decide },
         .{ .backend = .native, .priority = 0, .supports = &partition_mod.supportsAll },
@@ -1060,7 +1060,7 @@ test "buffer plan reuse follows partition submission order across independent br
         .{ .backend = .native, .node_ids = &.{ right, right_output }, .external_inputs = &.{.{ .node_id = x, .source_partition = 0 }} },
         .{ .backend = .native, .node_ids = &.{left_output}, .external_inputs = &.{.{ .node_id = left, .source_partition = 0 }} },
     };
-    const operator_plans: [5]?@import("operator_plan.zig").OperatorPlan = @splat(null);
+    const operator_plans: [5]?@import("../graph/operator_plan.zig").OperatorPlan = @splat(null);
     const placement = PartitionPlan{ .partitions = &parts, .node_assignment = &.{ 0, 0, 2, 1, 1 }, .node_operator_plans = &operator_plans, .allocator = a };
     var plan = try build(a, &graph, &placement, .{});
     defer plan.deinit();
@@ -1086,7 +1086,7 @@ test "buffer plan cross-backend reshape aliases its transfer allocation through 
         .{ .backend = .native, .node_ids = &.{ x, dense }, .external_inputs = &.{} },
         .{ .backend = .cuda, .node_ids = &.{view}, .external_inputs = &.{.{ .node_id = dense, .source_partition = 0 }} },
     };
-    const operator_plans: [3]?@import("operator_plan.zig").OperatorPlan = @splat(null);
+    const operator_plans: [3]?@import("../graph/operator_plan.zig").OperatorPlan = @splat(null);
     const placement = PartitionPlan{ .partitions = &parts, .node_assignment = &.{ 0, 0, 1 }, .node_operator_plans = &operator_plans, .allocator = a };
     var plan = try build(a, &graph, &placement, .{});
     defer plan.deinit();

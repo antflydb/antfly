@@ -34,7 +34,7 @@ repository, which then runs on the native implementation.
 `ImportedOnnxSession` does not own an ONNX-specific graph runtime. Its job is to
 parse and convert ONNX into Antfly inference's graph IR, build input/output
 metadata, and delegate execution to the generic graph runtime described in
-[GRAPH.md](GRAPH.md). That runtime lives in `src/graph/runtime.zig`.
+[GRAPH.md](GRAPH.md). That runtime lives in `src/execution/graph_runtime.zig`.
 
 The default imported-ONNX path is interpreter-backed for correctness.
 Opt-in partitioned execution is available for validating the generic runtime

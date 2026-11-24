@@ -24,7 +24,7 @@ const ops_mod = @import("../ops/ops.zig");
 const interpreter = @import("interpreter.zig");
 const partition_mod = @import("partition.zig");
 const metal_capabilities = @import("metal_capabilities.zig");
-const buffer_plan_mod = @import("buffer_plan.zig");
+const buffer_plan_mod = @import("../execution/buffer_plan.zig");
 const operator_plan_mod = @import("operator_plan.zig");
 const quant_kernel_compiler = @import("quant_kernel_compiler.zig");
 const device_mesh_mod = @import("device_mesh.zig");
@@ -22627,7 +22627,7 @@ fn expectCachedPreparedParameters(comptime rebind_slot: bool) !void {
     defer compute.deinit();
     var backend = compute.computeBackend();
     if (!backend.decoderRuntimeReady()) return error.ExpectedMetalDecoderRuntime;
-    var runtime = try @import("runtime.zig").Runtime.initWithOptions(a, &graph, &backend, .partitioned, .{ .tensor_descs = seeds });
+    var runtime = try @import("../execution/graph_runtime.zig").Runtime.initWithOptions(a, &graph, &backend, .partitioned, .{ .tensor_descs = seeds });
     defer runtime.deinit();
     var input_data: [dim]f32 = @splat(0.125);
     var first_data: [dim * dim]f32 = @splat(0.125);

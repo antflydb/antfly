@@ -257,7 +257,7 @@ pub const Definition = struct {
     descriptors: []?ops.kernel_descriptor.Descriptor,
     steps: []Node,
     analysis: @import("../graph/interpreter.zig").CachedAnalysis,
-    physical_layout: @import("../graph/runtime.zig").FrozenPhysicalLayout,
+    physical_layout: @import("graph_runtime.zig").FrozenPhysicalLayout,
     program_spec: ?OwnedSpec = null,
     parameter_recipe: []ParameterRecipe = &.{},
     runtime_recipe: []PendingBinding = &.{},
@@ -355,9 +355,9 @@ pub const Definition = struct {
         errdefer a.free(steps);
         var analysis = try @import("../graph/interpreter.zig").CachedAnalysis.compute(a, &graph);
         errdefer analysis.deinit(a);
-        var layout = try @import("../graph/runtime.zig").PhysicalLayout.create(a, &graph, &.{&builder.backend}, .{}, true);
+        var layout = try @import("graph_runtime.zig").PhysicalLayout.create(a, &graph, &.{&builder.backend}, .{}, true);
         errdefer layout.deinit();
-        var frozen = try @import("../graph/runtime.zig").FrozenPhysicalLayout.initConsuming(&graph, &layout, &.{&builder.backend});
+        var frozen = try @import("graph_runtime.zig").FrozenPhysicalLayout.initConsuming(&graph, &layout, &.{&builder.backend});
         errdefer frozen.deinit();
         self.* = .{ .allocator = a, .key = key, .shared = if (builder.preparation) |preparation| preparation.shared else null, .graph = frozen.graph().*, .descriptors = descriptors, .steps = steps, .analysis = analysis, .physical_layout = frozen, .plane_count = builder.planes.items.len, .program_spec = owned_spec, .parameter_recipe = recipe, .runtime_recipe = runtime_recipe, .immutable_recipe = immutable_recipe };
         // No fallible work follows transfer of the finalizer. Publication is
@@ -812,7 +812,7 @@ pub const Schedule = struct {
         self.values = values;
         var private_pool: ?*physical.Pool = (definition.physical_layout.createPool(a, &.{&self.backend}, self.descriptors) catch |err| switch (err) {
             error.PhysicalOutputLayoutChanged => fallback: {
-                var fresh = try @import("../graph/runtime.zig").PhysicalLayout.create(a, &self.graph, &.{&self.backend}, .{}, false);
+                var fresh = try @import("graph_runtime.zig").PhysicalLayout.create(a, &self.graph, &.{&self.backend}, .{}, false);
                 defer fresh.deinit();
                 break :fallback try fresh.createPool(a, &self.graph, &.{&self.backend}, self.descriptors);
             },

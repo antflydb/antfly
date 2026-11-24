@@ -52886,7 +52886,7 @@ const CompleteCudaProgramBudget = struct {
     // This admitted test caller owns the actual receiver B. A prepared Set's
     // construction epoch alone never gives an unrelated operation numerical
     // cleanup authority. Other existing recipe fixtures keep their old entry.
-    fn runWithReceiver(self: *const @This(), comptime bind_receiver: bool, executable: *@import("../../execution/executable.zig").Executable, allocator: std.mem.Allocator, options: @import("../../graph/interpreter.zig").ExecuteOptions) !@import("../../graph/runtime.zig").Result {
+    fn runWithReceiver(self: *const @This(), comptime bind_receiver: bool, executable: *@import("../../execution/executable.zig").Executable, allocator: std.mem.Allocator, options: @import("../../graph/interpreter.zig").ExecuteOptions) !@import("../../execution/graph_runtime.zig").Result {
         if (!bind_receiver) return executable.run(allocator, options);
         if (options.backend_operation != null or options.region_execution_profile != null) return error.UnexpectedCudaFixtureOperation;
         const operation = @import("../../execution/backend_operation.zig");
@@ -53233,7 +53233,7 @@ fn qualifyCompleteCudaProgramRecipe(comptime format: CompleteCudaProgramFormat, 
     const weights = weight_inputs[0..if (recipe == .rounded_mirror) 2 else 1];
     const ordinal_before = compute.temp_trace_seq;
     const learned_before = compute.temp_arena_planner.observations;
-    var held: ?@import("../../graph/runtime.zig").Result = null;
+    var held: ?@import("../../execution/graph_runtime.zig").Result = null;
     defer if (held) |*value| value.deinitWithCleanup(&executable.runtime, budget.?.cleanup());
     var captures: u64 = 0;
     var replays: u64 = 0;
@@ -53526,7 +53526,7 @@ test "CUDA bounded activation slice retains the exact planned source range" {
     var host = try Tensor.initFloat32(a, "x", &.{ 3, 2 }, &.{ -1, 2, -3, 4, -5, 6 });
     defer host.deinit();
     const ingress = [_]@import("../../execution/host_ingress.zig").Input{.{ .node_id = node, .value = &host }};
-    var held: ?@import("../../graph/runtime.zig").Result = null;
+    var held: ?@import("../../execution/graph_runtime.zig").Result = null;
     defer if (held) |*result| result.deinit(&executable.runtime);
     var captures: u64 = 0;
     var replays: u64 = 0;
@@ -53733,7 +53733,7 @@ test "complete CUDA ModelProgram span packed bias owns exact output banks throug
     defer input.deinit();
     const host = [_]@import("../../execution/host_ingress.zig").Input{.{ .node_id = input_node, .value = &input }};
     const weights = [_]@import("../../graph/interpreter.zig").RuntimeInput{ .{ .node_id = program.id_map[w], .value = weight, .source_backend = &cb }, .{ .node_id = program.id_map[b], .value = bias, .source_backend = &cb } };
-    var held: ?@import("../../graph/runtime.zig").Result = null;
+    var held: ?@import("../../execution/graph_runtime.zig").Result = null;
     defer if (held) |*value| value.deinitWithCleanup(&executable.runtime, budget.?.cleanup());
     var captures: u64 = 0;
     var replays: u64 = 0;
@@ -58710,7 +58710,7 @@ fn qualifyCudaPrimitiveDotOwnedRoute(comptime rank: u8, comptime lhs_transposed:
     var rhs_input = try Tensor.initFloat32(a, "rhs", &rhs_shape, &rhs_values);
     defer rhs_input.deinit();
     const host = [_]@import("../../execution/host_ingress.zig").Input{ .{ .node_id = program.id_map[lhs], .value = &lhs_input }, .{ .node_id = program.id_map[rhs], .value = &rhs_input } };
-    var held: ?@import("../../graph/runtime.zig").Result = null;
+    var held: ?@import("../../execution/graph_runtime.zig").Result = null;
     defer if (held) |*value| value.deinitWithCleanup(&executable.runtime, budget.?.cleanup());
     var captures: u64 = 0;
     var replays: u64 = 0;

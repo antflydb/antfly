@@ -57602,7 +57602,7 @@ const PreparedDenseRegionFixture = struct {
             if (mixed_fusion) {
                 // The private decoder Frame has a single provider, while the
                 // general partitioned executable also owns a fallback backend.
-                var layout = try @import("../graph/runtime.zig").PhysicalLayout.create(a, graph, &.{&cb}, .{}, false);
+                var layout = try @import("../execution/graph_runtime.zig").PhysicalLayout.create(a, graph, &.{&cb}, .{}, false);
                 defer layout.deinit();
                 const physical = @import("../execution/physical_buffers.zig");
                 var private_pool: ?*physical.Pool = (try layout.createPool(a, graph, &.{&cb}, null)) orelse return error.MissingPhysicalPool;
@@ -58199,7 +58199,7 @@ test "Metal prepared typed gather and layer norm retain named cached operands" {
             try graph.markOutput(normalized);
             var analysis = try @import("../graph/interpreter.zig").CachedAnalysis.compute(a, &graph);
             defer analysis.deinit(a);
-            var layout = try @import("../graph/runtime.zig").PhysicalLayout.create(a, &graph, &.{&cb}, .{}, false);
+            var layout = try @import("../execution/graph_runtime.zig").PhysicalLayout.create(a, &graph, &.{&cb}, .{}, false);
             defer layout.deinit();
             const physical = @import("../execution/physical_buffers.zig");
             var private: ?*physical.Pool = (try layout.createPool(a, &graph, &.{&cb}, null)) orelse return error.MissingPhysicalPool;
@@ -59458,7 +59458,7 @@ test "Metal Runtime operation routing preserves actual external frames and expli
     try graph.markOutput(y);
     const input = try auditDeviceTensor(compute, &cb, &.{ 2, 4, 6, 8 }, &.{4});
     defer cb.free(input);
-    var runtime = try @import("../graph/runtime.zig").Runtime.init(a, &graph, &cb, .interpreter);
+    var runtime = try @import("../execution/graph_runtime.zig").Runtime.init(a, &graph, &cb, .interpreter);
     defer runtime.deinit();
     const inputs = [_]@import("../graph/interpreter.zig").RuntimeInput{.{ .node_id = x, .value = input }};
     const operation = @import("../execution/backend_operation.zig");
@@ -59472,7 +59472,7 @@ test "Metal Runtime operation routing preserves actual external frames and expli
         try metal_runtime_mod.beginFrame(runtime_handle);
         var frame_live = true;
         defer if (frame_live) metal_runtime_mod.cancelFrame(runtime_handle) catch @panic("Runtime external frame cleanup failed");
-        var result: @import("../graph/runtime.zig").Result = undefined;
+        var result: @import("../execution/graph_runtime.zig").Result = undefined;
         try runtime.executeInto(a, &graph, &.{ .runtime_inputs = &inputs, .backend_operation = outer.token() }, &result);
         defer result.deinit(&runtime);
         try std.testing.expect(metal_runtime_mod.hasActiveFrame(runtime_handle));
@@ -60922,7 +60922,7 @@ test "complete Metal ModelProgram derives queued regular RoPE positions with cap
     var native_context = try context_mod.BackendContext.init(a, .native, null);
     defer native_context.deinit(a);
     const native_cb = native_context.computeBackend();
-    var held: ?@import("../graph/runtime.zig").Result = null;
+    var held: ?@import("../execution/graph_runtime.zig").Result = null;
     defer if (held) |*value| value.deinitWithCleanup(&executable.runtime, budget.?.cleanup());
     var warm_allocations: ?u64 = null;
     for ([_]?usize{ null, 7, null, 23 }, 0..) |override, iteration| {

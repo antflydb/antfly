@@ -18,7 +18,7 @@
 //! All mutation is committed only after successful metadata preparation.
 const std = @import("std");
 const ml = @import("ml");
-const buffers = @import("../graph/buffer_plan.zig");
+const buffers = @import("buffer_plan.zig");
 const none = std.math.maxInt(u32);
 
 fn active(plan: *const buffers.BufferPlan, slot: buffers.LogicalSlot, index: usize) !bool {

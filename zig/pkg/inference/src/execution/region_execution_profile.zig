@@ -230,7 +230,7 @@ test "Runtime profile finish failure drains the actual numerical output before d
     const native = @import("../ops/native_compute.zig");
     const ops = @import("../ops/ops.zig");
     const ml = @import("ml");
-    const runtime_mod = @import("../graph/runtime.zig");
+    const runtime_mod = @import("graph_runtime.zig");
     const Probe = struct {
         compute: native.NativeCompute,
         base_table: *const ops.ComputeBackend.VTable = undefined,

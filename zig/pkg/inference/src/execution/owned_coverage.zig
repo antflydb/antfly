@@ -17,7 +17,7 @@
 //! Opaque model/vendor envelopes and request IO retain independent protection.
 const std = @import("std");
 const physical = @import("physical_buffers.zig");
-const buffers = @import("../graph/buffer_plan.zig");
+const buffers = @import("buffer_plan.zig");
 const route = @import("kernel_route.zig");
 const ownership = @import("storage_ownership.zig");
 const ops = @import("../ops/ops.zig");

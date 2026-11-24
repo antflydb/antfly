@@ -20,7 +20,7 @@ const manifest_mod = @import("../models/manifest.zig");
 const c_file = @import("../util/c_file.zig");
 const kernel_jit_mod = @import("../graph/kernel_jit.zig");
 const backend_contracts = @import("../graph/backend_contracts.zig");
-const graph_runtime_mod = @import("../graph/runtime.zig");
+const graph_runtime_mod = @import("../execution/graph_runtime.zig");
 const execution_control = @import("../execution_control.zig");
 const Interruption = execution_control.Interruption;
 

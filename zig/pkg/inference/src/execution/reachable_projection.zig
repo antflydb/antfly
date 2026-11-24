@@ -16,7 +16,7 @@
 //! Cold storage projection for a private prepared variant. The executable's
 //! cached reachability is the only authority; root compatibility plans persist.
 const std = @import("std");
-const buffers = @import("../graph/buffer_plan.zig");
+const buffers = @import("buffer_plan.zig");
 
 pub fn deactivate(pool: anytype) !void {
     const graph = pool.coverage_graph orelse return;

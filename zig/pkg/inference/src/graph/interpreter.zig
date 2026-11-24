@@ -33,7 +33,7 @@ const ml = @import("ml");
 const ops_mod = @import("../ops/ops.zig");
 const contracts = @import("backend_contracts.zig");
 const transpose_utils = @import("transpose_utils.zig");
-const buffer_plan_mod = @import("buffer_plan.zig");
+const buffer_plan_mod = @import("../execution/buffer_plan.zig");
 const runtime_slice = @import("runtime_slice.zig");
 const runtime_shape_values = @import("runtime_shape_values.zig");
 

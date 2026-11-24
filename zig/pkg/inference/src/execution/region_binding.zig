@@ -18,7 +18,7 @@
 const ops = @import("../ops/ops.zig");
 const region = @import("region_route.zig");
 const kernel = @import("kernel_route.zig");
-const buffers = @import("../graph/buffer_plan.zig");
+const buffers = @import("buffer_plan.zig");
 
 pub const max_outputs = 8;
 pub const max_inputs = 32;

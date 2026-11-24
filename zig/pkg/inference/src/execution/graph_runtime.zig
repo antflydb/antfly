@@ -25,20 +25,20 @@ const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const ml = @import("ml");
 
-const contracts = @import("backend_contracts.zig");
+const contracts = @import("../graph/backend_contracts.zig");
 const ops_mod = @import("../ops/ops.zig");
 const native_mod = @import("../ops/native_compute.zig");
-const cache_mod = @import("cache.zig");
+const cache_mod = @import("../graph/cache.zig");
 const buffer_plan_mod = @import("buffer_plan.zig");
-const compiled_backend = @import("compiled_backend.zig");
-const compiled_registry = @import("compiled_registry.zig");
-const interpreter = @import("interpreter.zig");
-const partition_mod = @import("partition.zig");
-const metal_capabilities = @import("metal_capabilities.zig");
-const backend_policy = @import("backend_policy.zig");
-const multi_executor = @import("multi_executor.zig");
-const device_mesh_mod = @import("device_mesh.zig");
-const native_partition_executor = @import("native_partition_executor.zig");
+const compiled_backend = @import("../graph/compiled_backend.zig");
+const compiled_registry = @import("../graph/compiled_registry.zig");
+const interpreter = @import("../graph/interpreter.zig");
+const partition_mod = @import("../graph/partition.zig");
+const metal_capabilities = @import("../graph/metal_capabilities.zig");
+const backend_policy = @import("../graph/backend_policy.zig");
+const multi_executor = @import("../graph/multi_executor.zig");
+const device_mesh_mod = @import("../graph/device_mesh.zig");
+const native_partition_executor = @import("../graph/native_partition_executor.zig");
 
 const Graph = ml.graph.Graph;
 const ComputeBackend = ops_mod.ComputeBackend;
@@ -48,9 +48,9 @@ const WeightStore = native_mod.WeightStore;
 const Builder = ml.graph.Builder;
 const Shape = ml.graph.Shape;
 const NodeId = ml.graph.NodeId;
-const operator_plan = @import("operator_plan.zig");
+const operator_plan = @import("../graph/operator_plan.zig");
 
-pub const Strategy = @import("../execution/strategy.zig").Strategy;
+pub const Strategy = @import("strategy.zig").Strategy;
 
 pub const Result = struct {
     stats: partition_mod.PartitionExecutor.ExecutionStats = .{},
@@ -74,7 +74,7 @@ pub const Result = struct {
     pub fn deinit(self: *Result, runtime: *const Runtime) void {
         self.deinitWithCleanup(runtime, .{});
     }
-    pub fn deinitWithCleanup(self: *Result, runtime: *const Runtime, cleanup: @import("../execution/cleanup_context.zig").Context) void {
+    pub fn deinitWithCleanup(self: *Result, runtime: *const Runtime, cleanup: @import("cleanup_context.zig").Context) void {
         for (self.outputs, 0..) |ct, i| {
             const backend = self.backendFor(runtime, i);
             var duplicate = false;
@@ -200,15 +200,15 @@ pub const PhysicalLayout = struct {
 
     /// Reuse layout only; actual provider eligibility/workspace/aliases and
     /// literal/storage owners are resolved anew by the existing Pool factory.
-    pub fn createPool(self: *const PhysicalLayout, allocator: std.mem.Allocator, graph: *const Graph, backends: []const *const ComputeBackend, descriptors: ?[]const ?ops_mod.kernel_descriptor.Descriptor) !?*@import("../execution/physical_buffers.zig").Pool {
+    pub fn createPool(self: *const PhysicalLayout, allocator: std.mem.Allocator, graph: *const Graph, backends: []const *const ComputeBackend, descriptors: ?[]const ?ops_mod.kernel_descriptor.Descriptor) !?*@import("physical_buffers.zig").Pool {
         try self.validateCurrent(allocator, graph, backends);
         return self.createValidatedPool(allocator, graph, backends, descriptors);
     }
-    fn createValidatedPool(self: *const PhysicalLayout, allocator: std.mem.Allocator, graph: *const Graph, backends: []const *const ComputeBackend, descriptors: ?[]const ?ops_mod.kernel_descriptor.Descriptor) !?*@import("../execution/physical_buffers.zig").Pool {
+    fn createValidatedPool(self: *const PhysicalLayout, allocator: std.mem.Allocator, graph: *const Graph, backends: []const *const ComputeBackend, descriptors: ?[]const ?ops_mod.kernel_descriptor.Descriptor) !?*@import("physical_buffers.zig").Pool {
         var plan = try self.buffers.clone(allocator);
         var transferred = false;
         errdefer if (!transferred) plan.deinit();
-        const pool = (try @import("../execution/physical_buffers.zig").Pool.createWithDescriptors(allocator, graph, &plan, backends, self.partition.node_operator_plans, descriptors)) orelse {
+        const pool = (try @import("physical_buffers.zig").Pool.createWithDescriptors(allocator, graph, &plan, backends, self.partition.node_operator_plans, descriptors)) orelse {
             plan.deinit();
             return null;
         };
@@ -280,7 +280,7 @@ pub const FrozenPhysicalLayout = struct {
     pub fn layout(self: *const FrozenPhysicalLayout) *const PhysicalLayout {
         return &self.owned_layout;
     }
-    pub fn createPool(self: *const FrozenPhysicalLayout, allocator: std.mem.Allocator, backends: []const *const ComputeBackend, descriptors: ?[]const ?ops_mod.kernel_descriptor.Descriptor) !?*@import("../execution/physical_buffers.zig").Pool {
+    pub fn createPool(self: *const FrozenPhysicalLayout, allocator: std.mem.Allocator, backends: []const *const ComputeBackend, descriptors: ?[]const ?ops_mod.kernel_descriptor.Descriptor) !?*@import("physical_buffers.zig").Pool {
         if (self.descriptor_policy) |policy| {
             try self.owned_layout.validateReceiving(allocator, &self.owned_graph, backends);
             if (self.owned_layout.output_policy.len != self.owned_graph.nodeCount()) return error.InvalidTensorDescriptorTable;
@@ -304,7 +304,7 @@ pub const Runtime = struct {
     plan: ?multi_executor.DevicePartitionPlan = null,
     buffer_plan: ?buffer_plan_mod.BufferPlan = null,
     partition_last_use: ?[]u32 = null,
-    physical_pool: ?*@import("../execution/physical_buffers.zig").Pool = null,
+    physical_pool: ?*@import("physical_buffers.zig").Pool = null,
     runtime_cache_entry: ?cache_mod.CacheEntry = null,
     compiled_context: ?compiled_backend.AttachContext = null,
     native_partition_executors: std.ArrayListUnmanaged(*native_partition_executor.NativePartitionExecutor) = .empty,
@@ -319,9 +319,9 @@ pub const Runtime = struct {
         /// Borrow immutable compiled executors. The owner must outlive this frame.
         compiled_source: ?*const Runtime = null,
         kernel_descriptors: ?[]const ?ops_mod.kernel_descriptor.Descriptor = null,
-        tensor_descs: ?[]const ?@import("backend_contracts.zig").TensorDesc = null,
+        tensor_descs: ?[]const ?@import("../graph/backend_contracts.zig").TensorDesc = null,
         analysis: ?interpreter.CachedAnalysis = null,
-        region_costs: ?@import("../execution/placement.zig").RegionCosts = .{},
+        region_costs: ?@import("placement.zig").RegionCosts = .{},
     };
 
     pub fn init(
@@ -357,7 +357,7 @@ pub const Runtime = struct {
     pub fn deinit(self: *Runtime) void {
         self.deinitWithCleanup(.{});
     }
-    pub fn deinitWithCleanup(self: *Runtime, cleanup: @import("../execution/cleanup_context.zig").Context) void {
+    pub fn deinitWithCleanup(self: *Runtime, cleanup: @import("cleanup_context.zig").Context) void {
         if (self.partition_last_use) |uses| self.allocator.free(uses);
         self.partition_last_use = null;
         if (self.physical_pool) |pool| pool.deinitWithCleanup(cleanup);
@@ -411,12 +411,12 @@ pub const Runtime = struct {
         if (options.prepared_routes) |routes| try routes.pool.validateExecutionPolicy();
         const profile_owned = if (options.region_execution_profile) |profile| try profile.ensureScope(.{ .operation = .graph_execution, .implementation = .{ .context = self.default_backend.ptr, .table = self.default_backend.vtable }, .program = graph }) else false;
         errdefer if (profile_owned) options.region_execution_profile.?.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
-        const operation = @import("../execution/backend_operation.zig");
+        const operation = @import("backend_operation.zig");
         const borrowed_operation = options.backend_operation orelse self.default_backend.operationToken() orelse if (options.region_execution_profile) |profile| profile.operation_lease else null;
         var operation_scope: operation.Scope = undefined;
         try operation.enterInto(self.default_backend, graph, borrowed_operation, if (options.region_execution_profile != null or (if (options.prepared_routes) |routes| routes.pool.requiresManagedExecution() else false)) .managed else .legacy_unknown_frame, &operation_scope);
         errdefer operation_scope.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
-        const transfer_audit = @import("../execution/transfer_audit.zig");
+        const transfer_audit = @import("transfer_audit.zig");
         var audit = transfer_audit.Audit{ .forbid_activation_readbacks = options.activation_readbacks == .forbidden };
         const auditing = options.collect_partition_stats or audit.forbid_activation_readbacks;
         if (audit.forbid_activation_readbacks) try transfer_audit.validateBackend(self.default_backend.kind());
@@ -433,7 +433,7 @@ pub const Runtime = struct {
         return;
     }
 
-    fn addPhysicalStats(stats: *partition_mod.PartitionExecutor.ExecutionStats, physical: @import("../execution/physical_buffers.zig").Stats) void {
+    fn addPhysicalStats(stats: *partition_mod.PartitionExecutor.ExecutionStats, physical: @import("physical_buffers.zig").Stats) void {
         stats.physical_frame_observed = true;
         stats.prepared_payload_coverage = physical.prepared_payload_coverage;
         stats.assigned_regions = physical.assigned_regions;
@@ -464,7 +464,7 @@ pub const Runtime = struct {
         mesh: *const device_mesh_mod.DeviceMesh,
         options: *const interpreter.ExecuteOptions,
         stats: *partition_mod.PartitionExecutor.ExecutionStats,
-        frame: ?*@import("../execution/physical_buffers.zig").Frame,
+        frame: ?*@import("physical_buffers.zig").Frame,
         capturing: *bool,
     ) !multi_executor.DeviceOutputs {
         var result = multi_executor.executeDeviceOutputs(allocator, graph, plan, mesh, options, stats) catch |err| recover: {
@@ -493,7 +493,7 @@ pub const Runtime = struct {
         return result;
     }
 
-    noinline fn retainPhysicalCleanupEpoch(cap: @import("../execution/storage_admission.zig").Capability, operation: ?@import("../execution/backend_operation.zig").Borrowed) !@import("../execution/retirement_sink.zig").Epoch {
+    noinline fn retainPhysicalCleanupEpoch(cap: @import("storage_admission.zig").Capability, operation: ?@import("backend_operation.zig").Borrowed) !@import("retirement_sink.zig").Epoch {
         if (operation) |active| if (try active.retainCleanupEpoch()) |epoch| return epoch;
         // Explicit construction B comes from this invocation's prebound Set;
         // it grants no numerical authority and is never used for future drops.
@@ -501,7 +501,7 @@ pub const Runtime = struct {
         return error.MissingCurrentCleanupEpoch;
     }
 
-    fn executeImplInto(self: *Runtime, allocator: std.mem.Allocator, graph: *const Graph, options: *const interpreter.ExecuteOptions, backend_operation: ?@import("../execution/backend_operation.zig").Borrowed, output: *Result) !void {
+    fn executeImplInto(self: *Runtime, allocator: std.mem.Allocator, graph: *const Graph, options: *const interpreter.ExecuteOptions, backend_operation: ?@import("backend_operation.zig").Borrowed, output: *Result) !void {
         // Initialize only the small ownership payload here. The selected
         // submission branch initializes/writes stats once at its final address.
         output.outputs = &.{};
@@ -546,7 +546,7 @@ pub const Runtime = struct {
                 const strict_cuda = self.strictCudaPlan();
                 if (strict_cuda and (options.prepared_routes == null or selected_pool.?.completeOwnedPayload() == null)) {
                     if (graphPartitionReportRequested()) {
-                        const coverage: @import("../execution/owned_coverage.zig").Coverage = if (options.prepared_routes) |routes| routes.pool.payload_coverage else .{ .compatibility = .no_selected_routes };
+                        const coverage: @import("owned_coverage.zig").Coverage = if (options.prepared_routes) |routes| routes.pool.payload_coverage else .{ .compatibility = .no_selected_routes };
                         const reason = switch (coverage) {
                             .compatibility => |value| @tagName(value),
                             .complete => "provider_not_qualified",
@@ -569,7 +569,7 @@ pub const Runtime = struct {
                 }
                 var physical_epoch = if (options.storage_admission) |cap| if (cap.services.takeBacking != null) try retainPhysicalCleanupEpoch(cap, backend_operation) else null else null;
                 defer if (physical_epoch) |*epoch| epoch.release();
-                const physical_cleanup = @import("../execution/cleanup_context.zig").Context{ .operation = backend_operation, .boundary = if (physical_epoch) |*epoch| epoch else null };
+                const physical_cleanup = @import("cleanup_context.zig").Context{ .operation = backend_operation, .boundary = if (physical_epoch) |*epoch| epoch else null };
                 const frame = if (selected_pool) |pool| try pool.acquirePreparedWithRegionsAndOperation(options.storage_admission, options.physical_frame_claim, options.region_claims, graph, backend_operation) else null;
                 if (options.prepared_routes != null and frame == null) return error.PreparedPhysicalFrameUnavailable;
                 var frame_finished = false;
@@ -787,7 +787,7 @@ pub const Runtime = struct {
         if (options.compiled != null and !self.allComputePartitionsHaveAttachedExecutors(graph)) return error.UnsupportedCompiledGraphRuntime;
         self.buffer_plan = layout.buffers;
         layout.buffers_owned = false;
-        self.physical_pool = try @import("../execution/physical_buffers.zig").Pool.createWithDescriptors(self.allocator, graph, &self.buffer_plan.?, physical_backends[0..device_count], self.plan.?.base.node_operator_plans, options.kernel_descriptors);
+        self.physical_pool = try @import("physical_buffers.zig").Pool.createWithDescriptors(self.allocator, graph, &self.buffer_plan.?, physical_backends[0..device_count], self.plan.?.base.node_operator_plans, options.kernel_descriptors);
         try self.buffer_plan.?.validate(graph, &self.plan.?.base);
     }
 
@@ -1715,7 +1715,7 @@ test "graph result retains actual Native output with durable header after execut
         }
         fn execute(allocator: std.mem.Allocator, backend: ComputeBackend, strategy: Strategy) !Result {
             var budget = @import("../runtime/tier/memory.zig").RunBudget.init(.{});
-            const context = @import("../execution/invocation_context.zig").Context{ .cleanup = .{} };
+            const context = @import("invocation_context.zig").Context{ .cleanup = .{} };
             var local = backend;
             local.call_context = &context;
             local.execution_budget = &budget;
@@ -1726,9 +1726,9 @@ test "graph result retains actual Native output with durable header after execut
             var builder = Builder.init(&graph);
             const x = try builder.parameter("x", Shape.init(.f32, &.{4}));
             try graph.markOutput(try builder.relu(x));
-            var program = try @import("../execution/program.zig").ModelProgram.init(allocator, &graph, &.{});
+            var program = try @import("program.zig").ModelProgram.init(allocator, &graph, &.{});
             defer program.deinit();
-            var executable = try @import("../execution/executable.zig").prepare(allocator, &program, &local, strategy);
+            var executable = try @import("executable.zig").prepare(allocator, &program, &local, strategy);
             defer executable.deinit();
             const input = try backend.fromFloat32Shape(&.{ -1, 2, -3, 4 }, &.{4});
             defer backend.free(input);
@@ -1741,9 +1741,9 @@ test "graph result retains actual Native output with durable header after execut
         // Owned headers must suffice: the real executable/program/request have
         // died, while the actual endpoint and independently owned CT remain.
         const expired_runtime: Runtime = undefined;
-        var cleanup = try @import("../execution/cleanup_owner.zig").Owner.beginOutsideCleanup();
+        var cleanup = try @import("cleanup_owner.zig").Owner.beginOutsideCleanup();
         defer cleanup.finishAfterUnlock();
-        const now = @import("../execution/cleanup_context.zig").Context{ .boundary = cleanup.epoch() };
+        const now = @import("cleanup_context.zig").Context{ .boundary = cleanup.epoch() };
         defer result.deinitWithCleanup(&expired_runtime, now);
         const backend = result.owner_backend orelse return error.MissingDurableResultHeader;
         try std.testing.expect(backend.ptr == canonical.ptr and backend.vtable == canonical.vtable);
@@ -1812,7 +1812,7 @@ test "pure physical layout and fresh pool metadata unwind every allocation failu
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, PhysicalLayoutFixture.check, .{});
 }
 
-fn recordedNativePayloadCoverage(prepared: bool) !@import("../execution/invocation_report.zig").Report {
+fn recordedNativePayloadCoverage(prepared: bool) !@import("invocation_report.zig").Report {
     const a = std.testing.allocator;
     var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
     defer context.deinit(a);
@@ -1822,9 +1822,9 @@ fn recordedNativePayloadCoverage(prepared: bool) !@import("../execution/invocati
     var builder = Builder.init(&graph);
     const input_node = try builder.parameter("coverage.x", Shape.init(.f32, &.{4}));
     try graph.markOutput(try builder.neg(input_node));
-    var program = try @import("../execution/program.zig").ModelProgram.init(a, &graph, &.{.{ .name = "coverage.x", .node_id = input_node, .kind = .input }});
+    var program = try @import("program.zig").ModelProgram.init(a, &graph, &.{.{ .name = "coverage.x", .node_id = input_node, .kind = .input }});
     defer program.deinit();
-    var executable = try @import("../execution/executable.zig").prepare(a, &program, &backend, .partitioned);
+    var executable = try @import("executable.zig").prepare(a, &program, &backend, .partitioned);
     defer executable.deinit();
     executable.configureExecutionDiagnostics(true);
     const input = program.id_map[input_node];
@@ -1837,7 +1837,7 @@ fn recordedNativePayloadCoverage(prepared: bool) !@import("../execution/invocati
     defer host_tensor.deinit();
     const raw = try backend.fromFloat32Shape(&.{ 1, -2, 3, -4 }, &.{4});
     defer backend.free(raw);
-    const host_inputs = [_]@import("../execution/host_ingress.zig").Input{.{ .node_id = input, .value = &host_tensor }};
+    const host_inputs = [_]@import("host_ingress.zig").Input{.{ .node_id = input, .value = &host_tensor }};
     const runtime_inputs = [_]interpreter.RuntimeInput{.{ .node_id = input, .value = raw, .source_backend = &backend }};
     var result = try executable.run(a, .{ .prepared_routes = routes, .host_inputs = if (prepared) &host_inputs else null, .runtime_inputs = if (prepared) null else &runtime_inputs, .collect_partition_stats = true });
     defer result.deinit(&executable.runtime);
@@ -1851,7 +1851,7 @@ fn recordedNativePayloadCoverage(prepared: bool) !@import("../execution/invocati
     if (prepared) {
         try std.testing.expect(coverage.value == .complete);
         try std.testing.expectEqual(routes.?.pool.selection.?.epoch, coverage.value.complete.epoch);
-    } else try std.testing.expectEqual(@import("../execution/owned_coverage.zig").Reason.no_selected_routes, coverage.value.compatibility);
+    } else try std.testing.expectEqual(@import("owned_coverage.zig").Reason.no_selected_routes, coverage.value.compatibility);
     try std.testing.expect(report.metal_region_policy == null);
     return report;
 }
@@ -1862,7 +1862,7 @@ test "actual Native executable publishes owned admission coverage metadata after
         const retained = try recordedNativePayloadCoverage(prepared);
         // The actual Frame/Pool/Executable/backend/graph are already gone.
         const value = retained.payload_admission_coverage.?.value;
-        if (prepared) try std.testing.expect(value == .complete) else try std.testing.expectEqual(@import("../execution/owned_coverage.zig").Reason.no_selected_routes, value.compatibility);
+        if (prepared) try std.testing.expect(value == .complete) else try std.testing.expectEqual(@import("owned_coverage.zig").Reason.no_selected_routes, value.compatibility);
     }
 }
 

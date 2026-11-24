@@ -1016,7 +1016,7 @@ fn isGlinerLabelMarkerToken(token_id: i64, label_markers: LabelMarkerTokens) boo
 // can fuse into a single graph -- this function is a stepping stone.
 
 const interpreter = @import("../graph/interpreter.zig");
-const graph_runtime = @import("../graph/runtime.zig");
+const graph_runtime = @import("../execution/graph_runtime.zig");
 const deberta_graph = @import("deberta_graph.zig");
 
 const ops_mod = @import("../ops/ops.zig");

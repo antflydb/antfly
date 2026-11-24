@@ -19,7 +19,7 @@
 const std = @import("std");
 const ml = @import("ml");
 const ops = @import("../ops/ops.zig");
-const buffers = @import("../graph/buffer_plan.zig");
+const buffers = @import("buffer_plan.zig");
 const storage = ops.physical_storage;
 const accounting = @import("storage_accounting.zig");
 const kernels = ops.kernel_descriptor;
@@ -5211,7 +5211,7 @@ fn privateNativePreparationCase(a: std.mem.Allocator, borrowable: bool) !void {
     var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
     defer context.deinit(a);
     const backend = context.computeBackend();
-    var layout = try @import("../graph/runtime.zig").PhysicalLayout.create(a, &graph, &.{&backend}, .{}, false);
+    var layout = try @import("graph_runtime.zig").PhysicalLayout.create(a, &graph, &.{&backend}, .{}, false);
     defer layout.deinit();
     var owned: ?*Pool = (try layout.createPool(a, &graph, &.{&backend}, null)) orelse return error.MissingPhysicalPool;
     defer if (owned) |pool| pool.deinit();

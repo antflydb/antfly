@@ -314,7 +314,7 @@ pub const Selection = struct {
     fn kernelInput(self: *const Selection, pool: *const physical.Pool, consumer: NodeId, source: NodeId, retained: RetainedInput) RetainedInput {
         if (self.transfer_planes.len == 0) return retained;
         const slot = pool.plan.slotForNode(consumer) orelse return retained;
-        const index = pool.plan.transfer_index.get(@import("../graph/buffer_plan.zig").transferKey(source, slot.partition_index)) orelse return retained;
+        const index = pool.plan.transfer_index.get(@import("buffer_plan.zig").transferKey(source, slot.partition_index)) orelse return retained;
         if (index >= pool.plan.transfers.len) return .{ .value = .unknown, .witnessed = false };
         const edge = pool.plan.transfers[index];
         // Placement between partitions on the same provider preserves
@@ -391,8 +391,8 @@ pub const Selection = struct {
         const order = try self.allocator.alloc(NodeId, pool.kernels.len);
         defer self.allocator.free(order);
         for (order, 0..) |*node, index| node.* = @intCast(index);
-        std.mem.sort(NodeId, order, @as(*const @import("../graph/buffer_plan.zig").BufferPlan, &pool.plan), struct {
-            fn less(plan: *const @import("../graph/buffer_plan.zig").BufferPlan, a: NodeId, b: NodeId) bool {
+        std.mem.sort(NodeId, order, @as(*const @import("buffer_plan.zig").BufferPlan, &pool.plan), struct {
+            fn less(plan: *const @import("buffer_plan.zig").BufferPlan, a: NodeId, b: NodeId) bool {
                 return plan.positionForNode(a) < plan.positionForNode(b);
             }
         }.less);
@@ -661,7 +661,7 @@ test "prepared transfer facts expose only the consuming Metal partition represen
         .node_operator_plans = &.{ null, null, null },
         .owns_executors = false,
     };
-    var plan = try @import("../graph/buffer_plan.zig").build(a, &graph, &placement, .{});
+    var plan = try @import("buffer_plan.zig").build(a, &graph, &placement, .{});
     defer plan.deinit();
     const pool = (try physical.Pool.create(a, &graph, &plan, &.{ &host, &metal }, placement.node_operator_plans)) orelse return error.MissingPhysicalPool;
     defer pool.deinit();
@@ -919,7 +919,7 @@ fn currentConsumerReadOnlyCase(a: std.mem.Allocator) !void {
     const second = try builder.gather(table, indices, output_shape);
     try graph.markOutput(first);
     try graph.markOutput(second);
-    var layout = try @import("../graph/runtime.zig").PhysicalLayout.create(a, &graph, &.{&native}, .{}, false);
+    var layout = try @import("graph_runtime.zig").PhysicalLayout.create(a, &graph, &.{&native}, .{}, false);
     defer layout.deinit();
     const reachable = try a.alloc(bool, graph.nodeCount());
     defer a.free(reachable);

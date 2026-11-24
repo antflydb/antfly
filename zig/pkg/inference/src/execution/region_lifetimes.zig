@@ -17,7 +17,7 @@
 //! separate from the NodeIds used by interpreter value-handle reclamation.
 const std = @import("std");
 const ml = @import("ml");
-const buffers = @import("../graph/buffer_plan.zig");
+const buffers = @import("buffer_plan.zig");
 const region = @import("region_route.zig");
 const interpreter = @import("../graph/interpreter.zig");
 const none = std.math.maxInt(u32);

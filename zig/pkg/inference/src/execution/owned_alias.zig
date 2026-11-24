@@ -17,7 +17,7 @@
 //! contiguous device slices of allocations.
 const std = @import("std");
 const physical = @import("physical_buffers.zig");
-const buffers = @import("../graph/buffer_plan.zig");
+const buffers = @import("buffer_plan.zig");
 const metadata = @import("metadata_alias.zig");
 const ops = @import("../ops/ops.zig");
 const ml = @import("ml");

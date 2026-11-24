@@ -19,7 +19,7 @@ const std = @import("std");
 const ops = @import("../ops/ops.zig");
 const interpreter = @import("../graph/interpreter.zig");
 const ModelProgram = @import("program.zig").ModelProgram;
-pub const runtime_module = if (@import("build_options").enable_wasm) @import("wasm_runtime.zig") else @import("../graph/runtime.zig");
+pub const runtime_module = if (@import("build_options").enable_wasm) @import("wasm_runtime.zig") else @import("graph_runtime.zig");
 
 /// Borrows immutable program and backend. Both must outlive this executable,
 /// while the backend context must outlive resident results. Result storage and
@@ -545,7 +545,7 @@ test "prepared physical workspace is declared once reused and owned by its frame
     const pool = executable.runtime.physical_pool.?;
     const scratch_id = pool.workspace_allocations[0];
     const allocation = executable.runtime.buffer_plan.?.allocations[scratch_id];
-    try std.testing.expectEqual(@import("../graph/buffer_plan.zig").AllocationKind.workspace, allocation.kind);
+    try std.testing.expectEqual(@import("buffer_plan.zig").AllocationKind.workspace, allocation.kind);
     try std.testing.expectEqual(@as(u64, 32), allocation.byte_size);
     try std.testing.expectEqual(@as(u32, 8), allocation.alignment);
     try std.testing.expect(allocation.first_use == 0 and allocation.last_use >= program.graph.nodeCount());
@@ -826,7 +826,7 @@ test "prepared auxiliary planes reuse primary lifetimes and survive frame retire
     var executable_live = true;
     defer if (executable_live) executable.deinit();
     const pool = executable.runtime.physical_pool.?;
-    var plane_id: @import("../graph/buffer_plan.zig").AllocationId = undefined;
+    var plane_id: @import("buffer_plan.zig").AllocationId = undefined;
     for (pool.kernels) |maybe_kernel| if (maybe_kernel) |kernel| {
         const auxiliary = kernel.auxiliaries[0].?;
         plane_id = auxiliary.allocation;
@@ -3962,7 +3962,7 @@ fn exerciseReachableNativeProjection(a: std.mem.Allocator) !void {
     try std.testing.expect(routes.pool.plan.slotForNode(dead_kernel) == null);
     try std.testing.expect(routes.pool.plan.slotForNode(dead_literal) == null);
     try std.testing.expect(routes.pool.preparedKernelRoute(dead_kernel) == null);
-    try std.testing.expectEqual(@import("../graph/buffer_plan.zig").invalid_allocation, routes.pool.outputSlot(dead_kernel, 65536).allocation);
+    try std.testing.expectEqual(@import("buffer_plan.zig").invalid_allocation, routes.pool.outputSlot(dead_kernel, 65536).allocation);
     try std.testing.expect(root.plan.slotForNode(dead_kernel) != null);
     try std.testing.expectEqual(@as(u64, 65536), root.plan.allocations[original_bank].byte_size);
     try std.testing.expectEqual(@as(u64, 16), routes.pool.plan.allocations[original_bank].byte_size);
@@ -3975,7 +3975,7 @@ fn exerciseReachableNativeProjection(a: std.mem.Allocator) !void {
     // writable allocation merely because that bank is live for another node.
     routes.pool.plan.slots[dead_kernel].allocation = original_bank;
     const malformed = routes.pool.plan.validate(&graph, &executable.runtime.plan.?.base);
-    routes.pool.plan.slots[dead_kernel].allocation = @import("../graph/buffer_plan.zig").invalid_allocation;
+    routes.pool.plan.slots[dead_kernel].allocation = @import("buffer_plan.zig").invalid_allocation;
     try std.testing.expectError(error.InvalidBufferPlan, malformed);
     const bad_reachable = try a.dupe(bool, analysis.reachable);
     defer a.free(bad_reachable);
