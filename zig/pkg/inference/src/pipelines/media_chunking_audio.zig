@@ -20,8 +20,11 @@ const media = @import("antfly_media");
 pub const Lease = struct {
     pcm: audio.PcmAudio,
     owned: ?[]f32 = null,
+    reservation: media.admission.Token = .{},
     pub fn deinit(self: *Lease, a: std.mem.Allocator) void {
         if (self.owned) |samples| a.free(samples);
+        self.reservation.deinit();
+        self.owned = null;
     }
 };
 pub const Fork = struct {

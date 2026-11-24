@@ -13011,6 +13011,8 @@ test "actual Native architecture CLIP and CLAP resident entries preserve current
 test "native media geometry protects actual projected rows for both text and image audio inputs" {
     var owner: ArchSession = undefined;
     owner.task = .generic;
+    owner.backend_type = .native;
+    owner.glide_head = null;
     const info = [_]TensorInfo{
         .{ .name = "input_ids", .dtype = .i64, .shape = &.{ 2, 4 } },
         .{ .name = "pixel_values", .dtype = .f32, .shape = &.{ 2, 3, 16, 16 } },
