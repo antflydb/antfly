@@ -6533,6 +6533,8 @@ test "SQL scope retirement population HTTP controls never replay unknown deliver
     const Executor = struct {
         calls: usize = 0,
         mode: enum { lost, not_sent, rejected } = .lost,
+        rejection: anyerror = error.IdempotencyConflict,
+        outcome: []const u8 = routes.Routes.raft_mutation_outcome_not_proposed,
         fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
@@ -6548,14 +6550,14 @@ test "SQL scope retirement population HTTP controls never replay unknown deliver
                     return error.ConnectionRefused;
                 },
                 .rejected => {
-                    const body = try alloc.dupe(u8, "IdempotencyConflict");
+                    const body = try alloc.dupe(u8, @errorName(self.rejection));
                     errdefer alloc.free(body);
                     const headers = try alloc.alloc(http_common.Header, 1);
                     errdefer alloc.free(headers);
                     const name = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_header);
                     errdefer alloc.free(name);
-                    headers[0] = .{ .name = name, .value = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_not_proposed) };
-                    return .{ .status = system_catalog.httpStatus(error.IdempotencyConflict), .body = body, .headers = headers };
+                    headers[0] = .{ .name = name, .value = try alloc.dupe(u8, self.outcome) };
+                    return .{ .status = system_catalog.httpStatus(self.rejection), .body = body, .headers = headers };
                 },
             }
         }
@@ -6580,6 +6582,13 @@ test "SQL scope retirement population HTTP controls never replay unknown deliver
     try std.testing.expectError(error.IdempotencyConflict, client.submitQueryPopulationJob("http://metadata.invalid", request, 1000, true, .{ .submitted = &submitted }));
     try std.testing.expect(!submitted);
     try std.testing.expectEqual(@as(usize, 3), executor.calls);
+    executor.rejection = error.StoredDestinationAuthorizationRevoked;
+    try std.testing.expectError(error.StoredDestinationAuthorizationRevoked, client.submitQueryPopulationJob("http://metadata.invalid", request, 1000, true, .{ .submitted = &submitted }));
+    try std.testing.expect(!submitted);
+    executor.outcome = routes.Routes.raft_mutation_outcome_unknown;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.submitQueryPopulationJob("http://metadata.invalid", request, 1000, true, .{ .submitted = &submitted }));
+    try std.testing.expect(submitted);
+    try std.testing.expectEqual(@as(usize, 5), executor.calls);
 }
 
 test "metadata changefeed state transport validates replies and never replays uncertain writes" {

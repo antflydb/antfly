@@ -2481,7 +2481,7 @@ pub fn httpStatus(err: anyerror) u16 {
         error.ExtensionOwnedObject => 405,
         error.UnsupportedNativeIndexOwner => 501,
         error.CatalogPublicationProofPending => 503,
-        error.Forbidden => 403,
+        error.Forbidden, error.StoredDestinationAuthorizationRevoked => 403,
         error.InvalidInitialFkRetirementSignature, error.InitialFkRetirementSigningKeyUnavailable => 403,
         error.StoreRootEnrollmentChanged, error.ResolverCurationConflict, error.IndexOwnerReceiptChanged => 409,
         error.InvalidIndexOwnerReceipt => 400,
