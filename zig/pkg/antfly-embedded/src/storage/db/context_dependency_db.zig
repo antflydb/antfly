@@ -303,6 +303,8 @@ fn appendDerivedEdgesAlloc(a: Allocator, edges: *std.ArrayListUnmanaged(notices.
 var marker_counter = std.atomic.Value(u64).init(0);
 
 pub const pending_prefix = "\x00\x00__metadata__:context_dependency:generated_pending:";
+/// A follower's single crash intent (see `markGeneratedPending`).
+const follower_marker_key = pending_prefix ++ "follower";
 const reconcile_cursor_key = "\x00\x00__metadata__:context_dependency:reconcile_cursor";
 const reconcile_settled_key = "\x00\x00__metadata__:context_dependency:reconcile_settled";
 
@@ -316,6 +318,16 @@ fn readsGenerated(manager: anytype, batch: anytype) bool {
 /// between) triggers a reconcile that compares shadows with current values.
 pub fn markGeneratedPending(alloc: Allocator, primary: *docstore_mod.DocStore, manager: anytype, batch: anytype) !?u64 {
     if (!readsGenerated(manager, batch)) return null;
+    if (manager.context_replication) |replication| if (!replication.isOwner()) {
+        // A follower never stages these notices (the leader proposes them)
+        // and never reconciles while it follows. It only has to remember
+        // that, if it is promoted, it cannot know whether the old leader
+        // staged every record: one fixed marker says so, and the reconcile
+        // it triggers after promotion settles it. Unique markers per record
+        // would grow without bound on every follower.
+        try primary.put(follower_marker_key, "");
+        return null;
+    };
     // Unique per marker within the process; addresses vary across processes.
     const n = marker_counter.fetchAdd(1, .monotonic);
     const token = std.hash.Wyhash.hash(@intFromPtr(primary) ^ @intFromPtr(&marker_counter), std.mem.asBytes(&n));

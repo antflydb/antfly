@@ -19002,6 +19002,11 @@ pub const ApiHttpServer = struct {
     /// filter after the principal's policies change.
     fn applyContextRowPolicies(self: *ApiHttpServer, a: std.mem.Allocator, request: api_operation.RequestContext, owner_table: []const u8, sources: *std.json.Value) !void {
         if (sources.* != .object) return;
+        // The declaring principal's admitted credential carries its row
+        // policies; without it no filter could ever be captured.
+        const admitted: ?*const ?AuthenticatedIdentity = if (request.row_policy_credential) |ptr| @ptrCast(@alignCast(ptr)) else null;
+        const declarer: ?AuthenticatedIdentity = if (admitted) |ptr| ptr.* else null;
+        if (request.principal != null and declarer == null) return error.Forbidden;
         var it = sources.object.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.* != .object) continue;
@@ -19009,13 +19014,13 @@ pub const ApiHttpServer = struct {
             inline for (.{ "query", "document" }) |kind| if (spec.getPtr(kind)) |target| {
                 if (target.* != .object) return error.InvalidContextSourcesConfig;
                 const public_name: []const u8 = if (target.object.get("table")) |t| (if (t == .string) t.string else return error.InvalidContextSourcesConfig) else owner_table;
-                var identity: ?AuthenticatedIdentity = null;
-                const storage = self.resolveCatalogNameAlloc(a, request, public_name, &identity) catch |err| switch (err) {
+                var lookup_identity: ?AuthenticatedIdentity = null;
+                const storage = self.resolveCatalogNameAlloc(a, request, public_name, &lookup_identity) catch |err| switch (err) {
                     error.TableNotFound => return error.ContextSourceTableUnavailable,
                     else => return err,
                 };
                 _ = storage;
-                if (try resolveEffectiveRowFilterJson(a, identity, public_name)) |row_filter_json| {
+                if (try resolveEffectiveRowFilterJson(a, declarer, public_name)) |row_filter_json| {
                     const row_filter = try std.json.parseFromSliceLeaky(std.json.Value, a, row_filter_json, .{});
                     if (comptime std.mem.eql(u8, kind, "query")) {
                         // Live filters and ranked requests both narrow through
@@ -19200,43 +19205,111 @@ pub const ApiHttpServer = struct {
         if (!transitive and !std.mem.eql(u8, req.traversal, "direct")) return badRequest(alloc, "traversal must be direct or transitive");
         if (req.limit == 0 or req.limit > 10_000 or req.max_depth == 0 or req.max_depth > 64) return badRequest(alloc, "limit must be 1..10000 and max_depth 1..64");
         if (req.revision.len != 0 and @import("antfly_local_sources").storage_db_enrichment_context_dependency_store.parseRevision(req.revision) == null) return badRequest(alloc, "revision must be a hex digest");
+        // Lineage names documents: the caller must be able to see the input
+        // row, and dependent rows hidden by its row policies are omitted.
+        const admitted: ?*const ?AuthenticatedIdentity = if (request.row_policy_credential) |ptr| @ptrCast(@alignCast(ptr)) else null;
+        const caller: ?AuthenticatedIdentity = if (admitted) |ptr| ptr.* else null;
+        if (!try self.sourceDocumentVisibleToIdentity(table, req.key, caller)) return error.NotFound;
         const context_host = @import("context_host.zig");
+        const ctx_sources = @import("antfly_local_sources").storage_db_enrichment_context_sources;
         const tables = try self.contextTablesAlloc(a);
         const source = context_host.findByName(tables, table) orelse return error.TableNotFound;
         const input_identity = try context_host.identityAlloc(a, source.table_id);
-        const dependents = try context_host.dependentTablesAlloc(a, tables, .{ .collect_fn = collectContextEnrichments }, table);
-        const public_names = try self.publicTableNamesAlloc(a, request, dependents);
+        const public_names = try self.publicTableNamesAlloc(a, request, tables);
+        // Breadth-first over (table, key, artifact): the input row first,
+        // then (transitively) each dependent output, followed into the
+        // tables whose declarations read that output as `_artifacts.<name>`.
+        // Same-document chains are expanded by each group.
+        const Hop = struct { table: []const u8, key: []const u8, artifact: []const u8 };
+        const Node = struct { table: context_host.TableInfo, key: []const u8, artifact: ?[]const u8, depth: u32, via: []const Hop };
+        var queue = std.ArrayListUnmanaged(Node).empty;
+        try queue.append(a, .{ .table = source, .key = req.key, .artifact = null, .depth = 0, .via = &.{} });
+        var visited = std.StringHashMapUnmanaged(void).empty;
+        var configs = std.AutoHashMapUnmanaged(u64, []const db_mod.types.EnrichmentConfig).empty;
         var rows = std.ArrayListUnmanaged(std.json.Value).empty;
         var complete = true;
-        for (dependents, public_names) |dependent, public_name| {
-            self.authorizeTableReads(a, request, &.{dependent.name}) catch |err| switch (err) {
-                error.Forbidden => {
-                    complete = false;
-                    continue;
-                },
-                else => return err,
-            };
-            const own_identity = try context_host.identityAlloc(a, dependent.table_id);
-            var span = try table_catalog.routedSpanSnapshotUntil(a, self.catalogSource(), dependent.name, "", "", platform_time.monotonicNs() +| 5 * std.time.ns_per_s);
-            defer span.deinit(a);
-            for (span.group_ids) |group| {
-                if (rows.items.len >= req.limit) {
-                    complete = false;
-                    break;
-                }
-                const raw = self.contextGroupReadAlloc(a, group, dependent.name, .{ .op = "impact", .key = req.key, .input_table_id = input_identity, .own_table_id = own_identity, .revision = req.revision, .transitive = transitive, .max_depth = req.max_depth, .limit = req.limit - @as(u32, @intCast(rows.items.len)) }) catch |err| switch (err) {
-                    error.OutOfMemory => return err,
-                    else => {
+        var head: usize = 0;
+        walk: while (head < queue.items.len) : (head += 1) {
+            const node = queue.items[head];
+            const node_identity = try context_host.identityAlloc(a, node.table.table_id);
+            const dependents = try context_host.dependentTablesAlloc(a, tables, .{ .collect_fn = collectContextEnrichments }, node.table.name);
+            for (dependents) |dependent| {
+                self.authorizeTableReads(a, request, &.{dependent.name}) catch |err| switch (err) {
+                    error.Forbidden => {
                         complete = false;
                         continue;
                     },
+                    else => return err,
                 };
-                const page = try std.json.parseFromSliceLeaky(struct { rows: []std.json.Value, complete: bool }, a, raw, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
-                if (!page.complete) complete = false;
-                for (page.rows) |row| {
-                    var r = row;
-                    if (r == .object) try r.object.put(a, "table", .{ .string = public_name });
-                    try rows.append(a, r);
+                const public_name = for (tables, public_names) |t, n| {
+                    if (t.table_id == dependent.table_id) break n;
+                } else dependent.name;
+                const own_identity = try context_host.identityAlloc(a, dependent.table_id);
+                const dependent_configs = configs.get(dependent.table_id) orelse blk: {
+                    const parsed = try collectContextEnrichments(a, dependent.indexes_json);
+                    try configs.put(a, dependent.table_id, parsed);
+                    break :blk parsed;
+                };
+                var span = try table_catalog.routedSpanSnapshotUntil(a, self.catalogSource(), dependent.name, "", "", platform_time.monotonicNs() +| 5 * std.time.ns_per_s);
+                defer span.deinit(a);
+                for (span.group_ids) |group| {
+                    if (rows.items.len >= req.limit) {
+                        complete = false;
+                        break :walk;
+                    }
+                    const raw = self.contextGroupReadAlloc(a, group, dependent.name, .{ .op = "impact", .key = node.key, .input_table_id = node_identity, .own_table_id = own_identity, .revision = if (node.depth == 0) req.revision else "", .transitive = transitive, .max_depth = req.max_depth, .limit = req.limit - @as(u32, @intCast(rows.items.len)) }) catch |err| switch (err) {
+                        error.OutOfMemory => return err,
+                        else => {
+                            complete = false;
+                            continue;
+                        },
+                    };
+                    const page = try std.json.parseFromSliceLeaky(struct { rows: []std.json.Value, complete: bool }, a, raw, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+                    if (!page.complete) complete = false;
+                    for (page.rows) |row| {
+                        if (row != .object) continue;
+                        const row_key = (row.object.get("key") orelse continue);
+                        const row_artifact = (row.object.get("artifact") orelse continue);
+                        if (row_key != .string or row_artifact != .string) continue;
+                        // Past the first hop, only consumers whose declaration
+                        // reads the regenerated artifact are affected by it.
+                        if (node.artifact) |upstream| {
+                            const first = if (row.object.get("path")) |p| (if (p == .array and p.array.items.len != 0 and p.array.items[0] == .string) p.array.items[0].string else row_artifact.string) else row_artifact.string;
+                            const reads = for (dependent_configs) |cfg| {
+                                if (std.mem.eql(u8, cfg.name, first)) break ctx_sources.declarationReadsArtifact(a, cfg.context_sources_json, own_identity, node_identity, upstream);
+                            } else false;
+                            if (!reads) continue;
+                        }
+                        if (!try self.sourceDocumentVisibleToIdentity(dependent.name, row_key.string, caller)) {
+                            complete = false;
+                            continue;
+                        }
+                        const id = try std.fmt.allocPrint(a, "{d}\x00{s}\x00{s}", .{ dependent.table_id, row_key.string, row_artifact.string });
+                        if ((try visited.getOrPut(a, id)).found_existing) continue;
+                        var r = row;
+                        try r.object.put(a, "table", .{ .string = public_name });
+                        if (node.via.len != 0) {
+                            var via = std.json.Array.init(a);
+                            for (node.via) |hop| {
+                                var o: std.json.ObjectMap = .empty;
+                                try o.put(a, "table", .{ .string = hop.table });
+                                try o.put(a, "key", .{ .string = hop.key });
+                                try o.put(a, "artifact", .{ .string = hop.artifact });
+                                try via.append(.{ .object = o });
+                            }
+                            try r.object.put(a, "via", .{ .array = via });
+                        }
+                        try rows.append(a, r);
+                        if (!transitive) continue;
+                        if (node.depth + 1 >= req.max_depth) {
+                            // Cut by depth: incomplete only if some table
+                            // could still consume this output.
+                            if ((try context_host.dependentTablesAlloc(a, tables, .{ .collect_fn = collectContextEnrichments }, dependent.name)).len != 0) complete = false;
+                            continue;
+                        }
+                        const via = try std.mem.concat(a, Hop, &.{ node.via, &.{.{ .table = public_name, .key = row_key.string, .artifact = row_artifact.string }} });
+                        try queue.append(a, .{ .table = dependent, .key = row_key.string, .artifact = row_artifact.string, .depth = node.depth + 1, .via = via });
+                    }
                 }
             }
         }

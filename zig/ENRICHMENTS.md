@@ -1208,8 +1208,11 @@ Distributed tables expose the dependency state over HTTP:
   independently).
 - `POST /tables/{t}/dependencies/impact` returns reverse lineage for one
   source key from every group of every table that reads `t` (rows from
-  tables the caller may not read are omitted and mark the answer
-  incomplete), optionally with same-document downstream candidates.
+  tables the caller may not read, or rows its row policies hide, are omitted
+  and mark the answer incomplete). `traversal: transitive` follows every
+  dependent output onward, through same-document consumers and into rows of
+  any table whose declarations read it as `_artifacts.<name>` (reported with
+  `via`), up to `max_depth` hops.
 
 ### Execution identity
 
@@ -1255,9 +1258,6 @@ read, like a definer-rights view.
 - Row filters are captured at declaration; revocation applies on
   re-declaration, not automatically. There are no field-level policies to
   apply.
-- Impact traversal follows same-document chains; it does not walk into
-  other tables' consumers of a dependent artifact (cross-table invalidation
-  itself does propagate through `_artifacts` sources).
 - TTL: expiry notifies when TTL cleanup deletes the row, not at the
   expiry instant; until then an artifact built from the expired row stays
   `current`.

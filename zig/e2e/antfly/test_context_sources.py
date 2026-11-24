@@ -283,6 +283,48 @@ def test_cross_table_context_sources_follow_source_changes(
         for row in impact["dependents"]
     ), (people, [(r.get("table"), r.get("table_id"), r["key"], r["artifact"]) for r in impact["dependents"]])
     assert not any(row["key"] == "person:2" for row in impact["dependents"]), impact
+
+    # Transitive impact crosses tables: a third table reads the dependents'
+    # generated briefs, so its digest is a (via) dependent of the org row.
+    teams = f"ctx_teams_{suffix}"
+    stateful_api.create_table(teams, num_shards=NUM_SHARDS)
+    stateful_api.put(
+        f"/tables/{teams}/artifacts/digest/enrichment",
+        _enrichment(
+            echo_generator,
+            {
+                "members": {
+                    "query": {
+                        "table": people,
+                        "filter_query": {"field": "org", "term": {"$source": "/org"}},
+                    },
+                    "fields": ["_artifacts.brief"],
+                    "max_documents": 10,
+                }
+            },
+        ),
+    )
+    stateful_api.batch_write(
+        teams, inserts={"team:acme": {"org": "acme", "body": "team acme"}}, sync_level="enrichments"
+    )
+    assert wait_until(
+        _statement_containing(stateful_api, teams, "team:acme", "digest", "team acme"),
+        timeout_s=60,
+        interval_s=0.25,
+    ) is not None, _statement(stateful_api, teams, "team:acme", "digest")
+    transitive = stateful_api.post(
+        f"/tables/{orgs}/dependencies/impact",
+        {"key": "org:acme", "traversal": "transitive", "max_depth": 4, "limit": 50},
+    )
+    downstream = [
+        row for row in transitive["dependents"] if row["table"] == teams and row["key"] == "team:acme"
+    ]
+    assert downstream, transitive
+    assert downstream[0]["via"][0] == {"table": people, "key": "person:1", "artifact": "brief"}, downstream
+    direct_only = stateful_api.post(
+        f"/tables/{orgs}/dependencies/impact", {"key": "org:acme", "limit": 50}
+    )
+    assert not any(row["table"] == teams for row in direct_only["dependents"]), direct_only
     bad = stateful_api._request(
         "POST", f"/tables/{orgs}/dependencies/impact", {"key": "org:acme", "traversal": "sideways"}
     )

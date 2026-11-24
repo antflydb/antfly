@@ -3224,6 +3224,8 @@ const GraphReplacementProgress = struct { job: index_manager_mod.GraphReplacemen
 
 var next_query_schema_identity: std.atomic.Value(u64) = .init(1);
 
+const RetiredContextReader = struct { reader: *@import("context_source_db_reader.zig").RemoteReader, table_id: []u8 };
+
 pub const DB = struct {
     /// Content-only proof for this physical owner and immutable catalog cut.
     /// Native heads, grants and live logical bindings are validated separately.
@@ -3326,6 +3328,10 @@ pub const DB = struct {
     context_remote_reader: ?*@import("context_source_db_reader.zig").RemoteReader = null,
     context_topology_source: ?@import("context_host_json.zig").Topology = null,
     context_remote_table_id: ?[]u8 = null,
+    /// Readers superseded by a re-install. Enrichment workers started before
+    /// it may still hold `reader()` of one (its own_table_id included), so
+    /// they stay valid until close; re-installs are rare.
+    context_retired_readers: std.ArrayListUnmanaged(RetiredContextReader) = .empty,
     enrichment_owner: EnrichmentOwner = .{},
     query_recovery_owner: DetachedEnrichmentRuntime = .{},
     // Keep one reconstruction service owner when live producers are removed.
@@ -5415,6 +5421,13 @@ pub const DB = struct {
         self.context_remote_reader = null;
         if (self.context_remote_table_id) |id| self.alloc.free(id);
         self.context_remote_table_id = null;
+        for (self.context_retired_readers.items) |retired| {
+            retired.reader.deinit();
+            self.alloc.destroy(retired.reader);
+            self.alloc.free(retired.table_id);
+        }
+        self.context_retired_readers.deinit(self.alloc);
+        self.context_retired_readers = .empty;
         self.restore_decoder_cache.deinit(self.backend_runtime.filesystemIo() orelse std.Options.debug_io);
         self.rewrite_program_cache.deinit(self.backend_runtime.io() orelse std.Options.debug_io);
         self.rewrite_tail_cache.deinit(self.backend_runtime.io() orelse std.Options.debug_io);
@@ -10691,18 +10704,32 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("installContextHost", .{ self, config });
         var reader: ?@import("enrichment/context_resolution.zig").Reader = null;
         if (config.read_source) |source| {
-            const remote = if (self.context_remote_reader) |existing| blk: {
-                existing.deinit();
-                break :blk existing;
-            } else blk: {
-                const created = try self.alloc.create(@import("context_source_db_reader.zig").RemoteReader);
-                self.context_remote_reader = created;
-                break :blk created;
-            };
-            if (self.context_remote_table_id) |old| self.alloc.free(old);
-            self.context_remote_table_id = try self.alloc.dupe(u8, config.table_id);
-            remote.* = .{ .source = source, .own_table_id = self.context_remote_table_id.?, .cursor_alloc = self.alloc };
-            reader = remote.reader();
+            const Remote = @import("context_source_db_reader.zig").RemoteReader;
+            const unchanged = if (self.context_remote_reader) |existing|
+                existing.source.ptr == source.ptr and std.mem.eql(u8, existing.own_table_id, config.table_id)
+            else
+                false;
+            if (unchanged) {
+                // Same source and identity: keep the installed reader (and
+                // its scan continuations) rather than rebuilding it under
+                // workers that hold it.
+                reader = self.context_remote_reader.?.reader();
+            } else {
+                // Never mutate or free an installed reader in place: build a
+                // new one and retire the old until close. Every allocation
+                // happens before anything is swapped in.
+                const own_table_id = try self.alloc.dupe(u8, config.table_id);
+                errdefer self.alloc.free(own_table_id);
+                const remote = try self.alloc.create(Remote);
+                errdefer self.alloc.destroy(remote);
+                remote.* = .{ .source = source, .own_table_id = own_table_id, .cursor_alloc = self.alloc };
+                if (self.context_remote_reader) |old_reader| {
+                    try self.context_retired_readers.append(self.alloc, .{ .reader = old_reader, .table_id = self.context_remote_table_id.? });
+                }
+                self.context_remote_reader = remote;
+                self.context_remote_table_id = own_table_id;
+                reader = remote.reader();
+            }
         }
         if (config.replication != null) {
             // Topology is replicated state: restore what was committed and
@@ -10728,7 +10755,16 @@ pub const DB = struct {
         };
     }
 
-    const ContextTopology = struct { table_id: []const u8, inbound: []const @import("enrichment/context_notices.zig").DeclaredConfig };
+    pub const ContextTopology = struct { table_id: []const u8, inbound: []const @import("enrichment/context_notices.zig").DeclaredConfig };
+
+    /// The persisted inbound dependents (null before any install). Hosts
+    /// recomputing topology carry entries forward for dependents they could
+    /// not read this time rather than dropping their subscriptions.
+    pub fn contextPersistedInboundAlloc(self: *DB, alloc: Allocator) !?std.json.Parsed(ContextTopology) {
+        const raw = (try self.core.getStoreValue(alloc, context_dependency_host_key)) orelse return null;
+        defer alloc.free(raw);
+        return std.json.parseFromSlice(ContextTopology, alloc, raw, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch null;
+    }
 
     /// Install the committed topology (identity and inbound dependents) in
     /// memory. Called on host install and whenever a replicated topology
@@ -10858,13 +10894,17 @@ pub const DB = struct {
             collect.keys.deinit(self.alloc);
             collect.values.deinit(self.alloc);
         }
+        // Clear the hint before scanning: an inbox append applied during the
+        // scan sets it again instead of being cleared after the fact.
+        self.context_inbox_pending.store(false, .release);
+        errdefer self.context_inbox_pending.store(true, .release);
         {
             var reader = try context_dependency_db.StoreReader.init(self.core.store);
             defer reader.deinit();
             const prefix = context_dependency_store.familyPrefix(command_mod.inbox_family);
             try reader.reader().scanPrefix(self.alloc, &prefix, .{ .ptr = &collect, .visit_fn = Collect.visit });
         }
-        if (collect.keys.items.len < collect.limit) self.context_inbox_pending.store(false, .release);
+        if (collect.keys.items.len >= collect.limit) self.context_inbox_pending.store(true, .release);
         if (collect.keys.items.len == 0) return 0;
         const range = self.core.byteRange();
         var summary = try context_dependency_db.applyNoticesConsuming(self.alloc, self.core.store, self.core.index_manager, @ptrCast(collect.values.items), @ptrCast(collect.keys.items), contextNowMs(), range.start, range.end);

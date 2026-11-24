@@ -171,6 +171,10 @@ pub fn deinitHosts(handle: *h.Handle) void {
 pub fn sync(handle: *h.Handle) !void {
     const root = rootOf(handle);
     const alloc = root.alloc;
+    // Inbound dependents are recomputed from every table's catalog and
+    // persisted on each source; a namespace left unopened here would drop
+    // its declarations from every source's stored topology.
+    try tables.ensureDiscovered(root);
     var dbs = std.ArrayListUnmanaged(*db_mod.DB).empty;
     defer dbs.deinit(alloc);
     try dbs.append(alloc, &root.db);
@@ -189,6 +193,14 @@ pub fn sync(handle: *h.Handle) !void {
             try declared.append(a, .{ .dependent_table_id = identity, .artifact = try a.dupe(u8, entry.name), .stored_json = try a.dupe(u8, entry.context_sources_json) });
         }
     }
+    // Tables that failed to open this time: their declarations are unknown,
+    // not removed, so each source keeps what it last persisted for them.
+    var unavailable = std.StringHashMapUnmanaged(void).empty;
+    var failed = root.embedded_table_errors.keyIterator();
+    while (failed.next()) |name| {
+        const id = root.embedded_table_records.get(name.*) orelse continue;
+        try unavailable.put(a, try identityAlloc(a, id), {});
+    }
     for (dbs.items) |db| {
         const identity = (try identityForDb(a, root, db)) orelse continue;
         var inbound = std.ArrayListUnmanaged(notices.DeclaredConfig).empty;
@@ -201,6 +213,9 @@ pub fn sync(handle: *h.Handle) !void {
                 break;
             };
         }
+        if (unavailable.count() != 0) if (try db.contextPersistedInboundAlloc(a)) |persisted| {
+            for (persisted.value.inbound) |d| if (unavailable.contains(d.dependent_table_id)) try inbound.append(a, d);
+        };
         const reader = try registryFor(root, db, identity);
         try db.setContextDependencyHost(identity, inbound.items, reader, .{ .ptr = root, .deliver = deliver });
     }
@@ -343,23 +358,59 @@ pub fn impactJsonAlloc(alloc: std.mem.Allocator, handle: *h.Handle, request_json
     try dbs.append(alloc, &root.db);
     var it = root.embedded_tables.valueIterator();
     while (it.next()) |table| try dbs.append(alloc, &table.*.db);
-    for (dbs.items) |db| {
-        const identity = (try identityForDb(alloc, root, db)) orelse continue;
-        defer alloc.free(identity);
-        // Own-table inputs are recorded with this table's identity.
-        var page = try db.contextImpact(alloc, input_identity, req.key, revision, "", req.limit);
-        defer page.deinit(alloc);
-        if (page.resume_after != null) complete = false;
-        for (page.rows.items) |row| {
-            if (emitted >= req.limit) {
-                complete = false;
-                break;
+    // Breadth-first over (table, key, artifact): the input row, then
+    // (transitively) every dependent output, followed through same-document
+    // consumers and into tables whose declarations read it as
+    // `_artifacts.<name>`.
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Node = struct { identity: []const u8, key: []const u8, artifact: ?[]const u8, depth: u32 };
+    var queue = std.ArrayListUnmanaged(Node).empty;
+    try queue.append(a, .{ .identity = input_identity, .key = req.key, .artifact = null, .depth = 0 });
+    var visited = std.StringHashMapUnmanaged(void).empty;
+    var head: usize = 0;
+    walk: while (head < queue.items.len) : (head += 1) {
+        const node = queue.items[head];
+        for (dbs.items) |db| {
+            const identity = (try identityForDb(a, root, db)) orelse continue;
+            // Own-table inputs are recorded with this table's identity.
+            var page = try db.contextImpact(alloc, node.identity, node.key, if (node.depth == 0) revision else null, "", req.limit);
+            defer page.deinit(alloc);
+            if (page.resume_after != null) complete = false;
+            for (page.rows.items) |row| {
+                if (emitted >= req.limit) {
+                    complete = false;
+                    break :walk;
+                }
+                // Past the first hop, only consumers whose declaration reads
+                // the regenerated artifact are affected by it.
+                if (node.artifact) |upstream| {
+                    const entry = db.core.index_manager.getEnrichment(.asset, row.artifact) orelse continue;
+                    if (!ctx.declarationReadsArtifact(a, entry.context_sources_json, identity, node.identity, upstream)) continue;
+                }
+                const id = try std.fmt.allocPrint(a, "{s}\x00{s}\x00{s}", .{ identity, row.doc_key, row.artifact });
+                if ((try visited.getOrPut(a, id)).found_existing) continue;
+                try appendImpactRow(alloc, &out, &emitted, identity, row.doc_key, row.artifact, row.version, row.current_version, @tagName(row.freshness), &.{row.artifact});
+                if (!transitive) continue;
+                if (node.depth + 1 >= req.max_depth) {
+                    complete = false;
+                    continue;
+                }
+                const doc_key = try a.dupe(u8, row.doc_key);
+                try queue.append(a, .{ .identity = identity, .key = doc_key, .artifact = try a.dupe(u8, row.artifact), .depth = node.depth + 1 });
+                // Same-document downstream artifacts consume this output too.
+                const budget = if (emitted >= req.limit) 0 else req.limit - emitted;
+                const downstream = try context_api.downstreamImpactPaths(a, db.core.index_manager.enrichments.items, try a.dupe(u8, row.artifact), req.max_depth, budget);
+                if (!downstream.complete) complete = false;
+                for (downstream.paths) |path| {
+                    const leaf = path[path.len - 1];
+                    const leaf_id = try std.fmt.allocPrint(a, "{s}\x00{s}\x00{s}", .{ identity, doc_key, leaf });
+                    if ((try visited.getOrPut(a, leaf_id)).found_existing) continue;
+                    try appendImpactRow(alloc, &out, &emitted, identity, doc_key, leaf, 0, true, "candidate", path);
+                    try queue.append(a, .{ .identity = identity, .key = doc_key, .artifact = leaf, .depth = node.depth + 1 });
+                }
             }
-            try appendImpactRow(alloc, &out, &emitted, identity, row.doc_key, row.artifact, row.version, row.current_version, @tagName(row.freshness), &.{row.artifact});
-            if (!transitive) continue;
-            // Same-document downstream artifacts consume this output. Every
-            // consumer is a branch: walk them all breadth-first.
-            if (!try context_api.appendDownstreamImpact(alloc, &out, &emitted, db.core.index_manager.enrichments.items, identity, row.doc_key, row.artifact, req.max_depth, req.limit)) complete = false;
         }
     }
     try out.print(alloc, "],\"complete\":{},\"traversal\":", .{complete});

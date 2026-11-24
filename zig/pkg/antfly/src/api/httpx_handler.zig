@@ -2310,6 +2310,14 @@ pub const AntflyApiHandler = struct {
         });
     }
 
+    /// Read-only requests: the caller's table read authority and admitted
+    /// row-policy credential, without write authority.
+    fn tableReadContext(ctx: *httpx.Context, identity: *const ?AuthenticatedIdentity) operation_contract.RequestContext {
+        var request = tableMutationContext(ctx, identity);
+        request.table_write_authorization = null;
+        return request;
+    }
+
     fn tableMutationContext(ctx: *httpx.Context, identity: *const ?AuthenticatedIdentity) operation_contract.RequestContext {
         var request = operationContext(ctx, identity.*);
         request.row_policy_credential = identity;
@@ -10142,7 +10150,7 @@ pub const AntflyApiHandler = struct {
         // Dependency state names the source documents an output consumed:
         // only callers who may see the source document itself get it.
         if (!(try self.api_server.sourceDocumentVisibleToIdentity(decoded_table_name, decoded_key, authenticated_identity))) return textResponse(ctx, 404, "not found");
-        var resp = self.api_server.handlePublicArtifactDependencies(alloc, operationContext(ctx, authenticated_identity), decoded_table_name, decoded_key, decoded_artifact_name, require_current, wait_timeout_ms) catch |err| return dependencyFailure(ctx, err);
+        var resp = self.api_server.handlePublicArtifactDependencies(alloc, tableReadContext(ctx, &authenticated_identity), decoded_table_name, decoded_key, decoded_artifact_name, require_current, wait_timeout_ms) catch |err| return dependencyFailure(ctx, err);
         return respondOwnedApiResponse(ctx, &resp);
     }
 
@@ -10154,7 +10162,7 @@ pub const AntflyApiHandler = struct {
         const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
         defer alloc.free(decoded_table_name);
         const body_data = (try ctx.body()) orelse return textResponse(ctx, 400, "request body required");
-        var resp = self.api_server.handlePublicDependencyImpact(alloc, operationContext(ctx, authenticated_identity), decoded_table_name, body_data) catch |err| return dependencyFailure(ctx, err);
+        var resp = self.api_server.handlePublicDependencyImpact(alloc, tableReadContext(ctx, &authenticated_identity), decoded_table_name, body_data) catch |err| return dependencyFailure(ctx, err);
         return respondOwnedApiResponse(ctx, &resp);
     }
 
@@ -11006,7 +11014,7 @@ pub const AntflyApiHandler = struct {
         defer alloc.free(decoded_artifact_name);
         if (try self.privacyCatalogMutationBlocked(ctx, decoded_table_name, decoded_artifact_name)) |response| return response;
         const body_data = (try ctx.body()) orelse "";
-        var resp = try public_table_http.handlePutArtifactEnrichment(alloc, decoded_table_name, decoded_artifact_name, body_data, self.api_server.tableApi(operationContext(ctx, authenticated_identity)));
+        var resp = try public_table_http.handlePutArtifactEnrichment(alloc, decoded_table_name, decoded_artifact_name, body_data, self.api_server.tableApi(tableMutationContext(ctx, &authenticated_identity)));
         return respondOwnedApiResponse(ctx, &resp);
     }
 

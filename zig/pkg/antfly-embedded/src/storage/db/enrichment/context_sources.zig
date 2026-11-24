@@ -4613,6 +4613,37 @@ pub fn acyclicDeclarationsAlloc(alloc: Allocator, declared: []const DeclaredEnri
     return out.toOwnedSlice(alloc);
 }
 
+/// Whether a stored declaration (of an enrichment on `consumer_identity`)
+/// reads `_artifacts.<artifact>` of rows in `input_identity`: the edge a
+/// transitive impact walk follows from a regenerated artifact into another
+/// table's consumers. Own-table sources (empty identity) read the consumer's
+/// own table.
+pub fn declarationReadsArtifact(alloc: Allocator, stored_json: []const u8, consumer_identity: []const u8, input_identity: []const u8, artifact: []const u8) bool {
+    if (stored_json.len == 0) return false;
+    var config = parseStoredJson(alloc, stored_json) catch return false;
+    defer config.deinit();
+    for (config.sources) |source| {
+        const target = if (source.table_id.len == 0) consumer_identity else source.table_id;
+        if (!std.mem.eql(u8, target, input_identity)) continue;
+        for (source.artifact_names) |name| if (std.mem.eql(u8, name, artifact)) return true;
+    }
+    return false;
+}
+
+test "impact follows declarations that read another table's artifact" {
+    const alloc = testing.allocator;
+    var config = try parsePublicJson(alloc,
+        \\{"briefs":{"query":{"filter_query":{"field":"org","term":{"$source":"/org"}}},"fields":["_artifacts.brief"]}}
+    , "");
+    defer config.deinit();
+    @constCast(&config.sources[0]).table_id = "srv:2";
+    const stored = try config.canonicalJsonAlloc(alloc);
+    defer alloc.free(stored);
+    try testing.expect(declarationReadsArtifact(alloc, stored, "srv:9", "srv:2", "brief"));
+    try testing.expect(!declarationReadsArtifact(alloc, stored, "srv:9", "srv:2", "summary"));
+    try testing.expect(!declarationReadsArtifact(alloc, stored, "srv:9", "srv:3", "brief"));
+}
+
 /// Inbound declarations of `table_id`: other tables' enrichments whose live
 /// context sources read it (the source-side notice specs).
 pub fn inboundDeclarationsAlloc(alloc: Allocator, declared: []const DeclaredEnrichment, table_id: []const u8) ![]DeclaredEnrichment {
