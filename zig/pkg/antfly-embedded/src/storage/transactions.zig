@@ -5784,6 +5784,11 @@ pub fn requireExternalCompletionRelease(raw: []const u8, owner: ExternalDecision
     try requireCompletionResolvedRecord(raw, commit_version);
 }
 
+pub fn ordinaryCompletionOwnsCustody(raw: []const u8) !bool {
+    const record = try decodeRecord(raw);
+    return record.ordinary_producer and record.external_decision_owner == null;
+}
+
 pub fn requireOrdinaryCompletionRelease(a: Allocator, txn: anytype, id: TxnId, raw: []const u8, commit_version: u64, coordinator: bool) !void {
     const record = try decodeRecord(raw);
     if (record.external_decision_owner != null or !record.ordinary_producer or record.source_scope != null or
@@ -6742,6 +6747,7 @@ fn testCompletionCollection(comptime external_decision: bool) !void {
     {
         var txn = try store.beginWriteTxn();
         errdefer txn.abort();
+        try std.testing.expectEqual(!external_decision, try history.hasUnreleasedOrdinaryCompletions(a, &txn));
         if (external_decision) {
             var wrong = custody;
             wrong.decision_owner.admission_digest[0] ^= 1;
@@ -6769,6 +6775,7 @@ fn testCompletionCollection(comptime external_decision: bool) !void {
             try history.releaseOrdinaryCompletion(a, &txn, namespace, owner, id, ordinary);
             try history.releaseOrdinaryCompletion(a, &txn, namespace, owner, id, ordinary);
         }
+        try std.testing.expect(!try history.hasUnreleasedOrdinaryCompletions(a, &txn));
         try std.testing.expect(try history.reclaim(&txn, namespace));
         try std.testing.expect((try history.load(&txn)).?.retained_bytes > published.retained_bytes);
         try txn.commit();

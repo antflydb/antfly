@@ -2767,6 +2767,16 @@ fn batchMutatesDocuments(req: antfly.db.types.BatchRequest) bool {
         req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.transaction != null;
 }
 
+fn isCompletionCollection(req: antfly.db.types.BatchRequest) bool {
+    const transaction = req.transaction orelse return false;
+    if (transaction != .publish_completion) return false;
+    const publication = transaction.publish_completion;
+    if (publication.certificate.len != 0 or req.row_policy_install_bundle.len != 0 or
+        (publication.release != null) == (publication.ordinary_release != null)) return false;
+    @import("antfly_local_sources").api_internal_batch.validateCompletionControlRequest(req) catch return false;
+    return true;
+}
+
 fn onlineMergeMaintenanceScope(req: antfly.db.types.BatchRequest) ?@import("antfly_local_sources").storage_db_online_source_contract.Scope {
     const command = req.online_source orelse return null;
     if (command != .release and command != .reclaim) return null;
@@ -17935,7 +17945,7 @@ pub const DataServer = struct {
                     }
                     try ensureDataRaftBatchRouteActive(route);
                 }
-                if (batchMutatesDocuments(req)) {
+                if (batchMutatesDocuments(req) and !isCompletionCollection(req)) {
                     // No proposal has been attempted yet. A transition store
                     // that is not ready is retryable unavailability, not an
                     // ambiguous write outcome: returning the latter would
@@ -22601,6 +22611,7 @@ pub const DataServer = struct {
             .transition = transition,
             .receiver_group = receiver,
             .root_generation = qualified.owner.root_generation,
+            .require_completion_drain = true,
         }, .{})) orelse return true;
         return cut.retirementReady();
     }
@@ -52678,6 +52689,90 @@ fn consumerTests() type {
             };
             try ClockHarness.run(a, server, &owner, route.fence().?, ref);
             try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_exact_prepare_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+            const OrdinaryRetention = struct {
+                noinline fn run(allocator: std.mem.Allocator, node: *DataServer, captured: antfly.metadata_api.CatalogRouteFence, original_owner: @import("antfly_local_sources").storage_transaction_completion.RoutedOwner) !void {
+                    const txn = @import("../api/distributed_txn.zig");
+                    const completion = @import("antfly_local_sources").storage_transaction_completion;
+                    const ordinary_txn_id: [16]u8 = "ordinary-release".*;
+                    var ordinary_worker = txn.LocalTableWriteParticipantWorker.init(node.write_source.source());
+                    const ordinary_recovery = node.completionRecovery();
+                    const commit_outcome = try txn.executeMultiTableCommitWithOptions(allocator, node.write_source.catalog, ordinary_worker.worker(), ordinary_txn_id, 3000, 3001, &.{.{
+                        .source_producer = .ordinary,
+                        .table_name = "docs",
+                        .writes = &.{.{ .key = "ordinary-retention", .value = "{\"v\":9}" }},
+                    }}, .write, null, .{ .completion = .{ .owners = node.historyOwnerPort(), .recovery = ordinary_recovery } });
+                    try std.testing.expect(commit_outcome == .committed);
+                    try std.testing.expect(!commit_outcome.committed.propagation_pending);
+                    const decision_request: @import("../api/history_decision_operations.zig").Request = .{
+                        .version = 1,
+                        .owner = original_owner,
+                        .transaction_id = ordinary_txn_id,
+                        .minimum_applied_index = 1,
+                    };
+                    var observed_decision = try node.historyDecisionPort().read(allocator, captured, "docs", decision_request, .{});
+                    defer observed_decision.deinit();
+                    const terminal_decision = observed_decision.value.decision orelse return error.TestUnexpectedResult;
+                    try std.testing.expect(!terminal_decision.record.acknowledgments_pending and !terminal_decision.record.retain_terminal);
+                    const coordinator_member = try terminal_decision.admission.admission.coordinatorMember();
+                    const committed_manifest = try terminal_decision.committedManifest();
+                    const publication_request: @import("../api/history_publication_operations.zig").Request = .{
+                        .version = 2,
+                        .owner = original_owner,
+                        .transaction_id = ordinary_txn_id,
+                        .manifest_digest = committed_manifest.digest(),
+                        .commit_version = committed_manifest.commit_version,
+                        .minimum_applied_index = 1,
+                    };
+                    const retained_publication = try node.historyPublicationPort().read(allocator, captured, "docs", publication_request, .{});
+                    try std.testing.expect(!retained_publication.release.?.collection_staged);
+                    const release_binding: completion.OrdinaryRelease = .{
+                        .coordinator = original_owner,
+                        .admission_digest = terminal_decision.admission.digest,
+                        .certificate_digest = retained_publication.publication.?.digest,
+                        .commit_version = committed_manifest.commit_version,
+                    };
+                    var forged_release = release_binding;
+                    forged_release.certificate_digest[0] ^= 1;
+                    try std.testing.expectError(error.DecisionConflict, node.completionParticipantPort().releaseOrdinary(allocator, coordinator_member, captured, ordinary_txn_id, forged_release, .{}));
+                    const release_job: @import("antfly_local_sources").storage_history_recovery_wire.Request = .{
+                        .owner = original_owner,
+                        .transaction_id = ordinary_txn_id,
+                        .admission_digest = terminal_decision.admission.digest,
+                        .coordinator_locator = coordinator_member.locator,
+                        .resolution_timestamp_ns = 3002,
+                        .collect_ordinary = true,
+                    };
+                    try std.testing.expectEqual(.complete, try ordinary_recovery.runRetained(allocator, release_job, .{}));
+                    const collected_publication = try node.historyPublicationPort().read(allocator, captured, "docs", publication_request, .{});
+                    try std.testing.expect(collected_publication.release.?.collection_staged);
+                    try std.testing.expectEqualDeep(retained_publication.publication, collected_publication.publication);
+                }
+            };
+            try OrdinaryRetention.run(a, server, route.fence().?, producer_closure_owner orelse return error.TestExpectedProducerOwner);
+        }
+
+        test "data raft ordered history merge fences allow only isolated certificate collection" {
+            const owner: @import("antfly_local_sources").storage_transaction_completion.RoutedOwner = .{
+                .metadata_group_id = 1,
+                .metadata_incarnation = @splat('a'),
+                .namespace = @splat(2),
+                .table_binding = @splat(3),
+                .root_generation = 0,
+                .group_id = 4,
+                .topology_epoch = 5,
+            };
+            var request: antfly.db.types.BatchRequest = .{ .transaction = .{ .publish_completion = .{
+                .txn_id = @splat(6),
+                .completion_owner = owner,
+                .ordinary_release = .{ .coordinator = owner, .admission_digest = @splat(7), .certificate_digest = @splat(8), .commit_version = 9 },
+            } } };
+            try std.testing.expect(isCompletionCollection(request));
+            request.writes = &.{.{ .key = "row", .value = "{}" }};
+            try std.testing.expect(!isCompletionCollection(request));
+            request.writes = &.{};
+            request.transaction.?.publish_completion.ordinary_release = null;
+            request.transaction.?.publish_completion.certificate = "ordinary publication";
+            try std.testing.expect(!isCompletionCollection(request));
         }
 
         test "data raft ordered history table producer capability refuses lossy fallback" {

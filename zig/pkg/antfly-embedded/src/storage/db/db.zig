@@ -31446,6 +31446,9 @@ pub const DB = struct {
         cut.floor = state.floor();
         cut.active_consumers = active;
         cut.outstanding_reservations = state.reserved_bytes;
+        if (request.require_completion_drain)
+            cut.ordinary_completion_drained = cut.retirementReady() and
+                !try @import("../committed_history.zig").hasUnreleasedOrdinaryCompletions(self.alloc, &txn);
         if (!request.matches(cut)) return error.HistoryResynchronizationRequired;
         if (cut.index > applied.index or cut.term > applied.term) return error.HistoryCorrupt;
         return cut;

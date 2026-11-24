@@ -679,7 +679,7 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
 /// Version 77 carries physical history ownership in SQL completion calls.
 /// Version 78 retains the query policy guard through the owner callback.
 /// Version 79 separates frozen PREPARE time from external vote admission time.
-pub const descriptor_version: u32 = 80;
+pub const descriptor_version: u32 = 81;
 pub const Descriptor = extern struct {
     version: u32 = descriptor_version,
     table_layout: native.TypeContract,
