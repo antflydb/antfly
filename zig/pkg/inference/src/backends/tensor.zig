@@ -230,10 +230,10 @@ pub const Tensor = struct {
         };
     }
 
-    /// The caller owns the returned slice. Adopt compatible output storage.
+    /// The caller owns the returned slice. Adopt storage with no attached lifetime.
     pub fn takeOrCopyFloat32(self: *Tensor, allocator: std.mem.Allocator) ![]f32 {
         if (self.dtype != .f32 or self.data.len % @sizeOf(f32) != 0 or !self.isAlignedFor(f32)) return error.InvalidTensorData;
-        if (self.owns_data and self.data_alignment == std.mem.Alignment.of(f32) and
+        if (self.lifetime == null and self.owns_data and self.data_alignment == std.mem.Alignment.of(f32) and
             self.allocator.ptr == allocator.ptr and self.allocator.vtable == allocator.vtable)
         {
             self.owns_data = false;
@@ -548,4 +548,27 @@ test "dense F32 conversion respects logical prefixes and rejects truncated stora
         defer a.free(empty);
         try std.testing.expectEqual(@as(usize, 0), empty.len);
     }
+}
+
+test "float output keeps attached backing until tensor retirement" {
+    const Hook = struct {
+        fn release(raw: *anyopaque) void {
+            const count: *usize = @ptrCast(@alignCast(raw));
+            count.* += 1;
+        }
+    };
+    const a = std.testing.allocator;
+    var releases: usize = 0;
+    var tensor = try Tensor.initFloat32(a, "logits", &.{2}, &.{ 2, 4 });
+    tensor.lifetime = .{ .context = &releases, .release = Hook.release };
+    var retired = false;
+    defer if (!retired) tensor.deinit();
+    const values = try tensor.takeOrCopyFloat32(a);
+    defer a.free(values);
+    try std.testing.expectEqual(@as(usize, 0), releases);
+    try std.testing.expect(values.ptr != tensor.asFloat32().ptr);
+    tensor.deinit();
+    retired = true;
+    try std.testing.expectEqual(@as(usize, 1), releases);
+    try std.testing.expectEqualSlices(f32, &.{ 2, 4 }, values);
 }
