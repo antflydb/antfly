@@ -235,6 +235,23 @@ pub const Snapshot = struct {
     submission: ?@import("runtime_observation.zig").Counters = null,
     /// Process-wide interval/gauges, never per-request ownership or residency.
     process: ?Process = null,
+
+    pub fn recordKernelInterval(self: *Snapshot, scope: *const @import("runtime_observation.zig").KernelScope) void {
+        self.resolved_project_cuda_launches = scope.values;
+        self.resolved_project_metal_dispatches = if (comptime @import("build_options").enable_metal) scope.metal else null;
+        self.terminal_native_bodies = scope.native_bodies;
+        self.selected_native_dispatches = scope.native_dispatches;
+        self.joined_native_workers = scope.native_workers;
+        self.native_quant_worker_callbacks = scope.quant_worker_callbacks;
+        self.native_attention_programs = scope.attention_programs;
+        self.native_activation_programs = scope.activation_programs;
+        self.authored_native_programs = scope.native_programs;
+        self.authored_native_program_bank = scope.native_program_bank;
+        self.owned_native_fallbacks = scope.native_fallbacks;
+        self.metal_serial_workspace = scope.metal_serial_workspace;
+        self.cuda_audio_workspace = scope.cuda_audio_workspace;
+    }
+
     pub fn since(self: Snapshot, before: Snapshot) Snapshot {
         return .{
             .device_memory = self.device_memory,

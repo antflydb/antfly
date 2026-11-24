@@ -13804,13 +13804,22 @@ pub const StagedExecution = struct {
         // the provider and reopen it after regaining custody.
         const reopen_storage = try boundary.storage.park();
         try pause(self);
+        const observation = @import("runtime_observation.zig");
+        const observe_arena = observation.kernelObservationActive();
         var banks: [12]?Metal.FundedAudioBank = @splat(null);
         defer for (&banks) |*value| {
             if (value.*) |*bank| bank.discardAfterResume();
         };
         for (requests[0..count], banks[0..count]) |request, *value| {
             value.* = Metal.fundAudioScratch(cb, request, pin) catch |err| {
-                if (Metal.isAudioArenaPressure(err) or err == error.PreparedCacheGrowthChanged or err == error.MissingCacheRetirementDomain) continue;
+                if (Metal.isAudioArenaPressure(err)) {
+                    if (observe_arena) observation.metalSerialScheduleDecision(.arena_funding_pressure);
+                    continue;
+                }
+                if (err == error.PreparedCacheGrowthChanged or err == error.MissingCacheRetirementDomain) {
+                    if (observe_arena) observation.metalSerialScheduleDecision(.arena_funding_stale);
+                    continue;
+                }
                 cleanup(self);
                 return err;
             };
@@ -13836,10 +13845,16 @@ pub const StagedExecution = struct {
         try boundary.storage.resumeAfterPark(reopen_storage);
         for (requests[0..count], banks[0..count]) |request, *value| if (value.*) |*bank| {
             const published = Metal.publishAudioScratch(cb, request, bank) catch |err| {
-                if (Metal.isAudioArenaPressure(err)) continue;
+                if (Metal.isAudioArenaPressure(err)) {
+                    if (observe_arena) observation.metalSerialScheduleDecision(.arena_publication_declined);
+                    continue;
+                }
                 return err;
             };
-            if (published) value.* = null;
+            if (published) {
+                value.* = null;
+                if (observe_arena) observation.metalSerialScheduleDecision(.arena_published);
+            } else if (observe_arena) observation.metalSerialScheduleDecision(.arena_publication_declined);
         };
         return true;
     }
@@ -14860,8 +14875,13 @@ test "actual Metal stage admits two learned audio arenas in one quiescent pause"
     var peer_live = true;
     defer if (peer_live) peer.release();
     const cold_yields = timings.stage_yields;
+    var observation: @import("runtime_observation.zig").KernelScope = .{};
+    observation.begin();
+    defer _ = observation.finish();
     try std.testing.expect(try prepare(hook.ptr, cb, &keys, &.{input}, .{ .storage = &storage }));
     try std.testing.expectEqual(cold_yields + 1, timings.stage_yields);
+    try std.testing.expectEqual(@as(u64, keys.len), observation.metal_serial_workspace.?.decisions.arena_funding_pressure);
+    try std.testing.expectEqual(@as(u64, 0), observation.metal_serial_workspace.?.decisions.arena_published);
     try std.testing.expectEqual(@as(usize, 0), cache.backend_bytes);
     try std.testing.expectEqual(baseline.backend_weight_bytes, pin.controller().snapshot().backend_weight_bytes);
     for (compute.provider_impl.audio_schedules[0..keys.len]) |entry| {
@@ -14884,6 +14904,9 @@ test "actual Metal stage admits two learned audio arenas in one quiescent pause"
     try std.testing.expect(try prepare(hook.ptr, cb, &keys, &.{input}, .{ .storage = &storage }));
     try std.testing.expectEqual(yields + 1, timings.stage_yields);
     try std.testing.expectEqual(before_warm, pin.controller().snapshot().backend_weight_bytes);
+    var telemetry: ops.RuntimeTelemetry = .{};
+    telemetry.recordKernelInterval(&observation);
+    try std.testing.expectEqual(@as(u64, keys.len), telemetry.metal_serial_workspace.?.decisions.arena_published);
 }
 
 test "actual Metal staged fresh output keeps physical identity and quota through provider handoff" {

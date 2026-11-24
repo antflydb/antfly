@@ -298,6 +298,10 @@ pub const SerialWorkspaceObservation = struct {
         awaiting_preparation: u64 = 0,
         learning_backoff: u64 = 0,
         learning: u64 = 0,
+        arena_funding_pressure: u64 = 0,
+        arena_funding_stale: u64 = 0,
+        arena_publication_declined: u64 = 0,
+        arena_published: u64 = 0,
     };
 
     pub const Banks = struct {

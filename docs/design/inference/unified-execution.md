@@ -735,6 +735,8 @@ preparation API do not by themselves complete these remaining requirements:
   through readback and cleanup. Metal serial audio reports cold selection
   decisions even before a schedule has bank gauges. A ready schedule reports
   its eager/replay choice and latest planned, bound and charged bank sizes.
+  The managed stage also records funding pressure, stale funding requests,
+  declined publication and published arenas at the provider handoff.
   Reports retain the initiating failure
   and count the observed callbacks. Inter-phase work and GPU completion remain
   outside the sums. Registered owner intervals can include concurrent activity,
