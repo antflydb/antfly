@@ -1665,7 +1665,10 @@ pub const MetalPartitionExecutor = struct {
             };
             // These exact heuristics run ahead of the physical branch. Even
             // a supported descriptor cannot claim a producer they defer.
-            if (shouldDeferScaleMulForAdd(graph, id, reachable, last_use, null)) return .deferred_producer;
+            if (shouldDeferScaleMulForAdd(graph, id, reachable, last_use, null)) {
+                const pending = required_deferrals orelse return .deferred_producer;
+                try pending.append(.{ .producer = id, .consumer = last_use[id] });
+            }
             if (shouldDeferTransposeForLinearDot(graph, id, reachable, last_use)) {
                 const pending = required_deferrals orelse return .deferred_producer;
                 if (std.mem.indexOfScalar(NodeId, graph.outputs.items, id) != null) return .deferred_producer;

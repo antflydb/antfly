@@ -10002,6 +10002,11 @@ pub fn decoderRuntimeApplyMultiplyAdd(self: anytype, request: anytype, stats: an
     return null;
 }
 
+pub fn assignedScaledAddAvailable(self: anytype) bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    return antfly_metal_decoder_output_available(runtime, @backingInt(DecoderOutputKind.scaled_add_scale)) != 0;
+}
+
 pub fn assignedProductAddAvailable(self: anytype, pair: bool) bool {
     const runtime = self.raw_decode_runtime orelse return false;
     const kind: DecoderOutputKind = if (pair) .multiply_add2 else .multiply_add;

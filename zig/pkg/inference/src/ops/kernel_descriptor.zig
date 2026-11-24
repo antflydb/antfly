@@ -28,6 +28,30 @@ pub const NativeMatrixScratchGeometry = struct {
 
 pub const Unary = enum { negate, sqrt, rsqrt, exp, log, sin, cos, tanh, erf, abs, gelu, gelu_exact, relu, silu };
 pub const Binary = enum { add, subtract, multiply, divide };
+pub const F32ScaledAdd = struct {
+    product: ml.graph.NodeId,
+    source: ml.graph.NodeId,
+    addend: ml.graph.NodeId,
+    scale: f32,
+
+    pub fn match(graph: *const ml.graph.Graph, inputs: []const ml.graph.NodeId, shape: ml.graph.Shape, deferred: [2]bool) ?F32ScaledAdd {
+        if (inputs.len != 2 or shape.dtype != .f32) return null;
+        for (inputs, 0..) |id, index| {
+            if (!deferred[index] or deferred[1 - index] or id >= graph.nodeCount()) continue;
+            const mul = graph.node(id);
+            if ((mul.op != .mul and mul.op != .fused_elem_multiply) or mul.num_inputs != 2 or !mul.output_shape.eq(shape)) continue;
+            const addend = inputs[1 - index];
+            if (addend >= graph.nodeCount() or !graph.node(addend).output_shape.eq(shape)) continue;
+            for (mul.getInputs(), 0..) |scalar, scalar_index| {
+                const scale = scalarConstantF32(graph, scalar) orelse continue;
+                const source = mul.inputs[1 - scalar_index];
+                if (source < graph.nodeCount() and graph.node(source).output_shape.eq(shape)) return .{ .product = id, .source = source, .addend = addend, .scale = scale };
+            }
+        }
+        return null;
+    }
+};
+
 pub const F32Product = struct { node: ml.graph.NodeId, lhs_id: ml.graph.NodeId, rhs_id: ml.graph.NodeId };
 
 pub const F32ProductAdd = union(enum) {

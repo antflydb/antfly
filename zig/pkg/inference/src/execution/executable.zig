@@ -3502,21 +3502,22 @@ test "planned Metal elementwise product-add publishes into the assigned region o
     const dims = [_]i64{ 1, width };
     const shape = ml.graph.Shape.init(.f32, &dims);
     const names = [_][]const u8{ "a", "b", "c", "d" };
-    for ([_]enum { product_first, product_second, dual_product }{ .product_first, .product_second, .dual_product }) |order| {
+    for ([_]enum { product_first, product_second, dual_product, scale_first, scale_second }{ .product_first, .product_second, .dual_product, .scale_first, .scale_second }) |order| {
         const pair = order == .dual_product;
+        const scaled = order == .scale_first or order == .scale_second;
         var graph = ml.graph.Graph.init(a);
         defer graph.deinit();
         var builder = ml.graph.Builder.init(&graph);
-        const count: usize = if (pair) 4 else 3;
+        const count: usize = if (pair) 4 else if (scaled) 2 else 3;
         var nodes: [4]ml.graph.NodeId = undefined;
         var bindings: [4]@import("program.zig").Binding = undefined;
         for (names[0..count], nodes[0..count], bindings[0..count]) |name, *node, *binding| {
             node.* = try builder.parameter(name, shape);
             binding.* = .{ .name = name, .node_id = node.*, .kind = .input };
         }
-        const left = try builder.mul(nodes[0], nodes[1]);
-        const right = if (pair) try builder.mul(nodes[2], nodes[3]) else nodes[2];
-        const output_node = if (order == .product_second) try builder.add(right, left) else try builder.add(left, right);
+        const left = try builder.mul(nodes[0], if (scaled) try builder.scalarConst(.f32, 0.5) else nodes[1]);
+        const right = if (pair) try builder.mul(nodes[2], nodes[3]) else nodes[count - 1];
+        const output_node = if (order == .product_second or order == .scale_second) try builder.add(right, left) else try builder.add(left, right);
         try graph.markOutput(output_node);
         var program = try ModelProgram.init(a, &graph, bindings[0..count]);
         defer program.deinit();
@@ -3581,11 +3582,11 @@ test "planned Metal elementwise product-add publishes into the assigned region o
         defer next.deinit(&executable.runtime);
         const next_values = try cb.toFloat32(next.outputs[0], a);
         defer a.free(next_values);
-        for (next_values) |element| try std.testing.expectEqual(@as(f32, if (pair) 17 else 7), element);
+        for (next_values) |element| try std.testing.expectEqual(@as(f32, if (pair) 17 else if (scaled) 5.5 else 7), element);
         const output = try cb.toFloat32(result.outputs[0], a);
         defer a.free(output);
         try std.testing.expectEqual(@as(usize, width), output.len);
-        for (output) |element| try std.testing.expectEqual(@as(f32, if (pair) 14 else 5), element);
+        for (output) |element| try std.testing.expectEqual(@as(f32, if (pair) 14 else if (scaled) 2.5 else 5), element);
 
         var ordinary = try executable.run(a, .{ .host_inputs = inputs[0..count], .prepared_routes = compatibility, .output_placement = .producer, .activation_readbacks = .forbidden });
         defer ordinary.deinit(&executable.runtime);

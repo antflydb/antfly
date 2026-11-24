@@ -13104,6 +13104,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         operand_indices: [4]usize = undefined,
         operand_count: usize,
         elements: usize,
+        scale: ?f32 = null,
         gather: ?ops.kernel_descriptor.GatherAddBias = null,
         gather_inputs: [3]struct { shape: ml.graph.Shape, bytes: usize } = undefined,
 
@@ -13117,13 +13118,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const need = owned.requirements;
             if (@as(*anyopaque, @ptrCast(self.compute)) != ctx or owned.policy_key != 1 or
                 owned.entry_node != self.nodes[0] or owned.covered_nodes.ptr != &self.nodes or
-                owned.covered_nodes.len != self.operand_count - 1 or owned.input_nodes.ptr != &self.inputs or
+                owned.covered_nodes.len != (if (self.scale != null) @as(usize, 2) else self.operand_count - 1) or owned.input_nodes.ptr != &self.inputs or
                 owned.input_nodes.len != self.input_count or need.outputs.ptr != &self.outputs or need.outputs.len != 1 or
                 need.dispatch_workspace.byte_size != 0 or need.dispatch_workspace.host_byte_size != 0 or
                 need.preparation_workspace.byte_size != 0 or need.preparation_workspace.host_byte_size != 0 or
                 need.requires_execution_profile) return false;
             return if (self.gather != null)
                 metal_runtime.assignedGatherAddBiasAvailable(self.compute.provider_impl)
+            else if (self.scale != null)
+                metal_runtime.assignedScaledAddAvailable(self.compute.provider_impl)
             else
                 metal_runtime.assignedProductAddAvailable(self.compute.provider_impl, self.operand_count == 4);
         }
@@ -13157,7 +13160,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     return .declined_before_submission;
                 return .completed;
             }
-            var result = (if (self.operand_count == 4)
+            var result = (if (self.scale) |scale|
+                try metal_runtime.decoderRuntimeApplyScaledAddScale(self.compute.provider_impl, .{
+                    .lhs = inputs[0],
+                    .rhs = inputs[1],
+                    .dim = self.elements,
+                    .lhs_scale = scale,
+                    .output_scale = @as(f32, 1),
+                    .output = output,
+                }, &self.compute.timing_stats)
+            else if (self.operand_count == 4)
                 try metal_runtime.decoderRuntimeApplyMultiplyAdd2(self.compute.provider_impl, .{
                     .lhs0 = inputs[0],
                     .rhs0 = inputs[1],
@@ -13245,7 +13257,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (node.op == .gather and descriptor.GatherAddBias.match(graph, id) != null) break;
                 if ((node.op == .add or node.op == .fused_elem_add) and node.num_inputs == 2 and
                     (descriptor.sameShapeF32Product(graph, node.inputs[0], node.output_shape) != null or
-                        descriptor.sameShapeF32Product(graph, node.inputs[1], node.output_shape) != null)) break;
+                        descriptor.sameShapeF32Product(graph, node.inputs[1], node.output_shape) != null or
+                        descriptor.F32ScaledAdd.match(graph, node.getInputs(), node.output_shape, .{ true, false }) != null or
+                        descriptor.F32ScaledAdd.match(graph, node.getInputs(), node.output_shape, .{ false, true }) != null)) break;
             } else return;
             const last_use = try @import("../graph/interpreter.zig").computeLastUse(allocator, graph, request.reachable);
             defer allocator.free(last_use);
@@ -13266,17 +13280,23 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     allow.* = schedule.deferredAddConsumer(graph, input, request.reachable, last_use, uses) == add and
                         schedule.deferredProducerInputsLiveUntilConsumer(graph, input, add, last_use);
                 }
-                const recipe = descriptor.F32ProductAdd.match(graph, node.getInputs(), shape, deferred) orelse continue;
-                const both = recipe == .pair;
-                if (!metal_runtime.assignedProductAddAvailable(compute.provider_impl, both)) continue;
+                const scaled = descriptor.F32ScaledAdd.match(graph, node.getInputs(), shape, deferred);
+                const recipe = if (scaled == null) descriptor.F32ProductAdd.match(graph, node.getInputs(), shape, deferred) orelse continue else null;
+                const both = if (recipe) |value| value == .pair else false;
+                if (scaled != null) {
+                    if (!metal_runtime.assignedScaledAddAvailable(compute.provider_impl)) continue;
+                } else if (!metal_runtime.assignedProductAddAvailable(compute.provider_impl, both)) continue;
                 var operands: [4]NodeId = undefined;
                 var covered_nodes: [3]NodeId = .{ add, ml.graph.null_node, ml.graph.null_node };
-                if (both) {
-                    const pair = recipe.pair;
+                if (scaled) |scale| {
+                    operands[0..2].* = .{ scale.source, scale.addend };
+                    covered_nodes[1] = scale.product;
+                } else if (both) {
+                    const pair = recipe.?.pair;
                     operands = .{ pair[0].lhs_id, pair[0].rhs_id, pair[1].lhs_id, pair[1].rhs_id };
                     covered_nodes[1..3].* = .{ pair[0].node, pair[1].node };
                 } else {
-                    const single = recipe.single;
+                    const single = recipe.?.single;
                     operands[0..3].* = .{ single.product.lhs_id, single.product.rhs_id, single.addend };
                     covered_nodes[1] = single.product.node;
                 }
@@ -13285,7 +13305,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 const owner = try allocator.create(@This());
                 var published = false;
                 defer if (!published) allocator.destroy(owner);
-                owner.* = .{ .allocator = allocator, .compute = compute, .outputs = .{.{ .node = add, .logical = shape, .bytes = @as(usize, elements) * @sizeOf(f32) }}, .nodes = covered_nodes, .operand_count = if (both) 4 else 3, .elements = elements };
+                owner.* = .{ .allocator = allocator, .compute = compute, .outputs = .{.{ .node = add, .logical = shape, .bytes = @as(usize, elements) * @sizeOf(f32) }}, .nodes = covered_nodes, .operand_count = if (scaled != null) 2 else if (both) 4 else 3, .elements = elements, .scale = if (scaled) |value| value.scale else null };
                 for (operands[0..owner.operand_count], owner.operand_indices[0..owner.operand_count]) |input, *index| {
                     if (input >= request.node_facts.len or !owner.accepts(request.node_facts[input], request.implementation)) break;
                     const known = std.mem.indexOfScalar(NodeId, owner.inputs[0..owner.input_count], input);
