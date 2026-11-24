@@ -49540,6 +49540,12 @@ test "metal native planned compute scope records scopes and barriers" {
     try std.testing.expectError(FrameError.FrameNotActive, beginPlannedComputeScope(runtime, 4, .ffn));
     try beginFrame(runtime);
     try beginPlannedComputeScope(runtime, 4, .ffn);
+    try plannedComputeBarrier(runtime);
+    try cancelFrame(runtime);
+    try std.testing.expect(!hasActiveFrame(runtime));
+
+    try beginFrame(runtime);
+    try beginPlannedComputeScope(runtime, 4, .ffn);
     // Adjacent planned scopes coalesce into a single encoder so frame-level
     // command plans can move across logical regions without ending encoding.
     try beginPlannedComputeScope(runtime, 4, .ffn);

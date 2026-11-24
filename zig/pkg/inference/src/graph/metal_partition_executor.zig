@@ -2039,7 +2039,6 @@ pub const MetalPartitionExecutor = struct {
             try metal_compute_mod.MetalCompute.beginPlannedGraphScope(cb, .ffn)
         else
             metal_compute_mod.MetalCompute.PlannedGraphScope{};
-        errdefer metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope) catch {};
 
         // Coarse frame chunking: split the single frame every `chunk_ops`
         // executed nodes so dead/pooled device buffers release mid-step.
@@ -2705,7 +2704,7 @@ pub const MetalPartitionExecutor = struct {
                     donated,
                     effective_exec_ctx,
                 );
-                metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope) catch {};
+                try metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope);
                 planned_scope = metal_compute_mod.MetalCompute.PlannedGraphScope{};
                 try cb.decoderRuntimeSubmitAndWaitFrame();
                 frame_active = false;
@@ -2763,7 +2762,7 @@ pub const MetalPartitionExecutor = struct {
                         donated,
                         effective_exec_ctx,
                     );
-                    metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope) catch {};
+                    try metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope);
                     planned_scope = metal_compute_mod.MetalCompute.PlannedGraphScope{};
                     try cb.decoderRuntimeSubmitAndWaitFrame();
                     frame_active = false;
