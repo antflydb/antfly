@@ -457,11 +457,16 @@ pub const Session = struct {
                             // with a complete I picture and an empty prediction DPB.
                             if (independent and slice_type % 5 != 2) return error.UnsupportedDynamicGeometry;
                             if (self.epochs.items.len != 0) self.epochs.items[self.epochs.items.len - 1].end = i;
-                            // Grow amortized on normal clips. Under a strict admission
-                            // ceiling, retry with only the required epoch's storage.
-                            self.epochs.ensureUnusedCapacity(allocator, 1) catch {
-                                try self.epochs.ensureTotalCapacityPrecise(allocator, self.epochs.items.len + 1);
+                            // Retry amortized growth at the exact size when
+                            // a quota refused the larger reservation. Preserve
+                            // backing allocator failures for the caller.
+                            self.budget.denied = false;
+                            if (self.memory) |*memory| memory.denied = null;
+                            self.epochs.ensureUnusedCapacity(allocator, 1) catch |err| {
+                                if (!self.budget.denied and (self.memory == null or self.memory.?.denied == null)) return err;
                                 self.budget.denied = false;
+                                if (self.memory) |*memory| memory.denied = null;
+                                try self.epochs.ensureTotalCapacityPrecise(allocator, self.epochs.items.len + 1);
                             };
                             self.epochs.appendAssumeCapacity(.{ .start = if (self.active == null) 0 else i, .end = self.reader.packets.len, .entry = index, .independent = independent, .max_refs = self.entries.items[index].config.max_refs });
                         }

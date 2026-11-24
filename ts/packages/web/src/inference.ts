@@ -452,10 +452,16 @@ export class Inference {
     return this.execute(request, options, false, "decide");
   }
   /** Retrieval embeddings from a loaded EmbeddingGemma2 bundle (WASM CPU). */
-  embed(request: EmbeddingRequest, options: RunOptions = {}): Promise<RunResult<EmbeddingResponse>> {
+  embed(
+    request: EmbeddingRequest,
+    options: RunOptions = {}
+  ): Promise<RunResult<EmbeddingResponse>> {
     return this.execute(request, options, false, "embed");
   }
-  validateEmbedding(request: EmbeddingRequest, options: RunOptions = {}): Promise<ValidationResult> {
+  validateEmbedding(
+    request: EmbeddingRequest,
+    options: RunOptions = {}
+  ): Promise<ValidationResult> {
     return this.execute(request, options, true, "embed");
   }
   validateExtraction(

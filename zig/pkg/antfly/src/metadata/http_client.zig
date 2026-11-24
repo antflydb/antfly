@@ -1279,7 +1279,10 @@ pub const MetadataHttpClient = struct {
         );
     }
 
+    pub const sql_scope_supersession_header = "x-antfly-sql-scope-supersession";
+
     pub const CatalogRead = struct {
+        sql_scope_supersession_ready: bool = false,
         body: []u8,
         metadata_group_id: u64,
         metadata_incarnation: metadata_api.MetadataClusterIncarnation,
@@ -1528,6 +1531,7 @@ pub const MetadataHttpClient = struct {
         return .{
             .metadata_group_id = group_id,
             .metadata_incarnation = incarnation,
+            .sql_scope_supersession_ready = input == .sql_prepared_read and std.mem.eql(u8, responseHeader(response, sql_scope_supersession_header) orelse "", "1"),
             .body = try self.alloc.dupe(u8, response.body),
         };
     }

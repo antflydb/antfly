@@ -4085,6 +4085,10 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("open", .{ alloc, path, requested_opts });
         return blk: {
             var opts = requested_opts;
+            // Provider interfaces are move-only. Keep them in the mutable
+            // options until a runtime has adopted them so partial opens have
+            // exactly one cleanup owner.
+            errdefer if (opts.enrichment) |*cfg| deinitOwnedEnrichmentConfig(alloc, cfg);
             if (opts.sql_persistence) |descriptor| {
                 const context = opts.sql_persistence_context orelse return error.InvalidSqlRelationPersistence;
                 if (opts.identity_namespace == null) return error.InvalidSqlRelationPersistence;
@@ -4132,10 +4136,6 @@ pub const DB = struct {
                 if (opts.identity_namespace == null or !opts.identity_namespace.?.eql(bootstrap.namespace) or
                     opts.schema_before_index_load != null) return error.InvalidInitialChildPublication;
             }
-            // Provider interfaces are move-only. Keep them in the mutable
-            // options until a runtime has adopted them so partial opens have
-            // exactly one cleanup owner.
-            errdefer if (opts.enrichment) |*cfg| deinitOwnedEnrichmentConfig(alloc, cfg);
             if (opts._backend_configuration_resolution) |resolution| {
                 if (resolution.path_fingerprint != backendConfigurationPathFingerprint(path))
                     return error.BackendConfigurationPathMismatch;
@@ -6855,6 +6855,8 @@ pub const DB = struct {
             self.ttl_cleanup_context = null;
             self.enrichment_owner.deinit(self.runtime_alloc);
             publishEnrichmentOwner(self);
+            if (self.retained_recovery_config) |*config| deinitOwnedEnrichmentConfig(self.runtime_alloc, config);
+            self.retained_recovery_config = null;
             self.resolution_owner.deinitRuntime(self.runtime_alloc);
             self.resolution_runtime = null;
             self.async_context.resolution_runtime = null;
@@ -52788,7 +52790,7 @@ pub const DB = struct {
         const has_text = req.full_text != null or req.full_text_queries.len != 0 or
             (!db_query_search.isDefaultMatchAll(req.query) and db_query_search.isTextQuery(req.query));
         const has_dense = req.dense != null or req.dense_queries.len != 0;
-        const can_overlap = !req.count_only and req.limit != 0 and req.aggregations_json.len == 0 and
+        const can_overlap = !builtin.single_threaded and !req.count_only and req.limit != 0 and req.aggregations_json.len == 0 and
             (!req.include_stored or db_query_search.composedDefersComponentBodies(req)) and
             has_text and has_dense and req.full_text_queries.len <= 1 and
             req.dense_queries.len <= 1 and req.sparse == null and req.sparse_queries.len == 0 and
@@ -52834,7 +52836,7 @@ pub const DB = struct {
         var executor: db_query_search.ComposedSearchExecutor = .{
             .ctx = self,
             .component_ctx = &hybrid,
-            .search_components = if (hybrid.cut != null) HybridComponents.run else null,
+            .search_components = if (comptime builtin.single_threaded) null else if (hybrid.cut != null) HybridComponents.run else null,
             .resolve_structured_doc_filter = resolveStructuredDocFilterForComposedCallback,
             .resolve_structured_text_doc_filter = resolveStructuredTextDocFilterForComposedCallback,
             .search_text_query = searchTextQueryCallback,

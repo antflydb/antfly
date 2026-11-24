@@ -40,7 +40,10 @@ def freeze_reference(db, original):
             return cursor.statusmessage
 
     def rows():
-        return [list(row) for row in db.execute("SELECT id,status FROM usage_records ORDER BY id")]
+        return [
+            list(row)
+            for row in db.execute("SELECT id,status FROM usage_records ORDER BY id")
+        ]
 
     def rejection():
         try:
@@ -50,7 +53,9 @@ def freeze_reference(db, original):
             if error.sqlstate != "55000":
                 raise
             return error.sqlstate
-        raise AssertionError("COPY FREEZE accepted a generation from another subtransaction")
+        raise AssertionError(
+            "COPY FREEZE accepted a generation from another subtransaction"
+        )
 
     db.execute("DROP TABLE usage_records")
     db.execute(create)
@@ -126,7 +131,9 @@ def freeze_reference(db, original):
             raise
         restored_parent_sqlstate = error.sqlstate
     else:
-        raise AssertionError("COPY FREEZE restored eligibility after a replacement aborted")
+        raise AssertionError(
+            "COPY FREEZE restored eligibility after a replacement aborted"
+        )
     assert rows() == created
 
     # The logical CREATE witness survives rollback of a replacement, even
@@ -153,7 +160,10 @@ def freeze_reference(db, original):
     normal_copy = original["sql"].replace("FREEZE true,", "")
     assert normal_copy != original["sql"]
     with psycopg.connect(db.info.dsn, autocommit=True) as reader:
-        for label, statement in (("frozen", original["sql"]), ("ordinary", normal_copy)):
+        for label, statement in (
+            ("frozen", original["sql"]),
+            ("ordinary", normal_copy),
+        ):
             with reader.transaction():
                 reader.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
                 reader.execute("SELECT pg_current_snapshot()").fetchone()

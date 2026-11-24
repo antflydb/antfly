@@ -50429,13 +50429,15 @@ pub const RaftApplyStore = struct {
         for (receipt_work.receipts) |value| try value.session.requireRealm(standalone);
         for (work.records) |value| if (value.identity.session) |session| try session.requireRealm(standalone);
         try context.ensureActive();
-        const publication_capture_ready = if (standalone) false else ready: {
-            _ = self.standbyRelationActivationTxn(&txn, group, topology_protocol.sql_publication_capture_version) catch |err| switch (err) {
-                error.TableTopologyProtocolUpgradeRequired => break :ready false,
+        const activation_version = if (standalone and context.sql_scope_supersession_ready == null) 0 else ready: {
+            const activation = self.standbyRelationActivationTxn(&txn, group, topology_protocol.sql_publication_capture_version) catch |err| switch (err) {
+                error.TableTopologyProtocolUpgradeRequired => break :ready 0,
                 else => return err,
             };
-            break :ready true;
+            break :ready activation.version;
         };
+        if (context.sql_scope_supersession_ready) |ready| ready.* = activation_version >= topology_protocol.sql_idle_session_reenrollment_version;
+        const publication_capture_ready = !standalone and activation_version >= topology_protocol.sql_publication_capture_version;
         return std.json.Stringify.valueAlloc(alloc, PreparedTransactions.Snapshot{ .standalone = standalone, .publication_capture_ready = publication_capture_ready, .catalog_revision = revision, .incarnation = incarnation, .head = try journal.head(a), .active = active, .records = work.records, .receipts = receipt_work.receipts, .outstanding_receipts = outstanding, .next_after = if (request == .receipt_work) receipt_work.next_after else work.next_after }, .{});
     }
 

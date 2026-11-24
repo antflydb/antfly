@@ -72,6 +72,7 @@ def test_generated_commit_errors_preserve_content_type(status, code, retryable):
 def test_generated_session_commit_conflict_preserves_retry_diagnostic():
     from antfly.client_generated.api.data_operations import commit_transaction_session
     from antfly.client_generated.client import Client
+    from antfly.client_generated.models import TransactionSessionCommitResponse
 
     client = Client(base_url="http://test")
     message = "transaction commit retry body does not match the sealed request"
@@ -81,6 +82,7 @@ def test_generated_session_commit_conflict_preserves_retry_diagnostic():
     outcome = commit_transaction_session._parse_response(
         client=client, response=httpx.Response(409, json={"transaction_id": "123", "status": "aborted"})
     )
+    assert isinstance(outcome, TransactionSessionCommitResponse)
     assert outcome.transaction_id == "123"
 
 

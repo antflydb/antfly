@@ -450,11 +450,8 @@ pub fn encodedImagePrefixPixels(content_type: []const u8, bytes: []const u8) !u6
     const essence = mimeTypeEssence(content_type) catch return error.UnsupportedInferenceMimeType;
     if (antfly_image.inferenceFormatForMimeEssence(essence) != .webp)
         return encodedImagePixels(content_type, bytes);
-    const info = antfly_image.webp.probeDimensionsPrefix(bytes) catch return error.InvalidInferenceMedia;
-    const width = info.width orelse return error.InvalidInferenceMedia;
-    const height = info.height orelse return error.InvalidInferenceMedia;
-    if (width == 0 or height == 0) return error.InvalidInferenceMedia;
-    return @as(u64, width) * height;
+    const info = antfly_image.inspectWebpPrefix(bytes) catch return error.InvalidInferenceMedia;
+    return info.pixels() catch return error.InferenceDecodedPixelsExceeded;
 }
 
 test "inference capabilities measure physical image pixels and MIME" {

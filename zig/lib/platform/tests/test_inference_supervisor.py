@@ -26,15 +26,19 @@ FIXTURE = os.path.abspath(sys.argv.pop(1))
 
 
 class SupervisorTests(unittest.TestCase):
-    def start(self, mode="blocked", index=1, cancel=False, capture_errors=False, worker=False):
+    def start(
+        self, mode="blocked", index=1, cancel=False, capture_errors=False, worker=False
+    ):
         env = os.environ.copy()
         for key in tuple(env):
             if key.startswith("ANTFLY_INFERENCE_SUPERVIS"):
                 del env[key]
         env.update(FIXTURE_MODE=mode, FIXTURE_COMMAND_INDEX=str(index))
         if worker:
-            env.update(ANTFLY_INFERENCE_SUPERVISED_WORKER="1",
-                       ANTFLY_INFERENCE_SUPERVISOR_LIFELINE="stdin-v1")
+            env.update(
+                ANTFLY_INFERENCE_SUPERVISED_WORKER="1",
+                ANTFLY_INFERENCE_SUPERVISOR_LIFELINE="stdin-v1",
+            )
         if cancel:
             env["FIXTURE_CANCEL_PARENT"] = "1"
         args = [FIXTURE] + (["inference"] if index == 2 else []) + ["run"]
@@ -96,7 +100,9 @@ class SupervisorTests(unittest.TestCase):
                     proc.send_signal(sig)
                     output, _ = proc.communicate(timeout=5)
                     self.assertEqual(proc.returncode, 0)
-                    self.assertNotIn(b"worker ", output, "operator stop restarted a worker")
+                    self.assertNotIn(
+                        b"worker ", output, "operator stop restarted a worker"
+                    )
                     with self.assertRaises(ProcessLookupError):
                         os.kill(pid, 0)
 

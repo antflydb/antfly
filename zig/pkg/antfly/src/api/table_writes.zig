@@ -7202,6 +7202,7 @@ pub const ProvisionedTableWriteSource = struct {
         // so continuous polling cannot extend the drain.
         structural_waiters: usize = 0,
         operation_active: bool = false,
+        merge_finalize_handoff: ?db_mod.types.MergeSourceTransitionMutation = null,
         // Ordinary startup catch-up observed this exact shard while another
         // lifecycle owner held admission. Keep the entry alive until catch-up
         // is admitted; group-owner release uses it as a coalesced wake edge.
@@ -11248,12 +11249,29 @@ pub const ProvisionedTableWriteSource = struct {
         self.beginReplicatedApplyOperationLocked(table_name, group_id);
     }
 
-    fn tryBeginReplicatedApplyOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
-        // The Raft owner must not wait for an activity whose resolver backfill
-        // can call back into Raft. Contention is a pre-mutation retry boundary,
-        // including contention on the activity bookkeeping mutex itself.
+    fn tryBeginReplicatedApplyOperation(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_id: u64,
+        merge: ?db_mod.types.MergeSourceTransitionMutation,
+    ) bool {
+        // Committed apply yields to an unrelated active owner. A transition
+        // can hand its existing admission to the exact finalize entry after
+        // dropping its copy writer. The entry then owns the normal release.
         if (!self.table_activity_mutex.tryLock()) return false;
         defer self.table_activity_mutex.unlock(self.tableActivityIo());
+        if (merge) |command| {
+            if (self.findTableActivityLocked(table_name, group_id)) |index| {
+                const activity = &self.active_table_activities.items[index];
+                if (activity.merge_finalize_handoff) |expected| {
+                    if (!std.meta.eql(expected, command) or self.retiring_replica_groups.contains(group_id)) return false;
+                    std.debug.assert(activity.operation_active);
+                    activity.merge_finalize_handoff = null;
+                    activity.operation_allows_reads = true;
+                    return true;
+                }
+            }
+        }
         return self.tryBeginReadCompatibleGroupOperationLocked(table_name, group_id, false);
     }
 
@@ -11373,11 +11391,41 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         group_id: u64,
         active: bool = true,
+        merge_finalize_handoff: ?db_mod.types.MergeSourceTransitionMutation = null,
+
+        pub fn handoffMergeFinalize(self: *GroupTransitionActivity, command: db_mod.types.MergeSourceTransitionMutation) void {
+            std.debug.assert(self.active and self.merge_finalize_handoff == null and command.kind == .finalize);
+            const writer = self.source;
+            const io = writer.tableActivityIo();
+            writer.table_activity_mutex.lockUncancelable(io);
+            defer writer.table_activity_mutex.unlock(io);
+            const index = writer.findTableActivityLocked(self.table_name, self.group_id) orelse unreachable;
+            const activity = &writer.active_table_activities.items[index];
+            std.debug.assert(activity.operation_active and activity.merge_finalize_handoff == null);
+            activity.merge_finalize_handoff = command;
+            self.merge_finalize_handoff = command;
+        }
 
         pub fn deinit(self: *GroupTransitionActivity) void {
             if (!self.active) return;
-            self.source.endGroupOperation(self.table_name, self.group_id);
             self.active = false;
+            const writer = self.source;
+            const command = self.merge_finalize_handoff orelse {
+                writer.endGroupOperation(self.table_name, self.group_id);
+                return;
+            };
+            const io = writer.tableActivityIo();
+            writer.table_activity_mutex.lockUncancelable(io);
+            const owned = if (writer.findTableActivityLocked(self.table_name, self.group_id)) |index| owned: {
+                const activity = &writer.active_table_activities.items[index];
+                const expected = activity.merge_finalize_handoff orelse break :owned false;
+                if (!std.meta.eql(expected, command)) break :owned false;
+                activity.merge_finalize_handoff = null;
+                break :owned true;
+            } else false;
+            const wake = owned and writer.endGroupOperationLocked(self.table_name, self.group_id);
+            writer.table_activity_mutex.unlock(io);
+            if (wake) writer.notifyLocalChange(self.table_name, .startup_catch_up);
         }
 
         pub fn allowReads(self: *GroupTransitionActivity) void {
@@ -23178,7 +23226,7 @@ pub const ProvisionedTableWriteSource = struct {
         // the barrier behind the apply it is waiting for. Structural and
         // generation transitions remain exclusive in the activity gate.
         if (metadata_source == .local_persisted) {
-            if (!self.tryBeginReplicatedApplyOperation(table_name, group_id))
+            if (!self.tryBeginReplicatedApplyOperation(table_name, group_id, apply_req.merge_source_transition))
                 return error.RaftApplyWriterUnavailable;
         } else {
             self.beginReplicatedApplyOperation(table_name, group_id);
@@ -36971,10 +37019,38 @@ fn consumerTests() type {
             // be waiting for a committed entry. Preserve ordinary queue
             // priority without fencing that entry behind its own reader.
             try std.testing.expect(!source.tryBeginReadCompatibleGroupOperation("docs", 7001));
-            try std.testing.expect(source.tryBeginReplicatedApplyOperation("docs", 7001));
+            try std.testing.expect(source.tryBeginReplicatedApplyOperation("docs", 7001, null));
             defer source.endGroupOperation("docs", 7001);
-            try std.testing.expect(!source.tryBeginReplicatedApplyOperation("docs", 7001));
+            try std.testing.expect(!source.tryBeginReplicatedApplyOperation("docs", 7001, null));
             try std.testing.expect(source.readCompatibleMaintenanceActiveBestEffort("docs", 7001));
+        }
+
+        test "provisioned table write source merge finalize hands admission only to its committed entry" {
+            const Catalog = struct {
+                fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                    return error.UnexpectedCatalogCall;
+                }
+
+                fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+            };
+            var writer = ProvisionedTableWriteSource.init("/unused-merge-finalize-handoff", .{ .ptr = undefined, .vtable = &.{ .admin_snapshot = Catalog.snapshot, .free_admin_snapshot = Catalog.free } });
+            const command: db_mod.types.MergeSourceTransitionMutation = .{ .kind = .finalize, .transition_id = 9, .receiver_group_id = 7002 };
+            {
+                var abandoned = writer.beginGroupTransitionActivity("docs", 7001);
+                abandoned.handoffMergeFinalize(command);
+                abandoned.deinit();
+            }
+            var copying = writer.beginGroupTransitionActivity("docs", 7001);
+            defer copying.deinit();
+            copying.handoffMergeFinalize(command);
+            try std.testing.expect(!writer.tryBeginReplicatedApplyOperation("docs", 7001, null));
+            var other = command;
+            other.transition_id += 1;
+            try std.testing.expect(!writer.tryBeginReplicatedApplyOperation("docs", 7001, other));
+            try std.testing.expect(writer.tryBeginReplicatedApplyOperation("docs", 7001, command));
+            defer writer.endGroupOperation("docs", 7001);
+            copying.deinit();
+            try std.testing.expect(!writer.tryBeginReplicatedApplyOperation("docs", 7001, command));
         }
 
         test "structural reconcile reservation defers metadata group refresh without blocking admitted work" {
