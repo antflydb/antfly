@@ -5230,13 +5230,16 @@ pub const NativeGenerationPipeline = struct {
     ) !PrefillOutput {
         var numerical = self.prefillRuntime(decode_state, directPrefillExecutionMutex(true, false, false, self.execution_lock));
         const plan = try numerical.planEmbeddingPrompt(.{
-            .storage = decoderStorageRequest(config),
+            .route = decoderRouteRequest(config),
             .query_tokens = seq_len,
             .configured_chunk_rows = config.prefill_chunk_size,
             .scheduler_chunk_rows = if (self.scheduler_lease) |lease| lease.prefill_chunk_size else 0,
             .speculative_k = config.speculative_k,
             .sampled_ring_qualified = exact_hybrid_sampled_ring_qualification_override,
-        }, prepared.attn_or_mask, capture_last_hidden);
+            .capture_hidden = capture_last_hidden,
+            .has_draft = self.draft_cb != null,
+            .needs_host_logits = self.prefillNeedsHostLogits(config),
+        }, prepared.attn_or_mask);
         try numerical.resetRecurrentPrompt();
         const direct_prefill_turn_acquired = try self.beginPreparedPrefillTurn(seq_len);
         defer if (direct_prefill_turn_acquired) self.scheduler.?.finishTurn(self.scheduler_lease.?, .prefill);
@@ -5247,7 +5250,7 @@ pub const NativeGenerationPipeline = struct {
             .owner = &prepared.input_embeddings,
             .token_ids = prepared.ple_token_ids orelse prepared.token_ids,
             .sequence_length = seq_len,
-            .output_intent = decoder_routes.prefillOutputIntent(true, !capture_last_hidden and self.draft_cb == null and decoder_routes.shouldUsePreparedPrefillGreedyToken(self.cb.kind(), self.gpt_config, decoderRouteRequest(config), true, self.prefillNeedsHostLogits(config), self.cb.kind() != .cuda or (enableCudaPrefillFirstToken() and enableCudaPrefillGreedyToken())), capture_last_hidden),
+            .output_intent = plan.output_intent,
             .chunk_rows = plan.chunk_rows,
             .attention_mask = prepared.attn_or_mask,
         });

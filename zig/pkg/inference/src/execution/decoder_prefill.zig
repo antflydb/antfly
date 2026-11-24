@@ -712,8 +712,20 @@ test "fixed prefill windows preserve logical prefix and produce the exact final 
 }
 
 pub const EmbeddingRoute = enum { prepared_last_row, ordinary_last_row };
+pub const EmbeddingPromptRequest = struct {
+    route: decoder_routes.Request,
+    query_tokens: usize,
+    configured_chunk_rows: usize,
+    scheduler_chunk_rows: usize,
+    speculative_k: u32,
+    sampled_ring_qualified: bool,
+    capture_hidden: bool,
+    has_draft: bool,
+    needs_host_logits: bool,
+};
 pub const EmbeddingPromptPlan = struct {
     chunk_rows: usize,
+    output_intent: decoder_routes.PrefillOutputIntent,
     /// Ordinary routes reserve the complete logical KV window after obtaining
     /// their scheduler turn. The compiled path has already bound its window.
     reserve_whole_prompt: bool,
@@ -1140,14 +1152,37 @@ pub const Runtime = struct {
             self.forward.context.compiled_attachment_target == .whole_model and self.forward.graph_cache != null;
     }
 
-    pub fn planEmbeddingPrompt(self: *Runtime, request: CompiledPromptRequest, attention_mask: ?[]const u8, capture_hidden: bool) !EmbeddingPromptPlan {
+    pub fn planEmbeddingPrompt(self: *Runtime, request: EmbeddingPromptRequest, attention_mask: ?[]const u8) !EmbeddingPromptPlan {
+        const context = self.forward.context;
+        const backend = context.cb.kind();
+        const greedy = !request.capture_hidden and !request.has_draft and decoder_routes.shouldUsePreparedPrefillGreedyToken(
+            backend,
+            context.gpt_config.*,
+            request.route,
+            true,
+            request.needs_host_logits,
+            backend != .cuda or (firstTokenEnabled() and greedyTokenEnabled()),
+        );
+        const output_intent = decoder_routes.prefillOutputIntent(true, greedy, request.capture_hidden);
         if (!self.usesCompiledEmbeddings(.prepared_last_row)) return .{
             .chunk_rows = request.configured_chunk_rows,
+            .output_intent = output_intent,
             .reserve_whole_prompt = true,
         };
-        if (attention_mask != null or capture_hidden) return error.UnsupportedPreparedRows;
-        const plan = try self.prepareCompiledPrompt(request);
-        return .{ .chunk_rows = @min(plan.chunk_rows, compiled_embedding_chunk_limit), .reserve_whole_prompt = false };
+        if (attention_mask != null or request.capture_hidden) return error.UnsupportedPreparedRows;
+        const plan = try self.prepareCompiledPrompt(.{
+            .storage = request.route.storage,
+            .query_tokens = request.query_tokens,
+            .configured_chunk_rows = request.configured_chunk_rows,
+            .scheduler_chunk_rows = request.scheduler_chunk_rows,
+            .speculative_k = request.speculative_k,
+            .sampled_ring_qualified = request.sampled_ring_qualified,
+        });
+        return .{
+            .chunk_rows = @min(plan.chunk_rows, compiled_embedding_chunk_limit),
+            .output_intent = output_intent,
+            .reserve_whole_prompt = false,
+        };
     }
 
     pub fn resetRecurrentPrompt(self: *Runtime) !void {
@@ -1930,6 +1965,30 @@ fn checkMetalCompiledChunk(cb: ComputeBackend, native_reference: ComputeBackend)
         var state = graph_mod.decode_state_runtime.NativeDecodeState.initContiguous(a);
         defer state.deinit();
         var physical = Runtime{ .forward = .{ .context = .{ .allocator = a, .cb = &cb, .gpt_config = &model, .weight_semantics = .traced_decoder, .session = session, .compiled_partition_backend = .metal, .compiled_attachment_target = .whole_model, .kv_dtype = .f16, .execution_control = request_control }, .graph_cache = &cache }, .state = &state };
+        if (scenario == 0) {
+            var embedding = EmbeddingPromptRequest{
+                .route = .{ .storage = .{ .pure_greedy = true, .grammar = false, .prompt_cache = false, .compaction = false, .speculation = false, .draft = false }, .has_token_observer = false, .exact_hybrid = true },
+                .query_tokens = ids.len,
+                .configured_chunk_rows = 1,
+                .scheduler_chunk_rows = 0,
+                .speculative_k = 0,
+                .sampled_ring_qualified = false,
+                .capture_hidden = false,
+                .has_draft = false,
+                .needs_host_logits = false,
+            };
+            const planned = try physical.planEmbeddingPrompt(embedding, null);
+            try std.testing.expectEqual(.greedy_token, planned.output_intent);
+            try std.testing.expectEqual(@as(usize, 1), planned.chunk_rows);
+            try std.testing.expect(!planned.reserve_whole_prompt);
+            embedding.needs_host_logits = true;
+            try std.testing.expectEqual(.last_logits, (try physical.planEmbeddingPrompt(embedding, null)).output_intent);
+            embedding.needs_host_logits = false;
+            embedding.has_draft = true;
+            try std.testing.expectEqual(.last_logits, (try physical.planEmbeddingPrompt(embedding, null)).output_intent);
+            embedding.capture_hidden = true;
+            try std.testing.expectError(error.UnsupportedPreparedRows, physical.planEmbeddingPrompt(embedding, null));
+        }
         const request = Runtime.CompiledChunk{ .token_ids = &ids, .total_sequence_length = ids.len, .output = if (scenario == 0) .kv_only else if (scenario == 2) .greedy_token else .last_logits };
         if (scenario == 3) {
             var fault = Fault{};
