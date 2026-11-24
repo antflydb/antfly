@@ -242,7 +242,11 @@ pub fn materializeExternalVoteTimestamp(req: *@import("antfly_local_sources").st
             req.timestamp_ns = @max(1, realtime_ns);
         },
         .prepare => |prepare| if (prepare.external_decision_owner != null and !prepare.external_activation) {
-            req.timestamp_ns = @max(1, realtime_ns);
+            if (prepare.completion_owner != null) {
+                req.transaction.?.prepare.external_vote_admitted_at_ns = @max(1, realtime_ns);
+            } else {
+                req.timestamp_ns = @max(1, realtime_ns);
+            }
         },
         else => {},
     };

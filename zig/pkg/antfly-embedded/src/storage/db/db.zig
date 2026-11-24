@@ -31760,8 +31760,15 @@ pub const DB = struct {
     }
 
     fn writeTransactionInternalModePolicyObserved(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest, ordered_receipt: ?OrderedApplyReceipt, atomic_execution: ?*NativeAtomicExecution, policy_phase: *TransactionPolicyPhase) !backend_erased_mod.Ticket {
-        if (req.external_decision_owner) |owner|
-            try owner.requireFreshVoteAt(if (ordered_receipt != null) req.timestamp_ns else @max(1, currentTimeNs()));
+        if (req.external_decision_owner) |owner| {
+            const admitted_at_ns = if (ordered_receipt == null)
+                @max(1, currentTimeNs())
+            else if (req.completion_owner != null)
+                req.external_vote_admitted_at_ns
+            else
+                req.timestamp_ns;
+            try owner.requireFreshVoteAt(admitted_at_ns);
+        }
         if (ordered_receipt == null or req.row_policy_principal_proof.len != 0)
             try self.maybeFinalizePendingRowPolicyPublication();
         if (ordered_receipt != null and req.row_policy_principal_proof.len != 0 and

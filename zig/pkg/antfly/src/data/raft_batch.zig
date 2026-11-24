@@ -911,6 +911,40 @@ test "raft protocol barrier external transaction admission expires only new vote
     try internal_batch_forwarding.validateExternalVoteAdmission(request, 10_000);
     internal_batch_forwarding.materializeExternalVoteTimestamp(&request, 10_000);
     try std.testing.expectEqual(@as(u64, 100), request.timestamp_ns);
+
+    const a = std.testing.allocator;
+    const completion = @import("antfly_local_sources").storage_transaction_completion;
+    const routed: completion.RoutedOwner = .{
+        .metadata_group_id = 1,
+        .metadata_incarnation = owner.metadata_incarnation,
+        .namespace = @splat(1),
+        .table_binding = @splat(2),
+        .root_generation = 0,
+        .group_id = 8,
+        .topology_epoch = 7,
+    };
+    request = .{ .timestamp_ns = 5, .document_version_scheme = .revision_v1, .transaction = .{ .prepare = .{
+        .txn_id = @splat(4),
+        .topology_epoch = routed.topology_epoch,
+        .external_decision_owner = owner,
+        .completion_owner = routed,
+    } } };
+    const frozen = try batch_api.completionPrepareInput(a, request);
+    defer a.free(frozen);
+    internal_batch_forwarding.materializeExternalVoteTimestamp(&request, 101);
+    const encoded = try encode(a, "rows", request);
+    defer a.free(encoded);
+    var decoded = try decode(a, encoded);
+    defer decoded.deinit(a);
+    const retained = try types.TransactionIntentRequest.fromBatch(decoded.batch.req);
+    try std.testing.expectEqual(@as(u64, 5), retained.timestamp_ns);
+    try std.testing.expectEqual(@as(u64, 101), retained.external_vote_admitted_at_ns);
+    try owner.requireFreshVoteAt(retained.external_vote_admitted_at_ns);
+    try std.testing.expectError(error.ExternalTransactionAdmissionExpired, internal_batch_forwarding.validateExternalVoteAdmission(request, 200));
+    const applied = try batch_api.completionPrepareInput(a, decoded.batch.req);
+    defer a.free(applied);
+    try std.testing.expectEqualStrings(frozen, applied);
+
     request.transaction = .{ .begin = .{ .txn_id = @splat(4), .begin_timestamp = 5, .created_at_ns = 6, .topology_epoch = 7, .participants = &.{"table:rows:group:8"}, .retain_terminal = true, .external_decision_owner = owner } };
     try std.testing.expect(internal_batch_forwarding.externalTransactionProtocol(request) != null);
     try internal_batch_forwarding.validateExternalVoteAdmission(request, 100);

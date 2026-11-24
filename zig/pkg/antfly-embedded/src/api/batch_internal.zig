@@ -1868,6 +1868,12 @@ noinline fn parseBatchTransitions(alloc: std.mem.Allocator, root: std.json.Objec
         _ = std.fmt.hexToBytes(&txn_id, txn_value.string) catch return error.InvalidBatchRequest;
         const external_history_begin = std.mem.eql(u8, phase_value.string, "external_begin_completion_v1");
         const external_history_prepare = std.mem.eql(u8, phase_value.string, "external_prepare_completion_v1");
+        const external_vote_admitted_at_ns = if (object.get("external_vote_admitted_at_ns")) |admission_value| admitted: {
+            if (!external_history_prepare) return error.InvalidBatchRequest;
+            const admitted = try parseInternalU64(admission_value);
+            if (admitted == 0) return error.InvalidBatchRequest;
+            break :admitted admitted;
+        } else 0;
         const external_history_resolve = std.mem.eql(u8, phase_value.string, "external_resolve_completion_v1");
         const revision_begin = std.mem.eql(u8, phase_value.string, "external_begin_revisions_v1") or
             (external_history_begin and object.contains("document_revision_scope"));
@@ -2058,6 +2064,7 @@ noinline fn parseBatchTransitions(alloc: std.mem.Allocator, root: std.json.Objec
         if (std.mem.eql(u8, phase_value.string, "prepare") or guarded_prepare or ordinary_plain_prepare or legacy_plain_prepare or completion_prepare or external_prepare) break :transaction .{ .prepare = .{
             .external_decision_owner = external_owner,
             .external_activation = external_activation,
+            .external_vote_admitted_at_ns = external_vote_admitted_at_ns,
             .ordinary_producer = ordinary_prepare,
             .legacy_producer = legacy_prepare,
             .txn_id = txn_id,
@@ -3089,6 +3096,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_types.BatchRequest,
                 }
             },
             .prepare => |prepare| {
+                if (prepare.external_vote_admitted_at_ns != 0 and (prepare.external_decision_owner == null or prepare.completion_owner == null or prepare.external_activation)) return error.InvalidBatchRequest;
                 if (prepare.external_decision_owner != null and (prepare.ordinary_producer or prepare.legacy_producer or (prepare.external_activation and prepare.completion_owner != null) or prepare.source_purpose != null or prepare.source_scope != null or prepare.source_checkpoint != null)) return error.InvalidBatchRequest;
                 if ((prepare.ordinary_producer and prepare.legacy_producer) or ((prepare.ordinary_producer or prepare.legacy_producer) and (prepare.source_purpose != null or prepare.source_scope != null or prepare.source_checkpoint != null))) return error.InvalidBatchRequest;
                 try validateSourceCompletionPurpose(prepare.source_purpose, prepare.completion_owner);
@@ -3119,6 +3127,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_types.BatchRequest,
                 if (prepare.source_purpose) |purpose| try writer.print(",\"source_purpose\":{f}", .{std.json.fmt(purpose, .{})});
                 if (prepare.source_checkpoint) |checkpoint| try writer.print(",\"source_checkpoint\":{f}", .{std.json.fmt(checkpoint, .{})});
                 if (prepare.external_decision_owner) |owner| try writer.print(",\"external_decision_owner\":{f},\"external_activation\":{}", .{ std.json.fmt(owner, .{}), prepare.external_activation });
+                if (prepare.external_vote_admitted_at_ns != 0) try writer.print(",\"external_vote_admitted_at_ns\":\"{d}\"", .{prepare.external_vote_admitted_at_ns});
             },
             .resolve => |resolve| {
                 if (resolve.external_decision_owner != null and (resolve.source_purpose != null or resolve.source_scope != null)) return error.InvalidBatchRequest;
@@ -4851,6 +4860,7 @@ pub fn completionPrepareInput(a: std.mem.Allocator, request: db_types.BatchReque
         // The accepting transaction separately checks that exact owner and
         // publication grant before it writes any intent.
         input.transaction.?.prepare.external_decision_owner = null;
+        input.transaction.?.prepare.external_vote_admitted_at_ns = 0;
         input.transaction.?.prepare.publication_capture = null;
         input.transaction.?.prepare.document_revision_handoff = null;
         input.trigger_preparation_proof = "";
