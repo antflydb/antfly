@@ -486,7 +486,14 @@ fn prepareLoadedHostSession(allocator: std.mem.Allocator, model_path: []const u8
     if (build_options.enable_pjrt and preparation.backend == .pjrt) {
         const policy: ?pjrt_lib.pjrt.Client.MemoryPolicy = if (preparation.pjrt_memory_policy) |value| switch (value) {
             .cpu => .cpu,
-            .cuda => |limit| .{ .cuda = .{ .capacity_bytes = limit.capacity_bytes, .device_bytes = limit.device_bytes } },
+            .cuda => |limit| .{
+                .cuda = .{
+                    .capacity_bytes = limit.capacity_bytes,
+                    // The provider applies this fraction to the physical device.
+                    // A smaller operator envelope must never increase the fraction.
+                    .device_bytes = if (limit.device_bytes == 0) 0 else @max(limit.device_bytes, @import("../backends/backends.zig").cudaDeviceMemoryBytes(.cuda)),
+                },
+            },
         } else null;
         impl.backend_data.pjrt.client = try pjrt_lib.pjrt.Client.initFromEnvWithMemoryPolicy(allocator, policy);
         impl.backend_data.pjrt.client.?.compile_options.gpu_gemm = switch (preparation.pjrt_gemm) {
