@@ -1904,8 +1904,35 @@ pub const NativeWeightCacheControl = struct {
     prepare: *const fn (*anyopaque, *const ComputeBackend, NativeWeightCachePreparation) anyerror!EmbeddingCacheScope,
 };
 /// Caller-owned work that must finish before the stage can lend its provider.
+pub const AudioStorageScope = struct {
+    backend: *const ComputeBackend,
+    active: bool,
+
+    pub fn begin(backend: *const ComputeBackend) !AudioStorageScope {
+        return .{ .backend = backend, .active = try backend.audioStorage(true) };
+    }
+
+    pub fn park(self: *AudioStorageScope) !bool {
+        if (!self.active) return false;
+        if (!try self.backend.audioStorage(false)) return error.AudioStorageScopeUnavailable;
+        self.active = false;
+        return true;
+    }
+
+    pub fn resumeAfterPark(self: *AudioStorageScope, parked: bool) !void {
+        if (parked) self.active = try self.backend.audioStorage(true);
+    }
+
+    pub fn close(self: *AudioStorageScope) void {
+        _ = self.park() catch |err| {
+            std.log.warn("audio storage scope cleanup failed: {s}", .{@errorName(err)});
+            return;
+        };
+    }
+};
+
 pub const AudioScratchBoundary = struct {
-    storage: *bool,
+    storage: *AudioStorageScope,
     owns_active_frame: bool = false,
     context: ?*anyopaque = null,
     quiesce: ?*const fn (*anyopaque) anyerror!void = null,

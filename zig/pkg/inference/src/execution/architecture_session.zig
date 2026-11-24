@@ -13802,11 +13802,7 @@ pub const StagedExecution = struct {
 
         // Audio reuse is provider-wide. Park the scope before releasing
         // the provider and reopen it after regaining custody.
-        const reopen_storage = boundary.storage.*;
-        if (reopen_storage) {
-            if (!try cb.audioStorage(false)) return error.AudioStorageScopeUnavailable;
-            boundary.storage.* = false;
-        }
+        const reopen_storage = try boundary.storage.park();
         try pause(self);
         var banks: [12]?Metal.FundedAudioBank = @splat(null);
         defer for (&banks) |*value| {
@@ -13833,10 +13829,10 @@ pub const StagedExecution = struct {
             };
             try acquire(self);
             if (settlement) |err| return err;
-            if (reopen_storage) boundary.storage.* = try cb.audioStorage(true);
+            try boundary.storage.resumeAfterPark(reopen_storage);
             return true;
         };
-        if (reopen_storage) boundary.storage.* = try cb.audioStorage(true);
+        try boundary.storage.resumeAfterPark(reopen_storage);
         for (requests[0..count], banks[0..count]) |request, *value| if (value.*) |*bank| {
             if (try Metal.publishAudioScratch(cb, request, bank)) value.* = null;
         };

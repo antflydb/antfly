@@ -1694,10 +1694,8 @@ pub fn encodePreparedEmbeddingGemma2AudioBatchResident(cb: *const ComputeBackend
     if (prepared.len == 0 or prepared.len > 4) return error.InvalidInputShape;
     var cache_scope = try beginAudioCache(cb, embeddingGemma2AudioConfig(), prepared);
     defer cache_scope.close();
-    var storage = try cb.audioStorage(true);
-    defer if (storage) {
-        _ = cb.audioStorage(false) catch false;
-    };
+    var storage = try ops.AudioStorageScope.begin(cb);
+    defer storage.close();
     var weights = ProjectorWeights.initHuggingFace(cb, a);
     defer weights.deinit();
     var features: [4]AudioFeatures = undefined;
@@ -2165,16 +2163,14 @@ fn encodeAudioFeaturesResident(cb: *const ComputeBackend, allocator: std.mem.All
 fn encodeAudioFeatureCohortResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, declared_cfg: AudioConfig, features_list: []const *AudioFeatures, lengths: ?[]usize) !ResidentEncodedAudio {
     const cfg = try audioConfigForBackend(cb, declared_cfg);
     if (features_list.len == 0 or features_list.len > 4 or (lengths != null and lengths.?.len != features_list.len)) return error.InvalidInputShape;
-    var storage = try cb.audioStorage(true);
-    defer if (storage) {
-        _ = cb.audioStorage(false) catch false;
-    };
+    var storage = try ops.AudioStorageScope.begin(cb);
+    defer storage.close();
     return encodeAudioFeatureCohortResidentWithinStorage(cb, allocator, store, cfg, features_list, lengths, &storage);
 }
 
 // Only the owning wrapper above and the prepared-batch lexical storage owner
 // call this helper. It borrows their bank and never begins or retires storage.
-fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, features_list: []const *AudioFeatures, lengths: ?[]usize, storage: *bool) !ResidentEncodedAudio {
+fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, features_list: []const *AudioFeatures, lengths: ?[]usize, storage: *ops.AudioStorageScope) !ResidentEncodedAudio {
     if (features_list.len == 0 or features_list.len > 4 or (lengths != null and lengths.?.len != features_list.len)) return error.InvalidInputShape;
     const features = features_list[0];
     const cohort = features_list.len > 1;
