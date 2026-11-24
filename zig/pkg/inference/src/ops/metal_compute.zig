@@ -11746,6 +11746,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const input = toBuf(source).metal_tensor orelse return error.InvalidPhysicalTransferSize;
         if (target.dtype != .f32 and target.dtype != .i32 and target.dtype != .i64) return error.InvalidPhysicalTransferSize;
         if (target.physicalLease() == null or target.dtype != input.dtype or target.elemCount() != input.elemCount()) return error.InvalidPhysicalTransferSize;
+        const target_device = target.device orelse return error.InvalidPhysicalTransferSize;
+        if (input.device) |input_device| {
+            if (input_device.ref.runtime != target_device.ref.runtime) return error.RuntimeInputBackendMismatch;
+        }
+
         try input.copyInto(target);
     }
 

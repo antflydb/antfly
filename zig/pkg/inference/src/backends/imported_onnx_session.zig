@@ -4422,6 +4422,14 @@ const InvocationInputFacts = struct {
             if (metal and logical.dtype != .f32) continue;
 
             if (!@import("../execution/assigned_kernel_route.zig").bindingDense(target.cb, input.value, logical)) continue;
+            if (metal) {
+                const service = @import("../execution/device_owned_coverage.zig").services(target.cb) orelse continue;
+                const planes = input.value.resident.planes;
+                if (planes.len != 1 or planes[0].descriptor.storage != .metal_buffer or planes[0].backing == null) continue;
+                // Keep the exact backing when the provider can attest its root.
+                if (selected == null and (service.input(target.cb.ptr, input.value, logical) catch continue)) continue;
+            }
+
             input.value = .{ .imported_device = .{ .logical = logical, .implementation = .{ .context = target.cb.ptr, .table = target.cb.vtable } } };
         }
     }
@@ -6515,17 +6523,26 @@ test "complete Imported Metal Frame encoder owns shared ingress aliases outputs 
         try std.testing.expectEqual(count, impl.execution_count.load(.acquire));
         try std.testing.expectEqual(sdk.device_owned_buffers_created, @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_buffers_created);
     }
-    {
-        const backend = impl.shared_backend_ctx.stableBackend();
-        const value = try backend.ensureDeviceResidentOwned(try backend.fromFloat32Shape(&values, &.{ rows, width }));
-        defer backend.free(value);
-        const device_input: session_mod.StageInput = .{ .resident = .{ .value = value, .backend = backend, .shape = &.{ rows, width }, .estimated_bytes = payload } };
+    for ([_]bool{ false, true }) |offset_view| {
+        const stage_backend = impl.shared_backend_ctx.stableBackend();
+        var padded: [(rows + 1) * width]f32 = undefined;
+        @memset(padded[0..width], 7);
+        @memcpy(padded[width..], &values);
+        const root = if (offset_view)
+            try stage_backend.ensureDeviceResidentOwned(try stage_backend.fromFloat32Shape(&padded, &.{ rows + 1, width }))
+        else
+            try stage_backend.ensureDeviceResidentOwned(try stage_backend.fromFloat32Shape(&values, &.{ rows, width }));
+        defer stage_backend.free(root);
+        const value = if (offset_view) try stage_backend.sliceRows2D(a, root, 1, rows, width) else root;
+        defer if (offset_view) stage_backend.free(value);
+
+        const device_input: session_mod.StageInput = .{ .resident = .{ .value = value, .backend = stage_backend, .shape = &.{ rows, width }, .estimated_bytes = payload } };
         var observation = @import("../execution/runtime_observation.zig").Scope.init();
         defer observation.deinit();
         var result = (try session.runStageInputsWithControl(&.{device_input}, a, .{ .native_call_policy = .in_process })) orelse return error.MissingResidentResult;
         defer result.deinit();
         const stats = session.executionDiagnostics().?.execution.?;
-        try std.testing.expectEqual(@as(u64, payload), stats.physical_input_copy_bytes);
+        try std.testing.expectEqual(@as(u64, if (offset_view) payload else 0), stats.physical_input_copy_bytes);
         try std.testing.expectEqual(@as(u64, 0), stats.actual_download_bytes);
         try std.testing.expectEqual(@as(?u64, 1), observation.snapshot().metal_command_submissions);
         const actual = try result.backend.toFloat32(result.outputs[0], a);
