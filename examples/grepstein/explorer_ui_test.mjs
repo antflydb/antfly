@@ -105,3 +105,35 @@ test("a stale response cannot replace a newer collection search", async () => {
   pending[0](response("Stale")); await old;
   assert.equal(descendants(f.ids.get("#results")).find(x => x.tagName === "h3").textContent, "Latest");
 });
+
+test("native hierarchy provenance supplies audio timing when document projection is empty", async () => {
+  const record = hit("Native transcript", [{}]);
+  record.hierarchy.matches[0].hierarchy.ancestors.unit = {
+    document: { provenance: {} },
+    provenance: { start_time_ms: 500, end_time_ms: 1500 },
+  };
+  const f = fixture(async () => reply({ responses: [{ collection: collections[1], hits: { hits: [record] } }] }));
+  await flush();
+  await f.submit();
+  const card = f.ids.get("#results").children[0];
+  const nodes = descendants(card);
+  assert.match(nodes.find(x => x.tagName === "a").href, /#t=0\.5$/);
+  const player = nodes.find(x => x.tagName === "audio");
+  const seek = nodes.find(x => x.tagName === "button");
+  seek.onclick();
+  assert.equal(player.currentTime, 0.5);
+  assert.equal(player.playCount, 1);
+});
+
+test("image evidence links retain image semantics without PDF page controls", async () => {
+  const imageCollection = { id: "images", label: "Image records", profile: "images" };
+  const f = fixture(async () => reply({ responses: [{ collection: imageCollection, hits: { hits: [hit("Image fixture", [{ page_number: 1 }], { page_number: 2 })] } }] }));
+  await flush();
+  await f.submit();
+  const nodes = descendants(f.ids.get("#results").children[0]);
+  const link = nodes.find(x => x.tagName === "a");
+  assert.equal(link.textContent, "Open original image");
+  assert.match(link.href, /collection=images$/);
+  assert.equal(nodes.find(x => x.tagName === "summary").textContent, "Source and image evidence");
+  assert.equal(nodes.some(x => x.tagName === "audio"), false);
+});

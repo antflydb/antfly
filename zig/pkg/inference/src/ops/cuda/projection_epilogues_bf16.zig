@@ -46,17 +46,21 @@ pub fn validate(r: Request) !void {
 const catalog = @import("../../tile/cuda_standalone.zig");
 const image = @import("embedded_module.zig").profile;
 const EmbeddedPrograms = @import("embedded_module.zig").EmbeddedPrograms;
-const UpPrograms = EmbeddedPrograms(.{
-    .k768_f32 = image(catalog.gelu[0]),
-    .k768_bf16 = image(catalog.gelu[1]),
-    .k1024_f32 = image(catalog.gelu[2]),
-    .k1024_bf16 = image(catalog.gelu[3]),
+const UpPrograms = EmbeddedPrograms(struct {
+    pub const programs = .{
+        .k768_f32 = image(catalog.gelu[0]),
+        .k768_bf16 = image(catalog.gelu[1]),
+        .k1024_f32 = image(catalog.gelu[2]),
+        .k1024_bf16 = image(catalog.gelu[3]),
+    };
 });
-const DownPrograms = EmbeddedPrograms(.{
-    .k768_f32 = image(catalog.residual[0]),
-    .k768_bf16 = image(catalog.residual[1]),
-    .k1024_f32 = image(catalog.residual[2]),
-    .k1024_bf16 = image(catalog.residual[3]),
+const DownPrograms = EmbeddedPrograms(struct {
+    pub const programs = .{
+        .k768_f32 = image(catalog.residual[0]),
+        .k768_bf16 = image(catalog.residual[1]),
+        .k1024_f32 = image(catalog.residual[2]),
+        .k1024_bf16 = image(catalog.residual[3]),
+    };
 });
 
 pub const Module = struct {
