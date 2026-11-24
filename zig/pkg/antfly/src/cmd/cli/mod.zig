@@ -29,6 +29,7 @@ pub const discovery = @import("discovery.zig");
 pub const sql = @import("sql.zig");
 pub const data = @import("data.zig");
 pub const backup = @import("backup.zig");
+pub const sync = @import("sync.zig");
 pub const agents = @import("agents.zig");
 pub const internal = @import("internal.zig");
 pub const auth = @import("auth.zig");
@@ -237,6 +238,7 @@ pub fn commandUsage(command: []const u8) ?[]const u8 {
     ;
     if (std.mem.eql(u8, command, "backup")) return backup.usage;
     if (std.mem.eql(u8, command, "restore")) return backup.restore_usage;
+    if (std.mem.eql(u8, command, "sync")) return sync.usage;
     if (std.mem.eql(u8, command, "auth")) return "usage: antfly auth <me|users|permissions|roles|row-filters|subjects|api-keys> [options]\n";
     if (std.mem.eql(u8, command, "internal")) return
     \\usage: antfly internal metadata status
@@ -280,6 +282,7 @@ test "client commands expose help without a server" {
     try std.testing.expect(commandUsage("load") != null);
     try std.testing.expect(commandUsage("auth") != null);
     try std.testing.expect(commandUsage("unknown") == null);
+    try std.testing.expect(std.mem.indexOf(u8, commandUsage("sync").?, "--definition") != null);
     const backup_help = commandUsage("backup").?;
     try std.testing.expect(std.mem.indexOf(u8, backup_help, "--connection") != null);
     try std.testing.expect(std.mem.indexOf(u8, backup_help, "\"connections\":") != null);
