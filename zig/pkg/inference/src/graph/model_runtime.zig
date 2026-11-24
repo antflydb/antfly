@@ -337,6 +337,29 @@ pub const RequestFinish = struct {
         self.table = selected.vtable;
     }
 
+    /// Acquire the current operation before resolving retirement authority.
+    /// Mandatory cleanup can still run after the request has been cancelled.
+    pub fn finishWithAccess(
+        self: *RequestFinish,
+        backend: *const ops.ComputeBackend,
+        access: ?@import("../execution_control.zig").ExecutionAccess,
+        owner: ?*const @import("../execution/cleanup_owner.zig").Owner,
+    ) !void {
+        if (self.runtime == null) return;
+        var scope = if (access) |lane| lane.acquireCleanupScope() else null;
+        defer if (scope) |*held| held.deinit();
+        const operation = backend.operationToken();
+        var inherited = if (owner == null)
+            (if (operation) |held| try held.retainCleanupEpoch() else null)
+        else
+            null;
+        defer if (inherited) |*epoch| epoch.release();
+        try self.finish(.{
+            .boundary = if (owner) |selected| selected.epoch() else if (inherited) |*epoch| epoch else null,
+            .operation = operation,
+        });
+    }
+
     pub fn finish(self: *RequestFinish, current: CleanupContext) !void {
         const selected = self.runtime orelse return;
         if (selected.ptr != self.context or selected.vtable != self.table)
@@ -602,9 +625,6 @@ pub const ModelOutput = struct {
     pub fn takeHostLogits(self: *ModelOutput, allocator: std.mem.Allocator) ![]f32 {
         return self.takeHostLogitsWithCleanup(allocator, .{ .outside_execution = true });
     }
-    pub fn takeHostLogitsWithBoundary(self: *ModelOutput, allocator: std.mem.Allocator, boundary: ?*const @import("../execution/retirement_sink.zig").Epoch) ![]f32 {
-        return self.takeHostLogitsWithCleanup(allocator, .{ .boundary = boundary });
-    }
     pub fn takeHostLogitsWithCleanup(self: *ModelOutput, allocator: std.mem.Allocator, cleanup_context: CleanupContext) ![]f32 {
         _ = try self.hostLogitsWithCleanup(allocator, cleanup_context);
         const logits = self.logits orelse return error.InvalidModelOutput;
@@ -614,9 +634,6 @@ pub const ModelOutput = struct {
 
     pub fn greedyToken(self: *ModelOutput, allocator: std.mem.Allocator, vocab_size: usize) !i64 {
         return self.greedyTokenWithCleanup(allocator, vocab_size, .{ .outside_execution = true });
-    }
-    pub fn greedyTokenWithBoundary(self: *ModelOutput, allocator: std.mem.Allocator, vocab_size: usize, boundary: ?*const @import("../execution/retirement_sink.zig").Epoch) !i64 {
-        return self.greedyTokenWithCleanup(allocator, vocab_size, .{ .boundary = boundary });
     }
     pub fn greedyTokenWithCleanup(self: *ModelOutput, allocator: std.mem.Allocator, vocab_size: usize, cleanup_context: CleanupContext) !i64 {
         if (vocab_size == 0) return error.InvalidModelOutput;
@@ -1573,7 +1590,8 @@ fn modelRequestFinishCase(a: std.mem.Allocator) !void {
         }
         fn finish(raw: *anyopaque, supplied: CleanupContext) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            try std.testing.expect(supplied.boundary == self.boundary);
+            const boundary = supplied.boundary orelse return error.MissingCurrentCleanupEpoch;
+            try std.testing.expect(boundary.record == self.boundary.record and boundary.nonce == self.boundary.nonce);
             _ = try supplied.operationFor(&self.backend);
             self.calls += 1;
             if (self.fail) return error.InjectedRequestAwaitFailure;
@@ -1595,7 +1613,7 @@ fn modelRequestFinishCase(a: std.mem.Allocator) !void {
     var request: RequestFinish = .{};
     try request.receive(&model);
     try request.receive(&model);
-    try request.finish(current);
+    try request.finishWithAccess(&backend, null, null);
     try std.testing.expect(request.runtime == null);
     try std.testing.expect(!probe.armed);
     probe.armed = true;
@@ -1603,7 +1621,7 @@ fn modelRequestFinishCase(a: std.mem.Allocator) !void {
     // This receiving call borrows the live actual Native operation. A denial
     // is not permission to clear the runtime's uncertain pending ownership.
     try request.receive(&model);
-    if (request.finish(current)) |_| return error.ExpectedRequestFinishFailure else |err| {
+    if (request.finishWithAccess(&backend, null, null)) |_| return error.ExpectedRequestFinishFailure else |err| {
         if (err != error.InjectedRequestAwaitFailure) return err;
     }
     try std.testing.expect(probe.armed and request.runtime == &model);

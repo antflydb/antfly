@@ -351,18 +351,6 @@ pub fn nativeGenerationMediaAdmissionWithInspection(
     return admission;
 }
 
-/// Conservative media-token count used for scheduling and memory admission.
-/// Qwen image spans are dynamic, so derive their bound from the same
-/// preprocessor configuration that produces the final visual tokens.
-pub fn nativeGenerationAdmissionMediaTokenAllowance(
-    allocator: std.mem.Allocator,
-    model_dir: []const u8,
-    messages: []const Message,
-    config: gpt_mod.Config,
-) !usize {
-    return (try nativeGenerationMediaAdmission(allocator, model_dir, messages, config)).token_allowance;
-}
-
 /// Media allowance that can safely constrain the text-only encode before
 /// dynamic image preprocessing determines the exact expanded prompt length.
 pub fn nativeGenerationPreliminaryMediaTokenAllowance(messages: []const Message, config: gpt_mod.Config) usize {
@@ -650,21 +638,6 @@ fn validateKvCachePolicy(config: GenerationConfig) !void {
 }
 
 pub const kvSlidingTrimForced = decoder_storage.slidingTrimForced;
-
-pub fn metalSplitSwaRingRequestEligible(
-    model_config: gpt_mod.Config,
-    generation_config: GenerationConfig,
-) bool {
-    return decoder_storage.splitRingRequestEligible(model_config, decoderStorageRequest(generation_config), exact_hybrid_sampled_ring_qualification_override);
-}
-
-pub fn metalSplitSwaRingEligible(
-    model_config: gpt_mod.Config,
-    generation_config: GenerationConfig,
-    kv_dtype: runtime.kv.pool.KvDType,
-) bool {
-    return decoder_storage.splitRingEligible(model_config, decoderStorageRequest(generation_config), kv_dtype, exact_hybrid_sampled_ring_qualification_override);
-}
 
 pub const GenerationKvRoute = decoder_storage.Route;
 
@@ -2146,16 +2119,6 @@ pub fn gemma4MtpAutoMinGenerationTokens() usize {
 }
 
 const gemma4MtpUnsafeTargetReplayEnabled = decoder_forward.unsafeTargetReplayEnabled;
-
-pub fn gemma4MtpTargetReplayLikelyActive() bool {
-    if (!gemma4MtpUnsafeTargetReplayEnabled()) return false;
-    const raw = platform.env.getenv("ANTFLY_GEMMA4_MTP_TARGET_REPLAY") orelse "auto";
-    if (std.mem.eql(u8, raw, "off") or std.mem.eql(u8, raw, "0") or std.mem.eql(u8, raw, "false")) return false;
-    if (platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD")) |period| {
-        if (period > 0) return true;
-    }
-    return false;
-}
 
 fn gemma4MtpGraphReplayStatusName() []const u8 {
     const raw = platform.env.getenv("ANTFLY_GEMMA4_MTP_TARGET_REPLAY") orelse "auto";
@@ -8132,21 +8095,11 @@ pub const NativeGenerationPipeline = struct {
 
     fn finishModelRuntimeRequest(self: *NativeGenerationPipeline) !void {
         const finish = self.request_finish orelse return;
-        if (finish.runtime == null) return;
-        // Settle only the actual selected participant, never unrelated cached
-        // graphs or another request. Cleanup must proceed after cancellation.
-        var scope = if (self.execution_lock) |mutex| self.lockExecutionForCleanup(mutex) else null;
-        defer if (scope) |*held| held.deinit();
-        const operation = self.cb.operationToken();
-        var inherited = if (self.execution_cleanup_owner == null)
-            (if (operation) |held| try held.retainCleanupEpoch() else null)
-        else
-            null;
-        defer if (inherited) |*epoch| epoch.release();
-        try finish.finish(.{
-            .boundary = if (self.execution_cleanup_owner) |owner| owner.epoch() else if (inherited) |*epoch| epoch else null,
-            .operation = operation,
-        });
+        try finish.finishWithAccess(
+            &self.cb,
+            if (self.execution_lock) |mutex| self.executionAccess(mutex) else null,
+            self.execution_cleanup_owner,
+        );
     }
 
     pub fn deinit(self: *NativeGenerationPipeline) void {
@@ -8395,13 +8348,6 @@ pub const NativeGenerationPipeline = struct {
             .publication = publication,
         };
     }
-    pub fn runScheduledPreparedQwenPrefill(self: *NativeGenerationPipeline, prepared: *qwen3vl_projector.PreparedPrompt, state: *NativeDecodeState, seq: usize, wants_greedy: bool) !PrefillOutput {
-        var publication = StepPublication{ .scheduler = self.scheduler orelse return error.InvalidBatchDecodeState, .lease = self.scheduler_lease orelse return error.InvalidBatchDecodeState, .vocab_size = self.gpt_config.vocab_size };
-        var request = try self.positionedRequest(prepared, state, seq, wants_greedy, publication.interface());
-        defer self.mergeStepExecutor(&request.executor);
-        return request.runScheduled();
-    }
-
     /// Output of a successful step forward pass: the heap-allocated logits row
     /// buffer and the maximum query sequence length used to size each row.
     /// Caller owns the logits buffer.
@@ -8844,26 +8790,6 @@ fn notePendingExclusiveStepFromState(
 
 fn timestampDurationMillis(from: std.Io.Timestamp, to: std.Io.Timestamp) u64 {
     return @intCast(@divTrunc(std.Io.Timestamp.durationTo(from, to).nanoseconds, std.time.ns_per_ms));
-}
-
-pub fn maybePrependBos(encoded: *tokenizer_mod.EncodeResult, bos_token_id: i32, add_bos_token: bool) void {
-    if (!add_bos_token) return;
-    if (bos_token_id < 0) return;
-
-    var actual_prompt_tokens: usize = 0;
-    while (actual_prompt_tokens < encoded.attention_mask.len and encoded.attention_mask[actual_prompt_tokens] != 0) : (actual_prompt_tokens += 1) {}
-    if (actual_prompt_tokens == 0) return;
-    if (encoded.ids[0] == bos_token_id) return;
-
-    const limit = encoded.ids.len;
-    const copy_count = @min(actual_prompt_tokens, limit - 1);
-    var i = copy_count;
-    while (i > 0) : (i -= 1) {
-        encoded.ids[i] = encoded.ids[i - 1];
-        encoded.attention_mask[i] = encoded.attention_mask[i - 1];
-    }
-    encoded.ids[0] = bos_token_id;
-    encoded.attention_mask[0] = 1;
 }
 
 pub fn sampleTokenFromLogits(

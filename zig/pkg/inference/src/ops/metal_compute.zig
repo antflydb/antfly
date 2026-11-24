@@ -23034,7 +23034,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         // Quote every wrapper before touching the SDK. A denied host
         // reservation leaves both the old arena and the driver untouched.
-        const wrapper_bytes = try std.math.add(usize, persistentTensorBytes(1), try std.math.mul(usize, request.views, persistentTensorBytes(2)));
+        const wrapper_bytes = try audioArenaWrapperBytes(request.views);
         const bank = if (funded) |candidate| funded_bank: {
             const current = (try plan.scratchUpgrade(self.provider_impl.audio_schedule_clock +| 1, audio_schedule_bank_limit)) orelse return error.AudioScheduleRouteChanged;
             if (!std.meta.eql(request, current) or candidate.data != self.data or candidate.logical_bytes != request.bytes or candidate.wrapper_bytes != wrapper_bytes) return error.AudioScheduleRouteChanged;
@@ -23200,17 +23200,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         plan.bindings_ready = true;
     }
 
+    fn audioArenaWrapperBytes(views: usize) !usize {
+        return std.math.add(usize, persistentTensorBytes(1), try std.math.mul(usize, views, persistentTensorBytes(2)));
+    }
+
     fn audioPrepareInitialArena(self: *MetalCompute, plan: *audio_tape.Plan, funded: ?*FundedAudioBank) !void {
         const recipe = plan.arena_recipe;
         // Preserve the previous output-bank eligibility and admission fallback.
         // Optional clamp scratch must not evict an otherwise fitting bank.
         if (try plan.initialArena(audio_schedule_bank_limit)) |request| {
-            const view_bytes = persistentTensorBytes(2);
-            const output_headers = try std.math.add(usize, persistentTensorBytes(1), try std.math.mul(usize, request.output_views, view_bytes));
-            const scratch_headers = try std.math.mul(usize, request.workspace_views, view_bytes);
+            const output_headers = try audioArenaWrapperBytes(request.output_views);
             var selected = request;
             const output_only = request.outputOnly();
-            const headers = try std.math.add(usize, output_headers, scratch_headers);
+            const headers = try audioArenaWrapperBytes(try std.math.add(usize, request.output_views, request.workspace_views));
             var bank: ?MetalTensor = null;
             if (funded) |candidate| {
                 if (plan.arena != null or candidate.data != self.data) return error.AudioScheduleRouteChanged;
@@ -23463,12 +23465,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     pub fn fundAudioScratch(cb: *const ops.ComputeBackend, request: audio_tape.Plan.ArenaRequest, pin: *const @import("../runtime/tier/admission_domain.zig").Pin) !FundedAudioBank {
         if (!acceptsEmbeddingStage(cb)) return error.UnsupportedEmbeddingStage;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
-        const wrappers = try std.math.add(usize, persistentTensorBytes(1), try std.math.mul(usize, request.views, persistentTensorBytes(2)));
+        const wrappers = try audioArenaWrapperBytes(request.views);
         return self.fundAudioBankOutsideExecution(request.bytes, .private, wrappers, pin) catch |err| {
             const initial = request.initial orelse return err;
             if (err != error.MemoryBudgetExceeded and err != error.ResourceTemporarilyUnavailable) return err;
             const fallback = initial.outputOnly() orelse return err;
-            const output_wrappers = try std.math.add(usize, persistentTensorBytes(1), try std.math.mul(usize, fallback.output_views, persistentTensorBytes(2)));
+            const output_wrappers = try audioArenaWrapperBytes(fallback.output_views);
             return self.fundAudioBankOutsideExecution(fallback.bytes, .private, output_wrappers, pin);
         };
     }
