@@ -346,7 +346,9 @@ reading the source. A final atomic publication check also prevents concurrent
 publishers from overwriting each other. If publication succeeds but confirming
 filesystem durability fails, the command returns `DurabilityOutcomeUnknown`:
 **the output may already exist**. Inspect it before retrying or activating it;
-a nonzero exit in this case does not mean nothing was published.
+a nonzero exit in this case does not mean nothing was published. If the file
+was published and only the JSON report failed to reach stdout, sync reports
+`SyncReceiptDeliveryFailed`.
 
 The source is opened read-only through native storage readers; its server is
 never started. Use a stable `antfly lite snapshot` or an offline source, not a
@@ -369,8 +371,9 @@ document records, the default full-text index, and external dense embedding
 indexes with `name`, `type`, `external: true`, `dimension`, and `distance_metric`.
 It copies existing finite vectors, including partial coverage, and rebuilds indexes
 without inference. It rejects replication sources and stored enrichment/resolver
-definitions. Other artifact kinds, relational rows, and catalog scopes are
-unsupported.
+definitions and active schema migrations. Each selected table needs an initialized
+physical namespace matching its catalog range. Other artifact kinds, relational
+rows, and catalog scopes are unsupported.
 
 Source system catalogs, credentials, jobs, identities, and authorization records
 are excluded. The output uses the selected table names and the caller's schema
@@ -386,7 +389,9 @@ activation receipt. For one selected table, `output.table` is its name;
 `output.tables` always lists the complete selection.
 
 Defaults are 512 MiB of input, 1 GiB across the expanded portable streams and for
-the completed output, 250,000 documents total, and 16 MiB per document. Use
+the completed output, and 250,000 documents total. Each restored mutation can
+contain up to 16 MiB of serialized document, key, and vectors, with at most
+262,144 vector components per document. Use
 `--max-input-bytes` and `--max-expanded-bytes` to change the byte limits. Allow
 space beside the output for portable scratch and the new database. A process
 interruption can leave temporary siblings with `.sync-` in their names; remove
