@@ -2118,6 +2118,53 @@ test "research job advances phase by phase through the durable store to a cited 
     try std.testing.expectEqual(@as(i64, 8), job.result.?.usage.?.llm_calls.?);
 }
 
+test "research job connection refusal preserves its checkpoint for an explicit retry" {
+    const jobs = @import("research_jobs.zig");
+    const a = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(a);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const Failing = struct {
+        fake: TestFake = .{},
+        failure: ?anyerror = error.ConnectionRefused,
+        fn generate(raw: *anyopaque, alloc: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.failure) |err| {
+                self.failure = null;
+                return err;
+            }
+            return TestFake.generate(&self.fake, alloc, chain, messages);
+        }
+    };
+    var failing = Failing{};
+    const query = failing.fake.runners(null)[0];
+    const generator = GenerationRunner{ .ptr = &failing, .vtable = &.{ .execute_chain = Failing.generate } };
+    var store = jobs.Store.init(a, .{});
+    defer store.deinit();
+    a.free(try store.create(a, "rsj_connection", "alice", "synthetic", test_request));
+    const claim = (try store.begin(arena, "rsj_connection", "alice", 60_000)).?.started;
+    const refused = try jobs.advanceClaimed(&store, arena, query, generator, claim, 1, null, 60_000);
+    try std.testing.expectEqual(jobs.JobState.queued, refused.state);
+    try std.testing.expectEqualStrings("plan", refused.phase);
+    try std.testing.expectEqualStrings("ConnectionRefused", refused.last_error.?);
+    try std.testing.expectEqualStrings(test_request, refused.request);
+    try std.testing.expect((try store.load(arena, "rsj_connection", "bob")) == null);
+    // Only the next explicit claim retries. No hidden model replay occurs.
+    try std.testing.expectEqual(@as(usize, 0), failing.fake.planner_calls.load(.monotonic));
+    const retry = (try store.begin(arena, "rsj_connection", "alice", 60_000)).?.started;
+    const advanced = try jobs.advanceClaimed(&store, arena, query, generator, retry, 1, null, 60_000);
+    try std.testing.expectEqual(jobs.JobState.queued, advanced.state);
+    try std.testing.expectEqualStrings("research", advanced.phase);
+    try std.testing.expect(advanced.last_error == null);
+    try std.testing.expectEqual(@as(usize, 1), failing.fake.planner_calls.load(.monotonic));
+
+    // Refusal does not make unrelated authorization failures retryable.
+    failing.failure = error.Forbidden;
+    const denied = try jobs.advance(arena, query, generator, test_request, 1, null);
+    try std.testing.expectEqual(jobs.JobState.failed, denied.state);
+    try std.testing.expectEqualStrings("Forbidden", denied.last_error.?);
+}
+
 test "research agent retries a researcher without tools after a model tool-call failure" {
     var fake = TestFake{ .fail_tool_calls = true };
     const body =

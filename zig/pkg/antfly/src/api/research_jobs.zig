@@ -698,6 +698,9 @@ pub fn normalizeRequest(arena: std.mem.Allocator, request: std.json.Value) ![]co
 /// Errors after which the same pass may succeed if advanced again.
 fn transient(err: anyerror) bool {
     return switch (err) {
+        // No upstream accepted work when the connection was refused. Keep
+        // the last checkpoint so a later explicit advance can retry it.
+        error.ConnectionRefused,
         error.RateLimit,
         error.GenerationCapacityUnavailable,
         error.GenerateRequestFailed,
