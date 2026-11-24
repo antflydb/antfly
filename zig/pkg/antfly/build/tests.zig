@@ -4918,6 +4918,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "derived backlog tracker accounts payload and sequence ownership",
         "derived backlog tracker fails closed when sequence accounting allocation fails",
         "derived backlog tracker bounds sequence-only admission drain window",
+        "derived backlog retires the ordered prefix and compacts after half is retired",
         "hbc shared cache namespaces entries",
         "hbc index reports shared cache ownership",
         "hbc shared cache evicts across namespaces under one resource budget",

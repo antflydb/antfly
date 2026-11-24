@@ -2563,6 +2563,10 @@ pub const GraphIndex = struct {
     fn publishCounters(self: *GraphIndex, counters: Stats) void {
         @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
         defer self.ownership_mutex.unlock();
+        self.publishCountersLocked(counters);
+    }
+
+    fn publishCountersLocked(self: *GraphIndex, counters: Stats) void {
         self.edge_count = counters.edge_count;
         self.node_count = counters.node_count;
         self.edge_generation = counters.edge_generation;
@@ -7865,7 +7869,7 @@ pub const GraphIndex = struct {
         }
     }
 
-    fn clearPrivateEdgeStateInBatch(self: *GraphIndex, batch: *backend_erased.Batch, source: []const u8, edge_type: []const u8, target: []const u8, edge_id: []const u8, owner_document: []const u8) !void {
+    fn clearPrivateEdgeStateInBatch(self: *GraphIndex, batch: anytype, source: []const u8, edge_type: []const u8, target: []const u8, edge_id: []const u8, owner_document: []const u8) !void {
         var read = try self.beginReadReverseTxn();
         defer read.abort();
         if (edge_id.len == 0) {
@@ -8049,6 +8053,15 @@ pub const GraphIndex = struct {
         // member-row puts/deletes are appended to the reverse batch after it
         // opens, so membership and edge rows commit atomically.
 
+        const inject_split = builtin.is_test and (test_abort_doc_clear_after_forward_commit or test_abort_prune_after_forward_commit);
+        if (!inject_split and self.outgoing_owner == .native_catalog and self.reverse_owner == .native_catalog) {
+            const outgoing = self.outgoing_owner.native_catalog;
+            const reverse = self.reverse_owner.native_catalog;
+            if (outgoing.canCommitTogether(reverse)) {
+                return self.applyNativeMutationPage(outgoing, reverse, writes, deletes, suppressed, coalesced, completed_intent);
+            }
+        }
+
         // The outgoing store commits first. Persist the identities of document
         // clears in the reverse store before touching outgoing rows, so replay
         // can find even an edge with no TTL contribution or owner member row.
@@ -8115,6 +8128,68 @@ pub const GraphIndex = struct {
 
         var reverse_batch = try self.beginWriteReverseBatch();
         errdefer reverse_batch.abort();
+        const counters = try self.stageMutationPage(&main_batch, &reverse_batch, writes, deletes, suppressed, coalesced, completed_intent);
+        {
+            const wal_trace_scope = wal_trace.scope(.graph_forward_commit);
+            defer wal_trace_scope.end();
+            try main_batch.commit();
+        }
+        main_active = false;
+        // A durable reverse-store completion must never retire its recovery
+        // intent while the outgoing deletion can still be lost on power loss.
+        if (completed_intent != null or clears_private_state or clears_producer) try self.outgoing_owner.sync(true);
+        if (builtin.is_test and completed_intent == null and test_abort_doc_clear_after_forward_commit) {
+            for (deletes) |delete| {
+                if (delete.clear_all_private_state or delete.producer_clear) return error.TestInjectedGraphClearFailure;
+            }
+        }
+        if (builtin.is_test and completed_intent != null and test_abort_prune_after_forward_commit) return error.TestInjectedBackfillFailure;
+        {
+            const wal_trace_scope = wal_trace.scope(.graph_reverse_commit);
+            defer wal_trace_scope.end();
+            try reverse_batch.commit();
+        }
+        self.publishCounters(counters);
+    }
+
+    fn applyNativeMutationPage(
+        self: *GraphIndex,
+        outgoing: *native_catalog_backend.Backend,
+        reverse: *native_catalog_backend.Backend,
+        writes: []const BatchWrite,
+        deletes: []const BatchDelete,
+        suppressed: []const bool,
+        comptime coalesced: bool,
+        completed_intent: ?[]const u8,
+    ) !void {
+        const synchronization = @import("antfly_platform").sync;
+        synchronization.lockYielding(&outgoing.serialized_write_mutex);
+        defer outgoing.serialized_write_mutex.unlock();
+        synchronization.lockYielding(&reverse.serialized_write_mutex);
+        defer reverse.serialized_write_mutex.unlock();
+        var main_batch = try outgoing.boundWrite(.{});
+        errdefer main_batch.abort();
+        var reverse_batch = try reverse.boundWrite(.{});
+        errdefer reverse_batch.abort();
+        const counters = try self.stageMutationPage(&main_batch, &reverse_batch, writes, deletes, suppressed, coalesced, completed_intent);
+        try native_catalog_backend.Backend.submitTogether(&main_batch, &reverse_batch);
+        synchronization.lockYielding(&self.ownership_mutex);
+        main_batch.publishDurable();
+        reverse_batch.publishDurable();
+        self.publishCountersLocked(counters);
+        self.ownership_mutex.unlock();
+    }
+
+    fn stageMutationPage(
+        self: *GraphIndex,
+        main_batch: anytype,
+        reverse_batch: anytype,
+        writes: []const BatchWrite,
+        deletes: []const BatchDelete,
+        suppressed: []const bool,
+        comptime coalesced: bool,
+        completed_intent: ?[]const u8,
+    ) !Stats {
         var topology_changes = std.StringHashMapUnmanaged(TopologyMutation).empty;
         defer {
             var keys = topology_changes.keyIterator();
@@ -8124,7 +8199,7 @@ pub const GraphIndex = struct {
         const typed_demand = for (self.metric_configs) |cfg| {
             if (cfg.edge_filter.mode == .types) break true;
         } else false;
-        const typed_state = try typed_edges.maintenanceState(&reverse_batch, typed_demand);
+        const typed_state = try typed_edges.maintenanceState(reverse_batch, typed_demand);
         // Compare original and final identity sets, not intermediate delete /
         // insert operations. Replacing attributes or replaying an identical
         // batch must not retire immutable topology or restart numerical jobs.
@@ -8134,14 +8209,14 @@ pub const GraphIndex = struct {
             try self.rememberTopologyMutation(&topology_changes, item.source, item.target, item.edge_type, item.edge_id, item.owner_document, false);
         }
         for (writes) |item| try self.rememberTopologyMutation(&topology_changes, item.source, item.target, item.edge_type, item.edge_id, item.owner_document, true);
-        try self.resolveTopologyMutationPresence(&reverse_batch, &topology_changes, coalesced);
+        try self.resolveTopologyMutationPresence(reverse_batch, &topology_changes, coalesced);
         var changed_types = std.StringHashMapUnmanaged(void).empty;
         defer changed_types.deinit(self.alloc);
         var changes = topology_changes.iterator();
         while (changes.next()) |entry| {
             if (entry.value_ptr.before != entry.value_ptr.after) try changed_types.put(self.alloc, entry.value_ptr.kind, {});
         }
-        var counters = try graphCountersInTxn(&reverse_batch);
+        var counters = try graphCountersInTxn(reverse_batch);
         for (writes) |write| if (write.edge_id.len > 0) {
             counters.has_relationship_ids = true;
         };
@@ -8184,9 +8259,9 @@ pub const GraphIndex = struct {
 
             const rev_key = try relationshipKeyAlloc(self.alloc, delete.target, self.index_name, delete.edge_type, delete.source, delete.edge_id, delete.owner_document);
             defer self.alloc.free(rev_key);
-            try self.replaceProjectedExpirationInBatch(&reverse_batch, rev_key, null);
+            try self.replaceProjectedExpirationInBatch(reverse_batch, rev_key, null);
             if (delete.clear_all_private_state)
-                try self.clearPrivateEdgeStateInBatch(&reverse_batch, delete.source, delete.edge_type, delete.target, delete.edge_id, delete.owner_document);
+                try self.clearPrivateEdgeStateInBatch(reverse_batch, delete.source, delete.edge_type, delete.target, delete.edge_id, delete.owner_document);
             if (delete.clear_all_private_state) {
                 const intent_key = try relationshipClearIntentKeyAlloc(self.alloc, delete.source, delete.edge_type, delete.target, delete.edge_id, delete.owner_document);
                 defer self.alloc.free(intent_key);
@@ -8195,7 +8270,7 @@ pub const GraphIndex = struct {
                     else => return err,
                 };
             }
-            if (!coalesced) try self.accountReverseDelete(&reverse_batch, &counters, delete.source, delete.target, rev_key);
+            if (!coalesced) try self.accountReverseDelete(reverse_batch, &counters, delete.source, delete.target, rev_key);
             reverse_batch.delete(rev_key) catch |err| switch (err) {
                 error.NotFound => {},
                 else => return err,
@@ -8227,8 +8302,8 @@ pub const GraphIndex = struct {
 
             const rev_key = try relationshipKeyAlloc(self.alloc, write.target, self.index_name, write.edge_type, write.source, write.edge_id, write.owner_document);
             defer self.alloc.free(rev_key);
-            try self.replaceProjectedExpirationInBatch(&reverse_batch, rev_key, edge_val);
-            if (!coalesced) try self.accountReverseInsert(&reverse_batch, &counters, write.source, write.target, rev_key);
+            try self.replaceProjectedExpirationInBatch(reverse_batch, rev_key, edge_val);
+            if (!coalesced) try self.accountReverseInsert(reverse_batch, &counters, write.source, write.target, rev_key);
             try reverse_batch.put(rev_key, edge_val);
 
             if (write.owner.len > 0) {
@@ -8243,7 +8318,7 @@ pub const GraphIndex = struct {
             }
         }
 
-        if (coalesced) try self.accountTopologyMutations(&reverse_batch, &counters, &topology_changes);
+        if (coalesced) try self.accountTopologyMutations(reverse_batch, &counters, &topology_changes);
         var typed_updates = typed_edges.Updates.init(self.alloc);
         defer typed_updates.deinit();
         changes = topology_changes.iterator();
@@ -8251,27 +8326,27 @@ pub const GraphIndex = struct {
             if (!typed_state.active) break;
             if (entry.value_ptr.before == entry.value_ptr.after) continue;
             const mutation = entry.value_ptr.*;
-            try typed_updates.stageKnown(&reverse_batch, mutation.kind, entry.key_ptr.*, mutation.source, mutation.target, mutation.after, if (typed_state.ready) mutation.before else null);
+            try typed_updates.stageKnown(reverse_batch, mutation.kind, entry.key_ptr.*, mutation.source, mutation.target, mutation.after, if (typed_state.ready) mutation.before else null);
         }
-        try typed_updates.flush(&reverse_batch);
+        try typed_updates.flush(reverse_batch);
         if (typed_state.active and prev_edge_count == 0) try reverse_batch.put(typed_edges.ready_key, "1");
         if (changed_types.count() > 0) {
             counters.edge_generation = std.math.add(u64, counters.edge_generation, 1) catch return error.InvalidGraphMetricBuildManifest;
             // A migration floor gives previously indexed types a conservative
             // dependency epoch without an unbounded writer-side backfill.
             if (reverse_batch.get(graph_metric_type_epoch_floor_key)) |_| {} else |err| switch (err) {
-                error.NotFound => try putU64(&reverse_batch, graph_metric_type_epoch_floor_key, prev_edge_generation),
+                error.NotFound => try putU64(reverse_batch, graph_metric_type_epoch_floor_key, prev_edge_generation),
                 else => return err,
             }
             var kinds = changed_types.keyIterator();
             while (kinds.next()) |kind| {
                 const key = try self.graphMetricTypeEpochKeyAlloc(kind.*);
                 defer self.alloc.free(key);
-                try putU64(&reverse_batch, key, counters.edge_generation);
+                try putU64(reverse_batch, key, counters.edge_generation);
             }
-            try self.markMetricDirty(&reverse_batch, &changed_types, counters.edge_generation);
+            try self.markMetricDirty(reverse_batch, &changed_types, counters.edge_generation);
         }
-        try persistCounters(&reverse_batch, counters);
+        try persistCounters(reverse_batch, counters);
         if (completed_intent) |key| {
             // Advance the whole-range cursor atomically with reverse
             // accounting and intent retirement. Reopen never rescans the
@@ -8298,32 +8373,12 @@ pub const GraphIndex = struct {
         // contributor changes advance their own epoch, not the forward marker.
         const read_generation_key = try outgoingReadGenerationKeyAlloc(self.alloc, self.index_name);
         defer self.alloc.free(read_generation_key);
-        const next_read_generation = std.math.add(u64, try readU64OrZero(&reverse_batch, graph_read_generation_key), 1) catch return error.InvalidGraphMetricBuildManifest;
-        try putU64(&main_batch, read_generation_key, next_read_generation);
-        try putU64(&reverse_batch, graph_read_generation_key, next_read_generation);
-        try bumpReverseReadGeneration(&reverse_batch);
+        const next_read_generation = std.math.add(u64, try readU64OrZero(reverse_batch, graph_read_generation_key), 1) catch return error.InvalidGraphMetricBuildManifest;
+        try putU64(main_batch, read_generation_key, next_read_generation);
+        try putU64(reverse_batch, graph_read_generation_key, next_read_generation);
+        try bumpReverseReadGeneration(reverse_batch);
         if (builtin.is_test) if (test_counter_publication_hook) |hook| try hook(self, counters);
-        {
-            const wal_trace_scope = wal_trace.scope(.graph_forward_commit);
-            defer wal_trace_scope.end();
-            try main_batch.commit();
-        }
-        main_active = false;
-        // A durable reverse-store completion must never retire its recovery
-        // intent while the outgoing deletion can still be lost on power loss.
-        if (completed_intent != null or clears_private_state or clears_producer) try self.outgoing_owner.sync(true);
-        if (builtin.is_test and completed_intent == null and test_abort_doc_clear_after_forward_commit) {
-            for (deletes) |delete| {
-                if (delete.clear_all_private_state or delete.producer_clear) return error.TestInjectedGraphClearFailure;
-            }
-        }
-        if (builtin.is_test and completed_intent != null and test_abort_prune_after_forward_commit) return error.TestInjectedBackfillFailure;
-        {
-            const wal_trace_scope = wal_trace.scope(.graph_reverse_commit);
-            defer wal_trace_scope.end();
-            try reverse_batch.commit();
-        }
-        self.publishCounters(counters);
+        return counters;
     }
 
     // ------------------------------------------------------------------
@@ -8433,7 +8488,37 @@ pub const GraphIndex = struct {
     /// this API's narrow scope (see the section doc comment above); the
     /// caller falls back to `applyMutationPage` (via `addEdge`/the public
     /// batch-apply entry points) in that case.
+    pub const InlineWriterView = struct {
+        forward: native_catalog_backend.Backend,
+        reverse: native_catalog_backend.Backend,
+
+        pub fn close(self: *InlineWriterView) void {
+            self.reverse.close();
+            self.forward.close();
+        }
+
+        pub fn advance(self: *InlineWriterView, publication: *const InlineEdgePublication) !void {
+            errdefer {
+                self.forward.invalidateMirror();
+                self.reverse.invalidateMirror();
+            }
+            try self.forward.applyExternallyCommittedMutations(publication.forward_mutations);
+            try self.reverse.applyExternallyCommittedMutations(publication.reverse_mutations);
+        }
+    };
+
+    pub fn forkInlineWriter(self: *GraphIndex) !InlineWriterView {
+        if (self.outgoing_owner != .native_catalog or self.reverse_owner != .native_catalog) return error.InlineEdgePublicationUnsupported;
+        var forward = try self.outgoing_owner.native_catalog.forkWriterView();
+        errdefer forward.close();
+        return .{ .forward = forward, .reverse = try self.reverse_owner.native_catalog.forkWriterView() };
+    }
+
     pub fn prepareInlineEdgePublication(self: *GraphIndex, write: BatchWrite) !InlineEdgePublication {
+        return self.prepareInlineEdgePublicationFrom(null, write);
+    }
+
+    pub fn prepareInlineEdgePublicationFrom(self: *GraphIndex, writer: ?*InlineWriterView, write: BatchWrite) !InlineEdgePublication {
         if (std.meta.activeTag(self.outgoing_owner) != .native_catalog or std.meta.activeTag(self.reverse_owner) != .native_catalog) {
             wal_trace.recordOp(.graph_inline_prepare_backend_mismatch);
             return error.InlineEdgePublicationUnsupported;
@@ -8455,8 +8540,8 @@ pub const GraphIndex = struct {
         try edge_type_mod.validateStored(write.edge_type);
         try edge_weight.validateStored(write.weight);
 
-        const forward_backend = self.outgoing_owner.native_catalog;
-        const reverse_backend = self.reverse_owner.native_catalog;
+        const forward_backend = if (writer) |view| &view.forward else self.outgoing_owner.native_catalog;
+        const reverse_backend = if (writer) |view| &view.reverse else self.reverse_owner.native_catalog;
 
         var forward_txn = try forward_backend.boundWrite(.{});
         defer forward_txn.abort();
@@ -8511,12 +8596,69 @@ pub const GraphIndex = struct {
     /// publishes the in-memory counters -- the step after which a
     /// synchronous graph-visible write's ack may return.
     pub fn installInlineEdgePublication(self: *GraphIndex, publication: *InlineEdgePublication) !void {
-        try self.outgoing_owner.native_catalog.applyExternallyCommittedMutations(publication.forward_mutations);
-        try self.reverse_owner.native_catalog.applyExternallyCommittedMutations(publication.reverse_mutations);
-        self.publishCounters(publication.counters);
-        freeOwnedMutations(self.alloc, publication.forward_mutations);
-        freeOwnedMutations(self.alloc, publication.reverse_mutations);
-        publication.* = undefined;
+        try self.applyInlinePublicationToServing(publication);
+        publication.abort();
+    }
+
+    pub fn applyInlinePublicationToServing(self: *GraphIndex, publication: *const InlineEdgePublication) !void {
+        try self.publishCatalogDelta(publication.forward_mutations, publication.reverse_mutations, publication.counters, false);
+    }
+
+    pub fn refreshCatalogDelta(self: *GraphIndex, forward: []const native_catalog_backend.Mutation, reverse: []const native_catalog_backend.Mutation) !void {
+        if (self.outgoing_owner != .native_catalog or self.reverse_owner != .native_catalog) return error.UnsupportedRefresh;
+        var counters = self.committedStats();
+        var has_contributor_writes = false;
+        for (reverse) |mutation| {
+            if (mutation.namespace != null) continue;
+            const key = mutation.key;
+            if (std.mem.eql(u8, key, maintenance.ownership_key) or std.mem.eql(u8, key, maintenance.range_key) or
+                std.mem.eql(u8, key, maintenance.counters_key)) return error.UnsupportedRefresh;
+            if (!mutation.is_delete and (std.mem.startsWith(u8, key, edge_contribution_prefix) or
+                std.mem.startsWith(u8, key, relationship_contribution_prefix))) has_contributor_writes = true;
+            const field: *u64 = if (std.mem.eql(u8, key, graph_edge_count_key))
+                &counters.edge_count
+            else if (std.mem.eql(u8, key, graph_node_count_key))
+                &counters.node_count
+            else if (std.mem.eql(u8, key, graph_edge_generation_key))
+                &counters.edge_generation
+            else {
+                if (std.mem.eql(u8, key, "meta:relationship_ids:v1")) {
+                    if (!mutation.is_delete and mutation.value.len != 8) return error.UnsupportedRefresh;
+                    counters.has_relationship_ids = !mutation.is_delete and std.mem.readInt(u64, mutation.value[0..8], .little) != 0;
+                }
+                continue;
+            };
+            if (!mutation.is_delete and mutation.value.len != 8) return error.UnsupportedRefresh;
+            field.* = if (mutation.is_delete) 0 else std.mem.readInt(u64, mutation.value[0..8], .little);
+        }
+        try self.publishCatalogDelta(forward, reverse, counters, true);
+        if (has_contributor_writes) self.contributor_ordering_enabled.store(true, .release);
+    }
+
+    fn publishCatalogDelta(self: *GraphIndex, forward_mutations: []const native_catalog_backend.Mutation, reverse_mutations: []const native_catalog_backend.Mutation, counters: Stats, verify_pair: bool) !void {
+        const forward = self.outgoing_owner.native_catalog;
+        const reverse = self.reverse_owner.native_catalog;
+        errdefer if (!verify_pair) {
+            forward.invalidateMirror();
+            reverse.invalidateMirror();
+        };
+        var next_forward = try forward.prepareExternalMirror(forward_mutations);
+        defer next_forward.deinit();
+        var next_reverse = try reverse.prepareExternalMirror(reverse_mutations);
+        defer next_reverse.deinit();
+        if (verify_pair) {
+            const key = try outgoingReadGenerationKeyAlloc(self.alloc, self.index_name);
+            defer self.alloc.free(key);
+            const outgoing = next_forward.get(.{}, key) catch return error.UnsupportedRefresh;
+            const incoming = next_reverse.get(.{}, graph_read_generation_key) catch return error.UnsupportedRefresh;
+            if (outgoing.len != 8 or incoming.len != 8 or !std.mem.eql(u8, outgoing, incoming))
+                return error.UnsupportedRefresh;
+        }
+        @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
+        next_forward.publish();
+        next_reverse.publish();
+        self.publishCountersLocked(counters);
+        self.ownership_mutex.unlock();
     }
 
     /// The forward (outgoing-adjacency) store's `.native_catalog` scope --
@@ -22127,6 +22269,47 @@ test "graph native_catalog backend: reverse index stays consistent with forward 
         defer GraphIndex.freeEdges(alloc, in_edges);
         try std.testing.expectEqual(@as(usize, 1), in_edges.len);
         try std.testing.expectEqualStrings(node, in_edges[0].source);
+    }
+}
+
+test "graph private writer view advances both catalogs without serving queued edges" {
+    const alloc = std.testing.allocator;
+    var buffer: [256]u8 = undefined;
+    const path = tmpPath(&buffer, "inline-edge-writer-view");
+    defer cleanupTmp(path);
+    var backing = NativeCatalogTestSink{ .allocator = alloc };
+    defer backing.deinit();
+    var graph = try GraphIndex.open(alloc, @as(?*anyopaque, null), path, "g", .{
+        .reverse_backend = .native_catalog,
+        .native_catalog_sink = backing.sink(),
+    });
+    defer graph.close();
+    const submits = backing.submit_calls;
+    var writer = try graph.forkInlineWriter();
+    defer writer.close();
+
+    const edge: BatchWrite = .{ .source = "a", .target = "b", .edge_type = "rel" };
+    var first = try graph.prepareInlineEdgePublicationFrom(&writer, edge);
+    defer first.abort();
+    try writer.advance(&first);
+    var overwrite = try graph.prepareInlineEdgePublicationFrom(&writer, edge);
+    defer overwrite.abort();
+    try std.testing.expectEqual(first.counters, overwrite.counters);
+    try writer.advance(&overwrite);
+    try std.testing.expectEqual(submits, backing.submit_calls);
+    const served = try graph.getEdges(alloc, "a", "rel", .out);
+    defer GraphIndex.freeEdges(alloc, served);
+    try std.testing.expectEqual(@as(usize, 0), served.len);
+    try std.testing.expectError(error.UnsupportedRefresh, graph.refreshCatalogDelta(first.forwardMutations(), &.{}));
+    try graph.refreshCatalogDelta(first.forwardMutations(), first.reverseMutations());
+    try std.testing.expectEqual(first.counters, graph.committedStats());
+    for ([_]struct { key: []const u8, direction: EdgeDirection }{
+        .{ .key = "a", .direction = .out },
+        .{ .key = "b", .direction = .in },
+    }) |probe| {
+        const edges = try graph.getEdges(alloc, probe.key, "rel", probe.direction);
+        defer GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
     }
 }
 
