@@ -3502,10 +3502,11 @@ test "planned Metal elementwise product-add publishes into the assigned region o
     const dims = [_]i64{ 1, width };
     const shape = ml.graph.Shape.init(.f32, &dims);
     const names = [_][]const u8{ "a", "b", "c", "d" };
-    for ([_]enum { product_first, product_second, dual_product, scale_first, scale_second, dual_scaled }{ .product_first, .product_second, .dual_product, .scale_first, .scale_second, .dual_scaled }) |order| {
+    for ([_]enum { product_first, product_second, dual_product, scale_first, scale_second, dual_scaled, scale_published }{ .product_first, .product_second, .dual_product, .scale_first, .scale_second, .dual_scaled, .scale_published }) |order| {
         const pair = order == .dual_product;
         const dual_scaled = order == .dual_scaled;
-        const scaled = order == .scale_first or order == .scale_second or dual_scaled;
+        const publish_literal = order == .scale_published;
+        const scaled = order == .scale_first or order == .scale_second or dual_scaled or publish_literal;
         var graph = ml.graph.Graph.init(a);
         defer graph.deinit();
         var builder = ml.graph.Builder.init(&graph);
@@ -3516,10 +3517,12 @@ test "planned Metal elementwise product-add publishes into the assigned region o
             node.* = try builder.parameter(name, shape);
             binding.* = .{ .name = name, .node_id = node.*, .kind = .input };
         }
-        const left = try builder.mul(nodes[0], if (scaled) try builder.scalarConst(.f32, if (dual_scaled) 0x1.fffffcp-1 else 0.5) else nodes[1]);
+        const scale = if (scaled) try builder.scalarConst(.f32, if (dual_scaled) 0x1.fffffcp-1 else 0.5) else nodes[1];
+        const left = try builder.mul(nodes[0], scale);
         const right = if (pair) try builder.mul(nodes[2], nodes[3]) else if (dual_scaled) try builder.mul(nodes[1], try builder.scalarConst(.f32, 2)) else nodes[count - 1];
         const output_node = if (order == .product_second or order == .scale_second) try builder.add(right, left) else try builder.add(left, right);
         try graph.markOutput(output_node);
+        if (publish_literal) try graph.markOutput(scale);
         // The default graph pipeline folds scalar products into an existing
         // native descriptor. Exercise the provider-owned primitive schedule.
         const pipeline = if (scaled) ml.graph.passes.pipeline.Pipeline.provider_fusion else ml.graph.passes.pipeline.Pipeline.default;
@@ -3552,13 +3555,13 @@ test "planned Metal elementwise product-add publishes into the assigned region o
             return error.MissingProductAddCoverage;
         }
         try std.testing.expectEqual(@as(usize, 1), routes.pool.regions.len);
-        const expected_literals: usize = if (dual_scaled) 2 else if (scaled) 1 else 0;
+        const expected_literals: usize = if (dual_scaled) 2 else if (scaled and !publish_literal) 1 else 0;
         try std.testing.expectEqual(expected_literals, routes.pool.baked_region_literals.count());
         for (routes.pool.regions[0].owner.literal_nodes) |literal| {
             const store = routes.pool.literal_store orelse return error.MissingPhysicalPool;
             const index = store.node_indices[literal];
-            try std.testing.expect(!routes.pool.literalEnabled(index));
-            try std.testing.expect(routes.pool.plan.allocationById(store.literals[index].allocation) == null);
+            try std.testing.expectEqual(publish_literal, routes.pool.literalEnabled(index));
+            try std.testing.expectEqual(publish_literal, routes.pool.plan.allocationById(store.literals[index].allocation) != null);
         }
         const products = [_]ml.graph.NodeId{ left, right };
         for (products[0..if (pair or dual_scaled) @as(usize, 2) else 1]) |product| {
@@ -3579,6 +3582,11 @@ test "planned Metal elementwise product-add publishes into the assigned region o
         defer claims.releaseUnsubmitted();
         var result = try executable.run(a, .{ .host_inputs = inputs[0..count], .prepared_routes = routes, .region_claims = &claims, .output_placement = .producer, .collect_partition_stats = true, .activation_readbacks = .forbidden });
         defer result.deinit(&executable.runtime);
+        if (publish_literal) {
+            const published = try cb.toFloat32(result.outputs[1], a);
+            defer a.free(published);
+            try std.testing.expectEqualSlices(f32, &.{0.5}, published);
+        }
         try std.testing.expect(!result.stats.metal_region_policy_observed);
         try std.testing.expectEqual(@as(u64, 0), result.stats.graph_plan_slots_reserved);
         const dispatch = result.stats.assigned_regions orelse return error.MissingRegionDispatch;
