@@ -3540,21 +3540,21 @@ test "actual Metal greedy arm rejects an already submitted frame without disturb
         fn check(cb: ops.ComputeBackend, _: ops.ComputeBackend) !void {
             const Metal = @import("../ops/metal_compute.zig").MetalCompute;
             const compute: *Metal = @ptrCast(@alignCast(cb.ptr));
-            const runtime = compute.provider_impl.raw_decode_runtime orelse return error.ExpectedActualMetalProvider;
+            const raw = compute.provider_impl.raw_decode_runtime orelse return error.ExpectedActualMetalProvider;
             try std.testing.expect(cb.decoderRuntimeSetWhisperPipelinedFrames(true));
             defer _ = cb.decoderRuntimeSetWhisperPipelinedFrames(false);
-            try metal_runtime.beginFrame(runtime);
-            errdefer if (metal_runtime.hasActiveFrame(runtime)) metal_runtime.cancelFrame(runtime) catch {};
-            try metal_runtime.submitFrame(runtime);
-            defer metal_runtime.waitFrame(runtime) catch unreachable;
+            try metal_runtime.beginFrame(raw);
+            errdefer if (metal_runtime.hasActiveFrame(raw)) metal_runtime.cancelFrame(raw) catch {};
+            try metal_runtime.submitFrame(raw);
+            defer metal_runtime.waitFrame(raw) catch unreachable;
             try std.testing.expectError(error.FrameAlreadyActive, decoder_gated_runtime.decoderRuntimePipelinedControl(&cb, .submit_only));
-            try std.testing.expect(metal_runtime.hasSubmittedFrame(runtime));
-            try std.testing.expect(!metal_runtime.hasActiveFrame(runtime));
-            try metal_runtime.beginFrame(runtime);
-            defer if (metal_runtime.hasActiveFrame(runtime)) metal_runtime.cancelFrame(runtime) catch unreachable;
+            try std.testing.expect(metal_runtime.hasSubmittedFrame(raw));
+            try std.testing.expect(!metal_runtime.hasActiveFrame(raw));
+            try metal_runtime.beginFrame(raw);
+            defer if (metal_runtime.hasActiveFrame(raw)) metal_runtime.cancelFrame(raw) catch unreachable;
             try std.testing.expectError(error.FrameAlreadyActive, decoder_gated_runtime.decoderRuntimePipelinedControl(&cb, .submit_pending));
-            try std.testing.expect(metal_runtime.hasSubmittedFrame(runtime));
-            try std.testing.expect(metal_runtime.hasActiveFrame(runtime));
+            try std.testing.expect(metal_runtime.hasSubmittedFrame(raw));
+            try std.testing.expect(metal_runtime.hasActiveFrame(raw));
         }
     };
     try @import("../ops/media_residency_test.zig").onMetal(Fixture.populate, Fixture.check);
