@@ -3858,8 +3858,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         // `max_pending_segments` is where a writer starts merging
                         // (`mergeAtCapBeforeWrite`); while a merge already in flight
                         // elsewhere catches up, writes stay inline up to twice it.
+                        // Without writer merges nothing bounds that overshoot, so
+                        // the cap stays where merging starts.
                         if (S.ownerField(self, "text_merge_runtime").*) |runtime|
-                            (if (runtime.config.enabled) runtime.config.max_pending_segments *| 2 else 0)
+                            (if (!runtime.config.enabled) 0 else if (runtime.config.manual_producer_assistance) runtime.config.max_pending_segments *| 2 else runtime.config.max_pending_segments)
                         else
                             0,
                     ) catch {
