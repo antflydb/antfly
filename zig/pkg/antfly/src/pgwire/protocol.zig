@@ -471,29 +471,33 @@ pub const Session = struct {
                         try owner.authorizeRequest(self.alloc, self.request("", &.{}, &.{}), null);
                     }
                     if (self.hooks) |hooks| try hooks.register(hooks.context, self);
-                    if (self.source.vtable.start_connection) |start_connection| {
-                        if (self.backend_pid <= 0) {
-                            var pid_bytes: [4]u8 = undefined;
-                            try self.io.randomSecure(&pid_bytes);
-                            self.backend_pid = @intCast(1 + std.mem.readInt(u32, &pid_bytes, .little) % std.math.maxInt(i32));
+                    // Logical startup already authorized its replication owner.
+                    // Native SQL connection enrollment belongs to SQL sessions.
+                    if (self.replication_mode == .normal) {
+                        if (self.source.vtable.start_connection) |start_connection| {
+                            if (self.backend_pid <= 0) {
+                                var pid_bytes: [4]u8 = undefined;
+                                try self.io.randomSecure(&pid_bytes);
+                                self.backend_pid = @intCast(1 + std.mem.readInt(u32, &pid_bytes, .little) % std.math.maxInt(i32));
+                            }
+                            var accepted = false;
+                            for (0..8) |_| {
+                                start_connection(self.source.context, self.alloc, self.identity.?, self.request("", &.{}, &.{})) catch |err| {
+                                    if (err != error.SqlBackendPidInUse) return err;
+                                    if (self.hooks) |hooks| {
+                                        try (hooks.rekey orelse return err)(hooks.context, self);
+                                    } else {
+                                        var pid_bytes: [4]u8 = undefined;
+                                        try self.io.randomSecure(&pid_bytes);
+                                        self.backend_pid = @intCast(1 + std.mem.readInt(u32, &pid_bytes, .little) % std.math.maxInt(i32));
+                                    }
+                                    continue;
+                                };
+                                accepted = true;
+                                break;
+                            }
+                            if (!accepted) return error.SqlBackendPidInUse;
                         }
-                        var accepted = false;
-                        for (0..8) |_| {
-                            start_connection(self.source.context, self.alloc, self.identity.?, self.request("", &.{}, &.{})) catch |err| {
-                                if (err != error.SqlBackendPidInUse) return err;
-                                if (self.hooks) |hooks| {
-                                    try (hooks.rekey orelse return err)(hooks.context, self);
-                                } else {
-                                    var pid_bytes: [4]u8 = undefined;
-                                    try self.io.randomSecure(&pid_bytes);
-                                    self.backend_pid = @intCast(1 + std.mem.readInt(u32, &pid_bytes, .little) % std.math.maxInt(i32));
-                                }
-                                continue;
-                            };
-                            accepted = true;
-                            break;
-                        }
-                        if (!accepted) return error.SqlBackendPidInUse;
                     }
                     if (self.replication_mode == .logical and self.replication == null) {
                         const open = self.source.vtable.open_replication orelse return error.UnsupportedReplicationMode;
@@ -1356,6 +1360,9 @@ pub const Session = struct {
         var observed_end = stream.initial_end_lsn;
         var feedback_ceiling = stream.resume_lsn;
         var last_keepalive = self.replicationNow();
+        var idle_poll_ms = limits.replication_poll_ms;
+        var deferred_poll_ms = limits.replication_poll_ms;
+        const max_idle_poll_ms = @max(limits.replication_poll_ms, 1000);
         const Outcome = union(enum) { input: anyerror!replication_input.Input, tick: std.Io.Cancelable!void };
         var outcomes: [2]Outcome = undefined;
         var select = std.Io.Select(Outcome).init(self.io, &outcomes);
@@ -1432,13 +1439,15 @@ pub const Session = struct {
                             // no cursor. Require a fresh authorized read before
                             // emitting data or a keepalive for this position.
                             self.replicationDeadline(deadline);
-                            try select.concurrent(.tick, replicationTick, .{ self.io, limits.replication_poll_ms });
+                            try select.concurrent(.tick, replicationTick, .{ self.io, deferred_poll_ms });
+                            deferred_poll_ms = @min(deferred_poll_ms *| 2, max_idle_poll_ms);
                             continue;
                         }
                         std.log.debug("PostgreSQL replication poll failed err={s}", .{@errorName(err)});
                         return err;
                     };
                     defer poll.deinit();
+                    deferred_poll_ms = limits.replication_poll_ms;
                     if (@backingInt(poll.end_lsn) < @backingInt(observed_end)) return error.InvalidResult;
                     observed_end = poll.end_lsn;
                     try owner.authorizeRequest(scratch.allocator(), self.replicationRequest(statement, deadline), command_value);
@@ -1465,7 +1474,8 @@ pub const Session = struct {
                         last_keepalive = self.replicationNow();
                     }
                     const elapsed_ms: u32 = @intCast(@min(@as(i64, limits.replication_keepalive_ms), @divTrunc(@max(0, self.replicationNow() - last_keepalive), std.time.ns_per_ms)));
-                    const delay: u32 = if (chunks.len != 0) 0 else @min(limits.replication_poll_ms, @max(1, limits.replication_keepalive_ms - elapsed_ms));
+                    const delay: u32 = if (chunks.len != 0) 0 else @min(idle_poll_ms, @max(1, limits.replication_keepalive_ms - elapsed_ms));
+                    idle_poll_ms = if (chunks.len != 0) limits.replication_poll_ms else @min(idle_poll_ms *| 2, max_idle_poll_ms);
                     try select.concurrent(.tick, replicationTick, .{ self.io, delay });
                 },
             }
@@ -1593,10 +1603,11 @@ pub const Session = struct {
                     const sql = std.mem.trim(u8, statement, " \t\r\n");
                     const clear_path = std.ascii.eqlIgnoreCase(sql, "SELECT pg_catalog.set_config('search_path', '', false);");
                     const directory_mode = std.ascii.eqlIgnoreCase(sql, "SHOW data_directory_mode");
-                    if (self.replication != null and self.status == .idle and (clear_path or directory_mode)) {
-                        const owner = self.replication orelse return error.UnsupportedReplicationMode;
-                        const request_value = self.request(statement, &.{}, &.{});
-                        try owner.authorizeRequest(arena.allocator(), request_value, null);
+                    if ((self.replication != null or self.logical != null) and self.status == .idle and (clear_path or directory_mode)) {
+                        // These commands expose only connection-local settings.
+                        // Both logical backends have authorized startup.
+                        if (self.replication) |owner|
+                            try owner.authorizeRequest(arena.allocator(), self.request(statement, &.{}, &.{}), null);
                         if (clear_path) self.namespace_setting = .{};
                         const result: backend.Result = if (clear_path) .{
                             .columns = &.{.{ .name = "set_config", .type = .string }},
@@ -3022,16 +3033,23 @@ pub const Session = struct {
     fn complete(self: *Session, result: backend.Result) !void {
         try self.flushNotices();
         for (result.notices) |notice| try self.sendNotice(notice);
-        if (result.ddl_receipt_json != null and result.catalog_receipt_json != null) return error.InvalidResult;
-        if (result.catalog_receipt_json orelse result.ddl_receipt_json) |receipt| {
-            var bytes = std.Io.Writer.Allocating.init(self.alloc);
-            defer bytes.deinit();
-            const pending = std.mem.eql(u8, result.command_tag, "DDL PENDING");
-            const unknown = pending and result.mutation_outcome == null;
-            try bytes.writer.writeAll(if (unknown) "SERROR\x00C40003\x00MDDL admission outcome is unknown; do not replay; inspect receipt\x00D" else if (pending) "SERROR\x00C55000\x00MDDL operation was durably admitted but is not ready; do not replay; inspect receipt\x00D" else "SNOTICE\x00C01000\x00MDDL operation committed; inspect receipt for validation readiness\x00D");
-            try bytes.writer.writeAll(receipt);
-            try bytes.writer.writeAll("\x00\x00");
-            try self.message(if (pending) 'E' else 'N', bytes.written());
+        const pending = std.mem.eql(u8, result.command_tag, "DDL PENDING");
+        const unknown = pending and result.mutation_outcome == null;
+        // Catalog admission and constraint activation have separate recovery
+        // receipts. Prefer admission for an unknown outcome and activation
+        // after commit. Emit the other receipt as a notice so both survive.
+        const first = if (unknown) result.catalog_receipt_json else result.ddl_receipt_json;
+        const second = if (unknown) result.ddl_receipt_json else result.catalog_receipt_json;
+        if (first != null) if (second) |receipt| {
+            try self.sendDdlReceipt('N', "SNOTICE\x00C01000\x00MAdditional DDL recovery receipt\x00D", receipt);
+        };
+        if (first orelse second) |receipt| {
+            try self.sendDdlReceipt(if (pending) 'E' else 'N', if (unknown)
+                "SERROR\x00C40003\x00MDDL admission outcome is unknown; do not replay; inspect receipt\x00D"
+            else if (pending)
+                "SERROR\x00C55000\x00MDDL operation was durably admitted but is not ready; do not replay; inspect receipt\x00D"
+            else
+                "SNOTICE\x00C01000\x00MDDL operation committed; inspect receipt for validation readiness\x00D", receipt);
             if (pending) return;
         }
         if (result.mutation_outcome) |outcome| {
@@ -3042,6 +3060,12 @@ pub const Session = struct {
             }
         }
         try self.command(result.command_tag);
+    }
+
+    fn sendDdlReceipt(self: *Session, tag: u8, prefix: []const u8, receipt: []const u8) !void {
+        const bytes = try std.mem.concat(self.alloc, u8, &.{ prefix, receipt, "\x00\x00" });
+        defer self.alloc.free(bytes);
+        try self.message(tag, bytes);
     }
 
     fn ready(self: *Session) !void {

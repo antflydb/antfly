@@ -79,7 +79,10 @@ pub const Recovery = struct {
         budget.cancellation = context.cancellation;
         var session = try catalog_api.RoutingSession.initWithBudget(a, self.catalog, budget);
         defer session.deinit();
-        const fence = try routeRetainedOwner(&session, job.owner, job.coordinator_locator, budget, context);
+        const fence = if (job.collect_ordinary)
+            try routeRetainedOwnerForCleanup(&session, job.owner, job.coordinator_locator, budget, context)
+        else
+            try routeRetainedOwner(&session, job.owner, job.coordinator_locator, budget, context);
         const locator = local.api_local_transaction_contract.parseParticipantRef(job.coordinator_locator) orelse return error.InvalidParticipant;
         return self.runBound(a, job.owner, fence, locator.table_name, job.transaction_id, job, null, context);
     }
@@ -103,9 +106,202 @@ pub const Recovery = struct {
         const decision = observed.value.decision orelse return;
         if (!std.mem.eql(u8, &decision.admission.digest, &job.admission_digest)) return error.SourceTransactionIdentityConflict;
         const expected_status: @TypeOf(decision.record.status) = if (terminal == .committed) .committed else .aborted;
-        if (decision.record.status != expected_status) return error.SourceOutcomeUnresolved;
+        if (decision.record.status != expected_status or decision.record.externally_owned) return error.SourceOutcomeUnresolved;
         try self.checkpoint(context);
         try self.participants.acknowledgeRetainedCoordinator(a, job.owner, fence, job.coordinator_locator, job.transaction_id, context);
+    }
+
+    /// The source caller holds the durable metadata commit and the exact
+    /// native checkpoint receipt. Release the coordinator's retention lease
+    /// before removing the manifest that proves which transaction owns it.
+    pub fn releaseSource(self: Recovery, a: A, owner: completion.RoutedOwner, fence: metadata.CatalogRouteFence, table: []const u8, transaction_id: [16]u8, expected: SourceExpectation, original: Context) !void {
+        try expected.validate();
+        var scope = try publication_ops.Scope.init(fence, original);
+        const context = scope.context();
+        try self.checkpoint(context);
+        const query: decision_ops.Request = .{ .version = 1, .owner = owner, .transaction_id = transaction_id, .minimum_applied_index = 1 };
+        var observed = try self.decisions.read(a, fence, table, query, context);
+        defer observed.deinit();
+        try observed.value.validate(query.binding());
+        const decision = observed.value.decision orelse return;
+        if (!std.mem.eql(u8, &decision.admission.digest, &expected.admission_digest) or
+            decision.record.begin_timestamp != expected.begin_timestamp or
+            !std.meta.eql(decision.record.source_scope, @as(?local.storage_source_scope.Reference, expected.scope)) or
+            !std.meta.eql(decision.record.source_purpose, @as(?[32]u8, expected.purpose)))
+            return error.SourceTransactionIdentityConflict;
+        if (decision.record.status != .committed or decision.record.commit_version != expected.commit_version)
+            return error.SourceOutcomeUnresolved;
+        // acknowledgments_pending deliberately excludes the coordinator's
+        // retained lease once every follower is resolved. Release that lease
+        // explicitly. The native acknowledgment is idempotent.
+        if (!decision.record.retain_terminal) return;
+        const member = try decision.admission.admission.coordinatorMember();
+        var routed = owner;
+        routed.topology_epoch = fence.topology_epoch;
+        try self.checkpoint(context);
+        try self.participants.acknowledgeRetainedCoordinator(a, routed, fence, member.locator, transaction_id, context);
+    }
+
+    /// The caller supplies the durable metadata COMMIT after its entire
+    /// cohort has resolved. This lane only observes ordered owner receipts and
+    /// publishes their certificate. It cannot resolve or expire a decision.
+    pub fn publishExternal(self: Recovery, a: A, admission: completion.Admission, commit_version: u64, original: Context) !?completion.Digest {
+        const context = try original.platformDeadline();
+        try self.checkpoint(context);
+        const manifest = try admission.manifest(commit_version);
+        const manifest_digest = manifest.digest();
+        var budget = self.catalog.budget(null);
+        budget.deadline_ns = budget.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io });
+        budget.cancellation = context.cancellation;
+        var session = try catalog_api.RoutingSession.initWithBudget(a, self.catalog, budget);
+        defer session.deinit();
+        const fences = try a.alloc(metadata.CatalogRouteFence, admission.participants.len);
+        defer a.free(fences);
+        var assembly = try resolution_ops.wire.Assembly.init(a, manifest);
+        defer assembly.deinit();
+        for (admission.participants, fences) |member, *fence| {
+            try self.checkpoint(context);
+            const owner = member.routed_owner orelse return error.InvalidParticipant;
+            const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
+            fence.* = try routeRetainedOwnerForCleanup(&session, owner, member.locator, budget, context);
+            const request: resolution_ops.Request = .{
+                .version = 1,
+                .authority = .raft,
+                .namespace = member.namespace,
+                .transaction_id = admission.transaction_id,
+                .owner_fence = owner.digest(),
+                .manifest_digest = manifest_digest,
+                .commit_version = commit_version,
+                .minimum_applied_index = 1,
+            };
+            const receipt = try self.resolutions.read(a, fence.*, locator.table_name, request, context);
+            if (!try assembly.add(request.binding(), receipt)) return null;
+        }
+        const bytes = try assembly.encode(a);
+        defer a.free(bytes);
+        var parsed = try completion.parse(a, bytes);
+        defer parsed.deinit();
+        for (admission.participants, fences) |member, fence| {
+            try self.checkpoint(context);
+            const owner = member.routed_owner orelse return error.InvalidParticipant;
+            const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
+            const request: publication_ops.Request = .{
+                .version = 1,
+                .owner = owner,
+                .transaction_id = admission.transaction_id,
+                .manifest_digest = manifest_digest,
+                .commit_version = commit_version,
+                .minimum_applied_index = 1,
+            };
+            var observed = try self.publications.read(a, fence, locator.table_name, request, context);
+            try observed.validate(request.binding());
+            if (observed.publication == null) {
+                try self.participants.submitExternal(a, member, fence, .{ .sync_level = .write, .transaction = .{
+                    .publish_completion = .{ .txn_id = admission.transaction_id, .completion_owner = owner, .certificate = bytes },
+                } }, context);
+                observed = try self.publications.read(a, fence, locator.table_name, request, context);
+                try observed.validate(request.binding());
+            }
+            const evidence = observed.publication orelse return null;
+            if (!std.mem.eql(u8, &parsed.value.digest, &evidence.digest)) return error.DecisionConflict;
+        }
+        return parsed.value.digest;
+    }
+
+    /// A recipient leader qualifies the release against the original
+    /// coordinator's retained decision and certificate before proposing it.
+    pub fn requireOrdinaryRelease(self: Recovery, a: A, participant: completion.RoutedOwner, transaction_id: [16]u8, release: completion.OrdinaryRelease, context: Context) !void {
+        try release.validate(participant);
+        try self.checkpoint(context);
+        var budget = self.catalog.budget(null);
+        budget.deadline_ns = budget.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io });
+        budget.cancellation = context.cancellation;
+        var session = try catalog_api.RoutingSession.initWithBudget(a, self.catalog, budget);
+        defer session.deinit();
+        const table_id = std.mem.readInt(u64, release.coordinator.namespace[0..8], .big);
+        const table_index = session.table_id_indexes.get(table_id) orelse return error.TopologyChanged;
+        const table = session.snapshot.value.tables[table_index].name;
+        const locator = try local.api_local_transaction_contract.participantIdForGroup(a, table, release.coordinator.group_id);
+        defer a.free(locator);
+        const fence = try routeRetainedOwnerForCleanup(&session, release.coordinator, locator, budget, context);
+        const query: decision_ops.Request = .{ .version = 1, .owner = release.coordinator, .transaction_id = transaction_id, .minimum_applied_index = 1 };
+        var observed = try self.decisions.read(a, fence, table, query, context);
+        defer observed.deinit();
+        try observed.value.validate(query.binding());
+        const decision = observed.value.decision orelse return error.SourceOutcomeUnresolved;
+        if (decision.record.status != .committed or decision.record.acknowledgments_pending or decision.record.retain_terminal or
+            decision.record.externally_owned or decision.record.source_scope != null or decision.record.source_purpose != null)
+            return error.SourceOutcomeUnresolved;
+        if (!std.mem.eql(u8, &decision.admission.digest, &release.admission_digest) or
+            decision.record.commit_version != release.commit_version) return error.DecisionConflict;
+        _ = try decision.admission.admission.memberForOwner(participant);
+        const manifest = try decision.committedManifest();
+        const publication: publication_ops.Request = .{
+            .version = 1,
+            .owner = release.coordinator,
+            .transaction_id = transaction_id,
+            .manifest_digest = manifest.digest(),
+            .commit_version = manifest.commit_version,
+            .minimum_applied_index = 1,
+        };
+        const observed_publication = try self.publications.read(a, fence, table, publication, context);
+        try observed_publication.validate(publication.binding());
+        const certificate = observed_publication.publication orelse return error.SourceOutcomeUnresolved;
+        if (!std.mem.eql(u8, &certificate.digest, &release.certificate_digest)) return error.DecisionConflict;
+        try self.checkpoint(context);
+    }
+
+    fn collectOrdinary(self: Recovery, a: A, admission: completion.Admission, manifest: completion.Manifest, owner: completion.RoutedOwner, coordinator_fence: metadata.CatalogRouteFence, table: []const u8, context: Context) !Outcome {
+        const query: publication_ops.Request = .{
+            .version = 2,
+            .owner = owner,
+            .transaction_id = admission.transaction_id,
+            .manifest_digest = manifest.digest(),
+            .commit_version = manifest.commit_version,
+            .minimum_applied_index = 1,
+        };
+        const observed = try self.publications.read(a, coordinator_fence, table, query, context);
+        try observed.validate(query.binding());
+        const published = observed.publication orelse return .unproven;
+        const status = observed.release orelse return error.HistoryCorrupt;
+        if (status.collection_staged) return .complete;
+        const follower_count = admission.participants.len - 1;
+        if (status.released_followers > follower_count) return error.HistoryCorrupt;
+        var release: completion.OrdinaryRelease = .{
+            .coordinator = owner,
+            .admission_digest = admission.digest(),
+            .certificate_digest = published.digest,
+            .commit_version = manifest.commit_version,
+        };
+        const coordinator = try admission.coordinatorMember();
+        if (status.released_followers < follower_count) {
+            var budget = self.catalog.budget(null);
+            budget.deadline_ns = budget.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io });
+            budget.cancellation = context.cancellation;
+            var session = try catalog_api.RoutingSession.initWithBudget(a, self.catalog, budget);
+            defer session.deinit();
+            var ordinal: u16 = 0;
+            var released = status.released_followers;
+            for (admission.participants) |member| {
+                if (admission.isCoordinator(member)) continue;
+                defer ordinal += 1;
+                if (ordinal < status.released_followers) continue;
+                try self.checkpoint(context);
+                const recipient = member.routed_owner orelse return error.InvalidParticipant;
+                const fence = try routeRetainedOwnerForCleanup(&session, recipient, member.locator, budget, context);
+                try self.participants.releaseOrdinary(a, member, fence, admission.transaction_id, release, context);
+                released += 1;
+                if (released - status.released_followers == completion.OrdinaryRelease.fanout_window) break;
+            }
+            release.progress = .{ .expected = status.released_followers, .released = released };
+            try self.checkpoint(context);
+            try self.participants.releaseOrdinary(a, coordinator, coordinator_fence, admission.transaction_id, release, context);
+            if (released != follower_count) return .incomplete;
+            release.progress = null;
+        }
+        try self.checkpoint(context);
+        try self.participants.releaseOrdinary(a, coordinator, coordinator_fence, admission.transaction_id, release, context);
+        return .complete;
     }
 
     fn runBound(self: Recovery, a: A, coordinator: completion.RoutedOwner, coordinator_fence: metadata.CatalogRouteFence, table: []const u8, transaction_id: [16]u8, job: ?local.storage_history_recovery_wire.Request, source_expected: ?SourceExpectation, original: Context) !Outcome {
@@ -120,6 +316,7 @@ pub const Recovery = struct {
         if (job) |expected| {
             const initial = observed.value.decision orelse return .unproven;
             if (!std.mem.eql(u8, &initial.admission.digest, &expected.admission_digest)) return error.SourceTransactionIdentityConflict;
+            if (initial.record.externally_owned) return .pending;
             if (initial.record.status == .pending and initial.record.source_purpose == null and expected.abort_before_ns != 0 and initial.record.created_at_ns < expected.abort_before_ns) {
                 try self.checkpoint(context);
                 self.participants.abortExpired(a, request.binding(), observed.value, coordinator_fence, expected.abort_before_ns, expected.resolution_timestamp_ns, context) catch |err| switch (err) {
@@ -135,6 +332,7 @@ pub const Recovery = struct {
             }
         }
         const decision = observed.value.decision orelse return .unproven;
+        if (decision.record.externally_owned) return .pending;
         if (source_expected) |expected| {
             if (!std.mem.eql(u8, &decision.admission.digest, &expected.admission_digest) or decision.record.begin_timestamp != expected.begin_timestamp or
                 !std.meta.eql(decision.record.source_scope, @as(?local.storage_source_scope.Reference, expected.scope)) or
@@ -150,6 +348,12 @@ pub const Recovery = struct {
             .aborted, .committed => {},
         }
         const admission = decision.admission.admission;
+        if (job) |pending| {
+            if (pending.collect_ordinary and decision.record.status == .committed and
+                !decision.record.acknowledgments_pending and !decision.record.retain_terminal and
+                decision.record.source_scope == null and decision.record.source_purpose == null)
+                return self.collectOrdinary(a, admission, try decision.committedManifest(), coordinator, coordinator_fence, table, context);
+        }
         var budget = self.catalog.budget(null);
         budget.deadline_ns = budget.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io });
         budget.cancellation = context.cancellation;
@@ -158,8 +362,35 @@ pub const Recovery = struct {
         // Validate and retain every original route before any recovery write.
         const fences = try a.alloc(metadata.CatalogRouteFence, admission.participants.len);
         defer a.free(fences);
+        var refreshed_lease = coordinator_fence.topology_epoch != coordinator.topology_epoch;
         for (admission.participants, fences) |member, *fence| {
-            fence.* = try routeRetainedOwner(&session, (member.routed_owner orelse return error.ChangefeedCapabilityUnsupported), member.locator, budget, context);
+            const owner = member.routed_owner orelse return error.ChangefeedCapabilityUnsupported;
+            fence.* = if (source_expected != null)
+                try routeRetainedOwnerForCleanup(&session, owner, member.locator, budget, context)
+            else
+                try routeRetainedOwner(&session, owner, member.locator, budget, context);
+            refreshed_lease = refreshed_lease or fence.topology_epoch != owner.topology_epoch;
+        }
+        // A changed lease can still prove work completed before the change.
+        // Leave unresolved actions pending until terminal replay is qualified.
+        if (refreshed_lease and !decision.record.acknowledgments_pending) {
+            if (source_expected == null) return .incomplete;
+            const manifest = try decision.committedManifest();
+            var certificate: ?completion.Digest = null;
+            for (admission.participants, fences) |member, fence| {
+                try self.checkpoint(context);
+                const owner = member.routed_owner orelse return error.ChangefeedCapabilityUnsupported;
+                const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
+                const input: publication_ops.Request = .{ .version = 1, .owner = owner, .transaction_id = transaction_id, .manifest_digest = manifest.digest(), .commit_version = manifest.commit_version, .minimum_applied_index = 1 };
+                const observed_publication = try self.publications.read(a, fence, locator.table_name, input, context);
+                try observed_publication.validate(input.binding());
+                const evidence = observed_publication.publication orelse return .incomplete;
+                if (certificate) |expected| {
+                    if (!std.meta.eql(expected, evidence.digest)) return error.DecisionConflict;
+                } else certificate = evidence.digest;
+            }
+            try self.checkpoint(context);
+            return .complete;
         }
         if (decision.record.status == .aborted) {
             for (fences, 0..) |fence, index| {
@@ -181,6 +412,7 @@ pub const Recovery = struct {
             var receipt = try self.resolutions.read(a, fence, locator.table_name, input, context);
             try receipt.validate(input.binding());
             if (receipt.resolution == null) {
+                if (fence.topology_epoch != owner.topology_epoch) return .incomplete;
                 // A positive durable coordinator COMMIT, not absence, authorizes
                 // idempotent terminal resolution. BEGIN/PREPARE are forbidden.
                 try self.checkpoint(context);
@@ -222,6 +454,14 @@ pub const Recovery = struct {
 };
 
 pub fn routeRetainedOwner(session: *catalog_api.RoutingSession, owner: completion.RoutedOwner, locator_bytes: []const u8, budget: catalog_api.RoutingBudget, context: Context) !metadata.CatalogRouteFence {
+    return routeRetainedOwnerAtEpoch(session, owner, locator_bytes, budget, context, false);
+}
+
+pub fn routeRetainedOwnerForCleanup(session: *catalog_api.RoutingSession, owner: completion.RoutedOwner, locator_bytes: []const u8, budget: catalog_api.RoutingBudget, context: Context) !metadata.CatalogRouteFence {
+    return routeRetainedOwnerAtEpoch(session, owner, locator_bytes, budget, context, true);
+}
+
+fn routeRetainedOwnerAtEpoch(session: *catalog_api.RoutingSession, owner: completion.RoutedOwner, locator_bytes: []const u8, budget: catalog_api.RoutingBudget, context: Context, cleanup: bool) !metadata.CatalogRouteFence {
     try context.ensureActive();
     try owner.validate();
     const locator = local.api_local_transaction_contract.parseParticipantRef(locator_bytes) orelse return error.InvalidParticipant;
@@ -229,7 +469,7 @@ pub fn routeRetainedOwner(session: *catalog_api.RoutingSession, owner: completio
     const snapshot = session.snapshot.value;
     if (snapshot.metadata_group_id != owner.metadata_group_id or snapshot.metadata_incarnation == null or !std.mem.eql(u8, &snapshot.metadata_incarnation.?, &owner.metadata_incarnation)) return error.TopologyChanged;
     const view = try session.tableRoutingView(locator.table_name, budget);
-    if (view.table_id != std.mem.readInt(u64, owner.namespace[0..8], .big) or view.topology_epoch != owner.topology_epoch) return error.TopologyChanged;
+    if (view.table_id != std.mem.readInt(u64, owner.namespace[0..8], .big) or (!cleanup and view.topology_epoch != owner.topology_epoch)) return error.TopologyChanged;
     const table = snapshot.tables[session.table_id_indexes.get(view.table_id) orelse return error.TopologyChanged];
     if (table.storage.engine != .local or table.routing_storage_binding == null) return error.ChangefeedCapabilityUnsupported;
     if (!std.mem.eql(u8, &@import("../metadata/changefeed_control.zig").tableBinding(table), &owner.table_binding)) return error.TopologyChanged;
@@ -237,7 +477,7 @@ pub fn routeRetainedOwner(session: *catalog_api.RoutingSession, owner: completio
     const shard = tables.rangeDocIdentityShardId(range.*);
     const range_id = tables.rangeDocIdentityRangeId(range.*);
     if (shard != std.mem.readInt(u64, owner.namespace[8..16], .big) or range_id != std.mem.readInt(u64, owner.namespace[16..24], .big)) return error.TopologyChanged;
-    const fence: metadata.CatalogRouteFence = .{ .metadata_group_id = owner.metadata_group_id, .metadata_incarnation = owner.metadata_incarnation, .catalog_revision = snapshot.catalog_revision, .table_id = view.table_id, .topology_epoch = owner.topology_epoch, .route = .{ .group_id = owner.group_id, .range_id = range_id, .identity_namespace = .{ .table_id = view.table_id, .shard_id = shard, .range_id = range_id } }, .admission_deadline_ns = context.deadline_ns, .admission_deadline_io = context.deadline_io, .admission_cancellation = context.cancellation };
+    const fence: metadata.CatalogRouteFence = .{ .metadata_group_id = owner.metadata_group_id, .metadata_incarnation = owner.metadata_incarnation, .catalog_revision = snapshot.catalog_revision, .table_id = view.table_id, .topology_epoch = view.topology_epoch, .route = .{ .group_id = owner.group_id, .range_id = range_id, .identity_namespace = .{ .table_id = view.table_id, .shard_id = shard, .range_id = range_id } }, .admission_deadline_ns = context.deadline_ns, .admission_deadline_io = context.deadline_io, .admission_cancellation = context.cancellation };
     try fence.validate();
     try budget.checkpoint();
     return fence;
@@ -281,6 +521,10 @@ const consumer_tests = if (@hasDecl(@import("antfly_source_root"), "implementati
             acknowledgments: usize = 0,
             expect_coordinator_release: bool = false,
             lose_publication: bool = false,
+            lose_release_progress: bool = false,
+            released_followers: u16 = 0,
+            collection_staged: bool = false,
+            follower_releases: usize = 0,
             suppress_resolution: bool = false,
             state: decision_ops.wire.Record = .{ .status = .committed, .begin_timestamp = 10, .created_at_ns = 11, .commit_version = 20, .finalized_at_ns = 20, .prepared = true, .intents_resolved = true, .digest = @splat(7) },
             absent: bool = false,
@@ -293,7 +537,9 @@ const consumer_tests = if (@hasDecl(@import("antfly_source_root"), "implementati
             admin_frees: usize = 0,
             omit_admin_ranges: bool = false,
             source_recovery_mode: bool = false,
+            epoch_retirement: bool = false,
             begins: usize = 0,
+            first_begin_group: ?u64 = null,
             prepares: usize = 0,
             lose_prepare_once: bool = false,
             cancelled: std.atomic.Value(bool) = .init(false),
@@ -304,7 +550,7 @@ const consumer_tests = if (@hasDecl(@import("antfly_source_root"), "implementati
                 const index: usize = @intCast(input_fence.route.group_id - 9);
                 if (self.unsupported_owners[index]) return error.ChangefeedCapabilityUnsupported;
                 var owner = self.admission.participants[index].routed_owner.?;
-                owner.topology_epoch += self.capture_epoch_delta;
+                owner.topology_epoch = if (self.epoch_retirement) input_fence.topology_epoch else owner.topology_epoch + self.capture_epoch_delta;
                 return .{ .owner = owner, .observation = try @import("history_owner_operations.zig").wire.Reply.init(.{ .owner = owner }, .{ .term = 1, .index = 8 }, self.retention_limit_bytes) };
             }
             fn acquire(ptr: *anyopaque, budget: catalog_api.RoutingBudget, authoritative: bool) !*catalog_api.RoutingGeneration {
@@ -348,7 +594,15 @@ const consumer_tests = if (@hasDecl(@import("antfly_source_root"), "implementati
             fn publication(ptr: *anyopaque, _: A, fence: metadata.CatalogRouteFence, _: []const u8, input: publication_ops.Request, _: Context) !publication_ops.Reply {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 const index: usize = @intCast(fence.route.group_id - 9);
-                return publication_ops.Reply.init(input.binding(), .{ .term = 1, .index = 8 }, if (self.published[index]) .{ .digest = self.publication_digest, .retained_bytes = 1024, .position = .{ .term = 1, .index = 7 } } else null);
+                const evidence: ?publication_ops.wire.CompletionPublication = if (self.published[index])
+                    .{ .digest = self.publication_digest, .retained_bytes = 1024, .position = .{ .term = 1, .index = 7 } }
+                else
+                    null;
+                const release: ?publication_ops.Reply.ReleaseStatus = if (input.version == 2 and evidence != null)
+                    .{ .released_followers = self.released_followers, .collection_staged = self.collection_staged }
+                else
+                    null;
+                return publication_ops.Reply.initWithRelease(input.binding(), .{ .term = 1, .index = 8 }, evidence, release);
             }
             fn write(ptr: *anyopaque, alloc: A, _: @import("internal_group_operations.zig").RoutedBatchAuthority, group: u64, _: []const u8, request: local.storage_db_selected_root.db.types.BatchRequest, _: @import("internal_batch_forwarding.zig").Context, _: Context) !?void {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -372,6 +626,7 @@ const consumer_tests = if (@hasDecl(@import("antfly_source_root"), "implementati
                         try std.testing.expectEqualDeep(self.state.source_scope, begin.source_scope);
                         try std.testing.expectEqualDeep(self.state.source_purpose, begin.source_purpose);
                         try std.testing.expectEqual(self.state.created_at_ns, begin.created_at_ns);
+                        if (self.first_begin_group == null) self.first_begin_group = group;
                         self.begins += 1;
                     },
                     .prepare => |prepare| {
@@ -395,7 +650,12 @@ const consumer_tests = if (@hasDecl(@import("antfly_source_root"), "implementati
                         }
                         try std.testing.expectEqualDeep(self.state.source_purpose, terminal.source_purpose);
                         try std.testing.expectEqual(@as(local.storage_db_selected_root.db.types.TxnStatus, if (self.state.status == .committed) .committed else .aborted), terminal.status);
-                        try std.testing.expectEqual(@as(u64, if (self.state.status == .committed) 20 else 30), terminal.commit_version);
+                        if (self.epoch_retirement) {
+                            try std.testing.expectEqual(.aborted, terminal.status);
+                            try std.testing.expectEqualDeep(self.state.source_scope, terminal.source_scope);
+                            try std.testing.expectEqualDeep(try self.admission.coordinatorOwner(), terminal.completion_owner.?);
+                            try std.testing.expect(terminal.commit_version > self.state.begin_timestamp);
+                        } else try std.testing.expectEqual(@as(u64, if (self.state.status == .committed) 20 else 30), terminal.commit_version);
                         if (self.state.status == .pending and terminal.status == .aborted) {
                             self.state.status = .aborted;
                             self.state.commit_version = 0;
@@ -413,6 +673,7 @@ const consumer_tests = if (@hasDecl(@import("antfly_source_root"), "implementati
                             try std.testing.expect(self.state.status == .aborted and self.resolved[0] and self.resolved[1]);
                         }
                         try std.testing.expectEqualSlices(u8, &self.admission.transaction_id, &value.txn_id);
+                        if (self.epoch_retirement) self.state.acknowledgments_pending = false;
                         const coordinator = self.admission.coordinator_namespace;
                         if (self.expect_coordinator_release) {
                             try std.testing.expectEqual(@as(usize, 1), value.participants.len);
@@ -426,6 +687,28 @@ const consumer_tests = if (@hasDecl(@import("antfly_source_root"), "implementati
                         if (!self.state.retain_terminal) try std.testing.expectEqualStrings((try self.admission.member(coordinator)).locator, value.participants[1]);
                     },
                     .publish_completion => |value| {
+                        if (value.ordinary_release) |release| {
+                            try std.testing.expectEqualDeep(try self.admission.coordinatorOwner(), release.coordinator);
+                            try std.testing.expectEqualDeep(self.admission.digest(), release.admission_digest);
+                            try std.testing.expectEqualDeep(self.publication_digest, release.certificate_digest);
+                            if (release.progress) |advance| {
+                                try std.testing.expectEqual(@as(usize, 0), index);
+                                try std.testing.expectEqual(self.released_followers, advance.expected);
+                                try std.testing.expectEqual(@as(u16, 1), advance.released);
+                                try std.testing.expectEqual(@as(usize, 1), self.follower_releases);
+                                self.released_followers = advance.released;
+                                if (self.lose_release_progress) {
+                                    self.lose_release_progress = false;
+                                    return error.RaftBatchWriteOutcomeUnknown;
+                                }
+                            } else if (index == 0) {
+                                try std.testing.expectEqual(@as(u16, 1), self.released_followers);
+                                self.collection_staged = true;
+                            } else {
+                                self.follower_releases += 1;
+                            }
+                            return {};
+                        }
                         try std.testing.expect(self.resolved[0] and self.resolved[1]);
                         var certificate = try completion.parse(alloc, value.certificate);
                         defer certificate.deinit();
@@ -441,6 +724,30 @@ const consumer_tests = if (@hasDecl(@import("antfly_source_root"), "implementati
                     else => return error.TestUnexpectedResult,
                 }
                 return {};
+            }
+            const retirement_wire = @import("source_retirement_operations.zig").wire;
+
+            fn retire(ptr: *anyopaque, alloc: A, route: metadata.CatalogRouteFence, _: []const u8, request: retirement_wire.Request, _: Context) !retirement_wire.OwnedReply {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                try std.testing.expect(self.epoch_retirement and self.state.intents_resolved and self.state.acknowledgments_pending);
+                try std.testing.expectEqual(@as(u64, 9), route.route.group_id);
+                const intent = request.intent.?;
+                try std.testing.expect(route.topology_epoch != intent.owner.topology_epoch);
+                const cut: local.storage_source_scope.Cut = .{ .term = 1, .index = 9 };
+                const response: retirement_wire.Reply = .{
+                    .request_digest = try request.digest(alloc),
+                    .command = .{ .version = 1, .intent = intent, .observation = .{
+                        .request_digest = intent.coordinator.digest(),
+                        .cut = .{ .term = 1, .index = 8 },
+                        .decision = .{ .record = self.state, .admission = .{ .admission = self.admission, .digest = self.admission.digest() } },
+                    } },
+                    .receipt = cut,
+                    .outcome = .{ .applied = .{ .version = 1, .request_digest = intent.digest(), .coordinator_record_digest = self.state.digest, .cut = cut, .closed_through_token = intent.reference.token, .disposition = .fenced } },
+                };
+                self.resolved[0] = true;
+                const bytes = try std.json.Stringify.valueAlloc(alloc, response, .{});
+                defer alloc.free(bytes);
+                return std.json.parseFromSlice(retirement_wire.Reply, alloc, bytes, .{ .allocate = .alloc_always });
             }
         };
         var fake: Fake = .{ .generation = generation, .admission = admission };
@@ -481,6 +788,21 @@ const consumer_tests = if (@hasDecl(@import("antfly_source_root"), "implementati
         try recovery.releaseRetained(a, page_job, .committed, .{});
         fake.expect_coordinator_release = false;
         try std.testing.expectEqual(before_release + 1, fake.acknowledgments);
+
+        page_job.collect_ordinary = true;
+        fake.state.retain_terminal = false;
+        fake.state.acknowledgments_pending = false;
+        fake.lose_release_progress = true;
+        try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, recovery.runRetained(a, page_job, .{}));
+        try std.testing.expectEqual(@as(u16, 1), fake.released_followers);
+        try std.testing.expect(!fake.collection_staged);
+        try std.testing.expectEqual(.complete, try recovery.runRetained(a, page_job, .{}));
+        try std.testing.expect(fake.collection_staged);
+        try std.testing.expectEqual(.complete, try recovery.runRetained(a, page_job, .{}));
+        try std.testing.expectEqual(@as(usize, 1), fake.follower_releases);
+        fake.state.retain_terminal = true;
+        fake.state.acknowledgments_pending = true;
+
         fake.resolved[1] = false;
         fake.published = .{ false, false };
         fake.suppress_resolution = true;
@@ -531,6 +853,10 @@ const consumer_tests = if (@hasDecl(@import("antfly_source_root"), "implementati
         try std.testing.expectError(error.SourceOutcomeUnresolved, recovery.participants.abortExpired(a, source_query.binding(), source_observation.value, fence, 20, 30, .{}));
         try std.testing.expectEqual(@as(usize, 5), fake.resolves);
         fake.state.source_purpose = null;
+        fake.state.externally_owned = true;
+        try std.testing.expectEqual(.pending, try recovery.runRetained(a, retained, .{}));
+        try std.testing.expectEqual(@as(usize, 5), fake.resolves);
+        fake.state.externally_owned = false;
         try std.testing.expectEqual(.aborted, try recovery.runRetained(a, retained, .{}));
         try std.testing.expectEqual(@as(usize, 8), fake.resolves);
         try std.testing.expectEqual(@as(usize, 4), fake.publishes);
@@ -564,6 +890,41 @@ const consumer_tests = if (@hasDecl(@import("antfly_source_root"), "implementati
         fake.resolved = .{ true, true };
         fake.published = .{ false, false };
         fake.suppress_resolution = false;
+        // Metadata recovery must observe the entire roster before publishing.
+        // A lost reply leaves a durable partial publication, which a new pass
+        // joins without re-resolving or acknowledging any data transaction.
+        const before_external_resolves = fake.resolves;
+        const before_external_acks = fake.acknowledgments;
+        const before_external_publishes = fake.publishes;
+        fake.resolved[1] = false;
+        try std.testing.expectEqual(null, try recovery.publishExternal(a, frozen.admission, 20, .{}));
+        try std.testing.expectEqual(before_external_publishes, fake.publishes);
+        fake.resolved[1] = true;
+        fake.lose_publication = true;
+        try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, recovery.publishExternal(a, frozen.admission, 20, .{}));
+        try std.testing.expectEqual(before_external_publishes + 1, fake.publishes);
+        // A routing revision can move range boundaries while preserving both
+        // physical owners and their receipts. Recover the same certificate.
+        var publication_ranges = ranges;
+        publication_ranges[0].end_key = "n";
+        publication_ranges[1].start_key = "n";
+        const publication_generation = try catalog_api.RoutingGeneration.create(a, .{
+            .metadata_group_id = 1,
+            .metadata_incarnation = owners[0].metadata_incarnation,
+            .catalog_revision = 11,
+            .tables = &records,
+            .ranges = &publication_ranges,
+        }, .{});
+        defer publication_generation.release();
+        try std.testing.expect((try publication_generation.indexed.tableRoutingView("docs", .{})).topology_epoch != owners[0].topology_epoch);
+        fake.generation = publication_generation;
+        const recovered_certificate = (try recovery.publishExternal(a, frozen.admission, 20, .{})).?;
+        fake.generation = generation;
+        try std.testing.expectEqualDeep(recovered_certificate, fake.publication_digest);
+        try std.testing.expectEqual(before_external_publishes + 2, fake.publishes);
+        try std.testing.expectEqual(before_external_resolves, fake.resolves);
+        try std.testing.expectEqual(before_external_acks, fake.acknowledgments);
+        fake.published = .{ false, false };
         fake.visibility_errors = .{ error.EnrichmentWorkerFailed, error.EnrichmentRetryInProgress };
         const coordinator: admission_mod.Coordinator = .{ .owners = .{ .ptr = &fake, .read_fn = Fake.capture }, .recovery = recovery };
         const normal_inputs = [_]admission_mod.Input{
@@ -773,6 +1134,7 @@ const consumer_tests = if (@hasDecl(@import("antfly_source_root"), "implementati
         fake.lose_prepare_once = true;
         const source_resolves_before_replay = fake.resolves;
         try std.testing.expectError(error.CommitDecisionUnknown, coordinator.commitSourcePrepared(a, &prepared, 20, .{}));
+        try std.testing.expectEqual(@as(?u64, owners[1].group_id), fake.first_begin_group);
         try std.testing.expectEqual(@as(usize, 2), fake.begins);
         try std.testing.expectEqual(@as(usize, 1), fake.prepares);
         try std.testing.expectEqual(source_resolves_before_replay, fake.resolves);
@@ -813,6 +1175,32 @@ const consumer_tests = if (@hasDecl(@import("antfly_source_root"), "implementati
         fake.absent = false;
         try std.testing.expectEqual(resolutions_before_bound, fake.resolves);
         try std.testing.expectEqual(publications_before_bound, fake.publishes);
+        var newer_source_fence = source_fence;
+        newer_source_fence.topology_epoch += 1;
+        fake.state.acknowledgments_pending = false;
+        fake.publication_digest = @splat(27);
+        fake.published = .{ true, false };
+        try std.testing.expectEqual(.incomplete, try recovery.runSource(a, owners[1], newer_source_fence, "docs", admission.transaction_id, expected, .{}));
+        fake.published[1] = true;
+        try std.testing.expectEqual(.complete, try recovery.runSource(a, owners[1], newer_source_fence, "docs", admission.transaction_id, expected, .{}));
+        try std.testing.expectEqual(resolutions_before_bound, fake.resolves);
+        try std.testing.expectEqual(publications_before_bound, fake.publishes);
+        fake.state = committed_record;
+        fake.state.retain_terminal = true;
+        fake.state.acknowledgments_pending = true;
+        fake.expect_coordinator_release = true;
+        const before_source_release = fake.acknowledgments;
+        wrong_source = expected;
+        wrong_source.scope.token += 1;
+        try std.testing.expectError(error.SourceTransactionIdentityConflict, recovery.releaseSource(a, owners[1], newer_source_fence, "docs", admission.transaction_id, wrong_source, .{}));
+        try std.testing.expectEqual(before_source_release, fake.acknowledgments);
+        try recovery.releaseSource(a, owners[1], newer_source_fence, "docs", admission.transaction_id, expected, .{});
+        try std.testing.expectEqual(before_source_release + 1, fake.acknowledgments);
+        fake.state.acknowledgments_pending = false;
+        try recovery.releaseSource(a, owners[1], newer_source_fence, "docs", admission.transaction_id, expected, .{});
+        try std.testing.expectEqual(before_source_release + 2, fake.acknowledgments);
+        fake.expect_coordinator_release = false;
+        fake.state = committed_record;
         fake.resolved = .{ true, false };
         fake.published = .{ false, false };
         const destination = @import("source_destination_plan.zig");
@@ -846,8 +1234,18 @@ const consumer_tests = if (@hasDecl(@import("antfly_source_root"), "implementati
         const sealed_actor = actor_state;
         actor_state = try (source_control.Mutation{ .accept = .{ .reservation_digest = reservation_id, .receipt = accepted_source.receipt } }).apply(actor_alloc, actor_state);
         const completing: @import("source_destination_completion.zig").Completion = .{ .recovery = recovery };
-        try std.testing.expectEqual(.complete, try completing.run(a, actor_state, accepted_source.receipt, source_fence, .{}));
-        try std.testing.expectEqual(@as(u64, 0), actor_state.committed.sequence);
+        const saved_actor = try source_control.encode(a, actor_state);
+        defer a.free(saved_actor);
+        var restarted_actor = try source_control.parse(a, saved_actor);
+        defer restarted_actor.deinit();
+        var after_split = source_fence;
+        after_split.topology_epoch -%= 1;
+        const original_begins = fake.begins;
+        const original_prepares = fake.prepares;
+        try std.testing.expectEqual(.complete, try completing.run(a, restarted_actor.value, restarted_actor.value.accepted.reference, after_split, .{}));
+        try std.testing.expectEqual(original_begins, fake.begins);
+        try std.testing.expectEqual(original_prepares, fake.prepares);
+        try std.testing.expectEqual(@as(u64, 0), restarted_actor.value.committed.sequence);
         try std.testing.expectEqual(resolutions_before_bound + 1, fake.resolves);
         try std.testing.expectEqual(publications_before_bound + 2, fake.publishes);
 
@@ -856,9 +1254,10 @@ const consumer_tests = if (@hasDecl(@import("antfly_source_root"), "implementati
             state: source_control.State,
             metadata_group_id: u64 = 1,
             lose_reply: bool = true,
+            lose_reply_at: ?u64 = null,
 
             pub fn ensureLinearizableReadWithContext(_: *@This(), _: Context) !void {}
-            pub fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: Context, _: u16) !void {}
+            pub fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: Context, _: u16) error{TableTopologyProtocolUpgradeRequired}!void {}
             pub fn projectedStore(self: *@This()) ?*@This() {
                 return self;
             }
@@ -877,8 +1276,8 @@ const consumer_tests = if (@hasDecl(@import("antfly_source_root"), "implementati
                 self.state = saved.value;
                 return self.state.revision;
             }
-            pub fn waitForTransitionAppliedWithContext(self: *@This(), _: u64, _: Context) !void {
-                if (!self.lose_reply) return;
+            pub fn waitForTransitionAppliedWithContext(self: *@This(), revision: u64, _: Context) !void {
+                if (!self.lose_reply or (self.lose_reply_at != null and self.lose_reply_at.? != revision)) return;
                 self.lose_reply = false;
                 return error.TestLostMetadataReply;
             }
@@ -886,10 +1285,10 @@ const consumer_tests = if (@hasDecl(@import("antfly_source_root"), "implementati
         var journal: ActorMetadata = .{ .alloc = actor_alloc, .state = actor_state };
         const source_completion = @import("source_destination_completion.zig");
         const actor_admission: @import("source_destination_admission.zig").Admission = .{ .coordinator = coordinator, .artifacts = undefined, .checkpoints = undefined };
-        try std.testing.expectError(error.MetadataMutationOutcomeUnknown, source_completion.recover(&journal, actor_admission, a, actor_scope, @splat(32), .{}));
+        try std.testing.expectError(error.MetadataMutationOutcomeUnknown, source_completion.recover(&journal, actor_admission, a, journal.state, @splat(32), .{}));
         try std.testing.expectEqual(@as(u64, 1), journal.state.committed.sequence);
         try std.testing.expectEqual(.accepted, journal.state.artifact_control.?.current.?.phase);
-        try source_completion.recover(&journal, actor_admission, a, actor_scope, @splat(32), .{});
+        try source_completion.recover(&journal, actor_admission, a, journal.state, @splat(32), .{});
         try std.testing.expectEqual(.garbage, journal.state.artifact_control.?.current.?.phase);
         try std.testing.expectEqual(publications_before_bound + 2, fake.publishes);
 
@@ -935,7 +1334,7 @@ const consumer_tests = if (@hasDecl(@import("antfly_source_root"), "implementati
         reclaim_admission.artifacts.controls = .{ .ptr = &artifact_probe, .execute_fn = ArtifactProbe.execute };
         journal.state = try (source_control.Mutation{ .retire_artifact = .{ .reservation_digest = reservation_id, .proof = @splat(38), .reason = .not_admitted } }).apply(actor_alloc, sealed_actor);
         const retirement_revision = journal.state.revision;
-        try std.testing.expectError(error.SourceOutcomeUnresolved, source_completion.recover(&journal, reclaim_admission, a, actor_scope, @splat(32), .{}));
+        try std.testing.expectError(error.SourceOutcomeUnresolved, source_completion.recover(&journal, reclaim_admission, a, journal.state, @splat(32), .{}));
         try std.testing.expectEqual(retirement_revision, journal.state.revision);
         try std.testing.expectEqual(@as(usize, 1), artifact_probe.fences);
         try std.testing.expectEqual(.garbage, journal.state.artifact_control.?.current.?.phase);
@@ -945,8 +1344,30 @@ const consumer_tests = if (@hasDecl(@import("antfly_source_root"), "implementati
         const source_input: @import("../metadata/source_delivery.zig").Input = .{ .batch_id = "batch", .checkpoint = "lsn:1", .payload_digest = @splat(40), .accepted_at_ns = 50 };
         const effects: []const @import("distributed_txn.zig").TableCommitRequest = &.{.{ .table_name = "docs", .deletes = &.{"z"} }};
         try std.testing.expectError(error.MetadataMutationOutcomeUnknown, source_completion.stage(&journal, reclaim_admission, a, actor_scope, @splat(32), source_input, effects, null, .{}));
+        try std.testing.expect(!journal.state.pending.?.retain_payload);
+        try std.testing.expect(journal.state.payload_prewrite == null);
+        journal.state = initialized_actor;
+        journal.lose_reply = true;
+        journal.lose_reply_at = initialized_actor.revision + 2;
+        var spool_root = std.testing.tmpDir(.{});
+        defer spool_root.cleanup();
+        const spool_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/cdc-reservation", .{spool_root.sub_path});
+        defer a.free(spool_path);
+        var spool = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, spool_path);
+        defer spool.deinit();
+        const initialized_spool = try spool.spoolArtifactStore(.none);
+        var shared_spool = try spool.sharedSpoolArtifactStore(initialized_spool.namespace_identity.?, .none);
+        reclaim_admission.retained_payload_store = shared_spool;
+        try std.testing.expectError(error.MetadataMutationOutcomeUnknown, source_completion.stage(&journal, reclaim_admission, a, actor_scope, @splat(32), source_input, effects, null, .{}));
         try std.testing.expectEqual(@as(usize, 0), artifact_probe.begins);
         const original = journal.state.pending.?;
+        try std.testing.expect(original.retain_payload);
+        var saved_manifest = try @import("source_destination_plan.zig").parse(a, original.delivery_manifest, original.plan_digest);
+        defer saved_manifest.deinit();
+        const reference = saved_manifest.value.retained_payload orelse return error.TestUnexpectedResult;
+        const original_bytes = try reference.load(&shared_spool, a, .none);
+        defer a.free(original_bytes);
+        try std.testing.expectEqualSlices(u8, &saved_manifest.value.artifact.checksum, &source_control.digest(original_bytes));
         var retry = source_input;
         retry.accepted_at_ns = 99;
         try std.testing.expectError(error.SourceOutcomeUnresolved, source_completion.stage(&journal, reclaim_admission, a, actor_scope, @splat(32), retry, effects, null, .{}));
@@ -971,6 +1392,89 @@ const consumer_tests = if (@hasDecl(@import("antfly_source_root"), "implementati
         try std.testing.expectEqual(writes_before_aborted_source, fake.resolves);
         try std.testing.expectError(error.UnsupportedOperation, coordinator.commitSourcePrepared(a, &ordinary_prepared, 20, .{}));
         try std.testing.expectEqual(@as(usize, 4), fake.begins);
+
+        const readiness = struct {
+            pub fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: Context, required: u16) !void {
+                try std.testing.expect(required == source_control.epoch_attempt_retirement_protocol_version or required == source_control.epoch_attempt_progress_protocol_version);
+            }
+        };
+        var service: readiness = .{};
+        var next_member: u16 = 0;
+        reclaim_admission.retirements = .{ .ptr = &fake, .execute_fn = Fake.retire };
+        fake.state = committed_record;
+        fake.state.status = .pending;
+        fake.state.commit_version = 0;
+        fake.state.finalized_at_ns = 0;
+        fake.state.intents_resolved = false;
+        fake.state.retain_terminal = true;
+        fake.state.acknowledgments_pending = true;
+        fake.resolved = .{ false, false };
+        fake.epoch_retirement = true;
+        const manifest = retained_source.manifest;
+        try std.testing.expect(!try reclaim_admission.retireDisplacedDelivery(&service, a, manifest, source_fence, &next_member, .{}));
+        var changed_ranges = ranges;
+        changed_ranges[0].end_key = "n";
+        changed_ranges[1].start_key = "n";
+        const refreshed = try catalog_api.RoutingGeneration.create(a, .{
+            .metadata_group_id = 1,
+            .metadata_incarnation = owners[0].metadata_incarnation,
+            .catalog_revision = 11,
+            .tables = &records,
+            .ranges = &changed_ranges,
+        }, .{});
+        defer refreshed.release();
+        fake.generation = refreshed;
+        const changed_view = try refreshed.indexed.tableRoutingView("docs", .{});
+        var changed_fence = source_fence;
+        changed_fence.topology_epoch = changed_view.topology_epoch;
+        changed_fence.catalog_revision = 11;
+        try std.testing.expect(changed_fence.topology_epoch != source_fence.topology_epoch);
+
+        const cursor_write: source_control.Mutation = .{ .checkpoint_epoch_retirement = .{
+            .reservation_digest = journal.state.pending.?.identity(actor_scope),
+            .next_member = 1,
+        } };
+        const checkpointed_state = try cursor_write.apply(actor_alloc, journal.state);
+        const checkpointed_bytes = try source_control.encode(actor_alloc, checkpointed_state);
+        var reopened_progress = try source_control.parse(a, checkpointed_bytes);
+        defer reopened_progress.deinit();
+        try std.testing.expectEqual(@as(?u16, 1), reopened_progress.value.epoch_retirement_next_member);
+        try std.testing.expectError(error.SourceControlConflict, cursor_write.apply(actor_alloc, reopened_progress.value));
+
+        const pending_record = fake.state;
+        fake.state = committed_record;
+        try std.testing.expect(!try reclaim_admission.retireDisplacedDelivery(&service, a, manifest, changed_fence, &next_member, .{}));
+        try std.testing.expectEqual(.committed, fake.state.status);
+        fake.state = pending_record;
+
+        try std.testing.expectError(error.SourcePendingWork, reclaim_admission.retireDisplacedDelivery(&service, a, manifest, changed_fence, &next_member, .{}));
+        try std.testing.expectEqual(.aborted, fake.state.status);
+        try std.testing.expect(!fake.resolved[0] and fake.resolved[1] and fake.state.acknowledgments_pending);
+        try std.testing.expect(!try reclaim_admission.retireDisplacedDelivery(&service, a, manifest, changed_fence, &next_member, .{}));
+        try std.testing.expectEqual(@as(u16, 1), next_member);
+        try std.testing.expect(fake.resolved[0] and fake.state.acknowledgments_pending);
+        // The follower can leave the catalog after its cleanup was acknowledged.
+        var final_ranges = [_]tables.RangeRecord{changed_ranges[1]};
+        final_ranges[0].start_key = "";
+        const final_routes = try catalog_api.RoutingGeneration.create(a, .{
+            .metadata_group_id = 1,
+            .metadata_incarnation = owners[0].metadata_incarnation,
+            .catalog_revision = 12,
+            .tables = &records,
+            .ranges = &final_ranges,
+        }, .{});
+        defer final_routes.release();
+        fake.generation = final_routes;
+        changed_fence.topology_epoch = (try final_routes.indexed.tableRoutingView("docs", .{})).topology_epoch;
+        changed_fence.catalog_revision = 12;
+        try std.testing.expectError(error.SourcePendingWork, reclaim_admission.retireDisplacedDelivery(&service, a, manifest, changed_fence, &next_member, .{}));
+        try std.testing.expect(!fake.state.acknowledgments_pending);
+        fake.expect_coordinator_release = true;
+        const acknowledgments_before_release = fake.acknowledgments;
+        try std.testing.expect(try reclaim_admission.retireDisplacedDelivery(&service, a, manifest, changed_fence, &next_member, .{}));
+        try std.testing.expectEqual(acknowledgments_before_release + 1, fake.acknowledgments);
+        try std.testing.expectEqual(original_begins, fake.begins);
+        try std.testing.expectEqual(original_prepares, fake.prepares);
     }
 };
 

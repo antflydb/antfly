@@ -233,7 +233,10 @@ fn executePublication(root: *Adapter, allocators: catalog.DdlAllocators, ddl: as
     const observation = try native.observation(a, command);
     var receipt = try ordinary.newReceipt(allocators.result, a, observation);
     errdefer receipt.deinit(allocators.result);
-    const response = root.server.source.systemCatalog(a, private, .{ .sql_catalog_mutate = command }) catch null;
+    const response = root.server.source.systemCatalog(a, private, .{ .sql_catalog_mutate = command }) catch |err| switch (err) {
+        error.StoreRootEnrollmentChanged, error.CatalogPublicationProofPending => return err,
+        else => null,
+    };
     const known = if (response) |value| ordinary.decodeOutcome(a, value, observation) else null;
     if (known orelse ordinary.observe(root.server, root.identity.*, root.context, a, observation)) |outcome| {
         if (outcome == .rejected) _ = outcome.result() catch |err| switch (err) {

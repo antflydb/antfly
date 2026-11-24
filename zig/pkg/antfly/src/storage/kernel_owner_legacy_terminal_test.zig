@@ -56,7 +56,9 @@ test "storage owner legacy terminal resolution crosses native ABI and survives r
         command = .{ .version = 1, .owner = owner, .proof = .{ .root = try local.storage_source_scope.Basis.fromOwner(owner), .transaction_id = id, .record_digest = completion.bytesDigest(raw) } };
         _ = try db.applyOrderedSourceProducerClosure(owner, .{ .term = 1, .index = 2 }, false);
     }
-    const open: abi.OpenRequest = .{ .path = .fromSlice(path), .table_name = .fromSlice("docs"), .group_id = command.owner.group_id, .has_identity_namespace = 1, .identity_table_id = namespace.table_id, .identity_shard_id = namespace.shard_id, .identity_range_id = namespace.range_id, .lsm_root_generation = command.owner.root_generation, .schema_json = .fromSlice("{}"), .indexes_json = .fromSlice("{}") };
+    // Replay opens the existing catalog while the historic transaction still
+    // owns its schema lease.
+    const open: abi.OpenRequest = .{ .path = .fromSlice(path), .table_name = .fromSlice("docs"), .group_id = command.owner.group_id, .has_identity_namespace = 1, .identity_table_id = namespace.table_id, .identity_shard_id = namespace.shard_id, .identity_range_id = namespace.range_id, .lsm_root_generation = command.owner.root_generation };
     {
         var native = try client.Owner.open(open);
         defer native.deinit();

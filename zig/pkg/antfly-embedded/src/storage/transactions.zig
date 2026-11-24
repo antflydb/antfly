@@ -3697,6 +3697,9 @@ pub const TxnManager = struct {
                 if (summary.external_decision_owner) |owner| {
                     try owner.validate();
                     if (!summary.coordinator_known) return error.InvalidTxnRecord;
+                    // The metadata record alone can authorize abort.
+                    stats.kept_recent_pending += 1;
+                    continue;
                 }
                 if (summary.source_purpose != null) {
                     // Source-control recovery owns this original reservation;
@@ -4551,7 +4554,8 @@ pub const TxnManager = struct {
         if ((record.ordinary_producer and record.legacy_producer) or ((record.ordinary_producer or record.legacy_producer) and (record.source_purpose != null or record.source_scope != null))) return error.InvalidTxnRecord;
         if (record.source_scope != null and (record.source_purpose == null or !record.retain_terminal)) return error.InvalidTxnRecord;
         if (record.external_decision_owner != null and
-            (record.ordinary_producer or record.legacy_producer or record.source_purpose != null or record.source_scope != null))
+            (record.legacy_producer or record.source_purpose != null or record.source_scope != null or
+                (record.ordinary_producer and (record.native_pin != null or record.replication_source_required or !record.retain_terminal))))
             return error.InvalidTxnRecord;
         const size: usize = if (record.native_pin != null)
             txn_record_external_pinned_size
@@ -4581,7 +4585,11 @@ pub const TxnManager = struct {
         buf[51] = @intFromBool(record.retain_terminal);
         buf[52] = @intFromBool(record.intents_resolved);
         if (record.external_decision_owner) |owner| {
-            buf[txn_record_v6_size] = @as(u8, @intFromBool(record.document_revisions)) | (@as(u8, @intFromBool(record.publication_capture_required)) << 2) | (@as(u8, @intFromBool(record.replication_source_required)) << 3);
+            // Data Raft protocol 72 owns the external completion provenance bit.
+            buf[txn_record_v6_size] = @as(u8, @intFromBool(record.document_revisions)) |
+                (@as(u8, @intFromBool(record.publication_capture_required)) << 2) |
+                (@as(u8, @intFromBool(record.replication_source_required)) << 3) |
+                (@as(u8, @intFromBool(record.ordinary_producer)) << 4);
             if ((record.external_commit_started and !record.prepared) or !record.coordinator_known or
                 (record.status == .committed and !record.external_commit_started) or
                 (record.status == .aborted and record.external_commit_started)) return error.InvalidTxnRecord;
@@ -5769,6 +5777,28 @@ fn sameBytes(left: ?[]const u8, right: ?[]const u8) bool {
 
 /// Shared with the final history capture stage; it must inspect the staged
 /// record using the actual record codec rather than duplicating byte offsets.
+pub fn requireExternalCompletionRelease(raw: []const u8, owner: ExternalDecisionOwner, commit_version: u64) !void {
+    const record = try decodeRecord(raw);
+    const current = record.external_decision_owner orelse return error.ExternalTransactionDecisionRequired;
+    if (!current.eql(owner)) return error.ExternalTransactionDecisionChanged;
+    try requireCompletionResolvedRecord(raw, commit_version);
+}
+
+pub fn ordinaryCompletionOwnsCustody(raw: []const u8) !bool {
+    const record = try decodeRecord(raw);
+    return record.ordinary_producer and record.external_decision_owner == null;
+}
+
+pub fn requireOrdinaryCompletionRelease(a: Allocator, txn: anytype, id: TxnId, raw: []const u8, commit_version: u64, coordinator: bool) !void {
+    const record = try decodeRecord(raw);
+    if (record.external_decision_owner != null or !record.ordinary_producer or record.source_scope != null or
+        record.source_purpose != null or !record.coordinator_known or record.coordinator != coordinator)
+        return error.SourceTransactionIdentityConflict;
+    try requireCompletionResolvedRecord(raw, commit_version);
+    if (coordinator and (!record.retain_terminal_known or record.retain_terminal or
+        try TxnManager.hasUnresolvedParticipantsInRead(a, txn, id))) return error.SourceOutcomeUnresolved;
+}
+
 pub fn requireCompletionResolvedRecord(raw: []const u8, commit_version: u64) !void {
     const record = try decodeRecord(raw);
     if (record.status != .committed or record.commit_version != commit_version or !record.prepared_known or !record.prepared or !record.intents_resolved_known or !record.intents_resolved) return error.SourceOutcomeUnresolved;
@@ -5776,6 +5806,41 @@ pub fn requireCompletionResolvedRecord(raw: []const u8, commit_version: u64) !vo
 
 /// Decode the coordinator record with its canonical codec. Only retained,
 /// explicitly owned completion records qualify for restart decision recovery.
+/// Order an absent decision check against late BEGIN on the original
+/// checkpoint root. The caller must hold an authenticated source-attempt
+/// grant for this reference and apply this as a single native transaction.
+pub fn fenceUnadmittedSourceAttempt(a: Allocator, txn: anytype, root: source_scope.Basis, reference: source_scope.Reference, id: TxnId) !u64 {
+    if (std.mem.allEqual(u8, &id, 0)) return error.InvalidSourceAdmission;
+    const key = makeRecordKey(id);
+    if (txn.get(&key)) |_| {
+        return error.SourceOutcomeUnresolved;
+    } else |err| switch (@as(anyerror, err)) {
+        error.NotFound => {},
+        else => return err,
+    }
+    return source_scope.Store.fenceCoordinatorUnenlisted(a, txn, root, reference);
+}
+
+/// A planned transfer may replace a fully drained ABORT. Keep the terminal
+/// decision and require its exact scope plus the persisted native token fence.
+pub fn fenceSettledSourceAttempt(a: Allocator, txn: anytype, root: source_scope.Basis, reference: source_scope.Reference, id: TxnId) !u64 {
+    if (std.mem.allEqual(u8, &id, 0)) return error.InvalidSourceAdmission;
+    const key = makeRecordKey(id);
+    const raw = txn.get(&key) catch |err| switch (@as(anyerror, err)) {
+        error.NotFound => return source_scope.Store.fenceCoordinatorUnenlisted(a, txn, root, reference),
+        else => return err,
+    };
+    const record = try decodeRecord(raw);
+    if (record.status != .aborted or !record.coordinator_known or !record.coordinator or
+        !record.intents_resolved_known or !record.intents_resolved) return error.SourceOutcomeUnresolved;
+    if (!std.meta.eql(record.source_scope, @as(?source_scope.Reference, reference))) return error.SourceTransactionIdentityConflict;
+    if (try TxnManager.hasUnresolvedParticipantsInRead(a, txn, id)) return error.SourceOutcomeUnresolved;
+    const scoped = try source_scope.Store.requireRecord(a, txn, root, reference.domain);
+    if (!std.meta.eql(scoped.spec.checkpoint_owner, root) or scoped.closed_through_token < reference.token or
+        scoped.last_committed_sequence >= reference.sequence) return error.SourceOutcomeUnresolved;
+    return scoped.closed_through_token;
+}
+
 pub fn completionCoordinatorRecord(raw: []const u8) !@import("history_decision_wire.zig").Record {
     const record = try decodeRecord(raw);
     if (!record.coordinator_known or !record.coordinator or !record.retain_terminal_known or !record.prepared_known or (record.status != .pending and !record.intents_resolved_known)) return error.InvalidTxnRecord;
@@ -5793,6 +5858,7 @@ pub fn completionCoordinatorRecord(raw: []const u8) !@import("history_decision_w
         .intents_resolved = record.intents_resolved,
         .digest = completion.bytesDigest(raw),
         .retain_terminal = record.retain_terminal,
+        .externally_owned = record.external_decision_owner != null,
         .source_purpose = record.source_purpose,
         .source_scope = record.source_scope,
     };
@@ -5829,17 +5895,20 @@ fn decodeRecord(raw: []const u8) !TxnRecord {
     if (raw.len == 0 or raw[0] > @backingInt(TxnStatus.aborted)) return TxnError.InvalidTxnRecord;
     if (raw.len == txn_record_external_pinned_size) {
         var record = try decodeRecord(raw[0..txn_record_external_size]);
-        if (record.publication_capture_required or record.replication_source_required) return error.InvalidTxnRecord;
+        if (record.publication_capture_required or record.replication_source_required or record.ordinary_producer) return error.InvalidTxnRecord;
         record.native_pin = NativePhysicalPin.decode(raw[txn_record_external_size..]) catch return error.InvalidTxnRecord;
         return record;
     }
     if (raw.len == txn_record_external_size) {
         var record = try decodeRecord(raw[0..txn_record_v6_size]);
         const flags = raw[txn_record_v6_size];
-        if (raw[txn_record_external_size - 1] > 1 or flags & ~@as(u8, 13) != 0) return error.InvalidTxnRecord;
+        if (raw[txn_record_external_size - 1] > 1 or flags & ~@as(u8, 29) != 0) return error.InvalidTxnRecord;
         record.document_revisions = flags & 1 != 0;
         record.publication_capture_required = flags & 4 != 0;
         record.replication_source_required = flags & 8 != 0;
+        record.ordinary_producer = flags & 16 != 0;
+        if (record.ordinary_producer and (record.replication_source_required or !record.retain_terminal))
+            return error.InvalidTxnRecord;
         if (!record.prepared and (record.publication_capture_required or (record.replication_source_required and record.status != .aborted)))
             return error.InvalidTxnRecord;
         record.external_decision_owner = ExternalDecisionOwner.decode(raw[txn_record_v7_size..][0..ExternalDecisionOwner.encoded_len]) catch return error.InvalidTxnRecord;
@@ -6344,17 +6413,21 @@ test "committed history completion admission credits survive resolution and reje
             try std.testing.expectEqual(credit, (try State.read(&store)).reserved_bytes);
             try std.testing.expect(try manager.cleanupTransactionMetadataIfEligible(aborted.transaction_id, std.math.maxInt(u64), std.math.maxInt(u64)));
             try std.testing.expectEqual(credit, (try State.read(&store)).reserved_bytes);
-            const before_fill = try State.read(&store);
-            const available = before_fill.limit - before_fill.retained_bytes - before_fill.reserved_bytes;
-            const payload = try a.alloc(u8, @intCast(available - 2048));
-            defer a.free(payload);
-            @memset(payload, 'x');
-            const physical = try internal_keys.documentKeyAlloc(a, "large");
-            defer a.free(physical);
-            try store.put(physical, payload);
-            const full = try State.read(&store);
+            // With no live consumer, acknowledged frames can be reclaimed
+            // inline. Exhaust uncollectable admission credits to prove the
+            // failed BEGIN rolls back its companion marker.
             var rejected = admission;
-            rejected.transaction_id = @splat(7);
+            const attempt_limit = (try State.read(&store)).limit / 4096 + 1;
+            for (0..attempt_limit) |candidate| {
+                rejected.transaction_id = @splat(7);
+                std.mem.writeInt(u64, rejected.transaction_id[0..8], candidate, .little);
+                const candidate_bytes = try completion.encodeAdmission(a, rejected);
+                defer a.free(candidate_bytes);
+                const state = try State.read(&store);
+                if (try rejected.reservationBytes(candidate_bytes.len) > state.limit - state.reserved_bytes) break;
+                try manager.initTransactionWithCompletionAdmission(rejected, 40, 41, true, .{});
+            } else return error.TestExpectedError;
+            const full = try State.read(&store);
             const marker = "\x00\x00__completion_quota_test_marker";
             try std.testing.expectError(error.HistoryFull, manager.initTransactionWithCompletionAdmission(rejected, 40, 41, true, .{ .writes = &.{.{ .key = marker, .value = "must-not-commit" }} }));
             try std.testing.expect((try manager.getCompletionAdmission(a, rejected.transaction_id)) == null);
@@ -6527,6 +6600,199 @@ test "committed history completion admission raft resolution requires applying c
     defer a.free(applied);
     try std.testing.expectEqualSlices(u8, &marker, applied);
     try std.testing.expectEqual(@as(u64, 20), replayed.value.resolution.commit_version);
+}
+
+test "committed history completion admission keeps external certificates through the consumer floor" {
+    try testCompletionCollection(true);
+}
+
+test "committed history completion admission keeps ordinary certificates through coordinator acknowledgment and the consumer floor" {
+    try testCompletionCollection(false);
+}
+
+fn testCompletionCollection(comptime external_decision: bool) !void {
+    const history = @import("committed_history.zig");
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "txn-external-completion-release");
+    defer a.free(path);
+    defer cleanupTestDir(path);
+    var backend = try lsm_backend.Backend.open(a, path, .{ .flush_threshold_bytes = 1024 });
+    defer backend.close();
+    var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    const namespace: completion.Namespace = @splat(33);
+    const consumer_id: [16]u8 = @splat(1);
+    const consumer = enrolled: {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(&internal_keys.identity_namespace_key, &namespace);
+        try @import("source_authority.zig").bind(&txn, .raft, namespace);
+        const enrollment = try history.admit(&txn, namespace, consumer_id, history.default_limit, 1000, 1);
+        try txn.commit();
+        break :enrolled enrollment;
+    };
+    const owner: completion.RoutedOwner = .{
+        .metadata_group_id = 1,
+        .metadata_incarnation = @splat('1'),
+        .namespace = namespace,
+        .table_binding = @splat(2),
+        .root_generation = 0,
+        .group_id = 3,
+        .topology_epoch = 4,
+    };
+    const external: ExternalDecisionOwner = .{ .metadata_incarnation = owner.metadata_incarnation, .operation_id = @splat(2), .admission_digest = @splat(3), .expires_at_unix_ns = 1000 };
+    const id: TxnId = @splat(4);
+    const input = completion.preparedInputDigest(namespace, "effects");
+    const members = [_]completion.Participant{.{
+        .namespace = namespace,
+        .owner_fence = owner.digest(),
+        .roles = completion.Roles.effects,
+        .locator = "table2:00000004:docs:3",
+        .input_digest = input,
+        .routed_owner = owner,
+    }};
+    var follower = owner;
+    follower.namespace = @splat(34);
+    follower.group_id += 1;
+    const ordinary_members = members ++ [_]completion.Participant{.{
+        .namespace = follower.namespace,
+        .owner_fence = follower.digest(),
+        .roles = completion.Roles.guards,
+        .locator = "table2:00000004:docs:4",
+        .input_digest = @splat(5),
+        .routed_owner = follower,
+    }};
+    const admission: completion.Admission = .{ .version = 3, .transaction_id = id, .admission_digest = @splat(6), .coordinator_namespace = namespace, .coordinator_fence = owner.digest(), .participants = if (external_decision) &members else &ordinary_members };
+    var manager = try TxnManager.init(a, &store);
+    defer manager.deinit();
+    try manager.initTransactionWithCompletionAdmission(admission, 10, 11, external_decision, .{ .ordinary_producer = true, .completion_owner = owner, .external_decision_owner = if (external_decision) external else null });
+    try manager.writeIntentsExtraBatch(id, &.{.{ .key = "row", .value = "{}" }}, &.{}, .{
+        .ordinary_producer = true,
+        .completion_owner = owner,
+        .completion_input_digest = input,
+        .external_decision_owner = if (external_decision) external else null,
+    });
+    if (external_decision) try manager.activateExternalDecision(id, external, .{});
+    var marker: [16]u8 = @splat(0);
+    std.mem.writeInt(u64, marker[0..8], 2, .little);
+    std.mem.writeInt(u64, marker[8..16], 3, .little);
+    _ = try manager.resolveIntentsWithExtraBatch(id, .committed, 20, .{
+        .completion_owner = owner,
+        .external_decision_owner = if (external_decision) external else null,
+        .writes = &.{.{ .key = &internal_keys.ordered_document_applied_entry_key, .value = &marker }},
+    });
+    var receipt = (try manager.getCompletionResolution(a, id)).?;
+    defer receipt.deinit();
+    try std.testing.expectEqual(@as(u64, 1), receipt.value.resolution.outcome.effects.sequence);
+    const manifest = try admission.manifest(20);
+    const follower_position = receipt.value.resolution.source_position;
+    const resolutions = [_]completion.Resolution{ receipt.value.resolution, .{
+        .namespace = follower.namespace,
+        .owner_fence = follower.digest(),
+        .manifest_digest = manifest.digest(),
+        .commit_version = 20,
+        .source_position = follower_position,
+        .outcome = .{ .no_effect = completion.noEffectProof(manifest, follower.namespace, follower_position) },
+    } };
+    const raw = try completion.encode(a, .{ .manifest = manifest, .resolutions = resolutions[0..admission.participants.len] });
+    defer a.free(raw);
+    const published = observed: {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const publication = try history.publishCompletion(a, &txn, namespace, 0, owner, raw, .{ .term = 2, .index = 4 }, true);
+        std.mem.writeInt(u64, marker[8..16], 4, .little);
+        try txn.put(&internal_keys.ordered_document_applied_entry_key, &marker);
+        try txn.commit();
+        break :observed publication;
+    };
+    const custody: @import("db/types.zig").CompletionRelease = .{ .decision_owner = external, .certificate_digest = published.digest };
+    const ordinary: history.OrdinaryCompletionRelease = .{
+        .coordinator = owner,
+        .admission_digest = admission.digest(),
+        .certificate_digest = published.digest,
+        .commit_version = 20,
+    };
+    if (!external_decision) {
+        {
+            var txn = try store.beginWriteTxn();
+            defer txn.abort();
+            try std.testing.expectError(error.SourceOutcomeUnresolved, history.releaseOrdinaryCompletion(a, &txn, namespace, owner, id, ordinary));
+        }
+        try manager.markParticipantResolved(id, members[0].locator);
+        try manager.markParticipantResolved(id, ordinary_members[1].locator);
+        {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            try std.testing.expectError(error.SourceOutcomeUnresolved, history.releaseOrdinaryCompletion(a, &txn, namespace, owner, id, ordinary));
+            var advance = ordinary;
+            advance.progress = .{ .expected = 0, .released = 1 };
+            try history.releaseOrdinaryCompletion(a, &txn, namespace, owner, id, advance);
+            try txn.commit();
+        }
+        {
+            var txn = try store.beginReadTxn();
+            defer txn.abort();
+            const progress = try history.readCompletionPublication(a, &txn, namespace, 0, .{
+                .version = 2,
+                .owner = owner,
+                .transaction_id = id,
+                .manifest_digest = manifest.digest(),
+                .commit_version = 20,
+                .minimum_applied_index = 4,
+            });
+            try std.testing.expectEqual(@as(u16, 1), progress.release.?.released_followers);
+            try std.testing.expect(!progress.release.?.collection_staged);
+        }
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqual(!external_decision, try history.hasUnreleasedOrdinaryCompletions(a, &txn));
+        if (external_decision) {
+            var wrong = custody;
+            wrong.decision_owner.admission_digest[0] ^= 1;
+            try std.testing.expectError(error.ExternalTransactionDecisionChanged, history.releaseCompletion(a, &txn, namespace, owner, id, wrong));
+
+            const original_resolution = receipt.value.resolution;
+            const original_receipt = try completion.encodeResolution(a, try admission.manifest(20), original_resolution);
+            defer a.free(original_receipt);
+            const different_manifest = try admission.manifest(21);
+            var different_resolution = original_resolution;
+            different_resolution.commit_version = different_manifest.commit_version;
+            different_resolution.manifest_digest = different_manifest.digest();
+            const different_receipt = try completion.encodeResolution(a, different_manifest, different_resolution);
+            defer a.free(different_receipt);
+            try txn.put(&completion.resolutionKey(id), different_receipt);
+            try std.testing.expectError(error.SourceOutcomeUnresolved, history.releaseCompletion(a, &txn, namespace, owner, id, custody));
+            try txn.put(&completion.resolutionKey(id), original_receipt);
+
+            try history.releaseCompletion(a, &txn, namespace, owner, id, custody);
+            try history.releaseCompletion(a, &txn, namespace, owner, id, custody);
+        } else {
+            var wrong = ordinary;
+            wrong.admission_digest[0] ^= 1;
+            try std.testing.expectError(error.SourceTransactionIdentityConflict, history.releaseOrdinaryCompletion(a, &txn, namespace, owner, id, wrong));
+            try history.releaseOrdinaryCompletion(a, &txn, namespace, owner, id, ordinary);
+            try history.releaseOrdinaryCompletion(a, &txn, namespace, owner, id, ordinary);
+        }
+        try std.testing.expect(!try history.hasUnreleasedOrdinaryCompletions(a, &txn));
+        try std.testing.expect(try history.reclaim(&txn, namespace));
+        try std.testing.expect((try history.load(&txn)).?.retained_bytes > published.retained_bytes);
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try history.acknowledge(&txn, namespace, consumer_id, consumer.epoch, 0, 1);
+        try std.testing.expect(try history.reclaim(&txn, namespace));
+        if (external_decision)
+            try history.releaseCompletion(a, &txn, namespace, owner, id, custody)
+        else
+            try history.releaseOrdinaryCompletion(a, &txn, namespace, owner, id, ordinary);
+        try std.testing.expectEqual(@as(u64, 0), (try history.load(&txn)).?.retained_bytes);
+        try std.testing.expectError(error.NotFound, txn.get(&completion.resolutionKey(id)));
+        try txn.commit();
+    }
 }
 
 test "committed history transaction reservations survive reopen and committed recovery emits one original transaction" {
@@ -10468,6 +10734,19 @@ test "transaction source purpose scoped reference survives restart and fences st
             _ = try source_scope.Store.bind(arena.allocator(), &release, root, spec, .{ .group_id = 1, .incarnation = root.metadata_incarnation, .index = 10 });
             try release.commit();
         }
+        var expired = extra;
+        expired.source_scope.?.token = 1;
+        var expired_admission = admission;
+        expired_admission.transaction_id = @splat(43);
+        {
+            var fence = try store.beginWriteTxn();
+            errdefer fence.abort();
+            try std.testing.expectEqual(@as(u64, 1), try fenceUnadmittedSourceAttempt(a, &fence, root, expired.source_scope.?, expired_admission.transaction_id));
+            try std.testing.expectEqual(@as(u64, 1), try fenceUnadmittedSourceAttempt(a, &fence, root, expired.source_scope.?, expired_admission.transaction_id));
+            try fence.commit();
+        }
+        try std.testing.expectError(error.SourceCheckpointConflict, mgr.initTransactionWithCompletionAdmission(expired_admission, 10_000, 1_000, true, expired));
+        try std.testing.expectError(error.TxnNotFound, mgr.getTransactionStatus(expired_admission.transaction_id));
         var legacy_admission = admission;
         legacy_admission.transaction_id = @splat(40);
         try std.testing.expectError(error.SourceCheckpointConflict, mgr.initTransactionWithCompletionAdmission(legacy_admission, 10_000, 1_000, true, .{ .source_purpose = purpose }));
@@ -10480,6 +10759,12 @@ test "transaction source purpose scoped reference survives restart and fences st
         try std.testing.expectError(error.TxnNotFound, mgr.getTransactionStatus(unbound_admission.transaction_id));
         try std.testing.expectError(error.NotFound, store.get(a, &makeSidecarKey(completion_admission_prefix, unbound_admission.transaction_id)));
         try mgr.initTransactionWithCompletionAdmission(admission, 10_000, 1_000, true, extra);
+        {
+            var fence = try store.beginWriteTxn();
+            defer fence.abort();
+            try std.testing.expectError(error.SourceOutcomeUnresolved, fenceUnadmittedSourceAttempt(a, &fence, root, scope, id));
+            try std.testing.expectError(error.SourceOutcomeUnresolved, fenceSettledSourceAttempt(a, &fence, root, scope, id));
+        }
         try mgr.initTransactionWithCompletionAdmission(admission, 10_000, 2_000, true, extra);
         try std.testing.expectError(error.SourceTransactionIdentityConflict, mgr.initTransactionWithCompletionAdmission(admission, 10_000, 1_000, true, .{ .source_purpose = purpose }));
         var changed = extra;
@@ -10548,6 +10833,18 @@ test "transaction source purpose scoped reference survives restart and fences st
         defer a.free(raw);
         try std.testing.expectEqualDeep(scope, (try decodeRecord(raw)).source_scope.?);
         try std.testing.expectEqual(TxnStatus.aborted, (try decodeRecord(raw)).status);
+        {
+            var probe = try store.beginWriteTxn();
+            defer probe.abort();
+            try std.testing.expectError(error.SourceOutcomeUnresolved, fenceSettledSourceAttempt(a, &probe, root, scope, id));
+        }
+        try mgr.markParticipantResolved(id, members[0].locator);
+        {
+            var proof = try store.beginWriteTxn();
+            defer proof.abort();
+            try std.testing.expectError(error.SourceOutcomeUnresolved, fenceUnadmittedSourceAttempt(a, &proof, root, scope, id));
+            try std.testing.expectEqual(scope.token, try fenceSettledSourceAttempt(a, &proof, root, scope, id));
+        }
         var other_spec = spec;
         other_spec.source_id = @splat(45);
         other_spec.binding = @splat(46);
@@ -10706,9 +11003,10 @@ test "transaction source purpose closed legacy recovery inventory is bounded and
     defer all.deinit(a);
     try std.testing.expectEqual(@as(usize, 4), all.items.len);
     try std.testing.expectEqual(@as(u64, 7), all.closure.first_closed_at.index);
-    try manager.putValue(&makeRecordKey(@splat(3)), "corrupt");
+    try std.testing.expectError(error.InvalidTxnRecord, manager.putValue(&makeRecordKey(@splat(3)), "corrupt"));
+    try store.put(&makeRecordKey(@splat(3)), "corrupt");
     try std.testing.expectError(error.InvalidTxnRecord, manager.legacyRecoveryPage(a, root, null, 256));
-    try manager.putValue(&makeRecordKey(@splat(3)), raw);
+    try store.put(&makeRecordKey(@splat(3)), raw);
     // A malformed short key sorts before every full transaction ID. The
     // initial cursor must inspect the prefix itself rather than prefix+zero.
     try manager.putValue(records_prefix, raw);

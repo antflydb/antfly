@@ -164,6 +164,12 @@ fn runRecoveryPageWithConfig(
             var retained = saved;
             defer retained.deinit();
             const admission = retained.value.admission;
+            if (txn.external_decision_owner != null) {
+                // Metadata owns the decision and certificate handoff. Once
+                // collection removes the plan, ordinary terminal GC resumes.
+                summary.recovery.deferred_unresolved += 1;
+                continue;
+            }
             // Never pass completion work through the unfenced legacy resolver.
             if (!txn.coordinator_known or !txn.coordinator) continue;
             if (admission.version < 3) {
@@ -184,6 +190,7 @@ fn runRecoveryPageWithConfig(
                 .coordinator_locator = coordinator.locator,
                 .abort_before_ns = if (txn.source_purpose == null) now_ns -| config.cutoff_ns else 0,
                 .resolution_timestamp_ns = now_ns,
+                .collect_ordinary = txn.ordinary_producer,
             }) catch |err| {
                 summary.notification_failures += 1;
                 summary.recovery.deferred_unresolved += 1;

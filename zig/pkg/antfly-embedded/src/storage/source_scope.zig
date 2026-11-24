@@ -111,7 +111,7 @@ pub const Record = struct {
     closed_at: ?Cut = null,
     pub fn validate(self: @This()) !void {
         self.spec.validate() catch return error.SourceAdmissionCorrupt;
-        if (self.bound_metadata_index == 0 or self.last_committed_token > self.closed_through_token or (self.last_committed_sequence == 0 and self.last_committed_token != 0)) return error.SourceAdmissionCorrupt;
+        if ((self.bound_metadata_index == 0 and (self.phase != .closed or self.closed_through_token != 0 or self.last_committed_sequence != 0)) or self.last_committed_token > self.closed_through_token or (self.last_committed_sequence == 0 and self.last_committed_token != 0)) return error.SourceAdmissionCorrupt;
         if ((self.phase == .closed) != (self.closed_at != null) or (self.phase == .active) != (self.close_metadata_index == 0) or (self.phase != .active and self.close_metadata_index <= self.bound_metadata_index)) return error.SourceAdmissionCorrupt;
         if (self.closed_at) |cut| if (cut.term == 0 or cut.index == 0 or self.slot != null) return error.SourceAdmissionCorrupt;
         if (self.slot) |slot| {
@@ -135,6 +135,20 @@ pub const Record = struct {
         if (same(local, coordinator) and (self.last_committed_sequence == std.math.maxInt(u64) or slot.reference.sequence != self.last_committed_sequence + 1)) return error.SourceCheckpointConflict;
         self.slot = slot;
     }
+    /// Used in the same ordered transaction that proves the original
+    /// coordinator has no transaction record. Never fence past an enlisted
+    /// attempt or past a committed source sequence.
+    fn fenceCoordinatorUnenlisted(self: *Record, ref: Reference, root: Basis) !bool {
+        try self.matches(ref);
+        if (!same(root, self.spec.checkpoint_owner)) return error.SourceCheckpointConflict;
+        if (ref.sequence <= self.last_committed_sequence) return error.SourceOutcomeUnresolved;
+        if (ref.token <= self.closed_through_token) return false;
+        if (self.phase != .active or self.slot != null or
+            ref.sequence - 1 != self.last_committed_sequence) return error.SourceOutcomeUnresolved;
+        self.closed_through_token = ref.token;
+        return true;
+    }
+
     /// Only an independently observed original coordinator ABORT may call this.
     /// No local BEGIN/outcome is fabricated. One cumulative floor bounds storage.
     pub fn retireUnenlisted(self: *Record, slot: Slot, coordinator: Basis, local: Basis, applied: Cut) !bool {
@@ -186,6 +200,58 @@ pub const Record = struct {
         }
     }
 };
+/// Exact checkpoint data captured after the original scope closed on its
+/// native coordinator. The topology protocol must bind this record to its
+/// retiring-root cut before authorizing installation on a hidden successor.
+pub const CheckpointHandoff = struct {
+    donor: Record,
+    checkpoint: ?[]const u8,
+
+    pub fn validate(self: CheckpointHandoff) !void {
+        try self.donor.validate();
+        if (self.donor.phase != .closed or self.donor.slot != null) return error.SourcePendingWork;
+        if (self.checkpoint) |bytes| {
+            const head = try @import("source_checkpoint.zig").Head.decode(bytes);
+            if (!same(head.binding, self.donor.spec.binding) or head.sequence != self.donor.last_committed_sequence or
+                head.receipt_window != 1) return error.SourceCheckpointConflict;
+        } else if (self.donor.last_committed_sequence != 0) return error.SourceOutcomeUnresolved;
+    }
+
+    pub fn digest(self: CheckpointHandoff, a: std.mem.Allocator) !Digest {
+        try self.validate();
+        const record = try Store.encode(a, self.donor);
+        defer a.free(record);
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly:source-checkpoint-handoff:v1");
+        var record_hash: Digest = undefined;
+        var checkpoint_hash: Digest = undefined;
+        std.crypto.hash.sha2.Sha256.hash(record, &record_hash, .{});
+        std.crypto.hash.sha2.Sha256.hash(self.checkpoint orelse "", &checkpoint_hash, .{});
+        hash.update(&record_hash);
+        hash.update(&checkpoint_hash);
+        return hash.finalResult();
+    }
+};
+
+pub const CheckpointInstallReceipt = struct {
+    handoff_digest: Digest,
+    donor: Basis,
+    successor: Basis,
+    domain: Digest,
+    authorization: MetadataCut,
+    applied: Cut,
+
+    pub fn validate(self: CheckpointInstallReceipt) !void {
+        try self.donor.validate();
+        try self.successor.validate();
+        try self.authorization.require(self.successor);
+        if (same(self.donor, self.successor) or self.donor.metadata_group_id != self.successor.metadata_group_id or
+            !same(self.donor.metadata_incarnation, self.successor.metadata_incarnation) or
+            !nonzero(self.handoff_digest) or !nonzero(self.domain) or
+            self.applied.term == 0 or self.applied.index == 0) return error.SourceAdmissionCorrupt;
+    }
+};
+
 pub const Header = struct {
     version: u8 = 1,
     root: Basis,
@@ -245,7 +311,7 @@ pub const Store = struct {
     }
     fn checksum(comptime T: type, payload: []const u8) Digest {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        hash.update(if (T == Header) "antfly:source-scope-header:v1" else "antfly:source-scope-record:v1");
+        hash.update(if (T == Header) "antfly:source-scope-header:v1" else if (T == CheckpointInstallReceipt) "antfly:source-scope-checkpoint-install:v1" else "antfly:source-scope-record:v1");
         hash.update(payload);
         return hash.finalResult();
     }
@@ -264,7 +330,7 @@ pub const Store = struct {
         var parsed = std.json.parseFromSlice(T, a, bytes[36..], .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.SourceAdmissionCorrupt;
         defer parsed.deinit();
         const value = parsed.value;
-        if (T == Header or T == Record) try value.validate() else @compileError("unsupported source scope record type");
+        if (T == Header or T == Record or T == CheckpointInstallReceipt) try value.validate() else @compileError("unsupported source scope record type");
         return value;
     }
     /// Reject fresh legacy source admission once this root enables scoped work.
@@ -305,6 +371,102 @@ pub const Store = struct {
         defer a.free(bytes);
         try txn.put(&recordKey(record.spec.domain()), bytes);
     }
+    pub fn captureCheckpointHandoff(a: std.mem.Allocator, txn: anytype, root: Basis, expected: Spec, sequence: u64, cursor: ?[]const u8) !CheckpointHandoff {
+        if (!same(root, expected.checkpoint_owner)) return error.SourceBindingConflict;
+        const donor = try requireRecord(a, txn, root, expected.domain());
+        if (!same(donor.spec, expected) or donor.last_committed_sequence != sequence)
+            return error.SourceCheckpointConflict;
+        if (donor.phase != .closed or donor.slot != null) return error.SourcePendingWork;
+        const checkpoint = @import("source_checkpoint.zig");
+        const bytes = if (sequence != 0)
+            try checkpoint.captureScopedHandoff(a, txn, expected.binding, sequence, cursor)
+        else absent: {
+            if (cursor) |value| if (value.len != 0) return error.SourceCheckpointConflict;
+            if (txn.get(&checkpoint.key(expected.binding))) |_| {
+                return error.SourceOutcomeUnresolved;
+            } else |err| switch (@as(anyerror, err)) {
+                error.NotFound => break :absent null,
+                else => return err,
+            }
+        };
+        return .{ .donor = donor, .checkpoint = bytes };
+    }
+
+    fn checkpointInstallKey(domain: Digest) [prefix.len + "checkpoint-install:".len + 32]u8 {
+        return (prefix ++ "checkpoint-install:").* ++ domain;
+    }
+
+    pub fn readCheckpointInstall(a: std.mem.Allocator, txn: anytype, domain: Digest) !?CheckpointInstallReceipt {
+        const bytes = txn.get(&checkpointInstallKey(domain)) catch |err| switch (@as(anyerror, err)) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        const receipt = try decode(CheckpointInstallReceipt, a, bytes);
+        if (!same(receipt.domain, domain)) return error.SourceAdmissionCorrupt;
+        return receipt;
+    }
+
+    /// The writer belongs to a qualified hidden replacement root. The
+    /// enclosing topology mutation must install the scope and head together,
+    /// and must abort on error before exposing the successor.
+    pub fn installCheckpointHandoff(a: std.mem.Allocator, txn: anytype, root: Basis, handoff: CheckpointHandoff, cut: MetadataCut, applied: Cut) !CheckpointInstallReceipt {
+        try handoff.validate();
+        try cut.require(root);
+        const donor = handoff.donor;
+        const previous_root = donor.spec.checkpoint_owner;
+        if (same(root, previous_root) or root.metadata_group_id != previous_root.metadata_group_id or
+            !same(root.metadata_incarnation, previous_root.metadata_incarnation) or cut.index <= donor.close_metadata_index)
+            return error.SourceCheckpointConflict;
+        const receipt: CheckpointInstallReceipt = .{
+            .handoff_digest = try handoff.digest(a),
+            .donor = previous_root,
+            .successor = root,
+            .domain = donor.spec.domain(),
+            .authorization = cut,
+            .applied = applied,
+        };
+        try receipt.validate();
+        if (try readCheckpointInstall(a, txn, receipt.domain)) |installed| {
+            if (!same(installed.handoff_digest, receipt.handoff_digest) or
+                !same(installed.successor, root) or cut.index < installed.authorization.index)
+                return error.SourceCheckpointConflict;
+            return installed;
+        }
+        var header = try readHeader(a, txn, root);
+        var spec = donor.spec;
+        spec.checkpoint_owner = root;
+        const old = try readRecord(a, txn, spec.domain());
+        var record = if (old) |follower| existing: {
+            if (!header.strict or header.domains == 0) return error.SourceAdmissionCorrupt;
+            if (!same(follower.spec, donor.spec) or follower.phase == .closing or follower.slot != null or
+                follower.closed_through_token > donor.closed_through_token or
+                follower.last_committed_sequence > donor.last_committed_sequence or
+                follower.last_committed_token > donor.last_committed_token or
+                cut.index <= @max(follower.bound_metadata_index, follower.close_metadata_index) or cut.index < header.metadata_floor)
+                return error.SourceCheckpointConflict;
+            header.metadata_floor = cut.index;
+            break :existing Record{ .spec = spec, .bound_metadata_index = cut.index, .last_committed_sequence = donor.last_committed_sequence };
+        } else try header.bind(null, spec, cut, donor.last_committed_sequence);
+        record.closed_through_token = donor.closed_through_token;
+        record.last_committed_token = donor.last_committed_token;
+        try record.validate();
+        const checkpoint = @import("source_checkpoint.zig");
+        if (handoff.checkpoint) |bytes| {
+            try checkpoint.installScopedHandoff(txn, spec.binding, bytes);
+        } else if (txn.get(&checkpoint.key(spec.binding))) |_| {
+            return error.SourceCheckpointConflict;
+        } else |err| switch (@as(anyerror, err)) {
+            error.NotFound => {},
+            else => return err,
+        }
+        try writeRecord(a, txn, record);
+        try writeHeader(a, txn, header);
+        const encoded_receipt = try encode(a, receipt);
+        defer a.free(encoded_receipt);
+        try txn.put(&checkpointInstallKey(receipt.domain), encoded_receipt);
+        return receipt;
+    }
+
     pub fn bind(a: std.mem.Allocator, txn: anytype, root: Basis, spec: Spec, cut: MetadataCut) !Record {
         var header = try readHeader(a, txn, root);
         const old = try readRecord(a, txn, spec.domain());
@@ -326,6 +488,65 @@ pub const Store = struct {
         try writeHeader(a, txn, header);
         return record;
     }
+    pub fn closeCheckpointForTransfer(a: std.mem.Allocator, txn: anytype, root: Basis, spec: Spec, cut: MetadataCut, applied: Cut) !void {
+        try spec.validate();
+        try cut.require(root);
+        if (!same(root, spec.checkpoint_owner)) return error.SourceCheckpointConflict;
+        if (try readRecord(a, txn, spec.domain())) |record| {
+            if (!same(record.spec, spec)) return error.SourceCheckpointConflict;
+            _ = try close(a, txn, root, spec.domain(), spec, cut, applied);
+            return;
+        }
+        const checkpoint = @import("source_checkpoint.zig");
+        if (txn.get(&checkpoint.key(spec.binding))) |_| {
+            return error.SourceOutcomeUnresolved;
+        } else |err| switch (@as(anyerror, err)) {
+            error.NotFound => {},
+            else => return err,
+        }
+        var header = try readHeader(a, txn, root);
+        if (cut.index < header.metadata_floor) return error.SourceCheckpointConflict;
+        if (header.domains >= max_domains) return error.SourceAdmissionBackpressure;
+        const record: Record = .{
+            .spec = spec,
+            .bound_metadata_index = 0,
+            .phase = .closed,
+            .close_metadata_index = cut.index,
+            .closed_at = applied,
+        };
+        try record.validate();
+        header.strict = true;
+        header.metadata_floor = cut.index;
+        header.domains += 1;
+        try writeRecord(a, txn, record);
+        try writeHeader(a, txn, header);
+    }
+
+    pub fn bindAfterCheckpointTransfer(a: std.mem.Allocator, txn: anytype, root: Basis, spec: Spec, cut: MetadataCut) !Record {
+        const old = (try readRecord(a, txn, spec.domain())) orelse return bind(a, txn, root, spec, cut);
+        if (same(old.spec, spec) or spec.generation > old.spec.generation) return bind(a, txn, root, spec, cut);
+        try spec.validate();
+        try cut.require(root);
+        var header = try readHeader(a, txn, root);
+        if (!header.strict or header.domains == 0) return error.SourceAdmissionCorrupt;
+        var expected = old.spec;
+        expected.checkpoint_owner = spec.checkpoint_owner;
+        if (!same(expected, spec) or same(root, old.spec.checkpoint_owner) or same(root, spec.checkpoint_owner) or
+            old.phase == .closing or old.slot != null or cut.index < header.metadata_floor or
+            cut.index <= @max(old.bound_metadata_index, old.close_metadata_index))
+            return error.SourceCheckpointConflict;
+        var record = old;
+        record.spec = spec;
+        record.bound_metadata_index = cut.index;
+        record.close_metadata_index = 0;
+        record.closed_at = null;
+        record.phase = .active;
+        header.metadata_floor = cut.index;
+        try writeRecord(a, txn, record);
+        try writeHeader(a, txn, header);
+        return record;
+    }
+
     pub fn requireRecord(a: std.mem.Allocator, txn: anytype, root: Basis, domain: Digest) !Record {
         const header = try readHeader(a, txn, root);
         const record = (try readRecord(a, txn, domain)) orelse return error.SourceCheckpointConflict;
@@ -336,6 +557,13 @@ pub const Store = struct {
         var record = try requireRecord(a, txn, root, slot.reference.domain);
         try record.enter(slot, coordinator, root);
         try writeRecord(a, txn, record);
+    }
+    /// Persist a coordinator-side token floor inside the transaction that
+    /// checked native non-admission. The record owns the immutable scope.
+    pub fn fenceCoordinatorUnenlisted(a: std.mem.Allocator, txn: anytype, root: Basis, ref: Reference) !u64 {
+        var record = try requireRecord(a, txn, root, ref.domain);
+        if (try record.fenceCoordinatorUnenlisted(ref, root)) try writeRecord(a, txn, record);
+        return record.closed_through_token;
     }
     pub fn retireUnenlisted(a: std.mem.Allocator, txn: anytype, root: Basis, slot: Slot, coordinator: Basis, applied: Cut) !struct { changed: bool, floor: u64 } {
         var record = try requireRecord(a, txn, root, slot.reference.domain);
@@ -392,6 +620,10 @@ pub const Store = struct {
         };
         try header.drop(record, cut, retired_through_generation, closed_at);
         try txn.delete(&recordKey(domain));
+        txn.delete(&checkpointInstallKey(domain)) catch |err| switch (@as(anyerror, err)) {
+            error.NotFound => {},
+            else => return err,
+        };
         try writeHeader(a, txn, header);
     }
 };
@@ -576,4 +808,78 @@ test "scope absent closure fences queued old binding without allocating domain t
     try std.testing.expectError(error.SourcePendingWork, Store.closeAbsent(a, &txn, root, another, closing));
     try std.testing.expectEqual(@as(u64, 11), try Store.closeAbsent(a, &txn, root, spec, old));
     try std.testing.expectEqual(@as(u16, 1), (try Store.readHeader(a, &txn, root)).domains);
+}
+
+test "scope checkpoint handoff retains sequence and attempt fence on the successor" {
+    const a = std.testing.allocator;
+    const root: Basis = .{ .metadata_group_id = 1, .metadata_incarnation = "11111111111111111111111111111111".*, .namespace = @splat(1), .root_generation = 0, .group_id = 2 };
+    const spec: Spec = .{ .actor_table_id = 3, .source_id = @splat(4), .generation = 1, .binding = @splat(5), .checkpoint_owner = root };
+    var donor: TestTxn = .{};
+    defer donor.deinit();
+    const bound: MetadataCut = .{ .group_id = 1, .incarnation = root.metadata_incarnation, .index = 10 };
+    _ = try Store.bind(a, &donor, root, spec, bound);
+    const checkpoint = @import("source_checkpoint.zig");
+    const command: checkpoint.Command = .{ .binding = spec.binding, .purpose = @splat(6), .sequence = 1, .checkpoint = "opaque:\xff\x00successor", .accepted_at_ns = 10, .receipt_window = 1 };
+    const slot: Slot = .{ .reference = .{ .domain = spec.domain(), .binding = spec.binding, .generation = 1, .token = 7, .sequence = 1 }, .transaction_id = @splat(8), .source_purpose = command.purpose, .admission_digest = @splat(9) };
+    try std.testing.expectError(error.SourcePendingWork, Store.captureCheckpointHandoff(a, &donor, root, spec, 0, ""));
+    try Store.enter(a, &donor, root, slot, root);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const head = try checkpoint.prepare(owned, &donor, slot.transaction_id, slot.source_purpose, command);
+    try donor.put(head.key, head.value);
+    try donor.put(head.receipt_key.?, head.value);
+    try Store.finish(a, &donor, root, slot, true, .{ .term = 1, .index = 20 });
+    var closing = bound;
+    closing.index += 1;
+    _ = try Store.close(a, &donor, root, spec.domain(), spec, closing, .{ .term = 1, .index = 21 });
+    const handoff = try Store.captureCheckpointHandoff(owned, &donor, root, spec, command.sequence, command.checkpoint);
+    const wire = try std.json.Stringify.valueAlloc(owned, handoff, .{});
+    try std.testing.expect(std.unicode.utf8ValidateSlice(wire));
+    const json = try std.json.parseFromSliceLeaky(std.json.Value, owned, wire, .{});
+    const decoded = try std.json.parseFromValueLeaky(CheckpointHandoff, owned, json, .{});
+    try std.testing.expectEqualSlices(u8, handoff.checkpoint.?, decoded.checkpoint.?);
+    try std.testing.expectEqual(try handoff.digest(owned), try decoded.digest(owned));
+    var successor: TestTxn = .{};
+    defer successor.deinit();
+    var destination = root;
+    destination.group_id += 1;
+    destination.namespace = @splat(2);
+    try std.testing.expectError(error.SourceCheckpointConflict, Store.installCheckpointHandoff(a, &successor, destination, handoff, closing, .{ .term = 1, .index = 30 }));
+    var promoted = closing;
+    promoted.index += 1;
+    _ = try Store.bind(a, &successor, destination, spec, bound);
+    try Store.enter(a, &successor, destination, slot, root);
+    try std.testing.expectError(error.SourceCheckpointConflict, Store.installCheckpointHandoff(a, &successor, destination, decoded, promoted, .{ .term = 1, .index = 30 }));
+    try Store.finish(a, &successor, destination, slot, true, .{ .term = 1, .index = 29 });
+    const receipt = try Store.installCheckpointHandoff(a, &successor, destination, decoded, promoted, .{ .term = 1, .index = 30 });
+    try std.testing.expectEqual(receipt, (try Store.readCheckpointInstall(a, &successor, spec.domain())).?);
+    try std.testing.expectEqual(receipt, try Store.installCheckpointHandoff(a, &successor, destination, handoff, promoted, .{ .term = 2, .index = 31 }));
+    var retry_cut = promoted;
+    retry_cut.index += 1;
+    try std.testing.expectEqual(receipt, try Store.installCheckpointHandoff(a, &successor, destination, handoff, retry_cut, .{ .term = 2, .index = 32 }));
+    try std.testing.expectEqual(@as(u16, 1), (try Store.readHeader(a, &successor, destination)).domains);
+    const installed = (try Store.readRecord(a, &successor, spec.domain())).?;
+    try std.testing.expectEqual(destination, installed.spec.checkpoint_owner);
+    try std.testing.expectEqual(@as(u64, 1), installed.last_committed_sequence);
+    try std.testing.expectEqual(@as(u64, 7), installed.closed_through_token);
+    var follower: TestTxn = .{};
+    defer follower.deinit();
+    var third = destination;
+    third.group_id += 1;
+    third.namespace = @splat(3);
+    _ = try Store.bind(a, &follower, third, spec, bound);
+    try Store.enter(a, &follower, third, slot, root);
+    try std.testing.expectError(error.SourceCheckpointConflict, Store.bindAfterCheckpointTransfer(a, &follower, third, installed.spec, promoted));
+    try Store.finish(a, &follower, third, slot, true, .{ .term = 1, .index = 28 });
+    const rebound = try Store.bindAfterCheckpointTransfer(a, &follower, third, installed.spec, promoted);
+    try std.testing.expectEqual(installed.spec, rebound.spec);
+    try std.testing.expectEqual(slot.reference.token, rebound.closed_through_token);
+    try std.testing.expectError(error.SourceCheckpointConflict, Store.bind(a, &follower, third, spec, promoted));
+    try std.testing.expectError(error.SourceAlreadyCommitted, checkpoint.prepare(owned, &successor, slot.transaction_id, slot.source_purpose, command));
+    var next = slot;
+    next.reference.sequence += 1;
+    try std.testing.expectError(error.SourceCheckpointConflict, Store.enter(a, &successor, destination, next, destination));
+    next.reference.token += 1;
+    try Store.enter(a, &successor, destination, next, destination);
 }

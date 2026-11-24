@@ -1,7 +1,8 @@
 # Physical store-root enrollment
 
-Hosted initial foreign-key publication and replica retirement bind owner
-receipts to an administrator-approved physical store root. Ordinary node
+Hosted initial foreign-key publication, journal-backed logical replication,
+and replica retirement bind owner receipts to an administrator-approved
+physical store root. Ordinary node
 registration advertises the root's public key; it does not approve that key.
 Enroll each participating data store before using these workflows.
 

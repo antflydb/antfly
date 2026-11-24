@@ -2718,10 +2718,11 @@ const RaftTableApplyStateMachine = struct {
                             }
                             return error.RaftApplyWriterUnavailable;
                         } else {
-                            std.log.err("data raft document apply failed group_id={} index={} table={s} err={}", .{
+                            std.log.err("data raft document apply failed group_id={} index={} table={s} transaction_phase={s} err={}", .{
                                 group_id,
                                 entry.index,
                                 decoded.table_name,
+                                if (decoded.batch.req.transaction) |transaction| @tagName(transaction) else "none",
                                 err,
                             });
                             return err;
@@ -2767,7 +2768,41 @@ fn batchMutatesDocuments(req: antfly.db.types.BatchRequest) bool {
         req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.transaction != null;
 }
 
+fn isCompletionCollection(req: antfly.db.types.BatchRequest) bool {
+    const transaction = req.transaction orelse return false;
+    if (transaction != .publish_completion) return false;
+    const publication = transaction.publish_completion;
+    if (publication.certificate.len != 0 or req.row_policy_install_bundle.len != 0 or
+        (publication.release != null) == (publication.ordinary_release != null)) return false;
+    @import("antfly_local_sources").api_internal_batch.validateCompletionControlRequest(req) catch return false;
+    return true;
+}
+
+fn onlineMergeMaintenanceScope(req: antfly.db.types.BatchRequest) ?@import("antfly_local_sources").storage_db_online_source_contract.Scope {
+    const command = req.online_source orelse return null;
+    if (command != .release and command != .reclaim) return null;
+    @import("antfly_local_sources").storage_db_online_source_contract.validateRequest(req) catch return null;
+    // The wire codec resolves the document version mode and allocates
+    // its own empty slices. Compare the semantic shape of the control.
+    var shape = req;
+    shape.document_version_scheme = .admit_current;
+    const isolated: antfly.db.types.BatchRequest = .{ .online_source = command };
+    inline for (@typeInfo(antfly.db.types.BatchRequest).@"struct".field_names) |name| {
+        const field = @field(shape, name);
+        switch (@typeInfo(@TypeOf(field))) {
+            .pointer => |pointer| {
+                if (pointer.size == .slice and field.len == 0) @field(shape, name) = @field(isolated, name);
+            },
+            else => {},
+        }
+    }
+    return if (std.meta.eql(shape, isolated)) command.scope() else null;
+}
+
 fn needsDenseRepairWritePreflight(req: antfly.db.types.BatchRequest) bool {
+    // The published donor has no serving route. These isolated controls use
+    // its retained physical descriptor and the exact scope at ordered apply.
+    if (onlineMergeMaintenanceScope(req) != null) return false;
     // Policy install controls must progress while their schema/policy gate
     // deliberately defers ordinary writers. This exemption is only pressure
     // admission: private metadata authorization and exact ordered apply remain.
@@ -12631,6 +12666,7 @@ pub const DataServer = struct {
                 .local_node_id = dataReadRouterLocalNodeId,
                 .local_status = dataReadRouterLocalStatus,
                 .group_leader_node_id = dataReadRouterGroupLeaderNodeId,
+                .node_status = dataReadRouterNodeStatus,
                 .node_base_uri = dataReadRouterNodeBaseUri,
                 .node_base_uri_for_group = dataReadRouterNodeBaseUriForGroup,
                 .group_node_ids = dataReadRouterGroupNodeIds,
@@ -13246,6 +13282,18 @@ pub const DataServer = struct {
         return store.node_id;
     }
 
+    fn dataReadRouterNodeStatus(ptr: *anyopaque, node_id: u64, group_id: u64) antfly.raft.host.HostedReplicaStatus {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        if (node_id == dataReadRouterLocalNodeId(ptr)) return dataReadRouterLocalStatus(ptr, group_id);
+        if (self.remote_metadata) |metadata| {
+            const peers = metadata.acquireControlReadGeneration(.{}) catch return .absent;
+            defer peers.release();
+            return if (peers.readable(group_id, node_id) and peers.nodes.contains(node_id)) .active else .absent;
+        }
+        var router = @import("../api/table_router.zig").CatalogBackedGroupRouter.init(self.read_source.catalog, dataReadRouterLocalNodeId(ptr));
+        return router.router().nodeStatus(node_id, group_id) orelse .absent;
+    }
+
     fn dataReadRouterNodeBaseUri(ptr: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.remote_metadata) |metadata| {
@@ -13291,7 +13339,10 @@ pub const DataServer = struct {
             // catalog read when a retired source became cold. Its ReadIndex
             // has already established local authority; prepare that one owner
             // on the durable control lane and leave the caller's debt pending.
-            if (err == error.CatalogRoutingUnavailable and request.operation != .artifact)
+            if (request.operation != .artifact and switch (err) {
+                error.CatalogRoutingUnavailable, error.StorageReadTemporarilyUnavailable => true,
+                else => false,
+            })
                 self.requestRetainedOwnerWarmup(group_id, table_name) catch |warm_err|
                     std.log.warn("retained owner warmup admission deferred group_id={} err={s}", .{ group_id, @errorName(warm_err) });
             return err;
@@ -16116,6 +16167,8 @@ pub const DataServer = struct {
     }
 
     fn baseRequiredRaftBatchProtocolVersion(alloc: std.mem.Allocator, req: antfly.db.types.BatchRequest) !u16 {
+        if (req.merge_checkpoint) |checkpoint| if (checkpoint.kind == .qualify_cutover)
+            return @import("../common/data_raft_protocol.zig").batch_merge_cutover_receipt_protocol_version;
         if (req.split_checkpoint) |checkpoint| if (checkpoint.history_policy != null)
             return @import("../common/data_raft_protocol.zig").batch_split_history_seed_protocol_version;
         if (req.merge_source_transition) |transition| if (transition.kind == .finalize)
@@ -16844,7 +16897,7 @@ pub const DataServer = struct {
             const source_owner = if (kind == .legacy_inventory_observe) input.query.owner else if ((kind == .source_scope_observe or kind == .source_producer_closure_observe or kind == .source_producer_control or kind == .legacy_terminal_control)) input.owner else if ((kind == .source_scope_control or kind == .source_retirement_control)) input.owner() else input.source_owner;
             if (source_owner.group_id != original_fence.route.group_id or
                 source_owner.metadata_group_id != original_fence.metadata_group_id or
-                source_owner.topology_epoch != original_fence.topology_epoch or
+                (kind != .source_retirement_control and source_owner.topology_epoch != original_fence.topology_epoch) or
                 !std.mem.eql(u8, &source_owner.metadata_incarnation, &incarnation) or
                 !std.mem.eql(u8, &source_owner.namespace, &namespace)) return error.InvalidCatalogRouteFence;
         }
@@ -17561,10 +17614,14 @@ pub const DataServer = struct {
         defer descriptor.deinit(alloc);
         const expected_identity = fence.route.identity_namespace;
         if (descriptor.identity.table_id != expected_identity.table_id or descriptor.identity.shard_id != expected_identity.shard_id or descriptor.identity.range_id != expected_identity.range_id) return error.HistoryResynchronizationRequired;
-        if (comptime kind == .source_plan) try @import("../api/completion_owner_admission.zig").require(alloc, owner.catalog, table_name, fence, descriptor.view(), command.source_owner, context);
+        if (comptime kind == .source_plan) try @import("../api/completion_owner_admission.zig").require(alloc, owner.catalog, table_name, fence, descriptor.view(), try command.routedOwner(fence.topology_epoch), context);
         if (comptime kind == .producer_closure) try @import("../api/completion_owner_admission.zig").require(alloc, owner.catalog, table_name, fence, descriptor.view(), command, context);
         if (comptime kind == .legacy_terminal) try @import("../api/completion_owner_admission.zig").require(alloc, owner.catalog, table_name, fence, descriptor.view(), command.owner, context);
-        if (comptime kind == .source_scope or kind == .source_retirement) try @import("../api/completion_owner_admission.zig").require(alloc, owner.catalog, table_name, fence, descriptor.view(), command.intent.owner, context);
+        if (comptime kind == .source_scope or kind == .source_retirement) {
+            var routed = command.intent.owner;
+            if (comptime kind == .source_retirement) routed.topology_epoch = fence.topology_epoch;
+            try @import("../api/completion_owner_admission.zig").require(alloc, owner.catalog, table_name, fence, descriptor.view(), routed, context);
+        }
         const encoded = switch (kind) {
             .history => try @import("history_control_entry.zig").encode(alloc, .{ .table = table_name, .protocol = required, .storage_owner = descriptor.view(), .history_control = .{ .command = command } }, required),
             .source_plan => try @import("source_plan_entry.zig").encode(alloc, .{ .table = table_name, .protocol = required, .storage_owner = descriptor.view(), .source_owner = command.source_owner, .source_plan = command.command }, required),
@@ -17891,7 +17948,7 @@ pub const DataServer = struct {
                     }
                     try ensureDataRaftBatchRouteActive(route);
                 }
-                if (batchMutatesDocuments(req)) {
+                if (batchMutatesDocuments(req) and !isCompletionCollection(req)) {
                     // No proposal has been attempted yet. A transition store
                     // that is not ready is retryable unavailability, not an
                     // ambiguous write outcome: returning the latter would
@@ -18072,6 +18129,8 @@ pub const DataServer = struct {
                         const owner_source = try self.ensureKernelOwnerSource();
                         storage_owner_descriptor = if (route.initial_child_bootstrap) |bootstrap|
                             try owner_source.loadInitialChildDescriptor(alloc, group_id, table_name, bootstrap)
+                        else if (onlineMergeMaintenanceScope(req)) |scope|
+                            try owner_source.loadOnlineMergeMaintenanceDescriptor(alloc, group_id, table_name, scope)
                         else if (completion_command)
                             try owner_source.loadCompletionDescriptor(alloc, group_id, table_name, completion_context)
                         else
@@ -18085,15 +18144,26 @@ pub const DataServer = struct {
             }
 
             if (completion_command and preflighted_local_leader) {
-                const owner = switch (req.transaction.?) {
+                var owner = switch (req.transaction.?) {
                     .begin => |begin| begin.completion_owner orelse return error.InvalidHistoryAdmission,
                     .prepare => |prepare| prepare.completion_owner orelse return error.InvalidHistoryAdmission,
                     .resolve => |resolve| resolve.completion_owner orelse return error.InvalidHistoryAdmission,
                     .publish_completion => |publication| publication.completion_owner,
                     else => return error.InvalidBatchRequest,
                 };
+                // Publication and scoped ABORT are validated against the
+                // original retained transaction at apply. Refresh only the
+                // route, preserving the transaction's immutable owner.
+                if (req.transaction.? == .publish_completion or
+                    (req.transaction.? == .resolve and req.transaction.?.resolve.status == .aborted and req.transaction.?.resolve.source_scope != null))
+                    owner.topology_epoch = route.write_route_fence.?.topology_epoch;
                 const admission_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
                 try @import("../api/completion_owner_admission.zig").require(alloc, admission_source.catalog, table_name, route.write_route_fence.?, storage_owner_descriptor.?.view(), owner, completion_context);
+                if (req.transaction.? == .publish_completion) {
+                    const publication = req.transaction.?.publish_completion;
+                    if (publication.ordinary_release) |release|
+                        try self.completionRecovery().requireOrdinaryRelease(alloc, publication.completion_owner, publication.txn_id, release, completion_context);
+                }
             }
 
             var target_index: ?u64 = null;
@@ -22544,6 +22614,7 @@ pub const DataServer = struct {
             .transition = transition,
             .receiver_group = receiver,
             .root_generation = qualified.owner.root_generation,
+            .require_completion_drain = true,
         }, .{})) orelse return true;
         return cut.retirementReady();
     }
@@ -22554,31 +22625,14 @@ pub const DataServer = struct {
     ) !antfly.metadata.transition_state.MergeObservation {
         const store = self.localTransitionApplyStore() orelse
             return error.MissingMergeSourceStore;
-        var observation = try deriveReplicatedMergeObservation(self.alloc, store, record);
-        if (record.phase != .finalized and observation.donor.phase == .finalized and observation.receiver.phase == .finalized) {
-            var ready = try self.mergeHistoryRetirementReady(record.donor_group_id, record.receiver_group_id, record.transition_id, record.table_contract);
-            if (ready and try transitionHasCoordinatedConstraints(self.alloc, record.table_contract)) {
-                // A retired history grant can unblock observation between
-                // finalize calls. Do not publish cutover until a finalize
-                // call has released the receiver's durable integrity fence.
-                var status = try self.readRelationalTopologyValue(IntegrityTopologyStatus, self.alloc, record.receiver_group_id, record.table_contract.table_name, record.transition_id, 1, "status");
-                defer status.deinit();
-                ready = status.value.fence == null;
-            }
-            if (!ready) {
-                observation.donor.phase = .cutover_ready;
-                observation.receiver.phase = .cutover_ready;
-                observation.donor.cutover_ready = true;
-                observation.receiver.cutover_ready = true;
-            }
-        }
-        return observation;
+        return deriveReplicatedMergeObservation(self.alloc, store, record, true);
     }
 
     fn deriveReplicatedMergeObservation(
         alloc: std.mem.Allocator,
         store: *DataRaftApplyStore,
         record: antfly.metadata.MergeTransitionRecord,
+        require_cutover_receipt: bool,
     ) !antfly.metadata.transition_state.MergeObservation {
         var source_state = try store.currentMergeSourceState(alloc, record.donor_group_id);
         var receiver_state = try store.currentMergeReceiverState(alloc, record.receiver_group_id);
@@ -22628,6 +22682,11 @@ pub const DataServer = struct {
             source_finalized and if (receiver_state) |state| state.phase == .finalized else false,
             if (receiver_state) |state| state.phase == .rolled_back else false,
         );
+        // Post-finalize history controls can advance the donor index without
+        // creating merge deltas. Keep dispatching qualification, not copy.
+        if (require_cutover_receipt and record.phase != .finalized and
+            status.phase == .finalized and !receiver_state.?.cutover_qualified)
+            status.phase = .cutover_ready;
         status.allow_doc_identity_reassignment = record.allow_doc_identity_reassignment;
         if (receiver_state) |state| if (state.receiver_identity_reassignment_namespace) |namespace| {
             status.receiver_identity_reassignment_namespace_table_id = namespace.table_id;
@@ -22653,7 +22712,7 @@ pub const DataServer = struct {
             .receiver_group_id = receiver_group_id,
             .allow_doc_identity_reassignment = allow_doc_identity_reassignment,
             .table_contract = table_contract,
-        });
+        }, false);
         return observation.donor.phase == .finalized and
             observation.receiver.phase == .finalized;
     }
@@ -22872,6 +22931,82 @@ pub const DataServer = struct {
         });
     }
 
+    const MergeCutoverJob = struct {
+        server: *DataServer,
+        op: @FieldType(antfly.metadata.TransitionAction, "finalize_merge"),
+        lane: ?TransitionActionLanes.Lease,
+
+        fn run(ptr: *anyopaque) !void {
+            const job: *@This() = @ptrCast(@alignCast(ptr));
+            defer job.releaseLane();
+            try job.server.requireReplicatedTransitionActionActive(job.op.donor_group_id);
+            if (try job.server.qualifyReplicatedMergeCutover(job.op)) {
+                job.releaseLane();
+                try job.server.reportMergeFinalize(job.op);
+            }
+        }
+
+        fn releaseLane(job: *@This()) void {
+            if (job.lane) |*lane| lane.deinit();
+            job.lane = null;
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const job: *@This() = @ptrCast(@alignCast(ptr));
+            const alloc = job.server.alloc;
+            job.releaseLane();
+            job.op.table_contract.deinitOwned(alloc);
+            alloc.destroy(job);
+        }
+    };
+
+    fn enqueueMergeCutover(self: *DataServer, op: @FieldType(antfly.metadata.TransitionAction, "finalize_merge"), lane: *?TransitionActionLanes.Lease) !void {
+        const runtime = try self.ensureBackendRuntime();
+        const owner_id = try self.replicatedTransitionActionOwnerId(runtime);
+        const job = try self.alloc.create(MergeCutoverJob);
+        errdefer self.alloc.destroy(job);
+        var owned = op;
+        owned.table_contract = try op.table_contract.clone(self.alloc);
+        errdefer owned.table_contract.deinitOwned(self.alloc);
+        job.* = .{ .server = self, .op = owned, .lane = lane.* };
+        lane.* = null;
+        errdefer job.releaseLane();
+        try runtime.durable_jobs.submit(.{
+            .owner_id = owner_id,
+            .class = .maintenance,
+            .ptr = job,
+            .run = MergeCutoverJob.run,
+            .deinit = MergeCutoverJob.deinit,
+        });
+    }
+
+    fn qualifyReplicatedMergeCutover(self: *DataServer, op: @FieldType(antfly.metadata.TransitionAction, "finalize_merge")) !bool {
+        const store = self.localTransitionApplyStore() orelse return error.MissingMergeSourceStore;
+        var receipt = (try store.currentMergeReceiverState(self.alloc, op.receiver_group_id)) orelse
+            return error.MergeReceiverProjectionNotReady;
+        defer receipt.deinit(self.alloc);
+        if (receipt.phase != .finalized or receipt.transition_id != op.transition_id or
+            receipt.donor_group_id != op.donor_group_id or receipt.receiver_group_id != op.receiver_group_id)
+            return error.MergeReceiverProjectionNotReady;
+        if (receipt.cutover_qualified) return false;
+        if (!try self.mergeHistoryRetirementReady(op.donor_group_id, op.receiver_group_id, op.transition_id, op.table_contract))
+            return false;
+        try self.releaseRelationalMergeReceiver(op.donor_group_id, op.receiver_group_id, op.transition_id, op.table_contract);
+        try self.replicateMergeReceiverCheckpoint(mergeReceiverCheckpoint(
+            op.transition_id,
+            op.donor_group_id,
+            op.receiver_group_id,
+            receipt.receiver_base_range,
+            receipt.merged_range orelse return error.MergeReceiverProjectionNotReady,
+            .qualify_cutover,
+            0,
+            op.allow_doc_identity_reassignment,
+            op.table_contract,
+            receipt.copy_attempt,
+        ), op.table_contract);
+        return true;
+    }
+
     fn localFinalizeMerge(ptr: *anyopaque, _: u64, op: @FieldType(antfly.metadata.TransitionAction, "finalize_merge")) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         try op.table_contract.validateForMerge(
@@ -22879,9 +23014,9 @@ pub const DataServer = struct {
         );
         if (self.data_raft != null) {
             try self.requireLocalDataRaftLeader(op.donor_group_id);
-            var lane = self.replicated_transition_action_lanes.tryAcquire(op.donor_group_id) orelse
+            var lane: ?TransitionActionLanes.Lease = self.replicated_transition_action_lanes.tryAcquire(op.donor_group_id) orelse
                 return error.TransitionOperationBusy;
-            defer lane.deinit();
+            defer if (lane) |*lease| lease.deinit();
             if (try self.replicatedMergeAlreadyFinalized(
                 op.transition_id,
                 op.donor_group_id,
@@ -22889,13 +23024,7 @@ pub const DataServer = struct {
                 op.allow_doc_identity_reassignment,
                 op.table_contract,
             )) {
-                // Report the completed physical step so metadata can expose
-                // finalizing while the donor is still routed. Observation
-                // keeps the transition nonterminal until history drains.
-                if (!try self.mergeHistoryRetirementReady(op.donor_group_id, op.receiver_group_id, op.transition_id, op.table_contract))
-                    return;
-                try self.releaseRelationalMergeReceiver(op.donor_group_id, op.receiver_group_id, op.transition_id, op.table_contract);
-                return;
+                return self.enqueueMergeCutover(op, &lane);
             }
             // The source copy needs the transition writer, but proposal and
             // committed apply need the ordinary writer. Drop only the copy
@@ -22962,9 +23091,7 @@ pub const DataServer = struct {
                 ),
                 op.table_contract,
             );
-            if (!try self.mergeHistoryRetirementReady(op.donor_group_id, op.receiver_group_id, op.transition_id, op.table_contract))
-                return;
-            try self.releaseRelationalMergeReceiver(op.donor_group_id, op.receiver_group_id, op.transition_id, op.table_contract);
+            return self.enqueueMergeCutover(op, &lane);
         } else if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .finalize_merge = op });
         } else {
@@ -22995,6 +23122,10 @@ pub const DataServer = struct {
                 try transition.execute(.{ .finalize_merge = op });
             }
         }
+        try self.reportMergeFinalize(op);
+    }
+
+    fn reportMergeFinalize(self: *DataServer, op: @FieldType(antfly.metadata.TransitionAction, "finalize_merge")) !void {
         self.invalidateLocalGroupStatusCache();
         try self.reachDataRequestLifecycle(.{
             .phase = .writer_handoff_completed,
@@ -30535,7 +30666,19 @@ const activation_admission_tests = if (@import("builtin").is_test and implementa
         rollback_accept.merge_checkpoint.?.kind = .accept;
         rollback_accept.merge_checkpoint.?.page_source.?.integrity = .{ .catalog_digest = @splat(2), .generation_set = @splat(3) };
         try std.testing.expect(!onlineMergeRaftBatchRequiresArtifactBarrier(rollback_accept));
-        try std.testing.expect(!onlineMergeRaftBatchRequiresArtifactBarrier(.{ .online_source = .{ .release = bound } }));
+        const release: antfly.db.types.BatchRequest = .{ .online_source = .{ .release = bound } };
+        try std.testing.expect(!onlineMergeRaftBatchRequiresArtifactBarrier(release));
+        const batch = @import("antfly_local_sources").api_internal_batch;
+        for ([_]antfly.db.types.BatchRequest{ release, .{ .online_source = .{ .reclaim = .{ .scope = bound } } } }) |request| {
+            const encoded = try batch.encodeBatchRequest(alloc, request);
+            defer alloc.free(encoded);
+            var decoded = try batch.parseInternalBatchRequest(alloc, encoded);
+            defer decoded.deinit(alloc);
+            try std.testing.expect(!needsDenseRepairWritePreflight(decoded.req));
+        }
+        var mixed_release = release;
+        mixed_release.writes = &.{.{ .key = "doc:new", .value = "{}" }};
+        try std.testing.expect(needsDenseRepairWritePreflight(mixed_release));
         try std.testing.expect(!onlineMergeRaftBatchRequiresArtifactBarrier(.{}));
         const inventory = @import("antfly_local_sources").storage_db_artifact_inventory;
         const catalogs: inventory.Catalogs = .{};
@@ -35820,7 +35963,8 @@ fn remoteTableLifecycleMatches(
     return switch (expected) {
         .present => {
             const record = table orelse return false;
-            return remoteTableRangesReady(snapshot, record.table_id);
+            // Object tables commit catalog definitions without native placement.
+            return record.storage.engine == .object or remoteTableRangesReady(snapshot, record.table_id);
         },
         .absent => table == null,
     };
@@ -52587,9 +52731,9 @@ fn consumerTests() type {
             try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_exact_prepare_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
 
             const ClockHarness = struct {
-                noinline fn run(allocator: std.mem.Allocator, node: *DataServer, kernel: *antfly.public_api.ProvisionedKernelOwnerSource, captured: antfly.metadata_api.CatalogRouteFence, consumer: control.Reference) !void {
+                noinline fn run(allocator: std.mem.Allocator, node: *DataServer, captured: antfly.metadata_api.CatalogRouteFence, consumer: control.Reference) !void {
                     const group = captured.route.group_id;
-                    var before = try kernel.orderedHistoryPageRouted(allocator, captured, "docs", .{ .reference = consumer, .after = .{}, .now_seconds = 100 });
+                    var before = try node.historyLocalRead(allocator, captured, "docs", .page, .{ .version = 1, .request = .{ .reference = consumer, .after = .{}, .now_seconds = 100 } }, .{});
                     defer before.deinit();
                     const earliest = node.dataRaftRealtimeNs();
                     try node.proposeRaftBatchGroupWithLeaderWait(allocator, group, "docs", .{
@@ -52598,7 +52742,7 @@ fn consumerTests() type {
                         .writes = &.{.{ .key = "timestamped-history-row", .value = "{\"clock\":true}" }},
                     }, .{ .discovery = .cached, .allow_remote_forward = false, .write_route_fence = captured }, 5 * std.time.ns_per_s);
                     const latest = node.dataRaftRealtimeNs();
-                    var page = try kernel.orderedHistoryPageRouted(allocator, captured, "docs", .{ .reference = consumer, .after = .{ .sequence = before.observed_latest }, .now_seconds = 100 });
+                    var page = try node.historyLocalRead(allocator, captured, "docs", .page, .{ .version = 1, .request = .{ .reference = consumer, .after = .{ .sequence = before.observed_latest }, .now_seconds = 100 } }, .{});
                     defer page.deinit();
                     try std.testing.expectEqual(@as(usize, 1), page.events.len);
                     try std.testing.expectEqualStrings("{\"clock\":true}", page.events[0].after.?);
@@ -52606,8 +52750,92 @@ fn consumerTests() type {
                     try std.testing.expect(clock >= earliest and clock <= latest);
                 }
             };
-            try ClockHarness.run(a, server, &owner, route.fence().?, ref);
+            try ClockHarness.run(a, server, route.fence().?, ref);
             try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_exact_prepare_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+            const OrdinaryRetention = struct {
+                noinline fn run(allocator: std.mem.Allocator, node: *DataServer, captured: antfly.metadata_api.CatalogRouteFence, original_owner: @import("antfly_local_sources").storage_transaction_completion.RoutedOwner) !void {
+                    const txn = @import("../api/distributed_txn.zig");
+                    const completion = @import("antfly_local_sources").storage_transaction_completion;
+                    const ordinary_txn_id: [16]u8 = "ordinary-release".*;
+                    var ordinary_worker = txn.LocalTableWriteParticipantWorker.init(node.write_source.source());
+                    const ordinary_recovery = node.completionRecovery();
+                    const commit_outcome = try txn.executeMultiTableCommitWithOptions(allocator, node.write_source.catalog, ordinary_worker.worker(), ordinary_txn_id, 3000, 3001, &.{.{
+                        .source_producer = .ordinary,
+                        .table_name = "docs",
+                        .writes = &.{.{ .key = "ordinary-retention", .value = "{\"v\":9}" }},
+                    }}, .write, null, .{ .completion = .{ .owners = node.historyOwnerPort(), .recovery = ordinary_recovery } });
+                    try std.testing.expect(commit_outcome == .committed);
+                    try std.testing.expect(!commit_outcome.committed.propagation_pending);
+                    const decision_request: @import("../api/history_decision_operations.zig").Request = .{
+                        .version = 1,
+                        .owner = original_owner,
+                        .transaction_id = ordinary_txn_id,
+                        .minimum_applied_index = 1,
+                    };
+                    var observed_decision = try node.historyDecisionPort().read(allocator, captured, "docs", decision_request, .{});
+                    defer observed_decision.deinit();
+                    const terminal_decision = observed_decision.value.decision orelse return error.TestUnexpectedResult;
+                    try std.testing.expect(!terminal_decision.record.acknowledgments_pending and !terminal_decision.record.retain_terminal);
+                    const coordinator_member = try terminal_decision.admission.admission.coordinatorMember();
+                    const committed_manifest = try terminal_decision.committedManifest();
+                    const publication_request: @import("../api/history_publication_operations.zig").Request = .{
+                        .version = 2,
+                        .owner = original_owner,
+                        .transaction_id = ordinary_txn_id,
+                        .manifest_digest = committed_manifest.digest(),
+                        .commit_version = committed_manifest.commit_version,
+                        .minimum_applied_index = 1,
+                    };
+                    const retained_publication = try node.historyPublicationPort().read(allocator, captured, "docs", publication_request, .{});
+                    try std.testing.expect(!retained_publication.release.?.collection_staged);
+                    const release_binding: completion.OrdinaryRelease = .{
+                        .coordinator = original_owner,
+                        .admission_digest = terminal_decision.admission.digest,
+                        .certificate_digest = retained_publication.publication.?.digest,
+                        .commit_version = committed_manifest.commit_version,
+                    };
+                    var forged_release = release_binding;
+                    forged_release.certificate_digest[0] ^= 1;
+                    try std.testing.expectError(error.DecisionConflict, node.completionParticipantPort().releaseOrdinary(allocator, coordinator_member, captured, ordinary_txn_id, forged_release, .{}));
+                    const release_job: @import("antfly_local_sources").storage_history_recovery_wire.Request = .{
+                        .owner = original_owner,
+                        .transaction_id = ordinary_txn_id,
+                        .admission_digest = terminal_decision.admission.digest,
+                        .coordinator_locator = coordinator_member.locator,
+                        .resolution_timestamp_ns = 3002,
+                        .collect_ordinary = true,
+                    };
+                    try std.testing.expectEqual(.complete, try ordinary_recovery.runRetained(allocator, release_job, .{}));
+                    const collected_publication = try node.historyPublicationPort().read(allocator, captured, "docs", publication_request, .{});
+                    try std.testing.expect(collected_publication.release.?.collection_staged);
+                    try std.testing.expectEqualDeep(retained_publication.publication, collected_publication.publication);
+                }
+            };
+            try OrdinaryRetention.run(a, server, route.fence().?, producer_closure_owner orelse return error.TestExpectedProducerOwner);
+        }
+
+        test "data raft ordered history merge fences allow only isolated certificate collection" {
+            const owner: @import("antfly_local_sources").storage_transaction_completion.RoutedOwner = .{
+                .metadata_group_id = 1,
+                .metadata_incarnation = @splat('a'),
+                .namespace = @splat(2),
+                .table_binding = @splat(3),
+                .root_generation = 0,
+                .group_id = 4,
+                .topology_epoch = 5,
+            };
+            var request: antfly.db.types.BatchRequest = .{ .transaction = .{ .publish_completion = .{
+                .txn_id = @splat(6),
+                .completion_owner = owner,
+                .ordinary_release = .{ .coordinator = owner, .admission_digest = @splat(7), .certificate_digest = @splat(8), .commit_version = 9 },
+            } } };
+            try std.testing.expect(isCompletionCollection(request));
+            request.writes = &.{.{ .key = "row", .value = "{}" }};
+            try std.testing.expect(!isCompletionCollection(request));
+            request.writes = &.{};
+            request.transaction.?.publish_completion.ordinary_release = null;
+            request.transaction.?.publish_completion.certificate = "ordinary publication";
+            try std.testing.expect(!isCompletionCollection(request));
         }
 
         test "data raft ordered history table producer capability refuses lossy fallback" {
@@ -61902,11 +62130,12 @@ fn implementationTests() type {
                     target: *antfly.data.RaftApplyStore,
                     group_id: u64,
                     index: u64,
+                    protocol: u16,
                 ) !void {
                     const payload = try data_raft_batch.encodeProtocolBarrier(
                         allocator,
                         "docs",
-                        data_raft_batch.merge_transition_protocol_version,
+                        protocol,
                     );
                     defer allocator.free(payload);
                     const entries = try antfly.raft.state_machine.encodeCommittedEntries(allocator, &.{.{
@@ -61946,8 +62175,9 @@ fn implementationTests() type {
                     });
                 }
             };
-            try Apply.barrier(alloc, &store, record.donor_group_id, 1);
-            try Apply.barrier(alloc, &store, record.receiver_group_id, 1);
+            const legacy_protocol = data_raft_batch.merge_transition_protocol_version;
+            try Apply.barrier(alloc, &store, record.donor_group_id, 1, legacy_protocol);
+            try Apply.barrier(alloc, &store, record.receiver_group_id, 1, legacy_protocol);
             try Apply.command(alloc, &store, record.donor_group_id, 2, .{
                 .merge_source_transition = .{
                     .kind = .prepare,
@@ -61974,7 +62204,7 @@ fn implementationTests() type {
             try Apply.command(alloc, &store, record.receiver_group_id, 3, .{
                 .merge_checkpoint = complete,
             });
-            const observation = try DataServer.deriveReplicatedMergeObservation(alloc, &store, record);
+            const observation = try DataServer.deriveReplicatedMergeObservation(alloc, &store, record, true);
             try std.testing.expectEqual(antfly.data.storage.range_transition.TransitionPhase.cutover_ready, observation.receiver.phase);
             try std.testing.expect(observation.receiver.bootstrapped);
             try std.testing.expectEqual(@as(u64, 2), observation.receiver.donor_delta_sequence);
@@ -61982,10 +62212,28 @@ fn implementationTests() type {
             var next_record = record;
             next_record.transition_id = 7002;
             next_record.donor_group_id = 73;
-            try std.testing.expectError(error.ConflictingMergeTransition, DataServer.deriveReplicatedMergeObservation(alloc, &store, next_record));
+            try std.testing.expectError(error.ConflictingMergeTransition, DataServer.deriveReplicatedMergeObservation(alloc, &store, next_record, true));
             complete.kind = .finalize;
             try Apply.command(alloc, &store, record.receiver_group_id, 4, .{ .merge_checkpoint = complete });
-            const fresh_observation = try DataServer.deriveReplicatedMergeObservation(alloc, &store, next_record);
+            try Apply.command(alloc, &store, record.donor_group_id, 3, .{
+                .merge_source_transition = .{
+                    .kind = .finalize,
+                    .transition_id = record.transition_id,
+                    .receiver_group_id = record.receiver_group_id,
+                },
+            });
+            const draining = try DataServer.deriveReplicatedMergeObservation(alloc, &store, record, true);
+            try std.testing.expectEqual(antfly.data.storage.range_transition.TransitionPhase.cutover_ready, draining.receiver.phase);
+            var qualification = base_checkpoint;
+            qualification.kind = .qualify_cutover;
+            const protocol = @import("../common/data_raft_protocol.zig").batch_merge_cutover_receipt_protocol_version;
+            try std.testing.expectEqual(protocol, try DataServer.requiredRaftBatchProtocolVersion(alloc, .{ .merge_checkpoint = qualification }));
+            try std.testing.expectError(error.RaftBatchMergeProtocolNotActivated, Apply.command(alloc, &store, record.receiver_group_id, 5, .{ .merge_checkpoint = qualification }));
+            try Apply.barrier(alloc, &store, record.receiver_group_id, 5, protocol);
+            try Apply.command(alloc, &store, record.receiver_group_id, 6, .{ .merge_checkpoint = qualification });
+            const qualified = try DataServer.deriveReplicatedMergeObservation(alloc, &store, record, true);
+            try std.testing.expectEqual(antfly.data.storage.range_transition.TransitionPhase.finalized, qualified.receiver.phase);
+            const fresh_observation = try DataServer.deriveReplicatedMergeObservation(alloc, &store, next_record, true);
             try std.testing.expectEqual(antfly.data.storage.range_transition.TransitionPhase.prepare, fresh_observation.receiver.phase);
             try std.testing.expect(!fresh_observation.receiver.bootstrapped);
             var prior = (try store.currentMergeReceiverState(alloc, record.receiver_group_id)).?;
@@ -62003,11 +62251,11 @@ fn implementationTests() type {
             next_checkpoint.donor_group_id = next_record.donor_group_id;
             next_checkpoint.receiver_base_start = next_ranges.base.start;
             next_checkpoint.merged_start = next_ranges.merged.start;
-            try Apply.command(alloc, &store, record.receiver_group_id, 5, .{ .merge_checkpoint = next_checkpoint });
+            try Apply.command(alloc, &store, record.receiver_group_id, 7, .{ .merge_checkpoint = next_checkpoint });
             next_checkpoint.kind = .rollback;
-            try Apply.command(alloc, &store, record.receiver_group_id, 6, .{ .merge_checkpoint = next_checkpoint });
+            try Apply.command(alloc, &store, record.receiver_group_id, 8, .{ .merge_checkpoint = next_checkpoint });
             // A retired identity is not mistaken for a fresh request after rollback.
-            try std.testing.expectError(error.ConflictingMergeTransition, DataServer.deriveReplicatedMergeObservation(alloc, &store, record));
+            try std.testing.expectError(error.ConflictingMergeTransition, DataServer.deriveReplicatedMergeObservation(alloc, &store, record, true));
         }
 
         test "data raft split finalization persists the receiver base before merge and survives restart replay" {

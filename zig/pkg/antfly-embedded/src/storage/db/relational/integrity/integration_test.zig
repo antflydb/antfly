@@ -2219,8 +2219,10 @@ test "relational integrity topology handoff transfers routed companions with res
     defer tmp.cleanup();
     const source_path = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/source", .{tmp.sub_path});
     const destination_path = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/destination", .{tmp.sub_path});
-    var source = try db_mod.DB.open(alloc, source_path, .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 600, .shard_id = 601 }, .primary_backend = .{ .lsm = .{} } });
-    defer source.close();
+    const source_options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 600, .shard_id = 601 }, .primary_backend = .{ .lsm = .{} } };
+    var source = try db_mod.DB.open(alloc, source_path, source_options);
+    var source_open = true;
+    defer if (source_open) source.close();
     var destination = try db_mod.DB.open(alloc, destination_path, .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 600, .shard_id = 602 }, .primary_backend = .{ .lsm = .{} } });
     defer destination.close();
     const schema =
@@ -2268,6 +2270,21 @@ test "relational integrity topology handoff transfers routed companions with res
     try source.applyRelationalTopologyControl(parent_acknowledge, null);
     try source.applyRelationalTopologyControl(.{ .action = .begin, .fence = source_fence }, null);
     try destination.applyRelationalTopologyControl(.{ .action = .begin, .fence = destination_fence }, null);
+    const successor_json = try std.mem.replaceOwned(u8, owned, schema, "\"version\":1", "\"version\":2");
+    const public_schema = @import("../../../../schema/mod.zig");
+    var successor = try public_schema.parseValidatedTableSchema(alloc, successor_json);
+    defer successor.deinit(alloc);
+    const successor_runtime = try public_schema.deriveRuntimeTableSchema(alloc, successor);
+    defer @import("../../../schema.zig").freeSchema(alloc, successor_runtime);
+    var reopen_options = source_options;
+    reopen_options.schema_before_index_load = .{ .runtime_schema = successor_runtime, .public_schema_json = successor_json };
+    source.close();
+    source_open = false;
+    source = try db_mod.DB.open(alloc, source_path, reopen_options);
+    source_open = true;
+    try std.testing.expectEqual(@as(u32, 1), source.core.schema.?.version);
+    try std.testing.expectEqual(.deferred, try source.schemaOwnerCatalogPolicy(successor_json, false));
+    try std.testing.expect((try source.relationalTopologyStatus()).fence.?.eql(source_fence));
     const manifest = try source.relationalHandoffManifest(owned, source_fence, destination_fence, "m", "", 10);
     try destination.applyRelationalTopologyControl(.{ .action = .transfer, .fence = destination_fence, .transfer = .{ .begin = manifest } }, null);
     var page_count: usize = 0;

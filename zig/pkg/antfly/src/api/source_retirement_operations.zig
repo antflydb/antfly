@@ -37,7 +37,7 @@ pub fn execute(port: ?Port, a: A, group: u64, table: []const u8, body: []const u
     var decoded = try wire.decodeRequest(a, body);
     defer decoded.deinit();
     const request = decoded.value;
-    var route = try @import("source_owner_scope.zig").Scope.init(a, group, table, request.owner(), original);
+    var route = try @import("source_owner_scope.zig").Scope.initWithEpoch(a, group, table, request.owner(), true, original);
     defer route.deinit();
     var scope = try @import("history_publication_operations.zig").Scope.init(route.fence, original);
     const context = scope.context();

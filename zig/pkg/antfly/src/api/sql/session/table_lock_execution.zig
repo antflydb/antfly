@@ -79,7 +79,9 @@ pub const Owner = struct {
         return std.json.parseFromSliceLeaky(authority.Snapshot, a, bytes, .{ .allocate = .alloc_always });
     }
     fn refreshRoute(self: *Owner, a: A, previous: scopes.Data.Spec) !scopes.Data.Spec {
-        var routing = (try TableCatalog.authoritativeTableRoutingSnapshot(a, self.root.server.catalogSource(), previous.table_name, self.root.context.deadline_ns)) orelse return error.TableNotFound;
+        const routing_source = self.root.server.catalogSource();
+        const deadline = routing_source.deadlineFrom(.{ .deadline_ns = self.root.context.deadline_ns, .io = self.root.context.deadline_io });
+        var routing = (try TableCatalog.authoritativeTableRoutingSnapshot(a, routing_source, previous.table_name, deadline)) orelse return error.TableNotFound;
         defer routing.deinit(a);
         if (routing.table_id != previous.route.table_id or routing.topology_epoch != previous.route.topology_epoch) return error.CatalogGenerationChanged;
         for (routing.ranges) |range| {
@@ -89,8 +91,7 @@ pub const Owner = struct {
             var result = previous;
             result.route = routing.fenceForRoute(route);
             result.route.native_participant = previous.route.native_participant;
-            const routing_source = self.root.server.catalogSource();
-            try routing_source.pinNativeParticipant(a, &result.route, routing_source.deadlineFrom(.{ .deadline_ns = self.root.context.deadline_ns, .io = self.root.context.deadline_io }));
+            try routing_source.pinNativeParticipant(a, &result.route, deadline);
             return result;
         }
         return error.CatalogGenerationChanged;
@@ -266,7 +267,9 @@ pub fn table(raw: *anyopaque, _: A, target: catalog.Table, mode: locks.TableMode
         held.modes |= bit;
         return;
     }
-    var routing = (try TableCatalog.tableRoutingSnapshotForWrite(a, root.server.catalogSource(), target.physical_name, root.context.deadline_ns)) orelse return error.TableNotFound;
+    const routing_source = root.server.catalogSource();
+    const deadline = routing_source.deadlineFrom(.{ .deadline_ns = root.context.deadline_ns, .io = root.context.deadline_io });
+    var routing = (try TableCatalog.tableRoutingSnapshotForWrite(a, routing_source, target.physical_name, deadline)) orelse return error.TableNotFound;
     defer routing.deinit(a);
     if (routing.table_id != target.id) return error.CatalogGenerationChanged;
     // Stable range order is shared with write routing. Every range is enrolled

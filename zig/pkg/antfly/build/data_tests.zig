@@ -414,6 +414,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data raft merge pages native source projection requires trusted delegate and retries before shared applied publication",
         "data raft merge pages cleanup verifies pending put delete overlay and exact EOF",
         "data raft merge accept initializes a pristine replica projection",
+        "merge cutover qualification binds to the finalized copy attempt",
         "rolled back merge receiver admits only a fresh accept transition",
         "data raft merge controls converge across three replicas",
         "data raft split cursors are stable across apply batching and acknowledge same-batch writes",

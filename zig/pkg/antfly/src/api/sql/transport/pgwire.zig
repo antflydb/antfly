@@ -1631,7 +1631,14 @@ pub const Adapter = struct {
     fn startConnection(raw: *anyopaque, a: std.mem.Allocator, identity: wire.Identity, request: wire.Request) !void {
         const self: *Adapter = @ptrCast(@alignCast(raw));
         if (!self.server.source.vtable.supports_sql_command_ownership) return;
-        var job: Job = .{ .adapter = self, .alloc = a, .credential = @ptrCast(@alignCast(identity.context)), .request = request, .kind = .notification_connect };
+        const credential: *Credential = @ptrCast(@alignCast(identity.context));
+        if (credential.trusted_identity) |admitted| {
+            // A federated principal can administer its publication without
+            // holding the native identity required for notification enrollment.
+            // Native SQL execution still checks that identity at admission.
+            if (admitted.live_user_manager == null or admitted.user_instance_id == null) return;
+        }
+        var job: Job = .{ .adapter = self, .alloc = a, .credential = credential, .request = request, .kind = .notification_connect };
         try self.dispatch(&job);
     }
 
@@ -1699,7 +1706,7 @@ pub const Adapter = struct {
         try credential.validate();
         const lease = self.server.txn_sessions.tryAcquireCommitExecution(id) orelse return error.SqlWriteCapacityUnavailable;
         defer lease.release();
-        try self.server.txn_sessions.setSqlTransactionOptions(self.server.alloc, try credential.transactionGuard(id), .{
+        try self.server.txn_sessions.setSqlTransactionOptions(self.server.alloc, try credential.transactionGuard(id), credential.native_connection, .{
             .principal = credential.sessionPrincipal(),
             .database = request.database orelse "default",
             .namespace = request.session_namespace orelse request.namespace orelse "public",
@@ -1830,10 +1837,12 @@ pub const Adapter = struct {
 
     fn openStream(raw: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request) !?wire.ReadStream {
         const self: *Adapter = @ptrCast(@alignCast(raw));
-        if (try wire.replication_commands.parsePublication(alloc, request.statement, publication_control.max_tables)) |publication| {
-            var parsed = publication;
-            parsed.deinit();
-            return null;
+        if (self.replicationFactory() != null) {
+            if (try wire.replication_commands.parsePublication(alloc, request.statement, publication_control.max_tables)) |publication| {
+                var parsed = publication;
+                parsed.deinit();
+                return null;
+            }
         }
         var job = StreamJob{ .adapter = self, .alloc = alloc, .credential = @ptrCast(@alignCast(identity.context)), .request = request };
         try job.dispatch();
@@ -3759,7 +3768,13 @@ const Job = struct {
         }
         var preparation = self.adapter.server.sql_preparation_admission.tryAcquireLease() orelse return error.SqlWriteCapacityUnavailable;
         defer preparation.release();
-        if (try wire.replication_commands.parsePublication(self.alloc, self.request.statement, publication_control.max_tables)) |publication| {
+        // A retained-spool listener uses its publication catalog. The
+        // journal-backed listener uses the SQL catalog DDL and its capture plan.
+        const retained_publication = if (self.adapter.replicationFactory() != null)
+            try wire.replication_commands.parsePublication(self.alloc, self.request.statement, publication_control.max_tables)
+        else
+            null;
+        if (retained_publication) |publication| {
             var parsed = publication;
             defer parsed.deinit();
             if (self.request.session_id != null) return error.UnsupportedSqlExecution;

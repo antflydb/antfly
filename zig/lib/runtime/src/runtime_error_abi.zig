@@ -1289,6 +1289,7 @@ pub const Detail = enum(c_int) {
     sql_trigger_coordination_required = 1205,
     invalid_generation_transaction = 1206,
     generation_transaction_changed = 1207,
+    stored_destination_authorization_revoked = 1208,
 };
 
 test "SQL relation persistence callback failures preserve exact identity and behavior" {
@@ -2050,6 +2051,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.RestoreIntentConflict => status(.conflict, .restore_intent_conflict),
         error.Unauthorized => status(.unauthorized, .unauthorized),
         error.Forbidden => status(.forbidden, .forbidden),
+        error.StoredDestinationAuthorizationRevoked => status(.forbidden, .stored_destination_authorization_revoked),
         // Capability barriers can be unavailable during provisioning or a
         // rolling upgrade. They fail before batch proposal admission.
         error.Unavailable, error.RaftBatchMergeProtocolUnavailable, error.RaftBatchSplitDeltaProtocolUnavailable => status(.unavailable, .unavailable),
@@ -3333,6 +3335,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .restore_intent_conflict => "RestoreIntentConflict",
         .unauthorized => "Unauthorized",
         .forbidden => "Forbidden",
+        .stored_destination_authorization_revoked => "StoredDestinationAuthorizationRevoked",
         .unavailable => "Unavailable",
         .write_unavailable => "WriteUnavailable",
         .read_unavailable => "ReadUnavailable",
@@ -4745,6 +4748,12 @@ test "positional IO errors preserve identity without becoming retryable pressure
     const value = statusFromError(error.InputOutput);
     try std.testing.expectEqual(@backingInt(Code.internal), value.code);
     try std.testing.expectEqual(error.InputOutput, errorFromStatus(value));
+}
+
+test "durable destination authorization denial survives runtime transport" {
+    const denied = statusFromError(error.StoredDestinationAuthorizationRevoked);
+    try std.testing.expectEqual(@backingInt(Code.forbidden), denied.code);
+    try std.testing.expectEqual(error.StoredDestinationAuthorizationRevoked, errorFromStatus(denied));
 }
 
 test "source admission and history failures retain exact native boundary identities" {

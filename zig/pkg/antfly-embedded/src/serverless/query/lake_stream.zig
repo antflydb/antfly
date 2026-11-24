@@ -41,6 +41,13 @@ pub const Limits = struct {
     max_input_bytes: usize = 32 * 1024 * 1024,
     max_row_group_rows: usize = 1_000_000,
 };
+/// Bounds a speculative range probe independently of ordinary scan limits.
+pub const Speculation = struct {
+    max_rows_after_first_group: u64,
+    max_files: usize,
+    max_group_probes: usize,
+};
+
 pub const Stats = struct {
     files_opened: usize = 0,
     files_pruned: usize = 0,
@@ -86,6 +93,10 @@ pub const Stream = struct {
     predicates: []const Predicate,
     context: Context,
     limits: Limits,
+    speculation: ?Speculation = null,
+    speculative_files: usize = 0,
+    speculative_group_probes: usize = 0,
+    speculative_first_group_rows: u64 = 0,
     stats: Stats = .{},
     /// Statement-owned admission survives worker ranges and rolling windows.
     examined: ?*std.atomic.Value(u64) = null,
@@ -245,6 +256,7 @@ pub const Stream = struct {
         };
     }
     fn startBloomLookahead(self: *Stream) void {
+        if (self.speculation != null) return;
         if (self.partition_count != 1 or self.row_ranges.len != 0) return; // Partition workers already overlap required probes.
         const reader = self.source.scanner.shared_reader orelse return;
         const io = reader.context.io orelse return;
@@ -326,6 +338,7 @@ pub const Stream = struct {
             @min(self.limits.max_decoded_bytes, 2 * 1024 * 1024) *| 2;
     }
     fn startLookahead(self: *Stream) void {
+        if (self.speculation != null) return;
         if (self.identity_only or self.partition_count != 1 or self.row_ranges.len != 0) return;
         const reader = self.source.scanner.shared_reader orelse return;
         const io = reader.context.io orelse return;
@@ -1020,6 +1033,10 @@ pub const Stream = struct {
             }
             if (self.discovered) |*plan| {
                 while (self.group_index < plan.row_group_plan.row_groups.len) {
+                    if (self.speculation) |budget| {
+                        if (self.speculative_group_probes >= budget.max_group_probes) return error.LakeRowsScanBudgetExceeded;
+                        self.speculative_group_probes += 1;
+                    }
                     self.startBloomLookahead();
                     const input = plan.row_group_plan.row_groups[self.group_index];
                     self.group_index += 1;
@@ -1056,7 +1073,18 @@ pub const Stream = struct {
                         row_begin = range.begin -| first;
                         row_end = @min(group.row_count, range.end - first);
                     }
-                    try self.admitRows(row_end - row_begin);
+                    const examined = row_end - row_begin;
+                    if (self.speculation) |budget| {
+                        if (self.stats.groups_decoded == 0) {
+                            // One shared row group costs no more probes than
+                            // opening it separately for every requested key.
+                            self.speculative_first_group_rows = examined;
+                        } else {
+                            const extra = self.stats.rows_examined -| self.speculative_first_group_rows;
+                            if (examined > budget.max_rows_after_first_group -| extra) return error.LakeRowsScanBudgetExceeded;
+                        }
+                    }
+                    try self.admitRows(examined);
                     self.page_cursor = try @import("lake_parquet_cursor.zig").Cursor.init(self.alloc, self.source.scanner.reader(), plan.inventory, input.file_id, input.row_group_ordinal, if (self.identity_only) &.{} else if (self.schema_contract.len != 0) self.file_columns else self.columns, .{
                         .max_rows = self.limits.max_row_group_rows,
                         .max_struct_allocation_bytes = self.limits.max_decoded_bytes,
@@ -1156,6 +1184,7 @@ pub const Stream = struct {
         }
     }
     fn prefetchNext(self: *Stream) !void {
+        if (self.speculation != null) return;
         if (self.partition_count != 1 or self.row_ranges.len != 0) return;
         const reader = self.source.scanner.shared_reader orelse return;
         if (reader.context.io == null) return;
@@ -1248,6 +1277,10 @@ pub const Stream = struct {
         }
     }
     fn loadFile(self: *Stream, index: usize) !void {
+        if (self.speculation) |budget| {
+            if (self.speculative_files >= budget.max_files) return error.LakeRowsScanBudgetExceeded;
+            self.speculative_files += 1;
+        }
         try self.pinFileVersion(index);
         // Candidate hydration windows share immutable projected file readers.
         // Fresh version pinning above and delete preparation below remain
