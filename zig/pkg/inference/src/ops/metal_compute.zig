@@ -13154,8 +13154,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const destination = toBuf(request.outputs[0].tensor);
             _ = denseDeviceF32(request.outputs[0].tensor) orelse return error.PreparedRegionOutputMismatch;
             const output = &destination.metal_tensor.?;
+            try self.compute.validateProjectionOutput(output.*, request.outputs[0].authority orelse return error.InvalidPhysicalStorageAuthority);
             if (self.gather) |gather| {
-                try self.compute.validateProjectionOutput(output.*, request.outputs[0].authority orelse return error.InvalidPhysicalStorageAuthority);
                 if (!try metal_runtime.gatherAddBiasDeviceInto(self.compute.provider_impl, inputs[0..3].*, gather.rows, gather.cols, gather.index_count, output))
                     return .declined_before_submission;
                 return .completed;
