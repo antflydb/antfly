@@ -1502,6 +1502,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "public document artifact manifest handlers map HA read gate errors",
             "public document artifact manifest handler returns summary and raw state",
             "public document artifact reprocess handler returns accepted",
+            "public document artifact range reprocess handler returns bounded summary",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),

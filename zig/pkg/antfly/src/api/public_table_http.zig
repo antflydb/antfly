@@ -3059,6 +3059,7 @@ pub fn handleReprocessDocumentArtifactRange(
     api: TableApi,
 ) !OwnedResponse {
     const Request = struct {
+        selection: db_mod.types.ArtifactReprocessSelection = .all,
         from_key: []const u8 = "",
         to_key: []const u8 = "",
         limit: u32 = 100,
@@ -3098,6 +3099,7 @@ pub fn handleReprocessDocumentArtifactRange(
     defer parsed.deinit();
 
     var result = api.executeReprocessDocumentArtifactRange(alloc, table_name, artifact_name, .{
+        .selection = parsed.value.selection,
         .from_key = parsed.value.from_key,
         .to_key = parsed.value.to_key,
         .limit = parsed.value.limit,
@@ -6778,6 +6780,7 @@ test "public document artifact reprocess handler returns accepted" {
 
 test "public document artifact range reprocess handler returns bounded summary" {
     const Backend = struct {
+        var expected_selection: db_mod.types.ArtifactReprocessSelection = .incomplete;
         fn iface() TableApi {
             return .{
                 .ptr = undefined,
@@ -6807,6 +6810,7 @@ test "public document artifact range reprocess handler returns bounded summary" 
         ) TableApi.ExecuteReprocessDocumentArtifactRangeError!db_mod.types.DocumentArtifactTableReprocessResult {
             if (!std.mem.eql(u8, table_name, "docs")) return error.InternalFailure;
             if (!std.mem.eql(u8, artifact_name, "document_units_v1")) return error.InternalFailure;
+            if (req.selection != expected_selection) return error.InternalFailure;
             if (!std.mem.eql(u8, req.from_key, "doc:a")) return error.InternalFailure;
             if (req.shard_cursors.len != 1) return error.InternalFailure;
             if (req.shard_cursors[0].group_id != 42) return error.InternalFailure;
@@ -6845,7 +6849,7 @@ test "public document artifact range reprocess handler returns bounded summary" 
         std.testing.allocator,
         "docs",
         "document_units_v1",
-        "{\"from_key\":\"doc:a\",\"limit\":10,\"shard_cursors\":[{\"group_id\":42,\"next_key\":\"doc:b\",\"limit\":10}]}",
+        "{\"selection\":\"incomplete\",\"from_key\":\"doc:a\",\"limit\":10,\"shard_cursors\":[{\"group_id\":42,\"next_key\":\"doc:b\",\"limit\":10}]}",
         Backend.iface(),
     );
     defer resp.deinit(std.testing.allocator);
@@ -6896,6 +6900,15 @@ test "public document artifact range reprocess handler returns bounded summary" 
     try std.testing.expectEqual(@as(usize, 1), parsed.value.shard_cursors[0].reprocessed);
     try std.testing.expectEqual(@as(usize, 1), parsed.value.shard_cursors[0].failed);
     try std.testing.expectEqual(@as(u32, 10), parsed.value.shard_cursors[0].limit);
+    // Omitted selection keeps the all default; unknown policies must not be
+    // silently interpreted as a request to regenerate accepted artifacts.
+    Backend.expected_selection = .all;
+    var defaults = try handleReprocessDocumentArtifactRange(std.testing.allocator, "docs", "document_units_v1", "{\"from_key\":\"doc:a\",\"limit\":10,\"shard_cursors\":[{\"group_id\":42,\"next_key\":\"doc:b\",\"limit\":10}]}", Backend.iface());
+    defer defaults.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), defaults.status);
+    var invalid = try handleReprocessDocumentArtifactRange(std.testing.allocator, "docs", "document_units_v1", "{\"selection\":\"unknown\"}", Backend.iface());
+    defer invalid.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), invalid.status);
 }
 test "public table graph metric action handler returns status response" {
     const Backend = struct {
