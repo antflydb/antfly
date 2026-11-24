@@ -828,12 +828,6 @@ pub const Backend = struct {
         return self.sink.loadOneAlloc != null;
     }
 
-    /// One committed tip-only entry (null without tip reads, or absent).
-    pub fn loadTipOneAlloc(self: *const Backend, allocator: Allocator, namespace: ?[]const u8, key: []const u8) !?[]u8 {
-        const load_one = self.sink.loadOneAlloc orelse return null;
-        return try load_one(self.sink.ptr, allocator, self.scope, namespace, key);
-    }
-
     /// Keys of committed `tip_namespace` entries (empty without tip reads).
     /// Free with `freeEntries`.
     pub fn loadTipEntriesAlloc(self: *const Backend, allocator: Allocator) ![]Entry {
