@@ -9969,28 +9969,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             count = try std.math.mul(usize, count, @intCast(dim));
         }
         if (data.len != try std.math.mul(usize, count, physical.byteSize())) return error.InvalidTensorShape;
+        const indices = @import("index_metadata.zig");
+        const raw_dtype: tensor_mod.DType = switch (physical) {
+            inline else => |tag| @field(tensor_mod.DType, @tagName(tag)),
+        };
+        const bounds = try indices.Bounds.read(try indices.Reader.init(raw_dtype, data));
+
         const runtime = self.provider_impl.raw_decode_runtime orelse return error.MetalRuntimeUnavailable;
         var device = try MetalTensor.deviceAllocateTyped(self.allocator, @ptrCast(runtime), physical, .private, dims[0..shape.len]);
         errdefer self.retireTemporaryWorkspaceValue(&device);
         if (data.len != 0) try device.uploadBytes(data);
         const result = try self.ctFromOwnedMetalTensor(device);
-        if (count != 0) {
-            var minimum: i64 = std.math.maxInt(i64);
-            var maximum: i64 = std.math.minInt(i64);
-            for (0..count) |i| {
-                const value: i64 = switch (physical) {
-                    .i8 => @as(i8, @bitCast(data[i])),
-                    .i16 => std.mem.readInt(i16, data[i * 2 ..][0..2], .little),
-                    .i32 => std.mem.readInt(i32, data[i * 4 ..][0..4], .little),
-                    .i64 => std.mem.readInt(i64, data[i * 8 ..][0..8], .little),
-                    .u8, .bool_ => data[i],
-                    else => unreachable,
-                };
-                minimum = @min(minimum, value);
-                maximum = @max(maximum, value);
-            }
-            toBuf(result).integer_bounds = .{ .minimum = minimum, .maximum = maximum };
-        }
+        if (bounds) |range| toBuf(result).integer_bounds = .{ .minimum = range.min, .maximum = range.max };
+
         return result;
     }
 
