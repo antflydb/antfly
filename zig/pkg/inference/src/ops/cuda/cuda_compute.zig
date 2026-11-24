@@ -22659,6 +22659,7 @@ fn uploadOwnedHost(self: *CudaCompute, data: []f32, shape_src: []const i64) !CT 
 }
 
 fn createMetadataAliasOp(ctx: *anyopaque, input: CT, request: *const @import("../../execution/metadata_alias.zig").Request) anyerror!?CT {
+    if (request.input.shape.dtype != .f32 or request.output.shape.dtype != .f32) return null;
     const source = tensorFromCt(input);
     if (source.dtype != .f32 or source.quant_type != null or source.bf16_mirror.ptr != 0) return null;
     if (source.physical_lease) |lease| {

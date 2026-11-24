@@ -469,6 +469,10 @@ pub const Selection = struct {
             const source = self.retainedInput(pool, alias.source);
             const incoming = source.value;
             const root = @import("metadata_alias.zig").fullSpanRoot(&pool.plan, alias.source, slot.backend);
+            if (alias.input.dtype != .f32 and (incoming != .planned or root == null or (root.?.kind != .allocation and root.?.kind != .constant))) {
+                self.alias_enabled[alias_index] = false;
+                break :alias_candidate;
+            }
             if (alias.kind == .contiguous_slice and (root == null or root.?.kind != .allocation)) {
                 self.alias_enabled[alias_index] = false;
                 break :alias_candidate;

@@ -14258,6 +14258,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn createMetadataAliasOp(ctx: *anyopaque, input: CT, request: *const @import("../execution/metadata_alias.zig").Request) anyerror!?CT {
+        if (request.input.shape.dtype != .f32 or request.output.shape.dtype != .f32) return null;
         const source = toBuf(input);
         if (source.integer_storage or hasHostView(source) or source.logical_view_strides != null or source.view_base_offset != 0 or source.lazy_multiply != null or bufHasAnyQuantizedStorage(source)) return null;
         const tensor = source.metal_tensor orelse return null;
@@ -59720,6 +59721,10 @@ test "Metal full span physical alias retains the same SDK backing after source a
     var short = request;
     short.output.readable_bytes -= 4;
     try std.testing.expect((try cb.vtable.kernels.?.createMetadataAlias.?(cb.ptr, source, &short)) == null);
+    var retagged = request;
+    retagged.input.shape.dtype = .i32;
+    retagged.output.shape.dtype = .i32;
+    try std.testing.expect((try cb.vtable.kernels.?.createMetadataAlias.?(cb.ptr, source, &retagged)) == null);
     cb.free(source);
     source_open = false;
     bank.release();

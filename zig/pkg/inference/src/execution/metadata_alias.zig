@@ -42,7 +42,8 @@ pub const Plan = struct {
         if (node.num_inputs != 1 or node.inputs[0] >= graph.nodeCount()) return null;
         const input = graph.node(node.inputs[0]).output_shape;
         const output = node.output_shape;
-        if (input.dtype != .f32 or output.dtype != .f32 or logicalBytes(input) == null or logicalBytes(output) == null) return null;
+        if (input.dtype != output.dtype or logicalBytes(input) == null or logicalBytes(output) == null) return null;
+        if (input.dtype != .f32 and (backend != .native or node.op != .reshape)) return null;
         var result = Plan{ .node = id, .source = node.inputs[0], .input = input, .output = output, .kind = .reshape };
         switch (node.op) {
             .reshape => |attrs| {
@@ -97,7 +98,11 @@ pub const Plan = struct {
         const desc = source.descriptor;
         if (source.role != .primary or !desc.shape.eq(self.input) or desc.quant_format != null or desc.attention_storage != null or desc.attention_kv_format != null) return null;
         switch (desc.current_backend orelse return null) {
-            .native => if (desc.storage != .host_f32 and desc.storage != .metadata_view) return null,
+            .native => if (self.input.dtype == .f32) {
+                if (desc.storage != .host_f32 and desc.storage != .metadata_view) return null;
+            } else {
+                if (self.kind != .reshape or self.input.dtype != self.output.dtype or (desc.storage != .host_dense and desc.storage != .metadata_view)) return null;
+            },
             .cuda => if (desc.storage != .cuda_buffer or (self.kind != .reshape and self.kind != .contiguous_slice)) return null,
             .metal => if (desc.storage != .metal_buffer or (self.kind != .reshape and self.kind != .full_slice and self.kind != .contiguous_slice)) return null,
             else => return null,
@@ -140,10 +145,10 @@ pub const Plan = struct {
 };
 
 pub fn logicalBytes(shape: Shape) ?usize {
-    if (shape.dtype != .f32 or shape.rank() > 8) return null;
+    if ((shape.dtype != .f32 and shape.dtype != .i32 and shape.dtype != .i64) or shape.rank() > 8) return null;
     const count = shape.numElements() orelse return null;
     if (count <= 0) return null;
-    return std.math.mul(usize, @intCast(count), @sizeOf(f32)) catch null;
+    return std.math.mul(usize, @intCast(count), shape.dtype.byteSize()) catch null;
 }
 pub fn readableBytes(shape: Shape, strides: Strides) ?usize {
     if (logicalBytes(shape) == null or strides.rank != shape.rank()) return null;
@@ -153,7 +158,7 @@ pub fn readableBytes(shape: Shape, strides: Strides) ?usize {
         const extent = std.math.mul(usize, @intCast(dimension - 1), @intCast(stride)) catch return null;
         last = std.math.add(usize, last, extent) catch return null;
     }
-    return std.math.mul(usize, std.math.add(usize, last, 1) catch return null, @sizeOf(f32)) catch null;
+    return std.math.mul(usize, std.math.add(usize, last, 1) catch return null, shape.dtype.byteSize()) catch null;
 }
 pub fn dense(shape: Shape, strides: Strides) bool {
     if (logicalBytes(shape) == null or strides.rank != shape.rank()) return false;
@@ -221,6 +226,7 @@ test "affine lowering declines inconsistent static target attributes" {
 /// never becomes initialized data or a writable alias capability.
 pub fn fullSpanRequest(value: *const Request, actual_shape: []const i64, available_bytes: usize) bool {
     const bytes = logicalBytes(value.input.shape) orelse return false;
+    if (value.input.shape.dtype != value.output.shape.dtype) return false;
     return value.byte_offset == 0 and value.input.shape.rank() == actual_shape.len and std.mem.eql(i64, value.input.shape.dims[0..value.input.shape.rank()], actual_shape) and logicalBytes(value.output.shape) == bytes and value.input.readable_bytes == bytes and value.output.readable_bytes == bytes and bytes <= available_bytes and dense(value.input.shape, value.input.strides) and dense(value.output.shape, value.output.strides);
 }
 /// Validate a dense view against the size of its immediate source, never
@@ -231,7 +237,8 @@ pub fn contiguousRange(value: *const Request, actual_shape: []const i64, availab
     if (!std.mem.eql(i64, actual_shape, value.input.shape.dims[0..value.input.shape.rank()]) or
         !dense(value.input.shape, value.input.strides) or !dense(value.output.shape, value.output.strides) or
         value.input.readable_bytes != input_bytes or value.output.readable_bytes != output_bytes or
-        input_bytes != available_bytes or value.byte_offset % @sizeOf(f32) != 0 or
+        value.input.shape.dtype != value.output.shape.dtype or input_bytes != available_bytes or
+        value.byte_offset % value.input.shape.dtype.byteSize() != 0 or
         value.byte_offset > input_bytes or output_bytes > input_bytes - value.byte_offset) return null;
     return output_bytes;
 }
@@ -266,6 +273,10 @@ test "GPU full span alias metadata preserves source offsets and rejects padded o
         try std.testing.expect(fullSpanRequest(&exact, &.{ 2, 3 }, 512));
         exact.output.readable_bytes = 28;
         try std.testing.expect(!fullSpanRequest(&exact, &.{ 2, 3 }, 512));
+        exact = request(source, alias);
+        exact.output.shape = Shape.init(.i32, &.{6});
+        try std.testing.expect(!fullSpanRequest(&exact, &.{ 2, 3 }, 24));
+        try std.testing.expect(contiguousRange(&exact, &.{ 2, 3 }, 24) == null);
         exact = request(source, alias);
         exact.output.strides = Strides.init(&.{2});
         try std.testing.expect(!fullSpanRequest(&exact, &.{ 2, 3 }, 512));

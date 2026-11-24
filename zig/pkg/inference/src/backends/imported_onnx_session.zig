@@ -5515,6 +5515,46 @@ noinline fn validateFreshPreparedRouteFacts(target: *ImportedOnnxSession, routes
     try routes.validateWithClaims(facts.inputs, claims);
 }
 
+test "Native planned integer concat slice gather and reshape through imported ONNX" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const x = try b.parameter("values", Shape.init(.i64, &.{ 2, 2 }));
+    const joined = try b.concat(x, x, 1);
+    const sliced = try b.sliceLastDim(joined, 1, 3);
+    const idx = try b.tensorConstBytes(std.mem.asBytes(&[_]i64{ -1, 0 }), Shape.init(.i64, &.{2}));
+    const gathered = try b.gather(sliced, idx, Shape.init(.i64, &.{ 2, 2 }));
+    try graph.markOutput(try b.reshape(gathered, Shape.init(.i64, &.{4})));
+    const bytes = try onnx_graph.exportGraph(a, &graph, .{});
+    defer a.free(bytes);
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "integer-layout.onnx", .data = bytes });
+    const path = try dir.dir.realPathFileAlloc(std.testing.io, "integer-layout.onnx", a);
+    defer a.free(path);
+    var session = try createSessionWithOptions(a, path, .native, .{ .graph_runtime_strategy = .partitioned });
+    defer session.close();
+    try std.testing.expect(session.configureExecutionDiagnostics(true));
+    const n: i64 = 9_007_199_254_740_993;
+    var input = try Tensor.initInt64(a, "values", &.{ 2, 2 }, &.{ n, -n, n + 2, -(n + 2) });
+    defer input.deinit();
+    var request = (try prepared_mod.prepare(session, .{ .tensors = &.{input} }, a, null)) orelse return error.MissingPreparedIntegerInvocation;
+    const complete = request.hasCompleteOwnedPayload();
+    request.deinit();
+    try std.testing.expect(complete);
+    const outputs = try session.run(&.{input}, a);
+    defer {
+        for (outputs) |*output| output.deinit();
+        a.free(outputs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), outputs.len);
+    try std.testing.expectEqual(.i64, outputs[0].dtype);
+    try std.testing.expectEqualSlices(i64, &.{4}, outputs[0].shape);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&[_]i64{ -(n + 2), n + 2, -n, n }), outputs[0].data);
+    try std.testing.expectEqual(@as(u64, 3), session.executionDiagnostics().?.execution.?.assigned_kernel_dispatches);
+}
+
 fn importedTypedHostIngress(comptime backend_type: BackendType, comptime Index: type, comptime axis: u8) !void {
     const a = std.testing.allocator;
     if (backend_type == .cuda) {

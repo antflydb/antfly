@@ -7859,6 +7859,7 @@ const kernel_backend_impl: ops.KernelBackend = .{
     .physical_storage_policy = &physical_storage_policy,
     .runAssignedKernel = &runAssignedKernelOp,
     .writePhysicalFloat32 = &writePhysicalFloat32Op,
+    .writePhysicalIntegerLiteral = &writePhysicalIntegerLiteralOp,
     .copyPhysicalInput = &copyPhysicalInputOp,
     .readFloat32Into = &readFloat32IntoOp,
     .retainImmutableTensor = &retainImmutableTensorOp,
@@ -39101,12 +39102,11 @@ fn typedGather(self: *NativeCompute, input: CT, indices: CT, axis: u8, declared_
         const raw = try self.allocator.alloc(u8, try std.math.mul(usize, output_count, width));
         var transferred = false;
         errdefer if (!transferred) self.allocator.free(raw);
-        for (0..prefix) |p| for (0..index.len) |i| {
-            const selected = try index.normalized(i, extent);
-            const from = (p * extent + selected) * suffix * width;
-            const to = (p * index.len + i) * suffix * width;
-            @memcpy(raw[to..][0 .. suffix * width], integer.data[from..][0 .. suffix * width]);
-        };
+        if (raw.len != 0) {
+            try gatherAxisInto(u8, integer.data, index, raw, .{ .prefix = prefix, .extent = extent, .suffix = try std.math.mul(usize, suffix, width) }, false);
+        } else if (prefix != 0) {
+            try index.validate(extent);
+        }
         const owned_shape = try self.allocator.dupe(i64, output_shape);
         transferred = true;
         return self.makeBufWithOwnedSourceTensor(.{ .data = raw, .dtype = integer.dtype, .shape = owned_shape, .name = "", .allocator = self.allocator, .owns_data = true, .owns_shape = true });
@@ -39119,7 +39119,7 @@ fn typedGather(self: *NativeCompute, input: CT, indices: CT, axis: u8, declared_
             const selected = try index.normalized(i, extent);
             try convertTensorRowsToF32(tensor, p * extent + selected, 1, suffix, output[(p * index.len + i) * suffix ..][0..suffix]);
         };
-    } else try gatherAxisInto(dense, index, output, .{ .prefix = prefix, .extent = extent, .suffix = suffix }, false);
+    } else try gatherAxisInto(f32, dense, index, output, .{ .prefix = prefix, .extent = extent, .suffix = suffix }, false);
     return owned_output.intoShape(output_shape);
 }
 
@@ -39352,7 +39352,7 @@ fn primGatherOp(ctx: *anyopaque, input: CT, indices: CT, axis: u8, input_shape: 
             var owned_output = try OwnedDenseOutput.alloc(self, try geometry.count(index_count));
             defer owned_output.deinit();
             const output = owned_output.storage.?;
-            try gatherAxisInto(in_data, try IndexReader.init(indices), output, geometry, false);
+            try gatherAxisInto(f32, in_data, try IndexReader.init(indices), output, geometry, false);
 
             var out_shape_buf: [8]i64 = undefined;
             const out_rank = try kernel_geometry.gatherShape(resolved_input_shape, normalized_idx_shape, axis_index, &out_shape_buf);
@@ -53139,11 +53139,15 @@ fn assignedKernelGeometrySupported(descriptor: *const ops.kernel_descriptor.Desc
         if (descriptor.output_shape.dtype != .i32 and descriptor.output_shape.dtype != .i64) return false;
         const inputs: usize = switch (descriptor.operation) {
             .slice => 1,
-            .concat => 2,
+            .concat, .gather => 2,
             else => return false,
         };
         if (descriptor.input_count != inputs) return false;
-        for (descriptor.input_shapes[0..inputs]) |input| if (input.dtype != descriptor.output_shape.dtype) return false;
+        for (descriptor.input_shapes[0..inputs], 0..) |input, index| {
+            if (descriptor.operation == .gather and index == 1) {
+                if (input.dtype != .i32 and input.dtype != .i64) return false;
+            } else if (input.dtype != descriptor.output_shape.dtype) return false;
+        }
         return true;
     }
     return switch (descriptor.operation) {
@@ -53410,7 +53414,7 @@ fn runAssignedKernelImpl(comptime authored: bool, ctx: *anyopaque, request: ops.
                 try selected.execute(request, output);
             } else {
                 defer maybeDiscardMappedWeightAfterUse(self, request.inputs[0]);
-                try gatherAxisInto(dense_inputs[0], if (descriptor.input_shapes[1].dtype == .f32) try @import("index_metadata.zig").Reader.init(.f32, std.mem.sliceAsBytes(dense_inputs[1])) else try IndexReader.init(request.inputs[1]), output, gather.geometry, true);
+                try gatherAxisInto(f32, dense_inputs[0], if (descriptor.input_shapes[1].dtype == .f32) try @import("index_metadata.zig").Reader.init(.f32, std.mem.sliceAsBytes(dense_inputs[1])) else try IndexReader.init(request.inputs[1]), output, gather.geometry, true);
             }
         },
         .dot => |dot| denseDotInto(dense_inputs[0], dense_inputs[1], output, dot),
@@ -56200,10 +56204,35 @@ fn writePhysicalFloat32Op(_: *anyopaque, output: CT, input: []const f32) anyerro
     // public write/consume interfaces continue to reject its leased views.
     @memcpy(target.data, input);
 }
-fn copyPhysicalInputOp(_: *anyopaque, destination: CT, source: CT) anyerror!void {
+fn physicalIntegerPayload(ctx: *anyopaque, value: CT) ?*const tensor_mod.Tensor {
+    const buf = toBuf(value);
+    const lease = buf.physical_lease orelse return null;
+    if (lease.backend.ptr != ctx or buf.view_strides != null or buf.view_base_offset != 0 or buf.quantized_storage != null) return null;
+    const tensor = integerSource(value) orelse return null;
+    if (tensor.dtype != .i32 and tensor.dtype != .i64) return null;
+    const root = std.mem.sliceAsBytes(toBuf(lease.tensor).data);
+    if (tensor.data.ptr != root.ptr or tensor.data.len > root.len or tensor.data.len > lease.byte_size) return null;
+    return tensor;
+}
+
+fn writePhysicalIntegerLiteralOp(ctx: *anyopaque, output: CT, input: []const u8) anyerror!void {
+    const target = physicalIntegerPayload(ctx, output) orelse return error.InvalidPhysicalTransferSize;
+    const lease = toBuf(output).physical_lease.?;
+    if (!lease.isReadOnly() or lease.byte_size != input.len or target.data.len != input.len) return error.InvalidPhysicalTransferSize;
+    @memcpy(target.data, input);
+}
+
+fn copyPhysicalInputOp(ctx: *anyopaque, destination: CT, source: CT) anyerror!void {
     const target = toBuf(destination);
     const input = toBuf(source);
     if (nativeTensorReadOnly(target)) return error.ReadOnlyPhysicalStorage;
+    if (integerSource(destination) != null) {
+        const dst = physicalIntegerPayload(ctx, destination) orelse return error.InvalidPhysicalTransferSize;
+        const src = physicalIntegerPayload(ctx, source) orelse return error.InvalidPhysicalTransferSize;
+        if (dst.dtype != src.dtype or dst.data.len != src.data.len or !std.mem.eql(i64, dst.shape, src.shape)) return error.InvalidPhysicalTransferSize;
+        if (dst.data.ptr != src.data.ptr) @memcpy(dst.data, src.data);
+        return;
+    }
     if (target.physical_lease == null or target.data.len != input.data.len or input.source_tensor != null or input.quantized_storage != null or target.view_base_offset != input.view_base_offset) return error.InvalidPhysicalTransferSize;
     if ((target.view_strides == null) != (input.view_strides == null)) return error.InvalidPhysicalTransferSize;
     if (target.view_strides) |strides| if (!std.mem.eql(usize, strides, input.view_strides.?)) return error.InvalidPhysicalTransferSize;
@@ -57813,7 +57842,7 @@ fn sliceDenseInto(input: []const f32, output: []f32, plan: @import("slice_plan.z
     }
     for (output, 0..) |*value, index| value.* = input[plan.offset(index)];
 }
-fn gatherAxisInto(input: []const f32, index: @import("index_metadata.zig").Reader, output: []f32, geometry: kernel_geometry.GatherAxis, validate_before_write: bool) !void {
+fn gatherAxisInto(comptime T: type, input: []const T, index: @import("index_metadata.zig").Reader, output: []T, geometry: kernel_geometry.GatherAxis, validate_before_write: bool) !void {
     if (input.len != try std.math.mul(usize, try std.math.mul(usize, geometry.prefix, geometry.extent), geometry.suffix) or output.len != try geometry.count(index.len)) return error.ShapeMismatch;
     // Failure is atomic even when an invalid index appears after valid indices.
     if (validate_before_write) try index.validate(geometry.extent);
@@ -57991,7 +58020,7 @@ fn allocateNativePhysicalStorageOp(ctx: *anyopaque, bytes: usize) !?CT {
 }
 fn typedPhysicalTensorView(self: *NativeCompute, request: ops.physical_storage.View) !?CT {
     if (request.dtype != .i32 and request.dtype != .i64) return null;
-    if (request.layout_source != null or request.shape.len > 8) return null;
+    if (request.shape.len > 8) return null;
     const width = request.dtype.byteSize();
     const root = toBuf(request.storage.tensor);
     if (root.source_tensor != null or root.quantized_storage != null or root.view_strides != null or root.view_base_offset != 0) return null;
@@ -58006,6 +58035,11 @@ fn typedPhysicalTensorView(self: *NativeCompute, request: ops.physical_storage.V
     }
     const bytes = try std.math.mul(usize, count, width);
     if (bytes > available.len or bytes > request.storage.byte_size) return error.InvalidShape;
+    if (request.layout_source) |value| {
+        const prototype = physicalIntegerPayload(self, value) orelse return null;
+        const dtype: tensor_mod.DType = if (request.dtype == .i64) .i64 else .i32;
+        if (prototype.dtype != dtype or prototype.data.len != bytes or !std.mem.eql(i64, prototype.shape, shape[0..request.shape.len])) return null;
+    }
     const tensor = try self.makeBuf(&.{}, false);
     errdefer freeTensor(self, tensor);
     _ = try self.withLogicalShape(tensor, shape[0..request.shape.len]);
@@ -58446,7 +58480,8 @@ fn runAssignedIntegerLayout(request: ops.kernel_descriptor.Invocation) !bool {
         if (input.view_strides != null or input.view_base_offset != 0 or input.quantized_storage != null) return false;
         const source = integerSource(value) orelse return false;
         const shape = descriptor.input_shapes[index];
-        if (source.dtype != dtype or !std.mem.eql(i64, source.shape, shape.dims[0..shape.rank()])) return false;
+        const expected: tensor_mod.DType = if (shape.dtype == .i64) .i64 else .i32;
+        if (source.dtype != expected or !std.mem.eql(i64, source.shape, shape.dims[0..shape.rank()])) return false;
         const count = shape.numElements() orelse return error.InvalidTensorShape;
         if (try integerTensorCount(source) != count) return error.InvalidTensorShape;
         inputs[index] = source.data;
@@ -58470,10 +58505,14 @@ fn runAssignedIntegerLayout(request: ops.kernel_descriptor.Invocation) !bool {
     }
     if (slice) |plan| {
         try sliceBytesInto(inputs[0], output.data, dtype.byteSize(), plan);
-    } else {
+    } else if (descriptor.operation == .concat) {
         var geometry = descriptor.operation.concat;
         geometry.inner = try std.math.mul(usize, geometry.inner, dtype.byteSize());
         try concatContiguousInto(u8, inputs[0], inputs[1], output.data, geometry);
+    } else {
+        var geometry = descriptor.operation.gather.geometry;
+        geometry.suffix = try std.math.mul(usize, geometry.suffix, dtype.byteSize());
+        try gatherAxisInto(u8, inputs[0], try IndexReader.init(request.inputs[1]), output.data, geometry, true);
     }
     return true;
 }
@@ -58557,6 +58596,16 @@ fn createMetadataAliasOp(ctx: *anyopaque, input: CT, request: *const @import("..
     if (request.byte_offset != 0) return null;
     const affine = @import("../execution/metadata_alias.zig");
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (request.input.shape.dtype != .f32) {
+        const src = physicalIntegerPayload(ctx, input) orelse return null;
+        const output_shape = request.output.shape;
+        const dtype: @import("ml").graph.DType = if (src.dtype == .i64) .i64 else .i32;
+        if (request.input.shape.dtype != dtype or request.input.readable_bytes != src.data.len or
+            !affine.fullSpanRequest(request, src.shape, src.data.len)) return null;
+        var shape: [8]i32 = undefined;
+        for (output_shape.dims[0..output_shape.rank()], 0..) |dim, axis| shape[axis] = std.math.cast(i32, dim) orelse return null;
+        return typedPhysicalTensorView(self, .{ .storage = toBuf(input).physical_lease.?, .shape = shape[0..output_shape.rank()], .dtype = dtype });
+    }
     const source = toBuf(input);
     if (source.source_tensor != null or source.quantized_storage != null or (source.declared_dtype != null and source.declared_dtype != .f32)) return null;
     const source_shape = source.logical_shape orelse return null;

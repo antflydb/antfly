@@ -756,7 +756,7 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
     const shape = node.output_shape;
     const count = shape.numElements() orelse return null;
     const integer_layout = (shape.dtype == .i32 or shape.dtype == .i64) and
-        (node.op == .slice or node.op == .concat_prim or node.op == .fused_concat);
+        (node.op == .slice or node.op == .concat_prim or node.op == .fused_concat or node.op == .gather);
     if ((shape.dtype != .f32 and !integer_layout) or count <= 0 or count > std.math.maxInt(i32)) return null;
     const operation: Operation = switch (node.op) {
         .transpose, .broadcast_in_dim => blk: {
@@ -810,6 +810,7 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
             if (node.num_inputs != 2 or attrs.nd or attrs.elements or attrs.batch_dims != 0) return null;
             const input = inputShape(graph, id, 0) orelse return null;
             const indices = inputShape(graph, id, 1) orelse return null;
+            if (integer_layout and (input.dtype != shape.dtype or (indices.dtype != .i32 and indices.dtype != .i64))) return null;
             const geometry = kernel_geometry.GatherAxis.init(std.math.maxInt(u32), input.dims[0..input.rank()], attrs.axis) catch return null;
             const index_count = indices.numElements() orelse return null;
             const gather: Gather = .{ .axis = attrs.axis, .geometry = geometry };

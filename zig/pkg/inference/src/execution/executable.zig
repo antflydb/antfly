@@ -3235,7 +3235,7 @@ test "Native planned concat slice gather execute only declared banks across warm
     try std.testing.expectEqualSlices(f32, &.{ 5, 6, 4, 2, 3, 1 }, values);
 }
 
-test "Native planned integer concat and slice use assigned buffers and preserve full width" {
+test "Native planned integer concat slice and gather use assigned buffers and preserve full width" {
     if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
     const a = std.testing.allocator;
     const ml = @import("ml");
@@ -3252,7 +3252,15 @@ test "Native planned integer concat and slice use assigned buffers and preserve 
         const x = try b.parameter("x", ml.graph.Shape.init(dtype, &.{ 2, 2 }));
         const joined = try b.concat(x, x, 1);
         const sliced = try b.sliceLastDim(joined, 1, 3);
-        try graph.markOutput(sliced);
+        const Index = if (dtype == .i64) i32 else i64;
+        const index_values = [_]Index{ -1, 0 };
+        const indices = try b.tensorConstBytes(std.mem.asBytes(&index_values), ml.graph.Shape.init(if (Index == i64) .i64 else .i32, &.{2}));
+        const literal_values = [_]Int{ large, -large };
+        const literal_node = try b.tensorConstBytes(std.mem.asBytes(&literal_values), ml.graph.Shape.init(dtype, &.{2}));
+        const gathered = try b.gather(sliced, indices, ml.graph.Shape.init(dtype, &.{ 2, 2 }));
+        const reshaped = try b.reshape(gathered, ml.graph.Shape.init(dtype, &.{4}));
+        try graph.markOutput(reshaped);
+        try graph.markOutput(literal_node);
         var program = try ModelProgram.init(a, &graph, &.{.{ .name = "x", .node_id = x, .kind = .input }});
         defer program.deinit();
         var executable = try prepare(a, &program, &cb, .partitioned);
@@ -3261,9 +3269,14 @@ test "Native planned integer concat and slice use assigned buffers and preserve 
         const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
         const routes = (try pool.prepareRoutes(&.{.{ .node_id = node, .value = .{ .imported_host = .{ .logical = program.graph.node(node).output_shape, .target = .native, .owned_ingress = true } } }})) orelse return error.MissingPreparedKernelRoute;
         defer routes.release();
-        try std.testing.expect(routes.pool.completeOwnedPayload() != null);
-        try std.testing.expect(routes.pool.preparedKernelRoute(program.id_map[joined]) != null);
-        try std.testing.expect(routes.pool.preparedKernelRoute(program.id_map[sliced]) != null);
+        if (routes.pool.preparedKernelRoute(program.id_map[joined]) == null) return error.MissingIntegerConcatRoute;
+        if (routes.pool.preparedKernelRoute(program.id_map[sliced]) == null) return error.MissingIntegerSliceRoute;
+        if (routes.pool.preparedKernelRoute(program.id_map[gathered]) == null) return error.MissingIntegerGatherRoute;
+        if (routes.pool.selection.?.enabledAliasIndex(program.id_map[reshaped]) == null) return error.MissingIntegerReshapeAlias;
+        if (routes.pool.completeOwnedPayload() == null) {
+            std.debug.print("Integer layout payload proof: {any}\n", .{routes.pool.payload_coverage});
+            return error.MissingIntegerPayloadProof;
+        }
         var values: [4]Int = .{ large, -large, large + 2, -(large + 2) };
         const Tensor = @import("../backends/tensor.zig").Tensor;
         const input = Tensor{ .data = std.mem.asBytes(&values), .dtype = if (dtype == .i64) .i64 else .i32, .shape = &.{ 2, 2 }, .name = "x", .allocator = a, .owns_data = false, .owns_shape = false };
@@ -3272,8 +3285,24 @@ test "Native planned integer concat and slice use assigned buffers and preserve 
         const output = (try cb.exportTensorData(result.outputs[0], a)) orelse return error.MissingIntegerOutput;
         defer a.free(output.payload.bytes);
         try std.testing.expectEqual(input.dtype, output.dtype);
-        try std.testing.expectEqualSlices(u8, std.mem.asBytes(&[_]Int{ -large, large, -(large + 2), large + 2 }), output.payload.bytes);
-        try std.testing.expectEqual(@as(u64, 2), result.stats.assigned_kernel_dispatches);
+        try std.testing.expectEqualSlices(u8, std.mem.asBytes(&[_]Int{ -(large + 2), large + 2, -large, large }), output.payload.bytes);
+        const literal = (try cb.exportTensorData(result.outputs[1], a)) orelse return error.MissingIntegerLiteral;
+        defer a.free(literal.payload.bytes);
+        try std.testing.expectEqual(input.dtype, literal.dtype);
+        try std.testing.expectEqualSlices(u8, std.mem.asBytes(&literal_values), literal.payload.bytes);
+        try std.testing.expectEqual(@as(u64, 3), result.stats.assigned_kernel_dispatches);
+
+        // A subsequent frame may not reuse the allocation underneath the
+        // published reshape while its exact integer view remains live.
+        values = .{ -large, large, -(large + 2), large + 2 };
+        var next = try executable.run(a, .{ .host_inputs = &.{.{ .node_id = node, .value = &input }}, .prepared_routes = routes });
+        defer next.deinit(&executable.runtime);
+        const current = (try cb.exportTensorData(next.outputs[0], a)) orelse return error.MissingIntegerOutput;
+        defer a.free(current.payload.bytes);
+        try std.testing.expectEqualSlices(u8, std.mem.asBytes(&[_]Int{ large + 2, -(large + 2), large, -large }), current.payload.bytes);
+        const held = (try cb.exportTensorData(result.outputs[0], a)) orelse return error.MissingIntegerOutput;
+        defer a.free(held.payload.bytes);
+        try std.testing.expectEqualSlices(u8, output.payload.bytes, held.payload.bytes);
     }
 }
 
