@@ -17715,19 +17715,16 @@ fn allocDeviceBufferOrdinaryWithPolicy(self: *CudaCompute, len: usize, policy: T
     if (self.temp_scan_profile.enabled) self.temp_scan_profile.sections[2].operations += 1;
     if (lock_sample) |sample| self.temp_scan_profile.end(2, sample, 0);
     const seq = self.temp_trace_seq;
+    const capture_requires_pinned = self.debug_cuda_graph_capture_active and cudaEffectiveTempSlotPeriod(self) != 0;
     // Optional scratch must stay reclaimable and must not shift graph slot numbering.
     if (policy == .required) {
         self.temp_trace_seq = seq + 1;
         if (self.temp_slot_config.autoplan_enabled) {
-            self.temp_arena_planner.noteAllocation(self.allocator, len, max_temp_pinned_slots) catch {
-                self.temp_arena_planner.disabled = true;
-                self.temp_arena_planner.active = false;
-                self.temp_arena_planner.ready_for_capture = false;
-            };
+            self.temp_arena_planner.noteAllocation(self.allocator, len, max_temp_pinned_slots) catch {};
         }
         if (try allocPinnedTempSlot(self, seq, len)) |buffer| return buffer;
     }
-    if (self.debug_cuda_graph_capture_active and cudaEffectiveTempSlotPeriod(self) != 0) {
+    if (capture_requires_pinned) {
         // Falling through to the ordinary cache would let a graph retain an
         // address that can be reused immediately after capture. Captures with
         // a pinned arena therefore fail closed on any slot miss or ABI drift.

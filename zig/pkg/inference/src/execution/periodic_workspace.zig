@@ -159,7 +159,7 @@ pub const TempArenaPlanner = struct {
     }
 
     pub fn period(self: *const TempArenaPlanner) usize {
-        return if (self.active) self.candidate_lengths.items.len else 0;
+        return if (self.active and !self.disabled) self.candidate_lengths.items.len else 0;
     }
 
     /// Account and admit the learned physical layout before any pinned slot is
@@ -192,12 +192,19 @@ pub const TempArenaPlanner = struct {
     ) !void {
         if (self.disabled or !self.observing) return;
         if (byte_len == 0 or self.current_lengths.items.len >= max_slots) {
-            self.disabled = true;
-            self.active = false;
-            self.ready_for_capture = false;
+            self.disableObservation();
             return;
         }
-        try self.current_lengths.append(allocator, byte_len);
+        self.current_lengths.append(allocator, byte_len) catch |err| {
+            self.disableObservation();
+            return err;
+        };
+    }
+
+    fn disableObservation(self: *TempArenaPlanner) void {
+        // Keep the active flag until the boundary can retire graph addresses.
+        self.disabled = true;
+        self.ready_for_capture = false;
     }
 
     pub fn markPinnedValidationFailure(self: *TempArenaPlanner) void {
@@ -261,7 +268,13 @@ pub const TempArenaPlanner = struct {
         allocator: std.mem.Allocator,
         allocation_seq: usize,
     ) !BoundaryResult {
-        if (self.disabled) return .unchanged;
+        if (self.disabled) {
+            if (!self.active) return .unchanged;
+            self.active = false;
+            self.invalidations += 1;
+            self.current_lengths.clearRetainingCapacity();
+            return .invalidated;
+        }
         self.capture_warmup_boundaries +|= 1;
         if (!self.observing) {
             self.observing = true;
@@ -290,13 +303,13 @@ pub const TempArenaPlanner = struct {
             self.candidate_lengths.items,
             self.current_lengths.items,
         );
-        if (self.active and (!matches or self.pinned_validation_failed)) {
+        if (self.active and !matches) {
+            try self.replaceCandidate(allocator);
             self.active = false;
             self.ready_for_capture = false;
             self.replay_validation_failed = false;
             self.pinned_validation_failed = false;
             self.invalidations += 1;
-            try self.replaceCandidate(allocator);
             self.matching_iterations = if (self.candidate_lengths.items.len == 0) 0 else 1;
             self.current_lengths.clearRetainingCapacity();
             return .invalidated;
@@ -347,8 +360,9 @@ pub const TempArenaPlanner = struct {
     }
 
     fn replaceCandidate(self: *TempArenaPlanner, allocator: std.mem.Allocator) !void {
+        try self.candidate_lengths.ensureTotalCapacity(allocator, self.current_lengths.items.len);
         self.candidate_lengths.clearRetainingCapacity();
-        try self.candidate_lengths.appendSlice(allocator, self.current_lengths.items);
+        self.candidate_lengths.appendSliceAssumeCapacity(self.current_lengths.items);
     }
 };
 
@@ -671,4 +685,24 @@ test "CUDA temp arena planner keeps capture reachable within the warmup budget" 
     try std.testing.expect(planner.ready_for_capture);
     try std.testing.expectEqual(@as(usize, 0), planner.capture_warmup_boundaries);
     try std.testing.expect(!planner.captureWarmupExhausted());
+}
+
+test "CUDA temp arena retires active bindings when observation exceeds its limit" {
+    const allocator = std.testing.allocator;
+    var planner: TempArenaPlanner = .{};
+    defer planner.deinit(allocator);
+
+    _ = try planner.beginDecodeIteration(allocator, 0);
+    for (1..4) |sequence| {
+        try planner.noteAllocation(allocator, 64, 1);
+        _ = try planner.beginDecodeIteration(allocator, sequence);
+    }
+    try std.testing.expect(planner.ready_for_capture);
+
+    try planner.noteAllocation(allocator, 64, 1);
+    try planner.noteAllocation(allocator, 64, 1);
+    try std.testing.expectEqual(@as(usize, 0), planner.period());
+    try std.testing.expect(!planner.canGraphReplay(3, 1));
+    try std.testing.expectEqual(.invalidated, try planner.beginDecodeIteration(allocator, 5));
+    try std.testing.expectEqual(.unchanged, try planner.beginDecodeIteration(allocator, 5));
 }
