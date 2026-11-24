@@ -33515,7 +33515,20 @@ int termite_metal_decode_runtime_commit_graph_plan(termite_metal_decode_runtime 
             capacities[slot] = termite_metal_graph_plan_slot_capacity(runtime, slot, bytes);
         }
         if (!termite_metal_graph_plan_publish_capacities(runtime, NULL, capacities, TERMITE_METAL_GRAPH_PLAN_SLOT_CAPACITY,
-                &trace_allocations, &trace_reuses)) return -2;
+                &trace_allocations, &trace_reuses)) {
+            // A failed growth published nothing. Retry without speculative
+            // slack only when the original reservation used geometric growth.
+            if (runtime->embedding_workspace_bounded) return -2;
+            bool can_shrink = false;
+            for (size_t slot = 0; slot < TERMITE_METAL_GRAPH_PLAN_SLOT_CAPACITY; ++slot) {
+                const size_t bytes = runtime->graph_plan_requested_bytes[slot];
+                if (bytes == 0 || (runtime->graph_plan_buffers[slot] != nil && runtime->graph_plan_capacities[slot] >= bytes)) continue;
+                can_shrink = can_shrink || capacities[slot] > bytes;
+                capacities[slot] = bytes;
+            }
+            if (!can_shrink || !termite_metal_graph_plan_publish_capacities(runtime, NULL, capacities, TERMITE_METAL_GRAPH_PLAN_SLOT_CAPACITY,
+                    &trace_allocations, &trace_reuses)) return -2;
+        }
         runtime->graph_plan_allocations += trace_allocations;
         runtime->graph_plan_reuses += trace_reuses;
         runtime->graph_plan_active = 1;
@@ -38279,21 +38292,11 @@ static int termite_metal_decode_runtime_ensure_direct_block_q_buffer(
 ) {
     if (runtime == NULL) return -1;
     if (q_bytes == 0) return 0;
-    if (termite_metal_decode_runtime_ensure_graph_plan_slot(runtime, TERMITE_METAL_GRAPH_PLAN_DIRECT_Q_SLOT, q_bytes) == 0) {
-        runtime->direct_block_q_buffer = runtime->graph_plan_buffers[TERMITE_METAL_GRAPH_PLAN_DIRECT_Q_SLOT];
-        runtime->direct_block_q_capacity = runtime->graph_plan_capacities[TERMITE_METAL_GRAPH_PLAN_DIRECT_Q_SLOT];
-        return 0;
-    }
-    if (runtime->active_frame_cb != nil) return -3;
-    @autoreleasepool {
-        if (q_bytes > runtime->direct_block_q_capacity || runtime->direct_block_q_buffer == nil) {
-            id<MTLBuffer> buffer = termite_metal_workspace_buffer(runtime, q_bytes, MTLResourceStorageModePrivate);
-            if (buffer == nil) return -2;
-            runtime->direct_block_q_buffer = buffer;
-            runtime->direct_block_q_capacity = q_bytes;
-        }
-        return 0;
-    }
+    const size_t slot = TERMITE_METAL_GRAPH_PLAN_DIRECT_Q_SLOT;
+    if (termite_metal_decode_runtime_ensure_graph_plan_slot(runtime, slot, q_bytes) != 0) return -2;
+    runtime->direct_block_q_buffer = runtime->graph_plan_buffers[slot];
+    runtime->direct_block_q_capacity = runtime->graph_plan_capacities[slot];
+    return 0;
 }
 
 static int termite_metal_decode_runtime_sample_tail_scratch_sizes(
