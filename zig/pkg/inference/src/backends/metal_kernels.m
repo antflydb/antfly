@@ -33457,6 +33457,15 @@ static size_t termite_metal_decode_runtime_graph_plan_allocation_bytes(size_t cu
     return allocation_bytes;
 }
 
+static size_t termite_metal_graph_plan_slot_capacity(
+    const termite_metal_decode_runtime *runtime, size_t slot, size_t requested_bytes
+) {
+    const size_t current = runtime->graph_plan_capacities[slot];
+    if (runtime->graph_plan_buffers[slot] != nil && current >= requested_bytes) return current;
+    return runtime->embedding_workspace_bounded ? requested_bytes :
+        termite_metal_decode_runtime_graph_plan_allocation_bytes(current, requested_bytes);
+}
+
 int termite_metal_decode_runtime_commit_graph_plan(termite_metal_decode_runtime *runtime) {
     if (runtime == NULL || runtime->device == nil) return -1;
     @autoreleasepool {
@@ -33478,8 +33487,7 @@ int termite_metal_decode_runtime_commit_graph_plan(termite_metal_decode_runtime 
                 trace_reuses += 1;
                 continue;
             }
-            const size_t allocation_bytes = runtime->embedding_workspace_bounded ? bytes :
-                termite_metal_decode_runtime_graph_plan_allocation_bytes(runtime->graph_plan_capacities[slot], bytes);
+            const size_t allocation_bytes = termite_metal_graph_plan_slot_capacity(runtime, slot, bytes);
             id<MTLBuffer> buffer = termite_metal_workspace_buffer(runtime, allocation_bytes, MTLResourceStorageModePrivate);
             if (buffer == nil) return -2;
             runtime->graph_plan_buffers[slot] = buffer;
@@ -55402,12 +55410,17 @@ int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(
                 size_t retained_scratch_bytes = 0;
                 bool scratch_within_budget = true;
                 for (size_t i = 0; i < 5; ++i) {
-                    const size_t retained_slot_bytes = runtime->graph_plan_capacities[mps_slots[i]] >= mps_bytes[i]
-                        ? runtime->graph_plan_capacities[mps_slots[i]]
-                        : termite_metal_decode_runtime_graph_plan_allocation_bytes(
-                            runtime->graph_plan_capacities[mps_slots[i]],
-                            mps_bytes[i]
-                        );
+                    const size_t slot = mps_slots[i];
+                    const size_t capacity = runtime->graph_plan_capacities[slot];
+                    const size_t retained_slot_bytes = termite_metal_graph_plan_slot_capacity(runtime, slot, mps_bytes[i]);
+                    // Prior commands can still hold the old slot while the
+                    // replacement is allocated. Charge both until retirement.
+                    if (capacity < mps_bytes[i] && runtime->graph_plan_buffers[slot] != nil &&
+                        !termite_metal_size_add(retained_scratch_bytes, capacity, &retained_scratch_bytes))
+                    {
+                        scratch_within_budget = false;
+                        break;
+                    }
                     if (!termite_metal_size_add(retained_scratch_bytes, retained_slot_bytes, &retained_scratch_bytes) ||
                         retained_scratch_bytes > mps_attention_scratch_max_bytes)
                     {
