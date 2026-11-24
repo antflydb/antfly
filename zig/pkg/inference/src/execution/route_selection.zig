@@ -133,13 +133,6 @@ pub const Selection = struct {
         @memset(counts, 0);
         const enabled = try allocator.alloc(bool, if (pool.literal_store) |store| store.literals.len else 0);
         errdefer allocator.free(enabled);
-        @memset(enabled, true);
-        if (pool.plan.execution_reachable) |reachable| {
-            if (reachable.len != pool.plan.node_slots.len) return error.InvalidReachabilityTable;
-            if (pool.literal_store) |store| for (store.literals, enabled) |literal, *active| {
-                active.* = reachable[literal.node];
-            };
-        }
         const aliases = try allocator.alloc(bool, pool.metadata_aliases.len);
         errdefer allocator.free(aliases);
         @memset(aliases, true);
@@ -188,6 +181,15 @@ pub const Selection = struct {
         self.clearRoutes();
         if (self.literal_claim_selection) |claim| claim.release();
         self.literal_claim_selection = null;
+        // Installing regions can qualify consumers that had no ordinary route
+        // during the preceding selection. Recompute the literal fixed point.
+        @memset(self.literal_enabled, true);
+        if (pool.plan.execution_reachable) |reachable| {
+            if (reachable.len != pool.plan.node_slots.len) return error.InvalidReachabilityTable;
+            if (pool.literal_store) |store| for (store.literals, self.literal_enabled) |literal, *active| {
+                active.* = reachable[literal.node];
+            };
+        }
         const stable = try self.allocator.alloc(bool, if (self.alias_index) |index| index.by_node.len else 0);
         defer self.allocator.free(stable);
         while (true) {
