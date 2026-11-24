@@ -56945,7 +56945,7 @@ fn consumerTests() type {
                     try std.testing.expectEqual(@as(u64, 77), input.value.metadata_group_id);
                     const remaining = try std.fmt.parseUnsigned(u64, request.header(routes.routing_remaining_ms_header).?, 10);
                     const original_deadline = std.time.ns_per_s + 100 * std.time.ns_per_ms;
-                    const available_ms = (original_deadline - self.clock.monotonic_ns) / std.time.ns_per_ms;
+                    const available_ms: u64 = @intCast(@divTrunc(original_deadline - self.clock.monotonic_ns, std.time.ns_per_ms));
                     // Read attempt zero gets a share, then the retry gets the
                     // remainder of the same request budget.
                     const divisor: u64 = if (input.value.action != .mutate and self.reads != 1) 2 else 1;
