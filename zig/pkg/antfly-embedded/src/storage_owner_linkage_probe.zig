@@ -78,6 +78,15 @@ pub fn main(init: std.process.Init) !void {
 fn exercise(alloc: std.mem.Allocator, root: []const u8, physical: []const u8, io: std.Io) !void {
     const db = try db_mod.DB.openOwned(alloc, physical, .{ .start_optional_runtimes = false, .start_index_workers = false });
     defer db.closeOwned();
+    {
+        var policy = retained: {
+            var lease = try db.beginQueryReadLease();
+            defer lease.release();
+            break :retained try lease.retainPolicy();
+        };
+        defer policy.release();
+        try policy.checkAt(0);
+    }
     try db.batch(.{ .writes = &.{.{ .key = "shared-row", .value = "{\"n\":1}" }}, .sync_level = .write });
     const value = (try db.get(alloc, "shared-row")) orelse return error.SharedStorageReadBackFailed;
     defer alloc.free(value);

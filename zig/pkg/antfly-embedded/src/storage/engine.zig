@@ -677,7 +677,8 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
 /// Version 75 adds snapshot-qualified artifact publication history reads.
 /// Version 76 also includes SQL native lifetime and publication owner ports.
 /// Version 77 carries physical history ownership in SQL completion calls.
-pub const descriptor_version: u32 = 77;
+/// Version 78 retains the query policy guard through the owner callback.
+pub const descriptor_version: u32 = 78;
 pub const Descriptor = extern struct {
     version: u32 = descriptor_version,
     table_layout: native.TypeContract,
