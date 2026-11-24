@@ -3519,7 +3519,10 @@ test "planned Metal elementwise product-add publishes into the assigned region o
         const right = if (pair) try builder.mul(nodes[2], nodes[3]) else nodes[count - 1];
         const output_node = if (order == .product_second or order == .scale_second) try builder.add(right, left) else try builder.add(left, right);
         try graph.markOutput(output_node);
-        var program = try ModelProgram.init(a, &graph, bindings[0..count]);
+        // The default graph pipeline folds scalar products into an existing
+        // native descriptor. Exercise the provider-owned primitive schedule.
+        const pipeline = if (scaled) ml.graph.passes.pipeline.Pipeline.provider_fusion else ml.graph.passes.pipeline.Pipeline.default;
+        var program = try ModelProgram.initWithPipeline(a, &graph, bindings[0..count], pipeline);
         defer program.deinit();
         var executable = try prepare(a, &program, &cb, .partitioned);
         defer executable.deinit();
