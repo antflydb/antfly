@@ -49029,12 +49029,11 @@ test "metal_compute: compact DeBERTa relative rows match expanded native attenti
     const packed_bytes = 32 * 1024 * 1024;
     const visible_scratch = (seq_len * seq_len + seq_len * unique_rows +
         2 * seq_len * head_dim + unique_rows * head_dim) * batch * num_heads * @sizeOf(f32);
-    // This provider's cold graph-plan capacity grows each plane by 2x.
-    const cold_capacity = 2 * visible_scratch;
+    // The exact-cap arm permits the five planes without geometric growth.
     const Case = enum { below_budget, exact_budget, reuse };
     const before = metal_runtime_mod.runtimeMemorySnapshot(runtime);
     for ([_]Case{ .below_budget, .exact_budget, .reuse }) |case| {
-        try metal_runtime_mod.configureDebertaCacheLimits(runtime, packed_bytes, if (case == .below_budget) cold_capacity - 1 else cold_capacity);
+        try metal_runtime_mod.configureDebertaCacheLimits(runtime, packed_bytes, if (case == .below_budget) visible_scratch - 1 else visible_scratch);
         const metal_out = (try metal_compute.tryDisentangledRelativeAttentionResident(
             metal_q,
             metal_k,
@@ -49059,7 +49058,7 @@ test "metal_compute: compact DeBERTa relative rows match expanded native attenti
         try std.testing.expectEqual(@as(u64, @backingInt(case)), timing.provider.metal_runtime_deberta_attention_gemm_calls);
         const allocated = case != .below_budget;
         try std.testing.expectEqual(before.graph_plan_allocations + @as(u64, if (allocated) 5 else 0), memory.graph_plan_allocations);
-        try std.testing.expectEqual(before.graph_plan_bytes + @as(u64, if (allocated) cold_capacity else 0), memory.graph_plan_bytes);
+        try std.testing.expectEqual(before.graph_plan_bytes + @as(u64, if (allocated) visible_scratch else 0), memory.graph_plan_bytes);
     }
 }
 

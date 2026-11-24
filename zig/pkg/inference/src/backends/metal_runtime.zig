@@ -14301,7 +14301,7 @@ test "metal DeBERTa MPS attention is budgeted before the flash4 fallback" {
     const function_source = source[function_start..function_end];
 
     const mps_policy = std.mem.indexOf(u8, function_source, "termite_metal_deberta_mps_attention_scratch_max_bytes(runtime)").?;
-    const retained_capacity = std.mem.indexOf(u8, function_source, "retained_scratch_bytes > mps_attention_scratch_max_bytes").?;
+    const retained_capacity = std.mem.indexOf(u8, function_source, "termite_metal_deberta_attention_scratch_plan(runtime,").?;
     const mps_dispatch = std.mem.indexOf(u8, function_source, "antfly_metal_encode_matrix(runtime->deberta_cc_mps_mm, command_buffer, packed_q, packed_k, cc)") orelse return error.MissingMpsAttentionDispatch;
     const flash_dispatch = std.mem.indexOf(u8, function_source, "antfly_metal_set_compute_pipeline(flash_encoder, (runtime->disentangled_relative_attention_f32_flash4_pipeline))") orelse return error.MissingFlashAttentionDispatch;
     try std.testing.expect(mps_policy < retained_capacity);

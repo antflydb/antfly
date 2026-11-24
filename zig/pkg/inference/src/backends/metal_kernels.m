@@ -55252,6 +55252,67 @@ int termite_metal_decode_runtime_segment_training_attention_flash_v1(
     }
 }
 
+// Pick capacities for these five visible planes before creating any
+// buffers. The MPS implementation's internal storage is not part of this plan.
+enum { TERMITE_DEBERTA_MPS_SCRATCH_PLANES = 5 };
+
+static bool termite_metal_deberta_attention_scratch_plan(
+    const termite_metal_decode_runtime *runtime, const size_t *slots, const size_t *bytes,
+    size_t budget, size_t *capacities
+) {
+    size_t exact_peak = 0;
+    size_t growth_peak = 0;
+    bool growth_fits = true;
+    for (size_t i = 0; i < TERMITE_DEBERTA_MPS_SCRATCH_PLANES; ++i) {
+        const size_t slot = slots[i];
+        const size_t current = runtime->graph_plan_buffers[slot] == nil ? 0 : runtime->graph_plan_capacities[slot];
+        const bool reuse = current >= bytes[i];
+        const size_t exact = reuse ? current : bytes[i];
+        const size_t growth = termite_metal_graph_plan_slot_capacity(runtime, slot, bytes[i]);
+        const size_t overlap = reuse ? 0 : current;
+        if (!termite_metal_size_add(exact_peak, overlap, &exact_peak) ||
+            !termite_metal_size_add(exact_peak, exact, &exact_peak) || exact_peak > budget) return false;
+        growth_fits = growth_fits &&
+            termite_metal_size_add(growth_peak, overlap, &growth_peak) &&
+            termite_metal_size_add(growth_peak, growth, &growth_peak) && growth_peak <= budget;
+        capacities[i] = growth;
+    }
+    if (!growth_fits) {
+        for (size_t i = 0; i < TERMITE_DEBERTA_MPS_SCRATCH_PLANES; ++i) {
+            const size_t slot = slots[i];
+            const size_t current = runtime->graph_plan_buffers[slot] == nil ? 0 : runtime->graph_plan_capacities[slot];
+            capacities[i] = MAX(current, bytes[i]);
+        }
+    }
+    return true;
+}
+
+static bool termite_metal_deberta_attention_reserve_scratch(
+    termite_metal_decode_runtime *runtime, const size_t *slots, const size_t *capacities
+) {
+    id<MTLBuffer> replacements[TERMITE_DEBERTA_MPS_SCRATCH_PLANES] = { nil };
+    size_t grown = 0;
+    for (size_t i = 0; i < TERMITE_DEBERTA_MPS_SCRATCH_PLANES; ++i) {
+        const size_t slot = slots[i];
+        if (runtime->graph_plan_buffers[slot] != nil && runtime->graph_plan_capacities[slot] >= capacities[i]) continue;
+        replacements[i] = termite_metal_workspace_buffer(runtime, capacities[i], MTLResourceStorageModePrivate);
+        if (replacements[i] == nil) return false;
+        ++grown;
+    }
+    if (grown == 0) return true;
+    // Publish all planes together. A failed allocation leaves the original
+    // slot set usable by the next request.
+    for (size_t i = 0; i < TERMITE_DEBERTA_MPS_SCRATCH_PLANES; ++i) {
+        if (replacements[i] == nil) continue;
+        runtime->graph_plan_buffers[slots[i]] = replacements[i];
+        runtime->graph_plan_capacities[slots[i]] = capacities[i];
+    }
+    runtime->graph_plan_allocations += grown;
+    runtime->graph_plan_reuses += TERMITE_DEBERTA_MPS_SCRATCH_PLANES - grown;
+    runtime->graph_plan_count += 1;
+    return true;
+}
+
 int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(
     termite_metal_decode_runtime *runtime,
     void *q_handle,
@@ -55393,44 +55454,24 @@ int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(
                 termite_metal_size_mul(relative_score_count, sizeof(float), &relative_score_bytes);
             if (mps_shape_bytes_valid)
             {
-                const size_t mps_slots[5] = {
+                const size_t mps_slots[TERMITE_DEBERTA_MPS_SCRATCH_PLANES] = {
                     TERMITE_METAL_GRAPH_PLAN_DEBERTA_CC_SCORE_SLOT,
                     TERMITE_METAL_GRAPH_PLAN_DEBERTA_C2P_SCORE_SLOT,
                     TERMITE_METAL_GRAPH_PLAN_DEBERTA_PACKED_Q_SLOT,
                     TERMITE_METAL_GRAPH_PLAN_DEBERTA_PACKED_K_SLOT,
                     TERMITE_METAL_GRAPH_PLAN_DEBERTA_PACKED_REL_SLOT,
                 };
-                const size_t mps_bytes[5] = {
+                const size_t mps_bytes[TERMITE_DEBERTA_MPS_SCRATCH_PLANES] = {
                     cc_score_bytes,
                     relative_score_bytes,
                     packed_token_bytes,
                     packed_token_bytes,
                     packed_relative_bytes,
                 };
-                size_t retained_scratch_bytes = 0;
-                bool scratch_within_budget = true;
-                for (size_t i = 0; i < 5; ++i) {
-                    const size_t slot = mps_slots[i];
-                    const size_t capacity = runtime->graph_plan_capacities[slot];
-                    const size_t retained_slot_bytes = termite_metal_graph_plan_slot_capacity(runtime, slot, mps_bytes[i]);
-                    // Prior commands can still hold the old slot while the
-                    // replacement is allocated. Charge both until retirement.
-                    if (capacity < mps_bytes[i] && runtime->graph_plan_buffers[slot] != nil &&
-                        !termite_metal_size_add(retained_scratch_bytes, capacity, &retained_scratch_bytes))
-                    {
-                        scratch_within_budget = false;
-                        break;
-                    }
-                    if (!termite_metal_size_add(retained_scratch_bytes, retained_slot_bytes, &retained_scratch_bytes) ||
-                        retained_scratch_bytes > mps_attention_scratch_max_bytes)
-                    {
-                        scratch_within_budget = false;
-                        break;
-                    }
-                }
-                if (scratch_within_budget &&
+                size_t capacities[TERMITE_DEBERTA_MPS_SCRATCH_PLANES];
+                if (termite_metal_deberta_attention_scratch_plan(runtime, mps_slots, mps_bytes, mps_attention_scratch_max_bytes, capacities) &&
                     termite_metal_decode_runtime_cached_deberta_mps_mm(runtime, seq_len, relative_count, head_dim) &&
-                    termite_metal_decode_runtime_reserve_graph_plan_slots(runtime, mps_slots, mps_bytes, 5) == 0)
+                    termite_metal_deberta_attention_reserve_scratch(runtime, mps_slots, capacities))
                 {
                     id<MTLBuffer> cc_buffer = runtime->graph_plan_buffers[TERMITE_METAL_GRAPH_PLAN_DEBERTA_CC_SCORE_SLOT];
                     id<MTLBuffer> c2p_buffer = runtime->graph_plan_buffers[TERMITE_METAL_GRAPH_PLAN_DEBERTA_C2P_SCORE_SLOT];
