@@ -72,6 +72,14 @@ button.link.danger { color: var(--destructive); }
 button.wide { width: 100%; padding: 0.75rem; }
 label.inline { display: flex; gap: 0.6rem; align-items: flex-start; font-size: 14px; }
 label.inline input { width: auto; margin-top: 0.2rem; accent-color: var(--foreground); }
+/* Switches: the sidebar indicator (.dot) and the real checkbox in the sheet share one look. */
+label.switch { justify-content: space-between; align-items: center; gap: 1rem; padding: 0.6rem 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); cursor: pointer; }
+.dot, label.switch input { appearance: none; position: relative; flex: none; width: 30px; height: 18px; margin: 0; padding: 0; border: 0; border-radius: 999px; background: var(--input); transition: background-color 0.15s; }
+.dot::after, label.switch input::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--surface); box-shadow: 0 1px 2px rgb(0 0 0 / 0.2); transition: transform 0.15s; }
+.dot.on, label.switch input:checked { background: var(--foreground); }
+.dot.on::after, label.switch input:checked::after { transform: translateX(12px); }
+label.switch input { cursor: pointer; }
+label.switch input:focus-visible { outline: 2px solid var(--foreground); outline-offset: 2px; }
 
 /* "Search by Antfly": the one place the maker shows up inside the app. */
 .credit { display: flex; align-items: center; gap: 0.35rem; font-size: 12px; color: var(--faint); }
@@ -108,13 +116,12 @@ nav { display: grid; gap: 2px; }
 
 /* On-device search: a sidebar item that opens a floating sheet. */
 .device { position: relative; }
-.device summary { list-style: none; cursor: pointer; display: grid; grid-template-columns: 18px 1fr; column-gap: 0.7rem; align-items: center; padding: 0.55rem 0.75rem; border-radius: var(--radius); font-size: 14px; color: var(--muted); }
+.device summary { list-style: none; cursor: pointer; display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 0.7rem; align-items: center; padding: 0.55rem 0.75rem; border-radius: var(--radius); font-size: 14px; color: var(--muted); }
 .device summary::-webkit-details-marker { display: none; }
 .device summary:hover, .device[open] summary { background: var(--hover); color: var(--foreground); }
-.device summary small { grid-column: 2; font-size: 12px; color: var(--faint); }
-.dot { justify-self: center; width: 8px; height: 8px; border-radius: 50%; border: 1.5px solid var(--faint); }
-.dot.on { background: var(--foreground); border-color: var(--foreground); }
-.dot.busy { border-color: var(--foreground); animation: pulse 1.2s ease-in-out infinite; }
+.device summary small { grid-column: 1; font-size: 12px; color: var(--faint); }
+.device summary .dot { grid-column: 2; grid-row: 1 / span 2; }
+.dot.busy { animation: pulse 1.2s ease-in-out infinite; }
 @keyframes pulse { 50% { opacity: 0.3; } }
 .sheet {
   position: absolute;
@@ -284,12 +291,12 @@ pre { font: 15px/1.7 var(--font-sans); white-space: pre-wrap; overflow-wrap: any
 @media (max-width: 700px) {
   .shell { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
   .sidebar { gap: 0.25rem; flex-wrap: nowrap; padding: 0.6rem 0.75rem; }
-  .compose { padding: 0.5rem 0.7rem; margin-right: 0.25rem; }
+  .compose { padding: 0.5rem 0.7rem; }
   .account { flex: none; }
   .brand span, .signed-in span, .device summary small { display: none; }
-  .folder { padding: 0.5rem; font-size: 0; gap: 0; }
+  .folder { padding: 0.45rem; font-size: 0; gap: 0; }
   .folder .icon { width: 20px; height: 20px; }
-  .device summary { grid-template-columns: 18px; font-size: 0; padding: 0.55rem; }
+  .device summary { grid-template-columns: auto; font-size: 0; padding: 0.5rem 0.3rem; }
   .sheet { position: fixed; left: 0.75rem; right: 0.75rem; top: 4rem; width: auto; }
   .meta .time-col, .meta time { grid-column: 2 / -1; }
   .meta .addr { display: block; margin: 0; }

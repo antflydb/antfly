@@ -51,7 +51,7 @@
       <div class="sheet">
         <p class="sheet-title">On-device search</p>
         <p>Keep a private copy of this mailbox's text in this browser and search it by meaning with EmbeddingGemma, running entirely on this device. Messages and their embeddings never leave it, and search keeps working offline. The model is a one-time download, shared by every mailbox on this device.</p>
-        <label class="inline"><input type="checkbox" id="local-toggle"> Keep a searchable copy of this mailbox on this device</label>
+        <label class="inline switch"><span>Keep a searchable copy of this mailbox on this device</span><input type="checkbox" role="switch" id="local-toggle"></label>
         <progress id="local-progress" hidden></progress>
         <p id="local-status" class="quiet" role="status" aria-live="polite"></p>
         <p class="credit"><svg class="mark" aria-hidden="true"><use href="#mark"/></svg>Search by Antfly</p>
