@@ -69126,7 +69126,6 @@ const SourcePlanHttpFixture = struct {
         defer quota_response.deinit(a2);
         try std.testing.expectEqual(@as(u16, 200), quota_response.status);
         const quota = try SourcePlanHttp.native.decodeObservation(a2, quota_query, quota_response.body);
-        origin_server.remote_metadata.?.control_read_generation_at_ms = origin_server.remote_metadata.?.awakeMs();
         const remote_quota = try origin_server.sourcePlanObservePort().read(a2, fence, "docs", quota_input, .{});
         try std.testing.expectEqualDeep(quota, remote_quota);
         var checksum: [32]u8 = undefined;
@@ -69155,7 +69154,6 @@ const SourcePlanHttpFixture = struct {
         };
         request.operation = .recover;
         request.receipt = accepted.receipt;
-        origin_server.remote_metadata.?.control_read_generation_at_ms = origin_server.remote_metadata.?.awakeMs();
         const recovered = try origin_server.sourcePlanControlPort().execute(a2, fence, "docs", request, .{});
         try std.testing.expect(recovered.confirmed() and recovered.outcome.? == .applied);
         {
@@ -69184,7 +69182,6 @@ const SourcePlanHttpFixture = struct {
         try std.testing.expectEqual(@as(u16, 200), read_response.status);
         const owned = try SourcePlanHttp.native.decodeChunkReply(a2, read.request, read_response.body);
         defer a2.free(owned.bytes);
-        origin_server.remote_metadata.?.control_read_generation_at_ms = origin_server.remote_metadata.?.awakeMs();
         const remote_owned = try origin_server.sourcePlanChunkPort().read(a2, fence, "docs", read, .{});
         defer a2.free(remote_owned.bytes);
         try std.testing.expectEqualSlices(u8, owned.bytes, remote_owned.bytes);
