@@ -19,14 +19,12 @@ const std = @import("std");
 const provider = @import("../backends/compute_provider.zig");
 const factory = @import("../architectures/session_factory.zig");
 const generation = @import("generation.zig");
-const Cache = @import("../graph/cache.zig").GraphCache;
 const Model = @import("../models/loaded_runtime.zig").Runtime;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 
 pub const Request = struct {
     allocator: std.mem.Allocator,
     compute: provider.ManagedComputeBackend,
-    cache: Cache,
     pipeline: generation.NativeGenerationPipeline,
 
     pub const Policy = struct {
@@ -37,7 +35,7 @@ pub const Request = struct {
 
     pub fn create(a: std.mem.Allocator, io: std.Io, model: *Model, path: []const u8, policy: Policy, control: Control) !*Request {
         if (model.session.backend() != .pjrt) return error.GenerationBackendSelectionMismatch;
-        const client = factory.getPjrtClientPtr(model.session) orelse return error.GenerationBackendSelectionMismatch;
+        _ = factory.getPjrtClientPtr(model.session) orelse return error.GenerationBackendSelectionMismatch;
         const config = factory.getGptConfig(model.session) orelse return error.MissingDecoderConfig;
         const self = try a.create(Request);
         errdefer a.destroy(self);
@@ -48,7 +46,6 @@ pub const Request = struct {
         borrowed.hard_cancellation = null;
         borrowed.native_call_policy = .in_process;
         self.compute.backend.execution_control = borrowed;
-        self.cache = Cache.init(a);
         self.pipeline = .{
             .allocator = a,
             .io = io,
@@ -62,10 +59,8 @@ pub const Request = struct {
             .chat_template = model.chat_tmpl,
             .model_dir = path,
             .gguf_projector_path = model.manifest.gguf_projector_path,
-            .graph_cache = &self.cache,
             .compiled_partition_backend = .pjrt,
             .compiled_attachment_target = .whole_model,
-            .pjrt_client = client,
             .generation_admission = &model.generation_admission,
             .media_prepaid = .{ .process_bytes = policy.media_host_bytes },
             .pjrt_media_bucket_rows = policy.media_bucket_rows,
@@ -75,7 +70,6 @@ pub const Request = struct {
     }
     pub fn destroy(self: *Request) void {
         self.pipeline.deinit();
-        self.cache.deinitWithBackend(&self.compute.backend);
         self.compute.deinit();
         self.allocator.destroy(self);
     }

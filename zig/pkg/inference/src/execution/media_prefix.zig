@@ -58,6 +58,18 @@ pub fn prepareDecoder(
     return decoder;
 }
 
+/// Reuse the loaded session program for whole-prefix text decoding.
+pub fn runText(session: Session, history: []const i64, a: std.mem.Allocator, control: ?Control) ![]f32 {
+    if (history.len == 0) return error.InvalidPreparedPrompt;
+    const rows = std.math.cast(i64, history.len) orelse return error.InvalidInputShape;
+    const shape = [2]i64{ 1, rows };
+    const row = [1]i64{rows - 1};
+    return publishLogits(a, try session.runWithControl(&.{
+        Tensor.borrowInt64(a, "input_ids", &shape, history),
+        Tensor.borrowInt64(a, "logits_row", &.{1}, &row),
+    }, a, control));
+}
+
 pub const Prefix = struct {
     embeddings: Tensor,
     /// Zero preserves exact-shape execution; opt-in buckets bound padding.
@@ -294,12 +306,16 @@ pub const Prefix = struct {
             inputs.appendAssumeCapacity(mask);
         }
         const outputs = if (decoder) |cached| try cached.run(inputs.items, a, control) else try session.runWithControl(inputs.items, a, control);
-        defer a.free(outputs);
-        defer for (outputs) |*output| output.deinit();
-        if (outputs.len != 1 or !std.mem.eql(u8, outputs[0].name, "logits") or outputs[0].dtype != .f32) return error.InvalidModelProgramOutput;
-        return outputs[0].takeOrCopyFloat32(a);
+        return publishLogits(a, outputs);
     }
 };
+
+fn publishLogits(a: std.mem.Allocator, outputs: []Tensor) ![]f32 {
+    defer a.free(outputs);
+    defer for (outputs) |*output| output.deinit();
+    if (outputs.len != 1 or !std.mem.eql(u8, outputs[0].name, "logits") or outputs[0].dtype != .f32) return error.InvalidModelProgramOutput;
+    return outputs[0].takeOrCopyFloat32(a);
+}
 
 test "media prefix cached admission includes padded embeddings positions PLE visibility and metadata" {
     const a = std.testing.allocator;
@@ -362,4 +378,37 @@ test "prepared media prefix materializes an owned typed packet from the Native b
     try std.testing.expectEqualSlices(u8, input.visibility.?, prefix.visibility.?);
     try std.testing.expectEqual(@as(i64, -1), prefix.position_delta);
     try std.testing.expect(source == null);
+}
+
+test "whole-prefix text borrows history and publishes only the final logits row" {
+    const Probe = struct {
+        history: []const i64,
+        fn backend(_: *anyopaque) @import("../backends/backends.zig").BackendType {
+            return .pjrt;
+        }
+        fn info(_: *anyopaque) []const @import("../backends/tensor.zig").TensorInfo {
+            return &.{};
+        }
+        fn close(_: *anyopaque) void {}
+        fn run(raw: *anyopaque, inputs: []const Tensor, a: std.mem.Allocator) anyerror![]Tensor {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, 2), inputs.len);
+            try std.testing.expectEqualStrings("input_ids", inputs[0].name);
+            try std.testing.expectEqualStrings("logits_row", inputs[1].name);
+            try std.testing.expectEqual(self.history.ptr, inputs[0].asInt64().ptr);
+            try std.testing.expectEqualSlices(i64, &.{ 1, 3 }, inputs[0].shape);
+            try std.testing.expectEqualSlices(i64, &.{2}, inputs[1].asInt64());
+            const outputs = try a.alloc(Tensor, 1);
+            errdefer a.free(outputs);
+            outputs[0] = try Tensor.initFloat32(a, "logits", &.{ 1, 2 }, &.{ 3, 7 });
+            return outputs;
+        }
+        const table = Session.VTable{ .run = run, .backend = backend, .inputInfo = info, .outputInfo = info, .close = close };
+    };
+    const a = std.testing.allocator;
+    var probe = Probe{ .history = &.{ 4, 7, 9 } };
+    const session = Session{ .ptr = &probe, .vtable = &Probe.table };
+    const logits = try runText(session, probe.history, a, null);
+    defer a.free(logits);
+    try std.testing.expectEqualSlices(f32, &.{ 3, 7 }, logits);
 }
