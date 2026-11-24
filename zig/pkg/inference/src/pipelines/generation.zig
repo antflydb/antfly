@@ -3792,11 +3792,16 @@ pub const NativeGenerationPipeline = struct {
         const allow_prefill_greedy_token = !use_speculative or draft_is_gemma4_mtp;
         const capture_mtp_prefill_hidden = use_speculative and draft_is_gemma4_mtp and gemma4MtpTargetHiddenSource() == .final;
         if (self.usesPjrtSession()) {
+            var input: ?@import("../execution/media_prefix.zig").Prefix.Prepared = null;
             if (prepared_qwen3vl_prompt) |*prepared| {
                 if (prepared.deepstack_layer_count != 0) return error.UnsupportedResidentQwenVision;
-                compiled_prefix = try self.compileMediaPrefix(prepared.input_embeddings orelse return error.InvalidPreparedPrompt, prepared.token_ids.len, null, prepared.plan.mrope_positions, prepared.plan.mrope_position_delta, null);
+                input = .{ .tensor = prepared.input_embeddings orelse return error.InvalidPreparedPrompt, .rows = prepared.token_ids.len, .width = self.gpt_config.hidden_size, .bucket_rows = self.pjrt_media_bucket_rows, .positions = prepared.plan.mrope_positions, .position_delta = prepared.plan.mrope_position_delta };
             } else if (prepared_multimodal_prompt) |*prepared| {
-                compiled_prefix = try self.compileMediaPrefix(prepared.input_embeddings orelse return error.InvalidPreparedPrompt, prepared.token_ids.len, prepared.ple_token_ids, null, 0, prepared.attn_or_mask);
+                input = .{ .tensor = prepared.input_embeddings orelse return error.InvalidPreparedPrompt, .rows = prepared.token_ids.len, .width = self.gpt_config.hidden_size, .bucket_rows = self.pjrt_media_bucket_rows, .ple = prepared.ple_token_ids, .visibility = prepared.attn_or_mask };
+            }
+            if (input) |prepared| {
+                const access = if (self.execution_lock) |mutex| self.executionAccess(mutex) else .{};
+                compiled_prefix = try prepared.materialize(self.allocator, self.session.?, &self.cb, self.execution_control, access);
             }
             if (compiled_prefix) |*prefix| self.compiled_media_prefix = prefix;
         }
@@ -8088,32 +8093,6 @@ pub const NativeGenerationPipeline = struct {
 
     fn usesPjrtSession(self: *const NativeGenerationPipeline) bool {
         return if (self.session) |session| session.backend() == .pjrt else false;
-    }
-
-    fn compileMediaPrefix(self: *NativeGenerationPipeline, tensor: ops.CT, rows: usize, ple: ?[]const i64, positions: ?[]const u32, delta: i64, mask: ?[]const u8) !@import("../execution/media_prefix.zig").Prefix {
-        const session = self.session orelse return error.InvalidModelForGeneration;
-        var bytes = try std.math.mul(usize, try std.math.mul(usize, rows, self.gpt_config.hidden_size), @sizeOf(f32));
-        if (ple) |ids| bytes = try std.math.add(usize, bytes, try std.math.mul(usize, ids.len, @sizeOf(i64)));
-        if (positions) |ids| bytes = try std.math.add(usize, bytes, try std.math.mul(usize, ids.len, @sizeOf(u32)));
-        if (mask) |bits| bytes = try std.math.add(usize, bytes, bits.len);
-        // The prefix outlives each individual stage invocation. Admit its
-        // owned host copy before allocation and outside any provider lane.
-        var retained: ?@import("../backends/session.zig").RunPermit = try session.withAdmissionControl(self.execution_control).admitRetainedMedia(bytes, 0);
-        errdefer if (retained) |*permit| permit.deinit();
-        var scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
-        defer if (scope) |*held| held.deinit();
-        const values = try self.cb.toFloat32(tensor, self.allocator);
-        var values_owned = true;
-        errdefer if (values_owned) self.allocator.free(values);
-        var prefix = @import("../execution/media_prefix.zig").Prefix{ .bucket_rows = self.pjrt_media_bucket_rows, .embeddings = try backends.Tensor.initFloat32Owned(self.allocator, "input_embeddings", &.{ 1, @intCast(rows), self.gpt_config.hidden_size }, values), .position_delta = delta };
-        values_owned = false;
-        prefix.retained = retained;
-        retained = null;
-        errdefer prefix.deinit(self.allocator);
-        if (ple) |ids| prefix.ple_ids = try self.allocator.dupe(i64, ids);
-        if (positions) |ids| prefix.axis_positions = try self.allocator.dupe(u32, ids);
-        if (mask) |visibility| prefix.visibility = try self.allocator.dupe(u8, visibility);
-        return prefix;
     }
 
     fn encodeResidentProjected(self: *NativeGenerationPipeline, allocator: std.mem.Allocator, images: []const []const u8, limits: qwen3vl_projector.Limits) !qwen3vl_projector.ProjectedImages {

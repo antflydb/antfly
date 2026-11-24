@@ -20,6 +20,9 @@ const Tensor = @import("../backends/tensor.zig").Tensor;
 const Session = @import("../backends/session.zig").Session;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 
+const ExecutionAccess = @import("../execution_control.zig").ExecutionAccess;
+const ops = @import("../ops/ops.zig");
+
 const resident_decoder = @import("resident_decoder.zig");
 
 /// Admit cached or ordinary compiled prefill against the physical query
@@ -64,6 +67,65 @@ pub const Prefix = struct {
     axis_positions: ?[]u32 = null,
     position_delta: i64 = 0,
     visibility: ?[]u8 = null,
+
+    /// Session tensor ABI boundary for compiled generation. The request owns
+    /// the materialized prefix and pays for it until the last consumer retires.
+    pub const Prepared = struct {
+        tensor: ops.CT,
+        rows: usize,
+        width: usize,
+        bucket_rows: usize,
+        ple: ?[]const i64 = null,
+        positions: ?[]const u32 = null,
+        position_delta: i64 = 0,
+        visibility: ?[]const u8 = null,
+
+        fn retainedBytes(self: Prepared) !usize {
+            const mul = std.math.mul;
+            const add = std.math.add;
+            if (self.rows == 0 or self.width == 0 or self.bucket_rows > 256) return error.InvalidPreparedPrompt;
+            var bytes = try mul(usize, try mul(usize, self.rows, self.width), @sizeOf(f32));
+            if (self.ple) |ids| {
+                if (ids.len != self.rows) return error.InvalidPreparedPrompt;
+                bytes = try add(usize, bytes, try mul(usize, ids.len, @sizeOf(i64)));
+            }
+            if (self.positions) |ids| {
+                if (ids.len != try mul(usize, self.rows, 3)) return error.InvalidPreparedPrompt;
+                bytes = try add(usize, bytes, try mul(usize, ids.len, @sizeOf(u32)));
+            }
+            if (self.visibility) |mask| {
+                if (mask.len != try mul(usize, self.rows, self.rows)) return error.InvalidPreparedPrompt;
+                bytes = try add(usize, bytes, mask.len);
+            }
+            return try add(usize, bytes, 3 * @sizeOf(i64));
+        }
+
+        pub fn materialize(self: Prepared, a: std.mem.Allocator, session: Session, backend: *const ops.ComputeBackend, control: ?Control, access: ExecutionAccess) !Prefix {
+            const bytes = try self.retainedBytes();
+            const rows = std.math.cast(i64, self.rows) orelse return error.InvalidPreparedPrompt;
+            const width = std.math.cast(i64, self.width) orelse return error.InvalidPreparedPrompt;
+            var retained = try session.withAdmissionControl(control).admitRetainedMedia(bytes, 0);
+            errdefer retained.deinit();
+            const embeddings = read: {
+                var scope = try access.acquireScope();
+                defer if (scope) |*held| held.deinit();
+                const values = try backend.toFloat32(self.tensor, a);
+                errdefer a.free(values);
+                if (values.len != self.rows * self.width) return error.InvalidPreparedPrompt;
+                break :read try Tensor.initFloat32Owned(a, "input_embeddings", &.{ 1, rows, width }, values);
+            };
+            var prefix = Prefix{ .embeddings = embeddings, .bucket_rows = self.bucket_rows, .retained = retained, .position_delta = self.position_delta };
+            errdefer {
+                // Refund once, after disposing of the partially built prefix.
+                prefix.retained = null;
+                prefix.deinit(a);
+            }
+            if (self.ple) |ids| prefix.ple_ids = try a.dupe(i64, ids);
+            if (self.positions) |ids| prefix.axis_positions = try a.dupe(u32, ids);
+            if (self.visibility) |mask| prefix.visibility = try a.dupe(u8, mask);
+            return prefix;
+        }
+    };
 
     pub fn deinit(self: *Prefix, a: std.mem.Allocator) void {
         self.embeddings.deinit();
@@ -254,4 +316,32 @@ test "media prefix admission enforces the padded ordinary query bound" {
     const prefix = Prefix{ .embeddings = undefined, .bucket_rows = 4 };
     try std.testing.expectError(error.UnsupportedCompiledMediaPrefillChunking, prepareDecoder(allocator, session, false, &prefix, 3, 1, 32, 3, null));
     try std.testing.expect((try prepareDecoder(allocator, session, false, &prefix, 3, 1, 32, 4, null)) == null);
+}
+
+test "prepared media prefix materializes an owned typed packet from the Native backend" {
+    const native = @import("../ops/native_compute.zig");
+    const a = std.testing.allocator;
+    var weights = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer weights.deinitOwned();
+    var compute = native.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const source = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 });
+    defer cb.free(source);
+    const session = Session{ .ptr = undefined, .vtable = undefined };
+    const input = Prefix.Prepared{ .tensor = source, .rows = 2, .width = 2, .bucket_rows = 4, .ple = &.{ 7, 9 }, .positions = &.{ 0, 1, 0, 1, 0, 1 }, .visibility = &.{ 0, 1, 1, 0 }, .position_delta = -1 };
+    var prefix = try input.materialize(a, session, &cb, null, .{});
+    defer prefix.deinit(a);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2, 2 }, prefix.embeddings.shape);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, prefix.embeddings.asFloat32());
+    try std.testing.expectEqualSlices(i64, input.ple.?, prefix.ple_ids.?);
+    try std.testing.expectEqualSlices(u32, input.positions.?, prefix.axis_positions.?);
+    try std.testing.expectEqualSlices(u8, input.visibility.?, prefix.visibility.?);
+    try std.testing.expectEqual(@as(i64, -1), prefix.position_delta);
+    var invalid = input;
+    invalid.visibility = &.{1};
+    try std.testing.expectError(error.InvalidPreparedPrompt, invalid.materialize(a, session, &cb, null, .{}));
+    invalid = input;
+    invalid.width = 3;
+    try std.testing.expectError(error.InvalidPreparedPrompt, invalid.materialize(a, session, &cb, null, .{}));
 }
