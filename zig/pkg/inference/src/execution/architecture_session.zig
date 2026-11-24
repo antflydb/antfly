@@ -21889,6 +21889,10 @@ test "Native Whisper prefill declaration beyond the loaded position table keeps 
     const logits = try decoder.step(&.{0});
     defer a.free(logits);
     try std.testing.expectEqual(@as(usize, 4), logits.len);
+    try std.testing.expectEqual(@as(usize, 0), program.schedule.cursor);
+    const suffix = try decoder.step(&.{1});
+    defer a.free(suffix);
+    try std.testing.expectEqual(@as(usize, 4), suffix.len);
     try std.testing.expectEqual(program.schedule.steps.len, program.schedule.cursor);
 }
 
