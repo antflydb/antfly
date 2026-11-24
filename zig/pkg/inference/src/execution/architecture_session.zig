@@ -13809,12 +13809,10 @@ pub const StagedExecution = struct {
             if (value.*) |*bank| bank.discardAfterResume();
         };
         for (requests[0..count], banks[0..count]) |request, *value| {
-            value.* = Metal.fundAudioScratch(cb, request, pin) catch |err| switch (err) {
-                error.MemoryBudgetExceeded, error.ResourceTemporarilyUnavailable, error.OutOfMemory, error.MetalBufferAllocFailed, error.PreparedCacheGrowthChanged, error.MissingCacheRetirementDomain => continue,
-                else => {
-                    cleanup(self);
-                    return err;
-                },
+            value.* = Metal.fundAudioScratch(cb, request, pin) catch |err| {
+                if (Metal.isAudioArenaPressure(err) or err == error.PreparedCacheGrowthChanged or err == error.MissingCacheRetirementDomain) continue;
+                cleanup(self);
+                return err;
             };
         }
         // Cold candidates must not starve the original stage permit. Retire
@@ -13837,7 +13835,11 @@ pub const StagedExecution = struct {
         };
         try boundary.storage.resumeAfterPark(reopen_storage);
         for (requests[0..count], banks[0..count]) |request, *value| if (value.*) |*bank| {
-            if (try Metal.publishAudioScratch(cb, request, bank)) value.* = null;
+            const published = Metal.publishAudioScratch(cb, request, bank) catch |err| {
+                if (Metal.isAudioArenaPressure(err)) continue;
+                return err;
+            };
+            if (published) value.* = null;
         };
         return true;
     }

@@ -23565,13 +23565,20 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return null;
     }
 
+    pub fn isAudioArenaPressure(err: anyerror) bool {
+        return switch (err) {
+            error.MemoryBudgetExceeded, error.ResourceTemporarilyUnavailable, error.OutOfMemory, error.MetalBufferAllocFailed, error.AudioScheduleAdmission => true,
+            else => false,
+        };
+    }
+
     pub fn fundAudioScratch(cb: *const ops.ComputeBackend, request: audio_tape.Plan.ArenaRequest, pin: *const @import("../runtime/tier/admission_domain.zig").Pin) !FundedAudioBank {
         if (!acceptsEmbeddingStage(cb)) return error.UnsupportedEmbeddingStage;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         const wrappers = try audioArenaWrapperBytes(request.views);
         return self.fundAudioBankOutsideExecution(request.bytes, .private, wrappers, pin) catch |err| {
             const initial = request.initial orelse return err;
-            if (err != error.MemoryBudgetExceeded and err != error.ResourceTemporarilyUnavailable) return err;
+            if (!isAudioArenaPressure(err)) return err;
             const fallback = initial.outputOnly() orelse return err;
             const output_wrappers = try audioArenaWrapperBytes(fallback.output_views);
             return self.fundAudioBankOutsideExecution(fallback.bytes, .private, output_wrappers, pin);

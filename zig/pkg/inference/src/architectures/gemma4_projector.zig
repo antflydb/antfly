@@ -2203,8 +2203,9 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
         !cb.decoderRuntimeHasActiveFrame() and !cb.decoderRuntimeHasSubmittedFrame() and !profile_enabled and std.meta.eql(audioHostOps(), AudioHostOps{}) and platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") == null and
         !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_AUDIO");
     const frame_plan = if (grouped_frames) audio_schedule.audioFramePlan(subsampled.seq_len, cfg.audio_hidden, cfg.intermediate_size) else audio_schedule.AudioFramePlan{};
+    const cohort_layer_span = if (grouped_frames) frame_plan.layers else 1;
     var defer_audio_arena = false;
-    if ((grouped_frames or !cohort) and cb.kind() == .metal and audioExecutionEligible(cb, store, cfg, &layer_inputs)) {
+    if (cb.kind() == .metal and audioExecutionEligible(cb, store, cfg, &layer_inputs)) {
         if (cb.embedding_stage) |stage| if (stage.audio_scratch_fn) |prepare| {
             const Boundary = struct {
                 cb: *const ComputeBackend,
@@ -2228,7 +2229,7 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
             var count: usize = 0;
             var start: usize = 0;
             const recipe = audioCacheConfig(cfg);
-            const span = if (cohort) frame_plan.layers else cfg.block_count;
+            const span = if (cohort) cohort_layer_span else cfg.block_count;
             while (start < cfg.block_count) {
                 const end = @min(cfg.block_count, start + span);
                 keys[count] = recipe.key(layer_inputs.segments, start, end);
@@ -2265,7 +2266,7 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
     var layer: usize = 0;
     if (planned == null) while (layer < cfg.block_count) {
         try cb.checkExecutionControl();
-        const end = if (cohort and cb.kind() == .metal and !profile_enabled and platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") == null) @min(cfg.block_count, layer + frame_plan.layers) else layer + 1;
+        const end = @min(cfg.block_count, layer + cohort_layer_span);
         if (cohort and cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame()) frame_active = try cb.decoderRuntimeBeginFrame();
         const grouped = if (cohort and cb.kind() == .metal) try tryAudioExecutionRange(cb, allocator, store, cfg, hidden, &layer_inputs, layer, end, defer_audio_arena) else null;
         const next = grouped orelse try runAudioLayers(cb, allocator, store, cfg, hidden, &layer_inputs, layer, end);
