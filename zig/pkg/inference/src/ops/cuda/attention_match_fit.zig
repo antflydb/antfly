@@ -27,7 +27,9 @@ const check = algebra.check;
 const ptr = algebra.ptr;
 const int = algebra.int;
 const Kernel = enum { zero_values, normalize, pick_column, pack_basis, copy_scaled_column, finalize_column, delete_r_column, retriangularize, transpose_probabilities, select_column_cooperative };
-const Program = @import("embedded_module.zig").EmbeddedModule(@embedFile("artifacts/attention_match_fit.fatbin"), Kernel);
+const Program = @import("embedded_module.zig").EmbeddedModule(struct {
+    pub const image = @embedFile("artifacts/attention_match_fit.fatbin");
+}, Kernel);
 
 pub const Fitter = struct {
     context: *Context,

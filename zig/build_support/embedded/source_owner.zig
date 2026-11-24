@@ -148,6 +148,16 @@ pub fn localFor(consumer: *std.Build.Module) ?*std.Build.Module {
     return null;
 }
 
+/// Custom native link steps replace an executable's install edge. Finalize
+/// that executable explicitly before snapshotting its provider graph, since
+/// the normal top-level traversal can no longer reach the replaced artifact.
+pub fn finalizeExecutableLinks(b: *std.Build, artifact: *std.Build.Step.Compile) void {
+    if (storage_provider) |provider| {
+        var steps: std.AutoHashMap(*std.Build.Step, void) = .init(b.allocator);
+        attachStorageFinalLinks(b, &artifact.step, provider, &steps);
+    }
+}
+
 fn attachStorageFinalLinks(b: *std.Build, step: *std.Build.Step, provider: *std.Build.Step.Compile, seen: *std.AutoHashMap(*std.Build.Step, void)) void {
     if ((seen.getOrPut(step) catch @panic("OOM")).found_existing) return;
     if (step.cast(std.Build.Step.Compile)) |artifact| {
