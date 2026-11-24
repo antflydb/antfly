@@ -513,6 +513,9 @@ pub fn createExecutorWithOptions(
     options: compiler.CompileOptions,
     shared_parameters: ?*@import("pjrt_parameters.zig").Store,
 ) !*PjrtExecutor {
+    const debug = pjrtExecDebugEnabled();
+    const clock = @import("antfly_platform").time;
+    const lower_started = if (debug) clock.monotonicNs() else 0;
     // 1. Compile partition to HLO bytes
     var compile_options = options;
     if (compile_options.mutable_parameters != null) compile_options.parameter_inputs = true;
@@ -539,6 +542,9 @@ pub fn createExecutorWithOptions(
     var result = try compiler.compilePartitionWithOptions(allocator, graph, part, cb, compile_options);
     defer result.deinit();
 
+    const compile_started = if (debug) clock.monotonicNs() else 0;
+    if (debug) std.log.info("PJRT partition lowered host_wall_ns={d} hlo_bytes={d} nodes={d}", .{ compile_started - lower_started, result.hlo_bytes.len, part.node_ids.len });
+
     // 2. Compile HLO via PJRT
     // Precision fixes publication boundaries and accumulation types. Let the
     // provider choose its tuned GEMM/fusion schedule outside the qualified
@@ -549,6 +555,7 @@ pub fn createExecutorWithOptions(
         try client.compileWithEntryLayoutsAndOptions(result.hlo_bytes, result.output_node_ids.len, client.device, layouts, program_options, allocator)
     else
         try client.compileForDevice(result.hlo_bytes, result.output_node_ids.len, client.device);
+    if (debug) std.log.info("PJRT partition compiler returned host_wall_ns={d}", .{clock.monotonicNs() - compile_started});
     var executable_owned = true;
     errdefer if (executable_owned) executable.deinit();
 
@@ -571,7 +578,11 @@ pub fn createExecutorWithOptions(
     executor.resident_prefill_only = options.resident_initial or options.resident_visibility != null;
     executor.resident_initial = options.resident_initial;
     errdefer executor.partitionExecutor().deinitExecutor();
-    if (options.mutable_parameters) |flags| try executor.retainParameters(graph, cb, flags, shared_parameters);
+    if (options.mutable_parameters) |flags| {
+        const bind_started = if (debug) clock.monotonicNs() else 0;
+        try executor.retainParameters(graph, cb, flags, shared_parameters);
+        if (debug) std.log.info("PJRT partition parameter binding completed host_wall_ns={d}", .{clock.monotonicNs() - bind_started});
+    }
     return executor;
 }
 
