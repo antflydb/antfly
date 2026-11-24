@@ -19885,13 +19885,12 @@ fn launchPersistentDecodeGraph(self: *CudaCompute, slot: *CudaGraphReplaySlot, e
 /// Crossing a captured KV extent is a retirement boundary, not a reusable
 /// cache miss. Release that exec's captured resources before eager fallback;
 /// a later capture must prove the new extent rather than keep selecting it.
-fn cudaGraphReplayCapacityReady(self: *CudaCompute, slot_idx: usize) !bool {
+fn cudaGraphReplayCapacityReady(self: *CudaCompute, slot_idx: usize) bool {
     const slot = &self.debug_cuda_graph_slots[slot_idx];
     if (!slot.kv_replay_capacity_valid or self.debug_cuda_graph_decode_kv_seq_len <= slot.kv_replay_capacity_tokens) return true;
     self.stats.cuda_graph_capture_capacity_skips += 1;
     std.log.warn("cuda_graph_capture_probe: persistent_replay_kv_capacity_exceeded slot={d} kv_seq_len={d} capacity={d}", .{ slot_idx, self.debug_cuda_graph_decode_kv_seq_len, slot.kv_replay_capacity_tokens });
     resetCudaGraphReplaySlotMetadata(self, slot);
-    try flushDeferredDecodeScalarUpload(self);
     return false;
 }
 
@@ -19914,10 +19913,10 @@ test "CUDA replay retains input storage while retiring an exec at its addressabl
     slot.kv_replay_capacity_valid = true;
     slot.kv_replay_capacity_tokens = try cudaKvReplayAddressableCapacity(64, 2, 16, null);
     compute.debug_cuda_graph_decode_kv_seq_len = 32;
-    try std.testing.expect(try cudaGraphReplayCapacityReady(&compute, 0));
+    try std.testing.expect(cudaGraphReplayCapacityReady(&compute, 0));
     try compute.ctx.launchGraph(slot.exec);
     compute.debug_cuda_graph_decode_kv_seq_len = 33;
-    try std.testing.expect(!try cudaGraphReplayCapacityReady(&compute, 0));
+    try std.testing.expect(!cudaGraphReplayCapacityReady(&compute, 0));
     try std.testing.expect(slot.exec == null and slot.shape == null and !slot.valid and !slot.kv_replay_capacity_valid);
     try std.testing.expectEqual(original, slot.input_storage.ptr);
     var actual: [4]f32 = undefined;
@@ -20007,23 +20006,19 @@ test "CUDA replay retains input storage while retiring an exec at its addressabl
 }
 
 fn qualifiedPersistentDecodeGraph(self: *CudaCompute, input: CT) !?usize {
-    if (!cudaDebugGraphPersistentReplayEnabled(self)) {
-        try flushDeferredDecodeScalarUpload(self);
-        return null;
-    }
+    const slot = try findCompatibleDecodeReplaySlot(self, input);
+    if (slot == null) try flushDeferredDecodeScalarUpload(self);
+    return slot;
+}
+
+fn findCompatibleDecodeReplaySlot(self: *CudaCompute, input: CT) !?usize {
+    if (!cudaDebugGraphPersistentReplayEnabled(self)) return null;
     if (self.debug_cuda_graph_capture_active) return error.InvalidCudaState;
-    const slot_idx = self.debug_cuda_graph_prepared_slot orelse {
-        try flushDeferredDecodeScalarUpload(self);
-        return null;
-    };
+    const slot_idx = self.debug_cuda_graph_prepared_slot orelse return null;
     const slot = &self.debug_cuda_graph_slots[slot_idx];
-    if (slot.exec == null or !slot.valid) {
-        try flushDeferredDecodeScalarUpload(self);
-        return null;
-    }
+    if (slot.exec == null or !slot.valid) return null;
     if (!slot.outputAvailable()) {
         if (self.ctx.observation.load(.acquire)) |observation| observation.decodeOutputBankUnavailable();
-        try flushDeferredDecodeScalarUpload(self);
         return null;
     }
     if (!cudaGraphReplayArenaReady(self, slot)) {
@@ -20038,14 +20033,10 @@ fn qualifiedPersistentDecodeGraph(self: *CudaCompute, input: CT) !?usize {
         // generation: never retain an exec whose captured addresses cannot be
         // proven against the current request's allocation ABI.
         resetCudaGraphReplaySlotMetadata(self, slot);
-        try flushDeferredDecodeScalarUpload(self);
         return null;
     }
-    if (slot.shape == null) {
-        try flushDeferredDecodeScalarUpload(self);
-        return null;
-    }
-    if (!try cudaGraphReplayCapacityReady(self, slot_idx)) return null;
+    if (slot.shape == null) return null;
+    if (!cudaGraphReplayCapacityReady(self, slot_idx)) return null;
 
     const input_tensor = tensorFromCt(input);
     if (input_tensor.buffer.ptr != slot.input.ptr or input_tensor.buffer.len != slot.input.len or
@@ -20058,18 +20049,11 @@ fn qualifiedPersistentDecodeGraph(self: *CudaCompute, input: CT) !?usize {
             input_tensor.buffer.ptr,
             input_tensor.buffer.len,
         });
-        try flushDeferredDecodeScalarUpload(self);
         return null;
     }
-    if (slot.aux_input_required != slot.aux_input_prepared) {
-        try flushDeferredDecodeScalarUpload(self);
-        return null;
-    }
+    if (slot.aux_input_required != slot.aux_input_prepared) return null;
     if (slot.aux_input_required) {
-        if (!slot.aux_input_valid or slot.aux_input_shape == null) {
-            try flushDeferredDecodeScalarUpload(self);
-            return null;
-        }
+        if (!slot.aux_input_valid or slot.aux_input_shape == null) return null;
         if (slot.aux_input_storage.ptr != slot.aux_input.ptr or slot.aux_input_storage.len != slot.aux_input.len) {
             std.log.warn("cuda_graph_capture_probe: persistent_replay_aux_input_mismatch slot={d} expected=0x{x}/{d} actual=0x{x}/{d}", .{
                 slot_idx,
@@ -20078,15 +20062,11 @@ fn qualifiedPersistentDecodeGraph(self: *CudaCompute, input: CT) !?usize {
                 slot.aux_input_storage.ptr,
                 slot.aux_input_storage.len,
             });
-            try flushDeferredDecodeScalarUpload(self);
             return null;
         }
     }
 
-    if (slot.output.ptr == 0) {
-        try flushDeferredDecodeScalarUpload(self);
-        return null;
-    }
+    if (slot.output.ptr == 0) return null;
 
     return slot_idx;
 }
