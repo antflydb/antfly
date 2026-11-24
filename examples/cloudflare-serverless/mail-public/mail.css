@@ -214,7 +214,6 @@ nav { display: grid; gap: 2px; }
 .back { display: none; margin: 0.75rem 1rem 0; }
 #message, #editor { max-width: 780px; padding: 1.5rem 2.5rem 4rem; }
 .empty { display: grid; place-items: center; gap: 0.75rem; padding-top: 22vh; color: var(--muted); }
-.empty .mark { width: 36px; height: 36px; opacity: 0.25; }
 .toolbar { display: flex; flex-wrap: wrap; gap: 0.25rem; margin: 0 -0.5rem 1.75rem; }
 .toolbar .spacer { flex: 1; }
 .toolbar .primary { margin-right: 0.25rem; }

@@ -111,7 +111,6 @@ function text(tag, value) {
 function placeholder(message) {
   const box = document.createElement("div");
   box.className = "empty";
-  box.innerHTML = '<svg class="mark" aria-hidden="true"><use href="#mark"/></svg>';
   box.append(text("p", message));
   $("message").replaceChildren(box);
   selected = null;
