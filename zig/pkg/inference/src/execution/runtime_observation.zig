@@ -53,11 +53,34 @@ pub const EntryReport = struct {
     implementation_changes: u64 = 0,
     last_failure: FailureText = .{},
 };
+pub const EntryReturns = struct {
+    native: Counts = .{},
+    metal: Counts = .{},
+    cuda: Counts = .{},
+
+    pub const Counts = struct {
+        successful: u64 = 0,
+        declined: u64 = 0,
+        failed: u64 = 0,
+    };
+
+    pub fn accumulate(self: *EntryReturns, current: EntryReturns) void {
+        inline for (@typeInfo(EntryBackend).@"enum".field_names) |backend| {
+            const total = &@field(self, backend);
+            const delta = @field(current, backend);
+            total.successful +|= delta.successful;
+            total.declined +|= delta.declined;
+            total.failed +|= delta.failed;
+        }
+    }
+};
+
 pub const Entries = struct {
     scope: enum { submitting_thread_instrumented_backend_entries } = .submitting_thread_instrumented_backend_entries,
     unit: enum { callback_returns_not_device_kernels } = .callback_returns_not_device_kernels,
     coverage: enum { instrumented_entries_only } = .instrumented_entries_only,
     vendor_internal_algorithms: enum { opaque_vendor } = .opaque_vendor,
+    totals: EntryReturns = .{},
     records: [8]EntryReport = @splat(.{}),
     count: u8 = 0,
     truncated: bool = false,
@@ -96,12 +119,21 @@ fn entriesSince(before: [entry_slots]EntryCounts) Entries {
         const declined = state.counters.declined -| start.declined;
         const failed = state.counters.failed -| start.failed;
         if (selected == 0 and declined == 0 and failed == 0) continue;
+        const backend: EntryBackend = @fromBackingInt(@intCast(index / entry_count));
+        const totals = switch (backend) {
+            .native => &result.totals.native,
+            .metal => &result.totals.metal,
+            .cuda => &result.totals.cuda,
+        };
+        totals.successful +|= selected;
+        totals.declined +|= declined;
+        totals.failed +|= failed;
         result.observed_families += 1;
         if (result.count == result.records.len) {
             result.truncated = true;
             continue;
         }
-        result.records[result.count] = .{ .backend = @fromBackingInt(@intCast(index / entry_count)), .family = @fromBackingInt(@intCast(index % entry_count)), .successful_returns = selected, .declined_returns = declined, .failed_returns = failed, .last_implementation_identity = state.implementation, .implementation_changes = state.counters.identity_changes -| start.identity_changes, .last_failure = if (failed != 0) state.failure else .{} };
+        result.records[result.count] = .{ .backend = backend, .family = @fromBackingInt(@intCast(index % entry_count)), .successful_returns = selected, .declined_returns = declined, .failed_returns = failed, .last_implementation_identity = state.implementation, .implementation_changes = state.counters.identity_changes -| start.identity_changes, .last_failure = if (failed != 0) state.failure else .{} };
         result.count += 1;
     }
     return result;
@@ -243,15 +275,30 @@ noinline fn nativeActivationBodyEnabled(activation: []const u8, vector_width: us
 const MetalDispatchSink = *const fn (usize, usize, u32, u64, u64, u64, u64, u64, u64, bool) callconv(.c) void;
 extern fn termite_metal_observation_exchange_dispatch_sink(sink: ?MetalDispatchSink) ?MetalDispatchSink;
 
-/// A ready serial schedule's actual execution selection on the submitting
-/// thread. The bank gauges describe the latest selected plan, not a request peak.
+/// Serial schedule decisions and successful callbacks on the submitting thread.
 pub const SerialWorkspaceObservation = struct {
-    scope: enum { metal_ready_serial_schedule_callbacks } = .metal_ready_serial_schedule_callbacks,
+    scope: enum { metal_serial_schedule_callbacks } = .metal_serial_schedule_callbacks,
     /// Successful host callbacks. Device retirement is outside this observation.
     successful_replays: u64 = 0,
     successful_eager_calls: u64 = 0,
     callbacks_with_pending_frame: u64 = 0,
-    latest: Banks,
+    /// Decision counts include declined routes whose caller owns the eager callback.
+    decisions: Decisions = .{},
+    /// Gauges for the latest successful ready-plan callback.
+    latest: ?Banks = null,
+
+    pub const Decisions = struct {
+        selector_declined: u64 = 0,
+        waiting_for_reuse: u64 = 0,
+        cache_slot_busy: u64 = 0,
+        cache_owner_unavailable: u64 = 0,
+        metadata_allocation_declined: u64 = 0,
+        disabled_schedule: u64 = 0,
+        eager_reference: u64 = 0,
+        awaiting_preparation: u64 = 0,
+        learning_backoff: u64 = 0,
+        learning: u64 = 0,
+    };
 
     pub const Banks = struct {
         planned_output_bytes: usize,
@@ -266,10 +313,18 @@ pub inline fn kernelObservationActive() bool {
     return active_kernels != null;
 }
 
+pub noinline fn metalSerialScheduleDecision(comptime reason: @import("std").meta.FieldEnum(SerialWorkspaceObservation.Decisions)) void {
+    var active = active_kernels;
+    while (active) |scope| : (active = scope.previous) {
+        if (scope.metal_serial_workspace == null) scope.metal_serial_workspace = .{};
+        @field(scope.metal_serial_workspace.?.decisions, @tagName(reason)) +|= 1;
+    }
+}
+
 pub noinline fn metalSerialWorkspace(replayed: bool, pending_frame: bool, banks: SerialWorkspaceObservation.Banks) void {
     var active = active_kernels;
     while (active) |scope| : (active = scope.previous) {
-        if (scope.metal_serial_workspace == null) scope.metal_serial_workspace = .{ .latest = banks };
+        if (scope.metal_serial_workspace == null) scope.metal_serial_workspace = .{};
         const value = &scope.metal_serial_workspace.?;
         value.latest = banks;
         if (replayed) value.successful_replays +|= 1 else value.successful_eager_calls +|= 1;

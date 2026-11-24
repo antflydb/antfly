@@ -23614,7 +23614,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, _: @import("../execution/cleanup_context.zig").Context, defer_arena: bool) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        const selection = audioExecutionSelection(self, key, inputs) orelse return null;
+        const observation = @import("../execution/runtime_observation.zig");
+        const selection = audioExecutionSelection(self, key, inputs) orelse {
+            if (observation.kernelObservationActive()) observation.metalSerialScheduleDecision(.selector_declined);
+            return null;
+        };
         const p = self.provider_impl;
         p.audio_schedule_clock += 1;
         const k = selection.key;
@@ -23631,25 +23635,41 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         const recurrent = p.audio_schedule_history.observe(k, p.audio_schedule_clock);
         if (entry == null) {
-            if (!recurrent) return null;
+            if (!recurrent) {
+                if (observation.kernelObservationActive()) observation.metalSerialScheduleDecision(.waiting_for_reuse);
+                return null;
+            }
             if (p.audio_schedules[victim]) |old| {
-                if (!old.disabled and p.audio_schedule_clock - old.stamp < 8) return null;
-                // A pending frame can retain the plan backing after an eviction.
-                // Keep its charge until the provider reaches a quiescent boundary.
-                if (old.chargedBackendBytes() != 0 and
-                    (metal_runtime.hasActiveFrame(p.raw_decode_runtime) or metal_runtime.hasSubmittedFrame(p.raw_decode_runtime))) return null;
+                // An in-flight frame can retain an evicted plan's backing.
+                if ((!old.disabled and p.audio_schedule_clock - old.stamp < 8) or
+                    (old.chargedBackendBytes() != 0 and
+                        (metal_runtime.hasActiveFrame(p.raw_decode_runtime) or metal_runtime.hasSubmittedFrame(p.raw_decode_runtime))))
+                {
+                    if (observation.kernelObservationActive()) observation.metalSerialScheduleDecision(.cache_slot_busy);
+                    return null;
+                }
             }
 
             self.data.prefetch.lock();
             defer self.data.prefetch.unlock();
-            const cache = if (self.data.tier_cache) |*v| v else return null;
+            const cache = if (self.data.tier_cache) |*v| v else {
+                if (observation.kernelObservationActive()) observation.metalSerialScheduleDecision(.cache_owner_unavailable);
+                return null;
+            };
             if (p.embeddinggemma2_cache_admission) |bound| {
-                if (bound != cache) return null;
+                if (bound != cache) {
+                    if (observation.kernelObservationActive()) observation.metalSerialScheduleDecision(.cache_owner_unavailable);
+                    return null;
+                }
             }
             _ = p.dropAudioSchedule(victim);
-            cache.reserve(.host, @sizeOf(audio_tape.Plan)) catch return null;
+            cache.reserve(.host, @sizeOf(audio_tape.Plan)) catch {
+                if (observation.kernelObservationActive()) observation.metalSerialScheduleDecision(.metadata_allocation_declined);
+                return null;
+            };
             const plan = std.heap.c_allocator.create(audio_tape.Plan) catch {
                 cache.noteRelease(.host, @sizeOf(audio_tape.Plan));
+                if (observation.kernelObservationActive()) observation.metalSerialScheduleDecision(.metadata_allocation_declined);
                 return null;
             };
             plan.* = .{ .key = k, .warmed = true, .linear_only = selection.policy & 8 != 0 };
@@ -23659,21 +23679,29 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         const plan = entry.?;
         plan.stamp = p.audio_schedule_clock;
-        if (plan.disabled) return null;
+        if (plan.disabled) {
+            if (observation.kernelObservationActive()) observation.metalSerialScheduleDecision(.disabled_schedule);
+            return null;
+        }
         if (!plan.warmed) {
             plan.warmed = true;
+            if (observation.kernelObservationActive()) observation.metalSerialScheduleDecision(.waiting_for_reuse);
             return null;
         }
         const cb = self.computeBackend();
         const start = @import("antfly_platform").time.monotonicNs();
         if (plan.eager_ns == 0) {
+            if (observation.kernelObservationActive()) observation.metalSerialScheduleDecision(.eager_reference);
             const out = try run(context, inputs);
             plan.eager_ns = @import("antfly_platform").time.monotonicNs() -| start;
             return out;
         }
         if (plan.ready) {
             try self.audioTryPrepare(plan, defer_arena);
-            if (defer_arena and !plan.prepared) return try run(context, inputs);
+            if (defer_arena and !plan.prepared) {
+                if (observation.kernelObservationActive()) observation.metalSerialScheduleDecision(.awaiting_preparation);
+                return try run(context, inputs);
+            }
             const replay = plan.selection.useReplay();
             var out: CT = undefined;
             const stats = audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_AUDIO_STATS");
@@ -23692,7 +23720,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const elapsed = @import("antfly_platform").time.monotonicNs() -| start;
             plan.selection.record(replay, elapsed);
             if (replay) plan.replay_ns = elapsed else plan.eager_ns = elapsed;
-            const observation = @import("../execution/runtime_observation.zig");
             if (observation.kernelObservationActive()) observation.metalSerialWorkspace(replay, metal_runtime.hasActiveFrame(p.raw_decode_runtime) or metal_runtime.hasSubmittedFrame(p.raw_decode_runtime), .{
                 .planned_output_bytes = plan.arena_recipe.outputs_bytes,
                 .planned_scratch_bytes = plan.arena_recipe.input_workspace_bytes,
@@ -23703,7 +23730,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (stats) std.debug.print("metal_audio_schedule replay={} replays={d} encode_ns={d} encoders={d} arena_bytes={d} input_workspace_bytes={d} backend_bytes={d} funded_arena={}\n", .{ replay, plan.replays, elapsed, metal_runtime.runtimeMemorySnapshot(p.raw_decode_runtime).compute_encoder_count -| before_encoders, plan.arena_size, plan.input_workspace_bytes, plan.chargedBackendBytes(), plan.arena_charge != null });
             return out;
         }
-        if (p.audio_schedule_clock < plan.retry_after) return try run(context, inputs);
+        if (p.audio_schedule_clock < plan.retry_after) {
+            if (observation.kernelObservationActive()) observation.metalSerialScheduleDecision(.learning_backoff);
+            return try run(context, inputs);
+        }
+        if (observation.kernelObservationActive()) observation.metalSerialScheduleDecision(.learning);
         var capture = audio_tape.Capture.init(plan, inputs);
         self.audio_capture = &capture;
         const out = run(context, inputs) catch |err| {
@@ -53337,13 +53368,22 @@ test "embeddinggemma2 Metal audio instruction schedule binds fresh inputs and re
         const result = (try cb.audioExecution(42, &.{ x, y }, &run, Run.call)) orelse try Run.call(&run, &.{ x, y });
         defer cb.free(result);
         _ = scope.finish();
-        if (request >= 4) {
-            try std.testing.expect(scope.metal_serial_workspace != null);
-            const measured = scope.metal_serial_workspace.?;
+        try std.testing.expect(scope.metal_serial_workspace != null);
+        const measured = scope.metal_serial_workspace.?;
+        if (request < 3) {
+            try std.testing.expect(measured.latest == null);
+            switch (request) {
+                0 => try std.testing.expectEqual(@as(u64, 1), measured.decisions.waiting_for_reuse),
+                1 => try std.testing.expectEqual(@as(u64, 1), measured.decisions.eager_reference),
+                2 => try std.testing.expectEqual(@as(u64, 1), measured.decisions.learning),
+                else => unreachable,
+            }
+        } else if (request >= 4) {
             try std.testing.expectEqual(@as(u64, 1), measured.successful_replays + measured.successful_eager_calls);
             try std.testing.expectEqual(@as(u64, 1), measured.callbacks_with_pending_frame);
-            try std.testing.expect(measured.latest.arena_backing_bytes >= measured.latest.planned_output_bytes);
-            try std.testing.expect(measured.latest.charged_backend_bytes >= measured.latest.arena_backing_bytes);
+            const banks = measured.latest.?;
+            try std.testing.expect(banks.arena_backing_bytes >= banks.planned_output_bytes);
+            try std.testing.expect(banks.charged_backend_bytes >= banks.arena_backing_bytes);
         }
         try cb.decoderRuntimeSubmitAndWaitFrame();
         const actual = try cb.toFloat32(result, a);

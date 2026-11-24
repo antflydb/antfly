@@ -92,6 +92,7 @@ pub const PendingInterval = struct {
         /// Sum of callback host wall time, excluding inter-phase waits.
         callback_wall_ns: ?u64 = null,
         native_assigned_dispatches: u64 = 0,
+        backend_callback_returns: observation.EntryReturns = .{},
         metal_encoded_dispatches: ?u64 = null,
         metal_vendor_encodes: ?u64 = null,
         metal_command_submissions: ?u64 = null,
@@ -112,6 +113,7 @@ pub const PendingInterval = struct {
             self.index_metadata_host_access_bytes +|= transfers.index_metadata_host_access_bytes;
             self.callback_wall_ns = sum(self.count, self.callback_wall_ns, wall_ns);
             self.native_assigned_dispatches +|= submission.native_assigned_dispatches;
+            self.backend_callback_returns.accumulate(submission.backend_entries.totals);
             self.metal_encoded_dispatches = sum(self.count, self.metal_encoded_dispatches, submission.metal_encoded_dispatches);
             self.metal_vendor_encodes = sum(self.count, self.metal_vendor_encodes, submission.metal_vendor_encodes);
             self.metal_command_submissions = sum(self.count, self.metal_command_submissions, submission.metal_command_submissions);
@@ -186,6 +188,7 @@ pub const StagePlacement = struct {
     pub const Reason = enum {
         resident_pair,
         resident_incremental,
+        resident_merged_decoder,
         dispatcher_host_only,
         no_source_context,
         foreign_context,
@@ -206,7 +209,7 @@ pub const DecoderRoute = struct {
     backend: @import("../backends/backends.zig").BackendType,
     encoder_storage: enum { host, resident },
     /// A provider-owned state may itself use host storage. This field names
-    /// the owner and makes the merged decoder's host-tensor ABI explicit.
+    /// the owner independently of encoder placement.
     cache_custody: enum { unavailable, none, merged_resident, native_runtime, compiled_runtime },
     native_allowed: bool,
     merged_allowed: bool,

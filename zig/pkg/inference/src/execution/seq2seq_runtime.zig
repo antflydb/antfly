@@ -18,6 +18,7 @@
 const std = @import("std");
 const backends = @import("../backends/backends.zig");
 const kv = @import("../graph/onnx_kv_cache.zig");
+const ops = @import("../ops/ops.zig");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 
 const sessions = @import("../backends/session.zig");
@@ -144,15 +145,27 @@ pub const State = struct {
     stage_inputs: []sessions.StageInput = &.{},
     logits_index: usize,
     /// Encoder buffers and mask are pinned by the enclosing generation request.
-    encoder: backends.Tensor,
+    encoder: sessions.StageInput,
     mask: []const i64,
     position: usize = 0,
     vocab_size: usize,
 
-    pub fn init(allocator: std.mem.Allocator, session: backends.Session, encoder: backends.Tensor, mask: []const i64, vocab_size: usize) !?State {
+    pub fn init(allocator: std.mem.Allocator, session: backends.Session, encoder: sessions.StageInput, mask: []const i64, vocab_size: usize) !?State {
         if (!qualified(session, vocab_size)) return null;
         const input_info = session.inputInfo();
         const output_info = session.outputInfo();
+        if (encoder == .resident) {
+            const value = encoder.resident;
+            const target = session.shared_compute_context.?.stableBackend();
+            if (value.backend != target or value.shape.len != 3 or value.shape[0] != 1 or
+                value.shape[1] <= 0 or value.shape[2] <= 0 or std.math.cast(usize, value.shape[1]) != mask.len)
+                return error.InvalidInputShape;
+            for (input_info) |info| {
+                if (!std.mem.eql(u8, info.name, "encoder_hidden_states")) continue;
+                for (value.shape, info.shape) |actual, declared| if (declared > 0 and actual != declared) return error.InvalidInputShape;
+                break;
+            }
+        }
         const roles = try allocator.alloc(InputRole, input_info.len);
         errdefer allocator.free(roles);
         for (input_info, roles) |info, *role| {
@@ -180,7 +193,10 @@ pub const State = struct {
             .session = planned,
             .roles = roles,
             .logits_index = logits_index,
-            .encoder = encoder.borrowedView("encoder_hidden_states"),
+            .encoder = switch (encoder) {
+                .host => |value| .{ .host = value.borrowedView("encoder_hidden_states") },
+                .resident => encoder,
+            },
             .mask = mask,
             .vocab_size = vocab_size,
         };
@@ -224,7 +240,7 @@ pub const State = struct {
         for (self.session.inputInfo(), self.roles, slots, self.stage_inputs) |info, *role, *slot, *binding| {
             binding.* = switch (role.*) {
                 .tokens => .{ .host = self.borrow(info, &token_shape, std.mem.sliceAsBytes(suffix.tokens)) },
-                .encoder => .{ .host = self.encoder },
+                .encoder => self.encoder,
                 .mask => .{ .host = self.borrow(info, &mask_shape, std.mem.sliceAsBytes(self.mask)) },
                 .cache_branch => .{ .host = self.borrow(info, info.shape, &branch) },
                 .past => |*past| if (slot.*) |*owned| resident: {
@@ -242,15 +258,9 @@ pub const State = struct {
         for (self.roles, updated) |role, *slot| switch (role) {
             .past => |past| {
                 const value = outputs.outputs[past.output_index];
-                if (try outputs.backend.tensorDType(value) != .f32) return error.InvalidDecoderOutput;
-                const shape = try outputs.backend.tensorShape(value, self.allocator);
-                defer self.allocator.free(shape);
-                if (shape.len != 4) return error.InvalidDecoderOutput;
-                const elements = try cacheElements(shape);
-                if (!fresh and past.cross and elements == 0) continue;
-                const want = [_]i64{ 1, past.empty_shape[1], @intCast(if (past.cross) self.mask.len else end), past.empty_shape[3] };
-                if (!std.mem.eql(i64, shape, &want)) return error.InvalidDecoderOutput;
-                const bytes = try std.math.mul(usize, elements, @sizeOf(f32));
+                const length = std.math.cast(i64, if (past.cross) self.mask.len else end) orelse return error.InvalidDecoderOutput;
+                const want = [_]i64{ 1, past.empty_shape[1], length, past.empty_shape[3] };
+                const bytes = (try residentCacheBytes(outputs.backend, value, &want, if (!fresh and past.cross) &past.empty_shape else null, self.allocator)) orelse continue;
                 slot.* = .{
                     .pin = try outputs.retainResources(self.allocator),
                     .input = .{ .value = value, .backend = outputs.backend, .estimated_bytes = bytes },
@@ -422,15 +432,78 @@ pub const State = struct {
         };
     }
 
+    /// The output contract already supplies the full shape. Ordinary
+    /// Native, Metal and CUDA tensors can attest it without a shape copy.
+    fn residentCacheBytes(backend: *const ops.ComputeBackend, value: ops.CT, expected: *const [4]i64, omitted: ?*const [4]i64, allocator: std.mem.Allocator) !?usize {
+        if (try backend.tensorDType(value) != .f32) return error.InvalidDecoderOutput;
+        if (try backend.tensorShapeMatches(value, expected)) |matches| {
+            if (matches) {
+                const elements = try cacheElements(expected);
+                if (omitted != null and elements == 0) return null;
+                return try std.math.mul(usize, elements, @sizeOf(f32));
+            }
+            const sentinel = omitted orelse return error.InvalidDecoderOutput;
+            if ((try backend.tensorShapeMatches(value, sentinel)) == true) return null;
+        }
+
+        // Compatibility providers and noncanonical empty cross outputs retain
+        // the prior rank, extent and emptiness checks.
+        const shape = try backend.tensorShape(value, allocator);
+        defer allocator.free(shape);
+        if (shape.len != expected.len) return error.InvalidDecoderOutput;
+        const elements = try cacheElements(shape);
+        if (omitted != null and elements == 0) return null;
+        if (!std.mem.eql(i64, shape, expected)) return error.InvalidDecoderOutput;
+        return try std.math.mul(usize, elements, @sizeOf(f32));
+    }
+
     fn cacheElements(shape: []const i64) !usize {
         var count: usize = 1;
         for (shape) |dim| {
-            if (dim < 0) return error.InvalidDecoderOutput;
-            count = try std.math.mul(usize, count, @intCast(dim));
+            const extent = std.math.cast(usize, dim) orelse return error.InvalidDecoderOutput;
+            count = try std.math.mul(usize, count, extent);
         }
         return count;
     }
 };
+
+test "resident seq2seq cache validates exact and omitted cross shapes without allocation" {
+    const Probe = struct {
+        shape: [4]i64,
+
+        fn dtype(_: *anyopaque, _: ops.CT) !backends.DType {
+            return .f32;
+        }
+        fn matches(raw: *anyopaque, _: ops.CT, expected: []const i64) !?bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return std.mem.eql(i64, &self.shape, expected);
+        }
+        fn copyShape(raw: *anyopaque, _: ops.CT, allocator: std.mem.Allocator) ![]i64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return allocator.dupe(i64, &self.shape);
+        }
+    };
+    var table = @import("../ops/native_compute.zig").vtable_impl;
+    table.tensorDType = Probe.dtype;
+    table.tensorShapeMatches = Probe.matches;
+    table.tensorShape = Probe.copyShape;
+    var probe: Probe = .{ .shape = .{ 1, 2, 3, 4 } };
+    const backend: ops.ComputeBackend = .{ .ptr = &probe, .vtable = &table };
+    const value: ops.CT = @ptrFromInt(8);
+    const expected = [4]i64{ 1, 2, 3, 4 };
+    const omitted = [4]i64{ 1, 2, 0, 4 };
+    const a = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectEqual(@as(?usize, 96), try State.residentCacheBytes(&backend, value, &expected, null, failing.allocator()));
+    probe.shape = omitted;
+    try std.testing.expectError(error.InvalidDecoderOutput, State.residentCacheBytes(&backend, value, &expected, null, failing.allocator()));
+    try std.testing.expectEqual(@as(?usize, null), try State.residentCacheBytes(&backend, value, &expected, &omitted, failing.allocator()));
+    probe.shape = .{ 1, 0, 3, 4 };
+    try std.testing.expectEqual(@as(?usize, null), try State.residentCacheBytes(&backend, value, &expected, &omitted, a));
+    table.tensorShapeMatches = null;
+    probe.shape = expected;
+    try std.testing.expectEqual(@as(?usize, 96), try State.residentCacheBytes(&backend, value, &expected, null, a));
+}
 
 const fixture_inputs = [_]backends.TensorInfo{
     .{ .name = "input_ids", .dtype = .i64, .shape = &.{ -1, -1 } },
@@ -561,6 +634,45 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
     try std.testing.expectEqualSlices(f32, &.{ 7, 8, 9, 10 }, next.logits);
     const state = if (decoder.incremental) |*value| value else return error.InvalidMergedDecoderFixture;
     const expected_cache: []const f32 = &.{ 3, 4, 5, 6, 7, 8, 9, 10 };
+    if (!require_independent) {
+        // Exercise the full producer/consumer path with a real imported
+        // encoder sharing the decoder's exact provider context.
+        var producer = ml.graph.Graph.init(a);
+        defer producer.deinit();
+        var encoder_builder = ml.graph.Builder.init(&producer);
+        const features = try encoder_builder.parameter("features", ml.graph.Shape.init(.f32, &.{ 1, 1, 4 }));
+        try producer.markOutput(try encoder_builder.absOp(features));
+        const encoder_model = try @import("onnx_graph").exportGraph(a, &producer, .{});
+        defer a.free(encoder_model);
+        try directory.dir.writeFile(std.testing.io, .{ .sub_path = "encoder.onnx", .data = encoder_model });
+        const encoder_path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", directory.sub_path[0..], "encoder.onnx" });
+        defer a.free(encoder_path);
+        var encoder_session = try @import("../backends/imported_onnx_session.zig").createSessionWithOptions(a, encoder_path, backend, .{ .shared_backend_ctx = session.shared_compute_context });
+        defer encoder_session.close();
+        const stages = @import("encoder_decoder_runtime.zig");
+        const control: Control = .{ .native_call_policy = .in_process };
+        const feature_input = hidden.borrowedView("features");
+        var encoded_resident = resident: {
+            var audit = @import("transfer_audit.zig").Audit{ .forbid_activation_readbacks = true };
+            try @import("transfer_audit.zig").begin(&audit);
+            defer @import("transfer_audit.zig").end();
+            break :resident try stages.encodeForIncrementalWithPermit(a, encoder_session, session, &.{feature_input}, null, control, null);
+        };
+        defer encoded_resident.deinit(a);
+        try std.testing.expect(encoded_resident == .resident);
+        var resident_decoder = try @import("decoder_stage.zig").Decoder.init(a, session, &encoded_resident, 1, &.{1}, 4, control);
+        defer resident_decoder.deinit();
+        const resident_route = diagnostics.snapshot().?.report.?.decoder_route.?;
+        try std.testing.expectEqual(.merged_incremental, resident_route.selected);
+        try std.testing.expectEqual(.resident, resident_route.encoder_storage);
+        try std.testing.expect(resident_decoder.incremental.?.encoder == .resident);
+        var resident_first = try resident_decoder.stepSuffix(.{ .position = 0, .tokens = &.{2} }, null, null);
+        defer resident_first.deinit();
+        try std.testing.expectEqualSlices(f32, first.logits, resident_first.logits);
+        var resident_next = try resident_decoder.stepSuffix(.{ .position = 1, .tokens = &.{5} }, null, null);
+        defer resident_next.deinit();
+        try std.testing.expectEqualSlices(f32, next.logits, resident_next.logits);
+    }
     if (backend == .native) {
         const slots = state.resident_slots orelse return error.MissingResidentResult;
         const cpu_cache = for (slots[0..state.roles.len]) |slot| {

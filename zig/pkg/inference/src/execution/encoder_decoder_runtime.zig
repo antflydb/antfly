@@ -59,7 +59,7 @@ pub const EncoderOutputs = union(enum) {
 /// reference once. Merged-cache decoders have a separate stateful contract.
 const PlacementReason = @import("diagnostics.zig").StagePlacement.Reason;
 
-pub fn residentPairPlacement(encoder: backends.Session, decoder: backends.Session, controlled: bool) PlacementReason {
+fn residentStageDecline(encoder: backends.Session, decoder: backends.Session, controlled: bool) ?PlacementReason {
     const source = encoder.shared_compute_context orelse return .no_source_context;
     if (decoder.shared_compute_context != source) return .foreign_context;
     if (encoder.vtable.runResident == null or decoder.vtable.runResidentInputs == null) return .missing_resident_entry;
@@ -67,6 +67,19 @@ pub fn residentPairPlacement(encoder: backends.Session, decoder: backends.Sessio
     if (source.stableBackend().vtable.sliceRows2D == null) return .missing_resident_row_selection;
     const outputs = encoder.outputInfo();
     if (outputs.len != 1 or outputs[0].dtype != .f32 or outputs[0].shape.len != 3) return .unsupported_encoder_signature;
+    return null;
+}
+
+fn compatibleResidentEncoderShape(produced: []const i64, consumed: []const i64) bool {
+    for (produced, consumed) |source, destination| {
+        if (source > 0 and destination > 0 and source != destination) return false;
+    }
+    return true;
+}
+
+pub fn residentPairPlacement(encoder: backends.Session, decoder: backends.Session, controlled: bool) PlacementReason {
+    if (residentStageDecline(encoder, decoder, controlled)) |reason| return reason;
+    const outputs = encoder.outputInfo();
     const logits = decoder.outputInfo();
     if (logits.len != 1 or logits[0].dtype != .f32 or logits[0].shape.len != 3) return .unsupported_decoder_signature;
     const inputs = decoder.inputInfo();
@@ -81,14 +94,29 @@ pub fn residentPairPlacement(encoder: backends.Session, decoder: backends.Sessio
             },
             .encoder_hidden_states => {
                 if (input.dtype != .f32 or input.shape.len != 3) return .unsupported_decoder_signature;
-                for (outputs[0].shape, input.shape) |produced, consumed| {
-                    if (produced > 0 and consumed > 0 and produced != consumed) return .unsupported_decoder_signature;
-                }
+                if (!compatibleResidentEncoderShape(outputs[0].shape, input.shape)) return .unsupported_decoder_signature;
                 hidden = true;
             },
         }
     }
     return if (tokens and hidden) .resident_pair else .unsupported_decoder_signature;
+}
+
+fn residentMergedPlacement(encoder: backends.Session, decoder: backends.Session, controlled: bool) ?PlacementReason {
+    const vocab = for (decoder.outputInfo()) |output| {
+        if (std.mem.eql(u8, output.name, "logits") and output.shape.len == 3 and output.shape[2] > 0) {
+            break std.math.cast(usize, output.shape[2]) orelse return null;
+        }
+    } else return null;
+    if (!@import("seq2seq_runtime.zig").qualified(decoder, vocab)) return null;
+    if (residentStageDecline(encoder, decoder, controlled)) |reason| return reason;
+    const produced = encoder.outputInfo()[0].shape;
+    for (decoder.inputInfo()) |input| {
+        if (std.mem.eql(u8, input.name, "encoder_hidden_states")) {
+            return if (compatibleResidentEncoderShape(produced, input.shape)) .resident_merged_decoder else .unsupported_decoder_signature;
+        }
+    }
+    return .unsupported_decoder_signature;
 }
 
 /// The optional synchronous dispatch capability has the existing run method;
@@ -117,7 +145,7 @@ const EncoderRoute = struct {
     placement: PlacementReason,
 
     fn isResident(self: EncoderRoute) bool {
-        return self.placement == .resident_pair or self.placement == .resident_incremental;
+        return self.placement == .resident_pair or self.placement == .resident_incremental or self.placement == .resident_merged_decoder;
     }
 };
 fn encoderRoute(encoder: backends.Session, decoder: backends.Session, dispatch: anytype, control: ?Control, intent: EncoderIntent) EncoderRoute {
@@ -133,6 +161,7 @@ fn encoderRoute(encoder: backends.Session, decoder: backends.Session, dispatch: 
         if (Incremental.qualify(encoder, decoder)) |receiver| {
             return .{ .dispatcher = dispatcher, .incremental = receiver, .placement = .resident_incremental };
         }
+        if (residentMergedPlacement(encoder, decoder, control != null)) |placement| return .{ .dispatcher = dispatcher, .placement = placement };
     }
     const placement = residentPairPlacement(encoder, decoder, control != null);
     return .{ .dispatcher = dispatcher, .placement = placement };

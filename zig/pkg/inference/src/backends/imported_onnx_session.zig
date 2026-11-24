@@ -7536,7 +7536,7 @@ fn qualifyT5CachedRows(a: std.mem.Allocator, session: Session, selected: []const
         defer for (rows[0..row_count]) |row| a.free(row);
         var timings: [3][4]u64 = undefined;
         for (timings[0..if (observe_replay) 3 else 2], 0..) |*measurements, repeat| {
-            var state = (try runtime.State.init(a, session, hidden, &.{ 1, 1, 1, 1 }, vocab)) orelse return error.UnqualifiedMergedDecoder;
+            var state = (try runtime.State.init(a, session, .{ .host = hidden }, &.{ 1, 1, 1, 1 }, vocab)) orelse return error.UnqualifiedMergedDecoder;
             defer state.deinit();
             for (measurements, 0..) |*elapsed, offset| {
                 const end = case.prefix + offset;
@@ -7579,7 +7579,7 @@ fn qualifyT5CachedRows(a: std.mem.Allocator, session: Session, selected: []const
             try std.testing.expect(replays != 0);
         }
         for (rows, 0..) |row, offset| {
-            var full = (try runtime.State.init(a, session, hidden, &.{ 1, 1, 1, 1 }, vocab)) orelse return error.UnqualifiedMergedDecoder;
+            var full = (try runtime.State.init(a, session, .{ .host = hidden }, &.{ 1, 1, 1, 1 }, vocab)) orelse return error.UnqualifiedMergedDecoder;
             defer full.deinit();
             const reference = try full.stepResident(.{ .position = 0, .tokens = tokens[0 .. case.prefix + offset] }, control);
             defer a.free(reference);

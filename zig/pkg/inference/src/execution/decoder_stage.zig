@@ -125,7 +125,10 @@ pub const Decoder = struct {
         errdefer if (native) |*value| value.deinit();
         var compiled = if (native == null and options.allow_native and host != null) try @import("resident_decoder.zig").Decoder.initEncoderDecoder(allocator, session, encoder_length, options.compiled_cache, control) else null;
         errdefer if (compiled) |*value| value.deinit();
-        const incremental = if (options.allow_merged and native == null and compiled == null and host != null) try merged.State.init(allocator, session, host.?, encoder_mask, vocab_size) else null;
+        const incremental = if (options.allow_merged and native == null and compiled == null)
+            try merged.State.init(allocator, session, try stages.decoderHiddenInput(encoder, encoder_mask.len), encoder_mask, vocab_size)
+        else
+            null;
         const full_prefix = if (native == null and compiled == null and incremental == null)
             try stages.DecoderInputPlan.init(allocator, try session.inputInfoForStage(.decoder))
         else

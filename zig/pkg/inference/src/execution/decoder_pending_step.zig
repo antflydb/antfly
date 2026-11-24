@@ -592,6 +592,7 @@ pub fn PipelinedStage(comptime Decoder: type) type {
 const PendingObservationFixture = struct {
     const diagnostics_mod = @import("diagnostics.zig");
     const observation_mod = @import("pending_observation.zig");
+    const runtime = @import("runtime_observation.zig");
     const ModelLifetime = @import("../backends/session.zig").Session.ModelLifetime;
     var destroyed: bool = false;
     fn destroy(_: *anyopaque) void {
@@ -607,6 +608,7 @@ const PendingObservationFixture = struct {
             if (@import("allocation_registry.zig").enabled() != self.observed) return error.PendingDisabledPathChanged;
             self.calls += 1;
             @import("transfer_audit.zig").upload(8);
+            runtime.backendEntry(ops.BackendKind.native, .linear, 1, .selected, null);
             return .{ .handle = 42 };
         }
         fn finish(raw: *anyopaque, handle: ops.PendingI32ScalarDownload) !i32 {
@@ -614,7 +616,11 @@ const PendingObservationFixture = struct {
             if (handle.handle != 42 or destroyed) return error.PendingOwnerRetiredBeforeAwait;
             if (@import("allocation_registry.zig").enabled() != self.observed) return error.PendingDisabledPathChanged;
             self.calls += 1;
-            if (self.fail) return error.PendingAwaitFailure;
+            if (self.fail) {
+                runtime.backendEntry(ops.BackendKind.native, .linear, 1, .failed, "PendingAwaitFailure");
+                return error.PendingAwaitFailure;
+            }
+            runtime.backendEntry(ops.BackendKind.native, .linear, 1, .selected, null);
             @import("transfer_audit.zig").download(4);
             return 7;
         }
@@ -622,6 +628,7 @@ const PendingObservationFixture = struct {
             const self: *@This() = @ptrCast(@alignCast(raw));
             std.debug.assert(handle.handle == 42 and !destroyed);
             self.cancelled += 1;
+            runtime.backendEntry(ops.BackendKind.native, .add, 2, .declined, null);
         }
     };
 };
@@ -680,6 +687,7 @@ test "pending readback observations retain publication only and separate submiss
                 try std.testing.expect(ready.pending_interval.?.whole_interval_counters == .unavailable);
                 const joined = ready.pending_interval.?.observed_phases.?;
                 try std.testing.expectEqual(@as(u64, 2), joined.count);
+                try std.testing.expectEqual(@as(u64, 2), joined.backend_callback_returns.native.successful);
                 try std.testing.expect(joined.callback_wall_ns.? >= ready.pending_interval.?.callback_wall_ns.?);
                 try std.testing.expect(ready.pending_interval.?.elapsed_host_wall_ns.? >= joined.callback_wall_ns.?);
                 try std.testing.expectEqual(@as(u64, 1), joined.uploads);
@@ -707,6 +715,10 @@ test "pending readback observations retain publication only and separate submiss
             if (mode == 1 or mode == 2) {
                 try std.testing.expect(latest.pending_interval.?.phase == .cancel);
                 try std.testing.expect(latest.pending_interval.?.completion == .unavailable);
+                const callbacks = latest.pending_interval.?.observed_phases.?.backend_callback_returns.native;
+                try std.testing.expectEqual(@as(u64, 1), callbacks.successful);
+                try std.testing.expectEqual(@as(u64, 1), callbacks.declined);
+                try std.testing.expectEqual(@as(u64, if (mode == 1) 1 else 0), callbacks.failed);
             }
         } else {
             try std.testing.expect(!F.destroyed);
