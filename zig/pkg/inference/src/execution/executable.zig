@@ -3235,6 +3235,48 @@ test "Native planned concat slice gather execute only declared banks across warm
     try std.testing.expectEqualSlices(f32, &.{ 5, 6, 4, 2, 3, 1 }, values);
 }
 
+test "Native planned integer concat and slice use assigned buffers and preserve full width" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    const DType = ml.graph.DType;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    inline for (.{ DType.i32, DType.i64 }) |dtype| {
+        const Int = if (dtype == .i64) i64 else i32;
+        const large: Int = if (dtype == .i64) 9_007_199_254_740_993 else 16_777_217;
+        var graph = ml.graph.Graph.init(a);
+        defer graph.deinit();
+        var b = ml.graph.Builder.init(&graph);
+        const x = try b.parameter("x", ml.graph.Shape.init(dtype, &.{ 2, 2 }));
+        const joined = try b.concat(x, x, 1);
+        const sliced = try b.sliceLastDim(joined, 1, 3);
+        try graph.markOutput(sliced);
+        var program = try ModelProgram.init(a, &graph, &.{.{ .name = "x", .node_id = x, .kind = .input }});
+        defer program.deinit();
+        var executable = try prepare(a, &program, &cb, .partitioned);
+        defer executable.deinit();
+        const node = program.id_map[x];
+        const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+        const routes = (try pool.prepareRoutes(&.{.{ .node_id = node, .value = .{ .imported_host = .{ .logical = program.graph.node(node).output_shape, .target = .native, .owned_ingress = true } } }})) orelse return error.MissingPreparedKernelRoute;
+        defer routes.release();
+        try std.testing.expect(routes.pool.completeOwnedPayload() != null);
+        try std.testing.expect(routes.pool.preparedKernelRoute(program.id_map[joined]) != null);
+        try std.testing.expect(routes.pool.preparedKernelRoute(program.id_map[sliced]) != null);
+        var values: [4]Int = .{ large, -large, large + 2, -(large + 2) };
+        const Tensor = @import("../backends/tensor.zig").Tensor;
+        const input = Tensor{ .data = std.mem.asBytes(&values), .dtype = if (dtype == .i64) .i64 else .i32, .shape = &.{ 2, 2 }, .name = "x", .allocator = a, .owns_data = false, .owns_shape = false };
+        var result = try executable.run(a, .{ .host_inputs = &.{.{ .node_id = node, .value = &input }}, .prepared_routes = routes, .collect_partition_stats = true });
+        defer result.deinit(&executable.runtime);
+        const output = (try cb.exportTensorData(result.outputs[0], a)) orelse return error.MissingIntegerOutput;
+        defer a.free(output.payload.bytes);
+        try std.testing.expectEqual(input.dtype, output.dtype);
+        try std.testing.expectEqualSlices(u8, std.mem.asBytes(&[_]Int{ -large, large, -(large + 2), large + 2 }), output.payload.bytes);
+        try std.testing.expectEqual(@as(u64, 2), result.stats.assigned_kernel_dispatches);
+    }
+}
+
 test "Native declared typed ingress executes exact gather and retains held outputs across index failure" {
     if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
     const a = std.testing.allocator;

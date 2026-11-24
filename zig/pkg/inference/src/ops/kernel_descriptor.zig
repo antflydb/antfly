@@ -755,8 +755,9 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
     const node = graph.node(id);
     const shape = node.output_shape;
     const count = shape.numElements() orelse return null;
-    const typed_slice = node.op == .slice and (shape.dtype == .i32 or shape.dtype == .i64);
-    if ((shape.dtype != .f32 and !typed_slice) or count <= 0 or count > std.math.maxInt(i32)) return null;
+    const integer_layout = (shape.dtype == .i32 or shape.dtype == .i64) and
+        (node.op == .slice or node.op == .concat_prim or node.op == .fused_concat);
+    if ((shape.dtype != .f32 and !integer_layout) or count <= 0 or count > std.math.maxInt(i32)) return null;
     const operation: Operation = switch (node.op) {
         .transpose, .broadcast_in_dim => blk: {
             if (node.num_inputs != 1 or node.inputs[0] == ml.graph.null_node or node.inputs[0] >= graph.nodeCount()) return null;
@@ -893,8 +894,8 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
             (input_shape.dtype == .f16 or input_shape.dtype == .bf16);
         const integer_indices = index == 1 and operation == .gather and
             (input_shape.dtype == .i32 or input_shape.dtype == .i64);
-        const typed_slice_input = typed_slice and index == 0 and input_shape.dtype == shape.dtype;
-        if ((input_shape.dtype != .f32 and !reduced_weight and !integer_indices and !typed_slice_input) or input_count <= 0 or input_count > std.math.maxInt(i32)) return null;
+        const integer_layout_input = integer_layout and input_shape.dtype == shape.dtype;
+        if ((input_shape.dtype != .f32 and !reduced_weight and !integer_indices and !integer_layout_input) or input_count <= 0 or input_count > std.math.maxInt(i32)) return null;
         if ((operation == .unary or operation == .binary or operation == .softmax or operation == .rope) and input_count != 1 and !std.mem.eql(i64, input_shape.dims[0..input_shape.rank()], shape.dims[0..shape.rank()])) return null;
         if ((operation == .unary or operation == .softmax or operation == .rope) and input_count != count) return null;
         result.input_shapes[index] = input_shape;

@@ -53135,7 +53135,17 @@ fn assignedKernelSupportedOp(_: *anyopaque, descriptor: *const ops.kernel_descri
 // Pure cold geometry. Backend policy belongs in separately named live checks;
 // authored calls attest this immutable descriptor before banking resources.
 fn assignedKernelGeometrySupported(descriptor: *const ops.kernel_descriptor.Descriptor) bool {
-    if (descriptor.output_shape.dtype != .f32) return descriptor.operation == .slice and (descriptor.output_shape.dtype == .i32 or descriptor.output_shape.dtype == .i64) and descriptor.input_shapes[0].dtype == descriptor.output_shape.dtype;
+    if (descriptor.output_shape.dtype != .f32) {
+        if (descriptor.output_shape.dtype != .i32 and descriptor.output_shape.dtype != .i64) return false;
+        const inputs: usize = switch (descriptor.operation) {
+            .slice => 1,
+            .concat => 2,
+            else => return false,
+        };
+        if (descriptor.input_count != inputs) return false;
+        for (descriptor.input_shapes[0..inputs]) |input| if (input.dtype != descriptor.output_shape.dtype) return false;
+        return true;
+    }
     return switch (descriptor.operation) {
         .paged_attention => |geometry| geometry.valid(descriptor),
         .dense_attention_prefix => |geometry| geometry.valid(descriptor),
@@ -53267,7 +53277,7 @@ fn runAssignedKernelImpl(comptime authored: bool, ctx: *anyopaque, request: ops.
     if (request.inputs.len != descriptor.input_count) return error.InvalidTensorShape;
     if (comptime !authored) if (descriptor.output_shape.dtype != .f32) {
         if (source_route != null) return error.InvalidPreparedKernelRoute;
-        return runAssignedTypedSlice(request);
+        return runAssignedIntegerLayout(request);
     };
     var dense_inputs: [3][]const f32 = @splat(&.{});
     var current_dense = authored and (descriptor.operation == .paged_attention or descriptor.operation == .dense_attention_prefix or descriptor.operation == .dense_attention_rows);
@@ -58423,32 +58433,48 @@ fn sliceBytesInto(input: []const u8, output: []u8, width: usize, plan: @import("
     } else for (0..plan.count) |index| @memcpy(output[index * width ..][0..width], input[plan.offset(index) * width ..][0..width]);
 }
 
-fn runAssignedTypedSlice(request: ops.kernel_descriptor.Invocation) !bool {
+fn runAssignedIntegerLayout(request: ops.kernel_descriptor.Invocation) !bool {
     const descriptor = request.descriptor;
-    if (descriptor.operation != .slice or descriptor.input_count != 1 or request.inputs.len != 1) return false;
     const dtype: tensor_mod.DType = switch (descriptor.output_shape.dtype) {
         .i32 => .i32,
         .i64 => .i64,
-        else => return false,
+        else => unreachable,
     };
-    if (descriptor.input_shapes[0].dtype != descriptor.output_shape.dtype) return false;
-    const input = toBuf(request.inputs[0]);
-    if (input.view_strides != null or input.view_base_offset != 0 or input.quantized_storage != null) return false;
-    const source = integerSource(request.inputs[0]) orelse return false;
-    if (source.dtype != dtype or !std.mem.eql(i64, source.shape, descriptor.input_shapes[0].dims[0..descriptor.input_shapes[0].rank()])) return false;
-    const plan = try descriptor.operation.slice.plan(descriptor.input_shapes[0], descriptor.output_shape);
-    if (plan.input_count != try integerTensorCount(source)) return error.InvalidTensorShape;
+    var inputs: [2][]const u8 = undefined;
+    for (request.inputs, 0..) |value, index| {
+        const input = toBuf(value);
+        if (input.view_strides != null or input.view_base_offset != 0 or input.quantized_storage != null) return false;
+        const source = integerSource(value) orelse return false;
+        const shape = descriptor.input_shapes[index];
+        if (source.dtype != dtype or !std.mem.eql(i64, source.shape, shape.dims[0..shape.rank()])) return false;
+        const count = shape.numElements() orelse return error.InvalidTensorShape;
+        if (try integerTensorCount(source) != count) return error.InvalidTensorShape;
+        inputs[index] = source.data;
+    }
+    const slice = if (descriptor.operation == .slice)
+        try descriptor.operation.slice.plan(descriptor.input_shapes[0], descriptor.output_shape)
+    else
+        null;
     const output_ct = request.output orelse return true;
     const target = toBuf(output_ct);
     const lease = target.physical_lease orelse return error.InvalidAssignedOutput;
     const output = integerSource(output_ct) orelse return error.InvalidAssignedOutput;
-    const bytes = try std.math.mul(usize, plan.count, dtype.byteSize());
+    const count = descriptor.output_shape.numElements() orelse return error.InvalidTensorShape;
+    const bytes = try std.math.mul(usize, std.math.cast(usize, count) orelse return error.InvalidTensorShape, dtype.byteSize());
     if (nativeTensorReadOnly(target)) return error.ReadOnlyPhysicalStorage;
     if (output.owns_data or target.view_strides != null or target.view_base_offset != 0 or output.dtype != dtype or !std.mem.eql(i64, output.shape, descriptor.output_shape.dims[0..descriptor.output_shape.rank()]) or output.data.len != bytes or bytes > lease.byte_size or @intFromPtr(output.data.ptr) % dtype.byteSize() != 0) return error.InvalidAssignedOutput;
     const base = std.mem.sliceAsBytes(toBuf(lease.tensor).data);
     if (@intFromPtr(output.data.ptr) != @intFromPtr(base.ptr) or bytes > base.len) return error.InvalidAssignedOutput;
-    if (kernel_geometry.byteRangesOverlap(@intFromPtr(source.data.ptr), source.data.len, @intFromPtr(output.data.ptr), output.data.len)) return error.InvalidAssignedAlias;
-    try sliceBytesInto(source.data, output.data, dtype.byteSize(), plan);
+    for (inputs[0..request.inputs.len]) |source| {
+        if (kernel_geometry.byteRangesOverlap(@intFromPtr(source.ptr), source.len, @intFromPtr(output.data.ptr), output.data.len)) return error.InvalidAssignedAlias;
+    }
+    if (slice) |plan| {
+        try sliceBytesInto(inputs[0], output.data, dtype.byteSize(), plan);
+    } else {
+        var geometry = descriptor.operation.concat;
+        geometry.inner = try std.math.mul(usize, geometry.inner, dtype.byteSize());
+        try concatContiguousInto(u8, inputs[0], inputs[1], output.data, geometry);
+    }
     return true;
 }
 
