@@ -169,8 +169,7 @@ pub fn syncJsonAlloc(a: Allocator, input: []const u8, output: []const u8, select
             .shard_id = if (range.doc_identity_shard_id != 0) range.doc_identity_shard_id else range.group_id,
             .range_id = if (range.doc_identity_range_id != 0) range.doc_identity_range_id else if (range.range_id != 0) range.range_id else range.group_id,
         };
-        const actual_identity = (try local.storage_db_doc_identity.loadNamespaceFromStore(&store)) orelse return error.IdentityNamespaceMismatch;
-        if (!actual_identity.eql(expected_identity)) return error.IdentityNamespaceMismatch;
+        try verifySourceNamespace(&backend, namespace, &store, expected_identity);
 
         const archive_path = try std.fmt.allocPrint(a, "{s}.afb", .{temporary});
         defer a.free(archive_path);
@@ -281,6 +280,25 @@ pub fn syncJsonAlloc(a: Allocator, input: []const u8, output: []const u8, select
     errdefer a.free(json);
     try publishOutput(io, temporary, output, staging.confirmPublishedFileDurability);
     return json;
+}
+
+fn verifySourceNamespace(backend: *backend_mod.Handle, namespace: []const u8, store: *local.storage_docstore.DocStore, expected: local.storage_db_doc_identity.Namespace) !void {
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    if (try local.storage_db_doc_identity.loadNamespaceTxn(&read)) |actual| {
+        if (!actual.eql(expected)) return error.IdentityNamespaceMismatch;
+        return;
+    }
+    // Lite persists document identity lazily on the first write. An empty
+    // namespace still needs a durable physical root for the catalog's group.
+    const root = if (backend.root_namespace_alias) |alias|
+        (if (std.mem.eql(u8, alias, namespace)) "root" else namespace)
+    else
+        namespace;
+    if (try backend.existingRootIncarnation(root) == null or
+        try read.hasPrefix(&.{local.storage_internal_keys.user_namespace}) or
+        try read.hasPrefix(&.{local.storage_internal_keys.identity_namespace}))
+        return error.IdentityNamespaceMismatch;
 }
 
 // A dangling symlink also occupies --out. The final rename arbitrates publication.
