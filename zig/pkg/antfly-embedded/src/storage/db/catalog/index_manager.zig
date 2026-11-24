@@ -295,8 +295,11 @@ const default_text_build_memory_target_bytes: usize = 96 * 1024 * 1024;
 const default_text_doc_scratch_retained_bytes: usize = 1024 * 1024;
 const force_merge_max_segments_at_once = 16;
 /// Level-0 folds: at least this many records, at most this many records
-/// and bytes per merge.
-const level0_fold_min_records = 4;
+/// and bytes per merge. A merge's cost is mostly fixed: folding a handful of
+/// one-write records at a time cost an 8-writer indexed bench more per write
+/// than encoding them. Below the minimum, level-0 records wait for the fold
+/// (writers merge at the producer cap regardless).
+const level0_fold_min_records = 32;
 const level0_fold_max_records = 256;
 const level0_fold_max_bytes: u64 = 8 * 1024 * 1024;
 
@@ -27607,6 +27610,18 @@ pub const IndexManager = struct {
             }
             break :level0 try picked.toOwnedSlice(self.alloc);
         };
+        // Waiting level-0 records stay out of the tiered and forced plans,
+        // which would otherwise fold them a few at a time.
+        if (level0_plan == null) {
+            var kept: usize = 0;
+            for (infos.items) |info| {
+                if (persistent_mod.isL0SegmentId(snap.segments[info.index].id)) continue;
+                infos.items[kept] = info;
+                kept += 1;
+            }
+            infos.shrinkRetainingCapacity(kept);
+            if (infos.items.len < 2) return null;
+        }
         const planned = level0_plan orelse (try policy.plan(self.alloc, infos.items)) orelse blk: {
             // The tiered policy found nothing to merge (for example every
             // eligible segment floors to the same effective size under
@@ -27616,7 +27631,9 @@ pub const IndexManager = struct {
             // segments so producer admission always has a merge in flight to
             // wait on instead of retrying TextMergeBackpressureTimeout
             // against a scheduler that gave up.
-            if (snap.segments.len <= policy.max_segments_per_tier) return null;
+            // Count only what the plan may take: waiting level-0 records would
+            // otherwise keep re-draining the same few merged segments.
+            if (infos.items.len <= policy.max_segments_per_tier) return null;
             self.text_merge_scheduler.forced_drains += 1;
             break :blk try text_index_maintenance.planForceDrainFromInfos(
                 self.alloc,
