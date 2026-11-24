@@ -325,8 +325,8 @@ objects. To synchronize several tables, supply a definition for each table:
 ```
 
 The empty objects above show only the structure; each schema and index definition
-must be complete. Use `--tables docs,notes` to select several tables, or omit both
-selectors to include every source table. Missing definitions, duplicate selections,
+must be complete. Use `--table` for a single literal name, `--tables docs,notes`
+for a comma-separated list, or omit both selectors to include every source table. Missing definitions, duplicate selections,
 and unsupported selected tables fail the entire operation. Up to 256 tables are
 supported, with document and expanded-byte limits shared across the selection.
 
@@ -339,7 +339,7 @@ from it disappear, and newly computed vectors are included even if document text
 is unchanged. It does not merge with other destination tables. A caller that owns
 only part of a larger instance must not replace that instance with this output.
 
-`--out` must be a new path. The input and any existing output are never
+`--out` must be a new path ending in `.aflite`. The input and any existing output are never
 overwritten. All selected tables must succeed before the output is published.
 An existing directory entry (including a dangling symlink) is rejected before
 reading the source. A final atomic publication check also prevents concurrent

@@ -32,6 +32,7 @@ pub const Options = struct {
     max_expanded_bytes: u64 = 1024 * 1024 * 1024,
     max_document_bytes: usize = 16 * 1024 * 1024,
     max_documents: u64 = 250000,
+    selection_is_literal: bool = false,
 };
 
 const Definition = struct {
@@ -43,7 +44,7 @@ const Definition = struct {
 // map supplies a separate trusted schema/index policy for each table; the
 // original single-table definition is still accepted for one selected table.
 pub fn syncJsonAlloc(a: Allocator, input: []const u8, output: []const u8, selection: []const u8, definition_json: []const u8, options: Options) ![]u8 {
-    if (input.len == 0 or output.len == 0 or selection.len > 64 * 1024 or definition_json.len > 1024 * 1024 or options.max_input_bytes == 0 or options.max_expanded_bytes == 0)
+    if (input.len == 0 or !backend_mod.isAflitePath(output) or selection.len > 64 * 1024 or definition_json.len > 1024 * 1024 or options.max_input_bytes == 0 or options.max_expanded_bytes == 0)
         return error.InvalidArguments;
     var definitions = try std.json.parseFromSlice(Value, a, definition_json, .{});
     defer definitions.deinit();
@@ -52,7 +53,10 @@ pub fn syncJsonAlloc(a: Allocator, input: []const u8, output: []const u8, select
     if (named != null and (definitions.value.object.count() != 1 or named.? != .object or named.?.object.count() == 0 or named.?.object.count() > 256)) return error.InvalidBackupRequest;
     var names: std.ArrayList([]const u8) = .empty;
     defer names.deinit(a);
-    if (selection.len != 0) {
+    if (options.selection_is_literal) {
+        if (selection.len == 0 or selection.len > 256) return error.InvalidArguments;
+        try names.append(a, selection);
+    } else if (selection.len != 0) {
         var it = std.mem.splitScalar(u8, selection, ',');
         while (it.next()) |part| {
             const name = std.mem.trim(u8, part, " \t");
@@ -171,6 +175,11 @@ pub fn syncJsonAlloc(a: Allocator, input: []const u8, output: []const u8, select
             return err;
         };
         try writer.end();
+        const spool_path = try std.fmt.allocPrint(a, "{s}.spool", .{temporary});
+        defer a.free(spool_path);
+        const spool = try std.Io.Dir.cwd().createFile(io, spool_path, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
+        defer std.Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+        defer spool.close(io);
         var expanded_bytes: u64 = 0;
 
         {
@@ -189,21 +198,28 @@ pub fn syncJsonAlloc(a: Allocator, input: []const u8, output: []const u8, select
                 defer a.free(config.config_json);
                 try target.db.addIndex(config);
             }
-            var copy: Copy = .{ .a = a, .target = &target, .definition = definition, .options = table_options };
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            var copy: Copy = .{
+                .a = a,
+                .directory = arena.allocator(),
+                .io = io,
+                .spool = spool,
+                .target = &target,
+                .definition = definition,
+                .options = table_options,
+            };
             defer copy.decoder.deinit(a);
-            const inspection_options: portable.FileInspectionOptions = .{
-                .metadata_first = true,
+            // The exporter writes metadata first. Validate the file once and
+            // stage the data in one replay, even when vectors precede their rows.
+            const inspection = try portable.inspectPortableFileBlocks(a, io, archive, .{
                 .max_input_bytes = remaining_expanded,
                 .max_logical_bytes = remaining_expanded,
                 .max_metadata_bytes = 16 * 1024 * 1024,
                 .max_document_bytes = options.max_document_bytes,
-            };
-            const inspection = try portable.inspectPortableFileBlocks(a, io, archive, inspection_options, &copy, Copy.visit);
+            }, &copy, Copy.visit);
             expanded_bytes = @max(inspection.size_bytes, inspection.logical_bytes);
-            // Large archives can flush an artifact block before its document block.
-            // Restore documents first, then validate/copy vectors against those keys.
-            copy.vectors_only = true;
-            _ = try portable.inspectPortableFileBlocks(a, io, archive, inspection_options, &copy, Copy.visit);
+            try copy.restoreDocuments();
             try target.db.runUntilIdle();
             try target.db.sync(true);
             try target.db.syncIndexes(true);
@@ -296,7 +312,6 @@ fn openTableDestination(a: Allocator, path: []const u8, create: bool, index: usi
     defer a.free(namespace);
     var options: db_mod.OpenOptions = .{
         .open_mode = .writer,
-        .external_derived_checkpoints = false,
         .identity_namespace = identity,
         .online_source_authority = .native,
     };
@@ -334,53 +349,67 @@ fn validateDefinition(definition: Definition) !void {
 }
 
 const Copy = struct {
+    const Span = struct {
+        offset: u64,
+        len: usize,
+
+        fn read(self: Span, comptime T: type, a: Allocator, io: std.Io, file: std.Io.File) ![]T {
+            const values = try a.alloc(T, @divExact(self.len, @sizeOf(T)));
+            errdefer a.free(values);
+            if (try file.readPositionalAll(io, std.mem.sliceAsBytes(values), self.offset) != self.len)
+                return error.UnexpectedEndOfFile;
+            return values;
+        }
+    };
+
+    const Vector = struct {
+        name: []const u8,
+        values: Span,
+        next: ?*Vector,
+    };
+
     a: Allocator,
+    directory: Allocator,
+    io: std.Io,
+    spool: std.Io.File,
     target: *connection.Connection,
     definition: Definition,
     options: Options,
     decoder: portable.InspectionDocumentDecoder = .{},
+    document_blocks: std.ArrayList(Span) = .empty,
+    pending_vectors: std.StringHashMapUnmanaged(*Vector) = .empty,
+    spool_size: u64 = 0,
     documents: u64 = 0,
     vectors: u64 = 0,
-    vectors_only: bool = false,
+    version_floor: u64 = 0,
+
+    fn stage(self: *Copy, bytes: []const u8) !Span {
+        const offset = self.spool_size;
+        self.spool_size = std.math.add(u64, offset, bytes.len) catch return error.BackupExpansionLimitExceeded;
+        try self.spool.writePositionalAll(self.io, bytes, offset);
+        return .{ .offset = offset, .len = bytes.len };
+    }
 
     fn visit(self: *Copy, kind: codec.BlockType, payload: []const u8) !void {
         switch (kind) {
             .metadata_batch => {
-                if (self.vectors_only) return;
                 try self.decoder.metadataLimited(self.a, payload, 16 * 1024 * 1024);
                 var reader = try codec.KeyValueBatchReader.init(payload);
                 while (try reader.next()) |entry| {
+                    if (std.mem.eql(u8, entry.key, local.storage_ttl.document_version_watermark_key)) {
+                        if (entry.value.len != 8) return error.InvalidBackupRequest;
+                        self.version_floor = std.mem.readInt(u64, entry.value[0..8], .little);
+                    }
                     if (std.mem.endsWith(u8, entry.key, ":enrichments") or std.mem.endsWith(u8, entry.key, ":resolvers")) {
                         if (!try emptyArray(self.a, entry.value)) return error.InvalidBackupRequest;
                     }
                 }
             },
             .document_batch => {
-                if (self.vectors_only) return;
-                const entries = try codec.decodeDocumentBatchBorrowed(self.a, payload);
-                defer self.a.free(entries);
-                for (entries) |entry| {
-                    if (self.documents == self.options.max_documents or entry.value_flags & codec.doc_value_flag_relational_row != 0) return error.BackupInputLimitExceeded;
-                    const json = try self.decoder.documentJsonLimitedAlloc(self.a, entry, self.options.max_document_bytes);
-                    defer self.a.free(json);
-                    // Batch input has reserved write directives. Stored data
-                    // must not be reinterpreted as a request to create edges
-                    // or artifacts while rebuilding the destination.
-                    var document = try std.json.parseFromSlice(Value, self.a, json, .{});
-                    defer document.deinit();
-                    if (document.value != .object or document.value.object.contains("_edges") or document.value.object.contains("_embeddings")) return error.InvalidBackupRequest;
-                    const existing = try self.target.db.lookup(self.a, entry.key, .{});
-                    if (existing) |value| {
-                        var owned = value;
-                        owned.deinit(self.a);
-                        return error.InvalidBackupRequest;
-                    }
-                    try self.target.db.batch(.{ .writes = &.{.{ .key = entry.key, .value = json }}, .sync_level = .write });
-                    self.documents += 1;
-                }
+                const span = try self.stage(payload);
+                try self.document_blocks.append(self.directory, span);
             },
             .embedding_batch => {
-                if (!self.vectors_only) return;
                 const batch = try codec.decodeEmbeddingBatch(self.a, payload);
                 defer {
                     self.a.free(batch.index_name);
@@ -390,10 +419,9 @@ const Copy = struct {
                     }
                     self.a.free(batch.entries);
                 }
-                for (batch.entries) |entry| try self.copyVector(batch.index_name, entry.doc_key, entry.vector);
+                for (batch.entries) |entry| try self.stageVector(batch.index_name, entry.doc_key, entry.vector);
             },
             .artifact_batch => {
-                if (!self.vectors_only) return;
                 var reader = try codec.KeyValueBatchReader.init(payload);
                 while (try reader.next()) |entry| {
                     var ref = (try local.storage_db_artifact_ids.decodeArtifactPublicIdAlloc(self.a, entry.key)) orelse return error.InvalidBackupRequest;
@@ -401,7 +429,7 @@ const Copy = struct {
                     if (ref.kind != .embedding or ref.chunk_id != null or ref.window_index != null or ref.unit_id != null or ref.source != null or ref.revision != null or ref.derivation_revision != null) return error.InvalidBackupRequest;
                     const vector = try local.storage_db_enrichment_artifact_codec.decodeDenseEmbeddingAlloc(self.a, entry.value);
                     defer self.a.free(vector);
-                    try self.copyVector(ref.name, ref.document_id, vector);
+                    try self.stageVector(ref.name, ref.document_id, vector);
                 }
             },
             // Framing and source identities are verified, never installed.
@@ -410,50 +438,96 @@ const Copy = struct {
         }
     }
 
-    fn copyVector(self: *Copy, name: []const u8, doc_key: []const u8, vector: []const f32) !void {
-        const index = self.definition.indexes.object.get(name) orelse return error.InvalidBackupRequest;
-        const dims = index.object.get("dimension") orelse return error.InvalidBackupRequest;
+    fn stageVector(self: *Copy, name: []const u8, doc_key: []const u8, vector: []const f32) !void {
+        const index = self.definition.indexes.object.getEntry(name) orelse return error.InvalidBackupRequest;
+        const dims = index.value_ptr.object.get("dimension") orelse return error.InvalidBackupRequest;
         if (vector.len != dims.integer) return error.InvalidBackupRequest;
         for (vector) |v| if (!std.math.isFinite(v)) return error.InvalidBackupRequest;
-        var doc = (try self.target.db.lookup(self.a, doc_key, .{})) orelse return error.InvalidBackupRequest;
-        defer doc.deinit(self.a);
-        const key = try local.storage_internal_keys.embeddingArtifactKeyForDocumentAlloc(self.a, doc_key, name);
-        defer self.a.free(key);
-        const prior = self.target.db.core.store.get(self.a, key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
+        const group = try self.pending_vectors.getOrPut(self.directory, doc_key);
+        if (!group.found_existing) group.key_ptr.* = try self.directory.dupe(u8, doc_key);
+        const record = try self.directory.create(Vector);
+        record.* = .{
+            .name = index.key_ptr.*,
+            .values = try self.stage(std.mem.sliceAsBytes(vector)),
+            .next = if (group.found_existing) group.value_ptr.* else null,
         };
-        if (prior) |bytes| {
-            self.a.free(bytes);
-            return error.InvalidBackupRequest;
+        group.value_ptr.* = record;
+        self.vectors += 1;
+    }
+
+    fn restoreDocuments(self: *Copy) !void {
+        var versions: std.StringHashMapUnmanaged(u64) = .empty;
+        defer versions.deinit(self.a);
+        var ttl_sources: std.StringHashMapUnmanaged(i128) = .empty;
+        defer ttl_sources.deinit(self.a);
+        for (self.document_blocks.items) |span| {
+            const payload = try span.read(u8, self.a, self.io, self.spool);
+            defer self.a.free(payload);
+            const entries = try codec.decodeDocumentBatchBorrowed(self.a, payload);
+            defer self.a.free(entries);
+            for (entries) |entry| {
+                versions.clearRetainingCapacity();
+                ttl_sources.clearRetainingCapacity();
+                try versions.put(self.a, entry.key, entry.timestamp_ns);
+                if (entry.ttl_source_ns) |source| {
+                    try ttl_sources.put(self.a, entry.key, source);
+                } else if (entry.timestamp_ns != 0) {
+                    try ttl_sources.put(self.a, entry.key, entry.timestamp_ns);
+                }
+                try self.restoreDocument(entry, &versions, &ttl_sources);
+            }
         }
+        if (self.pending_vectors.count() != 0) return error.InvalidBackupRequest;
+        // A table with only deleted rows can still carry a version floor.
+        if (self.version_floor != 0) {
+            var bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &bytes, self.version_floor, .little);
+            try self.target.db.core.store.put(local.storage_ttl.document_version_watermark_key, &bytes);
+        }
+    }
+
+    fn restoreDocument(self: *Copy, entry: codec.DocumentEntry, versions: *const std.StringHashMapUnmanaged(u64), ttl_sources: *const std.StringHashMapUnmanaged(i128)) !void {
+        if (self.documents == self.options.max_documents or entry.value_flags & codec.doc_value_flag_relational_row != 0)
+            return error.BackupInputLimitExceeded;
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
         const a = arena.allocator();
-        var document = try std.json.parseFromSliceLeaky(Value, a, doc.json, .{});
-        var embeddings: Value = .{ .object = .empty };
-        // A document may have vectors in more than one caller-owned index.
-        // Preserve previously copied vectors when submitting its next mutation.
-        var it = self.definition.indexes.object.iterator();
-        while (it.next()) |entry| {
-            const index_name = entry.key_ptr.*;
-            if (!entry.value_ptr.object.contains("dimension")) continue;
-            const values = if (std.mem.eql(u8, index_name, name)) vector else existing: {
-                const other_key = try local.storage_internal_keys.embeddingArtifactKeyForDocumentAlloc(a, doc_key, index_name);
-                const bytes = self.target.db.core.store.get(a, other_key) catch |err| switch (err) {
-                    error.NotFound => continue,
-                    else => return err,
-                };
-                break :existing try local.storage_db_enrichment_artifact_codec.decodeDenseEmbeddingAlloc(a, bytes);
-            };
-            var array: Value = .{ .array = std.json.Array.init(a) };
-            for (values) |v| try array.array.append(.{ .float = @floatCast(v) });
-            try embeddings.object.put(a, index_name, array);
+        const json = try self.decoder.documentJsonLimitedAlloc(a, entry, self.options.max_document_bytes);
+        var document = try std.json.parseFromSliceLeaky(Value, a, json, .{});
+        // Reserved write directives are only added from validated vector records.
+        if (document != .object or document.object.contains("_edges") or document.object.contains("_embeddings"))
+            return error.InvalidBackupRequest;
+        const stored_key = try local.storage_internal_keys.documentKeyAlloc(a, entry.key);
+        if (self.target.db.core.store.get(a, stored_key)) |_| {
+            return error.InvalidBackupRequest;
+        } else |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
         }
-        try document.object.put(a, "_embeddings", embeddings);
-        const value = try std.json.Stringify.valueAlloc(a, document, .{});
-        try self.target.db.batch(.{ .writes = &.{.{ .key = doc_key, .value = value }}, .sync_level = .write });
-        self.vectors += 1;
+
+        var value = json;
+        if (self.pending_vectors.fetchRemove(entry.key)) |group| {
+            var embeddings: Value = .{ .object = .empty };
+            var next: ?*Vector = group.value;
+            while (next) |vector| : (next = vector.next) {
+                if (embeddings.object.contains(vector.name)) return error.InvalidBackupRequest;
+                const values = try vector.values.read(f32, a, self.io, self.spool);
+                var array: Value = .{ .array = std.json.Array.init(a) };
+                try array.array.ensureTotalCapacity(values.len);
+                for (values) |v| array.array.appendAssumeCapacity(.{ .float = @floatCast(v) });
+                try embeddings.object.put(a, vector.name, array);
+            }
+            try document.object.put(a, "_embeddings", embeddings);
+            value = try std.json.Stringify.valueAlloc(a, document, .{});
+        }
+        try self.target.db.batchInternal(.{ .writes = &.{.{ .key = entry.key, .value = value }}, .sync_level = .write }, null, .{
+            .restore_timestamps = versions,
+            .restore_ttl_sources = ttl_sources,
+            .restore_document_version_floor = self.version_floor,
+            .preserve_logical_values = true,
+        });
+        self.version_floor = 0;
+        self.documents += 1;
     }
 };
 
@@ -540,6 +614,13 @@ fn createTestSource(a: Allocator, path: []const u8, producer: bool) !void {
         .{ .key = "two", .value = "{\"content\":\"keyword only record\"}" },
     }, .sync_level = .write });
     try source.db.sync(true);
+    const ttl_one = try local.storage_internal_keys.ttlKeyAlloc(a, "one");
+    defer a.free(ttl_one);
+    const ttl_two = try local.storage_internal_keys.ttlKeyAlloc(a, "two");
+    defer a.free(ttl_two);
+    const historical = try local.storage_ttl.encodeTimestampAlloc(a, 1234, -42);
+    defer a.free(historical);
+    try source.db.core.store.putBatch(&.{.{ .key = ttl_one, .value = historical }}, &.{ttl_two});
     if (producer) try source.db.core.store.putBatch(&.{.{ .key = "\x00\x00__metadata__:enrichments", .value = "[{\"name\":\"hidden\",\"kind\":\"chunk\",\"source_field\":\"content\"}]" }}, &.{});
     const identity = connection.embeddedRootIdentity();
     const namespace = try std.fmt.allocPrint(a, "group-{d}/table-db", .{identity.shard_id});
@@ -591,6 +672,9 @@ test "data sync preserves documents and partial external vectors without source 
     try std.testing.expectEqualStrings(&before, &try fileDigest(io, source, (try source.stat(io)).size));
     var result = try openDestination(a, output, false);
     defer result.close();
+    try std.testing.expectEqual(@as(?u64, 1234), try local.storage_ttl.readTimestamp(result.db.core.store, a, "one"));
+    try std.testing.expectEqual(@as(?i128, -42), try local.storage_ttl.readSourceTimestamp(result.db.core.store, a, "one"));
+    try std.testing.expectEqual(@as(?u64, null), try local.storage_ttl.readTimestamp(result.db.core.store, a, "two"));
     try std.testing.expect(result.db.core.index_manager.vectorBlockReadyForDenseIndex("vectors"));
     const stats = try result.db.stats(a);
     defer local.storage_db_types.freeDBStats(a, stats);
@@ -689,7 +773,7 @@ test "data sync fails closed on limits corruption and existing outputs" {
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(io, output, .{}));
 }
 
-fn addSecondTestTable(a: Allocator, path: []const u8) !void {
+fn addSecondTestTable(a: Allocator, path: []const u8, table_name: []const u8) !void {
     var source = try openTableDestination(a, path, false, 1);
     defer source.close();
     try source.db.setSchemaJson(a, test_schema);
@@ -707,7 +791,7 @@ fn addSecondTestTable(a: Allocator, path: []const u8) !void {
     var catalog = try metadata.RaftApplyStore.init(a, .{ .root_dir = "", .borrowed_store = try source.backend.runtimeStoreForNamespace("system/metadata") });
     defer catalog.deinit();
     try catalog.updateStandaloneCatalog(local.common_group_ids.main_metadata_group_id, try catalog.standaloneRevision(), .{
-        .tables = &.{.{ .table_id = identity.table_id, .name = "other", .schema_json = test_schema, .indexes_json = test_indexes, .desired_replica_count = 1 }},
+        .tables = &.{.{ .table_id = identity.table_id, .name = table_name, .schema_json = test_schema, .indexes_json = test_indexes, .desired_replica_count = 1 }},
         .ranges = &.{.{ .table_id = identity.table_id, .group_id = identity.shard_id, .range_id = identity.range_id, .doc_identity_shard_id = identity.shard_id, .doc_identity_range_id = identity.range_id, .start_key = "" }},
     });
 }
@@ -722,7 +806,7 @@ test "data sync stages all or selected tables atomically with aggregate limits" 
     const input = try std.fs.path.join(a, &.{ root, "source.aflite" });
     defer a.free(input);
     try createTestSource(a, input, false);
-    try addSecondTestTable(a, input);
+    try addSecondTestTable(a, input, "other");
     const definitions = "{\"tables\":{\"records\":" ++ test_definition ++ ",\"other\":" ++ test_definition ++ "}}";
     for ([_][]const u8{ "", "records,other", "other" }, 0..) |selection, run| {
         const output = try std.fmt.allocPrint(a, "{s}/result-{d}.aflite", .{ root, run });
@@ -752,6 +836,26 @@ test "data sync stages all or selected tables atomically with aggregate limits" 
     const missing = "{\"tables\":{\"records\":" ++ test_definition ++ "}}";
     try std.testing.expectError(error.InvalidBackupRequest, syncJsonAlloc(a, input, output, "records,other", missing, .{}));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(io, output, .{}));
+}
+
+test "data sync selects a literal table name containing a comma" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const input = try std.fs.path.join(a, &.{ root, "source.aflite" });
+    defer a.free(input);
+    const output = try std.fs.path.join(a, &.{ root, "result.aflite" });
+    defer a.free(output);
+    try createTestSource(a, input, false);
+    try addSecondTestTable(a, input, "records,other");
+    const report = try syncJsonAlloc(a, input, output, "records,other", test_definition, .{ .selection_is_literal = true });
+    defer a.free(report);
+    var parsed = try std.json.parseFromSlice(Value, a, report, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("records,other", parsed.value.object.get("output").?.object.get("table").?.string);
 }
 
 test "data sync rejects occupied output entries before opening the source" {

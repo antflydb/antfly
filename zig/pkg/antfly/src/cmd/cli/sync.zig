@@ -36,10 +36,10 @@ pub fn run(a: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !
         cli.output.notice("{s}", .{usage});
         return;
     }
-    validate(opts) catch return cli.argumentError("sync requires --input, a new --out path, and --definition; use at most one table selector", .{});
+    validate(opts) catch return cli.argumentError("sync requires --input, a new .aflite --out path, and --definition; use at most one table selector", .{});
     const definition = try cli.readFileAlloc(io, a, opts.definition.?, 1024 * 1024);
     defer a.free(definition);
-    const report = staging.syncDataJsonAlloc(a, opts.input.?, opts.output.?, opts.table orelse opts.tables orelse "", definition, opts.max_input_bytes, opts.max_expanded_bytes) catch |err| {
+    const report = staging.syncDataJsonAlloc(a, opts.input.?, opts.output.?, opts.table orelse opts.tables orelse "", opts.table != null, definition, opts.max_input_bytes, opts.max_expanded_bytes) catch |err| {
         if (err == error.DurabilityOutcomeUnknown) {
             const hint = "Sync output may already have been published, but its durability could not be confirmed. Inspect --out before retrying; do not assume publication failed.";
             if (cli.output.isAgent()) {
@@ -91,6 +91,7 @@ fn validate(opts: Args) !void {
     for ([_]?[]const u8{ opts.input, opts.output, opts.definition }) |value| {
         if (value == null or value.?.len == 0) return error.InvalidSyncArguments;
     }
+    if (!std.mem.endsWith(u8, opts.output.?, ".aflite")) return error.InvalidSyncArguments;
     if (opts.max_input_bytes == 0 or opts.max_expanded_bytes == 0 or
         (opts.table != null and opts.tables != null)) return error.InvalidSyncArguments;
     if (opts.table) |name| if (name.len == 0) return error.InvalidSyncArguments;
@@ -104,7 +105,7 @@ pub const usage =
     \\  Stages a complete one-way replacement from documents and existing external dense vectors.
     \\  Omit table selection to include all source tables. Tables must be in default.public.
     \\  The caller supplies schema/index definitions; source jobs and authority are excluded.
-    \\  --out must be new. The source and any existing output are never overwritten.
+    \\  --out must be a new .aflite path. The source and any existing output are never overwritten.
     \\  The destination owner validates and activates this whole file, preserving its identity and grants.
     \\  Activation replaces the complete selected data, including deletions and vector-only updates.
     \\  No network connection, incremental merge, or running-server mutation is performed.
@@ -124,6 +125,9 @@ test "sync requires offline paths and a trusted definition with optional selecti
     try std.testing.expectError(error.InvalidSyncArguments, validate(opts));
     opts.tables = null;
     try validate(opts);
+    opts.output = "extensionless";
+    try std.testing.expectError(error.InvalidSyncArguments, validate(opts));
+    opts.output = "new.aflite";
     opts.definition = null;
     try std.testing.expectError(error.InvalidSyncArguments, validate(opts));
     try std.testing.expectError(error.InvalidSyncArguments, validate(.{}));

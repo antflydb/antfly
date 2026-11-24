@@ -193,6 +193,7 @@ pub const DataSyncContext = extern struct {
     output_len: usize,
     table_ptr: [*]const u8,
     table_len: usize,
+    selection_is_literal: bool,
     definition_ptr: [*]const u8,
     definition_len: usize,
     max_input_bytes: u64,
@@ -202,8 +203,8 @@ pub const DataSyncContext = extern struct {
 };
 extern fn antfly_data_sync(context: *const DataSyncContext) callconv(.c) c_int;
 
-pub fn syncDataJsonAlloc(allocator: std.mem.Allocator, input: []const u8, output: []const u8, table: []const u8, definition: []const u8, max_input_bytes: u64, max_expanded_bytes: u64) ![]u8 {
-    if (comptime use_direct_implementation) return @import("data_sync.zig").syncJsonAlloc(allocator, input, output, table, definition, .{ .max_input_bytes = max_input_bytes, .max_expanded_bytes = max_expanded_bytes });
+pub fn syncDataJsonAlloc(allocator: std.mem.Allocator, input: []const u8, output: []const u8, table: []const u8, selection_is_literal: bool, definition: []const u8, max_input_bytes: u64, max_expanded_bytes: u64) ![]u8 {
+    if (comptime use_direct_implementation) return @import("data_sync.zig").syncJsonAlloc(allocator, input, output, table, definition, .{ .max_input_bytes = max_input_bytes, .max_expanded_bytes = max_expanded_bytes, .selection_is_literal = selection_is_literal });
     var ptr: ?[*]u8 = null;
     var len: usize = 0;
     const status = antfly_data_sync(&.{
@@ -213,6 +214,7 @@ pub fn syncDataJsonAlloc(allocator: std.mem.Allocator, input: []const u8, output
         .output_len = output.len,
         .table_ptr = table.ptr,
         .table_len = table.len,
+        .selection_is_literal = selection_is_literal,
         .definition_ptr = definition.ptr,
         .definition_len = definition.len,
         .max_input_bytes = max_input_bytes,
