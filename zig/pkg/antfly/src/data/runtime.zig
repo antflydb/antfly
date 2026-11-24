@@ -2049,10 +2049,12 @@ const RaftTableApplyStateMachine = struct {
             protocol.withExactEnvelopeFloor(try protocol.completionProtocolVersion(self.alloc, req), exact_prepare);
         if (required_protocol) |required| {
             if (comptime !linked_storage) {
-                // The direct owner handles an ordinary producer with the
-                // standard ordered batch path. Retained controls and history
-                // clock entries still require their linked native owner.
-                if (history_commit_time_ns != null or exact_prepare or req.transaction != null or req.source_producer != .ordinary)
+                // Ordinary producer rows and transactions use the same
+                // ordered physical dispatch in both owners. Retained history
+                // and scoped source protocols need the linked owner.
+                if (history_commit_time_ns != null or exact_prepare or
+                    (required != protocol.batch_row_producer_protocol_version and required != protocol.batch_nonhistory_producer_protocol_version) or
+                    @import("antfly_local_sources").api_internal_batch.requiresCompletionProtocol(req))
                     return error.StorageKernelOwnerUnavailable;
             }
             const projection = self.topology_apply_store orelse return error.StorageKernelOwnerUnavailable;
@@ -39624,7 +39626,9 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                     .policy_version = try @import("antfly_local_sources").privacy_catalog.policyBinding(response_alloc, table.indexes_json),
                 }, .{}) };
             }
-            if (std.mem.endsWith(u8, request.uri, antfly.metadata_http_routes.Routes.internal_decision_admission)) {
+            if (std.mem.endsWith(u8, request.uri, antfly.metadata_http_routes.Routes.internal_decision_admission) or
+                std.mem.endsWith(u8, request.uri, antfly.metadata_http_routes.Routes.internal_transaction_admission))
+            {
                 const catalog_api = antfly.public_api.table_catalog;
                 const parsed = try std.json.parseFromSlice(antfly.metadata_api.DecisionAdmissionRequest, response_alloc, request.body, .{});
                 defer parsed.deinit();
@@ -68165,9 +68169,26 @@ fn implementationTests() type {
                     self.stage = 8;
                     self.observation = ops.observeMerge(retry_record) catch |err| return self.fail(err);
                     self.checkTerminalAccept(&ops, retry_record) catch |err| return self.fail(err);
+                    self.drainReceiverGraphCleanup(retry_record) catch |err| return self.fail(err);
                     self.server.quiesceBackgroundWork();
                     self.done = true;
                     self.stop_driver = true;
+                }
+
+                fn drainReceiverGraphCleanup(self: *@This(), record_to_clean: antfly.metadata.MergeTransitionRecord) !void {
+                    const node = self.server;
+                    const contract_to_clean = record_to_clean.table_contract;
+                    const receiver_group = record_to_clean.receiver_group_id;
+                    for (0..32) |_| {
+                        var batch = prepared: {
+                            const owner = try node.leaseTransitionDbForTableGroup(receiver_group, contract_to_clean, .target, .exact);
+                            defer owner.release();
+                            break :prepared try owner.db.prepareGraphEndpointCleanupBatch(node.alloc);
+                        } orelse return;
+                        defer batch.deinit();
+                        try node.proposeRaftBatchGroup(node.alloc, receiver_group, contract_to_clean.table_name, batch.request(), .{ .discovery = .cached });
+                    }
+                    return error.VoprGraphCleanupDidNotConverge;
                 }
 
                 fn checkTerminalAccept(self: *@This(), ops: *antfly.raft.ShardOperationAdapter, terminal_record: antfly.metadata.MergeTransitionRecord) !void {
