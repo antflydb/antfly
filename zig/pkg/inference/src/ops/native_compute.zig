@@ -4282,6 +4282,36 @@ pub const NativeCompute = struct {
         return owner;
     }
 
+    /// Resolve packed checkpoint geometry without opening a Native matrix
+    /// handle. Actual payload admission remains with the provider upload.
+    pub fn capturePackedWeightShape(backend: *const ops.ComputeBackend, name: []const u8) !?@import("ml").graph.Shape {
+        if (backend.vtable != &vtable_impl) return null;
+        const self: *NativeCompute = @ptrCast(@alignCast(backend.ptr));
+        if (self.prepare_native_weight_matrices) return null;
+        const data = self.data;
+        if (data.prefetch_initialized) data.prefetch.lock();
+        defer if (data.prefetch_initialized) data.prefetch.unlock();
+
+        if (data.resident_weights.getPtr(name)) |weight| return captureLoadedPackedShape(weight);
+        const entry = data.lazy_weights.getPtr(name) orelse return null;
+        if (entry.loaded) |*loaded| return captureLoadedPackedShape(loaded);
+        if (!data.allow_direct_quant or !entry.tensor_ref.quantized or entry.expert_coord != null) return null;
+        const store = data.tensor_store orelse return null;
+        var storage = (try store.loadQuantizedStorageRef(&entry.tensor_ref)) orelse return null;
+        defer storage.deinit();
+        return try capturePackedShape(storage.shape);
+    }
+
+    fn captureLoadedPackedShape(weight: *const LoadedWeight) !?@import("ml").graph.Shape {
+        const packed_storage = weight.quantized_storage orelse return null;
+        return try capturePackedShape(if (weight.tensor.shape.len != 0) weight.tensor.shape else packed_storage.shape);
+    }
+
+    fn capturePackedShape(shape: []const i64) !@import("ml").graph.Shape {
+        if (shape.len > @import("ml").graph.shape.max_rank) return error.UnsupportedShape;
+        return @import("ml").graph.Shape.init(.f32, shape);
+    }
+
     /// SDK-free immutable-source metadata, before the original tracer asks for
     /// a lookup header. Packed/lazy sources retain their original route.
     pub fn authoredResidentF32Shape(backend: *const ops.ComputeBackend, name: []const u8) !@import("ml").graph.Shape {
@@ -61956,6 +61986,10 @@ test "provider weight transport borrows packed weights without preparing Native 
     defer transport.deinit();
     transport.prepare_native_weight_matrices = false;
     const provider = transport.computeBackend();
+    const captured = (try NativeCompute.capturePackedWeightShape(&provider, "provider.weight")).?;
+    try std.testing.expectEqual(@import("ml").graph.DType.f32, captured.dtype);
+    try std.testing.expectEqualSlices(i64, &dims, captured.dims[0..captured.rank()]);
+    try std.testing.expectEqual(@as(usize, 0), transport.weight_handles.count());
     const value = try provider.getWeight("provider.weight");
     defer provider.free(value);
     const storage = &store.resident_weights.getPtr("provider.weight").?.quantized_storage.?;

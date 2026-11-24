@@ -128,6 +128,7 @@ const Entry = struct {
     }
     fn weightShape(context: ?*anyopaque, allocator: std.mem.Allocator, name: []const u8) anyerror!?@import("ml").graph.Shape {
         const backend: *const ops.ComputeBackend = @ptrCast(@alignCast(context.?));
+        if (comptime @import("build_options").enable_native) if (try @import("../ops/native_compute.zig").NativeCompute.capturePackedWeightShape(backend, name)) |shape| return shape;
         const weight = try backend.getWeight(name);
         defer backend.free(weight);
         const shape = try backend.tensorShape(weight, allocator);
