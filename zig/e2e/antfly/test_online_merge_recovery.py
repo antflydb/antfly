@@ -701,6 +701,7 @@ class CdcUploadFault(OwnerLinkFault):
         self.reclaimed = threading.Event()
         self.replacement = None
         self.upload_observations = deque(maxlen=32)
+        self.source_transaction_observations = deque(maxlen=32)
         self.first_chunk = None
 
     @staticmethod
@@ -737,6 +738,10 @@ class CdcUploadFault(OwnerLinkFault):
                 self.source_transactions[transaction["txn_id"]] = (
                     scope["binding"],
                     int(scope["token"]),
+                )
+            if phase and self.original is not None:
+                self.source_transaction_observations.append(
+                    (path, phase, (transaction.get("source_scope") or {}).get("token"))
                 )
             certified_source = None
             if self.window == "cdc_accepted" and phase == "publish_completion_v1":
@@ -790,6 +795,16 @@ class CdcUploadFault(OwnerLinkFault):
                     self.reply_dropped.set()
                     return True
                 return False
+            if self.window == "cdc_seal" and path.endswith("/source-plan/chunk-v1"):
+                # A successful observe can recover the lost seal reply. Hold
+                # the exact frozen payload read so the original worker cannot
+                # admit the transaction before the checkpoint owner moves.
+                spec = body.get("request", {}).get("query", {}).get("spec")
+                if (
+                    body.get("source_owner") == self.original["source_owner"]
+                    and spec == self.original["command"]["spec"]
+                ):
+                    return True
             donor = self.original["_fault_path"].rsplit("/source-plan/", 1)[0]
             if path.startswith(donor + "/") and (
                 path.endswith("/txn-begin") or phase == "begin_source_scope_v1"
@@ -941,6 +956,42 @@ def test_cdc_chunk_fault_blocks_second_chunk_after_unconfirmed_reply():
     assert fault.block(0, second)
     assert fault.reply_dropped.is_set()
     assert fault.original is first
+
+
+def test_cdc_seal_fault_holds_only_the_interrupted_frozen_payload():
+    fault = CdcUploadFault("cdc_seal")
+    fault.armed = True
+    spec = {"attempt": "interrupted", "chunk_hashes": ["first", "second"]}
+    owner = {"group_id": 7}
+    seal = {
+        "_fault_path": "/internal/groups/7/source-plan/control-v1",
+        "_upload_applied": True,
+        "operation": "submit",
+        "source_owner": owner,
+        "command": {"action": "seal", "spec": spec},
+    }
+    assert fault.drop_reply(0, seal)
+    chunk = {
+        "_fault_path": "/internal/groups/7/source-plan/chunk-v1",
+        "source_owner": owner,
+        "request": {"query": {"spec": spec}},
+    }
+    assert fault.block(0, chunk)
+    assert not fault.block(0, chunk | {"source_owner": {"group_id": 8}})
+    assert not fault.block(
+        0,
+        chunk
+        | {
+            "request": {"query": {"spec": spec | {"attempt": "successor"}}},
+        },
+    )
+    assert not fault.block(
+        0,
+        chunk
+        | {
+            "_fault_path": "/internal/groups/7/source-plan/observe-v1",
+        },
+    )
 
 
 def test_cdc_accepted_fault_matches_committed_upload_without_forwarded_publish():
@@ -1332,7 +1383,13 @@ def test_native_cdc_upload_survives_checkpoint_owner_merge(
             }
         if fault.window != "cdc_accepted":
             replacement = fault.replacement
-            assert replacement is not None, cluster.debug_logs()
+            assert replacement is not None, (
+                f"upload replies={list(fault.upload_observations)} "
+                f"transactions={list(fault.source_transaction_observations)} "
+                f"committed={list(fault.committed_transactions)} "
+                f"original_token={fault.upload_token(fault.original)}\n"
+                f"{cluster.debug_logs()}"
+            )
             assert int(replacement["source_owner"]["group_id"]) == receiver
             assert (
                 replacement["command"]["spec"]["domain"]
