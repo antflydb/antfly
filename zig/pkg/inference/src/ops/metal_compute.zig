@@ -3778,6 +3778,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     pub fn abortPlannedGraphScope(cb: *const ops.ComputeBackend, scope: PlannedGraphScope) void {
         if (cb.kind() != .metal or !scope.active) return;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        self.abortPlannedGraphScopeForSelf(scope);
+    }
+
+    fn abortPlannedGraphScopeForSelf(self: *MetalCompute, scope: PlannedGraphScope) void {
+        if (!scope.active) return;
         const runtime = self.provider_impl.raw_decode_runtime;
         if (scope.owns_frame) {
             var active = metal_runtime.hasActiveFrame(runtime);
@@ -23608,11 +23613,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 defer _ = metal_runtime.antfly_metal_audio_replay_scope(p.raw_decode_runtime, previous_scope);
                 const scope = if (metal_runtime.hasActiveFrame(p.raw_decode_runtime)) try self.beginPlannedGraphScopeForSelf(.ffn) else PlannedGraphScope{};
                 var ended = false;
-                defer if (!ended) self.endPlannedGraphScopeForSelf(scope) catch {};
+                defer if (!ended) self.abortPlannedGraphScopeForSelf(scope);
                 out = try plan.replay(&cb, inputs);
                 errdefer freeOp(ctx, out);
-                try self.endPlannedGraphScopeForSelf(scope);
                 ended = true;
+                try self.endPlannedGraphScopeForSelf(scope);
             } else out = try run(context, inputs);
             const elapsed = @import("antfly_platform").time.monotonicNs() -| start;
             plan.selection.record(replay, elapsed);
@@ -33718,41 +33723,47 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const ple_total_dim = std.math.mul(usize, request.ple_hidden_size, request.layer_count) catch return null;
 
         const planned_scope = try self.beginPlannedGraphScopeForSelf(.ple);
-        defer self.endPlannedGraphScopeForSelf(planned_scope) catch {};
+        var ended = false;
+        defer if (!ended) self.abortPlannedGraphScopeForSelf(planned_scope);
+        var output = encode: {
+            var ple_region_scope = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .ple);
+            defer self.retireTemporaryWorkspaceValue(&ple_region_scope);
 
-        var ple_region_scope = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .ple);
-        defer self.retireTemporaryWorkspaceValue(&ple_region_scope);
+            var model_proj = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+                .slot = ple_model_proj_slot,
+                .input = initial.hidden,
+                .in_dim = request.hidden_size,
+                .out_dim = ple_total_dim,
+            })) orelse return null;
+            defer self.retireTemporaryWorkspaceValue(&model_proj);
 
-        var model_proj = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
-            .slot = ple_model_proj_slot,
-            .input = initial.hidden,
-            .in_dim = request.hidden_size,
-            .out_dim = ple_total_dim,
-        })) orelse return null;
-        defer self.retireTemporaryWorkspaceValue(&model_proj);
+            const flat_rows = std.math.mul(usize, request.items.len, request.layer_count) catch return null;
+            var projected_flat = (try reshapeDecodeTensorView(&model_proj, flat_rows, request.ple_hidden_size)) orelse return null;
+            defer self.retireTemporaryWorkspaceValue(&projected_flat);
 
-        const flat_rows = std.math.mul(usize, request.items.len, request.layer_count) catch return null;
-        var projected_flat = (try reshapeDecodeTensorView(&model_proj, flat_rows, request.ple_hidden_size)) orelse return null;
-        defer self.retireTemporaryWorkspaceValue(&projected_flat);
+            var normed_flat = (try metal_runtime.decoderRuntimeApplyRmsNorm(self.provider_impl, .{
+                .slot = ple_proj_norm_slot,
+                .input = projected_flat,
+                .hidden_size = request.ple_hidden_size,
+                // The projection scale is folded out of this normalization.
+                .eps = request.norm_eps * @as(f32, @floatFromInt(request.hidden_size)),
+            }, &self.timing_stats)) orelse return null;
+            defer self.retireTemporaryWorkspaceValue(&normed_flat);
 
-        var normed_flat = (try metal_runtime.decoderRuntimeApplyRmsNorm(self.provider_impl, .{
-            .slot = ple_proj_norm_slot,
-            .input = projected_flat,
-            .hidden_size = request.ple_hidden_size,
-            // The projection scale is folded out of this normalization.
-            .eps = request.norm_eps * @as(f32, @floatFromInt(request.hidden_size)),
-        }, &self.timing_stats)) orelse return null;
-        defer self.retireTemporaryWorkspaceValue(&normed_flat);
+            var normed_proj = (try reshapeDecodeTensorView(&normed_flat, request.items.len, ple_total_dim)) orelse return null;
+            defer self.retireTemporaryWorkspaceValue(&normed_proj);
 
-        var normed_proj = (try reshapeDecodeTensorView(&normed_flat, request.items.len, ple_total_dim)) orelse return null;
-        defer self.retireTemporaryWorkspaceValue(&normed_proj);
-
-        return metal_runtime.decoderRuntimeApplyAddScale(self.provider_impl, .{
-            .lhs = ple_token_embedding,
-            .rhs = normed_proj,
-            .dim = ple_total_dim,
-            .scale = 1.0 / @sqrt(@as(f32, 2.0)),
-        }, &self.timing_stats);
+            break :encode (try metal_runtime.decoderRuntimeApplyAddScale(self.provider_impl, .{
+                .lhs = ple_token_embedding,
+                .rhs = normed_proj,
+                .dim = ple_total_dim,
+                .scale = 1.0 / @sqrt(@as(f32, 2.0)),
+            }, &self.timing_stats)) orelse return null;
+        };
+        errdefer self.retireTemporaryWorkspaceValue(&output);
+        ended = true;
+        try self.endPlannedGraphScopeForSelf(planned_scope);
+        return output;
     }
 
     fn sliceDecodePleLayerView(
@@ -37181,7 +37192,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             );
         }
         const embedding_scope = try self.beginPlannedGraphScopeForSelf(.embedding);
-        defer self.endPlannedGraphScopeForSelf(embedding_scope) catch {};
+        var embedding_ended = false;
+        defer if (!embedding_ended) self.abortPlannedGraphScopeForSelf(embedding_scope);
         const device_token = request.phase == .step;
         const fuse_a4b_token_embedding_scale = request.contract == .gemma4_a4b_shared_kv and
             a4bExplicitCandidateEnabled(
@@ -37220,7 +37232,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         if (request.ple_hidden_size != 0 and request.layer_count != 0) {
             const ple_scope = try self.beginPlannedGraphScopeForSelf(.ple);
-            defer self.endPlannedGraphScopeForSelf(ple_scope) catch {};
+            var ple_ended = false;
+            defer if (!ple_ended) self.abortPlannedGraphScopeForSelf(ple_scope);
             var ple_region_scope = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .ple);
             defer self.retireTemporaryWorkspaceValue(&ple_region_scope);
             const ple_token_embedding_weight = request.ple_token_embedding_weight orelse return null;
@@ -37243,11 +37256,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     true,
                 )) orelse return null;
             result.ple_token_embedding = ple_raw;
+            ple_ended = true;
+            try self.endPlannedGraphScopeForSelf(ple_scope);
         }
 
         if (result.ple_token_embedding != null) {
             result.ple_vectors = (try computeDecodePleVectors(self, request, &result)) orelse return null;
         }
+        embedding_ended = true;
+        try self.endPlannedGraphScopeForSelf(embedding_scope);
         transferred = true;
         return result;
     }
