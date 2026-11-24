@@ -50760,14 +50760,6 @@ test "metal native embeddinggemma2 two-frame scratch ownership survives wait and
     }
 }
 
-pub fn decoderRuntimeClippedLinear(self: anytype, input: MetalTensor, slot: usize, p: @import("../ops/ops.zig").ClippedLinearParams) !?MetalTensor {
-    const runtime = self.raw_decode_runtime orelse return null;
-    if (input.dtype != .f32) return null;
-    if (input.elemCount() != @as(usize, p.rows) * p.in_dim) return error.InvalidTensorShape;
-    var out = try MetalTensor.deviceAllocate(runtime, @as(usize, p.rows) * p.out_dim * 4, .private, &.{ @intCast(p.rows), @intCast(p.out_dim) });
-    errdefer out.deinit();
-    return finishDeviceOutput(&out, antfly_metal_clipped_linear(runtime, input.deviceHandle(), input.deviceByteOffset(), slot, &p, out.deviceHandle(), out.deviceByteOffset()));
-}
 pub extern fn antfly_metal_clipped_linear(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, slot: usize, params: *const @import("../ops/ops.zig").ClippedLinearParams, out: ?*anyopaque, out_offset: usize) c_int;
 
 pub extern fn antfly_metal_audio_storage_scope(runtime: ?*RawMetalDecodeRuntime, begin: c_int) c_int;

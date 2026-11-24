@@ -23894,6 +23894,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn audioPreparedLinearOp(ctx: *anyopaque, request: *const ops.AudioPreparedLinearRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const input = request.input;
+        if (!metal_runtime.decoderRuntimeLinearSlotPrepared(self.provider_impl, request.slot, request.in_dim, request.out_dim)) return null;
+        var x = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
+        defer self.retireTemporaryWorkspaceValue(&x);
+        return self.encodeAudioLinear(ctx, x, request, false);
+    }
+
+    fn encodeAudioLinear(self: *MetalCompute, ctx: *anyopaque, x: MetalTensor, request: *const ops.AudioPreparedLinearRequest, comptime fused_only: bool) !?CT {
         const slot = request.slot;
         const rows = request.rows;
         const in_dim = request.in_dim;
@@ -23902,36 +23909,41 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const output = request.output;
         const input_elements = try std.math.mul(usize, rows, in_dim);
         const output_elements = try std.math.mul(usize, rows, out_dim);
-        if (rows == 0 or in_dim == 0 or out_dim == 0) return error.InvalidTensorShape;
+        if (rows == 0 or in_dim == 0 or out_dim == 0 or x.elemCount() != input_elements) return error.InvalidTensorShape;
         if (clip) |params| {
             try params.validate();
             if (params.rows != rows or params.in_dim != in_dim or params.out_dim != out_dim) return error.InvalidTensorShape;
         }
-        if (!metal_runtime.decoderRuntimeLinearSlotPrepared(self.provider_impl, slot, in_dim, out_dim)) return null;
-        var x = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
-        defer self.retireTemporaryWorkspaceValue(&x);
-        if (x.elemCount() != input_elements) return error.InvalidTensorShape;
         const runtime = self.provider_impl.raw_decode_runtime orelse return null;
-        if (output) |ct| if (toBuf(ct).metal_tensor) |*tensor| tensor.invalidateHostMirror();
         var mt = if (output) |ct| try (denseDeviceF32(ct) orelse return error.InvalidPreparedProjectionOutput).retainedCopy() else try MetalTensor.deviceAllocate(runtime, try std.math.mul(usize, output_elements, @sizeOf(f32)), .private, &.{ std.math.cast(i32, rows) orelse return error.InvalidTensorShape, std.math.cast(i32, out_dim) orelse return error.InvalidTensorShape });
         var moved = false;
-        defer if (!moved) mt.deinit();
+        defer if (!moved) self.retireTemporaryWorkspaceValue(&mt);
         const output_bytes = try std.math.mul(usize, output_elements, @sizeOf(f32));
         if (mt.isReadOnlyPhysical() or !deviceTensorMatchesLinearRows(&mt, rows, out_dim) or mt.deviceByteLen() < output_bytes or
             mt.device.?.ref.runtime != @as(*anyopaque, @ptrCast(runtime)) or
             (mt.deviceHandle() == x.deviceHandle() and kernel_geometry.byteRangesOverlap(mt.deviceByteOffset(), output_bytes, x.deviceByteOffset(), x.deviceByteLen()))) return error.InvalidPreparedProjectionOutput;
+        // Reserve the owned result header before any kernel writes to it.
+        const result = output orelse blk: {
+            const ct = try self.ctFromOwnedMetalTensor(mt);
+            moved = true;
+            break :blk ct;
+        };
+        var published = false;
+        defer if (moved and !published) freeTemporaryWorkspaceCtOp(ctx, result);
+        if (output) |ct| if (toBuf(ct).metal_tensor) |*tensor| tensor.invalidateHostMirror();
         var fused = false;
         if (clip) |p| {
             const rc = metal_runtime.antfly_metal_clipped_linear(runtime, x.deviceHandle(), x.deviceByteOffset(), slot, &p, mt.deviceHandle(), mt.deviceByteOffset());
             if (rc != 0 and rc != -1) return error.MetalKernelFailed;
             fused = rc == 0;
         }
-        if (!fused) {
+        if (fused_only and !fused) return null;
+        if (!fused_only and !fused) {
             var clipped: ?CT = null;
             defer if (clipped) |ct| freeOp(ctx, ct);
             var prepared_operand: ?MetalTensor = null;
             if (clip) |p| if (p.flags & 3 != 0) {
-                if (request.input_workspace != null and denseDeviceF32(input) != null) {
+                if (request.input_workspace != null and denseDeviceF32(request.input) != null) {
                     const scratch = request.input_workspace.?;
                     const target = denseDeviceF32(scratch) orelse return error.InvalidPreparedProjectionWorkspace;
                     const bytes = try std.math.mul(usize, try std.math.mul(usize, rows, in_dim), @sizeOf(f32));
@@ -23943,7 +23955,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     if (!metal_runtime.decoderRuntimeAudioClampInto(self.provider_impl, x, target, p.flags & 3, p.input_min, p.input_max, false)) return error.MetalKernelFailed;
                     prepared_operand = target;
                 } else {
-                    clipped = try clampScalarOp(ctx, input, if (p.flags & 1 != 0) p.input_min else null, if (p.flags & 2 != 0) p.input_max else null);
+                    clipped = try clampScalarOp(ctx, request.input, if (p.flags & 1 != 0) p.input_min else null, if (p.flags & 2 != 0) p.input_max else null) orelse return error.AudioScheduleRouteChanged;
                 }
             };
             const operand = prepared_operand orelse if (clipped) |ct| denseDeviceF32(ct).? else x;
@@ -23952,10 +23964,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (!metal_runtime.decoderRuntimeAudioClampInto(self.provider_impl, mt, mt, (p.flags >> 2) & 3, p.output_min, p.output_max, p.flags & 16 != 0)) return error.AudioScheduleRouteChanged;
             };
         }
-        if (output) |ct| return ct;
-        const ct = try self.ctFromOwnedMetalTensor(mt);
-        moved = true;
-        return ct;
+        published = true;
+        return result;
     }
     fn audioExecutionSelection(self: *const MetalCompute, key: u64, inputs: []const CT) ?struct { key: u64, policy: u8 } {
         if (!self.require_f32_linears or disableRuntimeElementwise() or self.shared_provider_lease_io == null or self.audio_capture != null or inputs.len == 0 or inputs.len > 20 or audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_AUDIO_PLAN")) return null;
@@ -24350,8 +24360,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             try self.computeBackend().checkExecutionControl();
         }
         if (choice != 1) return null;
-        const out = (try metal_runtime.decoderRuntimeClippedLinear(self.provider_impl, x, slot, p)) orelse return null;
-        return self.ctFromOwnedMetalTensor(out);
+        return self.encodeAudioLinear(ctx, x, &.{
+            .input = input,
+            .slot = slot,
+            .rows = p.rows,
+            .in_dim = p.in_dim,
+            .out_dim = p.out_dim,
+            .clip = p,
+        }, true);
     }
     fn clampSiluOp(ctx: *anyopaque, input: CT, min_value: ?f32, max_value: ?f32) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
