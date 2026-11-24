@@ -3676,6 +3676,7 @@ pub const ComputeBackend = struct {
         beginI32ScalarDownload: ?*const fn (ctx: *anyopaque, tensor: CT) anyerror!?PendingI32ScalarDownload = null,
         finishI32ScalarDownload: ?*const fn (ctx: *anyopaque, pending: PendingI32ScalarDownload) anyerror!i32 = null,
         cancelI32ScalarDownload: ?*const fn (ctx: *anyopaque, pending: PendingI32ScalarDownload) void = null,
+        drainI32ScalarDownload: ?*const fn (ctx: *anyopaque, pending: PendingI32ScalarDownload) anyerror!void = null,
 
         /// Clone a tensor into a new backend handle with the requested logical
         /// shape without requiring host materialization. Backends may alias
@@ -6197,6 +6198,10 @@ pub const ComputeBackend = struct {
     }
 
     pub fn cancelI32ScalarDownload(self: *const ComputeBackend, pending: PendingI32ScalarDownload) void {
+        if (self.vtable.drainI32ScalarDownload) |drain| {
+            drain(self.ptr, pending) catch {};
+            return;
+        }
         if (self.vtable.cancelI32ScalarDownload) |cancel_i32_scalar_download| {
             cancel_i32_scalar_download(self.ptr, pending);
         }

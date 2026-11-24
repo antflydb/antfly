@@ -15081,15 +15081,15 @@ fn finishI32ScalarDownloadOp(ctx: *anyopaque, pending: ops.PendingI32ScalarDownl
     return std.mem.readInt(i32, bytes, .little);
 }
 
-fn cancelI32ScalarDownloadOp(ctx: *anyopaque, pending: ops.PendingI32ScalarDownload) void {
+fn drainI32ScalarDownloadOp(ctx: *anyopaque, pending: ops.PendingI32ScalarDownload) anyerror!void {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (!self.async_i32_scalar_download.in_use or
         self.async_i32_scalar_download.handle != pending.handle or
         self.async_i32_scalar_download.event == null)
     {
-        return;
+        return error.InvalidCudaState;
     }
-    self.ctx.driver.check(self.ctx.synchronizeEventResult(self.async_i32_scalar_download.event)) catch return;
+    try self.ctx.driver.check(self.ctx.synchronizeEventResult(self.async_i32_scalar_download.event));
     self.async_i32_scalar_download.in_use = false;
     self.stats.async_i32_scalar_download_cancels += 1;
 }
@@ -36855,7 +36855,7 @@ const vtable: ops.ComputeBackend.VTable = .{
     .exportTensorData = &exportTensorDataOp,
     .beginI32ScalarDownload = &beginI32ScalarDownloadOp,
     .finishI32ScalarDownload = &finishI32ScalarDownloadOp,
-    .cancelI32ScalarDownload = &cancelI32ScalarDownloadOp,
+    .drainI32ScalarDownload = &drainI32ScalarDownloadOp,
     .copyTensorFromBackend = &copyTensorFromBackendOp,
     .tensorDType = &tensorDTypeOp,
     .tensorShape = &tensorShapeOp,

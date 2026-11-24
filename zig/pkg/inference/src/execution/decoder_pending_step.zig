@@ -154,7 +154,14 @@ pub const Readback = struct {
             var runtime = self.context.runtime();
             runtime.truncateGeneratedTokens(1) catch {};
         }
-        if (self.pending) |pending| self.observation.call(self.context.backend, .cancel, .unavailable, cancelReadback, .{ self.context.backend, pending }) catch {};
+        if (self.pending) |pending| {
+            const backend = self.context.backend;
+            if (backend.vtable.drainI32ScalarDownload) |drain| {
+                self.observation.call(backend, .drain, .driver_await_returned, drain, .{ backend.ptr, pending }) catch {};
+            } else {
+                self.observation.call(backend, .cancel, .unavailable, cancelReadback, .{ backend, pending }) catch {};
+            }
+        }
         self.pending = null;
     }
     fn cancelReadback(backend: *const ops.ComputeBackend, pending: ops.PendingI32ScalarDownload) !void {
@@ -734,9 +741,14 @@ fn checkCudaPendingObservation(actual: ops.ComputeBackend, _: ops.ComputeBackend
     try std.testing.expectEqual(@as(u64, 1), ready.report.?.cuda_host_waits.?.event);
     pending.deinit();
     var cancelled = (try Readback.begin(context, tensor)) orelse return error.MissingCudaScalarReadback;
+    const cancel_submission = diagnostics.snapshot().?.pending_interval.?;
+
     cancelled.deinit();
-    const cancel = diagnostics.snapshot().?;
-    try std.testing.expect(cancel.pending_interval.?.phase == .cancel and cancel.pending_interval.?.completion == .unavailable);
+    const drained = diagnostics.snapshot().?.pending_interval.?;
+    try std.testing.expect(drained.phase == .drain and drained.completion == .driver_await_returned);
+    try std.testing.expectEqual(cancel_submission.identity, drained.identity);
+    try std.testing.expectEqual(@as(u64, 1), drained.observed_phases.?.cuda_host_waits.?.event);
+    try std.testing.expectEqual(@as(u64, 0), drained.observed_phases.?.cuda_host_waits.?.failed);
 }
 
 test "actual CUDA pending scalar observation labels submission readback and cancellation without interval kernel totals" {
