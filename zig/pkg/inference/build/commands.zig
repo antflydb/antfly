@@ -95,11 +95,13 @@ pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile 
     else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal)
         (if (ctx.optimize == .small) 10 else 14)
     else if (ctx.hasAccelerator()) 8 else 6;
-    // Zig 0.17 CUDA measured 12.08 GB stripped on GB10/aarch64 and
-    // 12.69 GB unstripped on x86_64/L4. Reserve 14 GiB for these profiles.
-    const linux_cuda_http_release = ctx.target.result.os.tag == .linux and
-        (ctx.target.result.cpu.arch == .x86_64 or (ctx.target.result.cpu.arch == .aarch64 and ctx.strip)) and
-        ctx.backend.enable_cuda and ctx.optimize == .fast;
+    // GB10/aarch64 ReleaseFast with stripping peaked at 15.05 GB in
+    // the current CUDA reader build. Keep the measured x86_64/L4 claim.
+    const aarch64_cuda_http_stripped = ctx.target.result.os.tag == .linux and
+        ctx.target.result.cpu.arch == .aarch64 and ctx.backend.enable_cuda and
+        ctx.optimize == .fast and ctx.strip;
+    const x86_cuda_http_release = ctx.target.result.os.tag == .linux and
+        ctx.target.result.cpu.arch == .x86_64 and ctx.backend.enable_cuda and ctx.optimize == .fast;
     // Native F32 HTTP-only ReleaseFast/strip on GB10/aarch64 measured a
     // 10.84 GB compiler peak. ReleaseSmall/strip also measured 9.55 GB
     // on ARM64 Linux; its old 6 GiB claim rejected successful compilation.
@@ -112,7 +114,7 @@ pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile 
     const aarch64_cuda_http_unstripped = ctx.target.result.os.tag == .linux and
         ctx.target.result.cpu.arch == .aarch64 and ctx.backend.enable_cuda and
         ctx.optimize == .fast and !ctx.strip;
-    const http_compile_memory_mb: usize = if (native_cpu_http_release) 3840 else if (aarch64_cuda_http_unstripped) 32 * 1024 else if (linux_cuda_http_release) 14 * 1024 else if (aarch64_cpu_http_release) 13 * 1024 else http_default_memory_gib * 1024;
+    const http_compile_memory_mb: usize = if (native_cpu_http_release) 3840 else if (aarch64_cuda_http_unstripped) 32 * 1024 else if (aarch64_cuda_http_stripped) 15 * 1024 else if (x86_cuda_http_release) 14 * 1024 else if (aarch64_cpu_http_release) 13 * 1024 else http_default_memory_gib * 1024;
     const http_server = b.addExecutable(.{
         .name = "antfly-inference-http-server",
         .max_rss = http_compile_memory_mb * 1024 * 1024,
