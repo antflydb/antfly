@@ -148793,7 +148793,7 @@ test "db native snapshot admission bounds capture under concurrent writes" {
 
         fn run(self: *@This()) void {
             self.started.store(true, .release);
-            _ = self.db.runLsmMaintenanceStepBestEffort() catch |err| {
+            _ = self.db.runLsmMaintenanceStep() catch |err| {
                 self.err = err;
                 self.done.store(true, .release);
                 return;
@@ -148873,6 +148873,7 @@ test "db native snapshot admission bounds capture under concurrent writes" {
 
     // Apply release alone is not the publication boundary: the short metadata
     // pin still excludes physical index maintenance.
+    try std.testing.expect(!try db.runLsmMaintenanceStepBestEffort());
     var maintenance = Maintenance{ .db = &db };
     var maintenance_thread = try std.testing.io.concurrent(Maintenance.run, .{&maintenance});
     defer {
