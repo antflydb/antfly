@@ -308,7 +308,7 @@ pub fn forwardGreedyTokenTensorFromFinalHidden(
     final_hidden: ops.CT,
     norm_kind: FinalNormKind,
     norm_slot: usize,
-) !?gpt_arch.GreedyDeviceTokenResult {
+) !gpt_arch.GreedyDeviceTokenResult {
     // Preserve one normalization and one shared greedy owner. A missing
     // prepared slot changes how this tail completes, never whether the
     // already-executed prefix must run again.
@@ -334,13 +334,14 @@ pub fn forwardGreedyTokenTensorOnlyFromFinalHidden(
     );
 }
 
-pub fn forwardLogitsTensorFromFinalHidden(
+fn forwardLogitsTensorFromFinalHidden(
     cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
     gpt_config: gpt_mod.Config,
     final_hidden: ops.CT,
     norm_kind: FinalNormKind,
     norm_slot: usize,
-) !?ops.CT {
+) !ops.CT {
     timing_stats.logits_calls += 1;
     var started_at = monotonicNowNs();
     const final_norm = (try applyFinalNorm(
@@ -350,7 +351,7 @@ pub fn forwardLogitsTensorFromFinalHidden(
         final_hidden,
         gpt_config.hidden_size,
         gpt_config.norm_eps,
-    )) orelse return null;
+    )) orelse try gpt_arch.applyFinalNorm(cb, allocator, gpt_config, final_hidden);
     var finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.logits_norm_nanos += finished_at - started_at;
     defer cb.free(final_norm);
@@ -368,7 +369,23 @@ pub fn forwardLogitsTensorFromFinalHidden(
     return logits;
 }
 
-pub fn forwardPreparedLogitsTensorFromFinalHidden(
+/// The prefix already submitted. A prepared-head miss completes using the
+/// same resident row and the ordinary vocabulary projection.
+pub fn completePreparedLogits(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    final_hidden: ops.CT,
+    norm_kind: FinalNormKind,
+    norm_slot: usize,
+    lm_head_slot: usize,
+) !ops.CT {
+    if (try forwardPreparedLogitsTensorFromFinalHidden(cb, gpt_config, final_hidden, norm_kind, norm_slot, lm_head_slot)) |logits|
+        return logits;
+    return forwardLogitsTensorFromFinalHidden(cb, allocator, gpt_config, final_hidden, norm_kind, norm_slot);
+}
+
+fn forwardPreparedLogitsTensorFromFinalHidden(
     cb: *const ops.ComputeBackend,
     gpt_config: gpt_mod.Config,
     final_hidden: ops.CT,
@@ -470,13 +487,7 @@ pub fn forwardSampledFromFinalHidden(
 ) !?i64 {
     timing_stats.sampled_calls += 1;
     var started_at = monotonicNowNs();
-    const logits = (try forwardLogitsTensorFromFinalHidden(
-        cb,
-        gpt_config,
-        final_hidden,
-        norm_kind,
-        norm_slot,
-    )) orelse return null;
+    const logits = try forwardLogitsTensorFromFinalHidden(cb, allocator, gpt_config, final_hidden, norm_kind, norm_slot);
     var finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.sampled_logits_nanos += finished_at - started_at;
     defer cb.free(logits);

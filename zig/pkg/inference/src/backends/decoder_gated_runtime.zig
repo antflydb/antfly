@@ -2208,6 +2208,12 @@ pub fn prewarmPleTokenEmbedding(
     return true;
 }
 
+fn completeDecoderRuntimeFrame(cb: *const ops.ComputeBackend, active: *bool) !void {
+    if (!active.*) return;
+    try cb.decoderRuntimeSubmitAndWaitFrame();
+    active.* = false;
+}
+
 fn finishDecoderRuntimeFrame(cb: *const ops.ComputeBackend, active: *bool) void {
     if (!active.*) return;
     cb.decoderRuntimeSubmitAndWaitFrame() catch |err| {
@@ -6346,14 +6352,14 @@ pub fn forwardGreedyTokenFromTokenTensor(
     }
 
     started_at = monotonicNowNs();
-    const result = (try decoder_tail_runtime.forwardGreedyTokenTensorFromFinalHidden(
+    const result = try decoder_tail_runtime.forwardGreedyTokenTensorFromFinalHidden(
         cb,
         allocator,
         gpt_config,
         final_hidden,
         .rms,
         finalNormSlot(configured_layer_count),
-    )) orelse return null;
+    );
     finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.greedy_tail_nanos += finished_at - started_at;
     if (compare_fallback_hidden) |fallback_hidden| {
@@ -6610,7 +6616,7 @@ pub fn forwardPrefillLastPreparedTail(
     else
         false;
     if (decoder_frame_active) ple_frame_active = false;
-    defer finishDecoderRuntimeFrame(cb, &decoder_frame_active);
+    errdefer cancelDecoderRuntimeFrame(cb, &decoder_frame_active);
     var final_hidden, var total_rows = if (direct_hidden_result) |direct_hidden|
         .{ direct_hidden.hidden, direct_hidden.total_rows }
     else blk: {
@@ -6683,7 +6689,7 @@ pub fn forwardPrefillLastPreparedTail(
     }
     if (syncGatedFamilyFinalHiddenRequested()) {
         const sync_started_at = monotonicNowNs();
-        finishDecoderRuntimeFrame(cb, &decoder_frame_active);
+        try completeDecoderRuntimeFrame(cb, &decoder_frame_active);
         const synced_hidden = try cb.toFloat32(final_hidden, allocator);
         allocator.free(synced_hidden);
         const sync_finished_at = monotonicNowNs();
@@ -6699,7 +6705,7 @@ pub fn forwardPrefillLastPreparedTail(
     cb.free(final_hidden);
     owns_final_hidden = false;
     const frame_finish_started_at = monotonicNowNs();
-    finishDecoderRuntimeFrame(cb, &decoder_frame_active);
+    try completeDecoderRuntimeFrame(cb, &decoder_frame_active);
     const frame_finish_finished_at = monotonicNowNs();
     if (frame_finish_finished_at > frame_finish_started_at) {
         timing_stats.prefill_frame_finish_nanos += frame_finish_finished_at - frame_finish_started_at;
@@ -6835,6 +6841,8 @@ fn forwardFinalHiddenRowsFromHidden(
     phase: BlockTimingPhase,
     row_output: PrefillRowsOutput,
 ) !?FinalHiddenRows {
+    var owns_input = owns_hidden;
+    defer if (owns_input) cb.free(hidden);
     var started_at = monotonicNowNs();
     var finished_at = started_at;
     const direct_ple_vectors = try computePleVectorsDirect(
@@ -6873,16 +6881,13 @@ fn forwardFinalHiddenRowsFromHidden(
         ple_vectors,
         row_output,
     );
-    if (direct_hidden_result == null) {
-        if (owns_hidden) cb.free(hidden);
-        return null;
-    }
-    const hidden_result = direct_hidden_result.?;
+    const hidden_result = direct_hidden_result orelse return null;
     // The direct paths copy the input rows into their own hidden buffers, so
     // an owned input is done once they return.
-    if (owns_hidden and hidden_result.hidden != hidden) cb.free(hidden);
+    if (owns_input and hidden_result.hidden != hidden) cb.free(hidden);
+    owns_input = false;
     var decoder_frame_active = hidden_result.decoder_frame_active;
-    defer finishDecoderRuntimeFrame(cb, &decoder_frame_active);
+    errdefer cancelDecoderRuntimeFrame(cb, &decoder_frame_active);
     finished_at = monotonicNowNs();
     if (finished_at > started_at) {
         if (phase == .greedy) {
@@ -6891,26 +6896,17 @@ fn forwardFinalHiddenRowsFromHidden(
             timing_stats.prefill_block_nanos += finished_at - started_at;
         }
     }
-    if (row_output == .kv_only and decoder_frame_active) {
-        // KV publication is the only output of this stage. A failed GPU
-        // completion must propagate before a later chunk can consume it.
-        cb.decoderRuntimeSubmitAndWaitFrame() catch |err| {
-            cancelDecoderRuntimeFrame(cb, &decoder_frame_active);
-            cb.free(hidden_result.hidden);
-            return err;
-        };
-        decoder_frame_active = false;
-    }
-    const final_hidden = if (row_output == .kv_only) hidden_result.hidden else (try cb.decoderRuntimeApplyRmsNorm(&.{
-        .slot = finalNormSlot(configured_layer_count),
-        .input = hidden_result.hidden,
-        .hidden_size = gpt_config.hidden_size,
-        .eps = gpt_config.norm_eps,
-    })) orelse {
-        cb.free(hidden_result.hidden);
-        return null;
+    const final_hidden = if (row_output == .kv_only) hidden_result.hidden else norm: {
+        errdefer cb.free(hidden_result.hidden);
+        const normalized = (try cb.decoderRuntimeApplyRmsNorm(&.{
+            .slot = finalNormSlot(configured_layer_count),
+            .input = hidden_result.hidden,
+            .hidden_size = gpt_config.hidden_size,
+            .eps = gpt_config.norm_eps,
+        })) orelse try gpt_arch.applyFinalNorm(cb, allocator, gpt_config, hidden_result.hidden);
+        if (normalized != hidden_result.hidden) cb.free(hidden_result.hidden);
+        break :norm normalized;
     };
-    if (final_hidden != hidden_result.hidden) cb.free(hidden_result.hidden);
     errdefer cb.free(final_hidden);
     var prepared_tail_choices: ?[]u32 = null;
     errdefer if (prepared_tail_choices) |choices| allocator.free(choices);
@@ -6931,6 +6927,7 @@ fn forwardFinalHiddenRowsFromHidden(
             if (!cb.decoderRuntimeHasActiveFrame()) decoder_frame_active = false;
         }
     }
+    try completeDecoderRuntimeFrame(cb, &decoder_frame_active);
     return .{
         .final_hidden = final_hidden,
         .rows = hidden_result.total_rows,
@@ -7100,24 +7097,15 @@ pub fn forwardPrefillLastLogits(
     defer cb.free(tail.final_hidden);
 
     const started_at = monotonicNowNs();
-    const logits = if (try decoder_tail_runtime.forwardPreparedLogitsTensorFromFinalHidden(
+    const logits = try decoder_tail_runtime.completePreparedLogits(
         cb,
+        allocator,
         gpt_config,
         tail.final_hidden,
         .rms,
         tail.final_norm_slot,
         tail.final_lm_head_slot,
-    )) |prepared_logits|
-        prepared_logits
-    else blk: {
-        break :blk (try decoder_tail_runtime.forwardLogitsTensorFromFinalHidden(
-            cb,
-            gpt_config,
-            tail.final_hidden,
-            .rms,
-            tail.final_norm_slot,
-        )) orelse return null;
-    };
+    );
     timing_stats.prefill_tail_logits_ops += 1;
     defer cb.free(logits);
     const result = try cb.toFloat32(logits, allocator);
@@ -7217,22 +7205,14 @@ pub fn forwardLastLogitsTensor(
         allocator.free(synced_hidden);
     }
 
-    if (try decoder_tail_runtime.forwardPreparedLogitsTensorFromFinalHidden(
+    return try decoder_tail_runtime.completePreparedLogits(
         cb,
+        allocator,
         gpt_config,
         final_hidden,
         .rms,
         finalNormSlot(configured_layer_count),
         finalLmHeadSlot(configured_layer_count),
-    )) |logits| {
-        return logits;
-    }
-    return decoder_tail_runtime.forwardLogitsTensorFromFinalHidden(
-        cb,
-        gpt_config,
-        final_hidden,
-        .rms,
-        finalNormSlot(configured_layer_count),
     );
 }
 
@@ -7436,6 +7416,41 @@ test "Gemma4 MTP input frame excludes full prompts and unsupported models" {
     other.num_local_experts = 8;
     other.num_experts_per_tok = 2;
     try std.testing.expect(!supportsMtpVerifyInputFrame(other, 3, 1024));
+}
+
+test "gated decoder frame completion propagates a failed submission once" {
+    const Probe = struct {
+        attempts: usize = 0,
+        cancellations: usize = 0,
+
+        fn submit(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.attempts += 1;
+            if (self.attempts == 1) return error.DeviceLost;
+        }
+        fn cancel(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.cancellations += 1;
+        }
+    };
+    var table = @import("../ops/native_compute.zig").vtable_impl;
+    table.regions.commands.submitAndWaitFrame = Probe.submit;
+    table.regions.commands.cancelFrame = Probe.cancel;
+    var probe: Probe = .{};
+    const cb: ops.ComputeBackend = .{ .ptr = &probe, .vtable = &table };
+    var owned = true;
+    try std.testing.expectError(error.DeviceLost, completeDecoderRuntimeFrame(&cb, &owned));
+    try std.testing.expect(owned);
+    try std.testing.expectEqual(@as(usize, 1), probe.attempts);
+    cancelDecoderRuntimeFrame(&cb, &owned);
+    try std.testing.expect(!owned);
+    try std.testing.expectEqual(@as(usize, 1), probe.cancellations);
+
+    owned = true;
+    try completeDecoderRuntimeFrame(&cb, &owned);
+    try std.testing.expect(!owned);
+    try completeDecoderRuntimeFrame(&cb, &owned);
+    try std.testing.expectEqual(@as(usize, 2), probe.attempts);
 }
 
 test "Gemma4 MTP input frame transfers and cancels only owned frames" {

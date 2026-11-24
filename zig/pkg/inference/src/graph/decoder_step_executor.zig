@@ -1007,15 +1007,16 @@ pub const Executor = struct {
         }
         // The callback may have parked/restored; read the actual owner NOW.
         const prepared = (try C.beginBoundedDecodeGraph(self.context.cb, .{ .boundary = self.context.cleanupEpoch(), .operation = self.context.cb.operationToken() }, &funding_phase, descriptor)) orelse return self.declineLightOnGraph(7);
-        // All graph tokens are consumed/published. Pure metadata can now retire
-        // at this B even if later scalar/host reads park and rotate it again.
-        try funding_phase.close(.{ .boundary = self.context.cleanupEpoch() });
         var graph = prepared;
         defer graph.deinit();
+        // Funding tokens are consumed or published. Close metadata while
+        // holding the claim, before later readback can rotate the boundary.
+        try funding_phase.close(.{ .boundary = self.context.cleanupEpoch() });
         errdefer {
             for (items) |item| if (item.state.qwen35_linear_cache) |cache| for (cache.layers) |*layer| {
                 layer.cuda_device.failed = true;
             };
+            graph.compute.bounded_decode_graph.disabled_epoch = graph.compute.bounded_decode_graph.epoch_id;
             graph.compute.clearCapturedGraphWithCleanup(.{ .boundary = self.context.cleanupEpoch() }) catch platform.inference_process_supervisor.restartWorker();
         }
         var burst = try graph.burst(embedding, self.context.gpt_config.vocab_size);
@@ -1072,7 +1073,7 @@ pub const Executor = struct {
         var render = Render{ .pipeline = self, .items = items, .burst = &burst, .head = head };
         if (graph.compute.bounded_decode_graph.phase == .replay) try render.advanceCpu();
         try self.context.cb.checkExecutionControl();
-        try graph.run(&render, Render.run, self.context.cleanup_owner, self.context.cleanupEpoch());
+        try graph.run(&render, Render.run);
         graph.noteKvTokens(storage, render.max_tokens);
         var host: [256]u32 = undefined;
         try graph.read(&burst, host[0 .. 2 * claimed.len]);

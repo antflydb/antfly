@@ -1649,28 +1649,18 @@ pub const Forward = struct {
             decode_context,
             .{ .execution = .captured_native },
         )) orelse return null;
-        var owns_hidden = true;
-        errdefer if (owns_hidden) self.forward.context.cb.free(tail.final_hidden);
-
-        var greedy = (try decoder_tail_runtime.forwardGreedyTokenTensorFromFinalHidden(
+        defer self.forward.context.cb.free(tail.final_hidden);
+        const greedy = try decoder_tail_runtime.forwardGreedyTokenTensorFromFinalHidden(
             self.forward.context.cb,
             self.forward.context.allocator,
             self.forward.context.gpt_config.*,
             tail.final_hidden,
             .rms,
             tail.final_norm_slot,
-        )) orelse {
-            self.forward.context.cb.free(tail.final_hidden);
-            return null;
-        };
-        if (greedy.token_tensor) |token_tensor| {
-            self.forward.context.cb.free(token_tensor);
-            greedy.token_tensor = null;
-        }
+        );
+        if (greedy.token_tensor) |token_tensor| self.forward.context.cb.free(token_tensor);
 
         const last_hidden = try self.capturePreparedTailPostNormHiddenFromModel(capture_last_hidden, tail.final_hidden, tail.final_norm_slot);
-        self.forward.context.cb.free(tail.final_hidden);
-        owns_hidden = false;
         debugGenerationStage(
             "executePrefill prepared_tail_greedy token={d} capture_hidden={}",
             .{ greedy.token_id, capture_last_hidden },
@@ -1760,26 +1750,15 @@ pub const Forward = struct {
             };
         }
 
-        const logits = if (try decoder_tail_runtime.forwardPreparedLogitsTensorFromFinalHidden(
+        const logits = try decoder_tail_runtime.completePreparedLogits(
             self.forward.context.cb,
+            self.forward.context.allocator,
             self.forward.context.gpt_config.*,
             tail.final_hidden,
             .rms,
             tail.final_norm_slot,
             tail.final_lm_head_slot,
-        )) |prepared_logits|
-            prepared_logits
-        else
-            (try decoder_tail_runtime.forwardLogitsTensorFromFinalHidden(
-                self.forward.context.cb,
-                self.forward.context.gpt_config.*,
-                tail.final_hidden,
-                .rms,
-                tail.final_norm_slot,
-            )) orelse {
-                if (last_hidden) |hidden| self.forward.context.cb.free(hidden);
-                return null;
-            };
+        );
         defer self.forward.context.cb.free(logits);
         const last_logits = try self.forward.context.cb.toFloat32(logits, self.forward.context.allocator);
         gpt_arch.applyFinalLogitSoftcapInPlace(self.forward.context.gpt_config.*, last_logits);

@@ -3720,7 +3720,7 @@ pub const CudaCompute = struct {
             const owner = &self.compute.bounded_decode_graph;
             try self.compute.lighton_attention.advanceGraph(&self.compute.ctx, owner.positions().ptr, owner.counter().ptr, @intCast(owner.rows * 3));
         }
-        pub fn run(self: *@This(), context: *anyopaque, callback: *const fn (*anyopaque, *@This()) anyerror!void, cleanup_owner: ?*const @import("../../execution/cleanup_owner.zig").Owner, cleanup_epoch: ?*const @import("../../execution/retirement_sink.zig").Epoch) !void {
+        pub fn run(self: *@This(), context: *anyopaque, callback: *const fn (*anyopaque, *@This()) anyerror!void) !void {
             const compute = self.compute;
             const owner = &compute.bounded_decode_graph;
             if (owner.phase == .replay) {
@@ -3734,22 +3734,23 @@ pub const CudaCompute = struct {
             }
             const phase = owner.phase;
             if (phase == .disabled) return error.InvalidExecutionPlan;
+            const plan = owner.plan orelse return error.InvalidExecutionPlan;
             const WorkspaceScope = @import("../../execution/stream_workspace.zig").Scope;
             const capture = phase == .capture;
             var scope = if (capture)
-                try WorkspaceScope.bind(owner.plan.?, try owner.arenaLayout(), owner.arena.ptr, owner.arena.len)
+                try WorkspaceScope.bind(plan, try owner.arenaLayout(), owner.arena.ptr, owner.arena.len)
             else
-                WorkspaceScope{ .plan = owner.plan.? };
+                WorkspaceScope{ .plan = plan };
             var capture_active = false;
             errdefer {
-                std.log.warn("LightOn decoder graph aborted: phase={s} event={d}/{d}", .{ @tagName(phase), scope.cursor, owner.plan.?.event_count });
+                std.log.warn("LightOn decoder graph aborted: phase={s} event={d}/{d}", .{ @tagName(phase), scope.cursor, plan.event_count });
                 compute.execution_scope = null;
                 owner.active = false;
                 if (capture_active) {
                     owner.pending_graph = graph_mod.endRecording(&compute.ctx) catch null;
                 }
-                owner.disabled_epoch = owner.epoch_id;
-                compute.clearCapturedGraphWithCleanup(.{ .boundary = if (cleanup_owner) |source| source.epoch() else cleanup_epoch }) catch platform.inference_process_supervisor.restartWorker();
+                // Keep the recording and backing owned until the claim's
+                // caller releases its burst views and retires the epoch.
             }
             if (capture) {
                 try compute.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED);
@@ -3772,8 +3773,8 @@ pub const CudaCompute = struct {
             if (owner.expected_ragged_packets != 0 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
                 std.debug.print("LIGHTONOCR3 cuda_model_graph_recorded_ragged_packets={d} rows={d}\n", .{ owner.expected_ragged_packets, owner.rows });
             if (phase == .learn) {
-                if (!owner.plan.?.finishNoOutput() or compute.stats.h2d_bytes != h2d or compute.stats.d2h_bytes != d2h or compute.lighton_attention.calls - attention_calls != owner.expected_attention_calls) {
-                    std.log.warn("LightOn decoder graph plan declined: allocations={d} events={d} peak={d} h2d={d} d2h={d}", .{ owner.plan.?.count, owner.plan.?.event_count, owner.plan.?.peak, compute.stats.h2d_bytes - h2d, compute.stats.d2h_bytes - d2h });
+                if (!plan.finishNoOutput() or compute.stats.h2d_bytes != h2d or compute.stats.d2h_bytes != d2h or compute.lighton_attention.calls - attention_calls != owner.expected_attention_calls) {
+                    std.log.warn("LightOn decoder graph plan declined: allocations={d} events={d} peak={d} h2d={d} d2h={d}", .{ plan.count, plan.event_count, plan.peak, compute.stats.h2d_bytes - h2d, compute.stats.d2h_bytes - d2h });
                     owner.disabled_epoch = owner.epoch_id;
                     owner.phase = .disabled;
                 } else owner.phase = .capture;

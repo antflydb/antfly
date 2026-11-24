@@ -667,23 +667,15 @@ pub fn forwardPrefillLastLogits(
     defer if (last_hidden != final_hidden) cb.free(last_hidden);
 
     started_at = monotonicNowNs();
-    const logits = if (try decoder_tail_runtime.forwardPreparedLogitsTensorFromFinalHidden(
+    const logits = try decoder_tail_runtime.completePreparedLogits(
         cb,
+        allocator,
         gpt_config,
         last_hidden,
         .rms,
         finalNormSlot(configured_layer_count),
         finalLmHeadSlot(configured_layer_count),
-    )) |prepared_logits|
-        prepared_logits
-    else
-        (try decoder_tail_runtime.forwardLogitsTensorFromFinalHidden(
-            cb,
-            gpt_config,
-            last_hidden,
-            .rms,
-            finalNormSlot(configured_layer_count),
-        )) orelse return null;
+    );
     defer cb.free(logits);
     const result = try cb.toFloat32(logits, allocator);
     gpt_arch.applyFinalLogitSoftcapInPlace(gpt_config, result);
@@ -732,22 +724,14 @@ pub fn forwardLastLogitsTensor(
     };
     defer cb.free(final_hidden);
 
-    if (try decoder_tail_runtime.forwardPreparedLogitsTensorFromFinalHidden(
+    return try decoder_tail_runtime.completePreparedLogits(
         cb,
+        allocator,
         gpt_config,
         final_hidden,
         .rms,
         finalNormSlot(configured_layer_count),
         finalLmHeadSlot(configured_layer_count),
-    )) |logits| {
-        return logits;
-    }
-    return decoder_tail_runtime.forwardLogitsTensorFromFinalHidden(
-        cb,
-        gpt_config,
-        final_hidden,
-        .rms,
-        finalNormSlot(configured_layer_count),
     );
 }
 
