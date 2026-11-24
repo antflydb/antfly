@@ -5777,11 +5777,21 @@ fn sameBytes(left: ?[]const u8, right: ?[]const u8) bool {
 
 /// Shared with the final history capture stage; it must inspect the staged
 /// record using the actual record codec rather than duplicating byte offsets.
-pub fn requireExternalCompletionRelease(raw: []const u8, owner: ExternalDecisionOwner) !void {
+pub fn requireExternalCompletionRelease(raw: []const u8, owner: ExternalDecisionOwner, commit_version: u64) !void {
     const record = try decodeRecord(raw);
     const current = record.external_decision_owner orelse return error.ExternalTransactionDecisionRequired;
     if (!current.eql(owner)) return error.ExternalTransactionDecisionChanged;
-    try requireCompletionResolvedRecord(raw, record.commit_version);
+    try requireCompletionResolvedRecord(raw, commit_version);
+}
+
+pub fn requireOrdinaryCompletionRelease(a: Allocator, txn: anytype, id: TxnId, raw: []const u8, commit_version: u64, coordinator: bool) !void {
+    const record = try decodeRecord(raw);
+    if (record.external_decision_owner != null or !record.ordinary_producer or record.source_scope != null or
+        record.source_purpose != null or !record.coordinator_known or record.coordinator != coordinator)
+        return error.SourceTransactionIdentityConflict;
+    try requireCompletionResolvedRecord(raw, commit_version);
+    if (coordinator and (!record.retain_terminal_known or record.retain_terminal or
+        try TxnManager.hasUnresolvedParticipantsInRead(a, txn, id))) return error.SourceOutcomeUnresolved;
 }
 
 pub fn requireCompletionResolvedRecord(raw: []const u8, commit_version: u64) !void {
@@ -6588,6 +6598,14 @@ test "committed history completion admission raft resolution requires applying c
 }
 
 test "committed history completion admission keeps external certificates through the consumer floor" {
+    try testCompletionCollection(true);
+}
+
+test "committed history completion admission keeps ordinary certificates through coordinator acknowledgment and the consumer floor" {
+    try testCompletionCollection(false);
+}
+
+fn testCompletionCollection(comptime external_decision: bool) !void {
     const history = @import("committed_history.zig");
     const a = std.testing.allocator;
     const path = try tempTestPath(a, "txn-external-completion-release");
@@ -6628,29 +6646,50 @@ test "committed history completion admission keeps external certificates through
         .input_digest = input,
         .routed_owner = owner,
     }};
-    const admission: completion.Admission = .{ .version = 3, .transaction_id = id, .admission_digest = @splat(6), .coordinator_namespace = namespace, .coordinator_fence = owner.digest(), .participants = &members };
+    var follower = owner;
+    follower.namespace = @splat(34);
+    follower.group_id += 1;
+    const ordinary_members = members ++ [_]completion.Participant{.{
+        .namespace = follower.namespace,
+        .owner_fence = follower.digest(),
+        .roles = completion.Roles.guards,
+        .locator = "table2:00000004:docs:4",
+        .input_digest = @splat(5),
+        .routed_owner = follower,
+    }};
+    const admission: completion.Admission = .{ .version = 3, .transaction_id = id, .admission_digest = @splat(6), .coordinator_namespace = namespace, .coordinator_fence = owner.digest(), .participants = if (external_decision) &members else &ordinary_members };
     var manager = try TxnManager.init(a, &store);
     defer manager.deinit();
-    try manager.initTransactionWithCompletionAdmission(admission, 10, 11, true, .{ .ordinary_producer = true, .completion_owner = owner, .external_decision_owner = external });
+    try manager.initTransactionWithCompletionAdmission(admission, 10, 11, external_decision, .{ .ordinary_producer = true, .completion_owner = owner, .external_decision_owner = if (external_decision) external else null });
     try manager.writeIntentsExtraBatch(id, &.{.{ .key = "row", .value = "{}" }}, &.{}, .{
         .ordinary_producer = true,
         .completion_owner = owner,
         .completion_input_digest = input,
-        .external_decision_owner = external,
+        .external_decision_owner = if (external_decision) external else null,
     });
-    try manager.activateExternalDecision(id, external, .{});
+    if (external_decision) try manager.activateExternalDecision(id, external, .{});
     var marker: [16]u8 = @splat(0);
     std.mem.writeInt(u64, marker[0..8], 2, .little);
     std.mem.writeInt(u64, marker[8..16], 3, .little);
     _ = try manager.resolveIntentsWithExtraBatch(id, .committed, 20, .{
         .completion_owner = owner,
-        .external_decision_owner = external,
+        .external_decision_owner = if (external_decision) external else null,
         .writes = &.{.{ .key = &internal_keys.ordered_document_applied_entry_key, .value = &marker }},
     });
     var receipt = (try manager.getCompletionResolution(a, id)).?;
     defer receipt.deinit();
     try std.testing.expectEqual(@as(u64, 1), receipt.value.resolution.outcome.effects.sequence);
-    const raw = try completion.encode(a, .{ .manifest = try admission.manifest(20), .resolutions = &.{receipt.value.resolution} });
+    const manifest = try admission.manifest(20);
+    const follower_position = receipt.value.resolution.source_position;
+    const resolutions = [_]completion.Resolution{ receipt.value.resolution, .{
+        .namespace = follower.namespace,
+        .owner_fence = follower.digest(),
+        .manifest_digest = manifest.digest(),
+        .commit_version = 20,
+        .source_position = follower_position,
+        .outcome = .{ .no_effect = completion.noEffectProof(manifest, follower.namespace, follower_position) },
+    } };
+    const raw = try completion.encode(a, .{ .manifest = manifest, .resolutions = resolutions[0..admission.participants.len] });
     defer a.free(raw);
     const published = observed: {
         var txn = try store.beginWriteTxn();
@@ -6662,14 +6701,74 @@ test "committed history completion admission keeps external certificates through
         break :observed publication;
     };
     const custody: @import("db/types.zig").CompletionRelease = .{ .decision_owner = external, .certificate_digest = published.digest };
+    const ordinary: history.OrdinaryCompletionRelease = .{
+        .coordinator = owner,
+        .admission_digest = admission.digest(),
+        .certificate_digest = published.digest,
+        .commit_version = 20,
+    };
+    if (!external_decision) {
+        {
+            var txn = try store.beginWriteTxn();
+            defer txn.abort();
+            try std.testing.expectError(error.SourceOutcomeUnresolved, history.releaseOrdinaryCompletion(a, &txn, namespace, owner, id, ordinary));
+        }
+        try manager.markParticipantResolved(id, members[0].locator);
+        try manager.markParticipantResolved(id, ordinary_members[1].locator);
+        {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            try std.testing.expectError(error.SourceOutcomeUnresolved, history.releaseOrdinaryCompletion(a, &txn, namespace, owner, id, ordinary));
+            var advance = ordinary;
+            advance.progress = .{ .expected = 0, .released = 1 };
+            try history.releaseOrdinaryCompletion(a, &txn, namespace, owner, id, advance);
+            try txn.commit();
+        }
+        {
+            var txn = try store.beginReadTxn();
+            defer txn.abort();
+            const progress = try history.readCompletionPublication(a, &txn, namespace, 0, .{
+                .version = 2,
+                .owner = owner,
+                .transaction_id = id,
+                .manifest_digest = manifest.digest(),
+                .commit_version = 20,
+                .minimum_applied_index = 4,
+            });
+            try std.testing.expectEqual(@as(u16, 1), progress.release.?.released_followers);
+            try std.testing.expect(!progress.release.?.collection_staged);
+        }
+    }
     {
         var txn = try store.beginWriteTxn();
         errdefer txn.abort();
-        var wrong = custody;
-        wrong.decision_owner.admission_digest[0] ^= 1;
-        try std.testing.expectError(error.ExternalTransactionDecisionChanged, history.releaseCompletion(a, &txn, namespace, owner, id, wrong));
-        try history.releaseCompletion(a, &txn, namespace, owner, id, custody);
-        try history.releaseCompletion(a, &txn, namespace, owner, id, custody);
+        if (external_decision) {
+            var wrong = custody;
+            wrong.decision_owner.admission_digest[0] ^= 1;
+            try std.testing.expectError(error.ExternalTransactionDecisionChanged, history.releaseCompletion(a, &txn, namespace, owner, id, wrong));
+
+            const original_resolution = receipt.value.resolution;
+            const original_receipt = try completion.encodeResolution(a, try admission.manifest(20), original_resolution);
+            defer a.free(original_receipt);
+            const different_manifest = try admission.manifest(21);
+            var different_resolution = original_resolution;
+            different_resolution.commit_version = different_manifest.commit_version;
+            different_resolution.manifest_digest = different_manifest.digest();
+            const different_receipt = try completion.encodeResolution(a, different_manifest, different_resolution);
+            defer a.free(different_receipt);
+            try txn.put(&completion.resolutionKey(id), different_receipt);
+            try std.testing.expectError(error.SourceOutcomeUnresolved, history.releaseCompletion(a, &txn, namespace, owner, id, custody));
+            try txn.put(&completion.resolutionKey(id), original_receipt);
+
+            try history.releaseCompletion(a, &txn, namespace, owner, id, custody);
+            try history.releaseCompletion(a, &txn, namespace, owner, id, custody);
+        } else {
+            var wrong = ordinary;
+            wrong.admission_digest[0] ^= 1;
+            try std.testing.expectError(error.SourceTransactionIdentityConflict, history.releaseOrdinaryCompletion(a, &txn, namespace, owner, id, wrong));
+            try history.releaseOrdinaryCompletion(a, &txn, namespace, owner, id, ordinary);
+            try history.releaseOrdinaryCompletion(a, &txn, namespace, owner, id, ordinary);
+        }
         try std.testing.expect(try history.reclaim(&txn, namespace));
         try std.testing.expect((try history.load(&txn)).?.retained_bytes > published.retained_bytes);
         try txn.commit();
@@ -6679,7 +6778,10 @@ test "committed history completion admission keeps external certificates through
         errdefer txn.abort();
         try history.acknowledge(&txn, namespace, consumer_id, consumer.epoch, 0, 1);
         try std.testing.expect(try history.reclaim(&txn, namespace));
-        try history.releaseCompletion(a, &txn, namespace, owner, id, custody);
+        if (external_decision)
+            try history.releaseCompletion(a, &txn, namespace, owner, id, custody)
+        else
+            try history.releaseOrdinaryCompletion(a, &txn, namespace, owner, id, ordinary);
         try std.testing.expectEqual(@as(u64, 0), (try history.load(&txn)).?.retained_bytes);
         try std.testing.expectError(error.NotFound, txn.get(&completion.resolutionKey(id)));
         try txn.commit();

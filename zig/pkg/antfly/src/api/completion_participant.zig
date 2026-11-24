@@ -140,6 +140,22 @@ pub const Port = struct {
         return self.writeRequest(a, fence, owner, locator.table_name, request, context, scope.deadline_ns);
     }
 
+    pub fn releaseOrdinary(self: Port, a: A, member: completion.Participant, fence: metadata.CatalogRouteFence, transaction_id: types.TxnId, release: completion.OrdinaryRelease, original: operation.RequestContext) !void {
+        const owner = member.routed_owner orelse return error.InvalidParticipant;
+        const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
+        try release.validate(owner);
+        var routed = owner;
+        routed.topology_epoch = fence.topology_epoch;
+        try validateParticipantFence(routed, locator.group_id, fence);
+        var scope = try @import("history_publication_operations.zig").Scope.init(fence, original);
+        const request: types.BatchRequest = .{ .sync_level = .write, .transaction = .{ .publish_completion = .{
+            .txn_id = transaction_id,
+            .completion_owner = owner,
+            .ordinary_release = release,
+        } } };
+        try self.writeRequest(a, fence, owner, locator.table_name, request, scope.context(), scope.deadline_ns);
+    }
+
     pub fn acknowledgeResolved(self: Port, a: A, lookup: @import("history_decision_operations.zig").wire.Query, observation: @import("history_decision_operations.zig").wire.Reply, fence: metadata.CatalogRouteFence, original: operation.RequestContext) !void {
         var scope = try @import("history_publication_operations.zig").Scope.init(fence, original);
         const context = scope.context();

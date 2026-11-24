@@ -1966,7 +1966,9 @@ noinline fn parseBatchTransitions(alloc: std.mem.Allocator, root: std.json.Objec
         const completion_prepare = external_history_prepare or legacy_completion_prepare or ordinary_completion_prepare or source_prepare or std.mem.eql(u8, phase_value.string, "prepare_completion_v1");
         const completion_resolve = external_history_resolve or source_resolve or std.mem.eql(u8, phase_value.string, "resolve_completion_v1");
         const completion_publish = std.mem.eql(u8, phase_value.string, "publish_completion_v1");
-        const completion_release = std.mem.eql(u8, phase_value.string, "release_external_completion_v1");
+        const external_completion_release = std.mem.eql(u8, phase_value.string, "release_external_completion_v1");
+        const ordinary_completion_release = std.mem.eql(u8, phase_value.string, "release_ordinary_completion_v1");
+        const completion_release = external_completion_release or ordinary_completion_release;
         if (completion_publish != object.contains("completion_certificate") or
             completion_release != object.contains("completion_release")) return error.InvalidBatchRequest;
         if (!completion_begin and !completion_prepare and !completion_resolve and !completion_publish and !completion_release and object.contains("completion_owner")) return error.InvalidBatchRequest;
@@ -1983,7 +1985,14 @@ noinline fn parseBatchTransitions(alloc: std.mem.Allocator, root: std.json.Objec
             const retain = object.get("retain_terminal") orelse return error.InvalidBatchRequest;
             if (retain != .bool or !retain.bool) return error.InvalidBatchRequest;
         }
-        if (completion_release) {
+        if (ordinary_completion_release) {
+            const binding = completion_owner orelse return error.InvalidBatchRequest;
+            var parsed = try std.json.parseFromValue(@import("../storage/transaction_completion.zig").OrdinaryRelease, alloc, object.get("completion_release").?, .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" });
+            defer parsed.deinit();
+            try parsed.value.validate(binding);
+            break :transaction .{ .publish_completion = .{ .txn_id = txn_id, .completion_owner = binding, .ordinary_release = parsed.value } };
+        }
+        if (external_completion_release) {
             const binding = completion_owner orelse return error.InvalidBatchRequest;
             var parsed = try std.json.parseFromValue(db_types.CompletionRelease, alloc, object.get("completion_release").?, .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" });
             defer parsed.deinit();
@@ -3156,7 +3165,11 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_types.BatchRequest,
             .publish_completion => |publication| {
                 try validateCompletionControlRequest(req);
                 const txn_hex = std.fmt.bytesToHex(publication.txn_id, .lower);
-                if (publication.release) |release| {
+                if (publication.ordinary_release) |release| {
+                    if (publication.certificate.len != 0 or publication.release != null) return error.InvalidBatchRequest;
+                    try release.validate(publication.completion_owner);
+                    try writer.print("\"phase\":\"release_ordinary_completion_v1\",\"txn_id\":\"{s}\",\"completion_owner\":{f},\"completion_release\":{f}", .{ &txn_hex, std.json.fmt(publication.completion_owner, .{}), std.json.fmt(release, .{}) });
+                } else if (publication.release) |release| {
                     if (publication.certificate.len != 0) return error.InvalidBatchRequest;
                     try release.validate(publication.completion_owner);
                     try writer.print("\"phase\":\"release_external_completion_v1\",\"txn_id\":\"{s}\",\"completion_owner\":{f},\"completion_release\":{f}", .{ &txn_hex, std.json.fmt(publication.completion_owner, .{}), std.json.fmt(release, .{}) });
@@ -5386,6 +5399,36 @@ test "external completion wire preserves both authorities and rejects downgrade"
         defer a.free(downgraded);
         try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(a, downgraded));
     }
+}
+
+test "completion begin wire ordinary release preserves authority and rejects downgrade" {
+    const a = std.testing.allocator;
+    const owner: @import("../storage/transaction_completion.zig").RoutedOwner = .{
+        .metadata_group_id = 1,
+        .metadata_incarnation = @splat('1'),
+        .namespace = @splat(1),
+        .table_binding = @splat(2),
+        .root_generation = 0,
+        .group_id = 2,
+        .topology_epoch = 3,
+    };
+    const request: db_types.BatchRequest = .{ .sync_level = .write, .transaction = .{ .publish_completion = .{
+        .txn_id = @splat(4),
+        .completion_owner = owner,
+        .ordinary_release = .{ .coordinator = owner, .admission_digest = @splat(5), .certificate_digest = @splat(6), .commit_version = 7 },
+    } } };
+    const bytes = try encodeBatchRequest(a, request);
+    defer a.free(bytes);
+    var decoded = try parseInternalBatchRequest(a, bytes);
+    defer decoded.deinit(a);
+    try std.testing.expectEqualDeep(request.transaction.?, decoded.req.transaction.?);
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(a, bytes));
+    const downgraded = try std.mem.replaceOwned(u8, a, bytes, "release_ordinary_completion_v1", "publish_completion_v1");
+    defer a.free(downgraded);
+    try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(a, downgraded));
+    var mixed = request;
+    mixed.transaction.?.publish_completion.certificate = "unexpected";
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(a, mixed));
 }
 
 test "completion begin wire producer completion phases preserve absence and reject downgrade" {

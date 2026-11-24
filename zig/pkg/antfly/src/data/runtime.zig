@@ -18146,6 +18146,11 @@ pub const DataServer = struct {
                     owner.topology_epoch = route.write_route_fence.?.topology_epoch;
                 const admission_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
                 try @import("../api/completion_owner_admission.zig").require(alloc, admission_source.catalog, table_name, route.write_route_fence.?, storage_owner_descriptor.?.view(), owner, completion_context);
+                if (req.transaction.? == .publish_completion) {
+                    const publication = req.transaction.?.publish_completion;
+                    if (publication.ordinary_release) |release|
+                        try self.completionRecovery().requireOrdinaryRelease(alloc, publication.completion_owner, publication.txn_id, release, completion_context);
+                }
             }
 
             var target_index: ?u64 = null;

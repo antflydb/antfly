@@ -629,7 +629,7 @@ pub const VTable = struct {
     orderedHistoryOutcome: *const fn (*DB, std.mem.Allocator, @import("history_ordered.zig").Lookup) Outcome(@import("history_ordered.zig").Outcome),
     nativeHistoryGrant: *const fn (*DB, @import("history_consumer.zig").GrantIdentity) Outcome(@import("history_consumer.zig").GrantObservation),
     orderedHistoryGrant: *const fn (*DB, @import("history_consumer.zig").GrantIdentity, u64) Outcome(@import("history_consumer.zig").GrantObservation),
-    releaseReplicatedCompletionCertificate: *const fn (*DB, types.TxnId, @import("transaction_completion.zig").RoutedOwner, types.CompletionRelease, types.OrderedApplyReceipt) Outcome(void),
+    releaseReplicatedCompletionCertificate: *const fn (*DB, types.TxnId, @import("transaction_completion.zig").RoutedOwner, types.CompletionCollectionAuthority, types.OrderedApplyReceipt) Outcome(void),
     publishReplicatedCompletionCertificate: *const fn (*DB, []const u8, @import("transaction_completion.zig").RoutedOwner, types.OrderedApplyReceipt) Outcome(@import("committed_history.zig").CompletionPublication),
     historyCompletionDecision: *const fn (*DB, Allocator, @import("history_decision_wire.zig").Query) Outcome([]u8),
     historyAdmission: *const fn (*DB, @import("history_admission_wire.zig").Query) Outcome(@import("history_admission_wire.zig").Reply),
@@ -679,7 +679,7 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
 /// Version 77 carries physical history ownership in SQL completion calls.
 /// Version 78 retains the query policy guard through the owner callback.
 /// Version 79 separates frozen PREPARE time from external vote admission time.
-pub const descriptor_version: u32 = 79;
+pub const descriptor_version: u32 = 80;
 pub const Descriptor = extern struct {
     version: u32 = descriptor_version,
     table_layout: native.TypeContract,

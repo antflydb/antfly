@@ -248,6 +248,7 @@ const completion = frame.completion;
 const completion_credit_prefix = "\x00\x00__committed_history__:completion_credit:";
 pub const completion_certificate_prefix = "\x00\x00__committed_history__:completion_certificate:";
 const completion_retained_prefix = "\x00\x00__committed_history__:completion_retained:";
+const ordinary_release_progress_prefix = "\x00\x00__committed_history__:ordinary_release_progress:";
 const completion_release_prefix = "\x00\x00__committed_history__:completion_release:";
 const publication_wire = @import("history_publication_wire.zig");
 pub const CompletionPublicationPosition = publication_wire.CompletionPublicationPosition;
@@ -760,14 +761,27 @@ fn reclaimReleasedCompletion(txn: anytype, state: *State, id: [16]u8, retained: 
     try txn.delete(&receipt_key);
     try txn.delete(&certificate_key);
     try txn.delete(&retained_key);
+    const progress_key = ordinary_release_progress_prefix.* ++ id;
+    if (try optional(txn, &progress_key) != null) try txn.delete(&progress_key);
     try txn.delete(&index_key);
     state.retained_bytes = std.math.sub(u64, state.retained_bytes, retained.bytes) catch return error.HistoryCorrupt;
 }
 
-/// Ordered release after metadata has durably joined every publication. A
-/// consumer can still read its local frame until the acknowledged prefix is
-/// physically reclaimed. Guard-only members have no such frame to retain.
+pub const OrdinaryCompletionRelease = completion.OrdinaryRelease;
+
+/// Metadata ordered release after all original participants have published.
 pub fn releaseCompletion(a: A, txn: anytype, namespace: frame.Namespace, owner: completion.RoutedOwner, id: [16]u8, custody: @import("db/types.zig").CompletionRelease) !void {
+    try releaseCompletionWithCustody(a, txn, namespace, owner, id, .{ .external = custody });
+}
+
+/// A Raft caller must qualify the durable all-participant publication at the
+/// original coordinator before ordering this release at any recipient.
+pub fn releaseOrdinaryCompletion(a: A, txn: anytype, namespace: frame.Namespace, owner: completion.RoutedOwner, id: [16]u8, custody: OrdinaryCompletionRelease) !void {
+    try custody.validate(owner);
+    try releaseCompletionWithCustody(a, txn, namespace, owner, id, .{ .ordinary = custody });
+}
+
+fn releaseCompletionWithCustody(a: A, txn: anytype, namespace: frame.Namespace, owner: completion.RoutedOwner, id: [16]u8, custody: @import("db/types.zig").CompletionCollectionAuthority) !void {
     var state = (try load(txn)) orelse return error.HistoryResynchronizationRequired;
     try requireNamespace(txn, state, namespace);
     if (!std.mem.eql(u8, &namespace, &owner.namespace)) return error.InvalidParticipant;
@@ -778,16 +792,62 @@ pub fn releaseCompletion(a: A, txn: anytype, namespace: frame.Namespace, owner: 
         return;
     };
     const retained = try RetainedCompletion.decode(raw);
-    if (!std.mem.eql(u8, &retained.certificate_digest, &custody.certificate_digest)) return error.DecisionConflict;
+    const expected_digest = switch (custody) {
+        inline else => |binding| binding.certificate_digest,
+    };
+    if (!std.mem.eql(u8, &retained.certificate_digest, &expected_digest)) return error.DecisionConflict;
     const record = (try optional(txn, &(completion.record_prefix.* ++ id))) orelse return error.HistoryCorrupt;
-    try @import("transactions.zig").requireExternalCompletionRelease(record, custody.decision_owner);
     const receipt_raw = (try optional(txn, &completion.resolutionKey(id))) orelse return error.HistoryCorrupt;
     var receipt = try completion.parseStoredResolution(a, receipt_raw);
     defer receipt.deinit();
     const resolution = receipt.value.resolution;
     if (!std.mem.eql(u8, &resolution.namespace, &namespace) or
         !std.mem.eql(u8, &resolution.owner_fence, &owner.digest())) return error.InvalidParticipant;
-    const sequence = switch (resolution.outcome) {
+    const transactions = @import("transactions.zig");
+    switch (custody) {
+        .external => |binding| try transactions.requireExternalCompletionRelease(record, binding.decision_owner, resolution.commit_version),
+        .ordinary => |binding| {
+            const raw_admission = (try optional(txn, &(completion.admission_prefix.* ++ id))) orelse return error.HistoryCorrupt;
+            var parsed = try completion.parseAdmission(a, raw_admission);
+            defer parsed.deinit();
+            const admission = parsed.value.admission;
+            const local = try admission.memberForOwner(owner);
+            if (!std.mem.eql(u8, &admission.transaction_id, &id) or
+                !std.mem.eql(u8, &parsed.value.digest, &binding.admission_digest) or
+                !std.meta.eql(try admission.coordinatorOwner(), binding.coordinator)) return error.SourceTransactionIdentityConflict;
+            try resolution.validate(try admission.manifest(binding.commit_version));
+            const coordinator = admission.isCoordinator(local);
+            try transactions.requireOrdinaryCompletionRelease(a, txn, id, record, binding.commit_version, coordinator);
+            if (coordinator) {
+                const followers = admission.participants.len - 1;
+                const released = try ordinaryCompletionReleaseProgress(txn, id);
+                if (released > followers) return error.HistoryCorrupt;
+                if (binding.progress) |advance| {
+                    if (advance.released > followers) return error.InvalidHistoryAdmission;
+                    if (released >= advance.released) return;
+                    if (released != advance.expected) return error.SourceOutcomeUnresolved;
+                    const key = ordinary_release_progress_prefix.* ++ id;
+                    var value: [2]u8 = undefined;
+                    std.mem.writeInt(u16, &value, advance.released, .big);
+                    try txn.put(&key, &value);
+                    return;
+                }
+                if (released != followers) return error.SourceOutcomeUnresolved;
+            }
+        },
+    }
+    try stageCompletionCollection(txn, &state, id, retained, resolution.outcome);
+}
+
+fn ordinaryCompletionReleaseProgress(txn: anytype, id: [16]u8) !u16 {
+    const key = ordinary_release_progress_prefix.* ++ id;
+    const raw = (try optional(txn, &key)) orelse return 0;
+    if (raw.len != 2) return error.HistoryCorrupt;
+    return std.mem.readInt(u16, raw[0..2], .big);
+}
+
+fn stageCompletionCollection(txn: anytype, state: *State, id: [16]u8, retained: RetainedCompletion, outcome: completion.Outcome) !void {
+    const sequence = switch (outcome) {
         .effects => |effects| effects.sequence,
         .no_effect => 0,
     };
@@ -801,8 +861,8 @@ pub fn releaseCompletion(a: A, txn: anytype, namespace: frame.Namespace, owner: 
         try txn.put(&key, &id);
         return;
     }
-    try reclaimReleasedCompletion(txn, &state, id, retained);
-    try save(txn, state);
+    try reclaimReleasedCompletion(txn, state, id, retained);
+    try save(txn, state.*);
 }
 
 /// Trusted ordered owner publication only. The caller must authenticate every
@@ -834,7 +894,24 @@ pub fn readCompletionPublication(a: A, txn: anytype, physical_namespace: frame.N
     defer certificate.deinit();
     const manifest = certificate.value.certificate.manifest;
     if (!std.mem.eql(u8, &manifest.transaction_id, &query.transaction_id) or !std.mem.eql(u8, &manifest.digest(), &query.manifest_digest) or manifest.commit_version != query.commit_version) return error.HistoryCorrupt;
-    return CompletionPublicationObservation.init(query, cut, try completionPublication(a, txn, physical_namespace, physical_root_generation, query.owner, raw, cut, false, false));
+    const published = try completionPublication(a, txn, physical_namespace, physical_root_generation, query.owner, raw, cut, false, false);
+    if (query.version == 1) return CompletionPublicationObservation.init(query, cut, published);
+    const owner_fence = query.owner.digest();
+    const local = for (certificate.value.certificate.resolutions) |resolution| {
+        if (std.mem.eql(u8, &resolution.namespace, &query.owner.namespace) and
+            std.mem.eql(u8, &resolution.owner_fence, &owner_fence)) break resolution;
+    } else return error.HistoryCorrupt;
+    const staged = switch (local.outcome) {
+        .no_effect => false,
+        .effects => |effects| if (try optional(txn, &completionReleaseKey(effects.sequence))) |id|
+            std.mem.eql(u8, id, &query.transaction_id)
+        else
+            false,
+    };
+    return CompletionPublicationObservation.initWithRelease(query, cut, published, .{
+        .released_followers = try ordinaryCompletionReleaseProgress(txn, query.transaction_id),
+        .collection_staged = staged,
+    });
 }
 
 pub const FrameCompletion = struct {

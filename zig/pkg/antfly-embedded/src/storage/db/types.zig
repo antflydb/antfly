@@ -264,6 +264,7 @@ pub const TransactionMutation = union(enum) {
         completion_owner: @import("../transaction_completion.zig").RoutedOwner,
         certificate: []const u8 = "",
         release: ?CompletionRelease = null,
+        ordinary_release: ?@import("../transaction_completion.zig").OrdinaryRelease = null,
     },
     /// Coordinator-side acknowledgement that one participant has durably
     /// learned the terminal decision. This must be ordered by coordinator
@@ -4842,6 +4843,17 @@ pub const CompletionRelease = struct {
         try owner.validate();
         if (!std.mem.eql(u8, &self.decision_owner.metadata_incarnation, &owner.metadata_incarnation) or
             std.mem.allEqual(u8, &self.certificate_digest, 0)) return error.InvalidHistoryAdmission;
+    }
+};
+
+pub const CompletionCollectionAuthority = union(enum) {
+    external: CompletionRelease,
+    ordinary: @import("../transaction_completion.zig").OrdinaryRelease,
+
+    pub fn validate(self: @This(), owner: @import("../transaction_completion.zig").RoutedOwner) !void {
+        switch (self) {
+            inline else => |binding| try binding.validate(owner),
+        }
     }
 };
 

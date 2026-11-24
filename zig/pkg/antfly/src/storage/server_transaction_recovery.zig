@@ -190,6 +190,7 @@ fn runRecoveryPageWithConfig(
                 .coordinator_locator = coordinator.locator,
                 .abort_before_ns = if (txn.source_purpose == null) now_ns -| config.cutoff_ns else 0,
                 .resolution_timestamp_ns = now_ns,
+                .collect_ordinary = txn.ordinary_producer,
             }) catch |err| {
                 summary.notification_failures += 1;
                 summary.recovery.deferred_unresolved += 1;

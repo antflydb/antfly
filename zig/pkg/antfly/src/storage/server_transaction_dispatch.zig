@@ -293,9 +293,12 @@ pub fn applyReplicatedTransactionMutationInternal(
             try @import("antfly_local_sources").api_internal_batch.validateCompletionControlRequest(req);
             const entry = raft_entry orelse return error.ChangefeedCapabilityUnsupported;
             if (publication.completion_owner.group_id != group_id) return error.TopologyChanged;
-            if (publication.release) |release| {
+            if (publication.ordinary_release) |release| {
+                if (publication.certificate.len != 0 or publication.release != null) return error.InvalidBatchRequest;
+                try db.releaseReplicatedCompletionCertificate(publication.txn_id, publication.completion_owner, .{ .ordinary = release }, entry);
+            } else if (publication.release) |release| {
                 if (publication.certificate.len != 0) return error.InvalidBatchRequest;
-                try db.releaseReplicatedCompletionCertificate(publication.txn_id, publication.completion_owner, release, entry);
+                try db.releaseReplicatedCompletionCertificate(publication.txn_id, publication.completion_owner, .{ .external = release }, entry);
             } else {
                 _ = try db.publishReplicatedCompletionCertificate(publication.certificate, publication.completion_owner, entry);
             }

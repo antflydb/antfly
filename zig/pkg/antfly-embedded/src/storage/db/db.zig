@@ -4427,6 +4427,7 @@ pub const DB = struct {
                 const policy_schema_pinned = core_owner.table_catalog.row_policy_phase != .disabled and
                     !try schema_mod.schemasEqual(alloc, core_owner.schema orelse return error.RowPolicyCatalogChanged, opts.schema_before_index_load.?.runtime_schema);
                 break :protected policy_schema_pinned or
+                    try rangeTransferPinsOwnerCatalog(&read, core_owner.identity_namespace) or
                     try @import("relational/indexes/owner_job.zig").protectsOwnerCatalog(&read, core_owner.identity_namespace) or
                     try @import("relational/schema_change/nullability_job.zig").protectedOwnerCatalog(alloc, &read, core_owner.identity_namespace) != null;
             } else false;
@@ -10928,6 +10929,17 @@ pub const DB = struct {
     /// validation or index job. Exact predecessor reads may use the durable runtime;
     /// installation remains unpublished until coordinated release. Historical
     /// descriptors only force deferral, never grant serving/mutation authority.
+    fn rangeTransferPinsOwnerCatalog(read: anytype, namespace: doc_identity.Namespace) !bool {
+        const fence = (try @import("relational/integrity/topology.zig").current(read)) orelse return false;
+        return switch (fence.role) {
+            .split_source, .split_destination, .merge_source, .merge_destination => blk: {
+                if (!fence.namespace.eql(namespace)) return error.IdentityNamespaceMismatch;
+                break :blk true;
+            },
+            else => false,
+        };
+    }
+
     pub fn schemaOwnerCatalogPolicy(self: *DB, schema_json: []const u8, historical: bool) !SchemaOwnerCatalogPolicy {
         const job = @import("relational/schema_change/nullability_job.zig");
         self.core.lockApplyShared();
@@ -10990,6 +11002,17 @@ pub const DB = struct {
                 if (!indexes.head.eql(head) or indexes.plan.schemaView().epoch != view.epoch) return error.PrivateIndexRootRecoveryRequired;
             } else if (resident.indexes != null) return error.PrivateIndexRootRecoveryRequired;
             return .readable;
+        }
+        if (try rangeTransferPinsOwnerCatalog(&read, self.core.identity_namespace)) {
+            // A cold range participant must load the durable schema even if
+            // the current descriptor would otherwise refresh its catalog.
+            // The ordered transition owns the fence and its release.
+            if (historical or schema_json.len == 0) return .deferred;
+            const durable = read.get(public_schema_json_key) catch |err| switch (err) {
+                error.NotFound => return .deferred,
+                else => return err,
+            };
+            return if (std.mem.eql(u8, schema_json, durable)) .readable else .deferred;
         }
         const header = (try job.protectedOwnerCatalog(self.alloc, &read, self.core.identity_namespace)) orelse return .unprotected;
         if (header.phase == .installed) try resident.require(header) else try resident.requireBefore(header.binding);
@@ -31144,7 +31167,7 @@ pub const DB = struct {
     }
 
     /// Release metadata custody while retaining any frame still pinned by consumers.
-    pub fn releaseReplicatedCompletionCertificate(self: *DB, id: types.TxnId, owner: @import("../transaction_completion.zig").RoutedOwner, release: types.CompletionRelease, entry: OrderedApplyReceipt) !void {
+    pub fn releaseReplicatedCompletionCertificate(self: *DB, id: types.TxnId, owner: @import("../transaction_completion.zig").RoutedOwner, release: types.CompletionCollectionAuthority, entry: OrderedApplyReceipt) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("releaseReplicatedCompletionCertificate", .{ self, id, owner, release, entry });
         try release.validate(owner);
         if (self.isClosed()) return error.StorageUnavailable;
@@ -31161,7 +31184,11 @@ pub const DB = struct {
         var txn = try self.core.store.beginWriteTxn();
         errdefer txn.abort();
         _ = try @import("../source_authority.zig").require(&txn, .raft, namespace);
-        try @import("../committed_history.zig").releaseCompletion(self.alloc, &txn, namespace, owner, id, release);
+        const history = @import("../committed_history.zig");
+        switch (release) {
+            .external => |binding| try history.releaseCompletion(self.alloc, &txn, namespace, owner, id, binding),
+            .ordinary => |binding| try history.releaseOrdinaryCompletion(self.alloc, &txn, namespace, owner, id, binding),
+        }
         var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
         const marker = orderedApplyReceiptWrite(entry, &marker_bytes);
         try txn.put(marker.key, marker.value);
