@@ -18,6 +18,7 @@ const ops = @import("../ops/ops.zig");
 const Tensor = @import("tensor.zig").Tensor;
 const TensorInfo = @import("tensor.zig").TensorInfo;
 const BackendType = @import("backends.zig").BackendType;
+const onnx_cache = @import("../execution/onnx_kv_cache.zig");
 const memory = @import("../runtime/tier/memory.zig");
 const invocation = @import("../execution/prepared_invocation.zig");
 const storage_admission = @import("../execution/storage_admission.zig");
@@ -972,20 +973,19 @@ pub const CachedDecoderGeometry = struct {
             if (std.mem.eql(u8, output.name, "logits")) {
                 bytes = try addBytes(bytes, try mulBytes(try mulBytes(try mulBytes(batch, tokens), self.vocab_size), output.dtype.byteSize()));
             } else {
-                const prefix = "present.";
-                if (!std.mem.startsWith(u8, output.name, prefix) or output.shape.len != 4) return error.UnresolvedOutputGeometry;
-                const suffix = output.name[prefix.len..];
+                const suffix = onnx_cache.presentOutputSuffix(output.name) orelse return error.UnresolvedOutputGeometry;
+                if (output.shape.len != 4) return error.UnresolvedOutputGeometry;
                 var past: ?TensorInfo = null;
                 for (0..inputs.len()) |i| {
                     const input = inputs.get(i);
-                    if (std.mem.startsWith(u8, input.name, "past_key_values.") and std.mem.eql(u8, input.name["past_key_values.".len..], suffix)) {
+                    if (std.mem.eql(u8, onnx_cache.pastInputSuffix(input.name) orelse continue, suffix)) {
                         past = input;
                         break;
                     }
                 }
                 const cached = past orelse return error.MissingInputs;
                 if (cached.shape.len != 4 or cached.shape[1] <= 0 or cached.shape[2] < 0 or cached.shape[3] <= 0) return error.InvalidInputShape;
-                const cross = std.mem.indexOf(u8, suffix, ".encoder.") != null;
+                const cross = onnx_cache.isCrossCacheSuffix(suffix);
                 const time = if (cross) context else try addBytes(@intCast(cached.shape[2]), tokens);
                 sequence = @max(sequence, time);
                 const elements = try mulBytes(try mulBytes(try mulBytes(batch, @intCast(cached.shape[1])), time), @intCast(cached.shape[3]));
@@ -1116,7 +1116,7 @@ pub fn retainedOutputAmounts(outputs: []const Tensor, cache_qualified: bool) !me
     var amounts = memory.AdmissionAmounts{};
     for (outputs) |output| {
         const bytes = try addBytes(output.data.len, try mulBytes(output.shape.len, @sizeOf(i64)));
-        if (cache_qualified and std.mem.startsWith(u8, output.name, "present.")) {
+        if (cache_qualified and onnx_cache.presentOutputSuffix(output.name) != null) {
             amounts.host_kv_bytes = try addBytes(amounts.host_kv_bytes, bytes);
         } else amounts.host_scratch_bytes = try addBytes(amounts.host_scratch_bytes, bytes);
     }
@@ -1134,8 +1134,7 @@ pub const OutputCredits = struct {
     const Entry = struct { group: usize = 0, remaining: usize = 0, amounts: memory.AdmissionAmounts = .{} };
 
     fn cacheGroup(name: []const u8) ?bool {
-        if (!std.mem.startsWith(u8, name, "present.")) return null;
-        return std.mem.indexOf(u8, name, ".encoder.") != null;
+        return onnx_cache.isCrossCacheSuffix(onnx_cache.presentOutputSuffix(name) orelse return null);
     }
 
     pub fn init(allocator: std.mem.Allocator, outputs: []const Tensor, cache_qualified: bool, covered: bool) !OutputCredits {

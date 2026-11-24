@@ -26,6 +26,8 @@ const StageInput = session_mod.StageInput;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const micro = @import("executor_microbatch.zig");
 
+const onnx_cache = @import("../execution/onnx_kv_cache.zig");
+
 pub const Dispatch = @import("../execution/tensor_dispatch.zig").Dispatch;
 
 /// Invocation-local metadata. Physical outputs/provider/model/quota are shared
@@ -40,8 +42,8 @@ const ResidentBatch = struct {
 
     fn omittedCrossCache(session: session_mod.Session, name: []const u8, shape: []const i64, total: usize) bool {
         if (session.cached_decoder_geometry == null or shape.len != 4) return false;
-        const suffix = @import("../graph/onnx_kv_cache.zig").presentOutputSuffix(name) orelse return false;
-        if (std.mem.indexOf(u8, suffix, ".encoder.") == null) return false;
+        const suffix = onnx_cache.presentOutputSuffix(name) orelse return false;
+        if (!onnx_cache.isCrossCacheSuffix(suffix)) return false;
         if (shape[0] != 0 and shape[0] != total) return false;
         var empty = false;
         for (shape) |dim| {
@@ -1104,7 +1106,7 @@ fn executeGroupMode(comptime placement: OutputPlacement, items: []const micro.Ex
     if (outputs.len == 0 or outputs.len != first.session.outputInfo().len) return error.InvalidFusedOutputShape;
     for (outputs, first.session.outputInfo()) |tensor, info| {
         const empty_cross_cache = first.session.cached_decoder_geometry != null and
-            std.mem.startsWith(u8, tensor.name, "present.") and std.mem.indexOf(u8, tensor.name, ".encoder.") != null and
+            onnx_cache.isCrossCacheSuffix(onnx_cache.presentOutputSuffix(tensor.name) orelse "") and
             tensor.data.len == 0 and tensor.shape.len == 4 and tensor.shape[0] == 0;
         if (!validTensor(tensor) or tensor.dtype != info.dtype or tensor.shape.len == 0 or (tensor.shape[0] != rows and !empty_cross_cache)) return error.InvalidFusedOutputShape;
         // Native multi-entry sessions qualify concrete stages independently

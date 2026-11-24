@@ -119,7 +119,7 @@ pub const metal_executor = if (build_options.enable_metal) @import("metal_execut
     }
 };
 pub const execution = @import("execution.zig");
-pub const onnx_kv_cache = @import("onnx_kv_cache.zig");
+pub const onnx_kv_cache = @import("../execution/onnx_kv_cache.zig");
 pub const compiled_pjrt = if (build_options.enable_pjrt) @import("compiled_pjrt.zig") else struct {};
 pub const pjrt_compiler = if (build_options.enable_pjrt) @import("pjrt_compiler.zig") else struct {};
 pub const pjrt_executor = if (build_options.enable_pjrt) @import("pjrt_executor.zig") else struct {};

@@ -17,7 +17,7 @@
 //! Reuses the graph KV owner, never a process-global prompt/context cache.
 const std = @import("std");
 const backends = @import("../backends/backends.zig");
-const kv = @import("../graph/onnx_kv_cache.zig");
+const kv = @import("onnx_kv_cache.zig");
 const ops = @import("../ops/ops.zig");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 
@@ -55,14 +55,14 @@ pub fn qualifiedSignature(inputs: []const backends.TensorInfo, outputs: []const 
             if (info.dtype != .bool_ or info.shape.len > 1 or (info.shape.len == 1 and info.shape[0] != 1)) return false;
             branch = true;
         } else if (kv.pastInputSuffix(info.name)) |suffix| {
-            if (!validCacheSuffix(suffix) or info.dtype != .f32 or info.shape.len != 4 or info.shape[0] == 0 or info.shape[0] > 1 or info.shape[1] <= 0 or info.shape[2] >= 0 or info.shape[3] <= 0) return false;
+            if (!kv.validCacheSuffix(suffix) or info.dtype != .f32 or info.shape.len != 4 or info.shape[0] == 0 or info.shape[0] > 1 or info.shape[1] <= 0 or info.shape[2] >= 0 or info.shape[3] <= 0) return false;
             const present = for (outputs) |output| {
                 if (kv.presentNameMatchesPastInput(info.name, output.name)) break output;
             } else return false;
             if (present.shape.len != 4 or
                 (present.shape[1] >= 0 and present.shape[1] != info.shape[1]) or
                 (present.shape[3] >= 0 and present.shape[3] != info.shape[3])) return false;
-            const cross = std.mem.indexOf(u8, suffix, ".encoder.") != null;
+            const cross = kv.isCrossCacheSuffix(suffix);
             if (!cross and present.shape[2] >= 0) return false;
             past_count += 1;
         } else return false;
@@ -76,26 +76,18 @@ pub fn qualifiedSignature(inputs: []const backends.TensorInfo, outputs: []const 
                 info.shape[1] >= 0 or (info.shape[2] >= 0 and info.shape[2] != vocab)) return false;
             logits = true;
         } else if (kv.presentOutputSuffix(info.name)) |suffix| {
-            if (!validCacheSuffix(suffix) or info.dtype != .f32 or info.shape.len != 4 or info.shape[0] == 0 or info.shape[0] > 1) return false;
+            if (!kv.validCacheSuffix(suffix) or info.dtype != .f32 or info.shape.len != 4 or info.shape[0] == 0 or info.shape[0] > 1) return false;
             present_count += 1;
         } else return false;
     }
     return ids and encoder and branch and logits and past_count > 0 and past_count == present_count;
 }
 
-fn validCacheSuffix(suffix: []const u8) bool {
-    const dot = std.mem.indexOfScalar(u8, suffix, '.') orelse return false;
-    _ = std.fmt.parseInt(usize, suffix[0..dot], 10) catch return false;
-    for ([_][]const u8{ ".decoder.key", ".decoder.value", ".encoder.key", ".encoder.value" }) |ending|
-        if (std.mem.eql(u8, suffix[dot..], ending)) return true;
-    return false;
-}
-
 fn cacheBound(session: backends.Session, batch: usize, tokens: usize, context: usize) !usize {
     var total: usize = 0;
     for (session.inputInfo()) |info| {
         const suffix = kv.pastInputSuffix(info.name) orelse continue;
-        const time = if (std.mem.indexOf(u8, suffix, ".encoder.") != null) context else tokens;
+        const time = if (kv.isCrossCacheSuffix(suffix)) context else tokens;
         const rows = try std.math.mul(usize, batch, time);
         const features = try std.math.mul(usize, @intCast(info.shape[1]), @intCast(info.shape[3]));
         const bytes = try std.math.mul(usize, try std.math.mul(usize, rows, features), info.dtype.byteSize());
@@ -174,7 +166,7 @@ pub const State = struct {
                     if (kv.presentNameMatchesPastInput(info.name, output.name)) break :cache .{ .past = .{
                         .output_index = index,
                         .empty_shape = .{ 1, info.shape[1], 0, info.shape[3] },
-                        .cross = std.mem.indexOf(u8, suffix, ".encoder.") != null,
+                        .cross = kv.isCrossCacheSuffix(suffix),
                     } };
                 }
                 unreachable; // The immutable qualified signature has an exact match.
