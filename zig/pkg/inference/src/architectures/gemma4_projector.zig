@@ -1978,7 +1978,6 @@ pub fn encodeProjectedAudioForPrompt(cb: *const ComputeBackend, allocator: std.m
     };
     if (!resident_handoff) return encodeProjectedAudioInputs(cb, allocator, projector, inputs);
     const cfg = try parseAudioConfig(&projector.gguf.parsed);
-    if (cfg.direct_unified) return encodeProjectedAudioInputs(cb, allocator, projector, inputs);
     if (inputs.len == 0) return error.EmptyEmbeddingInput;
     var weights = ProjectorWeights.init(cb, allocator, projector.gguf, projector);
     defer weights.deinit();
@@ -1989,16 +1988,23 @@ pub fn encodeProjectedAudioForPrompt(cb: *const ComputeBackend, allocator: std.m
     var initialized: usize = 0;
     defer for (clips[0..initialized]) |clip| cb.free(clip.embeddings);
     var total: usize = 0;
-    for (inputs, clips, counts) |input, *clip, *count| {
-        clip.* = switch (input) {
+    for (inputs, counts) |input, *count| {
+        const projected: ?ResidentEncodedAudio = if (cfg.direct_unified)
+            try encodeUnifiedDirectAudioResident(cb, allocator, &weights, cfg, input)
+        else switch (input) {
             .encoded => |bytes| try encodeSingleAudioResident(cb, allocator, &weights, cfg, bytes),
             .pcm => |pcm| try encodeSingleAudioPcmResident(cb, allocator, &weights, cfg, pcm),
         };
-        initialized += 1;
-        count.* = clip.tokens;
-        total = try std.math.add(usize, total, clip.tokens);
+        count.* = 0;
+        if (projected) |clip| {
+            clips[initialized] = clip;
+            initialized += 1;
+            count.* = clip.tokens;
+            total = try std.math.add(usize, total, clip.tokens);
+        }
     }
-    const rows = if (clips.len == 1) single: {
+    if (total == 0) return .{ .allocator = allocator, .embeddings = &.{}, .tokens_per_audio = counts, .hidden_size = cfg.text_hidden };
+    const rows = if (initialized == 1) single: {
         initialized = 0;
         break :single clips[0].embeddings;
     } else merged: {
@@ -2009,7 +2015,7 @@ pub fn encodeProjectedAudioForPrompt(cb: *const ComputeBackend, allocator: std.m
         const output = (try cb.allocUninitF32Shape(&shape)) orelse return error.UnsupportedResidentGemma4Audio;
         errdefer cb.free(output);
         var offset: usize = 0;
-        for (clips) |clip| {
+        for (clips[0..initialized]) |clip| {
             if (!try cb.copyRows2D(allocator, output, offset, clip.embeddings, 0, clip.tokens, cfg.text_hidden))
                 return error.UnsupportedResidentGemma4Audio;
             offset += clip.tokens;
@@ -2106,19 +2112,14 @@ fn embeddingGemma2StageTensor(cb: *const ComputeBackend, a: std.mem.Allocator, n
 }
 
 fn encodeSingleAudio(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, audio_bytes: []const u8) !EncodedAudio {
-    if (cfg.direct_unified) return encodeUnifiedDirectAudio(cb, allocator, store, cfg, audio_bytes);
+    if (cfg.direct_unified) return encodeUnifiedDirectAudio(cb, allocator, store, cfg, .{ .encoded = audio_bytes });
     const result = try encodeSingleAudioResident(cb, allocator, store, cfg, audio_bytes);
     defer cb.free(result.embeddings);
     return .{ .embeddings = try cb.toFloat32(result.embeddings, allocator), .tokens = result.tokens };
 }
 
 fn encodeSingleAudioPcm(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, pcm: audio.PcmAudio) !EncodedAudio {
-    if (cfg.direct_unified) {
-        for (pcm.samples) |sample| if (!std.math.isFinite(sample)) return error.InvalidAudioSamples;
-        const frames = try prepareGemma4RawAudioFramesPcm(allocator, pcm, cfg.raw_samples_per_token, cfg.max_direct_audio_tokens);
-        defer allocator.free(frames);
-        return encodeUnifiedDirectAudioFrames(cb, allocator, store, cfg, frames);
-    }
+    if (cfg.direct_unified) return encodeUnifiedDirectAudio(cb, allocator, store, cfg, .{ .pcm = pcm });
     const result = try encodeSingleAudioPcmResident(cb, allocator, store, cfg, pcm);
     defer cb.free(result.embeddings);
     return .{ .embeddings = try cb.toFloat32(result.embeddings, allocator), .tokens = result.tokens };
@@ -2380,43 +2381,36 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
     return .{ .embeddings = try deviceResidentFromFloat32(cb, packed_values, &.{ @intCast(valid_count), @intCast(cfg.text_hidden) }), .tokens = valid_count };
 }
 
-fn encodeUnifiedDirectAudio(
-    cb: *const ComputeBackend,
-    allocator: std.mem.Allocator,
-    store: *ProjectorWeights,
-    cfg: AudioConfig,
-    audio_bytes: []const u8,
-) !EncodedAudio {
-    const frames = try prepareGemma4RawAudioFrames(allocator, audio_bytes, cfg.raw_samples_per_token, cfg.max_direct_audio_tokens);
-    defer allocator.free(frames);
-    return encodeUnifiedDirectAudioFrames(cb, allocator, store, cfg, frames);
+fn encodeUnifiedDirectAudio(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, input: AudioInput) !EncodedAudio {
+    const result = (try encodeUnifiedDirectAudioResident(cb, a, store, cfg, input)) orelse
+        return .{ .embeddings = try a.alloc(f32, 0), .tokens = 0 };
+    defer cb.free(result.embeddings);
+    return .{ .embeddings = try cb.toFloat32(result.embeddings, a), .tokens = result.tokens };
 }
 
-fn encodeUnifiedDirectAudioFrames(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, frames: []const f32) !EncodedAudio {
-    const token_count = frames.len / cfg.raw_samples_per_token;
-    if (token_count == 0) {
-        return .{
-            .embeddings = try allocator.alloc(f32, 0),
-            .tokens = 0,
-        };
-    }
-    const frame_shape = [_]i32{ @intCast(token_count), @intCast(cfg.raw_samples_per_token) };
-    const frame_ct = try deviceResidentFromFloat32(cb, frames, &frame_shape);
-    defer cb.free(frame_ct);
-
-    // Direct unified audio projects RMS-normalized raw waveform chunks, matching
-    // llama.cpp's Gemma4UnifiedMultimodalEmbedder graph.
-    const normed = try rmsNormNoScaleCt(cb, allocator, frame_ct, token_count, cfg.raw_samples_per_token, cfg.layer_norm_eps);
-    defer cb.free(normed);
-    const projection_w = try store.linearCt("mm.a.input_projection.weight", cfg.raw_samples_per_token, cfg.text_hidden);
-    defer cb.free(projection_w);
-    const projected = try cb.linearNoBias(normed, projection_w, token_count, cfg.raw_samples_per_token, cfg.text_hidden);
-    defer cb.free(projected);
-
-    return .{
-        .embeddings = try cb.toFloat32(projected, allocator),
-        .tokens = token_count,
+fn encodeUnifiedDirectAudioResident(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, input: AudioInput) !?ResidentEncodedAudio {
+    const frames = switch (input) {
+        .encoded => |bytes| try prepareGemma4RawAudioFrames(a, bytes, cfg.raw_samples_per_token, cfg.max_direct_audio_tokens),
+        .pcm => |pcm| pcm_frames: {
+            for (pcm.samples) |sample| if (!std.math.isFinite(sample)) return error.InvalidAudioSamples;
+            break :pcm_frames try prepareGemma4RawAudioFramesPcm(a, pcm, cfg.raw_samples_per_token, cfg.max_direct_audio_tokens);
+        },
     };
+    defer a.free(frames);
+    const count = frames.len / cfg.raw_samples_per_token;
+    if (count == 0) return null;
+    const matrix = try deviceResidentFromFloat32(cb, frames, &.{ @intCast(count), @intCast(cfg.raw_samples_per_token) });
+    defer cb.free(matrix);
+    return try projectUnifiedAudioMatrix(cb, a, store, cfg, matrix, count);
+}
+
+fn projectUnifiedAudioMatrix(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, matrix: CT, frames: usize) !ResidentEncodedAudio {
+    const width = cfg.raw_samples_per_token;
+    const normalized = try rmsNormNoScaleCt(cb, a, matrix, frames, width, cfg.layer_norm_eps);
+    defer cb.free(normalized);
+    const weight = try store.linearCt("mm.a.input_projection.weight", width, cfg.text_hidden);
+    defer cb.free(weight);
+    return .{ .embeddings = try cb.linearNoBias(normalized, weight, frames, width, cfg.text_hidden), .tokens = frames };
 }
 
 fn prepareGemma4RawAudioFrames(
@@ -2458,6 +2452,43 @@ fn sourceSampleLimitForResample(target_samples: usize, source_rate: u32, target_
         return error.AudioInputTooLong;
     const source_samples = numerator / @as(u128, target_rate);
     return std.math.cast(usize, source_samples) orelse error.AudioInputTooLong;
+}
+
+test "Metal unified waveform projection shares host math and preserves empty clips" {
+    const helpers = @import("../ops/media_residency_test.zig");
+    const Fixture = struct {
+        fn weights(store: *@import("../ops/native_compute.zig").WeightStore) !void {
+            try helpers.putWeight(store, "mm.a.input_projection.weight", &.{ 64, 640 }, null);
+        }
+
+        fn check(backend: ComputeBackend, reference: ComputeBackend) !void {
+            const a = std.testing.allocator;
+            var cfg = embeddingGemma2AudioConfig();
+            cfg.direct_unified = true;
+            cfg.raw_samples_per_token = 640;
+            cfg.text_hidden = 64;
+            var source: ProjectorWeights = .{ .cb = &backend, .allocator = a, .gguf = null, .owner = null, .require_resident_weights = true };
+            defer source.deinit();
+            var host: ProjectorWeights = .{ .cb = &reference, .allocator = a, .gguf = null, .owner = null, .require_resident_weights = true };
+            defer host.deinit();
+            const empty: AudioInput = .{ .pcm = .{ .samples = &.{}, .sample_rate = 16000 } };
+            try std.testing.expect(try encodeUnifiedDirectAudioResident(&backend, a, &source, cfg, empty) == null);
+            const samples: [641]f32 = @splat(0.25);
+            const input: AudioInput = .{ .pcm = .{ .samples = &samples, .sample_rate = 16000 } };
+            const actual = (try encodeUnifiedDirectAudioResident(&backend, a, &source, cfg, input)) orelse return error.MissingResidentAudioProjection;
+            defer backend.free(actual.embeddings);
+            try std.testing.expect(@import("../ops/metal_compute.zig").MetalCompute.debugHasDeviceTensor(&backend, actual.embeddings));
+            const expected = try encodeUnifiedDirectAudio(&reference, a, &host, cfg, input);
+            defer a.free(expected.embeddings);
+            try std.testing.expectEqual(@as(usize, 2), actual.tokens);
+            try std.testing.expectEqual(expected.tokens, actual.tokens);
+            const values = try backend.toFloat32(actual.embeddings, a);
+            defer a.free(values);
+            try std.testing.expectEqual(expected.embeddings.len, values.len);
+            for (expected.embeddings, values) |want, have| try std.testing.expectApproxEqAbs(want, have, 1e-4);
+        }
+    };
+    try helpers.onMetal(Fixture.weights, Fixture.check);
 }
 
 test "gemma4 direct audio frames preserve raw waveform samples" {
@@ -2887,11 +2918,7 @@ pub fn encodeNamedAudioTensorResident(cb: *const ComputeBackend, a: std.mem.Allo
         for (mask) |valid| if (!valid) return error.InvalidAttentionMask;
         const matrix = try cb.primReshape(input, &.{ @intCast(frames), @intCast(width) });
         defer cb.free(matrix);
-        const normalized = try rmsNormNoScaleCt(cb, a, matrix, frames, width, cfg.layer_norm_eps);
-        defer cb.free(normalized);
-        const weight = try weights.linearCt("mm.a.input_projection.weight", width, cfg.text_hidden);
-        defer cb.free(weight);
-        return .{ .embeddings = try cb.linearNoBias(normalized, weight, frames, width, cfg.text_hidden), .tokens = frames };
+        return projectUnifiedAudioMatrix(cb, a, &weights, cfg, matrix, frames);
     }
     var features = AudioFeatures{ .allocator = a, .data = &.{}, .resident = input, .backend = cb, .mask = @constCast(mask), .frames = frames, .mel_bins = width };
     return encodeAudioFeaturesResident(cb, a, &weights, cfg, &features);
