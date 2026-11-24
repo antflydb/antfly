@@ -1107,7 +1107,7 @@ def test_pg_recvlogical_resume_after_restart(
                 timeout=20,
             )
             assert rejected.returncode != 0
-            assert "ChangefeedResynchronizationRequired" in rejected.stderr
+            assert "The retained position is no longer available." in rejected.stderr
             assert not rejected_output.exists() or not rejected_output.read_bytes()
             slot("--drop-slot")
             assert catalog_slot() == []
@@ -1134,8 +1134,8 @@ def test_pg_recvlogical_resume_after_restart(
                     assert any(
                         reason in result.stderr
                         for reason in (
-                            "ReplicationSlotActive",
-                            "HistoryPreparedTransactionsPresent",
+                            "The replication slot is active in another operation.",
+                            "Prepared transactions still own history required by this replication operation.",
                         )
                     ), result.stderr
                     return False
@@ -1157,7 +1157,7 @@ def test_pg_recvlogical_resume_after_restart(
                 timeout=20,
             )
             assert stale.returncode != 0
-            assert "ChangefeedResynchronizationRequired" in stale.stderr
+            assert "The retained position is no longer available." in stale.stderr
             assert not stale_output.exists() or not stale_output.read_bytes()
             sql("INSERT INTO smoke (id, content) VALUES (16, 'pre-schema-value')")
             sql("ALTER TABLE smoke ADD COLUMN additional TEXT")
@@ -1244,7 +1244,7 @@ def test_pg_recvlogical_resume_after_restart(
                 timeout=20,
             )
             assert invalidated.returncode != 0
-            assert "ChangefeedResynchronizationRequired" in invalidated.stderr
+            assert "The retained position is no longer available." in invalidated.stderr
             assert not discarded.exists() or not discarded.read_bytes()
             slot("--drop-slot")
             sql("DROP PUBLICATION changes", publication_owner=True)
