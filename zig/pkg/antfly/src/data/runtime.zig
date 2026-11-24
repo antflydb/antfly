@@ -16166,6 +16166,8 @@ pub const DataServer = struct {
     }
 
     fn baseRequiredRaftBatchProtocolVersion(alloc: std.mem.Allocator, req: antfly.db.types.BatchRequest) !u16 {
+        if (req.merge_checkpoint) |checkpoint| if (checkpoint.kind == .qualify_cutover)
+            return @import("../common/data_raft_protocol.zig").batch_merge_cutover_receipt_protocol_version;
         if (req.split_checkpoint) |checkpoint| if (checkpoint.history_policy != null)
             return @import("../common/data_raft_protocol.zig").batch_split_history_seed_protocol_version;
         if (req.merge_source_transition) |transition| if (transition.kind == .finalize)
@@ -22622,31 +22624,14 @@ pub const DataServer = struct {
     ) !antfly.metadata.transition_state.MergeObservation {
         const store = self.localTransitionApplyStore() orelse
             return error.MissingMergeSourceStore;
-        var observation = try deriveReplicatedMergeObservation(self.alloc, store, record);
-        if (record.phase != .finalized and observation.donor.phase == .finalized and observation.receiver.phase == .finalized) {
-            var ready = try self.mergeHistoryRetirementReady(record.donor_group_id, record.receiver_group_id, record.transition_id, record.table_contract);
-            if (ready and try transitionHasCoordinatedConstraints(self.alloc, record.table_contract)) {
-                // A retired history grant can unblock observation between
-                // finalize calls. Do not publish cutover until a finalize
-                // call has released the receiver's durable integrity fence.
-                var status = try self.readRelationalTopologyValue(IntegrityTopologyStatus, self.alloc, record.receiver_group_id, record.table_contract.table_name, record.transition_id, 1, "status");
-                defer status.deinit();
-                ready = status.value.fence == null;
-            }
-            if (!ready) {
-                observation.donor.phase = .cutover_ready;
-                observation.receiver.phase = .cutover_ready;
-                observation.donor.cutover_ready = true;
-                observation.receiver.cutover_ready = true;
-            }
-        }
-        return observation;
+        return deriveReplicatedMergeObservation(self.alloc, store, record, true);
     }
 
     fn deriveReplicatedMergeObservation(
         alloc: std.mem.Allocator,
         store: *DataRaftApplyStore,
         record: antfly.metadata.MergeTransitionRecord,
+        require_cutover_receipt: bool,
     ) !antfly.metadata.transition_state.MergeObservation {
         var source_state = try store.currentMergeSourceState(alloc, record.donor_group_id);
         var receiver_state = try store.currentMergeReceiverState(alloc, record.receiver_group_id);
@@ -22696,6 +22681,11 @@ pub const DataServer = struct {
             source_finalized and if (receiver_state) |state| state.phase == .finalized else false,
             if (receiver_state) |state| state.phase == .rolled_back else false,
         );
+        // Post-finalize history controls can advance the donor index without
+        // creating merge deltas. Keep dispatching qualification, not copy.
+        if (require_cutover_receipt and record.phase != .finalized and
+            status.phase == .finalized and !receiver_state.?.cutover_qualified)
+            status.phase = .cutover_ready;
         status.allow_doc_identity_reassignment = record.allow_doc_identity_reassignment;
         if (receiver_state) |state| if (state.receiver_identity_reassignment_namespace) |namespace| {
             status.receiver_identity_reassignment_namespace_table_id = namespace.table_id;
@@ -22721,7 +22711,7 @@ pub const DataServer = struct {
             .receiver_group_id = receiver_group_id,
             .allow_doc_identity_reassignment = allow_doc_identity_reassignment,
             .table_contract = table_contract,
-        });
+        }, false);
         return observation.donor.phase == .finalized and
             observation.receiver.phase == .finalized;
     }
@@ -22940,6 +22930,82 @@ pub const DataServer = struct {
         });
     }
 
+    const MergeCutoverJob = struct {
+        server: *DataServer,
+        op: @FieldType(antfly.metadata.TransitionAction, "finalize_merge"),
+        lane: ?TransitionActionLanes.Lease,
+
+        fn run(ptr: *anyopaque) !void {
+            const job: *@This() = @ptrCast(@alignCast(ptr));
+            defer job.releaseLane();
+            try job.server.requireReplicatedTransitionActionActive(job.op.donor_group_id);
+            if (try job.server.qualifyReplicatedMergeCutover(job.op)) {
+                job.releaseLane();
+                try job.server.reportMergeFinalize(job.op);
+            }
+        }
+
+        fn releaseLane(job: *@This()) void {
+            if (job.lane) |*lane| lane.deinit();
+            job.lane = null;
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const job: *@This() = @ptrCast(@alignCast(ptr));
+            const alloc = job.server.alloc;
+            job.releaseLane();
+            job.op.table_contract.deinitOwned(alloc);
+            alloc.destroy(job);
+        }
+    };
+
+    fn enqueueMergeCutover(self: *DataServer, op: @FieldType(antfly.metadata.TransitionAction, "finalize_merge"), lane: *?TransitionActionLanes.Lease) !void {
+        const runtime = try self.ensureBackendRuntime();
+        const owner_id = try self.replicatedTransitionActionOwnerId(runtime);
+        const job = try self.alloc.create(MergeCutoverJob);
+        errdefer self.alloc.destroy(job);
+        var owned = op;
+        owned.table_contract = try op.table_contract.clone(self.alloc);
+        errdefer owned.table_contract.deinitOwned(self.alloc);
+        job.* = .{ .server = self, .op = owned, .lane = lane.* };
+        lane.* = null;
+        errdefer job.releaseLane();
+        try runtime.durable_jobs.submit(.{
+            .owner_id = owner_id,
+            .class = .maintenance,
+            .ptr = job,
+            .run = MergeCutoverJob.run,
+            .deinit = MergeCutoverJob.deinit,
+        });
+    }
+
+    fn qualifyReplicatedMergeCutover(self: *DataServer, op: @FieldType(antfly.metadata.TransitionAction, "finalize_merge")) !bool {
+        const store = self.localTransitionApplyStore() orelse return error.MissingMergeSourceStore;
+        var receipt = (try store.currentMergeReceiverState(self.alloc, op.receiver_group_id)) orelse
+            return error.MergeReceiverProjectionNotReady;
+        defer receipt.deinit(self.alloc);
+        if (receipt.phase != .finalized or receipt.transition_id != op.transition_id or
+            receipt.donor_group_id != op.donor_group_id or receipt.receiver_group_id != op.receiver_group_id)
+            return error.MergeReceiverProjectionNotReady;
+        if (receipt.cutover_qualified) return false;
+        if (!try self.mergeHistoryRetirementReady(op.donor_group_id, op.receiver_group_id, op.transition_id, op.table_contract))
+            return false;
+        try self.releaseRelationalMergeReceiver(op.donor_group_id, op.receiver_group_id, op.transition_id, op.table_contract);
+        try self.replicateMergeReceiverCheckpoint(mergeReceiverCheckpoint(
+            op.transition_id,
+            op.donor_group_id,
+            op.receiver_group_id,
+            receipt.receiver_base_range,
+            receipt.merged_range orelse return error.MergeReceiverProjectionNotReady,
+            .qualify_cutover,
+            0,
+            op.allow_doc_identity_reassignment,
+            op.table_contract,
+            receipt.copy_attempt,
+        ), op.table_contract);
+        return true;
+    }
+
     fn localFinalizeMerge(ptr: *anyopaque, _: u64, op: @FieldType(antfly.metadata.TransitionAction, "finalize_merge")) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         try op.table_contract.validateForMerge(
@@ -22947,9 +23013,9 @@ pub const DataServer = struct {
         );
         if (self.data_raft != null) {
             try self.requireLocalDataRaftLeader(op.donor_group_id);
-            var lane = self.replicated_transition_action_lanes.tryAcquire(op.donor_group_id) orelse
+            var lane: ?TransitionActionLanes.Lease = self.replicated_transition_action_lanes.tryAcquire(op.donor_group_id) orelse
                 return error.TransitionOperationBusy;
-            defer lane.deinit();
+            defer if (lane) |*lease| lease.deinit();
             if (try self.replicatedMergeAlreadyFinalized(
                 op.transition_id,
                 op.donor_group_id,
@@ -22957,13 +23023,7 @@ pub const DataServer = struct {
                 op.allow_doc_identity_reassignment,
                 op.table_contract,
             )) {
-                // Report the completed physical step so metadata can expose
-                // finalizing while the donor is still routed. Observation
-                // keeps the transition nonterminal until history drains.
-                if (!try self.mergeHistoryRetirementReady(op.donor_group_id, op.receiver_group_id, op.transition_id, op.table_contract))
-                    return;
-                try self.releaseRelationalMergeReceiver(op.donor_group_id, op.receiver_group_id, op.transition_id, op.table_contract);
-                return;
+                return self.enqueueMergeCutover(op, &lane);
             }
             // The source copy needs the transition writer, but proposal and
             // committed apply need the ordinary writer. Drop only the copy
@@ -23030,9 +23090,7 @@ pub const DataServer = struct {
                 ),
                 op.table_contract,
             );
-            if (!try self.mergeHistoryRetirementReady(op.donor_group_id, op.receiver_group_id, op.transition_id, op.table_contract))
-                return;
-            try self.releaseRelationalMergeReceiver(op.donor_group_id, op.receiver_group_id, op.transition_id, op.table_contract);
+            return self.enqueueMergeCutover(op, &lane);
         } else if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .finalize_merge = op });
         } else {
@@ -23063,6 +23121,10 @@ pub const DataServer = struct {
                 try transition.execute(.{ .finalize_merge = op });
             }
         }
+        try self.reportMergeFinalize(op);
+    }
+
+    fn reportMergeFinalize(self: *DataServer, op: @FieldType(antfly.metadata.TransitionAction, "finalize_merge")) !void {
         self.invalidateLocalGroupStatusCache();
         try self.reachDataRequestLifecycle(.{
             .phase = .writer_handoff_completed,
@@ -62067,11 +62129,12 @@ fn implementationTests() type {
                     target: *antfly.data.RaftApplyStore,
                     group_id: u64,
                     index: u64,
+                    protocol: u16,
                 ) !void {
                     const payload = try data_raft_batch.encodeProtocolBarrier(
                         allocator,
                         "docs",
-                        data_raft_batch.merge_transition_protocol_version,
+                        protocol,
                     );
                     defer allocator.free(payload);
                     const entries = try antfly.raft.state_machine.encodeCommittedEntries(allocator, &.{.{
@@ -62111,8 +62174,9 @@ fn implementationTests() type {
                     });
                 }
             };
-            try Apply.barrier(alloc, &store, record.donor_group_id, 1);
-            try Apply.barrier(alloc, &store, record.receiver_group_id, 1);
+            const legacy_protocol = data_raft_batch.merge_transition_protocol_version;
+            try Apply.barrier(alloc, &store, record.donor_group_id, 1, legacy_protocol);
+            try Apply.barrier(alloc, &store, record.receiver_group_id, 1, legacy_protocol);
             try Apply.command(alloc, &store, record.donor_group_id, 2, .{
                 .merge_source_transition = .{
                     .kind = .prepare,
@@ -62139,7 +62203,7 @@ fn implementationTests() type {
             try Apply.command(alloc, &store, record.receiver_group_id, 3, .{
                 .merge_checkpoint = complete,
             });
-            const observation = try DataServer.deriveReplicatedMergeObservation(alloc, &store, record);
+            const observation = try DataServer.deriveReplicatedMergeObservation(alloc, &store, record, true);
             try std.testing.expectEqual(antfly.data.storage.range_transition.TransitionPhase.cutover_ready, observation.receiver.phase);
             try std.testing.expect(observation.receiver.bootstrapped);
             try std.testing.expectEqual(@as(u64, 2), observation.receiver.donor_delta_sequence);
@@ -62147,10 +62211,28 @@ fn implementationTests() type {
             var next_record = record;
             next_record.transition_id = 7002;
             next_record.donor_group_id = 73;
-            try std.testing.expectError(error.ConflictingMergeTransition, DataServer.deriveReplicatedMergeObservation(alloc, &store, next_record));
+            try std.testing.expectError(error.ConflictingMergeTransition, DataServer.deriveReplicatedMergeObservation(alloc, &store, next_record, true));
             complete.kind = .finalize;
             try Apply.command(alloc, &store, record.receiver_group_id, 4, .{ .merge_checkpoint = complete });
-            const fresh_observation = try DataServer.deriveReplicatedMergeObservation(alloc, &store, next_record);
+            try Apply.command(alloc, &store, record.donor_group_id, 3, .{
+                .merge_source_transition = .{
+                    .kind = .finalize,
+                    .transition_id = record.transition_id,
+                    .receiver_group_id = record.receiver_group_id,
+                },
+            });
+            const draining = try DataServer.deriveReplicatedMergeObservation(alloc, &store, record, true);
+            try std.testing.expectEqual(antfly.data.storage.range_transition.TransitionPhase.cutover_ready, draining.receiver.phase);
+            var qualification = base_checkpoint;
+            qualification.kind = .qualify_cutover;
+            const protocol = @import("../common/data_raft_protocol.zig").batch_merge_cutover_receipt_protocol_version;
+            try std.testing.expectEqual(protocol, try DataServer.requiredRaftBatchProtocolVersion(alloc, .{ .merge_checkpoint = qualification }));
+            try std.testing.expectError(error.RaftBatchMergeProtocolNotActivated, Apply.command(alloc, &store, record.receiver_group_id, 5, .{ .merge_checkpoint = qualification }));
+            try Apply.barrier(alloc, &store, record.receiver_group_id, 5, protocol);
+            try Apply.command(alloc, &store, record.receiver_group_id, 6, .{ .merge_checkpoint = qualification });
+            const qualified = try DataServer.deriveReplicatedMergeObservation(alloc, &store, record, true);
+            try std.testing.expectEqual(antfly.data.storage.range_transition.TransitionPhase.finalized, qualified.receiver.phase);
+            const fresh_observation = try DataServer.deriveReplicatedMergeObservation(alloc, &store, next_record, true);
             try std.testing.expectEqual(antfly.data.storage.range_transition.TransitionPhase.prepare, fresh_observation.receiver.phase);
             try std.testing.expect(!fresh_observation.receiver.bootstrapped);
             var prior = (try store.currentMergeReceiverState(alloc, record.receiver_group_id)).?;
@@ -62168,11 +62250,11 @@ fn implementationTests() type {
             next_checkpoint.donor_group_id = next_record.donor_group_id;
             next_checkpoint.receiver_base_start = next_ranges.base.start;
             next_checkpoint.merged_start = next_ranges.merged.start;
-            try Apply.command(alloc, &store, record.receiver_group_id, 5, .{ .merge_checkpoint = next_checkpoint });
+            try Apply.command(alloc, &store, record.receiver_group_id, 7, .{ .merge_checkpoint = next_checkpoint });
             next_checkpoint.kind = .rollback;
-            try Apply.command(alloc, &store, record.receiver_group_id, 6, .{ .merge_checkpoint = next_checkpoint });
+            try Apply.command(alloc, &store, record.receiver_group_id, 8, .{ .merge_checkpoint = next_checkpoint });
             // A retired identity is not mistaken for a fresh request after rollback.
-            try std.testing.expectError(error.ConflictingMergeTransition, DataServer.deriveReplicatedMergeObservation(alloc, &store, record));
+            try std.testing.expectError(error.ConflictingMergeTransition, DataServer.deriveReplicatedMergeObservation(alloc, &store, record, true));
         }
 
         test "data raft split finalization persists the receiver base before merge and survives restart replay" {

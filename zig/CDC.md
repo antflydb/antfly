@@ -70,6 +70,17 @@ The topology case uses the same slot through a live range split and merge. It
 verifies writes to both split participants, confirmed LSN advancement, and
 continuation after the merge and serving-node failover. These fixtures use
 three metadata nodes and three data nodes on a single host.
+
+For an ordinary replicated merge, physical copy and donor finalization can
+finish while the donor is still routed. The donor's frozen history cut must
+have no active grants or outstanding reservations. Its retention floor must
+reach the cut, and ordinary transaction completion certificates must finish
+collection. The data worker then releases any coordinated integrity fence on
+the receiver and commits a cutover receipt there. Metadata observes the
+replicated receipt before publishing the merged route. After a restart or
+leader change, an unfinished merge resumes qualification from the existing
+physical checkpoints. Writing the receipt requires protocol support from
+every applying member of the receiver's Raft group.
 Changing replica identity invalidates the old slot binding and returns a
 resynchronization error before streaming. Recreate the publication and slot
 when the binding changes. The same owner can reuse a slot name once the

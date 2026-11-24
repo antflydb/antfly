@@ -11007,7 +11007,7 @@ pub const DB = struct {
             // A cold range participant must load the durable schema even if
             // the current descriptor would otherwise refresh its catalog.
             // The ordered transition owns the fence and its release.
-            if (historical or schema_json.len == 0) return .deferred;
+            if (schema_json.len == 0) return .deferred;
             const durable = read.get(public_schema_json_key) catch |err| switch (err) {
                 error.NotFound => return .deferred,
                 else => return err,

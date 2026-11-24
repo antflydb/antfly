@@ -182,6 +182,7 @@ pub const MergeReplicationCheckpoint = struct {
         bootstrap_complete,
         finalize,
         rollback,
+        qualify_cutover,
     };
 
     kind: Kind,
@@ -465,6 +466,19 @@ pub const BatchRequest = struct {
         } orelse return null;
         if (!self.hasNoExternalControlEffects()) return null;
         return owner;
+    }
+
+    pub fn validateMergeCutoverReceipt(self: @This()) !bool {
+        const checkpoint = self.merge_checkpoint orelse return false;
+        if (checkpoint.kind != .qualify_cutover) return false;
+        var rest = self;
+        rest.merge_checkpoint = null;
+        rest.merge_replication = null;
+        if (self.transaction != null or !rest.hasNoExternalControlEffects() or
+            checkpoint.page_source != null or checkpoint.page_receiver_namespace != null or
+            checkpoint.page_source_catalogs != null)
+            return error.InvalidBatchRequest;
+        return true;
     }
 
     fn hasNoExternalControlEffects(self: @This()) bool {

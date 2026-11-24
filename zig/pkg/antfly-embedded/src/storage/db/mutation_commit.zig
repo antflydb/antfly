@@ -1498,7 +1498,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 coordinated_handoff = try @import("relational/integrity/handoff.zig").admitSplitRequest(S.ownerField(self, "alloc").*, topology_read, req);
                 if (hasCoordinatedConstraints(request_schema_view) and !coordinated_handoff) return error.CoordinatedConstraintTopologyUnsupported;
             }
-            if (req.merge_replication != null or req.merge_checkpoint != null or req.merge_page != null) {
+            if (try req.validateMergeCutoverReceipt()) {
+                const topology_read = try batchProbe(&batch_probe, self);
+                if (try @import("relational/integrity/topology.zig").current(topology_read)) |fence| {
+                    if (fence.transition_id == req.merge_checkpoint.?.transition_id)
+                        return error.IntegrityTopologyBusy;
+                }
+            } else if (req.merge_replication != null or req.merge_checkpoint != null or req.merge_page != null) {
                 const topology_read = try batchProbe(&batch_probe, self);
                 // Source retention remains authoritative after its brief pin
                 // fence is released. Receiving another merge would replace that
