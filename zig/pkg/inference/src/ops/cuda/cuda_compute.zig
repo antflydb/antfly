@@ -20637,11 +20637,9 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         const out = run(context, canonical[0..canonical_count]) catch |err| {
             self.execution_scope = null;
             if (err == error.Cancelled or err == error.Timeout) {
-                entry.owner = null;
-                owner.retire(plan_cleanup) catch |retire_err| {
+                entry.retireOwner(plan_cleanup) catch |retire_err| {
                     // Registration failed before custody transferred. Keep the
                     // owner for eviction without reusing an unfinished plan.
-                    entry.owner = owner;
                     entry.disabled = true;
                     std.log.warn("CUDA audio plan retirement after {s} failed: {s}", .{ @errorName(err), @errorName(retire_err) });
                 };

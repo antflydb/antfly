@@ -98,21 +98,23 @@ pub const Owner = struct {
         }
     }
 };
-pub const Entry = struct { key: u64 = 0, stamp: u64 = 0, warmed: bool = false, disabled: bool = false, owner: ?*Owner = null };
+pub const Entry = struct {
+    key: u64 = 0,
+    stamp: u64 = 0,
+    warmed: bool = false,
+    disabled: bool = false,
+    owner: ?*Owner = null,
+
+    pub fn retireOwner(self: *Entry, current: Cleanup) !void {
+        const owner = self.owner orelse return;
+        self.owner = null;
+        errdefer self.owner = owner;
+        try owner.retire(current);
+    }
+};
 pub const Cache = struct {
     entries: [8]Entry = @splat(.{}),
     clock: u64 = 0,
-    fn retireEntry(entry: *Entry, current: Cleanup) !void {
-        if (entry.owner) |owner| try owner.validateCleanup(current);
-        const previous = entry.*;
-        entry.* = .{}; // consume before any callback-capable outside death
-        if (previous.owner) |owner| {
-            owner.retire(current) catch |err| {
-                entry.* = previous; // registration failed before transfer
-                return err;
-            };
-        }
-    }
     pub fn getWithCleanup(self: *Cache, key: u64, current: Cleanup) !*Entry {
         var oldest: usize = 0;
         for (&self.entries, 0..) |*entry, index| {
@@ -130,7 +132,7 @@ pub const Cache = struct {
         var previous = entry.*;
         self.clock +|= 1;
         entry.* = .{ .key = key, .stamp = self.clock };
-        retireEntry(&previous, current) catch |err| {
+        previous.retireOwner(current) catch |err| {
             entry.* = previous; // no callback/transfer happened on error
             return err;
         };
@@ -146,7 +148,7 @@ pub const Cache = struct {
         // boundary registration allocates nothing after the validation above.
         var previous = self.*;
         self.* = .{};
-        for (&previous.entries) |*entry| retireEntry(entry, current) catch platform.inference_process_supervisor.restartWorker();
+        for (&previous.entries) |*entry| entry.retireOwner(current) catch platform.inference_process_supervisor.restartWorker();
     }
     pub fn clearLegacy(self: *Cache) !void {
         for (self.entries) |entry| if (entry.owner) |owner| {
@@ -158,6 +160,21 @@ pub const Cache = struct {
         self.clearLegacy() catch platform.inference_process_supervisor.restartWorker();
     }
 };
+test "CUDA audio plan retirement keeps custody when cleanup authority is missing" {
+    var entry: Entry = .{ .key = 17, .stamp = 2, .warmed = true };
+    const owner = try Owner.create(std.testing.allocator);
+    owner.managed = true;
+    entry.owner = owner;
+    defer entry.retireOwner(.{ .outside_execution = true }) catch unreachable;
+
+    try std.testing.expectError(error.MissingCurrentCleanupEpoch, entry.retireOwner(.{}));
+    try std.testing.expectEqual(@as(?*Owner, owner), entry.owner);
+    try std.testing.expect(!owner.retiring);
+    try entry.retireOwner(.{ .outside_execution = true });
+    try std.testing.expectEqual(@as(?*Owner, null), entry.owner);
+    try std.testing.expect(entry.warmed);
+}
+
 test "embeddinggemma2 CUDA audio lifetime plan reuses dead regions and rejects allocation drift" {
     const a = std.testing.allocator;
     const p = try a.create(Plan);
