@@ -72,12 +72,12 @@ button.link.danger { color: var(--destructive); }
 button.wide { width: 100%; padding: 0.75rem; }
 label.inline { display: flex; gap: 0.6rem; align-items: flex-start; font-size: 14px; }
 label.inline input { width: auto; margin-top: 0.2rem; accent-color: var(--foreground); }
-/* Switches: the sidebar indicator (.dot) and the real checkbox in the sheet share one look. */
-label.switch { justify-content: space-between; align-items: center; gap: 1rem; padding: 0.6rem 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); cursor: pointer; }
-.dot, label.switch input { appearance: none; position: relative; flex: none; width: 30px; height: 18px; margin: 0; padding: 0; border: 0; border-radius: 999px; background: var(--input); transition: background-color 0.15s; }
-.dot::after, label.switch input::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--surface); box-shadow: 0 1px 2px rgb(0 0 0 / 0.2); transition: transform 0.15s; }
-.dot.on, label.switch input:checked { background: var(--foreground); }
-.dot.on::after, label.switch input:checked::after { transform: translateX(12px); }
+/* A checkbox drawn as a switch. */
+label.switch { display: flex; justify-content: space-between; align-items: center; gap: 1rem; cursor: pointer; }
+label.switch input { appearance: none; position: relative; flex: none; width: 30px; height: 18px; margin: 0; padding: 0; border: 0; border-radius: 999px; background: var(--input); transition: background-color 0.15s; }
+label.switch input::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--surface); box-shadow: 0 1px 2px rgb(0 0 0 / 0.2); transition: transform 0.15s; }
+label.switch input:checked { background: var(--foreground); }
+label.switch input:checked::after { transform: translateX(12px); }
 label.switch input { cursor: pointer; }
 label.switch input:focus-visible { outline: 2px solid var(--foreground); outline-offset: 2px; }
 
@@ -114,35 +114,37 @@ nav { display: grid; gap: 2px; }
 .folder:hover { color: var(--foreground); }
 .folder[aria-current="page"] { background: var(--selected); color: var(--foreground); font-weight: 600; }
 
-/* On-device search: a sidebar item that opens a floating sheet. */
+/* On-device search: one switch, explained by a tooltip on hover or focus. */
 .device { position: relative; }
-.device summary { list-style: none; cursor: pointer; display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 0.7rem; align-items: center; padding: 0.55rem 0.75rem; border-radius: var(--radius); font-size: 14px; color: var(--muted); }
-.device summary::-webkit-details-marker { display: none; }
-.device summary:hover, .device[open] summary { background: var(--hover); color: var(--foreground); }
-.device summary small { grid-column: 1; font-size: 12px; color: var(--faint); }
-.device summary .dot { grid-column: 2; grid-row: 1 / span 2; }
-.dot.busy { animation: pulse 1.2s ease-in-out infinite; }
-@keyframes pulse { 50% { opacity: 0.3; } }
-.sheet {
+.device-row { padding: 0.55rem 0.75rem; border-radius: var(--radius); font-size: 14px; color: var(--muted); }
+.device-row:hover { background: var(--hover); color: var(--foreground); }
+.device-text { display: grid; min-width: 0; }
+.device-text small { font-size: 12px; color: var(--faint); }
+label.switch input.busy { animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: 0.4; } }
+.tooltip {
   position: absolute;
   z-index: 10;
-  left: 0;
-  top: calc(100% + 0.5rem);
-  width: 340px;
-  display: grid;
-  gap: 0.85rem;
-  padding: 1.15rem;
-  background: var(--surface);
-  border: 1px solid var(--input);
-  border-radius: var(--radius-lg);
-  box-shadow: 0 12px 32px rgb(0 0 0 / 0.08);
-  font-size: 14px;
+  left: calc(100% + 0.6rem);
+  top: 0;
+  width: 260px;
+  padding: 0.65rem 0.8rem;
+  border-radius: var(--radius);
+  background: var(--foreground);
+  color: var(--surface);
+  font-size: 12.5px;
+  line-height: 1.5;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 0.12);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity 0.12s, visibility 0.12s;
 }
-.sheet-title { font-weight: 600; }
-.sheet > p:not(.sheet-title):not(.credit) { color: var(--muted); }
-#local-status:empty, .row-actions:not(:has(button:not([hidden]))) { display: none; }
-.sheet progress { width: 100%; accent-color: var(--foreground); }
-.row-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+.device-row:hover + .tooltip, .device-row:focus-within + .tooltip { opacity: 1; visibility: visible; transition-delay: 0.35s; }
+.device progress { width: calc(100% - 1.5rem); margin: 0.25rem 0.75rem 0; accent-color: var(--foreground); }
+.device-status { padding: 0.2rem 0.75rem 0; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.device-status:not(:has(#local-status:not(:empty), button:not([hidden]))) { display: none; }
+.device-status .link { font-size: 12px; }
 .account { margin-top: auto; display: grid; grid-template-columns: minmax(0, 1fr); gap: 0.15rem; padding: 1rem 0.6rem 0; border-top: 1px solid var(--border); }
 .account .label { font-size: 12px; color: var(--faint); }
 .address { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -289,17 +291,19 @@ pre { font: 15px/1.7 var(--font-sans); white-space: pre-wrap; overflow-wrap: any
   .account { margin: 0 0 0 auto; padding: 0; border: 0; }
   .account .label, .address-row { display: none; }
   .signed-in { margin: 0; }
+  .tooltip { left: 0; top: calc(100% + 0.4rem); }
+  .device-status, .device progress { display: none; }
 }
 @media (max-width: 700px) {
   .shell { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
   .sidebar { gap: 0.25rem; flex-wrap: nowrap; padding: 0.6rem 0.75rem; }
   .compose { padding: 0.5rem 0.7rem; }
   .account { flex: none; }
-  .brand span, .signed-in span, .device summary small { display: none; }
+  .brand span, .signed-in span, .device-text { display: none; }
   .folder { padding: 0.45rem; font-size: 0; gap: 0; }
   .folder .icon { width: 20px; height: 20px; }
-  .device summary { grid-template-columns: auto; font-size: 0; padding: 0.5rem 0.3rem; }
-  .sheet { position: fixed; left: 0.75rem; right: 0.75rem; top: 4rem; width: auto; }
+  .device-row { padding: 0.5rem 0.3rem; }
+  .tooltip { position: fixed; left: 0.75rem; right: 0.75rem; top: 3.75rem; width: auto; }
   .meta .time-col, .meta time { grid-column: 2 / -1; }
   .meta .addr { display: block; margin: 0; }
   .list { border-right: 0; }

@@ -507,8 +507,8 @@ async function refresh() {
 function localStatus(message, progress) {
   $("local-status").textContent = message;
   $("local-progress").hidden = !progress;
-  // The sidebar dot pulses while the model downloads or messages are indexed.
-  $("local-dot").classList.toggle("busy", !!progress);
+  // The switch pulses while the model downloads or messages are indexed.
+  $("local-toggle").classList.toggle("busy", !!progress);
   if (progress) {
     if (progress.total) {
       $("local-progress").max = progress.total;
@@ -518,11 +518,9 @@ function localStatus(message, progress) {
 }
 function localReady(state) {
   $("local-badge").textContent = state ? (state.messages ?? 0) + " messages on this device" : "Off";
-  $("local-dot").classList.toggle("on", !!state);
   $("search-note-text").textContent = state ? "Search by meaning on this device, by Antfly" : "Search by Antfly";
   $("search-where").hidden = !state;
   $("local-sync").hidden = !state;
-  $("local-remove").hidden = !state;
 }
 const megabytes = (bytes) => (bytes / 1024 ** 2).toFixed(bytes < 10 * 1024 ** 2 ? 1 : 0) + " MB";
 // Open this mailbox's on-device copy, downloading the model on first use, then sync.
@@ -669,10 +667,6 @@ $("local-toggle").onchange = guarded(async (event) => {
   else await stopLocal();
 });
 $("local-sync").onclick = guarded(syncLocal);
-$("local-remove").onclick = guarded(async () => {
-  $("local-toggle").checked = false;
-  await stopLocal();
-});
 addEventListener("online", () => {
   if (local) syncLocal().catch((error) => localStatus(error.message));
 });

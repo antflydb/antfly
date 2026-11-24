@@ -46,18 +46,15 @@
       <button id="outbox" class="folder"><svg class="icon" aria-hidden="true"><use href="#i-sent"/></svg>Outbox</button>
       <button id="trash" class="folder"><svg class="icon" aria-hidden="true"><use href="#i-trash"/></svg>Trash</button>
     </nav>
-    <details id="local" class="device" hidden>
-      <summary><span class="dot" id="local-dot"></span><span>On-device search</span><small id="local-badge">Off</small></summary>
-      <div class="sheet">
-        <p class="sheet-title">On-device search</p>
-        <p>Keep a private copy of this mailbox's text in this browser and search it by meaning with EmbeddingGemma, running entirely on this device. Messages and their embeddings never leave it, and search keeps working offline. The model is a one-time download, shared by every mailbox on this device.</p>
-        <label class="inline switch"><span>Keep a searchable copy of this mailbox on this device</span><input type="checkbox" role="switch" id="local-toggle"></label>
-        <progress id="local-progress" hidden></progress>
-        <p id="local-status" class="quiet" role="status" aria-live="polite"></p>
-        <p class="credit"><svg class="mark" aria-hidden="true"><use href="#mark"/></svg>Search by Antfly</p>
-        <div class="row-actions"><button type="button" id="local-sync" hidden>Sync now</button><button type="button" id="local-remove" class="danger" hidden>Remove from this device</button></div>
-      </div>
-    </details>
+    <div id="local" class="device" hidden>
+      <label class="switch device-row" aria-describedby="local-help">
+        <span class="device-text"><span>On-device search</span><small id="local-badge">Off</small></span>
+        <input type="checkbox" role="switch" id="local-toggle" aria-label="On-device search">
+      </label>
+      <p id="local-help" class="tooltip" role="tooltip">Search your mail by meaning with a model that runs in this browser. Your messages and their embeddings stay on this device, and search keeps working offline. The model is a one-time download. Turning this off deletes the copy.</p>
+      <progress id="local-progress" hidden></progress>
+      <p class="device-status"><span id="local-status" role="status" aria-live="polite"></span> <button type="button" id="local-sync" class="link" hidden>Sync now</button></p>
+    </div>
     <footer class="account">
       <p class="label">Your address</p>
       <div class="address-row"><p id="address" class="address"></p><button type="button" id="copy-address" class="ghost icon-only" aria-label="Copy address" title="Copy address"><svg class="icon" aria-hidden="true"><use href="#i-copy"/></svg></button></div>
