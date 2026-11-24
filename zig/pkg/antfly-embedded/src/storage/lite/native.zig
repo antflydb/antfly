@@ -1710,7 +1710,9 @@ test "lite coordinator publication cancellation never performs fallible notifica
         var cancel_write: bool = false;
         var cancel_after_commit: bool = false;
         var writes: usize = 0;
+        var stats: usize = 0;
         fn stat(userdata: ?*anyopaque, handle: std.Io.File) std.Io.File.StatError!std.Io.File.Stat {
+            stats += 1;
             if (cancel_stat) return error.Canceled;
             return std.testing.io.vtable.fileStat(userdata, handle);
         }
@@ -1750,12 +1752,14 @@ test "lite coordinator publication cancellation never performs fallible notifica
         Fault.cancel_write = false;
         Fault.cancel_after_commit = false;
     }
+    // The notification's identity comes from the inode registry entry, so
+    // no stat (cancelable or not) runs on the publication path at all.
     Fault.writes = 0;
+    Fault.stats = 0;
     Fault.cancel_stat = true;
-    try std.testing.expectError(error.Canceled, file.publishCheckpoint(checkpoint, false, null));
+    try std.testing.expect(file.dataIdentity() != null);
+    try std.testing.expectEqual(@as(usize, 0), Fault.stats);
     try std.testing.expectEqual(@as(usize, 0), Fault.writes);
-    try std.testing.expectEqualDeep(before, file.header);
-    try std.testing.expect(!file.checkpoint_publication_uncertain);
     Fault.cancel_stat = false;
     Fault.cancel_write = true;
     // Cancellation inside the uncertain window reports an unknown outcome.
@@ -1770,7 +1774,9 @@ test "lite coordinator publication cancellation never performs fallible notifica
     // Cancellation after the active-slot write cannot undo a committed result
     // or make its coordinator notification abort the process.
     Fault.cancel_after_commit = true;
+    Fault.stats = 0;
     try file.publishCheckpoint(checkpoint, false, null);
+    try std.testing.expectEqual(@as(usize, 0), Fault.stats);
     try std.testing.expect(!file.checkpoint_publication_uncertain);
     try std.testing.expectEqual(checkpoint, file.activeCheckpoint());
     Fault.cancel_after_commit = false;
@@ -12233,6 +12239,10 @@ pub const NativeFile = struct {
         encodeHeader(&encoded, header);
         var hasher = std.crypto.hash.Blake3.init(.{});
         hasher.update(&encoded);
+        // An interrupted versioned-text migration encodes like a finished
+        // one (the pending state lives in the checksum, not a field). Only
+        // a pending fence adds input, so other fingerprints are unchanged.
+        if (header.versioned_text_fence_pending) hasher.update("versioned text fence pending");
         for (header.checkpoints) |slot| {
             var slot_payload: [checkpoint_slot_payload_size]u8 = undefined;
             encodeCheckpointSlotPayload(&slot_payload, slot);
@@ -21942,7 +21952,11 @@ pub const NativeFile = struct {
         try self.resyncRedoTailUnderAuthority();
         // Persist a pending physical slot before a new WAL record can
         // consume the sequence after it. The slot proves the gap on replay.
-        if (self.header.protected_redo and self.durable_header != null and self.pendingPhysicalRedoCheckpoint(self.activeCheckpoint())) {
+        // Another physical commit (`checkpointing`) appends no record, so a
+        // run of deferred ride-along reclaims stays sync-free; the next
+        // logical commit still pays this barrier first.
+        const physical_next = if (self.redo) |*redo| redo.checkpointing else false;
+        if (self.header.protected_redo and !physical_next and self.durable_header != null and self.pendingPhysicalRedoCheckpoint(self.activeCheckpoint())) {
             try self.sync();
         }
         self.debugEnterCommitSpan();
@@ -34509,6 +34523,14 @@ test "lite native reclaimPagesForMaintenanceWithCancel still defers the gated le
     for (0..8) |_| _ = try file.reclaimPagesForMaintenanceWithCancel(4096, null, false);
     try std.testing.expectEqual(folded_before, file.redo.?.checkpoint_sequence);
     try std.testing.expectEqual(syncs_before, file.test_sync_calls.load(.monotonic));
+    try std.testing.expect((try file.check()).valid);
+    // The next logical commit makes the deferred physical slot durable
+    // before its record consumes the following sequence.
+    try file.putDocument("after", "value");
+    try std.testing.expect(file.test_sync_calls.load(.monotonic) > syncs_before);
+    file.close();
+    file = try NativeFile.openWithIo(a, std.testing.io, path, .{});
+    try expectRedoDocument(&file, "after", "value");
     try std.testing.expect((try file.check()).valid);
 }
 
