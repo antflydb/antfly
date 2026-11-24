@@ -156,14 +156,19 @@ pub const Readback = struct {
         }
         if (self.pending) |pending| {
             const backend = self.context.backend;
-            if (backend.vtable.drainI32ScalarDownload) |drain| {
-                self.observation.call(backend, .drain, .driver_await_returned, drain, .{ backend.ptr, pending }) catch {};
+            if (backend.vtable.drainI32ScalarDownload != null) {
+                self.observation.call(backend, .drain, .driver_await_returned, drainReadback, .{ backend, pending }) catch {};
             } else {
                 self.observation.call(backend, .cancel, .unavailable, cancelReadback, .{ backend, pending }) catch {};
             }
         }
         self.pending = null;
     }
+    fn drainReadback(backend: *const ops.ComputeBackend, pending: ops.PendingI32ScalarDownload) !void {
+        const drain = backend.vtable.drainI32ScalarDownload orelse return error.UnsupportedBackendOp;
+        try drain(backend.ptr, pending);
+    }
+
     fn cancelReadback(backend: *const ops.ComputeBackend, pending: ops.PendingI32ScalarDownload) !void {
         // This legacy callback has no failure/completion result. Record only
         // return from a cancellation request, never successful GPU drain.
