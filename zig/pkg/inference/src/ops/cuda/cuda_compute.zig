@@ -6360,7 +6360,10 @@ pub const CudaCompute = struct {
     }
 
     pub fn embeddingGemma2Bf16Weight(self: *CudaCompute, name: []const u8) !buffer_mod.DeviceBuffer {
-        const lookup = try self.embeddingGemma2Weight(name);
+        return self.embeddingGemma2Bf16WeightStorage(try self.embeddingGemma2Weight(name));
+    }
+
+    fn embeddingGemma2Bf16WeightStorage(self: *CudaCompute, lookup: *CudaTensor) !buffer_mod.DeviceBuffer {
         const tensor = lookup.resident_parent orelse lookup;
         if (tensor.dtype == .bf16) return tensor.buffer;
         if (tensor.bf16_mirror.ptr != 0 and tensor.bf16_mirror.len >= tensor.elem_count * @sizeOf(u16)) return tensor.bf16_mirror;
@@ -7926,9 +7929,10 @@ pub const CudaCompute = struct {
         errdefer self.ctx.synchronize() catch {};
         try copyFromHostTracked(self, idbuf, std.mem.sliceAsBytes(ids));
         const module = try self.encoderMultimodalModule();
-        const weights = try self.embeddingGemma2Bf16Weight(embedding_gemma2_arch.WeightNames.token_embedding);
         const tensor = try self.embeddingGemma2Weight(embedding_gemma2_arch.WeightNames.token_embedding);
-        try module.launchLookup(&self.ctx, tensorFromCt(result).buffer, weights, idbuf, @intCast(ids.len), @intCast(tensor.shape[0]), 512, 22.625);
+        const vocabulary = tensor.shape[0];
+        const weights = try self.embeddingGemma2Bf16WeightStorage(tensor);
+        try module.launchLookup(&self.ctx, tensorFromCt(result).buffer, weights, idbuf, @intCast(ids.len), @intCast(vocabulary), 512, 22.625);
         return result;
     }
 
