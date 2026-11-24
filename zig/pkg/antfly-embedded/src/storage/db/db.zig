@@ -53009,7 +53009,7 @@ pub const DB = struct {
         }
 
         fn cutMatches(self: *HybridComponents, comptime phase: []const u8) bool {
-            var test_mutation = if (builtin.is_test and (comptime std.mem.eql(u8, phase, "fusion")) and
+            var test_mutation: ?snapshot_admission_mod.SnapshotAdmission.MutationLease = if (builtin.is_test and (comptime std.mem.eql(u8, phase, "fusion")) and
                 self.probe != null and self.probe.?.mutation_at_fusion)
                 self.db.core.snapshot_replay_admission.acquireMutation()
             else
