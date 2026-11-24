@@ -2345,15 +2345,6 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
 
     if (@import("builtin").is_test) try embeddingGemma2StageTensor(cb, allocator, "audio_projected", projected);
     const valid_count = countTrue(subsampled.valid_mask);
-    const valid_rows = try allocator.alloc(u32, valid_count);
-    defer allocator.free(valid_rows);
-    var dst: usize = 0;
-    for (subsampled.valid_mask, 0..) |valid, row| {
-        if (valid) {
-            valid_rows[dst] = @intCast(row);
-            dst += 1;
-        }
-    }
     if (lengths) |counts| {
         var offset: usize = 0;
         for (counts, if (subsampled.segments.len == 0) &[_]usize{subsampled.seq_len} else subsampled.segments) |*count, span| {
@@ -2363,6 +2354,27 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
         }
     }
     if (valid_count == 0) return error.EmptyEmbeddingInput;
+    // Ordinary clips often have only leading or trailing padding. Publish a
+    // contiguous span without uploading a gather map, into independent storage.
+    if ((cb.kind() == .metal or cb.kind() == .cuda) and cb.supportsCopyRows2D() and
+        try cb.tensorDType(projected) == .f32)
+    {
+        if (contiguousValidAudioRows(subsampled.valid_mask, valid_count)) |first| {
+            const snapshot = try cb.snapshotRows2D(allocator, projected, first, valid_count, cfg.text_hidden);
+            audioProfileMark(.readback);
+            if (profile_enabled) profile.finish(subsampled.seq_len);
+            return .{ .embeddings = snapshot, .tokens = valid_count };
+        }
+    }
+    const valid_rows = try allocator.alloc(u32, valid_count);
+    defer allocator.free(valid_rows);
+    var dst: usize = 0;
+    for (subsampled.valid_mask, 0..) |valid, row| {
+        if (valid) {
+            valid_rows[dst] = @intCast(row);
+            dst += 1;
+        }
+    }
     if (cb.vtable.takeRows != null) {
         const compact = try cb.takeRows(projected, valid_rows, valid_count, cfg.text_hidden) orelse return error.UnsupportedResidentGemma4Audio;
         errdefer cb.free(compact);
@@ -5644,6 +5656,19 @@ fn audioLinearWithBias(
     }
     const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
     return cb.fromFloat32Shape(data, &shape);
+}
+
+fn contiguousValidAudioRows(mask: []const bool, count: usize) ?usize {
+    const first = std.mem.findScalar(bool, mask, true) orelse return null;
+    if (count > mask.len - first) return null;
+    return if (std.mem.findScalar(bool, mask[first..][0..count], false) == null) first else null;
+}
+
+test "gemma4 audio publication bypasses gather only for contiguous valid rows" {
+    try std.testing.expectEqual(@as(?usize, 0), contiguousValidAudioRows(&.{ true, true }, 2));
+    try std.testing.expectEqual(@as(?usize, 1), contiguousValidAudioRows(&.{ false, true, true, false }, 2));
+    try std.testing.expectEqual(@as(?usize, null), contiguousValidAudioRows(&.{ true, false, true }, 2));
+    try std.testing.expectEqual(@as(?usize, null), contiguousValidAudioRows(&.{ false, false }, 0));
 }
 
 fn countTrue(mask: []const bool) usize {
