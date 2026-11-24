@@ -487,6 +487,7 @@ fn research(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Ant
         const job_id = try allocator.dupe(u8, record.value.job_id);
         defer allocator.free(job_id);
         cli.output.notice("research job {s}: {s} (phase {s})\n", .{ job_id, @tagName(record.value.state), @tagName(record.value.phase) });
+        if (try reportStoppedResearchJob(allocator, io, record.value)) return;
         return advanceResearchJobUntilDone(allocator, io, client, job_id);
     }
     if (streaming) {
@@ -509,8 +510,8 @@ fn research(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Ant
     if (response_failed) return error.ResearchAgentResponseError;
 }
 
-/// Advance one phase per request until the job is terminal, reporting each
-/// checkpoint on stderr and the final job (with its report) on stdout.
+/// Advance one phase per request until completion or a phase failure.
+/// Report checkpoints on stderr and the resulting job on stdout.
 fn advanceResearchJobUntilDone(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, job_id: []const u8) !void {
     while (true) {
         var advanced = try client.advanceResearchJob(job_id, 1);
@@ -523,16 +524,23 @@ fn advanceResearchJobUntilDone(allocator: std.mem.Allocator, io: std.Io, client:
             continue;
         }
         cli.output.notice("research job {s}: {s} (phase {s}, advances {d})\n", .{ job_id, @tagName(state), @tagName(record.value.phase), record.value.advances orelse 0 });
-        switch (state) {
-            .queued, .running => continue,
-            .succeeded, .failed, .cancelled => {
-                cli.output.context = .{ .scope = .workflow, .execution = if (state == .succeeded) .complete else .partial };
-                try cli.writeJson(allocator, io, record.value);
-                if (state != .succeeded) return error.ResearchAgentResponseError;
-                return;
-            },
-        }
+        if (try reportStoppedResearchJob(allocator, io, record.value)) return;
     }
+}
+
+fn reportStoppedResearchJob(allocator: std.mem.Allocator, io: std.Io, job: antfly_client.types.ResearchJob) !bool {
+    switch (job.state) {
+        .running => return false,
+        .queued => {
+            const message = job.last_error orelse return false;
+            cli.output.notice("research job {s}: {s}; resume with --resume-job {s}\n", .{ job.job_id, message, job.job_id });
+        },
+        .succeeded, .failed, .cancelled => {},
+    }
+    cli.output.context = .{ .scope = .workflow, .execution = if (job.state == .succeeded) .complete else .partial };
+    try cli.writeJson(allocator, io, job);
+    if (job.state != .succeeded) return error.ResearchAgentResponseError;
+    return true;
 }
 
 fn queryBuilder(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {

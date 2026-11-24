@@ -1,6 +1,6 @@
 {
   "name": "@antfly/graph",
-  "version": "0.0.3",
+  "version": "0.4.0",
   "private": false,
   "license": "Apache-2.0",
   "description": "Force-directed graph component for the Antfly design system",

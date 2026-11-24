@@ -1,6 +1,6 @@
 {
   "name": "@antfly/langchain",
-  "version": "0.1.0",
+  "version": "0.4.0",
   "description": "Antfly vector storage, embeddings, hybrid retrieval and reranking for LangChain.js",
   "type": "module",
   "main": "./dist/index.cjs",

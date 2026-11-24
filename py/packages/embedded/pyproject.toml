@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "antfly-embedded"
-version = "0.1.0"
+version = "0.4.0"
 description = "Python binding for embedded Antfly databases and inference (libantfly C ABI)"
 readme = "README.md"
 requires-python = ">=3.11"
