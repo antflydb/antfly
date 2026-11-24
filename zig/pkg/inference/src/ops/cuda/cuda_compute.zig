@@ -6017,6 +6017,7 @@ pub const CudaCompute = struct {
     temp_buffer_mutex: std.atomic.Mutex = .unlocked,
     temp_buffers: @import("buffer_cache.zig").Cache(buffer_mod.DeviceBuffer) = .empty,
     temp_pinned_slots: std.ArrayListUnmanaged(TempPinnedSlot) = .empty,
+    temp_pinned_slots_in_use: usize = 0,
     temp_arena_planner: periodic_workspace.TempArenaPlanner = .{},
     temp_arena_generation: u64 = 1,
     deferred_device_frees: std.ArrayListUnmanaged(buffer_mod.DeviceBuffer) = .empty,
@@ -17277,6 +17278,7 @@ fn allocPinnedTempSlot(
             slot.requested_len = len;
             self.stats.temp_buffer_hits += 1;
             slot.in_use = true;
+            self.temp_pinned_slots_in_use += 1;
             traceCudaTempAlloc(self, seq, "alloc_slot_seed", len, slot.buffer);
             return slot.buffer;
         }
@@ -17286,10 +17288,12 @@ fn allocPinnedTempSlot(
         self.noteDeviceBytes(len);
         self.stats.device_alloc_calls += 1;
         slot.in_use = true;
+        self.temp_pinned_slots_in_use += 1;
         traceCudaTempAlloc(self, seq, "alloc_slot_miss", len, slot.buffer);
         return slot.buffer;
     }
     slot.in_use = true;
+    self.temp_pinned_slots_in_use += 1;
     self.stats.temp_buffer_hits += 1;
     traceCudaTempAlloc(self, seq, "alloc_slot_hit", len, slot.buffer);
     return slot.buffer;
@@ -17299,7 +17303,10 @@ fn releasePinnedTempSlot(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer) b
     if (buffer.ptr == 0 or self.temp_pinned_slots.items.len == 0) return false;
     for (self.temp_pinned_slots.items) |*slot| {
         if (slot.buffer.ptr == buffer.ptr) {
-            slot.in_use = false;
+            if (slot.in_use) {
+                self.temp_pinned_slots_in_use -= 1;
+                slot.in_use = false;
+            }
             buffer.* = .{};
             return true;
         }
@@ -19865,21 +19872,35 @@ fn debugCudaGraphRegisterFinalHiddenReplayBoundary(ctx: *anyopaque, input: CT, o
     }
 }
 
+fn pinnedTempReplayRangeIdle(self: *const CudaCompute, start: usize, count: usize) bool {
+    if (self.temp_pinned_slots_in_use == 0) return true;
+    const period = cudaEffectiveTempSlotPeriod(self);
+    if (period == 0 or start >= period or period > self.temp_pinned_slots.items.len) return false;
+    const slots = self.temp_pinned_slots.items[0..period];
+    const span = @min(count, period);
+    const tail = @min(span, period - start);
+    for (slots[start..][0..tail]) |slot| if (slot.in_use) return false;
+    for (slots[0 .. span - tail]) |slot| if (slot.in_use) return false;
+    return true;
+}
+
 fn cudaGraphReplayArenaReady(self: *CudaCompute, slot: *const CudaGraphReplaySlot) bool {
     if (slot.temp_arena_generation == 0 or slot.temp_arena_generation != self.temp_arena_generation) return false;
-    // Matching allocation lengths do not imply matching pinned addresses.
-    // The graph recorded the exact starting slot, even for equal-size slots.
-    if (slot.captured_temp_allocation_count != 0 and
-        slot.captured_temp_slot_start != pinnedTempSlotIndex(self, self.temp_trace_seq)) return false;
-    if (self.temp_slot_config.autoplan_enabled) {
-        while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
-        defer self.temp_buffer_mutex.unlock();
-        return self.temp_arena_planner.canGraphReplay(
-            self.temp_trace_seq,
-            slot.captured_temp_allocation_count,
-        );
+    while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
+    defer self.temp_buffer_mutex.unlock();
+    // Matching lengths do not imply matching addresses. Check the captured
+    // physical ordinal and the live occupants of that interval.
+    if (slot.captured_temp_allocation_count != 0) {
+        const current_start = pinnedTempSlotIndex(self, self.temp_trace_seq);
+        if (slot.captured_temp_slot_start != current_start) return false;
+        if (current_start) |start| {
+            if (!pinnedTempReplayRangeIdle(self, start, slot.captured_temp_allocation_count)) return false;
+        }
     }
-    return true;
+    return !self.temp_slot_config.autoplan_enabled or self.temp_arena_planner.canGraphReplay(
+        self.temp_trace_seq,
+        slot.captured_temp_allocation_count,
+    );
 }
 
 fn noteCapturedTempAllocationsReplayed(self: *CudaCompute, allocation_count: usize) !void {
@@ -63468,6 +63489,12 @@ test "Gemma4 CUDA learned scratch backing survives requests without retaining th
     var second = (try allocPinnedTempSlot(&compute, 1, 128)).?;
     const first_ptr = first.ptr;
     const second_ptr = second.ptr;
+    try std.testing.expect(!pinnedTempReplayRangeIdle(&compute, 0, 1));
+    try std.testing.expect(!pinnedTempReplayRangeIdle(&compute, 1, 2));
+    try std.testing.expect(releasePinnedTempSlot(&compute, &second));
+    try std.testing.expect(pinnedTempReplayRangeIdle(&compute, 1, 1));
+    try std.testing.expect(!pinnedTempReplayRangeIdle(&compute, 1, 2));
+    second = (try allocPinnedTempSlot(&compute, 1, 128)).?;
     try std.testing.expect(releasePinnedTempSlot(&compute, &first));
     try std.testing.expect(releasePinnedTempSlot(&compute, &second));
     try compute.ctx.synchronize();
