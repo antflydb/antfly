@@ -2453,41 +2453,50 @@ fn sourceSampleLimitForResample(target_samples: usize, source_rate: u32, target_
     return std.math.cast(usize, source_samples) orelse error.AudioInputTooLong;
 }
 
-test "Metal unified waveform projection shares host math and preserves empty clips" {
+const UnifiedWaveformTest = struct {
     const helpers = @import("../ops/media_residency_test.zig");
-    const Fixture = struct {
-        fn weights(store: *@import("../ops/native_compute.zig").WeightStore) !void {
-            try helpers.putWeight(store, "mm.a.input_projection.weight", &.{ 64, 640 }, null);
-        }
 
-        fn check(backend: ComputeBackend, reference: ComputeBackend) !void {
-            const a = std.testing.allocator;
-            var cfg = embeddingGemma2AudioConfig();
-            cfg.direct_unified = true;
-            cfg.raw_samples_per_token = 640;
-            cfg.text_hidden = 64;
-            var source: ProjectorWeights = .{ .cb = &backend, .allocator = a, .gguf = null, .owner = null, .require_resident_weights = true };
-            defer source.deinit();
-            var host: ProjectorWeights = .{ .cb = &reference, .allocator = a, .gguf = null, .owner = null, .require_resident_weights = true };
-            defer host.deinit();
-            const empty: AudioInput = .{ .pcm = .{ .samples = &.{}, .sample_rate = 16000 } };
-            try std.testing.expect(try encodeUnifiedDirectAudioResident(&backend, a, &source, cfg, empty) == null);
-            const samples: [641]f32 = @splat(0.25);
-            const input: AudioInput = .{ .pcm = .{ .samples = &samples, .sample_rate = 16000 } };
-            const actual = (try encodeUnifiedDirectAudioResident(&backend, a, &source, cfg, input)) orelse return error.MissingResidentAudioProjection;
-            defer backend.free(actual.embeddings);
+    fn weights(store: *@import("../ops/native_compute.zig").WeightStore) !void {
+        try helpers.putWeight(store, "mm.a.input_projection.weight", &.{ 64, 640 }, null);
+    }
+
+    fn check(backend: ComputeBackend, reference: ComputeBackend) !void {
+        const a = std.testing.allocator;
+        var cfg = embeddingGemma2AudioConfig();
+        cfg.direct_unified = true;
+        cfg.raw_samples_per_token = 640;
+        cfg.text_hidden = 64;
+        var source: ProjectorWeights = .{ .cb = &backend, .allocator = a, .gguf = null, .owner = null, .require_resident_weights = true };
+        defer source.deinit();
+        var host: ProjectorWeights = .{ .cb = &reference, .allocator = a, .gguf = null, .owner = null, .require_resident_weights = true };
+        defer host.deinit();
+        const empty: AudioInput = .{ .pcm = .{ .samples = &.{}, .sample_rate = 16000 } };
+        try std.testing.expect(try encodeUnifiedDirectAudioResident(&backend, a, &source, cfg, empty) == null);
+        const samples: [641]f32 = @splat(0.25);
+        const input: AudioInput = .{ .pcm = .{ .samples = &samples, .sample_rate = 16000 } };
+        const before = helpers.Transfers.snapshot(backend);
+        const actual = (try encodeUnifiedDirectAudioResident(&backend, a, &source, cfg, input)) orelse return error.MissingResidentAudioProjection;
+        defer backend.free(actual.embeddings);
+        try before.expectUnchanged(backend);
+        if (backend.kind() == .metal)
             try std.testing.expect(@import("../ops/metal_compute.zig").MetalCompute.debugHasDeviceTensor(&backend, actual.embeddings));
-            const expected = try encodeUnifiedDirectAudio(&reference, a, &host, cfg, input);
-            defer a.free(expected.embeddings);
-            try std.testing.expectEqual(@as(usize, 2), actual.tokens);
-            try std.testing.expectEqual(expected.tokens, actual.tokens);
-            const values = try backend.toFloat32(actual.embeddings, a);
-            defer a.free(values);
-            try std.testing.expectEqual(expected.embeddings.len, values.len);
-            for (expected.embeddings, values) |want, have| try std.testing.expectApproxEqAbs(want, have, 1e-4);
-        }
-    };
-    try helpers.onMetal(Fixture.weights, Fixture.check);
+        const expected = try encodeUnifiedDirectAudio(&reference, a, &host, cfg, input);
+        defer a.free(expected.embeddings);
+        try std.testing.expectEqual(@as(usize, 2), actual.tokens);
+        try std.testing.expectEqual(expected.tokens, actual.tokens);
+        const values = try backend.toFloat32(actual.embeddings, a);
+        defer a.free(values);
+        try std.testing.expectEqual(expected.embeddings.len, values.len);
+        for (expected.embeddings, values) |want, have| try std.testing.expectApproxEqAbs(want, have, 1e-4);
+    }
+};
+
+test "Metal unified waveform projection shares host math and preserves empty clips" {
+    try @import("../ops/media_residency_test.zig").onMetal(UnifiedWaveformTest.weights, UnifiedWaveformTest.check);
+}
+
+test "CUDA unified waveform projection shares host math and preserves empty clips" {
+    try @import("../ops/media_residency_test.zig").onCuda(UnifiedWaveformTest.weights, UnifiedWaveformTest.check);
 }
 
 test "gemma4 direct audio frames preserve raw waveform samples" {
