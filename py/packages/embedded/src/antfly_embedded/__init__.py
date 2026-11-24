@@ -121,7 +121,7 @@ __all__ = [
     "decode_artifact_id",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.4.0"
 
 THREADING_SERIALIZED = _ffi.THREADING_SERIALIZED
 #: Minimum native stack, in bytes, for threads calling into libantfly

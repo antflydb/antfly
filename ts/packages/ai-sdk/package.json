@@ -1,6 +1,6 @@
 {
   "name": "@antfly/ai-sdk",
-  "version": "0.1.0",
+  "version": "0.4.0",
   "description": "Antfly provider, tools and chat history persistence for the Vercel AI SDK",
   "type": "module",
   "main": "./dist/index.cjs",

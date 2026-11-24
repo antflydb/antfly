@@ -5,6 +5,21 @@ image, and SDKs from tags. The intended long-term shape is that each supported
 OS, architecture, and libc ABI is built once and every downstream channel
 consumes those same archives.
 
+## Main-line package versions
+
+`main` prepares the 0.4 release line. First-party TypeScript packages, Python
+distributions, Rust crates, and the Zig runtime/embedded/inference package
+manifests use `0.4.0`, including their workspace dependency requirements,
+lockfile entries, Python runtime versions, and browser-runtime compatibility
+metadata. Keep patch fixes and 0.3 package releases on `v0.3.x`.
+
+These source versions do not publish anything on merge. SDK and JavaScript
+library tags remain independent release triggers. Go modules carry their
+versions in tags rather than a package manifest. Native CLI and embedded
+packaging still stamps the selected server release version into its package
+snapshots, so RC, nightly, and maintenance artifacts retain their exact release
+identity. `antfly-grep` keeps its independent release/version mechanism.
+
 ## SDK releases
 
 The core SDKs use independent tags: `go/pkg/sdk/vX.Y.Z`,
@@ -17,7 +32,7 @@ The TypeScript and Python tags trigger their existing registry workflows.
 After pushing a Rust SDK tag, dispatch its dedicated publisher from `main`:
 
 ```sh
-gh workflow run rust-sdk-release.yml --ref main -f tag_name=rs/antfly/sdk/v0.3.0
+gh workflow run rust-sdk-release.yml --ref main -f tag_name=rs/antfly/sdk/v0.4.0
 ```
 
 The controller checks the tag's package version and main ancestry. Its read-only
