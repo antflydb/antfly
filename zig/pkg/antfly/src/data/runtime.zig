@@ -12635,6 +12635,7 @@ pub const DataServer = struct {
                 .local_node_id = dataReadRouterLocalNodeId,
                 .local_status = dataReadRouterLocalStatus,
                 .group_leader_node_id = dataReadRouterGroupLeaderNodeId,
+                .node_status = dataReadRouterNodeStatus,
                 .node_base_uri = dataReadRouterNodeBaseUri,
                 .node_base_uri_for_group = dataReadRouterNodeBaseUriForGroup,
                 .group_node_ids = dataReadRouterGroupNodeIds,
@@ -13248,6 +13249,18 @@ pub const DataServer = struct {
         const store = findSnapshotStore(snapshot.stores, status.leader_store_id) orelse return null;
         if (!store.live or !std.mem.eql(u8, store.health_class, "healthy")) return null;
         return store.node_id;
+    }
+
+    fn dataReadRouterNodeStatus(ptr: *anyopaque, node_id: u64, group_id: u64) ?antfly.raft.host.HostedReplicaStatus {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        if (node_id == dataReadRouterLocalNodeId(ptr)) return dataReadRouterLocalStatus(ptr, group_id);
+        if (self.remote_metadata) |metadata| {
+            const peers = metadata.acquireControlReadGeneration(.{}) catch return null;
+            defer peers.release();
+            return if (peers.readable(group_id, node_id) and peers.nodes.contains(node_id)) .active else .absent;
+        }
+        var router = @import("../api/table_router.zig").CatalogBackedGroupRouter.init(self.read_source.catalog, dataReadRouterLocalNodeId(ptr));
+        return router.router().nodeStatus(node_id, group_id);
     }
 
     fn dataReadRouterNodeBaseUri(ptr: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {

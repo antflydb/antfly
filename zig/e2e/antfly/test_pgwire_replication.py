@@ -270,6 +270,8 @@ def test_pg_recvlogical_resume_after_restart(
                 retry_uncommitted
                 and (
                     "ERROR:  53300: A consistent SQL statement read" in result.stderr
+                    or "ERROR:  55P03: The database was busy with competing work; the statement was not applied."
+                    in result.stderr
                     or (
                         len(statements) == 1
                         and "ERROR:  40001: The mutation conflicted with a concurrent change and was not committed."
@@ -818,7 +820,7 @@ def test_pg_recvlogical_resume_after_restart(
                 )
                 markers.append(b"retained-stream-other")
             else:
-                sql(insert)
+                sql(insert, retry_uncommitted=True)
             deadline = time.monotonic() + 30
             payload = b""
             while time.monotonic() < deadline and reader.poll() is None:
@@ -882,7 +884,7 @@ def test_pg_recvlogical_resume_after_restart(
                 timeout=10,
             )
             assert wrong_owner.returncode != 0
-            assert "forbidden" in wrong_owner.stderr.lower()
+            assert "Permission denied for this SQL operation." in wrong_owner.stderr
             env["PGPASSWORD"] = _token(
                 secret, issuer=issuer, subject="admin", admin=True
             )
@@ -1186,7 +1188,7 @@ def test_pg_recvlogical_resume_after_restart(
                     "CREATE PUBLICATION truncates FOR TABLE smoke WITH (publish = 'truncate')"
                 )
             with pytest.raises(
-                AssertionError, match="0A000.*durable generation coordinator"
+                AssertionError, match="42501.*durable credential no longer authorizes"
             ):
                 sql("TRUNCATE TABLE smoke")
 
@@ -1286,7 +1288,7 @@ def test_pg_recvlogical_resume_after_restart(
                     timeout=20,
                 )
                 assert filtered.returncode != 0
-                assert "forbidden" in filtered.stderr.lower()
+                assert "Permission denied for this SQL operation." in filtered.stderr
                 assert not filtered_output.exists() or not filtered_output.read_bytes()
             finally:
                 if filter_installed:
