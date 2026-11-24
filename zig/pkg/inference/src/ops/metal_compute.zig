@@ -23907,6 +23907,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const out_dim = request.out_dim;
         const clip = request.clip;
         const output = request.output;
+        if (x.dtype != .f32) return null;
         const input_elements = try std.math.mul(usize, rows, in_dim);
         const output_elements = try std.math.mul(usize, rows, out_dim);
         if (rows == 0 or in_dim == 0 or out_dim == 0 or x.elemCount() != input_elements) return error.InvalidTensorShape;
@@ -23939,26 +23940,27 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         if (fused_only and !fused) return null;
         if (!fused_only and !fused) {
-            var clipped: ?CT = null;
-            defer if (clipped) |ct| freeOp(ctx, ct);
-            var prepared_operand: ?MetalTensor = null;
+            var owned_scratch: ?MetalTensor = null;
+            defer if (owned_scratch) |*tensor| self.retireTemporaryWorkspaceValue(tensor);
+            var operand = x;
             if (clip) |p| if (p.flags & 3 != 0) {
-                if (request.input_workspace != null and denseDeviceF32(request.input) != null) {
-                    const scratch = request.input_workspace.?;
+                const bytes = try std.math.mul(usize, input_elements, @sizeOf(f32));
+                const target = if (request.input_workspace) |scratch| blk: {
                     const target = denseDeviceF32(scratch) orelse return error.InvalidPreparedProjectionWorkspace;
-                    const bytes = try std.math.mul(usize, try std.math.mul(usize, rows, in_dim), @sizeOf(f32));
                     if (target.isReadOnlyPhysical() or !deviceTensorMatchesLinearRows(&target, rows, in_dim) or target.deviceByteLen() < bytes or
                         target.device.?.ref.runtime != @as(*anyopaque, @ptrCast(runtime)) or
                         (target.deviceHandle() == x.deviceHandle() and kernel_geometry.byteRangesOverlap(target.deviceByteOffset(), bytes, x.deviceByteOffset(), x.deviceByteLen())) or
-                        (target.deviceHandle() == mt.deviceHandle() and kernel_geometry.byteRangesOverlap(target.deviceByteOffset(), bytes, mt.deviceByteOffset(), mt.deviceByteLen()))) return error.InvalidPreparedProjectionWorkspace;
+                        (target.deviceHandle() == mt.deviceHandle() and kernel_geometry.byteRangesOverlap(target.deviceByteOffset(), bytes, mt.deviceByteOffset(), output_bytes))) return error.InvalidPreparedProjectionWorkspace;
                     toBuf(scratch).metal_tensor.?.invalidateHostMirror();
-                    if (!metal_runtime.decoderRuntimeAudioClampInto(self.provider_impl, x, target, p.flags & 3, p.input_min, p.input_max, false)) return error.MetalKernelFailed;
-                    prepared_operand = target;
-                } else {
-                    clipped = try clampScalarOp(ctx, request.input, if (p.flags & 1 != 0) p.input_min else null, if (p.flags & 2 != 0) p.input_max else null) orelse return error.AudioScheduleRouteChanged;
-                }
+                    break :blk target;
+                } else blk: {
+                    if (disableRuntimeElementwise()) return error.AudioScheduleRouteChanged;
+                    owned_scratch = try MetalTensor.deviceAllocate(runtime, bytes, .private, x.shape());
+                    break :blk owned_scratch.?;
+                };
+                if (!metal_runtime.decoderRuntimeAudioClampInto(self.provider_impl, x, target, p.flags & 3, p.input_min, p.input_max, false)) return error.MetalKernelFailed;
+                operand = target;
             };
-            const operand = prepared_operand orelse if (clipped) |ct| denseDeviceF32(ct).? else x;
             if (!try metal_runtime.decoderRuntimeApplyAudioLinearInto(self.provider_impl, slot, operand, rows, in_dim, out_dim, mt)) return error.AudioSchedulePreparedSlotMissing;
             if (clip) |p| if (p.flags & 28 != 0) {
                 if (!metal_runtime.decoderRuntimeAudioClampInto(self.provider_impl, mt, mt, (p.flags >> 2) & 3, p.output_min, p.output_max, p.flags & 16 != 0)) return error.AudioScheduleRouteChanged;
@@ -63052,6 +63054,10 @@ test "Metal prepared audio projection consumes disjoint clamp workspace after fu
     try std.testing.expectEqual(reference, (try MetalCompute.audioPreparedLinearOp(&compute, &request)).?);
     const expected = try cb.toFloat32(reference, a);
     defer a.free(expected);
+    for (values, expected) |value, actual| {
+        const bounded = std.math.clamp(value, -0.5, 0.5);
+        try std.testing.expectApproxEqAbs(bounded / (1.0 + @exp(-bounded)), actual, 1e-6);
+    }
     const Binding = struct { output: CT, workspace: CT };
     for ([_]Binding{ .{ .output = destination, .workspace = workspace }, .{ .output = shared_output, .workspace = shared_workspace } }) |binding| {
         request.output = binding.output;
