@@ -16002,8 +16002,10 @@ fn executeRuntimeScaledAddFromDeferredMul(
     output_hint: ?CT,
 ) !?CT {
     if (inputs.len < 2) return null;
-    if (pendingDeferredScaleMul(graph, values, inputs[0], output_shape)) |lhs_scaled| {
-        if (pendingDeferredScaleMul(graph, values, inputs[1], output_shape)) |rhs_scaled| {
+    const lhs_pending = pendingDeferredScaleMul(graph, values, inputs[0], output_shape);
+    const rhs_pending = pendingDeferredScaleMul(graph, values, inputs[1], output_shape);
+    if (lhs_pending) |lhs_scaled| {
+        if (rhs_pending) |rhs_scaled| {
             const lhs = (try executeDeferredScaleMulValue(cb, values, lhs_scaled)) orelse return null;
             defer cb.free(lhs);
             const rhs = (try executeDeferredScaleMulValue(cb, values, rhs_scaled)) orelse return null;
@@ -16015,35 +16017,19 @@ fn executeRuntimeScaledAddFromDeferredMul(
             return try promoteMetalOutputIfNeeded(cb, output, null);
         }
     }
-    if (pendingDeferredScaleMul(graph, values, inputs[0], output_shape)) |scaled| {
-        const scaled_lhs = valueFor(values, scaled.source_id) orelse return null;
-        const residual = valueFor(values, inputs[1]) orelse return null;
-        const output = try executeDecoderWithOutputHint(cb, ComputeBackend.decoderRuntimeApplyScaledAddScale, ops_mod.DecoderRuntimeApplyScaledAddScaleRequest{
-            .output = output_hint,
-            .lhs = scaled_lhs,
-            .rhs = residual,
-            .dim = dim,
-            .lhs_scale = scaled.scale,
-            .output_scale = 1.0,
-        });
-        if (try promoteMetalOutputIfNeeded(cb, output, output_hint)) |result| return result;
-        return try executeDeferredScaleAddFallback(cb, values, scaled, residual);
-    }
-    if (pendingDeferredScaleMul(graph, values, inputs[1], output_shape)) |scaled| {
-        const scaled_lhs = valueFor(values, scaled.source_id) orelse return null;
-        const residual = valueFor(values, inputs[0]) orelse return null;
-        const output = try executeDecoderWithOutputHint(cb, ComputeBackend.decoderRuntimeApplyScaledAddScale, ops_mod.DecoderRuntimeApplyScaledAddScaleRequest{
-            .output = output_hint,
-            .lhs = scaled_lhs,
-            .rhs = residual,
-            .dim = dim,
-            .lhs_scale = scaled.scale,
-            .output_scale = 1.0,
-        });
-        if (try promoteMetalOutputIfNeeded(cb, output, output_hint)) |result| return result;
-        return try executeDeferredScaleAddFallback(cb, values, scaled, residual);
-    }
-    return null;
+    const scaled = lhs_pending orelse rhs_pending orelse return null;
+    const scaled_input = valueFor(values, scaled.source_id) orelse return null;
+    const residual = valueFor(values, inputs[if (lhs_pending != null) 1 else 0]) orelse return null;
+    const output = try executeDecoderWithOutputHint(cb, ComputeBackend.decoderRuntimeApplyScaledAddScale, ops_mod.DecoderRuntimeApplyScaledAddScaleRequest{
+        .output = output_hint,
+        .lhs = scaled_input,
+        .rhs = residual,
+        .dim = dim,
+        .lhs_scale = scaled.scale,
+        .output_scale = 1.0,
+    });
+    if (try promoteMetalOutputIfNeeded(cb, output, output_hint)) |result| return result;
+    return try executeDeferredScaleAddFallback(cb, values, scaled, residual);
 }
 
 fn executeRuntimeMultiplyAddFromDeferredMul(
