@@ -33671,6 +33671,23 @@ static int termite_metal_decode_runtime_reserve_graph_plan_slots(
     return 0;
 }
 
+static void termite_metal_bind_planned_hot_buffers(
+    termite_metal_decode_runtime *runtime, size_t hidden_bytes, size_t intermediate_bytes
+) {
+    if (hidden_bytes > 0) {
+        for (size_t i = 0; i < 4; ++i) {
+            runtime->hot_hidden_buffers[i] = runtime->graph_plan_buffers[TERMITE_METAL_GRAPH_PLAN_HOT_HIDDEN_SLOT_BASE + i];
+        }
+        runtime->hot_hidden_capacity = hidden_bytes;
+    }
+    if (intermediate_bytes > 0) {
+        for (size_t i = 0; i < 5; ++i) {
+            runtime->hot_intermediate_buffers[i] = runtime->graph_plan_buffers[TERMITE_METAL_GRAPH_PLAN_HOT_INTERMEDIATE_SLOT_BASE + i];
+        }
+        runtime->hot_intermediate_capacity = intermediate_bytes;
+    }
+}
+
 static int termite_metal_reserve_decoder_scratch(
     termite_metal_decode_runtime *runtime, antfly_metal_prefill_scratch_sizes sizes
 ) {
@@ -33681,27 +33698,25 @@ static int termite_metal_reserve_decoder_scratch(
         TERMITE_METAL_GRAPH_PLAN_HOT_HIDDEN_SLOT_BASE == ANTFLY_PREFILL_HOT_HIDDEN_BASE &&
         TERMITE_METAL_GRAPH_PLAN_HOT_INTERMEDIATE_SLOT_BASE == ANTFLY_PREFILL_HOT_INTERMEDIATE_BASE,
         "prefill scratch slot ABI changed");
-    const size_t q_bytes = sizes.q_bytes;
-    const size_t kv_bytes = sizes.kv_bytes;
-    const size_t direct_hidden_bytes = sizes.direct_hidden_bytes;
-    const size_t hot_hidden_bytes = sizes.direct_hidden_bytes;
-    const size_t intermediate_bytes = sizes.intermediate_bytes;
-    const size_t tail_logits_bytes = sizes.tail_logits_bytes;
     if (termite_metal_decode_runtime_reserve_graph_plan_slots(runtime, sizes.slots, sizes.bytes, ANTFLY_PREFILL_SCRATCH_COUNT) != 0) return -3;
-    if (termite_metal_decode_runtime_ensure_active_layer_projection_buffer(runtime, 0, q_bytes) != 0) return -3;
-    if (termite_metal_decode_runtime_ensure_active_layer_projection_buffer(runtime, 1, kv_bytes) != 0) return -4;
-    if (termite_metal_decode_runtime_ensure_active_layer_projection_buffer(runtime, 2, kv_bytes) != 0) return -5;
-    if (termite_metal_decode_runtime_ensure_active_layer_projection_buffer(runtime, 3, q_bytes) != 0) return -6;
-    if (termite_metal_decode_runtime_ensure_active_layer_projection_buffer(runtime, 4, kv_bytes) != 0) return -7;
-    if (termite_metal_decode_runtime_ensure_active_layer_projection_buffer(runtime, 5, kv_bytes) != 0) return -8;
-    if (termite_metal_decode_runtime_ensure_direct_block_hidden_buffers(runtime, direct_hidden_bytes) != 0) return -10;
-    if (termite_metal_decode_runtime_ensure_direct_block_q_buffer(runtime, q_bytes) != 0) return -11;
-    if (hot_hidden_bytes > 0 || intermediate_bytes > 0) {
-        if (termite_metal_decode_runtime_ensure_hot_buffers(runtime, hot_hidden_bytes, intermediate_bytes) != 0) return -12;
+    // This reservation proves all nonempty roles. Publish bindings directly
+    // so a prepared frame cannot enter the independent eager allocators.
+    for (size_t i = 0; i < 6; ++i) {
+        runtime->active_layer_projection_buffers[i] = runtime->graph_plan_buffers[i];
+        runtime->active_layer_projection_capacities[i] = runtime->graph_plan_capacities[i];
     }
-    if (tail_logits_bytes > 0) {
-        runtime->sample_logits_buffer = runtime->graph_plan_buffers[TERMITE_METAL_GRAPH_PLAN_SAMPLE_LOGITS_SLOT];
-        runtime->sample_logits_capacity = runtime->graph_plan_capacities[TERMITE_METAL_GRAPH_PLAN_SAMPLE_LOGITS_SLOT];
+    for (size_t i = 0; i < TERMITE_METAL_DIRECT_BLOCK_HIDDEN_BUFFER_COUNT; ++i) {
+        runtime->direct_block_hidden_buffers[i] = runtime->graph_plan_buffers[TERMITE_METAL_GRAPH_PLAN_DIRECT_HIDDEN_SLOT_BASE + i];
+    }
+    runtime->direct_block_hidden_capacity = sizes.direct_hidden_bytes;
+    const size_t q_slot = TERMITE_METAL_GRAPH_PLAN_DIRECT_Q_SLOT;
+    runtime->direct_block_q_buffer = runtime->graph_plan_buffers[q_slot];
+    runtime->direct_block_q_capacity = runtime->graph_plan_capacities[q_slot];
+    termite_metal_bind_planned_hot_buffers(runtime, sizes.direct_hidden_bytes, sizes.intermediate_bytes);
+    if (sizes.tail_logits_bytes != 0) {
+        const size_t slot = TERMITE_METAL_GRAPH_PLAN_SAMPLE_LOGITS_SLOT;
+        runtime->sample_logits_buffer = runtime->graph_plan_buffers[slot];
+        runtime->sample_logits_capacity = runtime->graph_plan_capacities[slot];
     }
     return 0;
 }
@@ -33768,8 +33783,9 @@ int termite_metal_decode_runtime_reserve_gated_ffn_scratch(
 ) {
     if (runtime == NULL) return -1;
     if (rows == 0 || hidden_size == 0 || intermediate_size == 0) return -2;
-    const size_t hidden_bytes = rows * hidden_size * sizeof(float);
-    const size_t intermediate_bytes = rows * intermediate_size * sizeof(float);
+    size_t hidden_bytes, intermediate_bytes;
+    if (!termite_metal_size_mul3(rows, hidden_size, sizeof(float), &hidden_bytes) ||
+        !termite_metal_size_mul3(rows, intermediate_size, sizeof(float), &intermediate_bytes)) return -2;
     size_t slots[9] = {
         TERMITE_METAL_GRAPH_PLAN_HOT_HIDDEN_SLOT_BASE + 0,
         TERMITE_METAL_GRAPH_PLAN_HOT_HIDDEN_SLOT_BASE + 1,
@@ -33793,7 +33809,7 @@ int termite_metal_decode_runtime_reserve_gated_ffn_scratch(
         intermediate_bytes,
     };
     if (termite_metal_decode_runtime_reserve_graph_plan_slots(runtime, slots, bytes, 9) != 0) return -3;
-    if (termite_metal_decode_runtime_ensure_hot_buffers(runtime, hidden_bytes, intermediate_bytes) != 0) return -4;
+    termite_metal_bind_planned_hot_buffers(runtime, hidden_bytes, intermediate_bytes);
     return 0;
 }
 
@@ -38141,18 +38157,7 @@ static int termite_metal_decode_runtime_ensure_hot_buffers(
         }
     }
     if (hidden_planned_ready && intermediate_planned_ready) {
-        if (hidden_bytes > 0) {
-            for (size_t i = 0; i < 4; ++i) {
-                runtime->hot_hidden_buffers[i] = runtime->graph_plan_buffers[TERMITE_METAL_GRAPH_PLAN_HOT_HIDDEN_SLOT_BASE + i];
-            }
-            runtime->hot_hidden_capacity = hidden_bytes;
-        }
-        if (intermediate_bytes > 0) {
-            for (size_t i = 0; i < 5; ++i) {
-                runtime->hot_intermediate_buffers[i] = runtime->graph_plan_buffers[TERMITE_METAL_GRAPH_PLAN_HOT_INTERMEDIATE_SLOT_BASE + i];
-            }
-            runtime->hot_intermediate_capacity = intermediate_bytes;
-        }
+        termite_metal_bind_planned_hot_buffers(runtime, hidden_bytes, intermediate_bytes);
         return 0;
     }
     if (runtime->active_frame_cb != nil) return -6;

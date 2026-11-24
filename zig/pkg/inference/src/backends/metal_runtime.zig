@@ -50243,6 +50243,30 @@ test "metal native graph planner reserves prefill layer scratch up front" {
     try std.testing.expectEqual(snapshot.graph_plan_allocations, reused_snapshot.graph_plan_allocations);
 }
 
+test "metal native graph planner binds exact mixed decode widths into the reserved slots" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    const runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer termite_metal_decode_runtime_destroy(runtime);
+    const q_width = 4096;
+    const kv_width = 1024;
+    const hidden = 2304;
+    const ffn = 8960;
+    const q_bytes = q_width * @sizeOf(f32);
+    const kv_bytes = kv_width * @sizeOf(f32);
+    try std.testing.expectEqual(@as(c_int, 0), antfly_metal_reserve_decode_scratch(runtime, q_width, kv_width, hidden, ffn));
+    const before = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(@as(u64, 20), before.graph_plan_allocations);
+    const q = antfly_metal_dense_prefill_projection_output(runtime, 0, q_bytes) orelse return error.MissingProjectionScratch;
+    const kv = antfly_metal_dense_prefill_projection_output(runtime, 1, kv_bytes) orelse return error.MissingProjectionScratch;
+    try std.testing.expect(q != kv);
+    try std.testing.expect(antfly_metal_dense_prefill_projection_output(runtime, 1, q_bytes) == null);
+    try std.testing.expect(antfly_metal_dense_prefill_attention_output(runtime, q_bytes) != null);
+    try std.testing.expectEqual(@as(c_int, 0), antfly_metal_reserve_decode_scratch(runtime, q_width, kv_width, hidden, ffn));
+    try std.testing.expectEqual(before.graph_plan_allocations, runtimeMemorySnapshot(runtime).graph_plan_allocations);
+    try std.testing.expectEqual(@as(?*anyopaque, q), antfly_metal_dense_prefill_projection_output(runtime, 0, q_bytes));
+    try std.testing.expectEqual(@as(?*anyopaque, kv), antfly_metal_dense_prefill_projection_output(runtime, 1, kv_bytes));
+}
+
 test "metal native graph planner reserves gated ffn scratch up front" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
