@@ -254,12 +254,15 @@ pub const State = struct {
         if (outputs.outputs.len != self.session.outputInfo().len) return error.InvalidDecoderOutput;
         defer @memset(updated, null);
         errdefer for (updated) |slot| if (slot) |owned| owned.pin.release();
-        for (self.roles, updated) |role, *slot| switch (role) {
+        for (self.roles, slots, updated) |role, old, *slot| switch (role) {
             .past => |past| {
                 const value = outputs.outputs[past.output_index];
                 const length = std.math.cast(i64, if (past.cross) self.mask.len else end) orelse return error.InvalidDecoderOutput;
                 const want = [_]i64{ 1, past.empty_shape[1], length, past.empty_shape[3] };
-                const bytes = (try residentCacheBytes(outputs.backend, value, &want, if (!fresh and past.cross) &past.empty_shape else null)) orelse continue;
+                const bytes = (try residentCacheBytes(outputs.backend, value, &want, if (!fresh and past.cross) &past.empty_shape else null)) orelse {
+                    if (old == null) return error.InvalidDecoderOutput;
+                    continue;
+                };
                 slot.* = .{
                     .pin = try outputs.retainResources(self.allocator),
                     .input = .{ .value = value, .backend = outputs.backend, .estimated_bytes = bytes },
@@ -296,17 +299,7 @@ pub const State = struct {
             else => {},
         };
         // The logits readback has finished the invocation's numerical use.
-        // An omitted cross column can now be copied outside that frame.
-        if (!fresh) for (self.roles, slots, updated) |role, old, *slot| switch (role) {
-            .past => |past| if (past.cross and slot.* == null) {
-                const previous = old orelse return error.InvalidDecoderOutput;
-                if (!previous.independent) slot.* = self.copyCrossCache(previous, control) catch |err| switch (err) {
-                    error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.QueueFull, error.InvalidPhysicalTransferSize => null,
-                    else => return err,
-                };
-            },
-            else => {},
-        };
+        if (!fresh) try self.migrateOmittedCrossCaches(slots, updated, control);
         if (control) |active| try active.check();
         for (slots, updated) |*old, new| if (new) |value| {
             if (old.*) |previous| previous.pin.release();
@@ -368,19 +361,62 @@ pub const State = struct {
         return result;
     }
 
-    /// Move a cross cache off its original invocation once omission shows
-    /// that it could keep that invocation alive for the rest of the request.
-    fn copyCrossCache(self: *State, previous: ResidentSlot, control: ?Control) !?ResidentSlot {
+    /// Prepare each independently admitted target before submitting the
+    /// copies. One stream completion protects all sources and destinations.
+    fn migrateOmittedCrossCaches(self: *State, previous: []const ?ResidentSlot, updated: []?ResidentSlot, control: ?Control) !void {
+        const shared = self.session.shared_compute_context orelse return;
+        const backend = shared.stableBackend();
+        if (self.session.model_lifetime == null) return;
+        const kernels = backend.vtable.kernels orelse return;
+        if (!kernels.accepts(backend.vtable) or kernels.physical_storage_policy == null) return;
+        const copy = kernels.copyPhysicalInput orelse return;
+        if (kernels.physicalTensorView == null) return;
+        if (backend.kind() != .native and backend.kind() != .metal and kernels.createPhysicalCompletion == null) return;
+
+        var staged = false;
+        for (self.roles, previous, updated) |role, old, *slot| switch (role) {
+            .past => |past| if (past.cross and slot.* == null) {
+                const source = old orelse return error.InvalidDecoderOutput;
+                if (source.independent or source.input.backend.ptr != backend.ptr or source.input.backend.vtable != backend.vtable) continue;
+                slot.* = self.prepareCrossCache(backend, kernels, source, control) catch |err| switch (err) {
+                    error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.QueueFull, error.InvalidPhysicalTransferSize => null,
+                    else => return err,
+                };
+                staged = staged or slot.* != null;
+            },
+            else => {},
+        };
+        if (!staged) return;
+        if (control) |active| try active.check();
+        var protection = if (control) |active| try active.enterUninterruptible(self.session.interruption()) else null;
+        defer if (protection) |*guard| guard.deinit();
+        const operation = @import("backend_operation.zig");
+        var scope = try operation.enter(backend.*, null, backend.operationToken(), .legacy_unknown_frame);
+        defer scope.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        if (backend.kind() == .metal and (backend.decoderRuntimeHasActiveFrame() or backend.decoderRuntimeHasSubmittedFrame())) return error.InvalidDecoderOutput;
+        const completion = if (kernels.createPhysicalCompletion) |create| try create(backend.ptr) else null;
+        defer if (completion) |event| event.deinit();
+        {
+            // An error can follow command submission. Keep every staged
+            // target and its previous source alive until the stream drains.
+            defer if (completion) |event| {
+                event.record() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+                event.wait() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+            };
+            for (self.roles, previous, updated) |role, old, target| switch (role) {
+                .past => |past| if (past.cross) {
+                    if (target) |value| if (value.independent) try copy(backend.ptr, value.input.value, old.?.input.value);
+                },
+                else => {},
+            };
+        }
+        try scope.finish();
+    }
+
+    fn prepareCrossCache(self: *State, backend: *const ops.ComputeBackend, kernels: *const @import("../ops/kernel_backend.zig").VTable, previous: ResidentSlot, control: ?Control) !?ResidentSlot {
         const storage = @import("../ops/physical_storage.zig");
         const operation = @import("backend_operation.zig");
-        const shared = self.session.shared_compute_context orelse return null;
-        const backend = shared.stableBackend();
-        if (self.session.model_lifetime == null or previous.input.backend.ptr != backend.ptr or previous.input.backend.vtable != backend.vtable) return null;
-        const kernels = backend.vtable.kernels orelse return null;
-        if (!kernels.accepts(backend.vtable) or kernels.physical_storage_policy == null) return null;
-        const view = kernels.physicalTensorView orelse return null;
-        const copy = kernels.copyPhysicalInput orelse return null;
-        if (backend.kind() != .native and backend.kind() != .metal and kernels.createPhysicalCompletion == null) return null;
+        const view = kernels.physicalTensorView.?;
         if (control) |active| try active.check();
         const bytes = previous.input.estimated_bytes;
         var dimensions: [4]i32 = undefined;
@@ -401,8 +437,6 @@ pub const State = struct {
             // A standalone Metal blit completes synchronously. An open
             // frame would require that frame's submission and retirement.
             if (backend.kind() == .metal and (backend.decoderRuntimeHasActiveFrame() or backend.decoderRuntimeHasSubmittedFrame())) return null;
-            const completion = if (kernels.createPhysicalCompletion) |create| try create(backend.ptr) else null;
-            defer if (completion) |event| event.deinit();
             const allocation = (try storage.Lease.create(self.allocator, backend.*, bytes)) orelse return null;
             defer allocation.release();
             if ((allocation.backing_byte_size orelse return null) > bound) return error.PhysicalStorageExceededReservation;
@@ -411,15 +445,6 @@ pub const State = struct {
             self.session.pinResident(&copied);
             copied.resource_lease = admission.lease;
             admission.lease = null;
-            // A callback error can occur after an asynchronous submission.
-            // Complete the copy before releasing either source or destination.
-            {
-                defer if (completion) |event| {
-                    event.record() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
-                    event.wait() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
-                };
-                try copy(backend.ptr, handles[0], previous.input.value);
-            }
             try scope.finish();
         }
         if (control) |active| try active.check();
@@ -730,14 +755,38 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
                 try std.testing.expectEqualSlices(f32, expected_cache, adopted_cache);
                 try checkPooledSelfAdoption(state, owned, &controller, expected_cache);
                 const bound = try @import("../ops/physical_storage.zig").reservationBytes(owned.input.backend.*, .{ .byte_size = owned.input.estimated_bytes });
-                var below = state.*;
-                below.session.run_admission.?.limits.kv_limit_bytes = bound - 1;
+                var copy_state = state.*;
+                var cross_roles: [2]InputRole = @splat(.{ .past = .{ .output_index = 0, .empty_shape = undefined, .cross = true } });
+                copy_state.roles = &cross_roles;
+                const original_limits = copy_state.session.run_admission.?.limits;
+                copy_state.session.run_admission.?.limits.kv_limit_bytes = bound - 1;
+                var source = owned;
+                source.independent = false;
+                const previous: [2]?ResidentSlot = @splat(source);
+                var targets: [2]?ResidentSlot = @splat(null);
+                defer for (targets) |target| if (target) |value| value.pin.release();
                 const before_denial = controller.snapshot();
                 const copy_control: Control = .{ .native_call_policy = .in_process };
-                try std.testing.expectError(error.ResourceLimitExceeded, below.copyCrossCache(owned, copy_control));
+                try copy_state.migrateOmittedCrossCaches(&previous, &targets, copy_control);
+                try std.testing.expect(targets[0] == null and targets[1] == null);
                 try std.testing.expectEqualDeep(before_denial, controller.snapshot());
-                const detached = (try state.copyCrossCache(owned, copy_control)) orelse return error.MissingIndependentResidentCache;
-                defer detached.pin.release();
+                copy_state.session.run_admission.?.limits = original_limits;
+                const before_waits: ?u64 = if (comptime @import("build_options").enable_cuda) blk: {
+                    if (backend != .cuda) break :blk null;
+                    const cuda = &shared.ctx.cuda;
+                    cuda.ctx.enableRuntimeObservation();
+                    break :blk cuda.ctx.runtimeObservation().?.counters.?.host_event_synchronizations;
+                } else null;
+                try copy_state.migrateOmittedCrossCaches(&previous, &targets, copy_control);
+                if (comptime @import("build_options").enable_cuda) {
+                    if (before_waits) |count| try std.testing.expectEqual(count + 1, shared.ctx.cuda.ctx.runtimeObservation().?.counters.?.host_event_synchronizations);
+                }
+                const detached = targets[0] orelse return error.MissingIndependentResidentCache;
+                const other = targets[1] orelse return error.MissingIndependentResidentCache;
+                try std.testing.expect(other.independent and other.input.value != detached.input.value);
+                const other_cache = try other.input.backend.toFloat32(other.input.value, a);
+                defer a.free(other_cache);
+                try std.testing.expectEqualSlices(f32, expected_cache, other_cache);
                 try std.testing.expect(detached.independent);
                 try std.testing.expect(controller.snapshot().backend_kv_bytes >= owned.input.estimated_bytes);
                 slot.* = null;
