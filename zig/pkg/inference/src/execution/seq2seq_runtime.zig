@@ -787,7 +787,7 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
                 copy_state.session.run_admission.?.limits = original_limits;
                 const before_waits: ?u64 = if (comptime @import("build_options").enable_cuda) blk: {
                     if (backend != .cuda) break :blk null;
-                    const cuda = &shared.ctx.cuda;
+                    const cuda = shared.ctx.cuda;
                     cuda.ctx.enableRuntimeObservation();
                     break :blk cuda.ctx.runtimeObservation().?.counters.?.host_event_synchronizations;
                 } else null;
