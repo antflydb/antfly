@@ -19767,6 +19767,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (d < axis) outer = try std.math.mul(usize, outer, @intCast(ad));
             if (d > axis) inner = try std.math.mul(usize, inner, @intCast(ad));
         }
+        const geometry = kernel_geometry.ConcatAxis{ .outer = outer, .inner = inner, .a_axis = @intCast(a_dims[axis]), .b_axis = @intCast(b_dims[axis]) };
+        if (try self.concatResidentIntegers(a, b, geometry, shape[0..a_dims.len])) |output| return output;
         const lhs = (try cb.exportTensorData(a, self.allocator)) orelse return error.UnsupportedTensorType;
         defer self.allocator.free(lhs.payload.bytes);
         const rhs = (try cb.exportTensorData(b, self.allocator)) orelse return error.UnsupportedTensorType;
@@ -19785,6 +19787,39 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         const dtype = std.meta.stringToEnum(ops.GraphDType, @tagName(lhs.dtype)) orelse return error.UnsupportedTensorType;
         return (try cb.fromConstantBytes(output, dtype, shape[0..a_dims.len])) orelse error.UnsupportedTensorType;
+    }
+
+    fn concatResidentIntegers(self: *MetalCompute, a: CT, b: CT, geometry: kernel_geometry.ConcatAxis, shape: []const i64) !?CT {
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        const left = toBuf(a);
+        const right = toBuf(b);
+        const owner: *anyopaque = @ptrCast(self);
+        if (left.resident_owner != owner or right.resident_owner != owner or hasHostView(left) or hasHostView(right)) return null;
+        if (left.logical_view_strides != null or right.logical_view_strides != null or left.view_base_offset != 0 or right.view_base_offset != 0) return null;
+        const lhs = left.metal_tensor orelse return null;
+        const rhs = right.metal_tensor orelse return null;
+        if (!lhs.isDevice() or !rhs.isDevice() or lhs.dtype != rhs.dtype or (lhs.dtype != .i32 and lhs.dtype != .i64)) return null;
+        if (geometry.outer == 0 or geometry.inner == 0 or geometry.a_axis == 0 or geometry.b_axis == 0) return null;
+        const a_chunk = try std.math.mul(usize, geometry.a_axis, geometry.inner);
+        const b_chunk = try std.math.mul(usize, geometry.b_axis, geometry.inner);
+        const count = try geometry.count();
+        if (count > std.math.maxInt(u32) / (lhs.dtype.byteSize() / @sizeOf(u32))) return null;
+        var dims: [metal_tensor_mod.max_dims]i32 = undefined;
+        for (shape, 0..) |dim, i| dims[i] = std.math.cast(i32, dim) orelse return null;
+        const left_bounds = self.uploadedIndexBounds(a) catch null;
+        const right_bounds = self.uploadedIndexBounds(b) catch null;
+        var output = try MetalTensor.deviceAllocateTyped(self.allocator, @ptrCast(runtime), lhs.dtype, .private, dims[0..shape.len]);
+        errdefer self.retireTemporaryWorkspaceValue(&output);
+        if (!try metal_runtime.decoderRuntimeConcatWordsInto(self.provider_impl, lhs, rhs, geometry.outer, a_chunk, b_chunk, output)) {
+            self.retireTemporaryWorkspaceValue(&output);
+            return null;
+        }
+        const result = try self.ctFromOwnedMetalTensor(output);
+        if (left_bounds) |lb| if (right_bounds) |rb| {
+            toBuf(result).integer_bounds = .{ .minimum = @min(lb.min, rb.min), .maximum = @max(lb.max, rb.max) };
+            toBuf(result).integer_upload_version = output.storageVersion();
+        };
+        return result;
     }
 
     fn quantizedConcatPrim(self: *MetalCompute, a: CT, b: CT, axis: u8, a_shape: []const i64, b_shape: []const i64) !?CT {
@@ -54608,8 +54643,15 @@ test "metal_compute: GatherND coordinate concat preserves exact i64 bytes" {
     defer cb.free(lhs);
     const rhs = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&rhs_values), .i64, &dims)).?;
     defer cb.free(rhs);
-    const out = try cb.primConcatPrim(lhs, rhs, 4, &dims, &dims);
+    const out = concat: {
+        const transfer_audit = @import("../execution/transfer_audit.zig");
+        var audit = transfer_audit.Audit{ .forbid_device_host_access = true };
+        try transfer_audit.begin(&audit);
+        defer transfer_audit.end();
+        break :concat try cb.primConcatPrim(lhs, rhs, 4, &dims, &dims);
+    };
     defer cb.free(out);
+    try std.testing.expectEqualDeep(@import("index_metadata.zig").Bounds{ .min = lhs_values[1], .max = lhs_values[0] }, try compute.uploadedIndexBounds(out));
     const actual = (try cb.exportTensorData(out, a)).?;
     defer a.free(actual.payload.bytes);
     try std.testing.expectEqual(.i64, actual.dtype);

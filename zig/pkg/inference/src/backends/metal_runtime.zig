@@ -7772,7 +7772,7 @@ pub fn decoderRuntimeConcatWordsInto(self: anytype, a: MetalTensor, b: MetalTens
     const output_count = try std.math.mul(usize, rows, try std.math.add(usize, dim_a, dim_b));
     if (output_count > std.math.maxInt(u32) / words or output.elemCount() != output_count or
         a.elemCount() != try std.math.mul(usize, rows, dim_a) or b.elemCount() != try std.math.mul(usize, rows, dim_b)) return false;
-    return termite_metal_decode_runtime_concat_lastdim_f32_2d_device(
+    const rc = termite_metal_decode_runtime_concat_lastdim_f32_2d_device(
         runtime,
         a.deviceHandle(),
         a.deviceByteOffset(),
@@ -7783,7 +7783,9 @@ pub fn decoderRuntimeConcatWordsInto(self: anytype, a: MetalTensor, b: MetalTens
         b_words,
         output.deviceHandle(),
         output.deviceByteOffset(),
-    ) == 0;
+    );
+    if (rc == -12) return error.MetalConcatCompletionFailed;
+    return rc == 0;
 }
 inline fn decoderRuntimeConcatLastDimF32_2DDeviceImpl(self: anytype, a: MetalTensor, b: MetalTensor, rows: usize, dim_a: usize, dim_b: usize, output_shape: []const i32) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
