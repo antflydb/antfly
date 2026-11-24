@@ -1925,8 +1925,12 @@ pub const AudioStorageScope = struct {
         if (!self.active) return error.AudioStorageScopeUnavailable;
     }
 
+    pub fn finish(self: *AudioStorageScope) !void {
+        _ = try self.park();
+    }
+
     pub fn close(self: *AudioStorageScope) void {
-        _ = self.park() catch |err| {
+        self.finish() catch |err| {
             std.log.warn("audio storage scope cleanup failed: {s}", .{@errorName(err)});
             return;
         };
@@ -8244,12 +8248,13 @@ test "source scalar publication refuses copied canonical table before opaque cal
     try std.testing.expectEqual(@as(usize, 3), Fixture.calls);
 }
 
-test "parked audio storage scope surfaces provider reopen decline" {
+test "audio storage scope surfaces provider retirement and reopen declines" {
     const Fixture = struct {
         allow_begin: bool = true,
+        allow_end: bool = false,
         fn audio(raw: *anyopaque, begin: bool) anyerror!bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            return !begin or self.allow_begin;
+            return if (begin) self.allow_begin else self.allow_end;
         }
     };
     var fixture = Fixture{};
@@ -8259,6 +8264,9 @@ test "parked audio storage scope surfaces provider reopen decline" {
     const cb = ComputeBackend{ .ptr = &fixture, .vtable = &table };
     var scope = try AudioStorageScope.begin(&cb);
     defer scope.close();
+    try std.testing.expectError(error.AudioStorageScopeUnavailable, scope.finish());
+    try std.testing.expect(scope.active);
+    fixture.allow_end = true;
     const parked = try scope.park();
     try std.testing.expect(parked);
     fixture.allow_begin = false;

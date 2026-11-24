@@ -13804,7 +13804,7 @@ pub const StagedExecution = struct {
         const Metal = @import("../ops/metal_compute.zig").MetalCompute;
         if (!Metal.audioArenaDomainMatches(cb, pin)) return false;
         const Upgrade = @import("audio_schedule.zig").Plan.ArenaRequest;
-        var requests: [12]Upgrade = undefined;
+        var requests: [@import("audio_schedule.zig").retained_plan_capacity]Upgrade = undefined;
         if (keys.len > requests.len) return error.UnsupportedPreparedAudioCache;
         var count: usize = 0;
         for (keys) |key| {
@@ -13827,13 +13827,15 @@ pub const StagedExecution = struct {
         try pause(self);
         const observation = @import("runtime_observation.zig");
         const observe_arena = observation.kernelObservationActive();
-        var banks: [12]?Metal.FundedAudioBank = @splat(null);
+        var banks: [requests.len]?Metal.FundedAudioBank = @splat(null);
+        var pressure: [requests.len]bool = @splat(false);
         defer for (&banks) |*value| {
             if (value.*) |*bank| bank.discardAfterResume();
         };
-        for (requests[0..count], banks[0..count]) |request, *value| {
+        for (requests[0..count], banks[0..count], pressure[0..count]) |request, *value, *denied| {
             value.* = Metal.fundAudioScratch(cb, request, pin) catch |err| {
                 if (Metal.isAudioArenaPressure(err)) {
+                    denied.* = true;
                     if (observe_arena) observation.metalSerialScheduleDecision(.arena_funding_pressure);
                     continue;
                 }
@@ -13864,6 +13866,9 @@ pub const StagedExecution = struct {
             return true;
         };
         try boundary.storage.resumeAfterPark(reopen_storage);
+        for (requests[0..count], pressure[0..count]) |request, denied| {
+            if (denied) Metal.deferAudioScratchRetry(cb, request);
+        }
         for (requests[0..count], banks[0..count]) |request, *value| if (value.*) |*bank| {
             const published = Metal.publishAudioScratch(cb, request, bank) catch |err| {
                 if (Metal.isAudioArenaPressure(err)) {
@@ -14899,7 +14904,9 @@ test "actual Metal stage admits two learned audio arenas in one quiescent pause"
     var observation: @import("runtime_observation.zig").KernelScope = .{};
     observation.begin();
     defer _ = observation.finish();
-    try std.testing.expect(try prepare(hook.ptr, cb, &keys, &.{input}, .{ .storage = &storage }));
+    var full_schedule: [audio.retained_plan_capacity]u64 = undefined;
+    for (&full_schedule, 0..) |*key, index| key.* = keys[index % keys.len];
+    try std.testing.expect(try prepare(hook.ptr, cb, &full_schedule, &.{input}, .{ .storage = &storage }));
     try std.testing.expectEqual(cold_yields + 1, timings.stage_yields);
     try std.testing.expectEqual(@as(u64, keys.len), observation.metal_serial_workspace.?.decisions.arena_funding_pressure);
     try std.testing.expectEqual(@as(u64, 0), observation.metal_serial_workspace.?.decisions.arena_published);
@@ -14909,8 +14916,13 @@ test "actual Metal stage admits two learned audio arenas in one quiescent pause"
         const plan = entry orelse return error.MissingPreparedAudioCache;
         try std.testing.expect(plan.bindings_ready and !plan.prepared and plan.arena == null);
     }
+    try std.testing.expect(try prepare(hook.ptr, cb, &keys, &.{input}, .{ .storage = &storage }));
+    try std.testing.expectEqual(cold_yields + 2, timings.stage_yields);
+    try std.testing.expect(try prepare(hook.ptr, cb, &keys, &.{input}, .{ .storage = &storage }));
+    try std.testing.expectEqual(cold_yields + 2, timings.stage_yields);
     peer.release();
     peer_live = false;
+    compute.provider_impl.audio_schedule_clock += 1;
     const yields = timings.stage_yields;
     try std.testing.expect(try prepare(hook.ptr, cb, &keys, &.{input}, .{ .storage = &storage }));
     try std.testing.expectEqual(yields + 1, timings.stage_yields);

@@ -1680,19 +1680,23 @@ pub fn encodePreparedEmbeddingGemma2AudioBatchResident(cb: *const ComputeBackend
     var cache_scope = try beginAudioCache(cb, embeddingGemma2AudioConfig(), prepared);
     defer cache_scope.close();
     var storage = try ops.AudioStorageScope.begin(cb);
-    defer storage.close();
-    var weights = ProjectorWeights.initHuggingFace(cb, a);
-    defer weights.deinit();
-    var features: [4]AudioFeatures = undefined;
-    var pointers: [4]*AudioFeatures = undefined;
-    var count: usize = 0;
-    defer for (features[0..count]) |*feature| feature.deinit();
-    count = try audioFeatureCohort(cb, a, prepared, &features);
-    for (pointers[0..count], 0..) |*pointer, i| pointer.* = &features[i];
+    errdefer storage.close();
     const lengths = try a.alloc(usize, prepared.len);
     errdefer a.free(lengths);
-    // The outer storage lease also covers feature preparation; the cohort borrows it.
-    const result = try encodeAudioFeatureCohortResidentWithinStorage(cb, a, &weights, try audioConfigForBackend(cb, embeddingGemma2AudioConfig()), pointers[0..count], lengths, &storage);
+    var count: usize = 0;
+    const result = encode: {
+        var weights = ProjectorWeights.initHuggingFace(cb, a);
+        defer weights.deinit();
+        var features: [4]AudioFeatures = undefined;
+        var pointers: [4]*AudioFeatures = undefined;
+        defer for (features[0..count]) |*feature| feature.deinit();
+        count = try audioFeatureCohort(cb, a, prepared, &features);
+        for (pointers[0..count], 0..) |*pointer, i| pointer.* = &features[i];
+        // The outer storage lease also covers feature preparation; the cohort borrows it.
+        break :encode try encodeAudioFeatureCohortResidentWithinStorage(cb, a, &weights, try audioConfigForBackend(cb, embeddingGemma2AudioConfig()), pointers[0..count], lengths, &storage);
+    };
+    errdefer cb.free(result.embeddings);
+    try storage.finish();
     return .{ .allocator = a, .backend = cb, .embeddings = result.embeddings, .tokens_per_image = lengths, .hidden_size = 512, .batches_executed = 1, .max_batch_executed = count };
 }
 
@@ -2149,8 +2153,11 @@ fn encodeAudioFeatureCohortResident(cb: *const ComputeBackend, allocator: std.me
     const cfg = try audioConfigForBackend(cb, declared_cfg);
     if (features_list.len == 0 or features_list.len > 4 or (lengths != null and lengths.?.len != features_list.len)) return error.InvalidInputShape;
     var storage = try ops.AudioStorageScope.begin(cb);
-    defer storage.close();
-    return encodeAudioFeatureCohortResidentWithinStorage(cb, allocator, store, cfg, features_list, lengths, &storage);
+    errdefer storage.close();
+    const resident = try encodeAudioFeatureCohortResidentWithinStorage(cb, allocator, store, cfg, features_list, lengths, &storage);
+    errdefer cb.free(resident.embeddings);
+    try storage.finish();
+    return resident;
 }
 
 // Only the owning wrapper above and the prepared-batch lexical storage owner
@@ -2197,6 +2204,20 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
     if (@import("builtin").is_test) try embeddingGemma2StageTensor(cb, allocator, "audio_subsample", subsampled.hidden);
     audioProfileMark(.subsample);
 
+    const valid_count = if (lengths) |counts| block: {
+        var offset: usize = 0;
+        var total: usize = 0;
+        const segments = if (subsampled.segments.len == 0) &[_]usize{subsampled.seq_len} else subsampled.segments;
+        for (counts, segments) |*count, span| {
+            count.* = countTrue(subsampled.valid_mask[offset..][0..span]);
+            if (count.* == 0) return error.EmptyEmbeddingInput;
+            total += count.*;
+            offset += span;
+        }
+        break :block total;
+    } else countTrue(subsampled.valid_mask);
+    if (valid_count == 0) return error.EmptyEmbeddingInput;
+
     var layer_inputs = try AudioLayerInputs.initCached(cb, allocator, store, cfg, subsampled.valid_mask);
     defer layer_inputs.deinit(cb);
     try layer_inputs.setSegments(cb, subsampled.segments);
@@ -2207,7 +2228,10 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
     const frame_plan = if (grouped_frames) audio_schedule.audioFramePlan(subsampled.seq_len, cfg.audio_hidden, cfg.intermediate_size) else audio_schedule.AudioFramePlan{};
     const cohort_layer_span = if (grouped_frames) frame_plan.layers else 1;
     var defer_audio_arena = false;
-    if (cb.kind() == .metal and audioExecutionEligible(cb, store, cfg, &layer_inputs)) {
+    const schedule_span = if (cohort) cohort_layer_span else @max(cfg.block_count, 1);
+    const schedule_count = if (cohort) @divCeil(cfg.block_count, schedule_span) else @as(usize, @intFromBool(cfg.block_count != 0));
+    const fits_retained_schedules = schedule_count <= audio_schedule.retained_plan_capacity;
+    if (cb.kind() == .metal and fits_retained_schedules and audioExecutionEligible(cb, store, cfg, &layer_inputs)) {
         if (cb.embedding_stage) |stage| if (stage.audio_scratch_fn) |prepare| {
             const Boundary = struct {
                 cb: *const ComputeBackend,
@@ -2227,19 +2251,15 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
             };
             var boundary = Boundary{ .cb = cb, .store = store, .frame = &frame_active };
             const restart_frame = frame_active;
-            var keys: [12]u64 = undefined;
-            var count: usize = 0;
-            var start: usize = 0;
+            var keys: [audio_schedule.retained_plan_capacity]u64 = undefined;
             const recipe = audioCacheConfig(cfg);
-            const span = if (cohort) cohort_layer_span else cfg.block_count;
-            while (start < cfg.block_count) {
-                const end = @min(cfg.block_count, start + span);
-                keys[count] = recipe.key(layer_inputs.segments, start, end);
-                count += 1;
-                start = end;
+            for (keys[0..schedule_count], 0..) |*key, index| {
+                const start = index * schedule_span;
+                const end = start + @min(cfg.block_count - start, schedule_span);
+                key.* = recipe.key(layer_inputs.segments, start, end);
             }
             const values = audioExecutionInputs(hidden, &layer_inputs);
-            defer_audio_arena = try prepare(stage.ptr, cb, keys[0..count], &values, .{
+            defer_audio_arena = try prepare(stage.ptr, cb, keys[0..schedule_count], &values, .{
                 .storage = storage,
                 .owns_active_frame = frame_active,
                 .context = &boundary,
@@ -2276,7 +2296,7 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
         try cb.checkExecutionControl();
         const end = @min(cfg.block_count, layer + cohort_layer_span);
         if (cohort and cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame()) frame_active = try cb.decoderRuntimeBeginFrame();
-        const grouped = if (cohort and cb.kind() == .metal) try tryAudioExecutionRange(cb, allocator, store, cfg, hidden, &layer_inputs, layer, end, defer_audio_arena) else null;
+        const grouped = if (cohort and cb.kind() == .metal and fits_retained_schedules) try tryAudioExecutionRange(cb, allocator, store, cfg, hidden, &layer_inputs, layer, end, defer_audio_arena) else null;
         const next = grouped orelse try runAudioLayers(cb, allocator, store, cfg, hidden, &layer_inputs, layer, end);
         cb.free(hidden);
         hidden = next;
@@ -2326,7 +2346,6 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
         try cb.linearNoBias(normed, projection_w, subsampled.seq_len, cfg.output_hidden, cfg.text_hidden);
     defer cb.free(projected);
     audioProfileMark(.tail);
-    const valid_count = countTrue(subsampled.valid_mask);
     // A contiguous copy owns its destination independently of the frame.
     // Encode it before submitting the last Metal frame to share its fence.
     const contiguous_first = if (valid_count != 0 and (cb.kind() == .metal or cb.kind() == .cuda) and
@@ -2334,8 +2353,27 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
         contiguousValidAudioRows(subsampled.valid_mask, valid_count)
     else
         null;
+    // Stage only the index map for a ragged mask. The projected rows stay
+    // resident and the owned result crosses the frame boundary.
+    const valid_rows = if (contiguous_first == null and valid_count != 0) try allocator.alloc(u32, valid_count) else null;
+    defer if (valid_rows) |rows| allocator.free(rows);
+    if (valid_rows) |rows| {
+        var dst: usize = 0;
+        for (subsampled.valid_mask, 0..) |valid, row| {
+            if (valid) {
+                rows[dst] = @intCast(row);
+                dst += 1;
+            }
+        }
+    }
     if (frame_active and cb.kind() == .metal) {
-        if (contiguous_first) |first| frame_snapshot = try cb.snapshotRows2D(allocator, projected, first, valid_count, cfg.text_hidden);
+        if (contiguous_first) |first| {
+            frame_snapshot = try cb.snapshotRows2D(allocator, projected, first, valid_count, cfg.text_hidden);
+        } else if (valid_rows) |rows| {
+            if (cb.vtable.takeRows != null and try cb.tensorDType(projected) == .f32) {
+                frame_snapshot = try cb.takeRows(projected, rows, rows.len, cfg.text_hidden);
+            }
+        }
     }
     if (pending_frame) {
         if (frame_active) try @import("../ops/metal_compute.zig").MetalCompute.detachEmbeddingGemma2ActivationViews(cb);
@@ -2349,42 +2387,22 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
     }
 
     if (@import("builtin").is_test) try embeddingGemma2StageTensor(cb, allocator, "audio_projected", projected);
-    if (lengths) |counts| {
-        var offset: usize = 0;
-        for (counts, if (subsampled.segments.len == 0) &[_]usize{subsampled.seq_len} else subsampled.segments) |*count, span| {
-            count.* = countTrue(subsampled.valid_mask[offset..][0..span]);
-            if (count.* == 0) return error.EmptyEmbeddingInput;
-            offset += span;
-        }
-    }
-    if (valid_count == 0) return error.EmptyEmbeddingInput;
-    if (contiguous_first) |first| {
-        const snapshot = frame_snapshot orelse try cb.snapshotRows2D(allocator, projected, first, valid_count, cfg.text_hidden);
+    const resident: ?CT = frame_snapshot orelse if (contiguous_first) |first|
+        try cb.snapshotRows2D(allocator, projected, first, valid_count, cfg.text_hidden)
+    else if (cb.vtable.takeRows != null)
+        (try cb.takeRows(projected, valid_rows.?, valid_count, cfg.text_hidden)) orelse return error.UnsupportedResidentGemma4Audio
+    else
+        null;
+    if (resident) |output_rows| {
         audioProfileMark(.readback);
         if (profile_enabled) profile.finish(subsampled.seq_len);
-        return .{ .embeddings = snapshot, .tokens = valid_count };
-    }
-    const valid_rows = try allocator.alloc(u32, valid_count);
-    defer allocator.free(valid_rows);
-    var dst: usize = 0;
-    for (subsampled.valid_mask, 0..) |valid, row| {
-        if (valid) {
-            valid_rows[dst] = @intCast(row);
-            dst += 1;
-        }
-    }
-    if (cb.vtable.takeRows != null) {
-        const compact = try cb.takeRows(projected, valid_rows, valid_count, cfg.text_hidden) orelse return error.UnsupportedResidentGemma4Audio;
-        errdefer cb.free(compact);
-        audioProfileMark(.readback);
-        if (profile_enabled) profile.finish(subsampled.seq_len);
-        return .{ .embeddings = compact, .tokens = valid_count };
+        return .{ .embeddings = output_rows, .tokens = valid_count };
     }
     const values = try cb.toFloat32(projected, allocator);
     defer allocator.free(values);
     const packed_values = try allocator.alloc(f32, valid_count * cfg.text_hidden);
     defer allocator.free(packed_values);
-    for (valid_rows, 0..) |row, index| @memcpy(packed_values[index * cfg.text_hidden ..][0..cfg.text_hidden], values[row * cfg.text_hidden ..][0..cfg.text_hidden]);
+    for (valid_rows.?, 0..) |row, index| @memcpy(packed_values[index * cfg.text_hidden ..][0..cfg.text_hidden], values[row * cfg.text_hidden ..][0..cfg.text_hidden]);
     return .{ .embeddings = try deviceResidentFromFloat32(cb, packed_values, &.{ @intCast(valid_count), @intCast(cfg.text_hidden) }), .tokens = valid_count };
 }
 
@@ -8048,6 +8066,44 @@ test "gemma4 real mmproj audio device ops match the host encoder" {
         }
     }
     try std.testing.expect(worst < 5e-2);
+
+    const cfg = try parseAudioConfig(&projector.gguf.parsed);
+    const frames = 33;
+    const mel = try allocator.alloc(f32, frames * cfg.mel_bins);
+    defer allocator.free(mel);
+    for (mel, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index % 31)) * 0.01;
+    var mask: [frames]bool = @splat(true);
+    @memset(mask[12..20], false);
+    var features = AudioFeatures{ .allocator = allocator, .data = mel, .mask = &mask, .frames = frames, .mel_bins = cfg.mel_bins };
+    var weights = ProjectorWeights.init(&cb, allocator, projector.gguf, projector);
+    defer weights.deinit();
+    const standalone = block: {
+        const disabled = try AudioTestEnv.set("TERMITE_GEMMA4_AUDIO_DISABLE_ENCODER_FRAME", "1");
+        defer disabled.deinit();
+        break :block try encodeAudioFeaturesResident(&cb, allocator, &weights, cfg, &features);
+    };
+    defer cb.free(standalone.embeddings);
+    const enabled = try AudioTestEnv.set("TERMITE_GEMMA4_AUDIO_DISABLE_ENCODER_FRAME", "0");
+    defer enabled.deinit();
+    const submits_before = cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits;
+    const framed = try encodeAudioFeaturesResident(&cb, allocator, &weights, cfg, &features);
+    defer cb.free(framed.embeddings);
+    try std.testing.expect(cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits > submits_before);
+    try std.testing.expectEqual(@as(usize, 7), framed.tokens);
+    try std.testing.expectEqual(standalone.tokens, framed.tokens);
+    try std.testing.expect(!cb.decoderRuntimeHasActiveFrame());
+    try std.testing.expect(!cb.decoderRuntimeHasSubmittedFrame());
+    const expected_rows = try cb.toFloat32(standalone.embeddings, allocator);
+    defer allocator.free(expected_rows);
+    const actual_rows = try cb.toFloat32(framed.embeddings, allocator);
+    defer allocator.free(actual_rows);
+    try std.testing.expectEqual(expected_rows.len, actual_rows.len);
+    for (expected_rows, actual_rows) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
+
+    @memset(mask[0..], false);
+    try std.testing.expectError(error.EmptyEmbeddingInput, encodeAudioFeaturesResident(&cb, allocator, &weights, cfg, &features));
+    try std.testing.expect(!cb.decoderRuntimeHasActiveFrame());
+    try std.testing.expect(!cb.decoderRuntimeHasSubmittedFrame());
 }
 
 test "model-owned projector store serves requests with their own allocators" {

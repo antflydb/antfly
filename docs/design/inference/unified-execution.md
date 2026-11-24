@@ -534,15 +534,15 @@ preparation API do not by themselves complete these remaining requirements:
   Cancellation before acquiring a guard never releases another owner's lock,
   and a failed numerical call releases its guard without replay. Wider task
   guards and stateful cache scopes keep their existing lifetimes.
-  `graph/decode_batch.zig` now owns uniform, mixed prefill/decode and packed
+  `execution/decode_batch.zig` now owns uniform, mixed prefill/decode and packed
   batch metadata assembly, including per-sequence physical KV views, recurrent
-  caches and position ownership. Generation retains compatibility exports and
-  supplies typed state/geometry; batch layout does not depend on a task pipeline.
-  `graph/decoder_work.zig` owns borrowed queued prefill/decode records, resident
+  caches and position ownership. Generation supplies typed state and geometry.
+  Batch layout and its callers use the runtime owner directly.
+  `execution/decoder_work.zig` owns borrowed queued prefill/decode records, resident
   prefix geometry and validation. Bounded device bursts read an immutable token
   budget rather than dereferencing task continuation state. Task publication and
   stopping/streaming policy remain in generation. The physical scheduled forward
-  is owned by `graph/decoder_step_executor.zig`: it receives explicit context,
+  is owned by `execution/decoder_step_executor.zig`: it receives explicit context,
   queued work, padding, continuation control and lane access, without a task
   pipeline or tokenizer. It owns frame submission/readback cleanup, bounded
   device bursts, KV reservation rollback and CUDA epoch retirement. The reader
@@ -759,8 +759,8 @@ preparation API do not by themselves complete these remaining requirements:
 | Metal graph with a deferred producer or specialized region | Product-add, eligible shared transpose-dot groups, and F32 gather-after-bias can publish through assigned regions inside the prepared frame. A complete frame skips the compatibility region planner. Published intermediates and unqualified representations still use their supported routes. | Map remaining deferred edges to their existing tuned regions and prove producer lifetime, command count, numerical parity and held outputs before removing the corresponding allocating branch. |
 | Metal vendor projections and raw decoder entrypoints | Eligible prepared F32 MPS projections bind planned inputs and outputs and retire their matrix views with the command buffer. Compatibility admission still covers opaque SDK workspace. Eligible raw decoder frames reserve one shared graph scratch bank across layers and bind direct-Q, hidden, projection, and hot FFN slots from it. Other vendor or raw decoder signatures can still retain provider-visible scratch. | Assign the remaining provider-visible inputs, destinations and scratch. Retain admission for opaque SDK storage and qualify cancellation and retirement before removing redundant envelopes. |
 | Whisper with an undeclared or unsupported causal prefill shape, or with denied prefill workspace | The accepted single-token plan keeps its own bank and KV charge. Prefill uses the ordinary decoder when its phase is unavailable. A joint phase admission denial retires the cold attempt before retrying with the decode plan alone. Construction diagnostics record the requested phase outcome separately. | Qualify the phase transition and retirement on each supported backend. Reduced and packed signatures still need their numerical schedules and exact workspace recipes before compatibility allocations can be removed. |
-| Metal audio with a cold, disabled, or unfunded serial schedule | The frontend uses eager execution; the backend owns learned metadata and any retained bank. A managed stage may fund a bank only across its quiescent boundary. | Track eligible eager scratch through the common plan while preserving cold fallback and quiescent retirement. Cold decisions and ready-bank gauges are observed separately. |
-| CUDA legacy decoder workspace with an incomplete event recipe | The decoder provider keeps learned allocation and replay retirement. Bounded production recipes use stable workspace and explicit publication spans. | Require ordinary and capture execution to consume the same event, state and workspace plan before deleting learned address policy for a production signature. |
+| Metal audio with a cold, disabled, or unfunded serial schedule | The frontend uses eager execution; the backend owns learned metadata and any retained bank. A managed stage funds banks across its quiescent boundary and backs off repeat funding denials. Schedule planning uses the retained cache capacity. Owned F32 output compaction can run in the final frame and publish after retirement. | Qualify ragged compaction and admission retry on hardware. Track eligible eager scratch through the common plan while preserving cold fallback and quiescent retirement. Cold decisions and ready-bank gauges are observed separately. |
+| CUDA legacy decoder workspace with an incomplete event recipe | The decoder provider keeps learned periodic scratch and replay retirement. Legacy replay outputs use shared physical leases and report a pre-submission decline when an earlier result still holds the bank. Bounded production recipes use stable workspace and explicit publication spans. | Require ordinary and capture execution to consume the same event, state and workspace plan before deleting learned address policy for a production signature. |
 | Opaque or unsupported encoder-to-decoder provider pair | The resident-stage dispatcher retains the declared host route when the provider cannot accept the exact source or controlled invocation. | Qualify source custody, cancellation and final-row readback for each supported producer and consumer pair before removing intermediate host materialization. |
 
 The issue checklist records implementation and evidence separately from remaining

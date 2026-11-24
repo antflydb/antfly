@@ -130,6 +130,8 @@ pub const AudioRecipe = struct {
         return std.fmt.bufPrint(buffer, "audio_tower.layers.{d}.self_attn.{s}.linear.weight", .{ layer, names[component] });
     }
 };
+pub const retained_plan_capacity = 16;
+
 pub const AudioFramePlan = struct { layers: usize = 1, in_flight: usize = 1 };
 pub fn audioFramePlan(rows: usize, hidden: usize, intermediate: usize) AudioFramePlan {
     if (rows == 0 or hidden == 0 or intermediate == 0) return .{};
@@ -456,6 +458,11 @@ pub const Plan = struct {
         if (bytes == 0) return null;
         const counts = try self.arenaViewCounts(self.arena_recipe, false, .separate);
         return .{ .key = self.key, .stamp = self.stamp, .bytes = bytes, .views = counts.workspaces };
+    }
+
+    pub fn deferArenaRetry(self: *Plan, clock: u64) void {
+        self.retry_after = clock +| self.retry_delay;
+        self.retry_delay = @min(@as(u8, 64), self.retry_delay *| 2);
     }
 
     pub fn pendingArena(self: *const Plan, clock: u64, bank_limit: usize) !?ArenaRequest {

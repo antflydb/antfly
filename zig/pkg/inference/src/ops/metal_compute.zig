@@ -23526,8 +23526,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (defer_arena) return;
             const request = (try plan.scratchUpgrade(self.provider_impl.audio_schedule_clock, audio_schedule_bank_limit)) orelse return;
             self.audioUpgradeInputWorkspace(plan, request, null) catch |err| {
-                plan.retry_after = self.provider_impl.audio_schedule_clock + plan.retry_delay;
-                plan.retry_delay = @min(@as(u8, 64), plan.retry_delay *| 2);
+                plan.deferArenaRetry(self.provider_impl.audio_schedule_clock);
                 switch (err) {
                     error.OutOfMemory, error.MetalBufferAllocFailed, error.AudioScheduleAdmission => return,
                     else => return err,
@@ -23537,8 +23536,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         self.audioPreparePlan(plan, defer_arena) catch |err| {
             if (err != error.AudioScheduleAdmission or !plan.bindings_ready or plan.arena != null) self.audioUnpreparePlan(plan);
-            plan.retry_after = self.provider_impl.audio_schedule_clock + plan.retry_delay;
-            plan.retry_delay = @min(@as(u8, 64), plan.retry_delay *| 2);
+            plan.deferArenaRetry(self.provider_impl.audio_schedule_clock);
             switch (err) {
                 error.MemoryBudgetExceeded, error.ResourceTemporarilyUnavailable, error.OutOfMemory, error.MetalBufferAllocFailed, error.AudioScheduleAdmission => return,
                 else => return err,
@@ -24016,6 +24014,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
     }
 
+    pub fn deferAudioScratchRetry(cb: *const ops.ComputeBackend, request: audio_tape.Plan.ArenaRequest) void {
+        if (!acceptsEmbeddingStage(cb)) return;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const provider = self.provider_impl;
+        for (provider.audio_schedules) |entry| {
+            const plan = entry orelse continue;
+            if (plan.key != request.key) continue;
+            const current = (plan.pendingArena(provider.audio_schedule_clock +| 1, audio_schedule_bank_limit) catch return) orelse return;
+            if (std.meta.eql(current, request)) plan.deferArenaRetry(provider.audio_schedule_clock);
+            return;
+        }
+    }
+
     pub fn publishAudioScratch(cb: *const ops.ComputeBackend, request: audio_tape.Plan.ArenaRequest, bank: *FundedAudioBank) !bool {
         if (!acceptsEmbeddingStage(cb)) return error.UnsupportedEmbeddingStage;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
@@ -24093,7 +24104,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     return null;
                 }
             }
-            _ = p.dropAudioSchedule(victim);
             cache.reserve(.host, @sizeOf(audio_tape.Plan)) catch {
                 if (observation.kernelObservationActive()) observation.metalSerialScheduleDecision(.metadata_allocation_declined);
                 return null;
@@ -24104,6 +24114,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 return null;
             };
             plan.* = .{ .key = k, .warmed = true, .linear_only = selection.policy & 8 != 0 };
+            // Keep the warm schedule usable until its replacement is funded
+            // and initialized. A declined cold request still runs eagerly.
+            _ = p.dropAudioSchedule(victim);
             p.audio_schedules[victim] = plan;
             p.embeddinggemma2_cache_admission = cache;
             entry = plan;
@@ -53871,6 +53884,17 @@ test "embeddinggemma2 Metal audio instruction schedule binds fresh inputs and re
         try std.testing.expectEqual(victim_key, schedules[victim_index].?.key);
         try std.testing.expectEqual(charged_backend, store.tier_cache.?.backend_bytes);
         try cb.decoderRuntimeCancelFrame();
+        {
+            const cache = &store.tier_cache.?;
+            const host_budget = cache.budget.host_limit_bytes;
+            const charged_host = cache.host_bytes;
+            cache.budget.host_limit_bytes = charged_host;
+            defer cache.budget.host_limit_bytes = host_budget;
+            try std.testing.expect(try cb.audioExecution(200, &.{ x, y }, &run, Run.call) == null);
+            try std.testing.expectEqual(victim, schedules[victim_index].?);
+            try std.testing.expectEqual(charged_host, cache.host_bytes);
+            try std.testing.expectEqual(charged_backend, cache.backend_bytes);
+        }
         const replacement = (try cb.audioExecution(200, &.{ x, y }, &run, Run.call)) orelse return error.TestUnexpectedResult;
         cb.free(replacement);
         try std.testing.expect(victim_key != schedules[victim_index].?.key);
