@@ -408,6 +408,10 @@ pub const State = struct {
             };
             return;
         }
+        // Keep the Metal copies in one frame and publish only after retirement.
+        const metal_frame = backend.kind() == .metal and try backend.decoderRuntimeBeginFrame();
+        errdefer if (metal_frame and backend.decoderRuntimeHasActiveFrame())
+            backend.decoderRuntimeCancelFrame() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         const completion = if (kernels.createPhysicalCompletion) |create| try create(backend.ptr) else null;
         defer if (completion) |event| event.deinit();
         {
@@ -424,6 +428,7 @@ pub const State = struct {
                 else => {},
             };
         }
+        if (metal_frame) try backend.decoderRuntimeSubmitAndWaitFrame();
         try scope.finish();
     }
 
@@ -791,7 +796,16 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
                     cuda.ctx.enableRuntimeObservation();
                     break :blk cuda.ctx.runtimeObservation().?.counters.?.host_event_synchronizations;
                 } else null;
-                try copy_state.migrateOmittedCrossCaches(&previous, &targets, copy_control);
+                {
+                    var observation = @import("runtime_observation.zig").Scope.init();
+                    defer observation.deinit();
+                    try copy_state.migrateOmittedCrossCaches(&previous, &targets, copy_control);
+                    if (backend == .metal) {
+                        const counters = observation.snapshot();
+                        try std.testing.expectEqual(@as(?u64, 1), counters.metal_command_submissions);
+                        try std.testing.expectEqual(@as(?u64, 1), counters.metal_command_waits);
+                    }
+                }
                 if (comptime @import("build_options").enable_cuda) {
                     if (before_waits) |count| try std.testing.expectEqual(count + 1, shared.ctx.cuda.ctx.runtimeObservation().?.counters.?.host_event_synchronizations);
                 }
