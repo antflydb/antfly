@@ -1909,6 +1909,7 @@ const CudaGraphReplaySlot = struct {
     decode_scalars_auto_advance_delta: [5]u32 = .{ 1, 1, 1, 1, 0 },
     temp_arena_generation: u64 = 0,
     captured_temp_allocation_count: usize = 0,
+    captured_temp_slot_start: ?usize = null,
 
     fn bankStorage(bank: ?*ops.physical_storage.Lease) buffer_mod.DeviceBuffer {
         return if (bank) |lease| tensorFromCt(lease.tensor).buffer else .{};
@@ -16666,6 +16667,13 @@ fn cudaEffectiveTempSlotSkip(self: *const CudaCompute) usize {
     return self.temp_arena_planner.allocation_seq_base;
 }
 
+inline fn pinnedTempSlotIndex(self: *const CudaCompute, seq: usize) ?usize {
+    const period = cudaEffectiveTempSlotPeriod(self);
+    const skip = cudaEffectiveTempSlotSkip(self);
+    if (period == 0 or seq < skip) return null;
+    return (seq - skip) % period;
+}
+
 fn cudaDebugGraphCaptureMinAllocSeq(self: *const CudaCompute) usize {
     if (platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_CAPTURE_MIN_ALLOC_SEQ")) |seq| return seq;
     const period = cudaEffectiveTempSlotPeriod(self);
@@ -17245,13 +17253,8 @@ fn allocPinnedTempSlot(
     seq: usize,
     len: usize,
 ) !?buffer_mod.DeviceBuffer {
-    const period = cudaEffectiveTempSlotPeriod(self);
-    if (period == 0) return null;
-    const skip = cudaEffectiveTempSlotSkip(self);
-    if (seq < skip) return null;
-
-    try ensureTempPinnedSlots(self, period);
-    const slot_index = (seq - skip) % period;
+    const slot_index = pinnedTempSlotIndex(self, seq) orelse return null;
+    try ensureTempPinnedSlots(self, cudaEffectiveTempSlotPeriod(self));
     const slot = &self.temp_pinned_slots.items[slot_index];
     if (slot.in_use) {
         if (self.temp_slot_config.autoplan_enabled) self.temp_arena_planner.markPinnedValidationFailure();
@@ -18963,6 +18966,7 @@ fn resetCudaGraphReplaySlotMetadataWithCleanup(self: *CudaCompute, slot: *CudaGr
     resetCudaGraphReplaySlotMetadataKeepExec(self, slot);
     slot.temp_arena_generation = 0;
     slot.captured_temp_allocation_count = 0;
+    slot.captured_temp_slot_start = null;
 }
 
 fn resetCudaGraphReplaySlotMetadataKeepExec(self: *CudaCompute, slot: *CudaGraphReplaySlot) void {
@@ -19863,6 +19867,10 @@ fn debugCudaGraphRegisterFinalHiddenReplayBoundary(ctx: *anyopaque, input: CT, o
 
 fn cudaGraphReplayArenaReady(self: *CudaCompute, slot: *const CudaGraphReplaySlot) bool {
     if (slot.temp_arena_generation == 0 or slot.temp_arena_generation != self.temp_arena_generation) return false;
+    // Matching allocation lengths do not imply matching pinned addresses.
+    // The graph recorded the exact starting slot, even for equal-size slots.
+    if (slot.captured_temp_allocation_count != 0 and
+        slot.captured_temp_slot_start != pinnedTempSlotIndex(self, self.temp_trace_seq)) return false;
     if (self.temp_slot_config.autoplan_enabled) {
         while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.temp_buffer_mutex.unlock();
@@ -20009,6 +20017,22 @@ test "CUDA replay retains input storage while retiring an exec at its addressabl
     slot.input = tensorFromCt(prepared).buffer;
     slot.output = slot.outputStorage();
     try std.testing.expectEqual(@as(?usize, 0), try qualifiedPersistentDecodeGraph(&compute, prepared));
+    // A configured period can have indistinguishable sizes in adjacent
+    // slots. Replay must still start at the captured physical ordinal.
+    const previous_config = compute.temp_slot_config;
+    const previous_seq = compute.temp_trace_seq;
+    compute.temp_slot_config.configured_period = 2;
+    compute.temp_slot_config.configured_skip = 10;
+    slot.captured_temp_allocation_count = 1;
+    slot.captured_temp_slot_start = 0;
+    compute.temp_trace_seq = 12;
+    try std.testing.expect(cudaGraphReplayArenaReady(&compute, slot));
+    compute.temp_trace_seq = 13;
+    try std.testing.expect(!cudaGraphReplayArenaReady(&compute, slot));
+    compute.temp_slot_config = previous_config;
+    compute.temp_trace_seq = previous_seq;
+    slot.captured_temp_allocation_count = 0;
+    slot.captured_temp_slot_start = null;
     var unowned_input = borrowedSlotTensor(tensorFromCt(prepared));
     unowned_input.resident_parent = null;
     try std.testing.expectEqual(@as(?usize, null), try qualifiedPersistentDecodeGraph(&compute, &unowned_input));
@@ -20280,6 +20304,7 @@ fn debugCudaGraphCaptureEnd(ctx: *anyopaque, replay: bool) !void {
             if (cudaDebugGraphPersistentReplayEnabled(self) or cudaDebugGraphCaptureUpdateExecEnabled(self)) {
                 slot.temp_arena_generation = self.temp_arena_generation;
                 slot.captured_temp_allocation_count = captured_temp_allocation_count;
+                slot.captured_temp_slot_start = pinnedTempSlotIndex(self, self.debug_cuda_graph_capture_temp_seq_begin);
                 try replayCapturedDebugGraphWithUpdate(self, slot_idx, graph);
                 // Updating an exec may replace all of its addresses. Retire
                 // previous owners only after their last launch has completed.
