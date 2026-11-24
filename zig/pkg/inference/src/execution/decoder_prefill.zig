@@ -628,6 +628,14 @@ pub const PromptRequest = struct {
     speculative_k: u32,
     sampled_ring_qualified: bool,
 
+    pub fn compiledOutputIntent(self: PromptRequest, final: bool) Runtime.CompiledChunk.Intent {
+        if (!final) return .kv_only;
+        return if (self.allow_resident_greedy and self.route.storage.pure_greedy and !self.route.storage.grammar)
+            .greedy_token
+        else
+            .last_logits;
+    }
+
     pub fn compiled(self: PromptRequest) CompiledPromptRequest {
         return .{
             .storage = self.route.storage,
@@ -1052,7 +1060,9 @@ pub const Runtime = struct {
         token_ids: []const i64,
         prepared_rows: ?@import("resident_rows.zig").Rows = null,
         total_sequence_length: usize,
-        output: enum { kv_only, last_logits, greedy_token },
+        output: Intent,
+
+        pub const Intent = enum { kv_only, last_logits, greedy_token };
     };
 
     /// The whole-model runtime owns physical KV/cache storage. This owner
@@ -1150,6 +1160,18 @@ pub const Runtime = struct {
     fn usesCompiledEmbeddings(self: *const Runtime, route: EmbeddingRoute) bool {
         return route == .prepared_last_row and self.forward.context.compiled_partition_backend == .metal and
             self.forward.context.compiled_attachment_target == .whole_model and self.forward.graph_cache != null;
+    }
+
+    pub fn positionedWantsGreedy(self: *const Runtime, request: decoder_routes.Request, allow: bool, needs_host_logits: bool) bool {
+        const context = self.forward.context;
+        return decoder_routes.shouldUsePreparedQwenPrefillGreedyToken(
+            context.cb.kind(),
+            context.gpt_config.*,
+            request,
+            allow,
+            needs_host_logits,
+            firstTokenEnabled() and greedyTokenEnabled(),
+        );
     }
 
     pub fn planEmbeddingPrompt(self: *Runtime, request: EmbeddingPromptRequest, attention_mask: ?[]const u8) !EmbeddingPromptPlan {
@@ -2119,6 +2141,13 @@ test "prefill cursor preserves scalar coalescing and rejects invalid retry witho
 }
 
 test "prefill selection reconciles actual admitted plans cache bypass and checkpoint geometry" {
+    var compiled = promptOwnerTestRequest(2);
+    compiled.allow_resident_greedy = true;
+    compiled.route.storage.pure_greedy = true;
+    try std.testing.expectEqual(.kv_only, compiled.compiledOutputIntent(false));
+    try std.testing.expectEqual(.greedy_token, compiled.compiledOutputIntent(true));
+    compiled.route.storage.grammar = true;
+    try std.testing.expectEqual(.last_logits, compiled.compiledOutputIntent(true));
     const Case = struct {
         fn run(a: std.mem.Allocator) !void {
             var plan = try runtime.scheduler.native_generate.PrefillChunkPlan.init(a, 19, 8, 4096, .shared, .fixed_ceiling);

@@ -3824,14 +3824,7 @@ pub const NativeGenerationPipeline = struct {
         else if (self.checkpoint_resume) |request|
             try self.resumeNativeCheckpoint(request, token_ids[0..seq_len], max_tokens, decode_state, config)
         else if (prepared_qwen3vl_prompt) |*prepared|
-            try self.executePreparedQwen3VlPrefill(prepared, seq_len, decode_state, shouldUsePreparedQwenPrefillGreedyToken(
-                self.cb.kind(),
-                self.gpt_config,
-                config,
-                allow_prefill_greedy_token and !use_speculative and !has_any_grammar,
-                self.prefillNeedsHostLogits(config),
-                enableCudaPrefillFirstToken() and enableCudaPrefillGreedyToken(),
-            ))
+            try self.executePreparedQwen3VlPrefill(prepared, seq_len, decode_state, config, allow_prefill_greedy_token and !use_speculative and !has_any_grammar)
         else if (prepared_multimodal_prompt) |*prepared|
             try self.executePreparedMultimodalPrefill(prepared, seq_len, decode_state, capture_mtp_prefill_hidden, config)
         else
@@ -4966,12 +4959,10 @@ pub const NativeGenerationPipeline = struct {
             while (window.next()) |attempt| {
                 const chunk = prompt_ids[attempt.start..attempt.end];
                 const total_chunk_end = attempt.total_end;
-                const is_last_chunk = attempt.final;
                 const phase_timer = @import("antfly_readers").pipeline_metrics.start(.prefill);
                 defer phase_timer.finish();
-                const wants_greedy = is_last_chunk and request.allow_resident_greedy and isPureGreedyConfig(config) and config.grammar == null;
                 var compiled_prefill = self.prefillRuntime(decode_state, null);
-                const output = compiled_prefill.runCompiledChunk(.{ .token_ids = chunk, .total_sequence_length = total_chunk_end, .output = if (wants_greedy) .greedy_token else if (is_last_chunk) .last_logits else .kv_only }) catch |err| {
+                const output = compiled_prefill.runCompiledChunk(.{ .token_ids = chunk, .total_sequence_length = total_chunk_end, .output = request.compiledOutputIntent(attempt.final) }) catch |err| {
                     debugGenerationStage("executePrefill whole-model chunk failed chunk_start={d} chunk_end={d} err={s}", .{ attempt.start, attempt.end, @errorName(err) });
                     return err;
                 };
@@ -4988,7 +4979,7 @@ pub const NativeGenerationPipeline = struct {
                 if (self.scheduler) |scheduler| {
                     if (self.scheduler_lease) |lease| {
                         scheduler.notePrefillProgress(lease, total_chunk_end, seq_len);
-                        if (is_last_chunk) scheduler.finishTurn(lease, .prefill);
+                        if (attempt.final) scheduler.finishTurn(lease, .prefill);
                     }
                 }
             }
@@ -5323,7 +5314,8 @@ pub const NativeGenerationPipeline = struct {
         prepared: *qwen3vl_projector.PreparedPrompt,
         seq_len: usize,
         decode_state: *NativeDecodeState,
-        wants_greedy: bool,
+        config: GenerationConfig,
+        allow_resident_greedy: bool,
     ) !PrefillOutput {
         if (prepared.plan.tokenCount() != seq_len or !decode_state.isPaged()) return error.InvalidPreparedPrompt;
         // A chunk-sized epoch workspace cannot admit the direct full-prefix
@@ -5334,6 +5326,7 @@ pub const NativeGenerationPipeline = struct {
         try numerical.resetRecurrentPrompt();
         if (self.qwen_prefill_batch) |hook| if (prepared.deepstack_layer_count == 0) {
             var publication = StepPublication{ .scheduler = self.scheduler orelse return error.InvalidBatchDecodeState, .lease = self.scheduler_lease orelse return error.InvalidBatchDecodeState, .vocab_size = self.gpt_config.vocab_size };
+            const wants_greedy = numerical.positionedWantsGreedy(decoderRouteRequest(config), allow_resident_greedy, self.prefillNeedsHostLogits(config));
             var request = try self.positionedRequest(prepared, decode_state, seq_len, wants_greedy, publication.interface());
             defer self.mergeStepExecutor(&request.executor);
             return hook.run_fn(hook.ptr, &request);
@@ -14638,10 +14631,10 @@ test "LightOnOCR3 bounded chunk workspace rejects direct fallback before cache m
     var visual = [_]bool{true};
     var prompt = qwen3vl_projector.PreparedPrompt{ .allocator = a, .token_ids = &ids, .input_embeddings = null, .plan = .{ .allocator = a, .mrope_positions = &axes, .causal_positions = &causal, .visual_token_mask = &visual, .visual_spans = &.{}, .mrope_position_delta = 0 }, .deepstack_embeddings = &.{}, .deepstack_layer_count = 0 };
     var pipeline = NativeGenerationPipeline{ .allocator = a, .cb = undefined, .gpt_config = .{}, .tokenizer = undefined, .prepared_qwen_prefill_chunk_rows = 128 };
-    try std.testing.expectError(error.InvalidPreparedPrompt, pipeline.executePreparedQwen3VlPrefill(&prompt, 1, &state, false));
+    try std.testing.expectError(error.InvalidPreparedPrompt, pipeline.executePreparedQwen3VlPrefill(&prompt, 1, &state, .{}, false));
     try std.testing.expectEqual(@as(usize, 0), state.total_tokens);
     prompt.deepstack_layer_count = 1;
-    try std.testing.expectError(error.InvalidPreparedPrompt, pipeline.executePreparedQwen3VlPrefill(&prompt, 1, &state, false));
+    try std.testing.expectError(error.InvalidPreparedPrompt, pipeline.executePreparedQwen3VlPrefill(&prompt, 1, &state, .{}, false));
     try std.testing.expectEqual(@as(usize, 0), state.total_tokens);
 }
 
@@ -15238,7 +15231,7 @@ test "prepared positioned prefill retains its actual tensor owner when lane acqu
     const pool = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 4, .num_kv_heads = 1, .head_dim = 4, .store_cpu_bytes = false });
     var state = NativeDecodeState.initPaged(a, &manager, pool, null);
     defer state.deinit();
-    try std.testing.expectError(error.Cancelled, pipeline.executePreparedQwen3VlPrefill(&prepared, 1, &state, false));
+    try std.testing.expectError(error.Cancelled, pipeline.executePreparedQwen3VlPrefill(&prepared, 1, &state, .{}, false));
     try std.testing.expect(prepared.input_embeddings != null);
     try std.testing.expectEqual(tensor, prepared.input_embeddings.?);
     try std.testing.expect(mutex.tryLock());
