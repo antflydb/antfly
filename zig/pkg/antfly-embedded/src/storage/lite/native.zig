@@ -7320,7 +7320,16 @@ pub const NativeFile = struct {
     /// derived from durable state above this file revalidate against it
     /// (`adoptionEpoch`).
     adoption_epoch: antfly_platform.atomic.Value(u64) = .init(0),
+    /// The file's layout keeps no durable frontier (it was created
+    /// `no_sync`): recovery scans the log, and nothing waits on barriers.
     no_sync: bool = false,
+    /// Opened `no_sync` on a file whose layout syncs (`protected_redo`): the
+    /// protocol stays the layout's (frontier slots, published watermarks),
+    /// only the barrier syscalls are skipped, like SQLite's
+    /// `synchronous=OFF`. A process crash loses nothing; an OS crash or
+    /// power loss can lose recent commits, and a frontier this file reports
+    /// as synced need not be.
+    skip_barriers: bool = false,
     /// When set, durability barriers (`syncIfRequired`) call
     /// `antfly_platform.filesystem.syncData` directly on the raw handle
     /// instead of `self.file.sync(io)`: `fdatasync` on Linux instead of
@@ -7651,6 +7660,7 @@ pub const NativeFile = struct {
             .header = header,
             .read_only = opts.read_only,
             .no_sync = opts.no_sync and !header.protected_redo,
+            .skip_barriers = opts.no_sync and header.protected_redo,
             .page_cache_enabled = .init(true),
             // Only when this open built its own Threaded runtime (not
             // openWithIo, whose caller's Io might be a test/sim wrapper or
@@ -8413,6 +8423,7 @@ pub const NativeFile = struct {
     }
 
     fn syncRedoData(self: *NativeFile) !void {
+        if (self.skip_barriers) return;
         if (self.durability_policy) |policy|
             try antfly_platform.filesystem.syncData(self.file.handle, policy)
         else
@@ -10112,14 +10123,14 @@ pub const NativeFile = struct {
             std.mem.writeInt(u64, intent[8..16], target_pages, .little);
             try self.slotOnlyCatalogCommit(.{ .key = redo_reservation_key, .value = &intent });
             self.redo_reservation_release_pending = true;
-            if (!self.no_sync) try self.file.sync(io);
+            if (!self.syncsSkipped()) try self.file.sync(io);
         }
         var next_header = self.header;
         next_header.redo_log_capacity = target_capacity;
         var encoded: [header_size]u8 = undefined;
         encodeHeader(&encoded, next_header);
         try self.file.writePositionalAll(io, &encoded, 0);
-        try self.file.sync(io);
+        if (!self.skip_barriers) try self.file.sync(io);
         self.header.redo_log_capacity = target_capacity;
         self.last_synced_header = self.header;
 
@@ -11265,7 +11276,7 @@ pub const NativeFile = struct {
             self.test_fail_redo_log_erase = null;
             return err;
         };
-        try self.file.sync(io);
+        if (!self.skip_barriers) try self.file.sync(io);
     }
 
     fn resyncRedoTailUnderAuthority(self: *NativeFile) anyerror!void {
@@ -12095,7 +12106,7 @@ pub const NativeFile = struct {
             .read_only = true,
             .internal_reader = coordinated,
             .reader_coordinator = if (coordinated) self.reader_coordinator else null,
-            .no_sync = self.no_sync,
+            .no_sync = self.syncsSkipped(),
             .resource_manager = self.page_cache.resource_manager,
         });
         errdefer reader.close();
@@ -19201,7 +19212,7 @@ pub const NativeFile = struct {
         // anything using the registry on that inode, the same class of
         // bug this registry exists to rule out everywhere else.
         const inode_entry = try inode_lock.openForFile(io, tmp_path, compact_file);
-        const prepared: NativeFile = .{ .allocator = self.allocator, .io_impl = undefined, .borrowed_io = io, .path = tmp_path, .file = compact_file, .header = compact_header, .no_sync = self.no_sync, .page_cache_policy = .metadata_only, .page_cache = .{ .resource_manager = self.page_cache.resource_manager }, .max_file_bytes = self.vacuum_workspace_limit, .inode_lock_ref = .init(inode_entry) };
+        const prepared: NativeFile = .{ .allocator = self.allocator, .io_impl = undefined, .borrowed_io = io, .path = tmp_path, .file = compact_file, .header = compact_header, .no_sync = self.no_sync, .skip_barriers = self.skip_barriers, .page_cache_policy = .metadata_only, .page_cache = .{ .resource_manager = self.page_cache.resource_manager }, .max_file_bytes = self.vacuum_workspace_limit, .inode_lock_ref = .init(inode_entry) };
         // `prepared.redo` stays `null` here, deliberately, even when
         // `reserve_redo_log` reserved the page-id span and header fields
         // for one above: `prepared` is still under construction --
@@ -23743,6 +23754,12 @@ pub const NativeFile = struct {
     /// Opts this handle's durability barriers into the raw `syncData`
     /// primitive. See the `durability_policy` field doc for when that is
     /// safe to call.
+    /// Whether this open issues no durability barriers: a `no_sync` layout,
+    /// or a `no_sync` open of a syncing one (`skip_barriers`).
+    pub fn syncsSkipped(self: *const NativeFile) bool {
+        return self.no_sync or self.skip_barriers;
+    }
+
     pub fn setDurabilityPolicy(self: *NativeFile, policy: ?antfly_platform.filesystem.DurabilityPolicy) void {
         self.durability_policy = policy;
     }
@@ -23762,7 +23779,7 @@ pub const NativeFile = struct {
     }
 
     fn syncIfRequired(self: *NativeFile, hooks: ?SyncLockHooks) !void {
-        if (!self.no_sync and self.transaction_header == null) {
+        if (!self.syncsSkipped() and self.transaction_header == null) {
             // WS2: release the caller's lock (if any) for exactly the
             // durability-barrier syscall -- the one part of a commit slow
             // enough to be worth not blocking a concurrent reader/writer
@@ -41180,6 +41197,52 @@ test "lite redo durable frontier recovers acknowledged redo after losing one fro
 // frontier and lose the record. That commit was never acknowledged: cold
 // recovery falls back to the previous frontier, and the next commit
 // overwrites the stale slot instead of failing as out of order.
+test "lite redo a no_sync open of a protected file keeps its frontier and issues no barriers" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-no-sync-protected.aflite");
+    defer a.free(path);
+    {
+        var writer = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+        defer writer.close();
+        try std.testing.expect(writer.header.protected_redo);
+    }
+
+    const Counting = struct {
+        var syncs: std.atomic.Value(u64) = .init(0);
+        fn fileSync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            _ = syncs.fetchAdd(1, .monotonic);
+            return std.testing.io.vtable.fileSync(userdata, file);
+        }
+    };
+    var vtable = std.testing.io.vtable.*;
+    vtable.fileSync = Counting.fileSync;
+    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    var last_sequence: u64 = 0;
+    {
+        var writer = try NativeFile.openWithIo(a, io, path, .{ .no_sync = true });
+        defer writer.close();
+        // The layout keeps its protocol; only the barriers are skipped.
+        try std.testing.expect(!writer.no_sync and writer.skip_barriers and writer.syncsSkipped());
+        Counting.syncs.store(0, .monotonic);
+        for ([_][]const u8{ "alpha", "beta", "gamma" }) |key| {
+            try writer.beginTransaction();
+            try writer.putDocument(key, key);
+            try writer.commitTransaction();
+        }
+        try std.testing.expectEqual(@as(u64, 0), Counting.syncs.load(.monotonic));
+        last_sequence = writer.activeCheckpoint().commit_sequence;
+        const frontier = (try NativeFile.readDurableFrontier(a, writer.file, std.testing.io, writer.header)).?.frontier;
+        try std.testing.expectEqual(last_sequence, frontier.sequence);
+    }
+    var reader = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true });
+    defer reader.close();
+    try expectRedoDocument(&reader, "alpha", "alpha");
+    try expectRedoDocument(&reader, "beta", "beta");
+    try expectRedoDocument(&reader, "gamma", "gamma");
+}
+
 test "lite redo combined frontier falls back when its record was lost" {
     const a = std.testing.allocator;
     const io = std.testing.io;

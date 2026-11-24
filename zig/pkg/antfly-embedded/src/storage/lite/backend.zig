@@ -649,7 +649,7 @@ pub const Handle = struct {
                     .checkpoint_sequence = checkpoint.commit_sequence,
                     .redo_folded_through = checkpoint.redo_folded_through,
                     .page_count = checkpoint.page_count,
-                    .fsync = !file.no_sync,
+                    .fsync = !file.syncsSkipped(),
                 };
             },
             .bridge_lsm_container => .{
@@ -1351,7 +1351,7 @@ test "lite backend propagates no_sync to native engine" {
         });
         defer handle.deinit();
 
-        try std.testing.expect(handle.native_docstore.?.file.no_sync);
+        try std.testing.expect(handle.native_docstore.?.file.syncsSkipped());
         try handle.native_docstore.?.file.putDocument("doc:no-sync", "value");
     }
 
@@ -1363,7 +1363,7 @@ test "lite backend propagates no_sync to native engine" {
         });
         defer handle.deinit();
 
-        try std.testing.expect(handle.native_docstore.?.file.no_sync);
+        try std.testing.expect(handle.native_docstore.?.file.syncsSkipped());
         const value = (try handle.native_docstore.?.file.getDocumentAlloc(allocator, "doc:no-sync")) orelse return error.MissingNativeLiteDocument;
         defer allocator.free(value);
         try std.testing.expectEqualStrings("value", value);

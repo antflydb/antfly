@@ -5331,7 +5331,7 @@ pub const Store = struct {
         for (0..max_rounds) |round| {
             if (cancel) |token| try token.check();
             const final_round = round + 1 == max_rounds;
-            if (!self.file.no_sync) try image.prepared.file.sync(io);
+            if (!self.file.syncsSkipped()) try image.prepared.file.sync(io);
             const reserved = blk: {
                 if (final_round and from_background_worker) {
                     try self.reserveWriterSlotYielding();
@@ -5361,7 +5361,7 @@ pub const Store = struct {
                 }
                 if (final_round and capture.count > 0) {
                     try self.applyResidualVacuumChangesAssumeLocked(&image, &capture, cancel);
-                    if (!self.file.no_sync) try image.prepared.file.sync(io);
+                    if (!self.file.syncsSkipped()) try image.prepared.file.sync(io);
                 }
                 if (capture.count == 0) {
                     if (self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
@@ -5369,6 +5369,7 @@ pub const Store = struct {
                     image.report.before_size = (try self.file.file.stat(io)).size;
                     image.report.reclaimed_bytes = image.report.before_size -| image.report.after_size;
                     image.prepared.no_sync = self.file.no_sync;
+                    image.prepared.skip_barriers = self.file.skip_barriers;
                     try image.prepared.finishPublicationSequence(self.file.activeCheckpoint().commit_sequence + 1, image.prepared.activeCheckpoint());
                     image.report.after_size = (try image.prepared.file.stat(io)).size;
                     image.report.reclaimed_bytes = image.report.before_size -| image.report.after_size;
