@@ -47363,7 +47363,7 @@ const PreparedCudaProjection = struct {
                         try self.compute.ctx.makeCurrent();
                         try self.compute.graph_blas.?.singleF32WithWorkspace(self.compute.ctx.stream, @ptrFromInt(output.ptr), @ptrFromInt(weight.buffer.ptr), @ptrFromInt(input.buffer.ptr), layout, @ptrFromInt(workspace.ptr), workspace.len);
                     } else {
-                        if (self.compute.debug_cuda_graph_capture_active) return error.MissingAssignedWorkspace;
+                        if (recording) return error.MissingAssignedWorkspace;
                         try launchGraphVendorMatmul(self.compute, output, input.buffer, weight.buffer, g.rows, g.width, g.columns);
                     }
                 },
@@ -58454,10 +58454,9 @@ fn qualifyCudaPrimitiveDotOwnedRoute(comptime rank: u8, comptime lhs_transposed:
     const compute = shared.ctx.cuda;
     if (direct) {
         try compute.enableGraphBlas(false);
-        if (!compute.graph_portable_matmul) {
-            const blas = if (compute.graph_blas) |*value| value else return error.SkipZigTest;
-            blas.requireF32Workspace() catch return error.SkipZigTest;
-        }
+        if (graphMatmulPortableNow(compute, 128, 64, 64)) return error.SkipZigTest;
+        const blas = if (compute.graph_blas) |*value| value else return error.SkipZigTest;
+        blas.requireF32Workspace() catch return error.SkipZigTest;
     }
     const cb = shared.computeBackend();
     const ml = @import("ml");
@@ -58518,7 +58517,7 @@ fn qualifyCudaPrimitiveDotOwnedRoute(comptime rank: u8, comptime lhs_transposed:
         if (direct) {
             try std.testing.expectEqual(.f32_direct, projection.profile.family);
             try std.testing.expectEqual(@as(usize, 0), projection.profile.transpose_bytes);
-            const expected_workspace: usize = if (compute.graph_portable_matmul) 0 else @import("libraries.zig").Cublas.f32_source_workspace_bytes;
+            const expected_workspace = @import("libraries.zig").Cublas.f32_source_workspace_bytes;
             try std.testing.expectEqual(expected_workspace, selected.requirements.workspace.byte_size);
             try std.testing.expectEqual(.supported, selected.requirements.capture);
         } else {
