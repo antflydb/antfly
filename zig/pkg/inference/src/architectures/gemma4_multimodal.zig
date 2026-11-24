@@ -316,9 +316,15 @@ pub fn prepareExpandedPromptEmbeddingsFromRows(
     const has_resident = for (projections) |maybe| {
         if (maybe) |projected| if (projected.source == .resident) break true;
     } else false;
-    if (has_resident) {
-        const scaled = try cb.multiplyScalar(base_embeddings, config.tokenEmbeddingScale()) orelse return error.ResidentImageOperationUnavailable;
-        const input_embeddings = try cb.ensureDeviceResidentOwned(scaled);
+    const embedding_scale = config.tokenEmbeddingScale();
+    const unit_scale = std.math.approxEqAbs(f32, embedding_scale, 1.0, 1e-6);
+    const device_assembly = has_resident or (cb.kind() == .metal and cb.supportsCopyRows2D());
+    const scaled = if (device_assembly)
+        try cb.multiplyScalar(base_embeddings, if (!has_resident and unit_scale) 1.0 else embedding_scale)
+    else
+        null;
+    if (scaled) |owned| {
+        const input_embeddings = try cb.ensureDeviceResidentOwned(owned);
         errdefer cb.free(input_embeddings);
         for (projections, offsets) |maybe, starts| {
             if (maybe) |projected| try copyMediaPromptRows(cb, allocator, input_embeddings, starts, projected);
@@ -326,11 +332,12 @@ pub fn prepareExpandedPromptEmbeddingsFromRows(
         return .{ .allocator = allocator, .token_ids = token_ids, .ple_token_ids = ple_token_ids, .input_embeddings = input_embeddings, .attn_or_mask = null };
     }
 
+    if (has_resident) return error.ResidentImageOperationUnavailable;
+
     const prompt_embeddings = try cb.toFloat32(base_embeddings, allocator);
     defer allocator.free(prompt_embeddings);
 
-    const embedding_scale = config.tokenEmbeddingScale();
-    if (!std.math.approxEqAbs(f32, embedding_scale, 1.0, 1e-6)) {
+    if (!unit_scale) {
         for (prompt_embeddings) |*value| value.* *= embedding_scale;
     }
 
@@ -409,4 +416,46 @@ test "gemma4 expands dynamic audio token sequence" {
     const expanded = try expandPromptText(allocator, "a <|audio|> b", &.{}, &.{2});
     defer allocator.free(expanded);
     try std.testing.expectEqualStrings("a <|audio><|audio|><|audio|><audio|> b", expanded);
+}
+
+test "Metal assembles host-projected Gemma media directly on device" {
+    const helpers = @import("../ops/media_residency_test.zig");
+    const Fixture = struct {
+        fn weights(store: *@import("../ops/native_compute.zig").WeightStore) !void {
+            try helpers.putWeight(store, "model.embed_tokens.weight", &.{ 8, 4 }, 0.25);
+        }
+
+        fn check(backend: ComputeBackend, reference: ComputeBackend) !void {
+            const a = std.testing.allocator;
+            const tokenizer_json =
+                \\{"model":{"type":"BPE","unk_token":"[UNK]","vocab":{"[UNK]":0,"<|image>":1,"<|image|>":2,"<image|>":3,"<|audio>":4,"<|audio|>":5,"<audio|>":6,"text":7},"merges":[]},
+                \\"added_tokens":[
+                \\{"id":1,"content":"<|image>","special":true,"normalized":false},
+                \\{"id":2,"content":"<|image|>","special":true,"normalized":false},
+                \\{"id":3,"content":"<image|>","special":true,"normalized":false},
+                \\{"id":4,"content":"<|audio>","special":true,"normalized":false},
+                \\{"id":5,"content":"<|audio|>","special":true,"normalized":false},
+                \\{"id":6,"content":"<audio|>","special":true,"normalized":false}
+                \\]}
+            ;
+            const tokenizer = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, tokenizer_json);
+            defer tokenizer.deinitSelf();
+            const model: gpt_mod.Config = .{ .family = .gemma, .hidden_size = 4 };
+            const tokens = [_]i32{ 1, 2, 3, 4, 5, 6, 7 };
+            const image: prompt_rows.ProjectedInputRows = .{ .rows_per_item = &.{1}, .width = 4, .source = .{ .host = &.{ 1, 2, 3, 4 } } };
+            const audio: prompt_rows.ProjectedInputRows = .{ .rows_per_item = &.{1}, .width = 4, .source = .{ .host = &.{ 5, 6, 7, 8 } } };
+            var actual = try prepareExpandedPromptEmbeddingsFromRows(&backend, a, tokenizer.tokenizer(), model, &tokens, image, audio);
+            defer actual.deinit(&backend);
+            try std.testing.expect(@import("../ops/metal_compute.zig").MetalCompute.debugHasDeviceTensor(&backend, actual.input_embeddings));
+
+            var expected = try prepareExpandedPromptEmbeddingsFromRows(&reference, a, tokenizer.tokenizer(), model, &tokens, image, audio);
+            defer expected.deinit(&reference);
+            const have = try backend.toFloat32(actual.input_embeddings, a);
+            defer a.free(have);
+            const want = try reference.toFloat32(expected.input_embeddings, a);
+            defer a.free(want);
+            try std.testing.expectEqualSlices(f32, want, have);
+        }
+    };
+    try helpers.onMetal(Fixture.weights, Fixture.check);
 }
