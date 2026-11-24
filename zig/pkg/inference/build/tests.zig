@@ -70,7 +70,19 @@ pub fn create(ctx: Context) Suite {
         .enable_metal = ctx.backend.enable_metal,
     });
     const existing_test_compile_max_rss: usize = if (b.graph.host.result.os.tag == .linux and b.graph.host.result.cpu.arch == .aarch64 and ctx.target.result.os.tag == .linux and ctx.target.result.cpu.arch == .aarch64 and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt) @as(usize, if (ctx.optimize == .safe) 24 else 16) * 1024 * 1024 * 1024 else if (native_cpu_macos) @as(usize, if (ctx.optimize == .debug) 12_672 else 12_032) * 1024 * 1024 else @as(usize, if (cuda_arm_linux) 28 else if (ctx.backend.enable_cuda) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 20 else 9) * 1024 * 1024 * 1024;
-    const default_test_compile_memory_mb: usize = if (measured_cuda_pjrt_arm_linux) |profile| profile.testMiB(selected_test_filters.len, ctx.runtime_test_filter) orelse (existing_test_compile_max_rss / (1024 * 1024)) else existing_test_compile_max_rss / (1024 * 1024);
+    // Native Apple Silicon Metal ReleaseFast with runtime filtering compiles
+    // the full suite. Its unstripped compiler peaked at 30,041,653,248 bytes.
+    const measured_metal_runtime_filter = ctx.runtime_test_filter and !ctx.strip and ctx.optimize == .fast and
+        b.graph.host.result.os.tag == .macos and b.graph.host.result.cpu.arch == .aarch64 and
+        ctx.target.result.os.tag == .macos and ctx.target.result.cpu.arch == .aarch64 and
+        ctx.backend.enable_metal and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt;
+    const existing_test_compile_memory_mb = existing_test_compile_max_rss / (1024 * 1024);
+    const default_test_compile_memory_mb: usize = if (measured_metal_runtime_filter)
+        32 * 1024
+    else if (measured_cuda_pjrt_arm_linux) |profile|
+        profile.testMiB(selected_test_filters.len, ctx.runtime_test_filter) orelse existing_test_compile_memory_mb
+    else
+        existing_test_compile_memory_mb;
     const test_compile_memory_mb = b.option(usize, "inference-test-compile-memory-mb", "Declared inference test compiler memory bound in MiB") orelse default_test_compile_memory_mb;
     if (test_compile_memory_mb == 0) @panic("inference test compiler memory bound must be positive");
     const tests = b.addTest(.{
