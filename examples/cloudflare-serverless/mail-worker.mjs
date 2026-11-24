@@ -138,9 +138,13 @@ export default {
         return new Response("not found", { status: 404 });
       const runtime = /^\/local\/[a-f0-9]{16}\/[A-Za-z0-9._/-]+$/.test(url.pathname);
       let asset = await env.MAIL_ASSETS.fetch(request);
-      // Runtime files over the 25 MiB asset limit live in R2 at the same path.
-      if (runtime && asset.status === 404 && env.MAIL_MODELS && !url.pathname.includes(".."))
-        asset = (await localRuntime(env, url.pathname)) ?? asset;
+      // The SPA asset fallback can return the HTML shell with status 200.
+      const localAsset = runtime || url.pathname === "/local/config.json";
+      if (localAsset && (asset.status === 404 || asset.headers.get("Content-Type")?.includes("text/html"))) {
+        asset = (runtime && env.MAIL_MODELS && !url.pathname.includes("..")
+          ? await localRuntime(env, url.pathname)
+          : null) ?? new Response("not found", { status: 404 });
+      }
       const headers = new Headers(asset.headers);
       headers.set("Content-Security-Policy", contentSecurityPolicy);
       headers.set("X-Content-Type-Options", "nosniff");
