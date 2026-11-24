@@ -19097,7 +19097,10 @@ pub const ApiHttpServer = struct {
         self.source.replaceTableDefinition(table_before, replacement) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
-            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => {
+                std.log.warn("artifact enrichment metadata conflict table={s} artifact={s} err={s} request_id={s}", .{ table_name, artifact_name, @errorName(err), request.request_id });
+                return error.Conflict;
+            },
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig, error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired => return error.InvalidEnrichmentRequest,

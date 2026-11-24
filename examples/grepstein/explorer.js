@@ -29,10 +29,15 @@ fetch("/api/collections").then(async response => {
 }).catch(error => { status.textContent = error.message; });
 
 function unitEvidence(match) {
-  return match.hierarchy?.ancestors?.unit?.document || {};
+  const unit = match.hierarchy?.ancestors?.unit || {};
+  const document = unit.document || {};
+  // Native hierarchy citations carry authoritative provenance beside the
+  // projected document; a narrow document projection can omit these fields.
+  return { ...document, provenance: { ...document.provenance, ...unit.provenance } };
 }
 function timestamp(evidence, field) {
-  const value = evidence.provenance?.[field] ?? evidence["provenance." + field];
+  const canonical = field.replace("_ms", "_time_ms");
+  const value = evidence.provenance?.[canonical] ?? evidence.provenance?.[field] ?? evidence["provenance." + canonical] ?? evidence["provenance." + field];
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value / 1000 : null;
 }
 function timeLabel(seconds) {

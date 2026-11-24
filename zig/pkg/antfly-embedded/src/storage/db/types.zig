@@ -2328,7 +2328,15 @@ pub fn canonicalHierarchyChildrenRequestIsValid(req: SearchRequest) bool {
     // authorization constraints and lifecycle controls remain supported.
     const defaults = SearchRequest{};
     inline for (hierarchy_children_rejected_fields) |field_name| {
-        if (!std.meta.eql(@field(req, field_name), @field(defaults, field_name))) return false;
+        const value = @field(req, field_name);
+        const info = @typeInfo(@TypeOf(value));
+        if (comptime info == .pointer and info.pointer.size == .slice) {
+            // std.meta.eql compares slice addresses. Empty controls can come
+            // from another compiled owner or an allocator's empty sentinel;
+            // neither changes the request. Nonempty controls remain rejected.
+            comptime std.debug.assert(@field(defaults, field_name).len == 0);
+            if (value.len != 0) return false;
+        } else if (!std.meta.eql(value, @field(defaults, field_name))) return false;
     }
     if (req.limit == 0 or req.limit > max_canonical_hierarchy_groups) return false;
     if (req.offset != 0 or req.count_only or req.aggregations_json.len > 0) return false;
@@ -2345,6 +2353,32 @@ pub fn canonicalHierarchyChildrenRequestIsValid(req: SearchRequest) bool {
     return req.search_after.len == 2 and
         req.search_after[0] == .string and
         req.search_after[1] == .string;
+}
+
+test "db canonical hierarchy traversal rejects typed retrieval controls with distinct empty owners" {
+    const order = [_]SortField{ .{ .field = "_hierarchy.position" }, .{ .field = "_id" } };
+    const base: SearchRequest = .{
+        .hierarchy_children = .{ .parent_id = "source" },
+        .return_mode = .unit,
+        .order_by = &order,
+        .include_all_fields = false,
+        .fields = &.{"text"},
+        .limit = 1,
+    };
+    try std.testing.expect(canonicalHierarchyExecutionWithinBudget(base));
+    inline for (hierarchy_children_rejected_fields) |name| {
+        const info = @typeInfo(@FieldType(SearchRequest, name));
+        if (comptime info == .pointer and info.pointer.size == .slice) {
+            // Deliberately give each empty control a real backing address,
+            // rather than the validator owner's default literal/sentinel.
+            var backing: [1]info.pointer.child = undefined;
+            var req = base;
+            @field(req, name) = backing[0..0];
+            try std.testing.expect(canonicalHierarchyExecutionWithinBudget(req));
+            @field(req, name) = &backing;
+            try std.testing.expect(!canonicalHierarchyExecutionWithinBudget(req));
+        }
+    }
 }
 
 pub fn canonicalHierarchyExecutionWithinBudget(req: SearchRequest) bool {
