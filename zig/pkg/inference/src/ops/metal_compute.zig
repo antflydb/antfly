@@ -3743,6 +3743,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!metal_runtime.hasActiveFrame(runtime)) {
             scope.owns_frame = try self.beginDecoderRuntimeFrame(runtime);
         }
+        defer if (scope.owns_frame and !scope.active) {
+            var active = true;
+            self.cancelDecoderRuntimeFrame(runtime, &active);
+        };
         if (!metal_runtime.hasActiveFrame(runtime)) return .{};
         const source, const region = switch (kind) {
             .attention_project => .{ metal_runtime.ComputeSource.quant_linear, metal_runtime.ComputeRegion.attention_project },
@@ -3751,13 +3755,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .ple => .{ metal_runtime.ComputeSource.ple, metal_runtime.ComputeRegion.ple },
         };
         metal_runtime.beginPlannedComputeScope(runtime, @backingInt(source), region) catch |err| switch (err) {
-            error.RuntimeUnavailable, error.FrameNotActive, error.PlannedScopeActive => {
-                if (scope.owns_frame) {
-                    var active = true;
-                    self.cancelDecoderRuntimeFrame(runtime, &active);
-                }
-                return .{};
-            },
+            error.RuntimeUnavailable, error.FrameNotActive, error.PlannedScopeActive => return .{},
             else => return err,
         };
         if (traceMetalPlannedScopeLifecycle()) {
@@ -3780,6 +3778,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn endPlannedGraphScopeForSelf(self: *MetalCompute, scope: PlannedGraphScope) !void {
         if (!scope.active and !scope.owns_frame) return;
         const runtime = self.provider_impl.raw_decode_runtime orelse return;
+        var owned_frame = scope.owns_frame and metal_runtime.hasActiveFrame(runtime);
+        errdefer self.cancelDecoderRuntimeFrame(runtime, &owned_frame);
         if (scope.active) {
             metal_runtime.endPlannedComputeScope(runtime) catch |err| switch (err) {
                 error.PlannedScopeNotActive, error.RuntimeUnavailable => {},
@@ -3792,10 +3792,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .{ scope.active, scope.owns_frame },
             );
         }
-        if (scope.owns_frame) {
-            var active = metal_runtime.hasActiveFrame(runtime);
-            try self.submitAndWaitDecoderRuntimeFrame(runtime, &active);
-        }
+        if (owned_frame) try self.submitAndWaitDecoderRuntimeFrame(runtime, &owned_frame);
     }
 
     fn traceMetalPlannedScopeLifecycle() bool {
