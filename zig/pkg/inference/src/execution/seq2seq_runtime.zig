@@ -397,15 +397,7 @@ pub const State = struct {
             // Another invocation owns the frame. The old cache remains
             // authoritative, so retire only these unsubmitted replacements.
             try scope.finish();
-            for (self.roles, updated) |role, *target| switch (role) {
-                .past => |past| if (past.cross) {
-                    if (target.*) |value| if (value.independent) {
-                        value.pin.release();
-                        target.* = null;
-                    };
-                },
-                else => {},
-            };
+            self.discardStagedCrossCaches(updated);
             return;
         }
         // Keep the Metal copies in one frame and publish only after retirement.
@@ -414,7 +406,7 @@ pub const State = struct {
             backend.decoderRuntimeCancelFrame() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         const completion = if (kernels.createPhysicalCompletion) |create| try create(backend.ptr) else null;
         defer if (completion) |event| event.deinit();
-        {
+        const copied = copies: {
             // An error can follow command submission. Keep every staged
             // target and its previous source alive until the stream drains.
             defer if (completion) |event| {
@@ -423,13 +415,32 @@ pub const State = struct {
             };
             for (self.roles, previous, updated) |role, old, target| switch (role) {
                 .past => |past| if (past.cross) {
-                    if (target) |value| if (value.independent) try copy(backend.ptr, value.input.value, old.?.input.value);
+                    if (target) |value| if (value.independent) copy(backend.ptr, value.input.value, old.?.input.value) catch |err| switch (err) {
+                        error.InvalidPhysicalTransferSize => break :copies false,
+                        else => return err,
+                    };
                 },
                 else => {},
             };
+            break :copies true;
+        };
+        if (metal_frame) {
+            if (copied) try backend.decoderRuntimeSubmitAndWaitFrame() else try backend.decoderRuntimeCancelFrame();
         }
-        if (metal_frame) try backend.decoderRuntimeSubmitAndWaitFrame();
         try scope.finish();
+        if (!copied) self.discardStagedCrossCaches(updated);
+    }
+
+    fn discardStagedCrossCaches(self: *const State, updated: []?ResidentSlot) void {
+        for (self.roles, updated) |role, *target| switch (role) {
+            .past => |past| if (past.cross) {
+                if (target.*) |value| if (value.independent) {
+                    value.pin.release();
+                    target.* = null;
+                };
+            },
+            else => {},
+        };
     }
 
     fn prepareCrossCache(self: *State, backend: *const ops.ComputeBackend, kernels: *const @import("../ops/kernel_backend.zig").VTable, previous: ResidentSlot, control: ?Control) !?ResidentSlot {
