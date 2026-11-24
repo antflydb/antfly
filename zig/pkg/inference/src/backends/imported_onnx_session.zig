@@ -7429,11 +7429,12 @@ test "imported ONNX If cached decoding matches full prefix on optional T5-small"
     std.debug.print("t5 backend={s} model_setup_ns={d}\n", .{ selected, platform.time.monotonicNs() - setup_started });
     defer session.close();
     const root: *ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
-    if (platform.env.getenvBool("ANTFLY_ONNX_T5_REPLAY_DIAGNOSTICS")) {
-        try std.testing.expect(session.configureExecutionDiagnostics(true));
-    }
-    if (platform.env.getenvBool("ANTFLY_ONNX_T5_PREFILL_SWEEP")) return profileT5Prefill(a, session, selected);
-    try qualifyT5CachedRows(a, session, selected);
+    const diagnose_replay = platform.env.getenvBool("ANTFLY_ONNX_T5_REPLAY_DIAGNOSTICS");
+    const prefill_sweep = platform.env.getenvBool("ANTFLY_ONNX_T5_PREFILL_SWEEP");
+    const require_replay = !prefill_sweep and requested_backend == .cuda and root.requested_strategy == .compiled_preferred and root.packed_projections.entries.items.len == 0;
+    if (diagnose_replay or require_replay) try std.testing.expect(session.configureExecutionDiagnostics(true));
+    if (prefill_sweep) return profileT5Prefill(a, session, selected);
+    try qualifyT5CachedRows(a, session, selected, diagnose_replay, require_replay);
     if (comptime build_options.enable_cuda) {
         if (root.shared_backend_ctx.ctx == .cuda) {
             const stats = &root.shared_backend_ctx.ctx.cuda.stats;
@@ -7488,7 +7489,7 @@ test "imported ONNX If cached decoding matches full prefix on optional T5-small"
     }
 }
 
-fn qualifyT5CachedRows(a: std.mem.Allocator, session: Session, selected: []const u8) !void {
+fn qualifyT5CachedRows(a: std.mem.Allocator, session: Session, selected: []const u8, diagnose_replay: bool, require_replay: bool) !void {
     const platform = @import("antfly_platform");
     const runtime = @import("../execution/seq2seq_runtime.zig");
     const vocab = 32128;
@@ -7526,15 +7527,15 @@ fn qualifyT5CachedRows(a: std.mem.Allocator, session: Session, selected: []const
     };
     var tokens: [67]i64 = undefined;
     for (&tokens, 0..) |*token, index| token.* = @intCast(index);
+    const observe_replay = diagnose_replay or require_replay;
     for (cases) |case| {
         var rows: [4][]f32 = undefined;
         var row_count: usize = 0;
         var captures: u64 = 0;
         var replays: u64 = 0;
         defer for (rows[0..row_count]) |row| a.free(row);
-        const diagnose_replay = platform.env.getenvBool("ANTFLY_ONNX_T5_REPLAY_DIAGNOSTICS");
         var timings: [3][4]u64 = undefined;
-        for (timings[0..if (diagnose_replay) 3 else 2], 0..) |*measurements, repeat| {
+        for (timings[0..if (observe_replay) 3 else 2], 0..) |*measurements, repeat| {
             var state = (try runtime.State.init(a, session, hidden, &.{ 1, 1, 1, 1 }, vocab)) orelse return error.UnqualifiedMergedDecoder;
             defer state.deinit();
             for (measurements, 0..) |*elapsed, offset| {
@@ -7550,12 +7551,12 @@ fn qualifyT5CachedRows(a: std.mem.Allocator, session: Session, selected: []const
                 const row = try state.stepResident(.{ .position = start, .tokens = tokens[start..end] }, control);
                 elapsed.* = platform.time.monotonicNs() - before;
                 stopT5CudaProfile(&profile);
-                if (platform.env.getenvBool("ANTFLY_ONNX_T5_REPLAY_DIAGNOSTICS")) {
+                if (observe_replay) {
                     if (session.executionDiagnostics()) |snapshot| {
                         if (snapshot.execution) |stats| {
                             captures += stats.physical_graph_captures;
                             replays += stats.physical_graph_replays;
-                            std.debug.print("t5 replay prefix={d} step={d} decision={s}\n", .{ case.prefix, offset, @tagName(stats.physical_replay) });
+                            if (diagnose_replay) std.debug.print("t5 replay prefix={d} step={d} decision={s}\n", .{ case.prefix, offset, @tagName(stats.physical_replay) });
                             if (stats.physical_replay_blocker) |blocker| std.debug.print("t5 CUDA replay blocker node={d} op={s} dtype={s} reason={s}\n", .{ blocker.node, if (blocker.operation) |op| @tagName(op) else "unknown", if (blocker.dtype) |dtype| @tagName(dtype) else "unknown", @tagName(blocker.reason) });
                         }
                     }
@@ -7570,8 +7571,12 @@ fn qualifyT5CachedRows(a: std.mem.Allocator, session: Session, selected: []const
             }
         }
         std.debug.print("t5 backend={s} prefix={d} cold_ns={any} warm_ns={any}\n", .{ selected, case.prefix, timings[0], timings[1] });
-        if (platform.env.getenvBool("ANTFLY_ONNX_T5_REPLAY_DIAGNOSTICS")) {
+        if (observe_replay) {
             std.debug.print("t5 physical prefix={d} captures={d} replays={d}\n", .{ case.prefix, captures, replays });
+        }
+        if (require_replay) {
+            try std.testing.expect(captures != 0);
+            try std.testing.expect(replays != 0);
         }
         for (rows, 0..) |row, offset| {
             var full = (try runtime.State.init(a, session, hidden, &.{ 1, 1, 1, 1 }, vocab)) orelse return error.UnqualifiedMergedDecoder;
