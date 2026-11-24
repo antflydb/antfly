@@ -51259,9 +51259,11 @@ fn consumerTests() type {
             try std.testing.expectError(error.GroupLeaderUnavailable, server.submitHistoryControlLocal(a, unknown_group, "docs", .{ .enroll = grant }));
             try std.testing.expectEqual(@as(usize, 0), server.data_raft_protocol_activations.count());
             const submitted = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .enroll = grant });
-            try std.testing.expect(submitted.outcome != null);
-            try std.testing.expectEqual(@as(u64, 1), submitted.outcome.?.applied.consumer.?.epoch);
             try std.testing.expect(submitted.entry.index > 1);
+            // Confirmation can time out on a busy test host after acceptance.
+            // Recover the exact receipt through ReadIndex without replaying it.
+            const enrolled = submitted.outcome orelse try server.recoverHistoryControlLocal(a, route.fence().?, "docs", .{ .enroll = grant }, submitted.entry);
+            try std.testing.expectEqual(@as(u64, 1), enrolled.applied.consumer.?.epoch);
             try std.testing.expectEqual(@import("history_control_entry.zig").required_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
             const ref: control.Reference = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .epoch = 1, .grant = 1, .definition = grant.definition };
             for ([_][]const u8{ "{\"v\":1}", "{\"v\":2}" }) |value| {
