@@ -820,6 +820,12 @@ pub const GatedDeltaAttrs = struct {
     value_dim: u32,
 };
 
+pub const ScalarResidualAttrs = struct {
+    scale_before_add: bool = false,
+    /// An optimizer rewrite of separate F32 nodes preserves both roundings.
+    separate_rounding: bool = false,
+};
+
 pub const OpCode = union(enum) {
     // Primitives
     parameter: ParameterAttrs,
@@ -886,7 +892,7 @@ pub const OpCode = union(enum) {
     fused_elem_multiply: void,
     /// False: (a + b) * scalar. True: a * scalar + b. These are distinct
     /// arithmetic contracts even when a backend supplies a fused launcher.
-    fused_add_mul_scalar: struct { scale_before_add: bool = false },
+    fused_add_mul_scalar: ScalarResidualAttrs,
     fused_boundary_training_attention_v1: BoundaryTrainingAttentionAttrs,
     fused_boundary_training_attention_backward_v1: BoundaryTrainingAttentionAttrs,
     fused_sdpa: AttentionAttrs,

@@ -202,6 +202,7 @@ pub const Pool = struct {
     /// synchronous region. The root grants no primitive Frame credit.
     metal_projection_region_candidate: bool = false,
     coverage_backend: ?ops.ComputeBackend = null,
+    cold_coverage_decline: ?@import("owned_coverage.zig").Reason = null,
     payload_coverage: @import("owned_coverage.zig").Coverage = .{ .compatibility = .no_selected_routes },
     route_owner: ?*prepared_routes.PreparedRoutes = null,
     root_pool: ?*Pool = null,
@@ -1437,6 +1438,8 @@ pub const Pool = struct {
         try @import("reachable_projection.zig").refine(child);
         child.payload_coverage = if (child.cuda_frame_dispatch or child.metal_frame_dispatch)
             @import("device_owned_coverage.zig").assess(child, child.coverage_backend.?, authority)
+        else if ((child.root_pool orelse child).cold_coverage_decline) |reason|
+            .{ .compatibility = reason }
         else
             @import("owned_coverage.zig").assess(child);
         if (child.metal_frame_dispatch and child.device_input_plans.len != 0 and (child.payload_coverage != .complete or (profile == .synchronous and child.regions.len != 0))) return null;

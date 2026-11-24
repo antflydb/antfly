@@ -53203,7 +53203,10 @@ fn assignedKernelGeometrySupported(descriptor: *const ops.kernel_descriptor.Desc
         // Reduced DOT weights remain on the existing converting compatibility
         // path until their source staging has an exact assigned-workspace route.
         .dot => descriptor.input_shapes[0].dtype == .f32 and descriptor.input_shapes[1].dtype == .f32,
-        .transpose, .broadcast, .add_mul_scalar => false,
+        .transpose, .broadcast => false,
+        .add_mul_scalar => descriptor.input_count == 3 and
+            descriptor.input_shapes[0].eq(descriptor.output_shape) and descriptor.input_shapes[1].eq(descriptor.output_shape) and
+            descriptor.input_shapes[2].dtype == .f32 and descriptor.input_shapes[2].numElements() == 1,
         .slice => |slice| check: {
             if (descriptor.input_shapes[0].eq(descriptor.output_shape)) {
                 var identity = true;
@@ -53402,7 +53405,7 @@ fn runAssignedKernelImpl(comptime authored: bool, ctx: *anyopaque, request: ops.
             try selected.validate(.{ .inputs = &actual_bindings, .output = assigned.slot });
         }
     }
-    if (descriptor.operation == .concat or descriptor.operation == .slice or descriptor.operation == .gather) {
+    if (descriptor.operation == .concat or descriptor.operation == .slice or descriptor.operation == .gather or descriptor.operation == .add_mul_scalar) {
         for (request.inputs, 0..) |input, i| {
             const bytes = if (integerSource(input)) |source| source.data else std.mem.sliceAsBytes(dense_inputs[i]);
             if (kernel_geometry.byteRangesOverlap(@intFromPtr(bytes.ptr), bytes.len, @intFromPtr(output.ptr), output.len * 4)) return error.InvalidAssignedAlias;
@@ -53451,7 +53454,24 @@ fn runAssignedKernelImpl(comptime authored: bool, ctx: *anyopaque, request: ops.
             try actual.manager.writeLayerKvSuffix(actual.context.kv_cache.?.sequence_id, geometry.layer_index, actual.context.total_sequence_len, 1, dense_inputs[1], dense_inputs[2]);
             try gqaPagedAttentionDirectInto(actual.pool, actual.blocks, geometry.layer_index, dense_inputs[0], null, actual.context, geometry.num_heads, geometry.num_kv_heads, geometry.head_dim, null, output);
         },
-        .transpose, .broadcast, .add_mul_scalar => unreachable,
+        .add_mul_scalar => |attrs| {
+            const width = std.simd.suggestVectorLength(f32) orelse 4;
+            const Vec = @Vector(width, f32);
+            const lhs = dense_inputs[0];
+            const rhs = dense_inputs[1];
+            const scale = dense_inputs[2][0];
+            const vector_scale: Vec = @splat(scale);
+            var i: usize = 0;
+            while (i + width <= output.len) : (i += width) {
+                const a: Vec = lhs[i..][0..width].*;
+                const b: Vec = rhs[i..][0..width].*;
+                output[i..][0..width].* = if (attrs.scale_before_add) a * vector_scale + b else (a + b) * vector_scale;
+            }
+            while (i < output.len) : (i += 1) {
+                output[i] = if (attrs.scale_before_add) lhs[i] * scale + rhs[i] else (lhs[i] + rhs[i]) * scale;
+            }
+        },
+        .transpose, .broadcast => unreachable,
         .concat => |geometry| try concatContiguousInto(f32, dense_inputs[0], dense_inputs[1], output, geometry),
         .slice => |slice| try sliceDenseInto(dense_inputs[0], output, try slice.plan(descriptor.input_shapes[0], descriptor.output_shape)),
         .gather => |gather| {

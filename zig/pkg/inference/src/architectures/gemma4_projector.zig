@@ -11316,7 +11316,8 @@ fn checkPromptImageInputOwnership(a: std.mem.Allocator) !void {
             try std.testing.expect(rows.source == .resident);
             // The host-phase cleanup does not shorten resident payload life.
             input.releaseHost();
-            const values = try cb.toFloat32((try input.rows()).?.source.resident, a);
+            const payload = (try input.rows()).?.source.resident;
+            const values = try payload.backend.toFloat32(payload.rows, a);
             defer a.free(values);
             try std.testing.expectEqualSlices(f32, &expected, values);
         } else {

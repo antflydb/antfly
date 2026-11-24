@@ -364,8 +364,11 @@ without invalidating queued output references or resetting replay selection.
 Both placements use the same checked view geometry and byte bounds. Partial
 upgrades retire only their own quota and views before retry.
 The merged seq2seq route accepts mixed inputs. Tokens, masks, and branch
-controls use host tensors. Self and cross K/V feed backend tensors directly
-into the next invocation on imported ONNX CPU, Metal, and CUDA. The decoder
+controls use host tensors. A qualified encoder in the same provider context
+passes its activation directly into the merged decoder. Self and cross K/V
+feed backend tensors directly into the next invocation on imported ONNX CPU,
+Metal, and CUDA. Exact cache shapes use the provider comparison before
+allocating metadata for a compatibility case. The decoder
 reads only the final vocabulary row. The serving broker gathers compatible
 resident rows into admitted backing and keeps each request's output rows
 separate. Fixed batch exports run through the serial mixed-input route. CPU
@@ -414,6 +417,10 @@ preparation API do not by themselves complete these remaining requirements:
   owners retain their existing envelopes. CUDA prepared projections declare
   supported reduced/packed conversions and vendor workspace; these declarations
   preserve their tuned launches rather than replacing them with generic math.
+  Automatic F32 scalar residual fusion preserves the original product and sum
+  roundings. Native, Metal and current CUDA artifacts write the assigned
+  destination in one pass. Older CUDA artifacts use two launches into that
+  buffer. Authored CUDA residuals retain their contracting kernel.
   Ordinary F32 matrix multiplication stages a dynamic RHS transpose in assigned
   workspace and reuses the projection family's original SIMT/vendor policy.
   The current RHS is validated on every invocation rather than treated as an
@@ -630,8 +637,11 @@ preparation API do not by themselves complete these remaining requirements:
   device mesh. Escaping outputs retain their storage lease independently of the
   program, graph and template lifetime.
 - `execution/speculative_activation.zig` owns predictor rounds, including draft
-  chains, logits and accepted activation handoff. The physical decoder owns
-  verification suffix geometry and pending tensor/scalar selection; task code
+  chains, logits and accepted activation handoff. After a gated or BitNet
+  prefix submits, a prepared vocabulary-head miss completes from its resident
+  final row. Gated frame submission failures propagate before output publication.
+  The physical decoder owns verification suffix geometry and pending
+  tensor/scalar selection; task code
   retains acceptance, grammar, stopping and streaming. Unused private adapters
   are removed while public compatibility entries remain.
 - `execution/decoder_prefill.zig` assembles plain embedding rows once and keeps
@@ -720,9 +730,12 @@ preparation API do not by themselves complete these remaining requirements:
   and wait units, specialization decisions, selected Native bodies and workers,
   known fallback producers, and registered host/device allocation owners. Batch
   participants and pending outcomes survive model retirement. Each pending
-  owner sums the instrumented transfer, submission and callback host wall time
-  through readback and cleanup. A ready Metal serial audio schedule reports its
-  actual eager/replay choice and latest planned, bound and charged bank sizes. Reports retain the initiating failure
+  owner sums instrumented transfer and submission units, backend callback
+  returns by backend, and callback host wall time
+  through readback and cleanup. Metal serial audio reports cold selection
+  decisions even before a schedule has bank gauges. A ready schedule reports
+  its eager/replay choice and latest planned, bound and charged bank sizes.
+  Reports retain the initiating failure
   and count the observed callbacks. Inter-phase work and GPU completion remain
   outside the sums. Registered owner intervals can include concurrent activity,
   and lifetime peaks are labelled as such.
@@ -736,6 +749,17 @@ preparation API do not by themselves complete these remaining requirements:
   Unobserved fallback reasons and opaque vendor/private allocation domains remain
   unavailable. These scoped observations do not claim a whole-backend census or
   an exclusive invocation memory peak.
+
+### Compatibility routes still in production
+
+| Signature | Owner and boundary | Replacement and qualification needed |
+| --- | --- | --- |
+| Metal graph with a deferred elementwise producer, activation transpose, or mixed specialized region | The partition executor retains its region planner and compatibility admission. Complete physical coverage currently requires either an attested primitive frame or a synchronous region that owns every reachable result. | Install the tuned producer as an assigned region inside the frame, including its input lifetimes and scratch, then qualify command count, numerical parity and held outputs before removing its allocating branch. |
+| Metal MPS/MPP-selected projection and raw decoder entrypoints | The partition or decoder executor retains vendor or private scratch under its original envelope. Provider-internal workspace remains opaque. | Assign the provider-visible inputs, destinations and scratch independently of opaque vendor storage. Retain a separate charge for the opaque portion and prove cancellation and retirement before removing the old envelope for that signature. |
+| Native F32 audio decoder with an undeclared initial query, or a decoder whose reduced or packed plan is unsupported | The decoder retains the compatibility owner. Declared initial and incremental Native F32 schedules use separate phase banks and share the KV charge. | Extend the numerical schedule and phase recipe for admitted layouts, then test growing state, both phase transitions, retained outputs and memory pressure before deleting compatibility allocations. |
+| Metal audio with a cold, disabled, or unfunded serial schedule | The frontend uses eager execution; the backend owns learned metadata and any retained bank. A managed stage may fund a bank only across its quiescent boundary. | Track eligible eager scratch through the common plan while preserving cold fallback and quiescent retirement. Cold decisions and ready-bank gauges are observed separately. |
+| CUDA legacy decoder workspace with an incomplete event recipe | The decoder provider keeps learned allocation and replay retirement. Bounded production recipes use stable workspace and explicit publication spans. | Require ordinary and capture execution to consume the same event, state and workspace plan before deleting learned address policy for a production signature. |
+| Opaque or unsupported encoder-to-decoder provider pair | The resident-stage dispatcher retains the declared host route when the provider cannot accept the exact source or controlled invocation. | Qualify source custody, cancellation and final-row readback for each supported producer and consumer pair before removing intermediate host materialization. |
 
 The issue checklist records implementation and evidence separately from remaining
 migration. Compatibility paths stay until their replacements satisfy correctness,

@@ -2816,7 +2816,7 @@ pub fn executeNode(
 
         .fused_add_mul_scalar => |attrs| {
             if (attrs.scale_before_add) {
-                if (try cb.addMultiplyScalarTensor(V.get(ins[0]), V.get(ins[1]), V.get(ins[2]))) |fused| return fused;
+                if (!attrs.separate_rounding) if (try cb.addMultiplyScalarTensor(V.get(ins[0]), V.get(ins[1]), V.get(ins[2]))) |fused| return fused;
                 const scaled = try cb.multiply(V.get(ins[0]), V.get(ins[2]));
                 defer cb.free(scaled);
                 return cb.add(scaled, V.get(ins[1]));

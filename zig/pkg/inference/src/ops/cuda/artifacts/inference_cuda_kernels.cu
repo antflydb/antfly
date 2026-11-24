@@ -14408,6 +14408,20 @@ extern "C" __global__ void termite_deberta_scores_softmax_f32(
 }
 // tile-codegen:end elementwise.direct.17 family
 
+// tile-codegen:begin elementwise.direct.18 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+extern "C" __global__ void termite_add_mul_scalar_separate_f32(
+    float* dst,
+    const float* a,
+    const float* b,
+    const float* scalar,
+    unsigned int n
+) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __fadd_rn(__fmul_rn(a[i], scalar[0]), b[i]);
+}
+// tile-codegen:end elementwise.direct.18 family
+
+
 // tile-codegen:begin tensor.layout.direct.33 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_deberta_unpack_heads_f32(
     float* dst,

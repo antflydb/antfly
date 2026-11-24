@@ -240,7 +240,7 @@ pub const DenseAttentionRows = struct {
     }
 };
 
-pub const Operation = union(enum) { transpose: Layout, broadcast: Layout, unary: Unary, binary: Binary, add_mul_scalar: struct { scale_before_add: bool = false }, linear: Linear, norm: Norm, softmax: Softmax, rope: Rope, reduction: Reduction, dot: Dot, concat: kernel_geometry.ConcatAxis, slice: Slice, gather: Gather, paged_attention: PagedAttention, dense_attention_prefix: DenseAttentionPrefix, dense_attention_rows: DenseAttentionRows };
+pub const Operation = union(enum) { transpose: Layout, broadcast: Layout, unary: Unary, binary: Binary, add_mul_scalar: ml.graph.node.ScalarResidualAttrs, linear: Linear, norm: Norm, softmax: Softmax, rope: Rope, reduction: Reduction, dot: Dot, concat: kernel_geometry.ConcatAxis, slice: Slice, gather: Gather, paged_attention: PagedAttention, dense_attention_prefix: DenseAttentionPrefix, dense_attention_rows: DenseAttentionRows };
 
 pub const HeadMajorAttention = struct {
     query_rows: u32,
@@ -822,7 +822,7 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
         .sub => .{ .binary = .subtract },
         .mul, .fused_elem_multiply => .{ .binary = .multiply },
         .div => .{ .binary = .divide },
-        .fused_add_mul_scalar => |attrs| .{ .add_mul_scalar = .{ .scale_before_add = attrs.scale_before_add } },
+        .fused_add_mul_scalar => |attrs| .{ .add_mul_scalar = attrs },
         .fused_linear, .fused_linear_no_bias => |attrs| blk: {
             if (attrs.rows == 0 or attrs.in_dim == 0 or attrs.out_dim == 0 or (node.op == .fused_linear and attrs.num_projections != 0) or shape.rank() != 2 or shape.dim(0) != attrs.rows or shape.dim(1) != attrs.out_dim) return null;
             kernel_geometry.validateProjectionGroups(&attrs.projection_out_dims, attrs.num_projections, attrs.out_dim) catch return null;

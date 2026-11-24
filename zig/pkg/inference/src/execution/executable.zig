@@ -2901,6 +2901,7 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
     pool.cuda_frame_dispatch = false;
     pool.metal_frame_dispatch = false;
     pool.metal_projection_region_candidate = false;
+    pool.cold_coverage_decline = null;
     pool.coverage_backend = .{ .ptr = executable.runtime.default_backend.ptr, .vtable = executable.runtime.default_backend.vtable };
     if (comptime @import("build_options").enable_metal) {
         if (executable.runtime.default_backend.kind() == .metal and @import("device_owned_coverage.zig").services(executable.runtime.default_backend.*) != null) {
@@ -2957,7 +2958,10 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
                 if (!owned) return;
                 if (projection_head) {
                     if (active_partitions != 1 or !Executor.ownsPartition(actual, graph, executable.runtime.default_backend)) return;
-                } else if (!try Executor.attestOwnedFrameDispatch(actual, graph, executable.runtime.default_backend, part.node_ids, analysis.reachable, analysis.last_use)) return;
+                } else if (try Executor.ownedFrameDispatchDecline(actual, graph, executable.runtime.default_backend, part.node_ids, analysis.reachable, analysis.last_use)) |reason| {
+                    pool.cold_coverage_decline = reason;
+                    return;
+                }
             }
             if (active_partitions == 0 or (pool.plan.transfers.len != 0 and native_partitions == 0)) return;
             pool.mixed_frame_dispatch = native_partitions != 0;
@@ -3378,6 +3382,102 @@ test "Metal planned integer concat and slice preserve exact assigned output byte
         try std.testing.expectEqual(input.dtype, output.dtype);
         try std.testing.expectEqualSlices(u8, std.mem.asBytes(&[_]Int{ -large, large, -(large + 2), large + 2 }), output.payload.bytes);
         try std.testing.expectEqual(@as(u64, 2), result.stats.assigned_kernel_dispatches);
+    }
+}
+
+test "planned scalar residual fuses into one assigned output on Native, Metal and CUDA" {
+    const options = @import("build_options");
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    const Tensor = @import("../backends/tensor.zig").Tensor;
+    const Route = @import("kernel_route.zig");
+
+    const BackendType = @import("../backends/backends.zig").BackendType;
+    inline for (.{ BackendType.native, BackendType.metal, BackendType.cuda }) |kind| {
+        if (comptime switch (kind) {
+            .native => options.enable_native,
+            .metal => options.enable_metal,
+            .cuda => options.enable_cuda,
+            else => unreachable,
+        }) run: {
+            const Context = @import("../backends/compute_context.zig").SharedBackendContext;
+            if (kind == .metal and !@import("../backends/metal_runtime.zig").metalDeviceAvailable()) break :run;
+            const context = Context.init(a, kind, std.testing.io) catch |err| switch (@as(anyerror, err)) {
+                error.CudaUnavailable, error.NoCudaDevices => break :run,
+                else => return err,
+            };
+            defer context.release();
+            const cb = context.computeBackend();
+            if (kind == .metal and !@import("../backends/metal_runtime.zig").antfly_metal_host_input_shared_supported(context.ctx.metal_hosted.compute.provider_impl.raw_decode_runtime)) break :run;
+
+            var graph = ml.graph.Graph.init(a);
+            defer graph.deinit();
+            var builder = ml.graph.Builder.init(&graph);
+            const width = 8193;
+            const dims = [_]i64{ 1, width };
+            const shape = ml.graph.Shape.init(.f32, &dims);
+            const x = try builder.parameter("x", shape);
+            const y = try builder.parameter("y", shape);
+            const scale_value: f32 = 1.0 - 0x1p-23;
+            const scale = try builder.scalarConst(.f32, scale_value);
+            try graph.markOutput(try builder.add(try builder.mul(x, scale), y));
+            var program = try ModelProgram.init(a, &graph, &.{ .{ .name = "x", .node_id = x, .kind = .input }, .{ .name = "y", .node_id = y, .kind = .input } });
+            defer program.deinit();
+            const output = program.graph.outputs.items[0];
+            try std.testing.expect(program.graph.node(output).op == .fused_add_mul_scalar);
+            try std.testing.expect(program.graph.node(output).op.fused_add_mul_scalar.scale_before_add);
+            try std.testing.expect(program.graph.node(output).op.fused_add_mul_scalar.separate_rounding);
+
+            var executable = try prepare(a, &program, &cb, .partitioned);
+            defer executable.deinit();
+            const x_id = program.id_map[x];
+            const y_id = program.id_map[y];
+            const host: Route.Binding = .{ .imported_host = .{ .target = cb.kind(), .logical = shape, .owned_ingress = true } };
+            const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+            const routes = (try pool.prepareRoutes(&.{ .{ .node_id = x_id, .value = host }, .{ .node_id = y_id, .value = host } })) orelse return error.MissingPreparedKernelRoute;
+            defer routes.release();
+            if (routes.pool.preparedKernelRoute(output) == null or routes.pool.completeOwnedPayload() == null) {
+                const slot = routes.pool.plan.slotForNode(output).?;
+                std.debug.print("scalar residual requested={s} producer={s} assigned={} coverage={any} cuda_frame={} mixed={}\n", .{ @tagName(kind), @tagName(slot.backend), routes.pool.preparedKernelRoute(output) != null, routes.pool.payload_coverage, pool.cuda_frame_dispatch, pool.mixed_frame_dispatch });
+                if (executable.runtime.plan) |plan| for (plan.base.partitions, plan.device_assignment) |part, device| {
+                    std.debug.print("scalar residual partition={s} device={d} nodes={any} compiled={}\n", .{ @tagName(part.backend), device, part.node_ids, part.executor != null });
+                };
+                return error.MissingScalarResidualOwnership;
+            }
+
+            var x_values: [width]f32 = undefined;
+            var y_values: [width]f32 = undefined;
+            for (&x_values, &y_values, 0..) |*lhs, *rhs, i| {
+                lhs.* = @floatFromInt(i % 31);
+                rhs.* = @floatFromInt(i % 3);
+            }
+            x_values[0] = 1.0 + 0x1p-23;
+            y_values[0] = -1;
+            var left = try Tensor.initFloat32(a, "x", &dims, &x_values);
+            defer left.deinit();
+            var right = try Tensor.initFloat32(a, "y", &dims, &y_values);
+            defer right.deinit();
+            var launches: @import("runtime_observation.zig").KernelScope = .{};
+            if (kind == .cuda) launches.begin();
+            defer if (launches.attached) {
+                _ = launches.finish();
+            };
+            var result = try executable.run(a, .{ .host_inputs = &.{ .{ .node_id = x_id, .value = &left }, .{ .node_id = y_id, .value = &right } }, .prepared_routes = routes, .output_placement = .producer, .collect_partition_stats = true, .activation_readbacks = .forbidden });
+            defer result.deinit(&executable.runtime);
+            if (kind == .cuda) try std.testing.expectEqual(@as(u64, 1), launches.finish().total_calls);
+            if (result.stats.assigned_kernel_dispatches != 1) {
+                std.debug.print("scalar residual backend={s} dispatches={d} replay={s}\n", .{ @tagName(kind), result.stats.assigned_kernel_dispatches, @tagName(result.stats.physical_replay) });
+                return error.InvalidScalarResidualDispatchCount;
+            }
+            const values = try cb.toFloat32(result.outputs[0], a);
+            defer a.free(values);
+            try std.testing.expectEqual(@as(usize, width), values.len);
+            try std.testing.expectEqual(@as(f32, 0), values[0]);
+            for (values, left.asFloat32(), right.asFloat32()) |actual, lhs, rhs| {
+                const product: f32 = lhs * scale_value;
+                try std.testing.expectEqual(product + rhs, actual);
+            }
+        }
     }
 }
 

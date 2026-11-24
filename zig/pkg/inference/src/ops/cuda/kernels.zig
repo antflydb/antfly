@@ -2413,6 +2413,7 @@ pub const KernelModule = struct {
     add_scalar_f32: driver_mod.CUfunction = null,
     binary_scalar_f32: driver_mod.CUfunction = null,
     add_mul_scalar_f32: driver_mod.CUfunction = null,
+    add_mul_scalar_separate_f32: driver_mod.CUfunction = null,
     add_weighted_scalars_f32: driver_mod.CUfunction = null,
     linear_f32: driver_mod.CUfunction = null,
     linear_f32_tiled: driver_mod.CUfunction = null,
@@ -5227,6 +5228,7 @@ pub const KernelModule = struct {
         b: buffer_mod.DeviceBuffer,
         scalar: buffer_mod.DeviceBuffer,
         count: usize,
+        separate_rounding: bool,
     ) driver_mod.Error!void {
         try checkBytes(dst, count);
         try checkBytes(a, count);
@@ -5234,13 +5236,19 @@ pub const KernelModule = struct {
         try checkBytes(scalar, 1);
         if (count == 0) return;
 
+        const function = if (separate_rounding) self.add_mul_scalar_separate_f32 else self.add_mul_scalar_f32;
+        if (separate_rounding and function == null) {
+            try self.launchBinaryScalarF32(ctx, dst, a, scalar, count, .multiply, false);
+            try self.launchElementwiseF32(ctx, dst, dst, b, count, .add);
+            return;
+        }
         var dst_ptr = dst.ptr;
         var a_ptr = a.ptr;
         var b_ptr = b.ptr;
         var scalar_ptr = scalar.ptr;
         var count_u32 = try toU32(count);
         var params = launch_abi.addresses(.{ &dst_ptr, &a_ptr, &b_ptr, &scalar_ptr, &count_u32 });
-        try launch1d(self.add_mul_scalar_f32, ctx, count, &params);
+        try launch1d(function, ctx, count, &params);
     }
 
     pub fn launchAddWeightedScalarsF32(
@@ -18483,7 +18491,7 @@ fn smokeAddMulScalarF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaCont
     try a.copyFromHost(ctx, std.mem.sliceAsBytes(&a_data));
     try b.copyFromHost(ctx, std.mem.sliceAsBytes(&b_data));
     try scale.copyFromHost(ctx, std.mem.sliceAsBytes(&scale_data));
-    try module.launchAddMulScalarF32(ctx, output, a, b, scale, a_data.len);
+    try module.launchAddMulScalarF32(ctx, output, a, b, scale, a_data.len, false);
     try ctx.synchronize();
 
     const out = try allocator.alloc(f32, a_data.len);

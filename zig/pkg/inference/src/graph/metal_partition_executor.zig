@@ -1597,31 +1597,31 @@ pub const MetalPartitionExecutor = struct {
     /// Cold canonical-executor proof. The caller owns the actual provider's
     /// metadata operation before touching the cached region plan. This reuses
     /// the plan and reachability authority already used by real execution.
-    pub fn attestOwnedFrameDispatch(actual: *const PartitionExecutor, graph: *const Graph, backend: *const ComputeBackend, nodes: []const NodeId, reachable: []const bool, last_use: []const u32) !bool {
-        if (!ownsPartition(actual, graph, backend) or reachable.len != graph.nodeCount() or last_use.len != graph.nodeCount()) return false;
+    pub fn ownedFrameDispatchDecline(actual: *const PartitionExecutor, graph: *const Graph, backend: *const ComputeBackend, nodes: []const NodeId, reachable: []const bool, last_use: []const u32) !?@import("../execution/owned_coverage.zig").Reason {
+        if (!ownsPartition(actual, graph, backend) or reachable.len != graph.nodeCount() or last_use.len != graph.nodeCount()) return .execution_path;
         const self: *MetalPartitionExecutor = @ptrCast(@alignCast(actual.ptr));
         var saw_dot = false;
         for (nodes) |id| {
-            if (id >= reachable.len) return false;
+            if (id >= reachable.len) return .execution_path;
             if (!reachable[id]) continue;
             const node = graph.node(id);
             if (node.op == .parameter) {
-                if (!@import("../execution/host_ingress.zig").rawDType(node.output_shape.dtype)) return false;
+                if (!@import("../execution/host_ingress.zig").rawDType(node.output_shape.dtype)) return .input_representation;
                 continue;
             }
             if (node.op == .constant) {
                 // The executor materializes declared constants before beginFrame.
                 // Their typed Shared staging and Private storage are proved here.
-                const count = node.output_shape.numElements() orelse return false;
-                if (count <= 0 or count > std.math.maxInt(i32) or count != node.op.constant.data_len) return false;
-                const bytes = std.math.mul(usize, @intCast(count), node.output_shape.dtype.byteSize()) catch return false;
-                const functions = backend.vtable.kernels orelse return false;
-                if (!functions.accepts(backend.vtable)) return false;
-                const eligible = functions.physicalLiteralBindingSupported orelse return false;
-                if (!eligible(backend.ptr)) return false;
-                const query = functions.physicalLiteralInitializer orelse return false;
-                const initializer = (try query(backend.ptr, node.output_shape.dtype, bytes)) orelse return false;
-                if (initializer.staging.byte_size != bytes or initializer.staging.usage != .host_input or initializer.staging.admitted) return false;
+                const count = node.output_shape.numElements() orelse return .literal;
+                if (count <= 0 or count > std.math.maxInt(i32) or count != node.op.constant.data_len) return .literal;
+                const bytes = std.math.mul(usize, @intCast(count), node.output_shape.dtype.byteSize()) catch return .literal;
+                const functions = backend.vtable.kernels orelse return .literal;
+                if (!functions.accepts(backend.vtable)) return .literal;
+                const eligible = functions.physicalLiteralBindingSupported orelse return .literal;
+                if (!eligible(backend.ptr)) return .literal;
+                const query = functions.physicalLiteralInitializer orelse return .literal;
+                const initializer = (try query(backend.ptr, node.output_shape.dtype, bytes)) orelse return .literal;
+                if (initializer.staging.byte_size != bytes or initializer.staging.usage != .host_input or initializer.staging.admitted) return .literal;
                 continue;
             }
             // The region and elision checks below guard composite schedules
@@ -1632,39 +1632,40 @@ pub const MetalPartitionExecutor = struct {
             // validates its schedule before assigning any destination.
             const descriptor = ops_mod.kernel_descriptor.lower(graph, id);
             if (node.output_shape.dtype != .f32) {
-                const value = descriptor orelse return false;
-                if (!metal_compute_mod.supportsAssignedDescriptor(&value)) return false;
+                const value = descriptor orelse return .operation;
+                if (!metal_compute_mod.supportsAssignedDescriptor(&value)) return .operation;
             }
             if (descriptor) |value| switch (value.operation) {
                 .gather => {
                     // The selected route requires checked host or immutable indices. Keep
                     // the tuned gather-after-bias owner for composite graphs.
-                    if (value.input_shapes[1].dtype == .f32 or graph.node(node.inputs[0]).op == .add) return false;
+                    if (value.input_shapes[1].dtype == .f32) return .input_representation;
+                    if (graph.node(node.inputs[0]).op == .add) return .backend_region;
                 },
                 .dot => {
                     // A terminal standalone dot cannot be subsumed by a
                     // neighboring projection or grouped head schedule.
-                    if (saw_dot or std.mem.indexOfScalar(NodeId, graph.outputs.items, id) == null) return false;
+                    if (saw_dot or std.mem.indexOfScalar(NodeId, graph.outputs.items, id) == null) return .backend_region;
                     for (graph.nodes.items, reachable) |consumer, active| {
-                        if (active and std.mem.indexOfScalar(NodeId, consumer.getInputs(), id) != null) return false;
+                        if (active and std.mem.indexOfScalar(NodeId, consumer.getInputs(), id) != null) return .backend_region;
                     }
                     saw_dot = true;
                 },
                 else => {},
-            } else if (@import("../execution/metadata_alias.zig").Plan.lower(graph, id, .metal) == null) return false;
+            } else if (@import("../execution/metadata_alias.zig").Plan.lower(graph, id, .metal) == null) return .operation;
             // These exact heuristics run ahead of the physical branch. Even
             // a supported descriptor cannot claim a producer they defer.
-            if (shouldDeferScaleMulForAdd(graph, id, reachable, last_use, null) or shouldDeferElementwiseMulForAdd(graph, id, reachable, last_use, null) or shouldDeferTransposeForLinearDot(graph, id, reachable, last_use)) return false;
+            if (shouldDeferScaleMulForAdd(graph, id, reachable, last_use, null) or shouldDeferElementwiseMulForAdd(graph, id, reachable, last_use, null) or shouldDeferTransposeForLinearDot(graph, id, reachable, last_use)) return .deferred_producer;
         }
         var transient: ?RuntimeRegionPlan = null;
         defer if (transient) |*plan| plan.deinit(self.allocator);
         const plan = try self.runtimeRegionPlan(self.allocator, graph, nodes, graph.nodeCount(), reachable, last_use, null, &transient);
-        if (!plan.matches(nodes, graph.nodeCount()) or plan.region_count != 0 or plan.covered_node_count != 0 or plan.elided_node_count != 0 or plan.pre_skipped_node_count != 0) return false;
+        if (!plan.matches(nodes, graph.nodeCount()) or plan.region_count != 0 or plan.covered_node_count != 0 or plan.elided_node_count != 0 or plan.pre_skipped_node_count != 0) return .backend_region;
         for (nodes, 0..) |id, position| {
             if (!reachable[id] or graph.node(id).op == .parameter or graph.node(id).op == .constant) continue;
-            if (plan.descriptorAt(position) == null and @import("../execution/metadata_alias.zig").Plan.lower(graph, id, .metal) == null) return false;
+            if (plan.descriptorAt(position) == null and @import("../execution/metadata_alias.zig").Plan.lower(graph, id, .metal) == null) return .operation;
         }
-        return true;
+        return null;
     }
 
     fn executeFn(
@@ -14370,7 +14371,7 @@ fn tryExecuteMetalCommand(
         .fused_tanh_act => try executeRuntimeFusedUnary(cb, values, inputs, .tanh_act),
         .fused_elem_add, .add => try executeRuntimeAdd(graph, cb, values, inputs, n.output_shape, output_hint),
         .fused_elem_multiply, .mul => try executeRuntimeBinary(graph, cb, values, node_id, inputs, n.output_shape, .multiply, output_hint),
-        .fused_add_mul_scalar => |attrs| try executeRuntimeAddMulScalar(cb, values, inputs, attrs.scale_before_add),
+        .fused_add_mul_scalar => |attrs| try executeRuntimeAddMulScalar(cb, values, inputs, attrs),
         .sub => try executeRuntimeBinary(graph, cb, values, node_id, inputs, n.output_shape, .subtract, output_hint),
         .div => try executeRuntimeBinary(graph, cb, values, node_id, inputs, n.output_shape, .divide, output_hint),
         .less_than => try executeRuntimeBinary(graph, cb, values, node_id, inputs, n.output_shape, .less_than, null),
@@ -14975,13 +14976,13 @@ fn executeRuntimeAddMulScalar(
     cb: *const ComputeBackend,
     values: []?CT,
     inputs: []const NodeId,
-    scale_before_add: bool,
+    attrs: ml.graph.node.ScalarResidualAttrs,
 ) !?CT {
     const lhs = valueFor(values, inputs[0]) orelse return null;
     const rhs = valueFor(values, inputs[1]) orelse return null;
     const scalar = valueFor(values, inputs[2]) orelse return null;
-    if (scale_before_add) {
-        if (try cb.addMultiplyScalarTensor(lhs, rhs, scalar)) |fused| return fused;
+    if (attrs.scale_before_add) {
+        if (!attrs.separate_rounding) if (try cb.addMultiplyScalarTensor(lhs, rhs, scalar)) |fused| return fused;
         const scaled = try cb.multiply(lhs, scalar);
         defer cb.free(scaled);
         return cb.add(scaled, rhs);
@@ -18840,6 +18841,22 @@ test "metal partition executor defers same shape multiply for multiply-add" {
     try std.testing.expectEqual(@as(usize, 1), reachableUseCount(&g, multiplied, reachable, 2));
     try std.testing.expect(deferredElementwiseMul(&g, multiplied, g.node(out).output_shape) != null);
     try std.testing.expect(shouldDeferElementwiseMulForAdd(&g, multiplied, reachable, last_use, null));
+    if (ownedFramePolicyAvailable()) {
+        const Stub = struct {
+            fn kind(_: *anyopaque) ops_mod.BackendKind {
+                return .metal;
+            }
+        };
+        var table = native_compute.vtable_impl;
+        table.backendKind = Stub.kind;
+        var marker: u8 = 0;
+        const backend: ComputeBackend = .{ .ptr = &marker, .vtable = &table };
+        const executor = try MetalPartitionExecutor.create(allocator, &g, &backend);
+        const pe = executor.partitionExecutor();
+        defer pe.deinitExecutor();
+        const reason = try MetalPartitionExecutor.ownedFrameDispatchDecline(pe, &g, &backend, &.{ x, y, z, multiplied, out }, reachable, last_use);
+        try std.testing.expectEqual(@as(?@import("../execution/owned_coverage.zig").Reason, .deferred_producer), reason);
+    }
 }
 
 test "metal partition executor allows deferred multiply-add inside current frame chunk" {

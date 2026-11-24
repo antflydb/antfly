@@ -439,7 +439,7 @@ fn executeCommandNode(
             const rhs = valueFor(values, inputs[1]) orelse return error.MissingValue;
             const scalar = valueFor(values, inputs[2]) orelse return error.MissingValue;
             if (attrs.scale_before_add) {
-                if (try cb.addMultiplyScalarTensor(lhs, rhs, scalar)) |fused| break :blk fused;
+                if (!attrs.separate_rounding) if (try cb.addMultiplyScalarTensor(lhs, rhs, scalar)) |fused| break :blk fused;
                 const scaled = try cb.multiply(lhs, scalar);
                 defer cb.free(scaled);
                 break :blk try cb.add(scaled, rhs);

@@ -29590,7 +29590,7 @@ fn addMultiplyScalarTensor(ctx: *anyopaque, a: CT, b: CT, scalar: CT) anyerror!?
 
     var output = try OwnedF32Output.alloc(self, a_tensor.shape, a_tensor.elem_count);
     defer output.deinit();
-    try self.kernels.launchAddMulScalarF32(&self.ctx, output.buffer, a_tensor.buffer, b_tensor.buffer, scalar_tensor.buffer, a_tensor.elem_count);
+    try self.kernels.launchAddMulScalarF32(&self.ctx, output.buffer, a_tensor.buffer, b_tensor.buffer, scalar_tensor.buffer, a_tensor.elem_count, false);
     self.stats.launch_elementwise += 1;
     self.stats.add_mul_scalar_fused += 1;
     return output.intoTensor();
@@ -40592,8 +40592,12 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
                 if (kernel_geometry.byteRangesOverlap(output.buffer.ptr, output.elem_count * 4, source.buffer.ptr, source.elem_count * 4)) return error.InvalidAssignedAlias;
             }
             if (attrs.scale_before_add) {
-                try self.kernels.launchAddMulScalarF32(&self.ctx, output.buffer, a.buffer, tensorFromCt(request.inputs[1]).buffer, tensorFromCt(request.inputs[2]).buffer, output.elem_count);
-                self.stats.add_mul_scalar_fused += 1;
+                try self.kernels.launchAddMulScalarF32(&self.ctx, output.buffer, a.buffer, tensorFromCt(request.inputs[1]).buffer, tensorFromCt(request.inputs[2]).buffer, output.elem_count, attrs.separate_rounding);
+                if (attrs.separate_rounding and self.kernels.add_mul_scalar_separate_f32 == null) {
+                    self.stats.launch_elementwise += 1;
+                } else {
+                    self.stats.add_mul_scalar_fused += 1;
+                }
             } else {
                 // Keep the explicit FP32 sum boundary. The historical native
                 // scalar launcher computes a*scale+b, a different operation.

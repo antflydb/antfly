@@ -499,6 +499,8 @@ const PairFusionResult = struct {
     num_rewrites: u32,
 };
 
+const ScalarResidual = struct { lhs: NodeId, rhs: NodeId, scalar: NodeId };
+
 fn fuseAddMulScalar(allocator: std.mem.Allocator, work: *Graph, reachable: []const bool) !PairFusionResult {
     var redirects = std.ArrayListUnmanaged(Redirect).empty;
     errdefer redirects.deinit(allocator);
@@ -507,65 +509,80 @@ fn fuseAddMulScalar(allocator: std.mem.Allocator, work: *Graph, reachable: []con
     const count = work.nodeCount();
     const consumer_counts = try computeInputConsumerCounts(allocator, work);
     defer allocator.free(consumer_counts);
+    for (work.outputs.items) |output| if (output < count) {
+        consumer_counts[output] += 1;
+    };
 
     for (0..count) |i| {
         if (i >= reachable.len or !reachable[i]) continue;
-        const mul_id: NodeId = @intCast(i);
-        const n = work.node(mul_id);
-        if (!isMulLike(n.op)) continue;
+        const id: NodeId = @intCast(i);
+        const n = work.node(id);
+        const scale_before_add = isAddLike(n.op);
+        if (!scale_before_add and !isMulLike(n.op)) continue;
+        if (n.num_inputs != 2 or n.output_shape.dtype != .f32) continue;
 
         const lhs = n.inputs[0];
         const rhs = n.inputs[1];
-        if (lhs == null_node or rhs == null_node) continue;
-
-        const matched = matchAddMulScalar(work, lhs, rhs, consumer_counts) orelse
-            matchAddMulScalar(work, rhs, lhs, consumer_counts) orelse
-            continue;
+        if (lhs >= count or rhs >= count) continue;
+        const matched = if (scale_before_add)
+            matchScaledAdd(work, lhs, rhs, n.output_shape, consumer_counts) orelse
+                matchScaledAdd(work, rhs, lhs, n.output_shape, consumer_counts) orelse continue
+        else
+            matchAddMulScalar(work, lhs, rhs, n.output_shape, consumer_counts) orelse
+                matchAddMulScalar(work, rhs, lhs, n.output_shape, consumer_counts) orelse continue;
 
         const fused_id = try work.addNode(.{
-            .op = .{ .fused_add_mul_scalar = .{} },
+            .op = .{ .fused_add_mul_scalar = .{ .scale_before_add = scale_before_add, .separate_rounding = scale_before_add } },
             .output_shape = n.output_shape,
-            .inputs = .{ matched.add_lhs, matched.add_rhs, matched.scalar, null_node },
+            .inputs = .{ matched.lhs, matched.rhs, matched.scalar, null_node },
             .num_inputs = 3,
         });
-        try redirects.append(allocator, .{ .from = mul_id, .to = fused_id });
+        try redirects.append(allocator, .{ .from = id, .to = fused_id });
         num_rewrites += 1;
     }
 
     return .{ .redirects = redirects, .num_rewrites = num_rewrites };
 }
 
-fn matchAddMulScalar(
-    graph: *const Graph,
-    add_id: NodeId,
-    scalar_id: NodeId,
-    consumer_counts: []const u32,
-) ?struct { add_lhs: NodeId, add_rhs: NodeId, scalar: NodeId } {
-    if (add_id == null_node or scalar_id == null_node) return null;
-    if (add_id >= graph.nodeCount() or scalar_id >= graph.nodeCount()) return null;
-    if (add_id >= consumer_counts.len or consumer_counts[@intCast(add_id)] != 1) return null;
+fn matchAddMulScalar(graph: *const Graph, add_id: NodeId, scalar_id: NodeId, shape: Shape, consumer_counts: []const u32) ?ScalarResidual {
+    const sum = graph.node(add_id);
+    if (consumer_counts[add_id] != 1 or !isAddLike(sum.op) or sum.num_inputs != 2 or !shapesEqual(sum.output_shape, shape)) return null;
+    const lhs = sum.inputs[0];
+    const rhs = sum.inputs[1];
+    if (lhs >= graph.nodeCount() or rhs >= graph.nodeCount()) return null;
+    if (!shapesEqual(graph.node(lhs).output_shape, shape) or !shapesEqual(graph.node(rhs).output_shape, shape)) return null;
+    return .{ .lhs = lhs, .rhs = rhs, .scalar = residualScalar(graph, scalar_id, shape) orelse return null };
+}
 
-    const add_node = graph.node(add_id);
-    if (!isAddLike(add_node.op)) return null;
-    if (add_node.inputs[0] == null_node or add_node.inputs[1] == null_node) return null;
-    if (!shapesEqual(add_node.output_shape, graph.node(add_node.inputs[0]).output_shape)) return null;
-    if (!shapesEqual(add_node.output_shape, graph.node(add_node.inputs[1]).output_shape)) return null;
+fn matchScaledAdd(graph: *const Graph, mul_id: NodeId, residual: NodeId, shape: Shape, consumer_counts: []const u32) ?ScalarResidual {
+    const mul = graph.node(mul_id);
+    if (consumer_counts[mul_id] != 1 or !isMulLike(mul.op) or mul.num_inputs != 2 or
+        !shapesEqual(mul.output_shape, shape) or !shapesEqual(graph.node(residual).output_shape, shape)) return null;
+    for (0..2) |operand| {
+        const source = mul.inputs[operand];
+        if (source >= graph.nodeCount() or !shapesEqual(graph.node(source).output_shape, shape)) continue;
+        const scalar = residualScalar(graph, mul.inputs[1 - operand], shape) orelse continue;
+        // Preserve the existing policy for dynamic or independently retained scalars.
+        if (graph.node(scalar).op != .constant) continue;
+        return .{ .lhs = source, .rhs = residual, .scalar = scalar };
+    }
+    return null;
+}
 
-    const scalar_node = graph.node(scalar_id);
-    var scalar = if (isScalarLikeShape(scalar_node.output_shape))
-        scalar_id
-    else if (scalar_node.op == .broadcast_in_dim and scalar_node.num_inputs == 1 and shapesEqual(scalar_node.output_shape, add_node.output_shape))
-        scalar_node.inputs[0]
+fn residualScalar(graph: *const Graph, id: NodeId, shape: Shape) ?NodeId {
+    if (id >= graph.nodeCount()) return null;
+    const node = graph.node(id);
+    var scalar = if (isScalarLikeShape(node.output_shape))
+        id
+    else if (node.op == .broadcast_in_dim and node.num_inputs == 1 and shapesEqual(node.output_shape, shape))
+        node.inputs[0]
     else
         return null;
-    // A scalar's singleton reshape does not change the only element consumed
-    // by the fused kernel. ONNX broadcasts commonly introduce such a view.
-    while (scalar != null_node and scalar < graph.nodeCount()) {
+    // Singleton reshapes do not change the only element consumed by the kernel.
+    while (scalar < graph.nodeCount()) {
         const source = graph.node(scalar);
-        if (add_node.output_shape.dtype != .f32 or source.output_shape.dtype != .f32 or !isScalarLikeShape(source.output_shape)) return null;
-        if (source.op != .reshape or source.num_inputs != 1) {
-            return .{ .add_lhs = add_node.inputs[0], .add_rhs = add_node.inputs[1], .scalar = scalar };
-        }
+        if (source.output_shape.dtype != .f32 or !isScalarLikeShape(source.output_shape)) return null;
+        if (source.op != .reshape or source.num_inputs != 1) return scalar;
         if (source.inputs[0] >= scalar) return null;
         scalar = source.inputs[0];
     }
@@ -3787,6 +3804,32 @@ test "fuse detects add multiplied by an explicitly broadcast scalar" {
     const output = result.graph.node(result.graph.outputs.items[0]);
     try std.testing.expectEqualDeep(OpCode{ .fused_add_mul_scalar = .{} }, output.op);
     try std.testing.expectEqualDeep(Shape.init(.f32, &.{1}), result.graph.node(output.inputs[2]).output_shape);
+}
+
+test "fuse uses one residual operation for a single-use constant scale" {
+    const allocator = std.testing.allocator;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var builder = Builder.init(&graph);
+    const shape = Shape.init(.f32, &.{ 2, 4 });
+    const lhs = try builder.parameter("lhs", shape);
+    const rhs = try builder.parameter("rhs", shape);
+    const scalar = try builder.scalarConst(.f32, 2.5);
+    const scaled = try builder.mul(lhs, scalar);
+    const sum = try builder.add(rhs, scaled);
+    try graph.markOutput(sum);
+
+    var fused = try fuse(allocator, &graph);
+    defer fused.deinit();
+    const output = fused.graph.node(fused.graph.outputs.items[0]);
+    try std.testing.expectEqualDeep(OpCode{ .fused_add_mul_scalar = .{ .scale_before_add = true, .separate_rounding = true } }, output.op);
+    try std.testing.expectEqualSlices(NodeId, &.{ fused.id_map[lhs], fused.id_map[rhs], fused.id_map[scalar] }, output.getInputs());
+
+    try graph.markOutput(scaled);
+    var preserved = try fuse(allocator, &graph);
+    defer preserved.deinit();
+    try std.testing.expect(isAddLike(preserved.graph.node(preserved.graph.outputs.items[0]).op));
+    try std.testing.expect(isMulLike(preserved.graph.node(preserved.graph.outputs.items[1]).op));
 }
 
 test "fuse skips add multiplied by non-scalar tensor" {
