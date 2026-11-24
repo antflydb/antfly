@@ -38,13 +38,15 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     var image_path: ?[]const u8 = null;
-    var fast_matvec = false;
+    var fast_matvec_override: ?bool = null;
     var quantized_experts = false;
     while (arg) |option| : (arg = args.next()) {
         if (std.mem.eql(u8, option, "--image") and image_path == null) {
             image_path = args.next() orelse return error.InvalidArguments;
-        } else if (std.mem.eql(u8, option, "--fast-matvec") and !fast_matvec) {
-            fast_matvec = true;
+        } else if (std.mem.eql(u8, option, "--fast-matvec") and fast_matvec_override == null) {
+            fast_matvec_override = true;
+        } else if (std.mem.eql(u8, option, "--no-fast-matvec") and fast_matvec_override == null) {
+            fast_matvec_override = false;
         } else if (std.mem.eql(u8, option, "--quantized-experts") and !quantized_experts) {
             quantized_experts = true;
         } else return error.InvalidArguments;
@@ -84,6 +86,8 @@ pub fn main(init: std.process.Init) !void {
     if (tokens - 1 > source.config.value.text_config.model_max_length) return error.InvalidInkling2Context;
     var ctx = try Context.initDefault();
     defer ctx.deinit();
+    const fast_matvec = fast_matvec_override orelse
+        (ctx.info.compute_major == 12 and ctx.info.compute_minor == 1);
     const load_start = platform.time.monotonicNs();
     var model = try decoder.Decoder.load(allocator, &ctx, &source, .{
         .pack_attention_weights = fast_matvec,
@@ -128,7 +132,8 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn usage(io: std.Io) !void {
-    try std.Io.File.stdout().writeStreamingAll(io, "Usage: antfly-inference-inkling2-cuda MODEL_DIR PROMPT [MAX_NEW_TOKENS] [--image PATH] [--fast-matvec] [--quantized-experts]\n");
+    try std.Io.File.stdout().writeStreamingAll(io, "Usage: antfly-inference-inkling2-cuda MODEL_DIR PROMPT [MAX_NEW_TOKENS] [--image PATH] [--fast-matvec | --no-fast-matvec] [--quantized-experts]\n" ++
+        "Fast matvec is enabled by default on NVIDIA GB10 (SM121).\n");
 }
 
 fn inputToken(id: i32) !u32 {
