@@ -20770,7 +20770,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     defer if (out_owned) freeTensor(self, out);
     const output_bank = if (published_directly) tensorFromCt(out).buffer else if (storage.external_output) arena.buffers[1] else try audioBufferView(arena.buffers[0], output.offset, output.bytes);
     if (published_directly or storage.external_output) {
-        if (execution_scope) |*scope| try scope.bindPublishedOutput(output_bank.ptr, output.bytes);
+        if (execution_scope) |*scope| try scope.bindPublishedOutput(output_bank.ptr, output_bank.len);
     }
     const input_bank = if (replay or capture) try audioBufferView(arena.buffers[0], 0, storage.scratch_offset) else buffer_mod.DeviceBuffer{};
     defer arena.noteUse(&self.ctx);

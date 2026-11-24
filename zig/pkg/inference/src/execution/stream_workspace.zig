@@ -191,11 +191,12 @@ pub const Scope = struct {
         return self.isBound() and self.valid and self.cursor == self.plan.event_count;
     }
 
-    /// Bind the terminal write to disjoint storage before execution or capture.
-    pub fn bindPublishedOutput(self: *Scope, pointer: DevicePointer, bytes: usize) !void {
+    /// Bind the actual backing span before execution or capture. The sealed
+    /// event retains its exact write size even when the backing is larger.
+    pub fn bindPublishedOutput(self: *Scope, pointer: DevicePointer, backing_bytes: usize) !void {
         const slot = self.plan.output orelse return error.InvalidExecutionPlan;
         if (!self.valid or self.cursor != 0 or self.published_ptr != 0 or pointer % alignment != 0 or
-            bytes != self.plan.allocations[slot].bytes or !self.disjointBacking(pointer, bytes)) return error.InvalidExecutionPlan;
+            backing_bytes < self.plan.allocations[slot].bytes or !self.disjointBacking(pointer, backing_bytes)) return error.InvalidExecutionPlan;
         self.published_ptr = pointer;
     }
 
@@ -328,7 +329,8 @@ test "stream workspace redirects only the sealed publication slot" {
     try std.testing.expectError(error.InvalidExecutionPlan, scope.bindPublishedOutput(0x1100, 64));
     try std.testing.expectError(error.InvalidExecutionPlan, scope.bindPublishedOutput(0x1200, 64));
     try std.testing.expectError(error.InvalidExecutionPlan, scope.bindPublishedOutput(0x2000, 32));
-    try scope.bindPublishedOutput(0x2000, 64);
+    try std.testing.expectError(error.InvalidExecutionPlan, scope.bindPublishedOutput(0xf00, 512));
+    try scope.bindPublishedOutput(0x2000, alignment);
     try std.testing.expectEqual(@as(DevicePointer, 0x1100), try scope.allocate(64));
     scope.release(0x1100);
     try std.testing.expectEqual(@as(DevicePointer, 0x2000), try scope.allocate(64));
