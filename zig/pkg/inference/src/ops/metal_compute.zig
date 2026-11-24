@@ -24407,6 +24407,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             try self.computeBackend().checkExecutionControl();
         }
         if (choice != 0 and choice != 1) return null;
+        if (choice == 0 and (x.ndim() != 2 or !deviceTensorMatchesLinearRows(&x, p.rows, p.in_dim) or
+            metal_runtime.termite_metal_decode_runtime_ready(runtime) == 0 or
+            !metal_runtime.decoderRuntimeLinearSlotPrepared(self.provider_impl, slot, p.in_dim, p.out_dim) or
+            self.provider_impl.raw_linear_slot_kinds[slot] != .dense)) return null;
         const request = ops.AudioPreparedLinearRequest{
             .input = input,
             .slot = slot,
