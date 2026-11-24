@@ -1645,6 +1645,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         /// Physical integer storage; float primitives must not reinterpret it.
         integer_storage: bool = false,
         integer_bounds: ?struct { minimum: i64, maximum: i64 } = null,
+        integer_upload_version: ?u64 = null,
+
         resident_index_bounds: ?ops.resident_training.IndexBounds = null,
         resident_index_storage: ?*ResidentIndexStorage = null,
         /// Strict operations accept handles from their creating backend only.
@@ -9981,6 +9983,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (data.len != 0) try device.uploadBytes(data);
         const result = try self.ctFromOwnedMetalTensor(device);
         if (bounds) |range| toBuf(result).integer_bounds = .{ .minimum = range.min, .maximum = range.max };
+        if (bounds != null and (physical == .i32 or physical == .i64)) toBuf(result).integer_upload_version = device.storageVersion();
 
         return result;
     }
@@ -11742,7 +11745,33 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (input_device.ref.runtime != target_device.ref.runtime) return error.RuntimeInputBackendMismatch;
         }
 
+        target.physicalLease().?.invalidateHostIndices();
+
         try input.copyInto(target);
+    }
+
+    fn uploadedIndexBounds(self: *MetalCompute, source: CT) !@import("index_metadata.zig").Bounds {
+        const buf = toBuf(source);
+        const tensor = buf.metal_tensor orelse return error.MissingCurrentHostIndexProof;
+        const version = buf.integer_upload_version orelse return error.MissingCurrentHostIndexProof;
+        const bounds = buf.integer_bounds orelse return error.MissingCurrentHostIndexProof;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return error.MissingCurrentHostIndexProof;
+        const device = tensor.device orelse return error.MissingCurrentHostIndexProof;
+        if (device.ref.runtime != @as(*anyopaque, @ptrCast(runtime)) or tensor.storageVersion() != version) return error.MissingCurrentHostIndexProof;
+        if (tensor.dtype != .i32 and tensor.dtype != .i64) return error.MissingCurrentHostIndexProof;
+
+        return .{ .min = bounds.minimum, .max = bounds.maximum };
+    }
+
+    fn validatePhysicalIndexInputOp(ctx: *anyopaque, value: CT, extent: usize) anyerror!void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        try (try self.uploadedIndexBounds(value)).validate(extent);
+    }
+
+    fn copyPhysicalIndexInputOp(ctx: *anyopaque, dst: CT, src: CT) anyerror!void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        _ = try self.uploadedIndexBounds(src);
+        try copyPhysicalInputOp(ctx, dst, src);
     }
 
     fn markPhysicalStorageAdmittedOp(_: *anyopaque, tensor: CT) anyerror!void {
@@ -13689,7 +13718,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (proof.dtype != descriptor.input_shapes[1].dtype) return error.MissingCurrentHostIndexProof;
                 try proof.bounds.validate(extent);
             } else {
-                if (lease.usage != .host_input or route.vtable.host_input_constraint == null) return error.MissingCurrentHostIndexProof;
+                if ((lease.usage != .host_input and lease.usage != .ordinary) or route.vtable.host_input_constraint == null) return error.MissingCurrentHostIndexProof;
+
                 const issued = (request.assigned_inputs orelse return error.MissingCurrentHostIndexProof)[1] orelse return error.MissingCurrentHostIndexProof;
                 if (!lease.hostInputMatches(issued, extent, request.input_generation, indices.deviceByteLen())) return error.MissingCurrentHostIndexProof;
             }
@@ -17820,7 +17850,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn primGatherOp(ctx: *anyopaque, input: CT, indices: CT, axis: u8, input_shape: []const i64) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (toBuf(indices).integer_storage or toBuf(input).integer_storage) {
-            if (toBuf(indices).integer_bounds) |bounds| {
+            const index = toBuf(indices);
+            const current = if (index.integer_upload_version) |version| index.metal_tensor.?.storageVersion() == version else true;
+            if (if (current) index.integer_bounds else null) |bounds| {
                 const resolved = try resolveConcreteShape(toBuf(input), input_shape);
                 if (axis >= input_shape.len) return error.InvalidTensorShape;
                 const extent = resolved[axis];
@@ -41903,7 +41935,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return (descriptor.operation == .slice or descriptor.operation == .broadcast) and supportsAssignedDescriptor(descriptor);
     }
 
-    const kernel_backend_impl: ops.KernelBackend = .{ .denseDecoder = &dense_decoder_services, .ownedPayloadServices = &owned_payload_services, .retainImmutableTensor = retainImmutableTensorOp, .standaloneOutputBytes = standaloneOutputBytesOp, .pooledOutputStorage = pooledOutputStorageOp, .gatherDeviceRows = gatherDeviceRowsOp, .regionPolicyKey = denseRegionPolicyKey, .claimRegionExecutionProfile = claimDenseProjectionProfile, .prepareRegionRoutes = prepareDenseProjectionRegions, .regionRoutesInOrdinaryFrame = true, .hostInputRequirements = hostInputRequirementsOp, .createHostInput = createHostInputOp, .hostInputViewExclusive = hostInputViewExclusiveOp, .createMetadataAlias = createMetadataAliasOp, .materializesOutput = materializesOutputOp, .physicalReplayReshapeViews = true, .implementation_table = &vtable_impl, .acceptsImplementation = acceptsPhysicalImplementation, .storageOwnership = storageOwnershipOp, .physicalLiteralBindingSupported = physicalLiteralBindingSupportedOp, .writePhysicalFloat32 = writePhysicalFloat32Op, .physicalLiteralInitializer = physicalLiteralInitializerOp, .copyPhysicalInput = copyPhysicalInputOp, .readFloat32Into = readFloat32IntoOp, .physical_storage_policy = &physical_storage_policy, .physicalTensorView = physicalTensorViewOp, .runAssignedKernel = runAssignedKernelOp, .assignedKernelWorkspace = assignedKernelWorkspaceOp, .prepareKernelRoute = prepareKernelRouteOp };
+    const kernel_backend_impl: ops.KernelBackend = .{ .denseDecoder = &dense_decoder_services, .ownedPayloadServices = &owned_payload_services, .retainImmutableTensor = retainImmutableTensorOp, .standaloneOutputBytes = standaloneOutputBytesOp, .pooledOutputStorage = pooledOutputStorageOp, .gatherDeviceRows = gatherDeviceRowsOp, .regionPolicyKey = denseRegionPolicyKey, .claimRegionExecutionProfile = claimDenseProjectionProfile, .prepareRegionRoutes = prepareDenseProjectionRegions, .regionRoutesInOrdinaryFrame = true, .hostInputRequirements = hostInputRequirementsOp, .createHostInput = createHostInputOp, .hostInputViewExclusive = hostInputViewExclusiveOp, .createMetadataAlias = createMetadataAliasOp, .materializesOutput = materializesOutputOp, .physicalReplayReshapeViews = true, .implementation_table = &vtable_impl, .acceptsImplementation = acceptsPhysicalImplementation, .storageOwnership = storageOwnershipOp, .physicalLiteralBindingSupported = physicalLiteralBindingSupportedOp, .writePhysicalFloat32 = writePhysicalFloat32Op, .physicalLiteralInitializer = physicalLiteralInitializerOp, .copyPhysicalInput = copyPhysicalInputOp, .copyPhysicalIndexInput = copyPhysicalIndexInputOp, .validatePhysicalIndexInput = validatePhysicalIndexInputOp, .readFloat32Into = readFloat32IntoOp, .physical_storage_policy = &physical_storage_policy, .physicalTensorView = physicalTensorViewOp, .runAssignedKernel = runAssignedKernelOp, .assignedKernelWorkspace = assignedKernelWorkspaceOp, .prepareKernelRoute = prepareKernelRouteOp };
 
     const vtable_impl: ops.ComputeBackend.VTable = blk: {
         var vt = native_compute_mod.vtable_impl;

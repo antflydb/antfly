@@ -4403,14 +4403,14 @@ const InvocationInputFacts = struct {
         return live;
     }
 
-    fn promoteOwnedDeviceInputs(self: *InvocationInputFacts, target: *const ImportedOnnxSession, selected: ?*const PreparedRoutes, stage: bool) void {
+    fn promoteOwnedDeviceInputs(self: *InvocationInputFacts, target: *const ImportedOnnxSession, selected: ?*const PreparedRoutes, shapes: session_mod.ShapeInputs) void {
         const cuda = target.requested_strategy == .compiled_required and target.cb.kind() == .cuda;
         const metal = target.cb.kind() == .metal and if (target.executable.runtime.physical_pool) |pool| pool.metal_frame_dispatch and !pool.mixed_frame_dispatch and !pool.metal_projection_region_candidate else false;
         if (!cuda and !metal) return;
         for (self.inputs) |*input| {
             const logical = switch (input.value) {
                 .resident => |resident| resident.logical,
-                .imported_host => |host| if (cuda and stage and selected == null) host.logical else continue,
+                .imported_host => |host| if (cuda and shapes == .stage_inputs and selected == null) host.logical else continue,
                 else => continue,
             };
             if (selected) |routes| {
@@ -4419,7 +4419,6 @@ const InvocationInputFacts = struct {
                 if (saved != .imported_device) continue;
             }
             if (logical.dtype != .f32 and logical.dtype != .i32 and logical.dtype != .i64) continue;
-            if (metal and logical.dtype != .f32) continue;
 
             if (!@import("../execution/assigned_kernel_route.zig").bindingDense(target.cb, input.value, logical)) continue;
             if (metal) {
@@ -4428,6 +4427,15 @@ const InvocationInputFacts = struct {
                 if (planes.len != 1 or planes[0].descriptor.storage != .metal_buffer or planes[0].backing == null) continue;
                 // Keep the exact backing when the provider can attest its root.
                 if (selected == null and (service.input(target.cb.ptr, input.value, logical) catch continue)) continue;
+                if (logical.dtype != .f32) {
+                    const index = std.mem.indexOfScalar(ml.graph.NodeId, target.input_node_ids, input.node_id) orelse continue;
+                    const source = switch (shapes.source(index)) {
+                        .resident => |present| present.value,
+                        else => continue,
+                    };
+                    const validate = target.cb.vtable.kernels.?.validatePhysicalIndexInput orelse continue;
+                    validate(target.cb.ptr, source, @min(std.math.maxInt(usize), std.math.maxInt(i64))) catch continue;
+                }
             }
 
             input.value = .{ .imported_device = .{ .logical = logical, .implementation = .{ .context = target.cb.ptr, .table = target.cb.vtable } } };
@@ -5420,7 +5428,7 @@ noinline fn prepareDevicePhysicalInvocation(prepared: *prepared_mod.PreparedInvo
         try facts.init(target, shapes, allocator, null);
     }
     defer facts.deinit();
-    facts.promoteOwnedDeviceInputs(target, null, shapes == .stage_inputs);
+    facts.promoteOwnedDeviceInputs(target, null, shapes);
     return selectPhysicalInvocationControlled(prepared, session, target, root_pool, facts.inputs, allocator, cleanup, if (control) |active| active.* else null);
 }
 
@@ -5429,7 +5437,7 @@ fn preparePhysicalInvocationWithCleanup(prepared: *prepared_mod.PreparedInvocati
     var facts: InvocationInputFacts = undefined;
     try facts.init(target, shapes, allocator, null);
     defer facts.deinit();
-    facts.promoteOwnedDeviceInputs(target, null, shapes == .stage_inputs);
+    facts.promoteOwnedDeviceInputs(target, null, shapes);
     try selectPhysicalInvocationControlled(prepared, session, target, root_pool, facts.inputs, allocator, cleanup, control);
 }
 
@@ -5440,7 +5448,7 @@ noinline fn preparePhysicalResidentInvocationWithCleanup(prepared: *prepared_mod
     var facts: InvocationInputFacts = undefined;
     try facts.init(target, shapes, allocator, &storage);
     defer facts.deinit();
-    facts.promoteOwnedDeviceInputs(target, null, shapes == .stage_inputs);
+    facts.promoteOwnedDeviceInputs(target, null, shapes);
     try selectPhysicalInvocationControlled(prepared, session, target, root_pool, facts.inputs, allocator, cleanup, control);
 }
 
@@ -5522,7 +5530,7 @@ noinline fn validateFreshPreparedRouteFacts(target: *ImportedOnnxSession, routes
     var facts: InvocationInputFacts = undefined;
     try facts.init(target, shapes, allocator, if (InvocationInputFacts.needsResidentStorage(shapes)) &storage else null);
     defer facts.deinit();
-    facts.promoteOwnedDeviceInputs(target, routes, false);
+    facts.promoteOwnedDeviceInputs(target, routes, shapes);
     facts.satisfyImportedInputs(target, routes);
     try routes.validateWithClaims(facts.inputs, claims);
 }
@@ -5657,6 +5665,25 @@ fn importedTypedHostIngress(comptime backend_type: BackendType, comptime Index: 
         defer a.free(first);
         try std.testing.expectEqualSlices(f32, first_expected, first);
         @memcpy(raw, std.mem.sliceAsBytes(&selected));
+        const stage_backend = session.shared_compute_context.?.stableBackend();
+        const control: InferenceExecutionControl = .{ .native_call_policy = .in_process };
+        const source = (try stage_backend.fromReadOnlyBytes(raw, dtype, &.{2})) orelse return error.MissingResidentIndices;
+        defer stage_backend.free(source);
+        const stage_input: session_mod.StageInput = .{ .resident = .{ .backend = stage_backend, .value = source, .shape = &.{2}, .estimated_bytes = bytes_per_pair } };
+        var device_result = (try session.runStageInputsWithControl(&.{stage_input}, a, control)) orelse return error.MissingResidentResult;
+        defer device_result.deinit();
+        const ingress_stats = session.executionDiagnostics().?.execution.?;
+        try std.testing.expectEqual(@as(u64, bytes_per_pair), ingress_stats.physical_input_copy_bytes);
+        try std.testing.expectEqual(@as(u64, 0), ingress_stats.actual_download_bytes);
+        const found = try device_result.backend.toFloat32(device_result.outputs[0], a);
+        defer a.free(found);
+        try std.testing.expectEqualSlices(f32, first_expected, found);
+        const invalid = [_]Index{ if (Index == i64) 9_007_199_254_740_993 else 16_777_217, 0 };
+        const invalid_source = (try stage_backend.fromReadOnlyBytes(std.mem.sliceAsBytes(&invalid), dtype, &.{2})) orelse return error.MissingResidentIndices;
+        defer stage_backend.free(invalid_source);
+        var invalid_input = stage_input;
+        invalid_input.resident.value = invalid_source;
+        try std.testing.expectError(error.IndexOutOfBounds, session.runStageInputsWithControl(&.{invalid_input}, a, control));
     }
     const held = try session.run(&.{input}, a);
     defer {

@@ -1176,7 +1176,7 @@ pub const Pool = struct {
             var backend_index: ?usize = null;
             for (self.backends, 0..) |backend, index| {
                 const supported = backend.kind() == .cuda or
-                    (backend.kind() == .metal and self.metal_frame_dispatch and !self.mixed_frame_dispatch and device.logical.dtype == .f32);
+                    (backend.kind() == .metal and self.metal_frame_dispatch and !self.mixed_frame_dispatch);
                 if (!supported or backend.ptr != device.implementation.context or @as(*const anyopaque, @ptrCast(backend.vtable)) != device.implementation.table) continue;
                 const functions = backend.vtable.kernels orelse continue;
                 if (!functions.accepts(backend.vtable) or functions.copyPhysicalInput == null or functions.physicalTensorView == null or
@@ -2548,8 +2548,10 @@ pub const Frame = struct {
         self.endScope();
     }
     fn advanceHostInputGeneration(self: *Frame) !void {
-        if (self.pool.host_input_plans.len != 0) {
+        if (self.pool.host_input_plans.len != 0 or (self.pool.metal_frame_dispatch and self.pool.device_input_plans.len != 0)) {
             for (self.pool.host_input_plans) |input| if (self.storages[input.allocation]) |storage_owner| storage_owner.invalidateHostIndices();
+            if (self.pool.metal_frame_dispatch) for (self.pool.device_input_plans) |input| if (self.storages[input.allocation]) |owner| owner.invalidateHostIndices();
+
             self.host_input_generation = std.math.add(u64, self.host_input_generation, 1) catch {
                 self.retired = true;
                 return error.HostInputGenerationExhausted;
@@ -2867,7 +2869,18 @@ pub const Frame = struct {
         for (self.device_bound_inputs[0..self.bound_device_input_count], self.metal_device_sources, self.pool.device_input_plans) |target, source, plan| {
             const owner = target.source_backend.?;
             if (owner.ptr != backend.ptr or owner.vtable != backend.vtable) return error.RuntimeInputBackendMismatch;
-            try copy(backend.ptr, target.value, source);
+            if (plan.shape.dtype == .f32) {
+                try copy(backend.ptr, target.value, source);
+            } else {
+                const bounds = plan.index_bounds orelse return error.MissingCurrentHostIndexProof;
+                const lease = self.storages[plan.allocation] orelse return error.MissingPhysicalInputStorage;
+                const bytes = @as(usize, @intCast(plan.shape.numElements().?)) * plan.shape.dtype.byteSize();
+                const slot: route.OutputSlot = .{ .allocation = plan.allocation, .node = plan.node, .epoch = plan.epoch, .logical = plan.shape, .writable_bytes = bytes };
+                const assigned: route.AssignedOutput = .{ .slot = slot, .region = try lease.writableRegion(plan.allocation, plan.epoch, bytes), .input_generation = self.host_input_generation };
+                try backend.vtable.kernels.?.copyPhysicalIndexInput.?(backend.ptr, target.value, source);
+                try lease.certifyHostIndices(assigned, bounds.extent);
+            }
+
             self.stats.input_copies += 1;
             self.stats.input_copy_bytes += @as(u64, @intCast(plan.shape.numElements().?)) * plan.shape.dtype.byteSize();
         }
@@ -3795,9 +3808,9 @@ pub const Frame = struct {
         var issued_inputs: [3]?route.AssignedInput = @splat(null);
         const issue_inputs = if (selected_route) |owned| owned.vtable.host_input_constraint != null else false;
         if (issue_inputs) for (kernel.inputs[0..descriptor.input_count], 0..) |input_node, position| {
-            if (self.pool.hostInputIndex(input_node)) |host_index| {
-                const plan = self.pool.host_input_plans[host_index];
-                const owner = self.storages[plan.allocation] orelse return error.MissingCurrentHostIndexProof;
+            const input_allocation = if (self.pool.hostInputIndex(input_node)) |host_index| self.pool.host_input_plans[host_index].allocation else if (cb.kind() == .metal) self.pool.deviceInputAllocation(input_node) else null;
+            if (input_allocation) |allocation| {
+                const owner = self.storages[allocation] orelse return error.MissingCurrentHostIndexProof;
                 const authority = if (owner.slot_authority) |*slot| slot.token() else return error.MissingCurrentHostIndexProof;
                 issued_inputs[position] = .{ .node = input_node, .lease_identity = @intFromPtr(owner), .authority = authority, .generation = self.host_input_generation };
             }
