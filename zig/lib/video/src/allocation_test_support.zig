@@ -33,6 +33,33 @@ pub const CheckedAllocator = struct {
     }
 };
 
+// The failure schedule counts allocations. An opportunistic in-place resize
+// can change that count as the backing heap shifts between replays (for
+// example, when Linux can extend a mapping). Drive the explicit allocation
+// fallback consistently while retaining the backing allocator's safety checks.
+const StableBacking = struct {
+    backing: std.mem.Allocator,
+
+    fn allocator(self: *StableBacking) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = std.mem.Allocator.noResize,
+            .remap = std.mem.Allocator.noRemap,
+            .free = free,
+        } };
+    }
+
+    fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
+        const self: *StableBacking = @ptrCast(@alignCast(ptr));
+        return self.backing.rawAlloc(len, alignment, return_address);
+    }
+
+    fn free(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+        const self: *StableBacking = @ptrCast(@alignCast(ptr));
+        self.backing.rawFree(bytes, alignment, return_address);
+    }
+};
+
 pub fn checkAllAllocationFailures(comptime run: anytype, args: anytype) !void {
     // Keep exhaustive failure injection and SafeAllocator's leak, mismatch,
     // double-free and write-after-free checks. Capturing successful allocation
@@ -40,7 +67,8 @@ pub fn checkAllAllocationFailures(comptime run: anytype, args: anytype) !void {
     // FailingAllocator still retains the stack of the injected failure.
     var checked = try CheckedAllocator.init();
     defer checked.deinit();
-    std.testing.checkAllAllocationFailures(checked.allocator(), run, args) catch |err| {
+    var stable = StableBacking{ .backing = checked.allocator() };
+    std.testing.checkAllAllocationFailures(stable.allocator(), run, args) catch |err| {
         std.debug.print("allocation-failure campaign returned {s}\n", .{@errorName(err)});
         return err;
     };
