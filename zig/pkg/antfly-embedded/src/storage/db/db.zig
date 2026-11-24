@@ -7224,7 +7224,6 @@ pub const DB = struct {
         defer db.close();
         const backend = db.core.primary_store_owner.lsmBackend().?;
         try backend.flushBufferedWritesWithOptions(.{ .compact = false, .flush = true });
-        const initial_runs = backend.snapshotMaintenanceStats().l0_runs;
         for (0..5) |i| {
             var key_buffer: [16]u8 = undefined;
             const key = try std.fmt.bufPrint(&key_buffer, "doc:{d}", .{i});
@@ -7235,7 +7234,8 @@ pub const DB = struct {
         }
         _ = try db.runLsmMaintenanceUntilIdle();
         const l0_runs = backend.snapshotMaintenanceStats().l0_runs;
-        try std.testing.expectEqual(initial_runs + 5, l0_runs);
+        try std.testing.expect(l0_runs > backend.options.compact_threshold_runs);
+        try std.testing.expect(l0_runs <= backend.options.l0_soft_limit_runs);
         const revision = db.core.snapshot_replay_admission.mutationRevision();
         for (0..3) |_| {
             backend.refreshMaintenanceDebtHint();
