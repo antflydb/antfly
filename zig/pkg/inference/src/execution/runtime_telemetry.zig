@@ -141,6 +141,8 @@ pub const CudaCounters = struct {
     declared_graph_kernel_nodes_submitted: u64 = 0,
     declared_graph_nodes_submitted: u64 = 0,
     opaque_graph_submissions: u64 = 0,
+    /// A legacy decode replay declined before submission because its output bank was still held.
+    decode_replay_output_bank_denials: u64 = 0,
     /// Explicit project-owned successful host wait APIs. These are not CPU
     /// blocking durations or implicit vendor/free synchronizations.
     host_stream_synchronizations: u64 = 0,

@@ -59,6 +59,11 @@ pub const EncoderOutputs = union(enum) {
 /// reference once. Merged-cache decoders have a separate stateful contract.
 const PlacementReason = @import("diagnostics.zig").StagePlacement.Reason;
 
+fn supportsSingletonStageShape(shape: []const i64, rank: usize) bool {
+    if (shape.len != rank or shape[0] > 1) return false;
+    return std.mem.indexOfScalar(i64, shape, 0) == null;
+}
+
 fn residentStageDecline(encoder: backends.Session, decoder: backends.Session, controlled: bool) ?PlacementReason {
     const source = encoder.shared_compute_context orelse return .no_source_context;
     if (decoder.shared_compute_context != source) return .foreign_context;
@@ -66,13 +71,14 @@ fn residentStageDecline(encoder: backends.Session, decoder: backends.Session, co
     if (controlled and (encoder.vtable.runResidentWithControl == null or decoder.vtable.runResidentInputsWithControl == null)) return .missing_controlled_entry;
     if (source.stableBackend().vtable.sliceRows2D == null) return .missing_resident_row_selection;
     const outputs = encoder.outputInfo();
-    if (outputs.len != 1 or outputs[0].dtype != .f32 or outputs[0].shape.len != 3) return .unsupported_encoder_signature;
+    if (outputs.len != 1 or outputs[0].dtype != .f32 or !supportsSingletonStageShape(outputs[0].shape, 3)) return .unsupported_encoder_signature;
     return null;
 }
 
 fn compatibleResidentEncoderShape(produced: []const i64, consumed: []const i64) bool {
+    if (produced.len != consumed.len) return false;
     for (produced, consumed) |source, destination| {
-        if (source > 0 and destination > 0 and source != destination) return false;
+        if (source >= 0 and destination >= 0 and source != destination) return false;
     }
     return true;
 }
@@ -81,7 +87,7 @@ pub fn residentPairPlacement(encoder: backends.Session, decoder: backends.Sessio
     if (residentStageDecline(encoder, decoder, controlled)) |reason| return reason;
     const outputs = encoder.outputInfo();
     const logits = decoder.outputInfo();
-    if (logits.len != 1 or logits[0].dtype != .f32 or logits[0].shape.len != 3) return .unsupported_decoder_signature;
+    if (logits.len != 1 or logits[0].dtype != .f32 or !supportsSingletonStageShape(logits[0].shape, 3)) return .unsupported_decoder_signature;
     const inputs = decoder.inputInfo();
     const signature = DecoderInputPlan.Signature.resolve(inputs) catch return .unsupported_decoder_signature;
     var tokens = false;
@@ -89,11 +95,11 @@ pub fn residentPairPlacement(encoder: backends.Session, decoder: backends.Sessio
     for (inputs, signature.roles[0..signature.count]) |input, role| {
         switch (role) {
             .input_ids, .encoder_attention_mask, .decoder_attention_mask => {
-                if (input.dtype != .i64 or input.shape.len != 2) return .unsupported_decoder_signature;
+                if (input.dtype != .i64 or !supportsSingletonStageShape(input.shape, 2)) return .unsupported_decoder_signature;
                 if (role == .input_ids) tokens = true;
             },
             .encoder_hidden_states => {
-                if (input.dtype != .f32 or input.shape.len != 3) return .unsupported_decoder_signature;
+                if (input.dtype != .f32 or !supportsSingletonStageShape(input.shape, 3)) return .unsupported_decoder_signature;
                 if (!compatibleResidentEncoderShape(outputs[0].shape, input.shape)) return .unsupported_decoder_signature;
                 hidden = true;
             },
@@ -113,7 +119,9 @@ fn residentMergedPlacement(encoder: backends.Session, decoder: backends.Session,
     const produced = encoder.outputInfo()[0].shape;
     for (decoder.inputInfo()) |input| {
         if (std.mem.eql(u8, input.name, "encoder_hidden_states")) {
-            return if (compatibleResidentEncoderShape(produced, input.shape)) .resident_merged_decoder else .unsupported_decoder_signature;
+            if (!supportsSingletonStageShape(input.shape, 3) or !compatibleResidentEncoderShape(produced, input.shape))
+                return .unsupported_decoder_signature;
+            return .resident_merged_decoder;
         }
     }
     return .unsupported_decoder_signature;
@@ -201,24 +209,34 @@ fn encodeOptions(allocator: std.mem.Allocator, encoder: backends.Session, decode
             values.resource_lease = owner.lease;
             owner.lease = null;
         };
-        const shape = try residentEncoderShape(allocator, encoder.outputInfo(), &values);
+        const shape = try residentEncoderShape(encoder.outputInfo(), &values);
         return .{ .resident = .{ .values = values, .shape = shape, .incremental_receiver = incremental } };
     }
     return encodeHost(allocator, encoder, inputs, dispatch, control, supplied);
 }
 
-fn residentEncoderShape(allocator: std.mem.Allocator, outputs: []const backends.TensorInfo, values: *const session_mod.ResidentOutputs) ![3]i64 {
-    if (values.outputs.len != 1) return error.InvalidEncoderOutput;
+fn residentEncoderShape(outputs: []const backends.TensorInfo, values: *const session_mod.ResidentOutputs) ![3]i64 {
+    if (values.outputs.len != 1 or outputs.len != 1) return error.InvalidEncoderOutput;
     const value = values.outputs[0];
-    if (outputs.len == 1) {
-        const declared = outputs[0].shape;
-        if (declared.len == 3 and declared[0] == 1 and declared[1] > 0 and declared[2] > 0) {
-            if ((try values.backend.tensorShapeMatches(value, declared)) orelse false) return declared[0..3].*;
+    const declared = outputs[0].shape;
+    if (!supportsSingletonStageShape(declared, 3)) return error.InvalidEncoderOutput;
+    if (declared[0] == 1 and declared[1] > 0 and declared[2] > 0) {
+        if (try values.backend.tensorShapeMatches(value, declared)) |matches| {
+            if (!matches) return error.InvalidEncoderOutput;
+            return declared[0..3].*;
         }
     }
-    const actual = try values.backend.tensorShape(value, allocator);
-    defer allocator.free(actual);
+
+    // This handoff accepts exactly three dimensions. Keep the descriptor on
+    // the stack even when the encoder declares one or more dynamic dimensions.
+    var storage: [3 * @sizeOf(i64)]u8 align(@alignOf(i64)) = undefined;
+    var shape_allocator = std.heap.FixedBufferAllocator.init(&storage);
+    const actual = values.backend.tensorShape(value, shape_allocator.allocator()) catch |err| switch (err) {
+        error.OutOfMemory => return error.InvalidEncoderOutput,
+        else => return err,
+    };
     if (actual.len != 3 or actual[0] != 1 or actual[1] <= 0 or actual[2] <= 0) return error.InvalidEncoderOutput;
+    if (!compatibleResidentEncoderShape(actual, declared)) return error.InvalidEncoderOutput;
     return actual[0..3].*;
 }
 
@@ -455,6 +473,9 @@ test "encoder decoder resident stages retain hidden state and materialize only t
         const control = Control{ .native_call_policy = .in_process };
         try std.testing.expectEqual(PlacementReason.resident_pair, residentPairPlacement(encoder, decoder, true));
         const Mismatched = struct {
+            fn outputInfo(_: *anyopaque) []const backends.TensorInfo {
+                return &.{.{ .name = "encoder_hidden_states", .dtype = .f32, .shape = &.{ 2, -1, 4 } }};
+            }
             fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
                 return &.{
                     .{ .name = "input_ids", .dtype = .i64, .shape = &.{ 1, 2 } },
@@ -467,6 +488,11 @@ test "encoder decoder resident stages retain hidden state and materialize only t
         bad_table.inputInfo = Mismatched.inputInfo;
         bad_decoder.vtable = &bad_table;
         try std.testing.expectEqual(PlacementReason.unsupported_decoder_signature, residentPairPlacement(encoder, bad_decoder, true));
+        var bad_encoder = encoder;
+        var bad_encoder_table = encoder.vtable.*;
+        bad_encoder_table.outputInfo = Mismatched.outputInfo;
+        bad_encoder.vtable = &bad_encoder_table;
+        try std.testing.expectEqual(PlacementReason.unsupported_encoder_signature, residentPairPlacement(bad_encoder, decoder, true));
         const Broker = struct {
             calls: usize = 0,
             encoder_calls: usize = 0,
@@ -503,9 +529,12 @@ test "encoder decoder resident stages retain hidden state and materialize only t
             try std.testing.expect(permit.lease == null);
             try std.testing.expect(result.resident.values.resource_lease != null);
             try std.testing.expect(result == .resident);
-            try std.testing.expectEqual([3]i64{ 1, 2, 4 }, try residentEncoderShape(std.testing.failing_allocator, encoder.outputInfo(), &result.resident.values));
+            try std.testing.expectEqual([3]i64{ 1, 2, 4 }, try residentEncoderShape(encoder.outputInfo(), &result.resident.values));
             const dynamic = [_]backends.TensorInfo{.{ .name = encoder.outputInfo()[0].name, .dtype = .f32, .shape = &.{ 1, -1, 4 } }};
-            try std.testing.expectEqual(result.resident.shape, try residentEncoderShape(a, &dynamic, &result.resident.values));
+            try std.testing.expectEqual(result.resident.shape, try residentEncoderShape(&dynamic, &result.resident.values));
+            var wrong_width = dynamic;
+            wrong_width[0].shape = &.{ 1, -1, 5 };
+            try std.testing.expectError(error.InvalidEncoderOutput, residentEncoderShape(&wrong_width, &result.resident.values));
             try std.testing.expectEqual(@as(u64, 0), audit.download_bytes);
             try std.testing.expectEqual(@as(u64, 0), audit.host_access_bytes);
             break :blk result;

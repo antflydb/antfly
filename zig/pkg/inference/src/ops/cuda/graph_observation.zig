@@ -179,6 +179,10 @@ pub const State = struct {
     atomic_counters: AtomicCounters = initAtomicCounters(),
     graph_mutex: std.atomic.Mutex = .unlocked,
 
+    pub fn decodeOutputBankUnavailable(self: *State) void {
+        self.increment("decode_replay_output_bank_denials", 1);
+    }
+
     fn increment(self: *State, comptime name: []const u8, amount: u64) void {
         const counter = &@field(self.atomic_counters, name);
         var previous = counter.load(.monotonic);
