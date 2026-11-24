@@ -43,7 +43,7 @@ pub fn companionImages(session: Session, a: std.mem.Allocator, images: []const [
         const width: usize = @intCast(output.shape[2]);
         if (hidden != 0 and hidden != width) return error.InvalidTensorShape;
         hidden = width;
-        try values.appendSlice(a, output.asFloat32());
+        try appendFeatures(a, &values, &output, images.len == 1);
     }
     return .{ .allocator = a, .embeddings = try values.toOwnedSlice(a), .tokens_per_image = counts, .hidden_size = hidden, .batches_executed = images.len, .max_batch_executed = @intFromBool(images.len != 0) };
 }
@@ -71,7 +71,7 @@ pub fn patchImages(session: Session, a: std.mem.Allocator, config: gpt.Config, i
         count.* = @intCast(output.shape[0]);
         if (count.* != prepared.geometry.tokenCount() or output.shape[1] != config.hidden_size) return error.InvalidTensorShape;
         grid.* = .{ .temporal = 1, .height = @intCast(prepared.geometry.grid_y), .width = @intCast(prepared.geometry.grid_x) };
-        try values.appendSlice(a, output.asFloat32());
+        try appendFeatures(a, &values, output, images.len == 1);
     }
     const empty_deepstack = try a.alloc(f32, 0);
     errdefer a.free(empty_deepstack);
@@ -82,10 +82,20 @@ pub fn patchImages(session: Session, a: std.mem.Allocator, config: gpt.Config, i
     return .{ .allocator = a, .embeddings = try values.toOwnedSlice(a), .tokens_per_image = counts, .grids = grids, .hidden_size = config.hidden_size, .deepstack_layer_count = 0, .deepstack_embeddings = empty_deepstack, .preprocess_evidence = empty_evidence, .preprocess_spatial_patches = empty_patches };
 }
 
-fn imageOutput(outputs: []const Tensor, rank: usize) !Tensor {
+fn appendFeatures(a: std.mem.Allocator, values: *std.ArrayList(f32), output: *Tensor, single: bool) !void {
+    try @import("capture.zig").requireHostTensor(output.*, .f32, output.shape.len);
+    if (single) {
+        std.debug.assert(values.capacity == 0);
+        const owned = try output.takeOrCopyFloat32(a);
+        values.items = owned;
+        values.capacity = owned.len;
+    } else try values.appendSlice(a, output.asFloat32());
+}
+
+fn imageOutput(outputs: []Tensor, rank: usize) !*Tensor {
     if (outputs.len != 1 or !std.mem.eql(u8, outputs[0].name, "image_features") or outputs[0].dtype != .f32 or outputs[0].shape.len != rank) return error.InvalidModelProgramOutput;
     for (outputs[0].shape) |axis| if (axis <= 0) return error.InvalidTensorShape;
-    return outputs[0];
+    return &outputs[0];
 }
 
 fn checkImageControl(raw: ?*const anyopaque) !void {
@@ -120,7 +130,7 @@ pub fn companionAudio(session: Session, a: std.mem.Allocator, clips: []const com
         defer for (outputs) |*output| output.deinit();
         if (outputs.len != 1 or outputs[0].dtype != .f32 or !std.mem.eql(u8, outputs[0].name, "audio_features") or outputs[0].shape.len != 2 or outputs[0].shape[0] <= 0 or outputs[0].shape[1] != hidden) return error.InvalidModelProgramOutput;
         count.* = @intCast(outputs[0].shape[0]);
-        try values.appendSlice(a, outputs[0].asFloat32());
+        try appendFeatures(a, &values, &outputs[0], clips.len == 1);
     }
     return .{ .allocator = a, .embeddings = try values.toOwnedSlice(a), .tokens_per_audio = counts, .hidden_size = hidden };
 }
@@ -131,7 +141,7 @@ fn imageFeatures(session: Session, a: std.mem.Allocator, prepared: companion.Pre
     const outputs = try session.runWithControl(&.{input}, a, control);
     defer a.free(outputs);
     errdefer for (outputs) |*output| output.deinit();
-    return imageOutput(outputs, 3);
+    return (try imageOutput(outputs, 3)).*;
 }
 
 /// Each decoded frame reuses the exact still-image semantic stage, retaining
@@ -155,7 +165,7 @@ pub fn companionVideoFrames(session: Session, cb: *const @import("../ops/ops.zig
         if (hidden != 0 and hidden != width) return error.InvalidTensorShape;
         hidden = width;
         rows = try std.math.add(usize, rows, count);
-        try values.appendSlice(a, output.asFloat32());
+        try appendFeatures(a, &values, &output, false);
         try counts.append(a, count);
         try times.append(a, timestamp);
     };
@@ -166,4 +176,17 @@ pub fn companionVideoFrames(session: Session, cb: *const @import("../ops/ops.zig
     errdefer a.free(owned_counts);
     const owned_times = try times.toOwnedSlice(a);
     return .{ .images = .{ .allocator = a, .backend = cb, .embeddings = tensor, .tokens_per_image = owned_counts, .hidden_size = hidden, .batches_executed = owned_counts.len, .max_batch_executed = 1 }, .timestamps_us = owned_times, .stats = .{ .decoder_source_bytes = decoder_source_bytes, .selected_frames = owned_counts.len } };
+}
+
+test "compiled media feature assembly adopts a single compatible output" {
+    const a = std.testing.allocator;
+    var output = try Tensor.initFloat32(a, "image_features", &.{ 1, 2 }, &.{ 3, 7 });
+    defer output.deinit();
+    const original = output.asFloat32().ptr;
+    var values: std.ArrayList(f32) = .empty;
+    defer values.deinit(a);
+    try appendFeatures(a, &values, &output, true);
+    try std.testing.expect(!output.owns_data);
+    try std.testing.expectEqual(original, values.items.ptr);
+    try std.testing.expectEqualSlices(f32, &.{ 3, 7 }, values.items);
 }
