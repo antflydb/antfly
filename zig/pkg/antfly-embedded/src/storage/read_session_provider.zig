@@ -432,7 +432,11 @@ pub fn beginQueryLease(db: anytype) !@TypeOf(db.*).QueryReadLease.Protocol.Handl
             value.request.native_key_predicate = req.native_key_predicate;
             return .{ .value = value };
         }
-        const operations: Protocol.Operations = .{ .close = close, .reader = reader, .documents = documents, .search = search };
+        fn retainPolicy(handle: Protocol.Handle) contract.NativeOutcome(DB.QueryReadLease.PolicyLease) {
+            const self = handle.resolve(@This()) catch |err| return .{ .failure = .init(@errorName(err)) };
+            return .{ .value = self.value.retainPolicy() catch |err| return .{ .failure = .init(@errorName(err)) } };
+        }
+        const operations: Protocol.Operations = .{ .close = close, .reader = reader, .documents = documents, .search = search, .retain_policy = retainPolicy };
         const owner_c_allocator = std.heap.c_allocator;
     };
     const owner = try db.alloc.create(Owner);

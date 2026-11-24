@@ -30,7 +30,7 @@ pub const CompletionPublicationQuery = struct {
     minimum_applied_index: u64,
     pub fn validate(self: CompletionPublicationQuery) !void {
         try self.owner.validate();
-        if (self.version != 1 or self.commit_version == 0 or self.minimum_applied_index == 0 or std.mem.allEqual(u8, &self.transaction_id, 0) or std.mem.allEqual(u8, &self.manifest_digest, 0)) return error.InvalidHistoryAdmission;
+        if ((self.version != 1 and self.version != 2) or self.commit_version == 0 or self.minimum_applied_index == 0 or std.mem.allEqual(u8, &self.transaction_id, 0) or std.mem.allEqual(u8, &self.manifest_digest, 0)) return error.InvalidHistoryAdmission;
     }
     pub fn digest(self: CompletionPublicationQuery) completion.Digest {
         var sha = std.crypto.hash.sha2.Sha256.init(.{});
@@ -52,14 +52,42 @@ pub const CompletionPublicationObservation = struct {
     request_digest: completion.Digest,
     cut: CompletionPublicationPosition,
     publication: ?CompletionPublication,
+    release: ?ReleaseStatus = null,
+
+    pub const ReleaseStatus = struct {
+        released_followers: u16,
+        collection_staged: bool,
+    };
+
+    pub fn jsonStringify(self: CompletionPublicationObservation, stream: anytype) @TypeOf(stream.*).Error!void {
+        try stream.beginObject();
+        inline for (.{ "version", "request_digest", "cut", "publication" }) |name| {
+            try stream.objectField(name);
+            try stream.write(@field(self, name));
+        }
+        if (self.release) |status| {
+            try stream.objectField("release");
+            try stream.write(status);
+        }
+        try stream.endObject();
+    }
+
     pub fn init(query: CompletionPublicationQuery, cut: CompletionPublicationPosition, publication: ?CompletionPublication) !CompletionPublicationObservation {
-        const result: CompletionPublicationObservation = .{ .request_digest = query.digest(), .cut = cut, .publication = publication };
+        return initWithRelease(query, cut, publication, null);
+    }
+
+    pub fn initWithRelease(query: CompletionPublicationQuery, cut: CompletionPublicationPosition, publication: ?CompletionPublication, release: ?ReleaseStatus) !CompletionPublicationObservation {
+        const result: CompletionPublicationObservation = .{ .version = query.version, .request_digest = query.digest(), .cut = cut, .publication = publication, .release = release };
         try result.validate(query);
         return result;
     }
     pub fn validate(self: CompletionPublicationObservation, query: CompletionPublicationQuery) !void {
         try query.validate();
-        if (self.version != 1 or !std.mem.eql(u8, &self.request_digest, &query.digest()) or self.cut.term == 0 or self.cut.index < query.minimum_applied_index) return error.HistoryCorrupt;
+        if (self.version != query.version or !std.mem.eql(u8, &self.request_digest, &query.digest()) or self.cut.term == 0 or self.cut.index < query.minimum_applied_index) return error.HistoryCorrupt;
+        if (self.release) |status| {
+            if (self.version < 2 or status.released_followers >= completion.max_participants or self.publication == null)
+                return error.HistoryCorrupt;
+        } else if (self.version >= 2 and self.publication != null) return error.HistoryCorrupt;
         if (self.publication) |publication| {
             if (std.mem.allEqual(u8, &publication.digest, 0) or publication.retained_bytes == 0 or publication.retained_bytes > 2 * completion.max_bytes + 128 or publication.position.term == 0 or publication.position.index == 0 or publication.position.index > self.cut.index or publication.position.term > self.cut.term or (publication.position.index == self.cut.index and publication.position.term != self.cut.term)) return error.HistoryCorrupt;
         }

@@ -23,9 +23,14 @@ pub fn For(comptime DB: type, comptime SearchResult: type) type {
         const QueryReadLease = @This();
         pub const Result = SearchResult;
         pub const Protocol = Types.query_lease.Protocol(SearchResult);
+        pub const PolicyLease = Types.query_lease.PolicyLease;
         db: *DB,
         generation_exposed: bool = false,
-        row_policy_lease: Source.row_policy_gate.Gate.Lease,
+        row_policy_lease: PolicyLease,
+
+        pub fn retainPolicy(self: *const QueryReadLease) !PolicyLease {
+            return self.row_policy_lease.clone();
+        }
 
         /// Capture a primary typed reader under this lease's existing apply
         /// fence. Do not recursively acquire the fence behind a queued writer.

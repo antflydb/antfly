@@ -89,12 +89,15 @@ pub const Port = struct {
         const decision = observation.decision orelse return error.SourceOutcomeUnresolved;
         const admission = decision.admission.admission;
         try observation.validate(lookup);
-        if (decision.record.status == .pending) return error.SourceOutcomeUnresolved;
+        if (decision.record.status == .pending or decision.record.externally_owned) return error.SourceOutcomeUnresolved;
         if (index >= admission.participants.len) return error.InvalidParticipant;
         const member = admission.participants[index];
         const owner = member.routed_owner orelse return error.ChangefeedCapabilityUnsupported;
         const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
-        try validateParticipantFence(owner, locator.group_id, fence);
+        var routed = owner;
+        if (phase == .publish and decision.record.source_scope != null)
+            routed.topology_epoch = fence.topology_epoch;
+        try validateParticipantFence(routed, locator.group_id, fence);
         var parsed: ?std.json.Parsed(completion.Envelope) = null;
         defer if (parsed) |*value| value.deinit();
         const request: types.BatchRequest = switch (phase) {
@@ -120,20 +123,54 @@ pub const Port = struct {
         return self.writeRequest(a, fence, owner, locator.table_name, request, context, scope.deadline_ns);
     }
 
-    /// Settle participant tracking after recovery confirms publication on every
-    /// committed owner or rollback on every aborted owner.
+    /// Execute a phase owned by the durable metadata transaction.
+    pub fn submitExternal(self: Port, a: A, member: completion.Participant, fence: metadata.CatalogRouteFence, request: types.BatchRequest, original: operation.RequestContext) !void {
+        var scope = try @import("history_publication_operations.zig").Scope.init(fence, original);
+        const context = scope.context();
+        const owner = member.routed_owner orelse return error.InvalidParticipant;
+        const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
+        var routed = owner;
+        if (request.transaction) |mutation| if (mutation == .publish_completion) {
+            // Only the transport epoch changes. The ordered reducer still
+            // checks the original owner against the retained receipt.
+            if (!std.meta.eql(mutation.publish_completion.completion_owner, owner)) return error.InvalidParticipant;
+            routed.topology_epoch = fence.topology_epoch;
+        };
+        try validateParticipantFence(routed, locator.group_id, fence);
+        return self.writeRequest(a, fence, owner, locator.table_name, request, context, scope.deadline_ns);
+    }
+
+    pub fn releaseOrdinary(self: Port, a: A, member: completion.Participant, fence: metadata.CatalogRouteFence, transaction_id: types.TxnId, release: completion.OrdinaryRelease, original: operation.RequestContext) !void {
+        const owner = member.routed_owner orelse return error.InvalidParticipant;
+        const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
+        try release.validate(owner);
+        var routed = owner;
+        routed.topology_epoch = fence.topology_epoch;
+        try validateParticipantFence(routed, locator.group_id, fence);
+        var scope = try @import("history_publication_operations.zig").Scope.init(fence, original);
+        const request: types.BatchRequest = .{ .sync_level = .write, .transaction = .{ .publish_completion = .{
+            .txn_id = transaction_id,
+            .completion_owner = owner,
+            .ordinary_release = release,
+        } } };
+        try self.writeRequest(a, fence, owner, locator.table_name, request, scope.context(), scope.deadline_ns);
+    }
+
     pub fn acknowledgeResolved(self: Port, a: A, lookup: @import("history_decision_operations.zig").wire.Query, observation: @import("history_decision_operations.zig").wire.Reply, fence: metadata.CatalogRouteFence, original: operation.RequestContext) !void {
         var scope = try @import("history_publication_operations.zig").Scope.init(fence, original);
         const context = scope.context();
         try observation.validate(lookup);
         const decision = observation.decision orelse return error.SourceOutcomeUnresolved;
-        if (decision.record.status == .pending) return error.SourceOutcomeUnresolved;
+        if (decision.record.status == .pending or decision.record.externally_owned) return error.SourceOutcomeUnresolved;
         if (!decision.record.acknowledgments_pending) return;
         const admission = decision.admission.admission;
         const owner = try admission.coordinatorOwner();
         const coordinator = try admission.coordinatorMember();
         const locator = local.api_local_transaction_contract.parseParticipantRef(coordinator.locator) orelse return error.InvalidParticipant;
-        try validateParticipantFence(owner, locator.group_id, fence);
+        var routed = owner;
+        if (decision.record.source_scope != null)
+            routed.topology_epoch = fence.topology_epoch;
+        try validateParticipantFence(routed, locator.group_id, fence);
         var pending: [64][]const u8 = undefined;
         var count: usize = 0;
         for (admission.participants) |member| {
@@ -160,8 +197,43 @@ pub const Port = struct {
         try self.acknowledgeParticipants(a, owner, fence, locator.table_name, transaction_id, &.{locator_bytes}, scope.context(), scope.deadline_ns);
     }
 
+    pub fn acknowledgeRetiredFollower(self: Port, a: A, owner: completion.RoutedOwner, fence: metadata.CatalogRouteFence, coordinator_locator: []const u8, txn_id: types.TxnId, follower: []const u8, original: operation.RequestContext) !void {
+        const coordinator = local.api_local_transaction_contract.parseParticipantRef(coordinator_locator) orelse return error.InvalidParticipant;
+        if (std.mem.eql(u8, coordinator_locator, follower)) return error.InvalidParticipant;
+        try validateParticipantFence(owner, coordinator.group_id, fence);
+        var scope = try @import("history_publication_operations.zig").Scope.init(fence, original);
+        try self.acknowledgeParticipants(a, owner, fence, coordinator.table_name, txn_id, &.{follower}, scope.context(), scope.deadline_ns);
+    }
+
     fn acknowledgeParticipants(self: Port, a: A, owner: completion.RoutedOwner, fence: metadata.CatalogRouteFence, table: []const u8, txn_id: types.TxnId, participants: []const []const u8, context: operation.RequestContext, deadline_ns: u64) !void {
         return self.writeRequest(a, fence, owner, table, .{ .sync_level = .write, .transaction = .{ .acknowledge_many = .{ .txn_id = txn_id, .participants = participants } } }, context, deadline_ns);
+    }
+
+    /// The caller has qualified all original physical participants and
+    /// observed this exact coordinator admission under the refreshed lease.
+    pub fn abortDisplacedSource(self: Port, a: A, lookup: @import("history_decision_operations.zig").wire.Query, observation: @import("history_decision_operations.zig").wire.Reply, fence: metadata.CatalogRouteFence, timestamp_ns: u64, original: operation.RequestContext) !void {
+        try observation.validate(lookup);
+        const decision = observation.decision orelse return error.SourceOutcomeUnresolved;
+        const reference = decision.record.source_scope orelse return error.InvalidSourceAdmission;
+        const purpose = decision.record.source_purpose orelse return error.InvalidSourceAdmission;
+        if (decision.record.status != .pending or timestamp_ns <= decision.record.begin_timestamp) return error.SourceOutcomeUnresolved;
+        const admission = decision.admission.admission;
+        const member = try admission.coordinatorMember();
+        const owner = try admission.coordinatorOwner();
+        const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
+        var routed = owner;
+        routed.topology_epoch = fence.topology_epoch;
+        try validateParticipantFence(routed, locator.group_id, fence);
+        var lease = try @import("history_publication_operations.zig").Scope.init(fence, original);
+        const request: types.BatchRequest = .{ .sync_level = .write, .transaction = .{ .resolve = .{
+            .completion_owner = owner,
+            .source_purpose = purpose,
+            .source_scope = reference,
+            .txn_id = admission.transaction_id,
+            .status = .aborted,
+            .commit_version = timestamp_ns,
+        } } };
+        try self.writeRequest(a, fence, owner, locator.table_name, request, lease.context(), lease.deadline_ns);
     }
 
     /// Only the original coordinator can win the first terminal decision.
@@ -173,7 +245,7 @@ pub const Port = struct {
         try observation.validate(lookup);
         const decision = observation.decision orelse return error.SourceOutcomeUnresolved;
         if (cutoff_ns == 0 or timestamp_ns < cutoff_ns or decision.record.status != .pending or decision.record.created_at_ns >= cutoff_ns) return error.SourceOutcomeUnresolved;
-        if (decision.record.source_purpose != null) return error.SourceOutcomeUnresolved;
+        if (decision.record.source_purpose != null or decision.record.externally_owned) return error.SourceOutcomeUnresolved;
         const admission = decision.admission.admission;
         const member = try admission.coordinatorMember();
         const owner = member.routed_owner orelse return error.ChangefeedCapabilityUnsupported;
@@ -225,7 +297,7 @@ pub const HttpWriter = struct {
         const self: *HttpWriter = @ptrCast(@alignCast(ptr));
         if (authority != .catalog or authority.catalog.route.group_id != group) return error.InvalidCatalogRouteFence;
         try context.ensureActive();
-        const encoded = try batch.encodeBatchRequest(a, request);
+        const encoded = try batch.encodeRoutedBatchRequest(a, request);
         defer a.free(encoded);
         const fence = try std.json.Stringify.valueAlloc(a, authority.catalog, .{});
         defer a.free(fence);

@@ -303,7 +303,7 @@ pub fn requireDrained(txn: anytype, manager: *transactions.TxnManager, expected:
         // cohort evidence before publication; no history scan belongs here.
         return;
     }
-    if (try manager.hasTopologySensitiveTransactions()) return error.TransactionTopologyBusy;
+    if (try transactions.TxnManager.hasTopologySensitiveTransactionsInView(manager.alloc, txn)) return error.TransactionTopologyBusy;
 }
 
 /// Final release must share the ownership/cutover transaction. Persist a

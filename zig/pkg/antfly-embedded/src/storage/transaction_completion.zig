@@ -152,6 +152,34 @@ pub fn ownerLessThan(left: RoutedOwner, right: RoutedOwner) bool {
 }
 
 pub const physical_participant_version = 4;
+pub const OrdinaryRelease = struct {
+    coordinator: RoutedOwner,
+    admission_digest: Digest,
+    certificate_digest: Digest,
+    commit_version: u64,
+    progress: ?Progress = null,
+
+    pub const fanout_window = 8;
+    pub const Progress = struct {
+        expected: u16,
+        released: u16,
+    };
+
+    pub fn validate(self: OrdinaryRelease, participant: RoutedOwner) !void {
+        try self.coordinator.validate();
+        try participant.validate();
+        if (self.coordinator.metadata_group_id != participant.metadata_group_id or
+            !same(self.coordinator.metadata_incarnation, participant.metadata_incarnation) or
+            !nonzero(self.admission_digest) or !nonzero(self.certificate_digest) or self.commit_version == 0)
+            return error.InvalidHistoryAdmission;
+        if (self.progress) |progress| {
+            if (!std.meta.eql(self.coordinator, participant) or progress.released <= progress.expected or
+                progress.released > max_participants - 1 or progress.released - progress.expected > fanout_window)
+                return error.InvalidHistoryAdmission;
+        }
+    }
+};
+
 pub const Admission = struct {
     version: u16 = 1,
     transaction_id: [16]u8,

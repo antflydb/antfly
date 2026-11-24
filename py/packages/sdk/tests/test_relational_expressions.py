@@ -2,16 +2,20 @@ from antfly import RelationalColumnExpression, RelationalIndexPredicate
 from antfly.client_generated.models.relational_comparison_op import RelationalComparisonOp
 from antfly.client_generated.models.relational_expression_op import RelationalExpressionOp
 from antfly.client_generated.models.relational_expression_type import RelationalExpressionType
+from antfly.client_generated.models.relational_scalar_expression import RelationalScalarExpression
 from antfly.client_generated.models.sql_builtin_type import SQLBuiltinType
 
 
 def test_generated_numeric_functions_round_trip_typed_scale_and_exact_literal():
     for function in ("abs", "ceil", "floor", "round", "trunc", "sign", "sqrt"):
-        args = [{"op": "literal", "type": "numeric", "sql_type": "numeric", "value": "9007199254740993.5"}]
+        args: list[dict[str, str | int]] = [
+            {"op": "literal", "type": "numeric", "sql_type": "numeric", "value": "9007199254740993.5"}
+        ]
         if function in ("round", "trunc"):
             args.append({"op": "literal", "type": "integer", "sql_type": "int32", "value": -2})
         source = {"column": "n", "expression": {"op": function, "sql_type": "numeric", "args": args}}
         model = RelationalColumnExpression.from_dict(source)
+        assert isinstance(model.expression, RelationalScalarExpression)
         assert model.expression.op.value == function
         assert model.expression.sql_type is SQLBuiltinType.NUMERIC
         assert model.to_dict() == source
@@ -35,7 +39,9 @@ def test_generated_text_expression_operations_round_trip_recursively():
         },
     }
     model = RelationalColumnExpression.from_dict(source)
+    assert isinstance(model.expression, RelationalScalarExpression)
     assert model.expression.op is RelationalExpressionOp.MD5
+    assert isinstance(model.expression.args, list)
     assert model.expression.args[0].op is RelationalExpressionOp.REPLACE
     assert model.to_dict() == source
 
@@ -61,6 +67,7 @@ def test_generated_array_constructor_preserves_identity_children_and_typed_null(
         },
     }
     model = RelationalColumnExpression.from_dict(source)
+    assert isinstance(model.expression, RelationalScalarExpression)
     assert model.expression.op is RelationalExpressionOp.ARRAY
     assert model.expression.sql_type is SQLBuiltinType.INT32
     assert model.to_dict() == source
@@ -86,6 +93,7 @@ def test_generated_array_literal_keeps_exact_cells_bounds_and_sql_nulls():
                 },
             }
             model = RelationalColumnExpression.from_dict(source)
+            assert isinstance(model.expression, RelationalScalarExpression)
             assert model.expression.type_ is RelationalExpressionType.SQL_ARRAY
             assert model.expression.sql_type is identity
             assert model.to_dict() == source
@@ -119,6 +127,7 @@ def test_generated_numeric_assignment_cast_preserves_builtin_identity():
         },
     }
     model = RelationalColumnExpression.from_dict(value)
+    assert isinstance(model.expression, RelationalScalarExpression)
     assert model.expression.op is RelationalExpressionOp.CAST
     assert model.expression.sql_type is SQLBuiltinType.INT16
     assert isinstance(model.expression.args, list)
@@ -140,5 +149,6 @@ def test_generated_conditional_expression_keeps_order_and_null_fallback():
         },
     }
     model = RelationalColumnExpression.from_dict(value)
+    assert isinstance(model.expression, RelationalScalarExpression)
     assert model.expression.op is RelationalExpressionOp.CASE_WHEN
     assert model.to_dict() == value

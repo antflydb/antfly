@@ -19,6 +19,7 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -110,9 +111,13 @@ func explorerCollectionHandler(tableURL, profile string, client *http.Client, bu
 			http.Error(w, err.Error(), 400)
 			return
 		}
+		if err := requireExplorerGraphIndex(r.Context(), client, tableURL, mode); err != nil {
+			writeExplorerSearchError(w, err)
+			return
+		}
 		raw, err := corpusRequestWithContext(r.Context(), client, "POST", tableURL+"/query", payload)
 		if err != nil {
-			http.Error(w, "Search unavailable; check index coverage and server logs", 502)
+			writeExplorerSearchError(w, err)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -230,6 +235,31 @@ func boundExplorerRequests(next http.Handler, limit int) http.Handler {
 	})
 }
 
+var errExplorerGraphNotConfigured = errors.New("Graph search is not configured for this collection")
+
+// An empty anchor relation can legitimately short-circuit native traversal.
+// Check the configured feature independently so that absence of a graph index
+// cannot masquerade as a successful empty graph search in the explorer.
+func requireExplorerGraphIndex(ctx context.Context, client *http.Client, tableURL, mode string) error {
+	if mode != "graph" {
+		return nil
+	}
+	_, err := corpusRequestWithContext(ctx, client, http.MethodGet, tableURL+"/indexes/"+DefaultAutographIndex, nil)
+	var response *corpusHTTPError
+	if errors.As(err, &response) && response.StatusCode == http.StatusNotFound {
+		return errExplorerGraphNotConfigured
+	}
+	return err
+}
+
+func writeExplorerSearchError(w http.ResponseWriter, err error) {
+	message := "Search unavailable; check index coverage and server logs"
+	if errors.Is(err, errExplorerGraphNotConfigured) {
+		message = errExplorerGraphNotConfigured.Error()
+	}
+	http.Error(w, message, http.StatusBadGateway)
+}
+
 func explorerQuery(q, mode string) (map[string]any, error) {
 	return explorerProfileQuery(q, mode, "pdf")
 }
@@ -243,6 +273,8 @@ func explorerProfileQuery(q, mode, profile string) (map[string]any, error) {
 		payload["semantic_search"] = q
 		payload["indexes"] = []string{DefaultEmbeddingIndex}
 	case "graph":
+		// The graph stage owns edges on materialized per-unit source rows.
+		// Anchor in their content index so result_ref carries graph vertex IDs.
 		payload["full_text_index"] = DefaultFullTextIndex
 		payload["full_text_search"] = map[string]any{"match": q, "field": "content"}
 		payload["limit"] = 8

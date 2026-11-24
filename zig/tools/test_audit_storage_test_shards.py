@@ -119,7 +119,10 @@ class StorageTestShardAuditTest(unittest.TestCase):
             "local/source_catalog.zig",
             'pub const rows = @import("read_session_backend").RelationalRows;\n',
         )
-        self.write("server/storage/test_manifest.zig", '_ = @import("antfly_local_sources").rows;\n')
+        self.write(
+            "server/storage/test_manifest.zig",
+            '_ = @import("antfly_local_sources").rows;\n',
+        )
         self.assertEqual(
             [],
             audit.audit_manifest(
@@ -127,7 +130,10 @@ class StorageTestShardAuditTest(unittest.TestCase):
                 self.root / "server/storage/test_manifest.zig",
                 ["storage.db.rows.rows."],
                 catalog=self.root / "local/source_catalog.zig",
-                module_sources={"read_session_backend": self.root / "local/storage/read_session_source.zig"},
+                module_sources={
+                    "read_session_backend": self.root
+                    / "local/storage/read_session_source.zig"
+                },
             ),
         )
 

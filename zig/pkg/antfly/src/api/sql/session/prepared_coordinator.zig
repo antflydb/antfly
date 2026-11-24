@@ -45,7 +45,7 @@ pub const Registry = struct {
     anchor: ?struct { incarnation: [16]u8, standalone: bool, head: u64 } = null,
 
     pub fn authority(self: *@This()) distributed.ExternalAuthority {
-        return .{ .ptr = self, .read = read, .admit = admit, .advance = advance, .next_version = nextVersion, .prepare_locks = prepareLocks, .resolve_locks = resolveLocks, .retire_native = retireNative, .reserve_capture = reserveCapture, .observe_capture = observeCapture, .observe_terminal = observeTerminal, .drive_catalog = driveCatalog };
+        return .{ .ptr = self, .read = read, .admit = admit, .advance = advance, .next_version = nextVersion, .prepare_locks = prepareLocks, .resolve_locks = resolveLocks, .retire_native = retireNative, .reserve_capture = reserveCapture, .observe_capture = observeCapture, .observe_terminal = observeTerminal, .drive_catalog = driveCatalog, .publish_history = publishHistory, .dispatch_history = dispatchHistory };
     }
 
     const Publication = @import("../../logical_replication_capture_worker.zig");
@@ -71,6 +71,55 @@ pub const Registry = struct {
         try cohort.bindPublication(a, transaction, bindings);
     }
 
+    fn historyTransport(self: *@This(), fallback: *@import("../../table_router.zig").CatalogBackedGroupRouter) !@import("../../hosted_completion.zig").Hosted {
+        const server = self.server;
+        fallback.* = @import("../../table_router.zig").CatalogBackedGroupRouter.init(server.catalogSource(), server.localSessionNodeId());
+        return .{
+            .catalog = server.catalogSource(),
+            .router = server.cfg.session_router orelse fallback.router(),
+            .executor = server.cfg.session_executor orelse return error.ChangefeedCapabilityUnsupported,
+            .secret = server.cfg.internal_service_secret,
+            .issuer = server.cfg.internal_service_issuer,
+        };
+    }
+
+    fn bindHistory(self: *@This(), a: A, cut: registry.Snapshot, transaction_id: [16]u8, begin_timestamp: u64, cohort: *distributed.ExternalPreparation) !void {
+        if (cut.standalone or self.server.cfg.native_history_owner == null or cohort.manifest.len == 0) return;
+        var fallback: @import("../../table_router.zig").CatalogBackedGroupRouter = undefined;
+        var transport = try self.historyTransport(&fallback);
+        try cohort.bindHistory(a, transport.coordinator(), transaction_id, begin_timestamp, self.publicationContext());
+    }
+
+    fn dispatchHistory(raw: *anyopaque, a: A, member: @import("../../completion_plan.zig").completion.Participant, participant: registry.Participant, request: local.storage_db_types.BatchRequest, deadline: ?u64) anyerror!void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        var context = try self.publicationContext().platformDeadline();
+        if (deadline) |limit| context.deadline_ns = @min(context.deadline_ns orelse limit, limit);
+        var fallback: @import("../../table_router.zig").CatalogBackedGroupRouter = undefined;
+        var transport = try self.historyTransport(&fallback);
+        const recovery = transport.coordinator().recovery;
+        const fence = if (request.transaction.? == .publish_completion) blk: {
+            const owner = member.routed_owner orelse return error.InvalidParticipant;
+            var budget = recovery.catalog.budget(null);
+            budget.deadline_ns = budget.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io });
+            budget.cancellation = context.cancellation;
+            var session = try @import("../../table_catalog.zig").RoutingSession.initWithBudget(a, recovery.catalog, budget);
+            defer session.deinit();
+            break :blk try @import("../../completion_recovery.zig").routeRetainedOwnerForCleanup(&session, owner, member.locator, budget, context);
+        } else participant.route;
+        try recovery.participants.submitExternal(a, member, fence, request, context);
+    }
+
+    fn publishHistory(raw: *anyopaque, a: A, record: registry.Record) anyerror!?@import("../../completion_plan.zig").completion.Digest {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const admission = record.identity.history_completion orelse return error.InvalidCatalogRecord;
+        const decision = record.decision orelse return error.InvalidPreparedTransactionPhase;
+        if (record.phase != .resolved or decision.status != .committed or record.resolutions != record.mask())
+            return error.InvalidPreparedTransactionPhase;
+        var fallback: @import("../../table_router.zig").CatalogBackedGroupRouter = undefined;
+        var transport = try self.historyTransport(&fallback);
+        return transport.coordinator().recovery.publishExternal(a, admission, decision.version, self.publicationContext());
+    }
+
     fn reserveCapture(raw: *anyopaque, a: A, part: registry.Participant, request: Publication.Capacity.Request) anyerror!Publication.Proofs.CapacityReceipt {
         const self: *@This() = @ptrCast(@alignCast(raw));
         return self.server.routedPreparedPublicationReceipt(a, part.table_name, part.route, .capacity, request, self.publicationContext());
@@ -87,7 +136,12 @@ pub const Registry = struct {
     }
 
     pub fn snapshot(self: *@This(), a: A, lookup: registry.Read) !registry.Snapshot {
+        return self.snapshotWithScopeCapability(a, lookup, null);
+    }
+
+    fn snapshotWithScopeCapability(self: *@This(), a: A, lookup: registry.Read, scope_supersession_ready: ?*bool) !registry.Snapshot {
         var private = self.context;
+        private.sql_scope_supersession_ready = scope_supersession_ready;
         private.setting_admin = true;
         // The identity embeds the command scope. Independent decision delivery
         // must keep the sealed admission hash unchanged across client death.
@@ -756,22 +810,32 @@ pub const Registry = struct {
         return query;
     }
 
-    fn observeRecoveryScope(self: *@This(), a: A, context: local.api_operation.RequestContext, query: @import("../../../system_catalog/lock_authority.zig").Query) !@import("../../../system_catalog/lock_authority.zig").Snapshot {
+    const ScopeProof = enum { unknown, ready, unavailable };
+
+    fn recoveryScopeSnapshot(self: *@This(), a: A, context: local.api_operation.RequestContext, query: @import("../../../system_catalog/lock_authority.zig").Query) !@import("../../../system_catalog/lock_authority.zig").Snapshot {
         const types = @import("../../../system_catalog/lock_authority.zig");
-        const bytes = self.server.source.systemCatalog(a, context, .{ .sql_lock_read = query }) catch |err| switch (err) {
-            // Older receivers can reject the selector at decode or require
-            // activation before reading it. A plain read proves presence only.
-            error.UnknownField, error.UnsupportedOperation, error.TableTopologyProtocolUpgradeRequired => fallback: {
-                if (query.retired_connection == null) return err;
-                try context.ensureActive();
-                var plain = query;
-                plain.retired_connection = null;
-                break :fallback try self.server.source.systemCatalog(a, context, .{ .sql_lock_read = plain });
+        const bytes = try self.server.source.systemCatalog(a, context, .{ .sql_lock_read = query });
+        defer a.free(bytes);
+        return std.json.parseFromSliceLeaky(types.Snapshot, a, bytes, .{ .allocate = .alloc_always });
+    }
+
+    fn observeRecoveryScope(self: *@This(), a: A, context: local.api_operation.RequestContext, query: @import("../../../system_catalog/lock_authority.zig").Query, proof: *ScopeProof) !@import("../../../system_catalog/lock_authority.zig").Snapshot {
+        if (query.retired_connection == null) return self.recoveryScopeSnapshot(a, context, query);
+        var plain = query;
+        plain.retired_connection = null;
+        const original = if (proof.* != .ready) try self.recoveryScopeSnapshot(a, context, plain) else null;
+        if (original) |scope| if (scope.scope != null or proof.* == .unavailable) return scope;
+
+        // A leader predating the hint can still supply proof on demand.
+        // If leadership changes mid-quantum, retain the plain observation or
+        // retry once without the optional selector on the new leader.
+        var result = self.recoveryScopeSnapshot(a, context, query) catch |err| switch (err) {
+            error.UnknownField, error.UnsupportedOperation, error.TableTopologyProtocolUpgradeRequired => {
+                proof.* = .unavailable;
+                return original orelse try self.recoveryScopeSnapshot(a, context, plain);
             },
             else => return err,
         };
-        defer a.free(bytes);
-        var result = try std.json.parseFromSliceLeaky(types.Snapshot, a, bytes, .{ .allocate = .alloc_always });
         if (result.scope != null) result.superseded = null;
         return result;
     }
@@ -782,14 +846,16 @@ pub const Registry = struct {
     fn releaseUnadmittedScope(self: *@This(), a: A, seal: transactions.ExternalPreparationSeal) !bool {
         const ref = seal.identity.lock_scope orelse return true;
         const types = @import("../../../system_catalog/lock_authority.zig");
-        const anchor = try self.snapshot(a, .{ .operation = seal.identity.operation_id });
+        var ready = false;
+        const anchor = try self.snapshotWithScopeCapability(a, .{ .operation = seal.identity.operation_id }, &ready);
+        var proof: ScopeProof = if (ready) .ready else .unknown;
         var context = self.context;
         context.setting_admin = true;
         context.sql_command_fence = null;
         context.sql_completion = null;
         context.sql_completion_submission = null;
         const query = scopeRecoveryQuery(anchor, seal.identity, ref);
-        const before = try self.observeRecoveryScope(a, context, query);
+        const before = try self.observeRecoveryScope(a, context, query, &proof);
         const scope = before.scope orelse return if (before.superseded == true) true else error.InvalidSqlBackendResponse;
         if (scope.next_command > ref.command.sequence or scope.transaction == null) return true;
         if (!std.meta.eql(scope.transaction, @as(?types.scopes.Transaction, .{ .id = seal.identity.txn_id }))) return error.ExternalTransactionDecisionChanged;
@@ -802,7 +868,7 @@ pub const Registry = struct {
         _ = try result.result();
         self.anchor = null;
         // One bounded cleanup quantum, then yield to the existing supervisor.
-        const after = try self.observeRecoveryScope(a, context, query);
+        const after = try self.observeRecoveryScope(a, context, query, &proof);
         return after.superseded == true or after.scope != null and after.scope.?.transaction == null;
     }
 
@@ -811,14 +877,16 @@ pub const Registry = struct {
     fn releaseScopeQuantum(self: *@This(), a: A, identity: registry.Identity) !bool {
         const ref = identity.lock_scope orelse return true;
         const types = @import("../../../system_catalog/lock_authority.zig");
-        const anchor = try self.snapshot(a, .{ .operation = identity.operation_id });
+        var ready = false;
+        const anchor = try self.snapshotWithScopeCapability(a, .{ .operation = identity.operation_id }, &ready);
+        var proof: ScopeProof = if (ready) .ready else .unknown;
         if (identity.kind == .named) for (anchor.receipts) |receipt| {
             if (receipt.status == .prepared and receipt.owner.eql(try identity.owner(a))) return true;
         };
         var context = self.context;
         context.setting_admin = true;
         const query = scopeRecoveryQuery(anchor, identity, ref);
-        const before = try self.observeRecoveryScope(a, context, query);
+        const before = try self.observeRecoveryScope(a, context, query, &proof);
         const scope = before.scope orelse return if (before.superseded == true) true else error.InvalidSqlBackendResponse;
         // A completed sealed command is a permanent cleanup witness, even if
         // later transactions have replaced the single recent release marker.
@@ -837,7 +905,7 @@ pub const Registry = struct {
         _ = try result.result();
         self.server.sql_lock_work_pending.store(true, .release);
         self.anchor = null; // Scope progress advances the shared admission head.
-        const after = try self.observeRecoveryScope(a, context, query);
+        const after = try self.observeRecoveryScope(a, context, query, &proof);
         return after.superseded == true or after.scope != null and after.scope.?.transaction == null and std.meta.eql(after.scope.?.released_transaction, @as(?types.scopes.Transaction, expected));
     }
     pub fn acknowledgeReceipt(self: *@This(), a: A, identity: registry.Identity) !void {
@@ -1242,6 +1310,7 @@ fn completeScoped(server: *http.ApiHttpServer, user: ?http.AuthenticatedIdentity
     try server.embedding_provider_runtime.io.randomSecure(&operation_id);
     const cut = try source.snapshot(a, .{ .operation = operation_id });
     if (cut.standalone != frame.standalone or !std.mem.eql(u8, &cut.incarnation, &frame.backend.incarnation)) return error.CatalogGenerationChanged;
+    if (!abort and !retire_read) try source.bindHistory(a, cut, id, info.begin_timestamp, &cohort);
     try source.bindPublication(a, cut, id, &cohort);
     const now = @import("antfly_platform").time.realtimeNs();
     const pending = &state.metadata.catalog_generations;
@@ -1292,6 +1361,7 @@ fn completeScoped(server: *http.ApiHttpServer, user: ?http.AuthenticatedIdentity
         .catalog_participant = if (generation_cohort) |owned| owned.participant else null,
         .notification_plan = notification_plan,
         .kind = .session_commit,
+        .history_completion = if (cohort.history) |history| history.plan.admission else null,
         .lock_scope = .{ .backend = frame.backend, .command = frame.command },
         .commit_sync_level = if (info.sync_level == .propose) .write else info.sync_level,
         .session = .{ .owner_node_id = state.owner_node_id, .connection_id = connection_id, .standalone = cut.standalone },
@@ -1533,12 +1603,13 @@ pub fn execute(root: *execution.Adapter, session: *sql_session.Session, coordina
     defer server.alloc.free(encoded);
     var source: Registry = .{ .server = server, .context = root.context, .database_id = try databaseIdentity(root, scratch) };
     const cut = try source.snapshot(scratch, .{ .gid = command.gid });
+    try source.bindHistory(scratch, cut, id, info.begin_timestamp, &cohort);
     try source.bindPublication(scratch, cut, id, &cohort);
     const actor = try @import("../recovery/authorization_recovery.zig").actor(server, root.identity.*);
     var operation_id: [16]u8 = undefined;
     try server.embedding_provider_runtime.io.randomSecure(&operation_id);
     const now = @import("antfly_platform").time.realtimeNs();
-    const identity: registry.Identity = .{ .lock_scope = if (root.context.sql_command_fence) |fence| .{ .backend = fence.backend, .command = fence.command } else null, .session = .{ .owner_node_id = server.localSessionNodeId(), .connection_id = state.connection_id, .standalone = cut.standalone }, .gid = command.gid, .database_id = source.database_id, .native_service = root.context.native_service, .principal = actor.principal(), .txn_id = id, .operation_id = operation_id, .metadata_incarnation = std.fmt.bytesToHex(cut.incarnation, .lower), .begin_timestamp = info.begin_timestamp, .expires_at_unix_ns = try std.math.add(u64, now, 5 * std.time.ns_per_min), .plan_digest = try registry.planDigest(encoded), .manifest_digest = try registry.manifestDigest(scratch, cohort.manifest, std.fmt.bytesToHex(cut.incarnation, .lower)) };
+    const identity: registry.Identity = .{ .history_completion = if (cohort.history) |history| history.plan.admission else null, .lock_scope = if (root.context.sql_command_fence) |fence| .{ .backend = fence.backend, .command = fence.command } else null, .session = .{ .owner_node_id = server.localSessionNodeId(), .connection_id = state.connection_id, .standalone = cut.standalone }, .gid = command.gid, .database_id = source.database_id, .native_service = root.context.native_service, .principal = actor.principal(), .txn_id = id, .operation_id = operation_id, .metadata_incarnation = std.fmt.bytesToHex(cut.incarnation, .lower), .begin_timestamp = info.begin_timestamp, .expires_at_unix_ns = try std.math.add(u64, now, 5 * std.time.ns_per_min), .plan_digest = try registry.planDigest(encoded), .manifest_digest = try registry.manifestDigest(scratch, cohort.manifest, std.fmt.bytesToHex(cut.incarnation, .lower)) };
     const seal: transactions.ExternalPreparationSeal = .{ .admission_head = cut.head, .admitted_at_ns = now, .standalone = cut.standalone, .identity = identity, .actor = actor, .participants = cohort.manifest };
     var plan = (try server.txn_sessions.sealExternalEncodedExecutionPlan(server.alloc, id, seal, encoded)) orelse return error.SqlTransactionNotActive;
     defer plan.deinit();

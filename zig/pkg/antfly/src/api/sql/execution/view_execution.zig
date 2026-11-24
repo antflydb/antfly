@@ -364,7 +364,7 @@ test "SQL view public resolver executes a stored definition without a fabricated
             const found = switch (request.sql_sources[0]) {
                 .name => |name| std.mem.eql(u8, name.table, self.record.name),
                 .view_id => |id| id == self.record.id,
-                .table_id => false,
+                .table_id, .logical_relation_id => false,
             };
             const target: domain.Target = .{ .table = self.record.name };
             return std.json.Stringify.valueAlloc(a, domain.ResolvedMany{

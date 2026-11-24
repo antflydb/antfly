@@ -87,6 +87,15 @@ pub fn run(a: A) !void {
     const authority: control.checkpoint_authority.Spec = .{ .binding = source.identity(), .table_name = "checkpoint", .owner = .{ .metadata_group_id = group, .metadata_incarnation = incarnation, .namespace = @splat(1), .table_binding = @splat(4), .root_generation = 0, .group_id = 17, .topology_epoch = 1 } };
     try actor.apply(.{ .bind_checkpoint = authority });
     try actor.apply(.{ .enable_scope_fencing = {} });
+    {
+        var before = try actor.read();
+        defer before.deinit();
+        try actor.apply(.{ .pin_payload_prewrite = .{ .digest = @splat(3), .bytes = "{}" } });
+        var after = try actor.read();
+        defer after.deinit();
+        try std.testing.expectEqual(before.value.revision, after.value.revision);
+        try std.testing.expect(after.value.payload_prewrite == null);
+    }
     try actor.expectWork(1);
     try actor.apply(.{ .enable_scope_fencing = {} });
     try actor.expectWork(1);
@@ -513,6 +522,21 @@ pub fn run(a: A) !void {
     const cleanup_fence = try store.getTableTransitionFence(group, scoped_source.table_id);
     try store.applyStandaloneCommand(group, .{ .remove_table = .{ .table_id = scoped_source.table_id, .expected_transition_generation = cleanup_fence.generation } });
     try actor.apply(.{ .certify_native_bootstrap = "lsn:0/1234" });
+    {
+        // Version 18 had the canonical actor row without derived intake and
+        // recovery entries. Exercise reopening an actual old projection.
+        var actor_state = try actor.read();
+        defer actor_state.deinit();
+        var writer = try store.store.beginWriteTxn();
+        errdefer writer.abort();
+        const intake = @import("../source_legacy_intake.zig");
+        try intake.indexTransition(&writer, group, actor_state.value, .{});
+        try std.testing.expect(try intake.indexedRecovery(a, &writer, group, source.table_id, 0, source.definition) == null);
+        var marker_buffer: [160]u8 = undefined;
+        const marker = try std.fmt.bufPrint(&marker_buffer, "\x00\x00__metadata_derived__:catalog_index_version:{d}", .{group});
+        try writer.put(marker, "18");
+        try writer.commit();
+    }
     store.deinit();
     opened = false;
     store = try Store.init(a, .{ .root_dir = path });
@@ -520,6 +544,43 @@ pub fn run(a: A) !void {
     var restored = try actor.read();
     defer restored.deinit();
     try std.testing.expect(restored.value.scope_fencing and !restored.value.closing);
+    try std.testing.expectEqualDeep(@as(?control.Scope, source), try store.nativeSourceRecoveryScope(a, group, source.table_id, 0, source.definition));
+    const indexed_actor: Store.SourceCheckpointActor = .{ .table_id = source.table_id, .source_id = source.source_id };
+    const owners = try store.sourceCheckpointActors(group, authority.owner.group_id, null);
+    try std.testing.expectEqualSlices(Store.SourceCheckpointActor, &.{indexed_actor}, owners.items());
+    const consumed = try store.sourceCheckpointActors(group, authority.owner.group_id, indexed_actor);
+    try std.testing.expectEqual(@as(usize, 0), consumed.len);
+    {
+        const intake = @import("../source_legacy_intake.zig");
+        var writer = try store.store.beginWriteTxn();
+        defer writer.abort();
+        const other_owner = authority.owner.group_id + 1;
+        // Shuffle insertion order and cross more than one full page while
+        // unrelated entries remain visible under the original owner prefix.
+        for (0..65) |offset| {
+            var indexed = restored.value;
+            const number = 65 - offset;
+            indexed.scope.?.source_id = @splat(0);
+            std.mem.writeInt(u64, indexed.scope.?.source_id[24..32], number, .big);
+            indexed.checkpoint_authority.?.binding = indexed.scope.?.identity();
+            indexed.checkpoint_authority.?.owner.group_id = other_owner;
+            try intake.indexTransition(&writer, group, .{}, indexed);
+        }
+        var after: ?Store.SourceCheckpointActor = null;
+        var seen: usize = 0;
+        while (true) {
+            const page = try intake.checkpointActors(&writer, group, other_owner, after);
+            for (page.items()) |entry| {
+                seen += 1;
+                try std.testing.expectEqual(source.table_id, entry.table_id);
+                try std.testing.expectEqual(seen, std.mem.readInt(u64, entry.source_id[24..32], .big));
+                after = entry;
+            }
+            if (page.len != page.actors.len) break;
+        }
+        try std.testing.expectEqual(@as(usize, 65), seen);
+    }
+    try std.testing.expect(!try store.legacyReplicationSourceIntakeAllowed(a, group, source.table_id, 1, source.definition));
     try std.testing.expectEqualStrings("lsn:0/1234", restored.value.native_bootstrap_checkpoint.?);
     {
         const before = try store.listReplicationSourceStatuses(a, group);
@@ -616,6 +677,10 @@ pub fn run(a: A) !void {
     var closing = try installed.read();
     defer closing.deinit();
     try std.testing.expect(closing.value.scope_fencing and closing.value.closing);
+    const installed_owners = try target.sourceCheckpointActors(group, authority.owner.group_id, null);
+    try std.testing.expectEqualSlices(Store.SourceCheckpointActor, &.{indexed_actor}, installed_owners.items());
+    try std.testing.expectEqualDeep(@as(?control.Scope, source), try target.nativeSourceRecoveryScope(a, group, source.table_id, 0, source.definition));
+    try std.testing.expect(!try target.legacyReplicationSourceIntakeAllowed(a, group, source.table_id, 1, source.definition));
     try installed.expectWork(1);
     try std.testing.expectError(error.TableTransitionActive, target.captureTableDropProjection(a, group, "docs"));
     const fence = try target.getTableTransitionFence(group, source.table_id);
@@ -641,6 +706,8 @@ pub fn run(a: A) !void {
 
     try installed.apply(.{ .fence_checkpoint = .{ .authority_digest = authority.digest(), .proof = @splat(5) } });
     try installed.expectWork(0);
+    const retired_owners = try target.sourceCheckpointActors(group, authority.owner.group_id, null);
+    try std.testing.expectEqual(@as(usize, 0), retired_owners.len);
     try target.applyStandaloneCommand(group, replace);
     const after_fence = (try target.getTable(a, group, source.table_id)) orelse return error.TestUnexpectedResult;
     defer metadata.freeTable(a, after_fence);
@@ -653,15 +720,14 @@ pub fn run(a: A) !void {
     try std.testing.expectEqual(control.nativeBootstrapCatalogDigest(replacement), reseed.native_bootstrap_catalog_digest);
     try std.testing.expect(try target.nativeSourceRecoveryScope(a, group, source.table_id, 0, source.definition) == null);
     try std.testing.expect(!try target.legacyReplicationSourceIntakeAllowed(a, group, source.table_id, 0, source.definition));
-    // A bounded census must never turn an incomplete/corrupt scan into intake
-    // permission. Exercise the real cursor and persisted actor prefix.
-    const eligibility = @import("../source_legacy_intake.zig");
+    // Rebuild from a projection with more historical rows than the old
+    // request-time census could admit, preserving both positive and negative gates.
     {
         var txn = try target.store.beginWriteTxn();
         errdefer txn.abort();
         const empty = try control.encode(a, .{});
         defer a.free(empty);
-        for (0..eligibility.max_records + 1) |index| {
+        for (0..257) |index| {
             var id: control.Digest = @splat(0);
             std.mem.writeInt(u64, id[24..32], @intCast(index + 2), .big);
             var key_buffer: [256]u8 = undefined;
@@ -669,7 +735,9 @@ pub fn run(a: A) !void {
         }
         try txn.commit();
     }
-    try std.testing.expectError(error.SourceAdmissionBackpressure, target.legacyReplicationSourceIntakeAllowed(a, group, source.table_id, 9, @splat(99)));
+    try target.rebuildDerivedCatalogIndexes(group);
+    try std.testing.expect(try target.legacyReplicationSourceIntakeAllowed(a, group, source.table_id, 9, @splat(99)));
+    try std.testing.expect(!try target.legacyReplicationSourceIntakeAllowed(a, group, source.table_id, 0, source.definition));
     {
         var txn = try target.store.beginWriteTxn();
         errdefer txn.abort();
@@ -677,16 +745,5 @@ pub fn run(a: A) !void {
         try txn.put(try control.keyForGroup(&key_buffer, group, source.table_id, @splat(0)), "!");
         try txn.commit();
     }
-    try std.testing.expectError(error.SourceControlCorrupt, target.legacyReplicationSourceIntakeAllowed(a, group, source.table_id, 9, @splat(99)));
-    {
-        const oversized = try a.alloc(u8, eligibility.max_bytes + 1);
-        defer a.free(oversized);
-        @memset(oversized, ' ');
-        var txn = try target.store.beginWriteTxn();
-        errdefer txn.abort();
-        var key_buffer: [256]u8 = undefined;
-        try txn.put(try control.keyForGroup(&key_buffer, group, source.table_id, @splat(0)), oversized);
-        try txn.commit();
-    }
-    try std.testing.expectError(error.SourceAdmissionBackpressure, target.legacyReplicationSourceIntakeAllowed(a, group, source.table_id, 9, @splat(99)));
+    try std.testing.expectError(error.SourceControlCorrupt, target.rebuildDerivedCatalogIndexes(group));
 }

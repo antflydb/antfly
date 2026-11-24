@@ -161,6 +161,8 @@ pub const RequestContext = struct {
     /// Borrowed native admission observer; never decoded from request JSON.
     /// Set only at the first possible durable submission (or existing job).
     sql_completion_submission: ?*bool = null,
+    /// Optional capability from the same authoritative prepared snapshot.
+    sql_scope_supersession_ready: ?*bool = null,
     /// Borrowed native ingress capability. The coordinator must reserve an
     /// owner proof before sealing a mutation; never deserialize this from SQL.
     sql_completion: ?struct {

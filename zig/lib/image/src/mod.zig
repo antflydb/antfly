@@ -38,6 +38,7 @@ pub const inferenceFormatForMimeEssence = @import("image_values").inferenceForma
 pub const inferenceMimeEssenceForFormat = @import("image_values").inferenceMimeEssenceForFormat;
 pub const supportsInferenceMimeEssence = @import("image_values").supportsInferenceMimeEssence;
 pub const EncodedImageInfo = @import("image_values").EncodedImageInfo;
+pub const inspectWebpPrefix = @import("image_values").inspectWebpPrefix;
 
 pub fn detectFormat(bytes: []const u8) Format {
     if (png.hasSignature(bytes)) return .png;

@@ -104,8 +104,11 @@ def parse_args(argv=None):
         "output",
     ):
         p.add_argument("--" + name, required=True, type=Path)
-    p.add_argument("--runtime-contract", type=Path,
-                   help="Explicit reference runtime contract; omitted keeps the family driver's v1 default")
+    p.add_argument(
+        "--runtime-contract",
+        type=Path,
+        help="Explicit reference runtime contract; omitted keeps the family driver's v1 default",
+    )
     p.add_argument("--python", type=Path, default=Path(sys.executable))
     p.add_argument("--backend", required=True, choices=("metal", "native"))
     p.add_argument("--blocks", type=int, choices=range(1, 7), default=6)

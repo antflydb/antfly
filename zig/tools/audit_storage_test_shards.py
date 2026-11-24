@@ -48,7 +48,10 @@ def test_modules(root: Path) -> Iterable[tuple[Path, tuple[str, ...]]]:
 
 
 def manifest_sources(
-    root: Path, manifest: Path, catalog: Path | None = None, module_sources: Mapping[str, Path] | None = None
+    root: Path,
+    manifest: Path,
+    catalog: Path | None = None,
+    module_sources: Mapping[str, Path] | None = None,
 ) -> list[Path]:
     imports = MANIFEST_IMPORT.findall(manifest.read_text(encoding="utf-8"))
     sources = [(manifest.parent / imported).resolve() for imported in imports]
@@ -65,7 +68,9 @@ def manifest_sources(
     return [source for source in sources if source.is_relative_to(root)]
 
 
-def catalog_const_entries(catalog: Path, module_sources: Mapping[str, Path] | None = None) -> dict[str, str]:
+def catalog_const_entries(
+    catalog: Path, module_sources: Mapping[str, Path] | None = None
+) -> dict[str, str]:
     content = catalog.read_text()
     entries = dict(re.findall(r'pub const (\w+) = @import\("([^"\n]+)"\);', content))
     if module_sources:
@@ -231,7 +236,13 @@ def main() -> int:
     parser.add_argument("--filter", action="append", default=[])
     parser.add_argument("--local-root", type=Path)
     parser.add_argument("--local-catalog", type=Path)
-    parser.add_argument("--local-module", nargs=2, action="append", default=[], metavar=("NAME", "SOURCE"))
+    parser.add_argument(
+        "--local-module",
+        nargs=2,
+        action="append",
+        default=[],
+        metavar=("NAME", "SOURCE"),
+    )
     parser.add_argument(
         "--dedicated",
         type=Path,
@@ -264,7 +275,12 @@ def main() -> int:
         parser.error("--local-module requires --local-catalog")
     module_sources = {name: Path(source) for name, source in args.local_module}
     failures = audit_manifest(
-        args.root, args.manifest, args.filter, args.dedicated, args.local_catalog, module_sources
+        args.root,
+        args.manifest,
+        args.filter,
+        args.dedicated,
+        args.local_catalog,
+        module_sources,
     )
     if args.local_root:
         failures.extend(

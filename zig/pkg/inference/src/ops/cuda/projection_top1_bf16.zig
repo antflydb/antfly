@@ -48,9 +48,11 @@ pub fn validate(r: Request) !void {
 }
 
 // These historical device entries are retained compatibility ABI names.
-const Programs = @import("embedded_module.zig").EmbeddedPrograms(.{
-    .partial = image(catalog.top1[0]),
-    .finish = image(catalog.top1[1]),
+const Programs = @import("embedded_module.zig").EmbeddedPrograms(struct {
+    pub const programs = .{
+        .partial = image(catalog.top1[0]),
+        .finish = image(catalog.top1[1]),
+    };
 });
 
 pub const Module = struct {

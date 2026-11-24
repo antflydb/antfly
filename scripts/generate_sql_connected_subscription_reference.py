@@ -26,7 +26,12 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from generate_sql_postgres_reference import FIXTURES, ROOT, postgres, postgres_binary_dir
+from generate_sql_postgres_reference import (
+    FIXTURES,
+    ROOT,
+    postgres,
+    postgres_binary_dir,
+)
 
 
 @contextmanager

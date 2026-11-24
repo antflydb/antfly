@@ -15,6 +15,7 @@
 # limitations under the License.
 
 """PostgreSQL 18+ witness for exact CLUSTER originals and physical heap order."""
+
 import argparse
 import json
 from pathlib import Path
@@ -24,7 +25,12 @@ from generate_sql_postgres_reference import FIXTURES, postgres
 
 
 def reference():
-    originals = {e["id"]: e for e in json.loads((FIXTURES / "sql_parity_inventory.json").read_text())["entries"]}
+    originals = {
+        e["id"]: e
+        for e in json.loads((FIXTURES / "sql_parity_inventory.json").read_text())[
+            "entries"
+        ]
+    }
     setup = [
         "CREATE TABLE usage_records(id UUID PRIMARY KEY,status TEXT,body TEXT)",
         "CREATE INDEX usage_records_status_idx ON usage_records(status)",
@@ -47,8 +53,12 @@ def reference():
             original = originals[identity]
             before = output(db.execute(query))
             heap_before = output(db.execute(physical))
-            table = db.execute("SELECT oid,relfilenode FROM pg_class WHERE oid='usage_records'::regclass").fetchone()
-            index = db.execute("SELECT oid FROM pg_class WHERE oid='usage_records_status_idx'::regclass").fetchone()[0]
+            table = db.execute(
+                "SELECT oid,relfilenode FROM pg_class WHERE oid='usage_records'::regclass"
+            ).fetchone()
+            index = db.execute(
+                "SELECT oid FROM pg_class WHERE oid='usage_records_status_idx'::regclass"
+            ).fetchone()[0]
             notices.clear()
             tag = db.execute(original["sql"]).statusmessage
             verbose = any("clustering" in text.lower() for text in notices)
@@ -64,10 +74,19 @@ def reference():
                 "00000000-0000-0000-0000-000000000001",
                 "00000000-0000-0000-0000-000000000004",
             ]
-            replacement = db.execute("SELECT oid,relfilenode FROM pg_class WHERE oid='usage_records'::regclass").fetchone()
+            replacement = db.execute(
+                "SELECT oid,relfilenode FROM pg_class WHERE oid='usage_records'::regclass"
+            ).fetchone()
             assert replacement[0] == table[0] and replacement[1] != table[1]
-            assert db.execute("SELECT oid FROM pg_class WHERE oid='usage_records_status_idx'::regclass").fetchone()[0] == index
-            assert db.execute("SELECT indisclustered FROM pg_index WHERE indexrelid='usage_records_status_idx'::regclass").fetchone() == (True,)
+            assert (
+                db.execute(
+                    "SELECT oid FROM pg_class WHERE oid='usage_records_status_idx'::regclass"
+                ).fetchone()[0]
+                == index
+            )
+            assert db.execute(
+                "SELECT indisclustered FROM pg_index WHERE indexrelid='usage_records_status_idx'::regclass"
+            ).fetchone() == (True,)
             for statement in after_writes:
                 db.execute(statement)
             changed = output(db.execute(query))
@@ -81,20 +100,30 @@ def reference():
                 "00000000-0000-0000-0000-000000000003",
             ]
             assert output(db.execute(query)) == changed
-            cases.append({
-                **{k: original[k] for k in ("id", "source_entry_sha256", "sql")},
-                "setup": setup, "query": query, "output": before,
-                "command_tag": tag, "verbose_notice": verbose,
-                "physical_order": heap_after,
-                "stable_table_and_index_identity": True,
-                "new_physical_generation": True,
-                "preferred_index": "usage_records_status_idx",
-                "after_writes": after_writes, "changed_output": changed,
-                "preferred_recluster": "CLUSTER usage_records",
-                "reclustered_physical_order": reclustered,
-            })
+            cases.append(
+                {
+                    **{k: original[k] for k in ("id", "source_entry_sha256", "sql")},
+                    "setup": setup,
+                    "query": query,
+                    "output": before,
+                    "command_tag": tag,
+                    "verbose_notice": verbose,
+                    "physical_order": heap_after,
+                    "stable_table_and_index_identity": True,
+                    "new_physical_generation": True,
+                    "preferred_index": "usage_records_status_idx",
+                    "after_writes": after_writes,
+                    "changed_output": changed,
+                    "preferred_recluster": "CLUSTER usage_records",
+                    "reclustered_physical_order": reclustered,
+                }
+            )
             db.execute("DROP TABLE usage_records")
-    return {"format": 1, "reference": "PostgreSQL exact CLUSTER and physical heap order", "cases": cases}
+    return {
+        "format": 1,
+        "reference": "PostgreSQL exact CLUSTER and physical heap order",
+        "cases": cases,
+    }
 
 
 def main():
@@ -107,8 +136,12 @@ def main():
     if args.output:
         args.output.write_text(json.dumps(result, indent=2) + "\n")
     else:
-        assert json.loads(args.check.read_text()) == result, "PostgreSQL CLUSTER reference drift"
-        print("verified 2 exact CLUSTER originals, physical order, preferred-index reuse and future writes")
+        assert json.loads(args.check.read_text()) == result, (
+            "PostgreSQL CLUSTER reference drift"
+        )
+        print(
+            "verified 2 exact CLUSTER originals, physical order, preferred-index reuse and future writes"
+        )
 
 
 if __name__ == "__main__":

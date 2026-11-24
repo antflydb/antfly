@@ -89,7 +89,11 @@ def postgres_binary_dir():
 
 @contextmanager
 def postgres(
-    *, max_prepared_transactions=0, logical_replication=False, listen_port=None, server_env=None
+    *,
+    max_prepared_transactions=0,
+    logical_replication=False,
+    listen_port=None,
+    server_env=None,
 ):
     import psycopg
 

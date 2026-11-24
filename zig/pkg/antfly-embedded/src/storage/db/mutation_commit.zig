@@ -1248,12 +1248,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // admission identity; it is not ordinary/legacy row inference.
                 const policy = @import("../source_producer_policy.zig");
                 const row_producer = try policy.rowProducer(req.source_producer, opts.source_producer);
+                // Ordered split/merge copies materialize existing effects.
+                // Their scope and receipts are validated below before the
+                // primary write, independently of legacy producer fencing.
+                const ordered_topology = opts.ordered_apply_receipt != null and
+                    (req.split_replication != null or req.split_checkpoint != null or
+                        req.merge_replication != null or req.merge_checkpoint != null);
                 const producer = if (opts.transaction_resolution != null and opts.transaction_resolution.?.source_scope != null) scoped: {
                     if (row_producer != .unlabelled and row_producer != .scoped_source) return error.SourceTransactionIdentityConflict;
                     break :scoped policy.Producer.scoped_source;
                 } else ordinary: {
                     if (row_producer == .scoped_source) return error.InvalidSourceAdmission;
-                    break :ordinary row_producer;
+                    break :ordinary if (ordered_topology and row_producer == .unlabelled) policy.Producer.ordinary else row_producer;
                 };
                 if (opts.transaction_resolution != null and opts.transaction_resolution.?.legacy_terminal != null) {
                     const resolution = opts.transaction_resolution.?;
@@ -1493,7 +1499,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 coordinated_handoff = try @import("relational/integrity/handoff.zig").admitSplitRequest(S.ownerField(self, "alloc").*, topology_read, req);
                 if (hasCoordinatedConstraints(request_schema_view) and !coordinated_handoff) return error.CoordinatedConstraintTopologyUnsupported;
             }
-            if (req.merge_replication != null or req.merge_checkpoint != null or req.merge_page != null) {
+            if (try req.validateMergeCutoverReceipt()) {
+                const topology_read = try batchProbe(&batch_probe, self);
+                if (try @import("relational/integrity/topology.zig").current(topology_read)) |fence| {
+                    if (fence.transition_id == req.merge_checkpoint.?.transition_id)
+                        return error.IntegrityTopologyBusy;
+                }
+            } else if (req.merge_replication != null or req.merge_checkpoint != null or req.merge_page != null) {
                 const topology_read = try batchProbe(&batch_probe, self);
                 // Source retention remains authoritative after its brief pin
                 // fence is released. Receiving another merge would replace that
@@ -5955,11 +5967,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             participant: ?[]const u8,
             owner: transactions_mod.ExternalDecisionOwner,
             replication: ?transactions_mod.ReplicationOrderedPhase,
+            completion_owner: ?@import("../transaction_completion.zig").RoutedOwner,
         ) !void {
             var preparation: RequestPreparationContext = undefined;
             preparation.init(self);
             defer preparation.deinit();
-            resolveTransactionIntentsPreparedScopedWithLegacy(self, txn_id, status, commit_version, sync_level, cancellation, receipt, participant, null, null, &preparation.guard, null, null, null, owner, replication) catch |err| return preparation.mapError(err);
+            resolveTransactionIntentsPreparedScopedWithLegacy(self, txn_id, status, commit_version, sync_level, cancellation, receipt, participant, null, completion_owner, &preparation.guard, null, null, null, owner, replication) catch |err| return preparation.mapError(err);
         }
 
         pub fn resolveTransactionIntentsPrepared(
