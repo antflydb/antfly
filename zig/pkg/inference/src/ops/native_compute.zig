@@ -39744,17 +39744,19 @@ fn concatIntegerTensors(self: *NativeCompute, a: *const tensor_mod.Tensor, b: *c
     const b_count = try integerTensorCount(b);
     if (typedShapeNumel(shape_a) != a_count or typedShapeNumel(shape_b) != b_count) return error.ShapeMismatch;
 
-    const bytes = try self.allocator.alloc(u8, try std.math.add(usize, a.data.len, b.data.len));
-    if (bytes.len == 0) return takeOwnedIntegerBytes(self, bytes, a.dtype, shape[0..shape_a.len]);
-    const outer = typedShapeNumel(shape_a[0..axis]).?;
-    const left_bytes = a.data.len / outer;
-    const right_bytes = b.data.len / outer;
-    const row_bytes = left_bytes + right_bytes;
-    for (0..outer) |row| {
-        const out = bytes[row * row_bytes ..][0..row_bytes];
-        @memcpy(out[0..left_bytes], a.data[row * left_bytes ..][0..left_bytes]);
-        @memcpy(out[left_bytes..], b.data[row * right_bytes ..][0..right_bytes]);
-    }
+    const length = try std.math.add(usize, a.data.len, b.data.len);
+    if (length == 0) return takeOwnedIntegerBytes(self, try self.allocator.alloc(u8, 0), a.dtype, shape[0..shape_a.len]);
+    const geometry = kernel_geometry.ConcatAxis{
+        .outer = typedShapeNumel(shape_a[0..axis]) orelse return error.ShapeMismatch,
+        .inner = std.math.mul(usize, typedShapeNumel(shape_a[axis + 1 ..]) orelse return error.ShapeMismatch, a.dtype.byteSize()) catch return error.ShapeMismatch,
+        .a_axis = @intCast(shape_a[axis]),
+        .b_axis = @intCast(shape_b[axis]),
+    };
+    const bytes = try self.allocator.alloc(u8, length);
+    concatContiguousInto(u8, a.data, b.data, bytes, geometry) catch |err| {
+        self.allocator.free(bytes);
+        return err;
+    };
     return takeOwnedIntegerBytes(self, bytes, a.dtype, shape[0..shape_a.len]);
 }
 
@@ -39914,7 +39916,7 @@ fn primConcatPrimOp(ctx: *anyopaque, a: CT, b: CT, axis: u8, a_shape: []const i6
     var owned_output = try OwnedDenseOutput.alloc(self, out_numel);
     defer owned_output.deinit();
     const output = owned_output.storage.?;
-    try concatDenseInto(a_data, b_data, output, geometry);
+    try concatContiguousInto(f32, a_data, b_data, output, geometry);
     const result = try owned_output.intoResult();
     errdefer freeTensor(self, result);
     if (resolveShapeFromDataLen(out_shape[0..rank], out_numel)) |resolved_out_shape| {
@@ -53390,7 +53392,7 @@ fn runAssignedKernelImpl(comptime authored: bool, ctx: *anyopaque, request: ops.
             try gqaPagedAttentionDirectInto(actual.pool, actual.blocks, geometry.layer_index, dense_inputs[0], null, actual.context, geometry.num_heads, geometry.num_kv_heads, geometry.head_dim, null, output);
         },
         .transpose, .broadcast, .add_mul_scalar => unreachable,
-        .concat => |geometry| try concatDenseInto(dense_inputs[0], dense_inputs[1], output, geometry),
+        .concat => |geometry| try concatContiguousInto(f32, dense_inputs[0], dense_inputs[1], output, geometry),
         .slice => |slice| try sliceDenseInto(dense_inputs[0], output, try slice.plan(descriptor.input_shapes[0], descriptor.output_shape)),
         .gather => |gather| {
             if (packed_row_route) |selected| {
@@ -57782,7 +57784,7 @@ test "Native host ingress writes unaligned assigned payload without allocation a
 }
 
 /// Allocation-free dense layout kernels shared by allocating and assigned paths.
-fn concatDenseInto(a: []const f32, b: []const f32, output: []f32, geometry: kernel_geometry.ConcatAxis) !void {
+fn concatContiguousInto(comptime T: type, a: []const T, b: []const T, output: []T, geometry: kernel_geometry.ConcatAxis) !void {
     const a_chunk = try std.math.mul(usize, geometry.a_axis, geometry.inner);
     const b_chunk = try std.math.mul(usize, geometry.b_axis, geometry.inner);
     const out_chunk = try std.math.add(usize, a_chunk, b_chunk);
