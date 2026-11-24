@@ -175,6 +175,27 @@ mirrors (sparse halved, see `lite-index-write-path.md` stage 4). With level-0
 records read from the file and doc map, dead set and level-0 changes applied
 record by record, a refresh costs what changed, and writes can use it.
 
+## Measured after 2, 3 and 4a
+
+ReleaseFast, 8 writers, 10 s runs interleaved with the previous head
+(`c9dcb994d8`) on the same machine:
+
+| | before | after |
+|---|---|---|
+| full text, 8 threads | 1,398–1,459/s | 1,665–1,776/s |
+| full text, 8 processes | 803–1,061/s | 1,120–2,359/s |
+| dense, 8 threads | 3,458–3,541/s | 3,461–3,521/s |
+| dense, 8 processes | 785–1,088/s | 717–1,085/s |
+| plain, 8 threads | 7,383–7,705/s | 7,287–7,372/s |
+| plain, 8 processes | 7,269–7,521/s | 7,622–7,759/s |
+
+Full-text profile after (8 threads, per write): groups average three
+writes; the redo fsync is 15 µs and the frontier fsync runs for 2% of
+groups; preparing the level-0 segment is 55 µs, 21 of it encoding.
+Installing it is now the largest serialized cost: 99 µs syncing the catalog
+mirror and 93 µs publishing the segment. That is what the memtable (4)
+removes.
+
 ## Status
 
 | change | state |
