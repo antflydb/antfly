@@ -56788,6 +56788,7 @@ pub const SQLCatalogObjectKind = enum {
     view,
     extension,
     collation,
+    publication,
     subscription,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -56809,6 +56810,7 @@ pub const SQLCatalogObjectKind = enum {
             .view => "view",
             .extension => "extension",
             .collation => "collation",
+            .publication => "publication",
             .subscription => "subscription",
         };
         try jw.write(s);
@@ -56837,6 +56839,7 @@ pub const SQLCatalogObjectKind = enum {
             .{ "view", .view },
             .{ "extension", .extension },
             .{ "collation", .collation },
+            .{ "publication", .publication },
             .{ "subscription", .subscription },
         });
         return map.get(s) orelse error.UnexpectedToken;
