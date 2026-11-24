@@ -3234,6 +3234,7 @@ pub const DB = struct {
     owned_resource_manager: ?*resource_manager_mod.ResourceManager,
     capacity_source: ?types.RepairCapacitySource,
     executor: *derived_executor_mod.Executor,
+    lite_backlog_reconciled_through: u64 = 0,
     start_index_workers: bool,
     start_independent_maintenance: bool = true,
     graph_metric_idle_maintenance: OpenOptions.GraphMetricIdleMaintenanceMode,
@@ -4084,6 +4085,10 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("open", .{ alloc, path, requested_opts });
         return blk: {
             var opts = requested_opts;
+            // Provider interfaces are move-only. Keep them in the mutable
+            // options until a runtime has adopted them so partial opens have
+            // exactly one cleanup owner.
+            errdefer if (opts.enrichment) |*cfg| deinitOwnedEnrichmentConfig(alloc, cfg);
             if (opts.sql_persistence) |descriptor| {
                 const context = opts.sql_persistence_context orelse return error.InvalidSqlRelationPersistence;
                 if (opts.identity_namespace == null) return error.InvalidSqlRelationPersistence;
@@ -4131,10 +4136,6 @@ pub const DB = struct {
                 if (opts.identity_namespace == null or !opts.identity_namespace.?.eql(bootstrap.namespace) or
                     opts.schema_before_index_load != null) return error.InvalidInitialChildPublication;
             }
-            // Provider interfaces are move-only. Keep them in the mutable
-            // options until a runtime has adopted them so partial opens have
-            // exactly one cleanup owner.
-            errdefer if (opts.enrichment) |*cfg| deinitOwnedEnrichmentConfig(alloc, cfg);
             if (opts._backend_configuration_resolution) |resolution| {
                 if (resolution.path_fingerprint != backendConfigurationPathFingerprint(path))
                     return error.BackendConfigurationPathMismatch;
@@ -4161,9 +4162,13 @@ pub const DB = struct {
                 break :blk_runtime owned_backend_runtime.?.runtime;
             };
             if (opts.require_existing_catalog and opts.physical_root_mode == .filesystem_managed) {
-                const io = backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
-                // Check before generation-lock admission can create any path.
-                try std.Io.Dir.cwd().access(io, path, .{});
+                if (comptime builtin.os.tag == .freestanding) {
+                    return error.UnsupportedPlatform;
+                } else {
+                    const io = backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+                    // Check before generation-lock admission can create any path.
+                    try std.Io.Dir.cwd().access(io, path, .{});
+                }
             }
             var generation_read_lease = if (opts.staged_generation) |staged_generation| staged_blk: {
                 try staged_generation.validatePath(path);
@@ -5824,7 +5829,9 @@ pub const DB = struct {
             .snapshot_replay_admission = async_resources.snapshot_replay_admission,
             .repair_replay_mutex = async_resources.repair_replay_mutex,
             .io = self.backend_runtime.io(),
-            .native_projection_owner = .{ .enabled = self.start_index_workers },
+            // Externally managed Lite runtimes publish projection files in
+            // their detached maintenance turn through the path writer lane.
+            .native_projection_owner = .{ .enabled = self.start_index_workers and self.start_independent_maintenance },
             .require_graph_resolution_contract = true,
             .visibility_observer = .{},
             .text_merge_runtime = null,
@@ -6848,6 +6855,8 @@ pub const DB = struct {
             self.ttl_cleanup_context = null;
             self.enrichment_owner.deinit(self.runtime_alloc);
             publishEnrichmentOwner(self);
+            if (self.retained_recovery_config) |*config| deinitOwnedEnrichmentConfig(self.runtime_alloc, config);
+            self.retained_recovery_config = null;
             self.resolution_owner.deinitRuntime(self.runtime_alloc);
             self.resolution_runtime = null;
             self.async_context.resolution_runtime = null;
@@ -40253,6 +40262,46 @@ pub const DB = struct {
         return removed;
     }
 
+    /// Adopt replay and identity state while the Lite owner holds writer
+    /// admission for the already refreshed serving cut.
+    pub fn adoptLiteWriterCut(self: *DB) !bool {
+        if (!self.core.tryLockApplyExclusive()) return false;
+        defer self.core.unlockApplyExclusive();
+        const sequence = try self.core.store.adoptWriterReplayCut();
+        const summary = try doc_identity.visibilitySummaryFromStore(self.core.store);
+        if (self.executor.hasWorkers()) {
+            try self.executor.failIfUnhealthy();
+            const indexes = try self.core.managedIndexes(self.alloc);
+            defer {
+                for (indexes) |entry| self.alloc.free(@constCast(entry.name));
+                self.alloc.free(indexes);
+            }
+            var minimum = sequence;
+            for (indexes) |entry| {
+                if (self.executor.appliedSequence(entry.name) == null) continue;
+                const applied = try self.core.loadAppliedSequence(self.alloc, entry.name);
+                if (sequence != 0 and applied > sequence) return false;
+                if (!self.executor.adoptDurableProgress(entry.name, applied)) return false;
+                minimum = @min(minimum, applied);
+            }
+            self.executor.releaseBacklogThrough(minimum);
+            const accounted = @max(minimum, self.lite_backlog_reconciled_through);
+            if (accounted < sequence) {
+                const Track = struct {
+                    fn record(executor: *derived_executor_mod.Executor, replay_sequence: u64, payload: []const u8) !void {
+                        try executor.trackBacklogBytes(replay_sequence, payload.len);
+                    }
+                };
+                try self.core.store.forEachReplayFrom(accounted + 1, self.executor, Track.record);
+            }
+            self.lite_backlog_reconciled_through = sequence;
+        }
+        self.core.identity_visibility.summary = summary;
+        self.core.identity_visibility.clearLive();
+        self.core.identity_visibility.clearNonvisible();
+        return true;
+    }
+
     fn refreshManagedIndexWorkersLocked(self: *DB) !void {
         if (!self.start_index_workers) return;
 
@@ -52741,7 +52790,7 @@ pub const DB = struct {
         const has_text = req.full_text != null or req.full_text_queries.len != 0 or
             (!db_query_search.isDefaultMatchAll(req.query) and db_query_search.isTextQuery(req.query));
         const has_dense = req.dense != null or req.dense_queries.len != 0;
-        const can_overlap = !req.count_only and req.limit != 0 and req.aggregations_json.len == 0 and
+        const can_overlap = !builtin.single_threaded and !req.count_only and req.limit != 0 and req.aggregations_json.len == 0 and
             (!req.include_stored or db_query_search.composedDefersComponentBodies(req)) and
             has_text and has_dense and req.full_text_queries.len <= 1 and
             req.dense_queries.len <= 1 and req.sparse == null and req.sparse_queries.len == 0 and
@@ -52787,7 +52836,7 @@ pub const DB = struct {
         var executor: db_query_search.ComposedSearchExecutor = .{
             .ctx = self,
             .component_ctx = &hybrid,
-            .search_components = if (hybrid.cut != null) HybridComponents.run else null,
+            .search_components = if (comptime builtin.single_threaded) null else if (hybrid.cut != null) HybridComponents.run else null,
             .resolve_structured_doc_filter = resolveStructuredDocFilterForComposedCallback,
             .resolve_structured_text_doc_filter = resolveStructuredTextDocFilterForComposedCallback,
             .search_text_query = searchTextQueryCallback,
@@ -54822,7 +54871,6 @@ pub const DB = struct {
     }
 
     fn searchDenseInternal(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery, speculative: bool) !types.SearchResult {
-        if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
         const metric_name = self.denseQueryMetricIndexName(req);
         const start_ns = platform_time.monotonicNs();
         errdefer observeSearchFailureMetric(metric_name, .vector, platform_time.monotonicNs() -| start_ns);
@@ -54974,7 +55022,6 @@ pub const DB = struct {
     ) !ProfiledDenseSearchWithCapturedRequestResult {
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         defer row_policy_lease.release();
-        if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
         try self.enforcePortableRuntimeGate();
         if (self.async_context.resource_manager) |manager| manager.beginForegroundQuery();
         defer if (self.async_context.resource_manager) |manager| manager.finishForegroundQuery();

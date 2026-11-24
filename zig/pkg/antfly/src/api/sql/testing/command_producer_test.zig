@@ -51,6 +51,9 @@ const Native = struct {
     outcome_reads: usize = 0,
     scope_reads: usize = 0,
     reject_retired_connection: bool = false,
+    route_legacy_scope_reads: bool = false,
+    legacy_scope_reads: usize = 0,
+    legacy_selector_rejections: usize = 0,
     topology_version: u16 = protocol.current_version,
     failure: ?enum { admit, prepare, commit, handoff, ack, cancel } = null,
     fail_before: bool = false,
@@ -641,11 +644,56 @@ test "SQL command producer native retired sources preserve independent connectio
 test "SQL command producer native scoped COMMIT survives every metadata delivery boundary and cold adoption" {
     const coordinator = @import("../session/prepared_coordinator.zig");
     const Forward = struct {
+        const HttpClient = @import("../../../metadata/http_client.zig").MetadataHttpClient;
+        const http = @import("../../../raft/transport/http_common.zig");
+
         fn status(_: *anyopaque) anyerror!@import("../../../metadata/api.zig").MetadataStatus {
             return error.UnexpectedStatusRead;
         }
-        fn catalog(raw: *anyopaque, alloc: A, _: local.api_operation.RequestContext, input: Call) anyerror![]u8 {
+        fn catalog(raw: *anyopaque, alloc: A, context: local.api_operation.RequestContext, input: Call) anyerror![]u8 {
+            const native: *Native = @ptrCast(@alignCast(raw));
+            if (input == .sql_prepared_read) {
+                return native.metadata.sqlPreparedRead(alloc, group, input.sql_prepared_read, context);
+            }
+            if (input == .sql_lock_read and native.route_legacy_scope_reads) {
+                var client = HttpClient.init(alloc, .{ .ptr = native, .vtable = &.{ .execute = legacyScopeRead } });
+                _ = client.withSettingAuthority("legacy-recovery-test-secret", "legacy-recovery-test");
+                var cancellation = http.RequestCancellation.fromToken(context.cancellation);
+                const read = try client.readSystemCatalog("http://legacy-metadata.invalid", input, try context.remainingTimeoutMs() orelse 5000, &cancellation);
+                errdefer read.deinit(alloc);
+                try std.testing.expectEqual(group, read.metadata_group_id);
+                try std.testing.expectEqualDeep(@as([32]u8, @splat('1')), read.metadata_incarnation);
+                return read.body;
+            }
             return Native.call(raw, alloc, input);
+        }
+        fn legacyScopeRead(raw: *anyopaque, alloc: A, request: http.HttpRequest) !http.HttpResponse {
+            const native: *Native = @ptrCast(@alignCast(raw));
+            const parsed = try std.json.parseFromSlice(Call, alloc, request.body, .{});
+            defer parsed.deinit();
+            try std.testing.expect(parsed.value == .sql_lock_read);
+            if (parsed.value.sql_lock_read.retired_connection != null) {
+                native.legacy_selector_rejections += 1;
+                const headers = try alloc.alloc(http.Header, 0);
+                return .{ .status = 400, .headers = headers, .body = try alloc.dupe(u8, "invalid catalog request") };
+            }
+            native.legacy_scope_reads += 1;
+            const response = try Native.call(raw, alloc, parsed.value);
+            errdefer alloc.free(response);
+            const headers = try alloc.alloc(http.Header, 2);
+            errdefer alloc.free(headers);
+            var initialized: usize = 0;
+            errdefer for (headers[0..initialized]) |header| {
+                alloc.free(header.name);
+                alloc.free(header.value);
+            };
+            for (headers, [_][]const u8{ "x-antfly-catalog-metadata-group", "x-antfly-catalog-metadata-incarnation" }, [_][]const u8{ "9223372036854775809", &@as([32]u8, @splat('1')) }) |*header, name, value| {
+                const owned_name = try alloc.dupe(u8, name);
+                errdefer alloc.free(owned_name);
+                header.* = .{ .name = owned_name, .value = try alloc.dupe(u8, value) };
+                initialized += 1;
+            }
+            return .{ .status = 200, .headers = headers, .body = response };
         }
     };
     var tmp = std.testing.tmpDir(.{});
@@ -677,7 +725,12 @@ test "SQL command producer native scoped COMMIT survives every metadata delivery
                     }
                     // Ordinary scoped commits also complete while the newer
                     // supersession decoder is available but inactive.
-                    if (fault == null) native.topology_version = protocol.sql_idle_session_reenrollment_version - 1;
+                    if (fault == null) {
+                        native.route_legacy_scope_reads = true;
+                        // A known active cut followed by a legacy receiver
+                        // simulates a routing change between observations.
+                        if (!before) native.topology_version = protocol.sql_idle_session_reenrollment_version - 1;
+                    }
                     try setup(&metadata, &durable, true, &native);
                     try native.until(&durable, .idle, 2);
                     const ticket = try begin(&native, &durable, 60);
@@ -698,7 +751,15 @@ test "SQL command producer native scoped COMMIT survives every metadata delivery
                     const result = try @import("../session/session.zig").Coordinator.commit(&owner, .{ .principal = "alice", .database = "default", .namespace = "public" }, try fixtureMutation(&server.txn_sessions, txn_id));
                     try std.testing.expectEqualDeep(txn_id, result.reconciliation_id);
                     try std.testing.expect(result.outcome == .committed or result.outcome == .aborted or result.outcome == .unknown or (native.block_ack and result.outcome == .committed_pending));
-                    if (fault == null) try std.testing.expectEqual(.committed, result.outcome);
+                    if (fault == null) {
+                        try std.testing.expectEqual(.committed, result.outcome);
+                        try std.testing.expect(native.legacy_scope_reads > 0);
+                        if (before) {
+                            try std.testing.expect(native.legacy_selector_rejections > 0);
+                        } else {
+                            try std.testing.expectEqual(@as(usize, 0), native.legacy_selector_rejections);
+                        }
+                    }
                     var durable_result = (try durable.load(txn_id)).?;
                     defer durable_result.deinit(a);
                     var seal = try std.json.parseFromSlice(transactions.ExternalPreparationSeal, a, durable_result.external_preparation.?, .{});

@@ -2068,6 +2068,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "provisioned table transition waiter queues ahead of later writers",
             "provisioned table transition waiter queues ahead of later readers",
             "provisioned table write source read request permits replicated apply activity",
+            "provisioned table write source merge finalize hands admission only to its committed entry",
             "provisioned table group operation waiter queues ahead of later readers",
             "provisioned table write source drop table cancels index repair before structural admission",
             "dropped table quarantine path keeps valid API names in one portable component",

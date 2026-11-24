@@ -325,11 +325,25 @@ pub fn runTask(handle: u32, json: []const u8, task: u32, validate_only: bool) !v
     try wire.scanJsonEnvelope(json, limits);
     const selected = adapter(model);
     if (model.metadata.value.tasks) |tasks| {
-        if (!model_caps.hasCapability(tasks, if (task == 0) "extract" else "decide")) return error.UnsupportedInferenceTask;
+        const task_name: []const u8 = switch (task) {
+            0 => "extract",
+            1 => "decide",
+            2 => "embed",
+            else => return error.UnsupportedInferenceTask,
+        };
+        if (!model_caps.hasCapability(tasks, task_name)) return error.UnsupportedInferenceTask;
     }
     var arena = std.heap.ArenaAllocator.init(model.budget.allocator());
     defer arena.deinit();
     const a = arena.allocator();
+    if (task == 2) {
+        if (model.config != .embedding) return error.UnsupportedInferenceTask;
+        if (model.metadata.value.capabilities) |caps| if (!model_caps.hasCapability(caps, "embedding_similarity")) return error.UnsupportedInferenceTask;
+        const bytes = try embedding.embed(model.budget.allocator(), &model.compute, model.config.embedding, model.tokenizer.?.tokenizer(), json, &model.embedding_model_identity, validate_only);
+        defer model.budget.allocator().free(bytes);
+        result = try ctx.allocator.dupe(u8, bytes);
+        return;
+    }
     if (task == 0) {
         if (!selected.extraction) return error.UnsupportedInferenceTask;
         return run(handle, json, validate_only);

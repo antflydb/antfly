@@ -747,6 +747,9 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
             namespace: ?doc_identity.Namespace,
             open_options: ManagedDbOpenOptions,
         ) !db_mod.DB {
+            var unclaimed_enrichment = enrichment_cfg;
+            defer if (unclaimed_enrichment) |*config|
+                db_mod.enrichment_runtime.releaseConfigProviders(allocator, config);
             const schema_before_index_load = try prepareManagedSchemaBeforeIndexLoad(allocator, open_mode, open_options.schema_json_before_index_load);
             defer if (schema_before_index_load) |schema| storage_schema.freeSchema(allocator, schema.runtime_schema);
 
@@ -1057,6 +1060,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         },
                 };
             };
+            unclaimed_enrichment = null;
             return try db_mod.DB.open(allocator, db_path, resolved_options);
         }
     }.run;

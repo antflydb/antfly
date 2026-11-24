@@ -2215,6 +2215,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const embedded_tests = b.addTest(.{
         .root_module = embedded_mod,
+        .use_llvm = @import("../../../build_support/embedded/source_owner.zig").llvmBackend(target.result),
         .filters = &.{"embedded"},
     });
     const run_embedded_tests = addFilteredTestRunArtifact(b, embedded_tests);
@@ -2224,12 +2225,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // surface test, so run the API fixtures in their owning module as well.
     const embedded_api_tests = b.addTest(.{
         .root_module = embedded_api_mod,
+        .use_llvm = @import("../../../build_support/embedded/source_owner.zig").llvmBackend(target.result),
         .filters = &.{
             "embedded api round-trips batch lookup scan and search over memory-backed durable lsm",
             "embedded api Cypher catalog and writes share portable retained graph values",
             "embedded api Cypher relational counts account for rejected storage candidates",
             "embedded api hosted profile drains derived indexing without native runtimes",
             "embedded api hosted profile persists text index across reopen over storage",
+            "embedded api hosted profile persists text and vectors over host file storage",
+            "embedded api host file storage implements the storage file contract",
+            "embedded api host file storage lists more names than one buffer holds",
             "embedded api createLite provisions default full text index",
             "embedded api openLite round-trips batch lookup over aflite file",
             "embedded api openLite manages index and enrichment definitions over aflite file",
@@ -2240,6 +2245,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_embedded_api_tests = addFilteredTestRunArtifact(b, embedded_api_tests);
     const portable_cypher_tests = b.addTest(.{
         .root_module = embedded_api_mod,
+        .use_llvm = @import("../../../build_support/embedded/source_owner.zig").llvmBackend(target.result),
         .filters = &.{ "embedded api Cypher catalog and writes", "embedded api Cypher relational counts", "embedded api Cypher document scans" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
@@ -2255,6 +2261,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         count_projection_mod.addImport("antfly_storage_root", count_projection_mod);
     const count_projection_tests = b.addTest(.{
         .root_module = count_projection_mod,
+        .use_llvm = @import("../../../build_support/embedded/source_owner.zig").llvmBackend(target.result),
         .filters = &.{"public graph metric borrowed wire owner COUNT validates"},
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
@@ -2287,6 +2294,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // explicit treatment as the API fixtures above.
     const embedded_db_tests = b.addTest(.{
         .root_module = embedded_db_mod,
+        .use_llvm = @import("../../../build_support/embedded/source_owner.zig").llvmBackend(target.result),
         .filters = &.{
             "embedded db standalone catalog changes require the server after snapshot reopen",
             "embedded custom storage owns its physical namespace",
@@ -4910,6 +4918,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "derived backlog tracker accounts payload and sequence ownership",
         "derived backlog tracker fails closed when sequence accounting allocation fails",
         "derived backlog tracker bounds sequence-only admission drain window",
+        "derived backlog retires the ordered prefix and compacts after half is retired",
         "hbc shared cache namespaces entries",
         "hbc index reports shared cache ownership",
         "hbc shared cache evicts across namespaces under one resource budget",

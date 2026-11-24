@@ -2048,7 +2048,15 @@ const RaftTableApplyStateMachine = struct {
         else
             protocol.withExactEnvelopeFloor(try protocol.completionProtocolVersion(self.alloc, req), exact_prepare);
         if (required_protocol) |required| {
-            if (comptime !linked_storage) return error.StorageKernelOwnerUnavailable;
+            if (comptime !linked_storage) {
+                // Ordinary producer rows and transactions use the same
+                // ordered physical dispatch in both owners. Retained history
+                // and scoped source protocols need the linked owner.
+                if (history_commit_time_ns != null or exact_prepare or
+                    (required != protocol.batch_row_producer_protocol_version and required != protocol.batch_nonhistory_producer_protocol_version) or
+                    @import("antfly_local_sources").api_internal_batch.requiresCompletionProtocol(req))
+                    return error.StorageKernelOwnerUnavailable;
+            }
             const projection = self.topology_apply_store orelse return error.StorageKernelOwnerUnavailable;
             const floor = projection.raftBatchProtocolVersionForRequest(group_id) catch |err| switch (err) {
                 error.SplitSourceProjectionNotReady, error.StorageBusy => return error.RaftApplyWriterUnavailable,
@@ -5747,6 +5755,18 @@ const ReplicatedTransitionLease = struct {
     fn release(self: *ReplicatedTransitionLease) void {
         if (comptime linked_storage) self.owner.deinit() else self.owner.release();
         if (self.activity) |*activity| activity.deinit();
+    }
+
+    fn takeActivity(self: *ReplicatedTransitionLease) antfly.public_api.ProvisionedTableWriteSource.GroupTransitionActivity {
+        if (comptime linked_storage) {
+            const activity = self.activity.?;
+            self.activity = null;
+            return activity;
+        }
+        const context: *TransitionDbLeaseContext = @ptrCast(@alignCast(self.owner.ctx));
+        const activity = context.activity;
+        context.activity.active = false;
+        return activity;
     }
 
     fn reconcile(self: *ReplicatedTransitionLease, alloc: std.mem.Allocator, store: *DataRaftApplyStore, group_id: u64, expected: ?DataRaftAppliedBatch) !DataServer.SplitProjectionReconcileResult {
@@ -22877,35 +22897,37 @@ pub const DataServer = struct {
                 try self.releaseRelationalMergeReceiver(op.donor_group_id, op.receiver_group_id, op.transition_id, op.table_contract);
                 return;
             }
-            // Proposal preflight acquires the ordinary catalog descriptor.
-            // The transition descriptor intentionally omits initial-range
-            // hints, so holding its native owner while proposing to that same
-            // donor waits for our own lease to drain. Keep transition activity
-            // through cutover, but release the copied owner's lease first.
-            var transition_activity: ?antfly.public_api.ProvisionedTableWriteSource.GroupTransitionActivity = null;
-            defer if (transition_activity) |*activity| activity.deinit();
-            var donor_lease = try self.leaseReplicatedTransitionOwner(
-                op.donor_group_id,
-                op.table_contract,
-                .source,
-                .exact,
-            );
-            var owner_released = false;
-            defer if (!owner_released) donor_lease.release();
-            const attempt = try self.replicateMergeCopyUnderLease(
-                op.transition_id,
-                op.donor_group_id,
-                op.receiver_group_id,
-                op.allow_doc_identity_reassignment,
-                op.table_contract,
-                &donor_lease,
-            );
-            if (comptime linked_storage) {
-                transition_activity = donor_lease.activity;
-                donor_lease.activity = null;
-                donor_lease.release();
-                owner_released = true;
-            }
+            // The source copy needs the transition writer, but proposal and
+            // committed apply need the ordinary writer. Drop only the copy
+            // writer before Raft, preserving the transition's admission.
+            var transition_activity: antfly.public_api.ProvisionedTableWriteSource.GroupTransitionActivity = undefined;
+            const attempt = copied: {
+                var donor_lease = try self.leaseReplicatedTransitionOwner(
+                    op.donor_group_id,
+                    op.table_contract,
+                    .source,
+                    .exact,
+                );
+                defer donor_lease.release();
+                const attempt = try self.replicateMergeCopyUnderLease(
+                    op.transition_id,
+                    op.donor_group_id,
+                    op.receiver_group_id,
+                    op.allow_doc_identity_reassignment,
+                    op.table_contract,
+                    &donor_lease,
+                );
+                transition_activity = donor_lease.takeActivity();
+                break :copied attempt;
+            };
+            defer transition_activity.deinit();
+            // The direct storage path shares the transition admission gate
+            // with ordered apply. Transfer it only to this committed finalize.
+            if (comptime !linked_storage) transition_activity.handoffMergeFinalize(.{
+                .kind = .finalize,
+                .transition_id = op.transition_id,
+                .receiver_group_id = op.receiver_group_id,
+            });
             try self.replicateMergeSourceTransition(
                 op.transition_id,
                 op.donor_group_id,
@@ -34793,6 +34815,12 @@ const RemoteMetadataSource = struct {
                     @max(1, remaining_ns / std.time.ns_per_ms),
                 ));
                 const read = client.readSystemCatalog(self.base_uris[index], input, attempt_ms, &cancellation) catch |err| {
+                    // The coordinator can retry this optional selector as a
+                    // plain read. Preserve its remaining budget for that read.
+                    if (input == .sql_lock_read and input.sql_lock_read.retired_connection != null) switch (err) {
+                        error.UnsupportedOperation, error.TableTopologyProtocolUpgradeRequired => return err,
+                        else => {},
+                    };
                     switch (err) {
                         error.InvalidCatalogName, error.CatalogNotFound, error.CatalogGenerationChanged, error.GenerationPublicationNotFound, error.GenerationPublicationChanged, error.InvalidGenerationPublication, error.UnsupportedNativeIndexOwner, error.CatalogPublicationProofPending, error.CatalogCommandTooLarge, error.OutOfMemory, error.Cancelled, error.Canceled => return err,
                         else => {
@@ -34812,6 +34840,7 @@ const RemoteMetadataSource = struct {
                     continue;
                 };
                 self.noteMetadataAuthoritySuccess(index);
+                if (request.sql_scope_supersession_ready) |ready| ready.* = read.sql_scope_supersession_ready;
                 return read.body;
             }
             if (terminal_error) |err| return err;
@@ -39597,6 +39626,55 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                     .policy_version = try @import("antfly_local_sources").privacy_catalog.policyBinding(response_alloc, table.indexes_json),
                 }, .{}) };
             }
+            if (std.mem.endsWith(u8, request.uri, antfly.metadata_http_routes.Routes.internal_decision_admission) or
+                std.mem.endsWith(u8, request.uri, antfly.metadata_http_routes.Routes.internal_transaction_admission))
+            {
+                const catalog_api = antfly.public_api.table_catalog;
+                const parsed = try std.json.parseFromSlice(antfly.metadata_api.DecisionAdmissionRequest, response_alloc, request.body, .{});
+                defer parsed.deinit();
+                const input = parsed.value;
+                const generation = try catalog_api.RoutingGeneration.createFromFullRecords(response_alloc, .{
+                    .metadata_group_id = snapshot.status.metadata_group_id,
+                    .metadata_incarnation = snapshot.status.metadata_incarnation,
+                    .catalog_revision = snapshot.status.metadata_epoch,
+                    .tables = snapshot.tables,
+                    .ranges = snapshot.ranges,
+                }, .{});
+                defer generation.release();
+                const Validation = struct {
+                    fn tableMatches(cut: *const antfly.metadata_api.AdminSnapshot, gen: *catalog_api.RoutingGeneration, id: u64, name: []const u8, epoch: ?u64) bool {
+                        const table = antfly.public_api.tables.findTableByName(cut, name) orelse return false;
+                        if (id != table.table_id) return false;
+                        catalog_api.validateTransactionTopologyStableSnapshot(cut, table.*) catch return false;
+                        if (epoch) |expected| {
+                            const view = gen.indexed.tableRoutingView(name, .{}) catch return false;
+                            if (view.topology_epoch != expected) return false;
+                        }
+                        return true;
+                    }
+                };
+                var result: antfly.metadata_api.DecisionAdmission = .{
+                    .metadata_group_id = snapshot.status.metadata_group_id,
+                    .metadata_incarnation = snapshot.status.metadata_incarnation,
+                    .catalog_revision = snapshot.status.metadata_epoch,
+                    .stable = Validation.tableMatches(snapshot, generation, input.table_id, input.table_name, null),
+                };
+                if (input.route_check) |check| {
+                    result.route_checked = true;
+                    const current = catalog_api.generationDecisionRoute(generation, input.table_name, check.route.group_id, .{}) catch null;
+                    result.stable = result.stable and current != null and current.?.topology_epoch == check.topology_epoch and std.meta.eql(current.?.route, check.route);
+                }
+                if (input.table_batch) |batch| {
+                    result.tables_checked = true;
+                    for (batch.tables) |table| {
+                        if (Validation.tableMatches(snapshot, generation, table.table_id, table.table_name, table.topology_epoch)) continue;
+                        result.stable = false;
+                        result.rejected_table_id = table.table_id;
+                        break;
+                    }
+                }
+                return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(response_alloc, result, .{}) };
+            }
             // This fixture owns metadata directly. Serve the same compact
             // read contract as production instead of relying on data caches
             // to stand in for the catalog authority.
@@ -39618,7 +39696,21 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                         const tables = try response_alloc.alloc(?catalog.ResolvedTable, input.targets.len);
                         defer response_alloc.free(tables);
                         for (input.targets, tables) |target, *table| table.* = resolve(snapshot, target);
-                        break :blk try std.json.Stringify.valueAlloc(response_alloc, catalog.ResolvedMany{ .revision = snapshot.status.metadata_epoch, .tables = tables }, .{});
+                        const storage_tables: []?catalog.ResolvedTable = if (input.include_storage_bindings)
+                            try response_alloc.alloc(?catalog.ResolvedTable, input.storage_names.len)
+                        else
+                            &.{};
+                        defer response_alloc.free(storage_tables);
+                        for (input.storage_names[0..storage_tables.len], storage_tables) |name, *binding| {
+                            const table = antfly.public_api.tables.findTableByName(snapshot, name) orelse {
+                                binding.* = null;
+                                continue;
+                            };
+                            var resolved = catalog.ResolvedTable.fromTable(table);
+                            if (input.include_query_definitions) resolved.query_definition = catalog.QueryDefinition.fromTable(table);
+                            binding.* = resolved;
+                        }
+                        break :blk try std.json.Stringify.valueAlloc(response_alloc, catalog.ResolvedMany{ .revision = snapshot.status.metadata_epoch, .tables = tables, .storage_tables = storage_tables }, .{});
                     },
                     .table_record_read => |name| blk: {
                         const table = antfly.public_api.tables.findTableByName(snapshot, name);
@@ -41337,6 +41429,16 @@ fn consumerTests() type {
                     return try snapshot(raw);
                 }
                 fn freeAdmin(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+                fn routingSnapshot(raw: *anyopaque, _: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
+                    const current = try snapshot(raw);
+                    return .{
+                        .metadata_group_id = group,
+                        .metadata_incarnation = incarnation,
+                        .catalog_revision = current.status.metadata_epoch,
+                        .tables = current.tables,
+                        .ranges = current.ranges,
+                    };
+                }
                 fn boot(raw: *anyopaque, alloc: std.mem.Allocator, query: boots.Query, _: ?u64) !boots.Observation {
                     const self: *@This() = @ptrCast(@alignCast(raw));
                     const bytes = try self.store.sqlRelationBootJson(alloc, group, query);
@@ -41346,7 +41448,15 @@ fn consumerTests() type {
                     return parsed.value;
                 }
                 fn catalog(self: *@This()) antfly.public_api.table_catalog.CatalogSource {
-                    return .{ .ptr = self, .vtable = &.{ .admin_snapshot = snapshot, .free_admin_snapshot = freeAdmin, .catalog_identity = identity, .sql_relation_boot = boot } };
+                    return .{ .ptr = self, .vtable = &.{
+                        .admin_snapshot = snapshot,
+                        .free_admin_snapshot = freeAdmin,
+                        .catalog_identity = identity,
+                        .routing_snapshot = routingSnapshot,
+                        .linearizable_routing_snapshot = routingSnapshot,
+                        .free_routing_snapshot = freeRoutingSnapshot,
+                        .sql_relation_boot = boot,
+                    } };
                 }
                 fn system(raw: *anyopaque, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
                     const self: *@This() = @ptrCast(@alignCast(raw));
@@ -41375,7 +41485,7 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(raw));
                     return self.store.loadRestoreStagingProgress(alloc, group, id);
                 }
-                fn generation(raw: *anyopaque, _: ?u64, authoritative: bool) !*antfly.public_api.table_catalog.RoutingGeneration {
+                fn generation(raw: *anyopaque, _: antfly.public_api.table_catalog.RoutingBudget, authoritative: bool) !*antfly.public_api.table_catalog.RoutingGeneration {
                     try std.testing.expect(authoritative);
                     const current = try snapshot(raw);
                     return antfly.public_api.table_catalog.RoutingGeneration.create(std.testing.allocator, .{ .metadata_group_id = group, .metadata_incarnation = incarnation, .catalog_revision = current.status.metadata_epoch, .tables = current.tables, .ranges = current.ranges }, .{});
@@ -41440,12 +41550,16 @@ fn consumerTests() type {
                 if (!constrained) {
                     // This is actual native-primary user data, committed only
                     // after the durable initialized-image proof was published.
-                    var row_owner = try owner.leaseTransitionOwner(42, "rows", old_descriptor);
-                    defer row_owner.deinit();
-                    var written = try row_owner.lease.entry.owner.batchJson("rows", "{\"inserts\":{\"old-row\":{\"id\":1}},\"sync_level\":\"write\"}");
-                    written.deinit();
-                    const populated = try row_owner.lease.entry.owner.nativeRelationBinding(scratch, "rows");
-                    try std.testing.expect(populated.has_user_data);
+                    const route = try antfly.public_api.table_catalog.routedGroupSnapshot(scratch, provider.catalog(), "rows", "old-row");
+                    const fence = route.fence() orelse return error.TestUnexpectedResult;
+                    _ = (try owner.writeSource().batchGroupLocalRouted(scratch, 42, "rows", .{
+                        .writes = &.{.{ .key = "old-row", .value = "{\"id\":1}" }},
+                        .sync_level = .write,
+                    }, fence)) orelse return error.TestUnexpectedResult;
+                    var reads = owner.readSource();
+                    reads.route_fence = fence;
+                    var populated = (try reads.lookupGroupLocal(scratch, 42, "rows", "old-row", .{}, .read_index)) orelse return error.TestUnexpectedResult;
+                    defer populated.deinit(scratch);
                 }
                 // Withhold the actual shutdown transport before deinit: an
                 // orderly native flush is not itself a metadata clean receipt.
@@ -41523,16 +41637,25 @@ fn consumerTests() type {
             forbidden.scope.plan_digest[0] ^= 1;
             try std.testing.expectError(error.RestoreStagingScopeChanged, DataServer.restoreOwnerControl(&restarted, scratch, "rows", 43, forbidden, .{}));
             {
-                var captured = try DataServer.recoverRestoreDescriptor(&restarted, scratch, 43, "rows", scope.digest(), plan.id, .read, .{});
-                defer captured.deinit(scratch);
-                var row_owner = try owner.leaseTransitionOwner(43, "rows", captured.descriptor);
-                defer row_owner.deinit();
                 // The owned status projection is not a user-row read grant.
-                try std.testing.expectError(error.RestoreStagingInProgress, row_owner.lease.entry.owner.lookupJson("rows", "{\"key\":\"old-row\"}"));
+                const reads = owner.readSource();
+                if (reads.lookupGroupLocal(scratch, 43, "rows", "old-row", .{}, .stale)) |row| {
+                    if (row) |value| {
+                        var unexpected = value;
+                        unexpected.deinit(scratch);
+                        return error.TestUnexpectedResult;
+                    }
+                } else |err| switch (err) {
+                    error.GroupNotFound, error.TableNotFound, error.StorageKernelOwnerUnavailable, error.RestoreStagingInProgress => {},
+                    else => return err,
+                }
                 // Imported scope is still mutable; it cannot attest finalized
                 // emptiness before the real validation/installation sequence.
-                const finalization_lookup = try antfly.public_api.table_reads.encodeStorageKernelLookupRequest(scratch, "", .{ .relational_topology_json = "{\"mode\":\"native_empty_finalization\"}", .restore_staging_scope = scope.digest(), .restore_staging_plan_id = plan.id });
-                try std.testing.expectError(error.RestoreValidationPending, row_owner.lease.entry.owner.lookupJson("rows", finalization_lookup));
+                try std.testing.expectError(error.RestoreValidationPending, reads.lookupGroupLocal(scratch, 43, "rows", "", .{
+                    .relational_topology_json = "{\"mode\":\"native_empty_finalization\"}",
+                    .restore_staging_scope = scope.digest(),
+                    .restore_staging_plan_id = plan.id,
+                }, .read_index));
             }
             // Empty-generation BEGIN actually completed import. Preserve its
             // phase-specific physical receipt before validation changes it.
@@ -41590,11 +41713,8 @@ fn consumerTests() type {
             try std.testing.expectEqual(.recovering, (try Provider.boot(&provider, scratch, .{ .node = 9 }, null)).record.?.phase);
             try std.testing.expectEqualDeep(before, (try Provider.boot(&provider, scratch, .{ .node = 9, .binding_table = 7 }, null)).initialized.?);
             if (constrained) {
-                var hidden = try DataServer.recoverRestoreDescriptor(&restarted, scratch, 43, "rows", scope.digest(), plan.id, .resolve, .{});
-                defer hidden.deinit(scratch);
-                var retained = try owner.leaseTransitionOwner(43, "rows", hidden.descriptor);
-                defer retained.deinit();
-                try std.testing.expect((try retained.lease.entry.owner.nativeRelationBinding(scratch, "rows")).has_transaction_state);
+                const retained = try owner.inspectUnpublishedNativeImage(scratch, 43, successor);
+                try std.testing.expectEqual(@as(?bool, true), retained.has_transaction_state);
             }
             // Publish the actual acceptance, then finish the physical owner.
             // PK validation leaves a real, resolved ordinary coordinator in
@@ -41616,13 +41736,10 @@ fn consumerTests() type {
             const ready_boot = try ready.requireReady();
             try owner.admitRelationHost(.{ .node_id = 9, .store_id = 11, .execution_instance = instance, .generation_instance = instance, .data_generation = 2 }, ready_boot.boot());
             _ = try owner.reconcileServingCatalogAtRoot(43, "rows", .{ .deadline_ns = platform_time.monotonicNs() +| 10 * std.time.ns_per_s });
-            const public_descriptor: kernel_owner_descriptor.Descriptor = .{ .lsm_root_generation = restarted.provisioned_storage.groupVisibleRootGenerationSource().visibleRootGenerationForGroup(43), .identity = .{ .table_id = 8, .shard_id = 43, .range_id = 43 }, .schema_json = schema, .indexes_json = "{}", .table_storage = target_table.storage, .sql_persistence = successor };
-            var public_owner = try owner.leaseTransitionOwner(43, "rows", public_descriptor);
-            defer public_owner.deinit();
-            const reopened = try public_owner.lease.entry.owner.nativeRelationBinding(scratch, "rows");
-            try std.testing.expect(reopened.descriptor.eql(successor));
-            try std.testing.expectEqual(initialized.binding.physical_root_incarnation, reopened.physical_root_incarnation);
-            try std.testing.expect(!reopened.has_user_data);
+            const reopened = try owner.inspectUnpublishedNativeImage(scratch, 43, successor);
+            try std.testing.expect(reopened.descriptor.?.eql(successor));
+            try std.testing.expectEqual(@as(?u128, initialized.binding.physical_root_incarnation), reopened.physical_root_incarnation);
+            try std.testing.expectEqual(@as(?bool, false), reopened.has_user_data);
         }
 
         test "data runtime native restore phase two rejoins activating descriptor authority" {
@@ -41841,7 +41958,7 @@ fn consumerTests() type {
                 try std.testing.expectError(err, TestBoundary.call("apply", &Callbacks.foreign, &Callbacks.apply, .{&err}));
             }
         }
-        test "native index claims data receiver rejects canceled and incompatible authority before owner acquisition" {
+        test "native index claims data receiver rejects canceled or misrouted requests before owner acquisition" {
             var server: DataServer = undefined;
             const control: antfly.public_api.relational_index_owner_execution.Request = .{ .table_id = 1, .group_id = 7, .id = @splat(3), .operation = .fence };
             const request: antfly.public_api.relational_index_owner_execution.ClaimRequest = .{ .table_id = 1, .group_id = 7, .id = @splat(3), .claims = &.{.{ .tuple = "claim", .parent_table = "docs", .parent_key = "row", .schema_version = 2 }} };
@@ -41851,10 +41968,7 @@ fn consumerTests() type {
             try std.testing.expectError(error.GenerationPublicationChanged, DataServer.nativeIndexOwnerControl(&server, std.testing.allocator, "docs", 8, control, .{}));
             try std.testing.expectError(error.Canceled, server.relationalIndexClaimPort().execute(std.testing.allocator, "docs", 7, request, .{ .cancellation = .fromAtomic(&signal) }));
             try std.testing.expectError(error.DeadlineExceeded, DataServer.nativeIndexClaimsControl(&server, std.testing.allocator, "docs", 7, request, .{ .deadline_ns = 0 }));
-            server.api_server_cfg = .{ .deployment_mode = .standalone };
-            server.data_raft = @ptrFromInt(4096);
-            try std.testing.expectError(error.UnsupportedNativeIndexOwner, DataServer.nativeIndexOwnerControl(&server, std.testing.allocator, "docs", 7, control, .{}));
-            try std.testing.expectError(error.UnsupportedNativeIndexOwner, DataServer.nativeIndexClaimsControl(&server, std.testing.allocator, "docs", 7, request, .{}));
+            try std.testing.expectError(error.GenerationPublicationChanged, DataServer.nativeIndexClaimsControl(&server, std.testing.allocator, "docs", 8, request, .{}));
         }
 
         test "data raft source scope metadata authorization captures fresh phase and cut" {
@@ -42234,6 +42348,19 @@ fn consumerTests() type {
                 observations: std.atomic.Value(usize) = .init(0),
                 reject_next: std.atomic.Value(bool) = .init(false),
                 cancellation: ?*const antfly.raft.transport.http_common.RequestCancellation = null,
+                accepted_basis: ?@import("../metadata/sql/relation_lifecycle/boots.zig").ReportBasis = null,
+
+                fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+                    return error.UnsupportedOperation;
+                }
+
+                fn systemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try context.ensureActive();
+                    if (input != .store_report_basis or input.store_report_basis != 20) return error.UnsupportedOperation;
+                    return std.json.Stringify.valueAlloc(alloc, self.accepted_basis, .{});
+                }
+
                 fn dispatch(server: *DataServer, kind: StoreStatusReportKind) !void {
                     const deadline = platform_time.monotonicNs() + 10 * std.time.ns_per_s;
                     while (true) {
@@ -42272,11 +42399,18 @@ fn consumerTests() type {
                     defer update.deinit();
                     var digest: [32]u8 = undefined;
                     std.crypto.hash.sha2.Sha256.hash(request.body, &digest, .{});
-                    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, store_report_update.Cursor{
+                    const cursor: store_report_update.Cursor = .{
                         .reporter_incarnation = update.value.report.reporter_incarnation,
                         .sequence = update.value.sequence,
                         .digest = digest,
-                    }, .{}) };
+                    };
+                    self.accepted_basis = .{
+                        .reporter_incarnation = cursor.reporter_incarnation,
+                        .status_generation = update.value.report.status_generation,
+                        .cursor = cursor,
+                        .header_digest = digest,
+                    };
+                    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, cursor, .{}) };
                 }
             };
             var fake: Fake = .{};
@@ -42301,7 +42435,7 @@ fn consumerTests() type {
                 .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(a),
                 .read_source = antfly.public_api.ProvisionedTableReadSource.init("/tmp/unused-report-worker", antfly.public_api.table_catalog.emptyCatalogSource(), antfly.raft.read_gate.alreadyReadSafeBarrier()),
                 .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-report-worker", antfly.public_api.table_catalog.emptyCatalogSource()),
-                .status_source = undefined,
+                .status_source = .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.systemCatalog } },
                 .api_server_cfg = .{},
                 .query_async_limit = .nothing,
                 .listener_cfg = undefined,
@@ -42744,6 +42878,97 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 1), fake.calls);
         }
 
+        test "system catalog remote recovery preserves plain fallback budget after selector rejection" {
+            const alloc = std.testing.allocator;
+            const Http = antfly.common.http;
+            const Call = @import("../system_catalog/server_call.zig").Call;
+            const VoprIo = @import("vopr").vopr_io.VoprIo;
+            const Fake = struct {
+                clock: *VoprIo,
+                rejection: u16,
+                calls: usize = 0,
+                slow_calls: usize = 0,
+
+                fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: Http.HttpRequest) !Http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (std.mem.startsWith(u8, request.uri, "http://slow.invalid/")) {
+                        self.slow_calls += 1;
+                        try self.clock.advance(@as(u64, request.timeout_ms.?) * std.time.ns_per_ms);
+                        return error.Timeout;
+                    }
+                    self.calls += 1;
+                    const call = try std.json.parseFromSlice(Call, a, request.body, .{});
+                    defer call.deinit();
+                    switch (self.calls) {
+                        1 => try std.testing.expect(call.value == .sql_prepared_read),
+                        2 => {
+                            try std.testing.expect(call.value == .sql_lock_read and call.value.sql_lock_read.retired_connection != null);
+                            try self.clock.advance(250 * std.time.ns_per_ms);
+                            return .{ .status = self.rejection, .body = try a.dupe(u8, if (self.rejection == 400) "invalid catalog request" else "TableTopologyProtocolUpgradeRequired") };
+                        },
+                        3 => {
+                            try std.testing.expect(call.value == .sql_lock_read and call.value.sql_lock_read.retired_connection == null);
+                            try std.testing.expectEqual(@as(u32, 750), request.timeout_ms.?);
+                        },
+                        else => return error.TestUnexpectedResult,
+                    }
+                    const names = [_][]const u8{ "x-antfly-catalog-metadata-group", "x-antfly-catalog-metadata-incarnation", antfly.metadata_http_client.MetadataHttpClient.sql_scope_supersession_header };
+                    const values = [_][]const u8{ "9", "11111111111111111111111111111111", "1" };
+                    const headers = try a.alloc(Http.Header, if (self.calls == 1) 3 else 2);
+                    var initialized: usize = 0;
+                    errdefer {
+                        for (headers[0..initialized]) |header| {
+                            a.free(header.name);
+                            a.free(header.value);
+                        }
+                        a.free(headers);
+                    }
+                    for (headers, names[0..headers.len], values[0..headers.len]) |*header, name, value| {
+                        const owned_name = try a.dupe(u8, name);
+                        errdefer a.free(owned_name);
+                        header.* = .{ .name = owned_name, .value = try a.dupe(u8, value) };
+                        initialized += 1;
+                    }
+                    return .{ .status = 200, .headers = headers, .body = try a.dupe(u8, "null") };
+                }
+            };
+            for ([_]u16{ 400, 426 }) |rejection| {
+                var clock = try VoprIo.init(.{ .monotonic_ns = 7 * std.time.ns_per_s });
+                defer clock.deinit();
+                const io = clock.io();
+                var fake: Fake = .{ .clock = &clock, .rejection = rejection };
+                var source = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{ "http://leader.invalid", "http://slow.invalid" }, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, io);
+                defer source.deinit();
+                source.setting_authority_secret = "scope-recovery-test-secret";
+                source.setting_authority_issuer = "scope-recovery-test";
+                const context: antfly.public_api.operation.RequestContext = .{
+                    .deadline_ns = source.awakeNs() + std.time.ns_per_s,
+                    .deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io),
+                    .setting_admin = true,
+                };
+                var ready = false;
+                var prepared_context = context;
+                prepared_context.sql_scope_supersession_ready = &ready;
+                alloc.free(try RemoteMetadataSource.remoteSystemCatalog(&source, alloc, prepared_context, .{ .sql_prepared_read = .{ .operation = @splat(1) } }));
+                try std.testing.expect(ready);
+                var lock: Call = .{ .sql_lock_read = .{
+                    .incarnation = @splat(0x11),
+                    .standalone = false,
+                    .actor = .{ .session_user = .bootstrap, .credential = "" },
+                    .database = 1,
+                    .backend = .{ .incarnation = @splat(0x11), .id = @splat(2), .fence = 1 },
+                    .retired_connection = .{ .id = @splat('a'), .node = 1 },
+                } };
+                try std.testing.expectError(if (rejection == 400) error.UnsupportedOperation else error.TableTopologyProtocolUpgradeRequired, RemoteMetadataSource.remoteSystemCatalog(&source, alloc, context, lock));
+                lock.sql_lock_read.retired_connection = null;
+                const body = try RemoteMetadataSource.remoteSystemCatalog(&source, alloc, context, lock);
+                defer alloc.free(body);
+                try std.testing.expectEqualStrings("null", body);
+                try std.testing.expectEqual(@as(usize, 3), fake.calls);
+                try std.testing.expectEqual(@as(usize, 0), fake.slow_calls);
+            }
+        }
+
         test "system catalog remote reads spend one caller budget across bounded RPC attempts" {
             const alloc = std.testing.allocator;
             const Http = antfly.common.http;
@@ -43048,6 +43273,8 @@ fn consumerTests() type {
             try std.testing.expectEqualStrings("newly_created", updated.tables[0].name);
             try std.testing.expectEqual(@as(u64, 1), source.cached_snapshot.?.status.metadata_epoch);
 
+            // Change the immutable catalog cut to fence this in-flight reply.
+            tables[0].name = "newly_published";
             const ticket = source.beginLinearizableSnapshot();
             try std.testing.expectEqual(RemoteMetadataSource.LinearizableSnapshotAcceptance.published, try source.acceptLinearizableSnapshot(try cloneAdminSnapshotOwned(alloc, old), ticket));
             old.tables = &.{};
@@ -43055,6 +43282,7 @@ fn consumerTests() type {
             var superseded = try source.acceptObservedSnapshot(try cloneAdminSnapshotOwned(alloc, old), head, 0, 3);
             defer freeAdminSnapshotOwned(alloc, &superseded);
             try std.testing.expectEqual(@as(usize, 1), superseded.tables.len);
+            try std.testing.expectEqualStrings("newly_published", superseded.tables[0].name);
             source.invalidateCache();
             try std.testing.expectError(error.MetadataSnapshotHeadMismatch, source.acceptObservedSnapshot(try cloneAdminSnapshotOwned(alloc, old), head, 0, 4));
             try std.testing.expect(source.cached_snapshot == null);
@@ -44769,14 +44997,14 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     return self.reported_identity;
                 }
-                fn acquire(ptr: *anyopaque, deadline_ns: ?u64, authoritative: bool) !*catalog_mod.RoutingGeneration {
+                fn acquire(ptr: *anyopaque, budget: catalog_mod.RoutingBudget, authoritative: bool) !*catalog_mod.RoutingGeneration {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expect(!authoritative);
                     // Catalogs without an I/O clock use platform monotonic.
                     // Passing the worker's raw Threaded awake deadline here
                     // expires immediately on Darwin despite a live quantum.
-                    try std.testing.expect(deadline_ns != null);
-                    try (catalog_mod.RoutingBudget{ .deadline_ns = deadline_ns }).checkpoint();
+                    try std.testing.expect(budget.deadline_ns != null);
+                    try budget.checkpoint();
                     self.captures += 1;
                     self.generation.retain();
                     return self.generation;
@@ -45989,7 +46217,12 @@ fn consumerTests() type {
             defer a.free(frame);
             var apply = try RaftTableApplyStateMachine.init(a, "/unused-schema-control", antfly.public_api.table_catalog.emptyCatalogSource(), null);
             defer apply.deinit();
-            try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, RaftTableApplyStateMachine.applyReady(&apply, 72, null, &.{.{ .term = 1, .index = 1, .entry_type = .normal, .data = frame }}, &.{}));
+            const expected = if (linked_storage and
+                @import("../common/data_raft_protocol.zig").batch_protocol_version >= @import("../common/data_raft_protocol.zig").batch_schema_owner_control_protocol_version)
+                error.StorageKernelOwnerUnavailable
+            else
+                error.UnsupportedRaftBatchProtocolVersion;
+            try std.testing.expectError(expected, RaftTableApplyStateMachine.applyReady(&apply, 72, null, &.{.{ .term = 1, .index = 1, .entry_type = .normal, .data = frame }}, &.{}));
             try std.testing.expectEqual(@as(u64, 0), apply.appliedIndex(72));
             try std.testing.expectEqual(@as(u64, 0), apply.retry_apply_checkpoints.get(72).?.completed_index);
         }
@@ -50897,9 +51130,25 @@ fn consumerTests() type {
                 fn tableSnapshot(ptr: *anyopaque, _: []const u8, deadline: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
                     return routingSnapshot(ptr, deadline);
                 }
+                fn decisionAdmission(ptr: *anyopaque, request: antfly.metadata_api.DecisionAdmissionRequest, budget: antfly.public_api.table_catalog.RoutingBudget) !antfly.metadata_api.DecisionAdmission {
+                    const catalog_api = antfly.public_api.table_catalog;
+                    var cut = try routingSnapshot(ptr, budget.deadline_ns);
+                    defer catalog_api.TestAdminRoutingAdapter(snapshot, free).freeRoutingSnapshot(ptr, &cut);
+                    const generation = try catalog_api.RoutingGeneration.create(std.testing.allocator, cut, budget);
+                    defer generation.release();
+                    const check = request.route_check orelse return error.InvalidBatchRequest;
+                    const current = try catalog_api.generationDecisionRoute(generation, request.table_name, check.route.group_id, budget);
+                    return .{
+                        .metadata_group_id = current.metadata_group_id,
+                        .metadata_incarnation = current.metadata_incarnation,
+                        .catalog_revision = current.catalog_revision,
+                        .stable = current.table_id == request.table_id and current.topology_epoch == check.topology_epoch and std.meta.eql(current.route, check.route),
+                        .route_checked = true,
+                    };
+                }
                 fn iface(ptr: *anyopaque) antfly.public_api.table_catalog.CatalogSource {
                     const Adapter = antfly.public_api.table_catalog.TestAdminRoutingAdapter(snapshot, free);
-                    return .{ .ptr = ptr, .vtable = &.{ .admin_snapshot = snapshot, .free_admin_snapshot = free, .routing_snapshot = routingSnapshot, .table_routing_snapshot = tableSnapshot, .linearizable_table_routing_snapshot = tableSnapshot, .linearizable_routing_snapshot = routingSnapshot, .free_routing_snapshot = Adapter.freeRoutingSnapshot } };
+                    return .{ .ptr = ptr, .vtable = &.{ .admin_snapshot = snapshot, .free_admin_snapshot = free, .routing_snapshot = routingSnapshot, .table_routing_snapshot = tableSnapshot, .linearizable_table_routing_snapshot = tableSnapshot, .linearizable_routing_snapshot = routingSnapshot, .free_routing_snapshot = Adapter.freeRoutingSnapshot, .decision_admission = decisionAdmission } };
                 }
             };
             var tmp = std.testing.tmpDir(.{});
@@ -51010,9 +51259,11 @@ fn consumerTests() type {
             try std.testing.expectError(error.GroupLeaderUnavailable, server.submitHistoryControlLocal(a, unknown_group, "docs", .{ .enroll = grant }));
             try std.testing.expectEqual(@as(usize, 0), server.data_raft_protocol_activations.count());
             const submitted = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .enroll = grant });
-            try std.testing.expect(submitted.outcome != null);
-            try std.testing.expectEqual(@as(u64, 1), submitted.outcome.?.applied.consumer.?.epoch);
             try std.testing.expect(submitted.entry.index > 1);
+            // Confirmation can time out on a busy test host after acceptance.
+            // Recover the exact receipt through ReadIndex without replaying it.
+            const enrolled = submitted.outcome orelse try server.recoverHistoryControlLocal(a, route.fence().?, "docs", .{ .enroll = grant }, submitted.entry);
+            try std.testing.expectEqual(@as(u64, 1), enrolled.applied.consumer.?.epoch);
             try std.testing.expectEqual(@import("history_control_entry.zig").required_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
             const ref: control.Reference = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .epoch = 1, .grant = 1, .definition = grant.definition };
             for ([_][]const u8{ "{\"v\":1}", "{\"v\":2}" }) |value| {
@@ -51089,7 +51340,9 @@ fn consumerTests() type {
                 };
                 try peers.groups.put(a, 601, .{ .leader = 1 });
                 try peers.groups.getPtr(601).?.nodes.append(a, 1);
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                // Route against this fixed fixture cut even when a preceding
+                // native effect outlasts the normal peer-view cache TTL.
+                metadata_source.control_read_generation_at_ms = std.math.maxInt(u64);
                 const origin = try a.create(DataServer);
                 defer a.destroy(origin);
                 origin.* = .{ .alloc = a, .backend_runtime = runtime.ptr(), .remote_metadata = &metadata_source, .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(a), .read_source = antfly.public_api.ProvisionedTableReadSource.init(root, catalog, antfly.raft.read_gate.unavailableReadSafetyBarrier()), .write_source = antfly.public_api.ProvisionedTableWriteSource.init(root, catalog), .status_source = undefined, .api_server_cfg = .{ .internal_service_secret = secret, .internal_service_issuer = "history-runtime" }, .query_async_limit = .nothing, .listener_cfg = undefined };
@@ -51116,7 +51369,6 @@ fn consumerTests() type {
                 try std.testing.expectEqual(before_remote, after_remote);
                 const page_contract = @import("../api/history_page_operations.zig");
                 const page_input: page_contract.Request = .{ .version = 1, .request = .{ .reference = ref, .after = .{}, .now_seconds = 100 } };
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 var first_page = try origin.historyPagePort().read(a, route.fence().?, "docs", page_input, .{});
                 defer first_page.deinit();
                 try std.testing.expectEqual(@as(usize, 1), first_page.events.len);
@@ -51125,23 +51377,19 @@ fn consumerTests() type {
                 try std.testing.expect(!first_page.caught_up);
                 var next_page_input = page_input;
                 next_page_input.request.after = first_page.next;
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 var second_page = try origin.historyPagePort().read(a, route.fence().?, "docs", next_page_input, .{});
                 defer second_page.deinit();
                 try std.testing.expectEqualStrings("{\"v\":1}", second_page.events[0].before.?);
                 try std.testing.expectEqualStrings("{\"v\":2}", second_page.events[0].after.?);
                 try std.testing.expect(second_page.caught_up);
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 var replay_page = try origin.historyPagePort().read(a, route.fence().?, "docs", page_input, .{});
                 defer replay_page.deinit();
                 try std.testing.expectEqualDeep(first_page.events, replay_page.events);
                 // Reads do not ACK; the original page remains replayable.
                 var small_page_input = page_input;
                 small_page_input.request.max_bytes = 1;
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 try std.testing.expectError(error.HistoryTooLarge, origin.historyPagePort().read(a, route.fence().?, "docs", small_page_input, .{}));
                 const missing_snapshot: page_contract.Bootstrap.Request = .{ .version = 1, .request = .{ .reference = ref, .digest = @splat(77), .now_seconds = 100 } };
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 try std.testing.expectError(error.HistoryResynchronizationRequired, origin.historyBootstrapPagePort().read(a, route.fence().?, "docs", missing_snapshot, .{}));
                 var remote_input: ingress.wire.Request = .{ .version = 1, .operation = .submit, .command = .{ .inspect = ref } };
                 const submit_body = try std.json.Stringify.valueAlloc(a, remote_input, .{});
@@ -51154,7 +51402,6 @@ fn consumerTests() type {
                 const unknown_remote = blk: {
                     server.data_request_lifecycle_hook = .{ .ptr = server, .reach_fn = Loss.reach };
                     defer server.data_request_lifecycle_hook = null;
-                    metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                     break :blk try ingress.execute(origin.historyControlPort(), a, 601, "docs", submit_body, .{ .catalog_route_fence_json = encoded_fence });
                 };
                 try std.testing.expect(!unknown_remote.confirmed());
@@ -51162,12 +51409,10 @@ fn consumerTests() type {
                 try std.testing.expectEqual(after_remote + 1, unknown_remote.receipt.?.index);
                 const grant_operations = @import("../api/history_grant_operations.zig");
                 const grant_input: grant_operations.Request = .{ .version = 1, .identity = control.GrantIdentity.fromGrant(grant) };
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 const actual_grant = try origin.historyGrantPort().read(a, route.fence().?, "docs", grant_input, .{});
                 try std.testing.expectEqual(@as(u64, 1), actual_grant.active.consumer.epoch);
                 var absent_grant = grant_input;
                 absent_grant.identity.consumer = @splat(4);
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 try std.testing.expectEqual(@as(u64, 0), (try origin.historyGrantPort().read(a, route.fence().?, "docs", absent_grant, .{})).absent);
                 const resolution_operations = @import("../api/history_resolution_operations.zig");
                 const resolution_input: resolution_operations.Request = .{ .version = 1, .authority = .raft, .namespace = namespace, .transaction_id = @splat(91), .owner_fence = @splat(92), .manifest_digest = @splat(93), .commit_version = 94, .minimum_applied_index = 1 };
@@ -51176,7 +51421,6 @@ fn consumerTests() type {
                     defer server.data_raft_mutex.unlock();
                     break :blk managed.host.http_host.host.raftStatus(601).?.last_index;
                 };
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 const remote_resolution = try origin.historyResolutionPort().read(a, route.fence().?, "docs", resolution_input, .{});
                 try remote_resolution.validate(resolution_input.binding());
                 try std.testing.expect(remote_resolution.resolution == null);
@@ -51190,7 +51434,6 @@ fn consumerTests() type {
                 remote_input.receipt = unknown_remote.receipt;
                 const recover_body = try std.json.Stringify.valueAlloc(a, remote_input, .{});
                 defer a.free(recover_body);
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 const confirmed_remote = try ingress.execute(origin.historyControlPort(), a, 601, "docs", recover_body, .{ .catalog_route_fence_json = encoded_fence });
                 try std.testing.expect(confirmed_remote.confirmed());
                 try std.testing.expectEqualDeep(unknown_remote.receipt, confirmed_remote.receipt);
@@ -51214,7 +51457,7 @@ fn consumerTests() type {
                 defer a.destroy(meta_store);
                 meta_store.* = try FeedStore.init(a, .{ .root_dir = meta_path });
                 defer meta_store.deinit();
-                var feed_svc: feed_fixture.Service = .{ .store = meta_store, .id = @splat(6), .authority = grant.authority, .max_topology_protocol = feed_control.physical_history_protocol_version };
+                var feed_svc: feed_fixture.Service = .{ .store = meta_store, .id = @splat(6), .authority = grant.authority, .max_topology_protocol = feed_control.native_collection_protocol_version };
                 const feed_table: antfly.metadata.table_manager.TableRecord = .{ .table_id = 7, .name = "docs", .placement_role = "data", .schema_json = "{}", .indexes_json = "{}" };
                 try meta_store.applyStandaloneCommand(feed_svc.metadata_group_id, .{ .upsert_table = feed_table });
                 try feed_svc.mutate(a, .{ .create = .{ .id = feed_svc.id, .definition = .{ .owner = @splat(1), .authorization = @splat(2), .tables = &.{.{ .table_id = 7, .binding = feed_control.tableBinding(feed_table), .policy_revision = 1, .contract = .native_document }} }, .now = 100, .expires_at = 1000 } });
@@ -51232,7 +51475,6 @@ fn consumerTests() type {
                     try feed_svc.mutate(a, .{ .plan_roots = plans });
                 }
                 const DriverPolicy = struct {
-                    source: *RemoteMetadataSource,
                     roots: @import("../api/history_roots.zig").Source,
                     base: feed_policy = .{},
                     pub fn authorizeRoot(self: *@This(), state: feed_control.State, ns: feed_control.Namespace, request: feed_fixture.Request) !void {
@@ -51241,7 +51483,6 @@ fn consumerTests() type {
                     pub fn validateRoot(self: *@This(), state: feed_control.State, ns: feed_control.Namespace, frozen: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: feed_fixture.Request) !void {
                         try self.base.validateRoot(state, ns, frozen, table, request);
                         try self.roots.validate(std.testing.allocator, state, ns, frozen, table, try self.base.context(request));
-                        self.source.control_read_generation_at_ms = self.source.awakeMs();
                     }
                     pub fn newAttempt(self: *@This(), state: feed_control.State, ns: feed_control.Namespace, request: feed_fixture.Request) !feed_control.Id {
                         return self.base.newAttempt(state, ns, request);
@@ -51250,7 +51491,7 @@ fn consumerTests() type {
                         return self.base.context(request);
                     }
                 };
-                var driver_policy: DriverPolicy = .{ .source = &metadata_source, .roots = origin.historyRootsSource() };
+                var driver_policy: DriverPolicy = .{ .roots = origin.historyRootsSource() };
                 {
                     var feed_state = try feed_svc.load(a);
                     defer feed_state.deinit();
@@ -51308,13 +51549,18 @@ fn consumerTests() type {
                         var pulled = try feed_delivery.pull(svc, &provider, allocator, svc.id, state.value.latest_cursor, .{}, Context{});
                         defer pulled.deinit();
                         try std.testing.expectEqualStrings("{\"version\":1,\"events\":[],\"transaction\":null}", pulled.body);
-                        var replayed = try feed_delivery.pull(svc, &provider, allocator, svc.id, state.value.latest_cursor, .{}, Context{});
-                        defer replayed.deinit();
-                        try std.testing.expect(replayed.replayed);
-                        try std.testing.expectEqual(pulled.cursor, replayed.cursor);
+                        // An idle pull is a heartbeat and has no stored delivery
+                        // receipt. Repeating it leaves the cursor and sequence unchanged.
+                        var repeated = try feed_delivery.pull(svc, &provider, allocator, svc.id, state.value.latest_cursor, .{}, Context{});
+                        defer repeated.deinit();
+                        try std.testing.expect(!pulled.replayed and !repeated.replayed);
+                        try std.testing.expectEqual(state.value.latest_cursor, pulled.cursor);
+                        try std.testing.expectEqual(state.value.latest_delivery, pulled.sequence);
+                        try std.testing.expectEqual(pulled.cursor, repeated.cursor);
+                        try std.testing.expectEqual(pulled.sequence, repeated.sequence);
+                        try std.testing.expectEqualStrings(pulled.body, repeated.body);
                     }
                 };
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 try RoutedFeedHarness.run(a, &feed_svc, origin.historyRootsSource());
                 const final_driver_index = blk: {
                     lockAtomic(&server.data_raft_mutex);
@@ -51523,12 +51769,15 @@ fn consumerTests() type {
                             {
                                 svc.lose_ack_at = svc.proposals + 1;
                                 defer svc.lose_ack_at = null;
-                                try std.testing.expectError(error.MetadataMutationOutcomeUnknown, api.execute(http_api, allocator, credential, .{ .id = created.id, .after = snapshot.page.cursor }, null, .{}));
+                                // The durable metadata read confirms this ACK
+                                // even when its original apply reply was lost.
+                                var confirmed = try api.execute(http_api, allocator, credential, .{ .id = created.id, .after = snapshot.page.cursor }, null, .{});
+                                defer confirmed.deinit();
+                                try std.testing.expectEqual(snapshot.page.cursor, confirmed.acknowledged);
                             }
                             const maintenance: antfly.public_api.operation.RequestContext = .{ .principal = .{ .kind = .internal, .subject = "changefeed-maintenance" } };
                             const metadata_port = http_api.source.changefeeds.?;
                             try std.testing.expectError(error.Forbidden, api.maintainNativeFeed(metadata_port, source, http_api.inferenceIo(), allocator, created.id, .{}));
-                            try api.maintainNativeFeed(metadata_port, source, http_api.inferenceIo(), allocator, created.id, maintenance);
                             const LostRelease = struct {
                                 fn reach(_: *anyopaque, event: DataRequestLifecycleEvent) !void {
                                     if (event.phase == .proposal_accepted) return error.InjectedSnapshotReleaseReplyLoss;
@@ -51537,8 +51786,9 @@ fn consumerTests() type {
                             {
                                 node.data_request_lifecycle_hook = .{ .ptr = node, .reach_fn = LostRelease.reach };
                                 defer node.data_request_lifecycle_hook = null;
-                                try std.testing.expectError(error.MetadataMutationOutcomeUnknown, api.execute(http_api, allocator, credential, .{ .id = created.id, .after = snapshot.page.cursor }, null, .{}));
+                                try std.testing.expectError(error.MetadataMutationOutcomeUnknown, api.maintainNativeFeed(metadata_port, source, http_api.inferenceIo(), allocator, created.id, maintenance));
                             }
+                            try api.maintainNativeFeed(metadata_port, source, http_api.inferenceIo(), allocator, created.id, maintenance);
                             var ack = try api.execute(http_api, allocator, credential, .{ .id = created.id, .after = snapshot.page.cursor }, null, .{});
                             defer ack.deinit();
                             const bytes = try svc.store.getChangefeedControl(allocator, svc.metadata_group_id, created.id);
@@ -51573,7 +51823,8 @@ fn consumerTests() type {
                         defer current.deinit();
                         const item = current.value.roots[0];
                         try std.testing.expectEqual(item.start + 1, item.acknowledged.sequence);
-                        try std.testing.expectEqual(item.acknowledged.sequence, item.reclaimed_through);
+                        try std.testing.expectEqual(item.start, item.reclaimed_through);
+                        try std.testing.expect(current.value.pendingNativeAcknowledgment() != null);
                         const before_collect = blk: {
                             lockAtomic(&node.data_raft_mutex);
                             defer node.data_raft_mutex.unlock();
@@ -51585,7 +51836,32 @@ fn consumerTests() type {
                         {
                             lockAtomic(&node.data_raft_mutex);
                             defer node.data_raft_mutex.unlock();
-                            try std.testing.expectEqual(before_collect + 1, node.data_raft.?.host.http_host.host.raftStatus(fence.route.group_id).?.last_index);
+                            try std.testing.expectEqual(before_collect, node.data_raft.?.host.http_host.host.raftStatus(fence.route.group_id).?.last_index);
+                        }
+                        const metadata_port = http_api.source.changefeeds.?;
+                        const maintenance: antfly.public_api.operation.RequestContext = .{ .principal = .{ .kind = .internal, .subject = "changefeed-maintenance" } };
+                        try api.maintainNativeFeed(metadata_port, source, http_api.inferenceIo(), allocator, created.id, maintenance);
+                        {
+                            const collected_bytes = try metadata_port.read(allocator, created.id, maintenance);
+                            defer allocator.free(collected_bytes);
+                            var collected = try feed_control.parse(allocator, collected_bytes);
+                            defer collected.deinit();
+                            const collected_root = collected.value.roots[0];
+                            try std.testing.expectEqual(item.acknowledged.sequence, collected_root.reclaimed_through);
+                            try std.testing.expectEqual(item.acknowledged.sequence, collected_root.native_collected_through.?);
+                            try std.testing.expect(collected.value.pendingNativeAcknowledgment() == null);
+                        }
+                        const after_collect = blk: {
+                            lockAtomic(&node.data_raft_mutex);
+                            defer node.data_raft_mutex.unlock();
+                            break :blk node.data_raft.?.host.http_host.host.raftStatus(fence.route.group_id).?.last_index;
+                        };
+                        try std.testing.expectEqual(before_collect + 2, after_collect);
+                        try api.maintainNativeFeed(metadata_port, source, http_api.inferenceIo(), allocator, created.id, maintenance);
+                        {
+                            lockAtomic(&node.data_raft_mutex);
+                            defer node.data_raft_mutex.unlock();
+                            try std.testing.expectEqual(after_collect, node.data_raft.?.host.http_host.host.raftStatus(fence.route.group_id).?.last_index);
                         }
                         feed_catalog.logical_name = "renamed_docs";
                         try std.testing.expectError(error.Forbidden, api.execute(http_api, allocator, credential, .{ .id = created.id, .after = ack.acknowledged }, .{}, .{}));
@@ -51611,8 +51887,6 @@ fn consumerTests() type {
                         try std.testing.expectEqual(feed_control.Phase.deleted, deleted.value.phase);
 
                         const expiring = try api.create(http_api, allocator, credential, "expiring-feed", definition, .{});
-                        const metadata_port = http_api.source.changefeeds.?;
-                        const maintenance: antfly.public_api.operation.RequestContext = .{ .principal = .{ .kind = .internal, .subject = "changefeed-maintenance" } };
                         const active_bytes = try metadata_port.read(allocator, expiring.id, maintenance);
                         defer allocator.free(active_bytes);
                         var active_feed = try feed_control.parse(allocator, active_bytes);
@@ -51685,11 +51959,6 @@ fn consumerTests() type {
                             result.* = PublicFeedHarness.run(allocator, svc, source, table, node, fence, false);
                         }
                     };
-                    // This fixture supplies one immutable peer generation and
-                    // has no metadata HTTP server. Password checks can exceed
-                    // the production cache TTL within the test workflow.
-                    metadata_source.control_read_generation_at_ms = std.math.maxInt(u64);
-                    defer metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                     var outcome: anyerror!void = undefined;
                     const thread = try std.Thread.spawn(.{ .stack_size = 32 * 1024 * 1024 }, Worker.run, .{ &outcome, a, &feed_svc, origin.historyRootsSource(), feed_table, server, route.fence().? });
                     thread.join();
@@ -51705,8 +51974,6 @@ fn consumerTests() type {
                             result.* = PublicFeedHarness.run(allocator, svc, source, table, node, fence, true);
                         }
                     };
-                    metadata_source.control_read_generation_at_ms = std.math.maxInt(u64);
-                    defer metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                     var outcome: anyerror!void = undefined;
                     const thread = try std.Thread.spawn(.{ .stack_size = 32 * 1024 * 1024 }, Worker.run, .{ &outcome, a, &feed_svc, origin.historyRootsSource(), feed_table, server, route.fence().? });
                     thread.join();
@@ -51826,12 +52093,10 @@ fn consumerTests() type {
                 try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_exact_prepare_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
 
                 const positive_input: resolution_operations.Request = .{ .version = 1, .authority = .raft, .namespace = namespace, .transaction_id = txn_id, .owner_fence = current_owner.digest(), .manifest_digest = (try plan.manifest(1001)).digest(), .commit_version = 1001, .minimum_applied_index = 1 };
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 const positive = try origin.historyResolutionPort().read(a, route.fence().?, "docs", positive_input, .{});
                 try positive.validate(positive_input.binding());
                 try std.testing.expect(positive.resolution != null);
                 try std.testing.expect(positive.resolution.?.outcome.effects.sequence > 0);
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 const positive_retry = try origin.historyResolutionPort().read(a, route.fence().?, "docs", positive_input, .{});
                 try std.testing.expectEqualDeep(positive.resolution, positive_retry.resolution);
                 const decision_wire = @import("antfly_local_sources").storage_history_decision_wire;
@@ -51995,11 +52260,9 @@ fn consumerTests() type {
                 try idle_resolution.validate(positive_input.binding());
                 try std.testing.expectEqualDeep(positive.resolution, idle_resolution.resolution);
                 try std.testing.expect(idle_resolution.cut.index < idle_barrier_index);
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 var idle_page = try origin.historyPagePort().read(a, route.fence().?, "docs", page_input, .{});
                 defer idle_page.deinit();
                 try std.testing.expectEqualDeep(first_page.events, idle_page.events);
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 const idle_grant = try origin.historyGrantPort().read(a, route.fence().?, "docs", grant_input, .{});
                 try std.testing.expectEqualDeep(actual_grant, idle_grant);
                 // All recovery operations remain reads: no Raft entry was
@@ -52009,7 +52272,6 @@ fn consumerTests() type {
                     defer server.data_raft_mutex.unlock();
                     try std.testing.expectEqual(idle_barrier_index, host.raftStatus(601).?.last_index);
                 }
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 const remote_publication = try origin.historyPublicationPort().read(a, route.fence().?, "docs", publication_input, .{});
                 try remote_publication.validate(publication_query);
                 try std.testing.expectEqualDeep(observed_publication.publication, remote_publication.publication);
@@ -52140,11 +52402,9 @@ fn consumerTests() type {
                                 try std.testing.expectError(if (gap) error.SourceCheckpointConflict else error.SourcePayloadConflict, source_participant.submit(source_alloc, &attempt_plan, 0, source_fence, .prepare, .{}));
                             } else try source_participant.submit(source_alloc, &attempt_plan, 0, source_fence, .prepare, .{});
                             try source_participant.submit(source_alloc, &attempt_plan, 0, source_fence, .{ .resolve = .{ .status = if (attempt_id == 128) .committed else .aborted, .commit_version = 4102 + @as(u64, attempt_id) } }, .{});
-                            origin_server.remote_metadata.?.control_read_generation_at_ms = origin_server.remote_metadata.?.awakeMs();
                             const attempt_recovery = try source_recovery.run(source_alloc, source_binding, source_fence, "docs", @splat(attempt_id), .{});
                             try std.testing.expectEqual(@as(@TypeOf(attempt_recovery), if (attempt_id == 128) .complete else .aborted), attempt_recovery);
                         }
-                        origin_server.remote_metadata.?.control_read_generation_at_ms = origin_server.remote_metadata.?.awakeMs();
                         try @import("../api/source_checkpoint_native_test.zig").verify(source_alloc, origin_server.sourceCheckpointObservationPort(), source_fence, .{ .version = 1, .source_owner = source_binding, .transaction_id = source_id, .command = source_prepare.transaction.?.prepare.source_checkpoint.?, .minimum_applied_index = 1 });
                         try @import("../api/source_scope_native_test.zig").verify(source_alloc, native_owner, source_fence, source_binding);
                         try @import("../api/source_scope_native_test.zig").verifyRouted(source_alloc, origin_server.sourceScopeObservationPort(), source_fence, source_binding);
@@ -52156,7 +52416,6 @@ fn consumerTests() type {
                         try @import("../api/source_scope_native_test.zig").verifyRetirementRpc(source_alloc, origin_server.sourceRetirementControlPort(), origin_server.sourceScopeObservationPort(), source_fence, source_binding);
                     }
                 };
-                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 try SourceCompletion.run(a, origin, current_owner, route.fence().?, remote_participant, server.kernel_owner_source.?, server);
                 const HostedAdmission = struct {
                     noinline fn run(alloc: std.mem.Allocator, endpoint_uri: []const u8, source_catalog: antfly.public_api.table_catalog.CatalogSource, executor: antfly.common.http.RequestExecutor, root_path: []const u8, credential: []const u8) !void {
@@ -52207,7 +52466,6 @@ fn consumerTests() type {
                 };
                 var found_completion = false;
                 for (0..64) |_| {
-                    metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                     var qualified_page = origin.historyPagePort().read(a, route.fence().?, "docs", qualified_input, .{}) catch |err| {
                         std.debug.print("coordinated frame proof read after sequence {d} failed: {s}\n", .{ qualified_input.request.after.sequence, @errorName(err) });
                         return err;
@@ -56052,7 +56310,7 @@ fn consumerTests() type {
                 try std.testing.expectEqual(forwarding_clone_count, source.test_faults.snapshot_result_clones);
             }
             var pinned: DataServer.PinnedReadPeerRouter = .{ .server = &server, .peers = retained };
-            var route = (try antfly.public_api.table_router.resolveGroupRoute(alloc, undefined, pinned.router(), 77, .prefer_leader)).?;
+            var route = (try antfly.public_api.table_router.resolveGroupRoute(alloc, antfly.public_api.table_catalog.emptyCatalogSource(), pinned.router(), 77, .prefer_leader)).?;
             defer route.deinit(alloc);
             try std.testing.expectEqualStrings("http://new", route.remote.base_uri);
             try std.testing.expectEqual(@as(u64, 2), route.remote.node_id);
@@ -56061,7 +56319,7 @@ fn consumerTests() type {
             const failed_leader = try ControlReadGeneration.create(alloc, snapshot);
             defer failed_leader.release();
             pinned.peers = failed_leader;
-            var fallback = (try antfly.public_api.table_router.resolveGroupRoute(alloc, undefined, pinned.router(), 77, .prefer_leader)).?;
+            var fallback = (try antfly.public_api.table_router.resolveGroupRoute(alloc, antfly.public_api.table_catalog.emptyCatalogSource(), pinned.router(), 77, .prefer_leader)).?;
             defer fallback.deinit(alloc);
             try std.testing.expectEqual(@as(u64, 2), fallback.remote.node_id);
             try std.testing.expect(failed_leader.groups.get(77).?.leader == null);
@@ -56676,7 +56934,6 @@ fn consumerTests() type {
                 clock: *VoprIo,
                 reads: usize = 0,
                 writes: usize = 0,
-                previous_remaining: ?u64 = null,
                 fn execute(raw: *anyopaque, allocator: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
                     const self: *@This() = @ptrCast(@alignCast(raw));
                     if (std.mem.endsWith(u8, request.uri, routes.Routes.head)) return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(allocator, antfly.metadata_api.MetadataHead{ .metadata_group_id = 77, .metadata_incarnation = "11111111111111111111111111111111".*, .metadata_epoch = 1 }, .{}) };
@@ -56685,9 +56942,12 @@ fn consumerTests() type {
                     defer input.deinit();
                     try std.testing.expectEqual(@as(u64, 77), input.value.metadata_group_id);
                     const remaining = try std.fmt.parseUnsigned(u64, request.header(routes.routing_remaining_ms_header).?, 10);
-                    try std.testing.expect(remaining > 0 and remaining <= 100);
-                    if (self.previous_remaining) |previous| try std.testing.expect(remaining < previous);
-                    self.previous_remaining = remaining;
+                    const original_deadline = std.time.ns_per_s + 100 * std.time.ns_per_ms;
+                    const available_ms: u64 = @intCast(@divTrunc(original_deadline - self.clock.monotonic_ns, std.time.ns_per_ms));
+                    // Read attempt zero gets a share, then the retry gets the
+                    // remainder of the same request budget.
+                    const divisor: u64 = if (input.value.action != .mutate and self.reads != 1) 2 else 1;
+                    try std.testing.expectEqual(available_ms / divisor, remaining);
                     self.clock.monotonic_ns += std.time.ns_per_ms;
                     var result: feeds.Reply = .{ .action = input.value.action, .metadata_group_id = input.value.metadata_group_id, .metadata_incarnation = input.value.metadata_incarnation };
                     if (input.value.action == .mutate) {
@@ -57084,15 +57344,6 @@ fn consumerTests() type {
         }
 
         test "remote metadata source retries fenced snapshot generations until success" {
-            var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
-            defer backend_runtime.deinit();
-            var source = try RemoteMetadataSource.init(
-                std.testing.allocator,
-                &.{"http://metadata.invalid"},
-                backend_runtime.ptr().apiIoImpl().?,
-            );
-            defer source.deinit();
-
             const incarnation: antfly.metadata_api.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
             const snapshot = antfly.metadata_api.AdminSnapshot{
                 .status = .{ .metadata_group_id = 9, .metadata_incarnation = incarnation, .metadata_epoch = 1, .metrics = .{} },
@@ -57103,12 +57354,25 @@ fn consumerTests() type {
                 .split_transitions = &.{},
                 .merge_transitions = &.{},
             };
-            source.cached_snapshot = try cloneAdminSnapshotOwned(std.testing.allocator, snapshot);
+            const Fake = struct {
+                snapshot: antfly.metadata_api.AdminSnapshot,
+                reads: usize = 0,
+
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    const routes = @import("../metadata/http_routes.zig").Routes;
+                    if (std.mem.endsWith(u8, request.uri, @import("../metadata/snapshot_transfer.zig").path)) return error.UnsupportedOperation;
+                    try std.testing.expectEqual(.GET, request.method);
+                    try std.testing.expect(std.mem.endsWith(u8, request.uri, routes.admin_snapshot));
+                    self.reads += 1;
+                    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, self.snapshot, .{}) };
+                }
+            };
+            var fake: Fake = .{ .snapshot = snapshot };
+            var source = try RemoteMetadataSource.initWithRequestExecutors(std.testing.allocator, &.{"http://metadata.invalid"}, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, std.testing.io);
+            defer source.deinit();
             source.cached_head = RemoteMetadataSource.snapshotHead(&snapshot);
-            const now_ms = source.awakeMs();
-            source.cached_snapshot_at_ms = now_ms;
-            source.cached_head_at_ms = now_ms;
-            source.test_faults.force_snapshot_cache_miss = true;
+            source.cached_head_at_ms = std.math.maxInt(u64);
             source.test_faults.fetch_head_mismatches_remaining = 3;
 
             var fetched = try source.fetchSnapshot();
@@ -57116,6 +57380,7 @@ fn consumerTests() type {
 
             try std.testing.expectEqual(@as(u64, 9), fetched.status.metadata_group_id);
             try std.testing.expectEqual(@as(usize, 0), source.test_faults.fetch_head_mismatches_remaining);
+            try std.testing.expectEqual(@as(usize, 1), fake.reads);
         }
 
         test "remote metadata source bounds repeated fenced snapshot generations" {
@@ -57426,6 +57691,7 @@ fn consumerTests() type {
             var original_live = true;
             defer if (original_live) original.deinitOwned(a);
             try original.validate();
+            var original_controls = [_]controls.PackageControl{original};
             var owned = try cloneAdminSnapshotOwned(a, .{
                 .status = .{ .metadata_group_id = 9, .metrics = .{} },
                 .tables = &.{},
@@ -57434,7 +57700,7 @@ fn consumerTests() type {
                 .placement_intents = &.{},
                 .split_transitions = &.{},
                 .merge_transitions = &.{},
-                .sql_extension_controls = @constCast(&.{original}),
+                .sql_extension_controls = &original_controls,
             });
             defer freeAdminSnapshotOwned(a, &owned);
             try std.testing.expect(owned.sql_extension_controls[0].name.ptr != original.name.ptr);
@@ -59126,6 +59392,7 @@ fn implementationTests() type {
             var server: DataServer = undefined;
             server.data_raft = &host;
             server.data_raft_mutex = .unlocked;
+            server.api_server_cfg = .{ .deployment_mode = .distributed };
             server.group_leadership_source = .{ .ptr = &fake, .vtable = &.{ .is_local_leader = Fake.owns } };
             const source = server.relationalMaintenanceLeadershipSource().?;
             try std.testing.expect(server.data_raft_mutex.tryLock());
@@ -59140,7 +59407,9 @@ fn implementationTests() type {
             try std.testing.expectEqual(@as(usize, 3), fake.calls);
             server.group_leadership_source = null;
             server.data_raft = null;
-            try std.testing.expectEqual(null, server.relationalMaintenanceLeadershipSource());
+            try std.testing.expect(!source.isLocalLeader(7));
+            server.api_server_cfg.deployment_mode = .standalone;
+            try std.testing.expect(source.isLocalLeader(7));
         }
 
         test "data runtime status refresh skips opening the active startup group when no cached snapshot exists yet" {
@@ -67808,6 +68077,9 @@ fn implementationTests() type {
             }
 
             try server.syncDataRaftFromSnapshot(&snapshot, .linearizable);
+            // This fixture starts Raft directly instead of starting its HTTP
+            // listener. Attach the writer cache the listener normally wires.
+            server.data_raft_apply.?.attachProvisionedStorage(&server.provisioned_storage);
 
             const Shared = struct {
                 server: *DataServer,
@@ -67904,9 +68176,26 @@ fn implementationTests() type {
                     self.stage = 8;
                     self.observation = ops.observeMerge(retry_record) catch |err| return self.fail(err);
                     self.checkTerminalAccept(&ops, retry_record) catch |err| return self.fail(err);
+                    self.drainReceiverGraphCleanup(retry_record) catch |err| return self.fail(err);
                     self.server.quiesceBackgroundWork();
                     self.done = true;
                     self.stop_driver = true;
+                }
+
+                fn drainReceiverGraphCleanup(self: *@This(), record_to_clean: antfly.metadata.MergeTransitionRecord) !void {
+                    const node = self.server;
+                    const contract_to_clean = record_to_clean.table_contract;
+                    const receiver_group = record_to_clean.receiver_group_id;
+                    for (0..32) |_| {
+                        var batch = prepared: {
+                            const owner = try node.leaseTransitionDbForTableGroup(receiver_group, contract_to_clean, .target, .exact);
+                            defer owner.release();
+                            break :prepared try owner.db.prepareGraphEndpointCleanupBatch(node.alloc);
+                        } orelse return;
+                        defer batch.deinit();
+                        try node.proposeRaftBatchGroup(node.alloc, receiver_group, contract_to_clean.table_name, batch.request(), .{ .discovery = .cached });
+                    }
+                    return error.VoprGraphCleanupDidNotConverge;
                 }
 
                 fn checkTerminalAccept(self: *@This(), ops: *antfly.raft.ShardOperationAdapter, terminal_record: antfly.metadata.MergeTransitionRecord) !void {
@@ -68067,6 +68356,8 @@ fn implementationTests() type {
             try std.testing.expectEqual(.finalized, observation.receiver.phase);
             try std.testing.expect(observation.receiver.cutover_ready);
 
+            // Reopen the receiver from disk after stopping both Raft tasks.
+            try server.data_raft_apply.?.write_source.clearWriteCache();
             var receiver = try antfly.db.DB.open(alloc, receiver_path, .{
                 .identity_namespace = .{
                     .table_id = contract.table_id,
@@ -68835,7 +69126,6 @@ const SourcePlanHttpFixture = struct {
         defer quota_response.deinit(a2);
         try std.testing.expectEqual(@as(u16, 200), quota_response.status);
         const quota = try SourcePlanHttp.native.decodeObservation(a2, quota_query, quota_response.body);
-        origin_server.remote_metadata.?.control_read_generation_at_ms = origin_server.remote_metadata.?.awakeMs();
         const remote_quota = try origin_server.sourcePlanObservePort().read(a2, fence, "docs", quota_input, .{});
         try std.testing.expectEqualDeep(quota, remote_quota);
         var checksum: [32]u8 = undefined;
@@ -68864,7 +69154,6 @@ const SourcePlanHttpFixture = struct {
         };
         request.operation = .recover;
         request.receipt = accepted.receipt;
-        origin_server.remote_metadata.?.control_read_generation_at_ms = origin_server.remote_metadata.?.awakeMs();
         const recovered = try origin_server.sourcePlanControlPort().execute(a2, fence, "docs", request, .{});
         try std.testing.expect(recovered.confirmed() and recovered.outcome.? == .applied);
         {
@@ -68893,7 +69182,6 @@ const SourcePlanHttpFixture = struct {
         try std.testing.expectEqual(@as(u16, 200), read_response.status);
         const owned = try SourcePlanHttp.native.decodeChunkReply(a2, read.request, read_response.body);
         defer a2.free(owned.bytes);
-        origin_server.remote_metadata.?.control_read_generation_at_ms = origin_server.remote_metadata.?.awakeMs();
         const remote_owned = try origin_server.sourcePlanChunkPort().read(a2, fence, "docs", read, .{});
         defer a2.free(remote_owned.bytes);
         try std.testing.expectEqualSlices(u8, owned.bytes, remote_owned.bytes);

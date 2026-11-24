@@ -3233,6 +3233,7 @@ pub const StatusSource = struct {
                     defer read.deinit(client.alloc);
                     if (read.metadata_group_id != self.svc.metadata_group_id or !std.meta.eql(read.metadata_incarnation, incarnation)) return error.MetadataIncarnationMismatch;
                     self.result.* = try self.alloc.dupe(u8, read.body);
+                    if (self.request.sql_scope_supersession_ready) |ready| ready.* = read.sql_scope_supersession_ready;
                 } else {
                     const admin = self.input.requiresAdministrativeGrant();
                     if (admin and !self.request.setting_admin) return error.Forbidden;

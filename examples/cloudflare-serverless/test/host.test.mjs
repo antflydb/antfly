@@ -433,10 +433,17 @@ test("ranked text cursors preserve score and snapshot across publication", async
   await host.request(request("publish"));
   const first = await host.request(request("search", {text: "needle", limit: 1, fresh: true}));
   assert.equal(first.hits[0].doc_id, "a"); assert.ok(first.cursor);
+  const projection = {text: "needle", limit: 1, search_ids_only: true};
+  const ids = await host.request(request("search", projection));
+  assert.deepEqual(ids.hits.map(({doc_id, body}) => [doc_id, body]), [["a", ""]]);
+  assert.ok(ids.cursor);
+  await assert.rejects(host.request(request("search", {...projection, cursor: first.cursor})), /QueryCursorBindingMismatch/);
   await host.request(request("mutate", {operation_id: "ranked-change", mutations: [{kind: "delete", doc_id: "b"}]}));
   await host.request(request("publish"));
   const second = await host.request(request("search", {text: "needle", limit: 1, cursor: first.cursor}));
   assert.equal(second.hits[0].doc_id, "b");
+  const nextIds = await host.request(request("search", {...projection, cursor: ids.cursor}));
+  assert.deepEqual(nextIds.hits.map(({doc_id, body}) => [doc_id, body]), [["b", ""]]);
   await assert.rejects(host.request(request("search", {text: "different", limit: 1, cursor: first.cursor})), /QueryCursorBindingMismatch/);
 });
 

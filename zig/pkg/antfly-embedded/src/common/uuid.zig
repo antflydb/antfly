@@ -96,7 +96,7 @@ pub fn timestampUnixMicros(bytes: [16]u8) ?i64 {
 /// Processes/restarts have independent clocks and secure random tails: this
 /// does not promise globally ordered allocation across nodes or restarts.
 pub const Version7Clock = struct {
-    last: std.atomic.Value(u64) = .init(0),
+    last: @import("antfly_platform").atomic.Value(u64) = .init(0),
     pub const max_millis: u64 = std.math.maxInt(u48);
     pub const max_ticks: u64 = std.math.maxInt(u60);
 
