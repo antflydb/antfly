@@ -3268,7 +3268,9 @@ test "Metal immutable literal plans and publishes exact typed graph outputs" {
         const index = store.node_indices[node];
         try std.testing.expect(index != ml.graph.null_node);
         try std.testing.expectEqual(try @import("../ops/physical_storage.zig").reservationBytes(cb, initializer.staging), store.literals[index].staging_bound);
-        try std.testing.expect(store.publications[node] != null);
+        const publication = store.publications[node] orelse return error.MissingLiteralPublication;
+        try std.testing.expectEqual(@as(u32, @alignOf(i64)), pool.plan.allocations[store.literals[index].allocation].alignment);
+        try std.testing.expectEqual(@as(u32, @alignOf(i64)), pool.plan.allocations[publication.allocation].alignment);
         const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{ 2, 3 }));
         defer cb.free(input);
         const ownership = @import("storage_ownership.zig");

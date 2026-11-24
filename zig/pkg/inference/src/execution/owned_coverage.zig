@@ -136,6 +136,7 @@ fn literalIndex(pool: *const physical.Pool, slot: buffers.LogicalSlot) ?usize {
     const backend = pool.backends[item.backend_index];
     const owner = store.backends[item.backend_index];
     if (!canonical(backend) or owner.ptr != backend.ptr or owner.vtable != backend.vtable or !allocation(pool, item.allocation, bytes, .constant_binding)) return null;
+    if (pool.plan.allocations[item.allocation].alignment < item.shape.dtype.byteSize()) return null;
     return index;
 }
 fn publication(pool: *const physical.Pool, slot: buffers.LogicalSlot, index: usize) bool {
@@ -144,7 +145,7 @@ fn publication(pool: *const physical.Pool, slot: buffers.LogicalSlot, index: usi
     const copy = store.publications[slot.node_id] orelse return false;
     const item = store.literals[index];
     const bytes = logicalBytes(item.shape) orelse return false;
-    return copy.node == slot.node_id and copy.literal == index and copy.shape.eq(slot.desc.shape) and copy.allocation != item.allocation and allocation(pool, copy.allocation, bytes, .tensor) and !pool.plan.allocations[copy.allocation].reusable;
+    return copy.node == slot.node_id and copy.literal == index and copy.shape.eq(slot.desc.shape) and copy.allocation != item.allocation and allocation(pool, copy.allocation, bytes, .tensor) and !pool.plan.allocations[copy.allocation].reusable and pool.plan.allocations[copy.allocation].alignment >= item.shape.dtype.byteSize();
 }
 fn resources(pool: *const physical.Pool, kernel: physical.KernelPlan, owned: route.Owned) bool {
     const needed = owned.requirements;

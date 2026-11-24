@@ -104,6 +104,7 @@ fn literal(pool: *const physical.Pool, slot: buffers.LogicalSlot, target: ops.Co
     const backend = pool.backends[value.backend_index];
     const owner = store.backends[value.backend_index];
     if (backend.ptr != target.ptr or backend.vtable != target.vtable or owner.ptr != backend.ptr or owner.vtable != backend.vtable or services(backend) == null or !allocation(pool, value.allocation, size, .constant_binding, false)) return null;
+    if (pool.plan.allocations[value.allocation].alignment < value.shape.dtype.byteSize()) return null;
     if (target.kind() == .metal) {
         if (value.staging_bound == 0) return null;
         const functions = target.vtable.kernels.?;
@@ -123,7 +124,7 @@ fn publication(pool: *const physical.Pool, slot: buffers.LogicalSlot, index: usi
     const copy = store.publications[slot.node_id] orelse return false;
     const value = store.literals[index];
     const size = bytes(value.shape) orelse return false;
-    return copy.node == slot.node_id and copy.literal == index and copy.shape.eq(slot.desc.shape) and copy.allocation != value.allocation and allocation(pool, copy.allocation, size, .tensor, false) and !pool.plan.allocations[copy.allocation].reusable;
+    return copy.node == slot.node_id and copy.literal == index and copy.shape.eq(slot.desc.shape) and copy.allocation != value.allocation and allocation(pool, copy.allocation, size, .tensor, false) and !pool.plan.allocations[copy.allocation].reusable and pool.plan.allocations[copy.allocation].alignment >= value.shape.dtype.byteSize();
 }
 fn resources(pool: *const physical.Pool, kernel: physical.KernelPlan, owned: route.Owned) bool {
     const needed = owned.requirements;

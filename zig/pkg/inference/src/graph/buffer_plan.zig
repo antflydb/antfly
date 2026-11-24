@@ -225,9 +225,10 @@ pub const BufferPlan = struct {
         return id;
     }
 
-    pub fn addConstantBinding(self: *BufferPlan, backend: BackendKind, bytes: usize) !AllocationId {
-        const id = try self.addInputBinding(backend, bytes);
+    pub fn addConstantBinding(self: *BufferPlan, backend: BackendKind, bytes: usize, alignment: u32) !AllocationId {
+        const id = try self.addWorkspace(backend, bytes, alignment);
         self.allocations[id].kind = .constant_binding;
+        self.allocations[id].reusable = false;
         return id;
     }
 

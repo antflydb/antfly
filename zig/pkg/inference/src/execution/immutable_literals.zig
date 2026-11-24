@@ -89,7 +89,11 @@ pub const SharedLiteralStore = struct {
             const backend = selected_index.*;
             if (backend == ml.graph.null_node) continue;
             const attrs = node.op.constant;
-            const bytes = try std.math.mul(usize, attrs.data_len, node.output_shape.dtype.byteSize());
+            const alignment = node.output_shape.dtype.byteSize();
+            const bytes = try std.math.mul(usize, attrs.data_len, alignment);
+            const pool = graph.constant_pool.items;
+            if (attrs.data_offset % alignment != 0 or attrs.data_offset > pool.len or bytes > pool.len - attrs.data_offset)
+                return error.InvalidPhysicalLiteralInitialization;
             const bound = try ops.physical_storage.reservationBytes(backends[backend], .{ .byte_size = bytes });
             if (bound < bytes) return error.InvalidPhysicalStorageReservation;
             var staging_bound: usize = 0;
@@ -99,7 +103,15 @@ pub const SharedLiteralStore = struct {
                     return error.InvalidPhysicalLiteralInitialization;
                 staging_bound = try ops.physical_storage.reservationBytes(backends[backend], initializer.staging);
             };
-            literals[index] = .{ .node = @intCast(node_id), .shape = node.output_shape, .data = @alignCast(graph.constant_pool.items[attrs.data_offset..][0..bytes]), .allocation = try plan.addConstantBinding(backends[backend].kind(), bytes), .backend_index = backend, .cold_bound = bound, .staging_bound = staging_bound };
+            literals[index] = .{
+                .node = @intCast(node_id),
+                .shape = node.output_shape,
+                .data = @alignCast(pool[attrs.data_offset..][0..bytes]),
+                .allocation = try plan.addConstantBinding(backends[backend].kind(), bytes, @intCast(alignment)),
+                .backend_index = backend,
+                .cold_bound = bound,
+                .staging_bound = staging_bound,
+            };
             selected_index.* = @intCast(index);
             index += 1;
         }
@@ -167,7 +179,7 @@ pub const SharedLiteralStore = struct {
             if (literal == ml.graph.null_node) continue;
             const item = literals[literal];
             const bytes = item.data.len;
-            const id = try plan.addWorkspace(backends[item.backend_index].kind(), bytes, @alignOf(f32));
+            const id = try plan.addWorkspace(backends[item.backend_index].kind(), bytes, @intCast(item.shape.dtype.byteSize()));
             plan.allocations[id].kind = .tensor;
             plan.allocations[id].reusable = false;
             publications[output] = .{ .node = output, .literal = literal, .allocation = id, .shape = graph.node(output).output_shape };
