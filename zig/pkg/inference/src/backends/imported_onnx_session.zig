@@ -6524,7 +6524,18 @@ test "complete Imported Metal Frame encoder owns shared ingress aliases outputs 
         try std.testing.expectEqual(sdk.device_owned_buffers_created, @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_buffers_created);
     }
     for ([_]bool{ false, true }) |offset_view| {
-        const stage_backend = impl.shared_backend_ctx.stableBackend();
+        // Each variant retains a different warm frame. Keep it outside the
+        // original session's exact-cap exercise and give it its own lifetime.
+        const stage_domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+        defer stage_domain.release();
+        var stage_session = try createSessionWithOptions(a, path, .metal, .{ .graph_runtime_strategy = .partitioned });
+        defer stage_session.close();
+        stage_session.model_lifetime.?.admission_domain = stage_domain.pin();
+        stage_session.run_admission = session.run_admission;
+        stage_session.run_admission.?.controller = &stage_domain.controller;
+        try std.testing.expect(stage_session.configureExecutionDiagnostics(true));
+        const stage_impl: *ImportedOnnxSession = @ptrCast(@alignCast(stage_session.ptr));
+        const stage_backend = stage_impl.shared_backend_ctx.stableBackend();
         var padded: [(rows + 1) * width]f32 = undefined;
         @memset(padded[0..width], 7);
         @memcpy(padded[width..], &values);
@@ -6539,9 +6550,12 @@ test "complete Imported Metal Frame encoder owns shared ingress aliases outputs 
         const device_input: session_mod.StageInput = .{ .resident = .{ .value = value, .backend = stage_backend, .shape = &.{ rows, width }, .estimated_bytes = payload } };
         var observation = @import("../execution/runtime_observation.zig").Scope.init();
         defer observation.deinit();
-        var result = (try session.runStageInputsWithControl(&.{device_input}, a, .{ .native_call_policy = .in_process })) orelse return error.MissingResidentResult;
+        var result = (stage_session.runStageInputsWithControl(&.{device_input}, a, .{ .native_call_policy = .in_process }) catch |err| {
+            std.debug.print("Metal resident input offset_view={} failed: {s}\n", .{ offset_view, @errorName(err) });
+            return err;
+        }) orelse return error.MissingResidentResult;
         defer result.deinit();
-        const stats = session.executionDiagnostics().?.execution.?;
+        const stats = stage_session.executionDiagnostics().?.execution.?;
         try std.testing.expectEqual(@as(u64, if (offset_view) payload else 0), stats.physical_input_copy_bytes);
         try std.testing.expectEqual(@as(u64, 0), stats.actual_download_bytes);
         try std.testing.expectEqual(@as(?u64, 1), observation.snapshot().metal_command_submissions);
