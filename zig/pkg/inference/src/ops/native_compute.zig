@@ -37077,7 +37077,7 @@ fn tryGqaTiledPagedPrefill(
         @memcpy(v[index * width ..][0..width], row.v[0..width]);
     }
 
-    try linalg.flashCausalAttentionHostInto(query, k, v, null, attention.attn_or_mask, attention.sliding_window, 1, queries, keys, query_offset, key_offset, heads, kv_heads, head_dim, output, @alignCast(scratch[workspace_offset..]));
+    try linalg.flashCausalAttentionHostIntoWithGemm(native.SegmentAttentionGemm, query, k, v, null, attention.attn_or_mask, attention.sliding_window, 1, queries, keys, query_offset, key_offset, heads, kv_heads, head_dim, output, @alignCast(scratch[workspace_offset..]));
     return true;
 }
 

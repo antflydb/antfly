@@ -449,6 +449,33 @@ pub fn flashCausalAttentionHostInto(
     output: []f32,
     workspace: []align(64) f32,
 ) !void {
+    const Sequential = struct {
+        pub const sgemmTransBSync = gemm.sgemmTransBSequential;
+        pub const sgemmSync = gemm.sgemmSequential;
+    };
+    return flashCausalAttentionHostIntoWithGemm(Sequential, Q, K, V, bias, attn_or_mask, sliding_window, batch, q_seq_len, kv_seq_len, query_position_offset, kv_position_offset, num_heads, num_kv_heads, head_dim, output, workspace);
+}
+
+/// Share packed tiles and online softmax with a host GEMM provider.
+pub fn flashCausalAttentionHostIntoWithGemm(
+    comptime Gemm: type,
+    Q: []const f32,
+    K: []const f32,
+    V: []const f32,
+    bias: ?[]const f32,
+    attn_or_mask: ?[]const u8,
+    sliding_window: usize,
+    batch: usize,
+    q_seq_len: usize,
+    kv_seq_len: usize,
+    query_position_offset: usize,
+    kv_position_offset: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    output: []f32,
+    workspace: []align(64) f32,
+) !void {
     const shape = try hostAttentionShape(Q.len, K.len, V.len, batch, q_seq_len, kv_seq_len, query_position_offset, kv_position_offset, num_heads, num_kv_heads, head_dim);
     const H_q = shape.h_q;
     const H_kv = shape.h_kv;
@@ -534,7 +561,7 @@ pub fn flashCausalAttentionHostInto(
                     // QK^T as a single register-tiled GEMM with prescaled Q
                     // (alpha=scale folds the per-cell `* scale` into the
                     // matmul, dropping cur_bq*cur_bkv scalar muls).
-                    gemm.sgemmTransBSequential(cur_bq, cur_bkv, head_dim, scale, q_pack[0 .. cur_bq * head_dim], k_pack[0 .. cur_bkv * head_dim], 0.0, score_tile[0 .. cur_bq * cur_bkv]);
+                    Gemm.sgemmTransBSync(cur_bq, cur_bkv, head_dim, scale, q_pack[0 .. cur_bq * head_dim], k_pack[0 .. cur_bkv * head_dim], 0.0, score_tile[0 .. cur_bq * cur_bkv]);
 
                     if (bias) |bias_data| {
                         for (0..cur_bq) |qi_local| {
@@ -573,7 +600,7 @@ pub fn flashCausalAttentionHostInto(
                     }
 
                     // Batched V projection: out_pack[bq, hd] += score_tile[bq, bkv] @ V_pack[bkv, hd].
-                    gemm.sgemmSequential(cur_bq, head_dim, cur_bkv, 1.0, score_tile[0 .. cur_bq * cur_bkv], v_pack[0 .. cur_bkv * head_dim], 1.0, out_pack[0 .. cur_bq * head_dim]);
+                    Gemm.sgemmSync(cur_bq, head_dim, cur_bkv, 1.0, score_tile[0 .. cur_bq * cur_bkv], v_pack[0 .. cur_bkv * head_dim], 1.0, out_pack[0 .. cur_bq * head_dim]);
 
                     kv_start = kv_end;
                 }
