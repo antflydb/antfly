@@ -205,6 +205,11 @@ pub const InferenceAdmissionOwner = enum {
 pub const LocalInferenceConnectionTarget = inference_connection_abi.Target;
 
 const RemoteInferenceConnection = struct {
+    bind_origin: bool = false,
+    attribution: ?common_config.Config.InferenceConnectionConfig.InferenceAttribution = null,
+    tls_ca_file: ?[]const u8 = null,
+    allow_private_ips: ?bool = null,
+    headers: std.StringArrayHashMapUnmanaged([]u8) = .empty,
     url: []const u8,
     api_key: ?[]const u8,
     preserve_api_path: bool = false,
@@ -252,6 +257,12 @@ pub fn invokeInferenceConnection(
 
 /// Request transport metadata is separate from operation identity and JSON.
 pub const InvocationRequest = struct {
+    attribution_principal: ?[]const u8 = null,
+    attribution_scope: ?common_config.InferenceAttributionScope = null,
+    request_id: ?[]const u8 = null,
+    shared_attempt_sequence: ?*std.atomic.Value(u32) = null,
+    backend_model: ?[]const u8 = null,
+    stream_observation: ?*const @import("antfly_local_sources").common_inference_tasks.Observation = null,
     attempt_observer: ?httpx.AttemptObserver = null,
     content_type: []const u8 = "application/json",
     query: ?[]const u8 = null,
@@ -349,6 +360,30 @@ pub fn invokeInferenceConnectionWithRequest(
 
     const remote = resolved.remote;
     const raw_url = remote.url;
+    const base_client = http orelse return error.InferenceTransportUnavailable;
+    var scoped_client: ?httpx.Client = null;
+    defer if (scoped_client) |*client| client.deinit();
+    if (remote.bind_origin) {
+        var config = base_client.config;
+        config.tls_ca_file = remote.tls_ca_file;
+        config.address_filter = common_config.inferenceAddressFilter(remote.allow_private_ips) orelse config.address_filter;
+        config.verify_ssl = true;
+        config.request_origin = httpx.Uri.parse(raw_url) catch return error.InvalidConnectionURL;
+        config.cookies_enabled = false;
+        scoped_client = httpx.Client.initWithConfig(alloc, base_client.io, config);
+    }
+    const provider_http = if (scoped_client) |*client| client else base_client;
+    var attempts: ?@import("antfly_local_sources").common_inference_tasks.ProviderAttempts = if (request.request_id) |id| .{
+        .request_id = id,
+        .shared_sequence = request.shared_attempt_sequence,
+        .connection = connection_id,
+        .task = operation,
+        .model = request.backend_model orelse "",
+        .stream_observation = request.stream_observation,
+        .billing_principal = if (remote.attribution != null) request.attribution_principal else null,
+        .billing_scope = common_config.InferenceAttributionIdentity.billingScope(common_config.authenticatedInferenceAttribution(remote.attribution, request.attribution_principal, request.attribution_scope)),
+    } else null;
+    const attempt_results = if (attempts) |*tracker| tracker.observer() else null;
     const base = std.mem.trimEnd(u8, raw_url, "/");
     const prefix = try inferenceApiBaseAlloc(alloc, remote);
     defer alloc.free(prefix);
@@ -370,7 +405,7 @@ pub fn invokeInferenceConnectionWithRequest(
     const timeout_ms = try remainingInferenceInvocationMs(deadline_ns, platform_time.monotonicNs());
     const timeout_header = try std.fmt.allocPrint(alloc, "{d}", .{timeout_ms});
     defer alloc.free(timeout_header);
-    var header_buffer: [8][2][]const u8 = undefined;
+    var header_buffer: [8 + common_config.max_inference_connection_headers][2][]const u8 = undefined;
     header_buffer[0] = .{ "Content-Type", request.content_type };
     header_buffer[1] = .{ "X-Antfly-Inference-Attempts-Remaining", "1" };
     header_buffer[2] = .{ "X-Antfly-Inference-Timeout-Ms", timeout_header };
@@ -410,14 +445,20 @@ pub fn invokeInferenceConnectionWithRequest(
         header_buffer[header_count] = .{ "X-Antfly-Document-Token-Budget", token_budget_header.? };
         header_count += 1;
     }
+    var header_arena = std.heap.ArenaAllocator.init(alloc);
+    defer header_arena.deinit();
+    const custom_headers = try common_config.resolveInferenceHeadersForIdentity(header_arena.allocator(), secret_store, remote.headers, remote.attribution, common_config.authenticatedInferenceAttribution(remote.attribution, request.attribution_principal, request.attribution_scope));
+    @memcpy(header_buffer[header_count..][0..custom_headers.len], custom_headers);
+    header_count += custom_headers.len;
     const headers = header_buffer[0..header_count];
     if (durable_remote) {
-        var transport = try protocol.Owner.init(request.document_allocator orelse alloc, (http orelse return error.InferenceTransportUnavailable).io, request.document_store, body);
+        var transport = try protocol.Owner.init(request.document_allocator orelse alloc, provider_http.io, request.document_store, body);
         defer transport.deinit();
-        var response = try http.?.requestToWriter(.POST, url, .{
+        var response = try provider_http.requestToWriter(.POST, url, .{
             .headers = headers,
             .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
             .attempt_observer = request.attempt_observer,
+            .attempt_result_observer = attempt_results,
             .body_stream = .{ .context = &transport.upload, .read = protocol.Queue.read },
             .timeout_ms = timeout_ms,
             .cancellation = cancellation,
@@ -434,7 +475,7 @@ pub fn invokeInferenceConnectionWithRequest(
     }
     if (stream.start != null and stream.write != null and stream.close != null) {
         var writer = @import("antfly_local_sources").common_inference_tasks.StreamWriter{ .sink = stream };
-        var response = try (http orelse return error.InferenceTransportUnavailable).requestToWriter(switch (method) {
+        var response = try provider_http.requestToWriter(switch (method) {
             .get => .GET,
             .post => .POST,
             .put => .PUT,
@@ -444,6 +485,7 @@ pub fn invokeInferenceConnectionWithRequest(
             .headers = headers,
             .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
             .attempt_observer = request.attempt_observer,
+            .attempt_result_observer = attempt_results,
             .borrowed_body = if (request.body_source.read == null) body else null,
             .body_stream = if (request.body_source.read != null) .{ .context = @constCast(&request.body_source), .read = readInvocationBody } else null,
             .timeout_ms = timeout_ms,
@@ -456,7 +498,7 @@ pub fn invokeInferenceConnectionWithRequest(
         try writer.close();
         return .{ .status = response.status.code, .body = try alloc.dupe(u8, "") };
     }
-    var response = try (http orelse return error.InferenceTransportUnavailable).request(switch (method) {
+    var response = try provider_http.request(switch (method) {
         .get => .GET,
         .post => .POST,
         .put => .PUT,
@@ -466,6 +508,7 @@ pub fn invokeInferenceConnectionWithRequest(
         .headers = headers,
         .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
         .attempt_observer = request.attempt_observer,
+        .attempt_result_observer = attempt_results,
         .body = body,
         .timeout_ms = timeout_ms,
         .cancellation = cancellation,
@@ -539,7 +582,7 @@ fn resolveInferenceConnection(
         const uses_default = cfg.url.len == 0;
         if (uses_default) if (local_target) |target| return .{ .local = target };
         const url = if (uses_default) config.inference.api_url orelse return error.ConnectionURLMissing else cfg.url;
-        if (!validInferenceURL(url)) return error.InvalidConnectionURL;
+        if (!common_config.validInferenceURL(url)) return error.InvalidConnectionURL;
         return .{ .remote = .{
             .url = url,
             .api_key = cfg.api_key orelse (if (uses_default) config.inference.api_key else null),
@@ -560,7 +603,7 @@ fn resolveInferenceConnection(
             const uses_default = cfg.resolvedUrl() == null;
             if (uses_default) if (local_target) |target| return .{ .local = target };
             const url = cfg.resolvedUrl() orelse config.inference.api_url orelse return error.ConnectionURLMissing;
-            if (!validInferenceURL(url)) return error.InvalidConnectionURL;
+            if (!common_config.validInferenceURL(url)) return error.InvalidConnectionURL;
             return .{ .remote = .{
                 .url = url,
                 .api_key = cfg.bearer_token orelse cfg.api_key orelse (if (uses_default) config.inference.api_key else null),
@@ -573,20 +616,22 @@ fn resolveInferenceConnection(
     }
     if (std.mem.eql(u8, connection_id, common_config.default_inference_connection_id)) {
         const url = config.inference.api_url orelse return error.ConnectionNotFound;
-        if (!validInferenceURL(url)) return error.InvalidConnectionURL;
+        if (!common_config.validInferenceURL(url)) return error.InvalidConnectionURL;
         return .{ .remote = .{ .url = url, .api_key = config.inference.api_key } };
     }
-    const connection = config.connections.get(connection_id) orelse return error.ConnectionNotFound;
-    if (connection.kind != .inference) return error.ConnectionNotInference;
-    try requireInferenceCapability(connection.capabilities, required_capability);
-    const cfg = connection.inference orelse return error.InvalidConfig;
+    const cfg = try common_config.resolveInferenceConnection(&config.connections, connection_id, required_capability);
     if (!std.mem.eql(u8, cfg.provider, "antfly")) return error.ProviderNotAntflyCompatible;
     const raw_url = cfg.url orelse return error.ConnectionURLMissing;
-    if (!validInferenceURL(raw_url)) return error.InvalidConnectionURL;
+    if (!common_config.validInferenceURL(raw_url)) return error.InvalidConnectionURL;
     return .{
         .remote = .{
             .url = raw_url,
             .api_key = cfg.api_key,
+            .headers = cfg.headers,
+            .attribution = cfg.attribution,
+            .tls_ca_file = cfg.tls_ca_file,
+            .allow_private_ips = cfg.allow_private_ips,
+            .bind_origin = true,
             // The reserved connection ID above is the only process-local identity.
             // A configured URL may resolve through aliases, proxies, or a future
             // listener at the same origin, so URL equality must never transfer
@@ -633,17 +678,6 @@ fn resolveInferenceApiKey(
     raw: ?[]const u8,
 ) !?[]u8 {
     return if (raw) |value| try common_secrets.resolveReferenceOwned(alloc, secret_store, value) else null;
-}
-
-pub fn requireInferenceCapability(capabilities: []const []const u8, required: []const u8) !void {
-    if (!containsString(capabilities, required)) return error.ConnectionCapabilityMissing;
-}
-
-fn validInferenceURL(raw_url: []const u8) bool {
-    if (std.mem.indexOfAny(u8, raw_url, "?#") != null) return false;
-    const parsed = std.Uri.parse(raw_url) catch return false;
-    return parsed.host != null and
-        (std.ascii.eqlIgnoreCase(parsed.scheme, "http") or std.ascii.eqlIgnoreCase(parsed.scheme, "https"));
 }
 
 pub const Sources = struct {
@@ -807,6 +841,9 @@ fn dupeStringListConst(alloc: Allocator, values: []const []const u8) ![]const []
 
 /// Deduped inference provider instance gathered from configs.
 const Instance = struct {
+    tls_ca_file: ?[]const u8 = null,
+    allow_private_ips: ?bool = null,
+    headers: std.StringArrayHashMapUnmanaged([]u8) = .empty,
     provider: list_models.ProviderTag,
     url: []const u8 = "",
     api_key: ?[]const u8 = null,
@@ -816,6 +853,7 @@ const Instance = struct {
     credentials_path: []const u8 = "",
     workspace_id: []const u8 = "",
     key: []const u8 = "",
+    configured_connection_id: ?[]const u8 = null,
     names: std.ArrayListUnmanaged([]const u8) = .empty,
     sources: std.ArrayListUnmanaged([]const u8) = .empty,
     model_types: std.EnumSet(ConfiguredModelType) = std.EnumSet(ConfiguredModelType).empty,
@@ -836,8 +874,11 @@ const ModelsOutcome = struct {
 };
 
 const ModelsJob = struct {
+    tls_ca_file: ?[]const u8 = null,
+    allow_private_ips: ?bool = null,
     ep: list_models.Endpoint,
     timeout_ms: u64,
+    attempts: ?@import("antfly_local_sources").common_inference_tasks.ProviderAttempts = null,
     arena_state: std.heap.ArenaAllocator,
     result: ?list_models.ListResult = null,
     err: ?anyerror = null,
@@ -902,6 +943,11 @@ const ModelsJob = struct {
         const io = job.io orelse fallback_io_impl.?.io();
         var client = httpx.Client.initWithConfig(alloc, io, .{
             .keep_alive = false,
+            .attempt_result_observer = if (job.attempts) |*attempts| attempts.observer() else null,
+            .tls_ca_file = job.tls_ca_file,
+            .address_filter = common_config.inferenceAddressFilter(job.allow_private_ips),
+            .cookies_enabled = false,
+            .request_origin = if (common_config.validInferenceURL(job.ep.url)) try httpx.Uri.parse(job.ep.url) else null,
             .retry_policy = .{ .max_retries = 0 },
             .request_cancellation = if (job.request_context != null) httpx.CancellationToken.fromCallback(job, cancelled) else null,
         });
@@ -1327,7 +1373,20 @@ fn instanceFromConnectionConfig(
     const instance = try arena.create(Instance);
     instance.* = .{
         .provider = provider,
-        .url = if (cfg.url) |value| try arena.dupe(u8, value) else "",
+        .headers = cfg.headers,
+        .tls_ca_file = cfg.tls_ca_file,
+        .allow_private_ips = cfg.allow_private_ips,
+        .url = if (provider == .cloudflare)
+            if (cfg.discovery_url) |value|
+                try arena.dupe(u8, value)
+            else if (cfg.url == null)
+                try list_models.cloudflareDiscoveryURL(arena, cfg.account_id orelse return error.InvalidConfig)
+            else
+                ""
+        else if (cfg.url) |value|
+            try arena.dupe(u8, value)
+        else
+            try list_models.defaultDiscoveryURL(arena, provider, cfg.region),
         .api_key = if (cfg.api_key) |value| try arena.dupe(u8, value) else null,
         .region = if (cfg.region) |value| try arena.dupe(u8, value) else "",
         .project_id = if (cfg.project_id) |value| try arena.dupe(u8, value) else "",
@@ -1336,6 +1395,7 @@ fn instanceFromConnectionConfig(
         .workspace_id = if (cfg.workspace_id orelse (if (provider == .anthropic) @import("antfly_platform").env.getenv("ANTHROPIC_WORKSPACE_ID") else null)) |value| try arena.dupe(u8, value) else "",
         .key = try std.fmt.allocPrint(arena, "config:connections/{s}", .{id}),
         .model_types = model_types,
+        .configured_connection_id = id,
     };
     for (cfg.names) |name| try instance.names.append(arena, name);
     try instance.sources.append(arena, instance.key);
@@ -1428,6 +1488,7 @@ fn resolveModels(
 
     for (instances, 0..) |instance, i| {
         if (opts.request_context) |context| try context.check();
+        if (!instance.provider.supportsDiscovery() or (instance.provider == .cloudflare and instance.url.len == 0)) continue;
         if (instance.provider == .mock) {
             const result = try list_models.listModels(arena, undefined, .{ .provider = .mock }, opts.timeout_ms);
             outcomes[i] = .{ .ok = true, .models = result.models };
@@ -1437,7 +1498,7 @@ fn resolveModels(
         // Embedded inference node: call in-process when available and the
         // instance has no remote URL override.
         if (instance.provider == .antfly and instance.url.len == 0 or
-            (instance.provider == .antfly and sources.inference_api_url != null and std.mem.eql(u8, instance.url, sources.inference_api_url.?)))
+            (instance.provider == .antfly and instance.headers.count() == 0 and instance.tls_ca_file == null and instance.allow_private_ips == null and sources.inference_api_url != null and std.mem.eql(u8, instance.url, sources.inference_api_url.?)))
         {
             if (sources.antfly_provider) |provider| {
                 if (provider.list_models_json) |list_fn| {
@@ -1457,9 +1518,25 @@ fn resolveModels(
             }
         }
 
+        const api_key = resolveInferenceApiKey(arena, sources.secret_store, instance.api_key) catch |err| {
+            outcomes[i] = .{ .ok = false, .err_name = @errorName(err) };
+            continue;
+        };
+
+        if ((instance.headers.count() != 0 or instance.tls_ca_file != null or instance.allow_private_ips != null) and !common_config.validInferenceURL(instance.url)) {
+            outcomes[i] = .{ .ok = false, .err_name = @errorName(error.InvalidConnectionURL) };
+            continue;
+        }
+        const headers = common_config.resolveInferenceHeaders(arena, sources.secret_store, instance.headers) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            outcomes[i] = .{ .ok = false, .err_name = @errorName(err) };
+            continue;
+        };
+
+        const cache_key = try discoveryCacheKeyAlloc(arena, instance, api_key, headers);
         if (!opts.refresh) {
             if (cache) |c| {
-                if (try c.lookupCopy(arena, instance.key, now_ns, opts.ttl_ns)) |entry| {
+                if (try c.lookupCopy(arena, cache_key, now_ns, opts.ttl_ns)) |entry| {
                     outcomes[i] = .{
                         .ok = entry.ok,
                         .err_name = entry.err_name,
@@ -1470,17 +1547,15 @@ fn resolveModels(
             }
         }
 
-        const api_key = resolveInferenceApiKey(arena, sources.secret_store, instance.api_key) catch |err| {
-            outcomes[i] = .{ .ok = false, .err_name = @errorName(err) };
-            continue;
-        };
-
         const job = try arena.create(ModelsJob);
         job.* = .{
+            .tls_ca_file = instance.tls_ca_file,
+            .allow_private_ips = instance.allow_private_ips,
             .ep = .{
                 .provider = instance.provider,
                 .url = instance.url,
                 .api_key = api_key,
+                .headers = headers,
                 .region = instance.region,
                 .project_id = instance.project_id,
                 .location = instance.location,
@@ -1488,9 +1563,14 @@ fn resolveModels(
                 .workspace_id = instance.workspace_id,
             },
             .timeout_ms = opts.timeout_ms,
+            .attempts = if (instance.configured_connection_id) |id| .{
+                .connection = id,
+                .task = "discover",
+                .model = "",
+            } else null,
             .arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator),
             .cache = cache,
-            .cache_key = instance.key,
+            .cache_key = cache_key,
             .request_started_ns = now_ns,
             .ttl_ns = opts.ttl_ns,
             .refresh = opts.refresh,
@@ -1739,6 +1819,21 @@ fn resolveExternalIoProbes(
     }
 }
 
+fn discoveryCacheKeyAlloc(arena: Allocator, instance: *const Instance, api_key: ?[]const u8, headers: []const [2][]const u8) ![]const u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    for ([_][]const u8{ instance.key, @tagName(instance.provider), instance.url, instance.region, instance.project_id, instance.location, instance.credentials_path, instance.workspace_id }) |value| {
+        hashProbeField(&hash, value);
+    }
+    hashProbeOptionalField(&hash, api_key);
+    hashProbeOptionalField(&hash, instance.tls_ca_file);
+    hashProbeOptionalField(&hash, if (instance.allow_private_ips) |allowed| if (allowed) "allow" else "deny" else null);
+    for (headers) |header| {
+        hashProbeField(&hash, header[0]);
+        hashProbeField(&hash, header[1]);
+    }
+    return try arena.dupe(u8, &std.fmt.bytesToHex(hash.finalResult(), .lower));
+}
+
 fn objectProbeCacheKeyAlloc(arena: Allocator, name: []const u8, cfg: common_config.Config.ExternalIoConnectionConfig) ![]u8 {
     // Credential material participates in identity so rotation invalidates a
     // stale probe, but only its cryptographic digest is retained as a cache
@@ -1929,6 +2024,20 @@ fn probeFilesystemRoot(root: []const u8, shared_io: ?std.Io) !void {
 
 const table_manager = @import("../metadata/table_manager.zig");
 
+test "httpx inference gateway discovery cache follows credential rotation and network policy" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var instance: Instance = .{ .provider = .openai, .url = "https://gateway.internal", .key = "config:connections/gateway" };
+    const headers: []const [2][]const u8 = &.{.{ "X-Gateway-Key", "first" }};
+    const original = try discoveryCacheKeyAlloc(a, &instance, "key-one", headers);
+    try std.testing.expectEqualStrings(original, try discoveryCacheKeyAlloc(a, &instance, "key-one", headers));
+    try std.testing.expect(!std.mem.eql(u8, original, try discoveryCacheKeyAlloc(a, &instance, "key-two", headers)));
+    try std.testing.expect(!std.mem.eql(u8, original, try discoveryCacheKeyAlloc(a, &instance, "key-one", &.{.{ "X-Gateway-Key", "second" }})));
+    instance.allow_private_ips = false;
+    try std.testing.expect(!std.mem.eql(u8, original, try discoveryCacheKeyAlloc(a, &instance, "key-one", headers)));
+}
+
 test "object probe cache identity covers every bucket and credential source" {
     const alloc = std.testing.allocator;
     var first = common_config.Config.ExternalIoConnectionConfig{
@@ -2066,8 +2175,8 @@ test "inference connection operations are allowlisted" {
     try std.testing.expect(inferenceCapability("../models") == null);
 
     const embed_only = &.{"models.embed"};
-    try requireInferenceCapability(embed_only, inferenceCapability("embed").?);
-    try std.testing.expectError(error.ConnectionCapabilityMissing, requireInferenceCapability(embed_only, inferenceCapability("generate").?));
+    try common_config.requireInferenceCapability(embed_only, inferenceCapability("embed").?);
+    try std.testing.expectError(error.ConnectionCapabilityMissing, common_config.requireInferenceCapability(embed_only, inferenceCapability("generate").?));
 
     const alloc = std.testing.allocator;
     var cfg = try common_config.Config.parseFromSlice(alloc,
@@ -2098,6 +2207,63 @@ test "inference connection operations are allowlisted" {
     const resolved = (try resolveInferenceApiKey(alloc, &secret_store, "${secret:openai.api_key}")).?;
     defer alloc.free(resolved);
     try std.testing.expectEqualStrings("resolved-key", resolved);
+}
+
+test "httpx inference connection sends fixed headers on remote invocation and discovery" {
+    const Check = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("search", req.header("x-billing-team") orelse return error.MissingTestHeader);
+            try std.testing.expectEqualStrings("Bearer provider-key", req.header("authorization") orelse return error.MissingTestHeader);
+        }
+    };
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var upstream = try httpx.TestServer.start(alloc, io_impl.io(), &.{
+        .{ .method = .GET, .path = "/ai/v1/models", .assert_request = Check.request, .respond = .{ .body = "{}" } },
+        .{ .method = .POST, .path = "/ai/v1/generate", .assert_request = Check.request, .respond = .{ .body = "{}" } },
+    });
+    defer upstream.deinit();
+    const raw = try std.fmt.allocPrint(alloc,
+        \\{{"connections":{{"gateway":{{"kind":"inference","capabilities":["models.generate"],"inference":{{"provider":"antfly","url":"{s}","api_key":"provider-key","headers":{{"X-Billing-Team":"search"}}}}}}}}}}
+    , .{upstream.baseUrl()});
+    defer alloc.free(raw);
+    var config = try common_config.Config.parseFromSlice(alloc, raw);
+    defer config.deinit();
+    const Client = struct {
+        fn run(a: Allocator, io: std.Io, cfg: *const common_config.Config, failure: *?anyerror) void {
+            invoke(a, io, cfg) catch |err| {
+                failure.* = err;
+            };
+        }
+
+        fn invoke(a: Allocator, io: std.Io, cfg: *const common_config.Config) !void {
+            var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+            defer client.deinit();
+            const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+            var result = try invokeInferenceConnection(a, &client, cfg, null, null, "gateway", "generate", "{}", null, deadline, .{});
+            defer result.deinit(a);
+            try std.testing.expectEqual(@as(u16, 200), result.status);
+            try std.testing.expectEqualStrings("{}", result.body);
+
+            var discovery_arena = std.heap.ArenaAllocator.init(a);
+            defer discovery_arena.deinit();
+            const arena = discovery_arena.allocator();
+            const inference = cfg.connections.get("gateway").?.inference.?;
+            const instance = try instanceFromConnectionConfig(arena, "gateway", .antfly, inference, .empty);
+            const outcomes = try resolveModels(arena, .{ .network_io = io }, null, .{}, &.{instance});
+            try std.testing.expect(outcomes[0].?.ok);
+        }
+    };
+    var failure: ?anyerror = null;
+    const io = io_impl.io();
+    var group = std.Io.Group.init;
+    defer group.cancel(io);
+    try group.concurrent(io, Client.run, .{ alloc, io, &config, &failure });
+    try upstream.handleOne();
+    try upstream.handleOne();
+    try group.await(io);
+    if (failure) |err| return err;
 }
 
 test "inference admission ownership uses explicit connection identity" {
@@ -2315,10 +2481,10 @@ test "inference connection ABI rejects malformed responses without dereferencing
 }
 
 test "inference connection URLs require an HTTP origin" {
-    try std.testing.expect(validInferenceURL("https://platform.antfly.io/ai/v1"));
-    try std.testing.expect(validInferenceURL("http://antfly-inference.default.svc:8080"));
-    try std.testing.expect(!validInferenceURL("file:///etc/passwd"));
-    try std.testing.expect(!validInferenceURL("https://platform.antfly.io/ai/v1?redirect=bad"));
+    try std.testing.expect(common_config.validInferenceURL("https://platform.antfly.io/ai/v1"));
+    try std.testing.expect(common_config.validInferenceURL("http://antfly-inference.default.svc:8080"));
+    try std.testing.expect(!common_config.validInferenceURL("file:///etc/passwd"));
+    try std.testing.expect(!common_config.validInferenceURL("https://platform.antfly.io/ai/v1?redirect=bad"));
 }
 
 test "build response reports mock connected and types filter" {

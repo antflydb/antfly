@@ -446,12 +446,20 @@ pub fn resolveCredentialsUncached(alloc: std.mem.Allocator, http: *httpx.Client,
 
 fn resolveCredentialsUncachedWithContextAndIo(
     alloc: std.mem.Allocator,
-    http: *httpx.Client,
+    provider_http: *httpx.Client,
     filesystem_io: ?std.Io,
     region: []const u8,
     source: CredentialSource,
     context: RequestContext,
 ) !Credentials {
+    // Scoped provider clients carry billing headers and trust for one model
+    // origin. Credential services have their own routing and system trust.
+    var credential_http: ?httpx.Client = if (provider_http.config.request_origin != null)
+        httpx.Client.initWithConfig(alloc, provider_http.io, .{ .keep_alive = false, .cookies_enabled = false, .request_cancellation = provider_http.config.request_cancellation })
+    else
+        null;
+    defer if (credential_http) |*client| client.deinit();
+    const http = if (credential_http) |*client| client else provider_http;
     try context.check(http.io);
     return switch (source) {
         .profile => |profile| try credentialsFromProfile(alloc, http, filesystem_io, profile, context),

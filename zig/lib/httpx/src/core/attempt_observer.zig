@@ -37,3 +37,11 @@ pub const AttemptObserver = struct {
         output_tokens: u64,
     };
 };
+
+/// Passive reporting after each transport attempt, independent of admission.
+pub const AttemptResultObserver = struct {
+    context: *anyopaque,
+    record: *const fn (*anyopaque, Attempt, u64, ?*const Response, ?anyerror) void,
+
+    pub const Attempt = struct { request: u128, number: u32 };
+};

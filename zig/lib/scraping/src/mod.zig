@@ -1684,6 +1684,12 @@ fn hasComponentPrefix(path: []const u8, prefix: []const u8, separator: u8) bool 
     return path.len == prefix.len or prefix[prefix.len - 1] == separator or path[prefix.len] == separator;
 }
 
+/// Reuse the global-address classification for outbound transports with an
+/// independent policy. No remote-content configuration is inherited.
+pub fn globalAddressFilter() httpx.AddressFilter {
+    return .{ .acceptsFn = allowGlobalAddress };
+}
+
 fn allowGlobalAddress(context: ?*const anyopaque, address: std.Io.net.IpAddress) bool {
     const security: ?*const ContentSecurityConfig = if (context) |ptr| @ptrCast(@alignCast(ptr)) else null;
     return switch (address) {

@@ -423,7 +423,7 @@ pub const Registry = struct {
     }
 
     pub fn registerRerankerConfig(self: *Registry, name: []const u8, cfg: reranking.Config) !void {
-        try cfg.validate();
+        try cfg.validateForRegistry();
         const key = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(key);
         var owned_cfg = try cfg.clone(self.allocator);
@@ -489,7 +489,9 @@ pub const Registry = struct {
         for (owned_links) |link| {
             try link.validate();
             if (link.generator_name) |generator_name| {
-                if (!self.generator_configs.contains(generator_name)) return error.UnknownGenerator;
+                if (!self.generator_configs.contains(generator_name)) {
+                    if ((try @import("config.zig").InferenceModelReference.parse(generator_name)) == null) return error.UnknownGenerator;
+                }
             }
         }
 

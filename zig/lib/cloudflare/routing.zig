@@ -33,6 +33,20 @@ pub fn modelId(model: []const u8) !void {
     }
 }
 
+/// A qualified model defers account and gateway binding to the connection.
+pub fn validateModelRoute(model: []const u8, account: ?[]const u8, gateway: ?[]const u8) !void {
+    if (std.mem.startsWith(u8, model, "connections/")) {
+        if (account != null or gateway != null) return error.InvalidCloudflareConfig;
+        const tail = model["connections/".len..];
+        const separator = std.mem.indexOfScalar(u8, tail, '/') orelse return error.UnsupportedCloudflareModel;
+        if (separator == 0 or !std.mem.startsWith(u8, tail[separator..], "/models/")) return error.UnsupportedCloudflareModel;
+        return modelId(tail[separator + "/models/".len ..]);
+    }
+    try identifier(account orelse return error.InvalidCloudflareConfig);
+    try modelId(model);
+    if (gateway) |id| try identifier(id);
+}
+
 /// All ordinary Cloudflare adapters resolve their account into the endpoint
 /// before entering the existing pooled, quota-controlled provider execution.
 pub fn baseUrl(a: std.mem.Allocator, account: ?[]const u8, override: ?[]const u8) ![]u8 {

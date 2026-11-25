@@ -56,6 +56,17 @@ The primary embedded open surface is storage-neutral:
 - storage sizing, TTL cleanup tuning, embedded-inference resource budgets,
   and `busy_timeout_ms`.
 
+Set `inference_connections_json` to the JSON object normally placed under
+`connections` in standalone configuration. Embedded indexes and extractors can
+then refer to `connections/<id>/models/<model>`. Supply the connection map on
+each open that uses those providers. The library copies the map for the open
+handle and keeps its endpoint policy, headers, and credentials in memory.
+Workload attribution uses `default` for the root table and the catalog name
+for each named table.
+
+Python callers can use `OpenOptions.inference_connections`. Go callers can
+set `OpenOptions.InferenceConnectionsJSON`.
+
 Directory storage is the default for the generic open APIs. The
 `antfly_lite_open*` / `antfly_lite_create*` shortcuts open a `.aflite` file
 with default options; pass `antfly_open_options` with

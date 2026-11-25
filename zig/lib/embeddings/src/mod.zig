@@ -173,9 +173,7 @@ pub const Config = struct {
     pub fn validate(self: Config) !void {
         if (self.provider == .cloudflare and (self.sparse orelse false)) return error.InvalidEmbedderConfig;
         if (self.provider == .cloudflare) {
-            try cloudflare.identifier(self.account_id orelse return error.InvalidCloudflareConfig);
-            try cloudflare.modelId(self.model);
-            if (self.gateway_id) |id| try cloudflare.identifier(id);
+            try cloudflare.validateModelRoute(self.model, self.account_id, self.gateway_id);
         } else if (self.account_id != null or self.gateway_id != null) return error.InvalidCloudflareConfig;
         if (self.model_identity.len > 0) {
             if (self.provider != .antfly or self.model_identity.len != 64) return error.InvalidEmbedderConfig;

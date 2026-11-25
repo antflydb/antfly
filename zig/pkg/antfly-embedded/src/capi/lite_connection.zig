@@ -2210,6 +2210,7 @@ pub const Owner = struct {
     options: api.LiteResolvedOpenOptions,
     owned_ttl_owner_id: ?[]u8 = null,
     owned_models_dir: ?[]u8 = null,
+    owned_inference_connections_json: ?[]u8 = null,
     gate: *PathGate,
     /// WS3 writer lane: see `WriterLane`'s doc comment. One per Owner (one
     /// per Store), shared by every compatible `Connection` to this path in
@@ -5095,6 +5096,10 @@ pub const Owner = struct {
         self.reader_coordinator.release();
         if (self.owned_ttl_owner_id) |id| alloc.free(id);
         if (self.owned_models_dir) |directory| alloc.free(directory);
+        if (self.owned_inference_connections_json) |json| {
+            @memset(json, 0);
+            alloc.free(json);
+        }
         self.path_lock_io.deinit();
         @import("io_lifetime.zig").release();
         alloc.destroy(self);
@@ -5121,6 +5126,9 @@ fn compatible(a: api.LiteResolvedOpenOptions, b: api.LiteResolvedOpenOptions) bo
         left.inference.models_dir = null;
         right.inference.models_dir = null;
     }
+    if (!std.mem.eql(u8, left.inference_connections_json, right.inference_connections_json)) return false;
+    left.inference_connections_json = "";
+    right.inference_connections_json = "";
     return std.meta.eql(left, right);
 }
 
@@ -5735,6 +5743,15 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
         resolved_options.inference.models_dir = models_dir.?;
     }
     defer if (models_dir) |directory| alloc.free(directory);
+    var inference_connections_json: ?[]u8 = null;
+    if (options.inference_connections_json.len > 0) {
+        inference_connections_json = try alloc.dupe(u8, options.inference_connections_json);
+        resolved_options.inference_connections_json = inference_connections_json.?;
+    }
+    defer if (inference_connections_json) |json| {
+        @memset(json, 0);
+        alloc.free(json);
+    };
     var initial: ?*h.Handle = null;
     errdefer if (initial) |root| {
         root.lease_snapshot = true;
@@ -5776,7 +5793,7 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
         // Runtime snapshots may close out of order or before this owner. Keep
         // the process signal owner alive until this executor has joined too.
         @import("io_lifetime.zig").acquire();
-        owner.* = .{ .path = gate.path, .gate = gate, .options = resolved_options, .current = initial, .owned_ttl_owner_id = ttl_owner_id, .owned_models_dir = models_dir, .path_lock_io = std.Io.Threaded.init(alloc, .{ .async_limit = .nothing, .concurrent_limit = .limited(2) }) };
+        owner.* = .{ .path = gate.path, .gate = gate, .options = resolved_options, .current = initial, .owned_ttl_owner_id = ttl_owner_id, .owned_models_dir = models_dir, .owned_inference_connections_json = inference_connections_json, .path_lock_io = std.Io.Threaded.init(alloc, .{ .async_limit = .nothing, .concurrent_limit = .limited(2) }) };
         if (initial) |root| {
             root.lite_refresh_adoption_epoch = root.owned_lite_backend.?.native_docstore.?.file.adoptionEpoch();
             root.lite_runtime_sequence = root.owned_lite_backend.?.native_docstore.?.file.committedSequence();
@@ -5839,6 +5856,7 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
     if (existing == null) {
         ttl_owner_id = null;
         models_dir = null;
+        inference_connections_json = null;
     }
     return wrapper;
 }

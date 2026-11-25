@@ -50,6 +50,10 @@ pub const Record = struct {
     format: u32 = 1,
     run_id: []const u8,
     owner: []const u8,
+    /// Authenticated billing principal captured by the submitting API.
+    attribution_principal: ?[]const u8 = null,
+    attribution_tenant: ?[]const u8 = null,
+    attribution_project: ?[]const u8 = null,
     operation: enum { read, extract } = .read,
     connection: []const u8 = "local-inference",
     artifact_namespace: ?Digest = null,
@@ -103,6 +107,11 @@ pub const Record = struct {
 /// index-owned invocations. Only the initial preparation seal may narrow limits.
 pub fn validateIdentityTransition(previous: Record, next: Record) !void {
     if (!std.mem.eql(u8, previous.run_id, next.run_id) or !std.mem.eql(u8, previous.owner, next.owner) or previous.operation != next.operation or !std.mem.eql(u8, previous.connection, next.connection) or previous.retention_until_ms != next.retention_until_ms) return error.InvalidDocumentCheckpoint;
+    inline for (.{ "attribution_principal", "attribution_tenant", "attribution_project" }) |field| {
+        if (@field(previous, field)) |value| {
+            if (!std.mem.eql(u8, value, @field(next, field) orelse return error.InvalidDocumentCheckpoint)) return error.InvalidDocumentCheckpoint;
+        } else if (@field(next, field) != null) return error.InvalidDocumentCheckpoint;
+    }
     if (previous.artifact_namespace != null and !std.meta.eql(previous.artifact_namespace, next.artifact_namespace)) return error.DocumentModelRevisionMismatch;
     const preparing = !previous.prepared and next.prepared and previous.used.calls == 0 and previous.pending.len == 0 and previous.attempt == next.attempt and previous.state == .running and next.state == .running;
     if (!preparing and (!std.meta.eql(previous.identity, next.identity) or !std.meta.eql(previous.limits, next.limits))) return error.InvalidDocumentCheckpoint;

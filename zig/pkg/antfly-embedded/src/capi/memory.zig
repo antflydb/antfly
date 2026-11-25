@@ -85,7 +85,7 @@ pub fn execute(guard: *@import("db.zig").HandleGuard, handle_ptr: ?*anyopaque, a
     const provider_service = provider_owner.lite_inference;
     if (provider_service) |provider| provider.retain();
     defer if (provider_service) |provider| provider.release();
-    const runtime = try @import("../asset_producer_runtime.zig").Runtime.createOwned(a, h.handleLockIo(), .{ .antfly_provider = handle.liteAntflyProvider(), .source_table = table });
+    const runtime = try @import("../asset_producer_runtime.zig").Runtime.createOwned(a, h.handleLockIo(), .{ .antfly_provider = handle.liteAntflyProvider(), .source_table = table, .inference_connections = @import("db.zig").inferenceConnections(provider_owner) });
     defer runtime.deinit();
     const Hooks = struct {
         guard: *@import("db.zig").HandleGuard,

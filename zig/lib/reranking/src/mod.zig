@@ -182,13 +182,24 @@ pub const Config = struct {
     }
 
     pub fn validate(self: Config) !void {
-        if (self.provider == .cloudflare) {
+        return self.validateConfig(false);
+    }
+
+    pub fn validateForRegistry(self: Config) !void {
+        return self.validateConfig(true);
+    }
+
+    fn validateConfig(self: Config, allow_connection_reference: bool) !void {
+        const qualified = allow_connection_reference and std.mem.startsWith(u8, self.model, "connections/");
+        if (qualified and self.provider == .cloudflare) {
+            if (self.account_id != null or self.gateway_id != null) return error.InvalidCloudflareConfig;
+        } else if (self.provider == .cloudflare) {
             try cloudflare.identifier(self.account_id orelse return error.InvalidCloudflareConfig);
             try cloudflare.modelId(self.model);
             if (self.gateway_id) |id| try cloudflare.identifier(id);
         } else if (self.account_id != null or self.gateway_id != null) return error.InvalidCloudflareConfig;
         if (self.field.len == 0 and self.template.len == 0) return error.InvalidRerankerConfig;
-        if (self.provider == .cloudflare and !std.mem.eql(u8, self.model, "@cf/baai/bge-reranker-base")) return error.UnsupportedCloudflareModel;
+        if (!qualified and self.provider == .cloudflare and !std.mem.eql(u8, self.model, "@cf/baai/bge-reranker-base")) return error.UnsupportedCloudflareModel;
         const capabilities = providerCapabilities(self.provider);
         const model = std.mem.trim(u8, self.model, " \t\r\n");
         if ((self.model.len > 0 and model.len == 0) or (capabilities.model_required and model.len == 0))
@@ -225,7 +236,7 @@ test "reranker rejects a blank explicit routing model" {
 /// `candidate_count` is optional for ergonomic small queries, but omitting it
 /// must not let `offset + limit` bypass the same provider-work ceiling.
 pub fn validateQueryWindow(cfg: Config, offset: u32, limit: u32) !void {
-    try cfg.validate();
+    try cfg.validateForRegistry();
     const output_limit = cfg.top_n orelse limit;
     const page_end = offset +| output_limit;
     if (cfg.candidate_count) |candidate_count| {
@@ -278,7 +289,7 @@ pub fn configFromOpenApi(alloc: Allocator, generated: openapi.RerankerConfig) !C
         else
             null,
     };
-    try cfg.validate();
+    try cfg.validateForRegistry();
     return cfg.clone(alloc);
 }
 

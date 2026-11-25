@@ -451,7 +451,7 @@ fn adjudicationProducer(handle: *h.Handle) !@import("../storage/db/enrichment/as
     if (database.enrichment_runtime) |runtime| if (runtime.config.asset_producer) |producer| return producer;
     handle.query_producer_mutex.lockUncancelable(io);
     defer handle.query_producer_mutex.unlock(io);
-    if (handle.query_producer == null) handle.query_producer = try @import("../asset_producer_runtime.zig").Runtime.createOwned(handle.alloc, io, .{ .antfly_provider = handle.liteAntflyProvider() });
+    if (handle.query_producer == null) handle.query_producer = try @import("../asset_producer_runtime.zig").Runtime.createOwned(handle.alloc, io, .{ .antfly_provider = handle.liteAntflyProvider(), .inference_connections = @import("db.zig").inferenceConnections(handle) });
     return handle.query_producer.?.producer();
 }
 
