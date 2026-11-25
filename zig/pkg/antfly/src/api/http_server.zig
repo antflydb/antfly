@@ -51062,15 +51062,19 @@ test "api http server create index installs exact visible config and defers lagg
 
         // Replacing a producer used by an existing index is validated against
         // the complete post-update catalog before the metadata mutation.
+        // Omitting a producer can validly inherit the inline index embedder;
+        // use an actual output-dimension conflict to exercise rejection.
+        const commits_before_replacement = artifact_source.replace_definition_calls;
         var rejected_replacement = try executeHttpxTestRequest(&artifact_server, .{
             .method = .PUT,
             .uri = "/tables/docs/artifacts/p1_chunkvec_v1/enrichment",
             .content_type = "application/json",
-            .body = "{\"kind\":\"embedding\",\"field\":\"content\",\"source_artifact_name\":\"p1_chunks_v1\",\"expected_dims\":384}",
+            .body = "{\"kind\":\"embedding\",\"field\":\"content\",\"source_artifact_name\":\"p1_chunks_v1\",\"expected_dims\":768}",
         });
         defer rejected_replacement.deinit(alloc);
         try std.testing.expectEqual(@as(u16, 400), rejected_replacement.status);
-        try std.testing.expect(std.mem.indexOf(u8, rejected_replacement.body, "producer") != null);
+        try std.testing.expect(std.mem.indexOf(u8, rejected_replacement.body, "conflicting_embedding_artifact_dimensions") != null);
+        try std.testing.expectEqual(commits_before_replacement, artifact_source.replace_definition_calls);
         try std.testing.expectEqual(@as(usize, 0), artifact_source.put_enrichment_calls);
     }
 
