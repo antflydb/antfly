@@ -4994,7 +4994,10 @@ test "enrichment cancellation recovery reserves one replay pass without resettin
     try std.testing.expect(runtime.boundary_recovery_pending);
     try enrichment_state.saveRuntimeStatus(erased, scope_name, ordinary);
     const superseding = try enrichment_state.loadRuntimeObservation(alloc, erased, scope_name);
-    try std.testing.expectError(error.EnrichmentSourceChanged, saveRuntimeStatusWithRetry(&runtime, .boundary_recovery));
+    runtime.ownership = try ownership_mod.State.init(alloc, erased, enrichment_lease.default_lease_key, .{ .lease_owned = true });
+    defer runtime.ownership.deinitPreserveLease(alloc);
+    runtime.io_impl = .{ .borrowed = std.testing.io };
+    try std.testing.expectError(error.EnrichmentReplayAuthorityBusy, runForegroundCatchUpPassGuarded(&runtime, std.testing.io, failed.target_sequence, .{}));
     try std.testing.expect(!runtime.boundary_recovery_pending and runtime.retrying and !runtime.worker_failed);
     try std.testing.expectEqualDeep(superseding, try enrichment_state.loadRuntimeObservation(alloc, erased, scope_name));
     try std.testing.expect(boundaryFailureReadmission(failed, 14, 6) == null);
@@ -5620,10 +5623,9 @@ fn assetProducerProduceBatchReportedGuarded(
         try checkProviderFailureGuard(runtime);
         return assetProviderFailure(runtime, scoped, err);
     };
-    checkProviderFailureGuard(runtime) catch |err| {
-        produced.deinit(alloc);
-        return err;
-    };
+    errdefer produced.deinit(alloc);
+    scoped.invocation_context.check() catch |err| return assetProviderFailure(runtime, scoped, err);
+    try checkProviderFailureGuard(runtime);
     return produced;
 }
 
@@ -5666,10 +5668,9 @@ fn assetProducerProduceBorrowedRasterBatchReportedGuarded(
         try checkProviderFailureGuard(runtime);
         return assetProviderFailure(runtime, scoped, err);
     };
-    checkProviderFailureGuard(runtime) catch |err| {
-        produced.deinit(alloc);
-        return err;
-    };
+    errdefer produced.deinit(alloc);
+    scoped.invocation_context.check() catch |err| return assetProviderFailure(runtime, scoped, err);
+    try checkProviderFailureGuard(runtime);
     return produced;
 }
 
@@ -17920,7 +17921,7 @@ fn processAsset(
         // Asset acceptance is not graph completion. Retry the ordered graph
         // consumer without reinvoking the provider, including accepted absence
         // after primary deletion. Pending publication holds the replay cursor.
-        finishAcceptedAssetGraph(runtime, request) catch |err| return FailureScope.assetPublicationFailure(scope, err);
+        try finishAcceptedAssetGraph(runtime, request, scope);
         settleAcceptedMediaOutput(runtime, request, window) catch |err| return FailureScope.assetPublicationFailure(scope, err);
         retireMediaPassForAssetRequest(runtime, request) catch |err| return FailureScope.assetPublicationFailure(scope, err);
         retireIndexDocumentCheckpoint(runtime, request, if (context) |*value| value else null) catch |err| return FailureScope.assetPublicationFailure(scope, err);
@@ -17957,7 +17958,7 @@ fn processAsset(
             const artifact = requestArtifactName(request);
             const output_key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "asset", artifact);
             defer runtime.alloc.free(output_key);
-            enqueueAssetProducerOutput(runtime, request, value, output_key, null) catch |err| return FailureScope.assetPublicationFailure(scope, err);
+            try enqueueAssetProducerOutput(runtime, request, value, output_key, null, scope);
         }
         return;
     };
@@ -18016,7 +18017,7 @@ fn processAsset(
         }
         break :blk bytes;
     } else try extractEnrichmentSource(runtime, extractAssetSourceValue, runtime.alloc, raw, request)) orelse {
-        if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, null) catch |err| return FailureScope.assetPublicationFailure(scope, err);
+        if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, null, scope);
         const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
         defer runtime.alloc.free(state_key);
         if (producer_cfg.type == .document_extraction) {
@@ -18026,7 +18027,7 @@ fn processAsset(
             try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, key);
         }
         try appendFullTextDeleteDocumentToWindow(runtime, window, key, text_indexes);
-        materializeGraphAssetDeleteForRuntime(runtime, request, window) catch |err| return FailureScope.assetPublicationFailure(scope, err);
+        try materializeGraphAssetDeleteForRuntime(runtime, request, window, scope);
         // A null source is intentional no-output: settle graph/full_text
         // consumer coverage as skipped instead of leaving it pending.
         try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .skipped);
@@ -18063,7 +18064,7 @@ fn processAsset(
         // Missing selected fields use the same explicit no-output transition
         // as a missing upstream, so stale outputs cannot remain searchable.
         if (selected == null) {
-            if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, null) catch |err| return FailureScope.assetPublicationFailure(scope, err);
+            if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, null, scope);
             const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
             defer runtime.alloc.free(state_key);
             retireLocalAssetOutput(runtime, request, key, state_key, .{ .doc_key = request.doc_key, .digest = sourceRecordDigest(raw), .upstream_name = request.upstream_artifact_name, .upstream_digest = upstream_digest }) catch |err| return FailureScope.assetPublicationFailure(scope, err);
@@ -18087,7 +18088,7 @@ fn processAsset(
         source_text = selected;
     }
     if (source_text.len == 0) {
-        if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, null) catch |err| return FailureScope.assetPublicationFailure(scope, err);
+        if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, null, scope);
         const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
         defer runtime.alloc.free(state_key);
         if (producer_cfg.type == .document_extraction) {
@@ -18097,7 +18098,7 @@ fn processAsset(
             try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, key);
         }
         try appendFullTextDeleteDocumentToWindow(runtime, window, key, text_indexes);
-        materializeGraphAssetDeleteForRuntime(runtime, request, window) catch |err| return FailureScope.assetPublicationFailure(scope, err);
+        try materializeGraphAssetDeleteForRuntime(runtime, request, window, scope);
         try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .skipped);
         return;
     }
@@ -18136,7 +18137,7 @@ fn processAsset(
     };
 
     if (producer_cfg.type == .copy) {
-        if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, source_text) catch |err| return FailureScope.assetPublicationFailure(scope, err);
+        if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, source_text, scope);
         // Same reasoning as the generic producer's receipt below: key the
         // reuse receipt on the declared source (`source_text`), not the
         // whole primary document (`raw`), so an edit to an unrelated field
@@ -18146,7 +18147,7 @@ fn processAsset(
         const reuse_parent = if (runtime.index_manager.artifactFeedsGraph(artifact_name)) raw else source_text;
         if (try shouldSkipAssetArtifact(runtime, key, source_text) and try reusableLocalAsset(runtime, request.doc_key, artifact_name, reuse_parent, source_text)) {
             try appendInlineFullTextDocumentToWindow(runtime, window, key, source_text, text_indexes);
-            materializeGraphAssetForRuntime(runtime, request, source_text, raw, window) catch |err| return FailureScope.assetPublicationFailure(scope, err);
+            try materializeGraphAssetForRuntime(runtime, request, source_text, raw, window, scope);
             // The artifact exists and is current: produced coverage, so an
             // idempotent replay converges the consumer summary.
             try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .produced);
@@ -18160,7 +18161,7 @@ fn processAsset(
         storePutBatchGuardedWithRetry(runtime, &.{ .{ .key = key, .value = source_text }, .{ .key = receipt_key, .value = &receipt } }, &.{}, .{ .doc_key = request.doc_key, .digest = sourceRecordDigest(raw), .upstream_name = request.upstream_artifact_name, .upstream_digest = upstream_digest, .producer_name = artifact_name, .producer_recipe = producer_recipe }) catch |err| return FailureScope.assetPublicationFailure(scope, err);
         try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, key);
         try appendInlineFullTextDocumentToWindow(runtime, window, key, source_text, text_indexes);
-        materializeGraphAssetForRuntime(runtime, request, source_text, raw, window) catch |err| return FailureScope.assetPublicationFailure(scope, err);
+        try materializeGraphAssetForRuntime(runtime, request, source_text, raw, window, scope);
         recordArtifactBytes(runtime, .asset, source_text.len);
         try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .produced);
         return;
@@ -18242,7 +18243,7 @@ fn processAsset(
             // a snapshot source schedules its next refresh; the timer that
             // triggered this rebuild was consumed).
             if (context_publish) |publish| publishRetainedContextOutput(runtime, request.doc_key, requestArtifactName(request), publish) catch |err| return FailureScope.assetPublicationFailure(scope, err);
-            finishAcceptedAssetGraph(runtime, request) catch |err| return FailureScope.assetPublicationFailure(scope, err);
+            try finishAcceptedAssetGraph(runtime, request, scope);
             settleAcceptedMediaOutput(runtime, request, window) catch |err| return FailureScope.assetPublicationFailure(scope, err);
             retireMediaPassForAssetRequest(runtime, request) catch |err| return FailureScope.assetPublicationFailure(scope, err);
             retireIndexDocumentCheckpoint(runtime, request, token) catch |err| return FailureScope.assetPublicationFailure(scope, err);
@@ -18304,7 +18305,7 @@ fn processAsset(
                     storePutBatchGuardedWithRetry(runtime, &.{}, &.{}, .{ .doc_key = request.doc_key, .digest = sourceRecordDigest(raw), .dependency = .{ .artifact = artifact_name, .publish = publish, .new_version = false } }) catch |err| return FailureScope.assetPublicationFailure(scope, err);
                 }
                 try appendInlineFullTextDocumentToWindow(runtime, window, key, value, text_indexes);
-                materializeGraphAssetForRuntime(runtime, request, value, raw, window) catch |err| return FailureScope.assetPublicationFailure(scope, err);
+                try materializeGraphAssetForRuntime(runtime, request, value, raw, window, scope);
                 // Private outputs also require their destination-owned witness.
                 // A restored skip state cannot certify imported artifact bytes.
                 try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .produced);
@@ -20074,7 +20075,7 @@ fn processMediaOutput(runtime: *EnrichmentRuntime, request: enrichment_types.Gen
     const produced = try std.json.Stringify.valueAlloc(a, .{ .object = "media.output.list", .plan_id = if (boundary_metadata) |value| value.plan_id else null, .source_fingerprint = if (boundary_metadata) |value| value.source_fingerprint else null, .source_version = if (boundary_metadata) |value| value.source_version else null, .source_artifact_name = upstream.name, .output_name = config.value.output_name, .chunks = collected.rawRows(), .text = collected.text.items, .transcript_spans = collected.spans.items, .complete_chunks = collected.complete, .failed_chunks = collected.failed, .terminal_chunks = collected.terminal, .status = collected.status }, .{ .emit_null_optional_fields = false });
     defer a.free(produced);
     if (produced.len > 16 * 1024 * 1024) return error.ResourceLimitExceeded;
-    if (token) |context| return enqueueAssetProducerOutput(runtime, request, context, output_key, produced);
+    if (token) |context| return enqueueAssetProducerOutput(runtime, request, context, output_key, produced, scope);
     const state_key = try assetStateKeyAlloc(a, request.doc_key, requestArtifactName(request));
     defer a.free(state_key);
     const fingerprint = std.fmt.bytesToHex(digest.finalResult(), .lower);
@@ -20274,7 +20275,7 @@ fn processVectorLabels(runtime: *EnrichmentRuntime, request: enrichment_types.Ge
         const after = (try revision_fn.?(provider.ptr, a, upstream.name)) orelse return error.EmbeddingIdentityMismatch;
         if (!std.mem.eql(u8, &before, &after)) return error.EmbeddingIdentityMismatch;
     }
-    if (token) |context| return enqueueAssetProducerOutput(runtime, request, context, output_key, produced);
+    if (token) |context| return enqueueAssetProducerOutput(runtime, request, context, output_key, produced, scope);
     const state_key = try assetStateKeyAlloc(a, request.doc_key, requestArtifactName(request));
     defer a.free(state_key);
     const fingerprint = std.fmt.bytesToHex(source_hash.finalResult(), .lower);
@@ -20538,7 +20539,7 @@ fn applyAssetProducerBatchOutput(
         // Keep the output across retries (pending, catalog activation drift,
         // owner rejections); only acceptance retires it. The output depends
         // on the producer input alone, and every resubmission is validated.
-        enqueueAssetProducerOutput(runtime, item.request, value, item.artifact_key, validated) catch |err| return FailureScope.assetPublicationFailure(scope, err);
+        try enqueueAssetProducerOutput(runtime, item.request, value, item.artifact_key, validated, scope);
         if (submitted) |key| runtime.submitted_outputs.remove(runtime.alloc, key);
         return;
     }
@@ -20611,7 +20612,7 @@ fn applyAssetProducerBatchOutput(
         runtime.alloc.free(text_indexes);
     }
     try appendInlineFullTextDocumentToWindow(runtime, window, item.artifact_key, validated, text_indexes);
-    materializeGraphAssetForRuntime(runtime, item.request, validated, item.raw_doc, window) catch |err| return FailureScope.assetPublicationFailure(scope, err);
+    try materializeGraphAssetForRuntime(runtime, item.request, validated, item.raw_doc, window, scope);
     recordArtifactBytes(runtime, .asset, validated.len);
     try queueArtifactCoverageOutcomeForRequest(runtime, window, item.request, .produced);
     retireIndexDocumentCheckpoint(runtime, item.request, null) catch |err| return FailureScope.assetPublicationFailure(scope, err);
@@ -29522,7 +29523,7 @@ fn publishOrderedUnitChunksGenerationWithAllocator(runtime: *EnrichmentRuntime, 
     }
     const manifest = builder.finish().encode();
     effects[count] = .{ .family = .document_artifact, .key = input.manifest_key, .value = &manifest, .source_index = 0 };
-    try enqueueProducerEffects(runtime, &input.token, effects);
+    try enqueueProducerEffects(runtime, &input.token, effects, null);
 }
 
 fn appendRuntimeDocumentUnitChunkWrites(
@@ -29682,20 +29683,20 @@ const GraphAssetExpectation = union(enum) {
     observed: ?[]const u8,
 };
 
-fn publishOrderedGraphForRuntime(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, expected_asset: GraphAssetExpectation) !bool {
+fn publishOrderedGraphForRuntime(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, expected_asset: GraphAssetExpectation, failure_scope: ?*FailureScope) !bool {
     var budget = if (runtime.config.resource_manager orelse runtime.index_manager.resource_manager) |manager|
         resource_manager_mod.BudgetedAllocator.init(manager, .relational_preparation_working_set, runtime.alloc, 1)
     else
         null;
     defer if (budget) |*tracked| tracked.deinit();
     const alloc = if (budget) |*tracked| tracked.allocator() else runtime.alloc;
-    return publishOrderedGraphWithAllocator(runtime, alloc, request, expected_asset) catch |err| {
+    return publishOrderedGraphWithAllocator(runtime, alloc, request, expected_asset, failure_scope) catch |err| {
         if (err == error.OutOfMemory) if (budget) |*tracked| if (tracked.denied()) return error.ResourceBudgetExceeded;
         return err;
     };
 }
 
-fn publishOrderedGraphWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, expected_asset: GraphAssetExpectation) !bool {
+fn publishOrderedGraphWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, expected_asset: GraphAssetExpectation, failure_scope: ?*FailureScope) !bool {
     var read = try runtime.store.beginRead();
     var read_open = true;
     defer if (read_open) read.abort();
@@ -29740,8 +29741,8 @@ fn publishOrderedGraphWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocato
         const raw = try read.get(row_key);
         const logical = try runtime.index_manager.materializeStoredValueAlloc(alloc, row_key, raw);
         defer alloc.free(logical);
-        try materializeGraphAssetForRuntime(context, request, value, logical, &window);
-    } else try materializeGraphAssetDeleteForRuntime(context, request, &window);
+        try materializeGraphAssetForRuntime(context, request, value, logical, &window, null);
+    } else try materializeGraphAssetDeleteForRuntime(context, request, &window, null);
     // Serialization owns all bytes before the snapshot is released. Queue
     // admission cannot itself credit replay or coverage; accepted retries use
     // the same logical-input receipt and skip mutable-state planning.
@@ -29759,7 +29760,8 @@ fn publishOrderedGraphWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocato
     read_open = false;
     if (encoded.items.len == 0) return true;
     const dispatcher = runtime.artifact_publication_dispatcher orelse return error.ArtifactCatalogDrift;
-    for (encoded.items) |bytes| try dispatcher.submit(context.base.namespace, bytes);
+    for (encoded.items) |bytes| dispatcher.submit(context.base.namespace, bytes) catch |err|
+        return FailureScope.assetPublicationFailure(failure_scope, err);
     return error.ArtifactPublicationPending;
 }
 
@@ -29823,9 +29825,9 @@ fn queueGraphNeighborMutations(runtime: anytype, window: *GeneratedReplayWindow,
 /// Publish legacy runtime graph projections through the same guarded promotion
 /// transaction as their replay record. Private stages are never graph effects;
 /// graph artifacts, source guards, and endpoint notifications commit together.
-fn publishRuntimeGraphMutations(runtime: anytype, window: *GeneratedReplayWindow, writes: []const KVPair, deletes: []const []const u8) !void {
+fn publishRuntimeGraphMutations(runtime: anytype, window: *GeneratedReplayWindow, writes: []const KVPair, deletes: []const []const u8, failure_scope: ?*FailureScope) !void {
     if (comptime @TypeOf(runtime) != *EnrichmentRuntime) {
-        return storePutBatchWithRetry(runtime, writes, deletes);
+        return storePutBatchWithRetry(runtime, writes, deletes) catch |err| return FailureScope.assetPublicationFailure(failure_scope, err);
     }
     const promotion_start = window.artifact_promotions.items.len;
     const guard_start = window.source_guards.items.len;
@@ -29894,17 +29896,19 @@ fn publishRuntimeGraphMutations(runtime: anytype, window: *GeneratedReplayWindow
         try appendGeneratedSourceGuard(runtime, window, key, sourceRecordDigest(raw), null, 0);
         try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.artifact_delete_keys, &window.artifact_delete_key_index, key);
     }
-    if (stages.items.len != 0) try storePutBatchWithRetry(runtime, stages.items, &.{});
+    if (stages.items.len != 0) storePutBatchWithRetry(runtime, stages.items, &.{}) catch |err|
+        return FailureScope.assetPublicationFailure(failure_scope, err);
 }
 
-fn materializeGraphAssetForRuntime(runtime: anytype, request: enrichment_types.GeneratedEnrichmentRequest, value: []const u8, raw_doc: []const u8, window: *GeneratedReplayWindow) !void {
+fn materializeGraphAssetForRuntime(runtime: anytype, request: enrichment_types.GeneratedEnrichmentRequest, value: []const u8, raw_doc: []const u8, window: *GeneratedReplayWindow, failure_scope: ?*FailureScope) !void {
     const before = window.artifact_promotions.items.len;
     const deletes_before = window.artifact_delete_keys.items.len;
-    try prepareGraphAssetForRuntime(runtime, request, value, raw_doc, window);
+    try prepareGraphAssetForRuntime(runtime, request, value, raw_doc, window, failure_scope);
     // Publish before another source on this document arbitrates contenders.
     // Preparation releases primary/index leases before entering the writer.
     if (comptime @TypeOf(runtime) == *EnrichmentRuntime) {
-        if (window.artifact_promotions.items.len != before or window.artifact_delete_keys.items.len != deletes_before) try flushGeneratedReplayWindowWithIdentity(runtime, window, 0);
+        if (window.artifact_promotions.items.len != before or window.artifact_delete_keys.items.len != deletes_before)
+            flushGeneratedReplayWindowWithIdentity(runtime, window, 0) catch |err| return FailureScope.assetPublicationFailure(failure_scope, err);
     }
 }
 
@@ -29914,9 +29918,10 @@ fn prepareGraphAssetForRuntime(
     value: []const u8,
     raw_doc: []const u8,
     window: *GeneratedReplayWindow,
+    failure_scope: ?*FailureScope,
 ) !void {
     if (comptime @TypeOf(runtime) == *EnrichmentRuntime) {
-        if (try publishOrderedGraphForRuntime(runtime, request, .{ .observed = value })) return;
+        if (try publishOrderedGraphForRuntime(runtime, request, .{ .observed = value }, failure_scope)) return;
     }
     if (!runtime.index_manager.hasGraphIndexes()) return;
     if (comptime @hasField(@typeInfo(@TypeOf(runtime)).pointer.child, "coverage_apply_mutex")) {
@@ -30135,19 +30140,20 @@ fn prepareGraphAssetForRuntime(
         }
         try visible_writes.appendSlice(runtime.alloc, writes.items[graph_write_count..]);
         if (visible_writes.items.len > 0 or deletes.items.len > 0) {
-            try publishRuntimeGraphMutations(runtime, window, visible_writes.items, deletes.items);
+            try publishRuntimeGraphMutations(runtime, window, visible_writes.items, deletes.items, failure_scope);
         }
     }
 }
 
-fn materializeGraphAssetDeleteForRuntime(runtime: anytype, request: enrichment_types.GeneratedEnrichmentRequest, window: *GeneratedReplayWindow) !void {
+fn materializeGraphAssetDeleteForRuntime(runtime: anytype, request: enrichment_types.GeneratedEnrichmentRequest, window: *GeneratedReplayWindow, failure_scope: ?*FailureScope) !void {
     const before = window.artifact_promotions.items.len;
     const deletes_before = window.artifact_delete_keys.items.len;
-    try prepareGraphAssetDeleteForRuntime(runtime, request, window);
+    try prepareGraphAssetDeleteForRuntime(runtime, request, window, failure_scope);
     // Publish before another source on this document arbitrates contenders.
     // Preparation releases primary/index leases before entering the writer.
     if (comptime @TypeOf(runtime) == *EnrichmentRuntime) {
-        if (window.artifact_promotions.items.len != before or window.artifact_delete_keys.items.len != deletes_before) try flushGeneratedReplayWindowWithIdentity(runtime, window, 0);
+        if (window.artifact_promotions.items.len != before or window.artifact_delete_keys.items.len != deletes_before)
+            flushGeneratedReplayWindowWithIdentity(runtime, window, 0) catch |err| return FailureScope.assetPublicationFailure(failure_scope, err);
     }
 }
 
@@ -30155,9 +30161,10 @@ fn prepareGraphAssetDeleteForRuntime(
     runtime: anytype,
     request: enrichment_types.GeneratedEnrichmentRequest,
     window: *GeneratedReplayWindow,
+    failure_scope: ?*FailureScope,
 ) !void {
     if (comptime @TypeOf(runtime) == *EnrichmentRuntime) {
-        if (try publishOrderedGraphForRuntime(runtime, request, .{ .observed = null })) return;
+        if (try publishOrderedGraphForRuntime(runtime, request, .{ .observed = null }, failure_scope)) return;
     }
     if (!runtime.index_manager.hasGraphIndexes()) return;
     if (comptime @hasField(@typeInfo(@TypeOf(runtime)).pointer.child, "coverage_apply_mutex")) {
@@ -30288,7 +30295,7 @@ fn prepareGraphAssetDeleteForRuntime(
             try appendUniqueIndexedRuntimeKey(runtime.alloc, &deletes, &delete_keys, key);
         }
         if (writes.items.len > 0 or deletes.items.len > 0) {
-            try publishRuntimeGraphMutations(runtime, window, writes.items, deletes.items);
+            try publishRuntimeGraphMutations(runtime, window, writes.items, deletes.items, failure_scope);
         }
     }
 }
@@ -30958,6 +30965,51 @@ test "enrichment runtime graph materializer rejects non-finite mapped weights" {
             100,
         ));
     }
+
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-validation", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try db_mod.DB.open(alloc, path, .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"artifact":"relations_v1","path":"$.items[*]","format":"extraction_relation",
+        \\    "nodes":{"target":"{{ _item.to }}"},"edge":{"type":"{{ _item.rel }}","weight":"{{ _item.score }}"}},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"relations\":{\"items\":[{\"rel\":\"mentions\",\"to\":\"doc:b\",\"score\":\"NaN\"}]}}" }},
+        .sync_level = .write,
+    });
+    try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
+    const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
+    var pin = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer pin.release();
+    var request = for (pin.plan().generated_templates) |candidate| {
+        if (candidate.kind == .asset and std.mem.eql(u8, requestArtifactName(candidate), "relations_v1")) break candidate;
+    } else return error.TestUnexpectedResult;
+    request.doc_key = "doc:a";
+    var dependent = request;
+    dependent.upstream_artifact_name = "relations_v1";
+    var queued: std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest) = .empty;
+    defer queued.deinit(alloc);
+    var sources = PreparedDocumentSourceCache.init(runtime);
+    defer sources.deinit();
+    var window = GeneratedReplayWindow{ .alloc = alloc };
+    defer window.deinit();
+    const fingerprint = requestFailureFingerprint(request);
+    setActiveFailureFingerprint(runtime, fingerprint);
+    try std.testing.expectError(error.InvalidGraphEdges, processPlannedAsset(runtime, request, &.{dependent}, &queued, &sources, &window));
+    try std.testing.expectEqual(fingerprint, runtime.active_failure_fingerprint);
+    try std.testing.expectEqual(@as(u32, 0), runtime.consecutive_retry_count);
 }
 
 fn runtimeAppendRelationItemsFromPath(
@@ -31758,7 +31810,7 @@ fn publishMediaWindowVectors(runtime: *EnrichmentRuntime, a: Allocator, request:
     for (old_keys.items) |old| if (!wanted.contains(old)) try effects.append(scratch, .{ .family = .derived_vector, .key = old, .value = null, .source_index = 0 });
     if (effects.items.len == 0) return false;
     if (pending) return error.IncompleteChunkCoverage;
-    enqueueProducerEffects(runtime, &input.token, effects.items) catch |err| switch (err) {
+    enqueueProducerEffects(runtime, &input.token, effects.items, null) catch |err| switch (err) {
         error.ArtifactPublicationPending => {},
         else => return err,
     };
@@ -32222,7 +32274,7 @@ const OrderedDenseTextBatch = struct {
                     if (self.failed_requests.contains(requestFailureFingerprint(item.request))) continue;
                     const value = enrichment_artifact_codec.encodeDenseEmbeddingAlloc(runtime.alloc, item.source_hash, vector) catch |err| return self.scope.publicationFailure(err);
                     defer runtime.alloc.free(value);
-                    enqueueProducerEffects(runtime, &item.input.token, &.{.{ .family = .derived_vector, .key = item.input.output_key, .value = value, .source_index = 0 }}) catch |err| switch (err) {
+                    enqueueProducerEffects(runtime, &item.input.token, &.{.{ .family = .derived_vector, .key = item.input.output_key, .value = value, .source_index = 0 }}, null) catch |err| switch (err) {
                         error.ArtifactPublicationPending => {},
                         else => return self.scope.publicationFailure(err),
                     };
@@ -32581,7 +32633,7 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
                 break :blk encoded;
             } else null;
             defer if (value) |bytes| alloc.free(bytes);
-            enqueueProducerEffects(runtime, &item.input.token, &.{.{ .family = .derived_vector, .key = item.input.output_key, .value = value, .source_index = 0 }}) catch |err| switch (err) {
+            enqueueProducerEffects(runtime, &item.input.token, &.{.{ .family = .derived_vector, .key = item.input.output_key, .value = value, .source_index = 0 }}, null) catch |err| switch (err) {
                 error.ArtifactPublicationPending => {},
                 else => return err,
             };
@@ -33361,18 +33413,18 @@ fn captureAssetProducerContext(runtime: *EnrichmentRuntime, request: enrichment_
     return @import("../artifact_asset_publication.zig").capture(runtime.alloc, &read, request, plan.plan(), source_key, logical_input, .{ .ptr = runtime.index_manager, .materialize = materializeProducerInput });
 }
 
-fn finishAcceptedAssetGraph(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest) !void {
-    _ = try publishOrderedGraphForRuntime(runtime, request, .current);
+fn finishAcceptedAssetGraph(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, failure_scope: ?*FailureScope) !void {
+    _ = try publishOrderedGraphForRuntime(runtime, request, .current, failure_scope);
 }
 
-fn enqueueAssetProducerOutput(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, token: *@import("../artifact_producer_context.zig").Token, key: []const u8, payload: ?[]const u8) !void {
-    try enqueueProducerEffects(runtime, token, &.{.{ .family = .document_artifact, .key = key, .value = payload, .source_index = 0 }});
+fn enqueueAssetProducerOutput(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, token: *@import("../artifact_producer_context.zig").Token, key: []const u8, payload: ?[]const u8, failure_scope: ?*FailureScope) !void {
+    try enqueueProducerEffects(runtime, token, &.{.{ .family = .document_artifact, .key = key, .value = payload, .source_index = 0 }}, failure_scope);
     // Acceptance can race enqueue, including a deferred provider callback.
     // Consume the accepted bytes, never this callback's uncommitted response.
-    try finishAcceptedAssetGraph(runtime, request);
+    try finishAcceptedAssetGraph(runtime, request, failure_scope);
 }
 
-fn enqueueProducerEffects(runtime: *EnrichmentRuntime, token: *@import("../artifact_producer_context.zig").Token, effects: []const ordered_publication.Mutation) !void {
+fn enqueueProducerEffects(runtime: *EnrichmentRuntime, token: *@import("../artifact_producer_context.zig").Token, effects: []const ordered_publication.Mutation, failure_scope: ?*FailureScope) !void {
     {
         const fence = try requiredRuntimeStoreWriteFence(runtime, replayWriteGeneration(runtime));
         var read = try runtime.store.beginProbe();
@@ -33387,7 +33439,8 @@ fn enqueueProducerEffects(runtime: *EnrichmentRuntime, token: *@import("../artif
     try command.validate(runtime.alloc);
     const bytes = try @import("../artifact_publication_transport_codec.zig").encodeAlloc(runtime.alloc, command);
     defer runtime.alloc.free(bytes);
-    try dispatcher.submit(token.namespace, bytes);
+    dispatcher.submit(token.namespace, bytes) catch |err|
+        return FailureScope.assetPublicationFailure(failure_scope, err);
     // Provider completion is not owner acceptance; hold replay progress until
     // the next attempt observes the durable semantic receipt.
     return error.ArtifactPublicationPending;
@@ -35001,7 +35054,7 @@ fn processOrderedChunkText(runtime: *EnrichmentRuntime, request: enrichment_type
     };
     const manifest = rows.manifest.?.encode();
     effects[member_count] = .{ .family = .document_artifact, .key = captured.manifest_key, .value = &manifest, .source_index = 0 };
-    try enqueueProducerEffects(runtime, &captured.token, effects);
+    try enqueueProducerEffects(runtime, &captured.token, effects, null);
     return true;
 }
 
@@ -40188,7 +40241,7 @@ fn saveRuntimeStatusWithPlan(runtime: *EnrichmentRuntime, mode: StatusPublicatio
                 reconcileRuntimeObservation(runtime, observed);
                 if (comptime builtin.os.tag != .freestanding) if (state_io) |value| broadcastRuntimeStateChanged(runtime, value);
             }
-            if (mode == .boundary_recovery) return error.EnrichmentSourceChanged;
+            if (mode == .boundary_recovery) return error.EnrichmentReplayAuthorityBusy;
         }
         return;
     }
@@ -43430,10 +43483,13 @@ test "asset batch fallback isolates malformed envelope and preserves typed mixed
         single_count: usize = 0,
         retryable: bool = false,
         cancel_item: bool = false,
+        cancel_invocation: bool = false,
+        inherited: std.atomic.Value(bool) = .init(false),
 
         fn producer(self: *@This()) asset_producer_mod.Producer {
             return .{
                 .ptr = self,
+                .invocation_context = .{ .cancellation = CancellationToken.fromAtomic(&self.inherited) },
                 .vtable = &.{
                     .produce = produce,
                     .produce_batch_reported = produceBatchReported,
@@ -43465,6 +43521,7 @@ test "asset batch fallback isolates malformed envelope and preserves typed mixed
                     .retryable = self.retryable,
                 } },
             };
+            if (self.cancel_invocation) self.inherited.store(true, .release);
             return .{
                 .items = produced,
                 .execution = inference_work.ExecutionReport.native(requests.len),
@@ -43614,6 +43671,19 @@ test "asset batch fallback isolates malformed envelope and preserves typed mixed
     var canceled_scope = FailureScope{};
     try std.testing.expectError(error.ProviderInvocationCanceled, flushAssetProducerBatch(&runtime, &items, &window, &canceled_scope));
     try std.testing.expectEqual(failed_identity, canceled_scope.retry_fingerprint);
+    try std.testing.expectEqual(@as(usize, 2), failure_capture.count);
+    // Cancellation can arrive after the provider has completed a mixed
+    // envelope. Neither the canceled item nor its sibling may be applied.
+    mixed.cancel_invocation = true;
+    try items.append(alloc, try TestItem.make(alloc, "doc:5", "five", "artifact:inherited", "state:inherited"));
+    try items.append(alloc, try TestItem.make(alloc, "doc:6", "six", "artifact:inherited-sibling", "state:inherited-sibling"));
+    const before = runtimeStatusSnapshot(&runtime);
+    var inherited_scope = FailureScope{};
+    try std.testing.expectError(error.EnrichmentWaitCanceled, flushAssetProducerBatch(&runtime, &items, &window, &inherited_scope));
+    try std.testing.expect(mixed.inherited.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), inherited_scope.retry_fingerprint);
+    try std.testing.expectEqualDeep(before, runtimeStatusSnapshot(&runtime));
+    try std.testing.expectError(error.NotFound, storeGetAlloc(&runtime, "artifact:inherited"));
     try std.testing.expectEqual(@as(usize, 2), failure_capture.count);
     try std.testing.expectEqual(@as(usize, 0), mixed.single_count);
 }
