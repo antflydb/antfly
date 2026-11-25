@@ -6428,10 +6428,11 @@ fn embeddingInvocationFailure(runtime: *EnrichmentRuntime, guard: ForegroundCatc
 /// The composed token borrows this call's stack and must never escape into a
 /// cached generation or an asynchronous job.
 fn scopedEmbeddingRequestContext(runtime: *const EnrichmentRuntime, foreground: ?inference_request_context.RequestContext, inherited: ?inference_request_context.RequestContext, cancellation: *AssetInvocationCancellation) ?inference_request_context.RequestContext {
-    var effective = foreground orelse return inherited;
+    if (foreground == null and (inherited == null or runtime.config.cancellation.ptr == null)) return inherited;
+    var effective = foreground orelse inherited.?;
     cancellation.* = .{
         .lifecycle = runtime.config.cancellation,
-        .request = effective.cancellation orelse .none,
+        .request = if (foreground) |value| value.cancellation orelse .none else .none,
         .inherited = if (inherited) |value| value.cancellation orelse .none else .none,
     };
     effective.cancellation = .{ .ptr = cancellation, .is_cancelled_fn = AssetInvocationCancellation.isCancelled, .check_fn = AssetInvocationCancellation.check };
@@ -8367,7 +8368,7 @@ fn scopedChunkProvider(runtime: *EnrichmentRuntime, provider: ?ChunkProvider, ca
 }
 
 fn checkChunkOwner(runtime: *EnrichmentRuntime, provider: ?ChunkProvider) !void {
-    const context = if (provider) |scoped| asset_producer_mod.InvocationContext{
+    const context: asset_producer_mod.InvocationContext = if (provider) |scoped| .{
         .deadline_ns = scoped.execution.deadline_ns,
         .cancellation = scoped.execution.cancellation,
     } else .{};
@@ -10559,6 +10560,10 @@ test "enrichment cancellation defers dense sparse and multimodal provider calls 
         fn sparseBatch(ptr: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![]embedder_mod.SparseEmbedding {
             return fail(ptr);
         }
+        fn chunkPage(ptr: *anyopaque, a: Allocator, name: []const u8, _: @import("inference_chunker").Input, _: chunking_types_mod.Config, context: inference_request_context.RequestContext) !@import("inference_chunker").types.ChunkPage {
+            _ = try sparseRevision(ptr, a, name, context);
+            return error.TestUnexpectedResult;
+        }
         fn denseLease(ptr: *anyopaque, a: Allocator, name: []const u8, context: ?inference_request_context.RequestContext) !inference_work.CapabilityLease {
             const revision = try sparseRevision(ptr, a, name, context orelse return error.MissingExecutionContext);
             return .{ .capabilities = .{ .task = .embed, .input_modalities = .{ .text = true }, .input_granularity = .item, .output = .embedding, .model_revision = revision } };
@@ -10652,6 +10657,16 @@ test "enrichment cancellation defers dense sparse and multimodal provider calls 
     controlled_sparse.sparse_embed_with_context_fn = Mock.sparseWithContext;
     try std.testing.expectError(error.EnrichmentWaitCanceled, embedSparseWithRetry(controlled_sparse, &runtime, "sparse", "one"));
     try std.testing.expectEqual(@as(usize, 6), mock.revision_calls);
+
+    mock.inherited.store(false, .release);
+    runtime.config.chunk_provider = .{
+        .ptr = &mock,
+        .boundary_dispatch = chunk_provider.CallbackBoundary.local_dispatch,
+        .chunk_page_with_context_callback = @ptrCast(&Mock.chunkPage),
+        .execution = .{ .deadline_ns = mock.expected_deadline, .cancellation = CancellationToken.fromAtomic(&mock.inherited) },
+    };
+    try std.testing.expectError(error.EnrichmentWaitCanceled, dispatchModelPage(&runtime, std.testing.allocator, .{ .provider = .antfly, .model = "test", .embedding = .{ .model = "test" }, .page = true, .max_chunks = 1 }, .{ .text = "source" }));
+    try std.testing.expectEqual(@as(usize, 7), mock.revision_calls);
 }
 
 test "enrichment provider deadlines and progress cross native clock boundaries" {
@@ -14546,6 +14561,39 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
     const resources = runtime.config.resource_manager orelse manager.resource_manager.?;
     const before = resources.sliceStats(.document_extraction_working_set).used_bytes;
     {
+        // A completed OCR result can sit in the queue after its provider
+        // returns. Reject it if the inherited deadline expires before commit.
+        const expired = producer.withInvocationContext(.{ .deadline_ns = 0 });
+        var jobs = SharedPdfWindowScheduler.WindowJobs{ .scheduler = &scheduler, .primary = "{}" };
+        defer jobs.deinit();
+        var empty = batch;
+        empty.results = &.{};
+        const invocation = try PdfWindowConsumerLease.initIndependent(alloc, resources, 4096);
+        const job = alloc.create(SharedPdfWindowScheduler.WindowJobs.Job) catch |err| {
+            var grant = invocation;
+            grant.deinit();
+            return err;
+        };
+        job.* = .{
+            .embedder = undefined,
+            .request = requests[1],
+            .consumer = &scheduler.consumers.?[1],
+            .source_sha = &.{},
+            .stage_id = &.{},
+            .rendered = .{ .encoded = empty },
+            .invocation = invocation,
+            .guard = .{},
+            .cancellation = .none,
+            .group = &jobs,
+            .text = .{ .producer = expired, .index = 1, .recovered = true },
+        };
+        jobs.jobs[0] = job;
+        jobs.count = 1;
+        try std.testing.expectError(error.EnrichmentWaitTimeout, jobs.retireCompleted(&jobs.jobs[0], true));
+        try std.testing.expectEqual(@as(usize, 0), jobs.count);
+        try std.testing.expectEqual(before, resources.sliceStats(.document_extraction_working_set).used_bytes);
+    }
+    {
         const execution = try PrecommitDocumentExecution.create(&runtime, requests[0..3], "{}");
         defer execution.destroy();
         execution.validateSource(source.fingerprint);
@@ -16422,7 +16470,10 @@ const PreparedDocumentSourceCache = struct {
         config: template_remote.RenderConfig,
     ) !FetchOutcome {
         const identity = sourceIdentity(source_url);
-        const owner: asset_producer_mod.InvocationContext = .{ .cancellation = config.cancellation orelse .none, .deadline_ns = config.deadline_ns };
+        const owner: asset_producer_mod.InvocationContext = .{
+            .cancellation = if (@hasField(template_remote.RenderConfig, "cancellation")) config.cancellation orelse .none else .none,
+            .deadline_ns = config.deadline_ns,
+        };
         self.mutex.lockUncancelable(self.io);
         while (true) {
             checkPreparedSourceOwner(owner) catch |err| {
