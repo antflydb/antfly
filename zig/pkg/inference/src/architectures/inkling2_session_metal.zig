@@ -200,7 +200,8 @@ pub const TextPipeline = struct {
                 else => return error.UnsupportedInkling2Request,
             };
         } else .bf16;
-        return decoder.RequestPlan.initWithFormat(model, std.math.cast(u32, tokens) orelse return error.InvalidInkling2Context, prefill_rows, format);
+        const plan = try decoder.RequestPlan.initWithFormat(model, std.math.cast(u32, tokens) orelse return error.InvalidInkling2Context, prefill_rows, format);
+        return plan.withPrefillTail(model, @intCast(prefix % prefill_rows));
     }
 
     /// The caller owns the runtime execution gate and memory admission for
@@ -283,7 +284,7 @@ pub const TextPipeline = struct {
         var part_position: usize = 0;
         while (position < total) {
             try self.check();
-            const rows: usize = if (total - position >= chunk_rows) chunk_rows else 1;
+            const rows = @min(total - position, chunk_rows);
             var pending = rows;
             var batch: [3]decoder.PrefixPart = undefined;
             var active: usize = 0;

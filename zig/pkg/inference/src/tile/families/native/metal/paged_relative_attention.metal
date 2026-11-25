@@ -16,7 +16,7 @@
 // native-program:entry antfly_paged_relative_gqa_d128_bf16_partial
 struct PagedRelativeGqaParams {
     uint start, visible_start, page_tokens, first_page, page_count, physical_pages;
-    uint q_heads, kv_heads, window, relative_extent, splits, keys_per_split, q4;
+    uint q_heads, kv_heads, window, relative_extent, splits, q4;
     float score_scale;
 };
 
@@ -51,8 +51,14 @@ inline void antfly_paged_relative_gqa_d128_partial(
     const uint position = p.start + row_head / p.q_heads;
     const uint end = position + 1u;
     const uint first = max(p.visible_start, p.window != 0u && end > p.window ? end - p.window : 0u);
-    const uint begin = first + group.y * p.keys_per_split;
-    const uint limit = min(end, begin + p.keys_per_split);
+    // Give a query identical reduction boundaries when its row is run
+    // alone or in any prefill batch. The dispatch still uses the maximum
+    // split count so every row has the same scratch stride.
+    const uint live = max(end - first, 1u);
+    const uint row_splits = min(p.splits, (live - 1u) / 128u + 1u);
+    const uint keys_per_split = (live - 1u) / row_splits + 1u;
+    const uint begin = first + group.y * keys_per_split;
+    const uint limit = min(end, begin + keys_per_split);
     float4 q[heads], numerator[heads];
     float maximum[heads], denominator[heads];
     #pragma unroll

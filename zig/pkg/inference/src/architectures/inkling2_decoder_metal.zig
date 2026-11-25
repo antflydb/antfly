@@ -180,7 +180,7 @@ fn tempDtype(kind: Temp) tensors.DType {
 }
 
 pub const prefill_chunk_rows = 16;
-const grouped_prefill_chunk_rows = 64;
+const grouped_prefill_chunk_rows = 256;
 
 fn groupedPrefillEnabled() bool {
     return @import("antfly_platform").env.getenvBoolDefault("ANTFLY_METAL_GROUPED_ROUTED_PREFILL", true);
@@ -252,6 +252,7 @@ pub const RequestPlan = struct {
     bank: kv.BankConfig,
     decode: WorkPlan,
     prefill: ?WorkPlan,
+    prefill_tail: ?WorkPlan = null,
 
     pub fn init(model: *const Decoder, max_tokens: u32) !RequestPlan {
         return initPrefill(model, max_tokens, 1);
@@ -280,10 +281,20 @@ pub const RequestPlan = struct {
         };
     }
 
+    pub fn withPrefillTail(self: RequestPlan, model: *const Decoder, tail_rows: u32) !RequestPlan {
+        if (tail_rows < 2) return self;
+        const main = self.prefill orelse return error.InvalidShape;
+        if (tail_rows >= main.rows) return error.InvalidShape;
+        var result = self;
+        result.prefill_tail = try .init(model, tail_rows, @intCast(self.bank.layout.max_tokens));
+        return result;
+    }
+
     pub fn deviceBytes(self: RequestPlan) !usize {
-        var bytes = try std.math.add(usize, try State.deviceBytes(self.bank, self.width), try self.decode.deviceBytes(self.width));
-        if (self.prefill) |plan| bytes = try std.math.add(usize, bytes, try plan.deviceBytes(self.width));
-        return bytes;
+        const bytes = try std.math.add(usize, try State.deviceBytes(self.bank, self.width), try self.decode.deviceBytes(self.width));
+        const main_bytes = if (self.prefill) |plan| try plan.deviceBytes(self.width) else 0;
+        const tail_bytes = if (self.prefill_tail) |plan| try plan.deviceBytes(self.width) else 0;
+        return std.math.add(usize, bytes, @max(main_bytes, tail_bytes));
     }
 };
 
@@ -352,6 +363,7 @@ pub const Request = struct {
     state: State,
     decode: Work,
     prefill: ?Work,
+    prefill_tail: ?WorkPlan,
     host_logits: []f32,
     allocator: std.mem.Allocator,
 
@@ -363,7 +375,7 @@ pub const Request = struct {
 
     pub fn initWithPlan(self: *Request, a: std.mem.Allocator, model: *const Decoder, plan: RequestPlan) !void {
         const runtime = model.runtime;
-        self.* = .{ .model = model, .state = undefined, .decode = undefined, .prefill = null, .host_logits = undefined, .allocator = a };
+        self.* = .{ .model = model, .state = undefined, .decode = undefined, .prefill = null, .prefill_tail = plan.prefill_tail, .host_logits = undefined, .allocator = a };
         self.host_logits = try a.alloc(f32, model.text.unpadded_vocab_size);
         errdefer a.free(self.host_logits);
         self.decode = try .init(a, runtime, plan.width, plan.decode);
@@ -519,9 +531,19 @@ pub const Request = struct {
     pub fn appendPrefix(self: *Request, parts: []const PrefixPart) !void {
         var rows: usize = 0;
         for (parts) |part| rows = try std.math.add(usize, rows, part.rows());
-        const work = if (rows == 1) &self.decode else if (self.prefill) |*batch| batch else return error.InvalidShape;
-        if (rows != work.stack.rows) return error.InvalidShape;
-        try self.run(work, .{ .prefix = parts }, .none);
+        if (rows == 1) return self.run(&self.decode, .{ .prefix = parts }, .none);
+        const current = if (self.prefill) |*batch| batch else return error.InvalidShape;
+        if (rows != current.stack.rows) {
+            const tail = self.prefill_tail orelse return error.InvalidShape;
+            if (rows != tail.rows) return error.InvalidShape;
+            // Completed frames have released their bindings. Replace the
+            // main workspace before allocating its shorter final shape.
+            current.deinit();
+            self.prefill = null;
+            self.prefill = try .init(self.allocator, self.model.runtime, self.model.text.hidden_size, tail);
+            self.prefill_tail = null;
+        }
+        try self.run(&self.prefill.?, .{ .prefix = parts }, .none);
     }
 
     pub fn appendTokens(self: *Request, tokens: []const i32) !void {
@@ -634,25 +656,30 @@ test "Inkling Metal resident decoder runs the released text checkpoint" {
     });
 
     if (groupedPrefillEnabled()) {
-        var tokens: [grouped_prefill_chunk_rows]i32 = undefined;
+        const reference_rows = 64;
+        const tail_rows = 17;
+        var tokens: [grouped_prefill_chunk_rows + tail_rows]i32 = undefined;
         for (&tokens, 0..) |*id, i| id.* = prefix[i % prefix.len];
-        var baseline_plan = try RequestPlan.initPrefill(decoder, tokens.len + 1, prefill_chunk_rows);
-        baseline_plan.prefill.?.group_elements = 0;
         var baseline: Request = undefined;
-        try baseline.initWithPlan(a, decoder, baseline_plan);
+        try baseline.initWithPlan(a, decoder, try RequestPlan.initPrefill(decoder, tokens.len + 1, reference_rows));
         defer baseline.deinit();
         const base_start = time.monotonicNs();
         var offset: usize = 0;
-        while (offset < tokens.len) : (offset += prefill_chunk_rows)
-            try baseline.appendTokens(tokens[offset..][0..prefill_chunk_rows]);
+        while (offset + reference_rows <= tokens.len) : (offset += reference_rows)
+            try baseline.appendTokens(tokens[offset..][0..reference_rows]);
+        for (tokens[offset..]) |id| try baseline.append(@intCast(id));
         const baseline_ns = time.monotonicNs() - base_start;
         const baseline_logits = try baseline.step(last);
 
         var large: Request = undefined;
-        try large.initWithPlan(a, decoder, try RequestPlan.initPrefill(decoder, tokens.len + 1, tokens.len));
+        const wide = try RequestPlan.initPrefill(decoder, tokens.len + 1, grouped_prefill_chunk_rows);
+        const wide_tail = try wide.withPrefillTail(decoder, tail_rows);
+        try std.testing.expectEqual(try wide.deviceBytes(), try wide_tail.deviceBytes());
+        try large.initWithPlan(a, decoder, wide_tail);
         defer large.deinit();
         const started = time.monotonicNs();
-        try large.appendTokens(&tokens);
+        try large.appendTokens(tokens[0..grouped_prefill_chunk_rows]);
+        try large.appendTokens(tokens[grouped_prefill_chunk_rows..]);
         const elapsed = time.monotonicNs() - started;
         const grouped = try large.step(last);
         try std.testing.expectEqual(argmax(baseline_logits), argmax(grouped));

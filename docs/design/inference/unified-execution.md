@@ -974,6 +974,18 @@ After disconnecting a longer stream, the next text request returned `4`
 in 0.84 s. These requests use existing model selection, memory admission
 and the GPU runtime's execution gate.
 
+A wider Metal prefill batch increased capacity from 64 to 256 rows, compacted
+the final partial batch into a separately sized workspace, and gave each
+query its own context-dependent attention reduction boundaries. All 84
+tests passed. A 273-token released-checkpoint prefix took 4.95 s versus
+5.78 s with 64-row groups and a scalar remainder, with identical next-token
+logits. The warm HTTP medians were 0.716 s for short text and 0.831 s for
+images. The 6,397-token text lookup returned `271` in 118.94 s, and the
+6,404-token packed K/V image lookup gave the same answer in 119.12 s.
+The 256-row plan allocated 9,074,803,012 bytes of packed K/V at the full
+window and completed a decode with that capacity reserved. Its BF16 K/V
+layout would require 34,576,171,332 bytes.
+
 ### Official Gemma 4 E2B QAT serving comparison
 
 The decoder and projector came from Google's E2B QAT Q4_0 GGUF revision

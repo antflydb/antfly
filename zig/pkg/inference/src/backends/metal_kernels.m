@@ -13463,7 +13463,7 @@ static NSString *termite_metal_shader_source(void) {
            // tile-codegen:begin attention.paged_relative_bf16.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "struct PagedRelativeGqaParams {\n"
            "    uint start, visible_start, page_tokens, first_page, page_count, physical_pages;\n"
-           "    uint q_heads, kv_heads, window, relative_extent, splits, keys_per_split, q4;\n"
+           "    uint q_heads, kv_heads, window, relative_extent, splits, q4;\n"
            "    float score_scale;\n"
            "};\n"
            "\n"
@@ -13498,8 +13498,14 @@ static NSString *termite_metal_shader_source(void) {
            "    const uint position = p.start + row_head / p.q_heads;\n"
            "    const uint end = position + 1u;\n"
            "    const uint first = max(p.visible_start, p.window != 0u && end > p.window ? end - p.window : 0u);\n"
-           "    const uint begin = first + group.y * p.keys_per_split;\n"
-           "    const uint limit = min(end, begin + p.keys_per_split);\n"
+           "    // Give a query identical reduction boundaries when its row is run\n"
+           "    // alone or in any prefill batch. The dispatch still uses the maximum\n"
+           "    // split count so every row has the same scratch stride.\n"
+           "    const uint live = max(end - first, 1u);\n"
+           "    const uint row_splits = min(p.splits, (live - 1u) / 128u + 1u);\n"
+           "    const uint keys_per_split = (live - 1u) / row_splits + 1u;\n"
+           "    const uint begin = first + group.y * keys_per_split;\n"
+           "    const uint limit = min(end, begin + keys_per_split);\n"
            "    float4 q[heads], numerator[heads];\n"
            "    float maximum[heads], denominator[heads];\n"
            "    #pragma unroll\n"
@@ -13854,29 +13860,41 @@ static NSString *termite_metal_shader_source(void) {
            "    output[ulong(index.y) * p.width + index.x] = bfloat(sum);\n"
            "}\n"
            "\n"
+           "struct RoutedGroupParams {\n"
+           "    uint rows;\n"
+           "    uint experts;\n"
+           "};\n"
+           "\n"
+           "inline void antfly_write_routed_group(device uint *groups, thread const uint *routes, uint count) {\n"
+           "    if (count >= 4u) {\n"
+           "        device uint *leader = groups + ulong(routes[0]) * 9u;\n"
+           "        leader[0] = count;\n"
+           "        for (uint i = 0u; i < count; ++i) leader[i + 1u] = routes[i];\n"
+           "        for (uint i = 1u; i < count; ++i) groups[ulong(routes[i]) * 9u] = 0u;\n"
+           "    } else {\n"
+           "        for (uint i = 0u; i < count; ++i) groups[ulong(routes[i]) * 9u] = 1u;\n"
+           "    }\n"
+           "}\n"
+           "\n"
            // tile-codegen:end expert.projection.block_scaled.3 family
            // tile-codegen:begin expert.projection.block_scaled.4 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void antfly_routed_build_groups(\n"
-           "    device const uint *experts [[buffer(0)]], device uint *groups [[buffer(1)]],\n"
-           "    constant uint &rows [[buffer(2)]], uint route [[thread_position_in_grid]]\n"
+           "    device const uint *expert_ids [[buffer(0)]], device uint *groups [[buffer(1)]],\n"
+           "    constant RoutedGroupParams &p [[buffer(2)]], uint expert [[thread_position_in_grid]]\n"
            ") {\n"
-           "    if (route >= rows) return;\n"
-           "    const uint expert = experts[route];\n"
-           "    uint before = 0u;\n"
-           "    for (uint i = 0u; i < route; ++i) before += uint(experts[i] == expert);\n"
-           "    const uint local = before % 8u;\n"
-           "    device uint *entry = groups + ulong(route) * 9u;\n"
-           "    if (local == 0u) {\n"
-           "        uint count = 0u;\n"
-           "        for (uint i = route; i < rows && count < 8u; ++i) {\n"
-           "            if (experts[i] == expert) entry[1u + count++] = i;\n"
+           "    if (expert > p.experts) return;\n"
+           "    uint pending[8];\n"
+           "    uint count = 0;\n"
+           "    for (uint route = 0u; route < p.rows; ++route) {\n"
+           "        const uint id = expert_ids[route];\n"
+           "        if (id != expert && !(expert == p.experts && id > p.experts)) continue;\n"
+           "        pending[count++] = route;\n"
+           "        if (count == 8u) {\n"
+           "            antfly_write_routed_group(groups, pending, count);\n"
+           "            count = 0;\n"
            "        }\n"
-           "        entry[0] = count >= 4u ? count : 1u;\n"
-           "    } else {\n"
-           "        uint count = local + 1u;\n"
-           "        for (uint i = route + 1u; i < rows && count < 4u; ++i) count += uint(experts[i] == expert);\n"
-           "        entry[0] = count >= 4u ? 0u : 1u;\n"
            "    }\n"
+           "    antfly_write_routed_group(groups, pending, count);\n"
            "}\n"
            "\n"
            // tile-codegen:end expert.projection.block_scaled.4 family
@@ -37474,15 +37492,18 @@ static int antfly_metal_encode_routed_stage(
         views, required, alignments, view_count, write_mask, parameters, parameter_size, grid, threads);
 }
 
+enum { ANTFLY_METAL_ROUTED_GROUP_MAX_ROUTES = 2048 };
+
 int antfly_metal_dispatch_routed_groups(
-    termite_metal_decode_runtime *runtime, const antfly_metal_routed_buffer views[2], uint32_t rows
+    termite_metal_decode_runtime *runtime, const antfly_metal_routed_buffer views[2], uint32_t rows, uint32_t experts
 ) {
-    if (!runtime || !views || !rows || rows > 512) return -1;
+    if (!runtime || !views || !rows || rows > ANTFLY_METAL_ROUTED_GROUP_MAX_ROUTES || !experts || experts > 256) return -1;
     const size_t required[2] = {(size_t)rows * sizeof(uint32_t), (size_t)rows * 9u * sizeof(uint32_t)};
     const size_t alignment[2] = {4, 4};
+    const struct { uint32_t rows, experts; } shader = {rows, experts};
     const int status = antfly_metal_encode_typed_stage(runtime, @"antfly_routed_build_groups",
         &runtime->routed_group_build_pipeline, views, required, alignment, 2, 1u << 1,
-        &rows, sizeof(rows), MTLSizeMake((rows + 63u) / 64u, 1, 1), MTLSizeMake(64, 1, 1));
+        &shader, sizeof(shader), MTLSizeMake((experts + 64u) / 64u, 1, 1), MTLSizeMake(64, 1, 1));
     return status == -3 ? 1 : status;
 }
 
@@ -37509,7 +37530,7 @@ int antfly_metal_dispatch_routed_block_scaled_bf16(
     required[5] = sizeof(float);
     if (!fp4) required[4] = required[5] = 0;
     const size_t alignments[8] = {2, 1, 1, 4, 4, 4, 2, 4};
-    if (views[7].handle && p->rows <= 512 && !(p->input_width % 32u) && !(p->output_width % 8u)) {
+    if (views[7].handle && p->rows <= ANTFLY_METAL_ROUTED_GROUP_MAX_ROUTES && !(p->input_width % 32u) && !(p->output_width % 8u)) {
         required[7] = (size_t)p->rows * 9u * sizeof(uint32_t);
         const int grouped = antfly_metal_encode_typed_stage(runtime, @"antfly_routed_block_scaled_bf16_grouped",
             &runtime->routed_group_projection_pipeline, views, required, alignments, 8, 1u << 6,
@@ -37578,7 +37599,7 @@ int antfly_metal_dispatch_routed_epilogue(
 
 typedef struct {
     uint32_t start, visible_start, page_tokens, first_page, page_count, physical_pages;
-    uint32_t q_heads, kv_heads, window, relative_extent, splits, keys_per_split, q4;
+    uint32_t q_heads, kv_heads, window, relative_extent, splits, q4;
     float score_scale;
 } antfly_metal_paged_relative_bf16_params;
 
@@ -37600,7 +37621,7 @@ int antfly_metal_dispatch_paged_relative_bf16(
     const size_t partial_alignments[6] = {2, 2, 2, 2, 4, 4};
     const MTLSize threads = MTLSizeMake(32, 1, 1);
     const bool reuse = p->q_heads / p->kv_heads == 3u && p->q_heads % p->kv_heads == 0u &&
-        p->keys_per_split >= 8u && p->start >= 256u;
+        (p->window == 0u || p->window >= 8u) && p->start >= 256u;
     int status = -3;
     if (reuse) {
         NSString *partial = p->q4 ? @"antfly_paged_relative_gqa_d128_q4_partial_reuse3" : @"antfly_paged_relative_gqa_d128_bf16_partial_reuse3";

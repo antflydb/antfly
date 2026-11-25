@@ -52952,7 +52952,7 @@ pub const RoutedBlockScaledFfn = struct {
 
     pub fn groupElements(self: RoutedBlockScaledFfn) !usize {
         const shape = try self.scratchShape();
-        if (self.rows < 16 or shape.selected > 512 or self.hidden % 32 != 0 or self.intermediate % 32 != 0) return 0;
+        if (self.rows < 16 or shape.selected > 2048 or self.hidden % 32 != 0 or self.intermediate % 32 != 0) return 0;
         return @as(usize, @intCast(shape.selected)) * 9;
     }
 
@@ -52967,7 +52967,7 @@ pub const RoutedBlockScaledFfn = struct {
         up_cap: f32,
     };
     const Buffer = RoutedBlockScaledProjection.Buffer;
-    extern fn antfly_metal_dispatch_routed_groups(runtime: *RawMetalDecodeRuntime, views: *const [2]Buffer, rows: u32) c_int;
+    extern fn antfly_metal_dispatch_routed_groups(runtime: *RawMetalDecodeRuntime, views: *const [2]Buffer, rows: u32, experts: u32) c_int;
     extern fn antfly_metal_dispatch_routed_epilogue(runtime: *RawMetalDecodeRuntime, stage: Stage, buffers: *const [4]Buffer, wire: *const Wire) c_int;
 
     fn dispatch(self: RoutedBlockScaledFfn, runtime: *RawMetalDecodeRuntime, stage: Stage, views: [4]Buffer, rows: u32, width: u32) !void {
@@ -53038,7 +53038,7 @@ pub const RoutedBlockScaledFfn = struct {
             if (table.isReadOnlyPhysical()) return error.ReadOnlyPhysicalStorage;
             if (try self.groupElements() == 0) break :gather null;
             const views: [2]Buffer = .{ try .fromTensor(scratch.selected, .i32), try .fromTensor(table, .i32) };
-            switch (antfly_metal_dispatch_routed_groups(runtime, &views, routed_rows)) {
+            switch (antfly_metal_dispatch_routed_groups(runtime, &views, routed_rows, self.experts)) {
                 0 => table.invalidateHostMirror(),
                 1 => break :gather null,
                 else => return error.MetalKernelDispatchFailed,
@@ -53086,8 +53086,11 @@ test "Metal routed block-scaled projection groups frequent experts and preserves
     var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
     defer provider.deinitOwned();
     const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
-    const rows, const width, const columns, const experts = .{ 16, 32, 8, 4 };
-    const ids: [rows]u32 = .{ 0, 1, 0, 2, 3, 0, 3, 3, 1, 0, 0, 3, 1, 2, 1, 0 };
+    const rows, const width, const columns, const experts = .{ 528, 32, 8, 4 };
+    const valid_ids = [_]u32{ 0, 1, 0, 2, 3, 0, 3, 3, 1, 0, 0, 3, 1, 2, 1, 0 };
+    var ids: [rows]u32 = undefined;
+    @memcpy(ids[0..valid_ids.len], &valid_ids);
+    for (ids[valid_ids.len..], 0..) |*id, i| id.* = experts + @as(u32, @intCast(i % 3));
     var input: [rows * width]u16 = undefined;
     for (&input, 0..) |*bits, i| bits.* = if (i % 3 == 0) 0x4000 else 0xbf80;
     var values: [experts * columns * width / 2]u8 = undefined;
@@ -53112,7 +53115,7 @@ test "Metal routed block-scaled projection groups frequent experts and preserves
     errdefer cancelFrame(runtime) catch {};
     const Buffer = RoutedBlockScaledProjection.Buffer;
     const group_views: [2]Buffer = .{ try .fromTensor(&tensors[3], .i32), try .fromTensor(&tensors[6], .i32) };
-    switch (RoutedBlockScaledFfn.antfly_metal_dispatch_routed_groups(runtime, &group_views, rows)) {
+    switch (RoutedBlockScaledFfn.antfly_metal_dispatch_routed_groups(runtime, &group_views, rows, experts)) {
         0 => {},
         1 => return error.SkipZigTest,
         else => return error.MetalKernelDispatchFailed,
@@ -53231,7 +53234,6 @@ pub const PagedRelativeBf16Attention = struct {
         window: u32,
         relative_extent: u32,
         splits: u32,
-        keys_per_split: u32,
         q4: u32,
         score_scale: f32,
     };
@@ -53355,7 +53357,6 @@ pub const PagedRelativeBf16Attention = struct {
             .window = self.query.window,
             .relative_extent = self.query.relative_extent,
             .splits = split_count,
-            .keys_per_split = (coverage.live_keys - 1) / split_count + 1,
             .q4 = @intFromBool(self.format == .q4_head128),
             .score_scale = self.query.score_scale,
         }, coverage.row_heads, physical_rows) != 0) return error.MetalKernelDispatchFailed;

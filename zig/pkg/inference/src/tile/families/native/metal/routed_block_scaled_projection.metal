@@ -197,28 +197,40 @@ kernel void antfly_routed_reduce_bf16(
     output[ulong(index.y) * p.width + index.x] = bfloat(sum);
 }
 
+struct RoutedGroupParams {
+    uint rows;
+    uint experts;
+};
+
+inline void antfly_write_routed_group(device uint *groups, thread const uint *routes, uint count) {
+    if (count >= 4u) {
+        device uint *leader = groups + ulong(routes[0]) * 9u;
+        leader[0] = count;
+        for (uint i = 0u; i < count; ++i) leader[i + 1u] = routes[i];
+        for (uint i = 1u; i < count; ++i) groups[ulong(routes[i]) * 9u] = 0u;
+    } else {
+        for (uint i = 0u; i < count; ++i) groups[ulong(routes[i]) * 9u] = 1u;
+    }
+}
+
 // native-program:entry antfly_routed_build_groups
 kernel void antfly_routed_build_groups(
-    device const uint *experts [[buffer(0)]], device uint *groups [[buffer(1)]],
-    constant uint &rows [[buffer(2)]], uint route [[thread_position_in_grid]]
+    device const uint *expert_ids [[buffer(0)]], device uint *groups [[buffer(1)]],
+    constant RoutedGroupParams &p [[buffer(2)]], uint expert [[thread_position_in_grid]]
 ) {
-    if (route >= rows) return;
-    const uint expert = experts[route];
-    uint before = 0u;
-    for (uint i = 0u; i < route; ++i) before += uint(experts[i] == expert);
-    const uint local = before % 8u;
-    device uint *entry = groups + ulong(route) * 9u;
-    if (local == 0u) {
-        uint count = 0u;
-        for (uint i = route; i < rows && count < 8u; ++i) {
-            if (experts[i] == expert) entry[1u + count++] = i;
+    if (expert > p.experts) return;
+    uint pending[8];
+    uint count = 0;
+    for (uint route = 0u; route < p.rows; ++route) {
+        const uint id = expert_ids[route];
+        if (id != expert && !(expert == p.experts && id > p.experts)) continue;
+        pending[count++] = route;
+        if (count == 8u) {
+            antfly_write_routed_group(groups, pending, count);
+            count = 0;
         }
-        entry[0] = count >= 4u ? count : 1u;
-    } else {
-        uint count = local + 1u;
-        for (uint i = route + 1u; i < rows && count < 4u; ++i) count += uint(experts[i] == expert);
-        entry[0] = count >= 4u ? 0u : 1u;
     }
+    antfly_write_routed_group(groups, pending, count);
 }
 
 // native-program:entry antfly_routed_block_scaled_bf16_grouped
