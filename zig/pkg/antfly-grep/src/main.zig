@@ -73,6 +73,7 @@ const help =
     \\      --table-config PATH  Versioned Antfly table connection JSON
     \\      --table NAME         Select a configured table (repeatable)
     \\      --table-filter JSON  Server-side structured filter
+    \\      --require-complete  Reject incomplete artifact coverage before searching
     \\      --max-index-documents N  Exact scan document budget (default 100000)
     \\      --decision-batch-wait-ms N  Cross-file gather window (default 1ms; 0 disables)
     \\      --max-spill-bytes N     Ranked/inventory scratch cap (default 1GiB)

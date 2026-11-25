@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Reproducible local-search contracts from test-only ripgrep 15.2 / PCRE2 10.45.
+"""Reproducible local-search contracts from test-only ripgrep 16.0 / PCRE2 10.45.
 
 Run with a pinned oracle path; stdout is a fixture manifest. These synthetic
 inputs cover both engines and output/Unicode combinations without depending on
@@ -33,7 +33,7 @@ parser.add_argument("oracle", type=Path)
 args = parser.parse_args()
 oracle = str(args.oracle.resolve())
 version = subprocess.check_output([oracle, "--version"]).decode()
-assert "ripgrep 15.2.0" in version
+assert "ripgrep 16.0.0" in version
 assert "10.45" in subprocess.check_output([oracle, "--pcre2-version"]).decode()
 patterns = [
     r"[a-z]+",
@@ -84,6 +84,34 @@ for flags, data in [
     cases.append(
         {
             "category": "binary-encoding",
+            "args": flags,
+            "input": base64.b64encode(data).decode(),
+            "code": result.returncode,
+            "stdout": base64.b64encode(result.stdout).decode(),
+        }
+    )
+# Selection and match enumeration have different record boundaries in the
+# regular multiline optimization. Keep these contracts without a live oracle.
+for engine, data, pattern in itertools.product(
+    ["default", "pcre2", "auto"],
+    [b"aa", b"aa\r\n", b"aa\r\n\0", b"a\0b\0"],
+    ["a|$", "$", "^b"],
+):
+    flags = [
+        "--engine",
+        engine,
+        "--null-data",
+        "-U",
+        "--include-zero",
+        "--count-matches",
+        pattern,
+    ]
+    result = subprocess.run(
+        [oracle, *flags], input=data, check=False, capture_output=True, timeout=5
+    )
+    cases.append(
+        {
+            "category": "multiline-record-boundaries",
             "args": flags,
             "input": base64.b64encode(data).decode(),
             "code": result.returncode,

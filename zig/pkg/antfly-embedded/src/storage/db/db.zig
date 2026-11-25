@@ -45222,24 +45222,31 @@ pub const DB = struct {
         return error.HierarchyCursorStale;
     }
 
-    /// Reuse the authoritative source-completion contract on this query's
-    /// frozen store. Current HTTP readiness cannot certify a retained cut.
-    fn artifactMembersComplete(self: *DB, alloc: Allocator, name: []const u8) !bool {
-        for (self.core.index_manager.text_indexes.items) |entry| {
-            var bound = false;
-            for (entry.source_artifact_names) |source| if (std.mem.eql(u8, source, name)) {
-                bound = true;
-            };
-            if (entry.chunk_name) |source| if (std.mem.eql(u8, source, name)) {
-                bound = true;
-            };
-            if (!bound) continue;
-            var status = types.DBIndexStats{ .name = try alloc.dupe(u8, entry.config.name), .kind = .full_text };
-            defer types.freeDBIndexStatsItem(alloc, status);
-            try self.populateIndexSourceReplayStats(alloc, entry.config.name, 0, 0, &status);
-            for (status.source_replay) |source| if (std.mem.eql(u8, source.artifact_name, name) and source.producer_complete and source.repair_summary_ready and !source.failed) return true;
+    /// Enumerate only the logical members visible in this retained store.
+    /// Selected immutable chunk heads shadow legacy rows, including absent
+    /// ordinals; staging rows never enter this logical namespace. Publication
+    /// admission owns that visibility, independently of producer completeness.
+    fn artifactMemberKeysPage(self: *DB, alloc: Allocator, req: types.SearchRequest, parent: []const u8, artifact: []const u8, kind: types.ArtifactKind, prefix: []const u8, after: ?[]const u8, limit: usize) ![][]u8 {
+        if (kind == .asset) return self.core.store.scanPrefixKeysPage(alloc, prefix, after, limit);
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        var members = try @import("artifact_chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).openNamed(alloc, &txn, parent, artifact);
+        defer members.close();
+        if (after) |key| if (std.mem.startsWith(u8, key, prefix)) {
+            members.seekAfter(key) catch |err| return if (err == error.InvalidBatchRequest) error.InvalidQueryRequest else err;
+        };
+        var results: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (results.items) |key| alloc.free(key);
+            results.deinit(alloc);
         }
-        return false;
+        while (results.items.len < limit) {
+            const row = (try members.nextControlled(.{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns })) orelse break;
+            const key = try alloc.dupe(u8, row.key);
+            errdefer alloc.free(key);
+            try results.append(alloc, key);
+        }
+        return results.toOwnedSlice(alloc);
     }
 
     /// Sequential producer traversal seeks native keys inside one authorized
@@ -45252,7 +45259,10 @@ pub const DB = struct {
         // authenticated immutable cut. Validate retention against that DB too,
         // rather than requiring a token that execution intentionally removed.
         if (req.search_after.len != 0 and req.remote_snapshot == null and req.native_query_cut == null and self.retained_value_scope == null) return error.InvalidQueryRequest;
-        if (!try self.artifactMembersComplete(alloc, artifact_name)) return error.ArtifactPublicationPending;
+        // Enumerating published members does not certify that all sources
+        // finished extraction. Coverage belongs to readiness, not read admission.
+        // The caller's retained cut and ordinary publication visibility remain
+        // authoritative even while a sibling producer is pending or failed.
         var kind: ?types.ArtifactKind = null;
         var extraction = false;
         for (self.core.index_manager.enrichments.items) |entry| {
@@ -45267,19 +45277,20 @@ pub const DB = struct {
             break;
         }
         const member_kind = kind orelse return error.InvalidQueryRequest;
-        const prefixes = try alloc.alloc([]u8, parents.len);
+        const Scope = struct { prefix: []u8, parent: []const u8 };
+        const prefixes = try alloc.alloc(Scope, parents.len);
         var initialized: usize = 0;
         defer {
-            for (prefixes[0..initialized]) |prefix| alloc.free(prefix);
+            for (prefixes[0..initialized]) |scope| alloc.free(scope.prefix);
             alloc.free(prefixes);
         }
         for (parents) |parent| {
-            prefixes[initialized] = try internal_keys.artifactNamedPrefixAlloc(alloc, parent, if (member_kind == .asset) "asset" else "chunk", artifact_name);
+            prefixes[initialized] = .{ .parent = parent, .prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, parent, if (member_kind == .asset) "asset" else "chunk", artifact_name) };
             initialized += 1;
         }
-        std.mem.sort([]u8, prefixes, {}, struct {
-            fn less(_: void, a: []u8, b: []u8) bool {
-                return std.mem.order(u8, a, b) == .lt;
+        std.mem.sort(Scope, prefixes, {}, struct {
+            fn less(_: void, a: Scope, other: Scope) bool {
+                return std.mem.order(u8, a.prefix, other.prefix) == .lt;
             }
         }.less);
         var cursor: ?[]u8 = null;
@@ -45289,8 +45300,8 @@ pub const DB = struct {
             defer ref.deinit(alloc);
             const key = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, ref);
             cursor = key;
-            const selected = for (prefixes) |prefix| {
-                if (std.mem.startsWith(u8, key, prefix)) break true;
+            const selected = for (prefixes) |scope| {
+                if (std.mem.startsWith(u8, key, scope.prefix)) break true;
             } else false;
             if (!selected) return error.InvalidQueryRequest;
             const hex = try bytesToHexAlloc(alloc, key);
@@ -45304,12 +45315,13 @@ pub const DB = struct {
             for (hits.items) |*hit| hit.deinit(alloc);
             hits.deinit(alloc);
         }
-        for (prefixes) |prefix| {
+        for (prefixes) |scope| {
+            const prefix = scope.prefix;
             if (hits.items.len == req.limit) break;
             if (cursor) |key| if (std.mem.order(u8, prefix, key) == .lt and !std.mem.startsWith(u8, key, prefix)) continue;
             while (hits.items.len < req.limit) {
                 try checkHierarchyNavigationCancelled(req);
-                const keys = try self.core.store.scanPrefixKeysPage(alloc, prefix, cursor, @as(usize, req.limit) - hits.items.len);
+                const keys = try self.artifactMemberKeysPage(alloc, req, scope.parent, artifact_name, member_kind, prefix, cursor, @as(usize, req.limit) - hits.items.len);
                 defer freeOwnedKeySlice(alloc, keys);
                 if (keys.len == 0) break;
                 for (keys) |key| {
@@ -54750,6 +54762,57 @@ const embeddingArtifactKeyForBaseAlloc = local_mutation.embeddingArtifactKeyForB
 const PendingArtifactWriteIndex = execution_resources.PendingArtifactWriteIndex;
 
 const indexPendingArtifactWrites = local_mutation.indexPendingArtifactWrites;
+
+test "db artifact member navigation reads selected logical chunks without whole-source completion" {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("db");
+    defer tmp.cleanup();
+    var db = try DB.open(a, std.mem.span(tmp.path().ptr), .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    const generations = @import("artifact_chunk_generation.zig");
+    const manifests = @import("artifact_chunk_manifest.zig");
+    const first = try internal_keys.chunkArtifactKeyAlloc(a, "parent", "chunks", 0);
+    defer a.free(first);
+    const second = try internal_keys.chunkArtifactKeyAlloc(a, "parent", "chunks", 1);
+    defer a.free(second);
+    const stale = try internal_keys.chunkArtifactKeyAlloc(a, "parent", "chunks", 9);
+    defer a.free(stale);
+    const scope = (try manifests.keyForMemberAlloc(a, first)).?;
+    defer a.free(scope);
+    var output = manifests.Builder.init();
+    try output.append(0, "one");
+    try output.append(1, "two");
+    const spec = try generations.Spec.init(.{ .namespace = @splat(1), .epoch = 1, .catalog_digest = @splat(2) }, scope, @splat(3), output.finish(), 1);
+    var plan = try generations.Plan.init(a, scope, spec);
+    defer plan.deinit();
+    const encoded = spec.encode();
+    try db.core.store.putBatch(&.{ .{ .key = plan.head_key, .value = &encoded }, .{ .key = stale, .value = "obsolete" } }, &.{});
+    for ([_][]const u8{ "one", "two", "unpublished tail" }, 0..) |value, ordinal| {
+        const key = try a.alloc(u8, plan.row_prefix.len + 4);
+        defer a.free(key);
+        @memcpy(key[0..plan.row_prefix.len], plan.row_prefix);
+        std.mem.writeInt(u32, key[plan.row_prefix.len..][0..4], @intCast(ordinal), .big);
+        try db.core.store.putBatch(&.{.{ .key = key, .value = value }}, &.{});
+    }
+    const prefix = try internal_keys.artifactNamedPrefixAlloc(a, "parent", "chunk", "chunks");
+    defer a.free(prefix);
+    const page1 = try db.artifactMemberKeysPage(a, .{}, "parent", "chunks", .chunk, prefix, null, 1);
+    defer freeOwnedKeySlice(a, page1);
+    try std.testing.expectEqual(@as(usize, 1), page1.len);
+    try std.testing.expectEqualStrings(first, page1[0]);
+    const page2 = try db.artifactMemberKeysPage(a, .{}, "parent", "chunks", .chunk, prefix, page1[0], 1);
+    defer freeOwnedKeySlice(a, page2);
+    try std.testing.expectEqual(@as(usize, 1), page2.len);
+    try std.testing.expectEqualStrings(second, page2[0]);
+    const end = try db.artifactMemberKeysPage(a, .{}, "parent", "chunks", .chunk, prefix, page2[0], 1);
+    defer freeOwnedKeySlice(a, end);
+    try std.testing.expectEqual(@as(usize, 0), end.len);
+    const empty = try db.artifactMemberKeysPage(a, .{}, "pending", "chunks", .chunk, prefix, null, 1);
+    defer freeOwnedKeySlice(a, empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+    try std.testing.expectError(error.Timeout, db.artifactMemberKeysPage(a, .{ .execution_deadline_ns = 0 }, "parent", "chunks", .chunk, prefix, null, 1));
+    try std.testing.expectError(error.InvalidQueryRequest, db.artifactMemberKeysPage(a, .{}, "parent", "chunks", .chunk, prefix, prefix, 1));
+}
 
 test "pending artifact writes index only new writes by document" {
     const alloc = std.testing.allocator;

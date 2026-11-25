@@ -162,6 +162,7 @@ _arguments -s \
  '--regex-size-limit[regex-size-limit]:value:' \
  '--regexp[regexp]:value:' \
  '--replace[replace]:value:' \
+ '--require-complete[require-complete]' \
  '--require-git[require-git]' \
  '--retries[retries]:value:' \
  '--search-zip[search-zip]' \

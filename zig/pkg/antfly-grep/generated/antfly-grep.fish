@@ -162,6 +162,7 @@ complete -c antfly-grep -l refine
 complete -c antfly-grep -l regex-size-limit -r
 complete -c antfly-grep -l regexp -r
 complete -c antfly-grep -l replace -r
+complete -c antfly-grep -l require-complete
 complete -c antfly-grep -l require-git
 complete -c antfly-grep -l retries -r
 complete -c antfly-grep -l search-zip
