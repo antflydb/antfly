@@ -14861,7 +14861,7 @@ fn generatedQ6KQ8_1ArgmaxStage1Threads(in_dim: usize) usize {
     };
 }
 
-fn generatedQ4_0Q8_1ArgmaxLaunchBounds(rows: usize, in_dim: usize, out_dim: usize) driver_mod.Error!GeneratedQ4_0Q8_1ArgmaxLaunchBounds {
+pub fn generatedQ4_0Q8_1ArgmaxLaunchBounds(rows: usize, in_dim: usize, out_dim: usize) driver_mod.Error!GeneratedQ4_0Q8_1ArgmaxLaunchBounds {
     if (!linearQ4_0Q8_1ArgmaxE2BShapeEligible(rows, in_dim, out_dim)) return error.InvalidCudaState;
     const row_blocks = in_dim / q8_1_values_per_block;
     const col_tiles = (out_dim + generated_q4_0_q8_1_argmax_tile8_cols - 1) / generated_q4_0_q8_1_argmax_tile8_cols;

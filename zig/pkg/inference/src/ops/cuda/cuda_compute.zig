@@ -26166,8 +26166,9 @@ fn tryLinearQ4_0Q8_1ArgmaxE2BDevice(
     var profile_scope = beginDecodeProfile(self, .lm_head_argmax, rows);
     defer if (profile_scope) |*scope| scope.end();
 
-    const q8_bytes = try checkedMul(try checkedMul(rows, in_dim / 32), 36);
-    var scratch = ProjectionArgmaxScratch.acquire(self, rows, out_dim, 8, q8_bytes, suppress_token_ids) catch |err| switch (err) {
+    const bounds = try kernels_mod.generatedQ4_0Q8_1ArgmaxLaunchBounds(rows, in_dim, out_dim);
+    const layout = try ProjectionArgmaxScratch.Layout.init(bounds.partial_bytes, bounds.q8_input_bytes, suppress_token_ids.len);
+    var scratch = ProjectionArgmaxScratch.acquire(self, layout, suppress_token_ids) catch |err| switch (err) {
         error.CudaGraphCaptureUnsafeTempAlloc, error.CudaGraphCaptureUnsafeHostCopy => {
             noteQ4_0Q8_1ArgmaxFallback(self, @errorName(err), rows, in_dim, out_dim);
             return null;
@@ -26242,30 +26243,53 @@ const ProjectionArgmaxScratch = struct {
     suppression: buffer_mod.DeviceBuffer,
     quantized_input: buffer_mod.DeviceBuffer,
 
-    fn acquire(self: *CudaCompute, rows: usize, columns: usize, tile_columns: usize, packed_bytes: usize, suppressed: []const i32) !ProjectionArgmaxScratch {
-        const tiles = (columns - 1) / tile_columns + 1;
-        const partial_count = try checkedMul(rows, tiles);
-        const values_bytes = try checkedMul(partial_count, @sizeOf(f32));
-        const indices_bytes = try checkedMul(partial_count, @sizeOf(u32));
-        const suppression_bytes = try checkedMul(suppressed.len, @sizeOf(i32));
-        const indices_offset = try std.math.add(usize, packed_bytes, values_bytes);
-        const suppression_offset = try std.math.add(usize, indices_offset, indices_bytes);
-        const total = try std.math.add(usize, suppression_offset, suppression_bytes);
-        var bank = try allocDeviceBuffer(self, total);
+    const Layout = struct {
+        partial_bytes: usize,
+        packed_bytes: usize,
+        indices_offset: usize,
+        suppression_offset: usize,
+        suppression_bytes: usize,
+        bytes: usize,
+
+        fn init(partial_bytes: usize, packed_bytes: usize, suppress_count: usize) !Layout {
+            const indices_offset = try std.math.add(usize, packed_bytes, partial_bytes);
+            const suppression_offset = try std.math.add(usize, indices_offset, partial_bytes);
+            const suppression_bytes = try checkedMul(suppress_count, @sizeOf(i32));
+            return .{
+                .partial_bytes = partial_bytes,
+                .packed_bytes = packed_bytes,
+                .indices_offset = indices_offset,
+                .suppression_offset = suppression_offset,
+                .suppression_bytes = suppression_bytes,
+                .bytes = try std.math.add(usize, suppression_offset, suppression_bytes),
+            };
+        }
+
+        fn tile4(rows: usize, columns: usize, suppress_count: usize) !Layout {
+            const tiles = (columns - 1) / 4 + 1;
+            const partial_bytes = try checkedMul(try checkedMul(rows, tiles), @sizeOf(f32));
+            return init(partial_bytes, 0, suppress_count);
+        }
+    };
+
+    fn acquire(self: *CudaCompute, layout: Layout, suppressed: []const i32) !ProjectionArgmaxScratch {
+        std.debug.assert(layout.suppression_bytes == std.mem.sliceAsBytes(suppressed).len);
+        var bank = try allocDeviceBuffer(self, layout.bytes);
         errdefer releaseDeviceBuffer(self, &bank);
-        const suppression: buffer_mod.DeviceBuffer = if (suppressed.len == 0) .{} else .{
-            .ptr = bank.ptr + suppression_offset,
-            .len = suppression_bytes,
-            .borrowed = true,
-        };
+        const suppression = span(bank, layout.suppression_offset, layout.suppression_bytes);
         if (suppressed.len != 0) try copyFromHostTracked(self, suppression, std.mem.sliceAsBytes(suppressed));
         return .{
             .bank = bank,
-            .partial_values = .{ .ptr = bank.ptr + packed_bytes, .len = values_bytes, .borrowed = true },
-            .partial_indices = .{ .ptr = bank.ptr + indices_offset, .len = indices_bytes, .borrowed = true },
-            .quantized_input = if (packed_bytes == 0) .{} else .{ .ptr = bank.ptr, .len = packed_bytes, .borrowed = true },
+            .partial_values = span(bank, layout.packed_bytes, layout.partial_bytes),
+            .partial_indices = span(bank, layout.indices_offset, layout.partial_bytes),
+            .quantized_input = span(bank, 0, layout.packed_bytes),
             .suppression = suppression,
         };
+    }
+
+    fn span(bank: buffer_mod.DeviceBuffer, offset: usize, bytes: usize) buffer_mod.DeviceBuffer {
+        if (bytes == 0) return .{};
+        return .{ .ptr = bank.ptr + offset, .len = bytes, .borrowed = true };
     }
 
     fn deinit(scratch: *ProjectionArgmaxScratch, self: *CudaCompute) void {
@@ -26361,7 +26385,8 @@ fn linearNoBiasArgmaxLastRowSuppressTensor(ctx: *anyopaque, input: CT, weight: C
         return null;
     }
 
-    var scratch = try ProjectionArgmaxScratch.acquire(self, 1, out_dim, 4, 0, suppress_token_ids);
+    const layout = try ProjectionArgmaxScratch.Layout.tile4(1, out_dim, suppress_token_ids.len);
+    var scratch = try ProjectionArgmaxScratch.acquire(self, layout, suppress_token_ids);
     defer scratch.deinit(self);
 
     var token_device = try allocGreedyTokenDeviceBuffer(self, @sizeOf(i32));
@@ -26481,7 +26506,8 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
         null;
     defer if (profile_scope) |*scope| scope.end();
 
-    var scratch = try ProjectionArgmaxScratch.acquire(self, rows, out_dim, 4, 0, suppress_token_ids);
+    const layout = try ProjectionArgmaxScratch.Layout.tile4(rows, out_dim, suppress_token_ids.len);
+    var scratch = try ProjectionArgmaxScratch.acquire(self, layout, suppress_token_ids);
     defer scratch.deinit(self);
 
     var token_device = if (rows == 1 and allow_prepared_greedy_output)
