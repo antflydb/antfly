@@ -4508,8 +4508,10 @@ fn appendIndexReadinessStatus(
     const serving_failed = aggregate_query_blocked or
         ((terminal_load_failure or repair_failed) and
             (!active_generation_serviceable or repair_blocks_queryable)) or
-        (terminal_enrichment_failure and !serving_snapshot_ready and
-            (!full_text_serviceable or terminal_enrichment_global_failure));
+        // A producer supervisor failure still leaves a valid full-text
+        // checkpoint readable. Storage/load and repair admission above own
+        // serving failures; producer failures own extraction completeness.
+        (terminal_enrichment_failure and !serving_snapshot_ready and !full_text_serviceable);
     const publication_pending = incarnation_current and
         (!consumerCheckpointComplete(item) or (index_type == .embeddings and
             (replay_target_sequence > replay_applied_sequence or artifact_publish_pending or !serving_snapshot_ready)));
@@ -5308,6 +5310,11 @@ fn consumerTests() type {
                     try ant_json.testing.expectSubsetJsonText(a, "{\"readiness\":{\"queryable\":true,\"complete\":false,\"sources\":[{\"artifact\":\"pages\",\"complete\":false}]}}", encoded.items);
                 }
             }
+            // Even a failed producer supervisor cannot revoke a readable
+            // full-text checkpoint. It does keep source completion failed.
+            encoded.clearRetainingCapacity();
+            try appendSingleIndexRuntimeStatus(a, &encoded, .full_text, item, 1, .strict, false, 7, 41, .{}, .{ .enabled = true, .worker_failed = true }, null, null, .{}, metadata, true);
+            try ant_json.testing.expectSubsetJsonText(a, "{\"readiness\":{\"queryable\":true,\"complete\":false}}", encoded.items);
             // New replay work changes the desired cut, not the readability of
             // the existing full-text checkpoint.
             item.replay_target_sequence = 10;
