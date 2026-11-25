@@ -145,7 +145,9 @@ pub const TextPipeline = struct {
             config.token_observer != null or (config.speculation_requested and config.speculation_policy == .force))
             return error.UnsupportedInkling2Request;
         const tokens = try std.math.add(usize, self.prompt.count(), @as(usize, @intCast(config.max_tokens)) - 1);
-        return decoder.RequestPlan.init(model, std.math.cast(u32, tokens) orelse return error.InvalidInkling2Context);
+        const prefix = @max(self.prompt.before_image.len, self.prompt.after_image.len - 1);
+        const prefill_rows: u32 = if (prefix >= decoder.prefill_chunk_rows) decoder.prefill_chunk_rows else 1;
+        return decoder.RequestPlan.initPrefill(model, std.math.cast(u32, tokens) orelse return error.InvalidInkling2Context, prefill_rows);
     }
 
     /// The caller owns the runtime execution gate and memory admission for
@@ -165,12 +167,18 @@ pub const TextPipeline = struct {
         const greedy = chat.usesUnpenalizedGreedy(config);
         const after = self.prompt.after_image;
         for ([_][]const i32{ self.prompt.before_image, after[0 .. after.len - 1] }) |prefix| {
-            for (prefix) |id| {
+            const chunk_rows: usize = plan.bank.layout.max_append_tokens;
+            var offset: usize = 0;
+            while (chunk_rows > 1 and prefix.len - offset >= chunk_rows) : (offset += chunk_rows) {
+                try self.control.check();
+                try request.appendTokens(prefix[offset..][0..chunk_rows]);
+            }
+            for (prefix[offset..]) |id| {
                 try self.control.check();
                 const token = std.math.cast(u32, id) orelse return error.InvalidInkling2Token;
                 try request.append(token);
-                if (!greedy) try history.append(self.allocator, id);
             }
+            if (!greedy) for (prefix) |id| try history.append(self.allocator, id);
         }
 
         const turn_end = try chat.turnEndToken(self.allocator, self.tokenizer);

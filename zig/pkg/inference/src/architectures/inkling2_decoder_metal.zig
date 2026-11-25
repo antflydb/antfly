@@ -179,56 +179,132 @@ fn tempDtype(kind: Temp) tensors.DType {
     };
 }
 
-/// Exact requested device payloads. Metal allocation alignment and opaque
-/// command storage are accounted for separately by the allocator.
-pub const RequestPlan = struct {
-    width: u32,
-    elements: [@typeInfo(Temp).@"enum".field_names.len]usize,
-    bank: kv.BankConfig,
-    attention_workspace: attention.RequestWorkspace.Plan,
+pub const prefill_chunk_rows = 16;
 
-    pub fn init(model: *const Decoder, max_tokens: u32) !RequestPlan {
+const WorkPlan = struct {
+    rows: u32,
+    elements: [@typeInfo(Temp).@"enum".field_names.len]usize,
+    attention: attention.RequestWorkspace.Plan,
+
+    fn init(model: *const Decoder, rows: u32, max_tokens: u32) !WorkPlan {
         const text = model.text;
-        if (max_tokens == 0 or max_tokens > text.model_max_length) return error.InvalidInkling2Context;
-        const width = text.hidden_size;
-        const shape = try model.layers[0].experts.geometry(text, 1).scratchShape();
-        const elements = [_]usize{
-            width,                 width,                      width,                 width,                 width,                    width,                   width,                   width,                     width,                     width,
-            @as(usize, width) * 2, text.loop_config.gate_rank, @as(usize, width) * 2, text.n_routed_experts, @intCast(shape.selected), @intCast(shape.weights), @intCast(shape.gate_up), @intCast(shape.activated), @intCast(shape.projected), text.unpadded_vocab_size,
-        };
-        const bank: kv.BankConfig = .{
-            .layout = .{ .page_tokens = 16, .window_tokens = text.sliding_window_size, .max_tokens = max_tokens, .max_append_tokens = 1 },
-            .full_slots = checkpoint.full_slot_count,
-            .sliding_slots = checkpoint.sliding_slot_count,
-            .kv_heads = text.num_key_value_heads,
-            .head_dim = text.head_dim,
-        };
+        const width: usize = text.hidden_size;
+        const count = @as(usize, rows) * width;
+        const shape = try model.layers[0].experts.geometry(text, rows).scratchShape();
+        const elements = std.EnumArray(Temp, usize).init(.{
+            .query = count,
+            .key = count,
+            .value = count,
+            .raw = count,
+            .convolved_attention = count,
+            .convolved_expert = count,
+            .normalized = count,
+            .mix = count,
+            .shared_mix = count,
+            .message = count,
+            .pair = count * 2,
+            .rank = @as(usize, rows) * text.loop_config.gate_rank,
+            .gates = count * 2,
+            .router = @as(usize, rows) * text.n_routed_experts,
+            .selected = @intCast(shape.selected),
+            .route_weights = @intCast(shape.weights),
+            .gate_up = @intCast(shape.gate_up),
+            .activated = @intCast(shape.activated),
+            .projected = @intCast(shape.projected),
+            .logits = if (rows == 1) text.unpadded_vocab_size else 0,
+        });
         return .{
-            .width = width,
-            .elements = elements,
-            .bank = bank,
-            .attention_workspace = try .init(text, 1, max_tokens),
+            .rows = rows,
+            .elements = elements.values,
+            .attention = try .init(text, rows, max_tokens),
         };
     }
 
-    pub fn deviceBytes(self: RequestPlan) !usize {
-        const stack = try Stack.deviceBytes(self.width, 1);
-        const state = try State.deviceBytes(self.bank, self.width);
-        const attention_bytes = self.attention_workspace.bytes +
-            @as(usize, @intCast(self.attention_workspace.reduction_elements)) * @sizeOf(f32);
-        var bytes = try std.math.add(usize, try std.math.add(usize, stack, state), attention_bytes);
+    fn deviceBytes(self: WorkPlan, width: u32) !usize {
+        var bytes = try Stack.deviceBytes(width, self.rows);
+        bytes = try std.math.add(usize, bytes, self.attention.bytes);
+        bytes = try std.math.add(usize, bytes, @as(usize, @intCast(self.attention.reduction_elements)) * @sizeOf(f32));
         for (std.enums.values(Temp), self.elements) |kind, count|
             bytes = try std.math.add(usize, bytes, try std.math.mul(usize, count, tempDtype(kind).byteSize()));
         return bytes;
     }
 };
 
+/// Exact requested device payloads. Metal allocation alignment and opaque
+/// command storage are accounted for separately by the allocator.
+pub const RequestPlan = struct {
+    width: u32,
+    bank: kv.BankConfig,
+    decode: WorkPlan,
+    prefill: ?WorkPlan,
+
+    pub fn init(model: *const Decoder, max_tokens: u32) !RequestPlan {
+        return initPrefill(model, max_tokens, 1);
+    }
+
+    pub fn initPrefill(model: *const Decoder, max_tokens: u32, prefill_rows: u32) !RequestPlan {
+        const text = model.text;
+        if (max_tokens == 0 or max_tokens > text.model_max_length or prefill_rows == 0 or
+            prefill_rows > @min(prefill_chunk_rows, max_tokens)) return error.InvalidInkling2Context;
+        return .{
+            .width = text.hidden_size,
+            .bank = .{
+                .layout = .{ .page_tokens = 16, .window_tokens = text.sliding_window_size, .max_tokens = max_tokens, .max_append_tokens = prefill_rows },
+                .full_slots = checkpoint.full_slot_count,
+                .sliding_slots = checkpoint.sliding_slot_count,
+                .kv_heads = text.num_key_value_heads,
+                .head_dim = text.head_dim,
+            },
+            .decode = try .init(model, 1, max_tokens),
+            .prefill = if (prefill_rows == 1) null else try .init(model, prefill_rows, max_tokens),
+        };
+    }
+
+    pub fn deviceBytes(self: RequestPlan) !usize {
+        var bytes = try std.math.add(usize, try State.deviceBytes(self.bank, self.width), try self.decode.deviceBytes(self.width));
+        if (self.prefill) |plan| bytes = try std.math.add(usize, bytes, try plan.deviceBytes(self.width));
+        return bytes;
+    }
+};
+
+const Work = struct {
+    stack: Stack,
+    attention: attention.RequestWorkspace,
+    temps: [@typeInfo(Temp).@"enum".field_names.len]Tensor,
+
+    fn init(a: std.mem.Allocator, runtime: *Runtime, width: u32, plan: WorkPlan) !Work {
+        var result: Work = undefined;
+        result.stack = try Stack.init(a, runtime, width, plan.rows);
+        errdefer result.stack.deinit();
+        result.attention = try .init(a, runtime, plan.attention);
+        errdefer result.attention.deinit();
+        var initialized: usize = 0;
+        errdefer for (result.temps[0..initialized]) |*tensor| tensor.deinit();
+        for (&result.temps, std.enums.values(Temp), plan.elements) |*tensor, kind, elements| {
+            if (elements == 0) break;
+            tensor.* = try allocate(a, runtime, tempDtype(kind), elements, if (kind == .logits) .shared else .private);
+            initialized += 1;
+        }
+        return result;
+    }
+
+    fn deinit(self: *Work) void {
+        const count = if (self.stack.rows == 1) self.temps.len else @backingInt(Temp.logits);
+        for (self.temps[0..count]) |*tensor| tensor.deinit();
+        self.attention.deinit();
+        self.stack.deinit();
+    }
+
+    fn get(self: *Work, key: Temp) *Tensor {
+        return &self.temps[@backingInt(key)];
+    }
+};
+
 pub const Request = struct {
     model: *const Decoder,
     state: State,
-    attention_workspace: attention.RequestWorkspace,
-    stack: Stack,
-    temps: [@typeInfo(Temp).@"enum".field_names.len]Tensor,
+    decode: Work,
+    prefill: ?Work,
     host_logits: []f32,
     allocator: std.mem.Allocator,
 
@@ -240,121 +316,117 @@ pub const Request = struct {
 
     pub fn initWithPlan(self: *Request, a: std.mem.Allocator, model: *const Decoder, plan: RequestPlan) !void {
         const runtime = model.runtime;
-        self.* = .{ .model = model, .state = undefined, .stack = undefined, .attention_workspace = undefined, .temps = undefined, .host_logits = undefined, .allocator = a };
-        self.host_logits = try a.alloc(f32, plan.elements[@backingInt(Temp.logits)]);
+        self.* = .{ .model = model, .state = undefined, .decode = undefined, .prefill = null, .host_logits = undefined, .allocator = a };
+        self.host_logits = try a.alloc(f32, model.text.unpadded_vocab_size);
         errdefer a.free(self.host_logits);
-        self.stack = try Stack.init(a, runtime, plan.width, 1);
-        errdefer self.stack.deinit();
-        self.attention_workspace = try .init(a, runtime, plan.attention_workspace);
-        errdefer self.attention_workspace.deinit();
-        var initialized: usize = 0;
-        errdefer for (self.temps[0..initialized]) |*tensor| tensor.deinit();
-        for (&self.temps, std.enums.values(Temp), plan.elements) |*tensor, kind, elements| {
-            tensor.* = try allocate(a, runtime, tempDtype(kind), elements, if (kind == .logits) .shared else .private);
-            initialized += 1;
-        }
+        self.decode = try .init(a, runtime, plan.width, plan.decode);
+        errdefer self.decode.deinit();
+        if (plan.prefill) |batch| self.prefill = try .init(a, runtime, plan.width, batch);
+        errdefer if (self.prefill) |*batch| batch.deinit();
         try self.state.init(a, runtime, plan.bank, plan.width);
     }
 
     pub fn deinit(self: *Request) void {
         self.state.deinit();
-        for (&self.temps) |*tensor| tensor.deinit();
-        self.attention_workspace.deinit();
-        self.stack.deinit();
+        if (self.prefill) |*batch| batch.deinit();
+        self.decode.deinit();
         self.allocator.free(self.host_logits);
     }
 
-    fn get(self: *Request, key: Temp) *Tensor {
-        return &self.temps[@backingInt(key)];
-    }
-
-    fn control(self: *Request, layer: *const Layer, layer_index: usize, stream: checkpoint.ControllerStream, dest: *const Tensor, gamma: *const Tensor, output: *Tensor) !void {
+    fn control(self: *Request, work: *Work, layer: *const Layer, layer_index: usize, stream: checkpoint.ControllerStream, dest: *const Tensor, gamma: *const Tensor, output: *Tensor) !void {
         const runtime = self.model.runtime;
         const eps = self.model.text.rms_norm_eps;
         var query = try self.model.query(layer_index, stream);
         defer query.deinit();
-        try self.stack.mixBank(runtime, eps, &query, self.get(.message));
+        try work.stack.mixBank(runtime, eps, &query, work.get(.message));
         const ctrl = if (layer.controllers[@backingInt(stream)]) |*value| value else return error.InvalidInkling2Schedule;
-        try ctrl.encode(runtime, 1, eps, dest, self.get(.message), gamma, .{
-            .pair = self.get(.pair),
-            .rank = self.get(.rank),
-            .gates = self.get(.gates),
+        try ctrl.encode(runtime, work.stack.rows, eps, dest, work.get(.message), gamma, .{
+            .pair = work.get(.pair),
+            .rank = work.get(.rank),
+            .gates = work.get(.gates),
         }, output);
     }
 
-    fn visit(self: *Request, pending: *kv.Append, op: checkpoint.Visit) !void {
+    fn visit(self: *Request, work: *Work, pending: *kv.Append, op: checkpoint.Visit) !void {
         const text = self.model.text;
         const runtime = self.model.runtime;
         const eps = text.rms_norm_eps;
         const layer = &self.model.layers[op.weight_layer];
         const local = layer.attention.local;
         const looped = op.pass != 0;
-        try self.stack.advance(op, text.loop_config.core_start);
+        try work.stack.advance(op, text.loop_config.core_start);
 
-        const destinations = [_]*Tensor{ self.get(.query), self.get(.key), self.get(.value) };
+        const destinations = [_]*Tensor{ work.get(.query), work.get(.key), work.get(.value) };
         for ([_]checkpoint.ControllerStream{ .attn, .k, .v }, [_]Layer.Weight{ .q_norm, .k_norm, .v_norm }, destinations, 0..) |stream, norm, dest, index| {
             if (local and !looped and index != 0) break;
             const gamma = layer.weight(if (local) .q_norm else norm);
             if (op.weight_layer == 0) {
-                try metal.rowRmsBf16(runtime, 1, text.hidden_size, eps, self.stack.current(), gamma, dest);
+                try metal.rowRmsBf16(runtime, work.stack.rows, text.hidden_size, eps, work.stack.current(), gamma, dest);
                 continue;
             }
             if (!looped or !local or index == 0) {
                 var query = try row(layer.weight(.attn_query), index, text.hidden_size);
                 defer query.deinit();
                 if (looped) {
-                    try self.stack.mix(runtime, eps, &query, null, self.get(.shared_mix));
-                } else try self.stack.mix(runtime, eps, &query, gamma, dest);
+                    try work.stack.mix(runtime, eps, &query, null, work.get(.shared_mix));
+                } else try work.stack.mix(runtime, eps, &query, gamma, dest);
             }
-            if (looped) try self.control(layer, op.weight_layer, stream, self.get(.shared_mix), gamma, dest);
+            if (looped) try self.control(work, layer, op.weight_layer, stream, work.get(.shared_mix), gamma, dest);
         }
         const binding = try self.state.binding(pending, .{ .group = op.group, .slot = op.slot });
         try layer.attention.encode(runtime, text, pending, .{
             .query = destinations[0],
             .key = if (local and !looped) destinations[0] else destinations[1],
             .value = if (local and !looped) destinations[0] else destinations[2],
-        }, binding.page_ids, binding.planes, binding.history, self.attention_workspace.bind(local), self.get(.raw));
-        try self.state.convolveResidual(pending, text.hidden_size, self.get(.raw), layer.weight(.attn_taps), binding.attention_residual, self.get(.convolved_attention));
+        }, binding.page_ids, binding.planes, binding.history, work.attention.bind(local), work.get(.raw));
+        try self.state.convolveResidual(pending, text.hidden_size, work.get(.raw), layer.weight(.attn_taps), binding.attention_residual, work.get(.convolved_attention));
 
         const boundary = op.weight_layer % text.n_layers_per_attn_res_block == 0;
-        const completed = self.stack.depth + @intFromBool(boundary);
-        const previous = if (boundary) null else self.stack.current();
+        const completed = work.stack.depth + @intFromBool(boundary);
+        const previous = if (boundary) null else work.stack.current();
         const gamma = layer.weight(.mlp_norm);
-        try self.stack.mixPartial(runtime, eps, completed, self.get(.convolved_attention), previous, layer.weight(.mlp_query), if (looped) null else gamma, self.get(if (looped) .mix else .normalized));
-        if (looped) try self.control(layer, op.weight_layer, .mlp, self.get(.mix), gamma, self.get(.normalized));
-        try layer.experts.encode(runtime, text, 1, self.get(.normalized), self.get(.router), .{
-            .selected = self.get(.selected),
-            .weights = self.get(.route_weights),
-            .gate_up = self.get(.gate_up),
-            .activated = self.get(.activated),
-            .projected = self.get(.projected),
-        }, self.get(.raw));
-        try self.state.convolveResidual(pending, text.hidden_size, self.get(.raw), layer.weight(.mlp_taps), binding.expert_residual, self.get(.convolved_expert));
-        try self.stack.finish(runtime, boundary, self.get(.convolved_attention), self.get(.convolved_expert));
+        try work.stack.mixPartial(runtime, eps, completed, work.get(.convolved_attention), previous, layer.weight(.mlp_query), if (looped) null else gamma, work.get(if (looped) .mix else .normalized));
+        if (looped) try self.control(work, layer, op.weight_layer, .mlp, work.get(.mix), gamma, work.get(.normalized));
+        try layer.experts.encode(runtime, text, work.stack.rows, work.get(.normalized), work.get(.router), .{
+            .selected = work.get(.selected),
+            .weights = work.get(.route_weights),
+            .gate_up = work.get(.gate_up),
+            .activated = work.get(.activated),
+            .projected = work.get(.projected),
+        }, work.get(.raw));
+        try self.state.convolveResidual(pending, text.hidden_size, work.get(.raw), layer.weight(.mlp_taps), binding.expert_residual, work.get(.convolved_expert));
+        try work.stack.finish(runtime, boundary, work.get(.convolved_attention), work.get(.convolved_expert));
     }
 
     const Input = union(enum) {
         token: u32,
         embedding: *const Tensor,
+        tokens: []const i32,
     };
 
     const Output = enum { none, logits, greedy };
 
-    fn run(self: *Request, input: Input, output: Output) !void {
+    fn run(self: *Request, work: *Work, input: Input, output: Output) !void {
         const runtime = self.model.runtime;
-        var pending = try self.state.prepare(1);
+        var pending = try self.state.prepare(work.stack.rows);
         defer pending.abort();
         try metal.beginFrame(runtime);
         errdefer metal.cancelFrame(runtime) catch {};
-        const hidden = self.stack.reset();
+        const hidden = work.stack.reset();
         switch (input) {
             .token => |token| try self.model.endpoints.embed(runtime, token, hidden),
             .embedding => |image_row| try image_row.copyInto(hidden),
+            .tokens => |tokens| for (tokens, 0..) |id, index| {
+                var destination = try row(hidden, index, self.model.text.hidden_size);
+                defer destination.deinit();
+                const token = std.math.cast(u32, id) orelse return error.InvalidInkling2Token;
+                try self.model.endpoints.embed(runtime, token, &destination);
+            },
         }
-        for (self.model.schedule) |op| try self.visit(&pending, op);
+        for (self.model.schedule) |op| try self.visit(work, &pending, op);
         if (output != .none) {
-            const logits = self.get(.logits);
-            try self.model.endpoints.logits(runtime, &self.stack.backing, self.stack.current(), @intCast(self.stack.depth + 1), self.get(.normalized), logits);
+            const logits = work.get(.logits);
+            try self.model.endpoints.logits(runtime, &work.stack.backing, work.stack.current(), @intCast(work.stack.depth + 1), work.get(.normalized), logits);
             if (output == .greedy and metal.termite_metal_decode_runtime_encode_argmax_from_logits_device(
                 runtime,
                 logits.deviceHandle(),
@@ -367,24 +439,30 @@ pub const Request = struct {
     }
 
     pub fn append(self: *Request, token: u32) !void {
-        try self.run(.{ .token = token }, .none);
+        try self.run(&self.decode, .{ .token = token }, .none);
+    }
+
+    pub fn appendTokens(self: *Request, tokens: []const i32) !void {
+        const batch = if (self.prefill) |*work| work else return error.InvalidShape;
+        if (tokens.len != batch.stack.rows) return error.InvalidShape;
+        try self.run(batch, .{ .tokens = tokens }, .none);
     }
 
     pub fn appendEmbedding(self: *Request, image_row: *const Tensor) !void {
         if (!image_row.isDevice() or image_row.dtype != .i16 or
             image_row.deviceByteLen() != @as(usize, self.model.text.hidden_size) * @sizeOf(u16))
             return error.InvalidShape;
-        try self.run(.{ .embedding = image_row }, .none);
+        try self.run(&self.decode, .{ .embedding = image_row }, .none);
     }
 
     pub fn step(self: *Request, token: u32) ![]const f32 {
-        try self.run(.{ .token = token }, .logits);
-        try self.get(.logits).downloadF32Into(self.host_logits);
+        try self.run(&self.decode, .{ .token = token }, .logits);
+        try self.decode.get(.logits).downloadF32Into(self.host_logits);
         return self.host_logits;
     }
 
     pub fn stepGreedy(self: *Request, token: u32) !u32 {
-        try self.run(.{ .token = token }, .greedy);
+        try self.run(&self.decode, .{ .token = token }, .greedy);
         var next: u32 = 0;
         if (metal.termite_metal_decode_runtime_read_token_id(self.model.runtime, &next) != 0)
             return error.MetalKernelDispatchFailed;
@@ -430,6 +508,35 @@ test "Inkling Metal resident decoder runs the released text checkpoint" {
         });
         token = @intCast(next);
     }
+
+    const prefix = [_]i32{ 42, 34851, 220, 110104, 42, 34851, 220, 110104, 42, 34851, 220, 110104, 42, 34851, 220, 110104 };
+    const last: u32 = 1541;
+    var serial: Request = undefined;
+    try serial.init(a, decoder, prefix.len + 1);
+    defer serial.deinit();
+    const serial_start = time.monotonicNs();
+    for (prefix) |id| try serial.append(@intCast(id));
+    const serial_ns = time.monotonicNs() - serial_start;
+    const reference = try serial.step(last);
+
+    var batched: Request = undefined;
+    try batched.initWithPlan(a, decoder, try RequestPlan.initPrefill(decoder, prefix.len + 1, prefix.len));
+    defer batched.deinit();
+    const batch_start = time.monotonicNs();
+    try batched.appendTokens(&prefix);
+    const batch_ns = time.monotonicNs() - batch_start;
+    const candidate = try batched.step(last);
+    try std.testing.expectEqual(prefix.len + 1, batched.state.sequence.committed_tokens);
+    const argmax = @import("../backends/activations.zig").argmax;
+    try std.testing.expectEqual(argmax(reference), argmax(candidate));
+    var max_delta: f32 = 0;
+    for (reference, candidate) |expected, actual| {
+        try std.testing.expect(std.math.isFinite(actual));
+        max_delta = @max(max_delta, @abs(expected - actual));
+    }
+    std.debug.print("Inkling Metal prefill rows={d} serial_ms={d:.3} batched_ms={d:.3} peak_id={d} max_logit_delta={d:.5}\n", .{
+        prefix.len, @as(f64, @floatFromInt(serial_ns)) / 1e6, @as(f64, @floatFromInt(batch_ns)) / 1e6, argmax(candidate), max_delta,
+    });
 }
 
 test "Inkling Metal resident decoder executes the full visit schedule on a synthetic checkpoint" {
@@ -608,6 +715,15 @@ test "Inkling Metal resident decoder executes the full visit schedule on a synth
     try std.testing.expectApproxEqAbs(@as(f32, 0.76159416), logits[0], 0.00001);
     try std.testing.expectApproxEqAbs(@as(f32, -0.76159416), logits[1], 0.00001);
     try std.testing.expectEqual(@as(usize, 2), request.state.sequence.committed_tokens);
+    var batched: Request = undefined;
+    try batched.initWithPlan(a, &model, try RequestPlan.initPrefill(&model, 3, 2));
+    defer batched.deinit();
+    try std.testing.expectError(error.InvalidInkling2Token, batched.appendTokens(&.{ 0, -1 }));
+    try std.testing.expectEqual(@as(usize, 0), batched.state.sequence.committed_tokens);
+    try batched.appendTokens(&.{ 0, 1 });
+    try std.testing.expectEqual(@as(usize, 2), batched.state.sequence.committed_tokens);
+    const expected_after_prefix = try request.stepGreedy(0);
+    try std.testing.expectEqual(expected_after_prefix, try batched.stepGreedy(0));
     const hf_tokenizer = @import("inference_hf_tokenizer");
     var hf = try hf_tokenizer.HfTokenizer.loadFromBytes(a,
         \\{"version":"1.0","added_tokens":[{"id":14,"content":"<|end_message|>"}],"model":{"type":"BPE","unk_token":"<unk>","vocab":{"x":0,"y":1,"<unk>":2,"<|end_message|>":14},"merges":[]}}

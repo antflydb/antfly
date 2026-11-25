@@ -873,8 +873,12 @@ required, returned `4` for a 28-token arithmetic prompt through
 and 1.78 s. The warm streaming response emitted the same answer, a stop
 reason and `[DONE]` in 1.72 s. The focused Metal suite also covers the
 BF16 device embedding handoff and in-frame greedy argmax on a synthetic
-decoder. Metal image serving, long and full-context qualification, and
-the external performance comparison remain open.
+decoder. A released-checkpoint suite with batched text prefill passed all
+80 tests. On a 16-token prefix, prefill fell from 957.19 ms serial to
+521.92 ms batched, and the next-token logit vectors matched in that run.
+The complete serving and reference comparison still requires measuring
+the batched build over HTTP and qualifying Metal image and full-context
+requests.
 
 ### Official Gemma 4 E2B QAT serving comparison
 
