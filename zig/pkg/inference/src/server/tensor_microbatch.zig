@@ -708,8 +708,19 @@ const GatheredInputs = struct {
     initialized: usize = 0,
     allocator: std.mem.Allocator,
     has_device_storage: bool = false,
+    completion: ?@import("../ops/physical_storage.zig").Completion = null,
+
+    fn awaitCopies(self: *GatheredInputs) !void {
+        const completion = self.completion orelse return;
+        try completion.wait();
+        self.completion = null;
+        completion.deinit();
+    }
 
     fn deinit(self: *GatheredInputs, epoch: ?*const @import("../execution/retirement_sink.zig").Epoch) void {
+        // A declined or cancelled forward must drain the copies before any
+        // source request or destination can be retired or subdivided.
+        self.awaitCopies() catch platform.inference_process_supervisor.restartWorker();
         for (self.values[0..self.initialized]) |input| if (input == .resident) self.backend.freeWithBoundary(input.resident.value, epoch);
         self.allocator.free(self.values);
     }
@@ -802,12 +813,14 @@ fn gatherStageInputs(first: *const Ticket, items: []const micro.ExecuteItem, ten
     // One completion covers every packed cache column. No source or
     // destination may retire until all queued copies have completed.
     const event = if (kernels.createPhysicalCompletion) |create| try create(backend.ptr) else null;
-    defer if (event) |completion| completion.deinit();
+    var event_transferred = false;
+    defer if (!event_transferred) if (event) |completion| {
+        // This covers a failure after a driver call but before publication.
+        completion.record() catch fatal();
+        completion.wait() catch fatal();
+        completion.deinit();
+    };
     {
-        defer if (event) |completion| {
-            completion.record() catch fatal();
-            completion.wait() catch fatal();
-        };
         const metal_frame = backend.kind() == .metal and try backend.decoderRuntimeBeginFrame();
         var recording = metal_frame;
         defer if (recording and backend.decoderRuntimeHasActiveFrame()) backend.decoderRuntimeCancelFrame() catch fatal();
@@ -856,6 +869,11 @@ fn gatherStageInputs(first: *const Ticket, items: []const micro.ExecuteItem, ten
             recording = false;
             try backend.decoderRuntimeWaitSubmittedFrame();
         }
+    }
+    if (event) |completion| {
+        try completion.record();
+        result.completion = completion;
+        event_transferred = true;
     }
     try scope.finish();
     return result;
@@ -1042,6 +1060,9 @@ fn executeGroupMode(comptime placement: OutputPlacement, items: []const micro.Ex
     if (comptime placement == .host)
         cleanup_owner = try @import("../execution/cleanup_owner.zig").Owner.beginAdmitted(first.session);
     if (cleanup_owner.epoch()) |epoch| try permit.bindPhysicalCleanupEpoch(epoch);
+    // Exact shape admission and storage preparation use only metadata and
+    // can overlap CUDA gathering. Complete the transfer before the forward.
+    if (gathered) |*owned| try owned.awaitCopies();
     // The lexical cleanup owner binds prepared resources before this gate
     // and seals only after its eventual numerical unlock.
     try first.session.acquireSelectedCohort(control, &cohort_waiter);
