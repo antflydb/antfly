@@ -127,7 +127,9 @@ pub const TempArenaPlanner = struct {
 
     candidate_lengths: std.ArrayListUnmanaged(usize) = .empty,
     current_lengths: std.ArrayListUnmanaged(usize) = .empty,
-    whole_iteration_replayed: bool = false,
+    // Matching eager and replayed events advance this cursor. Only a
+    // divergence needs mutable event storage.
+    matched_prefix: usize = 0,
     observing: bool = false,
     active: bool = false,
     installation_pending: bool = false,
@@ -195,20 +197,24 @@ pub const TempArenaPlanner = struct {
     ) !void {
         if (self.disabled or !self.observing) return;
         if (self.installation_pending) self.markPinnedValidationFailure();
-        if (self.whole_iteration_replayed) {
-            // A further allocation needs a real trace so the next boundary
-            // can relearn the new iteration, including its replayed prefix.
-            self.current_lengths.appendSliceAssumeCapacity(self.candidate_lengths.items);
-            self.whole_iteration_replayed = false;
-        }
-        if (byte_len == 0 or self.current_lengths.items.len >= max_slots) {
+        const candidate = self.candidate_lengths.items;
+        if (byte_len == 0 or self.matched_prefix + self.current_lengths.items.len >= max_slots) {
             self.disableObservation();
             return;
         }
-        self.current_lengths.append(allocator, byte_len) catch |err| {
+        if (self.current_lengths.items.len == 0 and self.matched_prefix < candidate.len and
+            candidate[self.matched_prefix] == byte_len)
+        {
+            self.matched_prefix += 1;
+            return;
+        }
+        self.current_lengths.ensureUnusedCapacity(allocator, self.matched_prefix + 1) catch |err| {
             self.disableObservation();
             return err;
         };
+        self.current_lengths.appendSliceAssumeCapacity(candidate[0..self.matched_prefix]);
+        self.matched_prefix = 0;
+        self.current_lengths.appendAssumeCapacity(byte_len);
     }
 
     fn disableObservation(self: *TempArenaPlanner) void {
@@ -236,7 +242,7 @@ pub const TempArenaPlanner = struct {
         allocation_seq: usize,
         allocation_count: usize,
     ) bool {
-        if (!self.active or self.installation_pending or !self.ready_for_capture or self.whole_iteration_replayed or self.pinned_validation_failed or
+        if (!self.active or self.installation_pending or !self.ready_for_capture or self.pinned_validation_failed or
             self.replay_validation_failed)
         {
             return false;
@@ -244,18 +250,12 @@ pub const TempArenaPlanner = struct {
         const candidate = self.candidate_lengths.items;
         if (candidate.len == 0 or allocation_seq < self.allocation_seq_base) return false;
         const phase = (allocation_seq - self.allocation_seq_base) % candidate.len;
-        if (phase != self.current_lengths.items.len) return false;
-        if (allocation_count > candidate.len - phase) return false;
-        if (self.current_lengths.capacity < phase + allocation_count) return false;
-        return std.mem.eql(usize, candidate[0..phase], self.current_lengths.items);
+        return self.current_lengths.items.len == 0 and phase == self.matched_prefix and
+            allocation_count <= candidate.len - phase;
     }
 
-    /// CUDA graph replay skips the captured host allocation calls. Rebuild
-    /// that exact interval from the learned ABI so the next decode boundary
-    /// validates the complete iteration, including any uncaptured prefix or
-    /// tail. Merely marking the interval as replayed is unsafe: a missing or
-    /// extra tail allocation can phase-shift cyclic pinned slots, and repeated
-    /// byte lengths can otherwise hide the drift.
+    /// Replay extends an exact prefix without copying the candidate.
+    /// The iteration boundary still checks that every event was observed.
     pub fn markGraphReplay(
         self: *TempArenaPlanner,
         allocation_seq: usize,
@@ -265,13 +265,7 @@ pub const TempArenaPlanner = struct {
             if (self.active) self.replay_validation_failed = true;
             return false;
         }
-        const phase = self.current_lengths.items.len;
-        const end = phase + allocation_count;
-        if (phase == 0 and end == self.candidate_lengths.items.len) {
-            self.whole_iteration_replayed = true;
-        } else {
-            self.current_lengths.appendSliceAssumeCapacity(self.candidate_lengths.items[phase..end]);
-        }
+        self.matched_prefix += allocation_count;
         return true;
     }
 
@@ -279,19 +273,17 @@ pub const TempArenaPlanner = struct {
     /// since the preceding boundary describe the just-finished iteration.
     pub fn beginDecodeIteration(self: *TempArenaPlanner, allocation_seq: usize) BoundaryResult {
         if (self.installation_pending) return .unchanged;
-        const whole_iteration_replayed = self.whole_iteration_replayed;
-        self.whole_iteration_replayed = false;
         if (self.disabled) {
             if (!self.active) return .unchanged;
             self.active = false;
             self.invalidations += 1;
-            self.current_lengths.clearRetainingCapacity();
+            self.clearTrace();
             return .invalidated;
         }
         self.capture_warmup_boundaries +|= 1;
         if (!self.observing) {
             self.observing = true;
-            self.current_lengths.clearRetainingCapacity();
+            self.clearTrace();
             return .observing;
         }
 
@@ -307,15 +299,11 @@ pub const TempArenaPlanner = struct {
             self.pinned_validation_failed = false;
             self.invalidations += 1;
             self.matching_iterations = if (self.candidate_lengths.items.len == 0) 0 else 1;
-            self.current_lengths.clearRetainingCapacity();
+            self.clearTrace();
             return .invalidated;
         }
 
-        const matches = whole_iteration_replayed or std.mem.eql(
-            usize,
-            self.candidate_lengths.items,
-            self.current_lengths.items,
-        );
+        const matches = self.current_lengths.items.len == 0 and self.matched_prefix == self.candidate_lengths.items.len;
         if (self.active and !matches) {
             self.replaceCandidate();
             self.active = false;
@@ -324,7 +312,7 @@ pub const TempArenaPlanner = struct {
             self.pinned_validation_failed = false;
             self.invalidations += 1;
             self.matching_iterations = if (self.candidate_lengths.items.len == 0) 0 else 1;
-            self.current_lengths.clearRetainingCapacity();
+            self.clearTrace();
             return .invalidated;
         }
 
@@ -339,7 +327,7 @@ pub const TempArenaPlanner = struct {
             self.matching_iterations = if (self.candidate_lengths.items.len == 0) 0 else 1;
         }
 
-        self.current_lengths.clearRetainingCapacity();
+        self.clearTrace();
         if (self.active) {
             // The first complete iteration using pinned slots matched the
             // learned ABI. Capture may begin at the next boundary, and any
@@ -362,8 +350,7 @@ pub const TempArenaPlanner = struct {
     /// Preserve the last validated shape as a seed across request boundaries,
     /// but require the new request to prove it once before pinning addresses.
     pub fn resetForRequest(self: *TempArenaPlanner) void {
-        self.whole_iteration_replayed = false;
-        self.current_lengths.clearRetainingCapacity();
+        self.clearTrace();
         self.observing = false;
         self.active = false;
         self.installation_pending = false;
@@ -392,11 +379,19 @@ pub const TempArenaPlanner = struct {
         self.invalidations += 1;
     }
 
-    fn replaceCandidate(self: *TempArenaPlanner) void {
-        // The just-completed trace already owns its backing. Swapping makes
-        // invalidation infallible and retains the old capacity for recording.
-        std.mem.swap(std.ArrayListUnmanaged(usize), &self.candidate_lengths, &self.current_lengths);
+    fn clearTrace(self: *TempArenaPlanner) void {
+        self.matched_prefix = 0;
         self.current_lengths.clearRetainingCapacity();
+    }
+
+    fn replaceCandidate(self: *TempArenaPlanner) void {
+        if (self.current_lengths.items.len == 0) {
+            // A shortened trace already has its bytes in the candidate.
+            self.candidate_lengths.items.len = self.matched_prefix;
+        } else {
+            std.mem.swap(std.ArrayListUnmanaged(usize), &self.candidate_lengths, &self.current_lengths);
+        }
+        self.clearTrace();
     }
 };
 
