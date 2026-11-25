@@ -841,6 +841,15 @@ and without forced DSpark and returned the expected text and invoice answers.
 A single warm request took 2,524 ms without speculation and 2,808 ms with
 exact DSpark. The earlier batched throughput applies only to that verifier.
 
+At `465b08ea7d`, Spark GB10 passed all five tests across the CUDA
+relative-attention and hybrid K/V suites. The shared staged range supplied
+the physical paged GQA test with relative logits, a sink and a gate. The
+32,768-token rollback test preserved BF16 payload across 48 visits using
+2,048 full pages and 81 sliding pages. Local Metal passed its 63-test packed
+expert suite, and the shared host KV suite passed 13 tests. Metal coverage
+here reaches the resident expert stage. The Metal decoder and released
+checkpoint serving path remain open.
+
 ### Official Gemma 4 E2B QAT serving comparison
 
 The decoder and projector came from Google's E2B QAT Q4_0 GGUF revision
