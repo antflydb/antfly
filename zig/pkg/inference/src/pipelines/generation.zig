@@ -771,6 +771,7 @@ pub const NativeCheckpointResume = struct {
 pub const GenerationResult = struct {
     text: []const u8,
     reasoning_text: ?[]const u8 = null,
+    native_tool_calls: ?[]@import("tool_parser.zig").ToolCall = null,
     token_ids: ?[]i32 = null,
     prompt_tokens: usize = 0,
     tokens_used: usize,
@@ -783,6 +784,7 @@ pub const GenerationResult = struct {
     pub fn deinit(self: *GenerationResult) void {
         self.allocator.free(self.text);
         if (self.reasoning_text) |reasoning| self.allocator.free(reasoning);
+        if (self.native_tool_calls) |calls| @import("tool_parser.zig").freeToolCalls(self.allocator, calls);
         if (self.token_ids) |ids| self.allocator.free(ids);
     }
 };

@@ -17,6 +17,7 @@ pub const block = @import("block.zig");
 pub const pool = @import("pool.zig");
 pub const storage = @import("storage.zig");
 pub const block_table = @import("block_table.zig");
+pub const hybrid_paged = @import("hybrid_paged.zig");
 pub const manager = @import("manager.zig");
 pub const storage_runtime = @import("storage_runtime.zig");
 pub const linalg = @import("linalg.zig");
@@ -39,6 +40,7 @@ test {
     _ = pool;
     _ = storage;
     _ = block_table;
+    _ = hybrid_paged;
     _ = manager;
     _ = storage_runtime;
     _ = linalg;

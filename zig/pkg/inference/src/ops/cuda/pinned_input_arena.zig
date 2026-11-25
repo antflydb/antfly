@@ -99,6 +99,30 @@ pub const Arena = struct {
         };
         return true;
     }
+    /// Upload an immutable checkpoint tensor with a bounded pinned working
+    /// set. The arena tracks the asynchronous source bytes across wraparound.
+    pub fn uploadWeight(self: *Arena, ctx: *context.CudaContext, bytes: []const u8) !buffer.DeviceBuffer {
+        var result = try buffer.DeviceBuffer.allocWithPurpose(ctx, bytes.len, .model_cache);
+        errdefer {
+            ctx.synchronize() catch {};
+            result.free(ctx);
+        }
+        try self.copyWeight(ctx, result, bytes);
+        return result;
+    }
+
+    /// Fill a preallocated region of a resident checkpoint tensor.
+    pub fn copyWeight(self: *Arena, ctx: *context.CudaContext, destination: buffer.DeviceBuffer, bytes: []const u8) !void {
+        if (bytes.len == 0) return;
+        if (destination.ptr == 0 or bytes.len > destination.len) return error.InvalidShape;
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            const len = @min(capacity, bytes.len - offset);
+            const dst: buffer.DeviceBuffer = .{ .ptr = destination.ptr + offset, .len = len, .borrowed = true };
+            if (!try self.uploadUnadmitted(ctx, dst, bytes[offset..][0..len])) return error.PinnedWeightStagingUnavailable;
+            offset += len;
+        }
+    }
     pub fn uploadUnadmitted(self: *Arena, ctx: *context.CudaContext, device: buffer.DeviceBuffer, bytes: []const u8) !bool {
         if (ctx.video_cache_budget.admission != null or self.quota.hasLease()) return false;
         if (!self.canUpload(ctx, bytes)) return false;

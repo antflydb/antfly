@@ -524,10 +524,10 @@ pub const Runtime = struct {
 
         // Embedding checkpoints can ship their decoder backbone's chat
         // template, but embedding execution never uses it. Qwen rerankers use
-        // their explicit scoring templates instead of this general chat path.
+        // their explicit scoring templates. Inkling renders its own CUDA prompt.
         var chat_template_failed = false;
         const needs_chat_template = man.model_type != .embedder and
-            !man.isQwen3TextReranker() and !man.isQwen3VlReranker();
+            !man.isQwen3TextReranker() and !man.isQwen3VlReranker() and !man.isInkling2();
         const chat_template_source: ?[]const u8 = if (man.isLightOnOcr3())
             @import("../readers/lightonocr3.zig").chat_template
         else

@@ -53,6 +53,7 @@ pub fn artifactCandidateForBackend(
     man: manifest_mod.ModelManifest,
     backend: backends.BackendType,
 ) ?ArtifactCandidateKind {
+    if (man.isInkling2() and backend != .cuda) return null;
     if (backend == .wasm) return if (man.onnx_path != null) .onnx else null;
     if (man.nativeWeightArtifactKind()) |artifact| {
         return switch (artifact) {
@@ -562,11 +563,12 @@ fn compatibilitySummaryForBackendWithControl(allocator: std.mem.Allocator, model
     }
     try control.check();
     if (candidate == .safetensors) {
-        safetensors_mod.validateArtifactSetWithControl(
+        safetensors_mod.validateArtifactSetWithOptions(
             allocator,
             man.safetensors_path,
             man.safetensors_index_path,
             control,
+            if (man.isInkling2()) @import("../architectures/inkling2_checkpoint.zig").header_options else .{},
         ) catch |err| {
             if (err == error.OutOfMemory or err == error.Timeout or err == error.Canceled or err == error.Cancelled) return err;
             return .{
