@@ -284,7 +284,7 @@ pub const State = struct {
                     if (value == provisional.input.value) aliases += 1;
                 }
                 if (aliases != 1) continue;
-                const adopted = self.adoptCache(provisional, if (past.cross) .standalone else .pooled_or_standalone) catch |err| switch (err) {
+                const adopted = self.adoptCache(provisional, if (past.cross) .isolated_or_standalone else .pooled_or_standalone) catch |err| switch (err) {
                     error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable => null,
                     else => return err,
                 };
@@ -312,7 +312,7 @@ pub const State = struct {
         return row;
     }
 
-    const CacheAdoption = enum { standalone, pooled_or_standalone };
+    const CacheAdoption = enum { standalone, isolated_or_standalone, pooled_or_standalone };
 
     fn adoptCache(self: *State, source: ResidentSlot, policy: CacheAdoption) !?ResidentSlot {
         const shared = self.session.shared_compute_context orelse return null;
@@ -321,13 +321,16 @@ pub const State = struct {
         const kernels = backend.vtable.kernels orelse return null;
         if (!kernels.accepts(backend.vtable)) return null;
         const retain = kernels.retainImmutableTensor orelse return null;
-        // A cross-cache binding can outlive every suffix. Detaching a
-        // standalone allocation avoids migration without pinning a reusable
-        // producer bank for the rest of the sequence.
-        const pooled = if (policy == .pooled_or_standalone)
+        // Cross-cache bindings can outlive every suffix. Retain pool backing
+        // only when the cache spans the entire logical allocation.
+        const candidate = if (policy != .standalone)
             if (kernels.pooledOutputStorage) |storage| storage(backend.ptr, source.input.value) else null
         else
             null;
+        const pooled = if (candidate) |lease| blk: {
+            if (policy == .isolated_or_standalone and lease.byte_size != source.input.estimated_bytes) break :blk null;
+            break :blk lease;
+        } else null;
         var admission = if (pooled) |lease| blk: {
             if (lease.backend.ptr != backend.ptr or lease.backend.vtable != backend.vtable or
                 lease.usage != .ordinary or lease.accounting_class != .activation or lease.isReadOnly() or
@@ -1022,7 +1025,7 @@ fn checkPooledSelfAdoption(state: *State, previous: ResidentSlot, controller: *@
         source.input.value = value;
         try std.testing.expect((try state.adoptCache(source, .standalone)) == null);
         try std.testing.expectEqualDeep(charged, controller.snapshot());
-        const result = (try state.adoptCache(source, .pooled_or_standalone)) orelse return error.MissingIndependentPooledCache;
+        const result = (try state.adoptCache(source, .isolated_or_standalone)) orelse return error.MissingIndependentPooledCache;
         errdefer result.pin.release();
         try std.testing.expect(result.independent);
         try std.testing.expectEqualDeep(charged, controller.snapshot());
