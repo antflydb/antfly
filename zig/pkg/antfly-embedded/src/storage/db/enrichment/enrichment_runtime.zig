@@ -24892,7 +24892,7 @@ const RuntimePdfRenderWindowPreparer = struct {
         const available_bytes = try self.coordinator.availableRenderBytes();
         var policy = self.batch_policy;
         policy.defer_render_pressure = speculative;
-        var window = try renderRuntimePdfWindow(
+        var window = renderRuntimePdfWindow(
             self.runtime,
             @import("antfly_platform").allocator.concurrentFallback(),
             self.producer,
