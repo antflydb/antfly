@@ -39,6 +39,9 @@ test("Access requires a valid signed user token for this application", async (t)
     return data + "." + Buffer.from(signature).toString("base64url");
   }
   const valid = await sign();
+  const pinned = { ...config, pinnedKeys: [{ ...jwk, kid: "test" }] };
+  assert.equal((await accessIdentity(valid, pinned)).email, payload.email);
+  assert.equal(fetch.mock.callCount(), 0);
   assert.equal((await accessIdentity(valid, config)).email, payload.email);
   assert.equal(await accessIdentity(await sign({ aud: ["other"] }), config), null);
   assert.equal(await accessIdentity(await sign({ exp: 1 }), config), null);

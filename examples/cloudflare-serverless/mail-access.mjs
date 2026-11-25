@@ -26,10 +26,14 @@ export function accessConfig(env) {
   if (!/^https:\/\/[a-z0-9-]+\.cloudflareaccess\.com$/.test(env.MAIL_ACCESS_ISSUER ?? "") ||
       !env.MAIL_ACCESS_AUDIENCE || !env.MAIL_TEAM_ADDRESS?.endsWith("@" + env.MAIL_DOMAIN))
     throw Error("MailAccessConfigurationRequired");
-  return { issuer: env.MAIL_ACCESS_ISSUER, audience: env.MAIL_ACCESS_AUDIENCE };
+  const pinnedKeys = env.MAIL_ACCESS_JWKS ? JSON.parse(env.MAIL_ACCESS_JWKS).keys : [];
+  if (!Array.isArray(pinnedKeys)) throw Error("MailAccessConfigurationRequired");
+  return { issuer: env.MAIL_ACCESS_ISSUER, audience: env.MAIL_ACCESS_AUDIENCE, pinnedKeys };
 }
 
-async function signingKey(issuer, kid) {
+async function signingKey(issuer, kid, pinnedKeys) {
+  const pinned = pinnedKeys.find((key) => key.kid === kid && key.kty === "RSA");
+  if (pinned) return importSigningKey(pinned);
   let cached = keysByIssuer.get(issuer);
   if (!cached || cached.expires <= Date.now()) {
     const response = await fetch(issuer + "/cdn-cgi/access/certs", { redirect: "error" });
@@ -40,10 +44,14 @@ async function signingKey(issuer, kid) {
   }
   const jwk = cached.keys.find((key) => key.kid === kid && key.kty === "RSA");
   if (!jwk) throw Error("UnknownAccessKey");
+  return importSigningKey(jwk);
+}
+
+function importSigningKey(jwk) {
   return crypto.subtle.importKey("jwk", jwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
 }
 
-export async function accessIdentity(token, { issuer, audience }, onReject = () => {}) {
+export async function accessIdentity(token, { issuer, audience, pinnedKeys = [] }, onReject = () => {}) {
   function reject(reason) {
     onReject(reason);
     return null;
@@ -66,7 +74,7 @@ export async function accessIdentity(token, { issuer, audience }, onReject = () 
         typeof email !== "string" || !email.includes("@")) return reject("AccessClaimsInvalid");
     let key;
     try {
-      key = await signingKey(issuer, kid);
+      key = await signingKey(issuer, kid, pinnedKeys);
     } catch (error) {
       return reject(error.message === "UnknownAccessKey" ? "AccessSigningKeyUnknown" : "AccessSigningKeysUnavailable");
     }
