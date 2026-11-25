@@ -68,7 +68,7 @@ const ModelWeight = enum {
         };
     }
 };
-const LayerWeight = enum { q_norm, k_norm, v_norm, mlp_norm, attn_taps, mlp_taps, attn_query, mlp_query };
+const LayerWeight = checkpoint.ResidualWeight;
 const ControllerWeight = enum { down, gain_forget };
 
 fn Weights(comptime Kind: type) type {
@@ -99,24 +99,10 @@ const Layer = struct {
         };
         var result: Layer = .{ .attn = attn, .ffn = ffn };
         errdefer result.deinit(ctx);
-        for ([_]struct { LayerWeight, []const u8 }{
-            .{ .q_norm, if (attn.local) "attn_norm.weight" else "q_input_norm.weight" },
-            .{ .k_norm, "k_input_norm.weight" },
-            .{ .v_norm, "v_input_norm.weight" },
-            .{ .mlp_norm, "mlp_norm.weight" },
-            .{ .attn_taps, "attn_sconv.weight" },
-            .{ .mlp_taps, "mlp_sconv.weight" },
-        }) |entry| {
-            if (attn.local and (entry[0] == .k_norm or entry[0] == .v_norm)) continue;
-            result.weights[@backingInt(entry[0])] = try arena.uploadWeight(ctx, try source.layerTensor(layer, entry[1]));
+        for (std.enums.values(LayerWeight), &result.weights) |weight_key, *destination| {
+            if (try source.residualWeight(layer, attn.local, weight_key)) |bytes|
+                destination.* = try arena.uploadWeight(ctx, bytes);
         }
-        var name: [128]u8 = undefined;
-        if (layer != 0) {
-            const key = try std.fmt.bufPrint(&name, "model.llm.attn_res.attn_queries.{d}", .{layer - 1});
-            result.weights[@backingInt(LayerWeight.attn_query)] = try arena.uploadWeight(ctx, try source.reader.rawTensorBytes(key));
-        }
-        const key = try std.fmt.bufPrint(&name, "model.llm.attn_res.mlp_queries.{d}", .{layer});
-        result.weights[@backingInt(LayerWeight.mlp_query)] = try arena.uploadWeight(ctx, try source.reader.rawTensorBytes(key));
         const text = source.config.value.text_config;
         const core = text.loop_config;
         if (layer >= core.core_start and layer < core.core_end) {

@@ -51,7 +51,7 @@ const Layer = struct {
     weights: [8]?Tensor = @splat(null),
     controllers: [4]?Controller = @splat(null),
 
-    const Weight = enum { q_norm, k_norm, v_norm, expert_norm, attention_taps, expert_taps, attention_query, expert_query };
+    const Weight = checkpoint.ResidualWeight;
 
     fn weight(self: *const Layer, key: Weight) *const Tensor {
         return if (self.weights[@backingInt(key)]) |*value| value else unreachable;
@@ -65,25 +65,10 @@ const Layer = struct {
         };
         var result: Layer = .{ .attention = at, .experts = experts };
         errdefer result.deinit();
-        const names = [_][]const u8{
-            if (at.local) "attn_norm.weight" else "q_input_norm.weight",
-            "k_input_norm.weight",
-            "v_input_norm.weight",
-            "mlp_norm.weight",
-            "attn_sconv.weight",
-            "mlp_sconv.weight",
-        };
-        for (names, 0..) |name, index| {
-            if (at.local and (index == 1 or index == 2)) continue;
-            result.weights[index] = try upload(a, runtime, .i16, try source.layerTensor(layer, name));
+        for (std.enums.values(Weight), &result.weights) |weight_key, *destination| {
+            if (try source.residualWeight(layer, at.local, weight_key)) |bytes|
+                destination.* = try upload(a, runtime, if (weight_key.isF32()) .f32 else .i16, bytes);
         }
-        var name_buf: [128]u8 = undefined;
-        if (layer != 0) {
-            const name = try std.fmt.bufPrint(&name_buf, "model.llm.attn_res.attn_queries.{d}", .{layer - 1});
-            result.weights[@backingInt(Weight.attention_query)] = try upload(a, runtime, .f32, try source.reader.rawTensorBytes(name));
-        }
-        const name = try std.fmt.bufPrint(&name_buf, "model.llm.attn_res.mlp_queries.{d}", .{layer});
-        result.weights[@backingInt(Weight.expert_query)] = try upload(a, runtime, .f32, try source.reader.rawTensorBytes(name));
         const loop = source.config.value.text_config.loop_config;
         if (layer >= loop.core_start and layer < loop.core_end) {
             for (std.enums.values(checkpoint.ControllerStream), &result.controllers) |stream, *controller|
@@ -295,7 +280,7 @@ pub const Request = struct {
                 continue;
             }
             if (!looped or !local or index == 0) {
-                var query = try row(layer.weight(.attention_query), index, text.hidden_size);
+                var query = try row(layer.weight(.attn_query), index, text.hidden_size);
                 defer query.deinit();
                 if (looped) {
                     try self.stack.mix(runtime, eps, &query, null, self.get(.shared_mix));
@@ -309,13 +294,13 @@ pub const Request = struct {
             .key = if (local and !looped) destinations[0] else destinations[1],
             .value = if (local and !looped) destinations[0] else destinations[2],
         }, binding.page_ids, binding.planes, binding.history, self.attention_workspace.bind(local), self.get(.raw));
-        try self.state.convolveResidual(pending, text.hidden_size, self.get(.raw), layer.weight(.attention_taps), binding.attention_residual, self.get(.convolved_attention));
+        try self.state.convolveResidual(pending, text.hidden_size, self.get(.raw), layer.weight(.attn_taps), binding.attention_residual, self.get(.convolved_attention));
 
         const boundary = op.weight_layer % text.n_layers_per_attn_res_block == 0;
         const completed = self.stack.depth + @intFromBool(boundary);
         const previous = if (boundary) null else self.stack.current();
-        const gamma = layer.weight(.expert_norm);
-        try self.stack.mixPartial(runtime, eps, completed, self.get(.convolved_attention), previous, layer.weight(.expert_query), if (looped) null else gamma, self.get(if (looped) .mix else .normalized));
+        const gamma = layer.weight(.mlp_norm);
+        try self.stack.mixPartial(runtime, eps, completed, self.get(.convolved_attention), previous, layer.weight(.mlp_query), if (looped) null else gamma, self.get(if (looped) .mix else .normalized));
         if (looped) try self.control(layer, op.weight_layer, .mlp, self.get(.mix), gamma, self.get(.normalized));
         try layer.experts.encode(runtime, text, 1, self.get(.normalized), self.get(.router), .{
             .selected = self.get(.selected),
@@ -324,7 +309,7 @@ pub const Request = struct {
             .activated = self.get(.activated),
             .projected = self.get(.projected),
         }, self.get(.raw));
-        try self.state.convolveResidual(pending, text.hidden_size, self.get(.raw), layer.weight(.expert_taps), binding.expert_residual, self.get(.convolved_expert));
+        try self.state.convolveResidual(pending, text.hidden_size, self.get(.raw), layer.weight(.mlp_taps), binding.expert_residual, self.get(.convolved_expert));
         try self.stack.finish(runtime, boundary, self.get(.convolved_attention), self.get(.convolved_expert));
     }
 

@@ -202,6 +202,21 @@ pub const ExpertWeights = struct {
     outer_denominator: ?[]const u8 = null,
 };
 
+pub const ResidualWeight = enum {
+    q_norm,
+    k_norm,
+    v_norm,
+    mlp_norm,
+    attn_taps,
+    mlp_taps,
+    attn_query,
+    mlp_query,
+
+    pub fn isF32(self: ResidualWeight) bool {
+        return self == .attn_query or self == .mlp_query;
+    }
+};
+
 pub const ControllerStream = enum { attn, k, v, mlp };
 pub const ControllerWeights = struct {
     down: []const u8,
@@ -374,6 +389,27 @@ pub const Checkpoint = struct {
         return .{
             .weight = try self.reader.rawTensorBytes(try layerName(&buf, layer, "mlp.gate.weight")),
             .bias = try self.reader.rawTensorBytes(try layerName(&buf, layer, "mlp.gate.bias")),
+        };
+    }
+
+    pub fn residualWeight(self: *const Checkpoint, layer: usize, local: bool, weight: ResidualWeight) !?[]const u8 {
+        if (layer >= layer_count) return error.InvalidInkling2Layer;
+        return switch (weight) {
+            .q_norm => try self.layerTensor(layer, if (local) "attn_norm.weight" else "q_input_norm.weight"),
+            .k_norm => if (local) null else try self.layerTensor(layer, "k_input_norm.weight"),
+            .v_norm => if (local) null else try self.layerTensor(layer, "v_input_norm.weight"),
+            .mlp_norm => try self.layerTensor(layer, "mlp_norm.weight"),
+            .attn_taps => try self.layerTensor(layer, "attn_sconv.weight"),
+            .mlp_taps => try self.layerTensor(layer, "mlp_sconv.weight"),
+            .attn_query, .mlp_query => blk: {
+                if (weight == .attn_query and layer == 0) break :blk null;
+                var path: [128]u8 = undefined;
+                const name = if (weight == .attn_query)
+                    try std.fmt.bufPrint(&path, "model.llm.attn_res.attn_queries.{d}", .{layer - 1})
+                else
+                    try std.fmt.bufPrint(&path, "model.llm.attn_res.mlp_queries.{d}", .{layer});
+                break :blk try self.reader.rawTensorBytes(name);
+            },
         };
     }
 
