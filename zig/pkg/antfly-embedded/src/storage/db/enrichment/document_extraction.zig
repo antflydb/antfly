@@ -3506,9 +3506,15 @@ fn inspectPdfPageText(alloc: Allocator, parsed: *pdf.reader.Reader, page_num: us
         return cancellation.classifyError(err);
     result.text_blocks = pdf.text_structure.blocksFromAnalysisAlloc(alloc, result.text, analysis.runs, analysis.semantic_spans, cancellation) catch |err|
         return cancellation.classifyError(err);
-    const box = parsed.extractPageBox(page_num) catch null;
+    const box = parsed.extractPageBox(page_num) catch |err| switch (@as(anyerror, err)) {
+        error.Canceled, error.Cancelled => return cancellation.classifyError(err),
+        else => null,
+    };
     result.bbox = if (box) |b| .{ b.min_x, b.min_y, b.max_x, b.max_y } else null;
-    result.rotation = parsed.extractPageRotation(page_num) catch null;
+    result.rotation = parsed.extractPageRotation(page_num) catch |err| switch (@as(anyerror, err)) {
+        error.Canceled, error.Cancelled => return cancellation.classifyError(err),
+        else => null,
+    };
     if (cache) |c| try c.store_fn(c.ptr, page_num, result);
     return result;
 }

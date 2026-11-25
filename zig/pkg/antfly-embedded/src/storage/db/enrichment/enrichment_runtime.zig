@@ -17046,6 +17046,9 @@ fn processPendingDocumentGroup(
         switch (request.kind) {
             .asset => {
                 const succeeded = processPlannedAsset(runtime, request, planned[request_index + 1 ..], deferred_assets, prepared_sources, window) catch |err| {
+                    // Scanner publication clears its active identity on failure.
+                    // Do not reinstall the document owner on the scoped retry path.
+                    if (runtime.active_failure_fingerprint == 0) return err;
                     if (try scheduleScannerRetry(runtime, request, err)) {
                         try delayed_artifacts.put(runtime.alloc, if (request.kind == .dense_embedding or request.kind == .sparse_embedding) requestEmbeddingName(request) else requestArtifactName(request), {});
                         continue;
