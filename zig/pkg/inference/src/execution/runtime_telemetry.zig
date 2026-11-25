@@ -214,6 +214,12 @@ pub const PeriodicWorkspace = struct {
     capture_binding_denials: usize,
 };
 
+pub const BatchIngress = struct {
+    transfers: @import("transfer_audit.zig").Measurements,
+    // This is an ordering decision. It does not describe later retirement.
+    stream_ordered: bool,
+};
+
 pub const Snapshot = struct {
     device_memory: ?DeviceMemory = null,
     resolved_project_metal_dispatches: ?@import("runtime_observation.zig").MetalDispatches = null,
@@ -231,6 +237,8 @@ pub const Snapshot = struct {
     video_owned_resources: ?VideoOwnedResources = null,
     resolved_project_cuda_launches: ?@import("runtime_observation.zig").Kernels = null,
     transfers: ?@import("transfer_audit.zig").Measurements = null,
+    /// Copies for this physical cohort before the observed model forward.
+    batch_ingress: ?BatchIngress = null,
     counters: Counters = .{},
     native_allocations: ?NativeAllocations = null,
     /// Immutable deduplicated owner intervals for observed numerical dispatch.

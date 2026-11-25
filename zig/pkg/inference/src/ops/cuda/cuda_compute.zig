@@ -41266,6 +41266,7 @@ test "CUDA physical completion orders default stream changes and waits only at r
         var records: usize = 0;
         var dependencies: usize = 0;
         var waits: usize = 0;
+        var query_status: driver_mod.CUresult = driver_mod.CUDA_ERROR_NOT_READY;
         fn current(_: driver_mod.CUcontext) callconv(.c) driver_mod.CUresult {
             return driver_mod.CUDA_SUCCESS;
         }
@@ -41277,6 +41278,9 @@ test "CUDA physical completion orders default stream changes and waits only at r
             dependencies += 1;
             return driver_mod.CUDA_SUCCESS;
         }
+        fn query(_: driver_mod.CUevent) callconv(.c) driver_mod.CUresult {
+            return query_status;
+        }
         fn wait(_: driver_mod.CUevent) callconv(.c) driver_mod.CUresult {
             waits += 1;
             return driver_mod.CUDA_SUCCESS;
@@ -41285,11 +41289,13 @@ test "CUDA physical completion orders default stream changes and waits only at r
     Fake.records = 0;
     Fake.dependencies = 0;
     Fake.waits = 0;
+    Fake.query_status = driver_mod.CUDA_ERROR_NOT_READY;
     var driver: driver_mod.CudaDriver = undefined;
     driver.fns.cuCtxSetCurrent = Fake.current;
     driver.fns.cuEventRecord = Fake.record;
     driver.fns.cuStreamWaitEvent = Fake.depend;
     driver.fns.cuEventSynchronize = Fake.wait;
+    driver.fns.cuEventQuery = Fake.query;
     var compute = metadataOnlyTestCompute();
     compute.ctx.driver = driver;
     compute.ctx.ctx = @ptrFromInt(1);
@@ -41297,7 +41303,9 @@ test "CUDA physical completion orders default stream changes and waits only at r
     var fence = PhysicalCompletionContext{ .compute = &compute, .event = @ptrFromInt(3) };
     try PhysicalCompletionContext.wait(&fence);
     try std.testing.expectEqual(@as(usize, 0), Fake.waits);
+    try std.testing.expect(try PhysicalCompletionContext.isReady(&fence));
     try PhysicalCompletionContext.record(&fence);
+    try std.testing.expect(!try PhysicalCompletionContext.isReady(&fence));
     try PhysicalCompletionContext.beforeReuse(&fence);
     try std.testing.expectEqual(@as(usize, 0), Fake.dependencies);
     compute.ctx.stream = @ptrFromInt(2);
@@ -41307,6 +41315,11 @@ test "CUDA physical completion orders default stream changes and waits only at r
     try PhysicalCompletionContext.wait(&fence);
     try std.testing.expectEqual(@as(usize, 1), Fake.waits);
     try std.testing.expectEqual(@as(usize, 1), Fake.records);
+    Fake.query_status = driver_mod.CUDA_SUCCESS;
+    try std.testing.expect(try PhysicalCompletionContext.isReady(&fence));
+    try std.testing.expectEqual(@as(usize, 1), Fake.waits);
+    fence.unfenced = true;
+    try std.testing.expect(!try PhysicalCompletionContext.isReady(&fence));
 }
 
 test "CUDA immutable retention shares typed payload and metadata without GPU submission" {

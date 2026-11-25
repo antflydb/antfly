@@ -709,6 +709,7 @@ const GatheredInputs = struct {
     allocator: std.mem.Allocator,
     has_device_storage: bool = false,
     completion: ?@import("../ops/physical_storage.zig").Completion = null,
+    transfers: ?@import("../execution/transfer_audit.zig").Measurements = null,
 
     fn awaitCopies(self: *GatheredInputs) !void {
         const completion = self.completion orelse return;
@@ -865,6 +866,9 @@ fn gatherStageInputs(first: *const Ticket, items: []const micro.ExecuteItem, ten
                 }
             }
         };
+        if (first.session.invocation_diagnostics) |binding| {
+            if (binding.diagnostics.isEnabled()) result.transfers = audit.measurements();
+        }
         if (metal_frame) {
             try backend.decoderRuntimeSubmitFrame();
             recording = false;
@@ -1063,6 +1067,13 @@ fn executeGroupMode(comptime placement: OutputPlacement, items: []const micro.Ex
     if (cleanup_owner.epoch()) |epoch| try permit.bindPhysicalCleanupEpoch(epoch);
     const stream_ordered = @import("../backends/imported_onnx_session.zig").acceptsStreamOrderedStageInputs(first.session);
     if (!stream_ordered) if (gathered) |*owned| try owned.awaitCopies();
+    var ingress: @import("../execution/runtime_telemetry.zig").BatchIngress = undefined;
+    if (gathered) |owned| if (owned.transfers) |measurements| {
+        if (permit.session.invocation_diagnostics) |*binding| {
+            ingress = .{ .transfers = measurements, .stream_ordered = stream_ordered and owned.completion != null };
+            binding.batch_ingress = &ingress;
+        }
+    };
     // The lexical cleanup owner binds prepared resources before this gate
     // and seals only after its eventual numerical unlock.
     try first.session.acquireSelectedCohort(control, &cohort_waiter);
@@ -2497,6 +2508,7 @@ test "tensor microbatch released T5-small fuses suffixes after encoder retiremen
         peer.* = .{ .state = state, .token = token, .dispatch = &dispatch_context };
         ready += 1;
     }
+    try std.testing.expect(session.configureExecutionDiagnostics(true));
     var group = std.Io.Group.init;
     defer group.cancel(std.testing.io);
     for (&peers) |*peer| try group.concurrent(std.testing.io, Peer.run, .{peer});
@@ -2509,6 +2521,14 @@ test "tensor microbatch released T5-small fuses suffixes after encoder retiremen
         const row = peer.row orelse return error.MissingMergedDecoderResult;
         try std.testing.expectEqual(reference.len, row.len);
         for (reference, row) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
+    }
+    const observation = session.executionDiagnostics() orelse return error.MissingBatchObservation;
+    const ingress = observation.runtime.batch_ingress orelse return error.MissingBatchObservation;
+    try std.testing.expectEqual(kind == .cuda, ingress.stream_ordered);
+    try std.testing.expectEqual(@as(u64, 0), ingress.transfers.download_calls);
+    if (kind == .cuda) {
+        try std.testing.expect((ingress.transfers.device_copy_calls orelse 0) > 0);
+        try std.testing.expectEqual(@as(?u64, 2 * 24 * 4 * 512 * @sizeOf(f32)), ingress.transfers.device_copy_bytes);
     }
     const report = broker.snapshot(std.testing.io);
     try std.testing.expectEqual(@as(u64, 1), report.native_batches);

@@ -37,6 +37,7 @@ pub const Binding = struct {
     pending_interval: ?*const diagnostics_mod.PendingInterval = null,
     pending_counters: ?*diagnostics_mod.PendingInterval.ObservedPhases = null,
     capture_programs: bool = false,
+    batch_ingress: ?*const @import("runtime_telemetry.zig").BatchIngress = null,
     native_definition_templates: ?diagnostics_mod.NativeDefinitionTemplates = null,
     native_program_construction: ?diagnostics_mod.NativeProgramConstruction = null,
     model_allocator: ?std.mem.Allocator = null,
@@ -279,6 +280,7 @@ const Invocation = struct {
         };
         snapshot.execution_scope = if (snapshot.execution != null) .last_published_program else .unavailable;
         snapshot.runtime.transfers = self.transfers.measurements();
+        snapshot.runtime.batch_ingress = if (self.binding.batch_ingress) |ingress| ingress.* else null;
         snapshot.runtime.recordKernelInterval(&self.kernels);
         if (self.binding.native_definition_templates) |value| snapshot.native_definition_templates = value;
         if (self.binding.native_program_construction) |value| snapshot.native_program_construction = value;
