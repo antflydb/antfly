@@ -186,7 +186,7 @@ fn makeVisit(local: *const [layer_count]bool, layer: usize, pass: usize, full: *
 }
 
 pub const Projection = enum { w13, w2 };
-pub const ExpertFormat = enum { nvfp4, mxfp8 };
+pub const ExpertFormat = @import("antfly_tile").native_projection.BlockScaledFormat;
 pub const ExpertWeights = struct {
     format: ExpertFormat,
     weights: []const u8,
@@ -294,13 +294,15 @@ pub fn validateDecoder(header: *const safetensors.Header, config: TextConfig) !v
 }
 
 fn validateExpertProjection(header: *const safetensors.Header, config: TextConfig, layer: usize, projection: Projection) !void {
-    const nvfp4 = layer < nvfp4_layers;
-    const k: i64 = if (projection == .w13) config.hidden_size else config.intermediate_size;
+    const format: ExpertFormat = if (layer < nvfp4_layers) .nvfp4 else .mxfp8;
+    const k = if (projection == .w13) config.hidden_size else config.intermediate_size;
+    const row = format.row(k) catch return error.InvalidInkling2Config;
+    const nvfp4 = format == .nvfp4;
     const n: i64 = if (projection == .w13) @as(i64, config.intermediate_size) * 2 else config.hidden_size;
     const experts: i64 = config.n_routed_experts;
     var buf: [128]u8 = undefined;
-    try require(header, try expertName(&buf, layer, projection, ""), .u8, if (nvfp4) .dense else .e4m3fn, &.{ experts, n, if (nvfp4) @divExact(k, 2) else k });
-    try require(header, try expertName(&buf, layer, projection, "_scale"), .u8, if (nvfp4) .e4m3fn else .dense, &.{ experts, n, @divExact(k, if (nvfp4) @as(i64, 16) else 32) });
+    try require(header, try expertName(&buf, layer, projection, ""), .u8, if (nvfp4) .dense else .e4m3fn, &.{ experts, n, @intCast(row.values_bytes) });
+    try require(header, try expertName(&buf, layer, projection, "_scale"), .u8, if (nvfp4) .e4m3fn else .dense, &.{ experts, n, @intCast(row.scales_bytes) });
     if (nvfp4) {
         try require(header, try expertName(&buf, layer, projection, "_amax"), .f32, .dense, &.{experts});
         try require(header, try expertName(&buf, layer, projection, "_outer_scale_denominator"), .f32, .dense, &.{1});

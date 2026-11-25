@@ -29,7 +29,7 @@ const Matvec = embedded.EmbeddedModule(struct {
     pub const image = embedded.profile(catalog.routed_block_scaled_matvec).image;
 }, catalog.routed_block_scaled_matvec_entries);
 
-pub const Format = enum { nvfp4, mxfp8 };
+pub const Format = @import("antfly_tile").native_projection.BlockScaledFormat;
 pub const ActivationPrecision = enum { block_scaled, bf16 };
 
 pub const Request = struct {
@@ -110,18 +110,15 @@ const threads = 128;
 const columns_per_block = threads / 32;
 
 fn validate(r: Request) !void {
-    const block_values: u32 = if (r.format == .nvfp4) 16 else 32;
-    if (r.rows == 0 or r.rows > 65535 or r.in_dim == 0 or r.in_dim % block_values != 0 or
-        r.out_dim == 0 or r.expert_count == 0) return error.InvalidShape;
-    const elements_per_row: usize = if (r.format == .nvfp4) r.in_dim / 2 else r.in_dim;
-    const scales_per_row: usize = r.in_dim / block_values;
+    if (r.rows == 0 or r.rows > 65535 or r.out_dim == 0 or r.expert_count == 0) return error.InvalidShape;
+    const layout = try r.format.row(r.in_dim);
     const weight_rows = try std.math.mul(usize, r.expert_count, r.out_dim);
     const output_values = try std.math.mul(usize, r.rows, r.out_dim);
     const lengths = [7]usize{
-        try std.math.mul(usize, r.rows, elements_per_row),
-        try std.math.mul(usize, r.rows, scales_per_row),
-        try std.math.mul(usize, weight_rows, elements_per_row),
-        try std.math.mul(usize, weight_rows, scales_per_row),
+        try std.math.mul(usize, r.rows, layout.values_bytes),
+        try std.math.mul(usize, r.rows, layout.scales_bytes),
+        try std.math.mul(usize, weight_rows, layout.values_bytes),
+        try std.math.mul(usize, weight_rows, layout.scales_bytes),
         try std.math.mul(usize, r.rows, @sizeOf(u32)),
         if (r.format == .nvfp4) try std.math.mul(usize, r.rows, @sizeOf(f32)) else 0,
         try std.math.mul(usize, output_values, @sizeOf(u16)),

@@ -54,10 +54,7 @@ pub const Layer = struct {
         const router = try source.router(layer);
         const gate_up = try source.experts(layer, .w13);
         const down = try source.experts(layer, .w2);
-        var result: Layer = .{ .format = switch (gate_up.format) {
-            .nvfp4 => .nvfp4,
-            .mxfp8 => .mxfp8,
-        } };
+        var result: Layer = .{ .format = gate_up.format };
         errdefer result.deinit(ctx);
         result.router_weight = try staging.uploadWeight(ctx, router.weight);
         result.router_bias = try staging.uploadWeight(ctx, router.bias);

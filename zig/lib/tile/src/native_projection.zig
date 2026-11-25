@@ -17,6 +17,24 @@
 //! initialization, reduction/MMA schedule and epilogue publication.
 const render = @import("source_template.zig").render;
 
+/// Row-major packed values with one byte of scale per block. Providers may
+/// repack these planes after validating the original tensor extents.
+pub const BlockScaledFormat = enum {
+    nvfp4,
+    mxfp8,
+
+    pub const Row = struct { values_bytes: usize, scales_bytes: usize };
+
+    pub fn row(self: BlockScaledFormat, width: usize) error{InvalidShape}!Row {
+        const block: usize = if (self == .nvfp4) 16 else 32;
+        if (width == 0 or width % block != 0) return error.InvalidShape;
+        return .{
+            .values_bytes = if (self == .nvfp4) width / 2 else width,
+            .scales_bytes = width / block,
+        };
+    }
+};
+
 pub const Product = struct { left: []const u8, right: []const u8 };
 pub const Association = enum { combined, termwise };
 
@@ -87,3 +105,11 @@ pub const MetalBlock256Sub32Rows = struct {
         , .{ .type = if (paired) "float2" else "float", .dot = p.dot, .weights = p.weight ++ (if (p.other_weight) |other| ", " ++ other else ""), .update = update });
     }
 };
+
+test "block-scaled projection rows require complete scale blocks" {
+    const testing = @import("std").testing;
+    try testing.expectEqual(BlockScaledFormat.Row{ .values_bytes = 1152, .scales_bytes = 144 }, try BlockScaledFormat.nvfp4.row(2304));
+    try testing.expectEqual(BlockScaledFormat.Row{ .values_bytes = 1152, .scales_bytes = 36 }, try BlockScaledFormat.mxfp8.row(1152));
+    try testing.expectError(error.InvalidShape, BlockScaledFormat.nvfp4.row(0));
+    try testing.expectError(error.InvalidShape, BlockScaledFormat.mxfp8.row(16));
+}

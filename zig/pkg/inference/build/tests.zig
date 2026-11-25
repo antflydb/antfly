@@ -391,6 +391,7 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     ctx.step("test-hybrid-kv", "Verify bounded hybrid page tables and prepared KV transactions").dependOn(&ctx.addRunArtifact(hybrid_kv_host_tests).step);
     const inkling2_root = b.createModule(.{ .root_source_file = ctx.path("src/test_inkling2_checkpoint.zig"), .target = ctx.target, .optimize = ctx.optimize });
     inkling2_root.addImport("antfly_platform", ctx.graph.platform_mod);
+    inkling2_root.addImport("antfly_tile", ctx.graph.tile_mod);
     inkling2_root.link_libc = true;
     const inkling2_tests = b.addTest(.{ .root_module = inkling2_root, .filters = &.{"Inkling 2 Mini validates"} });
     const run_inkling2 = ctx.addRunArtifact(inkling2_tests);
