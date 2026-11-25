@@ -5371,6 +5371,13 @@ const AssetInvocationCancellation = struct {
         return self.lifecycle.isCancelled() or self.request.isCancelled() or
             self.inherited.isCancelled();
     }
+
+    fn check(ptr: *const anyopaque) !void {
+        const self: *const @This() = @ptrCast(@alignCast(ptr));
+        try self.lifecycle.check();
+        try self.request.check();
+        try self.inherited.check();
+    }
 };
 
 fn scopedAssetProducer(
@@ -5521,8 +5528,9 @@ fn checkProviderFailureGuardRecording(
     runtime: *EnrichmentRuntime,
     recovery_key: InferenceRecoveryKey,
     batch_items: usize,
+    inherited: ?inference_request_context.RequestContext,
 ) !void {
-    checkProviderFailureGuard(runtime) catch |err| {
+    checkEmbeddingInvocationOwner(runtime, runtime.active_provider_guard, inherited) catch |err| {
         noteInferenceControlFailure(runtime, recovery_key, err, batch_items);
         return err;
     };
@@ -5844,13 +5852,20 @@ test "forced dense generations recompute cached vectors and refresh the memo" {
 }
 
 fn captureDenseGeneration(runtime: *EnrichmentRuntime, provider: embedder_mod.DenseEmbedder, alloc: Allocator, name: []const u8, context: ?inference_request_context.RequestContext) !embedder_mod.DenseEmbedder.TextGeneration {
-    return (if (context) |control| provider.captureTextGenerationWithContext(alloc, name, control) else provider.captureTextGeneration(alloc, name)) catch |err|
-        return providerInvocationFailure(runtime, err);
+    var cancellation: AssetInvocationCancellation = undefined;
+    const scoped = provider.withRequestContext(scopedEmbeddingRequestContext(runtime, context orelse foregroundProviderRequestContext(runtime), provider.part_request_context, &cancellation));
+    const guard = runtime.active_provider_guard;
+    try checkEmbeddingInvocationOwner(runtime, guard, scoped.part_request_context);
+    const generation = scoped.captureTextGeneration(alloc, name) catch |err| return embeddingInvocationFailure(runtime, guard, scoped.part_request_context, err);
+    try checkEmbeddingInvocationOwner(runtime, guard, scoped.part_request_context);
+    return generation;
 }
 
 fn requireDenseGeneration(runtime: *EnrichmentRuntime, provider: embedder_mod.DenseEmbedder, alloc: Allocator, name: []const u8, generation: embedder_mod.DenseEmbedder.TextGeneration, context: ?inference_request_context.RequestContext) !void {
-    return (if (context) |control| provider.requireTextGenerationWithContext(alloc, name, generation, control) else provider.requireTextGeneration(alloc, name, generation)) catch |err|
-        return providerInvocationFailure(runtime, err);
+    var current = provider;
+    current.part_lease = null;
+    const observed = try captureDenseGeneration(runtime, current, alloc, name, context);
+    if (!std.meta.eql(generation.revision, observed.revision)) return error.EnrichmentSourceChanged;
 }
 
 fn embedDenseWithRetryUncached(
@@ -5864,11 +5879,13 @@ fn embedDenseWithRetryUncached(
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         try checkProviderInvocation(runtime, recovery_key, dense_embedder.foreground_bounded);
-        const vector = (if (foregroundProviderRequestContext(runtime)) |context|
+        try checkEmbeddingInvocationOwner(runtime, runtime.active_provider_guard, dense_embedder.part_request_context);
+        var cancellation: AssetInvocationCancellation = undefined;
+        const vector = (if (scopedEmbeddingRequestContext(runtime, foregroundProviderRequestContext(runtime), dense_embedder.part_request_context, &cancellation)) |context|
             dense_embedder.embedDenseWithContext(runtime.alloc, embedding_name, text, dims, context)
         else
             dense_embedder.embedDense(runtime.alloc, embedding_name, text, dims)) catch |err| {
-            try checkProviderFailureGuardRecording(runtime, recovery_key, 1);
+            try checkProviderFailureGuardRecording(runtime, recovery_key, 1, dense_embedder.part_request_context);
             if (inferenceControlFailure(err)) {
                 noteInferenceControlFailure(runtime, recovery_key, err, 1);
                 return providerInvocationFailure(runtime, err);
@@ -5883,7 +5900,7 @@ fn embedDenseWithRetryUncached(
             sleepRetryBackoff(runtime, transientEmbedRetrySleepNs(attempt));
             continue;
         };
-        checkProviderFailureGuardRecording(runtime, recovery_key, 1) catch |err| {
+        checkProviderFailureGuardRecording(runtime, recovery_key, 1, dense_embedder.part_request_context) catch |err| {
             runtime.alloc.free(vector);
             return err;
         };
@@ -5904,8 +5921,9 @@ fn embedDenseBatchWithRetryUncached(
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         try checkProviderInvocation(runtime, recovery_key, dense_embedder.foreground_bounded);
+        try checkEmbeddingInvocationOwner(runtime, runtime.active_provider_guard, dense_embedder.part_request_context);
         const vectors = embedDenseBatchAttemptLimits(dense_embedder, runtime, embedding_name, texts, dims, limits) catch |err| {
-            try checkProviderFailureGuardRecording(runtime, recovery_key, texts.len);
+            try checkProviderFailureGuardRecording(runtime, recovery_key, texts.len, dense_embedder.part_request_context);
             // An immutable plan cannot repair itself by repeating execution.
             // Yield so the coordinator resolves a fresh generation/route;
             // this is not capacity pressure and must not shrink batch limits.
@@ -5925,7 +5943,7 @@ fn embedDenseBatchWithRetryUncached(
             sleepRetryBackoff(runtime, transientEmbedRetrySleepNs(attempt));
             continue;
         };
-        checkProviderFailureGuardRecording(runtime, recovery_key, texts.len) catch |err| {
+        checkProviderFailureGuardRecording(runtime, recovery_key, texts.len, dense_embedder.part_request_context) catch |err| {
             embedder_mod.freeDenseEmbeddingBatch(runtime.alloc, vectors);
             return err;
         };
@@ -5939,30 +5957,31 @@ fn embedDenseBatchAttempt(dense_embedder: embedder_mod.DenseEmbedder, runtime: *
 }
 
 fn embedDenseBatchAttemptLimits(dense_embedder: embedder_mod.DenseEmbedder, runtime: *EnrichmentRuntime, name: []const u8, texts: []const []const u8, dims: u32, limits: ?DenseBatchLimits) ![]const []const f32 {
+    var cancellation: AssetInvocationCancellation = undefined;
+    const context = scopedEmbeddingRequestContext(runtime, assetProviderRequestContext(runtime), dense_embedder.part_request_context, &cancellation).?;
+    const foreground = runtime.active_provider_guard.deadline_ns != null or runtime.active_provider_guard.cancellation.ptr != null;
     if (limits) |bounded| {
         // Foreground calls promise an interruptible provider. Background
         // publication also uses a context for deadline/progress fences, but
         // must continue to support legacy synchronous providers.
-        if (!denseProviderSupportsContext(dense_embedder)) {
-            if (foregroundProviderRequestContext(runtime)) |context| {
-                try context.check();
-                return error.UncancellableInferenceProvider;
-            }
+        if (foreground and !denseProviderSupportsContext(dense_embedder)) {
+            try context.check();
+            return error.UncancellableInferenceProvider;
         }
-        return plannedDenseBatches(runtime.alloc, concurrencyIo(runtime), dense_embedder, name, texts, dims, assetProviderRequestContext(runtime), bounded);
+        return plannedDenseBatches(runtime.alloc, concurrencyIo(runtime), dense_embedder, name, texts, dims, context, bounded);
     }
     // Context-aware callbacks still require an explicit reentrancy guarantee.
     // Custom and legacy providers retain their serial path by default.
     const parallelism = @min(@min(generatedEmbedParallelBatches(), @max(@as(usize, 1), dense_embedder.dense_batch_concurrency)), texts.len);
     if (parallelism <= 1 or dense_embedder.dense_embed_batch_with_context_fn == null) {
         if (dense_embedder.dense_embed_batch_with_context_fn != null)
-            return dense_embedder.embedDenseBatchWithContext(runtime.alloc, name, texts, dims, assetProviderRequestContext(runtime));
-        return if (foregroundProviderRequestContext(runtime)) |context|
+            return dense_embedder.embedDenseBatchWithContext(runtime.alloc, name, texts, dims, context);
+        return if (foreground or dense_embedder.part_request_context != null)
             dense_embedder.embedDenseBatchWithContext(runtime.alloc, name, texts, dims, context)
         else
             dense_embedder.embedDenseBatch(runtime.alloc, name, texts, dims);
     }
-    return parallelDenseBatchWithCapacityFallback(runtime.alloc, concurrencyIo(runtime), dense_embedder, name, texts, dims, assetProviderRequestContext(runtime), parallelism);
+    return parallelDenseBatchWithCapacityFallback(runtime.alloc, concurrencyIo(runtime), dense_embedder, name, texts, dims, context, parallelism);
 }
 
 fn parallelDenseBatchWithCapacityFallback(alloc: Allocator, io: Io, provider: embedder_mod.DenseEmbedder, name: []const u8, texts: []const []const u8, dims: u32, context: inference_request_context.RequestContext, parallelism: usize) ![]const []const f32 {
@@ -6354,11 +6373,14 @@ fn embedDensePartsWithRetry(
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         try checkProviderInvocation(runtime, recovery_key, dense_embedder.foreground_bounded);
-        const vector = (if (foregroundProviderRequestContext(runtime)) |context|
+        try checkEmbeddingInvocationOwner(runtime, runtime.active_provider_guard, dense_embedder.part_request_context);
+        var cancellation: AssetInvocationCancellation = undefined;
+        const context = scopedEmbeddingRequestContext(runtime, assetProviderRequestContext(runtime), dense_embedder.part_request_context, &cancellation).?;
+        const vector = (if (runtime.active_provider_guard.deadline_ns != null or runtime.active_provider_guard.cancellation.ptr != null)
             dense_embedder.embedDensePartsWithContext(runtime.alloc, embedding_name, parts, dims, context)
         else
-            dense_embedder.embedDensePartsBackgroundWithContext(runtime.alloc, embedding_name, parts, dims, assetProviderRequestContext(runtime))) catch |err| {
-            try checkProviderFailureGuardRecording(runtime, recovery_key, 1);
+            dense_embedder.embedDensePartsBackgroundWithContext(runtime.alloc, embedding_name, parts, dims, context)) catch |err| {
+            try checkProviderFailureGuardRecording(runtime, recovery_key, 1, dense_embedder.part_request_context);
             if (inferenceControlFailure(err)) {
                 noteInferenceControlFailure(runtime, recovery_key, err, 1);
                 return providerInvocationFailure(runtime, err);
@@ -6374,7 +6396,7 @@ fn embedDensePartsWithRetry(
             sleepRetryBackoff(runtime, transientEmbedRetrySleepNs(attempt));
             continue;
         };
-        checkProviderFailureGuardRecording(runtime, recovery_key, 1) catch |err| {
+        checkProviderFailureGuardRecording(runtime, recovery_key, 1, dense_embedder.part_request_context) catch |err| {
             runtime.alloc.free(vector);
             return err;
         };
@@ -6393,36 +6415,41 @@ fn embeddingInvocationFailure(runtime: *EnrichmentRuntime, guard: ForegroundCatc
     return classifyProviderCancellation(err, guard, false);
 }
 
-fn captureDenseCacheRevision(runtime: *EnrichmentRuntime, provider: embedder_mod.DenseEmbedder, alloc: Allocator, name: []const u8) !?[32]u8 {
-    const resolve = provider.cache_revision_fn orelse return null;
-    const guard = runtime.active_provider_guard;
-    try checkEmbeddingInvocationOwner(runtime, guard, provider.part_request_context);
-    const revision = resolve(provider.ptr, alloc, name) catch |err| {
-        try checkEmbeddingInvocationOwner(runtime, guard, provider.part_request_context);
-        return classifyProviderCancellation(err, guard, false);
+/// The composed token borrows this call's stack and must never escape into a
+/// cached generation or an asynchronous job.
+fn scopedEmbeddingRequestContext(runtime: *const EnrichmentRuntime, foreground: ?inference_request_context.RequestContext, inherited: ?inference_request_context.RequestContext, cancellation: *AssetInvocationCancellation) ?inference_request_context.RequestContext {
+    var effective = foreground orelse return inherited;
+    cancellation.* = .{
+        .lifecycle = runtime.config.cancellation,
+        .request = effective.cancellation orelse .none,
+        .inherited = if (inherited) |value| value.cancellation orelse .none else .none,
     };
-    try checkEmbeddingInvocationOwner(runtime, guard, provider.part_request_context);
+    effective.cancellation = .{ .ptr = cancellation, .is_cancelled_fn = AssetInvocationCancellation.isCancelled, .check_fn = AssetInvocationCancellation.check };
+    if (inherited) |value| if (value.deadline_ns) |deadline| {
+        effective.deadline_ns = if (effective.deadline_ns) |current| @min(current, deadline) else deadline;
+    };
+    return effective;
+}
+
+fn captureDenseCacheRevision(runtime: *EnrichmentRuntime, provider: embedder_mod.DenseEmbedder, alloc: Allocator, name: []const u8, model_revision: ?[32]u8, foreground: ?inference_request_context.RequestContext) !?[32]u8 {
+    const guard = runtime.active_provider_guard;
+    var cancellation: AssetInvocationCancellation = undefined;
+    const context = scopedEmbeddingRequestContext(runtime, foreground, provider.part_request_context, &cancellation);
+    try checkEmbeddingInvocationOwner(runtime, guard, context);
+    const revision = (if (provider.cache_revision_from_model_fn) |derive|
+        if (model_revision) |model| derive(provider.ptr, alloc, name, model) else null
+    else if (context == null or provider.foreground_bounded)
+        if (provider.cache_revision_fn) |resolve| resolve(provider.ptr, alloc, name) else null
+    else
+        null) catch |err| return embeddingInvocationFailure(runtime, guard, context, err);
+    try checkEmbeddingInvocationOwner(runtime, guard, context);
     return revision;
 }
 
 fn captureSparseRevision(runtime: *EnrichmentRuntime, provider: embedder_mod.SparseEmbedder, alloc: Allocator, name: []const u8, foreground: ?inference_request_context.RequestContext) !?[32]u8 {
     const guard = runtime.active_provider_guard;
-    var scoped = provider;
     var cancellation: AssetInvocationCancellation = undefined;
-    if (foreground) |context| {
-        var effective = context;
-        const inherited = provider.request_context;
-        cancellation = .{
-            .lifecycle = runtime.config.cancellation,
-            .request = context.cancellation orelse .none,
-            .inherited = if (inherited) |value| value.cancellation orelse .none else .none,
-        };
-        effective.cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = AssetInvocationCancellation.isCancelled };
-        if (inherited) |value| if (value.deadline_ns) |deadline| {
-            effective.deadline_ns = if (effective.deadline_ns) |current| @min(current, deadline) else deadline;
-        };
-        scoped = provider.withRequestContext(effective);
-    }
+    const scoped = provider.withRequestContext(scopedEmbeddingRequestContext(runtime, foreground, provider.request_context, &cancellation));
     try checkEmbeddingInvocationOwner(runtime, guard, scoped.request_context);
     const revision = scoped.captureRevision(alloc, name) catch |err| {
         try checkEmbeddingInvocationOwner(runtime, guard, scoped.request_context);
@@ -6442,11 +6469,13 @@ fn embedSparseWithRetry(
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         try checkProviderInvocation(runtime, recovery_key, sparse_embedder.foreground_bounded);
-        const sparse = (if (foregroundProviderRequestContext(runtime)) |context|
+        try checkEmbeddingInvocationOwner(runtime, runtime.active_provider_guard, sparse_embedder.request_context);
+        var cancellation: AssetInvocationCancellation = undefined;
+        const sparse = (if (scopedEmbeddingRequestContext(runtime, foregroundProviderRequestContext(runtime), sparse_embedder.request_context, &cancellation)) |context|
             sparse_embedder.embedSparseWithContext(runtime.alloc, embedding_name, text, context)
         else
             sparse_embedder.embedSparse(runtime.alloc, embedding_name, text)) catch |err| {
-            try checkProviderFailureGuardRecording(runtime, recovery_key, 1);
+            try checkProviderFailureGuardRecording(runtime, recovery_key, 1, sparse_embedder.request_context);
             if (inferenceControlFailure(err)) {
                 noteInferenceControlFailure(runtime, recovery_key, err, 1);
                 return providerInvocationFailure(runtime, err);
@@ -6462,7 +6491,7 @@ fn embedSparseWithRetry(
             continue;
         };
         var owned_sparse = sparse;
-        checkProviderFailureGuardRecording(runtime, recovery_key, 1) catch |err| {
+        checkProviderFailureGuardRecording(runtime, recovery_key, 1, sparse_embedder.request_context) catch |err| {
             owned_sparse.deinit(runtime.alloc);
             return err;
         };
@@ -6481,11 +6510,13 @@ fn embedSparseBatchWithRetry(
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         try checkProviderInvocation(runtime, recovery_key, sparse_embedder.foreground_bounded);
-        const sparse_batch = (if (foregroundProviderRequestContext(runtime)) |context|
+        try checkEmbeddingInvocationOwner(runtime, runtime.active_provider_guard, sparse_embedder.request_context);
+        var cancellation: AssetInvocationCancellation = undefined;
+        const sparse_batch = (if (scopedEmbeddingRequestContext(runtime, foregroundProviderRequestContext(runtime), sparse_embedder.request_context, &cancellation)) |context|
             sparse_embedder.embedSparseBatchWithContext(runtime.alloc, embedding_name, texts, context)
         else
             sparse_embedder.embedSparseBatch(runtime.alloc, embedding_name, texts)) catch |err| {
-            try checkProviderFailureGuardRecording(runtime, recovery_key, texts.len);
+            try checkProviderFailureGuardRecording(runtime, recovery_key, texts.len, sparse_embedder.request_context);
             if (inferenceControlFailure(err)) {
                 noteInferenceControlFailure(runtime, recovery_key, err, texts.len);
                 return providerInvocationFailure(runtime, err);
@@ -6500,7 +6531,7 @@ fn embedSparseBatchWithRetry(
             sleepRetryBackoff(runtime, transientEmbedRetrySleepNs(attempt));
             continue;
         };
-        checkProviderFailureGuardRecording(runtime, recovery_key, texts.len) catch |err| {
+        checkProviderFailureGuardRecording(runtime, recovery_key, texts.len, sparse_embedder.request_context) catch |err| {
             embedder_mod.freeSparseEmbeddingBatch(runtime.alloc, sparse_batch);
             return err;
         };
@@ -7683,11 +7714,8 @@ fn getOrCreateRequestChunksWithProvider(runtime: *EnrichmentRuntime, alloc: Allo
             const chunks = if (source.input) |input|
                 if (model_chunk_client.supportsPagedCalls(chunk_config, provider))
                     try prepareModelPassChunksWithProbe(runtime, request, chunk_config, input, doc_store_key, source_digest.?, pass_scope, observed, false)
-                else legacy: {
-                    try authorizeModelSource(runtime, input);
-                    break :legacy model_chunk_client.chunkMediaWithProvider(alloc, chunk_config, input, provider) catch |err|
-                        return chunkProviderFailure(runtime, provider, err);
-                }
+                else
+                    try chunkMediaWithProviderForEnrichment(runtime, alloc, chunk_config, input, provider)
             else
                 try alloc.alloc(chunker_mod.Chunk, 0);
             errdefer chunker_mod.freeChunks(alloc, chunks);
@@ -8294,26 +8322,59 @@ fn mediaPassInputDigest(runtime: *EnrichmentRuntime, request: enrichment_types.G
     return hash.finalResult();
 }
 
+fn scopedChunkProvider(runtime: *EnrichmentRuntime, provider: ?ChunkProvider, cancellation: *AssetInvocationCancellation) ?ChunkProvider {
+    const guard = runtime.active_provider_guard;
+    if (guard.deadline_ns == null and guard.cancellation.ptr == null and runtime.config.cancellation.ptr == null) return provider;
+    var scoped = provider orelse ChunkProvider{};
+    cancellation.* = .{
+        .lifecycle = runtime.config.cancellation,
+        .request = guard.cancellation,
+        .inherited = scoped.execution.cancellation,
+    };
+    scoped.execution.cancellation = .{ .ptr = cancellation, .is_cancelled_fn = AssetInvocationCancellation.isCancelled, .check_fn = AssetInvocationCancellation.check };
+    scoped.execution.deadline_ns = guard.nativeDeadlineNs(scoped.execution.deadline_ns);
+    return scoped;
+}
+
+fn checkChunkOwner(runtime: *EnrichmentRuntime, provider: ?ChunkProvider) !void {
+    const context = if (provider) |scoped| asset_producer_mod.InvocationContext{
+        .deadline_ns = scoped.execution.deadline_ns,
+        .cancellation = scoped.execution.cancellation,
+    } else .{};
+    try checkAssetInvocationOwner(runtime, runtime.active_provider_guard, context);
+}
+
 fn chunkProviderFailure(runtime: *EnrichmentRuntime, provider: ?ChunkProvider, err: anyerror) anyerror {
     if (!isOperationInterruption(err)) return err;
-    if (provider) |configured| {
-        if (configured.execution.cancellation.isCancelled()) {
-            if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
-            return error.EnrichmentWaitCanceled;
-        }
-    }
+    checkChunkOwner(runtime, provider) catch |control| return control;
     return providerInvocationFailure(runtime, err);
 }
 
 fn chunkTextWithProviderForEnrichment(runtime: *EnrichmentRuntime, alloc: Allocator, text: []const u8, config_json: []const u8, provider: ?ChunkProvider) ![]chunker_mod.Chunk {
-    return chunker_mod.chunkTextWithConfigJsonAndProvider(alloc, text, config_json, provider) catch |err|
-        return chunkProviderFailure(runtime, provider, err);
+    var cancellation: AssetInvocationCancellation = undefined;
+    const scoped = scopedChunkProvider(runtime, provider, &cancellation);
+    try checkChunkOwner(runtime, scoped);
+    const chunks = chunker_mod.chunkTextWithConfigJsonAndProvider(alloc, text, config_json, scoped) catch |err|
+        return chunkProviderFailure(runtime, scoped, err);
+    errdefer chunker_mod.freeChunks(alloc, chunks);
+    try checkChunkOwner(runtime, scoped);
+    return chunks;
+}
+
+fn chunkMediaWithProviderForEnrichment(runtime: *EnrichmentRuntime, alloc: Allocator, config: chunking_types_mod.Config, input: @import("inference_chunker").Input, provider: ?ChunkProvider) ![]chunker_mod.Chunk {
+    var cancellation: AssetInvocationCancellation = undefined;
+    const scoped = scopedChunkProvider(runtime, provider, &cancellation);
+    try checkChunkOwner(runtime, scoped);
+    try authorizeModelSource(runtime, input);
+    const chunks = model_chunk_client.chunkMediaWithProvider(alloc, config, input, scoped) catch |err|
+        return chunkProviderFailure(runtime, scoped, err);
+    errdefer chunker_mod.freeChunks(alloc, chunks);
+    try checkChunkOwner(runtime, scoped);
+    return chunks;
 }
 
 fn dispatchModelPage(runtime: *EnrichmentRuntime, a: Allocator, config: chunking_types_mod.Config, input: @import("inference_chunker").Input) !@import("inference_chunker").types.ChunkPage {
-    try authorizeModelSource(runtime, input);
-    return model_chunk_client.chunkPageWithProvider(a, config, input, runtime.config.chunk_provider) catch |err|
-        return chunkProviderFailure(runtime, runtime.config.chunk_provider, err);
+    return dispatchModelPageWithMode(runtime, a, config, input, false);
 }
 
 fn authorizeModelSource(runtime: *EnrichmentRuntime, input: @import("inference_chunker").Input) !void {
@@ -8324,9 +8385,22 @@ fn authorizeModelSource(runtime: *EnrichmentRuntime, input: @import("inference_c
 /// Resolve deployed generations through the same local/remote chunk contract.
 /// Planning-only targets return identities without executing any output model.
 fn probeModelPass(runtime: *EnrichmentRuntime, supplied: chunking_types_mod.Config, input: @import("inference_chunker").Input) !@import("inference_chunker").types.ChunkPage {
+    return dispatchModelPageWithMode(runtime, runtime.alloc, supplied, input, true);
+}
+
+fn dispatchModelPageWithMode(runtime: *EnrichmentRuntime, a: Allocator, config: chunking_types_mod.Config, input: @import("inference_chunker").Input, probe: bool) !@import("inference_chunker").types.ChunkPage {
+    var cancellation: AssetInvocationCancellation = undefined;
+    const scoped = scopedChunkProvider(runtime, runtime.config.chunk_provider, &cancellation);
+    try checkChunkOwner(runtime, scoped);
     try authorizeModelSource(runtime, input);
-    return model_chunk_client.probeModelPageWithProvider(runtime.alloc, supplied, input, runtime.config.chunk_provider) catch |err|
-        return chunkProviderFailure(runtime, runtime.config.chunk_provider, err);
+    var page = (if (probe)
+        model_chunk_client.probeModelPageWithProvider(a, config, input, scoped)
+    else
+        model_chunk_client.chunkPageWithProvider(a, config, input, scoped)) catch |err|
+        return chunkProviderFailure(runtime, scoped, err);
+    errdefer page.deinit(a);
+    try checkChunkOwner(runtime, scoped);
+    return page;
 }
 
 fn prepareModelPassChunks(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, supplied_config: chunking_types_mod.Config, input: @import("inference_chunker").Input, source_key: []const u8, source_digest: [32]u8, prefix: []const u8) ![]chunker_mod.Chunk {
@@ -10444,6 +10518,14 @@ test "enrichment cancellation defers dense sparse and multimodal provider calls 
         fn sparseBatch(ptr: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![]embedder_mod.SparseEmbedding {
             return fail(ptr);
         }
+        fn denseLease(ptr: *anyopaque, a: Allocator, name: []const u8, context: ?inference_request_context.RequestContext) !inference_work.CapabilityLease {
+            const revision = try sparseRevision(ptr, a, name, context orelse return error.MissingExecutionContext);
+            return .{ .capabilities = .{ .task = .embed, .input_modalities = .{ .text = true }, .input_granularity = .item, .output = .embedding, .model_revision = revision } };
+        }
+        fn sparseWithContext(ptr: *anyopaque, a: Allocator, name: []const u8, _: []const u8, context: inference_request_context.RequestContext) !embedder_mod.SparseEmbedding {
+            _ = try sparseRevision(ptr, a, name, context);
+            return error.TestUnexpectedResult;
+        }
         fn sparseRevision(ptr: *anyopaque, _: Allocator, _: []const u8, context: inference_request_context.RequestContext) !?[32]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.revision_calls += 1;
@@ -10512,6 +10594,23 @@ test "enrichment cancellation defers dense sparse and multimodal provider calls 
     mock.cancel_revision = true;
     try std.testing.expectError(error.EnrichmentWaitCanceled, requireChunkProviderRevision(&runtime, std.testing.allocator, request, null, controlled_sparse, .{}, revision, context));
     try std.testing.expectEqual(@as(usize, 3), mock.revision_calls);
+
+    mock.inherited.store(false, .release);
+    mock.cancel_revision = false;
+    mock.expected_deadline = context.deadline_ns.? - std.time.ns_per_s;
+    var controlled_dense = dense;
+    controlled_dense.resolve_part_lease_fn = Mock.denseLease;
+    controlled_dense.part_request_context = .{ .io = std.testing.io, .deadline_ns = mock.expected_deadline, .cancellation = CancellationToken.fromAtomic(&mock.inherited) };
+    const generation = try captureDenseGeneration(&runtime, controlled_dense, std.testing.allocator, "dense", context);
+    mock.cancel_revision = true;
+    try std.testing.expectError(error.EnrichmentWaitCanceled, requireDenseGeneration(&runtime, controlled_dense, std.testing.allocator, "dense", generation, context));
+
+    mock.inherited.store(false, .release);
+    controlled_sparse.foreground_bounded = true;
+    controlled_sparse.request_context.?.deadline_ns = mock.expected_deadline;
+    controlled_sparse.sparse_embed_with_context_fn = Mock.sparseWithContext;
+    try std.testing.expectError(error.EnrichmentWaitCanceled, embedSparseWithRetry(controlled_sparse, &runtime, "sparse", "one"));
+    try std.testing.expectEqual(@as(usize, 6), mock.revision_calls);
 }
 
 test "enrichment provider deadlines and progress cross native clock boundaries" {
@@ -10738,7 +10837,7 @@ test "post-provider deadline records timeout recovery before returning" {
     const key = inferenceRecoveryKey(.{ .model = "bge-m3", .backend = "metal" });
     try std.testing.expectError(
         error.EnrichmentWaitTimeout,
-        checkProviderFailureGuardRecording(&runtime, key, 8),
+        checkProviderFailureGuardRecording(&runtime, key, 8, null),
     );
     try std.testing.expectEqual(@as(u64, 1), runtime.inference_timeout_count.load(.acquire));
     try std.testing.expectEqual(@as(usize, 4), recoveryBatchCap(&runtime, key));
@@ -12374,7 +12473,9 @@ const SharedPdfWindowScheduler = struct {
         // speculative vectors through replay's durable write/checkpoint path.
         if (self.precommit != null) return;
         if (request.kind != .dense_embedding or request.embedding_input != .pdf_page_images) return;
-        const embedder = self.runtime.config.dense_embedder orelse return;
+        const provider = self.runtime.config.dense_embedder orelse return;
+        var cancellation: AssetInvocationCancellation = undefined;
+        const embedder = provider.withRequestContext(scopedEmbeddingRequestContext(self.runtime, foregroundProviderRequestContext(self.runtime), provider.part_request_context, &cancellation));
         const indexes = try self.runtime.index_manager.denseIndexesForEmbedding(self.runtime.alloc, requestEmbeddingName(request), request.expected_dims);
         defer {
             for (indexes) |name| self.runtime.alloc.free(name);
@@ -12673,6 +12774,7 @@ const SharedPdfWindowScheduler = struct {
 
             fn invocationFailure(self: *const @This(), err: anyerror) anyerror {
                 if (!isOperationInterruption(err)) return err;
+                if (self.text) |text| checkAssetInvocationOwner(self.group.scheduler.runtime, self.guard, text.producer.invocation_context) catch |control| return control;
                 return classifyProviderCancellation(err, self.guard, isCanceled(self));
             }
 
@@ -12687,6 +12789,10 @@ const SharedPdfWindowScheduler = struct {
                     self.group.completed.set(self.group.lane.?.io());
                 }
                 if (self.text) |*text| {
+                    checkAssetInvocationOwner(self.group.scheduler.runtime, self.guard, text.producer.invocation_context) catch |err| {
+                        self.err = err;
+                        return;
+                    };
                     text.batch = (if (text.rasters) |rasters|
                         text.producer.produceBorrowedRasterBatchReported(self.invocation.allocator(), text.requests, rasters)
                     else
@@ -12783,7 +12889,12 @@ const SharedPdfWindowScheduler = struct {
                     values[i].source_fingerprint = text.fingerprint;
                 }
             }
-            text.producer = producer.withInvocationContext(.{ .io = self.lane.?.io(), .deadline_ns = job.guard.nativeDeadlineNs(producer.invocation_context.deadline_ns), .cancellation = .{ .ptr = job, .is_cancelled_fn = Job.isCanceled }, .progress = .{ .ptr = job, .update_fn = Job.progress } });
+            var context = producer.invocation_context;
+            context.io = self.lane.?.io();
+            context.deadline_ns = job.guard.nativeDeadlineNs(context.deadline_ns);
+            context.cancellation = .{ .ptr = job, .is_cancelled_fn = Job.isCanceled };
+            context.progress = .{ .ptr = job, .update_fn = Job.progress };
+            text.producer = producer.withInvocationContext(context);
             text.started_ns = runtime.clock.nowRealtimeNs();
             text.request_bytes = runtimeGeneratedTextBatchBytes(text.requests);
             if (text.rasters) |values| for (values) |raster| {
@@ -12926,6 +13037,10 @@ const SharedPdfWindowScheduler = struct {
             }
             setActiveFailureFingerprint(runtime, requestFailureFingerprint(job.request));
             const text = &job.text.?;
+            checkAssetInvocationOwner(runtime, job.guard, text.producer.invocation_context) catch |err| {
+                job.err = err;
+                return;
+            };
             const alloc = job.invocation.allocator();
             var parts = std.ArrayListUnmanaged([]u8).empty;
             recoverRuntimeGeneratedTextBatch(self.scheduler.runtime, alloc, alloc, text.producer, text.requests, text.rasters, text.indices, &parts, text.units, "ocr_text", .ocr, job.consumer.config.ocr_quality, document_extraction_mod.effectiveOcrPrompt(job.consumer.config), text.fingerprint, job.err.?) catch |err| {
@@ -12954,10 +13069,12 @@ const SharedPdfWindowScheduler = struct {
             if (publish) {
                 // Check the original owner after join, including providers
                 // that return a partial envelope instead of a control error.
-                if (runtime.shutdown_requested.load(.acquire)) return error.EnrichmentRetryAborted;
-                try job.guard.check();
-                if (Job.isCanceled(job)) return error.EnrichmentWaitCanceled;
-                if (job.text == null) try checkEmbeddingInvocationOwner(runtime, job.guard, job.embedder.part_request_context);
+                if (job.text) |text|
+                    try checkAssetInvocationOwner(runtime, job.guard, text.producer.invocation_context)
+                else {
+                    if (Job.isCanceled(job)) return error.EnrichmentWaitCanceled;
+                    try checkEmbeddingInvocationOwner(runtime, job.guard, job.embedder.part_request_context);
+                }
             }
             if (publish) if (job.text) |*text| {
                 if (text.batch) |batch| {
@@ -13662,7 +13779,9 @@ const SharedPdfWindowScheduler = struct {
             var invocation = try PdfWindowConsumerLease.init(runtime.alloc, manager, window_lease, required);
             defer invocation.deinit();
             const alloc = invocation.allocator();
-            const scoped_embedder = embedder.withPartLease(consumer.execution_lease orelse .{ .capabilities = consumer.capabilities });
+            var cancellation: AssetInvocationCancellation = undefined;
+            const context = scopedEmbeddingRequestContext(runtime, foregroundProviderRequestContext(runtime), embedder.part_request_context, &cancellation);
+            const scoped_embedder = embedder.withRequestContext(context).withPartLease(consumer.execution_lease orelse .{ .capabilities = consumer.capabilities });
             var output = embedPdfWindowPart(runtime, runtime.active_provider_guard, alloc, scoped_embedder, embedding_name, job_window, request.expected_dims) catch |err|
                 return invocation.mapError(err);
             defer output.deinit(alloc);
@@ -14073,6 +14192,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
         prefetch_started: ?*const std.atomic.Value(bool) = null,
         worker_failure: ?anyerror = null,
         cancel_embedder_owner: ?*std.atomic.Value(bool) = null,
+        check_sync_deadline: bool = false,
         text_calls: usize = 0,
         embed_calls: usize = 0,
         last_embed_items: usize = 0,
@@ -14205,6 +14325,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
                     @import("antfly_platform").time.yieldNow();
                 }
             }
+            if (self.check_sync_deadline) try std.testing.expect(context.deadline_ns != null);
             if (self.worker_failure) |err| {
                 if (self.cancel_embedder_owner) |signal| signal.store(true, .release);
                 return err;
@@ -14356,6 +14477,10 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             .deadline_ns = null,
             .cancellation = CancellationToken.fromAtomic(&inherited),
         };
+        runtime.active_provider_guard.deadline_ns = std.math.maxInt(u64);
+        defer runtime.active_provider_guard.deadline_ns = null;
+        harness.check_sync_deadline = true;
+        defer harness.check_sync_deadline = false;
         harness.cancel_embedder_owner = &inherited;
         defer harness.cancel_embedder_owner = null;
         harness.worker_failure = error.Canceled;
@@ -15477,7 +15602,9 @@ const DocumentPreparationPipeline = struct {
             const producer = scopedAssetProducer(&self.context, self.producer.withInvocationContext(context), &cancellation);
             const a = self.allocator();
             if (isCancelled(self)) return error.Canceled;
-            const fetched = try self.cache.fetch(self.source_url, if (self.config.credentials.len > 0) self.config.credentials else null, remoteRenderConfig(self.context.config.secret_store, &self.remote_config, self.context.config.io, CancellationToken{ .ptr = self, .is_cancelled_fn = isCancelled }, null, null));
+            var fetch_config = remoteRenderConfig(self.context.config.secret_store, &self.remote_config, self.context.config.io, .{ .ptr = self, .is_cancelled_fn = isCancelled }, null, null);
+            fetch_config.deadline_ns = producer.invocation_context.deadline_ns;
+            const fetched = try self.cache.fetch(self.source_url, if (self.config.credentials.len > 0) self.config.credentials else null, fetch_config);
             self.source = switch (fetched) {
                 .ok => |lease| lease,
                 .http_error => return,
@@ -15485,7 +15612,7 @@ const DocumentPreparationPipeline = struct {
             const entry = self.source.?.entry();
             try document_extraction_mod.verifyChecksumDigest(self.config, &entry.content_sha256);
             if (!document_extraction_mod.resolvesToPdf(self.config, self.source_url, entry.content.content_type, entry.content.data)) return;
-            self.pdf = try self.cache.preparePdf(&self.source.?, self.config.pdf_decode_limits, self.context.timeout_ms);
+            self.pdf = try self.cache.preparePdf(&self.source.?, self.config.pdf_decode_limits, self.context.timeout_ms, producer.invocation_context);
             self.fingerprint = try a.dupe(u8, &entry.content_fingerprint);
             const coordinator = try RuntimePdfOcrCoordinator.createFromPrepared(a, platform.allocator.concurrentFallback(), self.context.config.resource_manager orelse self.context.index_manager.resource_manager, self.context.timeout_ms, self.config, self.pdf.?.session());
             defer coordinator.destroy();
@@ -15969,7 +16096,8 @@ const PreparedDocumentSourceCache = struct {
     pending_pdfs: std.ArrayListUnmanaged(PendingPdf) = .empty,
     io: Io,
     mutex: Io.Mutex = .init,
-    drained: Io.Condition = .init,
+    drained: @import("antfly_platform").sync.BroadcastCondition = .{},
+    active_waiters: usize = 0,
     allocator_mutex: std.atomic.Mutex = .unlocked,
     shutting_down: bool = false,
     active_borrows: usize = 0,
@@ -16116,12 +16244,13 @@ const PreparedDocumentSourceCache = struct {
         self.clearMedia();
         self.mutex.lockUncancelable(self.io);
         self.shutting_down = true;
+        self.drained.broadcast(self.io);
         self.mutex.unlock(self.io);
         // Retire callbacks before destroying their context; never wait for a
         // ResourceManager callback while holding either of this cache's locks.
         if (self.budgeted) |*budgeted| budgeted.reservation.manager.unregisterReclaimer(self.reclaimer_id);
         self.mutex.lockUncancelable(self.io);
-        while (self.active_borrows != 0 or self.active_preparations != 0)
+        while (self.active_borrows != 0 or self.active_preparations != 0 or self.active_waiters != 0)
             self.drained.waitUncancelable(self.io, &self.mutex);
         const alloc = self.allocator();
         std.debug.assert(self.pending_sources.items.len == 0);
@@ -16229,6 +16358,22 @@ const PreparedDocumentSourceCache = struct {
         return false;
     }
 
+    fn waitForPreparationAssumeLocked(self: *@This(), owner: asset_producer_mod.InvocationContext) !void {
+        self.active_waiters += 1;
+        defer {
+            self.active_waiters -= 1;
+            if (self.shutting_down and self.active_waiters == 0) self.drained.broadcast(self.io);
+        }
+        if (owner.deadline_ns == null and owner.cancellation.ptr == null) {
+            self.drained.waitUncancelable(self.io, &self.mutex);
+            return;
+        }
+        // Wake immediately on completion. External cancellation tokens do
+        // not signal this condition, so sample them only on contended waits.
+        const remaining = if (owner.deadline_ns) |deadline| deadline -| platform_time.monotonicNs() else std.math.maxInt(u64);
+        try self.drained.waitTimeout(self.io, &self.mutex, .{ .duration = .{ .clock = .awake, .raw = .fromNanoseconds(@min(remaining, 10 * std.time.ns_per_ms)) } });
+    }
+
     fn fetch(
         self: *@This(),
         source_url: []const u8,
@@ -16236,8 +16381,13 @@ const PreparedDocumentSourceCache = struct {
         config: template_remote.RenderConfig,
     ) !FetchOutcome {
         const identity = sourceIdentity(source_url);
+        const owner: asset_producer_mod.InvocationContext = .{ .cancellation = config.cancellation orelse .none, .deadline_ns = config.deadline_ns };
+        self.mutex.lockUncancelable(self.io);
         while (true) {
-            self.mutex.lockUncancelable(self.io);
+            checkPreparedSourceOwner(owner) catch |err| {
+                self.mutex.unlock(self.io);
+                return err;
+            };
             if (self.shutting_down) {
                 self.mutex.unlock(self.io);
                 return error.PreparedDocumentCacheShuttingDown;
@@ -16255,8 +16405,10 @@ const PreparedDocumentSourceCache = struct {
                 return .{ .ok = lease };
             }
             if (self.sourcePendingAssumeLocked(identity, credential_name)) {
-                self.drained.waitUncancelable(self.io, &self.mutex);
-                self.mutex.unlock(self.io);
+                self.waitForPreparationAssumeLocked(owner) catch |err| {
+                    self.mutex.unlock(self.io);
+                    return err;
+                };
                 continue;
             }
             const owned_credential = if (credential_name) |value|
@@ -16466,12 +16618,17 @@ const PreparedDocumentSourceCache = struct {
         source: *const PreparedSourceLease,
         decode_limits: document_extraction_mod.PdfDecodeLimits,
         timeout_ms: u64,
+        owner: asset_producer_mod.InvocationContext,
     ) !PreparedPdfLease {
         if (source.cache != self or source.entry_ptr == null)
             return error.InvalidPreparedDocumentSourceLease;
         const entry = source.entry();
+        self.mutex.lockUncancelable(self.io);
         while (true) {
-            self.mutex.lockUncancelable(self.io);
+            checkPreparedSourceOwner(owner) catch |err| {
+                self.mutex.unlock(self.io);
+                return err;
+            };
             if (self.shutting_down) {
                 self.mutex.unlock(self.io);
                 return error.PreparedDocumentCacheShuttingDown;
@@ -16489,8 +16646,10 @@ const PreparedDocumentSourceCache = struct {
                 return lease;
             }
             if (self.pdfPendingAssumeLocked(entry, decode_limits)) {
-                self.drained.waitUncancelable(self.io, &self.mutex);
-                self.mutex.unlock(self.io);
+                self.waitForPreparationAssumeLocked(owner) catch |err| {
+                    self.mutex.unlock(self.io);
+                    return err;
+                };
                 continue;
             }
             self.pending_pdfs.append(@import("antfly_platform").allocator.concurrentFallback(), .{
@@ -16519,6 +16678,7 @@ const PreparedDocumentSourceCache = struct {
         };
         variant.* = .{ .entry = entry, .decode_limits = decode_limits };
         variant.deadline = document_extraction_mod.PdfRenderDeadline.init(timeout_ms);
+        variant.deadline.owner = .{ .context = &owner, .is_cancelled_fn = preparedSourceOwnerCanceled };
         const prepare_timer = pipeline_metrics.start(.pdf_prepare);
         defer prepare_timer.finish();
         const prepared = self.prepare_pdf_session_fn(
@@ -16529,6 +16689,9 @@ const PreparedDocumentSourceCache = struct {
         );
         if (prepared) |session| {
             variant.session = session;
+            // A retained parser must never refer to the preparing caller.
+            variant.session.?.setCancellationProbe(.{});
+            variant.deadline.owner = .{};
             self.mutex.lockUncancelable(self.io);
             if (self.shutting_down) {
                 variant.session.?.deinit();
@@ -16554,13 +16717,17 @@ const PreparedDocumentSourceCache = struct {
             };
             self.finishPendingPdfAssumeLocked(entry, decode_limits);
             self.mutex.unlock(self.io);
-            return lease;
+            var owned_lease = lease;
+            errdefer owned_lease.deinit();
+            try checkPreparedSourceOwner(owner);
+            return owned_lease;
         } else |err| {
             const classified = self.classifyPreparationError(variant.deadline.classifyError(err));
             alloc.destroy(variant);
             self.mutex.lockUncancelable(self.io);
             self.finishPendingPdfAssumeLocked(entry, decode_limits);
             self.mutex.unlock(self.io);
+            try checkPreparedSourceOwner(owner);
             return classified;
         }
     }
@@ -16696,6 +16863,21 @@ const PreparedDocumentSourceCache = struct {
         return digest;
     }
 };
+
+fn checkPreparedSourceOwner(owner: asset_producer_mod.InvocationContext) !void {
+    if (owner.deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.EnrichmentWaitTimeout;
+    owner.cancellation.check() catch |err| return if (isOperationCanceled(err)) error.EnrichmentWaitCanceled else err;
+}
+
+fn preparedSourceOwnerCanceled(ptr: ?*const anyopaque) bool {
+    const owner: *const asset_producer_mod.InvocationContext = @ptrCast(@alignCast(ptr orelse return true));
+    checkPreparedSourceOwner(owner.*) catch return true;
+    return false;
+}
+
+fn pdfPreparationOwner(runtime: *EnrichmentRuntime, cancellation: *const EnrichmentSourceCancellation) asset_producer_mod.InvocationContext {
+    return .{ .deadline_ns = runtime.active_provider_guard.nativeDeadlineNs(null), .cancellation = cancellation.token() };
+}
 
 fn sourceContentFingerprintFromDigest(digest: [std.crypto.hash.sha2.Sha256.digest_length]u8) [16]u8 {
     const content_hex = std.fmt.bytesToHex(digest, .lower);
@@ -16872,6 +17054,30 @@ test "prepared document source cache accounts retained bytes through eviction" {
     try std.testing.expectEqual(@as(usize, 0), cache.retainedSourceBytes());
 }
 
+test "prepared document cache detaches a timed-out waiter without canceling the flight" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const url = "https://example.test/pending.pdf";
+    var cache = PreparedDocumentSourceCache{ .backing_alloc = a, .budgeted = null, .io = std.testing.io };
+    defer cache.deinit();
+    const concurrent = platform.allocator.concurrentFallback();
+    try cache.pending_sources.append(concurrent, .{ .source_identity = PreparedDocumentSourceCache.sourceIdentity(url), .credential_name = null });
+    const outcome = cache.fetch(url, null, .{ .deadline_ns = platform_time.monotonicNs() + 20 * std.time.ns_per_ms });
+    try std.testing.expectEqual(@as(usize, 1), cache.pending_sources.items.len);
+    _ = cache.pending_sources.pop();
+    try std.testing.expectError(error.EnrichmentWaitTimeout, outcome);
+    var source = try cache.adoptOwned(url, null, .{ .content_type = try a.dupe(u8, "application/pdf"), .data = try a.dupe(u8, "%PDF-pending") });
+    defer source.deinit();
+    const limits = document_extraction_mod.PdfDecodeLimits{};
+    try cache.pending_pdfs.append(concurrent, .{ .entry = source.entry(), .decode_limits = limits });
+    const prepared = cache.preparePdf(&source, limits, 1_000, .{ .deadline_ns = platform_time.monotonicNs() + 20 * std.time.ns_per_ms });
+    try std.testing.expectEqual(@as(usize, 1), cache.pending_pdfs.items.len);
+    _ = cache.pending_pdfs.pop();
+    try std.testing.expectError(error.EnrichmentWaitTimeout, prepared);
+    try std.testing.expectEqual(@as(usize, 0), cache.active_waiters);
+    try std.testing.expectEqual(@as(usize, 0), cache.pdf_preparation_computations);
+}
+
 test "prepared document cache single-flights concurrent PDF variants and drains leases" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
@@ -16911,7 +17117,7 @@ test "prepared document cache single-flights concurrent PDF variants and drains 
             var prepared = self.cache.preparePdf(&source, .{
                 .max_decoded_stream_bytes = 1024,
                 .max_working_set_bytes = 2048,
-            }, 1_000) catch |err| {
+            }, 1_000, .{}) catch |err| {
                 self.errors[index] = err;
                 return;
             };
@@ -17009,7 +17215,7 @@ test "prepared document cache prepares unrelated PDF keys concurrently" {
             var prepared = self.cache.preparePdf(&source, .{
                 .max_decoded_stream_bytes = 1024,
                 .max_working_set_bytes = 2048,
-            }, 1_000) catch |err| {
+            }, 1_000, .{}) catch |err| {
                 self.err = err;
                 return;
             };
@@ -19630,7 +19836,7 @@ fn processVectorLabels(runtime: *EnrichmentRuntime, request: enrichment_types.Ge
     const generation = try captureDenseGeneration(runtime, provider, a, upstream.name, foreground);
     const pinned_provider = provider.withTextGeneration(generation);
     const provider_model = provider.recoveryIdentity(upstream.name).model;
-    const revision = try captureDenseCacheRevision(runtime, provider, a, upstream.name);
+    const revision = try captureDenseCacheRevision(runtime, provider, a, upstream.name, generation.revision, foreground);
     const source_request = mediaEmbeddingComputationRequest(runtime, .{ .kind = .dense_embedding, .index_name = upstream.name, .artifact_name = upstream.source_artifact_name, .embedding_name = upstream.name, .doc_key = request.doc_key, .source_field = upstream.source_field, .expected_dims = upstream.expected_dims, .producer_json = upstream.producer_json, .reprocess_generation = try embeddingReprocessGeneration(runtime, request.doc_key, upstream.name) });
     const manifest_key = try @import("../artifact_chunk_manifest.zig").keyAlloc(a, request.doc_key, upstream.source_artifact_name);
     defer a.free(manifest_key);
@@ -19766,7 +19972,7 @@ fn processVectorLabels(runtime: *EnrichmentRuntime, request: enrichment_types.Ge
         };
         try requireDenseGeneration(runtime, provider, a, upstream.name, generation, foreground);
         if (revision) |before| {
-            const after = (try captureDenseCacheRevision(runtime, provider, a, upstream.name)) orelse return error.EmbeddingIdentityMismatch;
+            const after = (try captureDenseCacheRevision(runtime, provider, a, upstream.name, generation.revision, foreground)) orelse return error.EmbeddingIdentityMismatch;
             if (!std.mem.eql(u8, &before, &after)) return error.EmbeddingIdentityMismatch;
             if (cacheable) scorer_cache.retain(entry);
         }
@@ -19786,7 +19992,7 @@ fn processVectorLabels(runtime: *EnrichmentRuntime, request: enrichment_types.Ge
     if (produced.len > 16 * 1024 * 1024) return error.ResourceLimitExceeded;
     try requireDenseGeneration(runtime, provider, a, upstream.name, generation, foreground);
     if (revision) |before| {
-        const after = (try captureDenseCacheRevision(runtime, provider, a, upstream.name)) orelse return error.EmbeddingIdentityMismatch;
+        const after = (try captureDenseCacheRevision(runtime, provider, a, upstream.name, generation.revision, foreground)) orelse return error.EmbeddingIdentityMismatch;
         if (!std.mem.eql(u8, &before, &after)) return error.EmbeddingIdentityMismatch;
     }
     if (token) |context| return enqueueAssetProducerOutput(runtime, request, context, output_key, produced, scope);
@@ -20388,11 +20594,13 @@ fn processDocumentExtractionAsset(
     // actual live bytes first. Task-local inspection is then allocator charged
     // at its live size, while each render/provider window owns a short-lived
     // atomic lease below.
+    const preparation_cancellation = enrichmentSourceCancellation(runtime);
     var prepared_pdf_source_lease: ?PreparedDocumentSourceCache.PreparedPdfLease = if (source_is_pdf)
         prepared_sources.preparePdf(
             &prepared_source_lease,
             configured_pdf_decode_limits,
             runtime.syncWaitTimeoutMs(),
+            pdfPreparationOwner(runtime, &preparation_cancellation),
         ) catch |raw_err| {
             const err = providerInvocationFailure(runtime, raw_err);
             if (try scope.shouldYield(runtime, err)) return err;
@@ -30869,8 +31077,13 @@ fn replayModelChunkVector(runtime: *EnrichmentRuntime, a: Allocator, request: en
     config.replay.?.source_version = try a.dupe(u8, metadata.source_version);
     config.replay.?.source_fingerprint = try a.dupe(u8, metadata.source_fingerprint);
     config.replay.?.plan_id = try a.dupe(u8, metadata.plan_id);
-    const chunks = try @import("../../../chunking/inference.zig").chunkInputWithProvider(a, config, input, runtime.config.chunk_provider);
+    var cancellation: AssetInvocationCancellation = undefined;
+    const scoped = scopedChunkProvider(runtime, runtime.config.chunk_provider, &cancellation);
+    try checkChunkOwner(runtime, scoped);
+    const chunks = model_chunk_client.chunkInputWithProvider(a, config, input, scoped) catch |err|
+        return chunkProviderFailure(runtime, scoped, err);
     defer @import("inference_chunker").types.freeChunks(a, chunks);
+    try checkChunkOwner(runtime, scoped);
     if (chunks.len != 1) return error.InvalidChunkReplay;
     const reproduced = chunks[0].metadata orelse return error.InvalidChunkReplay;
     if (!std.mem.eql(u8, reproduced.model_revision, metadata.model_revision) or !std.mem.eql(u8, reproduced.model_identity, metadata.model_identity) or !std.mem.eql(u8, reproduced.inference_id, metadata.inference_id)) return error.EnrichmentSourceChanged;
@@ -34917,7 +35130,7 @@ fn processPdfPageImageEmbeddingWithAllocator(
     runtime: *EnrichmentRuntime,
     metadata_alloc: Allocator,
     request: enrichment_types.GeneratedEnrichmentRequest,
-    dense_embedder: embedder_mod.DenseEmbedder,
+    provider: embedder_mod.DenseEmbedder,
     consumer_indexes: []const []const u8,
     prepared_sources: *PreparedDocumentSourceCache,
     window: *GeneratedReplayWindow,
@@ -34952,9 +35165,11 @@ fn processPdfPageImageEmbeddingWithAllocator(
     defer metadata_alloc.free(source_url);
 
     if (!document_extraction_mod.pdf_runtime_available) return error.PdfRuntimeUnavailable;
-    if (!dense_embedder.supportsPartItems() and !dense_embedder.supportsRasterItems())
+    if (!provider.supportsPartItems() and !provider.supportsRasterItems())
         return error.UnsupportedEmbeddingProvider;
     const embedding_name = requestEmbeddingName(request);
+    var cancellation: AssetInvocationCancellation = undefined;
+    const dense_embedder = provider.withRequestContext(scopedEmbeddingRequestContext(runtime, foregroundProviderRequestContext(runtime), provider.part_request_context, &cancellation));
     const policy = try enrichment_types.parseExecutionPolicyJson(metadata_alloc, request.execution_json);
     const execution_lease = dense_embedder.resolveMediaPartLease(metadata_alloc, embedding_name, @min(policy.batch_items orelse generated_ocr_default_batch_max_items, generated_ocr_absolute_batch_max_items)) catch |err|
         return embeddingInvocationFailure(runtime, runtime.active_provider_guard, dense_embedder.part_request_context, err);
@@ -35003,10 +35218,12 @@ fn processPdfPageImageEmbeddingWithAllocator(
     // The cached parser is a retained owner, not render scratch. Admit it
     // first so the following operation reservation sees the true remaining
     // process budget instead of starving preparation behind its own peak.
+    const preparation_cancellation = enrichmentSourceCancellation(runtime);
     var prepared_pdf_source_lease = prepared_sources.preparePdf(
         &prepared_source_lease,
         render_config.pdf_decode_limits,
         runtime.config.sync_wait_timeout_ms,
+        pdfPreparationOwner(runtime, &preparation_cancellation),
     ) catch |err| return providerInvocationFailure(runtime, err);
     defer prepared_pdf_source_lease.deinit();
     const prepared_pdf_source = prepared_pdf_source_lease.session();

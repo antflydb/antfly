@@ -297,6 +297,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "prepared document source cache isolates credentials and reuses bytes",
         "prepared document source cache accounts retained bytes through eviction",
         "prepared document cache single-flights concurrent PDF variants and drains leases",
+        "prepared document cache detaches a timed-out waiter without canceling the flight",
         "document unit spool admits replay memory before opening a read transaction",
         "document publication spool reads ordered segments with one transaction",
         "document publication spool admits replay memory before opening a read transaction",

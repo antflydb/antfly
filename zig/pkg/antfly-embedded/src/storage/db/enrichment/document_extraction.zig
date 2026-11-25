@@ -660,6 +660,7 @@ pub const PdfDecodeLimits = pdf.reader.DecodeLimits;
 /// a reader holds the returned probe.
 pub const PdfRenderDeadline = struct {
     deadline_ns: u64,
+    owner: PdfCancellationProbe = .{},
 
     pub fn init(timeout_ms: u64) @This() {
         const timeout_ns = std.math.mul(u64, @max(timeout_ms, 1), std.time.ns_per_ms) catch std.math.maxInt(u64);
@@ -668,11 +669,12 @@ pub const PdfRenderDeadline = struct {
 
     fn isCancelled(context: ?*const anyopaque) bool {
         const self: *const @This() = @ptrCast(@alignCast(context orelse return true));
+        self.owner.check() catch return true;
         return platform_time.monotonicNs() >= self.deadline_ns;
     }
 
     pub fn classifyError(self: *const @This(), err: anyerror) anyerror {
-        if ((err == error.Canceled or err == error.Cancelled) and isCancelled(self))
+        if ((err == error.Canceled or err == error.Cancelled) and platform_time.monotonicNs() >= self.deadline_ns)
             return error.PdfRenderTimeout;
         return err;
     }
