@@ -8373,7 +8373,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     /// Request aliases keep no payload ownership. The provider's model cache
     /// owns the charge and declaration until eviction or close.
-    fn ensureModelDenseLinearSlot(self: *MetalCompute, weight: CT, bias: CT, in_dim: usize, out_dim: usize) !?usize {
+    fn ensureModelDenseLinearSlot(self: *MetalCompute, weight: CT, bias: CT, in_dim: usize, out_dim: usize, publish: bool) !?usize {
         const weight_buf = toBuf(weight);
         const bias_buf = toBuf(bias);
         if (!isBorrowedImmutableF32(weight_buf) or
@@ -8401,7 +8401,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
             // Borrowed receivers may reuse a publication, while the cold
             // model owner alone can reserve and install new persistent slots.
-            if (self.shared_provider_lease_io == null) return null;
+            if (!publish or self.shared_provider_lease_io == null) return null;
             const next = self.nextFreeDynamicLinearSlot() orelse return null;
             const elements = try std.math.add(usize, try std.math.mul(usize, in_dim, out_dim), out_dim);
             const bytes = try std.math.mul(usize, elements, @sizeOf(f32));
@@ -41059,8 +41059,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var zero_bias_view: Buf = undefined;
         var zero_bias_shape: [1]i64 = undefined;
         const bias = request.bias orelse try self.borrowedZeroBiasBuf(&zero_bias_view, &zero_bias_shape, request.out_dim);
-        if (request.retain_model_slot) {
-            if (try self.ensureModelDenseLinearSlot(request.weight, bias, request.in_dim, request.out_dim)) |slot| return slot;
+        if (request.model_slot != .request) {
+            if (try self.ensureModelDenseLinearSlot(request.weight, bias, request.in_dim, request.out_dim, request.model_slot == .publish)) |slot| return slot;
+            if (request.model_slot == .publish) return null;
         }
         return self.ensureDynamicLinearSlotForPreparation(request.weight, bias, request.in_dim, request.out_dim, request.preparation_scope);
     }

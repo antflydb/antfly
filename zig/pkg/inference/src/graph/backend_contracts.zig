@@ -754,11 +754,13 @@ pub const DecoderRuntimePrepareLinearRequest = struct {
 };
 
 pub const DecoderRuntimeEnsureLinearSlotRequest = struct {
+    pub const ModelSlot = enum { request, reuse, publish };
+
     /// Explicit invocation scope. Zero never authorizes reuse of an unknown
     /// source across independent calls. No ambient/TLS preparation state.
     preparation_scope: u64 = 0,
-    /// Only immutable model-owned F32 projections may outlive this receiver.
-    retain_model_slot: bool = false,
+    /// Only cold model preparation can publish an immutable F32 slot.
+    model_slot: ModelSlot = .request,
     weight: CT,
     bias: ?CT,
     in_dim: usize,

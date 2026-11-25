@@ -1021,6 +1021,33 @@ pub const PreparedDecoderWeights = struct {
         }
     };
 
+    fn ensureQkvSlots(cb: *const ComputeBackend, projections: [3]Linear, width: usize, model_slot: ops.DecoderRuntimeEnsureLinearSlotRequest.ModelSlot) !?[3]usize {
+        var slots: [3]usize = undefined;
+        for (projections, 0..) |projection, index| {
+            const slot = (try cb.decoderRuntimeEnsureLinearSlot(&.{ .weight = projection.w, .bias = projection.b, .in_dim = width, .out_dim = width, .model_slot = model_slot })) orelse return null;
+            if (std.mem.indexOfScalar(usize, slots[0..index], slot) != null) return null;
+            slots[index] = slot;
+        }
+        return slots;
+    }
+
+    pub fn prepareModelQkvSlots(cb: *const ComputeBackend, allocator: std.mem.Allocator, width: usize, groups: [][3]usize) !usize {
+        var fetcher = WeightFetcher{ .cb = cb, .allocator = allocator };
+        defer fetcher.release(cb);
+        var name: [256]u8 = undefined;
+        var count: usize = 0;
+        for (0..groups.len) |layer| {
+            const projections = [3]Linear{
+                try fetcher.linear(layer, "self_attn.q_proj", &name),
+                try fetcher.linear(layer, "self_attn.k_proj", &name),
+                try fetcher.linear(layer, "self_attn.v_proj", &name),
+            };
+            groups[count] = (try ensureQkvSlots(cb, projections, width, .publish)) orelse break;
+            count += 1;
+        }
+        return count;
+    }
+
     pub fn init(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: Config, resolve_cross: bool) !PreparedDecoderWeights {
         return initWithSource(cb, allocator, config, resolve_cross, null);
     }
@@ -1050,13 +1077,9 @@ pub const PreparedDecoderWeights = struct {
         // Fused Q/K/V projection: one dispatch per layer instead of three.
         // Slots live in the backend runtime; a backend without them (or one
         // that ran out of slots) leaves the separate projections in place.
-        const retain_model_slots = cb.kind() == .metal and metalPackedPrefillEnabled();
+        const model_slot: ops.DecoderRuntimeEnsureLinearSlotRequest.ModelSlot = if (cb.kind() == .metal and metalPackedPrefillEnabled()) .reuse else .request;
         for (layer_weights) |*lw| {
-            const q_slot = (try cb.decoderRuntimeEnsureLinearSlot(&.{ .weight = lw.q.w, .bias = lw.q.b, .in_dim = d_model, .out_dim = d_model, .retain_model_slot = retain_model_slots })) orelse break;
-            const k_slot = (try cb.decoderRuntimeEnsureLinearSlot(&.{ .weight = lw.k.w, .bias = lw.k.b, .in_dim = d_model, .out_dim = d_model, .retain_model_slot = retain_model_slots })) orelse break;
-            const v_slot = (try cb.decoderRuntimeEnsureLinearSlot(&.{ .weight = lw.v.w, .bias = lw.v.b, .in_dim = d_model, .out_dim = d_model, .retain_model_slot = retain_model_slots })) orelse break;
-            if (q_slot == k_slot or q_slot == v_slot or k_slot == v_slot) break;
-            lw.qkv_slots = .{ q_slot, k_slot, v_slot };
+            lw.qkv_slots = (try ensureQkvSlots(cb, .{ lw.q, lw.k, lw.v }, d_model, model_slot)) orelse break;
         }
         const embed = try fetcher.fetch("model.decoder.embed_tokens.weight");
         var lm_head_source: @FieldType(PreparedDecoderWeights, "lm_head_source") = .projection;
