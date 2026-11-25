@@ -31,15 +31,7 @@ const head_dim = 128;
 const partial_width = head_dim + 2;
 const keys_per_split = 128;
 
-pub const Query = struct {
-    rows: u32,
-    start: u32,
-    q_heads: u32,
-    kv_heads: u32,
-    window: u32 = 0,
-    relative_extent: u32,
-    score_scale: f32,
-};
+pub const Query = @import("../paged_relative_attention.zig").Query;
 
 pub const Request = struct {
     geometry: Query,
@@ -62,15 +54,9 @@ const Plan = struct {
 };
 
 fn plan(query: Query, visible_start: usize, visible_end: usize) !Plan {
-    if (query.rows == 0 or query.q_heads == 0 or query.q_heads > 64 or query.kv_heads == 0 or
-        query.q_heads % query.kv_heads != 0 or !std.math.isFinite(query.score_scale) or query.score_scale <= 0)
-        return error.InvalidAttentionGeometry;
-    const end = try std.math.add(u32, query.start, query.rows);
-    const row_heads = try std.math.mul(u32, query.rows, query.q_heads);
-    if (visible_start > query.start or end > visible_end or visible_end > (1 << 24) or row_heads > 65535)
-        return error.InvalidAttentionGeometry;
-    const keys: u32 = end - @as(u32, @intCast(visible_start));
-    const live = if (query.window == 0) keys else @min(keys, query.window);
+    const coverage = try query.coverage(visible_start, visible_end);
+    const row_heads = coverage.row_heads;
+    const live = coverage.live_keys;
     const splits = @min(if (query.rows >= 8) @as(u32, 16) else 64, (live - 1) / keys_per_split + 1);
     const records = try std.math.mul(usize, row_heads, splits);
     return .{

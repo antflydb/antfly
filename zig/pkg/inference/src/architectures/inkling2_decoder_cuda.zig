@@ -978,16 +978,18 @@ pub const Request = struct {
     fn advanceVisit(self: *Request, visit: checkpoint.Visit, ordinal: usize, cursor: *VisitCursor) !void {
         const m = self.model;
         const hidden = self.blockBytes();
-        if (visit.weight_layer == m.text.loop_config.core_start) {
-            if (visit.pass == 0) {
+        switch (visit.preludeAction(m.text.loop_config.core_start)) {
+            .none => {},
+            .save => {
                 cursor.prelude_depth = cursor.depth;
                 try self.get(.prelude).copyFromDevice(m.ctx, self.block(cursor.depth), hidden);
-            } else {
+            },
+            .restore => {
                 std.debug.assert(cursor.depth == cursor.prelude_depth + 2);
                 try self.get(.bank).copyFromDevice(m.ctx, sub(self.get(.stack), (cursor.prelude_depth + 1) * hidden, 2 * hidden), 2 * hidden);
                 cursor.depth = cursor.prelude_depth;
                 try self.block(cursor.depth).copyFromDevice(m.ctx, self.get(.prelude), hidden);
-            }
+            },
         }
         if (self.draft) |draft| {
             if (cursor.tap < draft.taps.len and ordinal == draft.taps[cursor.tap]) {

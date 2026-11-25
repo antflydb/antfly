@@ -103,6 +103,13 @@ pub const Visit = struct {
     pass: u8,
     group: Group,
     slot: u16,
+
+    pub const PreludeAction = enum { none, save, restore };
+
+    pub fn preludeAction(self: Visit, core_start: usize) PreludeAction {
+        if (self.weight_layer != core_start) return .none;
+        return if (self.pass == 0) .save else .restore;
+    }
 };
 
 pub const DraftConfig = struct {

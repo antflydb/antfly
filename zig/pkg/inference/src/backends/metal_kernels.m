@@ -1776,6 +1776,7 @@ typedef struct antfly_metal_workspace_allocation_service {
 typedef struct termite_metal_decode_runtime {
     uint16_t pipeline_quant_formats;
     bool prefer_dense_mps_linear;
+    id<MTLComputePipelineState> routed_block_scaled_pipelines[4];
     TermiteMetalMtpHeadWorkspace *mtp_head_workspace;
     id<MTLDevice> device;
     // Opt-in dense embedding workspace guard. Counts fresh allocations until
@@ -12916,6 +12917,188 @@ static NSString *termite_metal_shader_source(void) {
            "    uint total = p.rows * p.dim; if (gid >= total) return; uint row = gid / p.dim; uint col = gid % p.dim; float value = 0.0f; uint route_base = row * p.top_k; for (uint k = 0u; k < p.top_k; ++k) { uint route = route_base + k; float scale = p.has_expert_scale != 0u ? expert_scale[expert_ids[route]] : 1.0f; value += (route_output[route * p.dim + col] * scale) * route_weights[route]; } output[gid] = value;\n"
            "}\n"
            // tile-codegen:end expert.projection.direct.7 family
+           // tile-codegen:begin expert.projection.block_scaled.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           "struct RoutedBlockScaledParams {\n"
+           "    uint rows;\n"
+           "    uint input_width;\n"
+           "    uint output_width;\n"
+           "    uint expert_count;\n"
+           "    uint input_repeat;\n"
+           "    uint format;\n"
+           "};\n"
+           "\n"
+           "inline float antfly_routed_decode_e2m1(uint nibble) {\n"
+           "    constexpr float magnitude[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};\n"
+           "    const float value = magnitude[nibble & 7u];\n"
+           "    return (nibble & 8u) == 0 ? value : -value;\n"
+           "}\n"
+           "\n"
+           "inline float antfly_routed_decode_e4m3(uint bits) {\n"
+           "    const uint exponent = (bits >> 3u) & 15u;\n"
+           "    const uint mantissa = bits & 7u;\n"
+           "    if (exponent == 15u && mantissa == 7u) return as_type<float>(0x7fc00000u);\n"
+           "    const float magnitude = exponent == 0u\n"
+           "        ? ldexp(float(mantissa), -9)\n"
+           "        : ldexp(1.0f + float(mantissa) * 0.125f, int(exponent) - 7);\n"
+           "    return (bits & 128u) == 0 ? magnitude : -magnitude;\n"
+           "}\n"
+           "\n"
+           "inline float antfly_routed_decode_e8m0(uint bits) {\n"
+           "    if (bits == 255u) return as_type<float>(0x7fc00000u);\n"
+           "    return as_type<float>(bits == 0u ? 0x00400000u : bits << 23u);\n"
+           "}\n"
+           "\n"
+           "kernel void antfly_routed_block_scaled_bf16(\n"
+           "    device const bfloat *input [[buffer(0)]],\n"
+           "    device const uchar *values [[buffer(1)]],\n"
+           "    device const uchar *scales [[buffer(2)]],\n"
+           "    device const uint *expert_ids [[buffer(3)]],\n"
+           "    device const float *outer_amax [[buffer(4)]],\n"
+           "    device const float *outer_denominator [[buffer(5)]],\n"
+           "    device bfloat *output [[buffer(6)]],\n"
+           "    constant RoutedBlockScaledParams &p [[buffer(7)]],\n"
+           "    uint2 group [[threadgroup_position_in_grid]],\n"
+           "    uint simd_group [[simdgroup_index_in_threadgroup]],\n"
+           "    uint lane [[thread_index_in_simdgroup]],\n"
+           "    uint simd_width [[threads_per_simdgroup]]\n"
+           ") {\n"
+           "    const uint column = group.x * 4u + simd_group;\n"
+           "    const uint row = group.y;\n"
+           "    if (column >= p.output_width || row >= p.rows) return;\n"
+           "    const ulong output_index = ulong(row) * p.output_width + column;\n"
+           "    const uint expert = expert_ids[row];\n"
+           "    if (expert >= p.expert_count) {\n"
+           "        if (lane == 0) output[output_index] = bfloat(0.0f);\n"
+           "        return;\n"
+           "    }\n"
+           "    const bool fp4 = p.format == 0;\n"
+           "    const uint block = fp4 ? 16u : 32u;\n"
+           "    const uint blocks = p.input_width / block;\n"
+           "    const uint packed_width = fp4 ? p.input_width / 2u : p.input_width;\n"
+           "    const ulong weight_row = ulong(expert) * p.output_width + column;\n"
+           "    const device uchar *weight = values + weight_row * packed_width;\n"
+           "    const device uchar *weight_scales = scales + weight_row * blocks;\n"
+           "    const device bfloat *activation = input + ulong(row / p.input_repeat) * p.input_width;\n"
+           "    const float outer = fp4 ? outer_amax[expert] / outer_denominator[0] : 1.0f;\n"
+           "    float accumulator = 0.0f;\n"
+           "    for (uint index = lane; index < p.input_width; index += simd_width) {\n"
+           "        const uint packet = weight[fp4 ? index / 2u : index];\n"
+           "        const uint scale = weight_scales[index / block];\n"
+           "        const float dequantized = fp4\n"
+           "            ? (antfly_routed_decode_e2m1(packet >> (4u * (index & 1u))) * antfly_routed_decode_e4m3(scale)) * outer\n"
+           "            : antfly_routed_decode_e4m3(packet) * antfly_routed_decode_e8m0(scale);\n"
+           "        accumulator = fma(float(activation[index]), float(bfloat(dequantized)), accumulator);\n"
+           "    }\n"
+           "    const float total = simd_sum(accumulator);\n"
+           "    if (lane == 0) output[output_index] = bfloat(total);\n"
+           "}\n"
+           "\n"
+           // tile-codegen:end expert.projection.block_scaled.0 family
+           // tile-codegen:begin expert.projection.block_scaled.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           "struct RoutedExpertSelectionParams {\n"
+           "    uint experts;\n"
+           "    uint count;\n"
+           "    float scale;\n"
+           "};\n"
+           "\n"
+           "inline float antfly_routed_log_sigmoid(float value) {\n"
+           "    return min(value, 0.0f) - log(1.0f + exp(-abs(value)));\n"
+           "}\n"
+           "\n"
+           "kernel void antfly_routed_biased_sigmoid_topk(\n"
+           "    device const float *logits [[buffer(0)]],\n"
+           "    device const float *bias [[buffer(1)]],\n"
+           "    device uint *indices [[buffer(2)]],\n"
+           "    device float *weights [[buffer(3)]],\n"
+           "    constant RoutedExpertSelectionParams &p [[buffer(4)]],\n"
+           "    uint row [[threadgroup_position_in_grid]],\n"
+           "    uint lane [[thread_index_in_simdgroup]]\n"
+           ") {\n"
+           "    float selected[8];\n"
+           "    const ulong start = ulong(row) * p.experts;\n"
+           "    uint local_indices[8];\n"
+           "    float scores[8];\n"
+           "    for (uint tile = 0; tile < 8; ++tile) {\n"
+           "        const uint index = tile * 32u + lane;\n"
+           "        local_indices[tile] = index < p.experts ? index : 0xffffffffu;\n"
+           "        const float value = index < p.experts ? logits[start + index] : -INFINITY;\n"
+           "        const float score = index < p.experts ? 1.0f / (1.0f + exp(-value)) + bias[index] : -INFINITY;\n"
+           "        scores[tile] = isnan(score) ? -INFINITY : score;\n"
+           "    }\n"
+           "    for (uint rank = 0; rank < p.count; ++rank) {\n"
+           "        float best = -INFINITY;\n"
+           "        uint best_index = 0xffffffffu;\n"
+           "        for (uint tile = 0; tile < 8; ++tile) {\n"
+           "            const float score = scores[tile];\n"
+           "            if (score > best || (score == best && score > -INFINITY && local_indices[tile] < best_index)) {\n"
+           "                best = score;\n"
+           "                best_index = local_indices[tile];\n"
+           "            }\n"
+           "        }\n"
+           "        const float row_best = simd_max(best);\n"
+           "        const uint picked = simd_min(best == row_best ? best_index : 0xffffffffu);\n"
+           "        const uint selected_index = picked < p.experts ? picked : 0u;\n"
+           "        selected[rank] = antfly_routed_log_sigmoid(logits[start + selected_index]);\n"
+           "        if (lane == 0) indices[ulong(row) * p.count + rank] = selected_index;\n"
+           "        for (uint tile = 0; tile < 8; ++tile) {\n"
+           "            if (local_indices[tile] == picked) scores[tile] = -INFINITY;\n"
+           "        }\n"
+           "    }\n"
+           "    const float value = lane < p.count ? selected[lane] : -INFINITY;\n"
+           "    const float maximum = simd_max(value);\n"
+           "    const float probability = (lane < p.count && maximum > -INFINITY) ? exp(value - maximum) : 0.0f;\n"
+           "    const float sum = simd_sum(probability);\n"
+           "    if (lane < p.count) weights[ulong(row) * p.count + lane] = sum > 0.0f\n"
+           "        ? probability * (p.scale / sum)\n"
+           "        : p.scale / float(p.count);\n"
+           "}\n"
+           "\n"
+           // tile-codegen:end expert.projection.block_scaled.1 family
+           // tile-codegen:begin expert.projection.block_scaled.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           "struct RoutedGateParams {\n"
+           "    uint width;\n"
+           "    uint rows;\n"
+           "    float gate_cap;\n"
+           "    float up_cap;\n"
+           "};\n"
+           "\n"
+           "kernel void antfly_routed_capped_gate_bf16(\n"
+           "    device const bfloat *pairs [[buffer(0)]],\n"
+           "    device const float *route_weights [[buffer(1)]],\n"
+           "    device bfloat *output [[buffer(2)]],\n"
+           "    constant RoutedGateParams &p [[buffer(3)]],\n"
+           "    uint2 index [[thread_position_in_grid]]\n"
+           ") {\n"
+           "    if (index.x >= p.width || index.y >= p.rows) return;\n"
+           "    const ulong offset = ulong(index.y) * p.width + index.x;\n"
+           "    const float gate = float(pairs[offset * 2]);\n"
+           "    const float up = float(pairs[offset * 2 + 1]);\n"
+           "    const float capped_gate = p.gate_cap * tanh(gate / p.gate_cap);\n"
+           "    const float capped_up = p.up_cap * tanh(up / p.up_cap);\n"
+           "    output[offset] = bfloat((capped_gate / (1.0f + exp(-gate))) * capped_up * route_weights[index.y]);\n"
+           "}\n"
+           "\n"
+           // tile-codegen:end expert.projection.block_scaled.2 family
+           // tile-codegen:begin expert.projection.block_scaled.3 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           "struct RoutedReduceParams {\n"
+           "    uint width;\n"
+           "    uint rows;\n"
+           "    uint count;\n"
+           "};\n"
+           "\n"
+           "kernel void antfly_routed_reduce_bf16(\n"
+           "    device const bfloat *input [[buffer(0)]],\n"
+           "    device bfloat *output [[buffer(1)]],\n"
+           "    constant RoutedReduceParams &p [[buffer(2)]],\n"
+           "    uint2 index [[thread_position_in_grid]]\n"
+           ") {\n"
+           "    if (index.x >= p.width || index.y >= p.rows) return;\n"
+           "    const ulong offset = ulong(index.y) * p.count * p.width + index.x;\n"
+           "    float sum = 0.0f;\n"
+           "    for (uint route = 0; route < p.count; ++route) sum += float(input[offset + ulong(route) * p.width]);\n"
+           "    output[ulong(index.y) * p.width + index.x] = bfloat(sum);\n"
+           "}\n"
+           // tile-codegen:end expert.projection.block_scaled.3 family
            // Read one byte from every VM page in a projection-sized no-copy
            // view. The private output is intentionally materialized so the
            // compiler cannot discard the reads as dead work.
@@ -33333,6 +33516,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->attention_span_v_row_stride = 0;
     runtime->attention_span_position_offset = 0;
     runtime->mtp_head_workspace = nil;
+    for (size_t index = 0; index < 4; ++index) runtime->routed_block_scaled_pipelines[index] = nil;
     free(runtime);
     }
 }
@@ -36327,6 +36511,162 @@ int termite_metal_decode_runtime_embedding_head_prepare(termite_metal_decode_run
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(cb, owned, -7);
     }
+}
+
+typedef struct { void *handle; size_t offset, bytes; } antfly_metal_routed_buffer;
+typedef struct {
+    uint32_t rows, input_width, output_width, expert_count, input_repeat, format;
+} antfly_metal_routed_block_scaled_params;
+
+static int antfly_metal_encode_routed_stage(
+    termite_metal_decode_runtime *runtime,
+    size_t stage,
+    const antfly_metal_routed_buffer *views,
+    const size_t *required,
+    const size_t *alignments,
+    size_t view_count,
+    unsigned write_mask,
+    const void *parameters,
+    size_t parameter_size,
+    MTLSize grid,
+    MTLSize threads
+) {
+    static NSString *const names[4] = {
+        @"antfly_routed_block_scaled_bf16",
+        @"antfly_routed_biased_sigmoid_topk",
+        @"antfly_routed_capped_gate_bf16",
+        @"antfly_routed_reduce_bf16",
+    };
+    @autoreleasepool {
+        id<MTLBuffer> buffers[7] = { nil };
+        termite_metal_planned_encoder_range accesses[7];
+        size_t count = 0;
+        for (size_t index = 0; index < view_count; ++index) {
+            if (required[index] == 0) continue;
+            buffers[index] = (__bridge id<MTLBuffer>)views[index].handle;
+            const size_t offset = views[index].offset;
+            const bool write = (write_mask & (1u << index)) != 0;
+            if (!buffers[index] || buffers[index].device != runtime->device ||
+                offset % alignments[index] || views[index].bytes < required[index] ||
+                !termite_metal_buffer_range_valid(buffers[index], offset, required[index]) ||
+                termite_metal_planned_range_make(buffers[index], offset, required[index],
+                    write ? TERMITE_METAL_PLANNED_RANGE_WRITE : TERMITE_METAL_PLANNED_RANGE_READ,
+                    &accesses[count], -2)) return -2;
+            for (size_t prior = 0; prior < count; ++prior)
+                if ((write || accesses[prior].type == TERMITE_METAL_PLANNED_RANGE_WRITE) &&
+                    termite_metal_planned_ranges_overlap(&accesses[prior], &accesses[count])) return -2;
+            ++count;
+        }
+        if (!runtime->routed_block_scaled_pipelines[stage]) {
+            runtime->routed_block_scaled_pipelines[stage] = termite_metal_make_pipeline(
+                runtime->device, runtime->library, names[stage]);
+        }
+        id<MTLComputePipelineState> pipeline = runtime->routed_block_scaled_pipelines[stage];
+        if (!pipeline || pipeline.threadExecutionWidth != 32 ||
+            pipeline.maxTotalThreadsPerThreadgroup < threads.width * threads.height) return -3;
+        bool owned = false;
+        id<MTLCommandBuffer> command = termite_metal_decode_runtime_command_buffer(runtime, __func__, &owned);
+        if (!command || termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, count, -4)) return -4;
+        if (!owned) for (size_t index = 0; index < view_count; ++index) {
+            if (buffers[index] && termite_metal_decode_runtime_retain_frame_resource(runtime, buffers[index]) != 0) return -4;
+        }
+        BOOL encoder_owned = YES;
+        id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(
+            runtime, command, TERMITE_METAL_COMPUTE_SOURCE_OTHER, &encoder_owned);
+        if (!encoder) return -5;
+        antfly_metal_set_compute_pipeline(encoder, pipeline);
+        for (size_t index = 0; index < view_count; ++index) {
+            const size_t source = buffers[index] ? index : 0;
+            [encoder setBuffer:buffers[source] offset:views[source].offset atIndex:index];
+        }
+        [encoder setBytes:parameters length:parameter_size atIndex:view_count];
+        antfly_metal_dispatch_threadgroups(encoder, grid, threads);
+        termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
+        return termite_metal_decode_runtime_finish_command_buffer(command, owned, -6);
+    }
+}
+
+int antfly_metal_dispatch_routed_block_scaled_bf16(
+    termite_metal_decode_runtime *runtime,
+    const antfly_metal_routed_buffer views[7],
+    const antfly_metal_routed_block_scaled_params *p
+) {
+    if (!runtime || !views || !p || !p->rows || !p->input_width || !p->output_width ||
+        !p->expert_count || !p->input_repeat || p->rows % p->input_repeat || p->format > 1) return -1;
+    const bool fp4 = p->format == 0;
+    const size_t block = fp4 ? 16 : 32;
+    if (p->input_width % block != 0) return -1;
+    size_t input_values, weight_rows, output_values, required[7];
+    if (!termite_metal_size_mul(p->rows / p->input_repeat, p->input_width, &input_values) ||
+        !termite_metal_size_mul(input_values, sizeof(uint16_t), &required[0]) ||
+        !termite_metal_size_mul(p->expert_count, p->output_width, &weight_rows) ||
+        !termite_metal_size_mul(weight_rows, fp4 ? p->input_width / 2 : p->input_width, &required[1]) ||
+        !termite_metal_size_mul(weight_rows, p->input_width / block, &required[2]) ||
+        !termite_metal_size_mul(p->rows, sizeof(uint32_t), &required[3]) ||
+        !termite_metal_size_mul(p->expert_count, sizeof(float), &required[4]) ||
+        !termite_metal_size_mul(p->rows, p->output_width, &output_values) ||
+        !termite_metal_size_mul(output_values, sizeof(uint16_t), &required[6])) return -1;
+    required[5] = sizeof(float);
+    if (!fp4) required[4] = required[5] = 0;
+    const size_t alignments[7] = {2, 1, 1, 4, 4, 4, 2};
+    return antfly_metal_encode_routed_stage(runtime, 0, views, required, alignments,
+        7, 1u << 6, p, sizeof(*p),
+        MTLSizeMake(((size_t)p->output_width + 3u) / 4u, p->rows, 1), MTLSizeMake(128, 1, 1));
+}
+
+typedef struct {
+    uint32_t rows, width, expert_count, top_k;
+    float route_scale, gate_cap, up_cap;
+} antfly_metal_routed_epilogue_params;
+
+int antfly_metal_dispatch_routed_epilogue(
+    termite_metal_decode_runtime *runtime,
+    unsigned stage,
+    const antfly_metal_routed_buffer views[4],
+    const antfly_metal_routed_epilogue_params *p
+) {
+    if (!runtime || !p || !views || !p->rows || !p->top_k || p->top_k > 8) return -1;
+    if (stage == 1) {
+        if (!p->expert_count || p->expert_count > 256 || p->top_k > p->expert_count ||
+            !isfinite(p->route_scale) || p->route_scale <= 0.0f) return -1;
+        size_t logits, routes, required[4];
+        if (!termite_metal_size_mul(p->rows, p->expert_count, &logits) ||
+            !termite_metal_size_mul(logits, sizeof(float), &required[0]) ||
+            !termite_metal_size_mul(p->expert_count, sizeof(float), &required[1]) ||
+            !termite_metal_size_mul(p->rows, p->top_k, &routes) ||
+            !termite_metal_size_mul(routes, sizeof(uint32_t), &required[2]) ||
+            !termite_metal_size_mul(routes, sizeof(float), &required[3])) return -1;
+        const size_t alignments[4] = {4, 4, 4, 4};
+        const struct { uint32_t experts, count; float scale; } shader = {p->expert_count, p->top_k, p->route_scale};
+        return antfly_metal_encode_routed_stage(runtime, stage, views, required, alignments, 4, 12,
+            &shader, sizeof(shader), MTLSizeMake(p->rows, 1, 1), MTLSizeMake(32, 1, 1));
+    }
+    size_t values, base_bytes;
+    if (!p->width || !termite_metal_size_mul(p->rows, p->width, &values) ||
+        !termite_metal_size_mul(values, sizeof(uint16_t), &base_bytes)) return -1;
+    const MTLSize grid = MTLSizeMake(((size_t)p->width + 31u) / 32u, ((size_t)p->rows + 3u) / 4u, 1);
+    const MTLSize threads = MTLSizeMake(32, 4, 1);
+    if (stage == 2) {
+        if (!isfinite(p->gate_cap) || p->gate_cap <= 0.0f || !isfinite(p->up_cap) || p->up_cap <= 0.0f) return -1;
+        size_t pairs_bytes, weight_bytes;
+        if (!termite_metal_size_mul(base_bytes, 2, &pairs_bytes) ||
+            !termite_metal_size_mul(p->rows, sizeof(float), &weight_bytes)) return -1;
+        const size_t required[3] = {pairs_bytes, weight_bytes, base_bytes};
+        const size_t alignments[3] = {2, 4, 2};
+        const struct { uint32_t width, rows; float gate_cap, up_cap; } shader = {p->width, p->rows, p->gate_cap, p->up_cap};
+        return antfly_metal_encode_routed_stage(runtime, stage, views, required, alignments, 3, 4,
+            &shader, sizeof(shader), grid, threads);
+    }
+    if (stage == 3) {
+        size_t routed_bytes;
+        if (!termite_metal_size_mul(base_bytes, p->top_k, &routed_bytes)) return -1;
+        const size_t required[2] = {routed_bytes, base_bytes};
+        const size_t alignments[2] = {2, 2};
+        const struct { uint32_t width, rows, count; } shader = {p->width, p->rows, p->top_k};
+        return antfly_metal_encode_routed_stage(runtime, stage, views, required, alignments, 2, 2,
+            &shader, sizeof(shader), grid, threads);
+    }
+    return -1;
 }
 
 typedef struct { uint32_t rows, hidden, head_dim, grid_x, grid_y; float eps, theta, scale; uint32_t stride, start, rotate, weighted, cached_rotary; } termite_vision_norm_rope_params;

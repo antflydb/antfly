@@ -118,6 +118,7 @@ pub const paths = [_][]const u8{
     "src/tile/families/native/metal/projection_direct_abi.m",
     "src/tile/families/native/metal/projection_f16_tiled.m",
     "src/tile/families/native/metal/recurrence.metal",
+    "src/tile/families/native/metal/routed_block_scaled_projection.metal",
     "src/tile/families/native/metal/selection.metal",
     "src/tile/families/native/metal/sequence_transforms.metal",
     "src/tile/families/native/metal/tensor_layout.metal",

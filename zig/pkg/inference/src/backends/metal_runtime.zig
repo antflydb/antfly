@@ -52745,3 +52745,339 @@ test "assigned dense private frame finishes submission before releasing exact co
     try owner.drain();
     try std.testing.expect(hasActiveFrame(runtime));
 }
+
+pub const RoutedBlockScaledProjection = struct {
+    const Format = @import("antfly_tile").native_projection.BlockScaledFormat;
+
+    rows: u32,
+    input_width: u32,
+    output_width: u32,
+    expert_count: u32,
+    input_repeat: u32,
+    format: Format,
+
+    const Wire = extern struct {
+        rows: u32,
+        input_width: u32,
+        output_width: u32,
+        expert_count: u32,
+        input_repeat: u32,
+        format: u32,
+    };
+
+    const Buffer = extern struct {
+        handle: ?*anyopaque = null,
+        offset: usize = 0,
+        bytes: usize = 0,
+
+        fn fromTensor(tensor: *const MetalTensor, dtype: metal_tensor.DType) !Buffer {
+            if (tensor.dtype != dtype) return error.UnsupportedTensorType;
+            return .{
+                .handle = tensor.deviceHandle() orelse return error.ReleasedDeviceBuffer,
+                .offset = tensor.deviceByteOffset(),
+                .bytes = tensor.deviceByteLen(),
+            };
+        }
+    };
+
+    extern fn antfly_metal_dispatch_routed_block_scaled_bf16(runtime: *RawMetalDecodeRuntime, buffers: *const [7]Buffer, wire: *const Wire) c_int;
+
+    /// Input and output use BF16 bits in two-byte storage. Packed weights and
+    /// per-block byte scales keep their original checkpoint layout.
+    pub fn encode(
+        self: RoutedBlockScaledProjection,
+        runtime: *RawMetalDecodeRuntime,
+        input: *const MetalTensor,
+        values: *const MetalTensor,
+        scales: *const MetalTensor,
+        expert_ids: *const MetalTensor,
+        outer_amax: ?*const MetalTensor,
+        outer_denominator: ?*const MetalTensor,
+        output: *MetalTensor,
+    ) !void {
+        _ = try self.format.row(self.input_width);
+        if (output.isReadOnlyPhysical()) return error.ReadOnlyPhysicalStorage;
+        if (self.format == .nvfp4 and (outer_amax == null or outer_denominator == null)) return error.InvalidShape;
+        const descriptors: [7]Buffer = .{
+            try .fromTensor(input, .i16),
+            try .fromTensor(values, .u8),
+            try .fromTensor(scales, .u8),
+            try .fromTensor(expert_ids, .i32),
+            if (outer_amax) |tensor| try .fromTensor(tensor, .f32) else .{},
+            if (outer_denominator) |tensor| try .fromTensor(tensor, .f32) else .{},
+            try .fromTensor(output, .i16),
+        };
+        const status = antfly_metal_dispatch_routed_block_scaled_bf16(runtime, &descriptors, &.{
+            .rows = self.rows,
+            .input_width = self.input_width,
+            .output_width = self.output_width,
+            .expert_count = self.expert_count,
+            .input_repeat = self.input_repeat,
+            .format = @backingInt(self.format),
+        });
+        if (status != 0) return error.MetalKernelDispatchFailed;
+        output.invalidateHostMirror();
+    }
+};
+
+test "Metal routed block-scaled projection consumes split NVFP4 and MXFP8 weights" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    for ([_]RoutedBlockScaledProjection.Format{ .nvfp4, .mxfp8 }) |format| {
+        const fp4 = format == .nvfp4;
+        const width: usize = if (fp4) 32 else 64;
+        const packed_row = try format.row(width);
+        const input: [64]u16 = @splat(0x3f80);
+        var weights: [384]u8 = undefined;
+        const half_weights = 3 * packed_row.values_bytes;
+        @memset(weights[0..half_weights], if (fp4) 0x22 else 0x38);
+        @memset(weights[half_weights .. 2 * half_weights], if (fp4) 0x44 else 0x40);
+        var scales: [12]u8 = undefined;
+        for (0..6) |row| {
+            scales[2 * row] = if (fp4) 0x38 else 127;
+            scales[2 * row + 1] = if (fp4) 0x40 else 128;
+        }
+        const ids = [_]i32{ 0, 1, 2 };
+        const amax = [_]f32{ 3, 4 };
+        const denominator = [_]f32{2};
+        const zeroes: [9]u16 = @splat(0);
+        const payloads: [7][]const u8 = .{
+            std.mem.sliceAsBytes(input[0..width]), weights[0 .. 2 * half_weights], &scales,
+            std.mem.asBytes(&ids),                 std.mem.asBytes(&amax),         std.mem.asBytes(&denominator),
+            std.mem.asBytes(&zeroes),
+        };
+        const dtypes: [7]metal_tensor.DType = .{ .i16, .u8, .u8, .i32, .f32, .f32, .i16 };
+        var tensors: [7]MetalTensor = undefined;
+        var allocated: usize = 0;
+        defer for (tensors[0..allocated]) |*tensor| tensor.deinit();
+        for (&tensors, payloads, dtypes) |*tensor, payload, dtype| {
+            tensor.* = try MetalTensor.deviceAllocateTyped(a, runtime, dtype, .shared, &.{@intCast(payload.len / dtype.byteSize())});
+            allocated += 1;
+            try tensor.uploadBytes(payload);
+        }
+        const projection: RoutedBlockScaledProjection = .{
+            .rows = 3,
+            .input_width = @intCast(width),
+            .output_width = 3,
+            .expert_count = 2,
+            .input_repeat = 3,
+            .format = format,
+        };
+        try beginFrame(runtime);
+        errdefer cancelFrame(runtime) catch {};
+        try projection.encode(runtime, &tensors[0], &tensors[1], &tensors[2], &tensors[3], if (fp4) &tensors[4] else null, if (fp4) &tensors[5] else null, &tensors[6]);
+        try submitFrame(runtime);
+        try waitFrame(runtime);
+        var actual: [9]u16 = undefined;
+        try tensors[6].downloadBytesInto(std.mem.asBytes(&actual));
+        const first: u16 = if (fp4) 0x4290 else 0x42c0;
+        try std.testing.expectEqual([9]u16{ first, first, first, 0x4340, 0x4340, 0x4340, 0, 0, 0 }, actual);
+    }
+}
+
+/// Encodes the routed feed-forward block without a host routing readback.
+/// The caller supplies admitted scratch and owns the enclosing Metal frame.
+pub const RoutedBlockScaledFfn = struct {
+    rows: u32,
+    hidden: u32,
+    intermediate: u32,
+    experts: u32,
+    top_k: u32,
+    format: RoutedBlockScaledProjection.Format,
+    route_scale: f32,
+    gate_cap: f32,
+    up_cap: f32,
+
+    pub const Weights = struct {
+        values: *const MetalTensor,
+        scales: *const MetalTensor,
+        amax: ?*const MetalTensor = null,
+        denominator: ?*const MetalTensor = null,
+    };
+
+    pub const Workspace = struct {
+        selected: *MetalTensor,
+        weights: *MetalTensor,
+        gate_up: *MetalTensor,
+        activated: *MetalTensor,
+        projected: *MetalTensor,
+    };
+
+    pub const ScratchShape = struct {
+        selected: i32,
+        weights: i32,
+        gate_up: i32,
+        activated: i32,
+        projected: i32,
+    };
+
+    /// Element counts for the five typed views admitted by the frame planner.
+    pub fn scratchShape(self: RoutedBlockScaledFfn) !ScratchShape {
+        if (self.rows == 0 or self.top_k == 0 or self.top_k > 8 or self.top_k > self.experts or self.experts > 256)
+            return error.InvalidShape;
+        _ = try self.format.row(self.hidden);
+        _ = try self.format.row(self.intermediate);
+        const routes = try std.math.mul(i32, std.math.cast(i32, self.rows) orelse return error.InvalidShape, @intCast(self.top_k));
+        const hidden = std.math.cast(i32, self.hidden) orelse return error.InvalidShape;
+        const intermediate = std.math.cast(i32, self.intermediate) orelse return error.InvalidShape;
+        const activated = try std.math.mul(i32, routes, intermediate);
+        return .{
+            .selected = routes,
+            .weights = routes,
+            .gate_up = try std.math.mul(i32, activated, 2),
+            .activated = activated,
+            .projected = try std.math.mul(i32, routes, hidden),
+        };
+    }
+
+    const Stage = enum(c_uint) { select = 1, gate = 2, reduce = 3 };
+    const Wire = extern struct {
+        rows: u32,
+        width: u32,
+        expert_count: u32,
+        top_k: u32,
+        route_scale: f32,
+        gate_cap: f32,
+        up_cap: f32,
+    };
+    const Buffer = RoutedBlockScaledProjection.Buffer;
+    extern fn antfly_metal_dispatch_routed_epilogue(runtime: *RawMetalDecodeRuntime, stage: Stage, buffers: *const [4]Buffer, wire: *const Wire) c_int;
+
+    fn dispatch(self: RoutedBlockScaledFfn, runtime: *RawMetalDecodeRuntime, stage: Stage, views: [4]Buffer, rows: u32, width: u32) !void {
+        if (antfly_metal_dispatch_routed_epilogue(runtime, stage, &views, &.{
+            .rows = rows,
+            .width = width,
+            .expert_count = self.experts,
+            .top_k = self.top_k,
+            .route_scale = self.route_scale,
+            .gate_cap = self.gate_cap,
+            .up_cap = self.up_cap,
+        }) != 0) return error.MetalKernelDispatchFailed;
+    }
+
+    pub fn encode(
+        self: RoutedBlockScaledFfn,
+        runtime: *RawMetalDecodeRuntime,
+        input: *const MetalTensor,
+        router_logits: *const MetalTensor,
+        router_bias: *const MetalTensor,
+        gate_up: Weights,
+        down: Weights,
+        scratch: Workspace,
+        output: *MetalTensor,
+    ) !void {
+        if (!hasActiveFrame(runtime)) return error.MetalFrameRequired;
+        const shape = try self.scratchShape();
+        const routed_rows: u32 = @intCast(shape.selected);
+        const gate_width = try std.math.mul(u32, self.intermediate, 2);
+        inline for (.{ scratch.selected, scratch.weights, scratch.gate_up, scratch.activated, scratch.projected, output }) |destination|
+            if (destination.isReadOnlyPhysical()) return error.ReadOnlyPhysicalStorage;
+        try self.dispatch(runtime, .select, .{
+            try .fromTensor(router_logits, .f32),
+            try .fromTensor(router_bias, .f32),
+            try .fromTensor(scratch.selected, .i32),
+            try .fromTensor(scratch.weights, .f32),
+        }, self.rows, 0);
+        scratch.selected.invalidateHostMirror();
+        scratch.weights.invalidateHostMirror();
+        const gate_projection: RoutedBlockScaledProjection = .{
+            .rows = routed_rows,
+            .input_width = self.hidden,
+            .output_width = gate_width,
+            .expert_count = self.experts,
+            .input_repeat = self.top_k,
+            .format = self.format,
+        };
+        try gate_projection.encode(runtime, input, gate_up.values, gate_up.scales, scratch.selected, gate_up.amax, gate_up.denominator, scratch.gate_up);
+        try self.dispatch(runtime, .gate, .{
+            try .fromTensor(scratch.gate_up, .i16),
+            try .fromTensor(scratch.weights, .f32),
+            try .fromTensor(scratch.activated, .i16),
+            .{},
+        }, routed_rows, self.intermediate);
+        scratch.activated.invalidateHostMirror();
+        const down_projection: RoutedBlockScaledProjection = .{
+            .rows = routed_rows,
+            .input_width = self.intermediate,
+            .output_width = self.hidden,
+            .expert_count = self.experts,
+            .input_repeat = 1,
+            .format = self.format,
+        };
+        try down_projection.encode(runtime, scratch.activated, down.values, down.scales, scratch.selected, down.amax, down.denominator, scratch.projected);
+        try self.dispatch(runtime, .reduce, .{
+            try .fromTensor(scratch.projected, .i16),
+            try .fromTensor(output, .i16),
+            .{},
+            .{},
+        }, self.rows, self.hidden);
+        output.invalidateHostMirror();
+    }
+};
+
+test "Metal routed block-scaled projection chains the complete expert stage in one frame" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const input: [32]u16 = @splat(0x3f80);
+    const zeros: [2]f32 = @splat(0);
+    const gate_values: [1024]u8 = @splat(0x22);
+    const gate_scales: [128]u8 = @splat(0x38);
+    const down_values: [512]u8 = @splat(0x22);
+    const down_scales: [64]u8 = @splat(0x38);
+    const amax: [2]f32 = @splat(1);
+    const divisor = [_]f32{1};
+    const payloads: [9][]const u8 = .{
+        std.mem.asBytes(&input), std.mem.asBytes(&zeros), std.mem.asBytes(&zeros),
+        &gate_values,            &gate_scales,            &down_values,
+        &down_scales,            std.mem.asBytes(&amax),  std.mem.asBytes(&divisor),
+    };
+    const dtypes: [15]metal_tensor.DType = .{ .i16, .f32, .f32, .u8, .u8, .u8, .u8, .f32, .f32, .i32, .f32, .i16, .i16, .i16, .i16 };
+    const ffn: RoutedBlockScaledFfn = .{
+        .rows = 1,
+        .hidden = 32,
+        .intermediate = 16,
+        .experts = 2,
+        .top_k = 2,
+        .format = .nvfp4,
+        .route_scale = 2,
+        .gate_cap = 3,
+        .up_cap = 2,
+    };
+    const shape = try ffn.scratchShape();
+    const scratch_extents = [_]i32{ shape.selected, shape.weights, shape.gate_up, shape.activated, shape.projected, 32 };
+    var tensors: [15]MetalTensor = undefined;
+    var allocated: usize = 0;
+    defer for (tensors[0..allocated]) |*tensor| tensor.deinit();
+    for (&tensors, dtypes, 0..) |*tensor, dtype, i| {
+        const extent: i32 = if (i < payloads.len) @intCast(payloads[i].len / dtype.byteSize()) else scratch_extents[i - payloads.len];
+        tensor.* = try MetalTensor.deviceAllocateTyped(a, runtime, dtype, .shared, &.{extent});
+        allocated += 1;
+        if (i < payloads.len) try tensor.uploadBytes(payloads[i]);
+    }
+    const gate: RoutedBlockScaledFfn.Weights = .{ .values = &tensors[3], .scales = &tensors[4], .amax = &tensors[7], .denominator = &tensors[8] };
+    const down: RoutedBlockScaledFfn.Weights = .{ .values = &tensors[5], .scales = &tensors[6], .amax = &tensors[7], .denominator = &tensors[8] };
+    const workspace: RoutedBlockScaledFfn.Workspace = .{
+        .selected = &tensors[9],
+        .weights = &tensors[10],
+        .gate_up = &tensors[11],
+        .activated = &tensors[12],
+        .projected = &tensors[13],
+    };
+    try beginFrame(runtime);
+    errdefer cancelFrame(runtime) catch {};
+    try ffn.encode(runtime, &tensors[0], &tensors[1], &tensors[2], gate, down, workspace, &tensors[14]);
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+    var selected: [2]i32 = undefined;
+    try workspace.selected.downloadBytesInto(std.mem.asBytes(&selected));
+    try std.testing.expectEqual([2]i32{ 0, 1 }, selected);
+    var output: [32]u16 = undefined;
+    try tensors[14].downloadBytesInto(std.mem.asBytes(&output));
+    try std.testing.expectEqual(@as([32]u16, @splat(0x4340)), output);
+}

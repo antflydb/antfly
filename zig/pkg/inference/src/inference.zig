@@ -503,3 +503,7 @@ pub fn printMetalInfo() void {
         std.debug.print("metal device_available={}\n", .{metal_runtime.metalDeviceAvailable()});
     }
 }
+
+test {
+    _ = @import("architectures/inkling2_chat.zig");
+}
