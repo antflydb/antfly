@@ -1568,6 +1568,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = api_derived_coverage_test_mod,
         .max_rss = @import("runtime_memory.zig").testCompileMaxRss("api-derived-coverage-tests", b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024),
         .filters = selectTestFilters(b, &.{
+            "full-text queryability is independent of source extraction coverage",
             "artifact replacement repairs obsolete inline extraction",
             "artifact replacement preserves inherited inline embedding producers",
             "live repair admission supersedes cached vector serviceability",

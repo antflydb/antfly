@@ -10832,9 +10832,9 @@ pub const IndexReadinessState = enum {
 
 pub const IndexReadinessStatus = struct {
     state: IndexReadinessState,
-    /// Whether the published generation can safely answer queries.
+    /// Whether the current index runtime can safely answer queries. Full-text extraction gaps and replay lag do not alone block queries against its valid existing checkpoint; unavailable or incompatible serving state still does.
     queryable: bool,
-    /// Whether the desired incarnation has complete coverage and publication according to its configured policies.
+    /// Whether the desired incarnation has complete coverage and publication at the captured target according to its configured policies and producer revision fences. Later writes can reopen completion. This observation is not a coverage certificate for an arbitrary retained query snapshot.
     complete: bool,
     /// Opaque identity for the desired index incarnation. Clients may compare it for equality but must not interpret its contents.
     incarnation: ?[]const u8 = null,

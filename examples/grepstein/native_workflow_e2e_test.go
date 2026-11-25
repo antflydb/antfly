@@ -16,6 +16,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -113,6 +114,7 @@ func testNativeExecutionPolicyRetry(t *testing.T, ctx context.Context, client *h
 		t.Fatal(err)
 	}
 	partial := wait(true)
+	testNativePartialCoverageGrep(t, ctx, client, tableURL)
 	update(8192)
 	raw, err := corpusRequestWithContext(ctx, client, "POST", tableURL+"/artifacts/"+corpusUnits+"/reprocess", map[string]any{"selection": "incomplete", "limit": 10})
 	if err != nil {
@@ -134,6 +136,97 @@ func testNativeExecutionPolicyRetry(t *testing.T, ctx context.Context, client *h
 		t.Fatalf("expected one truncated call and one successful retry; calls=%d -> %d", before, calls.Load())
 	}
 	t.Log("4K truncation repaired at 8K; completed extraction retained its generation")
+}
+
+// Exercise the shipped grep path against a real native full-text index with
+// both retained successful extraction and a terminally truncated sibling.
+func testNativePartialCoverageGrep(t *testing.T, ctx context.Context, client *http.Client, tableURL string) {
+	t.Helper()
+	binary := os.Getenv("ANTFLY_GREPSTEIN_E2E_GREP_BINARY")
+	if binary == "" {
+		return
+	}
+	binary, err := filepath.Abs(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var status struct {
+		Status struct {
+			Readiness struct{ Queryable, Complete bool }
+		}
+	}
+	for start := time.Now(); ; {
+		raw, err := corpusRequestWithContext(ctx, client, "GET", tableURL+"/indexes/"+corpusUnitsIndex, nil)
+		if err == nil && json.Unmarshal(raw, &status) == nil && status.Status.Readiness.Queryable && !status.Status.Readiness.Complete {
+			break
+		}
+		if time.Since(start) > 30*time.Second {
+			t.Fatalf("partial full-text index not queryable: %s (%v)", raw, err)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	root := t.TempDir()
+	config := nativeGrepConfigForProfile(strings.TrimSuffix(tableURL, "/tables/gcs_e2e"), "gcs_e2e", mustNativeProfile(t, "pdf"))
+	config["page_size"] = 1
+	path := filepath.Join(root, "grep.json")
+	if err := atomicCorpusJSON(path, config); err != nil {
+		t.Fatal(err)
+	}
+	for _, stream := range []string{"extracted", "chunks"} {
+		for _, strict := range []bool{false, true} {
+			args := []string{"--table-config", path, "--json", "--artifact", stream}
+			if strict {
+				args = append(args, "--require-complete")
+			}
+			args = append(args, "Native GCS extraction")
+			cmd := exec.CommandContext(ctx, binary, args...)
+			cmd.Dir = root
+			cmd.Env = append(os.Environ(), "XDG_CACHE_HOME="+filepath.Join(root, "grep-cache"))
+			output, err := cmd.Output()
+			exit, ok := err.(*exec.ExitError)
+			if !ok || exit.ExitCode() != 2 {
+				t.Fatalf("partial grep strict=%t: %v\n%s", strict, err, output)
+			}
+			var matches int
+			var summary struct {
+				Type  string
+				Stats struct {
+					Complete         bool
+					ScanComplete     bool `json:"scan_complete"`
+					CoverageComplete bool `json:"coverage_complete"`
+				}
+			}
+			for _, line := range bytes.Split(output, []byte("\n")) {
+				var event struct{ Type string }
+				if json.Unmarshal(line, &event) != nil {
+					continue
+				}
+				if event.Type == "match" {
+					matches++
+				}
+				if event.Type == "summary" {
+					if err := json.Unmarshal(line, &summary); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if summary.Type != "summary" || summary.Stats.Complete || summary.Stats.CoverageComplete {
+				t.Fatalf("incorrect coverage summary: %s", output)
+			}
+			if strict {
+				if matches != 0 || summary.Stats.ScanComplete {
+					t.Fatalf("strict grep searched incomplete stream: %s", output)
+				}
+			} else if matches == 0 || !summary.Stats.ScanComplete {
+				t.Fatalf("available grep did not finish with retained matches: %s\n%s", output, exit.Stderr)
+			}
+		}
+	}
+	t.Log("native partial full-text remains queryable; grep returns retained matches with explicit coverage gaps; strict grep rejects the gap")
 }
 
 type nativeBrowserTransport func(*http.Request) (*http.Response, error)
