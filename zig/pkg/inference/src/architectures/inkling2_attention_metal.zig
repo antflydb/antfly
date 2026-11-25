@@ -472,7 +472,7 @@ test "Inkling Metal attention weights drive local and global visits across commi
             .sliding_slots = 1,
             .kv_heads = 1,
             .head_dim = 128,
-        });
+        }, 128);
         defer state.deinit();
 
         var source = try allocate(a, runtime, 1);
@@ -481,16 +481,35 @@ test "Inkling Metal attention weights drive local and global visits across commi
         defer workspace.deinit();
         var output = try allocate(a, runtime, 1);
         defer output.deinit();
+        var residual_input = try upload(a, runtime, std.mem.asBytes(&Fixture.ones));
+        defer residual_input.deinit();
+        var residual_weight = try upload(a, runtime, std.mem.asBytes(&Fixture.zeros));
+        defer residual_weight.deinit();
+        var residual_output = try allocate(a, runtime, 128);
+        defer residual_output.deinit();
         for ([_]u16{ 0x3f80, 0xbf80 }, 0..) |activation, position| {
             var append = try state.prepare(1);
             defer append.abort();
             const binding = try state.binding(&append, .{ .group = group, .slot = 0 });
+            if (position == 0) {
+                try std.testing.expectEqual(null, binding.attention_residual.committed);
+                try std.testing.expectEqual(null, binding.expert_residual.committed);
+            } else {
+                try std.testing.expect(binding.attention_residual.committed.? != binding.attention_residual.next);
+                try std.testing.expect(binding.expert_residual.committed.? != binding.expert_residual.next);
+            }
             try source.uploadBytes(std.mem.asBytes(&activation));
             try metal.beginFrame(runtime);
             errdefer metal.cancelFrame(runtime) catch {};
             try layer.encode(runtime, text, &append, .{ .query = &source, .key = &source, .value = &source }, binding.page_ids, binding.planes, binding.history, workspace.bind(layer.local), &output);
+            try state.convolveResidual(&append, 128, &residual_input, &residual_weight, binding.attention_residual, &residual_output);
+            try state.convolveResidual(&append, 128, &residual_input, &residual_weight, binding.expert_residual, &residual_output);
             try metal.submitFrame(runtime);
             try state.publish(&append);
+            var next_history: [384]u16 = undefined;
+            try binding.expert_residual.next.downloadBytesInto(std.mem.asBytes(&next_history));
+            for (next_history[0 .. (2 - position) * 128]) |element| try std.testing.expectEqual(@as(u16, 0), element);
+            for (next_history[(2 - position) * 128 ..]) |element| try std.testing.expectEqual(@as(u16, 0x3f80), element);
             try std.testing.expectEqual(position + 1, state.sequence.committed_tokens);
             var result: u16 = undefined;
             try output.downloadBytesInto(std.mem.asBytes(&result));

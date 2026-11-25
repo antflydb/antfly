@@ -23,13 +23,13 @@ const attention = @import("inkling2_attention_metal.zig");
 const Tensor = tensors.MetalTensor;
 
 const Slot = struct {
-    buffers: [6]Tensor,
+    buffers: [10]Tensor,
 
-    fn init(a: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, plane: i32, history: i32) !Slot {
+    fn init(a: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, plane: i32, history: i32, residual: i32) !Slot {
         var result: Slot = undefined;
         var initialized: usize = 0;
         errdefer for (result.buffers[0..initialized]) |*buffer| buffer.deinit();
-        for (&result.buffers, [_]i32{ plane, plane, history, history, history, history }) |*buffer, count| {
+        for (&result.buffers, [_]i32{ plane, plane, history, history, history, history, residual, residual, residual, residual }) |*buffer, count| {
             buffer.* = try Tensor.deviceAllocateTyped(a, runtime, .i16, .private, &.{count});
             initialized += 1;
         }
@@ -48,12 +48,14 @@ const Bank = struct {
     host_ids: []u32,
     staged_first_page: ?usize = null,
 
-    fn init(a: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, config: kv.BankConfig, group: kv.Group) !Bank {
+    fn init(a: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, config: kv.BankConfig, group: kv.Group, hidden_width: u32) !Bank {
         const pages = try config.layout.pageCapacity(group);
         const count = config.slots(group);
         if (count == 0) return error.InvalidKvShape;
         const plane = std.math.cast(i32, (try config.planeBytes(group)) / 2) orelse return error.InvalidKvShape;
         const history = std.math.cast(i32, try std.math.mul(usize, (try config.rowBytes()) / 2, 3)) orelse return error.InvalidKvShape;
+        const residual = std.math.cast(i32, @as(usize, hidden_width) * 3) orelse return error.InvalidKvShape;
+        if (residual == 0) return error.InvalidKvShape;
         var pool = try storage.initHost(a, .{
             .backend = .metal,
             .dtype = .bf16,
@@ -70,7 +72,7 @@ const Bank = struct {
         var initialized: usize = 0;
         errdefer for (slots[0..initialized]) |*slot| slot.deinit();
         for (slots) |*slot| {
-            slot.* = try Slot.init(a, runtime, plane, history);
+            slot.* = try Slot.init(a, runtime, plane, history, residual);
             initialized += 1;
         }
         const host_ids = try a.alloc(u32, pages);
@@ -118,18 +120,46 @@ pub const State = struct {
     sliding: Bank,
     history_index: usize = 0,
 
+    pub const ResidualHistory = struct {
+        committed: ?*const Tensor,
+        next: *Tensor,
+    };
+
+    /// Stencil used by both hidden residual streams within a decoder visit.
+    pub fn convolveResidual(self: *const State, append: *const kv.Append, width: u32, input: *const Tensor, weight: *const Tensor, history: ResidualHistory, output: *Tensor) !void {
+        if (!append.active or append.sequence != &self.sequence) return error.KvAppendMissing;
+        const rows = std.math.cast(u32, append.next_tokens - self.sequence.committed_tokens) orelse return error.InvalidShape;
+        const convolution: metal.CausalDepthwise4Bf16 = .{
+            .rows = rows,
+            .channels = width,
+            .valid_history = @intCast(@min(3, self.sequence.committed_tokens)),
+            .output_scale = 1.0 / @sqrt(@as(f32, 5.0)),
+            .clip = 0,
+            .epsilon = 1,
+            .normalize = false,
+        };
+        try convolution.encode(self.runtime, .{
+            .values = input,
+            .weight = weight,
+            .history = history.committed,
+            .dynamic_taps = null,
+        }, output, history.next);
+    }
+
     pub const Binding = struct {
         planes: metal.PagedRelativeBf16Attention.Planes,
         history: attention.Layer.History,
+        attention_residual: ResidualHistory,
+        expert_residual: ResidualHistory,
         page_ids: *const Tensor,
     };
 
     /// Initialize at a stable address. Only the request's frame may use the
     /// returned views, and the commit/abort fence must precede reuse.
-    pub fn init(self: *State, a: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, config: kv.BankConfig) !void {
-        var full = try Bank.init(a, runtime, config, .full);
+    pub fn init(self: *State, a: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, config: kv.BankConfig, hidden_width: u32) !void {
+        var full = try Bank.init(a, runtime, config, .full, hidden_width);
         errdefer full.deinit(a);
-        var sliding = try Bank.init(a, runtime, config, .sliding);
+        var sliding = try Bank.init(a, runtime, config, .sliding, hidden_width);
         errdefer sliding.deinit(a);
         self.* = .{ .runtime = runtime, .sequence = undefined, .full = full, .sliding = sliding };
         self.sequence = try kv.Sequence.init(a, config.layout, &self.full.pool, &self.sliding.pool);
@@ -165,6 +195,14 @@ pub const State = struct {
                 .value = if (self.sequence.committed_tokens == 0) null else &buffers[old + 1],
                 .next_key = &buffers[next],
                 .next_value = &buffers[next + 1],
+            },
+            .attention_residual = .{
+                .committed = if (self.sequence.committed_tokens == 0) null else &buffers[old + 4],
+                .next = &buffers[next + 4],
+            },
+            .expert_residual = .{
+                .committed = if (self.sequence.committed_tokens == 0) null else &buffers[old + 5],
+                .next = &buffers[next + 5],
             },
             .page_ids = &bank.page_ids,
         };
