@@ -288,6 +288,23 @@ pub const Config = struct {
         return self.num_shared_experts > 0;
     }
 
+    /// Exact dense text layout used by Gemma 4 E2B's shared-KV prefill.
+    pub fn isGemma4E2bDenseLayout(config: Config) bool {
+        if (config.family != .gemma or config.usesMoe() or config.gemma4_mtp_assistant or
+            !config.gemma4_channel_protocol or config.position_encoding != .rope)
+            return false;
+        if (config.hidden_size != 1536 or config.num_hidden_layers != 35 or
+            config.vocab_size != 262144 or config.ple_hidden_size != 256 or
+            config.num_kv_shared_layers != 20 or config.intermediate_size != 6144 or
+            config.shared_layer_intermediate_size != 12288 or
+            config.num_attention_heads != 8 or config.num_key_value_heads != 1 or
+            config.headDim() != 256 or config.global_head_dim != 512 or
+            config.sliding_window != 512) return false;
+        for (0..15) |layer| if (config.intermediateSize(layer) != 6144) return false;
+        for (15..35) |layer| if (config.intermediateSize(layer) != 12288) return false;
+        return true;
+    }
+
     pub fn isMultimodal(self: Config) bool {
         return self.image_token_index >= 0 and (self.mm_tokens_per_image > 0 or self.vision_patch_size > 0 or self.vision_embed_dim > 0);
     }

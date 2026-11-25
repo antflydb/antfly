@@ -8000,11 +8000,19 @@ pub const NativeGenerationPipeline = struct {
                     try gpt_arch.tryCudaSharedKvPrefill(&self.cb, allocator, self.gpt_config, chunk, total_chunk_end, &decode_context, output_intent != .kv_only)
                 else
                     null;
-                const metal_prepared: ?PrefillOutput = if (shared_prefill == null and processed == 0 and total_chunk_end == seq_len and use_metal_prefill_greedy_token)
+                const e2b_shared = if (allow_shared_kv_prefill and
+                    (output_intent == .kv_only or output_intent == .last_logits))
+                    self.tryMetalE2bSharedKvPrefill(chunk, total_chunk_end, &decode_context, output_intent == .last_logits) catch |err| {
+                        if (try retryDirectPrefillAfterMemoryBudgetExceeded(&decode_runtime, chunk.len, chunk_size, &current_chunk_size, admitted_plan == null, err)) continue;
+                        return err;
+                    }
+                else
+                    null;
+                const metal_prepared: ?PrefillOutput = if (shared_prefill == null and e2b_shared == null and processed == 0 and total_chunk_end == seq_len and use_metal_prefill_greedy_token)
                     try self.tryMetalPreparedTailPrefillGreedy(chunk, total_chunk_end, &decode_context, capture_last_hidden)
                 else
                     null;
-                if (shared_prefill) |prepared| {
+                if (e2b_shared orelse shared_prefill) |prepared| {
                     prefill_last_logits = prepared.last_logits;
                     debugGenerationStage("executePrefill shared_kv_pruned rows={d} output={s}", .{ chunk.len, @tagName(output_intent) });
                 } else if (metal_prepared) |prepared| {
@@ -10430,6 +10438,45 @@ pub const NativeGenerationPipeline = struct {
             .pre_norm_hidden = hidden_result.pre_norm_hidden,
             .rows = hidden_result.total_rows,
         };
+    }
+
+    fn tryMetalE2bSharedKvPrefill(
+        self: *NativeGenerationPipeline,
+        ids: []const i64,
+        seq_len: usize,
+        context: *const gpt_arch.DecodeContext,
+        want_last_logits: bool,
+    ) !?gpt_arch.SharedKvPrefillResult {
+        if (self.cb.kind() != .metal or !self.gpt_config.isGemma4E2bDenseLayout() or
+            !platform.env.getenvBool("ANTFLY_INFERENCE_METAL_E2B_SHARED_KV_LAST_ROW") or
+            context.total_sequence_len < 512)
+            return null;
+
+        const Attempt = struct {
+            pipeline: *NativeGenerationPipeline,
+            ids: []const i64,
+            seq_len: usize,
+            context: *const gpt_arch.DecodeContext,
+            want_last_logits: bool,
+            output: ?gpt_arch.SharedKvPrefillResult = null,
+
+            fn run(raw: *anyopaque) !bool {
+                const self_: *@This() = @ptrCast(@alignCast(raw));
+                const pipeline = self_.pipeline;
+                const layers = pipeline.gpt_config.num_hidden_layers;
+                const ready = try pipeline.cb.decoderRuntimePrepareOrReuseFamily(pipeline.allocator, pipeline.gpt_config, self_.context.kv_sequence_len, layers);
+                if (!ready.prepared) return false;
+                self_.output = try decoder_gated_runtime.tryE2bSharedKvPrefill(&pipeline.cb, pipeline.allocator, pipeline.gpt_config, layers, self_.ids, self_.seq_len, self_.context, self_.want_last_logits);
+                return self_.output != null;
+            }
+        };
+
+        var attempt = Attempt{ .pipeline = self, .ids = ids, .seq_len = seq_len, .context = context, .want_last_logits = want_last_logits };
+        errdefer if (attempt.output) |output| {
+            if (output.last_logits) |logits| self.allocator.free(logits);
+        };
+        if (!try runWithDecoderRuntimeResetBoundary(&self.cb, @ptrCast(&attempt), Attempt.run)) return null;
+        return attempt.output;
     }
 
     fn tryMetalGemmaFinalHiddenFrame(
@@ -14420,9 +14467,9 @@ pub const NativeGenerationPipeline = struct {
             if (work.allow_shared_kv_prefill and !work.wants_last_logits) {
                 var decode_runtime = BorrowedDecodeStateRuntime.init(work.decode_state);
                 const context = decode_runtime.makeDecodeContext(work.seq_len, work.query_seq_len);
-                if (try gpt_arch.tryCudaSharedKvPrefill(&self.cb, self.allocator, self.gpt_config, work.token_ids, work.seq_len, &context, false)) |_| {
+                if (try self.tryMetalE2bSharedKvPrefill(work.token_ids, work.seq_len, &context, false) != null or
+                    try gpt_arch.tryCudaSharedKvPrefill(&self.cb, self.allocator, self.gpt_config, work.token_ids, work.seq_len, &context, false) != null)
                     return .{ .logits = null, .max_query_seq_len = max_query_seq_len };
-                }
             }
         }
 

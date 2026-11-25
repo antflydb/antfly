@@ -2527,6 +2527,19 @@ fn runtimePrefill(
     }
     if (decoder_runtime_ready) {
         try request.check();
+        if (try @import("../backends/decoder_gated_runtime.zig").tryE2bSharedKvPrefill(
+            &runtime_ctx.cb,
+            allocator,
+            runtime_ctx.gpt_config,
+            runtime_ctx.decoderRuntimeConfiguredLayerCount(),
+            request.input_ids,
+            request.seq_len,
+            &decode_context,
+            true,
+        )) |output| {
+            runtime_ctx.noteDecoderRuntimeStateFromCurrentView();
+            return .{ .logits = output.last_logits orelse return error.InvalidModelOutput };
+        }
         if (decoderRuntimePrefillTraceRequested()) {
             std.debug.print("prefill-trace: runtimePrefill entering direct family path\n", .{});
         }
@@ -2785,22 +2798,15 @@ fn runtimeDecodeGreedy(
     if (try runtime_ctx.forwardDecoderRuntimeLastLogits(allocator, request.token_id, step.seq_len, &step.decode_context)) |output| {
         var owned_output = output;
         defer owned_output.deinit(allocator);
-        if (owned_output.device_logits) |device_logits| {
-            const backend = owned_output.device_logits_backend orelse return error.InvalidModelOutput;
-            if (try backend.argmaxLastRow(device_logits, 1, runtime_ctx.gpt_config.vocab_size)) |token_id| {
-                try runtime_ctx.seedGreedyDeviceToken(@intCast(token_id));
-                timing_stats.decode_greedy_direct_nanos += @intCast(monotonicNowNs() - direct_started_at);
-                return .{ .token_id = @intCast(token_id) };
-            }
-        }
-        const logits = try owned_output.hostLogits(allocator);
-        var best_idx: usize = 0;
-        for (logits[1..], 1..) |value, idx| {
-            if (value > logits[best_idx]) best_idx = idx;
-        }
-        try runtime_ctx.seedGreedyDeviceToken(@intCast(best_idx));
+        const model = runtime_ctx.gpt_config;
+        const suppressed = if (model.isGemma4E2bDenseLayout()) model.suppressTokenIds() else &.{};
+        const token = if (suppressed.len == 0)
+            try owned_output.greedyToken(allocator, model.vocab_size)
+        else
+            try suppressedGreedyToken(&owned_output, allocator, model.vocab_size, suppressed);
+        try runtime_ctx.seedGreedyDeviceToken(token);
         timing_stats.decode_greedy_direct_nanos += @intCast(monotonicNowNs() - direct_started_at);
-        return .{ .token_id = @intCast(best_idx) };
+        return .{ .token_id = token };
     }
     timing_stats.decode_greedy_direct_nanos += @intCast(monotonicNowNs() - direct_started_at);
 
@@ -2820,6 +2826,35 @@ fn runtimeDecodeGreedy(
     return .{
         .token_id = @intCast(token_id),
     };
+}
+
+fn suppressedGreedyToken(output: *model_runtime.ModelOutput, allocator: std.mem.Allocator, vocab_size: usize, suppressed: []const i32) !i64 {
+    if (output.device_logits) |logits| {
+        const backend = output.device_logits_backend orelse return error.InvalidModelOutput;
+        if (try backend.argmaxLastRowSuppressTensor(logits, 1, vocab_size, suppressed)) |token| {
+            defer backend.free(token);
+            const data = try backend.toFloat32(token, allocator);
+            defer allocator.free(data);
+            if (data.len != 1 or !std.math.isFinite(data[0]) or data[0] < 0 or data[0] >= @as(f32, @floatFromInt(vocab_size))) return error.InvalidModelOutput;
+            return @intFromFloat(data[0]);
+        }
+    }
+
+    const logits = try output.takeHostLogits(allocator);
+    defer allocator.free(logits);
+    if (vocab_size == 0 or logits.len < vocab_size) return error.InvalidModelOutput;
+    const row = logits[0..vocab_size];
+    for (suppressed) |id| {
+        if (id >= 0 and id < row.len) row[@intCast(id)] = -std.math.inf(f32);
+    }
+    return @intCast(@import("../backends/activations.zig").argmax(row));
+}
+
+test "metal executor honors E2B token suppression on the greedy logits fallback" {
+    const a = std.testing.allocator;
+    var output = model_runtime.ModelOutput{ .logits = try a.dupe(f32, &.{ 0, 9, 8 }) };
+    defer output.deinit(a);
+    try std.testing.expectEqual(@as(i64, 2), try suppressedGreedyToken(&output, a, 3, &.{ 1, -1, 99 }));
 }
 
 fn forwardLastLogits(
