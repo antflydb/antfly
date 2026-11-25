@@ -26167,6 +26167,8 @@ fn tryLinearQ4_0Q8_1ArgmaxE2BDevice(
     defer if (profile_scope) |*scope| scope.end();
 
     const bounds = try kernels_mod.generatedQ4_0Q8_1ArgmaxLaunchBounds(rows, in_dim, out_dim);
+    const input_bytes = try checkedMul(try checkedMul(rows, in_dim), @sizeOf(f32));
+    if (input_tensor.buffer.len < input_bytes or weight_tensor.buffer.len < bounds.weight_bytes) return error.InvalidShape;
     const layout = try ProjectionArgmaxScratch.Layout.init(bounds.partial_bytes, bounds.q8_input_bytes, suppress_token_ids.len);
     var scratch = ProjectionArgmaxScratch.acquire(self, layout, suppress_token_ids) catch |err| switch (err) {
         error.CudaGraphCaptureUnsafeTempAlloc, error.CudaGraphCaptureUnsafeHostCopy => {
@@ -26187,14 +26189,10 @@ fn tryLinearQ4_0Q8_1ArgmaxE2BDevice(
     var token_device_transferred = false;
     defer if (!token_device_transferred) releaseDeviceBufferLease(self, &token_device);
 
-    self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, scratch.quantized_input, input_tensor.buffer, rows, in_dim) catch |err| switch (err) {
-        error.CudaKernelUnavailable => {
-            noteQ4_0Q8_1ArgmaxFallback(self, "quantize_unavailable", rows, in_dim, out_dim);
-            return null;
-        },
-        else => return err,
-    };
-    self.kernels.launchLinearQ4_0Q8_1ArgmaxRowsTile8E2B(
+    // All optional route checks are above this point. Once input packing
+    // has been submitted, preserve the original launch error.
+    try self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, scratch.quantized_input, input_tensor.buffer, rows, in_dim);
+    try self.kernels.launchLinearQ4_0Q8_1ArgmaxRowsTile8E2B(
         &self.ctx,
         token_device.buffer,
         scratch.partial_values,
@@ -26206,13 +26204,7 @@ fn tryLinearQ4_0Q8_1ArgmaxE2BDevice(
         in_dim,
         out_dim,
         suppress_token_ids.len,
-    ) catch |err| switch (err) {
-        error.CudaKernelUnavailable, error.InvalidCudaState => {
-            noteQ4_0Q8_1ArgmaxFallback(self, @errorName(err), rows, in_dim, out_dim);
-            return null;
-        },
-        else => return err,
-    };
+    );
 
     noteQ4Route(
         self,
@@ -26224,7 +26216,7 @@ fn tryLinearQ4_0Q8_1ArgmaxE2BDevice(
         .none,
         .generated,
         quant_kernel_compiler.first_e2b_cuda_q4_0_q8_1_argmax_kernel_id,
-        .{ rows * ((out_dim + 7) / 8), 1, 1 },
+        .{ bounds.partial_count, 1, 1 },
         .{ 96, 1, 1 },
     );
 
@@ -42361,6 +42353,11 @@ test "CUDA generated Q4_0 projection argmax packs into its declared scratch" {
     const values: [width]f32 = @splat(1);
     const input = try cb.fromFloat32Shape(&values, &.{ 1, width });
     defer cb.free(input);
+    var truncated = weight;
+    truncated.buffer.len -= 1;
+    const trace_before = compute.temp_trace_seq;
+    try std.testing.expectError(error.InvalidShape, tryLinearQ4_0Q8_1ArgmaxE2BDevice(&compute, tensorFromCt(input), &truncated, 1, width, vocabulary, &.{0}));
+    try std.testing.expectEqual(trace_before, compute.temp_trace_seq);
     var selected = (try tryLinearQ4_0Q8_1ArgmaxE2BDevice(&compute, tensorFromCt(input), &weight, 1, width, vocabulary, &.{0})) orelse return error.ExpectedFusedArgmax;
     defer releaseDeviceBufferLease(&compute, &selected);
     var token: [1]u32 = undefined;
