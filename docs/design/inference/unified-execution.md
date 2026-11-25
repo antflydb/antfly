@@ -939,7 +939,12 @@ the opt-in Metal backend and can be disabled with
 `ANTFLY_METAL_GROUPED_ROUTED_PREFILL=0`. Text and device-resident image rows
 now share the same prefill batch. The combined exact path passed all 84
 tests and took 1.18 s for the 64-token prefill, with identical logits to
-the four ungrouped chunks.
+the four ungrouped chunks. Grouped-query attention also shares one K/V load
+across three query heads for eligible long spans. At 32 queries across
+4,096 keys, the BF16 kernel fell from 2.60 to 1.14 ms and the packed kernel
+from 2.33 to 1.10 ms. All FP32 partials matched bit for bit. The released
+checkpoint suite still passed all 84 tests, including three queries
+reading the remapped final position of the synthetic million-token cache.
 
 ### Official Gemma 4 E2B QAT serving comparison
 

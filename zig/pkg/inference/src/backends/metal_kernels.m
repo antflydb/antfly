@@ -1778,7 +1778,7 @@ typedef struct termite_metal_decode_runtime {
     bool prefer_dense_mps_linear;
     id<MTLComputePipelineState> routed_block_scaled_pipelines[4];
     id<MTLComputePipelineState> routed_group_build_pipeline, routed_group_projection_pipeline;
-    id<MTLComputePipelineState> paged_relative_bf16_pipelines[3];
+    id<MTLComputePipelineState> paged_relative_bf16_pipelines[5];
     id<MTLComputePipelineState> pack_kv_q4_pipeline;
     id<MTLComputePipelineState> causal_depthwise4_bf16_pipeline;
     id<MTLComputePipelineState> dense_bf16_projection_pipeline;
@@ -13480,7 +13480,7 @@ static NSString *termite_metal_shader_source(void) {
            "    return float4(float(values[0]), float(values[32]), float(values[64]), float(values[96]));\n"
            "}\n"
            "\n"
-           "template <bool compressed>\n"
+           "template <bool compressed, uint heads>\n"
            "inline void antfly_paged_relative_gqa_d128_partial(\n"
            "    device const bfloat *query,\n"
            "    device const ushort *keys,\n"
@@ -13492,7 +13492,7 @@ static NSString *termite_metal_shader_source(void) {
            "    uint2 group,\n"
            "    uint lane\n"
            ") {\n"
-           "    const uint row_head = group.x;\n"
+           "    const uint row_head = group.x * heads;\n"
            "    const uint head = row_head % p.q_heads;\n"
            "    const uint kv_head = head / (p.q_heads / p.kv_heads);\n"
            "    const uint position = p.start + row_head / p.q_heads;\n"
@@ -13500,12 +13500,16 @@ static NSString *termite_metal_shader_source(void) {
            "    const uint first = max(p.visible_start, p.window != 0u && end > p.window ? end - p.window : 0u);\n"
            "    const uint begin = first + group.y * p.keys_per_split;\n"
            "    const uint limit = min(end, begin + p.keys_per_split);\n"
-           "    const ulong q_base = ulong(row_head) * 128u + lane;\n"
-           "    float4 q;\n"
-           "    for (uint i = 0; i < 4; ++i) q[i] = float(query[q_base + i * 32u]);\n"
-           "    float4 numerator = 0.0f;\n"
-           "    float maximum = -INFINITY;\n"
-           "    float denominator = 0.0f;\n"
+           "    float4 q[heads], numerator[heads];\n"
+           "    float maximum[heads], denominator[heads];\n"
+           "    #pragma unroll\n"
+           "    for (uint h = 0u; h < heads; ++h) {\n"
+           "        const ulong q_base = ulong(row_head + h) * 128u + lane;\n"
+           "        for (uint i = 0; i < 4; ++i) q[h][i] = float(query[q_base + i * 32u]);\n"
+           "        numerator[h] = float4(0.0f);\n"
+           "        maximum[h] = -INFINITY;\n"
+           "        denominator[h] = 0.0f;\n"
+           "    }\n"
            "    for (uint pos = begin; pos < limit; ++pos) {\n"
            "        const uint index = pos / p.page_tokens - p.first_page;\n"
            "        if (index >= p.page_count) continue;\n"
@@ -13514,25 +13518,31 @@ static NSString *termite_metal_shader_source(void) {
            "        const ulong row = ulong(page) * p.page_tokens + pos % p.page_tokens;\n"
            "        const ulong stored_head = row * p.kv_heads + kv_head;\n"
            "        const float4 key = antfly_relative_kv_head<compressed>(keys, stored_head, lane);\n"
-           "        float dot = 0.0f;\n"
-           "        for (uint i = 0; i < 4; ++i) dot = fma(q[i], key[i], dot);\n"
-           "        const float reduced = simd_sum(dot);\n"
-           "        const uint distance = position - pos;\n"
-           "        const float bias = distance < p.relative_extent ? float(relative[ulong(row_head) * p.relative_extent + distance]) : 0.0f;\n"
-           "        const float score = reduced * p.score_scale + bias;\n"
-           "        const float next_max = max(maximum, score);\n"
-           "        const float retain = exp(maximum - next_max);\n"
-           "        const float add = exp(score - next_max);\n"
-           "        denominator = fma(denominator, retain, add);\n"
            "        const float4 value = antfly_relative_kv_head<compressed>(values, stored_head, lane);\n"
-           "        numerator = fma(float4(add), value, numerator * retain);\n"
-           "        maximum = next_max;\n"
+           "        const uint distance = position - pos;\n"
+           "        #pragma unroll\n"
+           "        for (uint h = 0u; h < heads; ++h) {\n"
+           "            float dot = 0.0f;\n"
+           "            for (uint i = 0u; i < 4u; ++i) dot = fma(q[h][i], key[i], dot);\n"
+           "            const float reduced = simd_sum(dot);\n"
+           "            const float bias = distance < p.relative_extent ? float(relative[ulong(row_head + h) * p.relative_extent + distance]) : 0.0f;\n"
+           "            const float score = reduced * p.score_scale + bias;\n"
+           "            const float next_max = max(maximum[h], score);\n"
+           "            const float retain = exp(maximum[h] - next_max);\n"
+           "            const float add = exp(score - next_max);\n"
+           "            denominator[h] = fma(denominator[h], retain, add);\n"
+           "            numerator[h] = fma(float4(add), value, numerator[h] * retain);\n"
+           "            maximum[h] = next_max;\n"
+           "        }\n"
            "    }\n"
-           "    const ulong dst = (ulong(row_head) * p.splits + group.y) * 130u;\n"
-           "    for (uint i = 0; i < 4; ++i) partials[dst + i * 32u + lane] = numerator[i];\n"
-           "    if (lane == 0u) {\n"
-           "        partials[dst + 128u] = maximum;\n"
-           "        partials[dst + 129u] = denominator;\n"
+           "    #pragma unroll\n"
+           "    for (uint h = 0u; h < heads; ++h) {\n"
+           "        const ulong dst = (ulong(row_head + h) * p.splits + group.y) * 130u;\n"
+           "        for (uint i = 0u; i < 4u; ++i) partials[dst + i * 32u + lane] = numerator[h][i];\n"
+           "        if (lane == 0u) {\n"
+           "            partials[dst + 128u] = maximum[h];\n"
+           "            partials[dst + 129u] = denominator[h];\n"
+           "        }\n"
            "    }\n"
            "}\n"
            "\n"
@@ -13547,7 +13557,7 @@ static NSString *termite_metal_shader_source(void) {
            "    uint2 group [[threadgroup_position_in_grid]],\n"
            "    uint lane [[thread_index_in_simdgroup]]\n"
            ") {\n"
-           "    antfly_paged_relative_gqa_d128_partial<false>(query, keys, values, relative, page_ids, partials, p, group, lane);\n"
+           "    antfly_paged_relative_gqa_d128_partial<false, 1>(query, keys, values, relative, page_ids, partials, p, group, lane);\n"
            "}\n"
            "\n"
            // tile-codegen:end attention.paged_relative_bf16.0 family
@@ -13596,7 +13606,7 @@ static NSString *termite_metal_shader_source(void) {
            "    uint2 group [[threadgroup_position_in_grid]],\n"
            "    uint lane [[thread_index_in_simdgroup]]\n"
            ") {\n"
-           "    antfly_paged_relative_gqa_d128_partial<true>(query, keys, values, relative, page_ids, partials, p, group, lane);\n"
+           "    antfly_paged_relative_gqa_d128_partial<true, 1>(query, keys, values, relative, page_ids, partials, p, group, lane);\n"
            "}\n"
            "\n"
            // tile-codegen:end attention.paged_relative_bf16.2 family
@@ -13623,7 +13633,40 @@ static NSString *termite_metal_shader_source(void) {
            "    dst[offset + lane] = ushort(q.x | (q.y << 4u) | (q.z << 8u) | (q.w << 12u));\n"
            "    if (lane == 0u) dst[offset + 32u] = as_type<ushort>(scale);\n"
            "}\n"
+           "\n"
+           "\n"
            // tile-codegen:end attention.paged_relative_bf16.3 family
+           // tile-codegen:begin attention.paged_relative_bf16.4 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           "kernel void antfly_paged_relative_gqa_d128_bf16_partial_reuse3(\n"
+           "    device const bfloat *query [[buffer(0)]],\n"
+           "    device const ushort *keys [[buffer(1)]],\n"
+           "    device const ushort *values [[buffer(2)]],\n"
+           "    device const bfloat *relative [[buffer(3)]],\n"
+           "    device const uint *page_ids [[buffer(4)]],\n"
+           "    device float *partials [[buffer(5)]],\n"
+           "    constant PagedRelativeGqaParams &p [[buffer(6)]],\n"
+           "    uint2 group [[threadgroup_position_in_grid]],\n"
+           "    uint lane [[thread_index_in_simdgroup]]\n"
+           ") {\n"
+           "    antfly_paged_relative_gqa_d128_partial<false, 3>(query, keys, values, relative, page_ids, partials, p, group, lane);\n"
+           "}\n"
+           "\n"
+           // tile-codegen:end attention.paged_relative_bf16.4 family
+           // tile-codegen:begin attention.paged_relative_bf16.5 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           "kernel void antfly_paged_relative_gqa_d128_q4_partial_reuse3(\n"
+           "    device const bfloat *query [[buffer(0)]],\n"
+           "    device const ushort *keys [[buffer(1)]],\n"
+           "    device const ushort *values [[buffer(2)]],\n"
+           "    device const bfloat *relative [[buffer(3)]],\n"
+           "    device const uint *page_ids [[buffer(4)]],\n"
+           "    device float *partials [[buffer(5)]],\n"
+           "    constant PagedRelativeGqaParams &p [[buffer(6)]],\n"
+           "    uint2 group [[threadgroup_position_in_grid]],\n"
+           "    uint lane [[thread_index_in_simdgroup]]\n"
+           ") {\n"
+           "    antfly_paged_relative_gqa_d128_partial<true, 3>(query, keys, values, relative, page_ids, partials, p, group, lane);\n"
+           "}\n"
+           // tile-codegen:end attention.paged_relative_bf16.5 family
            // tile-codegen:begin expert.projection.block_scaled.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "struct RoutedBlockScaledParams {\n"
            "    uint rows;\n"
@@ -34333,7 +34376,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     for (size_t index = 0; index < 4; ++index) runtime->routed_block_scaled_pipelines[index] = nil;
     runtime->routed_group_build_pipeline = nil;
     runtime->routed_group_projection_pipeline = nil;
-    for (size_t index = 0; index < 3; ++index) runtime->paged_relative_bf16_pipelines[index] = nil;
+    for (size_t index = 0; index < 5; ++index) runtime->paged_relative_bf16_pipelines[index] = nil;
     runtime->pack_kv_q4_pipeline = nil;
     runtime->causal_depthwise4_bf16_pipeline = nil;
     runtime->dense_bf16_projection_pipeline = nil;
@@ -37556,10 +37599,21 @@ int antfly_metal_dispatch_paged_relative_bf16(
     const size_t partial_bytes[6] = {q_bytes, kv_bytes, kv_bytes, relative_bytes, page_bytes, scratch_bytes};
     const size_t partial_alignments[6] = {2, 2, 2, 2, 4, 4};
     const MTLSize threads = MTLSizeMake(32, 1, 1);
-    NSString *partial = p->q4 ? @"antfly_paged_relative_gqa_d128_q4_partial" : @"antfly_paged_relative_gqa_d128_bf16_partial";
-    int status = antfly_metal_encode_typed_stage(runtime, partial,
-        &runtime->paged_relative_bf16_pipelines[p->q4 ? 2 : 0], views, partial_bytes, partial_alignments, 6, 1u << 5,
-        p, sizeof(*p), MTLSizeMake(row_heads, p->splits, 1), threads);
+    const bool reuse = p->q_heads / p->kv_heads == 3u && p->q_heads % p->kv_heads == 0u &&
+        p->keys_per_split >= 8u && p->start >= 256u;
+    int status = -3;
+    if (reuse) {
+        NSString *partial = p->q4 ? @"antfly_paged_relative_gqa_d128_q4_partial_reuse3" : @"antfly_paged_relative_gqa_d128_bf16_partial_reuse3";
+        status = antfly_metal_encode_typed_stage(runtime, partial,
+            &runtime->paged_relative_bf16_pipelines[p->q4 ? 4u : 3u], views, partial_bytes, partial_alignments, 6, 1u << 5,
+            p, sizeof(*p), MTLSizeMake(row_heads / 3u, p->splits, 1), threads);
+    }
+    if (status == -3) {
+        NSString *partial = p->q4 ? @"antfly_paged_relative_gqa_d128_q4_partial" : @"antfly_paged_relative_gqa_d128_bf16_partial";
+        status = antfly_metal_encode_typed_stage(runtime, partial,
+            &runtime->paged_relative_bf16_pipelines[p->q4 ? 2u : 0u], views, partial_bytes, partial_alignments, 6, 1u << 5,
+            p, sizeof(*p), MTLSizeMake(row_heads, p->splits, 1), threads);
+    }
     if (status != 0) return status;
     const antfly_metal_routed_buffer reduce_views[4] = {views[5], views[6], views[7], views[8]};
     const size_t reduce_bytes[4] = {scratch_bytes, (size_t)row_heads * 2, q_bytes, q_bytes};
