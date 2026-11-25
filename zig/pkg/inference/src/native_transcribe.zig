@@ -338,6 +338,50 @@ test "transcription CLI explicitly selects CUDA without CPU fallback" {
     try std.testing.expectEqualSlices(backends.BackendType, &.{.cuda}, manager.preferred_backends);
 }
 
+test "Whisper Small Metal checkpoint runs assigned packed prefill" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const model_dir = std.c.getenv("ANTFLY_WHISPER_METAL_MODEL_DIR") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var sessions = backends.SessionManager.initWithIo(a, std.testing.io);
+    sessions.native_call_policy = .in_process;
+    sessions.process_termination_available = false;
+    configureBackendPreference(&sessions, .metal);
+    var manager = model_manager_mod.ModelManager.init(a, sessions);
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    const model = try manager.loadFromDir(std.mem.span(model_dir));
+    try std.testing.expectEqual(backends.BackendType.metal, model.session.backend());
+    const cfg = session_factory.getWhisperConfig(model.session) orelse return error.InvalidModelForTranscription;
+    const hidden = try a.alloc(f32, 8 * cfg.d_model);
+    defer a.free(hidden);
+    for (hidden, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index % 17)) / 64;
+    const Adapter = @import("execution/architecture_session.zig").IncrementalDecoderAdapter;
+    const control = @import("execution_control.zig").InferenceExecutionControl{ .io = std.testing.io, .native_call_policy = .in_process };
+    const tokens = [_]i64{ cfg.decoder_start_token_id, 50259, 50359, 50363 };
+    const expected = blk: {
+        var ordinary = (try Adapter.fromHostPrepared(model.session, a, control, hidden, 8, .{})) orelse return error.MissingWhisperDecoder;
+        defer ordinary.deinit();
+        break :blk try ordinary.step(&tokens);
+    };
+    defer a.free(expected);
+    for (0..3) |_| {
+        var decoder = (try Adapter.fromHostPrepared(model.session, a, control, hidden, 8, .{ .expected_initial_query_rows = tokens.len })) orelse return error.MissingWhisperDecoder;
+        defer decoder.deinit();
+        const program = decoder.cache.native_program orelse return error.MissingPreparedWhisperSchedule;
+        const initial = program.initial orelse return error.MissingPreparedWhisperInitialSchedule;
+        var packed_regions: usize = 0;
+        for (initial.schedule.selected.pool.regions) |region| {
+            if (region.owner.requirements.dispatch_workspace.byte_size != 0) packed_regions += 1;
+        }
+        try std.testing.expectEqual(cfg.decoder_layers, packed_regions);
+        const actual = try decoder.step(&tokens);
+        defer a.free(actual);
+        try std.testing.expectEqual(expected.len, actual.len);
+        for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.01);
+        try std.testing.expectEqual(initial.schedule.steps.len, initial.schedule.cursor);
+    }
+}
+
 test "Whisper CUDA checkpoint transcribes English with reusable model state" {
     if (comptime !build_options.enable_cuda) return error.SkipZigTest;
     const model_dir = std.c.getenv("ANTFLY_WHISPER_CUDA_MODEL_DIR") orelse return error.SkipZigTest;
