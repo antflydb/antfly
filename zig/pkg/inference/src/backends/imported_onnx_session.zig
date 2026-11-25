@@ -956,10 +956,10 @@ test "ONNX cache shape reuses attested metadata and queries a stale hint" {
     const allocator = std.testing.allocator;
     const shared = try SharedBackendContext.init(allocator, .native, std.testing.io);
     defer shared.release();
-    const backend = shared.stableBackend();
-    const value = try backend.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 });
-    defer backend.free(value);
-    var input: ResidentInput = .{ .value = value, .backend = backend, .shape = &.{ 2, 2 } };
+    const compute = shared.stableBackend();
+    const value = try compute.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 });
+    defer compute.free(value);
+    var input: ResidentInput = .{ .value = value, .backend = compute, .shape = &.{ 2, 2 } };
     var fail = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
     try std.testing.expect((try residentInputShapeAllocation(input, fail.allocator())) == null);
 
