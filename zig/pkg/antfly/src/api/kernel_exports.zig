@@ -336,6 +336,13 @@ pub fn prepareRestoreLeadership(context: *const CallContext) callconv(.c) abi.St
     return .ok;
 }
 
+pub fn contextStatement(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateCall(abi.ContextStatementInput, abi.ContextStatementOutput, context)) |failure| return failure;
+    const in = input(abi.ContextStatementInput, context);
+    output(abi.ContextStatementOutput, context).result = serverState(context).server.executeContextStatement(in.allocator, in.owner_table_id, in.request) catch |err| return fail(err);
+    return .ok;
+}
+
 pub fn scheduleSessionMaintenance(context: *const CallContext) callconv(.c) abi.Status {
     if (validateCall(void, void, context)) |failure| return failure;
     serverState(context).server.scheduleSessionMaintenance() catch |err| return fail(err);
@@ -589,7 +596,8 @@ const function_table: abi.FunctionTable = .{
     .capabilities = abi.Capability.core |
         abi.Capability.route_manifest |
         abi.Capability.inference_admission_stats |
-        abi.Capability.internal_service_ingress | abi.Capability.lake_stream_owner,
+        abi.Capability.internal_service_ingress | abi.Capability.lake_stream_owner |
+        abi.Capability.context_statement,
     .create = &create,
     .destroy = &destroy,
     .request_stats = &requestStats,
@@ -619,6 +627,7 @@ const function_table: abi.FunctionTable = .{
     .inference_admission_stats = &inferenceAdmissionStats,
     .handler_authorize_internal_service = &handlerAuthorizeInternalService,
     .lake_stream_owner_options = &lakeStreamOwnerOptions,
+    .context_statement = &contextStatement,
 };
 
 pub fn getFunctionTable() callconv(.c) *const abi.FunctionTable {

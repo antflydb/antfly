@@ -621,6 +621,10 @@ fn setSplitDeltaFinalSeq(self: *DB, seq: u64) engine.Outcome(void) {
     return .{ .value = self.setSplitDeltaFinalSeq(seq) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn importContextMergeState(self: *DB, donor: *DB, byte_range: types.ByteRange) engine.Outcome(void) {
+    return .{ .value = self.importContextMergeState(donor, byte_range) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn mergeArtifactsPage(self: *DB, alloc: std.mem.Allocator, byte_range: types.ByteRange, after_key: ?[]const u8) engine.Outcome([]types.BatchWrite) {
     return .{ .value = self.mergeArtifactsPage(alloc, byte_range, after_key) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
@@ -1756,6 +1760,14 @@ fn setEntitySink(self: *DB, sink: ?@import("db/promotion_runtime.zig").EntitySin
 
 fn setPromotionOwner(self: *DB, owner: ?@import("db/promotion_runtime.zig").PromotionOwner) engine.Outcome(void) {
     return .{ .value = self.setPromotionOwner(owner) };
+}
+
+fn installContextHost(self: *DB, config: DB.ContextHostConfig) engine.Outcome(void) {
+    return .{ .value = self.installContextHost(config) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn runContextMaintenance(self: *DB) engine.Outcome(bool) {
+    return .{ .value = self.runContextMaintenance() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn advanceGeneratedArtifactCleanupPage(self: *DB, index_name: ?[]const u8) engine.Outcome(DB.GeneratedArtifactCleanupAdvanceResult) {

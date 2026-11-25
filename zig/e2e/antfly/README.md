@@ -17,6 +17,12 @@ Use product-area names for test files. Do not use migration labels like `*_parit
   - serverless admin authentication and concurrent writers across two processes
   - opt-in real S3/GCS conditional publication; see [secret-store qualification](../../SECRETS.md#secret-store-qualification) for commands and CI setup
 
+- `test_context_sources.py`
+  - cross-table context sources between multi-shard tables through the artifact enrichment endpoint
+  - consumed-field changes, membership joins and deletions rebuild the dependent artifact across tables and Raft groups
+  - unrelated source rows do not rebuild unaffected dependents
+  - admission rejects unknown source tables and cross-table generated-input cycles
+
 - `test_aggregations.py`
   - exact terms and stats over 11,000 synthetic documents
   - read-only control followed by three trials with ten readers and two concurrent writers inserting documents without the aggregated field

@@ -56,7 +56,7 @@ pub fn validatePublicConfig(alloc: Allocator, cfg: types.EnrichmentConfig) !void
     if (cfg.kind == .group) {
         const source = cfg.source orelse return error.InvalidEnrichmentConfig;
         try source.validate();
-        if (cfg.field.len != 0 or cfg.template.len != 0 or cfg.source_artifact_name.len != 0 or cfg.producer_json.len != 0 or cfg.prior_context != null or cfg.neighbor_context != null or cfg.expected_dims != 0 or cfg.chunk_size != 0 or cfg.chunker_json.len != 0) return error.InvalidEnrichmentConfig;
+        if (cfg.field.len != 0 or cfg.template.len != 0 or cfg.source_artifact_name.len != 0 or cfg.producer_json.len != 0 or cfg.prior_context != null or cfg.neighbor_context != null or cfg.context_sources_json.len != 0 or cfg.expected_dims != 0 or cfg.chunk_size != 0 or cfg.chunker_json.len != 0) return error.InvalidEnrichmentConfig;
         if (source.filter != .null) {
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
@@ -91,6 +91,8 @@ pub fn validatePublicConfig(alloc: Allocator, cfg: types.EnrichmentConfig) !void
         return error.InvalidEnrichmentConfig;
     if (cfg.neighbor_context != null and cfg.kind != .asset)
         return error.InvalidEnrichmentConfig;
+    if (cfg.context_sources_json.len != 0 and cfg.kind != .asset)
+        return error.InvalidEnrichmentConfig;
     switch (cfg.kind) {
         .group => unreachable,
         .chunk => if (cfg.chunk_size == 0 and cfg.chunker_json.len == 0)
@@ -102,6 +104,16 @@ pub fn validatePublicConfig(alloc: Allocator, cfg: types.EnrichmentConfig) !void
             defer source_producer.deinit(alloc);
             if ((source_producer.type == .vector_labels or source_producer.type == .media_output) and cfg.source_artifact_name.len == 0) return error.InvalidEnrichmentConfig;
             if (cfg.neighbor_context) |context| try validateNeighborContextConfig(alloc, context, cfg.producer_json);
+            if (cfg.context_sources_json.len != 0) {
+                var context = @import("context_sources.zig").parseStoredJson(alloc, cfg.context_sources_json) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return error.InvalidEnrichmentConfig,
+                };
+                context.deinit();
+                // Context renders into prompt text; media-locator producers
+                // (copy, reader, transcriber, document extraction) reject it.
+                if (!producerConsumesPromptText(source_producer.type)) return error.InvalidEnrichmentConfig;
+            }
             if (cfg.source_artifact_name.len > 0) {
                 try validateUpstreamAssetProducer(alloc, cfg.producer_json);
             }
