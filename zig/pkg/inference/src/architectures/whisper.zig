@@ -2277,16 +2277,24 @@ fn decoderBlockCached(
     profile.mark(cb, .qkv);
 
     var self_attn: CT = undefined;
-    if (start == 0 and !cache.preallocated()) {
-        // First block without slabs: the projections become the cache.
+    if (start == 0) {
+        if (cache.preallocated()) {
+            if (!in_place) {
+                // Prefill attends over the projected rows directly. Copy
+                // into the slabs for the next step without making views.
+                _ = try appendSelfCache(cb, allocator, cache, &layer_cache.k_self, proj.k, start, dec_seq, d_model, true);
+                _ = try appendSelfCache(cb, allocator, cache, &layer_cache.v_self, proj.v, start, dec_seq, d_model, true);
+            }
+            profile.mark(cb, .kv_append);
+        }
         self_attn = try stepCausal(cb, profile, proj.q, proj.k, proj.v, dec_seq, num_heads, head_dim);
-        layer_cache.k_self = proj.k;
-        layer_cache.v_self = proj.v;
-        kv_consumed = true;
+        if (!cache.preallocated()) {
+            layer_cache.k_self = proj.k;
+            layer_cache.v_self = proj.v;
+            kv_consumed = true;
+        }
     } else {
-        // Slabs take a copy of the fresh rows unless they were projected in
-        // place; concatenation copies too. In every case the projections
-        // are released with this block.
+        // Continuation reads the entire committed prefix and its new row.
         const k_rows = if (proj.wrote_cache_banks and profile.assigned != null)
             CachedRows{ .tensor = proj.k, .owned_view = false }
         else if (in_place)
@@ -2302,13 +2310,8 @@ fn decoderBlockCached(
             try appendSelfCache(cb, allocator, cache, &layer_cache.v_self, proj.v, start, dec_seq, d_model, profile.assigned != null);
         defer if (v_rows.owned_view) stepRelease(cb, profile, v_rows.tensor);
         profile.mark(cb, .kv_append);
-        if (start == 0) {
-            self_attn = try stepCausal(cb, profile, proj.q, proj.k, proj.v, dec_seq, num_heads, head_dim);
-        } else {
-            // One new query over every cached key: causal by construction.
-            std.debug.assert(dec_seq == 1);
-            self_attn = try stepPrefix(cb, profile, proj.q, k_rows.tensor, v_rows.tensor, total, num_heads, head_dim);
-        }
+        std.debug.assert(dec_seq == 1);
+        self_attn = try stepPrefix(cb, profile, proj.q, k_rows.tensor, v_rows.tensor, total, num_heads, head_dim);
     }
     defer stepRelease(cb, profile, self_attn);
     profile.mark(cb, .self_attn);
