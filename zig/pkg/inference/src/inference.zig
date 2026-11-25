@@ -506,4 +506,5 @@ pub fn printMetalInfo() void {
 
 test {
     _ = @import("architectures/inkling2_chat.zig");
+    _ = @import("architectures/inkling2_moe_metal.zig");
 }
