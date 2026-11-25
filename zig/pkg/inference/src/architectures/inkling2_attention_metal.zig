@@ -57,6 +57,49 @@ pub const Layer = struct {
         return result;
     }
 
+    pub const Inputs = struct { query: *const Tensor, key: *const Tensor, value: *const Tensor };
+    pub const Projections = struct {
+        query: *Tensor,
+        relative: *Tensor,
+        gate: *Tensor,
+        sink: *Tensor,
+        key: *Tensor,
+        value: *Tensor,
+        key_taps: ?*Tensor = null,
+        value_taps: ?*Tensor = null,
+    };
+
+    /// Project normalized visit inputs into the operands for paged attention.
+    pub fn projectInputs(self: *const Layer, runtime: *metal.RawMetalDecodeRuntime, text: checkpoint.TextConfig, rows: u32, inputs: Inputs, outputs: Projections) !void {
+        if (self.local != (outputs.key_taps == null) or self.local != (outputs.value_taps == null))
+            return error.InvalidShape;
+        const destinations = [_]*Tensor{ outputs.query, outputs.relative, outputs.gate, outputs.sink, outputs.key, outputs.value };
+        const sources = [_]*const Tensor{ inputs.query, inputs.query, inputs.query, inputs.query, inputs.key, inputs.value };
+        for (layout.projection_weights, sources, destinations) |key, input, output| {
+            try self.project(runtime, key, rows, text.hidden_size, layout.projectionWidth(text, key), input, output);
+        }
+        if (!self.local) {
+            const width = @as(u32, text.num_key_value_heads) * text.sconv_kernel_size;
+            try self.project(runtime, .k_dynamic, rows, text.hidden_size, width, inputs.key, outputs.key_taps.?);
+            try self.project(runtime, .v_dynamic, rows, text.hidden_size, width, inputs.value, outputs.value_taps.?);
+        }
+    }
+
+    pub fn projectRelative(self: *const Layer, runtime: *metal.RawMetalDecodeRuntime, text: checkpoint.TextConfig, rows: u32, input: *const Tensor, output: *Tensor) !void {
+        const head_rows = try std.math.mul(u32, rows, text.num_attention_heads);
+        try self.project(runtime, .relative_basis, head_rows, text.d_rel, text.rel_extent, input, output);
+    }
+
+    pub fn projectOutput(self: *const Layer, runtime: *metal.RawMetalDecodeRuntime, text: checkpoint.TextConfig, rows: u32, input: *const Tensor, output: *Tensor) !void {
+        try self.project(runtime, .out, rows, layout.projectionWidth(text, .q), text.hidden_size, input, output);
+    }
+
+    fn project(self: *const Layer, runtime: *metal.RawMetalDecodeRuntime, key: Weight, rows: u32, in: u32, out: u32, input: *const Tensor, output: *Tensor) !void {
+        if (output.dtype != .i16) return error.UnsupportedTensorType;
+        const projection: metal.DenseBf16Projection = .{ .rows = rows, .input_width = in, .output_width = out };
+        try projection.encode(runtime, input, self.get(key) orelse return error.MissingWeight, output);
+    }
+
     pub fn deinit(self: *Layer) void {
         for (&self.weights) |*entry| {
             if (entry.*) |*weight| weight.deinit();
@@ -107,6 +150,7 @@ test "Inkling Metal attention weights preserve packed offsets and local/global l
     text.head_dim = 1;
     text.d_rel = 1;
     text.rel_extent = 1;
+    text.sconv_kernel_size = 1;
     @memset(&text.local_layer_ids, 0);
     for ([_]usize{ 0, 1 }) |index| {
         var layer = try Layer.loadTensors(std.testing.allocator, runtime, Fixture{}, text, index);
@@ -122,5 +166,38 @@ test "Inkling Metal attention weights preserve packed offsets and local/global l
         try std.testing.expectEqual(Fixture.data_a, bytes);
         try std.testing.expectEqual(index == 0, layer.local);
         try std.testing.expectEqual(index == 1, layer.get(.k_dynamic) != null);
+
+        var source = try upload(std.testing.allocator, runtime, &Fixture.data_b);
+        defer source.deinit();
+        var projected: [10]Tensor = undefined;
+        var count: usize = 0;
+        defer for (projected[0..count]) |*output| output.deinit();
+        for (&projected) |*output| {
+            output.* = try allocate(std.testing.allocator, runtime, 1);
+            count += 1;
+        }
+        try metal.beginFrame(runtime);
+        errdefer metal.cancelFrame(runtime) catch {};
+        try layer.projectInputs(runtime, text, 1, .{ .query = &source, .key = &source, .value = &source }, .{
+            .query = &projected[0],
+            .relative = &projected[1],
+            .gate = &projected[2],
+            .sink = &projected[3],
+            .key = &projected[4],
+            .value = &projected[5],
+            .key_taps = if (layer.local) null else &projected[6],
+            .value_taps = if (layer.local) null else &projected[7],
+        });
+        try layer.projectRelative(runtime, text, 1, &projected[1], &projected[8]);
+        try layer.projectOutput(runtime, text, 1, &projected[0], &projected[9]);
+        try metal.submitFrame(runtime);
+        try metal.waitFrame(runtime);
+        const expected = [_]u16{ 0x4080, 0x4000, 0x4000, 0x4000, 0x4000, 0x4000, 0x4080, 0x4000, 0x4000, 0x4080 };
+        for (&projected, expected, 0..) |*output, bits, slot| {
+            if (layer.local and (slot == 6 or slot == 7)) continue;
+            var actual: u16 = undefined;
+            try output.downloadBytesInto(std.mem.asBytes(&actual));
+            try std.testing.expectEqual(bits, actual);
+        }
     }
 }
