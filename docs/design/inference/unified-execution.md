@@ -985,5 +985,7 @@ The same graph with a resident I32 index tensor and a host F32 add operand
 now uses two assigned dispatches and issues zero downloads. The selected
 Metal frame binds the host operand through its admitted ingress plan and
 keeps the resident index on the device path. The stage adapter skips the
-temporary import only for inputs named by the selected host plan. Mixed
-cached decoder controls retain their existing import contract.
+temporary import only for inputs named by the selected host plan. A live
+Metal cache-branch operand uses the same ingress when the specialized
+frame owns it. The boolean selector is validated before dispatch and the
+fixture verifies that specialization eliminates its device binding.

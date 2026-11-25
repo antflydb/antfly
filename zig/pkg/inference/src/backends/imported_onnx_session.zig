@@ -4501,7 +4501,7 @@ const InvocationInputFacts = struct {
         }
         switch (shapes) {
             .tensors, .host_shapes => {},
-            .stage_inputs, .resident_inputs => if (target.cb.kind() != .metal or target.cache_branch) return false,
+            .stage_inputs, .resident_inputs => if (target.cb.kind() != .metal) return false,
             else => return false,
         }
         const functions = target.cb.vtable.kernels orelse return false;
@@ -7535,17 +7535,43 @@ test "imported ONNX If specializes the cache branch independently of input shape
     const path = try dir.dir.realPathFileAlloc(std.testing.io, "if.onnx", a);
     defer a.free(path);
     try inspectGraphCompatibility(a, path);
-    const session = try createSession(a, path, .native);
+    try checkCacheBranchIngress(a, path, .native);
+    if (comptime build_options.enable_metal) {
+        if (@import("metal_runtime.zig").metalDeviceAvailable()) try checkCacheBranchIngress(a, path, .metal);
+    }
+}
+
+fn checkCacheBranchIngress(a: std.mem.Allocator, path: []const u8, kind: BackendType) !void {
+    const session = try createSessionWithOptions(a, path, kind, .{ .graph_runtime_strategy = .partitioned });
     defer session.close();
+    const inspect_ingress = if (kind == .metal) ingress: {
+        const root: *ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
+        const runtime = root.shared_backend_ctx.ctx.metal_hosted.compute.provider_impl.raw_decode_runtime;
+        if (!@import("metal_runtime.zig").antfly_metal_host_input_shared_supported(runtime)) break :ingress false;
+        try std.testing.expect(session.configureExecutionDiagnostics(true));
+        break :ingress true;
+    } else false;
     var x = try Tensor.initFloat32(a, "x", &.{1}, &.{9});
     defer x.deinit();
     for ([_]u8{ 0, 1, 0, 1 }) |branch| {
         var flag = [_]u8{branch};
         const control_tensor: Tensor = .{ .name = cache_branch_name, .dtype = .bool_, .shape = &.{1}, .data = &flag, .allocator = a, .owns_data = false, .owns_shape = false };
-        const result = (try session.runStageInputsWithControl(&.{ .{ .host = control_tensor }, .{ .host = x } }, a, .{ .native_call_policy = .in_process })) orelse return error.MissingOnnxCacheBranch;
-        var owned = result;
+        const inputs = [_]session_mod.StageInput{ .{ .host = control_tensor }, .{ .host = x } };
+        if (inspect_ingress) {
+            var plan = (try prepared_mod.prepare(session, .{ .stage_inputs = .{ .info = session.inputInfo(), .values = &inputs } }, a, .{ .native_call_policy = .in_process })) orelse return error.MissingPreparedKernelRoute;
+            defer plan.deinit();
+            try std.testing.expect(plan.stageInputUnused(0));
+            try std.testing.expect(plan.stageInputUsesPlannedHost(1));
+            try std.testing.expectEqual(@as(usize, 1), plan.routes.?.pool.host_input_plans.len);
+        }
+        var owned = (try session.runStageInputsWithControl(&inputs, a, .{ .native_call_policy = .in_process })) orelse return error.MissingOnnxCacheBranch;
         defer owned.deinit();
-        const actual = try result.backend.toFloat32(result.outputs[0], a);
+        if (inspect_ingress) {
+            const stats = session.executionDiagnostics().?.execution orelse return error.MissingPreparedExecutionDiagnostics;
+            try std.testing.expectEqual(@as(u64, 1), stats.assigned_kernel_dispatches);
+            try std.testing.expectEqual(@as(u64, 0), stats.actual_download_bytes);
+        }
+        const actual = try owned.backend.toFloat32(owned.outputs[0], a);
         defer a.free(actual);
         try std.testing.expectEqualSlices(f32, if (branch == 1) &.{11} else &.{7}, actual);
     }
