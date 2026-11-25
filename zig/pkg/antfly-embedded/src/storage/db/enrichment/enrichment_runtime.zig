@@ -8427,7 +8427,7 @@ fn prepareModelPassChunksWithProbe(runtime: *EnrichmentRuntime, request: enrichm
                 if (!std.mem.eql(u8, &sourceRecordDigest(raw_doc), &source_digest)) return error.EnrichmentSourceChanged;
                 var repair_request = request;
                 repair_request.chunker_json = request.chunker_json;
-                if (try repairMediaOutputPage(runtime, repair_request, raw_doc, supplied_config, input, prefix, target.name, target, identity, page.chunks)) return error.IncompleteChunkCoverage;
+                if (try repairMediaOutputPage(runtime, repair_request, raw_doc, supplied_config, input, prefix, target.name, target, identity, page.chunks, null)) return error.IncompleteChunkCoverage;
                 const updated = try storeGetOptionalAllocWithRetry(runtime, cursor_key) orelse return error.EnrichmentSourceChanged;
                 if (cursor_bytes) |bytes| a.free(bytes);
                 cursor_bytes = updated;
@@ -18417,8 +18417,8 @@ fn captureContextSources(
     var bindings = enrichment_context_sources.bindForKeyAlloc(alloc, &config, request.doc_key, parsed.value) catch |err| switch (err) {
         error.OutOfMemory => return err,
         error.ContextBudgetExceeded, error.InvalidContextBinding => {
-            try recordContextFailure(runtime, request, artifact_name, null, &.{}, config_digest, @errorName(err));
-            try recordIsolatedRequestErrorNamed(runtime, window, request, @errorName(err), scope.attemptNumber(runtime));
+            recordContextFailure(runtime, request, artifact_name, null, &.{}, config_digest, @errorName(err)) catch |write_err| return FailureScope.assetPublicationFailure(scope, write_err);
+            recordIsolatedRequestErrorNamed(runtime, window, request, @errorName(err), scope.attemptNumber(runtime)) catch |write_err| return FailureScope.assetPublicationFailure(scope, write_err);
             return null;
         },
         else => return err,
@@ -18426,7 +18426,7 @@ fn captureContextSources(
     defer bindings.deinit();
     var tuples = try bindings.allTuplesAlloc(alloc);
     defer alloc.free(tuples);
-    var capture = try registerContextDependencies(runtime, request.doc_key, artifact_name, tuples, config_digest);
+    var capture = registerContextDependencies(runtime, request.doc_key, artifact_name, tuples, config_digest) catch |write_err| return FailureScope.assetPublicationFailure(scope, write_err);
     const reader = runtime.config.context_source_reader orelse return error.ContextSourceTableUnavailable;
     // Traversal discovers subscriptions only while reading (graph nodes and
     // members, top-N boundaries). Register what was discovered, then re-read
@@ -18437,8 +18437,8 @@ fn captureContextSources(
     while (true) : (attempt += 1) {
         var resolution = context_resolution.resolveAlloc(alloc, reader, &bindings, .{}) catch |err| switch (err) {
             error.ContextBudgetExceeded, error.RequiredContextMissing, error.InvalidContextBinding, error.ContextGraphUnavailable, error.ContextSearchUnavailable => {
-                try recordContextFailure(runtime, request, artifact_name, capture, tuples, config_digest, @errorName(err));
-                try recordIsolatedRequestErrorNamed(runtime, window, request, @errorName(err), scope.attemptNumber(runtime));
+                recordContextFailure(runtime, request, artifact_name, capture, tuples, config_digest, @errorName(err)) catch |write_err| return FailureScope.assetPublicationFailure(scope, write_err);
+                recordIsolatedRequestErrorNamed(runtime, window, request, @errorName(err), scope.attemptNumber(runtime)) catch |write_err| return FailureScope.assetPublicationFailure(scope, write_err);
                 return null;
             },
             else => return err,
@@ -18450,7 +18450,7 @@ fn captureContextSources(
             const merged = try mergeContextTuplesAlloc(alloc, tuples, resolution.tuples);
             alloc.free(tuples);
             tuples = merged;
-            capture = try registerContextDependencies(runtime, request.doc_key, artifact_name, tuples, config_digest);
+            capture = registerContextDependencies(runtime, request.doc_key, artifact_name, tuples, config_digest) catch |write_err| return FailureScope.assetPublicationFailure(scope, write_err);
             var validation = context_resolution.resolveAlloc(alloc, reader, &bindings, .{}) catch |err| switch (err) {
                 error.ContextBudgetExceeded, error.RequiredContextMissing, error.InvalidContextBinding => continue,
                 else => return err,
@@ -19895,7 +19895,7 @@ fn persistMediaRepairs(runtime: *EnrichmentRuntime, request: enrichment_types.Ge
     }
 }
 
-fn repairMediaOutputPage(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, raw_doc: []const u8, chunk_config: chunking_types_mod.Config, input: @import("inference_chunker").Input, stage_prefix: []const u8, name: []const u8, target: @import("inference_chunker").outputs.Target, current_output: ?@import("inference_chunker").outputs.Result, chunks: []const @import("inference_chunker").Chunk) !bool {
+fn repairMediaOutputPage(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, raw_doc: []const u8, chunk_config: chunking_types_mod.Config, input: @import("inference_chunker").Input, stage_prefix: []const u8, name: []const u8, target: @import("inference_chunker").outputs.Target, current_output: ?@import("inference_chunker").outputs.Result, chunks: []const @import("inference_chunker").Chunk, scope: ?*FailureScope) !bool {
     const a = runtime.alloc;
     var decision_arena = std.heap.ArenaAllocator.init(a);
     defer decision_arena.deinit();
@@ -19947,7 +19947,7 @@ fn repairMediaOutputPage(runtime: *EnrichmentRuntime, request: enrichment_types.
             if (err != error.IncompleteChunkCoverage) return err;
             retry = true;
         };
-        try persistMediaRepairs(runtime, request, raw_doc, stage_prefix, name, pending.updates.items);
+        persistMediaRepairs(runtime, request, raw_doc, stage_prefix, name, pending.updates.items) catch |err| return FailureScope.assetPublicationFailure(scope, err);
         _ = decision_arena.reset(.retain_capacity);
         if (batch.page) |page| if (page.terminal) |terminal| return terminal.failure();
         first = covered_end;
@@ -19996,7 +19996,7 @@ fn processMediaOutput(runtime: *EnrichmentRuntime, request: enrichment_types.Gen
     else empty: {
         // Missing/null media is an intentional empty revision, not a transient
         // source race. Retire private preparation and publish empty coverage.
-        try clearMediaPassScope(runtime, stage_prefix, null);
+        clearMediaPassScope(runtime, stage_prefix, null) catch |err| return FailureScope.assetPublicationFailure(scope, err);
         shared.clearMedia();
         break :empty null;
     };
@@ -20038,7 +20038,7 @@ fn processMediaOutput(runtime: *EnrichmentRuntime, request: enrichment_types.Gen
         defer page.deinit(a);
         if (page.start_ordinal != collected.count or page.chunks.len == 0 or page.covered_through_ordinal > prepared.chunks.len) return error.InvalidEnrichmentState;
         try hydrateMediaPassPageWithAssets(runtime, source_request, &page, assets);
-        retry = try repairMediaOutputPage(runtime, source_request, raw_doc, chunk_config, source.input.?, stage_prefix, config.value.output_name, target, current_output, page.chunks) or retry;
+        retry = try repairMediaOutputPage(runtime, source_request, raw_doc, chunk_config, source.input.?, stage_prefix, config.value.output_name, target, current_output, page.chunks, scope) or retry;
         var page_arena = std.heap.ArenaAllocator.init(a);
         defer page_arena.deinit();
         const pa = page_arena.allocator();
@@ -20083,7 +20083,7 @@ fn processMediaOutput(runtime: *EnrichmentRuntime, request: enrichment_types.Gen
     var item = AssetProducerBatchItem{ .request = request, .producer_type = .media_output, .config_json = @constCast(config_json), .raw_doc = @constCast(raw_doc), .source_text = &fingerprint, .artifact_key = @constCast(output_key), .state_key = state_key, .state_value = state };
     try applyAssetProducerBatchOutput(runtime, &item, produced, window, scope);
     if (collected.status == .failed) try recordIsolatedRequestError(runtime, window, request, error.RequiredMediaOutputFailed);
-    try retireMediaPassForAssetRequest(runtime, request);
+    retireMediaPassForAssetRequest(runtime, request) catch |err| return FailureScope.assetPublicationFailure(scope, err);
 }
 
 /// A fused vector authenticates against its selected receipt and canonical
@@ -49372,7 +49372,7 @@ test "model aware media output repairs retain healthy vectors and persist indepe
     var repair_request = request;
     repair_request.chunker_json = config;
     const speech_target = output_types.Target{ .name = "speech", .kind = .transcribe, .model = "whisper" };
-    try std.testing.expect(!try repairMediaOutputPage(&runtime, repair_request, raw, parsed_config, .{ .text = "original" }, prefix, "speech", speech_target, null, &originals));
+    try std.testing.expect(!try repairMediaOutputPage(&runtime, repair_request, raw, parsed_config, .{ .text = "original" }, prefix, "speech", speech_target, null, &originals, null));
     fake.page_cap = std.math.maxInt(usize);
     const saved_cursor = (try storeGetOptionalAllocWithRetry(&runtime, cursor_key)).?;
     defer alloc.free(saved_cursor);
