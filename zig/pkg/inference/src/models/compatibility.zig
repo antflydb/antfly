@@ -194,7 +194,7 @@ fn assessWithRuntimeFacts(
             man.nativeWeightArtifactKind() != .sharded_safetensors)
             return makeIncompatible(architecture, .unsupported_backend, "Inkling 2 requires a CUDA build and the sharded NVFP4 generation checkpoint");
         return makeCompatible(architecture, if (metal_qualification)
-            "Inkling 2 Mini Metal text qualification"
+            "Inkling 2 Mini Metal text and image qualification"
         else
             "Inkling 2 Mini CUDA text and image generation");
     }

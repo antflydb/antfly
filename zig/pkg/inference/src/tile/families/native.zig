@@ -241,6 +241,7 @@ pub const regions = r.regions(&.{
     r.metalSourceFamily("normalization.row_rms_bf16", @embedFile("native/metal/row_rms_bf16.metal")),
     r.metalSourceFamily("residual.gated_bf16", @embedFile("native/metal/gated_residual_bf16.metal")),
     r.metalSourceFamily("normalization.head_bf16", @embedFile("native/metal/head_norm_bf16.metal")),
+    r.metalSourceFamily("vision.patch_transformer_bf16", @embedFile("native/metal/patch_transformer_bf16.metal")),
     r.metalSourceFamily("projection.dense_bf16", @embedFile("native/metal/dense_bf16_projection.metal")),
     r.metalSourceFamily("convolution.causal_depthwise4_bf16", @embedFile("native/metal/causal_depthwise4_bf16.metal")),
     r.metalSourceFamily("attention.paged_relative_bf16", @embedFile("native/metal/paged_relative_attention.metal")),

@@ -885,6 +885,14 @@ in 215.74 s. llama.cpp used 6,396 and completed in 20.52 s. The reference
 was configured for an 8,192-token window. Antfly needs faster prompt
 execution, and full-context qualification remains open.
 
+The Metal BF16 vision tower and spatial adapter ran the same 57 by 62
+patterned RGB fixture used by the CUDA suite. Both produced four embedding
+rows and selected token 12. The Metal peak logit was 19.88336 and the CUDA
+peak was 19.87989. Metal encoded the image in 113.32 ms in that run. The
+released-checkpoint suite, including legacy managed manifest repair,
+passed all 81 tests. Image HTTP and matched reference performance are
+separate qualification gates.
+
 ### Official Gemma 4 E2B QAT serving comparison
 
 The decoder and projector came from Google's E2B QAT Q4_0 GGUF revision

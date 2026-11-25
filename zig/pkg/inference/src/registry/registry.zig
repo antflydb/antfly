@@ -1858,7 +1858,7 @@ fn appendInferredInputs(
         manifest.visual_projection_path != null or
         gguf_projector_has_image or
         // Native Moondream2 checkpoints carry the vision tower in model.safetensors.
-        std.mem.eql(u8, manifest.config_model_arch, "moondream1") or
+        std.mem.eql(u8, manifest.config_model_arch, "moondream1") or manifest.isInkling2() or
         (manifest.gguf_projector_path != null and gguf_projector_kind == .unknown);
     const has_audio = manifest.audio_model_path != null or
         manifest.audio_projection_path != null or

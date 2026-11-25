@@ -53585,6 +53585,43 @@ test "Metal causal depthwise stencil normalizes and stages independent BF16 hist
     }
 }
 
+/// Typed BF16 patch transformer operations on an already-owned frame.
+pub const PatchTransformerBf16 = struct {
+    pub const Stage = enum(c_uint) { patches, positions, rotary, attention, residual, gelu, merge, norm };
+    pub const Params = extern struct {
+        rows: u32,
+        width: u32,
+        gx: u32 = 0,
+        gy: u32 = 0,
+        image_x: u32 = 0,
+        image_y: u32 = 0,
+        epsilon: f32 = 0,
+    };
+    const Buffer = RoutedBlockScaledProjection.Buffer;
+    extern fn antfly_metal_dispatch_patch_transformer(runtime: *RawMetalDecodeRuntime, views: *const [5]Buffer, params: *const Params, stage: Stage) c_int;
+
+    pub fn encode(comptime stage: Stage, runtime: *RawMetalDecodeRuntime, params: Params, tensors: anytype) !void {
+        if (!hasActiveFrame(runtime)) return error.MetalFrameRequired;
+        const output_count = if (stage == .rotary) 2 else 1;
+        const inputs = switch (stage) {
+            .gelu => 1,
+            .patches, .rotary, .merge => 2,
+            .residual => 3,
+            .attention, .norm => 4,
+            .positions => 5,
+        };
+        comptime if (tensors.len != inputs) @compileError("Invalid patch transformer tensor count");
+        var views: [5]Buffer = @splat(.{});
+        inline for (tensors, 0..) |tensor, i| {
+            if (i < output_count and tensor.isReadOnlyPhysical()) return error.ReadOnlyPhysicalStorage;
+            views[i] = try .fromTensor(tensor, if (stage == .patches and i == 1) .u8 else .i16);
+        }
+        if (antfly_metal_dispatch_patch_transformer(runtime, &views, &params, stage) != 0)
+            return error.MetalKernelDispatchFailed;
+        inline for (0..output_count) |i| tensors[i].invalidateHostMirror();
+    }
+};
+
 /// Projects BF16 input and output-major BF16 weights with F32 accumulation.
 /// Router callers can retain the F32 logits through expert selection.
 pub const DenseBf16Projection = struct {
@@ -53594,21 +53631,27 @@ pub const DenseBf16Projection = struct {
     softcap: f32 = 0,
 
     const Buffer = RoutedBlockScaledProjection.Buffer;
-    const Wire = extern struct { rows: u32, input_width: u32, output_width: u32, f32_output: u32, softcap: f32 };
-    extern fn antfly_metal_dispatch_dense_bf16_projection(runtime: *RawMetalDecodeRuntime, views: *const [3]Buffer, params: *const Wire) c_int;
+    const Wire = extern struct { rows: u32, input_width: u32, output_width: u32, f32_output: u32, has_bias: u32, softcap: f32 };
+    extern fn antfly_metal_dispatch_dense_bf16_projection(runtime: *RawMetalDecodeRuntime, views: *const [4]Buffer, params: *const Wire) c_int;
 
     pub fn encode(self: DenseBf16Projection, runtime: *RawMetalDecodeRuntime, input: *const MetalTensor, weight: *const MetalTensor, output: *MetalTensor) !void {
+        return self.encodeWithBias(runtime, input, weight, null, output);
+    }
+
+    pub fn encodeWithBias(self: DenseBf16Projection, runtime: *RawMetalDecodeRuntime, input: *const MetalTensor, weight: *const MetalTensor, bias: ?*const MetalTensor, output: *MetalTensor) !void {
         if (!hasActiveFrame(runtime)) return error.MetalFrameRequired;
         if (output.isReadOnlyPhysical()) return error.ReadOnlyPhysicalStorage;
         if (output.dtype != .i16 and output.dtype != .f32) return error.UnsupportedTensorType;
-        const views: [3]Buffer = .{
-            try .fromTensor(input, .i16), try .fromTensor(weight, .i16), try .fromTensor(output, output.dtype),
+        const views: [4]Buffer = .{
+            try .fromTensor(input, .i16),                              try .fromTensor(weight, .i16), try .fromTensor(output, output.dtype),
+            if (bias) |values| try .fromTensor(values, .i16) else .{},
         };
         if (antfly_metal_dispatch_dense_bf16_projection(runtime, &views, &.{
             .rows = self.rows,
             .input_width = self.input_width,
             .output_width = self.output_width,
             .f32_output = @intFromBool(output.dtype == .f32),
+            .has_bias = @intFromBool(bias != null),
             .softcap = self.softcap,
         }) != 0) return error.MetalKernelDispatchFailed;
         output.invalidateHostMirror();

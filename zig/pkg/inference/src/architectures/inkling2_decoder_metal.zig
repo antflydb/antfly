@@ -448,11 +448,13 @@ pub const Request = struct {
         try self.run(batch, .{ .tokens = tokens }, .none);
     }
 
-    pub fn appendEmbedding(self: *Request, image_row: *const Tensor) !void {
-        if (!image_row.isDevice() or image_row.dtype != .i16 or
-            image_row.deviceByteLen() != @as(usize, self.model.text.hidden_size) * @sizeOf(u16))
+    pub fn appendEmbeddings(self: *Request, image_rows: *const Tensor, rows: u32) !void {
+        if (!image_rows.isDevice() or image_rows.dtype != .i16 or
+            image_rows.deviceByteLen() != @as(usize, rows) * self.model.text.hidden_size * @sizeOf(u16))
             return error.InvalidShape;
-        try self.run(&self.decode, .{ .embedding = image_row }, .none);
+        const work = if (rows == 1) &self.decode else if (self.prefill) |*batch| batch else return error.InvalidShape;
+        if (rows != work.stack.rows) return error.InvalidShape;
+        try self.run(work, .{ .embedding = image_rows }, .none);
     }
 
     pub fn step(self: *Request, token: u32) ![]const f32 {
@@ -536,6 +538,29 @@ test "Inkling Metal resident decoder runs the released text checkpoint" {
     }
     std.debug.print("Inkling Metal prefill rows={d} serial_ms={d:.3} batched_ms={d:.3} peak_id={d} max_logit_delta={d:.5}\n", .{
         prefix.len, @as(f64, @floatFromInt(serial_ns)) / 1e6, @as(f64, @floatFromInt(batch_ns)) / 1e6, argmax(candidate), max_delta,
+    });
+
+    // The same patterned RGB fixture runs in the released CUDA decoder suite.
+    const image_width = 57;
+    const image_height = 62;
+    var pixels: [image_width * image_height * 3]u8 = undefined;
+    for (&pixels, 0..) |*value, i| value.* = @truncate(i * 17);
+    const vision_start = time.monotonicNs();
+    var image = try resident.vision.encodeRgb(a, decoder.runtime, &pixels, image_width, image_height);
+    defer image.tensor.deinit();
+    const vision_ns = time.monotonicNs() - vision_start;
+    try std.testing.expectEqual(@as(u32, 4), image.rows);
+    var multimodal: Request = undefined;
+    try multimodal.initWithPlan(a, decoder, try RequestPlan.initPrefill(decoder, image.rows + 1, image.rows));
+    defer multimodal.deinit();
+    try multimodal.appendEmbeddings(&image.tensor, image.rows);
+    const image_logits = try multimodal.step(42);
+    const image_next = argmax(image_logits);
+    try std.testing.expectEqual(@as(usize, 5), multimodal.state.sequence.committed_tokens);
+    try std.testing.expectEqual(@as(usize, 12), image_next);
+    try std.testing.expectApproxEqAbs(@as(f32, 19.87989), image_logits[image_next], 0.25);
+    std.debug.print("Inkling Metal image={d}x{d} projected_rows={d} next={d} peak={d:.5} vision_ms={d:.3}\n", .{
+        image_width, image_height, image.rows, image_next, image_logits[image_next], @as(f64, @floatFromInt(vision_ns)) / 1e6,
     });
 }
 
@@ -706,9 +731,9 @@ test "Inkling Metal resident decoder executes the full visit schedule on a synth
     defer request.deinit();
     var image_row = try upload(a, runtime, .i16, std.mem.sliceAsBytes(embeddings[0..width]));
     defer image_row.deinit();
-    try std.testing.expectError(error.InvalidShape, request.appendEmbedding(&model.controller_queries[0]));
+    try std.testing.expectError(error.InvalidShape, request.appendEmbeddings(&model.controller_queries[0], 1));
     try std.testing.expectEqual(@as(usize, 0), request.state.sequence.committed_tokens);
-    try request.appendEmbedding(&image_row);
+    try request.appendEmbeddings(&image_row, 1);
     try std.testing.expectError(error.InvalidInkling2Token, request.append(2));
     try std.testing.expectEqual(@as(usize, 1), request.state.sequence.committed_tokens);
     const logits = try request.step(1);

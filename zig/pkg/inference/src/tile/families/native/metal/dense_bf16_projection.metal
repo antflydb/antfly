@@ -15,7 +15,7 @@
 
 // native-program:entry antfly_dense_bf16_projection_simd4
 struct DenseBf16ProjectionParams {
-    uint rows, input_width, output_width, f32_output;
+    uint rows, input_width, output_width, f32_output, has_bias;
     float softcap;
 };
 
@@ -23,7 +23,8 @@ kernel void antfly_dense_bf16_projection_simd4(
     device const bfloat *input [[buffer(0)]],
     device const bfloat *weight [[buffer(1)]],
     device uchar *output [[buffer(2)]],
-    constant DenseBf16ProjectionParams &p [[buffer(3)]],
+    device const bfloat *bias [[buffer(3)]],
+    constant DenseBf16ProjectionParams &p [[buffer(4)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint simd_group [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
@@ -35,8 +36,9 @@ kernel void antfly_dense_bf16_projection_simd4(
     float product = 0.0f;
     for (uint k = lane; k < p.input_width; k += 32u)
         product = fma(float(input[a + k]), float(weight[b + k]), product);
-    const float total = simd_sum(product);
+    const float dot = simd_sum(product);
     if (lane == 0u) {
+        const float total = p.has_bias ? dot + float(bias[column]) : dot;
         const ulong index = ulong(group.y) * p.output_width + column;
         if (p.f32_output) reinterpret_cast<device float *>(output)[index] = p.softcap > 0.0f ? tanh(total / p.softcap) * p.softcap : total;
         else reinterpret_cast<device bfloat *>(output)[index] = bfloat(total);

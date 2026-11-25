@@ -1780,6 +1780,7 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> paged_relative_bf16_pipelines[2];
     id<MTLComputePipelineState> causal_depthwise4_bf16_pipeline;
     id<MTLComputePipelineState> dense_bf16_projection_pipeline;
+    id<MTLComputePipelineState> patch_transformer_pipeline[8];
     id<MTLComputePipelineState> head_norm_bf16_pipeline;
     id<MTLComputePipelineState> residual_mix_bf16_pipeline;
     id<MTLComputePipelineState> residual_sum_bf16_pipeline;
@@ -13154,9 +13155,179 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            "}\n"
            // tile-codegen:end normalization.head_bf16 family
+           // tile-codegen:begin vision.patch_transformer_bf16.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           "struct PatchTransformerParams {\n"
+           "    uint rows, width, gx, gy, image_x, image_y;\n"
+           "    float epsilon;\n"
+           "};\n"
+           "\n"
+           "kernel void antfly_rgb_patch_rows_bf16(\n"
+           "    device bfloat *out [[buffer(0)]], device const uchar *rgb [[buffer(1)]],\n"
+           "    constant PatchTransformerParams &p [[buffer(5)]],\n"
+           "    uint row [[threadgroup_position_in_grid]], uint lane [[thread_index_in_threadgroup]]) {\n"
+           "    constexpr uint patch = 20u, features = patch * patch * 3u;\n"
+           "    const float3 mean = float3(0.48145466f, 0.4578275f, 0.40821073f);\n"
+           "    const float3 processor_std = float3(0.26862954f, 0.2613026f, 0.2757771f);\n"
+           "    const float3 scale = float3(0.26862954f, 0.26130258f, 0.27577711f);\n"
+           "    const uint x = (row % p.gx) * patch, y = (row / p.gx) * patch;\n"
+           "    for (uint i = lane; i < features; i += 128u) {\n"
+           "        const uint px = x + i / 3u % patch, py = y + i / (3u * patch), c = i % 3u;\n"
+           "        const float v = px < p.image_x && py < p.image_y ? float(rgb[(ulong(py) * p.image_x + px) * 3u + c]) : -1.0f;\n"
+           "        const float normalized = float(bfloat((v / 255.0f - mean[c]) / processor_std[c]));\n"
+           "        out[ulong(row) * features + i] = bfloat(2.0f * (normalized * scale[c] + mean[c]) - 1.0f);\n"
+           "    }\n"
+           "}\n"
+           "\n"
+           "inline float antfly_patch_lerp(float a, float b, float t) {\n"
+           "    return t < 0.5f ? fma(a, 1.0f - t, b * t) : fma(b, t, a * (1.0f - t));\n"
+           "}\n"
+           "\n"
+           // tile-codegen:end vision.patch_transformer_bf16.0 family
+           // tile-codegen:begin vision.patch_transformer_bf16.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           "kernel void antfly_patch_position_bf16(\n"
+           "    device bfloat *out [[buffer(0)]], device const bfloat *patch [[buffer(1)]],\n"
+           "    device const bfloat *pos [[buffer(2)]], device const bfloat *cls [[buffer(3)]],\n"
+           "    device const bfloat *cls_pos [[buffer(4)]], constant PatchTransformerParams &p [[buffer(5)]],\n"
+           "    uint row [[threadgroup_position_in_grid]], uint lane [[thread_index_in_threadgroup]]) {\n"
+           "    const float x = row == 0u ? 0.0f : clamp(32.0f * (float((row - 1u) % p.gx) + 0.5f) / float(p.gx) - 0.5f, 0.0f, 31.0f);\n"
+           "    const float y = row == 0u ? 0.0f : clamp(32.0f * (float((row - 1u) / p.gx) + 0.5f) / float(p.gy) - 0.5f, 0.0f, 31.0f);\n"
+           "    const uint x0 = uint(x), x1 = min(x0 + 1u, 31u), y0 = uint(y), y1 = min(y0 + 1u, 31u);\n"
+           "    for (uint i = lane; i < p.width; i += 128u) {\n"
+           "        float v;\n"
+           "        if (row == 0u) v = float(cls[i]) + float(cls_pos[i]);\n"
+           "        else {\n"
+           "            const float top = antfly_patch_lerp(float(pos[(y0 * 32u + x0) * p.width + i]), float(pos[(y0 * 32u + x1) * p.width + i]), x - float(x0));\n"
+           "            const float bottom = antfly_patch_lerp(float(pos[(y1 * 32u + x0) * p.width + i]), float(pos[(y1 * 32u + x1) * p.width + i]), x - float(x0));\n"
+           "            v = float(patch[ulong(row - 1u) * p.width + i]) + float(bfloat(antfly_patch_lerp(top, bottom, y - float(y0))));\n"
+           "        }\n"
+           "        out[ulong(row) * p.width + i] = bfloat(v);\n"
+           "    }\n"
+           "}\n"
+           "\n"
+           // tile-codegen:end vision.patch_transformer_bf16.1 family
+           // tile-codegen:begin vision.patch_transformer_bf16.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           "kernel void antfly_patch_rotary_bf16(\n"
+           "    device bfloat *q [[buffer(0)]], device bfloat *k [[buffer(1)]],\n"
+           "    constant PatchTransformerParams &p [[buffer(5)]],\n"
+           "    uint row [[threadgroup_position_in_grid]], uint lane [[thread_index_in_threadgroup]]) {\n"
+           "    if (row == 0u) return;\n"
+           "    const uint x = (row - 1u) % p.gx + 1u, y = (row - 1u) / p.gx + 1u;\n"
+           "    for (uint i = lane; i < p.width / 2u; i += 128u) {\n"
+           "        const uint pair = i % 32u;\n"
+           "        const float angle = float(pair < 16u ? x : y) * pow(10000.0f, -float(pair % 16u) / 16.0f);\n"
+           "        const float sn = sin(angle), cs = cos(angle);\n"
+           "        const ulong at = ulong(row) * p.width + i * 2u;\n"
+           "        const float qe = float(q[at]), qo = float(q[at + 1u]), ke = float(k[at]), ko = float(k[at + 1u]);\n"
+           "        q[at] = bfloat(fma(qe, cs, -qo * sn)); q[at + 1u] = bfloat(fma(qo, cs, qe * sn));\n"
+           "        k[at] = bfloat(fma(ke, cs, -ko * sn)); k[at + 1u] = bfloat(fma(ko, cs, ke * sn));\n"
+           "    }\n"
+           "}\n"
+           "\n"
+           // tile-codegen:end vision.patch_transformer_bf16.2 family
+           // tile-codegen:begin vision.patch_transformer_bf16.3 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           "kernel void antfly_bidirectional_attention_d64_bf16(\n"
+           "    device bfloat *out [[buffer(0)]], device const bfloat *q [[buffer(1)]],\n"
+           "    device const bfloat *k [[buffer(2)]], device const bfloat *v [[buffer(3)]],\n"
+           "    constant PatchTransformerParams &p [[buffer(5)]], uint2 tg [[threadgroup_position_in_grid]],\n"
+           "    uint warp [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {\n"
+           "    const uint head = tg.y * 4u + warp;\n"
+           "    if (head >= p.width / 64u) return;\n"
+           "    const uint offset = head * 64u + lane;\n"
+           "    const ulong at = ulong(tg.x) * p.width + offset;\n"
+           "    const float q0 = float(q[at]), q1 = float(q[at + 32u]);\n"
+           "    float maximum = -INFINITY, mass = 0.0f, acc0 = 0.0f, acc1 = 0.0f;\n"
+           "    for (uint j = 0; j < p.rows; ++j) {\n"
+           "        const ulong i = ulong(j) * p.width + offset;\n"
+           "        const float score = simd_sum(fma(q0, float(k[i]), q1 * float(k[i + 32u]))) * 0.125f;\n"
+           "        const float next = max(score, maximum);\n"
+           "        const float old = exp(maximum - next), add = exp(score - next);\n"
+           "        acc0 = fma(add, float(v[i]), acc0 * old);\n"
+           "        acc1 = fma(add, float(v[i + 32u]), acc1 * old);\n"
+           "        mass = fma(mass, old, add);\n"
+           "        maximum = next;\n"
+           "    }\n"
+           "    out[at] = bfloat(acc0 / mass);\n"
+           "    out[at + 32u] = bfloat(acc1 / mass);\n"
+           "}\n"
+           "\n"
+           // tile-codegen:end vision.patch_transformer_bf16.3 family
+           // tile-codegen:begin vision.patch_transformer_bf16.4 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           "kernel void antfly_layer_scale_residual_bf16(\n"
+           "    device bfloat *hidden [[buffer(0)]], device const bfloat *update [[buffer(1)]],\n"
+           "    device const bfloat *gamma [[buffer(2)]], constant PatchTransformerParams &p [[buffer(5)]],\n"
+           "    uint i [[thread_position_in_grid]]) {\n"
+           "    if (i < p.rows * p.width)\n"
+           "        hidden[i] = bfloat(float(hidden[i]) + float(bfloat(float(update[i]) * float(gamma[i % p.width]))));\n"
+           "}\n"
+           "\n"
+           "inline float antfly_vision_erf(float x) {\n"
+           "    const float a = abs(x), t = 1.0f / (1.0f + 0.3275911f * a);\n"
+           "    const float poly = (((((1.061405429f * t - 1.453152027f) * t) + 1.421413741f) * t - 0.284496736f) * t + 0.254829592f) * t;\n"
+           "    return copysign(1.0f - poly * exp(-a * a), x);\n"
+           "}\n"
+           "\n"
+           // tile-codegen:end vision.patch_transformer_bf16.4 family
+           // tile-codegen:begin vision.patch_transformer_bf16.5 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           "kernel void antfly_erf_gelu_bf16(\n"
+           "    device bfloat *values [[buffer(0)]], constant PatchTransformerParams &p [[buffer(5)]],\n"
+           "    uint i [[thread_position_in_grid]]) {\n"
+           "    if (i < p.rows * p.width) {\n"
+           "        const float x = float(values[i]);\n"
+           "        values[i] = bfloat(x * 0.5f * (1.0f + antfly_vision_erf(x * 0.7071067811865476f)));\n"
+           "    }\n"
+           "}\n"
+           "\n"
+           // tile-codegen:end vision.patch_transformer_bf16.5 family
+           // tile-codegen:begin vision.patch_transformer_bf16.6 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           "kernel void antfly_merge_patch_rows_bf16(\n"
+           "    device bfloat *out [[buffer(0)]], device const bfloat *hidden [[buffer(1)]],\n"
+           "    constant PatchTransformerParams &p [[buffer(5)]],\n"
+           "    uint row [[threadgroup_position_in_grid]], uint lane [[thread_index_in_threadgroup]]) {\n"
+           "    const uint half_x = p.gx / 2u;\n"
+           "    const uint first = 1u + 2u * (row / half_x) * p.gx + 2u * (row % half_x);\n"
+           "    for (uint i = lane; i < p.width * 4u; i += 128u) {\n"
+           "        const uint part = i / p.width;\n"
+           "        out[ulong(row) * p.width * 4u + i] = hidden[ulong(first + (part / 2u) * p.gx + part % 2u) * p.width + i % p.width];\n"
+           "    }\n"
+           "}\n"
+           "\n"
+           // tile-codegen:end vision.patch_transformer_bf16.6 family
+           // tile-codegen:begin vision.patch_transformer_bf16.7 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           "kernel void antfly_layer_norm_bf16(\n"
+           "    device bfloat *out [[buffer(0)]], device const bfloat *input [[buffer(1)]],\n"
+           "    device const bfloat *gamma [[buffer(2)]], device const bfloat *beta [[buffer(3)]],\n"
+           "    constant PatchTransformerParams &p [[buffer(5)]], uint row [[threadgroup_position_in_grid]],\n"
+           "    uint tid [[thread_index_in_threadgroup]], uint warp [[simdgroup_index_in_threadgroup]],\n"
+           "    uint lane [[thread_index_in_simdgroup]]) {\n"
+           "    threadgroup float sums[4];\n"
+           "    threadgroup float mean, inv;\n"
+           "    const ulong base = ulong(row) * p.width;\n"
+           "    float sum = 0.0f;\n"
+           "    for (uint i = tid; i < p.width; i += 128u) sum += float(input[base + i]);\n"
+           "    sum = simd_sum(sum);\n"
+           "    if (lane == 0u) sums[warp] = sum;\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    if (tid == 0u) mean = ((sums[0] + sums[1]) + (sums[2] + sums[3])) / float(p.width);\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    sum = 0.0f;\n"
+           "    for (uint i = tid; i < p.width; i += 128u) {\n"
+           "        const float v = float(input[base + i]) - mean;\n"
+           "        sum = fma(v, v, sum);\n"
+           "    }\n"
+           "    sum = simd_sum(sum);\n"
+           "    if (lane == 0u) sums[warp] = sum;\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    if (tid == 0u) inv = rsqrt(((sums[0] + sums[1]) + (sums[2] + sums[3])) / float(p.width) + p.epsilon);\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    for (uint i = tid; i < p.width; i += 128u) {\n"
+           "        const float centered = float(input[base + i]) - mean;\n"
+           "        out[base + i] = bfloat(fma(float(gamma[i]), centered * inv, float(beta[i])));\n"
+           "    }\n"
+           "}\n"
+           // tile-codegen:end vision.patch_transformer_bf16.7 family
            // tile-codegen:begin projection.dense_bf16 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "struct DenseBf16ProjectionParams {\n"
-           "    uint rows, input_width, output_width, f32_output;\n"
+           "    uint rows, input_width, output_width, f32_output, has_bias;\n"
            "    float softcap;\n"
            "};\n"
            "\n"
@@ -13164,7 +13335,8 @@ static NSString *termite_metal_shader_source(void) {
            "    device const bfloat *input [[buffer(0)]],\n"
            "    device const bfloat *weight [[buffer(1)]],\n"
            "    device uchar *output [[buffer(2)]],\n"
-           "    constant DenseBf16ProjectionParams &p [[buffer(3)]],\n"
+           "    device const bfloat *bias [[buffer(3)]],\n"
+           "    constant DenseBf16ProjectionParams &p [[buffer(4)]],\n"
            "    uint2 group [[threadgroup_position_in_grid]],\n"
            "    uint simd_group [[simdgroup_index_in_threadgroup]],\n"
            "    uint lane [[thread_index_in_simdgroup]]\n"
@@ -13176,8 +13348,9 @@ static NSString *termite_metal_shader_source(void) {
            "    float product = 0.0f;\n"
            "    for (uint k = lane; k < p.input_width; k += 32u)\n"
            "        product = fma(float(input[a + k]), float(weight[b + k]), product);\n"
-           "    const float total = simd_sum(product);\n"
+           "    const float dot = simd_sum(product);\n"
            "    if (lane == 0u) {\n"
+           "        const float total = p.has_bias ? dot + float(bias[column]) : dot;\n"
            "        const ulong index = ulong(group.y) * p.output_width + column;\n"
            "        if (p.f32_output) reinterpret_cast<device float *>(output)[index] = p.softcap > 0.0f ? tanh(total / p.softcap) * p.softcap : total;\n"
            "        else reinterpret_cast<device bfloat *>(output)[index] = bfloat(total);\n"
@@ -33943,6 +34116,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     for (size_t index = 0; index < 2; ++index) runtime->paged_relative_bf16_pipelines[index] = nil;
     runtime->causal_depthwise4_bf16_pipeline = nil;
     runtime->dense_bf16_projection_pipeline = nil;
+    for (size_t i = 0; i < 8; ++i) runtime->patch_transformer_pipeline[i] = nil;
     runtime->head_norm_bf16_pipeline = nil;
     runtime->residual_mix_bf16_pipeline = nil;
     runtime->residual_sum_bf16_pipeline = nil;
@@ -37181,25 +37355,93 @@ int antfly_metal_dispatch_causal_depthwise4_bf16(
 }
 
 typedef struct {
-    uint32_t rows, input_width, output_width, f32_output;
+    uint32_t rows, input_width, output_width, f32_output, has_bias;
     float softcap;
 } antfly_metal_dense_bf16_projection_params;
 
 int antfly_metal_dispatch_dense_bf16_projection(
-    termite_metal_decode_runtime *runtime, const antfly_metal_routed_buffer views[3],
+    termite_metal_decode_runtime *runtime, const antfly_metal_routed_buffer views[4],
     const antfly_metal_dense_bf16_projection_params *p
 ) {
     if (!runtime || !views || !p || !p->rows || !p->input_width || !p->output_width ||
         !isfinite(p->softcap) || p->softcap < 0 || (!p->f32_output && p->softcap != 0)) return -1;
     const size_t output_size = p->f32_output ? 4u : 2u;
-    size_t required[3];
+    size_t required[4] = {0, 0, 0, p->has_bias ? (size_t)p->output_width * 2u : 0};
     if (!termite_metal_size_mul(p->rows, (size_t)p->input_width * 2u, &required[0]) ||
         !termite_metal_size_mul(p->output_width, (size_t)p->input_width * 2u, &required[1]) ||
         !termite_metal_size_mul(p->rows, (size_t)p->output_width * output_size, &required[2])) return -1;
-    const size_t alignment[3] = {2, 2, output_size};
+    const size_t alignment[4] = {2, 2, output_size, 2};
     return antfly_metal_encode_typed_stage(runtime, @"antfly_dense_bf16_projection_simd4",
-        &runtime->dense_bf16_projection_pipeline, views, required, alignment, 3, 1u << 2,
+        &runtime->dense_bf16_projection_pipeline, views, required, alignment, 4, 1u << 2,
         p, sizeof(*p), MTLSizeMake(((size_t)p->output_width + 3u) / 4u, p->rows, 1), MTLSizeMake(128, 1, 1));
+}
+
+typedef struct {
+    uint32_t rows, width, gx, gy, image_x, image_y;
+    float epsilon;
+} antfly_metal_patch_transformer_params;
+
+int antfly_metal_dispatch_patch_transformer(
+    termite_metal_decode_runtime *runtime, const antfly_metal_routed_buffer views[5],
+    const antfly_metal_patch_transformer_params *p, unsigned stage
+) {
+    if (!runtime || !views || !p || stage >= 8 || !p->rows || p->rows > 42437 || !p->width || p->width > 4096) return -1;
+    if (p->gx > 206 || p->gy > 206 || p->image_x > 4096 || p->image_y > 4096) return -1;
+    const size_t patches = (size_t)p->gx * p->gy;
+    const size_t row_bytes = (size_t)p->width * 2u;
+    const size_t matrix_bytes = (size_t)p->rows * row_bytes;
+    const size_t patch_bytes = patches * row_bytes;
+    size_t required[5] = {0};
+    size_t alignment[5] = {2, 2, 2, 2, 2};
+    size_t x = p->rows, y = 1;
+    unsigned write_mask = 1;
+    NSString *names[8] = {
+        @"antfly_rgb_patch_rows_bf16", @"antfly_patch_position_bf16", @"antfly_patch_rotary_bf16",
+        @"antfly_bidirectional_attention_d64_bf16", @"antfly_layer_scale_residual_bf16",
+        @"antfly_erf_gelu_bf16", @"antfly_merge_patch_rows_bf16", @"antfly_layer_norm_bf16",
+    };
+    switch (stage) {
+        case 0:
+            if (!patches || p->rows != patches || !p->image_x || !p->image_y ||
+                p->gx != 2u * ((p->image_x + 39u) / 40u) || p->gy != 2u * ((p->image_y + 39u) / 40u)) return -1;
+            required[0] = patches * 1200u * 2u;
+            required[1] = (size_t)p->image_x * p->image_y * 3u;
+            alignment[1] = 1;
+            break;
+        case 1:
+            if (!patches || p->rows != patches + 1u) return -1;
+            required[0] = matrix_bytes; required[1] = patch_bytes; required[2] = row_bytes * 1024u;
+            required[3] = required[4] = row_bytes;
+            break;
+        case 2:
+            if (!patches || p->rows != patches + 1u || p->width % 64u) return -1;
+            required[0] = required[1] = matrix_bytes;
+            write_mask = 3;
+            break;
+        case 3:
+            if (p->width % 64u) return -1;
+            required[0] = required[1] = required[2] = required[3] = matrix_bytes;
+            y = (p->width / 64u + 3u) / 4u;
+            break;
+        case 4:
+            required[0] = required[1] = matrix_bytes; required[2] = row_bytes;
+            x = ((size_t)p->rows * p->width + 127u) / 128u;
+            break;
+        case 5:
+            required[0] = matrix_bytes;
+            x = ((size_t)p->rows * p->width + 127u) / 128u;
+            break;
+        case 6:
+            if (!patches || (p->gx & 1u) || (p->gy & 1u) || p->rows != patches / 4u) return -1;
+            required[0] = patch_bytes; required[1] = patch_bytes + row_bytes;
+            break;
+        case 7:
+            if (!isfinite(p->epsilon) || p->epsilon <= 0) return -1;
+            required[0] = required[1] = matrix_bytes; required[2] = required[3] = row_bytes;
+            break;
+    }
+    return antfly_metal_encode_typed_stage(runtime, names[stage], &runtime->patch_transformer_pipeline[stage],
+        views, required, alignment, 5, write_mask, p, sizeof(*p), MTLSizeMake(x, y, 1), MTLSizeMake(128, 1, 1));
 }
 
 typedef struct {

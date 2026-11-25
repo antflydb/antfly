@@ -1663,7 +1663,7 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
     // embedders cannot silently fall back to symmetric raw-text behavior.
     if (try catalog.readOptional("model_manifest.json")) |manifest_bytes| {
         defer allocator.free(manifest_bytes);
-        try parseModelManifestJson(&manifest, allocator, manifest_bytes);
+        try parseDirectoryModelManifest(&manifest, allocator, manifest_bytes, if (catalog.receipt) |receipt| receipt.parsed.value.source else null);
     }
 
     if (try catalog.readOptional("antfly_inference_bundle.json")) |bundle_bytes| {
@@ -1835,7 +1835,7 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
         // Keep discovery and compatibility admission aligned with the full
         // loader. An invalid Antfly manifest must never be advertised as a
         // loadable model and then fail only when a session is created.
-        try parseModelManifestJson(&manifest, allocator, manifest_bytes);
+        try parseDirectoryModelManifest(&manifest, allocator, manifest_bytes, if (catalog.receipt) |receipt| receipt.parsed.value.source else null);
     }
 
     if (try catalog.readOptional("antfly_inference_bundle.json")) |bundle_bytes| {
@@ -3026,12 +3026,23 @@ test "decision architecture declaration requires a Laya ModernBERT config" {
     try std.testing.expect(!configDeclaresLaya(bad.value.object));
 }
 
+fn applyInklingContext(manifest: *ModelManifest, obj: std.json.ObjectMap) void {
+    const architecture = obj.get("model_type") orelse return;
+    if (architecture != .string or !std.mem.eql(u8, architecture.string, @import("../architectures/inkling2_checkpoint.zig").architecture)) return;
+    const text = obj.get("text_config") orelse return;
+    if (text != .object) return;
+    const value = text.object.get("model_max_length") orelse return;
+    const limit = jsonU32(value) orelse return;
+    if (limit > 0) manifest.max_position_embeddings = limit;
+}
+
 fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_bytes: []const u8) !void {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
     defer parsed.deinit();
 
     if (parsed.value != .object) return error.InvalidModelConfig;
     const obj = parsed.value.object;
+    applyInklingContext(manifest, obj);
     manifest.laya_declared = configDeclaresLaya(obj);
     const jina_v5_embedding_config = isJinaV5TextEmbeddingConfig(&obj);
     applyVisionTargetFromModelConfig(manifest, obj);
@@ -3289,6 +3300,7 @@ fn parseListingConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator
 
     if (parsed.value != .object) return error.InvalidModelConfig;
     const obj = parsed.value.object;
+    applyInklingContext(manifest, obj);
     manifest.laya_declared = configDeclaresLaya(obj);
     applyVisionTargetFromModelConfig(manifest, obj);
 
@@ -4326,6 +4338,42 @@ fn applyFlorence2GgufBundle(
     if (manifest.config_model_arch.len > 0) allocator.free(manifest.config_model_arch);
     manifest.config_model_arch = arch;
     arch = "";
+}
+
+const legacy_inkling_pull_manifest = "{\"type\":\"generator\",\"tasks\":[\"generate\"],\"inputs\":[\"text\"]}";
+
+fn parseDirectoryModelManifest(manifest: *ModelManifest, allocator: std.mem.Allocator, bytes: []const u8, source: ?@import("../registry/managed_receipt.zig").DownloadSource) !void {
+    try parseModelManifestJson(manifest, allocator, bytes);
+    // Early managed pulls omitted the vision tower from synthesized inputs.
+    // Preserve the published receipt and any explicitly authored manifests.
+    const origin = source orelse return;
+    if (manifest.isInkling2() and std.mem.eql(u8, origin.owner, "thinkingmachines") and
+        std.mem.eql(u8, origin.name, "Inkling-2-Mini") and
+        std.mem.eql(u8, bytes, legacy_inkling_pull_manifest))
+        try setManifestInputs(allocator, manifest, &.{ "text", "image" });
+}
+
+test "Inkling directory metadata repairs legacy managed pulls" {
+    const a = std.testing.allocator;
+    const architecture = @import("../architectures/inkling2_checkpoint.zig").architecture;
+    var local: ModelManifest = .{ .allocator = a };
+    defer local.deinit();
+    const config = try std.json.Stringify.valueAlloc(a, .{
+        .model_type = architecture,
+        .text_config = .{ .model_max_length = 1048576 },
+    }, .{});
+    defer a.free(config);
+    try parseListingConfigJson(&local, a, config);
+    try std.testing.expectEqual(@as(u32, 1048576), local.max_position_embeddings);
+    try parseDirectoryModelManifest(&local, a, legacy_inkling_pull_manifest, null);
+    try std.testing.expectEqual(@as(usize, 1), local.inputs.len);
+    try parseDirectoryModelManifest(&local, a, legacy_inkling_pull_manifest, .{
+        .owner = "thinkingmachines",
+        .name = "Inkling-2-Mini",
+        .variant = "safetensors",
+    });
+    try std.testing.expectEqual(@as(usize, 2), local.inputs.len);
+    try std.testing.expectEqualStrings("image", local.inputs[1]);
 }
 
 fn setManifestInputs(allocator: std.mem.Allocator, manifest: *ModelManifest, inputs: []const []const u8) !void {
