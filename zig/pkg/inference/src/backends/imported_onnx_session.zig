@@ -943,6 +943,7 @@ fn prepareInvocationIntoWithCleanup(session: *const Session, shapes: session_mod
     } else try validatePreparedShapes(root, shapes);
     prepared.target = target;
     prepared.stage_input_unused = preparedStageInputUnused;
+    prepared.stage_input_planned_host = preparedStageInputUsesPlannedHost;
     if (target.cache_branch) prepared.validate_stage_controls = validateStageCacheBranch;
     prepared.target_lifetime = if (target != root) &target.model_lifetime else null;
     prepared.backend_cookie = events;
@@ -1021,6 +1022,13 @@ test "ONNX cache shape reuses attested metadata and queries a stale hint" {
     try std.testing.expectEqualSlices(i64, &.{ 2, 2 }, actual);
 }
 
+fn preparedStageInputUsesPlannedHost(prepared: *const prepared_mod.PreparedInvocation, index: usize) bool {
+    const target: *const ImportedOnnxSession = @ptrCast(@alignCast(prepared.target));
+    const routes = prepared.routes orelse return false;
+    if (index >= target.input_node_ids.len) return false;
+    return routes.pool.hostInputIndex(target.input_node_ids[index]) != null;
+}
+
 fn validatePreparedInputs(target: *ImportedOnnxSession, inputs: prepared_mod.Inputs, allocator: std.mem.Allocator) !void {
     switch (inputs) {
         .host => |host| try validatePreparedShapes(target, .{ .tensors = host }),
@@ -1029,7 +1037,9 @@ fn validatePreparedInputs(target: *ImportedOnnxSession, inputs: prepared_mod.Inp
             var cursor: usize = @intFromBool(target.cache_branch);
             for (resident, target.input_info, target.input_node_ids) |input, expected, node| {
                 if (input.metadata_only) {
-                    if (node != ml.graph.null_node) return error.UnpreparedStagePayload;
+                    if (input.planned_host) |host| {
+                        if (node == ml.graph.null_node or host.dtype != expected.dtype or !std.mem.eql(u8, host.name, expected.name) or !std.mem.eql(i64, host.shape, input.shape)) return error.UnpreparedStagePayload;
+                    } else if (node != ml.graph.null_node) return error.UnpreparedStagePayload;
                 } else {
                     try validateResidentInput(target, input);
                     if (try input.backend.tensorDType(input.value) != expected.dtype) return error.PreparedInvocationShapeMismatch;
@@ -1625,22 +1635,25 @@ fn runConcreteObservedWithOutputs(
     var allocated_host_inputs: ?[]ingress.Input = null;
     defer if (allocated_host_inputs) |inputs| allocator.free(inputs);
     const declared_inputs: ?[]const ingress.Input = if (owns_host_inputs) declared: {
-        const source = host_inputs orelse return error.MissingPreparedHostInputs;
-        const inputs = if (live_dynamic_count <= host_storage.len) host_storage[0..live_dynamic_count] else allocated: {
-            allocated_host_inputs = try allocator.alloc(ingress.Input, live_dynamic_count);
+        const pool = prepared_routes.?.pool;
+        const host_count = pool.host_input_plans.len;
+        const inputs = if (host_count <= host_storage.len) host_storage[0..host_count] else allocated: {
+            allocated_host_inputs = try allocator.alloc(ingress.Input, host_count);
             break :allocated allocated_host_inputs.?;
         };
         var index: usize = 0;
         for (self.input_node_ids, 0..) |node, i| {
-            if (node == ml.graph.null_node) continue;
-            inputs[index] = .{ .node_id = node, .value = &source[i] };
+            if (node == ml.graph.null_node or pool.hostInputIndex(node) == null) continue;
+            const value = if (host_inputs) |source| &source[i] else if (resident_inputs) |source| source[i].planned_host orelse return error.MissingPreparedHostInputs else return error.MissingPreparedHostInputs;
+            inputs[index] = .{ .node_id = node, .value = value };
             index += 1;
         }
-        if (!prepared_routes.?.pool.supportsHostInputs(inputs)) return error.InvalidHostIngressBinding;
+        if (index != inputs.len or !pool.supportsHostInputs(inputs)) return error.InvalidHostIngressBinding;
         break :declared inputs;
     } else null;
-    const dynamic_inputs: []RuntimeInput = if (owns_host_inputs) &.{} else try allocator.alloc(RuntimeInput, live_dynamic_count);
-    defer if (!owns_host_inputs) allocator.free(dynamic_inputs);
+    const host_count = if (declared_inputs) |values| values.len else 0;
+    const dynamic_inputs = try allocator.alloc(RuntimeInput, live_dynamic_count - host_count);
+    defer allocator.free(dynamic_inputs);
 
     var imported_count: usize = 0;
     errdefer {
@@ -1649,9 +1662,9 @@ fn runConcreteObservedWithOutputs(
         }
     }
 
-    if (!owns_host_inputs) for (self.input_node_ids, 0..) |node_id, i| {
+    for (self.input_node_ids, 0..) |node_id, i| {
         if (control) |active| try active.check();
-        if (node_id == ml.graph.null_node) continue;
+        if (node_id == ml.graph.null_node or (owns_host_inputs and prepared_routes.?.pool.hostInputIndex(node_id) != null)) continue;
         const value = if (host_inputs) |inputs|
             try self.shared_backend_ctx.importHostTensorWithOperation(allocator, &inputs[i], backend_operation)
         else if (resident_inputs) |inputs| blk: {
@@ -1663,9 +1676,9 @@ fn runConcreteObservedWithOutputs(
             .value = value,
         };
         imported_count += 1;
-    };
+    }
 
-    const merged_inputs = if (owns_host_inputs) null else try allocator.alloc(RuntimeInput, self.static_runtime_inputs.len + dynamic_inputs.len);
+    const merged_inputs = if (dynamic_inputs.len == 0) null else try allocator.alloc(RuntimeInput, self.static_runtime_inputs.len + dynamic_inputs.len);
     defer if (merged_inputs) |inputs| allocator.free(inputs);
     if (merged_inputs) |inputs| {
         @memcpy(inputs[0..self.static_runtime_inputs.len], self.static_runtime_inputs);
@@ -4488,6 +4501,7 @@ const InvocationInputFacts = struct {
         }
         switch (shapes) {
             .tensors, .host_shapes => {},
+            .stage_inputs, .resident_inputs => if (target.cb.kind() != .metal or target.cache_branch) return false,
             else => return false,
         }
         const functions = target.cb.vtable.kernels orelse return false;
@@ -4499,6 +4513,7 @@ const InvocationInputFacts = struct {
             // path until their defaults have a distinct cold binding table.
             for (target.static_runtime_inputs) |input| if (input.node_id == node) return false;
             live = true;
+            if (shapes.source(i) != .host_dense) continue;
             const shape = target.program.graph.node(node).output_shape;
             const actual = shapes.get(i);
             if (!@import("../execution/host_ingress.zig").rawDType(shape.dtype) or actual.dtype != dtypeFromShape(shape) or !std.mem.eql(i64, actual.shape, shape.dims[0..shape.rank()])) return false;
@@ -5796,7 +5811,7 @@ fn importedTypedHostIngress(comptime backend_type: BackendType, comptime Index: 
         defer device_result.deinit();
         const ingress_stats = session.executionDiagnostics().?.execution.?;
         if (live_add) {
-            try std.testing.expect(ingress_stats.assigned_kernel_dispatches > 0);
+            try std.testing.expectEqual(@as(u64, 2), ingress_stats.assigned_kernel_dispatches);
         } else try std.testing.expectEqual(@as(u64, bytes_per_pair), ingress_stats.physical_input_copy_bytes);
         try std.testing.expectEqual(@as(u64, 0), ingress_stats.actual_download_bytes);
         const found = try device_result.backend.toFloat32(device_result.outputs[0], a);

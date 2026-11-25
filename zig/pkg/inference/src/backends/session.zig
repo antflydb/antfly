@@ -38,6 +38,8 @@ pub const ResidentInput = struct {
     value: ops.CT,
     // Only a selected prepared stage can omit the tensor payload.
     metadata_only: bool = false,
+    // A selected physical ingress plan consumes this host binding directly.
+    planned_host: ?*const Tensor = null,
     backend: *const ops.ComputeBackend,
     estimated_bytes: usize = 0,
     shape: []const i64 = &.{},
@@ -928,7 +930,7 @@ pub const ShapeInputs = union(enum) {
         return switch (self) {
             .tensors, .host_shapes => .host_dense,
             .shapes => .unknown,
-            .resident_inputs => |v| .{ .resident = v.values[i] },
+            .resident_inputs => |v| if (v.values[i].planned_host != null) .host_dense else .{ .resident = v.values[i] },
             .stage_inputs => |v| switch (v.values[i]) {
                 .host => .host_dense,
                 .resident => |value| .{ .resident = value },
@@ -3248,7 +3250,7 @@ pub const Session = struct {
         const stage_backend = shared.stableBackend();
         for (inputs, self.inputInfo()) |input, info| switch (input) {
             .host => |host| if (!std.mem.eql(u8, host.name, info.name) or host.dtype != info.dtype) return false,
-            .resident => |value| if (value.metadata_only or !ResidentInput.backendCompatible(value.backend, stage_backend)) return false,
+            .resident => |value| if (value.metadata_only or value.planned_host != null or !ResidentInput.backendCompatible(value.backend, stage_backend)) return false,
         };
         return true;
     }
@@ -5890,15 +5892,21 @@ pub const RunPermit = struct {
             if (input == .host and !value.metadata_only) backend.free(value.value);
         };
         var omitted_payload = false;
-        for (inputs, resident, 0..) |input, *value, index| {
+        for (inputs, resident, 0..) |*input, *value, index| {
             if (control) |active| try active.check();
-            if (input == .host) if (self.prepared) |*selected| if (!selected.executed and selected.stageInputUnused(index)) {
+            if (input.* == .host) if (self.prepared) |*selected| if (!selected.executed and selected.stageInputUsesPlannedHost(index)) {
+                value.* = .{ .value = backend.ptr, .metadata_only = true, .planned_host = &input.host, .backend = backend, .shape = input.host.shape };
+                omitted_payload = true;
+                initialized += 1;
+                continue;
+            };
+            if (input.* == .host) if (self.prepared) |*selected| if (!selected.executed and selected.stageInputUnused(index)) {
                 value.* = .{ .value = backend.ptr, .metadata_only = true, .backend = backend, .shape = input.host.shape };
                 omitted_payload = true;
                 initialized += 1;
                 continue;
             };
-            value.* = switch (input) {
+            value.* = switch (input.*) {
                 .host => |host| .{
                     .value = try shared.importReadOnlyHostTensor(allocator, &host),
                     .backend = backend,

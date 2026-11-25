@@ -112,6 +112,7 @@ pub const PreparedInvocation = struct {
     validate_stage_controls: ?*const fn (*PreparedInvocation, []const @import("../backends/session.zig").StageInput) anyerror!void = null,
     stage_controls_validated: bool = false,
     stage_input_unused: ?*const fn (*const PreparedInvocation, usize) bool = null,
+    stage_input_planned_host: ?*const fn (*const PreparedInvocation, usize) bool = null,
     dispatch: *const fn (*PreparedInvocation, Inputs, Placement, std.mem.Allocator, ?Control, ?storage.Capability) anyerror!Result,
     reclaim_idle: ?*const fn (*PreparedInvocation, ?Control) anyerror!bool = null,
     reclaim_idle_with_cleanup: ?*const fn (*PreparedInvocation, ?Control, @import("cleanup_context.zig").Context) anyerror!bool = null,
@@ -121,6 +122,11 @@ pub const PreparedInvocation = struct {
     pub fn stageInputUnused(self: *const PreparedInvocation, index: usize) bool {
         const unused = self.stage_input_unused orelse return false;
         return unused(self, index);
+    }
+
+    pub fn stageInputUsesPlannedHost(self: *const PreparedInvocation, index: usize) bool {
+        const selected = self.stage_input_planned_host orelse return false;
+        return selected(self, index);
     }
 
     pub fn hasCompleteOwnedPayload(self: *const PreparedInvocation) bool {

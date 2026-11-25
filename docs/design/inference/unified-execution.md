@@ -982,8 +982,8 @@ host index buffer. Restoring the first index before the final dispatch
 makes that probe compare the intended result.
 
 The same graph with a resident I32 index tensor and a host F32 add operand
-also preserved results and rejected invalid indices on Metal. Its observed
-forward kept one assigned dispatch and issued zero downloads. Complete
-mixed ingress needs an admitted host binding alongside the resident index
-binding. The current stage adapter imports the host operand before
-resident dispatch.
+now uses two assigned dispatches and issues zero downloads. The selected
+Metal frame binds the host operand through its admitted ingress plan and
+keeps the resident index on the device path. The stage adapter skips the
+temporary import only for inputs named by the selected host plan. Mixed
+cached decoder controls retain their existing import contract.

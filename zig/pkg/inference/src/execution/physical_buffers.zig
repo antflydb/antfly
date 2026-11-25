@@ -1305,7 +1305,7 @@ pub const Pool = struct {
         return true;
     }
 
-    fn hostInputIndex(self: *const Pool, node: NodeId) ?usize {
+    pub fn hostInputIndex(self: *const Pool, node: NodeId) ?usize {
         for (self.host_input_plans, 0..) |plan, index| if (plan.node == node) return index;
         return null;
     }
