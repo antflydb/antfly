@@ -2042,6 +2042,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     allocator: std.mem.Allocator,
     require_f32_linears: bool = false,
+    prefer_lossless_f16_linears: bool = false,
     require_prepared_vision: bool = false,
     require_qwen_vision_resident: bool = false,
     embedding_stage_suspended: bool = false,
@@ -8293,6 +8294,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .in_dim = in_dim,
             .out_dim = out_dim,
         };
+    }
+
+    fn compactExactF16(allocator: std.mem.Allocator, source: []const f32) ?[]f16 {
+        const compact = allocator.alloc(f16, source.len) catch return null;
+        for (source, compact) |value, *half| {
+            half.* = @floatCast(value);
+            if (@as(f32, half.*) != value) {
+                allocator.free(compact);
+                return null;
+            }
+        }
+        return compact;
     }
 
     fn isBorrowedImmutableF32(buf: *const Buf) bool {
@@ -24235,11 +24248,29 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return cache.retirementDomainMatches(pin);
     }
 
-    /// Change dispatch preference while the caller owns the active frame.
-    pub fn swapDenseMpsLinearPreference(cb: *const ops.ComputeBackend, enabled: bool) bool {
-        std.debug.assert(cb.kind() == .metal);
+    pub const DenseLinearScope = struct {
+        receiver: *MetalCompute,
+        previous_mps: bool,
+        previous_lossless: bool,
+
+        pub fn deinit(self: DenseLinearScope) void {
+            self.receiver.prefer_lossless_f16_linears = self.previous_lossless;
+            _ = metal_runtime.antfly_metal_swap_dense_mps_linear_preference(self.receiver.provider_impl.raw_decode_runtime, self.previous_mps);
+        }
+    };
+
+    /// The caller owns its active frame and the numerical provider operation.
+    pub fn beginDenseLinearScope(cb: *const ops.ComputeBackend, prefer_lossless_f16: bool) ?DenseLinearScope {
+        if (!acceptsEmbeddingStage(cb)) return null;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
-        return metal_runtime.antfly_metal_swap_dense_mps_linear_preference(self.provider_impl.raw_decode_runtime, enabled);
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        const previous = self.prefer_lossless_f16_linears;
+        self.prefer_lossless_f16_linears = prefer_lossless_f16;
+        return .{
+            .receiver = self,
+            .previous_mps = metal_runtime.antfly_metal_swap_dense_mps_linear_preference(runtime, true),
+            .previous_lossless = previous,
+        };
     }
 
     pub fn pendingAudioScratch(cb: *const ops.ComputeBackend, key: u64, inputs: []const CT) !?audio_tape.Plan.ArenaRequest {
@@ -41105,14 +41136,25 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             weight_buf.native_dense_bytes
         else
             null;
-        const dense_f16_bytes = if (runtime_quantized_storage == null and has_native_f16)
+        const shape = weight_buf.logical_shape orelse &.{};
+        const compact_weight = if (self.prefer_lossless_f16_linears and runtime_quantized_storage == null and
+            !has_native_f16 and !has_native_bf16 and isBorrowedImmutableF32(weight_buf) and
+            shape.len == 2 and shape[0] == request.out_dim and shape[1] == request.in_dim and
+            weight_buf.data.len <= 8 * 1024 * 1024)
+            compactExactF16(std.heap.c_allocator, weight_buf.data)
+        else
+            null;
+        defer if (compact_weight) |values| std.heap.c_allocator.free(values);
+        const dense_f16_bytes = if (compact_weight) |values|
+            std.mem.sliceAsBytes(values)
+        else if (runtime_quantized_storage == null and has_native_f16)
             weight_buf.native_dense_bytes
         else
             null;
         const dense_bf16_no_copy_safe = dense_bf16_bytes != null and !weight_buf.native_dense_bytes_owned;
         if (getenvBool("TERMITE_METAL_TRACE_DENSE_LINEAR_PREPARE") and runtime_quantized_storage == null) {
             std.debug.print(
-                "metal_dense_prepare_request: slot={d} in={d} out={d} has_native_bf16={} native_bytes={d} no_copy_safe={}\n",
+                "metal_dense_prepare_request: slot={d} in={d} out={d} has_native_bf16={} native_bytes={d} no_copy_safe={} compact_f16={}\n",
                 .{
                     request.slot,
                     request.in_dim,
@@ -41120,6 +41162,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     has_native_bf16,
                     if (dense_bf16_bytes) |bytes| bytes.len else 0,
                     dense_bf16_no_copy_safe,
+                    compact_weight != null,
                 },
             );
         }

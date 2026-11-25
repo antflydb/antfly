@@ -188,12 +188,14 @@ fn encoderForwardOutput(
     var frame_active = try beginWhisperMetalFrame(cb, .prefill);
     errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
     const MetalCompute = @import("../ops/metal_compute.zig").MetalCompute;
-    const previous_mps: ?bool = if (@import("build_options").enable_metal and frame_active and qualifiedMetalSmall(config))
-        MetalCompute.swapDenseMpsLinearPreference(cb, true)
-    else
-        null;
+    const linear_scope = if (comptime @import("build_options").enable_metal)
+        if (frame_active and qualifiedMetalSmall(config))
+            MetalCompute.beginDenseLinearScope(cb, platform.env.getenvBoolDefault("TERMITE_WHISPER_METAL_LOSSLESS_F16_LINEAR", true))
+        else
+            null
+    else {};
     defer if (comptime @import("build_options").enable_metal) {
-        if (previous_mps) |previous| _ = MetalCompute.swapDenseMpsLinearPreference(cb, previous);
+        if (linear_scope) |scope| scope.deinit();
     };
     const scope_active = frame_active and (cb.decoderRuntimeBeginPlannedComputeScope() catch false);
     defer if (scope_active) cb.decoderRuntimeEndPlannedComputeScope();

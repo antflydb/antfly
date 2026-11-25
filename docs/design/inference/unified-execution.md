@@ -1021,6 +1021,13 @@ prefill enabled on both arms and the same five-phase schedule, the
 disabled/default warm p50 was 1378.75/1132.22 ms. All 30 publications
 matched the previous route exactly, including phrase boundaries.
 
+Whisper Small now stores eligible immutable encoder matrices as F16 after
+checking the full F32 round trip. A failed check leaves that matrix in F32.
+Using the same five-phase protocol, warm p50 moved from 1134.25 to
+1070.42 ms, with the same text and timestamps in every request. English
+and Spanish MP4 fixtures also produced identical publications with fixed
+and automatic language selection. Provider traces confirmed F16 slot use.
+
 ### Gemma 4 resident Metal projection
 
 The qualified Gemma 4 E2B and E4B channel geometries use the verified
@@ -1077,3 +1084,7 @@ exactly within its case. Cells report disabled / default warm p50 ms.
 The short warm CPU llama.cpp reference measured 467 / 15027 / 1224 /
 24059 ms for E2B (four samples per modality) and 1126 / 15437 / 1405 /
 24679 ms for E4B (one sample per modality), in the same modality order.
+
+Both checkpoints also retrieved the same code on M4 Max Metal at 16,384
+and 131,060 prompt tokens and rejected overflow with the 12-token output
+reservation. These Metal runs qualified context admission and retrieval.
