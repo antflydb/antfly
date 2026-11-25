@@ -42,6 +42,7 @@ pub const Options = struct {
     tables: std.ArrayList([]const u8) = .empty,
     table_token: ?[]const u8 = null,
     table_filter: ?[]const u8 = null,
+    require_complete: bool = false,
     max_index_documents: usize = 100000,
     max_spill_bytes: usize = 1024 * 1024 * 1024,
     max_pending_output: usize = 64 * 1024 * 1024,
@@ -553,7 +554,7 @@ pub const Options = struct {
                     self.json_compact = true;
                     continue;
                 }
-                const toggles = .{ .{ "--fixed-strings", "fixed" }, .{ "--ignore-case", "ignore_case" }, .{ "--word-regexp", "word" }, .{ "--line-regexp", "whole_line" }, .{ "--invert-match", "invert" }, .{ "--line-number", "line_numbers" }, .{ "--files-with-matches", "files_with_matches" }, .{ "--count", "count" }, .{ "--quiet", "quiet" }, .{ "--files", "files" }, .{ "--hidden", "hidden" }, .{ "--no-ignore", "no_ignore" }, .{ "--text", "text" }, .{ "--json", "json" }, .{ "--help", "help" }, .{ "--version", "version" } };
+                const toggles = .{ .{ "--require-complete", "require_complete" }, .{ "--fixed-strings", "fixed" }, .{ "--ignore-case", "ignore_case" }, .{ "--word-regexp", "word" }, .{ "--line-regexp", "whole_line" }, .{ "--invert-match", "invert" }, .{ "--line-number", "line_numbers" }, .{ "--files-with-matches", "files_with_matches" }, .{ "--count", "count" }, .{ "--quiet", "quiet" }, .{ "--files", "files" }, .{ "--hidden", "hidden" }, .{ "--no-ignore", "no_ignore" }, .{ "--text", "text" }, .{ "--json", "json" }, .{ "--help", "help" }, .{ "--version", "version" } };
                 var handled = false;
                 inline for (toggles) |toggle| {
                     if (std.mem.eql(u8, name, toggle[0])) {

@@ -1,7 +1,7 @@
 {
   "version": 1,
   "target": {
-    "ripgrep": "15.2.0",
+    "ripgrep": "16.0.0",
     "pcre2": "10.45",
     "implementation": "native Zig; no libpcre2"
   },
@@ -15,7 +15,7 @@
         "tests/generated_fixtures.json",
         "tests/differential.py"
       ],
-      "limits": "Pinned goldens plus seeded grammar-based exploration with bounded reduction of flags, patterns and subjects. Generated Linux x86 cases replay fully there; portable ASCII inputs replay elsewhere because upstream empty UTF matching differs by platform and PCRE2 JIT build configuration. Complete upstream dialect/JIT parity is not claimed. The pinned GNU/JIT Linux ARM64 and x86-64 PCRE empty-UTF output advances bytes; the pinned macOS ARM64 PCRE output advances codepoints. An oracle-independent CLI regression preserves that contract. The Linux musl/no-JIT release advances codepoints instead; the baseline/current/oracle comparison records this pre-existing difference.",
+      "limits": "Pinned v16 goldens plus seeded grammar-based exploration with bounded reduction of flags, patterns and subjects. All generated Unicode and ASCII cases replay on every supported platform. Empty-match output iteration advances bytes independently of the regex engine Unicode mode and host OS. Historical reports retain their original oracle versions and do not establish current exhaustive dialect or JIT parity.",
       "archived_evidence": [
         "macos-arm64-review-differential.json",
         "linux-arm64-review-differential.json",

@@ -1028,6 +1028,111 @@ fn configValue(a: Allocator, raw: []const u8) ![]u8 {
     return out.toOwnedSlice(a);
 }
 
+const GlobRange = struct { first: u8, last: u8 };
+
+fn posixGlobRanges(name: []const u8) ?[]const GlobRange {
+    const classes = .{
+        .{ "alnum", &[_]GlobRange{ .{ .first = '0', .last = '9' }, .{ .first = 'A', .last = 'Z' }, .{ .first = 'a', .last = 'z' } } },
+        .{ "alpha", &[_]GlobRange{ .{ .first = 'A', .last = 'Z' }, .{ .first = 'a', .last = 'z' } } },
+        .{ "blank", &[_]GlobRange{ .{ .first = '\t', .last = '\t' }, .{ .first = ' ', .last = ' ' } } },
+        .{ "cntrl", &[_]GlobRange{ .{ .first = 0, .last = 31 }, .{ .first = 127, .last = 127 } } },
+        .{ "digit", &[_]GlobRange{.{ .first = '0', .last = '9' }} },
+        .{ "graph", &[_]GlobRange{.{ .first = '!', .last = '~' }} },
+        .{ "lower", &[_]GlobRange{.{ .first = 'a', .last = 'z' }} },
+        .{ "print", &[_]GlobRange{.{ .first = ' ', .last = '~' }} },
+        .{ "punct", &[_]GlobRange{ .{ .first = '!', .last = '/' }, .{ .first = ':', .last = '@' }, .{ .first = '[', .last = '`' }, .{ .first = '{', .last = '~' } } },
+        .{ "space", &[_]GlobRange{ .{ .first = '\t', .last = '\r' }, .{ .first = ' ', .last = ' ' } } },
+        .{ "upper", &[_]GlobRange{.{ .first = 'A', .last = 'Z' }} },
+        .{ "xdigit", &[_]GlobRange{ .{ .first = '0', .last = '9' }, .{ .first = 'A', .last = 'F' }, .{ .first = 'a', .last = 'f' } } },
+    };
+    inline for (classes) |class| {
+        if (std.mem.eql(u8, name, class[0])) return class[1];
+    }
+    return null;
+}
+
+fn globClassByte(a: Allocator, out: *std.ArrayList(u8), byte: u8) !void {
+    if (byte == '\\' or byte == ']' or byte == '^' or byte == '-') try out.append(a, '\\');
+    try out.append(a, byte);
+}
+
+/// Normalize once at discovery time into the regex VM's byte membership table.
+/// Bracket classes never cross a path separator, including negated classes and
+/// POSIX ranges containing '/'. No per-path parsing or extra matcher is needed.
+fn globClass(a: Allocator, out: *std.ArrayList(u8), pattern: []const u8, start: usize) !?usize {
+    var next = start + 1;
+    const negate = next < pattern.len and (pattern[next] == '!' or pattern[next] == '^');
+    if (negate) next += 1;
+    var bytes: [256]bool = @splat(false);
+    var first = true;
+    var in_range = false;
+    var pending: ?GlobRange = null;
+    while (next < pattern.len) : (next += 1) {
+        const byte = pattern[next];
+        if (byte == ']' and !first) {
+            if (pending) |r| for (@as(usize, r.first)..@as(usize, r.last) + 1) |b| {
+                bytes[b] = true;
+            };
+            if (in_range) bytes['-'] = true;
+            for (&bytes) |*present| present.* = present.* != negate;
+            bytes['/'] = false;
+            try out.append(a, '[');
+            if (std.mem.indexOfScalar(bool, &bytes, true) == null) {
+                // The VM supports a negated full byte range, an empty set.
+                try out.appendSlice(a, &.{ '^', 0, '-', 255 });
+            } else {
+                var b: usize = 0;
+                while (b < bytes.len) : (b += 1) {
+                    if (!bytes[b]) continue;
+                    const lo = b;
+                    while (b + 1 < bytes.len and bytes[b + 1]) b += 1;
+                    try globClassByte(a, out, @intCast(lo));
+                    if (b > lo) {
+                        try out.append(a, '-');
+                        try globClassByte(a, out, @intCast(b));
+                    }
+                }
+            }
+            try out.append(a, ']');
+            return next;
+        }
+        if (byte == '-' and !first and !in_range) {
+            in_range = true;
+        } else if (in_range) {
+            if (byte < pending.?.first) return error.InvalidGlob;
+            pending.?.last = byte;
+            in_range = false;
+        } else {
+            var ranges: ?[]const GlobRange = null;
+            if (byte == '[' and next + 1 < pattern.len and pattern[next + 1] == ':') {
+                var end = next + 2;
+                while (end < pattern.len and end - (next + 2) < 8 and std.ascii.isLower(pattern[end])) : (end += 1) {}
+                if (end + 1 < pattern.len and pattern[end] == ':' and pattern[end + 1] == ']') {
+                    ranges = posixGlobRanges(pattern[next + 2 .. end]);
+                    // A syntactically valid but unknown POSIX class consumes its
+                    // suffix just like globset, retaining a literal '['.
+                    next = end + 1;
+                }
+            }
+            if (ranges) |rs| {
+                for (rs) |r| {
+                    if (pending) |prev| for (@as(usize, prev.first)..@as(usize, prev.last) + 1) |b| {
+                        bytes[b] = true;
+                    };
+                    pending = r;
+                }
+            } else {
+                if (pending) |prev| for (@as(usize, prev.first)..@as(usize, prev.last) + 1) |b| {
+                    bytes[b] = true;
+                };
+                pending = .{ .first = byte, .last = byte };
+            }
+        }
+        first = false;
+    }
+    return null;
+}
+
 pub fn glob(a: Allocator, pattern: []const u8) !regex.PreparedPattern {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(a);
@@ -1061,28 +1166,12 @@ pub fn glob(a: Allocator, pattern: []const u8) !regex.PreparedPattern {
                 if (braces > 0) try out.append(a, '|') else try out.appendSlice(a, "\\,");
             },
             '[' => {
-                var next = i + 1;
-                const negate = next < pattern.len and (pattern[next] == '!' or pattern[next] == '^');
-                if (negate) next += 1;
-                const start = next;
-                while (next < pattern.len and (next == start or pattern[next] != ']')) : (next += 1) {
-                    if (pattern[next] == '\\' and next + 1 < pattern.len) next += 1;
-                }
-                if (next == pattern.len) {
-                    // globset treats an unclosed bracket as a literal opener.
+                if (try globClass(a, &out, pattern, i)) |end| {
+                    i = end;
+                } else {
+                    // An unclosed class rolls back to a literal opener.
                     try out.appendSlice(a, "\\[");
-                    continue;
                 }
-                try out.append(a, '[');
-                if (negate) {
-                    try out.appendSlice(a, "^");
-                    // Keep an initial literal closing bracket literal.
-                    if (pattern[start] == ']') try out.appendSlice(a, "\\]");
-                }
-                const contents = if (negate and pattern[start] == ']') start + 1 else start;
-                try out.appendSlice(a, pattern[contents..next]);
-                try out.append(a, ']');
-                i = next;
             },
             '\\' => {
                 i += 1;
@@ -1110,6 +1199,38 @@ test "git-style globs preserve slashes and recursive zero-directory matches" {
     var q = try glob(a, "src/*.go");
     defer q.deinit();
     try std.testing.expect(!try q.matches(a, "src/sub/main.go"));
+}
+
+test "glob classes expand POSIX sets and never consume separators" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { pattern: []const u8, yes: []const u8, no: []const u8 }{
+        .{ .pattern = "[[:digit:]].txt", .yes = "1.txt", .no = "a.txt" },
+        .{ .pattern = "[a[:upper:]0-9]", .yes = "Z", .no = "b" },
+        .{ .pattern = "[![:digit:]]", .yes = "a", .no = "5" },
+        .{ .pattern = "[!ab]??[!ab]*", .yes = "dirc", .no = "dir/b" },
+        .{ .pattern = "[.-0]", .yes = ".", .no = "/" },
+        .{ .pattern = "[[:punct:]]", .yes = "!", .no = "/" },
+        .{ .pattern = "[[:digit:]-5]", .yes = "5", .no = "9" },
+        .{ .pattern = "[[:bogus:]]", .yes = "[", .no = "b" },
+        .{ .pattern = "[a", .yes = "[a", .no = "a" },
+        .{ .pattern = "[]a]", .yes = "]", .no = "/" },
+        .{ .pattern = "[\\a]", .yes = "\\", .no = "b" },
+        .{ .pattern = "[/]", .yes = "", .no = "/" },
+    };
+    for (cases) |case| {
+        var p = try glob(a, case.pattern);
+        defer p.deinit();
+        if (case.yes.len > 0) try std.testing.expect(try p.matches(a, case.yes));
+        try std.testing.expect(!try p.matches(a, case.no));
+        // The anchored shortcut and generic VM must see the same byte set.
+        var reference = p;
+        reference.fast = .{};
+        for (0..256) |b| {
+            const value = [_]u8{@intCast(b)};
+            try std.testing.expectEqual(try reference.matches(a, &value), try p.matches(a, &value));
+        }
+    }
+    try std.testing.expectError(error.InvalidGlob, glob(a, "[z-a]"));
 }
 
 test "compiled glob shortcuts agree with the Thompson VM on path components" {
