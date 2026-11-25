@@ -518,6 +518,21 @@ class NativeStreams(unittest.TestCase):
         self.assertEqual(summary["stats"]["files"], 1000)
         self.assertLessEqual(summary["stats"]["index_requests"], 40)
 
+    def test_complete_no_match_carries_its_coverage_revision(self):
+        result = self.run_grep("absent")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        events = [json.loads(line) for line in result.stdout.splitlines()]
+        coverage = next(e for e in events if e["type"] == "coverage")
+        self.assertTrue(coverage["complete"])
+        self.assertEqual(coverage["observation"]["target_revision"], 1)
+        self.assertEqual(coverage["observation"]["published_revision"], 1)
+        self.assertEqual(coverage["observation"]["incarnation"], "index-1")
+        self.assertEqual(coverage["observation"]["table"], "recordings")
+        self.assertEqual(coverage["observation"]["index"], "speech_text")
+        self.assertEqual(coverage["observation"]["field"], "text")
+        self.assertTrue(events[-1]["stats"]["complete"])
+        self.assertNotIn("incomplete extraction coverage", result.stderr)
+
     def test_available_content_is_searched_with_incomplete_coverage(self):
         self.complete = False
         for pattern, expected_matches in [("Tuesday", 2), ("absent", 0)]:

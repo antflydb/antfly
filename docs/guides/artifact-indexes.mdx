@@ -289,6 +289,11 @@ rejects known gaps before searching and requires stable, complete observations
 through the scan. This is an operational observation check, not a snapshot-bound
 coverage certificate. It does not wait for a permanently idle table.
 
+Successful artifact grep scans also emit a `coverage` JSON observation with
+`complete: true`, the table/index/field, incarnation, and target/published revisions, including when
+there are no matches. This qualifies the observation behind the summary boolean;
+it does not turn the observation into a snapshot-bound extraction certificate.
+
 Internal replay watermarks are diagnostics only.
 
 Changing source membership, projection fields, analyzer semantics, embedding space, or graph mapping changes what the index means and requires a new materialized generation. Execution batching fields tune work without changing artifact identity.

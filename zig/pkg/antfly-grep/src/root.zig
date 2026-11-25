@@ -613,10 +613,10 @@ pub const Search = struct {
     }
     /// Coverage is an observed source milestone, independent of whether the
     /// retained search itself finished. Do not count a known gap as a scan error.
-    pub fn reportCoverage(self: *Search, path: []const u8, artifact: []const u8, reason: []const u8, observation: anytype) !void {
-        self.summary.coverage_complete = false;
-        if (self.options.json and !self.options.quiet) try self.json(.{ .type = "coverage", .path = path, .artifact = artifact, .complete = false, .reason = reason, .observation = observation });
-        if (!self.options.no_messages) std.debug.print("antfly-grep: {s}: {s}: incomplete extraction coverage ({s}); searching available content\n", .{ path, artifact, reason });
+    pub fn reportCoverage(self: *Search, path: []const u8, artifact: []const u8, complete: bool, reason: []const u8, observation: anytype) !void {
+        self.summary.coverage_complete = self.summary.coverage_complete and complete;
+        if (self.options.json and !self.options.quiet) try self.json(.{ .type = "coverage", .path = path, .artifact = artifact, .complete = complete, .reason = reason, .observation = observation });
+        if (!complete and !self.options.no_messages) std.debug.print("antfly-grep: {s}: {s}: incomplete extraction coverage ({s}); searching available content\n", .{ path, artifact, reason });
     }
     pub fn reportError(self: *Search, path: []const u8, err: anyerror) !void {
         if (err == error.WriteFailed or err == error.BrokenPipe) return err;

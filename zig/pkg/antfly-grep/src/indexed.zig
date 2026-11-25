@@ -131,6 +131,9 @@ pub fn run(search: anytype) !void {
 // Revision progress is expected during ingestion; only a definition change
 // invalidates the binding of the retained scan.
 const StreamReadiness = struct {
+    table: []const u8,
+    index: []const u8,
+    field: []const u8,
     incarnation: []const u8,
     target_revision: u64,
     published_revision: u64,
@@ -152,7 +155,7 @@ fn scanStream(search: anytype, http: *httpx.Client, config: Config, table: Table
     if (!before.complete) {
         search.summary.coverage_complete = false;
         if (search.options.require_complete) return error.ArtifactStreamIncomplete;
-        try search.reportCoverage(table.alias orelse table.name, stream.artifact.?, "source_incomplete", before);
+        try search.reportCoverage(table.alias orelse table.name, stream.artifact.?, false, "source_incomplete", before);
     }
     scanArtifacts(search, http, config, table, count, seen) catch |err| {
         search.summary.coverage_complete = false;
@@ -170,7 +173,11 @@ fn scanStream(search: anytype, http: *httpx.Client, config: Config, table: Table
     // These observations are not a coverage certificate for remote_snapshot.
     // A moving revision cannot certify complete coverage of that scan's cut.
     if (before.complete and (!after.complete or !before.sameRevision(after))) {
-        try search.reportCoverage(table.alias orelse table.name, stream.artifact.?, if (!after.complete) "source_incomplete" else "observation_changed", after);
+        try search.reportCoverage(table.alias orelse table.name, stream.artifact.?, false, if (!after.complete) "source_incomplete" else "observation_changed", after);
+    } else if (before.complete) {
+        // Even an exhaustive no-match must identify the revision at which
+        // coverage was observed; a bare boolean has no continuous-update cut.
+        try search.reportCoverage(table.alias orelse table.name, stream.artifact.?, true, "observed_complete", after);
     }
 }
 fn scanArtifacts(search: anytype, http: *httpx.Client, config: Config, table: Table, count: *usize, seen: *Seen) !void {
@@ -413,6 +420,9 @@ fn streamReadiness(search: anytype, http: *httpx.Client, config: Config, table: 
     const target = try readinessRevision(document.field(readiness, "target_revision"));
     const published = try readinessRevision(document.field(readiness, "published_revision"));
     return .{
+        .table = table.table orelse table.name,
+        .index = stream.index.?,
+        .field = stream.field,
         .incarnation = try search.a.dupe(u8, incarnation),
         .target_revision = @intCast(target),
         .published_revision = @intCast(published),

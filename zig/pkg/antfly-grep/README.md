@@ -902,6 +902,11 @@ uncertain without invalidating the retained scan. Status observations are not
 snapshot-bound coverage certificates. Authorization failures, unknown readiness,
 changed definitions and invalid snapshots remain errors.
 
+Successful artifact grep scans also emit a `coverage` JSON observation with
+`complete: true`, the table/index/field, incarnation, and target/published revisions, including when
+there are no matches. This qualifies the observation behind the summary boolean;
+it does not turn the observation into a snapshot-bound extraction certificate.
+
 Every alternative must supply a substring of
 at least three bytes; otherwise the entire query falls back to an exact scan.
 All returned content is verified with the shared matcher. Missing certificates

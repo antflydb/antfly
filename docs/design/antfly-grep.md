@@ -323,6 +323,11 @@ failure. Catalog incarnation changes, authorization failures and expired or
 changed query snapshots still fail the scan. No per-document manifest walk is
 added to the search path; coverage comes from bounded native readiness metadata.
 
+Successful artifact grep scans also emit a `coverage` JSON observation with
+`complete: true`, the table/index/field, incarnation, and target/published revisions, including when
+there are no matches. This qualifies the observation behind the summary boolean;
+it does not turn the observation into a snapshot-bound extraction certificate.
+
 The durable searchable-source catalog lives in an ordinary Antfly table named
 `antfly_sources` by default (configurable for self-hosted profiles). It is shared
 infrastructure for hosted and self-hosted ingestion, not Cloud-specific storage or
