@@ -11559,7 +11559,10 @@ pub fn readFileRangeFromLocationUsingIo(alloc: std.mem.Allocator, io: std.Io, lo
         .file => |root| {
             const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root, relative_path });
             defer alloc.free(path);
-            const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+            const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
+                error.FileNotFound => return error.BackupArtifactMissing,
+                else => return err,
+            };
             defer file.close(io);
             if ((try file.stat(io)).size != expected_size) return error.SourceFileChanged;
             const result = try alloc.alloc(u8, wanted);
@@ -11571,22 +11574,64 @@ pub fn readFileRangeFromLocationUsingIo(alloc: std.mem.Allocator, io: std.Io, lo
         .remote => |*store| {
             const key = try store.keyAlloc(alloc, relative_path);
             defer alloc.free(key);
-            var metadata = try store.client.statObject(store.bucket, key);
+            var metadata = store.client.statObject(store.bucket, key) catch |err| switch (err) {
+                error.FileNotFound => return error.BackupArtifactMissing,
+                else => return err,
+            };
             defer metadata.deinit(alloc);
             if (metadata.content_length != expected_size) return error.SourceFileChanged;
             const etag = metadata.etag orelse return error.RestoreArtifactIdentityMissing;
-            var result = try store.client.getObject(store.bucket, key, .{
+            var result = store.client.getObject(store.bucket, key, .{
                 .range = .{ .offset = offset, .length = wanted },
                 .if_match_etag = etag,
                 .skip_metadata_probe = true,
                 .max_response_bytes = wanted,
                 .cancellation = object_storage.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
-            });
+            }) catch |err| switch (err) {
+                error.FileNotFound => return error.BackupArtifactMissing,
+                error.PreconditionFailed => return error.SourceFileChanged,
+                else => return err,
+            };
             defer result.deinit(alloc);
             if (result.body.len != wanted) return error.SourceFileChanged;
             return alloc.dupe(u8, result.body);
         },
     }
+}
+
+test "staged restore range reads classify missing repository artifacts" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+    var local: BackupLocation = .{ .file = root };
+    try std.testing.expectError(error.BackupArtifactMissing, readFileRangeFromLocationUsingIo(
+        alloc,
+        io,
+        &local,
+        "missing.afb",
+        1,
+        0,
+        1,
+        .none,
+    ));
+
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var remote: BackupLocation = .{ .remote = try RemoteBackupStore.initWithClient(alloc, memory.client(), "bucket", "backups") };
+    defer remote.deinit(alloc);
+    try std.testing.expectError(error.BackupArtifactMissing, readFileRangeFromLocationUsingIo(
+        alloc,
+        io,
+        &remote,
+        "missing.afb",
+        1,
+        0,
+        1,
+        .none,
+    ));
 }
 
 pub const copyFileFromLocationVerifiedUsingIo = @import("antfly_local_sources").api_local_backups.copyFileFromLocationVerifiedUsingIo;
