@@ -150,7 +150,7 @@ from .index_config import (
 )
 from .native_kv import NativeKvCheckpoint
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 from .read_requirements import read_after_write
 
