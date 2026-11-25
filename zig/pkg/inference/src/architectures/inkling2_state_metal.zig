@@ -154,6 +154,16 @@ pub const State = struct {
         page_ids: *const Tensor,
     };
 
+    pub fn deviceBytes(config: kv.BankConfig, width: u32) !usize {
+        const full = try config.deviceBytes(.full);
+        const sliding = try config.deviceBytes(.sliding);
+        const visit_count = @as(usize, config.full_slots) + config.sliding_slots;
+        const history = try std.math.mul(usize, 12 * @sizeOf(u16), try std.math.mul(usize, visit_count, @as(usize, width) + (try config.rowBytes()) / @sizeOf(u16)));
+        const pages = try std.math.add(usize, try config.layout.pageCapacity(.full), try config.layout.pageCapacity(.sliding));
+        const tables = try std.math.mul(usize, pages, @sizeOf(u32));
+        return std.math.add(usize, try std.math.add(usize, full, sliding), try std.math.add(usize, history, tables));
+    }
+
     /// Initialize at a stable address. Only the request's frame may use the
     /// returned views, and the commit/abort fence must precede reuse.
     pub fn init(self: *State, a: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, config: kv.BankConfig, hidden_width: u32) !void {

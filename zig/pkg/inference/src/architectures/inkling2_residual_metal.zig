@@ -32,6 +32,11 @@ pub const Stack = struct {
     depth: usize = 0,
     saved_depth: ?usize = null,
 
+    pub fn deviceBytes(width: u32, rows: u32) !usize {
+        const count = try std.math.mul(usize, width, rows);
+        return std.math.mul(usize, count, (capacity + 3) * @sizeOf(u16));
+    }
+
     pub fn init(a: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, width: u32, rows: u32) !Stack {
         if (width == 0 or rows == 0) return error.InvalidShape;
         const count = try std.math.mul(usize, width, rows);

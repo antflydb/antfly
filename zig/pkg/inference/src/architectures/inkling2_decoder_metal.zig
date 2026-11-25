@@ -169,6 +169,58 @@ const Temp = enum {
     logits,
 };
 
+fn tempDtype(kind: Temp) tensors.DType {
+    return switch (kind) {
+        .mix, .shared_mix, .message, .gates, .router, .route_weights, .logits => .f32,
+        .selected => .i32,
+        else => .i16,
+    };
+}
+
+/// Exact requested device payloads. Metal allocation alignment and opaque
+/// command storage are accounted for separately by the allocator.
+pub const RequestPlan = struct {
+    width: u32,
+    elements: [@typeInfo(Temp).@"enum".field_names.len]usize,
+    bank: kv.BankConfig,
+    attention_workspace: attention.RequestWorkspace.Plan,
+
+    pub fn init(model: *const Decoder, max_tokens: u32) !RequestPlan {
+        const text = model.text;
+        if (max_tokens == 0 or max_tokens > text.model_max_length) return error.InvalidInkling2Context;
+        const width = text.hidden_size;
+        const shape = try model.layers[0].experts.geometry(text, 1).scratchShape();
+        const elements = [_]usize{
+            width,                 width,                      width,                 width,                 width,                    width,                   width,                   width,                     width,                     width,
+            @as(usize, width) * 2, text.loop_config.gate_rank, @as(usize, width) * 2, text.n_routed_experts, @intCast(shape.selected), @intCast(shape.weights), @intCast(shape.gate_up), @intCast(shape.activated), @intCast(shape.projected), text.unpadded_vocab_size,
+        };
+        const bank: kv.BankConfig = .{
+            .layout = .{ .page_tokens = 16, .window_tokens = text.sliding_window_size, .max_tokens = max_tokens, .max_append_tokens = 1 },
+            .full_slots = checkpoint.full_slot_count,
+            .sliding_slots = checkpoint.sliding_slot_count,
+            .kv_heads = text.num_key_value_heads,
+            .head_dim = text.head_dim,
+        };
+        return .{
+            .width = width,
+            .elements = elements,
+            .bank = bank,
+            .attention_workspace = try .init(text, 1, max_tokens),
+        };
+    }
+
+    pub fn deviceBytes(self: RequestPlan) !usize {
+        const stack = try Stack.deviceBytes(self.width, 1);
+        const state = try State.deviceBytes(self.bank, self.width);
+        const attention_bytes = self.attention_workspace.bytes +
+            @as(usize, @intCast(self.attention_workspace.reduction_elements)) * @sizeOf(f32);
+        var bytes = try std.math.add(usize, try std.math.add(usize, stack, state), attention_bytes);
+        for (std.enums.values(Temp), self.elements) |kind, count|
+            bytes = try std.math.add(usize, bytes, try std.math.mul(usize, count, tempDtype(kind).byteSize()));
+        return bytes;
+    }
+};
+
 pub const Request = struct {
     model: *const Decoder,
     state: State,
@@ -181,40 +233,22 @@ pub const Request = struct {
     /// Initialize the request in its final storage so that KV's metadata pools
     /// retain stable addresses across submissions.
     pub fn init(self: *Request, a: std.mem.Allocator, model: *const Decoder, max_tokens: u32) !void {
-        const text = model.text;
-        if (max_tokens == 0 or max_tokens > text.model_max_length) return error.InvalidInkling2Context;
+        const plan = try RequestPlan.init(model, max_tokens);
         const runtime = model.runtime;
-        const width = text.hidden_size;
-        const shape = try model.layers[0].experts.geometry(text, 1).scratchShape();
         self.* = .{ .model = model, .state = undefined, .stack = undefined, .attention_workspace = undefined, .temps = undefined, .host_logits = undefined, .allocator = a };
-        self.host_logits = try a.alloc(f32, text.unpadded_vocab_size);
+        self.host_logits = try a.alloc(f32, plan.elements[@backingInt(Temp.logits)]);
         errdefer a.free(self.host_logits);
-        self.stack = try Stack.init(a, runtime, width, 1);
+        self.stack = try Stack.init(a, runtime, plan.width, 1);
         errdefer self.stack.deinit();
-        self.attention_workspace = try .init(a, runtime, try .init(text, 1, max_tokens));
+        self.attention_workspace = try .init(a, runtime, plan.attention_workspace);
         errdefer self.attention_workspace.deinit();
-        const counts = [_]usize{
-            width,                 width,                      width,                 width,                 width,                    width,                   width,                   width,                     width,                     width,
-            @as(usize, width) * 2, text.loop_config.gate_rank, @as(usize, width) * 2, text.n_routed_experts, @intCast(shape.selected), @intCast(shape.weights), @intCast(shape.gate_up), @intCast(shape.activated), @intCast(shape.projected), text.unpadded_vocab_size,
-        };
         var initialized: usize = 0;
         errdefer for (self.temps[0..initialized]) |*tensor| tensor.deinit();
-        for (&self.temps, std.enums.values(Temp), counts) |*tensor, kind, elements| {
-            const dtype: tensors.DType = switch (kind) {
-                .mix, .shared_mix, .message, .gates, .router, .route_weights, .logits => .f32,
-                .selected => .i32,
-                else => .i16,
-            };
-            tensor.* = try allocate(a, runtime, dtype, elements, if (kind == .logits) .shared else .private);
+        for (&self.temps, std.enums.values(Temp), plan.elements) |*tensor, kind, elements| {
+            tensor.* = try allocate(a, runtime, tempDtype(kind), elements, if (kind == .logits) .shared else .private);
             initialized += 1;
         }
-        try self.state.init(a, runtime, .{
-            .layout = .{ .page_tokens = 16, .window_tokens = text.sliding_window_size, .max_tokens = max_tokens, .max_append_tokens = 1 },
-            .full_slots = checkpoint.full_slot_count,
-            .sliding_slots = checkpoint.sliding_slot_count,
-            .kv_heads = text.num_key_value_heads,
-            .head_dim = text.head_dim,
-        }, width);
+        try self.state.init(a, runtime, plan.bank, plan.width);
     }
 
     pub fn deinit(self: *Request) void {
@@ -513,6 +547,10 @@ test "Inkling Metal resident decoder executes the full visit schedule on a synth
         layer.* = try Fixture.load(runtime, text, index);
         loaded += 1;
     }
+    const short_plan = try RequestPlan.init(&model, 3);
+    const expanded_plan = try RequestPlan.init(&model, 17);
+    const new_page_bytes = checkpoint.visit_count * 16 * width * 2 * @sizeOf(u16) + 2 * @sizeOf(u32);
+    try std.testing.expectEqual(@as(usize, new_page_bytes), (try expanded_plan.deviceBytes()) - (try short_plan.deviceBytes()));
     var request: Request = undefined;
     try request.init(a, &model, 3);
     defer request.deinit();
