@@ -530,6 +530,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.enrichment.enrichment_runtime.test.foreground enrichment catch-up treats cancellation as a waiter outcome",
         "enrichment cancellation recovery reserves one replay pass without resetting debt",
         "enrichment cancellation distinguishes PDF deadlines and asset invocation failures",
+        "enrichment cancellation defers dense sparse and multimodal provider calls without inline retry",
         "enrichment boundary failure readmission preserves durable debt and bounds crash reopen",
         "storage.db.enrichment.enrichment_runtime.test.isolated enrichment request does not advance when durable parking fails",
         "storage.db.enrichment.enrichment_runtime.test.optional enrichment reads never classify contention as source absence",
