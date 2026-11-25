@@ -6772,18 +6772,7 @@ test "capi native optional allocator proof admits append-only on a moving tip" {
     defer a.free(path);
     {
         var seed = try native.NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
-        defer seed.close();
-        const value: [32768]u8 = @splat('v');
-        for (0..16) |i| {
-            var key: [16]u8 = undefined;
-            try seed.putCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}), &value);
-        }
-        for (0..16) |i| {
-            var key: [16]u8 = undefined;
-            try seed.deleteCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}));
-        }
-        _ = try seed.reclaimPages(4096);
-        try std.testing.expect((try seed.allocatorStats()).?.reusable_pages > 64);
+        seed.close();
     }
     const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, false);
     defer h.closeHandle(wrapper);
@@ -6829,7 +6818,23 @@ test "capi native optional allocator proof admits append-only on a moving tip" {
         if (lease) |*held| held.close();
         connection.gate.mutex.unlock(io);
     }
-    owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
+    // Runtime bootstrap may consume the seed file's free pool. Create
+    // reusable pages after open so the mutation must enter the proof path.
+    const live = &owner.current.?.owned_lite_backend.?.native_docstore.?.file;
+    {
+        const value: [32768]u8 = @splat('v');
+        for (0..16) |i| {
+            var key: [16]u8 = undefined;
+            try live.putCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}), &value);
+        }
+        for (0..16) |i| {
+            var key: [16]u8 = undefined;
+            try live.deleteCatalogRecord(try std.fmt.bufPrint(&key, "pool-{d}", .{i}));
+        }
+        _ = try live.reclaimPages(4096);
+        try std.testing.expect((try live.allocatorStats()).?.reusable_pages > 64);
+    }
+    live.free_pages_verified = false;
     const proof_walks_before = owner.publication_stats.allocator_proof_walks;
     const proof_failures_before = owner.publication_stats.allocator_proof_failures;
     const result = connection.refresh(&lease, .mutation, false);
@@ -6843,6 +6848,7 @@ test "capi native optional allocator proof admits append-only on a moving tip" {
     try std.testing.expect(owner.publication_stats.allocator_proof_ns >= owner.publication_stats.allocator_proof_max_ns);
     try std.testing.expect(!owner.verification_cancel.requested.load(.acquire));
     // After the backoff, a stable request can verify pages for reuse.
+    connection.detach();
     owner.test_after_allocator_capture = null;
     owner.reuse_proof_lost_ns = null;
     const root = try connection.refresh(&lease, .mutation, false);
