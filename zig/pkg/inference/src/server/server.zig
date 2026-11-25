@@ -6731,13 +6731,11 @@ pub const Node = struct {
             if (inkling.Runtime.fromSession(model.session)) |resident| {
                 if (a4b_request != null or prompt_cache_key != null or preflight.audio_transcription)
                     return error.UnsupportedInkling2Request;
-                const slot = try model.generation_admission.acquire(execution_control, true, runtime.scheduler.generation_admission.Limits.forRequests(self.config.max_concurrent_requests, null));
+                const slot = try model.generation_admission.acquire(execution_control, false, runtime.scheduler.generation_admission.Limits.forRequests(self.config.max_concurrent_requests, inkling.max_active_requests));
                 defer slot.release();
                 const config: generation.GenerationConfig = .{ .max_tokens = max_tokens };
                 var pipeline = try inkling.Pipeline.init(allocator, resident, model.session, model.getTokenizer(), execution_control, messages, config, executor_contract.batch.max_input_tokens_per_item);
                 defer pipeline.deinit();
-                try execution_control.lock(model.nativeGenerationMutex());
-                defer model.nativeGenerationMutex().unlock();
                 const setup_at_ns = embedTimingNowNs();
                 var result = if (stream) |sink| blk: {
                     pipeline.continue_ctx = sink.ctx;
@@ -17192,14 +17190,14 @@ pub const Node = struct {
         else
             (try ctx.body()) orelse
                 return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
-        // Single JSON parse per request: only bodies that can carry
-        // chat_template_kwargs (substring pre-gate, false positives harmless)
-        // are parsed as an untyped Value, which then doubles as the kwargs
-        // validator input and the typed-parse source. Malformed bodies fall
-        // back to the raw typed parse so their errors stay identical.
+        // Reuse the untyped value for template options and the typed request.
+        // Escaped keys also need the untyped parse before validation.
         var parsed_body_value: ?std.json.Parsed(std.json.Value) = null;
         defer if (parsed_body_value) |*owned| owned.deinit();
-        if (std.mem.indexOf(u8, request_json, "chat_template_kwargs") != null) {
+        if (std.mem.indexOf(u8, request_json, "chat_template_kwargs") != null or
+            std.mem.indexOf(u8, request_json, "reasoning_effort") != null or
+            std.mem.indexOfScalar(u8, request_json, '\\') != null)
+        {
             parsed_body_value = @import("antfly-json").parseValueLossless(ctx.allocator, request_json) catch null;
         }
         if (parsed_body_value) |owned| {
@@ -17210,11 +17208,11 @@ pub const Node = struct {
                 });
             }
         }
-        var parsed = if (parsed_body_value) |owned|
-            try std.json.parseFromValue(api.GenerateRequest, ctx.allocator, owned.value, .{ .ignore_unknown_fields = true })
+        var parsed = (if (parsed_body_value) |owned|
+            std.json.parseFromValue(api.GenerateRequest, ctx.allocator, owned.value, .{ .ignore_unknown_fields = true })
         else
-            parseGenerateBody(api.GenerateRequest, ctx.allocator, request_json) catch
-                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid generation request" });
+            parseGenerateBody(api.GenerateRequest, ctx.allocator, request_json)) catch
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid generation request" });
         defer parsed.deinit();
         const body = parsed.value;
         if (native_transfer) |transfer| {
@@ -17441,21 +17439,25 @@ pub const Node = struct {
 
         var tool_parser: ?tool_parser_mod.Parser = null;
         defer if (tool_parser) |*parser| parser.deinit();
+        var inkling_tools: std.ArrayList(tool_parser_mod.ToolDefinition) = .empty;
+        defer inkling_tools.deinit(ctx.allocator);
 
         if (body.tools) |tools| {
             if (tools.len > 0 and tool_parser_mod.toolCallsEnabled(parsed_tool_choice)) {
-                tool_parser = tool_parser_mod.loadParser(ctx.allocator, model_path) catch |err| switch (err) {
-                    error.UnknownToolCallFormat => return ctx.status(400).json(.{
-                        .@"error" = "INVALID_MODEL",
-                        .message = "model has an unsupported tool_call_format",
-                    }),
-                    else => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) }),
-                };
-                if (tool_parser == null) {
-                    return ctx.status(400).json(.{
-                        .@"error" = "INVALID_MODEL",
-                        .message = "model does not support tool calling",
-                    });
+                if (!admission_manifest.isInkling2()) {
+                    tool_parser = tool_parser_mod.loadParser(ctx.allocator, model_path) catch |err| switch (err) {
+                        error.UnknownToolCallFormat => return ctx.status(400).json(.{
+                            .@"error" = "INVALID_MODEL",
+                            .message = "model has an unsupported tool_call_format",
+                        }),
+                        else => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) }),
+                    };
+                    if (tool_parser == null) {
+                        return ctx.status(400).json(.{
+                            .@"error" = "INVALID_MODEL",
+                            .message = "model does not support tool calling",
+                        });
+                    }
                 }
 
                 var selected_tools = std.ArrayListUnmanaged(tool_parser_mod.ToolDefinition).empty;
@@ -17490,19 +17492,24 @@ pub const Node = struct {
                     });
                 }
 
-                const tools_prompt = try tool_parser.?.formatToolsPrompt(ctx.allocator, selected_tools.items);
-                defer ctx.allocator.free(tools_prompt);
+                if (admission_manifest.isInkling2()) {
+                    inkling_tools = selected_tools;
+                    selected_tools = .empty;
+                } else {
+                    const tools_prompt = try tool_parser.?.formatToolsPrompt(ctx.allocator, selected_tools.items);
+                    defer ctx.allocator.free(tools_prompt);
 
-                const prompt = if (forced_function) |forced|
-                    try std.fmt.allocPrint(ctx.allocator, "{s}\nYou MUST call the {s} function. Do not respond with text, only call the function.\n", .{
-                        tools_prompt,
-                        forced,
-                    })
-                else
-                    try ctx.allocator.dupe(u8, tools_prompt);
-                defer ctx.allocator.free(prompt);
+                    const prompt = if (forced_function) |forced|
+                        try std.fmt.allocPrint(ctx.allocator, "{s}\nYou MUST call the {s} function. Do not respond with text, only call the function.\n", .{
+                            tools_prompt,
+                            forced,
+                        })
+                    else
+                        try ctx.allocator.dupe(u8, tools_prompt);
+                    defer ctx.allocator.free(prompt);
 
-                try prependSystemPrompt(ctx.allocator, &messages, prompt);
+                    try prependSystemPrompt(ctx.allocator, &messages, prompt);
+                }
             }
         }
         if (executor_contract.batch.max_text_bytes_per_item) |limit| {
@@ -17836,16 +17843,21 @@ pub const Node = struct {
                     body.speculation_calibration != null or tool_parser != null or wants_logprobs or
                     backend_selection.graph_mode_requested or backend_selection.compiled_partition_backend != null)
                     return generationErrorResponse(ctx, error.UnsupportedInkling2Request);
-                const slot = model.generation_admission.acquire(execution_control, true, runtime.scheduler.generation_admission.Limits.forRequests(self.config.max_concurrent_requests, null)) catch |err| {
+                const raw_effort = if (parsed_body_value) |owned| if (owned.value == .object) owned.value.object.get("reasoning_effort") else null else null;
+                const effort = if (raw_effort) |value| inkling.ChatOptions.parseEffort(value) catch |err|
+                    return generationErrorResponse(ctx, err) else null;
+                var pipeline = inkling.Pipeline.initChat(ctx.allocator, resident, model.session, model.getTokenizer(), execution_control, messages.items, config, executor_contract.batch.max_input_tokens_per_item, .{
+                    .effort = effort,
+                    .tools = inkling_tools.items,
+                    .choice = parsed_tool_choice,
+                }) catch |err|
+                    return generationErrorResponse(ctx, err);
+                defer pipeline.deinit();
+                const slot = model.generation_admission.acquire(execution_control, pipeline.speculate, runtime.scheduler.generation_admission.Limits.forRequests(self.config.max_concurrent_requests, inkling.max_active_requests)) catch |err| {
                     if (err == error.GenerationQueueFull) return modelResourceBusyResponse(ctx);
                     return inferenceFailureResponse(ctx, err);
                 };
                 defer slot.release();
-                var pipeline = inkling.Pipeline.init(ctx.allocator, resident, model.session, model.getTokenizer(), execution_control, messages.items, config, executor_contract.batch.max_input_tokens_per_item) catch |err|
-                    return generationErrorResponse(ctx, err);
-                defer pipeline.deinit();
-                execution_control.lock(model.nativeGenerationMutex()) catch |err| return inferenceFailureResponse(ctx, err);
-                defer model.nativeGenerationMutex().unlock();
                 if (want_stream) return self.streamGenerate(ctx, body.model, &pipeline, null, messages.items, config, null, include_stream_usage, null, completion);
                 var result = pipeline.generate(messages.items, config) catch |err| return generationErrorResponse(ctx, err);
                 defer result.deinit();
@@ -19128,7 +19140,7 @@ pub const Node = struct {
         var response_text = result.text;
         var tool_response_text: ?[]u8 = null;
         defer if (tool_response_text) |text| ctx.allocator.free(text);
-        const parsed_tool_calls = if (tool_parser) |parser| blk: {
+        const parsed_tool_calls: ?[]const tool_parser_mod.ToolCall = if (tool_parser) |parser| blk: {
             parser.reset();
             _ = parser.feed(result.text) catch |err|
                 return generationErrorResponse(ctx, err);
@@ -19138,7 +19150,7 @@ pub const Node = struct {
             if (response_text.len == 0) response_text = result.text;
             const calls = parser.toolCalls();
             break :blk if (calls.len > 0) calls else null;
-        } else null;
+        } else result.native_tool_calls;
 
         if (parsed_tool_calls == null and tool_parser != null and response_text.len == 0) {
             response_text = "No tool call was emitted.";
@@ -19158,9 +19170,9 @@ pub const Node = struct {
         return self.buildGenerateResponse(
             ctx,
             body.model,
-            response_text,
+            if (tool_parser != null and parsed_tool_calls != null) "" else response_text,
             result.reasoning_text,
-            if (parsed_tool_calls != null) "tool_calls" else result.finish_reason,
+            if (tool_parser != null and parsed_tool_calls != null) "tool_calls" else result.finish_reason,
             result.prompt_tokens,
             result.tokens_used,
             result.cached_prompt_tokens,
@@ -20649,7 +20661,7 @@ pub const Node = struct {
                                 results[idx].@"error" = batchGenerationError(err);
                                 continue;
                             };
-                            const slot = model.generation_admission.acquire(execution_control, true, runtime.scheduler.generation_admission.Limits.forRequests(self.config.max_concurrent_requests, null)) catch |err| {
+                            const slot = model.generation_admission.acquire(execution_control, false, runtime.scheduler.generation_admission.Limits.forRequests(self.config.max_concurrent_requests, inkling.max_active_requests)) catch |err| {
                                 results[idx].@"error" = batchGenerationError(err);
                                 continue;
                             };
@@ -20659,11 +20671,6 @@ pub const Node = struct {
                                 continue;
                             };
                             defer pipeline.deinit();
-                            execution_control.lock(model.nativeGenerationMutex()) catch |err| {
-                                results[idx].@"error" = batchGenerationError(err);
-                                continue;
-                            };
-                            defer model.nativeGenerationMutex().unlock();
                             execution_attempted[idx] = true;
                             var result = pipeline.generate(input, cfg) catch |err| {
                                 results[idx].@"error" = batchGenerationError(err);
@@ -21773,7 +21780,7 @@ pub const Node = struct {
                         .function = .{ .name = call.function.name, .arguments = call.function.arguments },
                     };
                 }
-                message.content = .null_value;
+                if (response_text.len == 0) message.content = .null_value;
                 message.tool_calls = api_calls;
             }
         }
@@ -21950,6 +21957,15 @@ pub const Node = struct {
                     !stream.request_context.isCancellationRequested();
             }
 
+            fn onReasoning(raw_ctx: *anyopaque, token_text: []const u8) bool {
+                const stream: *@This() = @ptrCast(@alignCast(raw_ctx));
+                emitReasoningDelta(stream.writer, stream.payload, stream.stream_id, stream.stream_created, stream.model_name, token_text) catch |err| {
+                    stream.write_error = err;
+                    return false;
+                };
+                return true;
+            }
+
             fn onToken(raw_ctx: *anyopaque, token_text: []const u8) bool {
                 const stream: *@This() = @ptrCast(@alignCast(raw_ctx));
                 // Reasoning is projected only once generation completes. For
@@ -22015,6 +22031,12 @@ pub const Node = struct {
         {
             pipeline.continue_ctx = @ptrCast(&stream_ctx);
             pipeline.continue_fn = StreamCtx.shouldContinue;
+        }
+
+        const streams_reasoning = comptime @hasField(@TypeOf(pipeline.*), "reasoning_callback");
+        if (streams_reasoning) {
+            pipeline.reasoning_ctx = @ptrCast(&stream_ctx);
+            pipeline.reasoning_callback = StreamCtx.onReasoning;
         }
 
         if (context_diagnostics) |diagnostics| {
@@ -22135,7 +22157,7 @@ pub const Node = struct {
             if (result.text.len > 0) stream_ctx.noteContent();
         } else {
             if (result.reasoning_text) |reasoning| {
-                if (reasoning.len > 0) emitReasoningDelta(
+                if (reasoning.len > 0 and !streams_reasoning) emitReasoningDelta(
                     &writer,
                     &chunk_payload,
                     stream_id,
@@ -22155,6 +22177,15 @@ pub const Node = struct {
                     return ctx.response.build();
                 };
             } else {
+                if (result.native_tool_calls) |calls| {
+                    for (calls, 0..) |call, index| {
+                        emitToolCallDelta(&writer, &chunk_payload, stream_id, stream_created, model_name, index, call) catch |err| {
+                            writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
+                            writer.close() catch {};
+                            return ctx.response.build();
+                        };
+                    }
+                }
                 emitFinishDelta(&writer, &chunk_payload, stream_id, stream_created, model_name, result.finish_reason, speculative) catch |err| {
                     writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
                     writer.close() catch {};
@@ -29367,6 +29398,15 @@ pub const Node = struct {
         try appendPromMetric(&writer.writer, "antfly_inference_generation_started_total", "counter", "Generation execution slots acquired", generation_stats.started);
         try appendPromMetric(&writer.writer, "antfly_inference_generation_queue_rejected_total", "counter", "Requests rejected by the bounded generation queue", generation_stats.rejected);
         try appendPromMetric(&writer.writer, "antfly_inference_generation_queue_cancelled_total", "counter", "Cancelled or expired generation waiters removed from the queue", generation_stats.cancelled);
+        if (comptime build_options.enable_cuda) {
+            const inkling = @import("../architectures/inkling2_session.zig");
+            var paired_steps: u64 = 0;
+            for (loaded_snapshot.handles) |handle| {
+                if (inkling.Runtime.fromSession(handle.get().session)) |model|
+                    paired_steps +|= model.pairedDecodeSteps();
+            }
+            try appendPromMetric(&writer.writer, "antfly_inference_inkling_paired_decode_steps_total", "counter", "Inkling CUDA decode steps that share a routed feed-forward batch across two sequences", paired_steps);
+        }
         try generation_stats.queue_wait.render(&writer.writer, "antfly_inference_generation_queue_wait_seconds", "Time waiting for a generation slot before device-memory admission");
         try generation_stats.first_content.render(&writer.writer, "antfly_inference_generation_first_content_seconds", "Server-observed first public content availability including queue and prefill; excludes network transit");
         try generation_stats.prefill.render(&writer.writer, "antfly_inference_generation_prefill_seconds", "Pipeline prefill elapsed time including cooperative scheduling waits");
@@ -46086,8 +46126,12 @@ fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
         .retryable = true,
     };
     return switch (err) {
-        error.UnsupportedInkling2Request => .{ .status = 400, .code = "UNSUPPORTED_FEATURE", .message = "Inkling 2 serves text and single-image chat with thinking disabled, using its native KV cache", .retryable = false },
+        error.InvalidInkling2Effort => .{ .status = 400, .code = "INVALID_REQUEST", .message = "reasoning_effort must be a supported effort name or a number between 0 and 0.99", .retryable = false },
+        error.InvalidInkling2ToolHistory => .{ .status = 400, .code = "INVALID_REQUEST", .message = "invalid Inkling 2 tool definition or tool message history", .retryable = false },
+        error.InvalidInkling2ToolOutput => .{ .status = 422, .code = "INVALID_TOOL_OUTPUT", .message = "Inkling 2 did not emit a complete call to a declared tool", .retryable = false },
+        error.UnsupportedInkling2Request => .{ .status = 400, .code = "UNSUPPORTED_FEATURE", .message = "Inkling 2 does not support the requested generation option", .retryable = false },
         error.UnsupportedInkling2Speculation => .{ .status = 400, .code = "UNSUPPORTED_FEATURE", .message = "Inkling 2 speculation requires mtp.safetensors, greedy decoding and speculative_k between 1 and 7", .retryable = false },
+        error.UnsupportedInkling2SpeculativeContext => .{ .status = 400, .code = "UNSUPPORTED_FEATURE", .message = "Inkling 2 speculation is limited to 8192 context tokens", .retryable = false },
         error.InvalidInkling2Context, error.InferenceInputTokensExceeded => .{ .status = 400, .code = "INPUT_TOKENS_EXCEEDED", .message = "the generation request exceeds the input or model context limit", .retryable = false },
         error.InvalidInkling2Image => .{ .status = 400, .code = "INVALID_MEDIA_LAYOUT", .message = "Inkling 2 accepts one valid user image up to 4096 pixels per side", .retryable = false },
         error.UnsupportedVideoBackend => .{ .status = 400, .code = "UNSUPPORTED_VIDEO_BACKEND", .message = "video input requires a Gemma 4 generator with its projector", .retryable = false },

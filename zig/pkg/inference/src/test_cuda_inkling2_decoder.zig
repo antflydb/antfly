@@ -360,6 +360,43 @@ fn verifyGreedyShortlist(allocator: std.mem.Allocator, model: *decoder.Decoder) 
     std.debug.print("Packed greedy selection preserved soft-cap ties, non-finite errors and the out-of-range exact scan\n", .{});
 }
 
+fn verifyPairedDecode(allocator: std.mem.Allocator, model: *decoder.Decoder) !void {
+    if (model.ctx.info.compute_major != 12 or model.ctx.info.compute_minor != 1) return;
+    var paired: [2]decoder.Request = undefined;
+    var scalars: [2]decoder.Request = undefined;
+    const limits = [_]u32{ 38, 53 };
+    var initialized: usize = 0;
+    defer for (0..initialized) |lane| {
+        paired[lane].deinit() catch @panic("unable to drain paired decode");
+        scalars[lane].deinit() catch @panic("unable to drain scalar decode");
+    };
+    for (&paired, &scalars, limits, 0..) |*pair, *scalar, limit, lane| {
+        try pair.initWithPrefill(allocator, model, limit, 2);
+        scalar.init(allocator, model, limit) catch |err| {
+            pair.deinit() catch @panic("unable to drain paired decode");
+            return err;
+        };
+        initialized += 1;
+        pair.use_dense = true;
+        scalar.use_dense = true;
+        for (0..3 + 12 * lane) |index| {
+            const token = head_tokens[index % head_tokens.len];
+            try pair.append(token);
+            try scalar.append(token);
+        }
+    }
+    try std.testing.expectError(error.InvalidInkling2Token, decoder.Request.stepGreedyPair(.{ &paired[0], &paired[1] }, .{ 42, model.text.unpadded_vocab_size }));
+    for (0..24) |index| {
+        const tokens = [2]u32{ head_tokens[index % head_tokens.len], head_tokens[(index + 7) % head_tokens.len] };
+        const result = try decoder.Request.stepGreedyPair(.{ &paired[0], &paired[1] }, tokens);
+        for (&paired, &scalars, tokens, result) |*pair, *scalar, token, actual| {
+            try std.testing.expectEqual(try scalar.stepGreedy(token), actual);
+            try std.testing.expectEqual(scalar.position(), pair.position());
+        }
+    }
+    std.debug.print("Inkling paired decode matched both scalar streams at 24 heterogeneous positions\n", .{});
+}
+
 test "CUDA Inkling 2 runs the fixed loop with all released text weights" {
     const allocator = std.testing.allocator;
     const dir = platform.env.getenv("ANTFLY_INKLING2_MODEL_DIR") orelse return error.Inkling2FixtureRequired;
@@ -401,6 +438,7 @@ test "CUDA Inkling 2 runs the fixed loop with all released text weights" {
         null;
     const long_qualification = platform.env.getenv("ANTFLY_INKLING2_QUALIFICATION_LONG") != null;
     defer if (qualification_dir) |dir_handle| dir_handle.close(std.testing.io);
+    try verifyPairedDecode(allocator, &model);
     try verifyReplay(allocator, &model, if (long_qualification) model.text.sliding_window_size else 130);
     try verifyOutputHead(allocator, &model);
     try verifyPackedWeights(allocator, &model);

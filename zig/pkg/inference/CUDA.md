@@ -793,6 +793,25 @@ Sanitizer reported zero memory errors and leaks when instrumenting the
 new expert kernels in text and image generation and zero synchronization
 errors for captured text decode.
 
+The HTTP worker admits up to four Inkling requests per loaded model, subject
+to the server's work-unit and memory limits. It yields the CUDA turn after
+each prefill chunk or decode step. On GB10, two ready greedy streams can share
+a routed feed-forward pass while keeping separate attention and KV state.
+`antfly_inference_inkling_paired_decode_steps_total` counts those passes.
+DSpark requests take an exclusive model slot because the drafter owns shared
+request workspace. DSpark verification is limited to 8,192 context tokens.
+Beyond that limit, `speculation_policy: auto` uses the regular decoder and
+reports `inkling_speculative_context_limit`. `force` returns an error.
+
+`/ai/v1/chat/completions` and `/ai/v1/generate` accept
+`chat_template_kwargs.enable_thinking` and `reasoning_effort`. Set
+`reasoning_effort` to `none`, `minimal`, `low`, `medium`, `high`, `xhigh`,
+`max`, or a number from 0 to 0.99. Text and reasoning are returned separately
+in JSON and SSE. Use `tools` and `tool_choice` for native function calls, then
+send the assistant's `tool_calls` and a `tool` message with the matching
+`tool_call_id`. For a strict tool definition, the worker validates the
+completed arguments against its schema before returning the call.
+
 Run the native qualification from `zig/`. Use absolute paths for
 `ANTFLY_INKLING2_MODEL_DIR` and `ANTFLY_INKLING2_QUALIFICATION_DIR`.
 Create the results directory before running the tests.

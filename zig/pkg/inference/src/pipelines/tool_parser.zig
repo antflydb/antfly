@@ -1357,7 +1357,7 @@ fn looksNumeric(text: []const u8) bool {
     return true;
 }
 
-fn generateCallId(allocator: std.mem.Allocator) ![]u8 {
+pub fn generateCallId(allocator: std.mem.Allocator) ![]u8 {
     const id = tool_call_counter.fetchAdd(1, .monotonic) + 1;
     return try std.fmt.allocPrint(allocator, "call_{x}", .{id});
 }

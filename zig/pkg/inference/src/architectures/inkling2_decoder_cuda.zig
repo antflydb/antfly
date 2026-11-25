@@ -37,6 +37,12 @@ const streams = 4;
 const block_slots = 5;
 const page_tokens = 16;
 pub const prefill_chunk_rows = 16;
+
+pub fn speculativeContextSupported(text: checkpoint.TextConfig, tokens: usize) bool {
+    // The multirow target verifier has diverged from row-one greedy decoding
+    // in the long-context log-scaling regime.
+    return tokens <= text.log_scaling_n_floor;
+}
 const Stream = enum { attn, k, v, mlp };
 
 const ModelWeight = enum {
@@ -243,7 +249,7 @@ pub const Decoder = struct {
     }
 };
 
-const Temp = enum { stack, prelude, bank, inputs, mix, message, pair, rank, gain_forget, raw, attn, mlp, normalized, logits, blas, relative, router, routed, pages, position };
+const Temp = enum { stack, prelude, bank, inputs, mix, message, pair, rank, gain_forget, raw, cohort, attn, mlp, normalized, logits, blas, relative, router, routed, pages, position };
 
 /// A request is bound to one CUDA stream. Initialize it in place and keep it
 /// at that address until deinit so the cache can retain its internal owners.
@@ -361,6 +367,7 @@ pub const Request = struct {
             .{ .normalized, activation_bytes },              .{ .logits, @as(usize, text.vocab_size) * 4 }, .{ .blas, 8 * 1024 * 1024 },              .{ .relative, relative_bytes },
             .{ .router, @max(nv.logits, mx.logits) },        .{ .routed, @max(nv.routed, mx.routed) },      .{ .pages, 2 * ids },
         }) |item| self.temps[@backingInt(item[0])] = try DeviceBuffer.allocWithPurpose(ctx, item[1], .command_workspace);
+        if (chunk_rows >= 2) self.temps[@backingInt(Temp.cohort)] = try DeviceBuffer.allocWithPurpose(ctx, 4 * hidden, .command_workspace);
         if (model.head_shortlist.workspaceBytes() != 0) {
             self.shortlist_workspace = DeviceBuffer.allocWithPurpose(ctx, model.head_shortlist.workspaceBytes(), .command_workspace) catch |err| switch (err) {
                 error.CudaMemoryLimitExceeded => .{},
@@ -603,7 +610,7 @@ pub const Request = struct {
         try m.mix.blendThree(m.ctx, group, dest, messages, gates, gammas, m.text.rms_norm_eps, self.get(.inputs));
     }
 
-    fn runVisit(self: *Request, visit: checkpoint.Visit, ordinal: usize, stack_depth: usize, replay: DeviceBuffer) !usize {
+    fn prepareVisit(self: *Request, visit: checkpoint.Visit, ordinal: usize, stack_depth: usize, replay: DeviceBuffer) !usize {
         const m = self.model;
         const ctx = m.ctx;
         const text = m.text;
@@ -679,15 +686,32 @@ pub const Request = struct {
         } else {
             try m.mix.mixAndNorm(ctx, self.shape(), self.get(.stack), attn, previous, @intCast(completed + 1), layer.weight(.mlp_query), layer.weight(.mlp_norm), eps, mlp_input);
         }
-        try m.ffn.run(ctx, &m.blas, text, &layer.ffn, self.workspace.rows, mlp_input, self.get(.raw), .{
+        return completed;
+    }
+
+    fn finishVisit(self: *Request, visit: checkpoint.Visit, ordinal: usize, completed: usize) !void {
+        const m = self.model;
+        const ctx = m.ctx;
+        const text = m.text;
+        const layer = &m.layers[visit.weight_layer];
+        const old = self.histories(ordinal, self.history_side);
+        const next = self.histories(ordinal, 1 - self.history_side);
+        const previous = if (visit.weight_layer % text.n_layers_per_attn_res_block == 0) DeviceBuffer{} else self.block(completed);
+        if (self.record_history) try self.verificationHistory(ordinal)[3].copyFromDevice(ctx, self.get(.raw), self.blockBytes());
+        try self.hiddenConv(layer.weight(.mlp_taps), old[3], next[3], self.get(.mlp));
+        try m.mix.sum(ctx, self.shape(), previous, self.get(.attn), self.get(.mlp), self.block(completed));
+    }
+
+    fn runVisit(self: *Request, visit: checkpoint.Visit, ordinal: usize, stack_depth: usize, replay: DeviceBuffer) !usize {
+        const completed = try self.prepareVisit(visit, ordinal, stack_depth, replay);
+        const m = self.model;
+        try m.ffn.run(m.ctx, &m.blas, m.text, &m.layers[visit.weight_layer].ffn, self.workspace.rows, self.get(.normalized), self.get(.raw), .{
             .logits = self.get(.router),
             .blas = self.get(.blas),
             .routed = self.get(.routed),
             .activation_precision = m.expert_activation_precision,
         });
-        if (self.record_history) try self.verificationHistory(ordinal)[3].copyFromDevice(ctx, self.get(.raw), self.blockBytes());
-        try self.hiddenConv(layer.weight(.mlp_taps), old[3], next[3], self.get(.mlp));
-        try m.mix.sum(ctx, self.shape(), previous, attn, self.get(.mlp), self.block(completed));
+        try self.finishVisit(visit, ordinal, completed);
         return completed;
     }
 
@@ -703,6 +727,60 @@ pub const Request = struct {
         return std.mem.bytesAsSlice(f32, bytes);
     }
 
+    pub fn canBatchGreedy(self: *const Request) bool {
+        return self.append_capacity >= 2 and self.draft == null and self.shortlist_workspace.ptr != 0 and
+            !self.use_reference_head and self.use_packed_weights;
+    }
+
+    /// Share the routed FFN for two independent sequences. Each attention
+    /// call reads its own staged pages and each convolution advances its own
+    /// history. The row-one head still produces each exact greedy token.
+    pub fn stepGreedyPair(requests: [2]*Request, tokens: [2]u32) ![2]u32 {
+        const leader = requests[0];
+        const m = leader.model;
+        const ctx = m.ctx;
+        const text = m.text;
+        const hidden = @as(usize, text.hidden_size) * 2;
+        std.debug.assert(requests[1] != leader and requests[1].model == m);
+        for (requests, tokens) |request, token| {
+            std.debug.assert(request.canBatchGreedy() and request.workspace.rows == 1);
+            try request.validateInput(.{ .tokens = &.{token} }, 1);
+        }
+        var staged: usize = 0;
+        errdefer for (requests[0..staged]) |request| request.abortAppend();
+        for (requests, tokens) |request, token| {
+            try request.kv.prepareAppend(1);
+            staged += 1;
+            try request.stageInput(.{ .tokens = &.{token} });
+        }
+        const in_pair = sub(leader.get(.cohort), 0, 2 * hidden);
+        const out_pair = sub(leader.get(.cohort), 2 * hidden, 2 * hidden);
+        var cursors: [2]VisitCursor = @splat(.{});
+        for (m.schedule, 0..) |visit, ordinal| {
+            for (requests, &cursors, 0..) |request, *cursor, lane| {
+                try request.advanceVisit(visit, ordinal, cursor);
+                cursor.depth = try request.prepareVisit(visit, ordinal, cursor.depth, .{});
+                try row(in_pair, lane, hidden).copyFromDevice(ctx, request.get(.normalized), hidden);
+            }
+            try m.ffn.run(ctx, &m.blas, text, &m.layers[visit.weight_layer].ffn, 2, in_pair, out_pair, .{
+                .logits = leader.get(.router),
+                .blas = leader.get(.blas),
+                .routed = leader.get(.routed),
+                .activation_precision = m.expert_activation_precision,
+            });
+            for (requests, cursors, 0..) |request, cursor, lane| {
+                try request.get(.raw).copyFromDevice(ctx, row(out_pair, lane, hidden), hidden);
+                try request.finishVisit(visit, ordinal, cursor.depth);
+            }
+        }
+        var results: [2]u32 = undefined;
+        for (requests, tokens, cursors, &results) |request, token, cursor, *result| {
+            try request.finishAppend(.{ .tokens = &.{token} }, 1, .greedy, cursor.depth);
+            result.* = try request.greedyToken();
+        }
+        return results;
+    }
+
     /// The shortlist certifies which rows may tie or beat an exact capped
     /// score. The returned index always comes from the original BF16 dot.
     pub fn stepGreedy(self: *Request, token: u32) !u32 {
@@ -716,6 +794,10 @@ pub const Request = struct {
             return @intCast(best);
         }
         try self.run(.{ .tokens = &.{token} }, 1, .greedy);
+        return self.greedyToken();
+    }
+
+    fn greedyToken(self: *const Request) !u32 {
         const best = std.mem.readInt(u32, self.logits.constBytes()[0..4], .little);
         if (best >= self.model.text.unpadded_vocab_size) return error.NonFiniteInkling2Logit;
         return best;
@@ -772,6 +854,8 @@ pub const Request = struct {
     pub fn verifyDraft(self: *Request, anchor: u32, proposed: []const u32) !Verification {
         if (self.draft == null or proposed.len == 0 or proposed.len >= dspark.block_rows or
             proposed.len >= self.append_capacity) return error.InvalidInkling2DraftContext;
+        if (!speculativeContextSupported(self.model.text, self.position() + proposed.len + 1))
+            return error.UnsupportedInkling2SpeculativeContext;
         var tokens: [dspark.block_rows]u32 = undefined;
         tokens[0] = anchor;
         @memcpy(tokens[1..][0..proposed.len], proposed);
@@ -780,35 +864,41 @@ pub const Request = struct {
         return result;
     }
 
-    fn runVisits(self: *Request, replay: DeviceBuffer) !usize {
+    const VisitCursor = struct {
+        depth: usize = 0,
+        prelude_depth: usize = undefined,
+        tap: usize = 0,
+    };
+
+    fn advanceVisit(self: *Request, visit: checkpoint.Visit, ordinal: usize, cursor: *VisitCursor) !void {
         const m = self.model;
-        const text = m.text;
-        const ctx = m.ctx;
         const hidden = self.blockBytes();
-        var depth: usize = 0;
-        var prelude_depth: usize = undefined;
-        var tap: usize = 0;
-        for (m.schedule, 0..) |visit, ordinal| {
-            if (visit.weight_layer == text.loop_config.core_start) {
-                if (visit.pass == 0) {
-                    prelude_depth = depth;
-                    try self.get(.prelude).copyFromDevice(ctx, self.block(depth), hidden);
-                } else {
-                    std.debug.assert(depth == prelude_depth + 2);
-                    try self.get(.bank).copyFromDevice(ctx, sub(self.get(.stack), (prelude_depth + 1) * hidden, 2 * hidden), 2 * hidden);
-                    depth = prelude_depth;
-                    try self.block(depth).copyFromDevice(ctx, self.get(.prelude), hidden);
-                }
+        if (visit.weight_layer == m.text.loop_config.core_start) {
+            if (visit.pass == 0) {
+                cursor.prelude_depth = cursor.depth;
+                try self.get(.prelude).copyFromDevice(m.ctx, self.block(cursor.depth), hidden);
+            } else {
+                std.debug.assert(cursor.depth == cursor.prelude_depth + 2);
+                try self.get(.bank).copyFromDevice(m.ctx, sub(self.get(.stack), (cursor.prelude_depth + 1) * hidden, 2 * hidden), 2 * hidden);
+                cursor.depth = cursor.prelude_depth;
+                try self.block(cursor.depth).copyFromDevice(m.ctx, self.get(.prelude), hidden);
             }
-            if (self.draft) |draft| {
-                if (tap < draft.taps.len and ordinal == draft.taps[tap]) {
-                    try draft.stage[tap].copyFromDevice(ctx, self.block(depth), hidden);
-                    tap += 1;
-                }
-            }
-            depth = try self.runVisit(visit, ordinal, depth, replay);
         }
-        return depth;
+        if (self.draft) |draft| {
+            if (cursor.tap < draft.taps.len and ordinal == draft.taps[cursor.tap]) {
+                try draft.stage[cursor.tap].copyFromDevice(m.ctx, self.block(cursor.depth), hidden);
+                cursor.tap += 1;
+            }
+        }
+    }
+
+    fn runVisits(self: *Request, replay: DeviceBuffer) !usize {
+        var cursor: VisitCursor = .{};
+        for (self.model.schedule, 0..) |visit, ordinal| {
+            try self.advanceVisit(visit, ordinal, &cursor);
+            cursor.depth = try self.runVisit(visit, ordinal, cursor.depth, replay);
+        }
+        return cursor.depth;
     }
 
     fn captureVisits(self: *Request) !cuda_graph.CapturedGraph {
@@ -856,36 +946,56 @@ pub const Request = struct {
         try m.blas.matmulBf16WeightF32Out(ctx, logits, normalized, m.weight(.unembed), self.get(.blas), 1, text.hidden_size, text.vocab_size);
     }
 
-    fn run(self: *Request, input: Input, rows: u32, output: Output) !void {
-        const m = self.model;
-        const text = m.text;
-        const ctx = m.ctx;
+    fn validateInput(self: *Request, input: Input, rows: u32) !void {
+        const text = self.model.text;
         const hidden = @as(usize, text.hidden_size) * 2;
-        std.debug.assert(rows > 0 and rows <= self.append_capacity and (rows == 1 or output == .none or output == .verify));
         switch (input) {
             .tokens => |tokens| for (tokens) |token| {
                 if (token >= text.unpadded_vocab_size) return error.InvalidInkling2Token;
             },
             .embedding => |embedding| try buffer.validateRegions(1, .{embedding}, .{hidden * rows}, .{2}, 1),
         }
-        self.workspace.rows = rows;
-        defer self.workspace.rows = 1;
-        self.record_history = output == .verify;
-        defer self.record_history = false;
-        try self.kv.prepareAppend(rows);
-        errdefer {
-            // Some work may have been enqueued before the first KV write.
-            ctx.synchronize() catch {};
-            self.kv.abort() catch {};
-        }
+    }
+
+    fn stageInput(self: *Request, input: Input) !void {
+        const m = self.model;
+        const text = m.text;
+        const ctx = m.ctx;
+        const hidden = @as(usize, text.hidden_size) * 2;
         try self.publishPages();
         switch (input) {
             .tokens => |tokens| for (tokens, 0..) |token, index| {
                 try m.mix.norm(ctx, .{ .width = text.hidden_size }, row(m.weight(.embed), token, hidden), .bf16, m.weight(.embed_norm), text.rms_norm_eps, row(self.block(0), index, hidden));
             },
-            .embedding => |embedding| try self.block(0).copyFromDevice(ctx, embedding, hidden * rows),
+            .embedding => |embedding| try self.block(0).copyFromDevice(ctx, embedding, self.blockBytes()),
         }
+    }
+
+    fn abortAppend(self: *Request) void {
+        // Some work may be in flight even when no KV write was reached.
+        self.model.ctx.synchronize() catch {};
+        self.kv.abort() catch {};
+    }
+
+    fn run(self: *Request, input: Input, rows: u32, output: Output) !void {
+        std.debug.assert(rows > 0 and rows <= self.append_capacity and (rows == 1 or output == .none or output == .verify));
+        try self.validateInput(input, rows);
+        self.workspace.rows = rows;
+        defer self.workspace.rows = 1;
+        self.record_history = output == .verify;
+        defer self.record_history = false;
+        try self.kv.prepareAppend(rows);
+        errdefer self.abortAppend();
+        try self.stageInput(input);
         const depth = if (try self.replayVisits()) block_slots - 1 else try self.runVisits(.{});
+        try self.finishAppend(input, rows, output, depth);
+        if (rows == 1) self.single_row_prepared = true;
+    }
+
+    fn finishAppend(self: *Request, input: Input, rows: u32, output: Output, depth: usize) !void {
+        const m = self.model;
+        const text = m.text;
+        const ctx = m.ctx;
         const normalized = self.get(.normalized);
         if (output != .none or self.draft != null)
             try m.mix.mixAndNorm(ctx, self.shape(), self.get(.stack), self.block(depth), .{}, @intCast(depth + 1), m.weight(.output_query), m.weight(.final_norm), text.rms_norm_eps, normalized);
@@ -913,7 +1023,6 @@ pub const Request = struct {
         }
         try self.kv.commitPrefix(committed);
         if (self.draft) |draft| draft.commitContext(committed);
-        if (rows == 1) self.single_row_prepared = true;
         self.history_side = 1 - self.history_side;
     }
 };

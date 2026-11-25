@@ -88,6 +88,8 @@ pub fn main(init: std.process.Init) !void {
     const prompt_count = try std.math.add(usize, prompt_ids.len, prefix_rows + image_rows);
     const tokens = try std.math.add(usize, prompt_count, limit);
     if (tokens - 1 > source.config.value.text_config.model_max_length) return error.InvalidInkling2Context;
+    if (draft_enabled and !decoder.speculativeContextSupported(source.config.value.text_config, tokens - 1))
+        return error.UnsupportedInkling2SpeculativeContext;
     var ctx = try Context.initDefault();
     defer ctx.deinit();
     const gb10 = ctx.info.compute_major == 12 and ctx.info.compute_minor == 1;
