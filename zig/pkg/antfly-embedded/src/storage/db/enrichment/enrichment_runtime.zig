@@ -5865,9 +5865,9 @@ fn captureDenseGeneration(runtime: *EnrichmentRuntime, provider: embedder_mod.De
     var cancellation: AssetInvocationCancellation = undefined;
     const scoped = provider.withRequestContext(scopedEmbeddingRequestContext(runtime, context orelse foregroundProviderRequestContext(runtime), provider.part_request_context, &cancellation));
     const guard = runtime.active_provider_guard;
-    try checkEmbeddingInvocationOwner(runtime, guard, scoped.part_request_context);
-    const generation = scoped.captureTextGeneration(alloc, name) catch |err| return embeddingInvocationFailure(runtime, guard, scoped.part_request_context, err);
-    try checkEmbeddingInvocationOwner(runtime, guard, scoped.part_request_context);
+    try checkEmbeddingInvocationOwner(runtime, guard, provider.part_request_context);
+    const generation = scoped.captureTextGeneration(alloc, name) catch |err| return embeddingInvocationFailure(runtime, guard, provider.part_request_context, err);
+    try checkEmbeddingInvocationOwner(runtime, guard, provider.part_request_context);
     return generation;
 }
 
@@ -16460,7 +16460,7 @@ const PreparedDocumentSourceCache = struct {
         // Wake immediately on completion. External cancellation tokens do
         // not signal this condition, so sample them only on contended waits.
         const remaining = if (owner.deadline_ns) |deadline| deadline -| platform_time.monotonicNs() else std.math.maxInt(u64);
-        try self.drained.waitTimeout(self.io, &self.mutex, .{ .duration = .{ .clock = .awake, .raw = .fromNanoseconds(@min(remaining, 10 * std.time.ns_per_ms)) } });
+        self.drained.waitTimeout(self.io, &self.mutex, .{ .duration = .{ .clock = .awake, .raw = .fromNanoseconds(@min(remaining, 10 * std.time.ns_per_ms)) } }) catch return error.EnrichmentWaitCanceled;
     }
 
     fn fetch(
@@ -16470,10 +16470,10 @@ const PreparedDocumentSourceCache = struct {
         config: template_remote.RenderConfig,
     ) !FetchOutcome {
         const identity = sourceIdentity(source_url);
-        const owner: asset_producer_mod.InvocationContext = .{
-            .cancellation = if (@hasField(template_remote.RenderConfig, "cancellation")) config.cancellation orelse .none else .none,
-            .deadline_ns = config.deadline_ns,
-        };
+        var owner: asset_producer_mod.InvocationContext = .{ .deadline_ns = config.deadline_ns };
+        if (comptime @hasField(template_remote.RenderConfig, "cancellation")) {
+            if (config.cancellation) |token| owner.cancellation = .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn };
+        }
         self.mutex.lockUncancelable(self.io);
         while (true) {
             checkPreparedSourceOwner(owner) catch |err| {
@@ -16770,7 +16770,8 @@ const PreparedDocumentSourceCache = struct {
         };
         variant.* = .{ .entry = entry, .decode_limits = decode_limits };
         variant.deadline = document_extraction_mod.PdfRenderDeadline.init(timeout_ms);
-        variant.deadline.owner = .{ .context = &owner, .is_cancelled_fn = preparedSourceOwnerCanceled };
+        if (owner.deadline_ns != null or owner.cancellation.ptr != null)
+            variant.deadline.owner = .{ .context = &owner, .is_cancelled_fn = preparedSourceOwnerCanceled };
         const prepare_timer = pipeline_metrics.start(.pdf_prepare);
         defer prepare_timer.finish();
         const prepared = self.prepare_pdf_session_fn(
@@ -42869,6 +42870,7 @@ const EnrichmentSourceCancellation = struct {
     }
 
     fn token(self: *const @This()) CancellationToken {
+        if (self.guard.deadline_ns == null and self.guard.cancellation.ptr == null and self.lifecycle.ptr == null) return .none;
         return .{ .ptr = self, .is_cancelled_fn = isCancelled };
     }
 };
