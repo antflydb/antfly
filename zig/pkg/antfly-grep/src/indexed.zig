@@ -104,8 +104,10 @@ pub fn run(search: anytype) !void {
     var seen = Seen.init(seen_memory.allocator());
     defer seen.deinit();
     var count: usize = 0;
+    // Visit the whole selection even after content execution stops, so any
+    // unobserved artifact stream can invalidate the aggregate coverage claim.
+    // scanStream performs no further I/O after cancellation or budget failure.
     for (config.tables, selected_tables) |table, selected| {
-        if (search.stopped() and !(search.options.quiet and search.summary.matches > 0)) break;
         if (!selected) continue;
         if (table.fields != null and !metadataListing(search.options)) {
             var selected_count: usize = 0;
@@ -119,7 +121,6 @@ pub fn run(search: anytype) !void {
                 var bound = table;
                 bound.selected_stream = stream;
                 scanStream(search, &http, config, bound, &count, &seen) catch |err| try search.reportError(table.alias orelse table.name, err);
-                if (search.stopped() and !(search.options.quiet and search.summary.matches > 0)) break;
             }
             if (selected_count == 0 and search.options.artifacts.items.len == 0) try search.reportError(table.alias orelse table.name, error.NoSearchableTextStreams);
         } else if (!search.stopped()) {
@@ -206,7 +207,6 @@ fn scanArtifacts(search: anytype, http: *httpx.Client, config: Config, table: Ta
     var setup = std.heap.ArenaAllocator.init(search.a);
     defer setup.deinit();
     const a = setup.allocator();
-    if (table.status) |status| if (!std.mem.eql(u8, status, "searchable")) return error.SourceNotSearchable;
     const url = try std.fmt.allocPrint(a, "{s}/tables/{s}/query", .{ std.mem.trimEnd(u8, config.endpoint, "/"), try escape(a, table.table orelse table.name) });
     const extra = if (search.options.table_filter) |raw| try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) else null;
     const user = if (table.source_filter) |source| (if (extra) |filter| try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .conjuncts = .{ source, filter } }, .{}), .{}) else source) else extra;
@@ -356,6 +356,7 @@ fn readinessRevision(value: ?std.json.Value) !u64 {
 }
 
 fn streamReadiness(search: anytype, http: *httpx.Client, config: Config, table: Table, stream: record_view.Stream) !StreamReadiness {
+    if (table.status) |status| if (!std.mem.eql(u8, status, "searchable")) return error.SourceNotSearchable;
     var arena = std.heap.ArenaAllocator.init(search.a);
     defer arena.deinit();
     const a = arena.allocator();

@@ -600,6 +600,23 @@ class NativeStreams(unittest.TestCase):
             self.assertEqual(limited.returncode, 2, limited.stderr)
             self.assertLessEqual(len(self.requests), 4)
 
+    def test_quiet_does_not_ignore_unsearchable_selected_sources(self):
+        config = json.loads(self.config.read_text())
+        other = json.loads(json.dumps(config["tables"][0]))
+        other["name"] = "unavailable"
+        other["status"] = "paused"
+        config["tables"].append(other)
+        self.config.write_text(json.dumps(config))
+        result = self.run_grep("Tuesday", "-q")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("SourceNotSearchable", result.stderr)
+        self.assertFalse(
+            any(
+                method == "GET" and "/unavailable/" in path
+                for method, path in self.requests
+            )
+        )
+
     def test_unqueryable_index_does_not_dispatch_queries(self):
         self.queryable = False
         result = self.run_grep("Tuesday")
