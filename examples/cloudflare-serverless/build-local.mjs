@@ -114,8 +114,11 @@ const bucket = process.env.LOCAL_RUNTIME_BUCKET ?? "antfly-mail-models";
 for (const path of oversized) {
   const key = `${bucket}/local-runtime/${build}/${path}`;
   if (process.argv.includes("--upload")) {
-    const where = process.argv.includes("--local") ? "--local" : "--remote";
-    run("npx", ["wrangler", "r2", "object", "put", key, "--file", join(r2, build, path), where], here);
+    // --local writes where `npm run dev:mail` keeps the app Worker's R2 state.
+    const where = process.argv.includes("--local")
+      ? ["--local", "--persist-to", join(here, "dist/mail-local/app/.wrangler/state")]
+      : ["--remote"];
+    run("npx", ["wrangler", "r2", "object", "put", key, "--file", join(r2, build, path), ...where], here);
   } else console.log(`upload to R2: npx wrangler r2 object put ${key} --file dist/local-r2/${build}/${path} --remote`);
 }
 const base = `/local/${build}/`;

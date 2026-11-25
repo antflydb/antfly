@@ -160,7 +160,11 @@ function upload(out, catalog, { bucket, prefix, local }) {
   for (const path of [...catalog.files.map((f) => f.path), "catalog.json"]) {
     const result = spawnSync(
       "npx",
-      ["wrangler", "r2", "object", "put", `${bucket}/${prefix}${path}`, "--file", join(out, path), local ? "--local" : "--remote"],
+      [
+        "wrangler", "r2", "object", "put", `${bucket}/${prefix}${path}`, "--file", join(out, path),
+        // --local writes where `npm run dev:mail` keeps the app Worker's R2 state.
+        ...(local ? ["--local", "--persist-to", join(import.meta.dirname, "dist/mail-local/app/.wrangler/state")] : ["--remote"]),
+      ],
       { stdio: "inherit" }
     );
     if (result.status !== 0) throw Error(`upload failed: ${path}`);
