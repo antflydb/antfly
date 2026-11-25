@@ -17297,15 +17297,18 @@ fn allocPinnedTempSlot(
             break :seed "alloc_slot_seed";
         } else allocate: {
             self.stats.temp_buffer_misses += 1;
-            slot.buffer = try allocFreshTempBufferUnlocked(self, len, .required);
+            slot.buffer = allocFreshTempBufferUnlocked(self, len, .required) catch |err| {
+                if (self.temp_slot_config.autoplan_enabled) self.temp_arena_planner.markPinnedValidationFailure();
+                return err;
+            };
             self.noteDeviceBytes(len);
             self.stats.device_alloc_calls += 1;
             break :allocate "alloc_slot_miss";
         };
         self.temp_pinned_slot_by_address.putAssumeCapacityNoClobber(slot.buffer.ptr, @intCast(slot_index));
-        slot.requested_len = len;
         break :source tag;
     };
+    slot.requested_len = len;
     slot.in_use = true;
     self.temp_pinned_slots_in_use += 1;
     traceCudaTempAlloc(self, seq, source, len, slot.buffer);
@@ -18747,7 +18750,10 @@ fn debugCudaGraphCaptureBegin(ctx: *anyopaque, label: []const u8) !bool {
     // its per-request observation budget is exhausted without a stable trace,
     // the autoplan branches above fail closed with CudaGraphReplayRequired.
     if (self.temp_trace_seq < min_alloc_seq) return false;
-    if (self.temp_slot_config.configured_period == 0 and self.temp_slot_config.autoplan_enabled and !hasBoundLearnedTempWorkspace(self)) {
+    if (self.temp_slot_config.configured_period == 0 and self.temp_slot_config.autoplan_enabled and
+        (self.temp_arena_planner.pinned_validation_failed or self.temp_arena_planner.replay_validation_failed or
+            !hasBoundLearnedTempWorkspace(self)))
+    {
         self.temp_arena_planner.capture_binding_denials +|= 1;
         self.temp_arena_planner.markPinnedValidationFailure();
         if (cudaRequestDecodeGraphReplayMode(self) == .required) return error.CudaGraphReplayRequired;
@@ -36523,14 +36529,25 @@ fn observePeriodicWorkspace(self: *CudaCompute) ?@import("../../execution/runtim
     if ((!config.autoplan_enabled and config.configured_period == 0) or !self.temp_buffer_mutex.tryLock()) return null;
     defer self.temp_buffer_mutex.unlock();
     const plan = &self.temp_arena_planner;
+    const period = cudaEffectiveTempSlotPeriod(self);
     var physical_bytes: usize = 0;
-    for (self.temp_pinned_slots.items) |slot| {
-        if (slot.buffer.ptr != 0) physical_bytes +|= pinnedWorkspaceBytes(slot.buffer);
+    var bound_bytes: usize = 0;
+    var bound_slots: usize = 0;
+    for (self.temp_pinned_slots.items, 0..) |slot, index| {
+        if (slot.buffer.ptr == 0) continue;
+        const bytes = pinnedWorkspaceBytes(slot.buffer);
+        physical_bytes +|= bytes;
+        if (index < period and !slot.buffer.borrowed and slot.requested_len == slot.buffer.len and bytes == slot.requested_len) {
+            bound_slots += 1;
+            bound_bytes +|= bytes;
+        }
     }
     const learned = config.configured_period == 0;
     return .{
-        .state = if (!learned) .fixed else if (plan.disabled) .disabled else if (plan.ready_for_capture) .capture_ready else if (plan.active) .validating else if (plan.observing) .observing else .idle,
-        .slots = cudaEffectiveTempSlotPeriod(self),
+        .state = if (!learned) .fixed else if (plan.disabled) .disabled else if (plan.installation_pending) .installing else if (plan.ready_for_capture and !plan.pinned_validation_failed and !plan.replay_validation_failed) .capture_ready else if (plan.active) .validating else if (plan.observing) .observing else .idle,
+        .slots = period,
+        .bound_slots = bound_slots,
+        .bound_backing_bytes = bound_bytes,
         .live_backing_bytes = physical_bytes,
         .planned_bytes = if (learned and plan.active) plan.planned_physical_high_water_bytes else null,
         .admission_limit_bytes = if (learned and plan.active) plan.admission_budget_bytes else null,
@@ -63643,12 +63660,18 @@ test "Gemma4 CUDA learned scratch backing survives requests without retaining th
     try std.testing.expectEqual(.fixed, observed.state);
     try std.testing.expectEqual(@as(usize, 2), observed.slots);
     try std.testing.expectEqual(@as(usize, 192), observed.live_backing_bytes);
+    try std.testing.expectEqual(@as(usize, 2), observed.bound_slots);
+    try std.testing.expectEqual(@as(usize, 192), observed.bound_backing_bytes);
     try std.testing.expect(observed.planned_bytes == null);
     try resetTempPinnedSlotsForRequest(&compute);
     try std.testing.expectEqual(@as(usize, 0), compute.temp_buffers.buffers.items.len);
     try std.testing.expectEqual(@as(usize, 0), compute.temp_pinned_slots.items[0].requested_len);
     try std.testing.expectEqual(@as(?u16, 0), compute.temp_pinned_slot_by_address.get(first_ptr));
     try std.testing.expectEqual(@as(?u16, 1), compute.temp_pinned_slot_by_address.get(second_ptr));
+    const retained = observePeriodicWorkspace(&compute).?;
+    try std.testing.expectEqual(@as(usize, 0), retained.bound_slots);
+    try std.testing.expectEqual(@as(usize, 0), retained.bound_backing_bytes);
+    try std.testing.expectEqual(@as(usize, 192), retained.live_backing_bytes);
     const lengths = [_]usize{ 64, 128 };
     try recycleTempPinnedSlotsUnlocked(&compute, .{ .plan = &lengths });
     first = (try allocPinnedTempSlot(&compute, 0, 64)).?;

@@ -195,8 +195,12 @@ pub const DeviceMemory = struct {
 
 pub const PeriodicWorkspace = struct {
     scope: enum { cuda_context_pinned_allocations } = .cuda_context_pinned_allocations,
-    state: enum { fixed, idle, observing, validating, capture_ready, disabled },
+    state: enum { fixed, idle, observing, installing, validating, capture_ready, disabled },
+    /// Published ordinals and their exact bound backing. Other live buffers
+    /// can be retained for reuse while the current request has no active plan.
     slots: usize,
+    bound_slots: usize,
+    bound_backing_bytes: usize,
     live_backing_bytes: usize,
     planned_bytes: ?usize = null,
     admission_limit_bytes: ?usize = null,
