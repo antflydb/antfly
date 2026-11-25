@@ -25,6 +25,7 @@ export interface Widget {
     size?: number;
     filterValue?: string;
     useCustomQuery?: boolean;
+    resultsId?: string;
     [key: string]: unknown;
   };
   result?: {
