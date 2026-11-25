@@ -4264,7 +4264,8 @@ fn isEnrichmentProgressPending(err: anyerror) bool {
 
 fn isEnrichmentControlError(err: anyerror) bool {
     return err == error.EnrichmentRetryAborted or err == error.Cancelled or err == error.Canceled or
-        err == error.EnrichmentWaitCanceled or err == error.EnrichmentWaitTimeout or isEnrichmentProgressPending(err);
+        err == error.EnrichmentWaitCanceled or err == error.EnrichmentWaitTimeout or
+        err == error.EnrichmentRetryInProgress or isEnrichmentProgressPending(err);
 }
 
 test "commit requirements prepared sources defer background publication without terminal failure" {
@@ -10718,7 +10719,8 @@ test "enrichment cancellation defers dense sparse and multimodal provider calls 
     mock.inherited.store(false, .release);
     runtime.config.chunk_provider.?.chunk_input_callback = @ptrCast(&Mock.legacyChunk);
     const media_config: chunking_types_mod.Config = .{ .provider = .antfly, .model = "test", .embedding = .{ .model = "test" } };
-    try std.testing.expectError(error.UncancellableInferenceProvider, chunkMediaWithProviderForEnrichment(&runtime, std.testing.allocator, media_config, .{ .text = "source" }, runtime.config.chunk_provider));
+    try std.testing.expectError(error.EnrichmentRetryInProgress, chunkMediaWithProviderForEnrichment(&runtime, std.testing.allocator, media_config, .{ .text = "source" }, runtime.config.chunk_provider));
+    try std.testing.expect(isEnrichmentControlError(error.EnrichmentRetryInProgress));
     runtime.active_provider_guard = .{};
     try std.testing.expectError(error.LegacyChunkDispatched, chunkMediaWithProviderForEnrichment(&runtime, std.testing.allocator, media_config, .{ .text = "source" }, runtime.config.chunk_provider));
 }
@@ -11935,6 +11937,7 @@ fn runForegroundCatchUpPassGuarded(
         // provider failure, or superseding writer leaves its own durable state.
         if (failure == RuntimeError.EnrichmentWaitCanceled or
             failure == RuntimeError.EnrichmentWaitTimeout or
+            failure == RuntimeError.EnrichmentRetryInProgress or
             (failure == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)))
         {
             if (recovery) |reserved| releaseBoundaryRecoveryReservation(runtime, reserved) catch |refund_err| switch (refund_err) {
