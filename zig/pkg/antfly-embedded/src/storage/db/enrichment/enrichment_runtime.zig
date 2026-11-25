@@ -580,6 +580,12 @@ const ForegroundCatchUpGuard = struct {
         return bounded(clock, config, cancellation);
     }
 
+    fn nativeDeadlineNs(self: @This(), inherited: ?u64) ?u64 {
+        const deadline = self.deadline_ns orelse return inherited;
+        const native = platform_time.monotonicNs() +| (deadline -| self.clock.nowRealtimeNs());
+        return if (inherited) |limit| @min(limit, native) else native;
+    }
+
     fn check(self: @This()) !void {
         if (self.cancellation.isCancelled())
             return RuntimeError.EnrichmentWaitCanceled;
@@ -5299,14 +5305,7 @@ fn scopedAssetProducer(
     };
     // InvocationContext consumes the native monotonic epoch, while the
     // visibility guard belongs to the runtime's imported or manual clock.
-    const native_deadline = if (guard.deadline_ns) |deadline|
-        platform_time.monotonicNs() +| (deadline -| guard.clock.nowRealtimeNs())
-    else
-        null;
-    const deadline_ns = if (producer.invocation_context.deadline_ns) |inherited|
-        if (native_deadline) |deadline| @min(inherited, deadline) else inherited
-    else
-        native_deadline;
+    const deadline_ns = guard.nativeDeadlineNs(producer.invocation_context.deadline_ns);
     return producer.withInvocationContext(.{
         .io = producer.invocation_context.io orelse runtime.config.io,
         .deadline_ns = deadline_ns,
@@ -12459,6 +12458,7 @@ const SharedPdfWindowScheduler = struct {
             invocation: PdfWindowConsumerLease,
             guard: ForegroundCatchUpGuard,
             cancellation: CancellationToken,
+            inherited_cancellation: CancellationToken = .none,
             canceled: std.atomic.Value(bool) = .init(false),
             done: std.atomic.Value(bool) = .init(false),
             group: *WindowJobs,
@@ -12499,12 +12499,13 @@ const SharedPdfWindowScheduler = struct {
 
             fn isCanceled(raw: *const anyopaque) bool {
                 const job: *const @This() = @ptrCast(@alignCast(raw));
-                return job.canceled.load(.acquire) or job.cancellation.isCancelled() or job.guard.cancellation.isCancelled();
+                return job.canceled.load(.acquire) or job.cancellation.isCancelled() or
+                    job.inherited_cancellation.isCancelled() or job.guard.cancellation.isCancelled();
             }
 
             fn invocationFailure(self: *const @This(), err: anyerror) anyerror {
                 if (!isOperationInterruption(err)) return err;
-                return classifyProviderCancellation(err, self.guard, self.canceled.load(.acquire) or self.cancellation.isCancelled());
+                return classifyProviderCancellation(err, self.guard, isCanceled(self));
             }
 
             fn progress(_: ?*anyopaque, _: inference_request_context.Progress) void {
@@ -12586,6 +12587,7 @@ const SharedPdfWindowScheduler = struct {
                 .cancellation = runtime.config.cancellation,
                 .group = self,
                 .text = .{ .producer = producer, .index = index },
+                .inherited_cancellation = producer.invocation_context.cancellation,
             };
             const alloc = job.invocation.allocator();
             const text = &job.text.?;
@@ -12616,7 +12618,7 @@ const SharedPdfWindowScheduler = struct {
                     values[i].source_fingerprint = text.fingerprint;
                 }
             }
-            text.producer = producer.withInvocationContext(.{ .io = self.lane.?.io(), .deadline_ns = job.guard.deadline_ns, .cancellation = .{ .ptr = job, .is_cancelled_fn = Job.isCanceled }, .progress = .{ .ptr = job, .update_fn = Job.progress } });
+            text.producer = producer.withInvocationContext(.{ .io = self.lane.?.io(), .deadline_ns = job.guard.nativeDeadlineNs(producer.invocation_context.deadline_ns), .cancellation = .{ .ptr = job, .is_cancelled_fn = Job.isCanceled }, .progress = .{ .ptr = job, .update_fn = Job.progress } });
             text.started_ns = runtime.clock.nowRealtimeNs();
             text.request_bytes = runtimeGeneratedTextBatchBytes(text.requests);
             if (text.rasters) |values| for (values) |raster| {
@@ -12694,7 +12696,9 @@ const SharedPdfWindowScheduler = struct {
                 },
             };
             const io = self.lane.?.io();
-            job.embedder.part_request_context = .{ .io = io, .deadline_ns = job.guard.deadline_ns, .cancellation = .{ .ptr = job, .is_cancelled_fn = Job.isCanceled }, .progress = .{ .ptr = job, .update_fn = Job.progress } };
+            const inherited = provider.part_request_context;
+            if (inherited) |context| job.inherited_cancellation = context.cancellation orelse .none;
+            job.embedder.part_request_context = .{ .io = io, .deadline_ns = job.guard.nativeDeadlineNs(if (inherited) |context| context.deadline_ns else null), .cancellation = .{ .ptr = job, .is_cancelled_fn = Job.isCanceled }, .progress = .{ .ptr = job, .update_fn = Job.progress } };
             // A saturated executor keeps the same isolated job/context and
             // executes it inline; it never creates another thread pool.
             self.launch(job);
@@ -42096,8 +42100,7 @@ fn fetchEnrichmentSource(
     try checkProviderFailureGuard(runtime);
     const cancellation = enrichmentSourceCancellation(runtime);
     var config = remoteRenderConfig(runtime.config.secret_store, runtime.config.remote_content, runtime.config.io, cancellation.token(), null, scopedRetryHint(runtime.config.fetch_retry_hint, request, raw));
-    if (runtime.active_provider_guard.deadline_ns != null)
-        config.deadline_ns = assetProviderRequestContext(runtime).deadline_ns;
+    config.deadline_ns = runtime.active_provider_guard.nativeDeadlineNs(null);
     return cache.fetch(source_url, credentials, config) catch |err| return providerInvocationFailure(runtime, err);
 }
 
