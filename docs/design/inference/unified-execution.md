@@ -876,9 +876,14 @@ BF16 device embedding handoff and in-frame greedy argmax on a synthetic
 decoder. A released-checkpoint suite with batched text prefill passed all
 80 tests. On a 16-token prefix, prefill fell from 957.19 ms serial to
 521.92 ms batched, and the next-token logit vectors matched in that run.
-The complete serving and reference comparison still requires measuring
-the batched build over HTTP and qualifying Metal image and full-context
-requests.
+On the M4 Max, the batched build returned `4` for the same short HTTP
+request in 1.30 s median over three warm runs. llama.cpp b12706 returned
+`4` in 0.339 s median using the same serialized 28-token prompt and its
+NVFP4 GGUF, with all 49 layers offloaded to Metal. Both engines returned
+`271` on the lookup request. Antfly used 6,397 prompt tokens and completed
+in 215.74 s. llama.cpp used 6,396 and completed in 20.52 s. The reference
+was configured for an 8,192-token window. Antfly needs faster prompt
+execution, and full-context qualification remains open.
 
 ### Official Gemma 4 E2B QAT serving comparison
 
