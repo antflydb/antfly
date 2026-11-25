@@ -17423,7 +17423,9 @@ fn installLearnedTempArenaPlan(self: *CudaCompute) !bool {
     while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
     defer self.temp_buffer_mutex.unlock();
 
-    // Reserve descriptor capacity before changing any published slot mapping.
+    // The boundary proposed the ABI. Publish its usable slot mappings only
+    // if all descriptor capacity and retirement checks succeed.
+    errdefer self.temp_arena_planner.abandonInstallation();
     try self.temp_pinned_slots.ensureTotalCapacity(self.allocator, lengths.len);
     try recycleTempPinnedSlotsUnlocked(self, .{ .plan = lengths });
     try ensureTempPinnedSlots(self, lengths.len);
@@ -17443,13 +17445,7 @@ fn discardLearnedTempArenaSlots(self: *CudaCompute) !void {
 fn noteLearnedTempArenaBoundary(self: *CudaCompute) !void {
     if (!self.temp_slot_config.autoplan_enabled) return;
     while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
-    const transition = self.temp_arena_planner.beginDecodeIteration(
-        self.allocator,
-        self.temp_trace_seq,
-    ) catch |err| {
-        self.temp_buffer_mutex.unlock();
-        return err;
-    };
+    const transition = self.temp_arena_planner.beginDecodeIteration(self.temp_trace_seq);
     self.temp_buffer_mutex.unlock();
     switch (transition) {
         .activated => {
@@ -19215,6 +19211,9 @@ test "CUDA decoder workspace recycling does not grow a full cache" {
 
     compute.temp_arena_planner.active = true;
     try std.testing.expectError(error.OutOfMemory, installLearnedTempArenaPlan(&compute));
+    try std.testing.expect(!compute.temp_arena_planner.active);
+    try std.testing.expect(!compute.temp_arena_planner.ready_for_capture);
+    try std.testing.expectEqual(@as(usize, 0), compute.temp_arena_planner.period());
     try std.testing.expectEqual(@as(usize, 1), compute.temp_pinned_slots.items.len);
     try std.testing.expectEqual(@as(usize, 0), compute.temp_pinned_slots.items[0].requested_len);
     try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0x2000), compute.temp_pinned_slots.items[0].buffer.ptr);
