@@ -46,6 +46,7 @@ const Bank = struct {
     slots: []Slot,
     page_ids: Tensor,
     host_ids: []u32,
+    staged_first_page: ?usize = null,
 
     fn init(a: std.mem.Allocator, runtime: *metal.RawMetalDecodeRuntime, config: kv.BankConfig, group: kv.Group) !Bank {
         const pages = try config.layout.pageCapacity(group);
@@ -74,7 +75,6 @@ const Bank = struct {
         }
         const host_ids = try a.alloc(u32, pages);
         errdefer a.free(host_ids);
-        @memset(host_ids, 0);
         const page_ids = try Tensor.deviceAllocateTyped(a, runtime, .i32, .shared, &.{std.math.cast(i32, pages) orelse return error.InvalidKvShape});
         return .{ .pool = pool, .slots = slots, .page_ids = page_ids, .host_ids = host_ids };
     }
@@ -88,8 +88,26 @@ const Bank = struct {
     }
 
     fn stagePages(self: *Bank, append: *kv.Append, group: kv.Group) !void {
-        _ = try append.stagedPageIds(group, self.host_ids);
-        try self.page_ids.uploadBytes(std.mem.sliceAsBytes(self.host_ids));
+        const range = try append.stagedRange(group);
+        const committed = append.sequence.committed_tokens;
+        const page_tokens: usize = range.page_tokens;
+        const committed_end_page = committed / page_tokens + @intFromBool(committed % page_tokens != 0);
+        const prefix = if (self.staged_first_page == range.first_page)
+            @min(range.page_count, committed_end_page -| range.first_page)
+        else
+            0;
+        if (prefix == range.page_count) return;
+
+        self.staged_first_page = null;
+        const changed = self.host_ids[prefix..range.page_count];
+        for (changed, range.first_page + prefix..) |*id, logical|
+            id.* = append.pageId(group, logical) orelse return error.InvalidKvRange;
+
+        const bytes = std.mem.sliceAsBytes(changed);
+        var patch = try self.page_ids.retainedView(prefix * @sizeOf(u32), bytes.len, &.{@intCast(changed.len)});
+        defer patch.deinit();
+        try patch.uploadBytes(bytes);
+        self.staged_first_page = range.first_page;
     }
 };
 
