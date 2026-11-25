@@ -2373,3 +2373,102 @@ fn checkDecoderGather(kind: @import("../backends/backends.zig").BackendType) !vo
     try std.testing.expectEqual(@as(u64, count), report.native_items);
     try std.testing.expectEqual(@as(u64, 1), report.native_batches);
 }
+
+test "tensor microbatch released T5-small fuses suffixes after encoder retirement" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const path = platform.env.getenv("ANTFLY_ONNX_T5_MERGED_DECODER") orelse return error.SkipZigTest;
+    const name = platform.env.getenv("ANTFLY_ONNX_T5_BACKEND") orelse "native";
+    const kind = std.meta.stringToEnum(@import("../backends/backends.zig").BackendType, name) orelse return error.InvalidBackend;
+    const a = std.testing.allocator;
+    const shared_allocator = std.heap.smp_allocator;
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    var session = try @import("../backends/imported_onnx_session.zig").createSession(a, path, kind);
+    defer session.close();
+    try session.model_lifetime.?.prepareFinalResources();
+    session.model_lifetime.?.admission_domain = domain.pin();
+    session.run_admission = .{ .controller = &domain.controller, .backend_class = if (kind == .native) .cpu else .gpu, .limits = .{}, .static_workspace_bytes = 1, .check_live_memory = false };
+    var broker = micro.Broker.init(a);
+    defer broker.deinit();
+    const Runtime = @import("../execution/seq2seq_runtime.zig");
+    const control: Control = .{ .native_call_policy = .in_process };
+    const DispatchContext = struct { broker: *micro.Broker, gate: std.atomic.Mutex = .unlocked };
+    var dispatch_context: DispatchContext = .{ .broker = &broker };
+    const Peer = struct {
+        state: Runtime.State,
+        token: i64,
+        dispatch: *DispatchContext,
+        row: ?[]f32 = null,
+        failure: ?anyerror = null,
+
+        fn stage(raw: *anyopaque, task: micro.Task, allocator: std.mem.Allocator, target: session_mod.Session, inputs: []const StageInput, active: ?Control) !session_mod.ResidentOutputs {
+            const dispatch: *DispatchContext = @ptrCast(@alignCast(raw));
+            return runStage(dispatch.broker, allocator, std.testing.io, task, target, target.execution_gate orelse &dispatch.gate, inputs, active, null, 20_000) catch |err| {
+                std.debug.print("T5 stage dispatch failed: {s}\n", .{@errorName(err)});
+                return err;
+            };
+        }
+
+        fn host(_: *anyopaque, _: micro.Task, _: std.mem.Allocator, _: session_mod.Session, _: ?*session_mod.RunPermit, _: ?*std.atomic.Mutex, _: []const Tensor, _: ?Control) ![]Tensor {
+            return error.UnexpectedHostDispatch;
+        }
+
+        fn run(peer: *@This()) void {
+            peer.row = peer.state.stepResidentDispatched(.{ .position = 4, .tokens = &.{peer.token} }, control, .{
+                .ptr = peer.dispatch,
+                .task = .rewrite,
+                .run_fn = host,
+                .run_stage_fn = stage,
+                .accepts_shape_only_stage_inputs = true,
+            }) catch |err| {
+                peer.failure = err;
+                return;
+            };
+        }
+    };
+    var peers: [2]Peer = undefined;
+    var references: [2][]f32 = undefined;
+    var ready: usize = 0;
+    defer for (peers[0..ready], references[0..ready]) |*peer, reference| {
+        if (peer.row) |row| shared_allocator.free(row);
+        a.free(reference);
+        peer.state.deinit();
+    };
+    for (&peers, &references, 0..) |*peer, *reference, index| {
+        const initial = [_]i64{ 0, 1, 2, @as(i64, @intCast(3 + index)) };
+        const token: i64 = @intCast(8 + index);
+        var hidden = try Tensor.initFloat32(a, "encoder_hidden_states", &.{ 1, 4, 512 }, &(@as([2048]f32, @splat(0.01))));
+        defer hidden.deinit();
+        const mask: []const i64 = &.{ 1, 1, 1, 1 };
+        reference.* = blk: {
+            var serial = (try Runtime.State.init(a, session, .{ .host = hidden }, mask, 32128)) orelse return error.UnqualifiedMergedDecoder;
+            defer serial.deinit();
+            break :blk try serial.stepResident(.{ .position = 0, .tokens = &(initial ++ [1]i64{token}) }, control);
+        };
+        errdefer a.free(reference.*);
+
+        var state = (try Runtime.State.init(shared_allocator, session, .{ .host = hidden }, mask, 32128)) orelse return error.UnqualifiedMergedDecoder;
+        errdefer state.deinit();
+        const row = try state.stepResident(.{ .position = 0, .tokens = &initial }, control);
+        shared_allocator.free(row);
+        try std.testing.expect(state.detachEncoderPayload());
+        peer.* = .{ .state = state, .token = token, .dispatch = &dispatch_context };
+        ready += 1;
+    }
+    var group = std.Io.Group.init;
+    defer group.cancel(std.testing.io);
+    for (&peers) |*peer| try group.concurrent(std.testing.io, Peer.run, .{peer});
+    try group.await(std.testing.io);
+    for (&peers, references) |*peer, reference| {
+        if (peer.failure) |err| {
+            std.debug.print("T5 broker suffix failure: {s}\n", .{@errorName(err)});
+            return err;
+        }
+        const row = peer.row orelse return error.MissingMergedDecoderResult;
+        try std.testing.expectEqual(reference.len, row.len);
+        for (reference, row) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
+    }
+    const report = broker.snapshot(std.testing.io);
+    try std.testing.expectEqual(@as(u64, 1), report.native_batches);
+    try std.testing.expectEqual(@as(u64, peers.len), report.native_items);
+}

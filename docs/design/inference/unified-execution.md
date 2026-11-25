@@ -768,6 +768,15 @@ migration. Compatibility paths stay until their replacements satisfy correctness
 residency, lifetime and performance checks. Physical L4/A100 qualification remains
 deferred; CPU, local Metal and Glowworm GB10 provide the available hardware tests.
 
+The released T5-small decoder also exercises the serving broker with two
+independent four-token prefills and distinct suffixes. Both encoder payloads
+are freed before the broker gathers the retained cache inputs into one batch.
+Both complete vocabulary rows match the full-prefix references within 0.001
+on Native, Metal, and Spark CUDA. Published logits readback waits for the
+provider with request cancellation checks if a sibling still owns the scope.
+This fixture verifies physical batching and output correctness. It does not
+measure serving throughput.
+
 ### Inkling 2 Mini CUDA integration
 
 The released safetensors text and single-image routes use the shared model

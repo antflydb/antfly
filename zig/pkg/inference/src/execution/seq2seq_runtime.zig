@@ -294,7 +294,7 @@ pub const State = struct {
             },
             else => {},
         };
-        const row = try @import("encoder_decoder_runtime.zig").residentVocabularyRow(self.allocator, self.session, &outputs, self.logits_index, suffix.tokens.len, self.vocab_size, control);
+        const row = try @import("encoder_decoder_runtime.zig").residentVocabularyRow(self.allocator, self.session, &outputs, self.logits_index, suffix.tokens.len, self.vocab_size, control, dispatch != null);
         errdefer self.allocator.free(row);
         for (self.roles, updated) |role, *slot| switch (role) {
             .past => |past| {
@@ -452,7 +452,10 @@ pub const State = struct {
         var protection = if (control) |active| try active.enterUninterruptible(self.session.interruption()) else null;
         defer if (protection) |*guard| guard.deinit();
         const operation = @import("backend_operation.zig");
-        var scope = try operation.enter(backend.*, null, backend.operationToken(), .legacy_unknown_frame);
+        var scope = operation.enter(backend.*, null, backend.operationToken(), .legacy_unknown_frame) catch |err| switch (err) {
+            error.QueueFull => return, // Already published cache views remain valid.
+            else => return err,
+        };
         defer scope.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         if (backend.kind() == .metal and (backend.decoderRuntimeHasActiveFrame() or backend.decoderRuntimeHasSubmittedFrame())) return scope.finish();
 
@@ -992,7 +995,7 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
     }
     var prefill = (try state.session.runStageInputsWithControl(&bindings, a, test_control)) orelse return error.MissingResidentResult;
     defer prefill.deinit();
-    const prefill_logits = try stages.residentVocabularyRow(a, state.session, &prefill, state.logits_index, 1, 4, test_control);
+    const prefill_logits = try stages.residentVocabularyRow(a, state.session, &prefill, state.logits_index, 1, 4, test_control, false);
     defer a.free(prefill_logits);
     try std.testing.expectEqualSlices(f32, first.logits, prefill_logits);
     for (state.session.inputInfo(), state.roles, &bindings) |info, role, *binding| switch (role) {
@@ -1003,7 +1006,7 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
     };
     var decoded = (try state.session.runStageInputsWithControl(&bindings, a, test_control)) orelse return error.MissingResidentResult;
     defer decoded.deinit();
-    const decode_logits = try stages.residentVocabularyRow(a, state.session, &decoded, state.logits_index, 1, 4, test_control);
+    const decode_logits = try stages.residentVocabularyRow(a, state.session, &decoded, state.logits_index, 1, 4, test_control, false);
     defer a.free(decode_logits);
     try std.testing.expectEqualSlices(f32, next.logits, decode_logits);
     const final_cache = try decoded.backend.toFloat32(decoded.outputs[1], a);

@@ -400,12 +400,12 @@ pub fn finalVocabularyRow(allocator: std.mem.Allocator, decoder: backends.Sessio
     var outputs = try @import("tensor_dispatch.zig").runStage(allocator, decoder, inputs, control, dispatch);
     defer outputs.deinit();
     if (outputs.outputs.len != 1) return error.InvalidDecoderOutput;
-    return residentVocabularyRow(allocator, decoder, &outputs, 0, query_rows, vocab, control);
+    return residentVocabularyRow(allocator, decoder, &outputs, 0, query_rows, vocab, control, dispatch != null);
 }
 
 /// The result retains the provider's admission and tensor custody across the
 /// readback. Only the requested row crosses the device boundary.
-pub fn residentVocabularyRow(allocator: std.mem.Allocator, decoder: backends.Session, outputs: *const session_mod.ResidentOutputs, logits_index: usize, query_rows: usize, vocab: usize, control: ?Control) ![]f32 {
+pub fn residentVocabularyRow(allocator: std.mem.Allocator, decoder: backends.Session, outputs: *const session_mod.ResidentOutputs, logits_index: usize, query_rows: usize, vocab: usize, control: ?Control, published: bool) ![]f32 {
     if (query_rows == 0 or vocab == 0 or logits_index >= outputs.outputs.len) return error.InvalidDecoderOutput;
     const expected = [_]i64{
         1,
@@ -414,7 +414,11 @@ pub fn residentVocabularyRow(allocator: std.mem.Allocator, decoder: backends.Ses
     };
     const logits = outputs.outputs[logits_index];
     var operation_scope: @import("backend_operation.zig").Scope = undefined;
-    try @import("backend_operation.zig").enterInto(outputs.backend, null, outputs.backend.operationToken(), .legacy_unknown_frame, &operation_scope);
+    const operation = @import("backend_operation.zig");
+    if (published)
+        try operation.enterPublishedInto(outputs.backend, control, &operation_scope)
+    else
+        try operation.enterInto(outputs.backend, null, outputs.backend.operationToken(), .legacy_unknown_frame, &operation_scope);
     errdefer operation_scope.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
     if (try outputs.backend.tensorShapeMatches(logits, &expected)) |matches| {
         if (!matches) return error.InvalidDecoderOutput;
