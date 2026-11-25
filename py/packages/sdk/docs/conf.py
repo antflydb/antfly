@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "antfly-sdk"))
 project = "antfly-sdk"
 copyright = "2025, ajroetker@antfly.io"
 author = "ajroetker@antfly.io"
-release = "0.1.0"
+release = "0.3.1"
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
