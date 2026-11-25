@@ -36,6 +36,9 @@ pub fn main(init: std.process.Init) !void {
     try std.Io.Dir.cwd().createDirPath(io, root);
     defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
 
+    try expectCommandContains(allocator, io, &.{ antfly_path, "--output", "table", "inference", "list", "--models-dir", root }, "MODEL");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "--output", "json", "inference", "list", "--models-dir", root }, "[]");
+
     const db_path = try join(allocator, root, "app.aflite");
     defer allocator.free(db_path);
     const restored_path = try join(allocator, root, "restored.aflite");

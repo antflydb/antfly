@@ -112,16 +112,10 @@ fn destroyRegistry(handle: *anyopaque) void {
     const allocator = owner.memory;
     allocator.asStd().destroy(owner);
 }
-fn listModels(handle: *anyopaque, io: io_abi.Borrow) !void {
+fn listModels(handle: *anyopaque, io: io_abi.Borrow, format: engine.ModelListFormat) !void {
     const owner = registry(handle);
     var receiver = try io.receive();
-    const models = try owner.registry.discover(receiver.io());
-    defer owner.memory.asStd().free(models);
-    for (models) |model| {
-        if (model.load_error) |err| {
-            std.debug.print("{s:<12} {s}  unusable: {s}\n", .{ @tagName(model.kind), model.name, @errorName(err) });
-        } else std.debug.print("{s:<12} {s}\n", .{ @tagName(model.kind), model.name });
-    }
+    return try engine.writeModelList(owner.memory.asStd(), receiver.io(), &owner.registry, format);
 }
 fn pull(handle: *anyopaque, io: io_abi.Borrow, ref: []const u8, config: engine.HubConfig, tasks: ?[]const u8, capabilities: ?[]const u8, projector: engine.ProjectorSelection) !void {
     var receiver = try io.receive();
@@ -197,8 +191,8 @@ fn createRegistryOutcome(allocator: memory.Allocator, directory: []const u8) eng
 fn destroyRegistryOutcome(handle: *anyopaque) engine.Outcome(void) {
     return .{ .value = destroyRegistry(handle) };
 }
-fn listModelsOutcome(handle: *anyopaque, io: io_abi.Borrow) engine.Outcome(void) {
-    return .{ .value = listModels(handle, io) catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn listModelsOutcome(handle: *anyopaque, io: io_abi.Borrow, format: engine.ModelListFormat) engine.Outcome(void) {
+    return .{ .value = listModels(handle, io, format) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 fn pullOutcome(handle: *anyopaque, io: io_abi.Borrow, ref: []const u8, config: engine.HubConfig, tasks: ?[]const u8, capabilities: ?[]const u8, projector: engine.ProjectorSelection) engine.Outcome(void) {
     return .{ .value = pull(handle, io, ref, config, tasks, capabilities, projector) catch |err| return .{ .failure = .init(@errorName(err)) } };
