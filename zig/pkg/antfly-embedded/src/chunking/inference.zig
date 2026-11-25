@@ -236,6 +236,7 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
             const chunk_input: ChunkInputWithContextFn = @ptrCast(@alignCast(callback));
             break :blk try ChunkProviderBoundary.call("chunk_input_with_context", dispatch, chunk_input, .{ ptr, alloc, if (cfg.model.len > 0) cfg.model else "fixed", input, cfg, request_context });
         } else if (provider.chunk_input_callback) |callback| blk: {
+            if (provider.require_controlled_linked) return error.UncancellableInferenceProvider;
             const chunk_input: ChunkInputFn = @ptrCast(@alignCast(callback));
             break :blk try ChunkProviderBoundary.call("chunk_input", dispatch, chunk_input, .{ ptr, alloc, if (cfg.model.len > 0) cfg.model else "fixed", input, cfg });
         } else return error.InvalidChunkProvider;

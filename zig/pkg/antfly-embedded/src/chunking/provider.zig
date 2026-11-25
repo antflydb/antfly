@@ -49,6 +49,8 @@ pub const Provider = struct {
     chunk_page_with_context_callback: ?*const anyopaque = null,
     execution: execution_context.Context = .{},
     dispatch_accounting: ?DispatchAccounting = null,
+    /// Foreground replay permits linked callbacks only if they receive control.
+    require_controlled_linked: bool = false,
     owned_allocator: ?std.mem.Allocator = null,
     owned_default_endpoint: ?[]u8 = null,
     owned_source_table: ?[]u8 = null,

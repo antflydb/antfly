@@ -208,6 +208,8 @@ pub const Config = struct {
     /// Runtime-owned cancellation propagated through template remote I/O and
     /// provider calls. Set by `start`; callers do not configure this directly.
     cancellation: CancellationToken = .none,
+    /// Absolute native deadline for request-scoped template transports.
+    source_deadline_ns: ?u64 = null,
     /// Runtime-owned source retry observer, installed alongside cancellation.
     fetch_retry_hint: ?template_remote.RetryHintObserver = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
@@ -587,7 +589,7 @@ const ForegroundCatchUpGuard = struct {
     }
 
     fn check(self: @This()) !void {
-        self.cancellation.check() catch |err| return if (isOperationCanceled(err)) RuntimeError.EnrichmentWaitCanceled else err;
+        self.cancellation.check() catch |err| return callerCheckpointFailure(err);
         if (self.deadline_ns) |deadline_ns| {
             if (self.clock.nowRealtimeNs() >= deadline_ns)
                 return RuntimeError.EnrichmentWaitTimeout;
@@ -2774,7 +2776,7 @@ fn assetRequestRecoveryKey(alloc: Allocator, request: enrichment_types.Generated
 
 fn inferenceControlFailurePolicy(err: anyerror, batch_items: usize) ?InferenceControlFailurePolicy {
     if (!inferenceControlFailure(err)) return null;
-    if (err == error.Cancelled or err == error.Canceled or err == error.EnrichmentWaitCanceled) return .{};
+    if (err != error.Timeout) return .{};
     if (batch_items > 1) return .{
         .next_batch_cap = @max(@as(usize, 1), batch_items / 2),
         .failed_capacity_batch = batch_items,
@@ -2784,7 +2786,11 @@ fn inferenceControlFailurePolicy(err: anyerror, batch_items: usize) ?InferenceCo
 
 fn noteInferenceControlFailure(runtime: *EnrichmentRuntime, recovery_key: InferenceRecoveryKey, err: anyerror, batch_items: usize) void {
     const policy = inferenceControlFailurePolicy(err, batch_items) orelse return;
-    if (err == error.Timeout or err == error.EnrichmentWaitTimeout) {
+    if (err == error.EnrichmentWaitTimeout) {
+        _ = runtime.inference_timeout_count.fetchAdd(1, .monotonic);
+        return;
+    }
+    if (err == error.Timeout) {
         _ = runtime.inference_timeout_count.fetchAdd(1, .monotonic);
         lockInferenceRecovery(runtime);
         defer runtime.inference_recovery_mutex.unlock();
@@ -4993,6 +4999,20 @@ test "enrichment cancellation recovery reserves one replay pass without resettin
     try std.testing.expect(!runtime.boundary_recovery_pending);
     const expired: ForegroundCatchUpGuard = .{ .deadline_ns = 0 };
     try std.testing.expectEqual(error.EnrichmentWaitTimeout, foregroundPassFailure(&runtime, expired, error.Canceled));
+    const reserved_observed = try enrichment_state.loadRuntimeObservation(alloc, erased, scope_name);
+    const lease_key = enrichment_lease.default_lease_key;
+    const successor_lease = try std.json.Stringify.valueAlloc(alloc, lease_mod.LeaseRecord{
+        .owner_id = "successor",
+        .epoch = 2,
+        .expires_at_ms = std.math.maxInt(u64),
+    }, .{});
+    defer alloc.free(successor_lease);
+    try storePutBatchWithRetry(&runtime, &.{.{ .key = lease_key, .value = successor_lease }}, &.{});
+    var stale = receipt.?;
+    stale.fence = .{ .lease_key = lease_key, .owner_id = "previous", .epoch = 1 };
+    try std.testing.expectError(error.EnrichmentLeaseFenceLost, releaseBoundaryRecoveryReservation(&runtime, stale));
+    try std.testing.expectEqualDeep(reserved_observed, try enrichment_state.loadRuntimeObservation(alloc, erased, scope_name));
+    try storePutBatchWithRetry(&runtime, &.{}, &.{lease_key});
     try releaseBoundaryRecoveryReservation(&runtime, receipt.?);
     try runtime.reloadDurableState();
     try std.testing.expect(runtime.boundary_recovery_pending and !runtime.worker_failed);
@@ -5451,12 +5471,8 @@ fn checkAssetInvocationOwner(runtime: *EnrichmentRuntime, guard: ForegroundCatch
         if (runtime.shutdown_requested.load(.acquire)) return error.EnrichmentRetryAborted;
     }
     try guard.check();
-    runtime.config.cancellation.check() catch |err| return if (isOperationCanceled(err)) error.EnrichmentWaitCanceled else err;
-    context.check() catch |err| {
-        if (isOperationCanceled(err)) return error.EnrichmentWaitCanceled;
-        if (err == error.Timeout) return error.EnrichmentWaitTimeout;
-        return err;
-    };
+    runtime.config.cancellation.check() catch |err| return callerCheckpointFailure(err);
+    context.check() catch |err| return callerCheckpointFailure(err);
 }
 
 fn checkAssetProviderInvocation(
@@ -5502,6 +5518,12 @@ fn checkProviderFailureGuard(runtime: *EnrichmentRuntime) !void {
     const guard = runtime.active_provider_guard;
     if (guard.deadline_ns == null and guard.cancellation.ptr == null) return;
     try guard.check();
+}
+
+fn callerCheckpointFailure(err: anyerror) anyerror {
+    if (isOperationCanceled(err)) return error.EnrichmentWaitCanceled;
+    if (err == error.DeadlineExceeded or err == error.Timeout) return error.EnrichmentWaitTimeout;
+    return err;
 }
 
 fn isOperationCanceled(err: anyerror) bool {
@@ -5574,11 +5596,8 @@ fn assetProviderFailure(runtime: anytype, producer: asset_producer_mod.Producer,
         if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
     }
     runtime.active_provider_guard.check() catch |control| return control;
-    runtime.config.cancellation.check() catch |owner| return if (isOperationCanceled(owner)) error.EnrichmentWaitCanceled else owner;
-    producer.invocation_context.check() catch |owner| {
-        if (isOperationCanceled(owner)) return error.EnrichmentWaitCanceled;
-        return if (owner == error.Timeout) error.EnrichmentWaitTimeout else owner;
-    };
+    runtime.config.cancellation.check() catch |owner| return callerCheckpointFailure(owner);
+    producer.invocation_context.check() catch |owner| return callerCheckpointFailure(owner);
     return if (isOperationCanceled(err)) error.ProviderInvocationCanceled else err;
 }
 
@@ -8397,6 +8416,7 @@ fn scopedChunkProvider(runtime: *EnrichmentRuntime, provider: ?ChunkProvider, ca
     };
     scoped.execution.cancellation = .{ .ptr = cancellation, .is_cancelled_fn = AssetInvocationCancellation.isCancelled, .check_fn = AssetInvocationCancellation.check };
     scoped.execution.deadline_ns = guard.nativeDeadlineNs(scoped.execution.deadline_ns);
+    scoped.require_controlled_linked = scoped.require_controlled_linked or guard.deadline_ns != null or guard.cancellation.ptr != null;
     return scoped;
 }
 
@@ -9337,6 +9357,9 @@ const PlatformEnrichmentRuntime = struct {
     worker_failed: bool = false,
     /// Set only when loading a failed durable status actually admitted recovery.
     boundary_recovery_pending: bool = false,
+    // The replay-pass owner retries a clean exit's failed status write before
+    // dispatching work again. A new tenure cannot adopt a stale receipt.
+    pending_boundary_refund: ?BoundaryRecoveryReservation = null,
     relational_base_rows: std.atomic.Value(bool) = .init(false),
     skip_by_hash_count: u64 = 0,
     skipped_source_count: u64 = 0,
@@ -10597,6 +10620,9 @@ test "enrichment cancellation defers dense sparse and multimodal provider calls 
         fn sparseBatch(ptr: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![]embedder_mod.SparseEmbedding {
             return fail(ptr);
         }
+        fn legacyChunk(_: *anyopaque, _: Allocator, _: []const u8, _: @import("inference_chunker").Input, _: chunking_types_mod.Config) ![]@import("inference_chunker").Chunk {
+            return error.LegacyChunkDispatched;
+        }
         fn chunkPage(ptr: *anyopaque, a: Allocator, name: []const u8, _: @import("inference_chunker").Input, _: chunking_types_mod.Config, context: inference_request_context.RequestContext) !@import("inference_chunker").types.ChunkPage {
             _ = try sparseRevision(ptr, a, name, context);
             return error.TestUnexpectedResult;
@@ -10729,6 +10755,13 @@ test "enrichment cancellation defers dense sparse and multimodal provider calls 
     const scoped = scopedAssetProducer(&runtime, producer, &cancel);
     try std.testing.expect(!scoped.invocation_context.cancellation.isCancelled());
     try std.testing.expectError(error.EnrichmentLeaseFenceLost, checkAssetInvocationOwner(&runtime, runtime.active_provider_guard, scoped.invocation_context));
+
+    mock.inherited.store(false, .release);
+    runtime.config.chunk_provider.?.chunk_input_callback = @ptrCast(&Mock.legacyChunk);
+    const media_config: chunking_types_mod.Config = .{ .provider = .antfly, .model = "test", .embedding = .{ .model = "test" } };
+    try std.testing.expectError(error.UncancellableInferenceProvider, chunkMediaWithProviderForEnrichment(&runtime, std.testing.allocator, media_config, .{ .text = "source" }, runtime.config.chunk_provider));
+    runtime.active_provider_guard = .{};
+    try std.testing.expectError(error.LegacyChunkDispatched, chunkMediaWithProviderForEnrichment(&runtime, std.testing.allocator, media_config, .{ .text = "source" }, runtime.config.chunk_provider));
 }
 
 test "enrichment provider deadlines and progress cross native clock boundaries" {
@@ -10804,6 +10837,17 @@ test "enrichment provider deadlines and progress cross native clock boundaries" 
 test "foreground enrichment catch-up guard has a monotonic deadline" {
     const guard = ForegroundCatchUpGuard{ .deadline_ns = platform_time.monotonicNs() };
     try std.testing.expectError(error.EnrichmentWaitTimeout, guard.check());
+    const Script = struct {
+        fn check(ptr: *const anyopaque) !void {
+            const failure: *const anyerror = @ptrCast(@alignCast(ptr));
+            return failure.*;
+        }
+    };
+    var failure: anyerror = error.DeadlineExceeded;
+    const caller: ForegroundCatchUpGuard = .{ .cancellation = .{ .ptr = &failure, .check_fn = Script.check } };
+    try std.testing.expectError(error.EnrichmentWaitTimeout, caller.check());
+    failure = error.EnrichmentLeaseFenceLost;
+    try std.testing.expectError(error.EnrichmentLeaseFenceLost, caller.check());
 }
 
 test "foreground enrichment rejects providers without a bounded-operation contract" {
@@ -10933,7 +10977,7 @@ test "asset inference recovery uses one identity from plan through provider call
     try std.testing.expectEqual(@as(usize, 4), recoveryBatchCap(&runtime, planned_key));
 }
 
-test "post-provider deadline records timeout recovery before returning" {
+test "post-provider caller deadline records a metric without changing admission" {
     var runtime = EnrichmentRuntime{
         .alloc = std.testing.allocator,
         .io_impl = null,
@@ -10957,8 +11001,10 @@ test "post-provider deadline records timeout recovery before returning" {
         error.EnrichmentWaitTimeout,
         checkProviderFailureGuardRecording(&runtime, key, 8, null),
     );
-    try std.testing.expectEqual(@as(u64, 1), runtime.inference_timeout_count.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 4), recoveryBatchCap(&runtime, key));
+    try std.testing.expectError(error.EnrichmentWaitTimeout, checkProviderFailureGuardRecording(&runtime, key, 1, null));
+    try std.testing.expectEqual(@as(u64, 2), runtime.inference_timeout_count.load(.acquire));
+    try std.testing.expectEqual(std.math.maxInt(usize), recoveryBatchCap(&runtime, key));
+    try std.testing.expectEqual(@as(usize, 0), runtime.inference_recovery.count());
 }
 
 const FailedReplay = struct { generation: u64, through: u64 };
@@ -11915,19 +11961,34 @@ fn runForegroundCatchUpPassGuarded(
     const previous_generation = swapReplayWriteGeneration(runtime, generation);
     defer _ = swapReplayWriteGeneration(runtime, previous_generation);
     var recovery: ?BoundaryRecoveryReservation = null;
-    runForegroundCatchUpPassOwned(runtime, io, target_sequence, guard, generation, &recovery) catch |err| {
+    var publication_failure: ?anyerror = null;
+    var lease_guard = RuntimeLeaseHeartbeatGuard.init(runtime);
+    defer lease_guard.stop();
+    runForegroundCatchUpPassOwned(runtime, io, target_sequence, guard, generation, &lease_guard, &recovery, &publication_failure) catch |err| {
         const failure = foregroundPassFailure(runtime, guard, err);
+        const failed = FailedReplay{ .generation = generation, .through = target_sequence };
+        if (publication_failure) |cause| {
+            setActiveFailureFingerprint(runtime, 0);
+            handleWorkerLoopError(runtime, io, cause, failed);
+            return failure;
+        }
         // A clean waiter exit can refund an unchanged reservation. A crash,
         // provider failure, or superseding writer leaves its own durable state.
         if (failure == RuntimeError.EnrichmentWaitCanceled or
             failure == RuntimeError.EnrichmentWaitTimeout or
             (failure == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)))
         {
-            if (recovery) |reserved| try releaseBoundaryRecoveryReservation(runtime, reserved);
+            if (recovery) |reserved| releaseBoundaryRecoveryReservation(runtime, reserved) catch |refund_err| switch (refund_err) {
+                error.EnrichmentLeaseFenceLost, error.EnrichmentSourceChanged => {},
+                else => {
+                    runtime.pending_boundary_refund = reserved;
+                    std.log.warn("enrichment recovery reservation refund deferred: {s}", .{@errorName(refund_err)});
+                },
+            };
             return failure;
         }
         if (failure == error.EnrichmentReplayAuthorityBusy or isGraphRecoveryPending(failure)) return failure;
-        handleWorkerLoopError(runtime, io, failure, .{ .generation = generation, .through = target_sequence });
+        handleWorkerLoopError(runtime, io, failure, failed);
         return failure;
     };
 }
@@ -11946,7 +12007,9 @@ fn runForegroundCatchUpPassOwned(
     target_sequence: u64,
     guard: ForegroundCatchUpGuard,
     generation: u64,
+    replay_lease_guard: *RuntimeLeaseHeartbeatGuard,
     recovery: *?BoundaryRecoveryReservation,
+    publication_failure: *?anyerror,
 ) !void {
     try guard.check();
     try validateReplayPassGeneration(runtime, generation);
@@ -11984,9 +12047,14 @@ fn runForegroundCatchUpPassOwned(
     // Per-write durable fences still reject results after a real takeover.
     try maintainIndexDocumentCheckpoints(runtime);
 
-    var replay_lease_guard = RuntimeLeaseHeartbeatGuard.init(runtime);
     try replay_lease_guard.start();
-    defer replay_lease_guard.stop();
+    if (runtime.pending_boundary_refund) |reservation| {
+        releaseBoundaryRecoveryReservation(runtime, reservation) catch |err| switch (err) {
+            error.EnrichmentLeaseFenceLost, error.EnrichmentSourceChanged => {},
+            else => return err,
+        };
+        runtime.pending_boundary_refund = null;
+    }
 
     try guard.check();
     runtime.mutex.lockUncancelable(io);
@@ -12035,6 +12103,9 @@ fn runForegroundCatchUpPassOwned(
     var processed_request_count: u64 = 0;
     if (due.groups.len != 0) {
         var due_pipeline = LanePipeline.init(runtime);
+        defer if (due_pipeline.publication_failure) |err| {
+            publication_failure.* = err;
+        };
         const due_result = runGeneratedCatchUpQuanta(runtime, runtime.appliedSequence(), .due_tickets, due.groups, null, null, guard, &due_pipeline, &processed_request_count);
         const drain_due = due_pipeline.drainAll(if (due_result) |_| true else |_| false);
         _ = due_result catch |err| {
@@ -12079,6 +12150,9 @@ fn runForegroundCatchUpPassOwned(
     var pipeline = LanePipeline.init(runtime);
     pipeline.cursor_config_hash = config_hash;
     pipeline.replay_generation = generation;
+    defer if (pipeline.publication_failure) |err| {
+        publication_failure.* = err;
+    };
     if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
     // Draining unconditionally (not just on the success path) is what keeps
     // cross-quantum pipelining from turning into abandoned concurrent work:
@@ -17091,7 +17165,7 @@ fn checkedFetchOutcome(owner: asset_producer_mod.InvocationContext, outcome: Pre
 
 fn checkPreparedSourceOwner(owner: asset_producer_mod.InvocationContext) !void {
     if (owner.deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.EnrichmentWaitTimeout;
-    owner.cancellation.check() catch |err| return if (isOperationCanceled(err)) error.EnrichmentWaitCanceled else err;
+    owner.cancellation.check() catch |err| return callerCheckpointFailure(err);
 }
 
 fn preparedSourceOwnerCanceled(ptr: ?*const anyopaque) bool {
@@ -17809,7 +17883,7 @@ const AssetExecutionLane = struct {
             // identity travels in `scope`; the pipeline installs it.
             return err;
         }
-        if (self.group) |group| try saveReplayCursorForGroup(self.runtime, .assets, self.applied_sequence, self.cursor_config_hash, self.replay_generation, group);
+        if (self.group) |group| saveReplayCursorForGroup(self.runtime, .assets, self.applied_sequence, self.cursor_config_hash, self.replay_generation, group) catch |err| return FailureScope.assetPublicationFailure(&self.scope, err);
     }
 
     pub fn deinitOwned(self: *AssetExecutionLane) void {
@@ -17869,7 +17943,7 @@ const DenseExecutionLane = struct {
         // installs it on the scanner thread when it returns this error.
         if (deferred_retry_error) |err| return err;
         for (self.chunked_dense) |request| try retireMediaPassForDenseRequest(self.runtime, request);
-        if (self.group) |group| try saveReplayCursorForGroup(self.runtime, .dense, self.applied_sequence, self.cursor_config_hash, self.replay_generation, group);
+        if (self.group) |group| saveReplayCursorForGroup(self.runtime, .dense, self.applied_sequence, self.cursor_config_hash, self.replay_generation, group) catch |err| return FailureScope.assetPublicationFailure(&self.scope, err);
     }
 
     pub fn deinitOwned(self: *DenseExecutionLane) void {
@@ -17967,6 +18041,7 @@ fn prepareDenseLane(
 const LaneOutcome = struct {
     result: anyerror!void,
     retry_fingerprint: u64,
+    publication_failure: ?anyerror = null,
 
     const ok: LaneOutcome = .{ .result = {}, .retry_fingerprint = 0 };
 
@@ -17981,7 +18056,8 @@ const LaneOutcome = struct {
             if (scope.first_scheduled_fingerprint != 0 and deferred == err and scope.retry_fingerprint == scope.first_scheduled_fingerprint) return .ok;
             break :blk if (deferred == err) scope.retry_fingerprint else 0;
         };
-        return .{ .result = result, .retry_fingerprint = retry_fingerprint };
+        const publication_failure = if (result) |_| null else |err| if (scope.publication_failed and !isEnrichmentControlError(err)) err else null;
+        return .{ .result = result, .retry_fingerprint = retry_fingerprint, .publication_failure = publication_failure };
     }
 };
 
@@ -18004,8 +18080,9 @@ fn adoptLaneRetryIdentity(runtime: *EnrichmentRuntime, outcome: LaneOutcome) voi
 /// dense lane's identity overwrite the asset lane's while the asset error is
 /// the one returned, charging the wrong request's retry budget.
 fn selectLaneOutcome(asset: LaneOutcome, dense: LaneOutcome) LaneOutcome {
-    if (asset.result) |_| {} else |_| return asset;
-    return dense;
+    var selected = if (asset.result) |_| dense else |_| asset;
+    selected.publication_failure = asset.publication_failure orelse dense.publication_failure;
+    return selected;
 }
 
 test "lane outcome selection keeps the returned error's own identity" {
@@ -18022,6 +18099,12 @@ test "lane outcome selection keeps the returned error's own identity" {
     const neither = selectLaneOutcome(LaneOutcome.ok, LaneOutcome.ok);
     try neither.result;
     try std.testing.expectEqual(@as(u64, 0), neither.retry_fingerprint);
+
+    var failed_publish = FailureScope{};
+    const storage = LaneOutcome.of(&failed_publish, failed_publish.publicationFailure(error.WriterLocked));
+    const timeout = selectLaneOutcome(LaneOutcome.failed(error.EnrichmentWaitTimeout), storage);
+    try std.testing.expectError(error.EnrichmentWaitTimeout, timeout.result);
+    try std.testing.expectEqual(error.WriterLocked, timeout.publication_failure.?);
 }
 
 const LanePipeline = struct {
@@ -18039,6 +18122,7 @@ const LanePipeline = struct {
     replay_generation: ?u64 = null,
     asset_inflight: ?AssetInFlight = null,
     dense_inflight: ?DenseInFlight = null,
+    publication_failure: ?anyerror = null,
 
     fn init(runtime: *EnrichmentRuntime) LanePipeline {
         return .{ .runtime = runtime };
@@ -18085,6 +18169,7 @@ const LanePipeline = struct {
         const asset = self.awaitAsset() orelse LaneOutcome.ok;
         const dense = self.awaitDense() orelse LaneOutcome.ok;
         const selected = selectLaneOutcome(asset, dense);
+        if (self.publication_failure == null) self.publication_failure = selected.publication_failure;
         selected.result catch |err| {
             if (adopt_identity) adoptLaneRetryIdentity(self.runtime, selected);
             return err;
@@ -18229,6 +18314,7 @@ fn dispatchDeferredGeneratedWork(
     // would let the dense lane's overwrite the asset lane's while the asset
     // error is the one the supervisor charges.
     const selected = selectLaneOutcome(asset_outcome, dense_outcome);
+    if (pipeline.publication_failure == null) pipeline.publication_failure = selected.publication_failure;
     selected.result catch |err| {
         adoptLaneRetryIdentity(runtime, selected);
         return err;
@@ -18484,6 +18570,7 @@ fn processAsset(
                 const cancellation = enrichmentSourceCancellation(owner.runtime);
                 var scoped_config = owner.runtime.config;
                 scoped_config.cancellation = cancellation.token();
+                scoped_config.source_deadline_ns = owner.runtime.active_provider_guard.nativeDeadlineNs(scoped_config.source_deadline_ns);
                 scoped_config.fetch_retry_hint = scopedRetryHint(scoped_config.fetch_retry_hint, owner.request, owner.primary);
                 return renderSourceTemplateText(a, scoped_config, json, prior_template) catch |err|
                     return providerInvocationFailure(owner.runtime, err);
@@ -21310,6 +21397,7 @@ fn processDocumentExtractionAsset(
         try writeDocumentExtractionFailureManifest(
             runtime,
             request.doc_key,
+            raw_doc,
             artifact_name,
             source_url,
             metadata_fingerprint orelse "",
@@ -21343,6 +21431,7 @@ fn processDocumentExtractionAsset(
             try writeDocumentExtractionFailureManifest(
                 runtime,
                 request.doc_key,
+                raw_doc,
                 artifact_name,
                 source_url,
                 metadata_fingerprint orelse "",
@@ -21377,6 +21466,7 @@ fn processDocumentExtractionAsset(
         try writeDocumentExtractionFailureManifest(
             runtime,
             request.doc_key,
+            raw_doc,
             artifact_name,
             source_url,
             metadata_fingerprint orelse "",
@@ -21469,6 +21559,7 @@ fn processDocumentExtractionAsset(
             try writeDocumentExtractionFailureManifest(
                 runtime,
                 request.doc_key,
+                raw_doc,
                 artifact_name,
                 source_url,
                 source_fingerprint,
@@ -21626,6 +21717,7 @@ fn processDocumentExtractionAsset(
         try writeDocumentExtractionFailureManifest(
             runtime,
             request.doc_key,
+            raw_doc,
             artifact_name,
             source_url,
             source_fingerprint,
@@ -21857,6 +21949,7 @@ fn processDocumentExtractionAsset(
         try writeDocumentExtractionFailureManifest(
             runtime,
             request.doc_key,
+            raw_doc,
             artifact_name,
             source_url,
             source_fingerprint,
@@ -22022,6 +22115,7 @@ fn boundaryFailureErrorName(failure: *const runtime_failure_abi.FailureIdentity,
 fn writeDocumentExtractionFailureManifest(
     runtime: *EnrichmentRuntime,
     doc_key: []const u8,
+    raw_doc: []const u8,
     artifact_name: []const u8,
     source_url: []const u8,
     source_fingerprint: []const u8,
@@ -22075,26 +22169,15 @@ fn writeDocumentExtractionFailureManifest(
     );
     defer runtime.alloc.free(manifest);
 
-    var writes = std.ArrayListUnmanaged(KVPair).empty;
-    defer {
-        for (writes.items) |write| {
-            runtime.alloc.free(@constCast(write.key));
-            runtime.alloc.free(@constCast(write.value));
-        }
-        writes.deinit(runtime.alloc);
-    }
-
-    try writes.append(runtime.alloc, .{
-        .key = try runtime.alloc.dupe(u8, manifest_key),
-        .value = try runtime.alloc.dupe(u8, manifest),
-    });
-    try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, manifest_key);
-
     // Keep the last successfully materialized state and child artifacts. The
     // failed manifest and repair ledger make the source stale/observable, while
     // retaining searchable data and enough prior state for a later repair to
     // diff and remove obsolete children correctly.
-    storePutBatchWithRetry(runtime, writes.items, &.{}) catch |err| return FailureScope.assetPublicationFailure(scope, err);
+    storePutBatchGuardedWithRetry(runtime, &.{.{ .key = manifest_key, .value = manifest }}, &.{}, .{
+        .doc_key = doc_key,
+        .digest = sourceRecordDigest(raw_doc),
+    }) catch |err| return FailureScope.assetPublicationFailure(scope, err);
+    appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, manifest_key) catch |err| return FailureScope.assetPublicationFailure(scope, err);
     recordArtifactBytes(runtime, .asset, manifest.len);
 }
 
@@ -40782,6 +40865,7 @@ const BoundaryRecoveryReservation = struct {
     cut: ReplayCut,
     revision: u64,
     status: enrichment_state.RuntimeStatus,
+    fence: ?GeneratedWriteFence,
 };
 
 fn releaseBoundaryRecoveryReservation(runtime: *EnrichmentRuntime, reservation: BoundaryRecoveryReservation) !void {
@@ -40798,6 +40882,13 @@ fn releaseBoundaryRecoveryReservation(runtime: *EnrichmentRuntime, reservation: 
     defer publication_store.deinit();
     var status = reservation.status;
     status.consecutive_retry_count -= 1;
+    const Guard = struct {
+        runtime: *EnrichmentRuntime,
+        fence: ?GeneratedWriteFence,
+        pub fn validate(self: @This(), txn: anytype) !void {
+            try validateRuntimeStoreWriteFenceTxn(self.runtime, txn, self.fence);
+        }
+    };
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
         const revision = enrichment_state.restoreBoundaryRecoveryReservation(
@@ -40808,6 +40899,7 @@ fn releaseBoundaryRecoveryReservation(runtime: *EnrichmentRuntime, reservation: 
             reservation.cut.generation,
             reservation.revision,
             status,
+            Guard{ .runtime = runtime, .fence = reservation.fence },
         ) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
@@ -40846,6 +40938,7 @@ fn saveRuntimeStatusWithPlanReceipt(runtime: *EnrichmentRuntime, mode: StatusPub
         .current, .failure => snapshot,
         .boundary_recovery => boundaryFailureAdmissionStatus(snapshot, recovery_pending, applied) orelse return,
     };
+    const reservation_fence = if (reservation != null) try requiredRuntimeStoreWriteFence(runtime, generation) else null;
     var publication_store = try RuntimePublicationStore.init(runtime);
     defer publication_store.deinit();
     const live_store = publication_store.store(runtime);
@@ -40869,7 +40962,7 @@ fn saveRuntimeStatusWithPlanReceipt(runtime: *EnrichmentRuntime, mode: StatusPub
                     runtime.boundary_recovery_pending = false;
                     if (reservation) |receipt| {
                         runtime.status_revision = next.?;
-                        receipt.* = .{ .cut = .{ .generation = generation, .applied = applied }, .revision = next.?, .status = status };
+                        receipt.* = .{ .cut = .{ .generation = generation, .applied = applied }, .revision = next.?, .status = status, .fence = reservation_fence };
                     }
                     unlockRuntime(runtime, state_io);
                 }
@@ -43089,6 +43182,7 @@ fn extractEnrichmentSource(
     const cancellation = enrichmentSourceCancellation(runtime);
     var config = runtime.config;
     config.cancellation = cancellation.token();
+    config.source_deadline_ns = runtime.active_provider_guard.nativeDeadlineNs(config.source_deadline_ns);
     return extract(alloc, config, raw, request) catch |err|
         return providerInvocationFailure(runtime, err);
 }
@@ -43129,19 +43223,21 @@ fn renderSourceTemplateText(
     raw_doc: []const u8,
     source_template: []const u8,
 ) ![]const u8 {
+    var render_config = remoteRenderConfig(config.secret_store, config.remote_content, config.io, config.cancellation, null, config.fetch_retry_hint);
+    render_config.deadline_ns = config.source_deadline_ns;
     if (comptime @hasDecl(template_remote, "renderJsonToValidatedTextWithConfig")) {
         return template_remote.renderJsonToValidatedTextWithConfig(
             alloc,
             source_template,
             raw_doc,
-            remoteRenderConfig(config.secret_store, config.remote_content, config.io, config.cancellation, null, config.fetch_retry_hint),
+            render_config,
         );
     }
     return template_remote.renderJsonToTextWithConfig(
         alloc,
         source_template,
         raw_doc,
-        remoteRenderConfig(config.secret_store, config.remote_content, config.io, config.cancellation, null, config.fetch_retry_hint),
+        render_config,
     );
 }
 
@@ -43209,6 +43305,7 @@ fn prepareDenseEnrichmentSourceInput(runtime: *EnrichmentRuntime, dense: embedde
     const cancellation = enrichmentSourceCancellation(runtime);
     var config = runtime.config;
     config.cancellation = cancellation.token();
+    config.source_deadline_ns = runtime.active_provider_guard.nativeDeadlineNs(config.source_deadline_ns);
     return prepareDenseSourceInput(runtime.alloc, config, dense, raw, request) catch |err|
         return providerInvocationFailure(runtime, err);
 }
@@ -43235,8 +43332,10 @@ fn renderSourceParts(
     max_media_parts: ?usize,
 ) !?[]template.ContentPart {
     if (request.source_template.len == 0) return null;
+    var render_config = remoteRenderConfig(config.secret_store, config.remote_content, config.io, config.cancellation, max_media_parts, scopedRetryHint(config.fetch_retry_hint, request, raw_doc));
+    render_config.deadline_ns = config.source_deadline_ns;
     const parts = if (comptime @hasDecl(template_remote, "renderJsonToPartsWithConfig"))
-        template_remote.renderJsonToPartsWithConfig(alloc, request.source_template, raw_doc, remoteRenderConfig(config.secret_store, config.remote_content, config.io, config.cancellation, max_media_parts, scopedRetryHint(config.fetch_retry_hint, request, raw_doc))) catch |err| {
+        template_remote.renderJsonToPartsWithConfig(alloc, request.source_template, raw_doc, render_config) catch |err| {
             if (sourceTemplateHasNoInput(err)) return null;
             return err;
         }
@@ -48984,17 +49083,21 @@ test "extractSourceText with template and invalid JSON returns null" {
 
 test "enrichment preserves snapshot failures instead of skipping source content" {
     const Probe = struct {
-        fn text(raw: ?*anyopaque, _: Allocator, _: []const u8, _: []const u8, _: template_remote.RenderConfig) anyerror![]const u8 {
-            const failure: *anyerror = @ptrCast(@alignCast(raw.?));
-            return failure.*;
+        failure: anyerror = error.ResourceTemporarilyUnavailable,
+        deadline: ?u64 = null,
+        fn text(raw: ?*anyopaque, _: Allocator, _: []const u8, _: []const u8, config: template_remote.RenderConfig) anyerror![]const u8 {
+            const probe: *@This() = @ptrCast(@alignCast(raw.?));
+            probe.deadline = config.deadline_ns;
+            return probe.failure;
         }
-        fn parts(raw: ?*anyopaque, _: Allocator, _: []const u8, _: []const u8, _: template_remote.RenderConfig) anyerror![]template.ContentPart {
-            const failure: *anyerror = @ptrCast(@alignCast(raw.?));
-            return failure.*;
+        fn parts(raw: ?*anyopaque, _: Allocator, _: []const u8, _: []const u8, config: template_remote.RenderConfig) anyerror![]template.ContentPart {
+            const probe: *@This() = @ptrCast(@alignCast(raw.?));
+            probe.deadline = config.deadline_ns;
+            return probe.failure;
         }
     };
-    var failure: anyerror = error.ResourceTemporarilyUnavailable;
-    template_remote.setHostRenderer(.{ .ctx = &failure, .render_json_to_text = Probe.text, .render_json_to_parts = Probe.parts });
+    var probe = Probe{};
+    template_remote.setHostRenderer(.{ .ctx = &probe, .render_json_to_text = Probe.text, .render_json_to_parts = Probe.parts });
     defer template_remote.setHostRenderer(null);
     const request = enrichment_types.GeneratedEnrichmentRequest{
         .kind = .dense_embedding,
@@ -49020,13 +49123,21 @@ test "enrichment preserves snapshot failures instead of skipping source content"
         .ownership = undefined,
     };
     for ([_]anyerror{ error.OutOfMemory, error.ResourceTemporarilyUnavailable, error.Timeout, error.Canceled, error.UnexpectedEof, error.ConnectionResetByPeer, error.ConnectionClosed }) |err| {
-        failure = err;
+        probe.failure = err;
         try std.testing.expectError(err, extractSourceText(std.testing.allocator, .{}, doc, request));
         try std.testing.expectError(err, extractAssetSourceValue(std.testing.allocator, .{}, doc, request));
         try std.testing.expectError(err, renderSourceParts(std.testing.allocator, .{}, doc, request, null));
         const native_error = if (isOperationCanceled(err)) error.ProviderInvocationCanceled else err;
         try std.testing.expectError(native_error, extractEnrichmentSource(&runtime, extractSourceText, std.testing.allocator, doc, request));
         try std.testing.expectError(native_error, extractEnrichmentSource(&runtime, renderSourcePartsJson, std.testing.allocator, doc, request));
+    }
+    runtime.active_provider_guard = .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s };
+    probe.failure = error.ResourceTemporarilyUnavailable;
+    inline for (.{ extractSourceText, renderSourcePartsJson }) |extract| {
+        probe.deadline = null;
+        try std.testing.expectError(probe.failure, extractEnrichmentSource(&runtime, extract, std.testing.allocator, doc, request));
+        try std.testing.expect(probe.deadline != null and probe.deadline.? > platform_time.monotonicNs());
+        try std.testing.expect(probe.deadline.? - platform_time.monotonicNs() <= std.time.ns_per_s);
     }
     runtime.active_provider_guard.deadline_ns = 0;
     try std.testing.expectError(error.EnrichmentWaitTimeout, extractEnrichmentSource(&runtime, renderSourcePartsJson, std.testing.allocator, doc, request));
@@ -52435,6 +52546,9 @@ test "durable enrichment scoped retry permits healthy targets and restores exact
         extraction_scope.enterRequest(request);
         const manifest_key = try internal_keys.artifactNamedPrefixAlloc(a, request.doc_key, "asset", requestArtifactName(request));
         defer a.free(manifest_key);
+        const primary_key = try documentSourceStoreKeyAlloc(&runtime, request.doc_key);
+        defer a.free(primary_key);
+        try storePutBatchWithRetry(&runtime, &.{.{ .key = primary_key, .value = "{}" }}, &.{});
         try processDocumentExtractionAsset(&runtime, request, "{}", uri, "{}", manifest_key, &sources, &window, &extraction_scope);
         const manifest = try storeGetAlloc(&runtime, manifest_key);
         defer a.free(manifest);
@@ -52442,6 +52556,11 @@ test "durable enrichment scoped retry permits healthy targets and restores exact
         defer parsed.deinit();
         try std.testing.expectEqualStrings("error", parsed.value.object.get("route_type").?.string);
         try std.testing.expectEqualStrings("RemoteDocumentFetchFailed", parsed.value.object.get("last_error").?.object.get("code").?.string);
+        try storePutBatchWithRetry(&runtime, &.{.{ .key = primary_key, .value = "{\"body\":\"replacement\"}" }}, &.{});
+        try std.testing.expectError(error.EnrichmentSourceChanged, processDocumentExtractionAsset(&runtime, request, "{}", uri, "{}", manifest_key, &sources, &window, &extraction_scope));
+        const unchanged = try storeGetAlloc(&runtime, manifest_key);
+        defer a.free(unchanged);
+        try std.testing.expectEqualStrings(manifest, unchanged);
         try std.testing.expectEqual(@as(u64, 2), extraction_scope.attemptNumber(&runtime));
         try std.testing.expectEqual(@as(u64, 0), runtime.active_failure_fingerprint);
     }
