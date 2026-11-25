@@ -53348,3 +53348,117 @@ test "Metal paged relative attention reads KV staged in the same frame" {
     try tensors[8].downloadBytesInto(std.mem.asBytes(&output));
     for (output) |value| try std.testing.expectEqual(@as(u16, 0x3f40), value);
 }
+
+pub const CausalDepthwise4Bf16 = struct {
+    channels: u32,
+    rows: u32,
+    valid_history: u32,
+    output_scale: f32,
+    clip: f32,
+    epsilon: f32,
+
+    const Buffer = RoutedBlockScaledProjection.Buffer;
+    const Wire = extern struct {
+        channels: u32,
+        rows: u32,
+        valid_history: u32,
+        dynamic: u32,
+        output_scale: f32,
+        clip: f32,
+        epsilon: f32,
+    };
+
+    extern fn antfly_metal_dispatch_causal_depthwise4_bf16(runtime: *RawMetalDecodeRuntime, views: *const [6]Buffer, params: *const Wire) c_int;
+
+    pub const Inputs = struct {
+        values: *const MetalTensor,
+        weight: *const MetalTensor,
+        history: ?*const MetalTensor,
+        dynamic_taps: ?*const MetalTensor,
+    };
+
+    pub fn encode(self: CausalDepthwise4Bf16, runtime: *RawMetalDecodeRuntime, input: Inputs, output: *MetalTensor, next_history: *MetalTensor) !void {
+        if (!hasActiveFrame(runtime)) return error.MetalFrameRequired;
+        if (output.isReadOnlyPhysical() or next_history.isReadOnlyPhysical()) return error.ReadOnlyPhysicalStorage;
+        if (self.valid_history != 0 and input.history == null) return error.InvalidShape;
+        const views: [6]Buffer = .{
+            try .fromTensor(input.values, .i16),
+            try .fromTensor(input.weight, .i16),
+            if (input.history) |history| try .fromTensor(history, .i16) else .{},
+            if (input.dynamic_taps) |taps| try .fromTensor(taps, .i16) else .{},
+            try .fromTensor(output, .i16),
+            try .fromTensor(next_history, .i16),
+        };
+        if (antfly_metal_dispatch_causal_depthwise4_bf16(runtime, &views, &.{
+            .channels = self.channels,
+            .rows = self.rows,
+            .valid_history = self.valid_history,
+            .dynamic = @intFromBool(input.dynamic_taps != null),
+            .output_scale = self.output_scale,
+            .clip = self.clip,
+            .epsilon = self.epsilon,
+        }) != 0) return error.MetalKernelDispatchFailed;
+        output.invalidateHostMirror();
+        next_history.invalidateHostMirror();
+    }
+};
+
+test "Metal causal depthwise stencil normalizes and stages independent BF16 history" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    var input: [256]u16 = undefined;
+    @memset(input[0..128], 0x4080);
+    @memset(input[128..], 0x40a0);
+    var history: [384]u16 = undefined;
+    @memset(history[0..128], 0x3f80);
+    @memset(history[128..256], 0x4000);
+    @memset(history[256..], 0x4040);
+    var weight: [512]u16 = @splat(0);
+    for (0..128) |channel| weight[channel * 4 + 2] = 0xc000;
+    const dynamic_weight: [512]u16 = @splat(0);
+    const taps = [8]u16{ 0xbf80, 0x3f00, 0, 0, 0xbf80, 0x3f00, 0, 0 };
+    const payloads: [5][]const u8 = .{
+        std.mem.asBytes(&input),          std.mem.asBytes(&history), std.mem.asBytes(&weight),
+        std.mem.asBytes(&dynamic_weight), std.mem.asBytes(&taps),
+    };
+    var tensors: [7]MetalTensor = undefined;
+    var count: usize = 0;
+    defer for (tensors[0..count]) |*tensor| tensor.deinit();
+    for (&tensors, [_]i32{ 256, 384, 512, 512, 8, 256, 384 }, 0..) |*tensor, size, index| {
+        tensor.* = try MetalTensor.deviceAllocateTyped(std.testing.allocator, runtime, .i16, .shared, &.{size});
+        count += 1;
+        if (index < payloads.len) try tensor.uploadBytes(payloads[index]);
+    }
+    var output: [256]u16 = undefined;
+    var next: [384]u16 = undefined;
+    for ([_]bool{ false, true }) |dynamic| {
+        const stencil: CausalDepthwise4Bf16 = .{
+            .channels = 128,
+            .rows = 2,
+            .valid_history = 3,
+            .output_scale = 1,
+            .clip = if (dynamic) 0 else @sqrt(@as(f32, 128)) / 2,
+            .epsilon = 0.000001,
+        };
+        try beginFrame(runtime);
+        errdefer cancelFrame(runtime) catch {};
+        try stencil.encode(runtime, .{
+            .values = &tensors[0],
+            .history = &tensors[1],
+            .weight = if (dynamic) &tensors[3] else &tensors[2],
+            .dynamic_taps = if (dynamic) &tensors[4] else null,
+        }, &tensors[5], &tensors[6]);
+        try submitFrame(runtime);
+        try waitFrame(runtime);
+        try tensors[5].downloadBytesInto(std.mem.asBytes(&output));
+        try tensors[6].downloadBytesInto(std.mem.asBytes(&next));
+        for (output) |value| try std.testing.expectEqual(@as(u16, if (dynamic) 0x3f80 else 0xbf00), value);
+        try std.testing.expectEqualSlices(u16, history[256..], next[0..128]);
+        try std.testing.expectEqualSlices(u16, &input, next[128..]);
+        var previous: [384]u16 = undefined;
+        try tensors[1].downloadBytesInto(std.mem.asBytes(&previous));
+        try std.testing.expectEqualSlices(u16, &history, &previous);
+    }
+}

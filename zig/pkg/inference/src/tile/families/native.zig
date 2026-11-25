@@ -236,6 +236,7 @@ pub const regions = r.regions(&.{
     }),
     r.shared(r.metalSourceFamily("elementwise.direct", program.render(@embedFile("native/metal/elementwise_direct.metal"), row_statistics.metal_scalar)), &.{.{ .operation = "statistics.tree", .source = "../../lib/tile/src/native_statistics.zig", .scope = .phase, .source_index = 12, .export_name = "termite_dot_general_2d_f32_reduce", .precision = "F32; retain native max/sum, masks and nonfinite behavior", .schedule = "qualified halving shared tree and scratch publication order" }}),
     r.encodedMetalSourceFamily("expert.projection.direct", @embedFile("native/metal/expert_projection.m")),
+    r.metalSourceFamily("convolution.causal_depthwise4_bf16", @embedFile("native/metal/causal_depthwise4_bf16.metal")),
     r.metalSourceFamily("attention.paged_relative_bf16", @embedFile("native/metal/paged_relative_attention.metal")),
     r.metalSourceFamily("expert.projection.block_scaled", @embedFile("native/metal/routed_block_scaled_projection.metal")),
     r.shared(r.metalSourceFamily("kv.storage.direct", program.render(@embedFile("native/metal/kv_storage.metal"), row_statistics.metal_storage)), &.{.{ .operation = "statistics.tree", .source = "../../lib/tile/src/native_statistics.zig", .scope = .phase, .source_index = 3, .export_name = "termite_encode_int8_per_head", .precision = "F32; retain native max/sum, masks and nonfinite behavior", .schedule = "qualified halving shared tree and scratch publication order" }}),

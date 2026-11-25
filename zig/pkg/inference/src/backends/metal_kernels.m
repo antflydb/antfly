@@ -1778,6 +1778,7 @@ typedef struct termite_metal_decode_runtime {
     bool prefer_dense_mps_linear;
     id<MTLComputePipelineState> routed_block_scaled_pipelines[4];
     id<MTLComputePipelineState> paged_relative_bf16_pipelines[2];
+    id<MTLComputePipelineState> causal_depthwise4_bf16_pipeline;
     TermiteMetalMtpHeadWorkspace *mtp_head_workspace;
     id<MTLDevice> device;
     // Opt-in dense embedding workspace guard. Counts fresh allocations until
@@ -12918,6 +12919,66 @@ static NSString *termite_metal_shader_source(void) {
            "    uint total = p.rows * p.dim; if (gid >= total) return; uint row = gid / p.dim; uint col = gid % p.dim; float value = 0.0f; uint route_base = row * p.top_k; for (uint k = 0u; k < p.top_k; ++k) { uint route = route_base + k; float scale = p.has_expert_scale != 0u ? expert_scale[expert_ids[route]] : 1.0f; value += (route_output[route * p.dim + col] * scale) * route_weights[route]; } output[gid] = value;\n"
            "}\n"
            // tile-codegen:end expert.projection.direct.7 family
+           // tile-codegen:begin convolution.causal_depthwise4_bf16 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           "struct CausalDepthwise4Bf16Params {\n"
+           "    uint channels, rows, valid_history, dynamic;\n"
+           "    float output_scale, clip, epsilon;\n"
+           "};\n"
+           "\n"
+           "inline bfloat antfly_causal_depthwise4_sample(\n"
+           "    device const bfloat *input, device const bfloat *history,\n"
+           "    int row, uint channel, constant CausalDepthwise4Bf16Params &p\n"
+           ") {\n"
+           "    if (row >= 0) return input[ulong(row) * p.channels + channel];\n"
+           "    if (uint(-row) > p.valid_history) return bfloat(0.0f);\n"
+           "    return history[ulong(row + 3) * p.channels + channel];\n"
+           "}\n"
+           "\n"
+           "kernel void antfly_causal_depthwise4_head_norm_d128_bf16(\n"
+           "    device const bfloat *input [[buffer(0)]],\n"
+           "    device const bfloat *weight [[buffer(1)]],\n"
+           "    device const bfloat *history [[buffer(2)]],\n"
+           "    device const bfloat *dynamic_taps [[buffer(3)]],\n"
+           "    device bfloat *output [[buffer(4)]],\n"
+           "    device bfloat *next_history [[buffer(5)]],\n"
+           "    constant CausalDepthwise4Bf16Params &p [[buffer(6)]],\n"
+           "    uint2 group [[threadgroup_position_in_grid]],\n"
+           "    uint lane [[thread_index_in_simdgroup]]\n"
+           ") {\n"
+           "    const uint head = group.x;\n"
+           "    const int row = int(group.y);\n"
+           "    const uint heads = p.channels / 128u;\n"
+           "    const bool dynamic = p.dynamic != 0u;\n"
+           "    float4 rounded;\n"
+           "    float square = 0.0f;\n"
+           "    for (uint i = 0; i < 4; ++i) {\n"
+           "        const uint channel = head * 128u + lane + i * 32u;\n"
+           "        float sum = 0.0f;\n"
+           "        for (uint tap = 0; tap < 4; ++tap) {\n"
+           "            const uint lag = dynamic ? tap : 3u - tap;\n"
+           "            const float sample = float(antfly_causal_depthwise4_sample(input, history, row - int(lag), channel, p));\n"
+           "            float w = float(weight[dynamic ? ulong(tap) * p.channels + channel : ulong(channel) * 4u + tap]);\n"
+           "            if (dynamic) w += float(dynamic_taps[(ulong(row) * heads + head) * 4u + tap]);\n"
+           "            sum = fma(sample, w, sum);\n"
+           "        }\n"
+           "        const ulong index = ulong(row) * p.channels + channel;\n"
+           "        rounded[i] = float(bfloat((sum + float(input[index])) * p.output_scale));\n"
+           "        square = fma(rounded[i], rounded[i], square);\n"
+           "        if (row == 0) {\n"
+           "            for (uint j = 0; j < 3; ++j)\n"
+           "                next_history[ulong(j) * p.channels + channel] =\n"
+           "                    antfly_causal_depthwise4_sample(input, history, int(p.rows) - 3 + int(j), channel, p);\n"
+           "        }\n"
+           "    }\n"
+           "    for (uint delta = 16u; delta != 0u; delta >>= 1u)\n"
+           "        square += simd_shuffle_down(square, delta);\n"
+           "    square = simd_broadcast(square, 0);\n"
+           "    const float factor = p.clip > 0.0f ? min(1.0f, p.clip / (sqrt(square) + p.epsilon))\n"
+           "                                       : rsqrt(square / 128.0f + p.epsilon);\n"
+           "    const ulong base = ulong(row) * p.channels + head * 128u + lane;\n"
+           "    for (uint i = 0; i < 4; ++i) output[base + i * 32u] = bfloat(rounded[i] * factor);\n"
+           "}\n"
+           // tile-codegen:end convolution.causal_depthwise4_bf16 family
            // tile-codegen:begin attention.paged_relative_bf16.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "struct PagedRelativeGqaParams {\n"
            "    uint start, visible_start, page_tokens, first_page, page_count, physical_pages;\n"
@@ -33613,6 +33674,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->mtp_head_workspace = nil;
     for (size_t index = 0; index < 4; ++index) runtime->routed_block_scaled_pipelines[index] = nil;
     for (size_t index = 0; index < 2; ++index) runtime->paged_relative_bf16_pipelines[index] = nil;
+    runtime->causal_depthwise4_bf16_pipeline = nil;
     free(runtime);
     }
 }
@@ -36813,6 +36875,34 @@ int antfly_metal_dispatch_paged_relative_bf16(
     return antfly_metal_encode_typed_stage(runtime, @"antfly_paged_relative_gqa_d128_bf16_reduce",
         &runtime->paged_relative_bf16_pipelines[1], reduce_views, reduce_bytes, reduce_alignments, 4, 1u << 3,
         &p->splits, sizeof(p->splits), MTLSizeMake(row_heads, 1, 1), threads);
+}
+
+typedef struct {
+    uint32_t channels, rows, valid_history, dynamic;
+    float output_scale, clip, epsilon;
+} antfly_metal_causal_depthwise4_bf16_params;
+
+int antfly_metal_dispatch_causal_depthwise4_bf16(
+    termite_metal_decode_runtime *runtime,
+    const antfly_metal_routed_buffer views[6],
+    const antfly_metal_causal_depthwise4_bf16_params *p
+) {
+    if (!runtime || !views || !p || !p->rows || p->rows > 65535 ||
+        !p->channels || p->channels > (1u << 20) || p->channels % 128u || p->valid_history > 3 ||
+        !isfinite(p->output_scale) || p->output_scale <= 0 || !isfinite(p->clip) || p->clip < 0 ||
+        !isfinite(p->epsilon) || p->epsilon <= 0) return -1;
+    const size_t row_bytes = (size_t)p->channels * 2u;
+    const size_t io_bytes = row_bytes * p->rows;
+    const size_t history_bytes = row_bytes * 3u;
+    const size_t dynamic_bytes = p->dynamic ? (size_t)p->rows * (p->channels / 128u) * 8u : 0;
+    const size_t required[6] = {
+        io_bytes, row_bytes * 4u, p->valid_history ? history_bytes : 0,
+        dynamic_bytes, io_bytes, history_bytes,
+    };
+    const size_t alignment[6] = {2, 2, 2, 2, 2, 2};
+    return antfly_metal_encode_typed_stage(runtime, @"antfly_causal_depthwise4_head_norm_d128_bf16",
+        &runtime->causal_depthwise4_bf16_pipeline, views, required, alignment, 6, (1u << 4) | (1u << 5),
+        p, sizeof(*p), MTLSizeMake(p->channels / 128u, p->rows, 1), MTLSizeMake(32, 1, 1));
 }
 
 typedef struct { uint32_t rows, hidden, head_dim, grid_x, grid_y; float eps, theta, scale; uint32_t stride, start, rotate, weighted, cached_rotary; } termite_vision_norm_rope_params;

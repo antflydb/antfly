@@ -485,7 +485,7 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     test_step.dependOn(&run_microbatch_tests.step);
     ctx.step("test-executor-microbatch", "Verify executor batching, GLiNER adapters, row ownership, capacity and cancellation").dependOn(&run_microbatch_tests.step);
     if (ctx.backend.enable_metal) {
-        const routed_metal = b.addTest(.{ .root_module = suite.tests.root_module, .filters = &.{ "Metal routed block-scaled projection", "Inkling chat frontend", "Metal paged relative attention" } });
+        const routed_metal = b.addTest(.{ .root_module = suite.tests.root_module, .filters = &.{ "Metal routed block-scaled projection", "Inkling chat frontend", "Metal paged relative attention", "Metal causal depthwise stencil" } });
         const run_routed_metal = ctx.addRunArtifact(routed_metal);
         run_routed_metal.has_side_effects = true;
         ctx.step("test-metal-routed-projection", "Verify packed routed projections in a physical Metal frame").dependOn(&run_routed_metal.step);
