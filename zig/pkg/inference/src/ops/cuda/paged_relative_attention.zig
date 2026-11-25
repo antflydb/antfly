@@ -111,16 +111,16 @@ pub const Module = struct {
 
     pub fn appendReplay(self: *Module, ctx: *Context, binding: cache.StagedView, positions: DeviceBuffer, ids: DeviceBuffer, source: cache.Planes, kv_heads: u32) !void {
         const bytes = @as(usize, kv_heads) * head_dim * 2;
-        if (binding.visible_start != 0 or binding.first_page != 0 or bytes == 0 or binding.page_tokens == 0) return error.InvalidAttentionGeometry;
-        const plane_bytes = try std.math.mul(usize, bytes, binding.physical_pages * binding.page_tokens);
+        if (binding.range.visible_start != 0 or binding.range.first_page != 0 or bytes == 0 or binding.range.page_tokens == 0) return error.InvalidAttentionGeometry;
+        const plane_bytes = try std.math.mul(usize, bytes, try binding.range.physicalRows());
         try buffer.validateRegions(6, .{ source.key, source.value, ids, positions, binding.planes.key, binding.planes.value }, .{
-            bytes, bytes, binding.page_count * 4, 4, plane_bytes, plane_bytes,
+            bytes, bytes, binding.range.page_count * 4, 4, plane_bytes, plane_bytes,
         }, @splat(4), 4);
         try self.program.init(ctx);
         var pointers = [_]u64{ binding.planes.key.ptr, binding.planes.value.ptr, source.key.ptr, source.value.ptr, ids.ptr, positions.ptr };
-        var tokens: u32 = binding.page_tokens;
+        var tokens: u32 = binding.range.page_tokens;
         var pairs: u32 = @intCast(bytes / 4);
-        var pages: u32 = @intCast(binding.physical_pages);
+        var pages: u32 = @intCast(binding.range.physical_pages);
         var args = [_]?*anyopaque{ &pointers[0], &pointers[1], &pointers[2], &pointers[3], &pointers[4], &pointers[5], &tokens, &pairs, &pages };
         try self.program.launch(ctx, .append, (pairs - 1) / 128 + 1, 1, 128, &args);
     }
@@ -128,19 +128,20 @@ pub const Module = struct {
     /// Queue attention on the same stream as the staged K/V and page upload.
     pub fn run(self: *Module, ctx: *Context, r: Request) !void {
         const q = r.geometry;
-        const g = try plan(q, r.kv.visible_start, r.kv.visible_end);
-        const page_tokens = r.kv.page_tokens;
-        const physical_rows = try r.kv.range().physicalRows();
+        const range = r.kv.range;
+        const g = try plan(q, range.visible_start, range.visible_end);
+        const page_tokens = range.page_tokens;
+        const physical_rows = try range.physicalRows();
         const kv_bytes = try std.math.mul(usize, physical_rows, q.kv_heads * head_dim * 2);
         const q_bytes = @as(usize, g.rows_by_heads) * head_dim * 2;
         const relative_bytes = try std.math.mul(usize, g.rows_by_heads, @as(usize, q.relative_extent) * 2);
         const replay_bytes: usize = if (r.replay_position.ptr == 0) 0 else 4;
-        if (replay_bytes != 0 and (q.rows != 1 or r.kv.first_page != 0 or r.kv.visible_start != 0)) return error.InvalidAttentionGeometry;
+        if (replay_bytes != 0 and (q.rows != 1 or range.first_page != 0 or range.visible_start != 0)) return error.InvalidAttentionGeometry;
         try buffer.validateRegions(10, .{
             r.query, r.kv.planes.key, r.kv.planes.value, r.relative, r.sinks, r.gate, r.device_page_ids, r.replay_position, r.scratch, r.output,
         }, .{
-            q_bytes,             kv_bytes,     kv_bytes,        relative_bytes, @as(usize, g.rows_by_heads) * 2, q_bytes,
-            r.kv.page_count * 4, replay_bytes, g.scratch_bytes, q_bytes,
+            q_bytes,              kv_bytes,     kv_bytes,        relative_bytes, @as(usize, g.rows_by_heads) * 2, q_bytes,
+            range.page_count * 4, replay_bytes, g.scratch_bytes, q_bytes,
         }, .{ 2, 2, 2, 2, 2, 2, 4, 4, 4, 2 }, 8);
         if (ctx.info.compute_major < 8) return error.UnsupportedCudaDevice;
         try self.program.init(ctx);
@@ -156,11 +157,11 @@ pub const Module = struct {
             .output = r.output.ptr,
             .replay_position = r.replay_position.ptr,
             .query_start = q.start,
-            .visible_start = @intCast(r.kv.visible_start),
+            .visible_start = @intCast(range.visible_start),
             .page_size = page_tokens,
-            .first_page = @intCast(r.kv.first_page),
-            .page_count = @intCast(r.kv.page_count),
-            .physical_pages = @intCast(r.kv.physical_pages),
+            .first_page = @intCast(range.first_page),
+            .page_count = @intCast(range.page_count),
+            .physical_pages = @intCast(range.physical_pages),
             .q_heads = q.q_heads,
             .kv_heads = q.kv_heads,
             .window = q.window,

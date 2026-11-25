@@ -241,8 +241,8 @@ test "CUDA paged relative attention reads staged BF16 cache with GQA sink and ga
     for ([_]kv.Group{ .full, .sliding }) |group| {
         var ids: [32]u32 = undefined;
         const binding = try cache.stagedView(.{ .group = group, .slot = 0 }, &ids);
-        if (group == .sliding) try std.testing.expect(binding.first_page > 0);
-        var pages = try upload(&ctx, std.mem.sliceAsBytes(ids[0..binding.page_count]));
+        if (group == .sliding) try std.testing.expect(binding.range.first_page > 0);
+        var pages = try upload(&ctx, std.mem.sliceAsBytes(ids[0..binding.range.page_count]));
         defer pages.free(&ctx);
         const geometry: attention.Query = .{
             .rows = rows,
@@ -253,7 +253,7 @@ test "CUDA paged relative attention reads staged BF16 cache with GQA sink and ga
             .relative_extent = relative_extent,
             .score_scale = model_scale,
         };
-        var scratch = try buffer.DeviceBuffer.alloc(&ctx, try attention.scratchBytes(geometry, binding.visible_start, binding.visible_end));
+        var scratch = try buffer.DeviceBuffer.alloc(&ctx, try attention.scratchBytes(geometry, binding.range.visible_start, binding.range.visible_end));
         defer scratch.free(&ctx);
         var request: attention.Request = .{
             .geometry = geometry,

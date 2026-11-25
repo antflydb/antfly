@@ -36,23 +36,7 @@ pub const Planes = struct {
 
 pub const StagedView = struct {
     planes: Planes,
-    first_page: usize,
-    page_count: usize,
-    physical_pages: usize,
-    page_tokens: u16,
-    visible_start: usize,
-    visible_end: usize,
-
-    pub fn range(self: StagedView) metadata.StagedRange {
-        return .{
-            .first_page = self.first_page,
-            .page_count = self.page_count,
-            .physical_pages = self.physical_pages,
-            .page_tokens = self.page_tokens,
-            .visible_start = self.visible_start,
-            .visible_end = self.visible_end,
-        };
-    }
+    range: metadata.StagedRange,
 };
 
 fn view(parent: DeviceBuffer, offset: usize, len: usize) DeviceBuffer {
@@ -231,15 +215,9 @@ pub const Cache = struct {
         if (visit.slot >= selected.written.len) return error.InvalidKvRange;
         if (pending.failed) return error.KvAppendFailed;
         if (!selected.written[visit.slot]) return error.KvVisitNotWritten;
-        const range = try pending.append.stagedRange(visit.group);
         return .{
             .planes = selected.planes(visit.slot),
-            .first_page = range.first_page,
-            .page_count = range.page_count,
-            .physical_pages = range.physical_pages,
-            .page_tokens = range.page_tokens,
-            .visible_start = range.visible_start,
-            .visible_end = range.visible_end,
+            .range = try pending.append.stagedRange(visit.group),
         };
     }
 
@@ -255,12 +233,14 @@ pub const Cache = struct {
         if (visit.slot >= selected.written.len) return error.InvalidKvRange;
         return .{
             .planes = selected.planes(visit.slot),
-            .first_page = 0,
-            .page_count = (layout.max_tokens - 1) / layout.page_tokens + 1,
-            .physical_pages = try layout.pageCapacity(visit.group),
-            .page_tokens = layout.page_tokens,
-            .visible_start = 0,
-            .visible_end = layout.max_tokens,
+            .range = .{
+                .first_page = 0,
+                .page_count = (layout.max_tokens - 1) / layout.page_tokens + 1,
+                .physical_pages = try layout.pageCapacity(visit.group),
+                .page_tokens = layout.page_tokens,
+                .visible_start = 0,
+                .visible_end = layout.max_tokens,
+            },
         };
     }
 

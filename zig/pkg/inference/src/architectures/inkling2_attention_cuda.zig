@@ -260,7 +260,7 @@ pub const Forward = struct {
     pub fn run(self: *Forward, ctx: *Context, blas: *Blas, text: model.TextConfig, layer: *const Layer, r: Request) !void {
         if ((r.visit.group == .sliding) != layer.local) return error.InvalidInkling2Layer;
         const replay = if (r.replay_position.ptr != 0) try r.cache_owner.replayBinding(r.visit) else null;
-        const position: u32 = if (replay) |binding| @intCast(binding.visible_end - 1) else @intCast(r.cache_owner.committedTokens());
+        const position: u32 = if (replay) |binding| @intCast(binding.range.visible_end - 1) else @intCast(r.cache_owner.committedTokens());
         const rows = r.workspace.rows;
         const q_width = @as(u32, text.num_attention_heads) * text.head_dim;
         const kv_width = @as(u32, text.num_key_value_heads) * text.head_dim;
