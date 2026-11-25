@@ -62057,7 +62057,11 @@ test "CUDA replay retains dense pointwise output facts without fabricating unkno
     defer selected.deinit();
     try std.testing.expect(selected.validation_scope == .invocation and selected.output_plane_metadata == .assigned_dense);
     try selected.validate(.{ .inputs = &facts, .output = slot });
-    try std.testing.expect(!ownedPayloadRoute(&compute, &selected));
+    // The direct program attests its assigned output. Each input requires
+    // separate evidence before the ownership planner can credit its payload.
+    try std.testing.expect(ownedPayloadRoute(&compute, &selected));
+    try std.testing.expectEqual(@as(usize, 16), selected.requirements.primary_bytes);
+    for (facts) |binding| try std.testing.expect(!try ownedPayloadInput(&compute, binding, shape));
     // Current CT validation remains real: malformed predecessor extents are
     // rejected before output acquisition or touching the synthetic GPU pointer.
     var dimensions = [_]i64{1};
