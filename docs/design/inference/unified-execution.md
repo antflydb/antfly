@@ -965,6 +965,15 @@ The packed-cache image lookup also returned `271`. The streaming image
 request returned `Blue`, a stop reason, usage and `[DONE]` in 0.833 s.
 No comparable vLLM Metal run was available for this checkpoint.
 
+With the normal model directory and both backend override variables unset,
+the optimized HTTP server selected Metal. A mixed `/ml/v1/generate/batch`
+returned `4` and `Red` for valid items and an item-level error for an audio
+part. The normal generate route returned `4` in 0.72 s warm. Streaming image
+chat returned `Blue`, a stop reason, token usage, and `[DONE]` in 0.84 s.
+After disconnecting a longer stream, the next text request returned `4`
+in 0.84 s. These requests use existing model selection, memory admission
+and the GPU runtime's execution gate.
+
 ### Official Gemma 4 E2B QAT serving comparison
 
 The decoder and projector came from Google's E2B QAT Q4_0 GGUF revision

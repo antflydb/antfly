@@ -6460,6 +6460,82 @@ pub const Node = struct {
         continue_fn: ?*const fn (*anyopaque) bool = null,
     };
 
+    const InklingCuda = @import("../architectures/inkling2_session.zig");
+    const InklingMetal = @import("../architectures/inkling2_session_metal.zig");
+
+    const InklingEagerRuntime = union(enum) {
+        cuda: *InklingCuda.Runtime,
+        metal: *InklingMetal.Runtime,
+
+        fn fromSession(session: backends_mod.Session) ?InklingEagerRuntime {
+            if (comptime build_options.enable_metal) {
+                if (InklingMetal.Runtime.fromSession(session)) |resident| return .{ .metal = resident };
+            }
+            if (comptime build_options.enable_cuda) {
+                if (InklingCuda.Runtime.fromSession(session)) |resident| return .{ .cuda = resident };
+            }
+            return null;
+        }
+
+        fn maxActiveRequests(self: InklingEagerRuntime) usize {
+            return switch (self) {
+                .cuda => InklingCuda.max_active_requests,
+                .metal => InklingMetal.max_active_requests,
+            };
+        }
+
+        fn init(self: InklingEagerRuntime, allocator: std.mem.Allocator, model: *model_manager_mod.LoadedModel, control: InferenceExecutionControl, input: []const generation.Message, config: generation.GenerationConfig, limit: ?usize) !InklingEagerPipeline {
+            return switch (self) {
+                .cuda => |resident| if (comptime build_options.enable_cuda)
+                    .{ .cuda = try InklingCuda.Pipeline.init(allocator, resident, model.session, model.getTokenizer(), control, input, config, limit) }
+                else
+                    unreachable,
+                .metal => |resident| if (comptime build_options.enable_metal)
+                    .{ .metal = .{
+                        .resident = resident,
+                        .session = model.session,
+                        .text = try InklingMetal.TextPipeline.init(allocator, model.getTokenizer(), control, input, config, limit, .{}),
+                    } }
+                else
+                    unreachable,
+            };
+        }
+    };
+
+    const InklingEagerPipeline = union(enum) {
+        cuda: InklingCuda.Pipeline,
+        metal: InklingMetal.ServingPipeline,
+
+        fn deinit(self: *InklingEagerPipeline) void {
+            switch (self.*) {
+                .cuda => |*pipeline| if (comptime build_options.enable_cuda) pipeline.deinit() else unreachable,
+                .metal => |*pipeline| if (comptime build_options.enable_metal) pipeline.deinit() else unreachable,
+            }
+        }
+
+        fn generate(self: *InklingEagerPipeline, input: []const generation.Message, config: generation.GenerationConfig, stream: ?DirectGenerateStream) !generation.GenerationResult {
+            return switch (self.*) {
+                .cuda => |*pipeline| if (comptime build_options.enable_cuda)
+                    generateWith(pipeline, input, config, stream)
+                else
+                    unreachable,
+                .metal => |*pipeline| if (comptime build_options.enable_metal)
+                    generateWith(pipeline, input, config, stream)
+                else
+                    unreachable,
+            };
+        }
+
+        fn generateWith(pipeline: anytype, input: []const generation.Message, config: generation.GenerationConfig, stream: ?DirectGenerateStream) !generation.GenerationResult {
+            if (stream) |sink| {
+                pipeline.continue_ctx = sink.ctx;
+                pipeline.continue_fn = sink.continue_fn;
+                return pipeline.generateStreaming(input, config, sink.ctx, sink.on_token);
+            }
+            return pipeline.generate(input, config);
+        }
+    };
+
     const DirectGenerateTiming = struct {
         resolve_ms: u64 = 0,
         load_ms: u64 = 0,
@@ -6740,41 +6816,34 @@ pub const Node = struct {
         if (timing != null) {
             std.log.info("direct generator loaded model={s} backend={s}", .{ model_name, @tagName(model.session.backend()) });
         }
-        if (comptime build_options.enable_cuda) {
-            const inkling = @import("../architectures/inkling2_session.zig");
-            if (inkling.Runtime.fromSession(model.session)) |resident| {
-                if (a4b_request != null or prompt_cache_key != null or preflight.audio_transcription)
-                    return error.UnsupportedInkling2Request;
-                const slot = try model.generation_admission.acquire(execution_control, false, runtime.scheduler.generation_admission.Limits.forRequests(self.config.max_concurrent_requests, inkling.max_active_requests));
-                defer slot.release();
-                const config: generation.GenerationConfig = .{ .max_tokens = max_tokens };
-                var pipeline = try inkling.Pipeline.init(allocator, resident, model.session, model.getTokenizer(), execution_control, messages, config, executor_contract.batch.max_input_tokens_per_item);
-                defer pipeline.deinit();
-                const setup_at_ns = embedTimingNowNs();
-                var result = if (stream) |sink| blk: {
-                    pipeline.continue_ctx = sink.ctx;
-                    pipeline.continue_fn = sink.continue_fn;
-                    break :blk try pipeline.generateStreaming(messages, config, sink.ctx, sink.on_token);
-                } else try pipeline.generate(messages, config);
-                defer result.deinit();
-                const generated_at_ns = embedTimingNowNs();
-                if (timing) |report| report.* = .{
-                    .resolve_ms = elapsedMs(started_at_ns, resolved_at_ns),
-                    .load_ms = elapsedMs(resolved_at_ns, loaded_at_ns),
-                    .setup_ms = elapsedMs(loaded_at_ns, setup_at_ns),
-                    .generate_ms = elapsedMs(setup_at_ns, generated_at_ns),
-                    .total_ms = elapsedMs(started_at_ns, generated_at_ns),
-                };
-                const text = try caller_allocator.dupe(u8, result.text);
-                if (pin_after_success) model_handle.pin();
-                return .{
-                    .text = text,
-                    .prompt_tokens = result.prompt_tokens,
-                    .completion_tokens = result.tokens_used,
-                    .truncated = std.mem.eql(u8, result.finish_reason, "length"),
-                    .naturally_completed = std.mem.eql(u8, result.finish_reason, "stop"),
-                };
-            }
+        if (InklingEagerRuntime.fromSession(model.session)) |resident| {
+            if (a4b_request != null or prompt_cache_key != null or preflight.audio_transcription)
+                return error.UnsupportedInkling2Request;
+            const slot = try model.generation_admission.acquire(execution_control, false, runtime.scheduler.generation_admission.Limits.forRequests(self.config.max_concurrent_requests, resident.maxActiveRequests()));
+            defer slot.release();
+            const config: generation.GenerationConfig = .{ .max_tokens = max_tokens };
+            var pipeline = try resident.init(allocator, model, execution_control, messages, config, executor_contract.batch.max_input_tokens_per_item);
+            defer pipeline.deinit();
+            const setup_at_ns = embedTimingNowNs();
+            var result = try pipeline.generate(messages, config, stream);
+            defer result.deinit();
+            const generated_at_ns = embedTimingNowNs();
+            if (timing) |report| report.* = .{
+                .resolve_ms = elapsedMs(started_at_ns, resolved_at_ns),
+                .load_ms = elapsedMs(resolved_at_ns, loaded_at_ns),
+                .setup_ms = elapsedMs(loaded_at_ns, setup_at_ns),
+                .generate_ms = elapsedMs(setup_at_ns, generated_at_ns),
+                .total_ms = elapsedMs(started_at_ns, generated_at_ns),
+            };
+            const text = try caller_allocator.dupe(u8, result.text);
+            if (pin_after_success) model_handle.pin();
+            return .{
+                .text = text,
+                .prompt_tokens = result.prompt_tokens,
+                .completion_tokens = result.tokens_used,
+                .truncated = std.mem.eql(u8, result.finish_reason, "length"),
+                .naturally_completed = std.mem.eql(u8, result.finish_reason, "stop"),
+            };
         }
         const gpt_config = session_factory.getGptConfig(model.session) orelse return error.UnsupportedGeneratorProvider;
         // Preserve model resolution, capability checks, admission and cancellation
@@ -17873,8 +17942,8 @@ pub const Node = struct {
                         .choice = parsed_tool_choice,
                     }) catch |err| return generationErrorResponse(ctx, err),
                 };
-                defer pipeline.text.deinit();
-                const slot = model.generation_admission.acquire(execution_control, false, runtime.scheduler.generation_admission.Limits.forRequests(self.config.max_concurrent_requests, 1)) catch |err| {
+                defer pipeline.deinit();
+                const slot = model.generation_admission.acquire(execution_control, false, runtime.scheduler.generation_admission.Limits.forRequests(self.config.max_concurrent_requests, inkling.max_active_requests)) catch |err| {
                     if (err == error.GenerationQueueFull) return modelResourceBusyResponse(ctx);
                     return inferenceFailureResponse(ctx, err);
                 };
@@ -20707,47 +20776,44 @@ pub const Node = struct {
                     prompt_estimates[idx] = null;
                 };
 
-                if (comptime build_options.enable_cuda) {
-                    const inkling = @import("../architectures/inkling2_session.zig");
-                    if (inkling.Runtime.fromSession(model.session)) |resident| {
-                        for (group_indices.items) |idx| {
-                            pending[idx] = false;
-                            const item = body.requests[idx].body;
-                            const input = owned_messages[idx].messages;
-                            var grammar: ?[]u8 = null;
-                            defer if (grammar) |value| ctx.allocator.free(value);
-                            const cfg = generateConfigFromBody(ctx.allocator, item, &grammar) catch |err| {
-                                results[idx].@"error" = batchGenerationError(err);
-                                continue;
-                            };
-                            const slot = model.generation_admission.acquire(execution_control, false, runtime.scheduler.generation_admission.Limits.forRequests(self.config.max_concurrent_requests, inkling.max_active_requests)) catch |err| {
-                                results[idx].@"error" = batchGenerationError(err);
-                                continue;
-                            };
-                            defer slot.release();
-                            var pipeline = inkling.Pipeline.init(ctx.allocator, resident, model.session, model.getTokenizer(), execution_control, input, cfg, executor_contract.batch.max_input_tokens_per_item) catch |err| {
-                                results[idx].@"error" = batchGenerationError(err);
-                                continue;
-                            };
-                            defer pipeline.deinit();
-                            execution_attempted[idx] = true;
-                            var result = pipeline.generate(input, cfg) catch |err| {
-                                results[idx].@"error" = batchGenerationError(err);
-                                continue;
-                            };
-                            defer result.deinit();
-                            results[idx].response = try buildGenerateResponseValue(
-                                response_alloc,
-                                item.model,
-                                result.text,
-                                result.reasoning_text,
-                                result.finish_reason,
-                                result.prompt_tokens,
-                                result.tokens_used,
-                            );
-                        }
-                        continue;
+                if (InklingEagerRuntime.fromSession(model.session)) |resident| {
+                    for (group_indices.items) |idx| {
+                        pending[idx] = false;
+                        const item = body.requests[idx].body;
+                        const input = owned_messages[idx].messages;
+                        var grammar: ?[]u8 = null;
+                        defer if (grammar) |value| ctx.allocator.free(value);
+                        const cfg = generateConfigFromBody(ctx.allocator, item, &grammar) catch |err| {
+                            results[idx].@"error" = batchGenerationError(err);
+                            continue;
+                        };
+                        const slot = model.generation_admission.acquire(execution_control, false, runtime.scheduler.generation_admission.Limits.forRequests(self.config.max_concurrent_requests, resident.maxActiveRequests())) catch |err| {
+                            results[idx].@"error" = batchGenerationError(err);
+                            continue;
+                        };
+                        defer slot.release();
+                        var pipeline = resident.init(ctx.allocator, model, execution_control, input, cfg, executor_contract.batch.max_input_tokens_per_item) catch |err| {
+                            results[idx].@"error" = batchGenerationError(err);
+                            continue;
+                        };
+                        defer pipeline.deinit();
+                        execution_attempted[idx] = true;
+                        var result = pipeline.generate(input, cfg, null) catch |err| {
+                            results[idx].@"error" = batchGenerationError(err);
+                            continue;
+                        };
+                        defer result.deinit();
+                        results[idx].response = try buildGenerateResponseValue(
+                            response_alloc,
+                            item.model,
+                            result.text,
+                            result.reasoning_text,
+                            result.finish_reason,
+                            result.prompt_tokens,
+                            result.tokens_used,
+                        );
                     }
+                    continue;
                 }
                 const gpt_config = session_factory.getGptConfig(model.session) orelse {
                     for (group_indices.items) |idx| {

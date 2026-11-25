@@ -30,6 +30,9 @@ const MetalNativeProvider = @import("../backends/metal_native_provider.zig").Met
 const State = @import("inkling2_state_metal.zig").State;
 const Scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler;
 
+// The resident decoder records frames against a single Metal runtime.
+pub const max_active_requests = 1;
+
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
     provider: MetalNativeProvider,
@@ -151,6 +154,8 @@ pub const TextPipeline = struct {
     control: Control,
     prompt: chat.Prompt,
     options: chat.ChatOptions,
+    continue_ctx: ?*anyopaque = null,
+    continue_fn: ?*const fn (*anyopaque) bool = null,
 
     pub const Callbacks = struct {
         text_ctx: ?*anyopaque = null,
@@ -165,6 +170,13 @@ pub const TextPipeline = struct {
         errdefer prompt.deinit(a);
         if (input_limit) |limit| if (prompt.count() > limit) return error.InferenceInputTokensExceeded;
         return .{ .allocator = a, .tokenizer = tokenizer, .control = control, .prompt = prompt, .options = options };
+    }
+
+    fn check(self: *const TextPipeline) !void {
+        try self.control.check();
+        if (self.continue_fn) |keep_going| {
+            if (!keep_going(self.continue_ctx orelse return error.Cancelled)) return error.Cancelled;
+        }
     }
 
     pub fn deinit(self: *TextPipeline) void {
@@ -198,7 +210,7 @@ pub const TextPipeline = struct {
     }
 
     fn generateWithPlan(self: *const TextPipeline, model: *const decoder.Decoder, vision: ?*const vision_model.Vision, eos: u32, config: generation.GenerationConfig, callbacks: Callbacks, plan: decoder.RequestPlan) !generation.GenerationResult {
-        try self.control.check();
+        try self.check();
         var request: decoder.Request = undefined;
         try request.initWithPlan(self.allocator, model, plan);
         defer request.deinit();
@@ -235,7 +247,7 @@ pub const TextPipeline = struct {
         const limit: usize = @intCast(config.max_tokens);
         var token = std.math.cast(u32, after[after.len - 1]) orelse return error.InvalidInkling2Token;
         while (output.tokens.items.len < limit) {
-            try self.control.check();
+            try self.check();
             if (greedy) {
                 token = try request.stepGreedy(token);
             } else {
@@ -243,7 +255,7 @@ pub const TextPipeline = struct {
                 try history.append(self.allocator, token);
                 token = @intCast(generation.sampleTokenFromLogits(self.allocator, logits, config, history.items));
             }
-            try self.control.check();
+            try self.check();
             if (!config.ignore_eos and (token == eos or (channels == null and token == turn_end))) break;
             try output.append(token);
         }
@@ -270,7 +282,7 @@ pub const TextPipeline = struct {
         var part_index: usize = 0;
         var part_position: usize = 0;
         while (position < total) {
-            try self.control.check();
+            try self.check();
             const rows: usize = if (total - position >= chunk_rows) chunk_rows else 1;
             var pending = rows;
             var batch: [3]decoder.PrefixPart = undefined;
@@ -296,7 +308,7 @@ pub const TextPipeline = struct {
     }
 
     fn encodeImage(self: *const TextPipeline, model: *const decoder.Decoder, encoder: *const vision_model.Vision, data: []const u8) !vision_model.Vision.Embeddings {
-        try self.control.check();
+        try self.check();
         const rgb = image.decodeRgb(self.allocator, data) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return error.InvalidInkling2Image,
@@ -316,12 +328,24 @@ pub const ServingPipeline = struct {
     text: TextPipeline,
     reasoning_ctx: ?*anyopaque = null,
     reasoning_callback: ?generation.TokenCallback = null,
+    continue_ctx: ?*anyopaque = null,
+    continue_fn: ?*const fn (*anyopaque) bool = null,
+
+    pub fn deinit(self: *ServingPipeline) void {
+        self.text.deinit();
+    }
 
     pub fn generate(self: *ServingPipeline, _: []const generation.Message, config: generation.GenerationConfig) !generation.GenerationResult {
         return self.resident.generate(self.session, &self.text, config, .{});
     }
 
     pub fn generateStreaming(self: *ServingPipeline, _: []const generation.Message, config: generation.GenerationConfig, ctx: *anyopaque, callback: generation.TokenCallback) !generation.GenerationResult {
+        self.text.continue_ctx = self.continue_ctx;
+        self.text.continue_fn = self.continue_fn;
+        defer {
+            self.text.continue_ctx = null;
+            self.text.continue_fn = null;
+        }
         return self.resident.generate(self.session, &self.text, config, .{
             .text_ctx = ctx,
             .text = callback,

@@ -963,8 +963,7 @@ pub const BoundModelSource = struct {
         if (self.kind != .directory) return self.view();
         const directory = &self.directory_manifest.?;
         const man = &directory.manifest;
-        if (man.isInkling2() and backend != .cuda and
-            !(backend == .metal and @import("../architectures/inkling2_checkpoint.zig").metalQualificationEnabled())) return null;
+        if (man.isInkling2() and backend != .cuda and backend != .metal) return null;
         if (backend == .wasm or !manifestHasNativeAssets(man.*)) {
             if (man.onnx_path) |selected| {
                 if (self.onnx_binding == null) {
