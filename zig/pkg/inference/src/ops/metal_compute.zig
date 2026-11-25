@@ -23966,10 +23966,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (params.rows != rows or params.in_dim != in_dim or params.out_dim != out_dim) return error.InvalidTensorShape;
         }
         const runtime = self.provider_impl.raw_decode_runtime orelse return null;
-        var mt = if (output) |ct| try (denseDeviceF32(ct) orelse return error.InvalidPreparedProjectionOutput).retainedCopy() else try MetalTensor.deviceAllocate(runtime, try std.math.mul(usize, output_elements, @sizeOf(f32)), .private, &.{ std.math.cast(i32, rows) orelse return error.InvalidTensorShape, std.math.cast(i32, out_dim) orelse return error.InvalidTensorShape });
-        var moved = false;
-        defer if (!moved) self.retireTemporaryWorkspaceValue(&mt);
         const output_bytes = try std.math.mul(usize, output_elements, @sizeOf(f32));
+        // The assigned destination's caller owns its backing through encoding.
+        // Only a newly allocated destination needs local retirement or transfer.
+        var mt = if (output) |ct|
+            denseDeviceF32(ct) orelse return error.InvalidPreparedProjectionOutput
+        else
+            try MetalTensor.deviceAllocate(runtime, output_bytes, .private, &.{
+                std.math.cast(i32, rows) orelse return error.InvalidTensorShape,
+                std.math.cast(i32, out_dim) orelse return error.InvalidTensorShape,
+            });
+        var moved = false;
+        defer if (output == null and !moved) self.retireTemporaryWorkspaceValue(&mt);
         if (mt.isReadOnlyPhysical() or !deviceTensorMatchesLinearRows(&mt, rows, out_dim) or mt.deviceByteLen() < output_bytes or
             mt.device.?.ref.runtime != @as(*anyopaque, @ptrCast(runtime)) or
             (mt.deviceHandle() == x.deviceHandle() and kernel_geometry.byteRangesOverlap(mt.deviceByteOffset(), output_bytes, x.deviceByteOffset(), x.deviceByteLen()))) return error.InvalidPreparedProjectionOutput;
