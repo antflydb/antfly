@@ -6113,6 +6113,8 @@ pub const CudaCompute = struct {
     // F32 physical routes and must never be used as an arithmetic-policy flag.
     bf16_blas: ?@import("libraries.zig").Cublas = null,
     source_reduction_threads_per_sm: u32 = 0,
+    // The exclusive decode request may capture this fixed projection span.
+    projection_argmax_replay_scratch: buffer_mod.DeviceBuffer = .{},
     source_linear_scratch: struct {
         active: bool = false,
         in_use: bool = false,
@@ -8682,6 +8684,9 @@ pub const CudaCompute = struct {
             self.capturing_physical_storage.deinitWithCleanup(self.allocator, current);
         }
         for (&self.debug_cuda_graph_slots) |*slot| deinitCudaGraphReplaySlot(self, slot, current);
+        if (self.projection_argmax_replay_scratch.ptr != 0)
+            self.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
+        retireProjectionArgmaxReplayScratch(self) catch platform.inference_process_supervisor.restartWorker();
         self.audio_plans.clearWithCleanup(current) catch platform.inference_process_supervisor.restartWorker();
         const retained_cleanup_failed = failed: {
             self.embedding_gemma2_resize.clearWithCleanup(&self.ctx, current) catch break :failed true;
@@ -13003,6 +13008,7 @@ fn beginRequestUsing(ctx: *anyopaque, current: CacheCleanup) anyerror!void {
         if (self.prefill_programs.specializationCount() != 0) self.prefill_cache_pressure.store(true, .release);
     }
     try resetDebugCudaGraphRequestStateWithCleanup(self, current);
+    try retireProjectionArgmaxReplayScratch(self);
     self.gemma4_request_replay_capacity = null;
     self.gemma4_request_replay_disabled = false;
     if (self.temp_slot_config.autoplan_enabled or
@@ -26170,7 +26176,7 @@ fn tryLinearQ4_0Q8_1ArgmaxE2BDevice(
     const input_bytes = try checkedMul(try checkedMul(rows, in_dim), @sizeOf(f32));
     if (input_tensor.buffer.len < input_bytes or weight_tensor.buffer.len < bounds.weight_bytes) return error.InvalidShape;
     const layout = try ProjectionArgmaxScratch.Layout.init(bounds.partial_bytes, bounds.q8_input_bytes, suppress_token_ids.len);
-    var scratch = ProjectionArgmaxScratch.acquire(self, layout, suppress_token_ids) catch |err| switch (err) {
+    var scratch = ProjectionArgmaxScratch.acquireForGeneratedReplay(self, layout, suppress_token_ids) catch |err| switch (err) {
         error.CudaGraphCaptureUnsafeTempAlloc, error.CudaGraphCaptureUnsafeHostCopy => {
             noteQ4_0Q8_1ArgmaxFallback(self, @errorName(err), rows, in_dim, out_dim);
             return null;
@@ -26227,6 +26233,12 @@ fn tryLinearQ4_0Q8_1ArgmaxE2BDevice(
     return token_device;
 }
 
+fn retireProjectionArgmaxReplayScratch(self: *CudaCompute) !void {
+    if (self.projection_argmax_replay_scratch.ptr == 0) return;
+    _ = try self.projection_argmax_replay_scratch.freeChecked(&self.ctx);
+    self.stats.device_free_calls += 1;
+}
+
 // Projection reductions and any input packing share one scratch lifetime.
 const ProjectionArgmaxScratch = struct {
     bank: buffer_mod.DeviceBuffer,
@@ -26264,6 +26276,30 @@ const ProjectionArgmaxScratch = struct {
         }
     };
 
+    fn acquireForGeneratedReplay(self: *CudaCompute, layout: Layout, suppressed: []const i32) !ProjectionArgmaxScratch {
+        if (self.gemma4_request_replay_capacity != null and !self.gemma4_request_replay_disabled and
+            self.execution_scope == null and self.temp_slot_config.configured_period == 0 and suppressed.len == 0)
+        {
+            const owner = &self.projection_argmax_replay_scratch;
+            if (owner.ptr == 0 and !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active and
+                !self.temp_arena_planner.active and layout.bytes <= cudaTempArenaAdmissionBudgetBytes(self))
+            {
+                owner.* = buffer_mod.DeviceBuffer.allocWithPurpose(&self.ctx, layout.bytes, .command_workspace) catch |err| switch (err) {
+                    error.CudaMemoryLimitExceeded => return acquire(self, layout, suppressed),
+                    else => return err,
+                };
+                self.stats.device_alloc_calls += 1;
+                self.noteDeviceBytes(layout.bytes);
+            }
+            if (owner.len == layout.bytes and owner.ptr != 0) {
+                var scratch = bind(owner.*, layout);
+                scratch.bank = .{}; // The request retires this address after its graph execs.
+                return scratch;
+            }
+        }
+        return acquire(self, layout, suppressed);
+    }
+
     fn acquire(self: *CudaCompute, layout: Layout, suppressed: []const i32) !ProjectionArgmaxScratch {
         std.debug.assert(layout.suppression_bytes == std.mem.sliceAsBytes(suppressed).len);
         // Host suppression is not a prepared input. Refuse it before
@@ -26273,14 +26309,18 @@ const ProjectionArgmaxScratch = struct {
         }
         var bank = try allocDeviceBuffer(self, layout.bytes);
         errdefer releaseDeviceBuffer(self, &bank);
-        const suppression = span(bank, layout.suppression_offset, layout.suppression_bytes);
-        if (suppressed.len != 0) try copyFromHostTracked(self, suppression, std.mem.sliceAsBytes(suppressed));
+        const scratch = bind(bank, layout);
+        if (suppressed.len != 0) try copyFromHostTracked(self, scratch.suppression, std.mem.sliceAsBytes(suppressed));
+        return scratch;
+    }
+
+    fn bind(bank: buffer_mod.DeviceBuffer, layout: Layout) ProjectionArgmaxScratch {
         return .{
             .bank = bank,
             .partial_values = span(bank, layout.packed_bytes, layout.partial_bytes),
             .partial_indices = span(bank, layout.indices_offset, layout.partial_bytes),
             .quantized_input = span(bank, 0, layout.packed_bytes),
-            .suppression = suppression,
+            .suppression = span(bank, layout.suppression_offset, layout.suppression_bytes),
         };
     }
 
@@ -42428,6 +42468,31 @@ test "CUDA generated Q4_0 projection argmax packs into its declared scratch" {
     }
     try std.testing.expectEqual(planned_trace, compute.temp_trace_seq);
     try std.testing.expectEqual(allocation_count, compute.stats.device_alloc_calls);
+
+    compute.temp_slot_config.configured_period = 0;
+    compute.gemma4_request_replay_capacity = 128;
+    for ([_]bool{ false, true }) |capture| {
+        if (capture) try compute.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED);
+        errdefer if (compute.ctx.debug_graph_capture_active) graph_mod.discardRecording(&compute.ctx);
+        var result = (try tryLinearQ4_0Q8_1ArgmaxE2BDevice(&compute, tensorFromCt(input), &weight, 1, width, vocabulary, &.{})) orelse return error.ExpectedFusedArgmax;
+        defer releaseDeviceBufferLease(&compute, &result);
+        if (capture) {
+            var graph = try graph_mod.endRecording(&compute.ctx);
+            defer compute.ctx.destroyGraphChecked(&graph) catch platform.inference_process_supervisor.restartWorker();
+            // Retain the exec through request reset to exercise retirement
+            // before releasing the scratch address that it embeds.
+            compute.debug_cuda_graph_slots[0].exec = try compute.ctx.instantiateGraph(graph);
+            try compute.ctx.launchGraph(compute.debug_cuda_graph_slots[0].exec);
+        }
+        try copyToHostTrackedAndSync(&compute, result.buffer, std.mem.sliceAsBytes(&token));
+        try std.testing.expectEqual(@as(u32, 0), token[0]);
+        try std.testing.expectEqual(layout.bytes, compute.projection_argmax_replay_scratch.len);
+        try std.testing.expectEqual(allocation_count + 1, compute.stats.device_alloc_calls);
+    }
+    try std.testing.expectEqual(planned_trace, compute.temp_trace_seq);
+    try beginRequest(&compute);
+    try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0), compute.projection_argmax_replay_scratch.ptr);
+    try std.testing.expect(compute.debug_cuda_graph_slots[0].exec == null);
 }
 
 test "LightOnOCR3 CUDA Florence F16 LM head declines quantized fusion and preserves dense argmax" {
