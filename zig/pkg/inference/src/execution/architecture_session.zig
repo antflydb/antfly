@@ -22162,9 +22162,13 @@ pub fn createSessionFromManifestWithCudaOptions(
     cuda_options: CudaLoadOptions,
 ) !Session {
     if (manifest.isInkling2()) {
+        if (jit.qualified_profile_path != null or a4b != null or precision != null) return error.UnsupportedBackend;
+        if (comptime build_options.enable_metal) {
+            if (backend == .metal and @import("../architectures/inkling2_checkpoint.zig").metalQualificationEnabled())
+                return @import("../architectures/inkling2_session_metal.zig").Runtime.load(allocator, manifest);
+        }
+        if (backend != .cuda) return error.UnsupportedBackend;
         if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
-        if (backend != .cuda or jit.qualified_profile_path != null or a4b != null or precision != null)
-            return error.UnsupportedBackend;
         return @import("../architectures/inkling2_session.zig").Runtime.load(allocator, manifest);
     }
     return switch (backend) {

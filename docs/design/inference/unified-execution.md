@@ -864,8 +864,17 @@ peak logits were 26.42824, 27.44696, and 24.87517. The fourth Metal step
 produced token 1541 with a peak of 26.31770. The decoder reported
 18,881,301,664 resident device bytes and a 55.88 s load. The four decode
 intervals were 21,549.53, 564.39, 61.19, and 60.54 ms with concurrent server
-compilation. These timings are from one run and leave the on-Mac HTTP and
-reference-engine gates open.
+compilation. These timings are from one run.
+
+The experimental Metal chat route, enabled with
+`ANTFLY_INFERENCE_INKLING_METAL_QUALIFICATION=1` and measured with Metal
+required, returned `4` for a 28-token arithmetic prompt through
+`/ml/v1/chat/completions`. Cold and warm HTTP requests completed in 37.24 s
+and 1.78 s. The warm streaming response emitted the same answer, a stop
+reason and `[DONE]` in 1.72 s. The focused Metal suite also covers the
+BF16 device embedding handoff and in-frame greedy argmax on a synthetic
+decoder. Metal image serving, long and full-context qualification, and
+the external performance comparison remain open.
 
 ### Official Gemma 4 E2B QAT serving comparison
 

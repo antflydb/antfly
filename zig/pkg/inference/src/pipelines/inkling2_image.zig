@@ -15,9 +15,10 @@
 
 const std = @import("std");
 const image = @import("image.zig");
+const vision = @import("../architectures/inkling2_vision.zig");
 
 pub fn decodeRgb(allocator: std.mem.Allocator, data: []const u8) !image.Image {
-    _ = try image.inspectEncodedForInference(data, 4096);
+    _ = try image.inspectEncodedForInference(data, vision.max_image_side);
     const rgba = try image.decodeRgba(allocator, data);
     defer rgba.deinit(allocator);
     const rgb = try allocator.alloc(u8, @as(usize, rgba.width) * rgba.height * 3);

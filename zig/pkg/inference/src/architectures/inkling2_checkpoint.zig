@@ -21,6 +21,11 @@ const DType = @import("../backends/tensor.zig").DType;
 const Group = @import("../runtime/kv/hybrid_paged.zig").Group;
 
 pub const architecture = "inkling2_loop";
+pub fn metalQualificationEnabled() bool {
+    return @import("build_options").enable_metal and
+        @import("antfly_platform").env.getenvBool("ANTFLY_INFERENCE_INKLING_METAL_QUALIFICATION");
+}
+
 pub const shard_name = "model-00001-of-00001.safetensors";
 pub const draft_name = "mtp.safetensors";
 pub const header_options: safetensors.HeaderOptions = .{ .allow_e4m3fn = true };

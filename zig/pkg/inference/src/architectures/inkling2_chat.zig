@@ -16,11 +16,17 @@
 //! Inkling 2 chat formatting and output publication shared by execution providers.
 const std = @import("std");
 const images = @import("../pipelines/image.zig");
+const vision = @import("inkling2_vision.zig");
 const generation = @import("../pipelines/generation.zig");
 const Tokenizer = @import("inference_tokenizer").Tokenizer;
 const jsonschema = @import("antfly_jsonschema");
 
 const tooling = @import("../pipelines/tool_parser.zig");
+
+pub fn usesUnpenalizedGreedy(config: generation.GenerationConfig) bool {
+    return config.temperature == 0 and config.repetition_penalty == 1 and
+        config.frequency_penalty == 0 and config.presence_penalty == 0;
+}
 
 pub const ChatOptions = struct {
     effort: ?f64 = null,
@@ -137,7 +143,7 @@ pub const Prompt = struct {
         if (after.len == 0) return error.InvalidInkling2Tokenizer;
         var prompt = Prompt{ .before_image = before, .after_image = after, .image = image_data, .initial_channel = initial_channel };
         if (image_data) |data| {
-            const info = images.inspectEncodedForInference(data, 4096) catch return error.InvalidInkling2Image;
+            const info = images.inspectEncodedForInference(data, vision.max_image_side) catch return error.InvalidInkling2Image;
             prompt.image_width = info.width;
             prompt.image_height = info.height;
         }
@@ -217,7 +223,7 @@ pub const Prompt = struct {
     }
 
     pub fn imageRows(self: Prompt) usize {
-        return ((self.image_width + 39) / 40) * ((self.image_height + 39) / 40);
+        return vision.Geometry.fromDimensions(self.image_width, self.image_height).mergedRows();
     }
 
     pub fn count(self: Prompt) usize {

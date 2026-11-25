@@ -162,13 +162,14 @@ pub const TextPipeline = struct {
 
         var history: std.ArrayList(i64) = .empty;
         defer history.deinit(self.allocator);
+        const greedy = chat.usesUnpenalizedGreedy(config);
         const after = self.prompt.after_image;
         for ([_][]const i32{ self.prompt.before_image, after[0 .. after.len - 1] }) |prefix| {
             for (prefix) |id| {
                 try self.control.check();
                 const token = std.math.cast(u32, id) orelse return error.InvalidInkling2Token;
                 try request.append(token);
-                try history.append(self.allocator, id);
+                if (!greedy) try history.append(self.allocator, id);
             }
         }
 
@@ -193,13 +194,38 @@ pub const TextPipeline = struct {
         var token = std.math.cast(u32, after[after.len - 1]) orelse return error.InvalidInkling2Token;
         while (output.tokens.items.len < limit) {
             try self.control.check();
-            const logits = try request.step(token);
-            try history.append(self.allocator, token);
-            token = @intCast(generation.sampleTokenFromLogits(self.allocator, logits, config, history.items));
+            if (greedy) {
+                token = try request.stepGreedy(token);
+            } else {
+                const logits = try request.step(token);
+                try history.append(self.allocator, token);
+                token = @intCast(generation.sampleTokenFromLogits(self.allocator, logits, config, history.items));
+            }
             try self.control.check();
             if (!config.ignore_eos and (token == eos or (channels == null and token == turn_end))) break;
             try output.append(token);
         }
         return output.finalize(self.options, self.prompt.count(), limit);
+    }
+};
+
+pub const ServingPipeline = struct {
+    resident: *Runtime,
+    session: backends.Session,
+    text: TextPipeline,
+    reasoning_ctx: ?*anyopaque = null,
+    reasoning_callback: ?generation.TokenCallback = null,
+
+    pub fn generate(self: *ServingPipeline, _: []const generation.Message, config: generation.GenerationConfig) !generation.GenerationResult {
+        return self.resident.generate(self.session, &self.text, config, .{});
+    }
+
+    pub fn generateStreaming(self: *ServingPipeline, _: []const generation.Message, config: generation.GenerationConfig, ctx: *anyopaque, callback: generation.TokenCallback) !generation.GenerationResult {
+        return self.resident.generate(self.session, &self.text, config, .{
+            .text_ctx = ctx,
+            .text = callback,
+            .reasoning_ctx = self.reasoning_ctx,
+            .reasoning = self.reasoning_callback,
+        });
     }
 };

@@ -29,23 +29,21 @@ const Program = embedded.EmbeddedModule(struct {
 }, entries.patch_transformer_entries);
 const DeviceBuffer = buffer.DeviceBuffer;
 
-const width = 1024;
-const inner = 4096;
-const text_width = 2304;
-const patch_features = 20 * 20 * 3;
-const layers = 23;
-const eps = 1e-5;
+const vision_schema = @import("inkling2_vision.zig");
+const width = vision_schema.width;
+const inner = vision_schema.inner;
+const text_width = vision_schema.text_width;
+const patch_features = vision_schema.patch_features;
+const layers = vision_schema.layers;
+const eps = vision_schema.eps;
+const Layer = vision_schema.Layer;
+const Weight = vision_schema.Weight;
 const threads = 128;
-
-const Layer = enum { ln1, bias1, ln2, bias2, scale1, scale2, q, q_bias, k, k_bias, v, v_bias, out, out_bias, up, up_bias, down, down_bias };
-const Weight = enum { patch, pos, cls, cls_pos, pre, pre_bias, in, out };
 const Temp = enum { rgb, patches, patch_embed, embed, hidden, normed, q, k, v, attention, update, wide, merged, blas };
 
 fn Buffers(comptime T: type) type {
     return [@typeInfo(T).@"enum".field_names.len]DeviceBuffer;
 }
-
-const Tensor = struct { name: []const u8, shape: []const i64 };
 
 fn upload(ctx: *Context, source: *const checkpoint.Checkpoint, arena: *Arena, path: []const u8, shape: []const i64) !DeviceBuffer {
     const tensor = source.reader.header.tensors.get(path) orelse return error.MissingInkling2Weight;
@@ -75,45 +73,15 @@ pub const Vision = struct {
         const mapping = if (source.reader.mmap_region) |region| region.data else null;
         var upload_read = MmapRegion.SequentialRead.begin(mapping, source.reader.file_bytes);
         defer upload_read.deinit();
-        const model_tensors: std.EnumArray(Weight, Tensor) = .init(.{
-            .patch = .{ .name = "backbone.embeddings.patch_embedding.weight", .shape = &.{ width, patch_features } },
-            .pos = .{ .name = "backbone.embeddings.position_embedding", .shape = &.{ 32 * 32, width } },
-            .cls = .{ .name = "backbone.embeddings.class_embedding", .shape = &.{width} },
-            .cls_pos = .{ .name = "backbone.embeddings.cls_position_embedding", .shape = &.{width} },
-            .pre = .{ .name = "backbone.ln_pre.weight", .shape = &.{width} },
-            .pre_bias = .{ .name = "backbone.ln_pre.bias", .shape = &.{width} },
-            .in = .{ .name = "proj_in.weight", .shape = &.{ inner, width * 4 } },
-            .out = .{ .name = "proj_out.weight", .shape = &.{ text_width, inner } },
-        });
-        const layer_tensors: std.EnumArray(Layer, Tensor) = .init(.{
-            .ln1 = .{ .name = "ln_1.weight", .shape = &.{width} },
-            .bias1 = .{ .name = "ln_1.bias", .shape = &.{width} },
-            .ln2 = .{ .name = "ln_2.weight", .shape = &.{width} },
-            .bias2 = .{ .name = "ln_2.bias", .shape = &.{width} },
-            .scale1 = .{ .name = "ls_1.gamma", .shape = &.{width} },
-            .scale2 = .{ .name = "ls_2.gamma", .shape = &.{width} },
-            .q = .{ .name = "self_attn.q_proj.weight", .shape = &.{ width, width } },
-            .q_bias = .{ .name = "self_attn.q_proj.bias", .shape = &.{width} },
-            .k = .{ .name = "self_attn.k_proj.weight", .shape = &.{ width, width } },
-            .k_bias = .{ .name = "self_attn.k_proj.bias", .shape = &.{width} },
-            .v = .{ .name = "self_attn.v_proj.weight", .shape = &.{ width, width } },
-            .v_bias = .{ .name = "self_attn.v_proj.bias", .shape = &.{width} },
-            .out = .{ .name = "self_attn.out_proj.weight", .shape = &.{ width, width } },
-            .out_bias = .{ .name = "self_attn.out_proj.bias", .shape = &.{width} },
-            .up = .{ .name = "mlp.c_fc.weight", .shape = &.{ inner, width } },
-            .up_bias = .{ .name = "mlp.c_fc.bias", .shape = &.{inner} },
-            .down = .{ .name = "mlp.c_proj.weight", .shape = &.{ width, inner } },
-            .down_bias = .{ .name = "mlp.c_proj.bias", .shape = &.{width} },
-        });
         var name_buf: [128]u8 = undefined;
         inline for (std.enums.values(Weight)) |key| {
-            const tensor = model_tensors.get(key);
+            const tensor = vision_schema.model_tensors.get(key);
             const name = try std.fmt.bufPrint(&name_buf, "model.visual.{s}", .{tensor.name});
             vision.weights[@backingInt(key)] = try upload(ctx, source, &arena, name, tensor.shape);
         }
         for (&vision.layer_weights, 0..) |*storage, i| {
             inline for (std.enums.values(Layer)) |key| {
-                const tensor = layer_tensors.get(key);
+                const tensor = vision_schema.layer_tensors.get(key);
                 const name = try std.fmt.bufPrint(&name_buf, "model.visual.backbone.layers.{d}.{s}", .{ i, tensor.name });
                 storage[@backingInt(key)] = try upload(ctx, source, &arena, name, tensor.shape);
             }
@@ -152,13 +120,13 @@ pub const Vision = struct {
     }
 
     pub fn encodeRgb(self: *Vision, blas: *Blas, rgb: []const u8, image_x: u32, image_y: u32) !Embeddings {
-        if (image_x == 0 or image_y == 0 or image_x > 4096 or image_y > 4096 or rgb.len != @as(usize, image_x) * image_y * 3) return error.InvalidInkling2Image;
+        const geometry = try vision_schema.Geometry.fromRgb(rgb, image_x, image_y);
         const ctx = self.ctx;
-        var gx: u32 = 2 * ((image_x + 39) / 40);
-        var gy: u32 = 2 * ((image_y + 39) / 40);
-        const patch_rows = gx * gy;
+        var gx = geometry.grid_x;
+        var gy = geometry.grid_y;
+        const patch_rows = geometry.patchRows();
         var token_rows = patch_rows + 1;
-        const merged_rows = patch_rows / 4;
+        const merged_rows = geometry.mergedRows();
         var arena: Buffers(Temp) = @splat(.{});
         defer for (&arena) |*item| item.free(ctx);
         var pinned = try buffer.HostBuffer.alloc(ctx, rgb.len);

@@ -53,7 +53,8 @@ pub fn artifactCandidateForBackend(
     man: manifest_mod.ModelManifest,
     backend: backends.BackendType,
 ) ?ArtifactCandidateKind {
-    if (man.isInkling2() and backend != .cuda) return null;
+    if (man.isInkling2() and backend != .cuda and
+        !(backend == .metal and @import("../architectures/inkling2_checkpoint.zig").metalQualificationEnabled())) return null;
     if (backend == .wasm) return if (man.onnx_path != null) .onnx else null;
     if (man.nativeWeightArtifactKind()) |artifact| {
         return switch (artifact) {

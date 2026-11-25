@@ -17853,6 +17853,39 @@ pub const Node = struct {
             .has_video = owned_messages.decoded_video.len > 0,
         }) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
 
+        if (comptime build_options.enable_metal) {
+            const inkling = @import("../architectures/inkling2_session_metal.zig");
+            if (inkling.Runtime.fromSession(model.session)) |resident| {
+                if (body.context_management != null or native_transfer != null or requested_draft_model_name != null or
+                    body.speculation_calibration != null or tool_parser != null or wants_logprobs or
+                    backend_selection.graph_mode_requested or backend_selection.compiled_partition_backend != null)
+                    return generationErrorResponse(ctx, error.UnsupportedInkling2Request);
+                const raw_effort = if (parsed_body_value) |owned| if (owned.value == .object) owned.value.object.get("reasoning_effort") else null else null;
+                const ChatOptions = @import("../architectures/inkling2_chat.zig").ChatOptions;
+                const effort = if (raw_effort) |value| ChatOptions.parseEffort(value) catch |err|
+                    return generationErrorResponse(ctx, err) else null;
+                var pipeline: inkling.ServingPipeline = .{
+                    .resident = resident,
+                    .session = model.session,
+                    .text = inkling.TextPipeline.init(ctx.allocator, model.getTokenizer(), execution_control, messages.items, config, executor_contract.batch.max_input_tokens_per_item, .{
+                        .effort = effort,
+                        .tools = inkling_tools.items,
+                        .choice = parsed_tool_choice,
+                    }) catch |err| return generationErrorResponse(ctx, err),
+                };
+                defer pipeline.text.deinit();
+                const slot = model.generation_admission.acquire(execution_control, false, runtime.scheduler.generation_admission.Limits.forRequests(self.config.max_concurrent_requests, 1)) catch |err| {
+                    if (err == error.GenerationQueueFull) return modelResourceBusyResponse(ctx);
+                    return inferenceFailureResponse(ctx, err);
+                };
+                defer slot.release();
+                if (want_stream) return self.streamGenerate(ctx, body.model, &pipeline, null, messages.items, config, null, include_stream_usage, null, completion);
+                var result = pipeline.generate(messages.items, config) catch |err| return generationErrorResponse(ctx, err);
+                defer result.deinit();
+                return self.finishGenerate(ctx, body, result, config, null, null, null);
+            }
+        }
+
         if (comptime build_options.enable_cuda) {
             const inkling = @import("../architectures/inkling2_session.zig");
             if (inkling.Runtime.fromSession(model.session)) |resident| {

@@ -345,10 +345,7 @@ pub const Pipeline = struct {
         }
     }
 
-    fn usesGreedy(config: generation.GenerationConfig) bool {
-        return config.temperature == 0 and config.repetition_penalty == 1 and
-            config.frequency_penalty == 0 and config.presence_penalty == 0;
-    }
+    const usesGreedy = chat.usesUnpenalizedGreedy;
 
     fn initializeRequest(self: *Pipeline, request: *decoder.Request, plan: decoder.RequestPlan, draft: ?*dspark.Draft) !void {
         var turn: StepScheduler.Waiter = .{};

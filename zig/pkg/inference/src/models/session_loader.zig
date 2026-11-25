@@ -422,9 +422,15 @@ fn loadPreferredWithArtifactsImpl(
             if (managed_admission) {
                 if (loaded.session.executionCapabilities().measured_resident_weights) |weight_bytes| {
                     const construction_bytes = resident_amounts.backend_weight_bytes;
-                    resident_amounts.backend_weight_bytes = try session_factory.retainedCudaMirrorWeightBytes(construction_bytes, weight_bytes);
-                    std.log.info("cuda_eager_weight_residency construction_bytes={d} measured_weight_bytes={d} retained_weight_bytes={d}", .{
-                        construction_bytes, weight_bytes, resident_amounts.backend_weight_bytes,
+                    resident_amounts.backend_weight_bytes = switch (backend) {
+                        .cuda => try session_factory.retainedCudaMirrorWeightBytes(construction_bytes, weight_bytes),
+                        else => if (weight_bytes > 0 and weight_bytes <= construction_bytes)
+                            weight_bytes
+                        else
+                            return error.ResourceLimitExceeded,
+                    };
+                    std.log.info("model_weight_residency backend={s} construction_bytes={d} measured_weight_bytes={d} retained_weight_bytes={d}", .{
+                        @tagName(backend), construction_bytes, weight_bytes, resident_amounts.backend_weight_bytes,
                     });
                 }
                 if (serving_floor) |floor| session_factory.configureReservedGenerationWorkspace(
@@ -957,7 +963,8 @@ pub const BoundModelSource = struct {
         if (self.kind != .directory) return self.view();
         const directory = &self.directory_manifest.?;
         const man = &directory.manifest;
-        if (man.isInkling2() and backend != .cuda) return null;
+        if (man.isInkling2() and backend != .cuda and
+            !(backend == .metal and @import("../architectures/inkling2_checkpoint.zig").metalQualificationEnabled())) return null;
         if (backend == .wasm or !manifestHasNativeAssets(man.*)) {
             if (man.onnx_path) |selected| {
                 if (self.onnx_binding == null) {

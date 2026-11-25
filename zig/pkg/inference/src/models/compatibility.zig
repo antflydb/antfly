@@ -189,10 +189,14 @@ fn assessWithRuntimeFacts(
     }
 
     if (man.isInkling2()) {
-        if (!@import("build_options").enable_cuda or man.model_type != .generator or
+        const metal_qualification = @import("../architectures/inkling2_checkpoint.zig").metalQualificationEnabled();
+        if ((!@import("build_options").enable_cuda and !metal_qualification) or man.model_type != .generator or
             man.nativeWeightArtifactKind() != .sharded_safetensors)
             return makeIncompatible(architecture, .unsupported_backend, "Inkling 2 requires a CUDA build and the sharded NVFP4 generation checkpoint");
-        return makeCompatible(architecture, "Inkling 2 Mini CUDA text and image generation");
+        return makeCompatible(architecture, if (metal_qualification)
+            "Inkling 2 Mini Metal text qualification"
+        else
+            "Inkling 2 Mini CUDA text and image generation");
     }
 
     if (man.isQwen3VlBundle()) {

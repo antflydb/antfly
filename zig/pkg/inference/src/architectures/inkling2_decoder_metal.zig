@@ -333,27 +333,62 @@ pub const Request = struct {
         try self.stack.finish(runtime, boundary, self.get(.convolved_attention), self.get(.convolved_expert));
     }
 
-    fn run(self: *Request, token: u32, produce_logits: bool) !void {
+    const Input = union(enum) {
+        token: u32,
+        embedding: *const Tensor,
+    };
+
+    const Output = enum { none, logits, greedy };
+
+    fn run(self: *Request, input: Input, output: Output) !void {
         const runtime = self.model.runtime;
         var pending = try self.state.prepare(1);
         defer pending.abort();
         try metal.beginFrame(runtime);
         errdefer metal.cancelFrame(runtime) catch {};
-        try self.model.endpoints.embed(runtime, token, self.stack.reset());
+        const hidden = self.stack.reset();
+        switch (input) {
+            .token => |token| try self.model.endpoints.embed(runtime, token, hidden),
+            .embedding => |image_row| try image_row.copyInto(hidden),
+        }
         for (self.model.schedule) |op| try self.visit(&pending, op);
-        if (produce_logits) try self.model.endpoints.logits(runtime, &self.stack.backing, self.stack.current(), @intCast(self.stack.depth + 1), self.get(.normalized), self.get(.logits));
+        if (output != .none) {
+            const logits = self.get(.logits);
+            try self.model.endpoints.logits(runtime, &self.stack.backing, self.stack.current(), @intCast(self.stack.depth + 1), self.get(.normalized), logits);
+            if (output == .greedy and metal.termite_metal_decode_runtime_encode_argmax_from_logits_device(
+                runtime,
+                logits.deviceHandle(),
+                logits.deviceByteOffset(),
+                self.model.text.unpadded_vocab_size,
+            ) != 0) return error.MetalKernelDispatchFailed;
+        }
         try metal.submitFrame(runtime);
         try self.state.publish(&pending);
     }
 
     pub fn append(self: *Request, token: u32) !void {
-        try self.run(token, false);
+        try self.run(.{ .token = token }, .none);
+    }
+
+    pub fn appendEmbedding(self: *Request, image_row: *const Tensor) !void {
+        if (!image_row.isDevice() or image_row.dtype != .i16 or
+            image_row.deviceByteLen() != @as(usize, self.model.text.hidden_size) * @sizeOf(u16))
+            return error.InvalidShape;
+        try self.run(.{ .embedding = image_row }, .none);
     }
 
     pub fn step(self: *Request, token: u32) ![]const f32 {
-        try self.run(token, true);
+        try self.run(.{ .token = token }, .logits);
         try self.get(.logits).downloadF32Into(self.host_logits);
         return self.host_logits;
+    }
+
+    pub fn stepGreedy(self: *Request, token: u32) !u32 {
+        try self.run(.{ .token = token }, .greedy);
+        var next: u32 = 0;
+        if (metal.termite_metal_decode_runtime_read_token_id(self.model.runtime, &next) != 0)
+            return error.MetalKernelDispatchFailed;
+        return next;
     }
 };
 
@@ -562,7 +597,11 @@ test "Inkling Metal resident decoder executes the full visit schedule on a synth
     var request: Request = undefined;
     try request.init(a, &model, 3);
     defer request.deinit();
-    try request.append(0);
+    var image_row = try upload(a, runtime, .i16, std.mem.sliceAsBytes(embeddings[0..width]));
+    defer image_row.deinit();
+    try std.testing.expectError(error.InvalidShape, request.appendEmbedding(&model.controller_queries[0]));
+    try std.testing.expectEqual(@as(usize, 0), request.state.sequence.committed_tokens);
+    try request.appendEmbedding(&image_row);
     try std.testing.expectError(error.InvalidInkling2Token, request.append(2));
     try std.testing.expectEqual(@as(usize, 1), request.state.sequence.committed_tokens);
     const logits = try request.step(1);

@@ -792,6 +792,8 @@ pub fn estimateBaseModelLoadAdmission(
 ) !ModelLoadAdmissionPlan {
     const weights = try estimateModelArtifactBytes(man);
     if (man.isInkling2()) {
+        if (backend_runtime.backend == .metal and @import("../architectures/inkling2_checkpoint.zig").metalQualificationEnabled())
+            return nativeModelLoadAdmission(weights, .metal, .{});
         if (backend_runtime.backend != .cuda) return error.UnsupportedBackend;
         var total = weights;
         if (man.inkling2_draft_path) |path| try addArtifactBytes(&total, man.allocator, path);
