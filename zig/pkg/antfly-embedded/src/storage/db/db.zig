@@ -125244,9 +125244,11 @@ test "db hybrid search does not hard-filter dense leg with scoring full_text" {
         .sync_level = .full_index,
     });
 
+    var keyword = try @import("../../api/public_query_string.zig").parseStatefulQueryAlloc(alloc, "body:the body:quickstart", 1);
+    defer keyword.deinit(alloc);
     const req: types.SearchRequest = .{
         .index_name = "ft_v1",
-        .full_text = .{ .match = .{ .field = "body", .text = "quickstart" } },
+        .full_text = keyword,
         .dense_queries = &.{
             .{
                 .name = "dv_v1",
@@ -125275,7 +125277,11 @@ test "db hybrid search does not hard-filter dense leg with scoring full_text" {
     var saw_text_hit = false;
     for (result.hits) |hit| {
         if (std.mem.eql(u8, hit.id, "doc:a")) saw_semantic_only_hit = true;
-        if (std.mem.eql(u8, hit.id, "doc:b")) saw_text_hit = true;
+        if (std.mem.eql(u8, hit.id, "doc:b")) {
+            for (hit.index_scores) |score| {
+                if (std.mem.eql(u8, score.index_name, "full_text") and score.score > 0) saw_text_hit = true;
+            }
+        }
     }
     try std.testing.expect(saw_semantic_only_hit);
     try std.testing.expect(saw_text_hit);
