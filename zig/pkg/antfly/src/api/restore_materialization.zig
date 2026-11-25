@@ -165,7 +165,10 @@ pub fn stepWithBudget(alloc: std.mem.Allocator, io: std.Io, location: *backups.B
         error.FileNotFound => blk: {
             const remote_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ source.snapshot_path, native.manifest_file_name });
             defer alloc.free(remote_path);
-            const fetched = try backups.readFileFromLocationUsingIoLimited(alloc, io, location, remote_path, native.max_manifest_bytes);
+            const fetched = backups.readFileFromLocationUsingIoLimited(alloc, io, location, remote_path, native.max_manifest_bytes) catch |read_err| switch (read_err) {
+                error.FileNotFound => return error.BackupArtifactMissing,
+                else => return read_err,
+            };
             errdefer alloc.free(fetched);
             var digest: [32]u8 = undefined;
             Sha.hash(fetched, &digest, .{});
@@ -203,7 +206,10 @@ pub fn stepWithBudget(alloc: std.mem.Allocator, io: std.Io, location: *backups.B
             error.FileNotFound => blk: {
                 const remote = try std.fmt.allocPrint(alloc, "{s}/backup-seal-receipt.json", .{source.snapshot_path});
                 defer alloc.free(remote);
-                const value = try backups.readFileFromLocationUsingIoLimited(alloc, io, location, remote, 4096);
+                const value = backups.readFileFromLocationUsingIoLimited(alloc, io, location, remote, 4096) catch |read_err| switch (read_err) {
+                    error.FileNotFound => return error.BackupArtifactMissing,
+                    else => return read_err,
+                };
                 errdefer alloc.free(value);
                 try writeAtomic(alloc, io, receipt_path, value);
                 break :blk value;
