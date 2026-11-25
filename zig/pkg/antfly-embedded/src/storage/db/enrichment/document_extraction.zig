@@ -663,6 +663,12 @@ pub const PdfRenderDeadline = struct {
         return platform_time.monotonicNs() >= self.deadline_ns;
     }
 
+    pub fn classifyError(self: *const @This(), err: anyerror) anyerror {
+        if ((err == error.Canceled or err == error.Cancelled) and isCancelled(self))
+            return error.PdfRenderTimeout;
+        return err;
+    }
+
     pub fn probe(self: *const @This()) PdfCancellationProbe {
         return .{ .context = self, .is_cancelled_fn = isCancelled };
     }

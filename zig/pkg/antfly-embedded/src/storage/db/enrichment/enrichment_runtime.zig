@@ -4839,15 +4839,66 @@ fn restorePersistedRuntimeStatus(runtime: anytype, persisted_status: enrichment_
 // diagnostics and request-owned retry/terminal debt. Ordinary fatal failures
 // and exhausted episodes still require explicit repair.
 fn boundaryFailureReadmission(status: enrichment_state.RuntimeStatus, applied: u64, limit: u32) ?enrichment_state.RuntimeStatus {
-    if (!status.worker_failed or status.target_sequence <= applied or
-        !std.mem.eql(u8, status.last_error_code.slice(), "RuntimeBoundaryFailure") or
-        status.consecutive_retry_count >= limit) return null;
+    if (!status.worker_failed or status.target_sequence <= applied) return null;
+    const code = status.last_error_code.slice();
+    if (std.mem.eql(u8, code, "RuntimeBoundaryFailure")) {
+        if (status.consecutive_retry_count >= limit) return null;
+    } else {
+        // Older owners could spend the pipeline budget on a document
+        // cancellation. Give an upgraded owner one fenced pass over pending
+        // work. Keep the existing checkpoint and request retry history.
+        if (!isLegacyPipelineCancellation(status) or limit < 2 or
+            status.consecutive_retry_count != limit - 1) return null;
+    }
     var admitted = status;
     admitted.worker_failed = false;
     admitted.retrying = true;
     admitted.next_retry_at_ms = 0;
     admitted.consecutive_retry_count += 1;
     return admitted;
+}
+
+fn isLegacyPipelineCancellation(status: enrichment_state.RuntimeStatus) bool {
+    const code = status.last_error_code.slice();
+    return (std.mem.eql(u8, code, "Canceled") or std.mem.eql(u8, code, "Cancelled")) and
+        status.retry_failure_fingerprint == pipelineFailureFingerprint(error.Canceled);
+}
+
+test "enrichment cancellation recovery reserves one replay pass without resetting debt" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased = try backend_erased.storeFrom(alloc, store);
+    defer erased.deinit();
+    const failed: enrichment_state.RuntimeStatus = .{
+        .last_error_code = .init("Canceled"),
+        .target_sequence = 14,
+        .worker_failed = true,
+        .consecutive_retry_count = 5,
+        .retry_failure_count = 5,
+        .retry_failure_fingerprint = pipelineFailureFingerprint(error.Canceled),
+        .terminal_failure_min_sequence = 8,
+        .terminal_failure_max_sequence = 9,
+    };
+    try enrichment_state.saveAppliedSequence(erased, scope_name, 10);
+    try enrichment_state.saveRuntimeStatus(erased, scope_name, failed);
+    const first = try enrichment_state.loadRuntimeObservation(alloc, erased, scope_name);
+    const admitted = boundaryFailureReadmission(first.status, first.applied, 6) orelse return error.TestUnexpectedResult;
+    const reserved = boundaryFailureAdmissionStatus(admitted) orelse return error.TestUnexpectedResult;
+    var expected = failed;
+    expected.consecutive_retry_count = 6;
+    try std.testing.expectEqualDeep(expected, reserved);
+    _ = (try enrichment_state.saveRuntimeStatusAndProjection(alloc, erased, scope_name, first.applied, first.revision, reserved, .repair_required, 0, first.generation, null)) orelse return error.TestUnexpectedResult;
+    const reopened = try enrichment_state.loadRuntimeObservation(alloc, erased, scope_name);
+    try std.testing.expectEqual(first.applied, reopened.applied);
+    try std.testing.expectEqual(first.generation, reopened.generation);
+    try std.testing.expect(boundaryFailureReadmission(reopened.status, reopened.applied, 6) == null);
+    try std.testing.expect(boundaryFailureReadmission(failed, 14, 6) == null);
+    var unrelated = failed;
+    unrelated.retry_failure_fingerprint = 0;
+    try std.testing.expect(boundaryFailureReadmission(unrelated, 10, 6) == null);
 }
 
 fn restoreThreadedRuntimeStatus(runtime: *EnrichmentRuntime, status: enrichment_state.RuntimeStatus) void {
@@ -4859,7 +4910,8 @@ fn restoreThreadedRuntimeStatus(runtime: *EnrichmentRuntime, status: enrichment_
 // must consume this slot rather than silently forgiving the failed episode.
 fn boundaryFailureAdmissionStatus(status: enrichment_state.RuntimeStatus) ?enrichment_state.RuntimeStatus {
     if (status.worker_failed or !status.retrying or status.consecutive_retry_count == 0 or
-        !std.mem.eql(u8, status.last_error_code.slice(), "RuntimeBoundaryFailure")) return null;
+        (!std.mem.eql(u8, status.last_error_code.slice(), "RuntimeBoundaryFailure") and
+            !isLegacyPipelineCancellation(status))) return null;
     var durable = status;
     durable.worker_failed = true;
     durable.retrying = false;
@@ -5305,6 +5357,17 @@ fn checkProviderFailureGuard(runtime: *EnrichmentRuntime) !void {
     try guard.check();
 }
 
+fn isOperationCanceled(err: anyerror) bool {
+    return err == error.Canceled or err == error.Cancelled;
+}
+
+fn assetInvocationFailure(runtime: *EnrichmentRuntime, err: anyerror) anyerror {
+    if (!isOperationCanceled(err)) return err;
+    if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
+    if (runtime.config.cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
+    return error.AssetInvocationCanceled;
+}
+
 fn assetProviderRequestContext(runtime: *EnrichmentRuntime) inference_request_context.RequestContext {
     const guard = runtime.active_provider_guard;
     const cancellation = if (guard.cancellation.ptr != null)
@@ -5381,7 +5444,7 @@ fn assetProducerProduceGuarded(
     const produced = scoped.produce(alloc, request) catch |err| {
         checkProviderFailureGuardRecording(runtime, recovery_key, 1) catch |guard_err| return guard_err;
         if (inferenceControlFailure(err)) noteInferenceControlFailure(runtime, recovery_key, err, 1);
-        return err;
+        return assetInvocationFailure(runtime, err);
     };
     checkProviderFailureGuardRecording(runtime, recovery_key, 1) catch |err| {
         alloc.free(produced);
@@ -5405,7 +5468,7 @@ fn assetProducerProduceBatchGuarded(
     const produced = scoped.produceBatch(alloc, requests) catch |err| {
         checkProviderFailureGuardRecording(runtime, recovery_key, requests.len) catch |guard_err| return guard_err;
         if (inferenceControlFailure(err)) noteInferenceControlFailure(runtime, recovery_key, err, requests.len);
-        return err;
+        return assetInvocationFailure(runtime, err);
     };
     checkProviderFailureGuardRecording(runtime, recovery_key, requests.len) catch |err| {
         for (produced) |output| if (output.len > 0) alloc.free(output);
@@ -5427,7 +5490,7 @@ fn assetProducerProduceBatchReportedGuarded(
     const scoped = scopedAssetProducer(runtime, producer, &cancellation);
     var produced = scoped.produceBatchReported(alloc, requests) catch |err| {
         try checkProviderFailureGuard(runtime);
-        return err;
+        return assetInvocationFailure(runtime, err);
     };
     checkProviderFailureGuard(runtime) catch |err| {
         produced.deinit(alloc);
@@ -5473,7 +5536,7 @@ fn assetProducerProduceBorrowedRasterBatchReportedGuarded(
     const scoped = scopedAssetProducer(runtime, producer, &cancellation);
     var produced = scoped.produceBorrowedRasterBatchReported(alloc, requests, rasters) catch |err| {
         try checkProviderFailureGuard(runtime);
-        return err;
+        return assetInvocationFailure(runtime, err);
     };
     checkProviderFailureGuard(runtime) catch |err| {
         produced.deinit(alloc);
@@ -10082,6 +10145,39 @@ test "foreground enrichment catch-up treats cancellation as a waiter outcome" {
     try std.testing.expectEqual(@as(u64, 0), runtime.error_count);
 }
 
+test "enrichment cancellation distinguishes PDF deadlines and asset invocation failures" {
+    var signal = std.atomic.Value(bool).init(false);
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .cancellation = CancellationToken.fromAtomic(&signal) },
+        .ownership = undefined,
+    };
+    const expired: document_extraction_mod.PdfRenderDeadline = .{ .deadline_ns = 0 };
+    expired.probe().check() catch |err| {
+        const classified = expired.classifyError(err);
+        try std.testing.expectEqual(error.PdfRenderTimeout, classified);
+        try std.testing.expect(!isEnrichmentControlError(classified));
+        try std.testing.expectEqual(EnrichmentErrorDisposition.retryable_request, enrichmentErrorDisposition(classified));
+    };
+    try std.testing.expectEqual(error.WriterLocked, expired.classifyError(error.WriterLocked));
+    const upstream = assetInvocationFailure(&runtime, error.Canceled);
+    try std.testing.expectEqual(error.AssetInvocationCanceled, upstream);
+    try std.testing.expect(!isEnrichmentControlError(upstream));
+    try std.testing.expectEqual(EnrichmentErrorDisposition.retryable_request, enrichmentErrorDisposition(upstream));
+    signal.store(true, .release);
+    try std.testing.expectEqual(error.EnrichmentWaitCanceled, assetInvocationFailure(&runtime, error.Cancelled));
+}
+
 test "enrichment provider deadlines and progress cross native clock boundaries" {
     if (comptime builtin.os.tag == .freestanding) return error.SkipZigTest;
     var clock: platform_clock.ManualClock = .{};
@@ -11269,6 +11365,10 @@ fn runForegroundCatchUpPassGuarded(
         // Request cancellation and the visibility deadline are waiter
         // outcomes, not provider or pipeline failures. Never persist them into
         // the durable worker retry budget.
+        if (isOperationCanceled(err)) {
+            try guard.check();
+            if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
+        }
         if (err == RuntimeError.EnrichmentWaitCanceled or
             err == RuntimeError.EnrichmentWaitTimeout or
             err == error.EnrichmentReplayAuthorityBusy or
@@ -16040,7 +16140,7 @@ const PreparedDocumentSourceCache = struct {
             self.mutex.unlock(self.io);
             return lease;
         } else |err| {
-            const classified = self.classifyPreparationError(err);
+            const classified = self.classifyPreparationError(variant.deadline.classifyError(err));
             alloc.destroy(variant);
             self.mutex.lockUncancelable(self.io);
             self.finishPendingPdfAssumeLocked(entry, decode_limits);
@@ -18098,7 +18198,8 @@ fn processPlannedAsset(
         try processAssetOrDefer(runtime, request, deferred, prepared_sources, window);
         return true;
     }
-    var scope = FailureScope{ .fingerprint = runtime.active_failure_fingerprint };
+    var scope = FailureScope{};
+    scope.enterRequest(request);
     var batch = PreparedAssetBatch{};
     defer batch.deinit(runtime.alloc);
     processAsset(runtime, request, &batch, prepared_sources, window, &scope) catch |err| return scope.scannerFailure(runtime, err);
@@ -18421,15 +18522,16 @@ fn flushTextAssetProducerBatchItems(
         scope.enterAsset(item);
         switch (produced.result) {
             .item_error => |failure| {
-                if (isEnrichmentControlError(failure.cause) or enrichmentErrorDisposition(failure.cause) == .fatal_worker)
-                    return failure.cause;
+                const cause = assetInvocationFailure(runtime, failure.cause);
+                if (isEnrichmentControlError(cause) or enrichmentErrorDisposition(cause) == .fatal_worker)
+                    return cause;
                 // The exact item identity is consulted for its durable
                 // budget. Independent successful items publish even when a
                 // sibling still needs another attempt.
                 setRetryAfterHintFor(runtime, scope.fingerprint, failure.retry_after_ms);
-                if (failure.retryable and try scope.shouldYield(runtime, failure.cause)) {
-                    outcome.deferRetry(scope, failure.cause);
-                } else try recordAssetProducerFailure(runtime, window, item.*, failure.cause, scope.attemptNumber(runtime));
+                if (failure.retryable and try scope.shouldYield(runtime, cause)) {
+                    outcome.deferRetry(scope, cause);
+                } else try recordAssetProducerFailure(runtime, window, item.*, cause, scope.attemptNumber(runtime));
             },
             .value => |output| {
                 applyAssetProducerBatchOutput(runtime, item, output, window) catch |err| {
@@ -19670,7 +19772,10 @@ fn processDocumentExtractionAsset(
             scopedRetryHint(runtime.config.fetch_retry_hint, request, raw_doc),
         ),
     ) catch |raw_err| {
-        const err: anyerror = if (raw_err == error.OutOfMemory and
+        if (isOperationCanceled(raw_err)) try checkProviderFailureGuard(runtime);
+        const err: anyerror = if (isOperationCanceled(raw_err))
+            assetInvocationFailure(runtime, raw_err)
+        else if (raw_err == error.OutOfMemory and
             prepared_sources.budgeted != null and prepared_sources.budgeted.?.denied())
             documentExtractionBudgetDenialError(&prepared_sources.budgeted.?)
         else
@@ -19872,11 +19977,11 @@ fn processDocumentExtractionAsset(
     const document_extraction_alloc = if (source_is_pdf) pdf_inspection_reservation.allocator() else runtime.alloc;
     var pdf_inspection_deadline = document_extraction_mod.PdfRenderDeadline.init(runtime.syncWaitTimeoutMs());
     var prepared_pdf_session: ?document_extraction_mod.PdfRenderSession = if (prepared_pdf_source) |source|
-        try document_extraction_mod.PdfRenderSession.initFromPrepared(
+        document_extraction_mod.PdfRenderSession.initFromPrepared(
             document_extraction_alloc,
             source,
             pdf_inspection_deadline.probe(),
-        )
+        ) catch |err| return pdf_inspection_deadline.classifyError(err)
     else
         null;
     if (prepared_pdf_session) |*session| try session.setDecodeLimits(extraction_config.pdf_decode_limits);
@@ -19976,7 +20081,7 @@ fn processDocumentExtractionAsset(
         config.pdf_decode_limits = configured_pdf_decode_limits;
         config.pdf_render_max_inflight_bytes = configured_pdf_render_inflight_bytes;
         const err: anyerror = if (raw_err != error.OutOfMemory)
-            raw_err
+            pdf_inspection_deadline.classifyError(raw_err)
         else if (pdf_inspection_reservation.limit_exceeded)
             error.DocumentExtractionWorkingSetTooLarge
         else if (collection_budgeted != null and collection_budgeted.?.denied())
@@ -24037,7 +24142,7 @@ fn renderRuntimePdfWindow(
     admission_phase = "render";
     var deferred_render: ?PdfDeferredRenderRetry = null;
     errdefer if (deferred_render) |*retry| retry.deinit(alloc);
-    var batch = try renderAdmittedPdfWindowBatchAlloc(runtime, session, lease, prepared_plans[0..requests.items.len], .{
+    var batch = renderAdmittedPdfWindowBatchAlloc(runtime, session, lease, prepared_plans[0..requests.items.len], .{
         .max_batch_pages = max_pages,
         .max_parallel_pages = parallel_pages,
         .max_inflight_pixels = config.pdf_render_max_inflight_pixels,
@@ -24047,7 +24152,10 @@ fn renderRuntimePdfWindow(
         .profile = .ocr,
         .cancellation = render_cancellation.probe(),
         .executor_io = runtime.config.io,
-    }, use_borrowed_rasters, max_inflight_bytes, if (batch_policy.defer_render_pressure) &deferred_render else null);
+    }, use_borrowed_rasters, max_inflight_bytes, if (batch_policy.defer_render_pressure) &deferred_render else null) catch |err| {
+        if (isOperationCanceled(err)) try cancellation.check();
+        return render_cancellation.deadline.classifyError(err);
+    };
     errdefer switch (batch) {
         inline else => |*value| value.deinit(lease.allocator()),
     };
@@ -24133,7 +24241,13 @@ const RuntimePdfRenderWindowPreparer = struct {
             start_index,
             self.use_borrowed_rasters,
             self.cancellationProbe(),
-        );
+        ) catch |err| {
+            if (isOperationCanceled(err)) {
+                try self.guard.check();
+                if (self.lifecycle.isCancelled() or self.cancel_requested.load(.acquire)) return err;
+            }
+            return self.coordinator.deadline.classifyError(err);
+        };
         errdefer window.deinit();
         if (self.cancel_requested.load(.acquire)) return error.Canceled;
         return window;
@@ -24204,6 +24318,7 @@ fn checkPdfPrefetchRetry(err: anyerror) !void {
         error.ResourceTemporarilyUnavailable,
         error.DocumentExtractionWorkingSetTooLarge,
         error.Canceled,
+        error.PdfRenderTimeout,
         => {},
         else => err,
     };
@@ -24777,8 +24892,11 @@ fn runtimeGeneratedTextBatchFailureToYield(
     items: []const asset_producer_mod.ProducedItem,
 ) ?inference_work.ItemFailure {
     for (items) |item| switch (item.result) {
-        .item_error => |failure| {
-            if (failure.retryable and shouldYieldRequestError(runtime, failure.cause))
+        .item_error => |raw_failure| {
+            var failure = raw_failure;
+            failure.cause = assetInvocationFailure(runtime, failure.cause);
+            if (isEnrichmentControlError(failure.cause) or
+                (failure.retryable and shouldYieldRequestError(runtime, failure.cause)))
                 return failure;
         },
         .value => {},
@@ -25005,7 +25123,7 @@ fn applyRuntimeGeneratedTextBatch(
     for (produced_batch.items, unit_indices, 0..) |*item, unit_idx, i| {
         switch (item.result) {
             .item_error => |failure| {
-                staged_updates[i] = try stageRuntimeGeneratedUnitFailure(alloc, units[unit_idx], method, kind, failure.cause);
+                staged_updates[i] = try stageRuntimeGeneratedUnitFailure(alloc, units[unit_idx], method, kind, assetInvocationFailure(runtime, failure.cause));
             },
             .value => |output| {
                 staged_updates[i] = try cloneDocumentExtractionUnit(alloc, units[unit_idx]);
