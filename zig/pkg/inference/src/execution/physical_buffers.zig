@@ -2362,21 +2362,23 @@ pub const Frame = struct {
                 if (lease.references.load(.acquire) != 1 + capture_pin + private_pins + program_pins) return null;
             }
             if (identity) |expected| {
-                if (requirement) |refined| {
+                const retained = lease.backing_byte_size orelse lease.byte_size;
+                const bound = if (requirement != null) blk: {
                     if (id >= self.pool.storage_requirement_bounds.len) return error.InvalidPhysicalAllocation;
-                    const bound = self.pool.storage_requirement_bounds[id];
-                    if (!shared_literal and bound != 0) {
-                        const retained = lease.backing_byte_size orelse lease.byte_size;
+                    break :blk self.pool.storage_requirement_bounds[id];
+                } else null;
+                if (requirement) |refined| {
+                    if (!shared_literal and bound.? != 0) {
                         const domain = if (lease.backend.kind() == .native) &refined.host_scratch_bytes else &refined.backend_scratch_bytes;
-                        if (domain.* < bound) return error.InvalidPhysicalStorageReservation;
-                        domain.* = try std.math.add(usize, domain.* - bound, retained);
+                        if (domain.* < bound.?) return error.InvalidPhysicalStorageReservation;
+                        domain.* = try std.math.add(usize, domain.* - bound.?, retained);
                     }
                 }
                 if (lease.admission) |reserved| {
                     if (!reserved.identity.eql(expected)) return null;
                     // Shared literal ownership cannot be lent by an exclusive frame.
-                    if (shared_literal) continue;
-                    const owned = lease.admittedAmounts();
+                    if (shared_literal or bound == 0) continue;
+                    const owned = reserved.amountsForBytes(@min(retained, lease.admittedBytes()));
                     credit.host_scratch_bytes = try std.math.add(usize, credit.host_scratch_bytes, owned.host_scratch_bytes);
                     credit.backend_scratch_bytes = try std.math.add(usize, credit.backend_scratch_bytes, owned.backend_scratch_bytes);
                 }
@@ -2395,7 +2397,7 @@ pub const Frame = struct {
     }
     fn hostOwnedAmounts(reserved: *const admission.Reservation, owner: ?*const @import("backing_retirement.zig").BackingOwner, actual_bytes: usize) @import("../runtime/tier/memory.zig").AdmissionAmounts {
         if (owner) |value| return value.charge.storageAmountsForBytes(@min(actual_bytes, value.admittedBytes()));
-        return reserved.amounts();
+        return reserved.amountsForBytes(@min(actual_bytes, reserved.reservedBytes()));
     }
     fn adoptAdmission(self: *Frame, capability: admission.Capability) !void {
         if (self.host_workspace_admission) |existing| {
