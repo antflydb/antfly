@@ -53107,6 +53107,57 @@ pub const PagedRelativeBf16Attention = struct {
     query: geometry.Query,
     range: StagedRange,
 
+    pub const Planes = struct { key: *MetalTensor, value: *MetalTensor };
+    pub const SourcePlanes = struct { key: *const MetalTensor, value: *const MetalTensor };
+
+    /// Stage the append suffix into the already admitted physical visit planes.
+    /// The request owns the frame, and can publish the transaction after its fence.
+    pub fn stageRows(
+        runtime: *RawMetalDecodeRuntime,
+        append: *@import("../runtime/kv/hybrid_paged.zig").Append,
+        group: @import("../runtime/kv/hybrid_paged.zig").Group,
+        kv_heads: u32,
+        source: SourcePlanes,
+        destination: Planes,
+    ) !void {
+        if (!hasActiveFrame(runtime)) return error.MetalFrameRequired;
+        if (kv_heads == 0 or kv_heads > 64) return error.InvalidShape;
+        const row_bytes = @as(usize, kv_heads) * 256;
+        const range = try append.stagedRange(group);
+        const plane_bytes = try std.math.mul(usize, try range.physicalRows(), row_bytes);
+        const start = append.sequence.committed_tokens;
+        const input_bytes = try std.math.mul(usize, range.visible_end - start, row_bytes);
+        for ([_]*const MetalTensor{ source.key, source.value }, [_]*MetalTensor{ destination.key, destination.value }) |src, dst| {
+            if (dst.isReadOnlyPhysical()) return error.ReadOnlyPhysicalStorage;
+            if (src.dtype != .i16 or dst.dtype != .i16 or src.deviceHandle() == null or dst.deviceHandle() == null)
+                return error.UnsupportedTensorType;
+            if (src.deviceByteLen() < input_bytes or dst.deviceByteLen() < plane_bytes)
+                return error.InvalidShape;
+        }
+
+        var position = start;
+        while (position < range.visible_end) {
+            const logical = position / range.page_tokens;
+            const within_page = position % range.page_tokens;
+            const page = append.pageId(group, logical) orelse return error.InvalidKvRange;
+            if (page >= range.physical_pages) return error.InvalidKvRange;
+            const rows = @min(range.visible_end - position, range.page_tokens - within_page);
+            const bytes = rows * row_bytes;
+            const source_offset = (position - start) * row_bytes;
+            const destination_offset = (@as(usize, page) * range.page_tokens + within_page) * row_bytes;
+            const elements = std.math.cast(i32, bytes / 2) orelse return error.InvalidShape;
+            for ([_]*const MetalTensor{ source.key, source.value }, [_]*MetalTensor{ destination.key, destination.value }) |src, dst| {
+                var input = try src.retainedView(source_offset, bytes, &.{elements});
+                defer input.deinit();
+                var output = try dst.retainedView(destination_offset, bytes, &.{elements});
+                defer output.deinit();
+                dst.invalidateHostMirror();
+                try input.copyInto(&output);
+            }
+            position += rows;
+        }
+    }
+
     pub const Inputs = struct {
         query: *const MetalTensor,
         keys: *const MetalTensor,
@@ -53221,4 +53272,85 @@ test "Metal paged relative attention resolves shuffled pages with sink and gate"
     const expected = [4]u16{ 0x3f80, 0x4000, 0x3f83, 0x4080 };
     for (expected, 0..) |bits, head|
         for (output[head * 128 ..][0..128]) |value| try std.testing.expectEqual(bits, value);
+}
+
+test "Metal paged relative attention reads KV staged in the same frame" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const metadata = @import("../runtime/kv/hybrid_paged.zig");
+    const kv_storage = @import("../runtime/kv/storage.zig");
+    const layout: metadata.Layout = .{ .page_tokens = 2, .max_tokens = 4, .window_tokens = 4, .max_append_tokens = 2 };
+    const pool_config: @import("../runtime/kv/pool.zig").KvPoolConfig = .{
+        .backend = .metal,
+        .dtype = .bf16,
+        .page_size_tokens = 2,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 128,
+        .store_cpu_bytes = false,
+    };
+    var full = try kv_storage.initHost(a, pool_config);
+    defer full.deinit(a);
+    var sliding = try kv_storage.initHost(a, pool_config);
+    defer sliding.deinit(a);
+    var sequence = try metadata.Sequence.init(a, layout, &full, &sliding);
+    defer sequence.deinit();
+    {
+        var prefix = try sequence.prepareAppend(1);
+        defer prefix.abort();
+        prefix.commit();
+    }
+    var append = try sequence.prepareAppend(2);
+    defer append.abort();
+    var ids: [2]u32 = undefined;
+    try std.testing.expectEqual(ids.len, try append.stagedPageIds(.full, &ids));
+
+    var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const attention: PagedRelativeBf16Attention = .{
+        .query = .{ .rows = 1, .start = 2, .q_heads = 1, .kv_heads = 1, .relative_extent = 0, .score_scale = 1 },
+        .range = try append.stagedRange(.full),
+    };
+    const zeros: [512]u16 = @splat(0);
+    var values: [256]u16 = undefined;
+    @memset(values[0..128], 0x4000);
+    @memset(values[128..], 0x4080);
+    const dtypes: [9]metal_tensor.DType = .{ .i16, .i16, .i16, .i16, .i16, .i32, .i16, .f32, .i16 };
+    const sizes = [9]i32{ 128, 512, 512, 256, 256, 2, 1, try attention.scratchElements(), 128 };
+    const payloads: [7][]const u8 = .{
+        std.mem.sliceAsBytes(zeros[0..128]), std.mem.asBytes(&zeros),  std.mem.asBytes(&zeros),
+        std.mem.sliceAsBytes(zeros[0..256]), std.mem.asBytes(&values), std.mem.asBytes(&ids),
+        std.mem.sliceAsBytes(zeros[0..1]),
+    };
+    var tensors: [9]MetalTensor = undefined;
+    var count: usize = 0;
+    defer for (tensors[0..count]) |*tensor| tensor.deinit();
+    for (&tensors, dtypes, sizes, 0..) |*tensor, dtype, size, index| {
+        tensor.* = try MetalTensor.deviceAllocateTyped(a, runtime, dtype, .shared, &.{size});
+        count += 1;
+        if (index < payloads.len) try tensor.uploadBytes(payloads[index]);
+    }
+
+    try beginFrame(runtime);
+    errdefer cancelFrame(runtime) catch {};
+    try PagedRelativeBf16Attention.stageRows(runtime, &append, .full, 1, .{ .key = &tensors[3], .value = &tensors[4] }, .{ .key = &tensors[1], .value = &tensors[2] });
+    try attention.encode(runtime, .{
+        .query = &tensors[0],
+        .keys = &tensors[1],
+        .values = &tensors[2],
+        .relative = null,
+        .page_ids = &tensors[5],
+        .sinks = &tensors[6],
+        .gates = &tensors[0],
+    }, &tensors[7], &tensors[8]);
+    try std.testing.expectEqual(@as(usize, 1), sequence.committed_tokens);
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+    append.commit();
+    try std.testing.expectEqual(@as(usize, 3), sequence.committed_tokens);
+
+    var output: [128]u16 = undefined;
+    try tensors[8].downloadBytesInto(std.mem.asBytes(&output));
+    for (output) |value| try std.testing.expectEqual(@as(u16, 0x3f40), value);
 }
