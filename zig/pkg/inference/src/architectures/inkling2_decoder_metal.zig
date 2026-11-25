@@ -218,7 +218,10 @@ pub const Request = struct {
     /// Initialize the request in its final storage so that KV's metadata pools
     /// retain stable addresses across submissions.
     pub fn init(self: *Request, a: std.mem.Allocator, model: *const Decoder, max_tokens: u32) !void {
-        const plan = try RequestPlan.init(model, max_tokens);
+        try self.initWithPlan(a, model, try RequestPlan.init(model, max_tokens));
+    }
+
+    pub fn initWithPlan(self: *Request, a: std.mem.Allocator, model: *const Decoder, plan: RequestPlan) !void {
         const runtime = model.runtime;
         self.* = .{ .model = model, .state = undefined, .stack = undefined, .attention_workspace = undefined, .temps = undefined, .host_logits = undefined, .allocator = a };
         self.host_logits = try a.alloc(f32, plan.elements[@backingInt(Temp.logits)]);
@@ -546,4 +549,22 @@ test "Inkling Metal resident decoder executes the full visit schedule on a synth
     try std.testing.expectApproxEqAbs(@as(f32, 0.76159416), logits[0], 0.00001);
     try std.testing.expectApproxEqAbs(@as(f32, -0.76159416), logits[1], 0.00001);
     try std.testing.expectEqual(@as(usize, 2), request.state.sequence.committed_tokens);
+    const hf_tokenizer = @import("inference_hf_tokenizer");
+    var hf = try hf_tokenizer.HfTokenizer.loadFromBytes(a,
+        \\{"version":"1.0","added_tokens":[{"id":14,"content":"<|end_message|>"}],"model":{"type":"BPE","unk_token":"<unk>","vocab":{"x":0,"y":1,"<unk>":2,"<|end_message|>":14},"merges":[]}}
+    );
+    defer hf.deinitSelf();
+    var pipeline = @import("inkling2_session_metal.zig").TextPipeline{
+        .allocator = a,
+        .tokenizer = hf.tokenizer(),
+        .control = .{},
+        .prompt = .{ .before_image = &.{}, .after_image = try a.dupe(i32, &.{1}), .image = null, .initial_channel = null },
+        .options = .{},
+    };
+    defer pipeline.deinit();
+    var generated = try pipeline.generate(&model, 1, .{ .max_tokens = 2, .ignore_eos = true }, .{});
+    defer generated.deinit();
+    try std.testing.expectEqualSlices(i32, &.{ 0, 1 }, generated.token_ids.?);
+    try std.testing.expectEqualStrings("length", generated.finish_reason);
+    try std.testing.expectEqual(@as(usize, 1), generated.prompt_tokens);
 }
