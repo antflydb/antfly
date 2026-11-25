@@ -19002,6 +19002,11 @@ pub const Node = struct {
             );
         }
 
+        var cuda_profile = if (!isolated_generation and (owns_generation_lock or prepared_generation != null))
+            session_factory.GenerationCudaProfile.begin(model.session, &pipeline.cb)
+        else
+            null;
+        defer if (cuda_profile) |profile| profile.finish(model.session, false);
         const server_a4b_telemetry_before = serverA4bTelemetrySnapshot(&pipeline.cb);
         var telemetry_pending = true;
         defer if (telemetry_pending) logServerA4bTelemetry(&pipeline.cb, server_a4b_telemetry_before, body.model);
@@ -19012,6 +19017,10 @@ pub const Node = struct {
             return generationErrorResponse(ctx, err);
         };
         defer result.deinit();
+        if (cuda_profile) |profile| {
+            profile.finish(model.session, true);
+            cuda_profile = null;
+        }
         if (result.text.len > 0) model.generation_admission.noteFirstContent(generation_request_started_ns);
         if (native_transfer) |transfer| if (transfer.prepare) |prepare| {
             // The result owns only host arrays. Retire request GPU storage and

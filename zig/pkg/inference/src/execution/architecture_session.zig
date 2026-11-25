@@ -4912,6 +4912,42 @@ pub fn cudaOpProfileLoggingEnabled() bool {
     return cuda_compute_mod.cudaPrefillOpProfileEnabled() or cuda_compute_mod.cudaDecodeProfileEnabled();
 }
 
+/// Buffered generation may collect request-level events while it holds
+/// exclusive access to the original model provider.
+pub const GenerationCudaProfile = struct {
+    before: CudaRuntimeStats,
+
+    pub fn begin(session: Session, backend: *const ops.ComputeBackend) ?GenerationCudaProfile {
+        if (comptime build_options.enable_cuda) {
+            if (backend.execution_owner != 0 or backend.kind() != .cuda or !cudaOpProfileLoggingEnabled()) return null;
+            if (session.vtable != &arch_vtable) return null;
+            const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+            if (self.backend_type != .cuda or backend.ptr != @as(*anyopaque, @ptrCast(self.backend_data.cuda.compute))) return null;
+            drainCudaProfile(session);
+            return .{ .before = getCudaRuntimeStats(session).? };
+        }
+        return null;
+    }
+
+    pub fn finish(self: GenerationCudaProfile, session: Session, complete: bool) void {
+        if (comptime build_options.enable_cuda) {
+            drainCudaProfile(session);
+            const after = getCudaRuntimeStats(session) orelse return;
+            const outcome = if (complete) "complete" else "partial";
+            if (after.profile_collection_failures == std.math.maxInt(usize) or after.profile_collection_failures != self.before.profile_collection_failures) {
+                std.log.warn("cuda_generate_profile: status=unavailable reason=CudaProfileCollectionIncomplete request_outcome={s}", .{outcome});
+                return;
+            }
+            const delta = cudaStatsDelta(after, self.before);
+            if (delta.decode_profile_events == 0 and delta.prefill_profile_events == 0) return;
+            var lines: [1536]u8 = undefined;
+            const decode = formatCudaDecodeProfileLine(lines[0..768], delta);
+            const prefill = formatCudaPrefillProfileLine(lines[768..], delta);
+            std.log.info("cuda_generate_profile: scope=request status=observed request_outcome={s} {s} {s}", .{ outcome, decode, prefill });
+        }
+    }
+};
+
 /// Saturating per-field delta of two CUDA runtime-stat snapshots. Shared by the
 /// CLI and the server so a request's profile line reflects that request alone.
 pub fn cudaStatsDelta(after: CudaRuntimeStats, before: CudaRuntimeStats) CudaRuntimeStats {
