@@ -152,7 +152,7 @@ pub const EncoderDecoderPipeline = struct {
             .incremental_with_vocabulary = .{ .vocabulary = self.config.vocab_size, .allow_native = self.batch_dispatch == null },
         });
         defer encoded.deinit(allocator);
-        return self.greedyDecodeOutputs(allocator, &encoded, mask, input_ids.len);
+        return self.greedyDecodeOutputs(allocator, &encoded, mask, input_ids.len, self.batch_dispatch == null);
     }
 
     /// Greedy autoregressive decode from encoder outputs.
@@ -164,7 +164,7 @@ pub const EncoderDecoderPipeline = struct {
         encoder_seq_len: usize,
     ) !EncoderDecoderResult {
         var encoded = stage_runtime.EncoderOutputs{ .host = encoder_outputs };
-        return self.greedyDecodeOutputs(allocator, &encoded, encoder_attention_mask, encoder_seq_len);
+        return self.greedyDecodeOutputs(allocator, &encoded, encoder_attention_mask, encoder_seq_len, false);
     }
 
     fn greedyDecodeOutputs(
@@ -173,6 +173,7 @@ pub const EncoderDecoderPipeline = struct {
         encoder_outputs: *stage_runtime.EncoderOutputs,
         encoder_attention_mask: []const i64,
         encoder_seq_len: usize,
+        retire_encoder: bool,
     ) !EncoderDecoderResult {
         const max_len = self.config.max_length;
         var output_ids = std.ArrayListUnmanaged(i32).empty;
@@ -197,6 +198,7 @@ pub const EncoderDecoderPipeline = struct {
                 else => return err,
             };
             defer row.deinit();
+            if (retire_encoder) numerical.retireEncoderAfterPrefill(encoder_outputs);
             if (self.config.vocab_size == 0 or row.logits.len != self.config.vocab_size) return error.LogitsSizeMismatch;
             var best: usize = 0;
             for (row.logits[1..], 1..) |value, index| if (value > row.logits[best]) {
@@ -546,9 +548,9 @@ test "encoder decoder task shares actual resident and host route owner without c
         var host_encoded = stage_runtime.EncoderOutputs{ .host = try encoder.runWithControl(&.{pixels}, a, null) };
         defer host_encoded.deinit(a);
         var task = EncoderDecoderPipeline{ .allocator = a, .encoder = encoder, .decoder = decoder, .owns_sessions = false, .config = .{ .vocab_size = 3, .max_length = 1, .decoder_start_token_id = 0, .eos_token_id = 2 } };
-        var actual = try task.greedyDecodeOutputs(a, &encoded, &.{1}, 1);
+        var actual = try task.greedyDecodeOutputs(a, &encoded, &.{1}, 1, false);
         defer actual.deinit();
-        var expected = try task.greedyDecodeOutputs(a, &host_encoded, &.{1}, 1);
+        var expected = try task.greedyDecodeOutputs(a, &host_encoded, &.{1}, 1, false);
         defer expected.deinit();
         try std.testing.expectEqualSlices(i32, &.{ 0, 1 }, actual.text_ids);
         try std.testing.expectEqualSlices(i32, expected.text_ids, actual.text_ids);
@@ -558,12 +560,12 @@ test "encoder decoder task shares actual resident and host route owner without c
             }
         };
         task.execution_control = .{ .check_fn = Cancel.check };
-        try std.testing.expectError(error.Cancelled, task.greedyDecodeOutputs(a, &encoded, &.{1}, 1));
+        try std.testing.expectError(error.Cancelled, task.greedyDecodeOutputs(a, &encoded, &.{1}, 1, false));
         if (kind == .native) {
             task.execution_control = null;
             const Case = struct {
                 fn run(allocator: std.mem.Allocator, pipeline: *EncoderDecoderPipeline, values: *stage_runtime.EncoderOutputs) !void {
-                    var result = try pipeline.greedyDecodeOutputs(allocator, values, &.{1}, 1);
+                    var result = try pipeline.greedyDecodeOutputs(allocator, values, &.{1}, 1, false);
                     defer result.deinit();
                     try std.testing.expectEqualSlices(i32, &.{ 0, 1 }, result.text_ids);
                 }

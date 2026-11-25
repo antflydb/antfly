@@ -138,6 +138,7 @@ pub const State = struct {
     logits_index: usize,
     /// Encoder buffers and mask are pinned by the enclosing generation request.
     encoder: sessions.StageInput,
+    retired_encoder_shape: ?[3]i64 = null,
     mask: []const i64,
     position: usize = 0,
     vocab_size: usize,
@@ -214,6 +215,25 @@ pub const State = struct {
         return .{ .data = @constCast(data), .shape = shape, .dtype = info.dtype, .name = info.name, .allocator = self.allocator, .owns_data = false, .owns_shape = false };
     }
 
+    /// Return permission to retire the caller's original output after prefill.
+    /// No retained cache may still depend on the producer or its frame banks.
+    pub fn detachEncoderPayload(self: *State) bool {
+        if (self.position == 0 or self.retired_encoder_shape != null or
+            !@import("../backends/imported_onnx_session.zig").cachedEncoderShapeOnly(self.session)) return false;
+        const slots = self.resident_slots orelse return false;
+        for (self.roles, slots[0..self.roles.len]) |role, slot| {
+            if (role == .past and (slot == null or !slot.?.independent)) return false;
+        }
+        const shape = switch (self.encoder) {
+            .host => |host| host.shape,
+            .resident => |resident| resident.shape,
+        };
+        if (shape.len != 3) return false;
+        self.retired_encoder_shape = shape[0..3].*;
+        self.encoder = .{ .host = .{ .name = "encoder_hidden_states", .dtype = .f32, .shape = &.{}, .data = &.{}, .allocator = self.allocator, .owns_data = false, .owns_shape = false } };
+        return true;
+    }
+
     /// Each cache binding retains its producer independently. Omitted cross
     /// outputs keep their previous pin without retaining a chain of results.
     pub fn stepResident(self: *State, suffix: Suffix, control: ?Control) ![]f32 {
@@ -239,7 +259,10 @@ pub const State = struct {
         for (self.session.inputInfo(), self.roles, slots, self.stage_inputs) |info, *role, *slot, *binding| {
             binding.* = switch (role.*) {
                 .tokens => .{ .host = self.borrow(info, &token_shape, std.mem.sliceAsBytes(suffix.tokens)) },
-                .encoder => self.encoder,
+                .encoder => if (self.retired_encoder_shape) |*shape|
+                    .{ .host = self.borrow(info, shape, &.{}) }
+                else
+                    self.encoder,
                 .mask => .{ .host = self.borrow(info, &mask_shape, std.mem.sliceAsBytes(self.mask)) },
                 .cache_branch => .{ .host = self.borrow(info, info.shape, &branch) },
                 .past => |*past| if (slot.*) |*owned| resident: {

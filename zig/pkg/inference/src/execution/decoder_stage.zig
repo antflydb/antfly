@@ -183,6 +183,14 @@ pub const Decoder = struct {
         });
     }
 
+    pub fn retireEncoderAfterPrefill(self: *Decoder, encoder: *stages.EncoderOutputs) void {
+        if (self.encoder != encoder) return;
+        const state = if (self.incremental) |*value| value else return;
+        if (!state.detachEncoderPayload()) return;
+        encoder.deinit(self.allocator);
+        encoder.* = .{ .host = &.{} };
+    }
+
     pub fn deinit(self: *Decoder) void {
         if (self.native) |*value| value.deinit();
         if (self.compiled) |*value| value.deinit();

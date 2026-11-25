@@ -88,6 +88,7 @@ pub const ImportedOnnxSession = struct {
     shape_template: ?[]u8 = null,
     packed_projections: onnx_projection_pack.Registry = .{},
     cache_branch: bool = false,
+    cached_encoder_shape_only: bool = false,
     requested_strategy: graph_runtime_mod.Strategy = .interpreter,
     io: ?std.Io = null,
     specialization_mutex: std.atomic.Mutex = .unlocked,
@@ -425,6 +426,50 @@ fn collectShapeTemplateReferences(allocator: std.mem.Allocator, graph: onnx_grap
 
 const cache_branch_name = "use_cache_branch";
 
+/// After concrete input-shape specialization, Shape reads no payload. Reject
+/// nested captures and direct graph outputs unless their custody is explicit.
+fn cachedEncoderUsesOnlyShape(graph: *const onnx_graph.GraphProto) bool {
+    const encoder = "encoder_hidden_states";
+    for (graph.outputs) |output| if (std.mem.eql(u8, output.name, encoder)) return false;
+    var found_cache_branch = false;
+    for (graph.nodes) |node| {
+        if (!nodeUsesEncoderShapeOnly(node)) return false;
+        const cache = std.mem.eql(u8, node.op_type, "If") and node.domain.len == 0 and
+            node.inputs.len == 1 and std.mem.eql(u8, node.inputs[0], cache_branch_name);
+        if (!cache) {
+            for (node.attributes) |attr| if (attr.g != null or attr.graphs.len != 0) return false;
+            continue;
+        }
+        if (found_cache_branch) return false;
+        var then_branch: ?*const onnx_graph.GraphProto = null;
+        for (node.attributes) |*attr| {
+            if (attr.graphs.len != 0) return false;
+            if (attr.g) |*nested| {
+                if (std.mem.eql(u8, attr.name, "then_branch")) {
+                    if (then_branch != null) return false;
+                    then_branch = nested;
+                } else if (!std.mem.eql(u8, attr.name, "else_branch")) return false;
+            }
+        }
+        const cached = then_branch orelse return false;
+        for (cached.outputs) |output| if (std.mem.eql(u8, output.name, encoder)) return false;
+        for (cached.nodes) |child| {
+            if (!nodeUsesEncoderShapeOnly(child)) return false;
+            for (child.attributes) |attr| if (attr.g != null or attr.graphs.len != 0) return false;
+        }
+        found_cache_branch = true;
+    }
+    return found_cache_branch;
+}
+
+fn nodeUsesEncoderShapeOnly(node: onnx_graph.NodeProto) bool {
+    for (node.inputs) |input| {
+        if (!std.mem.eql(u8, input, "encoder_hidden_states")) continue;
+        if (node.inputs.len != 1 or node.domain.len != 0 or !std.mem.eql(u8, node.op_type, "Shape")) return false;
+    }
+    return true;
+}
+
 /// Only the declared ONNX decoder control is specialized. A runtime data
 /// condition cannot be bound by a shape-only or resident-only caller.
 fn cacheBranchBinding(model: *onnx_graph.Model, inputs: ?session_mod.ShapeInputs) !?onnx_graph.Model.BooleanBinding {
@@ -629,6 +674,7 @@ pub fn createSessionWithOptions(
         .program = program,
         .input_node_ids = owned_input_ids,
         .cache_branch = boolean != null,
+        .cached_encoder_shape_only = boolean != null and cachedEncoderUsesOnlyShape(model.graph() orelse return error.InvalidOnnxGraph),
         .input_info = undefined,
         .output_info = undefined,
         .static_runtime_inputs = undefined,
@@ -1147,6 +1193,12 @@ fn runWithControl(
 
 /// Branch lowering can build shape programs that still require dynamic
 /// execution support. Keep the ordinary decoder available for those exports.
+pub fn cachedEncoderShapeOnly(session: Session) bool {
+    if (session.vtable != &imported_session_vtable) return false;
+    const self: *const ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
+    return self.cached_encoder_shape_only;
+}
+
 pub fn supportsMergedCacheBranch(session: Session) bool {
     if (session.vtable != &imported_session_vtable) return true;
     const self: *const ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
@@ -7597,9 +7649,7 @@ fn qualifyT5CachedRows(a: std.mem.Allocator, session: Session, selected: []const
                     null;
                 defer stopT5CudaProfile(&profile);
                 const row = try state.stepResident(.{ .position = start, .tokens = tokens[start..end] }, control);
-                // The cached branch only needs the encoder shape. Removing the
-                // bytes here proves the prepared ingress never imports them.
-                if (offset == 0) state.encoder.host.data = &.{};
+                if (offset == 0 and session.run_admission != null) try std.testing.expect(state.detachEncoderPayload());
                 elapsed.* = platform.time.monotonicNs() - before;
                 stopT5CudaProfile(&profile);
                 if (observe_replay) {
