@@ -717,12 +717,20 @@ pub fn prepareWithOptions(
                 cuda_compute.configureBoundedTemporaryReuse();
             }
 
+            const mqa = host_weights_owner.architecture.gpt.num_key_value_heads == 1;
+            const automatic_mqa = mqa and plan.automatic and qualified_warp;
+            if (automatic_mqa) {
+                if (cuda_compute.kernels.gqa_prefill_profile == .automatic and
+                    platform.env.getenv("ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE") == null)
+                    cuda_compute.kernels.gqa_prefill_profile = .mma;
+                if (platform.env.getenv("ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX") == null)
+                    cuda_compute.tuned_route_gates.lm_head_q8_1_argmax = true;
+            }
             plan.warp_decode = plan.warp_decode and (qualified_warp or requested_sm89);
             if (plan.warp_decode) {
                 cuda_compute.kernels.f16_gqa_warp_split_enabled = true;
                 cuda_compute.kernels.f16_mqa_warp_split_enabled = qualified_warp and
-                    host_weights_owner.architecture.gpt.num_key_value_heads == 1 and
-                    platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_F16_MQA_WARP_SPLIT");
+                    mqa and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_F16_MQA_WARP_SPLIT", automatic_mqa);
                 cuda_compute.kernels.gqa_score_prework_mode = @import("../ops/cuda/kernels.zig").scorePreworkModeForPartitionedDecode(
                     cuda_compute.kernels.gqa_score_prework_mode,
                     cuda_compute.kernels.gqa_score_prework_consumer_mode,

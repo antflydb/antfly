@@ -1909,22 +1909,15 @@ fn cudaDecodeGraphReplayMode() CudaDecodeGraphReplayMode {
     return cudaDecodeGraphReplayModeFromValue(platform.env.getenv("ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY"));
 }
 
-fn cudaDecodeGraphReplayRequested() bool {
-    return cudaDecodeGraphReplayMode() != .off;
-}
-
 pub fn cudaDecodeGraphReplayRequired() bool {
     return cudaDecodeGraphReplayMode() == .required;
 }
 
 /// Automatic request replay must reach the graph-aware forward before an
-/// eager fused shortcut. Its failure policy remains automatic, not required.
+/// eager fused shortcut. A process preference alone cannot supply bounded KV
+/// or exclusive storage for an automatic capture.
 pub fn cudaDecodeGraphReplayPrefersGraph(cb: *const ComputeBackend) bool {
     return cudaDecodeGraphReplayRequired() or cb.debugCudaGraphReplayRequested();
-}
-
-fn cudaDecodeGraphReplayRequestedForBackend(cb: *const ComputeBackend) bool {
-    return cudaDecodeGraphReplayRequested() or cb.debugCudaGraphReplayRequested();
 }
 
 test "Gemma4 CUDA request replay reaches architecture capture without global flags" {
@@ -1956,7 +1949,7 @@ test "Gemma4 CUDA request replay reaches architecture capture without global fla
     try std.testing.expect(!cudaCaptureFinalHiddenProbeEnabled(&cb, 1, 32, &prefill));
     cb.execution_owner = 7;
     try std.testing.expect(!cb.debugCudaGraphReplayRequested());
-    try std.testing.expectEqual(cudaDecodeGraphReplayRequested(), cudaDecodeGraphReplayRequestedForBackend(&cb));
+    try std.testing.expectEqual(cudaDecodeGraphReplayRequired(), cudaDecodeGraphReplayPrefersGraph(&cb));
     cb.execution_owner = 0;
     active = false;
     try std.testing.expectEqual(cudaDecodeGraphReplayRequired(), cudaDecodeGraphReplayPrefersGraph(&cb));
@@ -1990,7 +1983,7 @@ fn cudaCaptureFinalHiddenProbeEnabled(
     decode_context: ?*const DecodeContext,
 ) bool {
     if (!platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_FINAL_HIDDEN", false) and
-        !cudaDecodeGraphReplayRequestedForBackend(cb)) return false;
+        !cudaDecodeGraphReplayPrefersGraph(cb)) return false;
     if (cb.kind() != .cuda) return false;
     if (batch != 1) return false;
     return actualQuerySeqLen(seq_len, decode_context) == 1;
@@ -2004,7 +1997,7 @@ fn cudaCaptureGreedyTokenProbeEnabled(
 ) bool {
     if (!cudaCaptureFinalHiddenProbeEnabled(cb, batch, seq_len, decode_context)) return false;
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_GREEDY_TOKEN", false) or
-        cudaDecodeGraphReplayRequestedForBackend(cb);
+        cudaDecodeGraphReplayPrefersGraph(cb);
 }
 
 fn forwardGreedyLastTokenTensorFromEmbeddingsWithLayer0Overrides(

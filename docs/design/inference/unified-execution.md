@@ -884,3 +884,13 @@ The F16 MQA route reproduced the earlier tuned regime on the same binary.
 It leads the llama.cpp reference on the silent video fixture and trails on
 text, image and audio. The tuned flags are explicit, so these measurements
 leave default qualification open.
+
+The GB10 automatic policy now requires the exact MQA geometry and complete
+Q4_0 donor inventory before admitting its 1,104,150,528 bytes of BF16 mirrors.
+The official checkpoint selected 15 donor layers, MMA prefill and F16 MQA
+warp split without tuning variables. The same 16-token serving measurement
+gave Antfly 200 / 271 / 220 / 244 ms for text / image / audio / silent video.
+The contemporaneous llama.cpp medians were 168 / 205 / 165 / 280 ms.
+All 64 measured Antfly responses matched the explicitly tuned run's content
+and finish reasons. Both engines passed all four fixture fact checks with
+48 tokens. The Spark tests passed 94 cases with one Metal-only skip.

@@ -56,15 +56,21 @@ pub fn selected() ?Projection {
 /// Automatic rollout is narrower than explicit experimental policy. Check
 /// parsed geometry and the actual donor storage inventory, never a model name.
 pub fn automaticGeometry(config: Config) bool {
-    return config.sharedKvPrefillDonorLayers() != null and config.intermediate_size == 10240 and
-        config.sliding_window == 512 and config.sliding_window_pattern == 6 and
-        config.ple_hidden_size == 256 and config.vocab_size == 262144 and config.max_position_embeddings == 131072;
+    if (config.sliding_window != 512 or config.ple_hidden_size != 256 or
+        config.vocab_size != 262144 or config.max_position_embeddings != 131072) return false;
+    if (config.sharedKvPrefillDonorLayers() != null)
+        return config.intermediate_size == 10240 and config.sliding_window_pattern == 6;
+    return config.hidden_size == 1536 and config.intermediate_size == 6144 and
+        config.num_hidden_layers == 35 and config.num_kv_shared_layers == 20 and
+        config.num_attention_heads == 8 and config.num_key_value_heads == 1 and
+        config.attention_head_dim == 256 and config.global_head_dim == 512 and
+        config.sliding_window_pattern == 5 and config.sharedKvFunctionalDonorLayers() == 15;
 }
 pub fn automaticArtifact(config: Config, file: ?*const @import("../gguf/format.zig").File) bool {
     if (!automaticGeometry(config)) return false;
     const geometry = Geometry.resolve(config).?;
     var seen: [24]u8 = @splat(0);
-    if (geometry.donor_layers != seen.len) return false;
+    if (geometry.donor_layers > seen.len) return false;
     for ((file orelse return false).tensors) |tensor| {
         if (!geometry.mirrorsWeight(tensor.name)) continue;
         if ((tensor.tensor_type != .known or tensor.tensor_type.known != .Q4_0) or tensor.dimensions.len != 2 or !std.mem.startsWith(u8, tensor.name, "blk.")) return false;
@@ -87,7 +93,7 @@ pub fn automaticArtifact(config: Config, file: ?*const @import("../gguf/format.z
             break;
         }
     }
-    for (seen) |mask| if (mask != 0x7f) return false;
+    for (seen[0..geometry.donor_layers]) |mask| if (mask != 0x7f) return false;
     return true;
 }
 
@@ -130,7 +136,7 @@ pub const Plan = struct {
             .geometry = Geometry.resolve(config) orelse return null,
             .wide_f32_vendor = !platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_DISABLE_WIDE_F32_VENDOR"),
             .flash_prefill = !platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_DISABLE_PAGED_F16_FLASH"),
-            .capture_prefill = platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_PREFILL", platform.env.getenv("ANTFLY_INFERENCE_CUDA_GEMMA4_NATIVE_PLAN") == null and qualifiedDefaultDevice()),
+            .capture_prefill = platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_PREFILL", platform.env.getenv("ANTFLY_INFERENCE_CUDA_GEMMA4_NATIVE_PLAN") == null and config.num_key_value_heads == 2 and qualifiedDefaultDevice()),
             .trace_prefill = platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_TRACE_PREFILL_PROGRAM"),
             .warp_decode = platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_F16_WARP_DECODE", true),
             .vision_f16 = platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_VISION_F16", true),
@@ -263,36 +269,44 @@ test "native plan automatic projection is restricted to the qualified CUDA targe
 test "native plan automatic artifact requires complete unique Q4 donors and exact geometry" {
     const a = std.testing.allocator;
     const gguf = @import("../gguf/format.zig");
-    const cfg = Config{ .family = .gemma, .position_encoding = .rope, .hidden_size = 2560, .num_hidden_layers = 42, .num_attention_heads = 8, .num_key_value_heads = 2, .attention_head_dim = 256, .global_head_dim = 512, .intermediate_size = 10240, .num_kv_shared_layers = 18, .sliding_window = 512, .sliding_window_pattern = 6, .ple_hidden_size = 256, .vocab_size = 262144, .max_position_embeddings = 131072 };
-    var arena = std.heap.ArenaAllocator.init(a);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const tensors = try allocator.alloc(gguf.TensorInfo, 24 * 7);
-    const names = [_][]const u8{ "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight", "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight" };
-    for (0..24) |layer| {
-        const head: u64 = cfg.effectiveHeadDimForLayer(layer);
-        const shapes = [_][2]u64{ .{ 2560, 8 * head }, .{ 2560, 2 * head }, .{ 2560, 2 * head }, .{ 8 * head, 2560 }, .{ 2560, 10240 }, .{ 2560, 10240 }, .{ 10240, 2560 } };
-        for (names, shapes, 0..) |name, shape, index| tensors[layer * 7 + index] = .{ .name = try std.fmt.allocPrint(allocator, "blk.{d}.{s}", .{ layer, name }), .dimensions = try allocator.dupe(u64, &shape), .tensor_type = .{ .known = .Q4_0 }, .offset = 0, .data_offset = 0 };
+    const variants = [_]Config{
+        Config{ .family = .gemma, .position_encoding = .rope, .hidden_size = 2560, .num_hidden_layers = 42, .num_attention_heads = 8, .num_key_value_heads = 2, .attention_head_dim = 256, .global_head_dim = 512, .intermediate_size = 10240, .num_kv_shared_layers = 18, .sliding_window = 512, .sliding_window_pattern = 6, .ple_hidden_size = 256, .vocab_size = 262144, .max_position_embeddings = 131072 },
+        Config{ .family = .gemma, .position_encoding = .rope, .hidden_size = 1536, .num_hidden_layers = 35, .num_attention_heads = 8, .num_key_value_heads = 1, .attention_head_dim = 256, .global_head_dim = 512, .intermediate_size = 6144, .num_kv_shared_layers = 20, .sliding_window = 512, .sliding_window_pattern = 5, .ple_hidden_size = 256, .vocab_size = 262144, .max_position_embeddings = 131072 },
+    };
+    for (variants, [_]usize{ 24, 15 }, [_]u64{ 4508876800, 1104150528 }) |cfg, donors, mirror_bytes| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const tensors = try allocator.alloc(gguf.TensorInfo, donors * 7);
+        const names = [_][]const u8{ "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight", "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight" };
+        for (0..donors) |layer| {
+            const head: u64 = cfg.effectiveHeadDimForLayer(layer);
+            const h: u64 = cfg.hidden_size;
+            const f: u64 = cfg.intermediate_size;
+            const kv = cfg.num_key_value_heads * head;
+            const shapes = [_][2]u64{ .{ h, 8 * head }, .{ h, kv }, .{ h, kv }, .{ 8 * head, h }, .{ h, f }, .{ h, f }, .{ f, h } };
+            for (names, shapes, 0..) |name, shape, index| tensors[layer * 7 + index] = .{ .name = try std.fmt.allocPrint(allocator, "blk.{d}.{s}", .{ layer, name }), .dimensions = try allocator.dupe(u64, &shape), .tensor_type = .{ .known = .Q4_0 }, .offset = 0, .data_offset = 0 };
+        }
+        var file = gguf.File{ .header = .{ .version = 3, .tensor_count = tensors.len, .metadata_count = 0 }, .metadata = &.{}, .tensors = tensors, .alignment = 32, .data_region_offset = 0 };
+        try std.testing.expect(automaticArtifact(cfg, &file));
+        if (comptime @sizeOf(usize) >= 8) try std.testing.expectEqual(@as(usize, @intCast(mirror_bytes)), try Geometry.resolve(cfg).?.mirroredBf16Bytes(&file));
+        try std.testing.expect(!automaticArtifact(cfg, null));
+        var other = cfg;
+        other.sliding_window = 1024;
+        try std.testing.expect(!automaticArtifact(other, &file));
+        tensors[0].tensor_type = .{ .known = .Q8_0 };
+        try std.testing.expect(!automaticArtifact(cfg, &file));
+        tensors[0].tensor_type = .{ .known = .Q4_0 };
+        tensors[0].dimensions[0] -= 1;
+        try std.testing.expect(!automaticArtifact(cfg, &file));
+        tensors[0].dimensions[0] += 1;
+        file.tensors = tensors[1..];
+        try std.testing.expect(!automaticArtifact(cfg, &file));
+        file.tensors = tensors;
+        const first = tensors[0];
+        tensors[0] = tensors[1];
+        try std.testing.expect(!automaticArtifact(cfg, &file));
+        tensors[0] = first;
+        try std.testing.expect(automaticArtifact(cfg, &file));
     }
-    var file = gguf.File{ .header = .{ .version = 3, .tensor_count = tensors.len, .metadata_count = 0 }, .metadata = &.{}, .tensors = tensors, .alignment = 32, .data_region_offset = 0 };
-    try std.testing.expect(automaticArtifact(cfg, &file));
-    if (comptime @sizeOf(usize) >= 8) try std.testing.expectEqual(@as(usize, 4508876800), try Geometry.resolve(cfg).?.mirroredBf16Bytes(&file));
-    try std.testing.expect(!automaticArtifact(cfg, null));
-    var other = cfg;
-    other.sliding_window = 1024;
-    try std.testing.expect(!automaticArtifact(other, &file));
-    tensors[0].tensor_type = .{ .known = .Q8_0 };
-    try std.testing.expect(!automaticArtifact(cfg, &file));
-    tensors[0].tensor_type = .{ .known = .Q4_0 };
-    tensors[0].dimensions[0] -= 1;
-    try std.testing.expect(!automaticArtifact(cfg, &file));
-    tensors[0].dimensions[0] += 1;
-    file.tensors = tensors[1..];
-    try std.testing.expect(!automaticArtifact(cfg, &file));
-    file.tensors = tensors;
-    const first = tensors[0];
-    tensors[0] = tensors[1];
-    try std.testing.expect(!automaticArtifact(cfg, &file));
-    tensors[0] = first;
-    try std.testing.expect(automaticArtifact(cfg, &file));
 }
