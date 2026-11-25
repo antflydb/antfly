@@ -42195,11 +42195,26 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             !metal_runtime.decoderRuntimeLinearSlotPrepared(self.provider_impl, request.v_slot, in_dim, out_dim)) return false;
         const k_out = (try self.projectionDestination(key)) orelse return false;
         const v_out = (try self.projectionDestination(value)) orelse return false;
+        // The caller holds the resident activation throughout encoding.
+        // Only materialized or reshaped inputs need temporary ownership.
+        if (denseDeviceF32(request.input)) |resident| {
+            if (resident.ndim() == 2 and resident.dim(0) > 0 and resident.dim(1) == in_dim and
+                !hasHostView(toBuf(request.input)))
+            {
+                return self.applyPreparedKvToViews(request, resident, k_out, v_out);
+            }
+        }
         var input = try self.ownedMetalTensorFromCt(request.input);
         defer self.retireTemporaryWorkspaceValue(&input);
         var linear_input = try retainedLinearInputView(&input, in_dim);
         defer self.retireTemporaryWorkspaceValue(&linear_input);
         if (!linear_input.isDevice()) return false;
+        return self.applyPreparedKvToViews(request, linear_input, k_out, v_out);
+    }
+
+    fn applyPreparedKvToViews(self: *MetalCompute, request: *const ops.DecoderRuntimeApplyLinearQkvRequest, linear_input: MetalTensor, k_out: *MetalTensor, v_out: *MetalTensor) !bool {
+        const in_dim = request.in_dim;
+        const out_dim = request.kv_out_dim;
         const rows: usize = @intCast(linear_input.dim(0));
         if (!sameDenseProjectionShape(k_out.*, rows, out_dim) or !sameDenseProjectionShape(v_out.*, rows, out_dim)) return false;
         if (projectionRangesOverlap(k_out.*, v_out.*) or projectionRangesOverlap(linear_input, k_out.*) or
