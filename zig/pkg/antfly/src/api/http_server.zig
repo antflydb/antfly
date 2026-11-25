@@ -51073,7 +51073,7 @@ test "api http server create index installs exact visible config and defers lagg
         });
         defer rejected_replacement.deinit(alloc);
         try std.testing.expectEqual(@as(u16, 400), rejected_replacement.status);
-        try std.testing.expect(std.mem.indexOf(u8, rejected_replacement.body, "conflicting_embedding_artifact_dimensions") != null);
+        try std.testing.expectEqualStrings("embedding index sources declare different dimensions", rejected_replacement.body);
         try std.testing.expectEqual(commits_before_replacement, artifact_source.replace_definition_calls);
         try std.testing.expectEqual(@as(usize, 0), artifact_source.put_enrichment_calls);
     }

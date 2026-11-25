@@ -2282,6 +2282,8 @@ class CliTests(unittest.TestCase):
         }
         self.env["HOME"] = str(self.root)
         self.env["XDG_CONFIG_HOME"] = str(self.root / "config")
+        # A host XDG override must not merge independent fixture caches.
+        self.env["XDG_CACHE_HOME"] = str(self.root / ".cache")
         self.server.asset_mode = None
         self.server.select_mode = None
         self.server.projected_asset_bytes = 0
