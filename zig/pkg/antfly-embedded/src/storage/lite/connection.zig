@@ -272,7 +272,7 @@ test "lite connection propagates fsync policy to native file" {
 
     var connection = try Connection.openWithOptions(allocator, path, .writer, .{ .fsync = false });
     defer connection.close();
-    try std.testing.expect(connection.backend.native_docstore.?.file.no_sync);
+    try std.testing.expect(connection.backend.native_docstore.?.file.syncsSkipped());
 }
 
 test "lite connection create provisions the default full text index" {

@@ -187,14 +187,16 @@ test "opaque privacy decoder ABI rejects ABI117 ABI118 and ABI119 context and lo
     defer context.deinit();
     var owner = try client.Owner.open(.{ .context = context.handle, .path = .fromSlice(path), .table_name = .fromSlice("rows"), .group_id = 72 });
     defer owner.deinit();
-    var response: abi.OwnedBytes = .{};
-    defer abi.antfly_storage_owner_buffer_destroy(&response);
+    var response: abi.VersionedOwnedBytes = .{};
+    defer abi.antfly_storage_owner_buffer_destroy(&response.buffer);
     // The combined profile must reject before looking at privacy flags or
     // dereferencing the old provider's opaque JSON payload.
     for ([_]u32{ 117, 118, 119 }) |old_version| {
         try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_lookup_json(owner.handle, &.{ .version = old_version, .table_name = .fromSlice("rows"), .request_json = .{ .ptr = @ptrFromInt(1), .len = 64 } }, &response));
     }
-    try std.testing.expect(response.ptr == null and response.len == 0);
+    try std.testing.expect(response.buffer.ptr == null and response.buffer.len == 0);
+    try std.testing.expectEqual(@as(u64, 0), response.version);
+    try std.testing.expectEqual(@as(u8, 0), response.has_expected_content_digest);
     var accepted = try owner.batchJson("rows", "{\"inserts\":{\"probe\":{\"n\":1}}}");
     accepted.deinit();
     var found = try owner.lookupJson("rows", "{\"key\":\"probe\"}");

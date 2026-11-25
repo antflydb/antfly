@@ -6757,7 +6757,7 @@ fn collectStatsGrouped(
         defer selected_segment.deinit();
         const seg = selected_segment.entry;
         try reads.retainSegment(selected_segment);
-        const reader = (try reads.get(&seg.reader, field)) orelse continue;
+        const reader = (try reads.get(seg.reader.encoded(), field)) orelse continue;
 
         // Selective aggregations probe only their candidates. Dense scans use
         // one cursor and join sorted IDs in linear time without value arrays.
@@ -6806,7 +6806,7 @@ fn readF64ForDoc(
     defer selected_segment.deinit();
     const seg = selected_segment.entry;
     try reads.retainSegment(selected_segment);
-    const reader = (try reads.get(&seg.reader, field)) orelse return null;
+    const reader = (try reads.get(seg.reader.encoded(), field)) orelse return null;
     return readNumericAsF64(reader, resolved.local_id);
 }
 
@@ -6842,7 +6842,7 @@ fn readBytesForDoc(
     defer selected_segment.deinit();
     const seg = selected_segment.entry;
     try reads.retainSegment(selected_segment);
-    const reader = (try reads.get(&seg.reader, field)) orelse return null;
+    const reader = (try reads.get(seg.reader.encoded(), field)) orelse return null;
     if (reader.value_type != .bytes_val) return null;
 
     return reader.getBytesAllocWithAllocator(alloc, resolved.local_id);
@@ -6862,7 +6862,7 @@ fn readTimestampForDoc(
     defer selected_segment.deinit();
     const seg = selected_segment.entry;
     try reads.retainSegment(selected_segment);
-    const reader = (try reads.get(&seg.reader, field)) orelse return null;
+    const reader = (try reads.get(seg.reader.encoded(), field)) orelse return null;
     if (reader.value_type == .datetime_ns) return try reader.getDateTimeNs(resolved.local_id);
     if (reader.value_type != .u64_val) return null;
     return if (try reader.getU64(resolved.local_id)) |ns| @as(i128, ns) else null;
@@ -6882,7 +6882,7 @@ fn readGeoPointForDoc(
     defer selected_segment.deinit();
     const seg = selected_segment.entry;
     try reads.retainSegment(selected_segment);
-    const reader = (try reads.get(&seg.reader, field)) orelse return null;
+    const reader = (try reads.get(seg.reader.encoded(), field)) orelse return null;
     if (reader.value_type != .geo_point) return null;
     const gp = try reader.getGeoPoint(resolved.local_id) orelse return null;
     return geo_mod.GeoPoint{ .lat = gp.lat, .lon = gp.lon };
@@ -8945,7 +8945,7 @@ test "search stored hit cursor preserves order ownership and allocation failure 
     try populateStoredHits(a, native.snapshot(), &native_single, null);
     try std.testing.expectEqualStrings("b", native_single[0].id.?);
     try std.testing.expectEqualStrings("second", native_single[0].stored_data.?);
-    try std.testing.expectEqual(@as(usize, 0), native.snapshot().segments[0].reader.native.?.identity_bytes);
+    try std.testing.expectEqual(@as(usize, 0), native.snapshot().segments[0].reader.encoded().native.?.identity_bytes);
     var singleton = [_]ScoredHit{.{ .doc_id = 0, .score = 1, .id = null, .stored_data = null }};
     defer freeStoredBodies(a, &singleton);
     try populateStoredHits(a, snapshot, &singleton, null);
@@ -9093,14 +9093,14 @@ test "native ID filters and deletes never retain stable identity pages" {
     defer matches.deinit();
     const after = entry.reader.nativeNavigationBytes();
     try std.testing.expectEqual(@as(usize, 0), matches.cardinality());
-    try std.testing.expectEqual(@as(usize, 0), entry.reader.native.?.identity_bytes);
+    try std.testing.expectEqual(@as(usize, 0), entry.reader.encoded().native.?.identity_bytes);
     var id: [1024]u8 = @splat('x');
     std.mem.writeInt(u64, id[0..8], 1023, .little);
     const deletes = try writer.deleteAllByIdsTracked(a, &.{ &id, "absent" });
     defer index_mod.IndexWriter.freeDeleteInfos(a, deletes);
     try std.testing.expectEqual(@as(usize, 1), deletes.len);
     try std.testing.expectEqual(@as(usize, 1), deletes[0].local_ids.len);
-    try std.testing.expectEqual(@as(usize, 0), entry.reader.native.?.identity_bytes);
+    try std.testing.expectEqual(@as(usize, 0), entry.reader.encoded().native.?.identity_bytes);
     std.debug.print("LITE_ID_SCAN rows=2048 retained_growth={d} retained_ids=0\n", .{after - before});
 }
 
@@ -10890,7 +10890,7 @@ test "streaming boolean term candidates avoid inventory plans and exact bounds r
     var provider: Provider = .{};
     // Any eager readSegment() now allocates a query binding even though all
     // planning and refinement statistics are available independently.
-    for (writer.snapshot().segments) |*entry| entry.reader.postings_loader = .{ .ptr = &provider, .ensure = Provider.ensure };
+    for (writer.snapshot().segments) |*entry| entry.reader.encodedMut().postings_loader = .{ .ptr = &provider, .ensure = Provider.ensure };
     const snapshot = try writer.acquireSnapshotWithReadCapability(.{ .ptr = &provider, .check = Provider.check });
     defer snapshot.release();
     snapshot.text_statistics = .{ .ptr = &provider, .check = Provider.check, .frequencies = Provider.frequencies, .summary = Provider.summary, .candidates = Provider.candidates, .hierarchical = true };
@@ -11147,7 +11147,7 @@ test "streaming boolean inherited publication cutoff prunes before payload admis
     };
     var provider: u8 = 0;
     const snapshot = writer.snapshot();
-    for (snapshot.segments) |*entry| entry.reader.postings_loader = .{ .ptr = &provider, .ensure = Provider.ensure };
+    for (snapshot.segments) |*entry| entry.reader.encodedMut().postings_loader = .{ .ptr = &provider, .ensure = Provider.ensure };
     snapshot.text_statistics = .{ .ptr = &provider, .check = Provider.check, .frequencies = Provider.frequencies, .summary = Provider.summary };
     var diagnostics: SearchDiagnostics = .{};
     var result = try execute(a, snapshot, .{ .query = .{ .term = .{ .field = "body", .term = "common" } }, .k = 2, .include_stored = false, .minimum_competitive_score = 1e6, .diagnostics = &diagnostics });

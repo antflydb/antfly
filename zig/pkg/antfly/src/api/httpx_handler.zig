@@ -1166,6 +1166,7 @@ const AgentGenerationRunner = struct {
     secret_store: ?*common_secrets.FileStore,
     io: std.Io,
     request_context: managed_embedder.RequestContext,
+    inference_api_url: ?[]const u8,
     inference_api_key: ?[]const u8,
 
     fn iface(runner: *@This()) retrieval_agent.GenerationRunner {
@@ -1198,7 +1199,23 @@ const AgentGenerationRunner = struct {
         try runner.request_context.check();
         var client = httpx.Client.initWithConfig(a, runner.io, .{ .keep_alive = false });
         defer client.deinit();
-        return try generating_runtime.executeChainWithOptions(a, &client, chain, .{ .chatgpt = runner.chatgpt, .chatgpt_failure = &runner.chatgpt_failure, .chatgpt_pin = runner.chatgpt_pin, .personal_owner = runner.personal_owner, .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .inference_api_key = runner.inference_api_key, .request_context = runner.request_context }, messages);
+        return try generating_runtime.executeChainWithOptions(a, &client, chain, .{
+            .chatgpt = runner.chatgpt,
+            .chatgpt_failure = &runner.chatgpt_failure,
+            .chatgpt_pin = runner.chatgpt_pin,
+            .personal_owner = runner.personal_owner,
+            .antfly_provider = runner.antfly_provider,
+            .secret_store = runner.secret_store,
+            .inference_api_key = runner.inference_api_key,
+            .execution = .{
+                // Keep the node endpoint with its credential. The backend
+                // still gives explicit URLs and linked providers precedence.
+                .default_endpoint = runner.inference_api_url,
+                .deadline_ns = runner.request_context.deadline_ns,
+                .cancellation = runner.request_context.cancellation orelse .none,
+            },
+            .request_context = runner.request_context,
+        }, messages);
     }
 };
 
@@ -9993,6 +10010,7 @@ pub const AntflyApiHandler = struct {
             .secret_store = self.api_server.cfg.secret_store,
             .io = self.api_server.inferenceIo(),
             .request_context = self.agentRequestContext(ctx),
+            .inference_api_url = self.api_server.configuredInferenceAPIURL(),
             .inference_api_key = self.api_server.cfg.inference_api_key,
         };
 
@@ -10123,6 +10141,7 @@ pub const AntflyApiHandler = struct {
                 .secret_store = self.api_server.cfg.secret_store,
                 .io = self.api_server.inferenceIo(),
                 .request_context = request_context,
+                .inference_api_url = self.api_server.configuredInferenceAPIURL(),
                 .inference_api_key = self.api_server.cfg.inference_api_key,
             },
         };
@@ -23923,6 +23942,187 @@ test "SQL catalog NUMERIC HTTP delivery preserves exact cells descriptors and NU
         }
         try std.testing.expectEqual(@as(i64, 24), result.columns[0].numeric_modifier.?.precision);
         try std.testing.expectEqual(@as(i64, 4), result.columns[0].numeric_modifier.?.scale);
+    }
+}
+
+test "httpx agent generation routes durable planning through the configured inference endpoint" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Upstream = struct {
+        fn check(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer node-inference-fixture", req.header("authorization").?);
+        }
+        fn serve(server: *httpx.TestServer, failure: *?anyerror) std.Io.Cancelable!void {
+            server.handleOne() catch |err| {
+                if (err != error.Canceled and err != error.Cancelled) failure.* = err;
+            };
+        }
+    };
+    const plan = "{\"brief\":\"Synthetic planning check\",\"sub_questions\":[{\"question\":\"What does the fixture say?\",\"sources\":[\"tables\"]}]}";
+    const body = try std.json.Stringify.valueAlloc(a, .{ .choices = .{.{ .message = .{ .content = plan }, .finish_reason = "stop" }} }, .{});
+    defer a.free(body);
+    var upstream = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = "/ai/v1/generate", .assert_request = Upstream.check, .respond = .{ .body = body } }});
+    defer upstream.deinit();
+    var group = std.Io.Group.init;
+    var upstream_failure: ?anyerror = null;
+    try group.concurrent(io, Upstream.serve, .{ &upstream, &upstream_failure });
+    defer group.cancel(io);
+
+    var config = try common_config.Config.parseFromSlice(a, "{}");
+    defer config.deinit();
+    config.inference.api_url = try a.dupe(u8, upstream.baseUrl());
+    var status = AuthStatusSource{};
+    // Planning must not read a table. Any accidental read fails this test.
+    const reads = table_reads.TableReadSource{ .ptr = undefined, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined } };
+    var server = ApiHttpServer.init(a, .{ .node_config = &config, .inference_api_key = "node-inference-fixture", .imported_runtime_io = .{ .api = io, .api_network = io } }, status.iface(), reads, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    // HTTP handlers allocate transient decoded values in the request arena.
+    var request_arena = std.heap.ArenaAllocator.init(a);
+    defer request_arena.deinit();
+    var start = try httpx.Request.init(a, .POST, "http://localhost/db/v1/agents/research/jobs");
+    defer start.deinit();
+    start.body =
+        \\{"request":{"query":"What does the fixture say?","queries":[{"table":"docs","filter_query":{"term":"allowed","field":"reader"}}],"generator":{"provider":"antfly","model":"fixture"},"budget":{"deadline_ms":5000,"max_rounds":1,"max_sub_questions":1}}}
+    ;
+    var start_ctx = httpx.Context.init(request_arena.allocator(), io, &start);
+    defer start_ctx.deinit();
+    var started = try handler.startResearchJob(&start_ctx);
+    defer started.deinit();
+    try std.testing.expectEqual(@as(u16, 202), started.status.code);
+    const job = try std.json.parseFromSlice(metadata_openapi.ResearchJob, a, started.body.?, .{ .ignore_unknown_fields = true });
+    defer job.deinit();
+    var advance = try httpx.Request.init(a, .POST, "http://localhost/db/v1/agents/research/jobs/advance");
+    defer advance.deinit();
+    advance.body = "{\"max_phases\":1}";
+    var advance_ctx = httpx.Context.init(request_arena.allocator(), io, &advance);
+    defer advance_ctx.deinit();
+    var advanced = try handler.advanceResearchJob(&advance_ctx, job.value.job_id);
+    defer advanced.deinit();
+    const checkpoint = try std.json.parseFromSlice(metadata_openapi.ResearchJob, a, advanced.body.?, .{ .ignore_unknown_fields = true });
+    defer checkpoint.deinit();
+    if (checkpoint.value.phase != .research) std.debug.print("planning checkpoint: state={s} phase={s} error={s}\n", .{ @tagName(checkpoint.value.state), @tagName(checkpoint.value.phase), checkpoint.value.last_error orelse "none" });
+    try std.testing.expectEqual(metadata_openapi.ResearchPhase.research, checkpoint.value.phase);
+    try std.testing.expect(checkpoint.value.last_error == null);
+    try group.await(io);
+    if (upstream_failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 1), upstream.routeHitCount(0));
+}
+
+test "httpx agent generation explicit endpoints do not inherit node credentials" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Upstream = struct {
+        fn check(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expect(!std.mem.eql(u8, req.header("authorization") orelse "", "Bearer node-inference-fixture"));
+        }
+        fn explicit(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer explicit-fixture", req.header("authorization").?);
+        }
+        fn serve(server: *httpx.TestServer, failure: *?anyerror) std.Io.Cancelable!void {
+            server.handleOne() catch |err| {
+                if (err != error.Canceled and err != error.Cancelled) failure.* = err;
+            };
+        }
+        fn unexpected(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: ?managed_embedder.RequestContext) ![]u8 {
+            return error.TestUnexpectedResult;
+        }
+    };
+    for ([_]bool{ false, true }) |explicit_key| {
+        var upstream = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = "/generate", .assert_request = if (explicit_key) Upstream.explicit else Upstream.check, .respond = .{ .body = "{\"choices\":[{\"message\":{\"content\":\"remote\"},\"finish_reason\":\"stop\"}]}" } }});
+        defer upstream.deinit();
+        var failure: ?anyerror = null;
+        var group = std.Io.Group.init;
+        try group.concurrent(io, Upstream.serve, .{ &upstream, &failure });
+        defer group.cancel(io);
+        var runner = AgentGenerationRunner{
+            .antfly_provider = .{ .ptr = undefined, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .generate_json = Upstream.unexpected },
+            .secret_store = null,
+            .io = io,
+            .request_context = .{ .io = io, .deadline_ns = null },
+            .inference_api_url = "http://127.0.0.1:0",
+            .inference_api_key = "node-inference-fixture",
+        };
+        var result = try runner.iface().executeChain(a, &.{.{ .generator = .{ .provider = .antfly, .model = "fixture", .url = upstream.baseUrl(), .api_key = if (explicit_key) "explicit-fixture" else null, .tools_json = "[]" } }}, &.{.{ .role = .user, .content = .{ .text = "synthetic" } }});
+        defer result.deinit();
+        try std.testing.expectEqualStrings("remote", result.content);
+        try group.await(io);
+        if (failure) |err| return err;
+        try std.testing.expectEqual(@as(usize, 1), upstream.routeHitCount(0));
+    }
+}
+
+test "httpx agent generation linked providers retain precedence and cancellation" {
+    const a = std.testing.allocator;
+    const Local = struct {
+        calls: usize = 0,
+        fn generate(raw: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: ?managed_embedder.RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return alloc.dupe(u8, "{\"choices\":[{\"message\":{\"content\":\"linked\"},\"finish_reason\":\"stop\"}]}");
+        }
+        fn cancelled(_: *const anyopaque) bool {
+            return true;
+        }
+    };
+    var local = Local{};
+    var runner = AgentGenerationRunner{
+        .antfly_provider = .{ .ptr = &local, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .generate_json = Local.generate },
+        .secret_store = null,
+        .io = std.testing.io,
+        .request_context = .{ .io = std.testing.io, .deadline_ns = null },
+        .inference_api_url = "http://127.0.0.1:0",
+        .inference_api_key = "node-inference-fixture",
+    };
+    const chain = &[_]generating_runtime.ChainLink{.{ .generator = .{ .provider = .antfly, .model = "fixture", .url = "", .tools_json = "[]" } }};
+    const messages = &[_]generating_runtime.ChatMessage{.{ .role = .user, .content = .{ .text = "synthetic" } }};
+    var result = try runner.iface().executeChain(a, chain, messages);
+    defer result.deinit();
+    try std.testing.expectEqualStrings("linked", result.content);
+    try std.testing.expectEqual(@as(usize, 1), local.calls);
+    runner.request_context.cancellation = .{ .ptr = &local, .is_cancelled_fn = Local.cancelled };
+    try std.testing.expectError(error.Cancelled, runner.iface().executeChain(a, chain, messages));
+    try std.testing.expectEqual(@as(usize, 1), local.calls);
+}
+
+test "httpx agent generation remote inference retains request deadlines and cancellation" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Upstream = struct {
+        var cancelled: std.atomic.Value(bool) = .init(false);
+        fn cancel(_: httpx.testing_mod.RequestInfo) !void {
+            cancelled.store(true, .release);
+        }
+        fn serve(server: *httpx.TestServer) std.Io.Cancelable!void {
+            server.handleOne() catch {};
+        }
+    };
+    for ([_]bool{ false, true }) |cancel| {
+        Upstream.cancelled.store(false, .release);
+        var upstream = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = "/ai/v1/generate", .assert_request = if (cancel) Upstream.cancel else null, .respond = .{ .delay_ns = 2 * std.time.ns_per_s, .body = "{\"choices\":[{\"message\":{\"content\":\"late\"}}]}" } }});
+        defer upstream.deinit();
+        var group = std.Io.Group.init;
+        try group.concurrent(io, Upstream.serve, .{&upstream});
+        defer group.cancel(io);
+        var runner = AgentGenerationRunner{
+            .antfly_provider = null,
+            .secret_store = null,
+            .io = io,
+            .request_context = .{
+                .io = io,
+                .deadline_ns = if (cancel) null else @import("antfly_platform").time.monotonicNs() + 50 * std.time.ns_per_ms,
+                .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&Upstream.cancelled),
+            },
+            .inference_api_url = upstream.baseUrl(),
+            .inference_api_key = "node-inference-fixture",
+        };
+        try std.testing.expectError(if (cancel) error.Cancelled else error.Timeout, runner.iface().executeChain(a, &.{.{ .generator = .{ .provider = .antfly, .model = "fixture", .url = "" } }}, &.{.{ .role = .user, .content = .{ .text = "synthetic" } }}));
     }
 }
 

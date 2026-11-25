@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const storage_engine = @import("../engine_dispatch.zig").implementation;
+const write_stage_profile = @import("../write_stage_profile.zig");
 const snapshot_staging = @import("snapshot_staging.zig");
 const execution_resources = @import("execution_resources.zig");
 const read_projection = @import("read_projection.zig");
@@ -8287,6 +8288,9 @@ pub const DB = struct {
         // and explicit maintenance retain complete cleanup guarantees.
         const max_pages: usize = if (req.sync_level == .full_index) std.math.maxInt(usize) else 1;
         const drained = try self.drainStandaloneGraphEndpointCleanupWithOptions(opts, max_pages);
+        // Without a graph index there is no endpoint cleanup to include, and
+        // the write already waited for its own sync level.
+        if (!drained and !self.core.hasGraphIndexes()) return;
         // A resident worker can finish before the foreground queue probe.
         // Deletes/transforms must still include its newly committed replay cut.
         if (req.sync_level == .full_index and (drained or req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0))
@@ -12445,6 +12449,9 @@ pub const DB = struct {
     pub fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
         if (req.logical_publication_control != null or req.logical_publication_gc != null) return error.OrderedApplyRequired;
         if (comptime storage_engine.enabled) return storage_engine.call("batchInternal", .{ self, req, profile, opts });
+        const profile_span = write_stage_profile.begin(.write);
+        defer profile_span.end();
+        if (self.text_merge_runtime) |runtime| runtime.mergeAtCapBeforeWrite();
         var committed = false;
         var tracked = opts;
         tracked.primary_committed = opts.primary_committed orelse &committed;
@@ -46713,7 +46720,14 @@ pub const DB = struct {
                 try waitForManagedIndexesApplied(self, sequence, sync_targets.full_text_indexes);
             },
             .full_index => {
-                if (has_groups) {
+                // Every index served this write inline (its publication rode
+                // in the primary commit) and no enrichment or group source
+                // owes it anything: it is already visible. Catching every
+                // derived worker up to this sequence, and chasing writes that
+                // committed meanwhile, only delays the ack.
+                const served_inline = sync_targets.served_inline and !has_groups and sync_targets.all_indexes.len == 0 and
+                    (self.enrichment_runtime == null or skip_enrichment_runtime_wait);
+                if (served_inline) {} else if (has_groups) {
                     if (wait_primary_enrichments) try self.runEnrichmentUntilWithVisibilityDeadlineRetrying(sequence, cancellation, deadline_ns, wait);
                     // Own grouped publications have been accepted before
                     // this cut. Include them once without chasing unrelated
@@ -138866,7 +138880,7 @@ test "db text compaction preserves index sort acceleration" {
     const snapshot = text_index.snapshot();
     try std.testing.expect(snapshot.segments.len <= index_manager_mod.default_text_merge_max_segments_per_tier);
     for (snapshot.segments) |segment| {
-        const fields = (try segment.reader.indexSortFieldsAlloc(alloc)) orelse return error.TestUnexpectedResult;
+        const fields = (try segment.reader.encoded().indexSortFieldsAlloc(alloc)) orelse return error.TestUnexpectedResult;
         defer segment_mod.freeIndexSortFields(alloc, fields);
         try std.testing.expectEqual(@as(usize, 2), fields.len);
         try std.testing.expectEqualStrings("price", fields[0].field);

@@ -3,7 +3,7 @@
 export const RUNTIME_COMPATIBILITY = Object.freeze({
   manifestVersion: 1,
   protocolVersion: 2,
-  clientVersion: "0.3.0",
+  clientVersion: "0.4.0",
   extractionAbiVersion: 2,
   runtimeId: "unprepared",
 });

@@ -36,7 +36,7 @@ every index type's write path:
   rewrites global counters and a read-generation key; algebraic rewrites
   aggregate rows, whole HLL sketches and an `applied_generation` key. Each is
   serialized, and several are hot keys every writer contends on.
-- **A full reopen per foreign commit.** `lite_connection.zig` `refreshImpl`
+- **A full reopen per foreign commit** (still, for writes). `lite_connection.zig` `refreshImpl`
   reopens the runtime whenever another process committed; every index is then
   rebuilt from the catalog (the native-catalog backend mirrors whole scopes in
   memory: HBC nodes, sparse postings, graph adjacency). In process mode this
@@ -233,18 +233,33 @@ doc map, as full-text has) before it pays.
    records are folded by ordinary merges, which check each input at the
    tip (`l0/` present) rather than in this process's mirror.
 4. Incremental cross-process refresh. Done for reads of document rows,
-   full-text and sparse indexes, so a read no longer needs the writer lease
-   after another process commits; `refreshCrossProcessRedoOverlay` adopts
-   the page bound other writers raised (`SharedRedoOverlay.pageBoundThrough`).
-   A write still reopens after one (`Owner.writer_reopen_pending`): the
-   runtime's free-page allocator and replay-sequence caches did not see those
-   commits. Next: reconcile those two in place, then let writes reuse it.
-   Releasing the writer lease before the durability wait stays off: it
-   measured no gain across processes (67 vs 65 writes/s, Debug) and a loss
-   across threads (about 250 vs 380, with stale results), where the writer
-   lane already hands the lease between writers. Letting writes refresh in
-   place gained little (65 to 86) and left stale results across processes,
-   so writes still reopen.
+   full-text and sparse indexes: after another process commits, a read
+   catches its runtime up in place instead of reopening.
+   `refreshCrossProcessRedoOverlay` adopts the page bound other writers raised
+   (`SharedRedoOverlay.pageBoundThrough`). Index workers are raised to the
+   durable progress other processes recorded (`raiseWorkersToDurableProgress`),
+   as a reopen would start them.
+   A write still reopens after another process's commit
+   (`Owner.writer_reopen_pending`). Letting it refresh in place works: the
+   allocator rebuilds from the checkpoint's free map, which only a fold (a
+   reopen) changes, and the replay sequence and redo tail resync once the
+   adoption epoch moves. But in ReleaseFast it measured no faster across
+   processes (about 500 vs 550 writes/s), and sparse halved (580 vs 1,160),
+   because a sparse refresh reloads the whole mirror. It waits for refreshes
+   that apply only the changed records.
+   Two bugs it exposed are fixed for every path. First, a worker behind
+   durable progress replayed records another process had already applied and
+   published a second copy of a version already in the dead set; a merge that
+   dropped one copy then pruned the version while the other copy still
+   carried it, reviving overwritten text. A replay now skips every copy whose
+   version the tip already covers (`PersistentIndex.versionCoveredAtTip`), so
+   a version lives in one segment and pruning stays safe. Second, a merge on
+   another thread waited for the writer lease held by a producer blocked on
+   that merge's admission; a blocked producer now lends its lease to its
+   runtime's merges (`text_merge_runtime.mergeMayUseLeaseOf`).
+   Releasing the writer lease before the durability wait is not possible as
+   built: the group leader stages commit participants (full-text `stage`)
+   inside `Ticket.wait`, so the waiting writer can be the one publishing.
 5. Delete-marker cleanup and the remaining per-type folds.
 
 Each stage keeps the crash sweeps, the multi-process capi tests and the

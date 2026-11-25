@@ -16,6 +16,7 @@
 //! Runtime document-store adapter over native `.aflite` document pages.
 
 const std = @import("std");
+const write_stage_profile = @import("../write_stage_profile.zig");
 const antfly_platform = @import("antfly_platform");
 const platform_sync = antfly_platform.sync;
 const backend_adapter = @import("../backend_adapter.zig");
@@ -5330,7 +5331,7 @@ pub const Store = struct {
         for (0..max_rounds) |round| {
             if (cancel) |token| try token.check();
             const final_round = round + 1 == max_rounds;
-            if (!self.file.no_sync) try image.prepared.file.sync(io);
+            if (!self.file.syncsSkipped()) try image.prepared.file.sync(io);
             const reserved = blk: {
                 if (final_round and from_background_worker) {
                     try self.reserveWriterSlotYielding();
@@ -5360,7 +5361,7 @@ pub const Store = struct {
                 }
                 if (final_round and capture.count > 0) {
                     try self.applyResidualVacuumChangesAssumeLocked(&image, &capture, cancel);
-                    if (!self.file.no_sync) try image.prepared.file.sync(io);
+                    if (!self.file.syncsSkipped()) try image.prepared.file.sync(io);
                 }
                 if (capture.count == 0) {
                     if (self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
@@ -5368,6 +5369,7 @@ pub const Store = struct {
                     image.report.before_size = (try self.file.file.stat(io)).size;
                     image.report.reclaimed_bytes = image.report.before_size -| image.report.after_size;
                     image.prepared.no_sync = self.file.no_sync;
+                    image.prepared.skip_barriers = self.file.skip_barriers;
                     try image.prepared.finishPublicationSequence(self.file.activeCheckpoint().commit_sequence + 1, image.prepared.activeCheckpoint());
                     image.report.after_size = (try image.prepared.file.stat(io)).size;
                     image.report.reclaimed_bytes = image.report.before_size -| image.report.after_size;
@@ -6851,6 +6853,8 @@ pub const Store = struct {
     /// `force_durable` makes this group durable regardless of any member's
     /// own `durable` flag; see `driveMutationCoordinator`.
     fn applyMutationGroup(self: *Store, head: *MutationRequest, force_durable: bool) !void {
+        const profile_span = write_stage_profile.begin(.group_apply);
+        defer profile_span.end();
         // §9.4 (revised, step 4): start the background idle/threshold
         // checkpoint turn (`rideAlongFlushLoop`, extended to also drive
         // `maybeCheckpointRedoLogOnIdleTurn`) the first time this file
@@ -11569,7 +11573,7 @@ test "lite maintenance upgrades a v11 redo file without reclamation debt" {
     defer store.close();
     try std.testing.expectEqual(native.format_version, store.file.header.diskFormatVersion());
     try store.maintainOnce(false);
-    try std.testing.expectEqual(native.segmented_redo_format_version, store.file.header.diskFormatVersion());
+    try std.testing.expectEqual(native.segmented_redo_format_version | native.sealed_redo_format_bit, store.file.header.diskFormatVersion());
     var read = try store.beginRead();
     defer read.abort();
     try std.testing.expectEqualStrings("old", try read.get("doc"));
@@ -14217,25 +14221,11 @@ test "lite replay cleanup propagates record corruption without deleting a partia
 /// comment), so any divergence is a real leak or double-release, not a
 /// benign timing difference.
 pub fn expectLedgerMatchesScanForTest(store: *Store) !void {
-    const Collector = struct {
-        bytes: u64 = 0,
-        records: u64 = 0,
-        fn collect(ptr: *anyopaque, _: u64, payload: []const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.bytes += internal_keys.replay_key_len + payload.len;
-            self.records += 1;
-        }
-    };
-    var collector = Collector{};
-    // Journal sharing: the "all" lane is the only lane with a physical,
-    // charged entry now -- a hint-specific `forEachReplayLane` call filters
-    // that same entry at read time instead of scanning a stored copy of
-    // its own, so iterating it here would double-count bytes the ledger
-    // was never charged for.
-    _ = try forEachReplayLaneRaw(store, "", internal_keys.replay_all_kind, 0, 0, &collector, Collector.collect);
-
     var read = try Txn.openReadWithPrefix(store, "");
     defer read.abort();
+    // The same scan journal upgrades charge from: the shared "all" lane's
+    // entries plus each hint lane's empty index entries.
+    const scanned = try scanReplayJournalLedger(&read);
     const ledger = blk: {
         const raw = read.get(internal_keys.journal_credit_ledger_key[0..]) catch |err| switch (err) {
             error.NotFound => break :blk internal_keys.JournalCreditLedger{},
@@ -14243,8 +14233,8 @@ pub fn expectLedgerMatchesScanForTest(store: *Store) !void {
         };
         break :blk internal_keys.JournalCreditLedger.decode(raw) orelse return error.TestUnexpectedResult;
     };
-    try std.testing.expectEqual(collector.bytes, ledger.bytes);
-    try std.testing.expectEqual(collector.records, ledger.records);
+    try std.testing.expectEqual(scanned.bytes, ledger.bytes);
+    try std.testing.expectEqual(scanned.records, ledger.records);
 }
 
 test "WS5 serviceRetirement retires every lane in exactly one native commit" {

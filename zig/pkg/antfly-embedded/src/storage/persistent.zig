@@ -1822,7 +1822,7 @@ pub const PersistentIndex = struct {
 
                 if (dead_versions) |*dead| {
                     const segments = writer.snapshot().segments;
-                    if (try derivedDeletionBitmap(alloc, &segments[segments.len - 1].reader, dead)) |bitmap| writer.setDeletionBitmap(seg_id, bitmap);
+                    if (try derivedDeletionBitmap(alloc, segments[segments.len - 1].reader.encoded(), dead)) |bitmap| writer.setDeletionBitmap(seg_id, bitmap);
                     continue;
                 }
                 const deletion_bytes = read_txn.get(.deletions, &seg_key) catch |err| switch (err) {
@@ -1855,7 +1855,7 @@ pub const PersistentIndex = struct {
                         const seg_id = l0SegmentId(std.mem.readInt(u64, item.key[0..8], .big));
                         try writer.addSegmentWithIdData(seg_id, index_mod.SegmentData.fromOwnedHeap(try alloc.dupe(u8, item.value)));
                         const segments = writer.snapshot().segments;
-                        if (try derivedDeletionBitmap(alloc, &segments[segments.len - 1].reader, dead)) |bitmap| writer.setDeletionBitmap(seg_id, bitmap);
+                        if (try derivedDeletionBitmap(alloc, segments[segments.len - 1].reader.encoded(), dead)) |bitmap| writer.setDeletionBitmap(seg_id, bitmap);
                     }
                 }
             }
@@ -2480,7 +2480,7 @@ pub const PersistentIndex = struct {
         defer snap.release();
         for (snap.segments) |*segment| {
             if (!present.contains(segment.id)) continue;
-            if (try derivedDeletionBitmap(self.alloc, &segment.reader, &dead)) |bitmap| {
+            if (try derivedDeletionBitmap(self.alloc, segment.reader.encoded(), &dead)) |bitmap| {
                 self.writer.setDeletionBitmap(segment.id, bitmap);
             } else if (segment.shared.deleted_count.load(.acquire) != 0) {
                 self.writer.setDeletionBitmap(segment.id, roaring.RoaringBitmap.init(self.alloc));
@@ -2704,6 +2704,27 @@ pub const PersistentIndex = struct {
     /// index's segment/range/active-set records must scope them exactly
     /// the same way `native_catalog_sink.zig`'s `Sink.submit` does, or
     /// they will not be found by this index's own reads.
+    /// Reads a batch of version-map keys at one committed catalog cut.
+    pub fn loadVersionsAtTip(self: *PersistentIndex, alloc: Allocator, keys: []const []const u8, versions: []?u64) !void {
+        std.debug.assert(keys.len == versions.len);
+        @memset(versions, null);
+        if (!self.versioned or !self.resolvesAtTip()) return;
+        const backend = switch (self.main_store_owner) {
+            .native_catalog => |backend| backend,
+            .mem, .lsm => return,
+        };
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const lookups = try scratch.alloc(native_catalog_backend.Mutation, keys.len);
+        for (keys, lookups) |key, *lookup| lookup.* = .{ .namespace = native_catalog_backend.tip_namespace, .key = key };
+        const values = try scratch.alloc(?[]const u8, keys.len);
+        try backend.loadCommittedValues(scratch, lookups, values);
+        for (values, versions) |value, *version| if (value) |bytes| {
+            version.* = try DocVersion.decode(bytes);
+        };
+    }
+
     pub fn nativeCatalogScope(self: *const PersistentIndex) ?[]const u8 {
         return switch (self.main_store_owner) {
             .native_catalog => |backend| backend.scope,
@@ -3942,7 +3963,7 @@ pub const PersistentIndex = struct {
             const seg = &snap.segments[seg_idx];
             if (deleted_docs == null) owned_deleted_docs[i] = try seg.cloneDeleted(work_alloc);
             inputs[i] = .{
-                .reader = &seg.reader,
+                .reader = seg.reader.encoded(),
                 .deleted = if (deleted_docs) |frozen| frozen[i] else owned_deleted_docs[i],
             };
         }
@@ -4888,7 +4909,7 @@ pub const PersistentIndex = struct {
             defer snap.release();
             for (snap.segments) |*segment| {
                 if (std.mem.indexOfScalar(u64, self.output_ids.items, segment.id) == null) continue;
-                var bitmap = (try derivedDeletionBitmap(alloc, &segment.reader, &dead)) orelse continue;
+                var bitmap = (try derivedDeletionBitmap(alloc, segment.reader.encoded(), &dead)) orelse continue;
                 defer bitmap.deinit();
                 var locals = std.ArrayListUnmanaged(u32).empty;
                 defer locals.deinit(alloc);
@@ -6779,6 +6800,40 @@ test "persistent index doc map names each key's current version" {
     var cursor = try txn.openCursor(.docmap);
     defer cursor.close();
     try std.testing.expect((try cursor.first()) == null);
+}
+
+// A replay of a record some process already applied must not publish a
+// second copy of a published version: a merge that drops one copy prunes the
+// version from the dead set, and the other copy is live again. The replay
+// path skips every copy whose version the tip already covers.
+test "persistent index reports versions the tip already covers" {
+    const alloc = std.testing.allocator;
+    var test_sink = InlinePublicationTestSink{ .allocator = alloc };
+    defer test_sink.deinit(alloc);
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+    var pi = try openVersionedTestIndex(alloc, &test_sink, path);
+    defer pi.close();
+
+    const first = try buildSimpleSegment(alloc, "doc:a", "alpha");
+    defer alloc.free(first);
+    try pi.indexSegment(first);
+    const second = try buildSimpleSegment(alloc, "doc:a", "beta");
+    defer alloc.free(second);
+    try pi.indexSegment(second);
+    const v2 = (try test_sink.docVersion("doc:a")).?;
+
+    var versions: [2]?u64 = undefined;
+    try pi.loadVersionsAtTip(alloc, &.{ "doc:a", "doc:never" }, &versions);
+    try std.testing.expectEqual(@as(?u64, v2), versions[0]);
+    try std.testing.expectEqual(@as(?u64, null), versions[1]);
+
+    const delete_version = try DocVersion.of(nextTestWriteSequence(), 0);
+    try pi.deleteVersioned(&.{"doc:a"}, &.{delete_version});
+    try pi.loadVersionsAtTip(alloc, &.{ "doc:a", "doc:never" }, &versions);
+    try std.testing.expectEqual(DocVersion.order(delete_version), DocVersion.order(versions[0].?));
+    try std.testing.expectEqual(@as(?u64, null), versions[1]);
 }
 
 // A merge decides nothing per document: a write another process commits
@@ -9314,7 +9369,7 @@ test "lite persistent mapped fifty thousand sorted documents stream postings and
             try std.testing.expectEqual(@as(usize, 50_000), try persistentSearchHitCount(alloc, snapshot, "common"));
             var reads = segment_mod.TypedReadScope.init(alloc);
             defer reads.deinit();
-            const values = (try reads.get(&segment.reader, "rank")).?;
+            const values = (try reads.get(segment.reader.encoded(), "rank")).?;
             for ([_]u32{ 0, 1, 127, 128, 2048, 49_999 }) |doc| {
                 try std.testing.expectEqual(@as(u64, doc), (try values.getU64(doc)).?);
                 var key: [32]u8 = undefined;
@@ -9433,7 +9488,7 @@ test "lite persistent mapped initial streamed typed flush aborts and reopens ato
     open = false;
     index = try PersistentIndex.open(a, opts);
     open = true;
-    const reader = &index.snapshot().segments[0].reader;
+    const reader = index.snapshot().segments[0].reader.encoded();
     try std.testing.expectEqual(@as(u32, 2), reader.doc_count);
     var cursor = segment_mod.SegmentReader.StoredDocCursor.init(a);
     defer cursor.deinit();
