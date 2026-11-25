@@ -327,16 +327,34 @@ test "Inkling Metal resident decoder runs the released text checkpoint" {
     const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
     var source = try checkpoint.Checkpoint.open(a, dir);
     defer source.deinit();
+    const time = @import("antfly_platform").time;
+    const load_start = time.monotonicNs();
     var decoder = try Decoder.load(a, runtime, &source);
     defer decoder.deinit();
+    std.debug.print("Inkling Metal resident text model loaded in {d:.3}s, {d} visits\n", .{
+        @as(f64, @floatFromInt(time.monotonicNs() - load_start)) / 1e9, decoder.schedule.len,
+    });
     var request: Request = undefined;
     try request.init(a, &decoder, 8);
     defer request.deinit();
-    try request.append(1);
-    const logits = try request.step(2);
-    try std.testing.expectEqual(@as(usize, decoder.text.unpadded_vocab_size), logits.len);
-    for (logits) |score| try std.testing.expect(std.math.isFinite(score));
-    try std.testing.expectEqual(@as(usize, 2), request.state.sequence.committed_tokens);
+    // Start from the same token as the released CUDA decoder test.
+    var token: u32 = 42;
+    for (1..5) |position| {
+        const step_start = time.monotonicNs();
+        const logits = try request.step(token);
+        try std.testing.expectEqual(@as(usize, decoder.text.unpadded_vocab_size), logits.len);
+        var next: usize = 0;
+        for (logits, 0..) |score, index| {
+            try std.testing.expect(std.math.isFinite(score));
+            if (score > logits[next]) next = index;
+        }
+        try std.testing.expect(logits[next] > 0);
+        try std.testing.expectEqual(position, request.state.sequence.committed_tokens);
+        std.debug.print("Inkling Metal text position={d} token={d} next={d} peak={d:.5} latency_ms={d:.3}\n", .{
+            position, token, next, logits[next], @as(f64, @floatFromInt(time.monotonicNs() - step_start)) / 1e6,
+        });
+        token = @intCast(next);
+    }
 }
 
 test "Inkling Metal resident decoder executes the full visit schedule on a synthetic checkpoint" {
