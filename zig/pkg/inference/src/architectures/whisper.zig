@@ -2237,10 +2237,17 @@ fn decoderBlockCached(
             var q_in_place: ?CT = null;
             if (dec_seq == 1) {
                 q_in_place = try cb.decoderRuntimeApplyLinearQkvInto(&request, k_dst, v_dst);
-            } else {
-                const k_ok = try cb.decoderRuntimeApplyLinearInto(&.{ .slot = slots[1], .input = normed, .in_dim = d_model, .out_dim = d_model }, k_dst);
-                const v_ok = k_ok and try cb.decoderRuntimeApplyLinearInto(&.{ .slot = slots[2], .input = normed, .in_dim = d_model, .out_dim = d_model }, v_dst);
-                if (v_ok) q_in_place = try stepLinear(cb, profile, w.q, normed, dec_seq, d_model, d_model);
+            } else if (cb.decoderRuntimeLinearSlotPrepared(slots[1], d_model, d_model) and
+                cb.decoderRuntimeLinearSlotPrepared(slots[2], d_model, d_model))
+            {
+                const k_request = ops.DecoderRuntimeApplyLinearRequest{ .slot = slots[1], .input = normed, .in_dim = d_model, .out_dim = d_model };
+                const v_request = ops.DecoderRuntimeApplyLinearRequest{ .slot = slots[2], .input = normed, .in_dim = d_model, .out_dim = d_model };
+                if (try cb.decoderRuntimeApplyLinearInto(&k_request, k_dst)) {
+                    // This route has started writing the suffix. A later
+                    // decline must unwind it instead of replaying projections.
+                    if (!try cb.decoderRuntimeApplyLinearInto(&v_request, v_dst)) return error.PreparedDenseProjectionChanged;
+                    q_in_place = try stepLinear(cb, profile, w.q, normed, dec_seq, d_model, d_model);
+                }
             }
             if (q_in_place) |q| {
                 proj = .{ .q = q, .k = k_dst, .v = v_dst };
