@@ -1811,6 +1811,8 @@ pub fn decoderStepCached(
     output: StepOutput,
 ) !StepResult {
     if (tokens.len == 0) return error.InvalidInputShape;
+    const end = @import("../execution/decoder_position.zig").appendEnd(cache.positions, tokens.len) catch return error.SequenceTooLong;
+    if (end > config.max_target_positions) return error.SequenceTooLong;
     if (cache.positions == 0) return decodeBlockCached(cb, allocator, config, tokens, cache, output);
     var index: usize = 0;
     while (index + 1 < tokens.len) : (index += 1) {
@@ -1962,8 +1964,9 @@ fn decodeBlockCached(
     const d_model = config.d_model;
     const n = tokens.len;
     const start = cache.positions;
-    if (start + n > config.max_target_positions) return error.SequenceTooLong;
     std.debug.assert(start == 0 or n == 1);
+    var pos_ids_buf: [2048]i64 = undefined;
+    if (n > pos_ids_buf.len) return error.SequenceTooLong;
     const weights = &cache.weights;
 
     // One submission for the whole step. Registered before any tensor so a
@@ -2004,8 +2007,6 @@ fn decodeBlockCached(
     var embedded_live = true;
     defer if (embedded_live) stepRelease(cb, &profile, embedded);
 
-    var pos_ids_buf: [2048]i64 = undefined;
-    if (n > pos_ids_buf.len) return error.SequenceTooLong;
     const pos_ids = pos_ids_buf[0..n];
     for (0..n) |i| pos_ids[i] = @intCast(start + i);
     const pos_emb = try stepEmbedding(cb, &profile, weights.positions, pos_ids, n, d_model);
@@ -2305,7 +2306,8 @@ fn decoderBlockCached(
             self_attn = try stepCausal(cb, profile, proj.q, proj.k, proj.v, dec_seq, num_heads, head_dim);
         } else {
             // One new query over every cached key: causal by construction.
-            self_attn = if (dec_seq == 1) try stepPrefix(cb, profile, proj.q, k_rows.tensor, v_rows.tensor, total, num_heads, head_dim) else try cb.crossAttention(proj.q, k_rows.tensor, v_rows.tensor, null, 1, dec_seq, total, num_heads, head_dim);
+            std.debug.assert(dec_seq == 1);
+            self_attn = try stepPrefix(cb, profile, proj.q, k_rows.tensor, v_rows.tensor, total, num_heads, head_dim);
         }
     }
     defer stepRelease(cb, profile, self_attn);
@@ -2398,6 +2400,14 @@ fn checkIncrementalResidentEncoder(cb: ComputeBackend, reference: ComputeBackend
     for (expected_first, actual_first) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.0001);
     for (expected_second, actual_second) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.0001);
     try std.testing.expectEqual(@as(usize, 3), cache.positions);
+    try std.testing.expectError(error.SequenceTooLong, decoderStepCachedLogits(&cb, a, config, &.{ 0, 1, 2, 0, 1, 2 }, &cache));
+    try std.testing.expectEqual(@as(usize, 3), cache.positions);
+    const actual_retry = try decoderStepCachedLogits(&cb, a, config, &.{ 0, 1 }, &cache);
+    defer a.free(actual_retry);
+    const expected_retry = try decoderStepCachedLogits(&reference, a, config, &.{ 0, 1 }, &expected_cache);
+    defer a.free(expected_retry);
+    for (expected_retry, actual_retry) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.0001);
+    try std.testing.expectEqual(@as(usize, 5), cache.positions);
     const geometry = try CacheGeometry.init(config, 2);
     const amounts = try geometry.cacheAmounts(&cb);
     const logical = 2 * config.decoder_layers * (geometry.cross_tensor_bytes + geometry.self_tensor_bytes);
