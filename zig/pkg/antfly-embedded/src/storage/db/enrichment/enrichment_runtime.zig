@@ -5405,12 +5405,29 @@ fn scopedAssetProducer(
             .is_cancelled_fn = AssetInvocationCancellation.isCancelled,
         },
         .max_response_bytes = producer.invocation_context.max_response_bytes,
+        .expected_model_revision = producer.invocation_context.expected_model_revision,
         .document_checkpoints = producer.invocation_context.document_checkpoints,
         .progress = if (comptime @TypeOf(runtime) == *EnrichmentRuntime)
             producer.invocation_context.progress orelse inference_request_context.ProgressSink{ .ptr = runtime, .update_fn = noteInferenceProgress }
         else
             null,
     });
+}
+
+/// Validate the owner in its original clock domains. The provider's scoped
+/// context borrows a stack token, so keep only the original producer at the
+/// result application boundary.
+fn checkAssetInvocationOwner(runtime: *EnrichmentRuntime, guard: ForegroundCatchUpGuard, context: asset_producer_mod.InvocationContext) !void {
+    if (comptime builtin.os.tag != .freestanding) {
+        if (runtime.shutdown_requested.load(.acquire)) return error.EnrichmentRetryAborted;
+    }
+    try guard.check();
+    if (runtime.config.cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
+    context.check() catch |err| {
+        if (isOperationCanceled(err)) return error.EnrichmentWaitCanceled;
+        if (err == error.Timeout) return error.EnrichmentWaitTimeout;
+        return err;
+    };
 }
 
 fn checkAssetProviderInvocation(
@@ -5432,6 +5449,7 @@ fn checkAssetProviderAdmission(
     requests: []const asset_producer_mod.Request,
 ) !void {
     if (requests.len == 0) return;
+    try checkAssetInvocationOwner(runtime, guard, producer.invocation_context);
     const recovery_key = assetInferenceRecoveryKey(requests[0]);
     lockInferenceRecovery(runtime);
     const circuit_open_until_ns = if (runtime.inference_recovery.get(recovery_key)) |state|
@@ -5441,12 +5459,12 @@ fn checkAssetProviderAdmission(
     runtime.inference_recovery_mutex.unlock();
     if (circuit_open_until_ns > runtime.deadline_clock.nowRealtimeNs()) return error.InferenceCircuitOpen;
     if (guard.deadline_ns == null and guard.cancellation.ptr == null) return;
-    try guard.check();
-    const foreground_bounded = try producer.foregroundBoundedForRequests(alloc, requests);
-    // Request-aware routing may parse provider configuration. Recheck before
-    // entering the provider so that work done by the contract hook cannot
-    // consume the caller's remaining deadline unnoticed.
-    try guard.check();
+    const foreground_bounded = producer.foregroundBoundedForRequests(alloc, requests) catch |err| {
+        try checkAssetInvocationOwner(runtime, guard, producer.invocation_context);
+        return classifyProviderCancellation(err, guard, false);
+    };
+    // Capability discovery may consume the owner's remaining time.
+    try checkAssetInvocationOwner(runtime, guard, producer.invocation_context);
     if (!foreground_bounded)
         return error.UnboundedEnrichmentProvider;
 }
@@ -5573,11 +5591,15 @@ fn assetProducerProduceGuarded(
     var cancellation: AssetInvocationCancellation = undefined;
     const scoped = scopedAssetProducer(runtime, producer, &cancellation);
     const produced = scoped.produce(alloc, request) catch |err| {
-        checkProviderFailureGuardRecording(runtime, recovery_key, 1) catch |guard_err| return guard_err;
+        checkAssetInvocationOwner(runtime, runtime.active_provider_guard, producer.invocation_context) catch |owner_err| {
+            noteInferenceControlFailure(runtime, recovery_key, owner_err, 1);
+            return owner_err;
+        };
         if (inferenceControlFailure(err)) noteInferenceControlFailure(runtime, recovery_key, err, 1);
         return assetProviderFailure(runtime, scoped, err);
     };
-    checkProviderFailureGuardRecording(runtime, recovery_key, 1) catch |err| {
+    checkAssetInvocationOwner(runtime, runtime.active_provider_guard, producer.invocation_context) catch |err| {
+        noteInferenceControlFailure(runtime, recovery_key, err, 1);
         alloc.free(produced);
         return err;
     };
@@ -5597,11 +5619,15 @@ fn assetProducerProduceBatchGuarded(
     var cancellation: AssetInvocationCancellation = undefined;
     const scoped = scopedAssetProducer(runtime, producer, &cancellation);
     const produced = scoped.produceBatch(alloc, requests) catch |err| {
-        checkProviderFailureGuardRecording(runtime, recovery_key, requests.len) catch |guard_err| return guard_err;
+        checkAssetInvocationOwner(runtime, runtime.active_provider_guard, producer.invocation_context) catch |owner_err| {
+            noteInferenceControlFailure(runtime, recovery_key, owner_err, requests.len);
+            return owner_err;
+        };
         if (inferenceControlFailure(err)) noteInferenceControlFailure(runtime, recovery_key, err, requests.len);
         return assetProviderFailure(runtime, scoped, err);
     };
-    checkProviderFailureGuardRecording(runtime, recovery_key, requests.len) catch |err| {
+    checkAssetInvocationOwner(runtime, runtime.active_provider_guard, producer.invocation_context) catch |err| {
+        noteInferenceControlFailure(runtime, recovery_key, err, requests.len);
         for (produced) |output| if (output.len > 0) alloc.free(output);
         alloc.free(produced);
         return err;
@@ -5620,12 +5646,11 @@ fn assetProducerProduceBatchReportedGuarded(
     var cancellation: AssetInvocationCancellation = undefined;
     const scoped = scopedAssetProducer(runtime, producer, &cancellation);
     var produced = scoped.produceBatchReported(alloc, requests) catch |err| {
-        try checkProviderFailureGuard(runtime);
+        try checkAssetInvocationOwner(runtime, runtime.active_provider_guard, producer.invocation_context);
         return assetProviderFailure(runtime, scoped, err);
     };
     errdefer produced.deinit(alloc);
-    scoped.invocation_context.check() catch |err| return assetProviderFailure(runtime, scoped, err);
-    try checkProviderFailureGuard(runtime);
+    try checkAssetInvocationOwner(runtime, runtime.active_provider_guard, producer.invocation_context);
     return produced;
 }
 
@@ -5665,12 +5690,11 @@ fn assetProducerProduceBorrowedRasterBatchReportedGuarded(
     var cancellation: AssetInvocationCancellation = undefined;
     const scoped = scopedAssetProducer(runtime, producer, &cancellation);
     var produced = scoped.produceBorrowedRasterBatchReported(alloc, requests, rasters) catch |err| {
-        try checkProviderFailureGuard(runtime);
+        try checkAssetInvocationOwner(runtime, runtime.active_provider_guard, producer.invocation_context);
         return assetProviderFailure(runtime, scoped, err);
     };
     errdefer produced.deinit(alloc);
-    scoped.invocation_context.check() catch |err| return assetProviderFailure(runtime, scoped, err);
-    try checkProviderFailureGuard(runtime);
+    try checkAssetInvocationOwner(runtime, runtime.active_provider_guard, producer.invocation_context);
     return produced;
 }
 
@@ -15352,7 +15376,11 @@ const DocumentPreparationPipeline = struct {
             }
             // Speculation always needs cooperative teardown, even for durable
             // replay with no caller deadline. Never dispatch a legacy callback.
-            if (!try producer.foregroundBoundedForRequests(self.allocator(), requests)) return error.UnboundedEnrichmentProvider;
+            const bounded = producer.foregroundBoundedForRequests(self.allocator(), requests) catch |err| {
+                if (isCancelled(self)) return error.Canceled;
+                return assetProviderFailure(&self.context, producer, err);
+            };
+            if (!bounded) return error.UnboundedEnrichmentProvider;
             if (isCancelled(self)) return error.Canceled;
         }
         fn checkDiscovery(self: *@This(), producer: asset_producer_mod.Producer, requests: []const asset_producer_mod.Request) !void {
@@ -19239,6 +19267,7 @@ const AssetBatchOutcome = struct {
 /// items were handled without production.
 fn resubmitPendingAssetOutputs(
     runtime: *EnrichmentRuntime,
+    producer: ?asset_producer_mod.Producer,
     items: []AssetProducerBatchItem,
     window: *GeneratedReplayWindow,
     scope: *FailureScope,
@@ -19275,6 +19304,7 @@ fn resubmitPendingAssetOutputs(
             },
         };
         defer runtime.alloc.free(cached);
+        try checkAssetInvocationOwner(runtime, runtime.active_provider_guard, if (producer) |value| value.invocation_context else .{});
         applyAssetProducerBatchOutput(runtime, current, cached, window, scope) catch |err| {
             if (scope.publication_failed) return err;
             if (err == error.ArtifactPublicationPending) {
@@ -19319,7 +19349,7 @@ fn flushAssetProducerBatchItems(
         for (claimed.items) |key| runtime.submitted_outputs.release(key);
         claimed.deinit(runtime.alloc);
     }
-    const pending_count = try resubmitPendingAssetOutputs(runtime, items, window, scope, &outcome, &claimed);
+    const pending_count = try resubmitPendingAssetOutputs(runtime, runtime.config.asset_producer, items, window, scope, &outcome, &claimed);
     if (pending_count == items.len) return outcome.finish();
     const remaining = items[pending_count..];
     scope.enterOwned(assetProducerBatchFailureFingerprint(remaining), .{ .assets = remaining });
@@ -19397,7 +19427,7 @@ fn flushTextAssetProducerBatchItems(
     for (items, 0..) |*item, idx| requests[idx] = item.asRequest();
 
     const can_batch = assetProducerCanBatchGuarded(runtime, producer, runtime.alloc, requests) catch |err| {
-        if (err == error.ProviderInvocationCanceled) return deferCanceledAssetBatch(runtime, items, window, scope);
+        if (err == error.ProviderInvocationCanceled) return deferCanceledAssetBatch(runtime, producer, items, window, scope);
         if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
         return try flushAssetProducerBatchSequential(runtime, producer, items, window, scope);
     };
@@ -19406,7 +19436,7 @@ fn flushTextAssetProducerBatchItems(
 
     var produced_batch = assetProducerProduceBatchReportedGuarded(runtime, producer, runtime.alloc, requests) catch |err| {
         if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
-        if (err == error.ProviderInvocationCanceled) return deferCanceledAssetBatch(runtime, items, window, scope);
+        if (err == error.ProviderInvocationCanceled) return deferCanceledAssetBatch(runtime, producer, items, window, scope);
         // Batch execution is an optimization boundary, not a logical repair
         // identity. Fall back immediately so durable retry ownership belongs to
         // each source request and cannot oscillate between batch and singleton
@@ -19417,7 +19447,7 @@ fn flushTextAssetProducerBatchItems(
 
     var outcome: AssetBatchOutcome = .{};
     for (items, produced_batch.items) |*item, *produced| {
-        if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
+        try checkAssetInvocationOwner(runtime, runtime.active_provider_guard, producer.invocation_context);
         scope.enterAsset(item);
         switch (produced.result) {
             .item_error => |failure| {
@@ -19463,7 +19493,8 @@ fn noteParkedRequests(runtime: *EnrichmentRuntime, scheduler: *ScopedReplay, err
     scheduler.refreshRuntime(runtime);
 }
 
-fn deferCanceledAssetBatch(runtime: *EnrichmentRuntime, items: []AssetProducerBatchItem, window: *GeneratedReplayWindow, scope: *FailureScope) !void {
+fn deferCanceledAssetBatch(runtime: *EnrichmentRuntime, producer: asset_producer_mod.Producer, items: []AssetProducerBatchItem, window: *GeneratedReplayWindow, scope: *FailureScope) !void {
+    const cause = error.ProviderInvocationCanceled;
     var outcome: AssetBatchOutcome = .{};
     var pending: std.ArrayListUnmanaged(ScopedReplay.ParkMember) = .empty;
     defer pending.deinit(runtime.alloc);
@@ -19471,23 +19502,20 @@ fn deferCanceledAssetBatch(runtime: *EnrichmentRuntime, items: []AssetProducerBa
     var terminal: std.ArrayListUnmanaged(Terminal) = .empty;
     defer terminal.deinit(runtime.alloc);
     for (items) |*item| {
-        const cause = providerInvocationFailure(runtime, error.Canceled);
-        if (cause != error.ProviderInvocationCanceled) return cause;
+        try checkAssetInvocationOwner(runtime, runtime.active_provider_guard, producer.invocation_context);
         scope.enterAsset(item);
         if (try scope.shouldYieldWithPending(runtime, cause, &pending)) {
             outcome.deferRetry(scope, cause);
         } else try terminal.append(runtime.alloc, .{ .item = item, .attempt = scope.attemptNumber(runtime) });
     }
     if (pending.items.len != 0) {
-        const cause = providerInvocationFailure(runtime, error.Canceled);
-        if (cause != error.ProviderInvocationCanceled) return cause;
+        try checkAssetInvocationOwner(runtime, runtime.active_provider_guard, producer.invocation_context);
         const scheduler = runtime.retry_scheduler.?;
         const parked = scheduler.parkPreparedMembers(runtime, pending.items, cause, true) catch |err| return scope.publicationFailure(err);
         noteParkedRequests(runtime, scheduler, cause, parked);
     }
     for (terminal.items) |failure| {
-        const cause = providerInvocationFailure(runtime, error.Canceled);
-        if (cause != error.ProviderInvocationCanceled) return cause;
+        try checkAssetInvocationOwner(runtime, runtime.active_provider_guard, producer.invocation_context);
         try recordAssetProducerFailure(runtime, window, failure.item.*, cause, failure.attempt, scope);
     }
     return outcome.finish();
@@ -19546,6 +19574,7 @@ fn flushIndexDocumentBatch(runtime: *EnrichmentRuntime, producer: asset_producer
             runtime.alloc.free(bytes);
         };
         for (results[0..count], items[offset..][0..count]) |result, *item| {
+            try checkAssetInvocationOwner(runtime, runtime.active_provider_guard, producer.invocation_context);
             scope.enterAsset(item);
             const bytes = result catch |err| {
                 if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
@@ -19580,7 +19609,7 @@ fn flushAssetProducerBatchSequential(
 ) !void {
     var outcome: AssetBatchOutcome = .{};
     for (items) |*item| {
-        if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
+        try checkAssetInvocationOwner(runtime, runtime.active_provider_guard, producer.invocation_context);
         scope.enterAsset(item);
         const request = item.asRequest();
         const produced = assetProducerProduceGuarded(runtime, producer, runtime.alloc, request) catch |err| {
@@ -19591,6 +19620,7 @@ fn flushAssetProducerBatchSequential(
             continue;
         };
         defer runtime.alloc.free(produced);
+        try checkAssetInvocationOwner(runtime, runtime.active_provider_guard, producer.invocation_context);
         applyAssetProducerBatchOutput(runtime, item, produced, window, scope) catch |err| {
             if (scope.publication_failed) return err;
             if (err == error.ArtifactPublicationPending) {
@@ -20779,8 +20809,9 @@ fn processDocumentExtractionAsset(
             from_generation,
             request.execution_json,
             window,
+            scope,
         );
-        try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
+        recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime)) catch |save_err| return FailureScope.assetPublicationFailure(scope, save_err);
         return;
     };
     var prepared_source_lease = switch (fetched) {
@@ -20810,8 +20841,9 @@ fn processDocumentExtractionAsset(
                 from_generation,
                 request.execution_json,
                 window,
+                scope,
             );
-            try recordIsolatedRequestErrorFor(runtime, window, request, error.RemoteDocumentFetchFailed, scope.attemptNumber(runtime));
+            recordIsolatedRequestErrorFor(runtime, window, request, error.RemoteDocumentFetchFailed, scope.attemptNumber(runtime)) catch |save_err| return FailureScope.assetPublicationFailure(scope, save_err);
             return;
         },
     };
@@ -20843,8 +20875,9 @@ fn processDocumentExtractionAsset(
             from_generation,
             request.execution_json,
             window,
+            scope,
         );
-        try recordIsolatedRequestErrorFor(runtime, window, request, raw_err, scope.attemptNumber(runtime));
+        recordIsolatedRequestErrorFor(runtime, window, request, raw_err, scope.attemptNumber(runtime)) catch |save_err| return FailureScope.assetPublicationFailure(scope, save_err);
         return;
     };
     const byte_source_fingerprint = if (metadata_fingerprint == null)
@@ -20932,8 +20965,9 @@ fn processDocumentExtractionAsset(
                 from_generation,
                 request.execution_json,
                 window,
+                scope,
             );
-            try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
+            recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime)) catch |save_err| return FailureScope.assetPublicationFailure(scope, save_err);
             return;
         }
     else
@@ -21088,8 +21122,9 @@ fn processDocumentExtractionAsset(
             from_generation,
             request.execution_json,
             window,
+            scope,
         );
-        try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
+        recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime)) catch |save_err| return FailureScope.assetPublicationFailure(scope, save_err);
         return;
     };
     // Page rendering is complete. Its task-local coordinator is gone, while the
@@ -21318,8 +21353,9 @@ fn processDocumentExtractionAsset(
             from_generation,
             request.execution_json,
             window,
+            scope,
         );
-        try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
+        recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime)) catch |save_err| return FailureScope.assetPublicationFailure(scope, save_err);
         return;
     };
     config.pdf_decode_limits = configured_pdf_decode_limits;
@@ -21482,6 +21518,7 @@ fn writeDocumentExtractionFailureManifest(
     from_generation: u64,
     execution_json: []const u8,
     window: *GeneratedReplayWindow,
+    scope: *FailureScope,
 ) !void {
     var previous_state = RuntimeDocumentExtractionPreviousState{};
     defer previous_state.deinit(runtime.alloc);
@@ -21540,7 +21577,7 @@ fn writeDocumentExtractionFailureManifest(
     // failed manifest and repair ledger make the source stale/observable, while
     // retaining searchable data and enough prior state for a later repair to
     // diff and remove obsolete children correctly.
-    try storePutBatchWithRetry(runtime, writes.items, &.{});
+    storePutBatchWithRetry(runtime, writes.items, &.{}) catch |err| return FailureScope.assetPublicationFailure(scope, err);
     recordArtifactBytes(runtime, .asset, manifest.len);
 }
 
@@ -43484,6 +43521,8 @@ test "asset batch fallback isolates malformed envelope and preserves typed mixed
         retryable: bool = false,
         cancel_item: bool = false,
         cancel_invocation: bool = false,
+        cancel_single: bool = false,
+        capability_error: ?anyerror = null,
         inherited: std.atomic.Value(bool) = .init(false),
 
         fn producer(self: *@This()) asset_producer_mod.Producer {
@@ -43492,16 +43531,30 @@ test "asset batch fallback isolates malformed envelope and preserves typed mixed
                 .invocation_context = .{ .cancellation = CancellationToken.fromAtomic(&self.inherited) },
                 .vtable = &.{
                     .produce = produce,
+                    .produce_with_context = produceWithContext,
+                    .foreground_bounded_for_requests = foregroundBounded,
                     .produce_batch_reported = produceBatchReported,
                     .invocation_memory_for_requests = testInvocationMemoryForRequests,
                 },
             };
         }
 
-        fn produce(ptr: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
+        fn produce(ptr: *anyopaque, a: Allocator, _: asset_producer_mod.Request) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.single_count += 1;
-            return error.TestUnexpectedSequentialFallback;
+            if (!self.cancel_single) return error.TestUnexpectedSequentialFallback;
+            self.inherited.store(true, .release);
+            return a.dupe(u8, "singleton");
+        }
+
+        fn produceWithContext(ptr: *anyopaque, a: Allocator, request: asset_producer_mod.Request, _: asset_producer_mod.InvocationContext) ![]u8 {
+            return produce(ptr, a, request);
+        }
+
+        fn foregroundBounded(ptr: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.capability_error) |err| return err;
+            return true;
         }
 
         fn produceBatchReported(ptr: *anyopaque, a: Allocator, requests: []const asset_producer_mod.Request) !asset_producer_mod.ProducedBatch {
@@ -43686,6 +43739,53 @@ test "asset batch fallback isolates malformed envelope and preserves typed mixed
     try std.testing.expectError(error.NotFound, storeGetAlloc(&runtime, "artifact:inherited"));
     try std.testing.expectEqual(@as(usize, 2), failure_capture.count);
     try std.testing.expectEqual(@as(usize, 0), mixed.single_count);
+
+    // The first item's write can finish after the invocation owner cancels.
+    // The later failed item must not acquire a retry ticket or failure receipt.
+    const CancelOnWrite = struct {
+        var original: *const fn (Allocator, *anyopaque) anyerror!backend_erased.Batch = undefined;
+        var signal: *std.atomic.Value(bool) = undefined;
+        fn begin(a: Allocator, ptr: *anyopaque) anyerror!backend_erased.Batch {
+            signal.store(true, .release);
+            return original(a, ptr);
+        }
+    };
+    var scheduler = try ScopedReplay.load(&runtime);
+    defer scheduler.deinit(alloc);
+    runtime.retry_scheduler = &scheduler;
+    defer runtime.retry_scheduler = null;
+    const original = runtime.store.vtable;
+    var instrumented = original.*;
+    CancelOnWrite.original = original.begin_batch;
+    CancelOnWrite.signal = &mixed.inherited;
+    instrumented.begin_batch = CancelOnWrite.begin;
+    mixed.cancel_invocation = false;
+    mixed.inherited.store(false, .release);
+    try items.append(alloc, try TestItem.make(alloc, "doc:5", "five", "artifact:started", "state:started"));
+    try items.append(alloc, try TestItem.make(alloc, "doc:6", "six", "artifact:after-cancel", "state:after-cancel"));
+    var during_write = FailureScope{};
+    {
+        runtime.store.vtable = &instrumented;
+        defer runtime.store.vtable = original;
+        try std.testing.expectError(error.EnrichmentWaitCanceled, flushAssetProducerBatch(&runtime, &items, &window, &during_write));
+    }
+    const started = try storeGetAlloc(&runtime, "artifact:started");
+    defer alloc.free(started);
+    try std.testing.expectEqualStrings("native:three", started);
+    try std.testing.expectError(error.NotFound, storeGetAlloc(&runtime, "artifact:after-cancel"));
+    try std.testing.expectEqual(@as(usize, 0), scheduler.state.tickets.items.len);
+    try std.testing.expectEqual(@as(usize, 2), failure_capture.count);
+
+    const request: asset_producer_mod.Request = .{ .producer_type = .generator, .config_json = "{}", .source_text = "one" };
+    mixed.inherited.store(false, .release);
+    mixed.cancel_single = true;
+    try std.testing.expectError(error.EnrichmentWaitCanceled, assetProducerProduceGuarded(&runtime, mixed.producer(), alloc, request));
+
+    mixed.inherited.store(false, .release);
+    mixed.capability_error = error.Canceled;
+    runtime.active_provider_guard.deadline_ns = std.math.maxInt(u64);
+    try std.testing.expectError(error.ProviderInvocationCanceled, checkAssetProviderInvocation(&runtime, mixed.producer(), alloc, &.{request}));
+    try std.testing.expectEqual(@as(usize, 1), mixed.single_count);
 }
 
 test "ordered artifact inventory unit chunk callback reconstructs publishes and retires accepted inputs" {
@@ -47533,6 +47633,40 @@ test "asset batch fallback keeps the logical request retry budget" {
     try std.testing.expectEqual(@as(u64, 0), runtime.active_failure_fingerprint);
     try std.testing.expectEqual(@as(usize, 2), scheduler.state.tickets.items.len);
     try std.testing.expectEqual(@as(usize, 1), failure_capture.count);
+
+    // Exhaust terminal source handling at its two durable boundaries.
+    // The bad input is document-owned, but a failed manifest or ledger write
+    // must clear the scanner's active request identity.
+    var extraction = copy;
+    extraction.index_name = "extraction";
+    extraction.artifact_name = "extraction";
+    extraction.producer_json = "{\"type\":\"document_extraction\",\"config\":{}}";
+    dependent.upstream_artifact_name = "extraction";
+    runtime.store.vtable = original;
+    try storePutWithRetry(&runtime, source_key, "{\"body\":\"data:text/plain;base64,%%%\"}");
+    runtime.config.worker_retry_max_attempts = 1;
+    runtime.store.vtable = &instrumented;
+    setActiveFailureFingerprint(&runtime, requestFailureFingerprint(extraction));
+    try std.testing.expectError(error.WriterLocked, processPlannedAsset(&runtime, extraction, &.{dependent}, &queued, &sources, &window));
+    try std.testing.expectEqual(@as(u64, 0), runtime.active_failure_fingerprint);
+    try std.testing.expectEqual(@as(usize, 1), failure_capture.count);
+
+    const LockedLedger = struct {
+        fn record(_: *anyopaque, _: RequestFailure) !void {
+            return error.WriterLocked;
+        }
+    };
+    runtime.store.vtable = original;
+    runtime.failure_fn = LockedLedger.record;
+    setActiveFailureFingerprint(&runtime, requestFailureFingerprint(extraction));
+    try std.testing.expectError(error.WriterLocked, processPlannedAsset(&runtime, extraction, &.{dependent}, &queued, &sources, &window));
+    try std.testing.expectEqual(@as(u64, 0), runtime.active_failure_fingerprint);
+    try std.testing.expectEqual(@as(usize, 2), scheduler.state.tickets.items.len);
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, extraction.doc_key, "asset", extraction.artifact_name);
+    defer alloc.free(manifest_key);
+    const manifest = try storeGetAlloc(&runtime, manifest_key);
+    defer alloc.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"route_type\":\"error\"") != null);
 }
 
 test "document extraction generated OCR bypasses unsupported native batch" {
