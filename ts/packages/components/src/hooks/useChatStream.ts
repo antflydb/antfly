@@ -12,6 +12,7 @@ import type {
   RetrievalAgentSteps,
   SSEStepStarted,
 } from "@antfly/sdk";
+import { type AnswerRetrievalOptions, answerRetrieval } from "@antfly/sdk";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { streamAnswer } from "../utils";
 
@@ -56,10 +57,12 @@ export interface ChatConfig {
   generator: GeneratorConfig;
   table: string;
   semanticIndexes?: string[];
+  retrievalMode?: AnswerRetrievalOptions["retrievalMode"];
   agentKnowledge?: string;
   systemPrompt?: string;
   maxInternalIterations?: number;
   followUpCount?: number;
+  showFollowUpQuestions?: boolean;
   limit?: number;
   steps?: RetrievalAgentSteps;
   tools?: ChatToolsConfig;
@@ -135,44 +138,31 @@ export function useChatStream() {
     };
 
     // Build retrieval agent request
-    const request: RetrievalAgentRequest = {
+    const request: Omit<RetrievalAgentRequest, "queries"> = {
       query: text,
       generator: config.generator,
       agent_knowledge: config.agentKnowledge,
       stream: true,
       messages,
-      queries: [
-        {
-          table: config.table,
-          semantic_search: text,
-          ...(config.semanticIndexes?.length ? { indexes: config.semanticIndexes } : {}),
-          ...(config.fields?.length ? { fields: config.fields } : {}),
-          ...(config.filterQuery ? { filter_query: config.filterQuery } : {}),
-          ...(config.exclusionQuery ? { exclusion_query: config.exclusionQuery } : {}),
-          limit: config.limit ?? 10,
-        },
-      ],
       steps: {
         ...(config.steps ?? {
           generation: {},
           classification: {},
-          followup: { ...(config.followUpCount ? { count: config.followUpCount } : {}) },
+          ...((config.showFollowUpQuestions ?? config.followUpCount !== undefined)
+            ? { followup: { count: config.followUpCount } }
+            : {}),
           confidence: {},
         }),
         ...(config.systemPrompt && (!config.steps || config.steps.generation)
           ? { generation: { ...config.steps?.generation, system_prompt: config.systemPrompt } }
           : {}),
       },
-      ...(config.tools ? { tools: config.tools } : {}),
-      ...(config.maxInternalIterations
-        ? { max_internal_iterations: config.maxInternalIterations }
-        : {}),
     };
 
     try {
       await streamAnswer(
         config.url,
-        request,
+        { ...request, ...answerRetrieval(config.table, text, config) },
         config.headers || {},
         {
           onClassification: (data) => {
@@ -192,7 +182,7 @@ export function useChatStream() {
               ...t,
               steps: [...t.steps, step],
               activeSteps: t.activeSteps.filter((s) => s.id !== step.id),
-              toolCallsMade: t.toolCallsMade + 1,
+              toolCallsMade: t.toolCallsMade + (step.kind === "tool_call" ? 1 : 0),
             }));
           },
           onGeneration: (chunk) => {
@@ -216,6 +206,13 @@ export function useChatStream() {
           onRetrievalAgentResult: (result) => {
             updateTurn((t) => ({
               ...t,
+              error:
+                result.status === "completed" &&
+                request.steps?.generation &&
+                request.steps.generation.enabled !== false &&
+                !(result.generation?.trim() || t.assistantMessage.trim())
+                  ? "Retrieval completed without generating an answer."
+                  : t.error,
               assistantMessage: result.generation ?? t.assistantMessage,
               hits: result.hits ?? t.hits,
               followUpQuestions: result.followup_questions ?? t.followUpQuestions,
