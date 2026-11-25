@@ -327,3 +327,24 @@ receive external mail. Select the inbox in the web app before composing.
    destination. If the Outbox says **Not sent**, check the recipient and
    sender-domain setup before composing a new test. Rejected messages are
    not resent automatically.
+
+### Planned on-device mail classification
+
+The GLiDE-0.4B checkpoint needs a browser decision adapter before it can be
+published in the mailbox catalog. Use the existing Antfly GLiDE prompt
+format, tokenizer assets, readout weights and option scoring. Validate the
+browser's CPU and WebGPU results against native decisions on the same
+checkpoint before enabling downloads in the UI.
+
+Classify bounded message text into Primary, Updates, Promotions, Social or
+Forums. Keep Important independent. Start by showing suggestions and keep
+uncertain messages in Primary. Preserve user corrections across model
+upgrades. GLiDE-0.4B supports text only. For decisions with image content,
+require a model that advertises and implements image input rather than
+dropping the images.
+
+Keep the model opt-in and cache it independently from EmbeddingGemma 2.
+Publish a revision-pinned, hashed bundle with the upstream license and
+notices. Large weight files use multipart R2 uploads. Carry the Fastino
+attribution and check the checkpoint's commercial terms before enabling
+production use.
