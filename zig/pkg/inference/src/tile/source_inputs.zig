@@ -113,6 +113,7 @@ pub const paths = [_][]const u8{
     "src/tile/families/native/metal/elementwise_direct_abi.m",
     "src/tile/families/native/metal/expert_projection.m",
     "src/tile/families/native/metal/expert_projection_abi.m",
+    "src/tile/families/native/metal/gated_residual_bf16.metal",
     "src/tile/families/native/metal/head_norm_bf16.metal",
     "src/tile/families/native/metal/kv_storage.metal",
     "src/tile/families/native/metal/normalization_direct.metal",

@@ -1782,6 +1782,7 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> dense_bf16_projection_pipeline;
     id<MTLComputePipelineState> head_norm_bf16_pipeline;
     id<MTLComputePipelineState> residual_mix_bf16_pipeline;
+    id<MTLComputePipelineState> gated_residual_bf16_pipelines[2];
     TermiteMetalMtpHeadWorkspace *mtp_head_workspace;
     id<MTLDevice> device;
     // Opt-in dense embedding workspace guard. Counts fresh allocations until
@@ -13004,6 +13005,64 @@ static NSString *termite_metal_shader_source(void) {
            "        reinterpret_cast<device bfloat *>(output)[base + column] = bfloat((mixed[column] * norm) * float(gamma[column]));\n"
            "}\n"
            // tile-codegen:end residual.mix_bf16 family
+           // tile-codegen:begin residual.gated_bf16.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           "struct GatedResidualParams { uint width; float epsilon; };\n"
+           "\n"
+           "kernel void antfly_normalize_pair_f32_to_bf16(\n"
+           "    device const float *destination [[buffer(0)]],\n"
+           "    device const float *message [[buffer(1)]],\n"
+           "    device bfloat *pair [[buffer(2)]],\n"
+           "    constant GatedResidualParams &p [[buffer(3)]],\n"
+           "    uint row [[threadgroup_position_in_grid]],\n"
+           "    uint tid [[thread_index_in_threadgroup]]\n"
+           ") {\n"
+           "    const ulong base = ulong(row) * p.width;\n"
+           "    threadgroup float partial[4];\n"
+           "    float d = 0.0f, m = 0.0f;\n"
+           "    for (uint i = tid; i < p.width; i += 128u) {\n"
+           "        d = fma(destination[base + i], destination[base + i], d);\n"
+           "        m = fma(message[base + i], message[base + i], m);\n"
+           "    }\n"
+           "    const float dn = rsqrt(antfly_residual_mix_reduce(d, tid, partial) / float(p.width) + p.epsilon);\n"
+           "    const float mn = rsqrt(antfly_residual_mix_reduce(m, tid, partial) / float(p.width) + p.epsilon);\n"
+           "    for (uint i = tid; i < p.width; i += 128u) {\n"
+           "        pair[2u * base + i] = bfloat(destination[base + i] * dn);\n"
+           "        pair[2u * base + p.width + i] = bfloat(message[base + i] * mn);\n"
+           "    }\n"
+           "}\n"
+           "\n"
+           // tile-codegen:end residual.gated_bf16.0 family
+           // tile-codegen:begin residual.gated_bf16.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           "inline float antfly_gated_residual(float destination, float message, float gain, float forget) {\n"
+           "    return (1.0f - tanh(forget)) * destination + tanh(gain) * message;\n"
+           "}\n"
+           "\n"
+           "kernel void antfly_gated_residual_rms_f32_to_bf16(\n"
+           "    device const float *destination [[buffer(0)]],\n"
+           "    device const float *message [[buffer(1)]],\n"
+           "    device const float *gates [[buffer(2)]],\n"
+           "    device const bfloat *gamma [[buffer(3)]],\n"
+           "    device bfloat *output [[buffer(4)]],\n"
+           "    constant GatedResidualParams &p [[buffer(5)]],\n"
+           "    uint row [[threadgroup_position_in_grid]],\n"
+           "    uint tid [[thread_index_in_threadgroup]]\n"
+           ") {\n"
+           "    const ulong base = ulong(row) * p.width;\n"
+           "    threadgroup float partial[4];\n"
+           "    float square = 0.0f;\n"
+           "    for (uint i = tid; i < p.width; i += 128u) {\n"
+           "        const float value = antfly_gated_residual(destination[base + i], message[base + i],\n"
+           "            gates[2u * base + i], gates[2u * base + p.width + i]);\n"
+           "        square = fma(value, value, square);\n"
+           "    }\n"
+           "    const float norm = rsqrt(antfly_residual_mix_reduce(square, tid, partial) / float(p.width) + p.epsilon);\n"
+           "    for (uint i = tid; i < p.width; i += 128u) {\n"
+           "        const float value = antfly_gated_residual(destination[base + i], message[base + i],\n"
+           "            gates[2u * base + i], gates[2u * base + p.width + i]);\n"
+           "        output[base + i] = bfloat((value * norm) * float(gamma[i]));\n"
+           "    }\n"
+           "}\n"
+           // tile-codegen:end residual.gated_bf16.1 family
            // tile-codegen:begin normalization.head_bf16 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "struct HeadNormBf16Params {\n"
            "    uint rows, heads, dim, position, log_floor, weighted;\n"
@@ -33835,6 +33894,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->dense_bf16_projection_pipeline = nil;
     runtime->head_norm_bf16_pipeline = nil;
     runtime->residual_mix_bf16_pipeline = nil;
+    for (size_t index = 0; index < 2; ++index) runtime->gated_residual_bf16_pipelines[index] = nil;
     free(runtime);
     }
 }
@@ -37133,6 +37193,31 @@ int antfly_metal_dispatch_residual_mix_bf16(
     return antfly_metal_encode_typed_stage(runtime, @"antfly_residual_mix_bf16",
         &runtime->residual_mix_bf16_pipeline, views, required, alignment, 6, 1u << 5,
         p, sizeof(*p), MTLSizeMake(p->rows, 1, 1), MTLSizeMake(128, 1, 1));
+}
+
+int antfly_metal_dispatch_gated_residual_bf16(
+    termite_metal_decode_runtime *runtime, const antfly_metal_routed_buffer views[5],
+    uint32_t rows, uint32_t width, float epsilon, unsigned stage
+) {
+    if (!runtime || !views || !rows || !width || stage > 1 || !isfinite(epsilon) || epsilon <= 0) return -1;
+    size_t values, bytes;
+    if (!termite_metal_size_mul(rows, width, &values) ||
+        !termite_metal_size_mul(values, 8, &bytes)) return -1;
+    const struct { uint32_t width; float epsilon; } params = {width, epsilon};
+    const MTLSize grid = MTLSizeMake(rows, 1, 1);
+    const MTLSize threads = MTLSizeMake(128, 1, 1);
+    if (stage == 0) {
+        const size_t required[3] = {bytes / 2, bytes / 2, bytes / 2};
+        const size_t alignment[3] = {4, 4, 2};
+        return antfly_metal_encode_typed_stage(runtime, @"antfly_normalize_pair_f32_to_bf16",
+            &runtime->gated_residual_bf16_pipelines[0], views, required, alignment, 3, 1u << 2,
+            &params, sizeof(params), grid, threads);
+    }
+    const size_t required[5] = {bytes / 2, bytes / 2, bytes, (size_t)width * 2, bytes / 4};
+    const size_t alignment[5] = {4, 4, 4, 2, 2};
+    return antfly_metal_encode_typed_stage(runtime, @"antfly_gated_residual_rms_f32_to_bf16",
+        &runtime->gated_residual_bf16_pipelines[1], views, required, alignment, 5, 1u << 4,
+        &params, sizeof(params), grid, threads);
 }
 
 typedef struct { uint32_t rows, hidden, head_dim, grid_x, grid_y; float eps, theta, scale; uint32_t stride, start, rotate, weighted, cached_rotary; } termite_vision_norm_rope_params;

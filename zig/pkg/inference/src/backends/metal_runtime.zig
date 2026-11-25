@@ -53786,3 +53786,92 @@ test "Metal BF16 residual mixing preserves F32 and normalized output boundaries"
     try tensors[5].downloadBytesInto(std.mem.asBytes(&bf16));
     try std.testing.expectEqual(twos, bf16);
 }
+
+/// Normalize the destination/message pair, project the gain and forget gates,
+/// and publish the updated BF16 residual in the caller's command frame.
+pub const GatedResidualBf16 = struct {
+    rows: u32,
+    width: u32,
+    rank: u32,
+    epsilon: f32,
+
+    const Buffer = RoutedBlockScaledProjection.Buffer;
+    extern fn antfly_metal_dispatch_gated_residual_bf16(runtime: *RawMetalDecodeRuntime, views: *const [5]Buffer, rows: u32, width: u32, epsilon: f32, stage: c_uint) c_int;
+
+    pub const Weights = struct {
+        down: *const MetalTensor,
+        gates: *const MetalTensor,
+        gamma: *const MetalTensor,
+    };
+
+    pub const Workspace = struct {
+        pair: *MetalTensor,
+        rank: *MetalTensor,
+        gates: *MetalTensor,
+    };
+
+    pub fn encode(self: GatedResidualBf16, runtime: *RawMetalDecodeRuntime, destination: *const MetalTensor, message: *const MetalTensor, weights: Weights, scratch: Workspace, output: *MetalTensor) !void {
+        if (!hasActiveFrame(runtime)) return error.MetalFrameRequired;
+        if (scratch.pair.isReadOnlyPhysical() or output.isReadOnlyPhysical()) return error.ReadOnlyPhysicalStorage;
+        const pair_width = try std.math.mul(u32, self.width, 2);
+        const d = try Buffer.fromTensor(destination, .f32);
+        const m = try Buffer.fromTensor(message, .f32);
+        const views: [5]Buffer = .{ d, m, try .fromTensor(scratch.pair, .i16), .{}, .{} };
+        if (antfly_metal_dispatch_gated_residual_bf16(runtime, &views, self.rows, self.width, self.epsilon, 0) != 0)
+            return error.MetalKernelDispatchFailed;
+        scratch.pair.invalidateHostMirror();
+
+        if (scratch.rank.dtype != .i16 or scratch.gates.dtype != .f32) return error.UnsupportedTensorType;
+        const down: DenseBf16Projection = .{ .rows = self.rows, .input_width = pair_width, .output_width = self.rank };
+        const gate: DenseBf16Projection = .{ .rows = self.rows, .input_width = self.rank, .output_width = pair_width };
+        try down.encode(runtime, scratch.pair, weights.down, scratch.rank);
+        try gate.encode(runtime, scratch.rank, weights.gates, scratch.gates);
+
+        const blend: [5]Buffer = .{
+            d, m, try .fromTensor(scratch.gates, .f32), try .fromTensor(weights.gamma, .i16), try .fromTensor(output, .i16),
+        };
+        if (antfly_metal_dispatch_gated_residual_bf16(runtime, &blend, self.rows, self.width, self.epsilon, 1) != 0)
+            return error.MetalKernelDispatchFailed;
+        output.invalidateHostMirror();
+    }
+};
+
+test "Metal gated residual projects and applies the controller without readback" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const destination: [2]f32 = .{ 1, 0 };
+    const message: [2]f32 = .{ 0, 1 };
+    const down: [4]u16 = .{ 0x3f80, 0, 0, 0 };
+    const gates: [4]u16 = .{ 0, 0x4100, 0, 0 };
+    const gamma: [2]u16 = @splat(0x3f80);
+    const payloads: [5][]const u8 = .{
+        std.mem.asBytes(&destination), std.mem.asBytes(&message), std.mem.asBytes(&down),
+        std.mem.asBytes(&gates),       std.mem.asBytes(&gamma),
+    };
+    var tensors: [9]MetalTensor = undefined;
+    var initialized: usize = 0;
+    defer for (tensors[0..initialized]) |*tensor| tensor.deinit();
+    for (&tensors, [_]metal_tensor.DType{ .f32, .f32, .i16, .i16, .i16, .i16, .i16, .f32, .i16 }, [_]i32{ 2, 2, 4, 4, 2, 4, 1, 4, 2 }) |*tensor, dtype, extent| {
+        tensor.* = try MetalTensor.deviceAllocateTyped(std.testing.allocator, runtime, dtype, .shared, &.{extent});
+        initialized += 1;
+        if (initialized <= payloads.len) try tensor.uploadBytes(payloads[initialized - 1]);
+    }
+    const controller: GatedResidualBf16 = .{ .rows = 1, .width = 2, .rank = 1, .epsilon = 0.000001 };
+    try beginFrame(runtime);
+    errdefer cancelFrame(runtime) catch {};
+    try controller.encode(runtime, &tensors[0], &tensors[1], .{
+        .down = &tensors[2],
+        .gates = &tensors[3],
+        .gamma = &tensors[4],
+    }, .{ .pair = &tensors[5], .rank = &tensors[6], .gates = &tensors[7] }, &tensors[8]);
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+    var pair: [4]u16 = undefined;
+    try tensors[5].downloadBytesInto(std.mem.asBytes(&pair));
+    try std.testing.expectEqual([4]u16{ 0x3fb5, 0, 0, 0x3fb5 }, pair);
+    var output: [2]u16 = undefined;
+    try tensors[8].downloadBytesInto(std.mem.asBytes(&output));
+    try std.testing.expectEqual(gamma, output);
+}
