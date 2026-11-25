@@ -989,3 +989,17 @@ temporary import only for inputs named by the selected host plan. A live
 Metal cache-branch operand uses the same ingress when the specialized
 frame owns it. The boolean selector is validated before dispatch and the
 fixture verifies that specialization eliminates its device binding.
+
+### Whisper Small multi-window Metal serving
+
+The default enables packed Metal prefill for the 12-layer, 768-wide,
+80-mel Whisper Small geometry. The existing environment override and the
+provider’s admission and per-request fallback checks remain available.
+
+The public reader decoded a 71.489-second input containing three separated
+copies of the same English clip with timestamps enabled. The five phases
+used one warmup and five measured requests in A–A–B–B–A order. A explicitly
+disabled packed preparation and B used the default with no override. All 30
+publications matched exactly, including three phrase segments and timestamp
+offsets. The pooled warm p50 was 1413.81 ms with the override and 1374.38 ms
+with the default on M4 Max, a 2.8% reduction.

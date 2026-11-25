@@ -667,10 +667,14 @@ fn whisperMetalFramesEnabled() bool {
     return !platform.env.getenvBool("TERMITE_WHISPER_METAL_DISABLE_FRAMES");
 }
 
-pub fn metalPackedPrefillEnabled() bool {
+pub fn metalPackedPrefillEnabled(config: Config) bool {
+    // The released Small model has passed single- and multi-window
+    // serving qualification with this geometry.
+    const qualified = config.d_model == 768 and config.encoder_layers == 12 and
+        config.decoder_layers == 12 and config.decoder_attention_heads == 12 and config.num_mel_bins == 80;
     return whisperMetalFramesEnabled() and
         !platform.env.getenvBool("TERMITE_METAL_DISABLE_DENSE_QKV_PACKED") and
-        platform.env.getenvBool("TERMITE_METAL_WHISPER_PREPARE_PACKED_QKV");
+        platform.env.getenvBoolDefault("TERMITE_METAL_WHISPER_PREPARE_PACKED_QKV", qualified);
 }
 
 fn whisperMetalProfileEnabled() bool {
@@ -1077,7 +1081,7 @@ pub const PreparedDecoderWeights = struct {
         // Fused Q/K/V projection: one dispatch per layer instead of three.
         // Slots live in the backend runtime; a backend without them (or one
         // that ran out of slots) leaves the separate projections in place.
-        const model_slot: ops.DecoderRuntimeEnsureLinearSlotRequest.ModelSlot = if (cb.kind() == .metal and metalPackedPrefillEnabled()) .reuse else .request;
+        const model_slot: ops.DecoderRuntimeEnsureLinearSlotRequest.ModelSlot = if (cb.kind() == .metal and metalPackedPrefillEnabled(config)) .reuse else .request;
         for (layer_weights) |*lw| {
             lw.qkv_slots = (try ensureQkvSlots(cb, .{ lw.q, lw.k, lw.v }, d_model, model_slot)) orelse break;
         }

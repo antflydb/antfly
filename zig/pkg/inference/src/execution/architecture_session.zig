@@ -5807,7 +5807,7 @@ fn prepareColdWhisperPhases(session: Session, allocator: std.mem.Allocator, cont
     // require reclaiming storage even when the task uses an arena.
     const backing = if (@import("dense_decoder_schedule.zig").preparationBackingSupported(allocator))
         allocator
-    else if (session.backend() == .metal and session.run_admission != null and whisper_arch.metalPackedPrefillEnabled())
+    else if (session.backend() == .metal and session.run_admission != null and whisper_arch.metalPackedPrefillEnabled(config))
         std.heap.c_allocator
     else
         return null;
@@ -7333,9 +7333,9 @@ fn createPreparationBackend(raw: *anyopaque, session: Session, allocator: std.me
 
 fn prepareWhisperPackedProjections(session: Session, control: ?InferenceExecutionControl) !void {
     if (comptime !build_options.enable_metal) return;
-    if (session.backend() != .metal or !whisper_arch.metalPackedPrefillEnabled()) return;
+    if (session.backend() != .metal) return;
     const owner: *ArchSession = @ptrCast(@alignCast(session.ptr));
-    if (owner.arch_config != .whisper) return;
+    if (owner.arch_config != .whisper or !whisper_arch.metalPackedPrefillEnabled(owner.arch_config.whisper)) return;
     const policy = session.run_admission orelse return;
     const model = session.model_lifetime orelse return;
     const pin = model.retainAdmissionDomain(policy.controller) orelse return;
