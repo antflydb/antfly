@@ -147,9 +147,15 @@ pub fn eqHelper(ctx: HelperContext) anyerror!Value {
     return .{ .boolean = equal };
 }
 
+fn trimHelper(ctx: HelperContext) anyerror!Value {
+    if (ctx.params.len != 1 or ctx.params[0] != .string) return .{ .string = "" };
+    return .{ .string = std.mem.trim(u8, ctx.params[0].string, &std.ascii.whitespace) };
+}
+
 /// Shared deterministic helpers for execution and dependency inspection.
 pub fn addPureHelpers(arena: Allocator, helpers: *hbs.HelperMap) !void {
     try helpers.put(arena, "scrubHtml", hbs.Helper.from(&scrubHtmlHelper));
+    try helpers.put(arena, "trim", hbs.Helper.from(&trimHelper));
     try helpers.put(arena, "eq", hbs.Helper.from(&eqHelper));
     try helpers.put(arena, "media", hbs.Helper.from(&mediaHelper));
 }

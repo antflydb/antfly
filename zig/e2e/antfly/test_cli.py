@@ -299,7 +299,11 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
         {
             "name": "title_body",
             "type": "embeddings",
-            "template": "{{title}} {{body}}",
+            "template": (
+                "{{#if (trim title)}}{{#if (trim body)}}"
+                "{{title}} {{body}}{{/if}}{{/if}}"
+            ),
+            "coverage_policy": "partial",
             "dimension": 3,
             "embedder": {
                 "provider": "antfly",
@@ -331,7 +335,7 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
                     {
                         "id": "doc:beta",
                         "title": "Beta",
-                        "body": "beta unrelated notes",
+                        "body": " \t",
                     }
                 ),
             ]
@@ -354,7 +358,7 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
         # complete and must remain independently readable while the resident
         # embeddings owner is waiting on its provider.
         embedder_server.arm_delay()
-        cli(
+        load = cli(
             "load",
             "--table",
             table,
@@ -366,6 +370,9 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             "full_text",
             "--no-checkpoint",
         )
+        load_summary = parse_json(load.stdout)
+        assert load_summary["sync_level"] == "full_text"
+        assert load_summary["load"]["committed"] == 2
         assert embedder_server.wait_for_embedding_request(10.0)
 
         full_text_query = cli(
@@ -485,6 +492,7 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
         )
         assert_no_unexpected_semantic_warning(text_query, "title_body")
         text_hits = parse_json(text_query.stdout)["responses"][0]["hits"]["hits"]
+        assert all(hit["_id"] != "doc:beta" for hit in text_hits)
         assert text_hits and text_hits[0]["_id"] == "doc:alpha", (
             f"complete semantic query did not return Alpha\n"
             f"partial wait: {text_wait.stdout}\n"
