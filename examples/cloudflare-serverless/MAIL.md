@@ -159,7 +159,7 @@ registration type, but the application does not read or write that database.
 
 `wrangler.mail-auth.jsonc` and `wrangler.mail-app.jsonc` are templates. Before
 activation, choose an origin and dedicated mail domain, change placeholder
-resource names, provision the three R2 buckets and both Queues/DLQs, install a
+resource names, provision the four R2 buckets and both Queues/DLQs, install a
 stable `BETTER_AUTH_SECRET` on the private auth Worker, then deploy the auth and
 app Workers. Both must agree on `AUTH_ORIGIN` and `MAIL_DOMAIN`. Set the app's
 `AUTH_SERVICE` binding to the deployed private auth Worker.
@@ -283,8 +283,8 @@ with two allowed users, one denied user and a real inbound message before
 relying on the inbox. Leave browser model assets unconfigured unless the team
 has approved keeping offline copies on staff devices.
 
-This mode supports one shared inbox per deployment. Mailbox switching,
-assignments and per-user unread state are separate work.
+This mode supports one shared inbox per deployment plus optional personal
+inboxes. Assignments and per-user unread state are separate work.
 
 Set `MAIL_ACCESS_PERSONAL_LOGIN_DOMAIN=antfly.io` on the auth Worker to
 offer personal inboxes alongside the shared inbox. On first authenticated
@@ -293,3 +293,37 @@ address is available. Ownership follows the stable Access subject. A
 different subject cannot claim an address already provisioned to another
 user. Add an exact Email Routing rule for each personal address that should
 receive external mail. Select the inbox in the web app before composing.
+
+### Team deployment checklist
+
+1. **Access.** Create a self-hosted application with a public hostname
+   destination for `mail.antfly.ai` and leave the path blank. Select the
+   existing company identity provider and attach a dedicated Allow policy.
+   Verify that a teammate outside the policy is denied. In the saved app,
+   open **Additional settings** to copy the **Application Audience (AUD) Tag**.
+   [Cloudflare AUD instructions](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/authorization-cookie/validating-json/#get-your-aud-tag)
+2. **Workers.** Follow [Live deployment](#live-deployment) to build the
+   serverless WASM and provision the auth, database, mail object, and optional
+   model storage bindings, plus both queues and their dead-letter queues.
+   Install the auth secret, deploy the private auth Worker first, and attach
+   `mail.antfly.ai` as the app Worker's custom domain. A signed-out request to
+   `/api/me` should redirect to Access. After Workspace sign-in, it should
+   return the selected mailbox. If the auth Worker cannot fetch the signing
+   keys, `MAIL_ACCESS_JWKS` can temporarily hold the public JWKS JSON from
+   the configured issuer's `/cdn-cgi/access/certs` endpoint. Remove the pin
+   once dynamic lookup works so keys rotate automatically.
+3. **Inbound.** Check the selected domain's existing MX records before
+   enabling Email Routing. Enable it on `antfly.ai`, then create an exact
+   rule for `support@antfly.ai` pointing to the app Worker. For a personal
+   inbox, sign in to provision the address and route that exact address too.
+4. **Outbound.** In **Compute → Email Service → Email Sending**, select
+   **Onboard Domain** and choose the exact From domain, `antfly.ai`. Wait
+   until it shows **Enabled** and **DNS records: Configured**. Inbound
+   routing and an existing sending domain such as `mail-demo.antfly.io`
+   do not enable outbound mail from `antfly.ai`.
+5. **Verify delivery.** Send a real test message into each routed inbox.
+   Compose from the selected inbox to a known working external address,
+   check the From line and Outbox state, and confirm receipt at the
+   destination. If the Outbox says **Not sent**, check the recipient and
+   sender-domain setup before composing a new test. Rejected messages are
+   not resent automatically.
