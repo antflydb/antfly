@@ -1199,6 +1199,12 @@ pub fn cachedEncoderShapeOnly(session: Session) bool {
     return self.cached_encoder_shape_only;
 }
 
+/// Resident CUDA execution uses the stable shared compute context's stream,
+/// including prepared graph replay and stream-ordered host reads.
+pub fn acceptsStreamOrderedStageInputs(session: Session) bool {
+    return acceptsPreparedInvocation(session) and session.backend() == .cuda;
+}
+
 pub fn cachedEncoderStageInputIsShapeOnly(session: Session, inputs: []const session_mod.StageInput, index: usize) bool {
     if (!cachedEncoderShapeOnly(session)) return false;
     const info = session.inputInfo();

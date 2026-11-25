@@ -40979,7 +40979,7 @@ const PhysicalCompletionContext = struct {
     recorded: bool = false,
     unfenced: bool = false,
     pending_stream: driver_mod.CUstream = null,
-    const vtable = ops.physical_storage.Completion.VTable{ .record = record, .before_reuse = beforeReuse, .wait = wait, .deinit = deinit };
+    const vtable = ops.physical_storage.Completion.VTable{ .record = record, .before_reuse = beforeReuse, .wait = wait, .is_ready = isReady, .deinit = deinit };
     fn record(raw: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         self.pending_stream = self.compute.ctx.stream;
@@ -40994,6 +40994,16 @@ const PhysicalCompletionContext = struct {
         const self: *@This() = @ptrCast(@alignCast(raw));
         if (self.unfenced) return error.UncertainPhysicalCompletion;
         if (self.recorded and self.recorded_stream != self.compute.ctx.stream) try self.compute.ctx.waitEvent(self.event);
+    }
+    fn isReady(raw: *anyopaque) !bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.unfenced) return false;
+        if (!self.recorded) return true;
+        try self.compute.ctx.makeCurrent();
+        const status = self.compute.ctx.driver.fns.cuEventQuery(self.event);
+        if (status == driver_mod.CUDA_ERROR_NOT_READY) return false;
+        try self.compute.ctx.driver.check(status);
+        return true;
     }
     fn wait(raw: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));

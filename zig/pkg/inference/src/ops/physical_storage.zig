@@ -404,6 +404,7 @@ pub const Completion = struct {
         record: *const fn (*anyopaque) anyerror!void,
         before_reuse: *const fn (*anyopaque) anyerror!void,
         wait: ?*const fn (*anyopaque) anyerror!void = null,
+        is_ready: ?*const fn (*anyopaque) anyerror!bool = null,
         deinit: *const fn (*anyopaque) void,
     };
     pub fn record(self: Completion) !void {
@@ -411,6 +412,10 @@ pub const Completion = struct {
     }
     pub fn beforeReuse(self: Completion) !void {
         return self.vtable.before_reuse(self.ptr);
+    }
+    pub fn isReady(self: Completion) !bool {
+        const check = self.vtable.is_ready orelse return false;
+        return check(self.ptr);
     }
     pub fn wait(self: Completion) !void {
         if (self.vtable.wait) |synchronize| try synchronize(self.ptr);

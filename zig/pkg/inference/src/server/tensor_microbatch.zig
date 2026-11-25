@@ -712,7 +712,8 @@ const GatheredInputs = struct {
 
     fn awaitCopies(self: *GatheredInputs) !void {
         const completion = self.completion orelse return;
-        try completion.wait();
+        // A failed query falls through to the checked drain path.
+        if (!(completion.isReady() catch false)) try completion.wait();
         self.completion = null;
         completion.deinit();
     }
@@ -1060,15 +1061,19 @@ fn executeGroupMode(comptime placement: OutputPlacement, items: []const micro.Ex
     if (comptime placement == .host)
         cleanup_owner = try @import("../execution/cleanup_owner.zig").Owner.beginAdmitted(first.session);
     if (cleanup_owner.epoch()) |epoch| try permit.bindPhysicalCleanupEpoch(epoch);
-    // Exact shape admission and storage preparation use only metadata and
-    // can overlap CUDA gathering. Complete the transfer before the forward.
-    if (gathered) |*owned| try owned.awaitCopies();
+    const stream_ordered = @import("../backends/imported_onnx_session.zig").acceptsStreamOrderedStageInputs(first.session);
+    if (!stream_ordered) if (gathered) |*owned| try owned.awaitCopies();
     // The lexical cleanup owner binds prepared resources before this gate
     // and seals only after its eventual numerical unlock.
     try first.session.acquireSelectedCohort(control, &cohort_waiter);
     var locked = true;
     defer if (locked) first.session.releaseSelectedCohortGate(&cohort_waiter);
     if (comptime placement == .resident) {
+        if (stream_ordered) if (gathered) |owned| if (owned.completion) |completion| {
+            // Keep the fence and source tickets until publication or error
+            // cleanup. The provider orders its reads without a host wait.
+            try completion.beforeReuse();
+        };
         var outputs = (if (gathered) |owned|
             try permit.runStageInputsWithControl(owned.values, alloc, control)
         else
