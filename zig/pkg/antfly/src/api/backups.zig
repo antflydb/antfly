@@ -176,7 +176,7 @@ pub fn encodeBackupOutcomeAmbiguousBody(
 ///
 /// Entries bind the declared manifest identity to a freshly probed storage
 /// identity. A cache hit therefore avoids a second payload stream while still
-/// detecting replacement or mutation between repository-health admission and
+/// detecting replacement or mutation between backup admission and
 /// materialization. The hard ceiling prevents an adversarial manifest from
 /// turning one restore request into unbounded resident state.
 pub const ArtifactVerificationCache = struct {
@@ -1838,9 +1838,7 @@ pub const ClusterBackupAttemptHead = struct {
     format_version: u32 = backup_attempt_head_version,
     attempt_id: []const u8,
     state: ClusterBackupAttemptState = .active,
-    /// Monotonic repository mutation sequence. Restore admission compares this
-    /// before and after validation so an active attempt cannot appear and retire
-    /// inside the admission window without being observed.
+    /// Monotonic sequence for attempt publication and state transitions.
     generation: u64,
 };
 
@@ -2333,9 +2331,8 @@ fn reservationPath(
 ) ![]u8 {
     try validateBackupId(backup_id);
     return if (cluster)
-        // Cluster backup attempts mutate repository-global health state. A
-        // single location-wide lease serializes those mutations even when
-        // callers use distinct logical backup IDs.
+        // A single location-wide lease serializes cluster backup writers
+        // even when callers use distinct logical backup IDs.
         try std.fmt.allocPrint(alloc, "{s}/.antfly-cluster-reservation", .{backup_root})
     else
         try std.fmt.allocPrint(alloc, "{s}/{s}-reservation", .{ backup_root, backup_id });
@@ -5192,9 +5189,7 @@ fn transitionClusterBackupAttemptHeadIfOwnedWithRoot(
     };
 }
 
-/// Preserve failed-attempt evidence after exact artifact cleanup. Restore
-/// health remains failed until a later attempt publishes a new authoritative
-/// head and complete aggregate manifest.
+/// Preserve failed-attempt evidence after exact artifact cleanup.
 pub fn retireClusterBackupAttemptHeadIfOwned(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -8063,7 +8058,7 @@ pub fn fenceUnpublishedCohortAttempt(alloc: std.mem.Allocator, io: std.Io, locat
     defer marker.deinit();
     if (!std.mem.eql(u8, marker.value.cluster_backup_id, backup_id)) return error.InvalidBackupAttemptMarker;
     var budget: usize = backup_attempt_cleanup_object_budget;
-    _ = try reclaimClusterBackupAttemptMarker(alloc, io, location, &marker.value, now_unix_ns, null, &budget);
+    _ = try reclaimClusterBackupAttemptMarker(alloc, io, location, &marker.value, now_unix_ns, &budget);
     var remaining = readClusterBackupAttemptMarker(alloc, io, location, attempt_id) catch |err| switch (err) {
         error.FileNotFound => return !try clusterManifestExistsAtLocationWithIo(alloc, io, location, backup_id),
         else => return err,
@@ -8400,7 +8395,6 @@ fn reclaimClusterBackupAttemptMarker(
     location: *BackupLocation,
     marker: *const ClusterBackupAttemptMarker,
     now_unix_ns: u64,
-    authoritative_attempt_id: ?[]const u8,
     object_budget: *usize,
 ) !bool {
     return reclaimClusterBackupAttemptMarkerWithRoot(
@@ -8409,7 +8403,6 @@ fn reclaimClusterBackupAttemptMarker(
         location,
         marker,
         now_unix_ns,
-        authoritative_attempt_id,
         object_budget,
         null,
     );
@@ -8421,7 +8414,6 @@ fn reclaimClusterBackupAttemptMarkerWithRoot(
     location: *BackupLocation,
     marker: *const ClusterBackupAttemptMarker,
     now_unix_ns: u64,
-    authoritative_attempt_id: ?[]const u8,
     object_budget: *usize,
     pinned_root: ?std.Io.Dir,
 ) !bool {
@@ -8502,7 +8494,6 @@ fn reclaimClusterBackupAttemptMarkerWithRoot(
         };
         return true;
     }
-    _ = authoritative_attempt_id;
     if (!try releaseCommittedClusterTableWriterStatesWithRoot(
         alloc,
         io,
@@ -8566,9 +8557,6 @@ fn reclaimClusterBackupAttemptMarkerWithRoot(
         pinned_root,
     ) catch return false;
     defer if (remaining_owner) |owner| alloc.free(owner);
-    // A durable aggregate makes this journal non-authoritative even when the
-    // head still names the same attempt (for example, after a crash between
-    // commit and marker retirement).
     try deleteClusterBackupAttemptMarkerWithRoot(
         alloc,
         io,
@@ -8590,7 +8578,6 @@ fn reclaimClusterBackupAttemptById(
     location: *BackupLocation,
     attempt_id: []const u8,
     now_unix_ns: u64,
-    authoritative_attempt_id: ?[]const u8,
     object_budget: *usize,
 ) !bool {
     return reclaimClusterBackupAttemptByIdWithRoot(
@@ -8599,7 +8586,6 @@ fn reclaimClusterBackupAttemptById(
         location,
         attempt_id,
         now_unix_ns,
-        authoritative_attempt_id,
         object_budget,
         null,
     );
@@ -8611,7 +8597,6 @@ fn reclaimClusterBackupAttemptByIdWithRoot(
     location: *BackupLocation,
     attempt_id: []const u8,
     now_unix_ns: u64,
-    authoritative_attempt_id: ?[]const u8,
     object_budget: *usize,
     pinned_root: ?std.Io.Dir,
 ) !bool {
@@ -8630,7 +8615,6 @@ fn reclaimClusterBackupAttemptByIdWithRoot(
         location,
         &parsed.value,
         now_unix_ns,
-        authoritative_attempt_id,
         object_budget,
         pinned_root,
     );
@@ -9274,17 +9258,6 @@ fn reclaimStaleClusterBackupAttemptsWithHook(
                 else => return err,
             };
             defer backup_dir.close(io);
-            var parsed_head = try readClusterBackupAttemptHeadWithRoot(
-                alloc,
-                io,
-                location,
-                backup_dir,
-            );
-            defer if (parsed_head) |*head| head.deinit();
-            const authoritative_attempt_id: ?[]const u8 = if (parsed_head) |*head|
-                head.value.attempt_id
-            else
-                null;
             const cursor_path = try backupAttemptReclaimCursorPath(alloc, "");
             defer alloc.free(cursor_path);
             const relative_cursor_path = trimLeftSlash(cursor_path);
@@ -9331,7 +9304,6 @@ fn reclaimStaleClusterBackupAttemptsWithHook(
                     location,
                     claim.attempt_id,
                     now_unix_ns,
-                    authoritative_attempt_id,
                     &object_budget,
                     backup_dir,
                 ) catch |err| {
@@ -9361,12 +9333,6 @@ fn reclaimStaleClusterBackupAttemptsWithHook(
             cursor_lock.unlock(io);
         },
         .remote => |*store| {
-            var parsed_head = try readClusterBackupAttemptHead(alloc, io, location);
-            defer if (parsed_head) |*head| head.deinit();
-            const authoritative_attempt_id: ?[]const u8 = if (parsed_head) |*head|
-                head.value.attempt_id
-            else
-                null;
             const key_prefix = try store.keyPrefixAlloc(alloc, incomplete_backup_prefix);
             defer alloc.free(key_prefix);
             const cursor_body = store.readBytesAllocLimited(
@@ -9432,7 +9398,6 @@ fn reclaimStaleClusterBackupAttemptsWithHook(
                     location,
                     attempt_id,
                     now_unix_ns,
-                    authoritative_attempt_id,
                     &object_budget,
                 ) catch |err| {
                     std.log.warn("stale backup attempt reclamation deferred phase=remote class={s}", .{@errorName(err)});
@@ -10516,9 +10481,7 @@ pub fn verifyTableBackupArtifactsIntegrityAtLocationWithCache(
 }
 
 /// Cryptographically verifies a complete cluster backup with bounded memory.
-/// Callers use this for both the authoritative newest-attempt health gate and
-/// the exact backup being materialized. Reads are streamed in bounded chunks;
-/// repository integrity therefore remains fail-closed without buffering large
+/// Reads are streamed in bounded chunks so verification does not buffer large
 /// artifacts in memory.
 pub fn verifyClusterBackupArtifactsIntegrityAtLocation(
     alloc: std.mem.Allocator,
@@ -10563,40 +10526,6 @@ pub fn verifyClusterBackupArtifactsIntegrityAtLocationWithCache(
     }
 }
 
-fn ensureClusterBackupAttemptHeadRestorable(
-    alloc: std.mem.Allocator,
-    io: std.Io,
-    location: *BackupLocation,
-    head: *const ClusterBackupAttemptHead,
-    cache: ?*ArtifactVerificationCache,
-) !void {
-    try validateClusterBackupAttemptHead(head);
-    if (head.state == .failed) return error.IncompleteClusterBackup;
-    var marker = try readClusterBackupAttemptMarker(alloc, io, location, head.attempt_id);
-    defer marker.deinit();
-    var manifest = readClusterManifestFromLocation(
-        alloc,
-        location,
-        marker.value.cluster_backup_id,
-    ) catch |err| switch (err) {
-        error.FileNotFound => return error.IncompleteClusterBackup,
-        else => return err,
-    };
-    defer manifest.deinit(alloc);
-    if (!clusterManifestMatchesAttemptMarker(&manifest, &marker.value))
-        return error.IncompleteClusterBackup;
-    // Repository health is fail-closed: a historical restore must not mask
-    // same-size corruption in the authoritative newest attempt. Receipts
-    // eliminate duplicate payload reads when that attempt is also selected.
-    try verifyClusterBackupArtifactsIntegrityAtLocationWithCache(
-        alloc,
-        io,
-        location,
-        &manifest,
-        cache,
-    );
-}
-
 fn clusterManifestMatchesAttemptMarker(
     manifest: *const ClusterBackupManifest,
     marker: *const ClusterBackupAttemptMarker,
@@ -10616,22 +10545,6 @@ fn clusterManifestMatchesAttemptMarker(
         }
     }
     return true;
-}
-
-pub fn ensureNewestClusterBackupAttemptRestorable(
-    alloc: std.mem.Allocator,
-    io: std.Io,
-    location: *BackupLocation,
-) !void {
-    var head = (try readClusterBackupAttemptHead(alloc, io, location)) orelse return;
-    defer head.deinit();
-    try ensureClusterBackupAttemptHeadRestorable(
-        alloc,
-        io,
-        location,
-        &head.value,
-        null,
-    );
 }
 
 fn validateNewestCurrentGoBackupAttempt(
@@ -10718,13 +10631,13 @@ fn validateNewestCurrentGoBackupAttempt(
     return decoded.manifest;
 }
 
-fn readCurrentGoManifestForRestoreAdmission(
+fn validateCurrentGoRestoreAdmission(
     alloc: std.mem.Allocator,
     io: std.Io,
     location: *BackupLocation,
-    backup_id: []const u8,
+    selected: *const ClusterBackupManifest,
     cache: ?*ArtifactVerificationCache,
-) !ClusterBackupManifest {
+) !void {
     var before = (try readCurrentGoClusterBackupAttemptHead(
         alloc,
         io,
@@ -10745,12 +10658,6 @@ fn readCurrentGoManifestForRestoreAdmission(
     defer newest_parsed.deinit();
     const newest = &newest_parsed.parsed.value;
 
-    // A Zig producer may have started while the migration head was being
-    // validated. Never mix both repository protocols in one admission.
-    var intermediate_head = try readClusterBackupAttemptHead(alloc, io, location);
-    defer if (intermediate_head) |*head| head.deinit();
-    if (intermediate_head != null) return error.BackupRepositoryBusy;
-
     var newest_manifest = try validateNewestCurrentGoBackupAttempt(
         alloc,
         io,
@@ -10758,24 +10665,10 @@ fn readCurrentGoManifestForRestoreAdmission(
         newest,
         cache,
     );
-    var decoded: DecodedClusterManifest = if (std.mem.eql(
-        u8,
-        backup_id,
-        newest.backup_id,
-    ))
-        .{ .manifest = newest_manifest, .encoding = .go_portable_v2 }
-    else blk: {
-        newest_manifest.deinit(alloc);
-        break :blk try readClusterManifestFromLocationDecoded(
-            alloc,
-            io,
-            location,
-            backup_id,
-        );
-    };
-    errdefer decoded.manifest.deinit(alloc);
-    if (decoded.encoding != .go_portable_v2)
-        return error.IncompleteClusterBackup;
+    defer newest_manifest.deinit(alloc);
+    if (std.mem.eql(u8, selected.backup_id, newest.backup_id) and
+        !std.mem.eql(u8, &selected.persisted_sha256.?, &newest_manifest.persisted_sha256.?))
+        return error.BackupRepositoryBusy;
 
     var after = (try readCurrentGoClusterBackupAttemptHead(
         alloc,
@@ -10783,20 +10676,11 @@ fn readCurrentGoManifestForRestoreAdmission(
         location,
     )) orelse return error.BackupRepositoryBusy;
     defer after.deinit();
-    var final_head = try readClusterBackupAttemptHead(alloc, io, location);
-    defer if (final_head) |*head| head.deinit();
-    if (final_head != null or
-        !currentGoClusterBackupAttemptHeadsEqual(&before.value, &after.value))
-    {
+    if (!currentGoClusterBackupAttemptHeadsEqual(&before.value, &after.value))
         return error.BackupRepositoryBusy;
-    }
-    return decoded.manifest;
 }
 
-/// Restore admission is intentionally repository-scoped: the newest published
-/// attempt must be complete and intact before any requested historical
-/// manifest may be selected. Keeping both operations behind one API prevents a
-/// caller from accidentally bypassing the newest-attempt health invariant.
+/// Admit the requested backup using its published aggregate and artifacts.
 pub fn readClusterManifestForRestoreAdmission(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -10819,50 +10703,31 @@ pub fn readClusterManifestForRestoreAdmissionWithCache(
     backup_id: []const u8,
     cache: ?*ArtifactVerificationCache,
 ) !ClusterBackupManifest {
-    // Zig repositories use their monotonic head. Current Go repositories use
-    // the compact digest-pinned head. Headless journals are intentionally not
-    // accepted by this breaking release.
-    var attempt: usize = 0;
-    while (attempt < 4) : (attempt += 1) {
-        const before = try readClusterBackupAttemptHead(alloc, io, location);
-        if (before == null) {
-            return readCurrentGoManifestForRestoreAdmission(
+    var decoded = try readClusterManifestFromLocationDecoded(alloc, io, location, backup_id);
+    errdefer decoded.manifest.deinit(alloc);
+    if (decoded.encoding == .go_portable_v2) {
+        // The current Go import protocol has its own digest-pinned admission
+        // rules. Preserve them for backups written by that producer.
+        var attempt: usize = 0;
+        while (attempt < 4) : (attempt += 1) {
+            validateCurrentGoRestoreAdmission(
                 alloc,
                 io,
                 location,
-                backup_id,
+                &decoded.manifest,
                 cache,
             ) catch |err| switch (err) {
                 error.BackupRepositoryBusy => continue,
                 else => return err,
             };
+            return decoded.manifest;
         }
-        var stable_before = before.?;
-        defer stable_before.deinit();
-        try ensureClusterBackupAttemptHeadRestorable(
-            alloc,
-            io,
-            location,
-            &stable_before.value,
-            cache,
-        );
-
-        var manifest = try readClusterManifestFromLocation(alloc, location, backup_id);
-        errdefer manifest.deinit(alloc);
-        var after = (try readClusterBackupAttemptHead(alloc, io, location)) orelse {
-            manifest.deinit(alloc);
-            continue;
-        };
-        defer after.deinit();
-        if (clusterBackupAttemptHeadsEqual(
-            &stable_before.value,
-            &after.value,
-        )) {
-            return manifest;
-        }
-        manifest.deinit(alloc);
+        return error.BackupRepositoryBusy;
     }
-    return error.BackupRepositoryBusy;
+
+    // Publication commits the aggregate. The restore worker verifies each
+    // selected table's artifacts before publishing that table's data.
+    return decoded.manifest;
 }
 
 pub fn encodeClusterBackupResponse(
@@ -11694,7 +11559,10 @@ pub fn readFileRangeFromLocationUsingIo(alloc: std.mem.Allocator, io: std.Io, lo
         .file => |root| {
             const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root, relative_path });
             defer alloc.free(path);
-            const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+            const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
+                error.FileNotFound => return error.BackupArtifactMissing,
+                else => return err,
+            };
             defer file.close(io);
             if ((try file.stat(io)).size != expected_size) return error.SourceFileChanged;
             const result = try alloc.alloc(u8, wanted);
@@ -11706,22 +11574,64 @@ pub fn readFileRangeFromLocationUsingIo(alloc: std.mem.Allocator, io: std.Io, lo
         .remote => |*store| {
             const key = try store.keyAlloc(alloc, relative_path);
             defer alloc.free(key);
-            var metadata = try store.client.statObject(store.bucket, key);
+            var metadata = store.client.statObject(store.bucket, key) catch |err| switch (err) {
+                error.FileNotFound => return error.BackupArtifactMissing,
+                else => return err,
+            };
             defer metadata.deinit(alloc);
             if (metadata.content_length != expected_size) return error.SourceFileChanged;
             const etag = metadata.etag orelse return error.RestoreArtifactIdentityMissing;
-            var result = try store.client.getObject(store.bucket, key, .{
+            var result = store.client.getObject(store.bucket, key, .{
                 .range = .{ .offset = offset, .length = wanted },
                 .if_match_etag = etag,
                 .skip_metadata_probe = true,
                 .max_response_bytes = wanted,
                 .cancellation = object_storage.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
-            });
+            }) catch |err| switch (err) {
+                error.FileNotFound => return error.BackupArtifactMissing,
+                error.PreconditionFailed => return error.SourceFileChanged,
+                else => return err,
+            };
             defer result.deinit(alloc);
             if (result.body.len != wanted) return error.SourceFileChanged;
             return alloc.dupe(u8, result.body);
         },
     }
+}
+
+test "staged restore range reads classify missing repository artifacts" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+    var local: BackupLocation = .{ .file = root };
+    try std.testing.expectError(error.BackupArtifactMissing, readFileRangeFromLocationUsingIo(
+        alloc,
+        io,
+        &local,
+        "missing.afb",
+        1,
+        0,
+        1,
+        .none,
+    ));
+
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var remote: BackupLocation = .{ .remote = try RemoteBackupStore.initWithClient(alloc, memory.client(), "bucket", "backups") };
+    defer remote.deinit(alloc);
+    try std.testing.expectError(error.BackupArtifactMissing, readFileRangeFromLocationUsingIo(
+        alloc,
+        io,
+        &remote,
+        "missing.afb",
+        1,
+        0,
+        1,
+        .none,
+    ));
 }
 
 pub const copyFileFromLocationVerifiedUsingIo = @import("antfly_local_sources").api_local_backups.copyFileFromLocationVerifiedUsingIo;
@@ -13899,7 +13809,7 @@ test "cluster repository reservation serializes distinct backup ids and owners" 
     );
 }
 
-test "attempt head ordering ignores producer wall clocks and journal scans" {
+test "named Zig restore ignores newer failed attempts and unrelated journals" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
@@ -13960,14 +13870,13 @@ test "attempt head ordering ignores producer wall clocks and journal scans" {
     );
     try writeClusterBackupAttemptHead(alloc, io, &location, new_marker.attempt_id);
 
+    try std.testing.expect(try retireClusterBackupAttemptHeadIfOwned(alloc, io, &location, new_marker.attempt_id));
+    var admitted = try readClusterManifestForRestoreAdmission(alloc, io, &location, committed.backup_id);
+    defer admitted.deinit(alloc);
+    try std.testing.expectEqualStrings(committed.backup_id, admitted.backup_id);
     try std.testing.expectError(
-        error.IncompleteClusterBackup,
-        readClusterManifestForRestoreAdmission(
-            alloc,
-            io,
-            &location,
-            committed.backup_id,
-        ),
+        error.FileNotFound,
+        readClusterManifestForRestoreAdmission(alloc, io, &location, new_marker.cluster_backup_id),
     );
 }
 
@@ -14034,7 +13943,7 @@ test "attempt head generation detects publication and retirement ABA" {
     try std.testing.expectEqual(ClusterBackupAttemptState.committed, committed.value.state);
 }
 
-test "newest attempt exact verification detects corruption and receipts revalidate identity" {
+test "native filesystem restore admission survives marker reclamation with per-table integrity verification" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
@@ -14045,7 +13954,28 @@ test "newest attempt exact verification detects corruption and receipts revalida
     defer alloc.free(root);
     var location: BackupLocation = .{ .file = root };
 
-    try writePortableListValidationFixture(alloc, &location, "table-snap", "docs");
+    const snapshot_path = "artifact-snap/groups/1";
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root, snapshot_path });
+    defer alloc.free(snapshot_root);
+    const artifact_path = try std.fmt.allocPrint(alloc, "{s}/data.sst", .{snapshot_root});
+    defer alloc.free(artifact_path);
+    try writeFileAbsolute(artifact_path, "payload");
+    var integrity = try directoryArtifactIntegrityAlloc(alloc, io, snapshot_root);
+    defer integrity.deinit(alloc);
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 1,
+        .name = "docs",
+        .schema_json = "{}",
+    };
+    var table_manifest = try createManifest(alloc, "table-snap", .native, &table, &.{.{
+        .group_id = 1,
+        .start_key = "",
+        .snapshot_path = snapshot_path,
+        .artifact_size_bytes = integrity.size_bytes,
+        .artifact_sha256 = integrity.sha256,
+    }});
+    defer table_manifest.deinit(alloc);
+    try writeManifestToLocationWithIo(alloc, io, &location, &table_manifest);
     const committed_tables = [_]ClusterTableBackupEntry{.{
         .name = "docs",
         .table_backup_id = "table-snap",
@@ -14067,23 +13997,20 @@ test "newest attempt exact verification detects corruption and receipts revalida
         .attempt_id = "attempt-snap",
         .cluster_backup_id = "cluster-snap",
         .created_at_unix_ns = 1,
-        .format = .portable,
+        .format = .native,
         .tables = &attempt_tables,
     };
     try writeClusterBackupAttemptMarker(alloc, io, &location, &marker);
     try writeClusterBackupAttemptHead(alloc, io, &location, marker.attempt_id);
-    const artifact_path = try std.fmt.allocPrint(alloc, "{s}/table-snap.afb", .{root});
-    defer alloc.free(artifact_path);
     try writeFileAbsolute(artifact_path, "PAYLOAD");
 
-    try std.testing.expectError(
-        error.BackupArtifactIntegrityMismatch,
-        ensureNewestClusterBackupAttemptRestorable(
-            alloc,
-            io,
-            &location,
-        ),
+    var admitted_with_corruption = try readClusterManifestForRestoreAdmission(
+        alloc,
+        io,
+        &location,
+        committed.backup_id,
     );
+    defer admitted_with_corruption.deinit(alloc);
     try std.testing.expectError(
         error.BackupArtifactIntegrityMismatch,
         verifyClusterBackupArtifactsIntegrityAtLocation(
@@ -14095,6 +14022,14 @@ test "newest attempt exact verification detects corruption and receipts revalida
     );
 
     try writeFileAbsolute(artifact_path, "payload");
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try reclaimStaleClusterBackupAttempts(alloc, io, &location, backup_attempt_reclaim_age_ns + 1),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        readClusterBackupAttemptMarker(alloc, io, &location, marker.attempt_id),
+    );
     var verification_cache: ArtifactVerificationCache = .{};
     defer verification_cache.deinit(alloc);
     var admitted = try readClusterManifestForRestoreAdmissionWithCache(
@@ -14105,7 +14040,7 @@ test "newest attempt exact verification detects corruption and receipts revalida
         &verification_cache,
     );
     defer admitted.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), verification_cache.entries.count());
+    try std.testing.expectEqual(@as(usize, 0), verification_cache.entries.count());
     try verifyClusterBackupArtifactsIntegrityAtLocationWithCache(
         alloc,
         io,
@@ -15483,10 +15418,6 @@ test "stale owned cluster backup attempt retains generation fences and retires a
     defer failed_head.deinit();
     try std.testing.expectEqual(ClusterBackupAttemptState.failed, failed_head.value.state);
     try std.testing.expectEqualStrings(marker.attempt_id, failed_head.value.attempt_id);
-    try std.testing.expectError(
-        error.IncompleteClusterBackup,
-        ensureNewestClusterBackupAttemptRestorable(alloc, io, &location),
-    );
     try reserveClusterBackupAttemptLeaseAtLocation(
         alloc,
         io,
@@ -16713,7 +16644,7 @@ test "filesystem artifact cleanup rejects adversarial depth within a fixed trave
     );
 }
 
-test "stale committed marker retires when the authoritative head is unchanged" {
+test "stale committed marker retires while the authoritative head is unchanged" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
@@ -16889,7 +16820,6 @@ test "committed cluster reconciliation quarantines a different marker generation
         &location,
         &stale_marker,
         backup_attempt_reclaim_age_ns + 1,
-        stale_marker.attempt_id,
         &undersized_budget,
     ));
     try std.testing.expectEqual(
@@ -18769,15 +18699,15 @@ test "restore admission validates the stable newest current Go attempt" {
     );
     defer zig_manifest.deinit(alloc);
     try writeClusterManifestToLocationWithIo(alloc, io, &location, &zig_manifest);
-    try std.testing.expectError(
-        error.IncompleteClusterBackup,
-        readClusterManifestForRestoreAdmission(
-            alloc,
-            io,
-            &location,
-            zig_backup_id,
-        ),
-    );
+    var admitted_zig = try readClusterManifestForRestoreAdmission(alloc, io, &location, zig_backup_id);
+    defer admitted_zig.deinit(alloc);
+
+    // A Zig writer can publish to the same repository. Its attempt head
+    // must not prevent validating the Go producer's separate commit record.
+    try writeClusterBackupAttemptHead(alloc, io, &location, "zig-attempt");
+    var admitted_go_in_mixed_repository = try readClusterManifestForRestoreAdmission(alloc, io, &location, go_backup_id);
+    defer admitted_go_in_mixed_repository.deinit(alloc);
+    try std.testing.expectEqualStrings(go_backup_id, admitted_go_in_mixed_repository.backup_id);
 
     const newer_attempt_body =
         "{\"version\":1,\"attempt_id\":\"afba-newer\",\"backup_id\":\"newer-cluster\",\"created_at\":\"2026-07-25T12:00:00.3Z\",\"format\":\"portable\",\"expected_table_count\":1,\"table_names\":[\"events\"],\"metadata_ids\":[\"table-b2aa693bbed89e7783245e7a6b468282bff526817c1285fd6bb3b8707b3187b7\"],\"artifact_names\":[\"newer-cluster-1.afb\"]}";
