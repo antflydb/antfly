@@ -5785,28 +5785,28 @@ fn importedTypedHostIngress(comptime backend_type: BackendType, comptime Index: 
         const first = try resident.backend.toFloat32(resident.outputs[0], a);
         defer a.free(first);
         try std.testing.expectEqualSlices(f32, first_expected, first);
-        if (!live_add) {
-            @memcpy(raw, std.mem.sliceAsBytes(&selected));
-            const stage_backend = session.shared_compute_context.?.stableBackend();
-            const control: InferenceExecutionControl = .{ .native_call_policy = .in_process };
-            const source = (try stage_backend.fromReadOnlyBytes(raw, dtype, &.{2})) orelse return error.MissingResidentIndices;
-            defer stage_backend.free(source);
-            const stage_input: session_mod.StageInput = .{ .resident = .{ .backend = stage_backend, .value = source, .shape = &.{2}, .estimated_bytes = bytes_per_pair } };
-            var device_result = (try session.runStageInputsWithControl(&.{stage_input}, a, control)) orelse return error.MissingResidentResult;
-            defer device_result.deinit();
-            const ingress_stats = session.executionDiagnostics().?.execution.?;
-            try std.testing.expectEqual(@as(u64, bytes_per_pair), ingress_stats.physical_input_copy_bytes);
-            try std.testing.expectEqual(@as(u64, 0), ingress_stats.actual_download_bytes);
-            const found = try device_result.backend.toFloat32(device_result.outputs[0], a);
-            defer a.free(found);
-            try std.testing.expectEqualSlices(f32, first_expected, found);
-            const invalid = [_]Index{ if (Index == i64) 9_007_199_254_740_993 else 16_777_217, 0 };
-            const invalid_source = (try stage_backend.fromReadOnlyBytes(std.mem.sliceAsBytes(&invalid), dtype, &.{2})) orelse return error.MissingResidentIndices;
-            defer stage_backend.free(invalid_source);
-            var invalid_input = stage_input;
-            invalid_input.resident.value = invalid_source;
-            try std.testing.expectError(error.IndexOutOfBounds, session.runStageInputsWithControl(&.{invalid_input}, a, control));
-        }
+        @memcpy(raw, std.mem.sliceAsBytes(&selected));
+        const stage_backend = session.shared_compute_context.?.stableBackend();
+        const control: InferenceExecutionControl = .{ .native_call_policy = .in_process };
+        const source = (try stage_backend.fromReadOnlyBytes(raw, dtype, &.{2})) orelse return error.MissingResidentIndices;
+        defer stage_backend.free(source);
+        const stage_input: session_mod.StageInput = .{ .resident = .{ .backend = stage_backend, .value = source, .shape = &.{2}, .estimated_bytes = bytes_per_pair } };
+        var stage_inputs = [_]session_mod.StageInput{ stage_input, .{ .host = table_delta } };
+        var device_result = (try session.runStageInputsWithControl(stage_inputs[0..inputs.len], a, control)) orelse return error.MissingResidentResult;
+        defer device_result.deinit();
+        const ingress_stats = session.executionDiagnostics().?.execution.?;
+        if (live_add) {
+            try std.testing.expect(ingress_stats.assigned_kernel_dispatches > 0);
+        } else try std.testing.expectEqual(@as(u64, bytes_per_pair), ingress_stats.physical_input_copy_bytes);
+        try std.testing.expectEqual(@as(u64, 0), ingress_stats.actual_download_bytes);
+        const found = try device_result.backend.toFloat32(device_result.outputs[0], a);
+        defer a.free(found);
+        try std.testing.expectEqualSlices(f32, first_expected, found);
+        const invalid = [_]Index{ if (Index == i64) 9_007_199_254_740_993 else 16_777_217, 0 };
+        const invalid_source = (try stage_backend.fromReadOnlyBytes(std.mem.sliceAsBytes(&invalid), dtype, &.{2})) orelse return error.MissingResidentIndices;
+        defer stage_backend.free(invalid_source);
+        stage_inputs[0].resident.value = invalid_source;
+        try std.testing.expectError(error.IndexOutOfBounds, session.runStageInputsWithControl(stage_inputs[0..inputs.len], a, control));
     }
     @memcpy(raw, std.mem.sliceAsBytes(&selected));
     const held = try session.run(inputs, a);
