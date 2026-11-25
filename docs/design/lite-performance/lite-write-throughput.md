@@ -221,6 +221,41 @@ Next, from the same profile: groups now average about one write (each pays
 both redo barriers), full_index catch-up runs for writes not served inline,
 and merges run about once per six writes.
 
+## Measured after the review fixes and lane work
+
+ReleaseFast, 8 writers, 10 s full-text runs, each change interleaved with
+the build before it:
+
+| | 8 threads | 8 processes |
+|---|---|---|
+| after 4 | 1,486–1,870/s | 0 of 10 stalled |
+| merges ahead of the cap, small segments folded | 3,511–3,903/s | 2,445–2,838/s |
+| maintenance ride-alongs drive their group | 4,804–5,516/s | 2,487–2,790/s |
+| store mutex parks on a futex | 6,027–6,247/s | 2,393–2,830/s |
+| unverified ledger rebases | 5,662–6,271/s | 2,533–2,568/s |
+
+Merges kept the inline producer under its cap: level-0 records fold at a
+quarter of it, pressure starts at three quarters, and a pressured level-0
+merge also takes every segment below the floor size. Before that, tiered
+tiny segments filled the cap and about 15% of writes fell to replay.
+
+The writer lane was then 92% occupied. Maintenance turns held it about
+10 ms each: a maintenance snapshot forwards its writes to the foreground
+store, where its ride-along bookkeeping commits waited for a foreground
+leader that could not run while the turn held the lane. Forwarded
+ride-alongs now drive their own group, and turns hold the lane about 1 ms.
+Inside a writer's 167 µs hold, a third was the store mutex sleeping in
+100 µs steps behind a group apply; waiters now park on a futex.
+
+8 processes are bounded by the cross-process lease, which a process hands
+off only once its writes are durable. Summed over processes, holders keep
+it 78% of wall time: writes under it (180 µs each, 80 of them the fsync
+wait) take 49%, serving-runtime refreshes 18%, and the rest is handoff.
+Most refreshes reopen the runtime, because the 512 KiB redo log folds about
+every 180 full-text writes and a fold changes the physical roots. A 4 MiB
+log folded 8 times less often and did not change throughput, so the
+handoff rule, not the reopen, is the limit.
+
 ## Status
 
 | change | state |
@@ -230,6 +265,6 @@ and merges run about once per six writes.
 | 3. indexed writes overlap their wait (group commit) | committed |
 | 4a. level-0 encoding: CRC shortcut, profile split | committed |
 | 4b. `SegmentView` interface | committed |
-| 4. cheap level-0 publication, read admission | implemented |
+| 4. cheap level-0 publication, read admission | committed |
 | 5. bounded merges outside the lease | designed |
 | 6. incremental writer refresh | #1830; peer deltas no longer wait for inline installs |
