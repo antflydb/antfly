@@ -8401,46 +8401,7 @@ pub const NativeGenerationPipeline = struct {
     const rollbackScheduledPrefillState = decoder_step_executor.Executor.rollbackScheduledPrefillState;
     const rollbackPrefillReservations = decoder_step_executor.Executor.rollbackPrefillReservations;
 
-    /// Surface a step-level failure as a per-item failure on every claimed
-    /// work, marking each ready so its caller's wait loop unblocks. Used when
-    /// the step forward pass cannot run at all (allocation failure, build
-    /// context failure, forward kernel failure). Pairs with
-    /// `scheduler.completeStep` to remove the pending entries.
-    fn markStepFailed(
-        claimed: []const runtime.scheduler.native_generate.StepItem,
-        err: anyerror,
-    ) void {
-        if (platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_LAZY_PROFILE")) {
-            for (claimed) |item| {
-                std.log.err(
-                    "scheduled_step_failed: phase={s} err={s} query_seq_len={d} total_seq_len={d} kv_seq_len={d} kv_pos={d}",
-                    .{
-                        @tagName(item.phase),
-                        @errorName(err),
-                        item.query_sequence_len,
-                        item.total_sequence_len,
-                        item.kv_sequence_len,
-                        item.kv_position_offset,
-                    },
-                );
-            }
-        }
-        for (claimed) |item| {
-            switch (item.phase) {
-                .decode => {
-                    const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
-                    work.failure = err;
-                    work.ready.store(true, .release);
-                },
-                .prefill => {
-                    const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
-                    work.failure = err;
-                    work.ready.store(true, .release);
-                },
-                .waiting => {},
-            }
-        }
-    }
+    const markStepFailed = decoder_work.markStepFailed;
 
     /// Slice a flat logits buffer into per-item rows and dupe each row onto
     /// the owning work. A per-work `dupe` failure is recorded as that work's
@@ -8530,13 +8491,15 @@ pub const NativeGenerationPipeline = struct {
             return;
         };
         for (claimed, 0..) |item, idx| {
-            const row_index = if (last_rows_only) idx else idx * max_query_seq_len + (item.query_sequence_len - 1);
-            const start = row_index * vocab_size;
-            const slice = logits_buf[start..][0..vocab_size];
             switch (item.phase) {
                 .decode => {
                     const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
                     if (cancelledDecodeWork(work)) continue;
+                    const slice = decoder_work.lastLogitRow(logits_buf, item, idx, max_query_seq_len, vocab_size, last_rows_only) catch |err| {
+                        work.failure = err;
+                        work.ready.store(true, .release);
+                        continue;
+                    };
                     if (pendingSequence(work)) |sequence| {
                         const allocator = work.allocator;
                         const masked = allocator.dupe(f32, slice) catch |err| {
@@ -8560,6 +8523,11 @@ pub const NativeGenerationPipeline = struct {
                 .prefill => {
                     const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
                     if (work.wants_last_logits) {
+                        const slice = decoder_work.lastLogitRow(logits_buf, item, idx, max_query_seq_len, vocab_size, last_rows_only) catch |err| {
+                            work.failure = err;
+                            work.ready.store(true, .release);
+                            continue;
+                        };
                         if (work.allocator.dupe(f32, slice)) |buf| {
                             work.logits = buf;
                         } else |dupe_err| {
@@ -14186,6 +14154,17 @@ test "LightOnOCR3 packed last logits publish independent rows for unequal query 
     try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3 }, decode.logits.?);
     try std.testing.expectEqualSlices(f32, &.{ 4, 5, 6 }, prefill.logits.?);
     try std.testing.expect(decode.ready.load(.acquire) and prefill.ready.load(.acquire));
+    a.free(decode.logits.?);
+    a.free(prefill.logits.?);
+    decode.logits = null;
+    prefill.logits = null;
+    decode.ready.store(false, .release);
+    prefill.ready.store(false, .release);
+
+    NativeGenerationPipeline.dispatchStepLogitsLayout(3, &items, &.{ 7, 8, 9 }, 555, true);
+    try std.testing.expectEqualSlices(f32, &.{ 7, 8, 9 }, decode.logits.?);
+    try std.testing.expectEqual(error.InvalidBatchDecodeState, prefill.failure.?);
+    try std.testing.expect(prefill.logits == null and prefill.ready.load(.acquire));
 }
 
 test "LightOnOCR3 packed greedy publication keeps only independent prefix logits in either order" {

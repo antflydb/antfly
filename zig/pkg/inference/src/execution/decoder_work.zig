@@ -61,6 +61,60 @@ pub const Prefill = struct {
     ready: std.atomic.Value(bool) = .init(false),
 };
 
+/// Surface a step-level failure as a per-item failure on every claimed
+/// work, marking each ready so its caller's wait loop unblocks. Used when
+/// the step forward pass cannot run at all (allocation failure, build
+/// context failure, forward kernel failure). Pairs with
+/// `scheduler.completeStep` to remove the pending entries.
+pub fn markStepFailed(
+    claimed: []const StepItem,
+    err: anyerror,
+) void {
+    if (@import("antfly_platform").env.getenvBool("ANTFLY_INFERENCE_CUDA_LAZY_PROFILE")) {
+        for (claimed) |item| {
+            std.log.err(
+                "scheduled_step_failed: phase={s} err={s} query_seq_len={d} total_seq_len={d} kv_seq_len={d} kv_pos={d}",
+                .{
+                    @tagName(item.phase),
+                    @errorName(err),
+                    item.query_sequence_len,
+                    item.total_sequence_len,
+                    item.kv_sequence_len,
+                    item.kv_position_offset,
+                },
+            );
+        }
+    }
+    for (claimed) |item| {
+        switch (item.phase) {
+            .decode => {
+                const work: *Decode = @ptrCast(@alignCast(item.work_ptr));
+                work.failure = err;
+                work.ready.store(true, .release);
+            },
+            .prefill => {
+                const work: *Prefill = @ptrCast(@alignCast(item.work_ptr));
+                work.failure = err;
+                work.ready.store(true, .release);
+            },
+            .waiting => {},
+        }
+    }
+}
+
+/// Locate the last vocabulary row without trusting a provider's output length.
+pub fn lastLogitRow(logits: []const f32, item: StepItem, ordinal: usize, query_window: usize, vocabulary: usize, last_rows_only: bool) ![]const f32 {
+    if (vocabulary == 0 or item.query_sequence_len == 0) return error.InvalidBatchDecodeState;
+    const row = if (last_rows_only) ordinal else full: {
+        if (item.query_sequence_len > query_window) return error.InvalidBatchDecodeState;
+        const base = std.math.mul(usize, ordinal, query_window) catch return error.InvalidBatchDecodeState;
+        break :full std.math.add(usize, base, item.query_sequence_len - 1) catch return error.InvalidBatchDecodeState;
+    };
+    const start = std.math.mul(usize, row, vocabulary) catch return error.InvalidBatchDecodeState;
+    if (start > logits.len or vocabulary > logits.len - start) return error.InvalidBatchDecodeState;
+    return logits[start..][0..vocabulary];
+}
+
 /// Validate the full request before reserving any peer KV or recurrent state.
 pub fn preparedPrefixStart(work: *const Prefill, item: StepItem) !usize {
     const prefix = work.prepared_prefix orelse return error.InvalidPreparedPrompt;
