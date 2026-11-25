@@ -53171,24 +53171,29 @@ test "Metal paged relative attention resolves shuffled pages with sink and gate"
     defer provider.deinitOwned();
     const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
     const attention: PagedRelativeBf16Attention = .{
-        .query = .{ .rows = 2, .start = 3, .q_heads = 2, .kv_heads = 1, .window = 2, .relative_extent = 2, .score_scale = 1 },
-        .range = .{ .first_page = 1, .page_count = 2, .physical_pages = 2, .page_tokens = 2, .visible_start = 2, .visible_end = 5 },
+        .query = .{ .rows = 2, .start = 131, .q_heads = 2, .kv_heads = 1, .window = 130, .relative_extent = 2, .score_scale = 1 },
+        .range = .{ .first_page = 1, .page_count = 66, .physical_pages = 66, .page_tokens = 2, .visible_start = 2, .visible_end = 133 },
     };
     const zeros: [512]u16 = @splat(0);
-    var values: [512]u16 = @splat(0);
-    @memset(values[0..128], 0x4080); // position 4, value 4
-    @memset(values[256..384], 0x3f80); // position 2, value 1
-    @memset(values[384..512], 0x4000); // position 3, value 2
-    const ids = [2]u32{ 1, 0 };
-    const relative: [8]u16 = @splat(0);
+    const key_count = 66 * 2 * 128;
+    const keys: [key_count]u16 = @splat(0);
+    var values: [key_count]u16 = @splat(0x4000);
+    // Reverse physical page order. Position 133 is beyond both query positions.
+    @memset(values[128..256], 0x4480);
+    @memset(values[3 * 128 .. 4 * 128], 0x4080); // position 131
+    @memset(values[0..128], 0x4100); // position 132
+    var ids: [66]u32 = undefined;
+    for (&ids, 0..) |*id, page| id.* = @intCast(ids.len - 1 - page);
+    // Head 1 in each row gives the most recent token a logit of +16.
+    const relative = [8]u16{ 0, 0, 0x4180, 0, 0, 0, 0x4180, 0 };
     const sinks: [4]u16 = @splat(0);
     const payloads: [7][]const u8 = .{
-        std.mem.asBytes(&zeros),    std.mem.asBytes(&zeros), std.mem.asBytes(&values),
-        std.mem.asBytes(&relative), std.mem.asBytes(&ids),   std.mem.asBytes(&sinks),
+        std.mem.asBytes(&zeros),    std.mem.asBytes(&keys), std.mem.asBytes(&values),
+        std.mem.asBytes(&relative), std.mem.asBytes(&ids),  std.mem.asBytes(&sinks),
         std.mem.asBytes(&zeros),
     };
     const types: [9]metal_tensor.DType = .{ .i16, .i16, .i16, .i16, .i32, .i16, .i16, .f32, .i16 };
-    const sizes = [9]i32{ 512, 512, 512, 8, 2, 4, 512, try attention.scratchElements(), 512 };
+    const sizes = [9]i32{ 512, key_count, key_count, 8, ids.len, 4, 512, try attention.scratchElements(), 512 };
     var tensors: [9]MetalTensor = undefined;
     var count: usize = 0;
     defer for (tensors[0..count]) |*tensor| tensor.deinit();
@@ -53212,6 +53217,8 @@ test "Metal paged relative attention resolves shuffled pages with sink and gate"
     try waitFrame(runtime);
     var output: [512]u16 = undefined;
     try tensors[8].downloadBytesInto(std.mem.asBytes(&output));
-    for (output[0..256]) |value| try std.testing.expectEqual(@as(u16, 0x3f00), value);
-    for (output[256..]) |value| try std.testing.expectEqual(@as(u16, 0x3f80), value);
+    try std.testing.expectEqual(@as(i32, 4 * 2 * 130), try attention.scratchElements());
+    const expected = [4]u16{ 0x3f80, 0x4000, 0x3f83, 0x4080 };
+    for (expected, 0..) |bits, head|
+        for (output[head * 128 ..][0..128]) |value| try std.testing.expectEqual(bits, value);
 }
