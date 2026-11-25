@@ -4796,6 +4796,13 @@ pub fn appendTextQueryValue(
             try out.append(alloc, '}');
         },
         .bool_query => |bool_query| {
+            if (bool_query.query_string) |source| {
+                try out.appendSlice(alloc, "{\"query\":");
+                try appendJsonString(alloc, out, source.text);
+                try appendTextQueryBoost(alloc, out, source.boost);
+                try out.append(alloc, '}');
+                return;
+            }
             try out.append(alloc, '{');
             var first = true;
             if (bool_query.must.len > 0) {

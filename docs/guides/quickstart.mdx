@@ -95,9 +95,9 @@ antfly query --table wikipedia \
   --limit 5
 ```
 
-The results include article titles and source links. Add the global option
-`antfly --output json query ...` when you need the complete JSON response.
-Try another word or phrase, or continue to Cloud or local AI below.
+The results include article titles and source links. For scripts, use
+`antfly --output json query ...` to get the complete JSON payload without the
+agent envelope. Try another word or phrase, or continue to Cloud or local AI below.
 
 ## Move this database to Cloud
 
@@ -150,13 +150,16 @@ Add an index to the table you already loaded:
 antfly index create --table wikipedia \
   --index title_body \
   --type embeddings \
-  --template '{{title}} {{body}}' \
+  --coverage-policy partial \
+  --template '{{#if (scrubHtml title)}}{{#if (scrubHtml body)}}{{title}} {{body}}{{/if}}{{/if}}' \
   --embedder '{"provider":"antfly","model":"google/embeddinggemma-2:bf16-safetensors-bundle-v1"}' \
   --chunker '{"provider":"antfly","text":{"target_tokens":200,"overlap_tokens":25}}'
 ```
 
-Antfly backfills the existing articles; do not reload them. Wait until 10% of
-source documents have searchable embeddings:
+Antfly backfills the existing articles. The text template emits content only
+when both the title and body have text. Articles skipped by this index still
+remain in the table and can be indexed by thumbnail. Wait until 10% of source
+documents have searchable embeddings:
 
 ```bash
 antfly index wait --table wikipedia \
@@ -260,7 +263,7 @@ The retrieval agent plans the query, runs the search, and hands the results to a
 ### Pull a generation model
 
 ```bash
-antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_0 \
+antfly inference pull hf:google/gemma-4-E2B-it-qat-q4_0-gguf:gguf \
   --tasks generate \
   --projector auto
 ```
@@ -274,12 +277,12 @@ to the query builder, searches, and answers from the results.
 
 ```bash
 antfly agents retrieval --table wikipedia \
-  --intent "What are the major events in Korean history?" \
+  --intent "How do scientists monitor volcanoes for signs of an eruption?" \
   --fields "title,body" \
   --limit 5 \
   --generator '{
     "provider": "antfly",
-    "model": "ggml-org/gemma-4-E4B-it-GGUF",
+    "model": "google/gemma-4-E2B-it-qat-q4_0-gguf",
     "max_tokens": 512
   }' \
   --max-internal-iterations 8 \
@@ -306,7 +309,7 @@ Requires a [Google AI API key](https://aistudio.google.com/apikey), exported in 
 export GEMINI_API_KEY="your-api-key-here"
 
 antfly agents retrieval --table wikipedia \
-  --semantic-search "What are the major events in Korean history?" \
+  --semantic-search "How do scientists monitor volcanoes for signs of an eruption?" \
   --indexes "title_body" \
   --fields "title,body" \
   --limit 5 \
@@ -323,7 +326,7 @@ Requires an [OpenAI API key](https://platform.openai.com/api-keys), exported in 
 export OPENAI_API_KEY="your-api-key-here"
 
 antfly agents retrieval --table wikipedia \
-  --semantic-search "What are the major events in Korean history?" \
+  --semantic-search "How do scientists monitor volcanoes for signs of an eruption?" \
   --indexes "title_body" \
   --fields "title,body" \
   --limit 5 \
@@ -340,7 +343,7 @@ Requires [Ollama](https://ollama.com) running locally. Pull the model first:
 ollama pull gemma3:4b-it-qat
 
 antfly agents retrieval --table wikipedia \
-  --semantic-search "What are the major events in Korean history?" \
+  --semantic-search "How do scientists monitor volcanoes for signs of an eruption?" \
   --indexes "title_body" \
   --fields "title,body" \
   --limit 5 \

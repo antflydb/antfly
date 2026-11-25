@@ -69,7 +69,7 @@ fn mainImpl(init: std.process.Init) !void {
 
     const command = completion.findCommand(subcommand) orelse
         return runRuntimeUnit(.cli, subcommand, init, &args);
-    if (invocation.has_global_prefix and command.route != .cli)
+    if (invocation.has_global_prefix and command.route != .cli and command.route != .inference)
         return runRuntimeUnit(.cli, subcommand, init, &args);
 
     // Server-side subcommands dispatch into independently generated runtime
@@ -86,7 +86,7 @@ fn mainImpl(init: std.process.Init) !void {
         .inference => {
             var worker_lifetime = inference_process_supervisor.WorkerLifetime{};
             defer worker_lifetime.deinit(init.io);
-            if (try inference_process_supervisor.runIfNeeded(init, 2, &worker_lifetime)) return;
+            if (!invocation.has_global_prefix and try inference_process_supervisor.runIfNeeded(init, 2, &worker_lifetime)) return;
             return runRuntimeUnit(.inference, subcommand, init, &args);
         },
         .metadata => return runRuntimeUnit(.metadata, subcommand, init, &args),

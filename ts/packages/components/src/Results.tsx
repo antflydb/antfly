@@ -3,7 +3,7 @@ import React, { type ReactNode, useCallback, useEffect, useRef, useState } from 
 import Pagination from "./Pagination";
 import { SafeRender } from "./SafeRender";
 import { useSharedContext } from "./SharedContext";
-import { disjunctsFrom } from "./utils";
+import { disjunctsFrom, resolveTable } from "./utils";
 
 export interface ResultsProps {
   id: string;
@@ -53,7 +53,7 @@ export default function Results({
   filterQuery,
   exclusionQuery,
 }: ResultsProps) {
-  const [{ widgets }, dispatch] = useSharedContext();
+  const [{ widgets, table: defaultTable }, dispatch] = useSharedContext();
   const [page, setPage] = useState(initialPage);
   const [lastQueryHash, setLastQueryHash] = useState<string | null>(null);
   const [isInitialized, setIsInitialized] = useState(false);
@@ -102,11 +102,37 @@ export default function Results({
     [isSemanticEnabled, customQuery, fields]
   );
 
-  // Create a hash of all search/filter widgets to detect query changes
-  const queryWidgets = Array.from(widgets.values()).filter((w) => w.needsQuery);
-  const queryHash = JSON.stringify(
-    queryWidgets.map((w) => ({ id: w.id, value: w.value, query: w.query }))
+  const resolvedTable = resolveTable(table, defaultTable);
+  const sharedQueries = [...widgets.values()]
+    .filter(
+      (w) =>
+        w.needsQuery &&
+        !w.wantResults &&
+        !w.isAutosuggest &&
+        resolveTable(w.table, defaultTable) === resolvedTable &&
+        (!w.configuration?.resultsId || w.configuration.resultsId === id)
+    )
+    .map((w) => [w.id, w.query]);
+  const ownQuery = React.useMemo(
+    () =>
+      searchBoxId
+        ? isSemanticEnabled
+          ? (customQuery?.() ?? null)
+          : queryFromValue(searchValue)
+        : undefined,
+    [searchBoxId, isSemanticEnabled, customQuery, queryFromValue, searchValue]
   );
+  const queryHash = JSON.stringify([
+    resolvedTable,
+    searchValue,
+    ownQuery,
+    semanticIndexes,
+    filterQuery,
+    exclusionQuery,
+    sort,
+    itemsPerPage,
+    sharedQueries,
+  ]);
 
   // Compute the desired page based on query changes
   const desiredPage = React.useMemo(() => {
@@ -143,13 +169,7 @@ export default function Results({
       rootQuery: false, // Not a root query - doesn't need isolation
       wantResults: true,
       isSemantic: isSemanticEnabled,
-      query: shouldContributeQuery
-        ? isSemanticEnabled
-          ? customQuery
-            ? customQuery()
-            : null
-          : queryFromValue(searchValue)
-        : undefined,
+      query: ownQuery,
       semanticQuery: shouldContributeQuery && isSemanticEnabled ? searchValue : undefined,
       table: table,
       filterQuery: filterQuery,
@@ -182,8 +202,7 @@ export default function Results({
     isSemanticEnabled,
     semanticIndexes,
     limit,
-    customQuery,
-    queryFromValue,
+    ownQuery,
   ]);
 
   // Destroy widget from context (remove from the list to unapply its effects)

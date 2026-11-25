@@ -74,7 +74,18 @@ fn normalizeExpandedTerms(filter: *search_filter_mod.Filter) void {
     }
 }
 
-pub fn filterToStatefulTextQueryAlloc(
+pub fn parseStatefulQueryAlloc(alloc: std.mem.Allocator, input: []const u8, boost: f32) !db_types.TextQuery {
+    var owned = try parseFilterAlloc(alloc, input);
+    defer owned.deinit(alloc);
+    const source = if (owned.filter == .bool_filter) try alloc.dupe(u8, input) else null;
+    errdefer if (source) |text| alloc.free(text);
+
+    var query = try filterToStatefulTextQueryAlloc(alloc, owned.filter, boost);
+    if (source) |text| query.bool_query.query_string = .{ .text = text, .boost = boost };
+    return query;
+}
+
+fn filterToStatefulTextQueryAlloc(
     alloc: std.mem.Allocator,
     filter: search_filter_mod.Filter,
     root_boost: f32,

@@ -17,11 +17,15 @@
       "import": "./dist/adapters.js",
       "require": "./dist/adapters.cjs"
     },
-    "./styles": "./dist/components.css"
+    "./styles": {
+      "types": "./styles.d.ts",
+      "default": "./dist/components.css"
+    }
   },
   "files": [
     "dist",
     "types",
+    "styles.d.ts",
     "README.md",
     "LICENSE"
   ],

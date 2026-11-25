@@ -648,7 +648,7 @@ const Parser = struct {
                 self.pos += 1;
                 const end_char = try self.parseClassChar();
                 if (start_char > end_char) return error.InvalidRegex;
-                for (start_char..end_char + 1) |value| class.bytes[value] = true;
+                for (@as(usize, start_char)..@as(usize, end_char) + 1) |value| class.bytes[value] = true;
                 continue;
             }
 
@@ -1002,5 +1002,19 @@ test "ASCII insensitive FST regex preserves ranges negation escapes and anchored
         var forked = compiled.fork(a);
         defer forked.deinit();
         try std.testing.expect(matchesCompiled(case.pattern, &forked, case.yes));
+    }
+}
+
+// Inclusive byte ranges must include 0xff without overflowing their u8 endpoint.
+test "prepared byte classes include the maximum byte" {
+    const a = std.testing.allocator;
+    var p = try PreparedPattern.init(a, &.{ '^', '[', 0, '-', 255, ']', '$' });
+    defer p.deinit();
+    var reference = p;
+    reference.fast = .{};
+    for (0..256) |b| {
+        const value = [_]u8{@intCast(b)};
+        try std.testing.expect(try p.matches(a, &value));
+        try std.testing.expect(try reference.matches(a, &value));
     }
 }
