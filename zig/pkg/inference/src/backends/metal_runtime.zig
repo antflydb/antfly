@@ -52958,6 +52958,33 @@ pub const RoutedBlockScaledFfn = struct {
         }) != 0) return error.MetalKernelDispatchFailed;
     }
 
+    pub const Router = struct {
+        weight: *const MetalTensor,
+        bias: *const MetalTensor,
+        logits: *MetalTensor,
+    };
+
+    pub fn encodeWithRouter(
+        self: RoutedBlockScaledFfn,
+        runtime: *RawMetalDecodeRuntime,
+        input: *const MetalTensor,
+        router: Router,
+        gate_up: Weights,
+        down: Weights,
+        scratch: Workspace,
+        output: *MetalTensor,
+    ) !void {
+        _ = try self.scratchShape();
+        if (router.logits.dtype != .f32) return error.UnsupportedTensorType;
+        const projection: DenseBf16Projection = .{
+            .rows = self.rows,
+            .input_width = self.hidden,
+            .output_width = self.experts,
+        };
+        try projection.encode(runtime, input, router.weight, router.logits);
+        try self.encode(runtime, input, router.logits, router.bias, gate_up, down, scratch, output);
+    }
+
     pub fn encode(
         self: RoutedBlockScaledFfn,
         runtime: *RawMetalDecodeRuntime,
@@ -53025,7 +53052,8 @@ test "Metal routed block-scaled projection chains the complete expert stage in o
     defer provider.deinitOwned();
     const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
     const input: [32]u16 = @splat(0x3f80);
-    const zeros: [2]f32 = @splat(0);
+    const bias = [2]f32{ 0, 1 };
+    const router_weight: [64]u16 = @splat(0x3e00);
     const gate_values: [1024]u8 = @splat(0x22);
     const gate_scales: [128]u8 = @splat(0x38);
     const down_values: [512]u8 = @splat(0x22);
@@ -53033,11 +53061,11 @@ test "Metal routed block-scaled projection chains the complete expert stage in o
     const amax: [2]f32 = @splat(1);
     const divisor = [_]f32{1};
     const payloads: [9][]const u8 = .{
-        std.mem.asBytes(&input), std.mem.asBytes(&zeros), std.mem.asBytes(&zeros),
-        &gate_values,            &gate_scales,            &down_values,
-        &down_scales,            std.mem.asBytes(&amax),  std.mem.asBytes(&divisor),
+        std.mem.asBytes(&input), std.mem.asBytes(&router_weight), std.mem.asBytes(&bias),
+        &gate_values,            &gate_scales,                    &down_values,
+        &down_scales,            std.mem.asBytes(&amax),          std.mem.asBytes(&divisor),
     };
-    const dtypes: [15]metal_tensor.DType = .{ .i16, .f32, .f32, .u8, .u8, .u8, .u8, .f32, .f32, .i32, .f32, .i16, .i16, .i16, .i16 };
+    const dtypes: [16]metal_tensor.DType = .{ .i16, .i16, .f32, .u8, .u8, .u8, .u8, .f32, .f32, .i32, .f32, .i16, .i16, .i16, .i16, .f32 };
     const ffn: RoutedBlockScaledFfn = .{
         .rows = 1,
         .hidden = 32,
@@ -53050,8 +53078,8 @@ test "Metal routed block-scaled projection chains the complete expert stage in o
         .up_cap = 2,
     };
     const shape = try ffn.scratchShape();
-    const scratch_extents = [_]i32{ shape.selected, shape.weights, shape.gate_up, shape.activated, shape.projected, 32 };
-    var tensors: [15]MetalTensor = undefined;
+    const scratch_extents = [_]i32{ shape.selected, shape.weights, shape.gate_up, shape.activated, shape.projected, 32, 2 };
+    var tensors: [16]MetalTensor = undefined;
     var allocated: usize = 0;
     defer for (tensors[0..allocated]) |*tensor| tensor.deinit();
     for (&tensors, dtypes, 0..) |*tensor, dtype, i| {
@@ -53071,12 +53099,19 @@ test "Metal routed block-scaled projection chains the complete expert stage in o
     };
     try beginFrame(runtime);
     errdefer cancelFrame(runtime) catch {};
-    try ffn.encode(runtime, &tensors[0], &tensors[1], &tensors[2], gate, down, workspace, &tensors[14]);
+    try ffn.encodeWithRouter(runtime, &tensors[0], .{
+        .weight = &tensors[1],
+        .bias = &tensors[2],
+        .logits = &tensors[15],
+    }, gate, down, workspace, &tensors[14]);
     try submitFrame(runtime);
     try waitFrame(runtime);
     var selected: [2]i32 = undefined;
     try workspace.selected.downloadBytesInto(std.mem.asBytes(&selected));
-    try std.testing.expectEqual([2]i32{ 0, 1 }, selected);
+    try std.testing.expectEqual([2]i32{ 1, 0 }, selected);
+    var logits: [2]f32 = undefined;
+    try tensors[15].downloadF32Into(&logits);
+    try std.testing.expectEqual([2]f32{ 4, 4 }, logits);
     var output: [32]u16 = undefined;
     try tensors[14].downloadBytesInto(std.mem.asBytes(&output));
     try std.testing.expectEqual(@as([32]u16, @splat(0x4340)), output);
