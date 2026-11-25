@@ -939,3 +939,35 @@ The contemporaneous llama.cpp medians were 168 / 205 / 165 / 280 ms.
 All 64 measured Antfly responses matched the explicitly tuned run's content
 and finish reasons. Both engines passed all four fixture fact checks with
 48 tokens. The Spark tests passed 94 cases with one Metal-only skip.
+
+### Issue closure audit
+
+This audit uses `97ae654504` as the implementation head and `2fd277baea`
+as the merged-main ancestor. It covers the seven open #1166 entries and
+the implementation, deletion and qualification gates in #1771.
+
+| Requirement | State at the audited head | Evidence and remaining gate |
+| --- | --- | --- |
+| Shared liveness and authoritative storage | Partial | Dependency analysis and admitted destination/workspace are shared. The physical Metal scopes and opaque vendor workspaces in the compatibility table still have separate allocation ownership. |
+| Stable addresses and CUDA capture | Partial | Prepared plans retain stable storage. Released T5-small has bounded replay at prefixes 1, 8, 32 and 64. Legacy decoder and audio signatures still need ordinary/capture recipe parity before deleting learned address policy. |
+| Runtime-owned state and physical policy | Partial | `decoder_storage.zig` owns Gemma4 replay capacity. `decoder_prefill.zig` selects chunk sizes, binds eager routes and owns scheduled work and cancellation. Task-bound state and publication decisions still need the remaining architecture-specific migration. |
+| Resident placement | Partial | Released fused T5-small frees both encoder activations before the cached step on Native, Metal and CUDA. Glowworm recorded 393,216 device-to-device gather bytes with zero gather downloads. Untested or opaque encoder/consumer pairs still need residency and output-custody qualification. |
+| Task orchestration | Partial | Generation supplies publication callbacks to shared scheduled steps and preserves independent outputs through the publication boundary. Compatibility routes still own numerical transitions for some model/provider pairs. |
+| Ownership and deletion | Partial | Ten detected source renames establish common execution ownership. The original `cuda_owned_coverage.zig` wrapper was removed and its provider check is shared by `device_owned_coverage.zig`. The remaining physical compatibility owners have deletion gates in the preceding table. |
+| Common telemetry | Partial | Invocation reports now record cache-gather copy counts, bytes and stream ordering alongside the separate model-forward observations. The gather receipt covers submission and ordering. Cross-provider lifetime and retirement observations still need coverage. |
+
+The diff from merged main contains 46 added paths, 225 modified paths, ten
+detected renames and one deleted path. The deleted path is the 24-line
+CUDA coverage wrapper, of which nine lines follow the license header.
+These counts describe the source tree diff. A rename can include edits,
+and generated copies and binary sizes are outside this deletion count.
+
+The publication and optional-component suite at the audited head passed
+199 of 203 selected tests with four skips. The targeted prefill and
+T5-small evidence covers smaller physical and model-specific cohorts.
+Closure still requires a current-head tier-one regression and performance
+matrix against frozen merged main, including Whisper multi-window,
+Gemma4 text/image/audio/video and the E2B comparative deficits above,
+EmbeddingGemma2, LightOnOCR, GLiNER2.5/DECIDE, Inkling 2 Mini and the
+representative Qwen3 routes. Spark GB10, local Metal and CPU are the
+available physical targets. L4 and A100 remain the user-deferred targets.
