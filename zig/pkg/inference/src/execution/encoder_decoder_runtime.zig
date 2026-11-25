@@ -435,7 +435,19 @@ pub fn residentVocabularyRow(allocator: std.mem.Allocator, decoder: backends.Ses
         };
         defer if (!direct) outputs.backend.free(row);
         if (direct and try outputs.backend.tensorDType(logits) != .f32) return error.InvalidDecoderOutput;
-        const result = try outputs.backend.toFloat32(row, allocator);
+        const result = downloaded: {
+            if (outputs.backend.vtable.kernels) |kernels| {
+                if (kernels.accepts(outputs.backend.vtable) and kernels.readFloat32Into != null) {
+                    // Write directly into the caller's row. Device providers
+                    // can avoid making a persistent host mirror of logits.
+                    const destination = try allocator.alloc(f32, vocab);
+                    errdefer allocator.free(destination);
+                    if (try outputs.backend.readFloat32Into(row, destination)) break :downloaded destination;
+                    allocator.free(destination);
+                }
+            }
+            break :downloaded try outputs.backend.toFloat32(row, allocator);
+        };
         errdefer allocator.free(result);
         if (result.len != vocab) return error.InvalidDecoderOutput;
         if (control) |active| try active.check();
