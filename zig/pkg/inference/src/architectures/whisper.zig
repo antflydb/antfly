@@ -1537,6 +1537,7 @@ pub const DecodeCache = struct {
     /// Consumption is explicit: on error the caller still owns all cold weights.
     /// Numerical encoder projections remain at the original execution boundary.
     pub fn initPrepared(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: Config, encoder_hidden: CT, enc_seq: usize, prepared: *PreparedDecoderWeights, program_owner: ?*?PreparedSingleToken) !DecodeCache {
+        try cb.checkExecutionControl();
         if (cb.ptr != prepared.backend.ptr or cb.vtable != prepared.backend.vtable or prepared.weights.layers.len != config.decoder_layers) return error.PreparedDecoderWeightOwnerChanged;
         const native = if (program_owner) |owner| if (owner.*) |*program| program else null else null;
         if (native) |program| if (program.schedule.frame == null or program.schedule.frame.?.scope_backends != 1) return error.DenseScheduleNotEntered;
@@ -1572,6 +1573,7 @@ pub const DecodeCache = struct {
         const scope_active = native != null and frame_active and (cb.decoderRuntimeBeginPlannedComputeScope() catch false);
         defer if (scope_active) cb.decoderRuntimeEndPlannedComputeScope();
         for (0..config.decoder_layers) |layer| {
+            try cb.checkExecutionControl();
             prepared.fetcher.cb = cb;
             var buf: [256]u8 = undefined;
             const cross = if (prepared.cross) |values| values[layer] else PreparedDecoderWeights.Cross{
@@ -1612,6 +1614,7 @@ pub const DecodeCache = struct {
             layers[layer] = .{ .k_cross = k_cross, .v_cross = v_cross };
             built += 1;
         }
+        try cb.checkExecutionControl();
         if (frame_active) {
             try cb.decoderRuntimeSubmitAndWaitFrame();
             frame_active = false;
@@ -1630,6 +1633,7 @@ pub const DecodeCache = struct {
             const shape = [_]i32{ @intCast(slab_rows), @intCast(d_model) };
             var all_allocated = true;
             for (layers) |*layer| {
+                try cb.checkExecutionControl();
                 const k_slab = (try cb.allocUninitF32Shape(&shape)) orelse {
                     all_allocated = false;
                     break;
@@ -1653,6 +1657,7 @@ pub const DecodeCache = struct {
             }
         }
 
+        try cb.checkExecutionControl();
         var fetcher = prepared.fetcher;
         prepared.fetcher.handles = .empty;
         prepared.weights.layers = &.{};

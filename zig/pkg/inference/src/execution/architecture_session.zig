@@ -6044,7 +6044,7 @@ fn optionalColdNativeWhisper(session: Session, allocator: std.mem.Allocator, con
 }
 
 fn finishColdNativeWhisper(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, cold: *ColdNativeWhisper, config: whisper_mod.Config, rows: usize, base: @import("../backends/session.zig").RunPermit, gate: ?*std.atomic.Mutex, destination_model: ?*Session.ModelLifetime, source_resources: ?Session.ModelLifetime.ResourcePin, cleanup: *const ReceiverCleanup) !WhisperNativeDecoder {
-    _ = control;
+    if (control) |active| try active.check();
     const data = denseWhisperPreparationModelData(session) orelse return error.ForeignNativeWeightModel;
     if (cold.program.?.source_data != data) return error.ForeignNativeWeightModel;
     if (session.backend() == .native) {
@@ -20873,6 +20873,34 @@ test "actual Native Whisper cancellation refuses before planned ingress or KV mu
     const next = try decoder.step(&.{2});
     defer a.free(next);
     try std.testing.expectEqual(positions + 1, decoder.positions());
+}
+
+test "Native Whisper cross-cache construction cancels between layers without adopting weights" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var session = try IncrementalFixture.session(a);
+    defer session.close();
+    const hidden = [_]f32{ 0.2, 0.4, -0.1, 0.7, 0.5, 0.6, -0.2, 0.3 };
+    var decoder = (try whisperNativeDecoder(session, a, null, &hidden, 2)).?;
+    defer decoder.deinit();
+    var backend = decoder.cb.backend;
+    var weights = try whisper_arch.PreparedDecoderWeights.init(&backend, a, decoder.config, true);
+    defer weights.deinit();
+    const Probe = struct {
+        fn check(raw: ?*anyopaque) !void {
+            const checks: *usize = @ptrCast(@alignCast(raw.?));
+            checks.* += 1;
+            if (checks.* == 3) return error.Cancelled;
+        }
+    };
+    var checks: usize = 0;
+    backend.execution_control = .{ .ptr = &checks, .check_fn = Probe.check, .native_call_policy = .in_process };
+    try std.testing.expectError(error.Cancelled, whisper_arch.DecodeCache.initPrepared(&backend, a, decoder.config, decoder.encoder_hidden, 2, &weights, null));
+    try std.testing.expectEqual(decoder.config.decoder_layers, weights.weights.layers.len);
+    backend.execution_control = null;
+    var retried = try whisper_arch.DecodeCache.initPrepared(&backend, a, decoder.config, decoder.encoder_hidden, 2, &weights, null);
+    defer retried.deinit(&backend);
+    try std.testing.expectEqual(decoder.config.decoder_layers, retried.layers.len);
 }
 
 test "actual admitted Native Whisper program retires exact KV scratch metadata and moved construction capability after Model close" {
