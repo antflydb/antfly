@@ -5473,7 +5473,8 @@ pub const Connection = struct {
                 // allocate append-only, and skip proofs for a while, rather
                 // than starve while a peer keeps writing.
                 if (try needsCapacityProof(root)) return error.FileBusy;
-                if (try self.needsReuseAdmission(root)) self.owner.noteReuseProofLost();
+                if (!root.owned_lite_backend.?.native_docstore.?.file.free_pages_verified)
+                    self.owner.noteReuseProofLost();
             }
         }
         self.current = root;
@@ -7022,7 +7023,9 @@ test "capi native optional allocator proof admits batch and SQL on a moving tip"
             if (probe.failure) |err| return err;
             try std.testing.expectEqual(h.capi.ErrorCode.ok, result);
             try std.testing.expectEqual(h.capi.ErrorCode.ok, h.capi.lastErrorCode());
-            try std.testing.expectEqual(@as(usize, 1), probe.captures);
+            // An inherited proof can admit the write without a new walk.
+            // If a walk did run, a competing publication cannot force a second.
+            try std.testing.expect(probe.captures <= 1);
             var out: h.capi.Buffer = .{};
             defer api.antfly_buffer_free_zero(&out);
             if (operation == .batch) {
