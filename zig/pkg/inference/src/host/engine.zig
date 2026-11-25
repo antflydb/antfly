@@ -60,7 +60,7 @@ pub const VTable = struct {
     serve: *const fn (*anyopaque, []const u8, u16, Lifecycle) Outcome(void),
     create_registry: *const fn (memory.Allocator, []const u8) Outcome(*anyopaque),
     destroy_registry: *const fn (*anyopaque) Outcome(void),
-    list_models: *const fn (*anyopaque, io_abi.Borrow) Outcome(void),
+    list_models: *const fn (*anyopaque, io_abi.Borrow, ModelListFormat) Outcome(void),
     pull: *const fn (*anyopaque, io_abi.Borrow, []const u8, HubConfig, ?[]const u8, ?[]const u8, ProjectorSelection) Outcome(void),
     predictor_pull: *const fn (memory.Allocator, io_abi.Borrow, []const []const u8, []const u8) Outcome(void),
     command: *const fn (Command, *const std.process.Init, memory.Allocator, io_abi.Borrow, []const []const u8, []const u8) Outcome(void),
@@ -146,6 +146,46 @@ pub const Node = struct {
         return call("serve", .{ self.handle, host, port, lifecycle });
     }
 };
+pub const ModelListFormat = enum { auto, table, json, compact };
+
+pub fn writeModelList(alloc: std.mem.Allocator, io: std.Io, registry: anytype, format: ModelListFormat) !void {
+    const models = try registry.discover(io);
+    defer {
+        for (models) |model| {
+            alloc.free(model.name);
+            alloc.free(model.path);
+        }
+        alloc.free(models);
+    }
+    var buffer: [4096]u8 = undefined;
+    const stream = if (format == .auto) std.Io.File.stderr() else std.Io.File.stdout();
+    var output = stream.writer(io, &buffer);
+    const writer = &output.interface;
+
+    if (format == .json or format == .compact) {
+        var json: std.json.Stringify = .{
+            .writer = writer,
+            .options = .{ .whitespace = if (format == .json) .indent_2 else .minified },
+        };
+        try json.beginArray();
+        for (models) |model| try json.write(.{
+            .kind = @tagName(model.kind),
+            .name = model.name,
+            .load_error = if (model.load_error) |err| @errorName(err) else null,
+        });
+        try json.endArray();
+        try writer.writeByte('\n');
+    } else {
+        if (format == .table) try writer.print("{s:<12} {s}\n", .{ "TYPE", "MODEL" });
+        for (models) |model| {
+            try writer.print("{s:<12} {s}", .{ @tagName(model.kind), model.name });
+            if (model.load_error) |err| try writer.print("  unusable: {s}", .{@errorName(err)});
+            try writer.writeByte('\n');
+        }
+    }
+    try writer.flush();
+}
+
 pub const ModelRegistry = struct {
     handle: *anyopaque,
     lease: AllocatorLease,
@@ -158,8 +198,8 @@ pub const ModelRegistry = struct {
         call("destroy_registry", .{self.handle}) catch unreachable;
         self.lease.deinit();
     }
-    pub fn list(self: *ModelRegistry, io: std.Io) !void {
-        return call("list_models", .{ self.handle, io_abi.Borrow.init(&io) });
+    pub fn list(self: *ModelRegistry, io: std.Io, format: ModelListFormat) !void {
+        return call("list_models", .{ self.handle, io_abi.Borrow.init(&io), format });
     }
     pub fn pull(self: *ModelRegistry, io: std.Io, ref: []const u8, config: HubConfig, tasks: ?[]const u8, capabilities: ?[]const u8, projector: ProjectorSelection) !void {
         return call("pull", .{ self.handle, io_abi.Borrow.init(&io), ref, config, tasks, capabilities, projector });
