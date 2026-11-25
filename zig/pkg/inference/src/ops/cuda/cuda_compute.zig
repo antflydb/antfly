@@ -26266,6 +26266,11 @@ const ProjectionArgmaxScratch = struct {
 
     fn acquire(self: *CudaCompute, layout: Layout, suppressed: []const i32) !ProjectionArgmaxScratch {
         std.debug.assert(layout.suppression_bytes == std.mem.sliceAsBytes(suppressed).len);
+        // Host suppression is not a prepared input. Refuse it before
+        // consuming an event in a bound workspace.
+        if (suppressed.len != 0) {
+            if (self.execution_scope) |scope| if (scope.isBound()) return error.CudaGraphCaptureUnsafeHostCopy;
+        }
         var bank = try allocDeviceBuffer(self, layout.bytes);
         errdefer releaseDeviceBuffer(self, &bank);
         const suppression = span(bank, layout.suppression_offset, layout.suppression_bytes);
@@ -42280,6 +42285,29 @@ test "LightOnOCR3 CUDA F32 projection row chunks cover large vision batches and 
     }
 }
 
+test "CUDA projection argmax binds declared scratch without advancing rejected events" {
+    const workspace = @import("../../execution/stream_workspace.zig");
+    const layout = try ProjectionArgmaxScratch.Layout.init(128, 36, 0);
+    const with_suppression = try ProjectionArgmaxScratch.Layout.init(128, 36, 1);
+    var plan: workspace.Plan = .{};
+    try plan.declareScratch(layout.bytes);
+    const geometry = try plan.layout(0);
+    const backing = 0x10000000;
+    var scope = try workspace.Scope.bind(&plan, geometry, backing, geometry.bytes);
+    var compute = metadataOnlyTestCompute();
+    compute.execution_scope = &scope;
+
+    try std.testing.expectError(error.CudaGraphCaptureUnsafeHostCopy, ProjectionArgmaxScratch.acquire(&compute, with_suppression, &.{8}));
+    try std.testing.expectEqual(@as(usize, 0), scope.cursor);
+    var scratch = try ProjectionArgmaxScratch.acquire(&compute, layout, &.{});
+    try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, backing), scratch.quantized_input.ptr);
+    try std.testing.expectEqual(scratch.quantized_input.ptr + scratch.quantized_input.len, scratch.partial_values.ptr);
+    try std.testing.expectEqual(scratch.partial_values.ptr + scratch.partial_values.len, scratch.partial_indices.ptr);
+    scratch.deinit(&compute);
+    try std.testing.expect(scope.complete());
+    try std.testing.expectEqual(@as(u64, 0), compute.stats.device_alloc_calls);
+}
+
 test "CUDA projection argmax shares scratch across scalar and batched tails" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -42363,6 +42391,43 @@ test "CUDA generated Q4_0 projection argmax packs into its declared scratch" {
     var token: [1]u32 = undefined;
     try copyToHostTrackedAndSync(&compute, selected.buffer, std.mem.sliceAsBytes(&token));
     try std.testing.expectEqual(@as(u32, 1), token[0]);
+
+    // The same declared interval and distinct token output serve ordinary
+    // execution and recording. Neither invocation learns a temp ordinal.
+    const workspace = @import("../../execution/stream_workspace.zig");
+    const bounds = try kernels_mod.generatedQ4_0Q8_1ArgmaxLaunchBounds(1, width, vocabulary);
+    const layout = try ProjectionArgmaxScratch.Layout.init(bounds.partial_bytes, bounds.q8_input_bytes, 0);
+    var plan: workspace.Plan = .{};
+    try plan.declareScratch(layout.bytes);
+    const geometry = try plan.layout(0);
+    const bank = try allocCudaGraphReplayBank(&compute, geometry.bytes);
+    defer bank.releaseWithCleanup(physicalScopeCleanup(&compute));
+    const backing = tensorFromCt(bank.tensor).buffer;
+    compute.debug_cuda_graph_slots[0].output_bank = try allocCudaGraphReplayBank(&compute, @sizeOf(u32));
+    compute.debug_cuda_graph_prepared_slot = 0;
+    compute.debug_cuda_graph_prepared_output_kind = .greedy_token;
+    const planned_trace = compute.temp_trace_seq;
+    const allocation_count = compute.stats.device_alloc_calls;
+    for ([_]bool{ false, true }) |capture| {
+        var scope = try workspace.Scope.bind(&plan, geometry, backing.ptr, backing.len);
+        compute.execution_scope = &scope;
+        defer compute.execution_scope = null;
+        if (capture) try compute.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED);
+        errdefer if (compute.ctx.debug_graph_capture_active) graph_mod.discardRecording(&compute.ctx);
+        var result = (try tryLinearQ4_0Q8_1ArgmaxE2BDevice(&compute, tensorFromCt(input), &weight, 1, width, vocabulary, &.{})) orelse return error.ExpectedFusedArgmax;
+        defer releaseDeviceBufferLease(&compute, &result);
+        try std.testing.expect(scope.complete());
+        compute.execution_scope = null;
+        if (capture) {
+            var graph = try graph_mod.endRecording(&compute.ctx);
+            defer compute.ctx.destroyGraphChecked(&graph) catch platform.inference_process_supervisor.restartWorker();
+            try replayCapturedDebugGraphOneShot(&compute, graph);
+        }
+        try copyToHostTrackedAndSync(&compute, result.buffer, std.mem.sliceAsBytes(&token));
+        try std.testing.expectEqual(@as(u32, 0), token[0]);
+    }
+    try std.testing.expectEqual(planned_trace, compute.temp_trace_seq);
+    try std.testing.expectEqual(allocation_count, compute.stats.device_alloc_calls);
 }
 
 test "LightOnOCR3 CUDA Florence F16 LM head declines quantized fusion and preserves dense argmax" {

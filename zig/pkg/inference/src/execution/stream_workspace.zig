@@ -103,6 +103,19 @@ pub const Plan = struct {
             return;
         };
     }
+    /// Declare one non-escaping interval on an empty plan. Both ordinary
+    /// execution and recording consume the same allocate/release events.
+    pub fn declareScratch(self: *Plan, bytes: usize) !void {
+        if (!self.valid or self.sealed or self.event_count != 0 or self.count != 0 or bytes == 0 or bytes > limit)
+            return error.InvalidExecutionPlan;
+        self.allocations[0] = .{ .pointer = 0, .bytes = @intCast(bytes), .offset = 0 };
+        self.count = 1;
+        self.event(0, true);
+        self.event(0, false);
+        self.peak = std.mem.alignForward(usize, bytes, alignment);
+        if (!self.finishNoOutput()) return error.InvalidExecutionPlan;
+    }
+
     pub fn finishNoOutput(self: *Plan) bool {
         return self.seal(null);
     }
@@ -303,6 +316,19 @@ test "sealed workspace identity excludes learning addresses and distinguishes ge
     plan.allocate(512, 2048);
     try std.testing.expect(plan.finish(2048));
     try std.testing.expect(identity != plan.fingerprint(17));
+}
+
+test "declared scratch is identical to a sealed allocation interval" {
+    var declared: Plan = .{};
+    var learned: Plan = .{};
+    try std.testing.expectError(error.InvalidExecutionPlan, declared.declareScratch(0));
+    try declared.declareScratch(257);
+    try std.testing.expectError(error.InvalidExecutionPlan, declared.declareScratch(64));
+    learned.allocate(257, 1024);
+    learned.release(1024);
+    try std.testing.expect(learned.finishNoOutput());
+    try std.testing.expectEqual(try learned.layout(0), try declared.layout(0));
+    try std.testing.expectEqual(learned.fingerprint(17), declared.fingerprint(17));
 }
 
 test "CUDA arena preserves device addresses wider than a 32-bit host pointer" {
