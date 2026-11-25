@@ -383,7 +383,7 @@ const Fixture = struct {
             .install_generation_admissions => 0,
             .publish => 8,
             .cancel => 16,
-            .status => 0,
+            .status, .capture_initial => 0,
         };
         if (self.restart_after_commit and fault_bit != 0 and self.faults_seen[i] & fault_bit == 0) {
             self.faults_seen[i] |= fault_bit;

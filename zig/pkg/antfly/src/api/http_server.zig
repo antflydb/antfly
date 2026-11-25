@@ -20182,11 +20182,8 @@ pub const ApiHttpServer = struct {
                 location,
                 attempt_id,
             ) catch |err| blk: {
-                // The immutable aggregate above is the commit point. Preserve
-                // success after an ambiguous terminal-head update: active-head
-                // admission validates the same marker, manifest, and artifact
-                // identities and maintenance never treats a present commit as
-                // an unpublished attempt.
+                // The immutable aggregate above is the commit point. Named
+                // restores verify that aggregate and its artifacts directly.
                 std.log.warn("cluster backup committed head update deferred class={s}", .{@errorName(err)});
                 break :blk false;
             })) {
@@ -21919,8 +21916,8 @@ pub const ApiHttpServer = struct {
         // archives instead of writing lease sidecars into the source.
         var verification_cache: backups_api.ArtifactVerificationCache = .{};
         defer verification_cache.deinit(op_alloc);
-        // Pinned legacy attempts already verified repository health at admission.
-        // Reopening the head would check unrelated and already published shards.
+        // Admission pins the aggregate and selected child manifests so retries
+        // can recover publication using the same backup identities.
         var manifest = (if (req.admitted_manifest_json) |bytes|
             backups_api.parseClusterManifestBytes(op_alloc, bytes, req.backup_id)
         else if (req.admitted_child_pins != null)
@@ -22202,7 +22199,14 @@ pub const ApiHttpServer = struct {
             }
         }
 
-        for (table_names, destinations, 0..) |source_name, table_name, i| {
+        // On retry the active table owns the only publication checkpoint.
+        // Resolve it before revisiting any earlier table that failed preflight.
+        const first_index = active_table_index orelse 0;
+        if (active_table_index != null and first_index >= table_names.len) return error.InternalFailure;
+        for (0..table_names.len) |step| {
+            const i = if (step == 0) first_index else if (step <= first_index) step - 1 else step;
+            const source_name = table_names[i];
+            const table_name = destinations[i];
             try self.ensureRestoreActive(cancellation);
             if (statuses[i].@"error" != null or std.mem.eql(u8, statuses[i].status, "skipped") or
                 (locally_completed.isSet(i) or restore_jobs.containsTableIndex(completed_table_ranges, @intCast(i)))) continue;
@@ -22242,12 +22246,12 @@ pub const ApiHttpServer = struct {
                 continue;
             }
 
-            if (!restoreTableAttempted(active_table_index, durability_pending_table_ranges, published_table_ranges, @intCast(i))) {
-                self.checkpointRestoreTableStarted(cancellation, @intCast(i)) catch |err| {
-                    if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return error.NotLeader;
-                    return error.InternalFailure;
-                };
-            }
+            var needs_start_checkpoint = !restoreTableAttempted(active_table_index, durability_pending_table_ranges, published_table_ranges, @intCast(i));
+
+            // An interrupted publication may still own its checkpoint. If
+            // preflight fails on that ordinal, preserve the checkpoint and
+            // return the actual failure instead of advancing to another table.
+            const resuming_active_table = active_table_index == @as(u16, @intCast(i));
 
             // Overwrite publication is local and generation-aware. New-table
             // restores may delegate to metadata in distributed deployments.
@@ -22269,10 +22273,12 @@ pub const ApiHttpServer = struct {
                             return error.InternalFailure;
                         },
                         error.BackupIntegrityFailure => {
+                            if (resuming_active_table) return error.BackupIntegrityFailure;
                             statuses[i].@"error" = backups_api.integrity_failure_message;
                             continue;
                         },
                         error.InvalidRequest => {
+                            if (resuming_active_table) return error.InvalidRequest;
                             statuses[i].@"error" = "invalid table backup manifest";
                             continue;
                         },
@@ -22281,6 +22287,7 @@ pub const ApiHttpServer = struct {
                 };
                 defer table_manifest.deinit(op_alloc);
                 if (!std.mem.eql(u8, table_manifest.table_name, cluster_table.name)) {
+                    if (resuming_active_table) return error.BackupIntegrityFailure;
                     statuses[i].@"error" = "table backup manifest does not match table";
                     continue;
                 }
@@ -22311,10 +22318,12 @@ pub const ApiHttpServer = struct {
                             return error.InternalFailure;
                         },
                         error.BackupIntegrityFailure => {
+                            if (resuming_active_table) return error.BackupIntegrityFailure;
                             statuses[i].@"error" = backups_api.integrity_failure_message;
                             continue;
                         },
                         error.InvalidRequest => {
+                            if (resuming_active_table) return error.InvalidRequest;
                             statuses[i].@"error" = "unable to bind portable backup artifact integrity";
                             continue;
                         },
@@ -22380,6 +22389,14 @@ pub const ApiHttpServer = struct {
                 };
 
                 table_manifest.restore_admission_fingerprint = admission_fingerprint;
+                if (needs_start_checkpoint) {
+                    self.checkpointRestoreTableStarted(cancellation, @intCast(i)) catch |err| {
+                        if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return error.NotLeader;
+                        return error.InternalFailure;
+                    };
+                    needs_start_checkpoint = false;
+                }
+
                 const restored_via_metadata = self.restoreMetadataTableWithRetry(
                     alloc,
                     table_name,
@@ -22460,6 +22477,13 @@ pub const ApiHttpServer = struct {
                 authorized_manifest.indexes_json,
             ) catch return error.InternalFailure;
             defer op_alloc.free(destination_authorization_fingerprint);
+            if (needs_start_checkpoint) {
+                self.checkpointRestoreTableStarted(cancellation, @intCast(i)) catch |err| {
+                    if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return error.NotLeader;
+                    return error.InternalFailure;
+                };
+            }
+
             const outcome = self.restoreOwnedTableWithRetryAndLifecycle(
                 table_name,
                 location,

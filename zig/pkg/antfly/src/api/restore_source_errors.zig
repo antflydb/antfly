@@ -25,6 +25,7 @@ pub fn permanent(err: anyerror) bool {
     return switch (err) {
         error.BackupIntegrityFailure,
         error.BackupArtifactIntegrityMismatch,
+        error.BackupArtifactMissing,
         error.NativeBackupArtifactIntegrityMismatch,
         error.InvalidNativeBackupManifest,
         error.SourceFileChanged,
@@ -60,7 +61,7 @@ pub fn normalize(err: anyerror) anyerror {
 
 test "restore immutable rewrite failures are terminal but transport pressure is retryable" {
     const testing = @import("std").testing;
-    for ([_]anyerror{ error.RelationalRewriteTypeChange, error.RelationalRewriteColumnDrop, error.RelationalRewriteRequiresRelational, error.RelationalRewriteBudgetExceeded, error.RelationalExpressionDivisionByZero, error.InvalidRelationalGeneratedValue, error.InvalidRelationalRow }) |err| {
+    for ([_]anyerror{ error.BackupArtifactMissing, error.RelationalRewriteTypeChange, error.RelationalRewriteColumnDrop, error.RelationalRewriteRequiresRelational, error.RelationalRewriteBudgetExceeded, error.RelationalExpressionDivisionByZero, error.InvalidRelationalGeneratedValue, error.InvalidRelationalRow }) |err| {
         try testing.expect(permanent(err));
         try testing.expectEqual(error.BackupIntegrityFailure, normalize(err));
     }
