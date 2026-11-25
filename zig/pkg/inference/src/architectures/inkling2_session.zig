@@ -543,11 +543,11 @@ pub const Pipeline = struct {
             config.frequency_penalty == 0 and config.presence_penalty == 0;
     }
 
-    fn initializeRequest(self: *Pipeline, request: *decoder.Request, draft: ?*dspark.Draft) !void {
+    fn initializeRequest(self: *Pipeline, request: *decoder.Request, plan: decoder.RequestPlan, draft: ?*dspark.Draft) !void {
         var turn: StepScheduler.Waiter = .{};
         try self.model.enterStep(&turn, self.control);
         defer StepScheduler.leave(&turn);
-        try request.initWithPrefill(self.allocator, &self.model.model, self.context_tokens, self.chunk_rows);
+        try request.initWithPlan(self.allocator, plan);
         errdefer request.deinit() catch @panic("unable to drain the Inkling CUDA stream");
         request.use_dense = self.model.fast_matvec;
         if (draft) |active| {
@@ -622,7 +622,8 @@ pub const Pipeline = struct {
         const model = self.model;
         const session = self.session.withAdmissionControl(self.control);
         const pixels = @as(usize, self.prompt.image_width) * self.prompt.image_height;
-        const amount = try decoder.requestMemory(model.model.text, self.context_tokens, self.chunk_rows);
+        const plan = try decoder.RequestPlan.init(&model.model, self.context_tokens, self.chunk_rows);
+        const amount = try plan.memory(self.speculate);
         const draft_kv = if (self.speculate) dspark.Draft.requestKvBytes(self.context_tokens) else 0;
         const image_workspace = if (self.prompt.image != null) vision.requestWorkspaceBytes(self.prompt.imageRows(), pixels) else 0;
         var admission = try session.admitRetainedStateWithWorkspace(
@@ -634,7 +635,7 @@ pub const Pipeline = struct {
 
         var request: decoder.Request = undefined;
         const draft: ?*dspark.Draft = if (self.speculate) &model.draft.? else null;
-        try self.initializeRequest(&request, draft);
+        try self.initializeRequest(&request, plan, draft);
         defer self.deinitializeRequest(&request, draft);
         try self.prefill(&request, self.prompt.before_image);
         if (self.prompt.image) |data| try self.prefillImage(&request, data);

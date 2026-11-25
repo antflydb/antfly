@@ -479,8 +479,13 @@ test "CUDA Inkling 2 runs the fixed loop with all released text weights" {
     });
     var request: decoder.Request = undefined;
     const context_limit = 18;
-    try request.init(allocator, &model, context_limit);
+    const plan = try decoder.RequestPlan.init(&model, context_limit, 1);
+    const amounts = try plan.memory(false);
+    const before = ctx.device_allocations.snapshot().physical_live;
+    try request.initWithPlan(allocator, plan);
     defer request.deinit() catch @panic("unable to drain Inkling decode request");
+    const added = ctx.device_allocations.snapshot().physical_live - before;
+    try std.testing.expect(added != 0 and added <= amounts.kv + amounts.workspace);
     try std.testing.expectError(error.InvalidInkling2Token, request.step(model.text.unpadded_vocab_size));
     try std.testing.expectEqual(@as(usize, 0), request.position());
     var token: u32 = 42;

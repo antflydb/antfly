@@ -114,6 +114,8 @@ fn alloc(ctx: *Context, len: usize) !DeviceBuffer {
     return DeviceBuffer.allocWithPurpose(ctx, len, .command_workspace);
 }
 
+const feature_stage_count = 4;
+
 pub const Draft = struct {
     ctx: *Context,
     shared: SharedWeights,
@@ -124,7 +126,7 @@ pub const Draft = struct {
     taps: [3]u8,
     capacity: u32 = 0,
     max_capacity: u32,
-    stage: [4]DeviceBuffer = @splat(.{}),
+    stage: [feature_stage_count]DeviceBuffer = @splat(.{}),
     mix_weights: [4][4]f32 = undefined,
     layers: [num_layers]Buffers(LayerWeight) = @splat(@splat(.{})),
     kv: [num_layers][2]DeviceBuffer = @splat(@splat(.{})),
@@ -289,6 +291,10 @@ pub const Draft = struct {
             plane.* = try DeviceBuffer.allocWithPurpose(ctx, requestKvBytes(capacity) / (num_layers * 2), .kv_state);
         };
         self.capacity = capacity;
+    }
+
+    pub fn requestWorkspaceBytes(feature_rows: u32) usize {
+        return (feature_stage_count + 1) * @as(usize, feature_rows) * width * 2;
     }
 
     pub fn requestKvBytes(capacity: u32) usize {

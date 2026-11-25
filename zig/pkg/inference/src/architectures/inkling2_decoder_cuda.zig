@@ -250,7 +250,7 @@ pub const Decoder = struct {
     }
 };
 
-const Temp = enum { stack, prelude, bank, inputs, mix, message, pair, rank, gain_forget, raw, cohort, attn, mlp, normalized, logits, blas, relative, router, routed, pages, position };
+const Temp = enum { stack, prelude, bank, inputs, mix, message, pair, rank, gain_forget, raw, attn, mlp, normalized, logits, blas, relative, router, routed, pages, cohort, position };
 
 /// A request is bound to one CUDA stream. Initialize it in place and keep it
 /// at that address until deinit so the cache can retain its internal owners.
@@ -264,23 +264,94 @@ fn requestCacheConfig(text: checkpoint.TextConfig, max_tokens: u32, chunk_rows: 
     };
 }
 
-pub fn requestMemory(text: checkpoint.TextConfig, max_tokens: u32, chunk_rows: u32) !struct { host: usize, kv: usize, workspace: usize } {
-    const config = requestCacheConfig(text, max_tokens, chunk_rows);
-    const hidden_bytes = @as(usize, text.hidden_size) * 2;
-    const kv_row_bytes = @as(usize, text.num_key_value_heads) * text.head_dim * 2;
-    const history_bytes = 4 * checkpoint.visit_count * 6 * (hidden_bytes + kv_row_bytes);
-    const page_count = try std.math.divCeil(usize, max_tokens, page_tokens);
-    const relative_bytes = try relativeScratchBytes(text, max_tokens, chunk_rows);
-    const nv = try moe.scratchBytes(.nvfp4, text, chunk_rows);
-    const mx = try moe.scratchBytes(.mxfp8, text, chunk_rows);
-    return .{
-        .host = 128 * page_count + @as(usize, text.vocab_size) * 4,
-        .kv = try config.deviceBytes(.full) + try config.deviceBytes(.sliding) + history_bytes,
-        // Fixed allowance for BLAS, row-one plans, the vocabulary shortlist,
-        // page tables, and row-bounded attention and controller intermediates.
-        .workspace = 64 * 1024 * 1024 + 16 * page_count + relative_bytes +
-            @max(nv.logits, mx.logits) + @max(nv.routed, mx.routed),
-    };
+/// Cold layout used by both admission and allocation. Kernel dispatch only
+/// receives the individual buffers described by this plan.
+pub const RequestPlan = struct {
+    model: *Decoder,
+    max_tokens: u32,
+    chunk_rows: u32,
+    kv: cache.Config,
+    attention_space: attention.Workspace.Layout,
+    history_bytes: usize,
+    page_table_bytes: usize,
+    logits_bytes: usize,
+    shortlist_bytes: usize,
+    temp_bytes: std.EnumArray(Temp, usize),
+    replay_enabled: bool,
+
+    pub fn init(model: *Decoder, max_tokens: u32, chunk_rows: u32) !RequestPlan {
+        const text = model.text;
+        if (max_tokens == 0 or max_tokens > text.model_max_length or chunk_rows == 0 or
+            chunk_rows > @min(prefill_chunk_rows, max_tokens)) return error.InvalidInkling2Context;
+        const ctx = model.ctx;
+        const replay_enabled = ctx.info.compute_major == 12 and ctx.info.compute_minor <= 1 and
+            max_tokens >= 5 and max_tokens <= text.sliding_window_size;
+        const controller_rows: usize = @max(chunk_rows, if (Request.supportsGroupedControllers(ctx)) @as(u32, 3) else 1);
+        const hidden = @as(usize, text.hidden_size) * 2;
+        const kv_row = @as(usize, text.num_key_value_heads) * text.head_dim * 2;
+        const head_bytes = @as(usize, text.num_attention_heads) * text.head_dim * 2;
+        const page_table_bytes = (try std.math.divCeil(usize, max_tokens, page_tokens)) * 8;
+        const nv = try moe.scratchBytes(.nvfp4, text, chunk_rows);
+        const mx = try moe.scratchBytes(.mxfp8, text, chunk_rows);
+        const activation_bytes = hidden * chunk_rows;
+        return .{
+            .model = model,
+            .max_tokens = max_tokens,
+            .chunk_rows = chunk_rows,
+            .kv = requestCacheConfig(text, max_tokens, chunk_rows),
+            .attention_space = try attention.Workspace.layout(text, chunk_rows),
+            .history_bytes = 2 * checkpoint.visit_count * 6 * (hidden + kv_row),
+            .page_table_bytes = page_table_bytes,
+            .logits_bytes = @as(usize, text.unpadded_vocab_size) * 4,
+            .shortlist_bytes = model.head_shortlist.workspaceBytes(),
+            .replay_enabled = replay_enabled,
+            .temp_bytes = .initDefault(0, .{
+                .stack = block_slots * activation_bytes,
+                .prelude = activation_bytes,
+                .bank = 2 * activation_bytes,
+                .inputs = 3 * activation_bytes,
+                .mix = 2 * hidden * controller_rows,
+                .message = 2 * hidden * controller_rows,
+                .pair = 2 * hidden * controller_rows,
+                .rank = @as(usize, text.loop_config.gate_rank) * 2 * controller_rows,
+                .gain_forget = 4 * hidden * controller_rows,
+                .raw = activation_bytes,
+                .cohort = if (chunk_rows >= 2) (head_bytes + hidden) * @min(chunk_rows, decode_batch_rows) else 0,
+                .attn = activation_bytes,
+                .mlp = activation_bytes,
+                .normalized = activation_bytes,
+                .logits = @as(usize, text.vocab_size) * 4,
+                .blas = 8 * 1024 * 1024,
+                .relative = try relativeScratchBytes(text, max_tokens, chunk_rows),
+                .router = @max(nv.logits, mx.logits),
+                .routed = @max(nv.routed, mx.routed),
+                .pages = page_table_bytes,
+                .position = if (replay_enabled) 4 else 0,
+            }),
+        };
+    }
+
+    pub fn memory(self: RequestPlan, speculative: bool) !struct { host: usize, kv: usize, workspace: usize } {
+        var workspace = self.attention_space.bytes + self.shortlist_bytes;
+        for (self.temp_bytes.values) |bytes| workspace = try std.math.add(usize, workspace, bytes);
+        const legacy_floor = 64 * 1024 * 1024 + 2 * self.page_table_bytes +
+            self.temp_bytes.get(.relative) + self.temp_bytes.get(.router) + self.temp_bytes.get(.routed);
+        if (speculative) {
+            workspace = try std.math.add(usize, workspace, dspark.Draft.requestWorkspaceBytes(self.chunk_rows));
+            if (speculativeBlockContextSupported(self.model.text, self.max_tokens))
+                workspace = try std.math.add(usize, workspace, verificationHistoryBytes(self.model.text));
+        }
+        return .{
+            .host = @max(self.logits_bytes + self.page_table_bytes + @as(usize, if (self.replay_enabled) 4 else 0), 16 * self.page_table_bytes + @as(usize, self.model.text.vocab_size) * 4),
+            .kv = try self.kv.deviceBytes(.full) + try self.kv.deviceBytes(.sliding) + 2 * self.history_bytes,
+            .workspace = @max(workspace, legacy_floor),
+        };
+    }
+};
+
+fn verificationHistoryBytes(text: checkpoint.TextConfig) usize {
+    const widths = @as(usize, text.hidden_size) + @as(usize, text.num_key_value_heads) * text.head_dim;
+    return 4 * widths * checkpoint.visit_count * dspark.block_rows;
 }
 
 fn relativeScratchBytes(text: checkpoint.TextConfig, max_tokens: u32, chunk_rows: u32) !usize {
@@ -329,51 +400,35 @@ pub const Request = struct {
     }
 
     pub fn initWithPrefill(self: *Request, allocator: std.mem.Allocator, model: *Decoder, max_tokens: u32, chunk_rows: u32) !void {
-        const text = model.text;
-        if (max_tokens == 0 or max_tokens > text.model_max_length or chunk_rows == 0 or
-            chunk_rows > @min(prefill_chunk_rows, max_tokens)) return error.InvalidInkling2Context;
+        try self.initWithPlan(allocator, try RequestPlan.init(model, max_tokens, chunk_rows));
+    }
+
+    pub fn initWithPlan(self: *Request, allocator: std.mem.Allocator, plan: RequestPlan) !void {
+        const ctx = plan.model.ctx;
         self.* = .{
-            .model = model,
-            .max_tokens = max_tokens,
-            .append_capacity = chunk_rows,
-            .replay_enabled = model.ctx.info.compute_major == 12 and model.ctx.info.compute_minor <= 1 and
-                max_tokens >= 5 and max_tokens <= text.sliding_window_size,
+            .model = plan.model,
+            .max_tokens = plan.max_tokens,
+            .append_capacity = plan.chunk_rows,
+            .replay_enabled = plan.replay_enabled,
         };
-        const ctx = model.ctx;
-        const controller_rows: usize = @max(chunk_rows, if (supportsGroupedControllers(ctx)) @as(u32, 3) else 1);
-        try self.kv.init(allocator, ctx, requestCacheConfig(text, max_tokens, chunk_rows));
+        try self.kv.init(allocator, ctx, plan.kv);
         errdefer self.kv.deinit() catch {};
-        self.workspace = try attention.Workspace.init(ctx, text, chunk_rows);
+        self.workspace = try attention.Workspace.allocate(ctx, plan.attention_space);
         self.workspace.rows = 1;
         errdefer self.workspace.deinit(ctx);
         errdefer self.freeBuffers();
-        const hidden = @as(usize, text.hidden_size) * 2;
-        const kv = @as(usize, text.num_key_value_heads) * text.head_dim * 2;
-        const ids = (std.math.divCeil(usize, max_tokens, page_tokens) catch unreachable) * 4;
-        const nv = try moe.scratchBytes(.nvfp4, text, chunk_rows);
-        const mx = try moe.scratchBytes(.mxfp8, text, chunk_rows);
-        const relative_bytes = try relativeScratchBytes(text, max_tokens, chunk_rows);
-        const activation_bytes = hidden * chunk_rows;
-        self.history = try DeviceBuffer.allocWithPurpose(ctx, 2 * checkpoint.visit_count * 6 * (hidden + kv), .kv_state);
-        self.pages = try HostBuffer.alloc(ctx, 2 * ids);
-        if (self.replay_enabled) {
+        self.history = try DeviceBuffer.allocWithPurpose(ctx, plan.history_bytes, .kv_state);
+        self.pages = try HostBuffer.alloc(ctx, plan.page_table_bytes);
+        if (plan.replay_enabled) {
             self.replay_position = try HostBuffer.alloc(ctx, 4);
-            self.temps[@backingInt(Temp.position)] = try DeviceBuffer.allocWithPurpose(ctx, 4, .command_workspace);
+            self.temps[@backingInt(Temp.position)] = try DeviceBuffer.allocWithPurpose(ctx, plan.temp_bytes.get(.position), .command_workspace);
         }
-        self.logits = try HostBuffer.alloc(ctx, @as(usize, text.unpadded_vocab_size) * 4);
-        for ([_]struct { Temp, usize }{
-            .{ .stack, block_slots * activation_bytes },     .{ .prelude, activation_bytes },               .{ .bank, 2 * activation_bytes },         .{ .inputs, 3 * activation_bytes },
-            .{ .mix, 2 * hidden * controller_rows },         .{ .message, 2 * hidden * controller_rows },   .{ .pair, 2 * hidden * controller_rows }, .{ .rank, @as(usize, text.loop_config.gate_rank) * 2 * controller_rows },
-            .{ .gain_forget, 4 * hidden * controller_rows }, .{ .raw, activation_bytes },                   .{ .attn, activation_bytes },             .{ .mlp, activation_bytes },
-            .{ .normalized, activation_bytes },              .{ .logits, @as(usize, text.vocab_size) * 4 }, .{ .blas, 8 * 1024 * 1024 },              .{ .relative, relative_bytes },
-            .{ .router, @max(nv.logits, mx.logits) },        .{ .routed, @max(nv.routed, mx.routed) },      .{ .pages, 2 * ids },
-        }) |item| self.temps[@backingInt(item[0])] = try DeviceBuffer.allocWithPurpose(ctx, item[1], .command_workspace);
-        if (chunk_rows >= 2) {
-            const head_bytes = @as(usize, text.num_attention_heads) * text.head_dim * 2;
-            self.temps[@backingInt(Temp.cohort)] = try DeviceBuffer.allocWithPurpose(ctx, (head_bytes + hidden) * @min(chunk_rows, decode_batch_rows), .command_workspace);
+        self.logits = try HostBuffer.alloc(ctx, plan.logits_bytes);
+        for (plan.temp_bytes.values[0..@backingInt(Temp.position)], self.temps[0..@backingInt(Temp.position)]) |bytes, *target| {
+            if (bytes != 0) target.* = try DeviceBuffer.allocWithPurpose(ctx, bytes, .command_workspace);
         }
-        if (model.head_shortlist.workspaceBytes() != 0) {
-            self.shortlist_workspace = DeviceBuffer.allocWithPurpose(ctx, model.head_shortlist.workspaceBytes(), .command_workspace) catch |err| switch (err) {
+        if (plan.shortlist_bytes != 0) {
+            self.shortlist_workspace = DeviceBuffer.allocWithPurpose(ctx, plan.shortlist_bytes, .command_workspace) catch |err| switch (err) {
                 error.CudaMemoryLimitExceeded => .{},
                 else => return err,
             };
@@ -406,12 +461,11 @@ pub const Request = struct {
         if (self.position() != 0 or self.draft != null or draft.ctx != self.model.ctx or
             draft.capacity != self.max_tokens or draft.position != 0) return error.InvalidInkling2DraftContext;
         const text = self.model.text;
-        const widths = @as(usize, text.hidden_size) + @as(usize, text.num_key_value_heads) * text.head_dim;
         for (draft.stage) |plane| {
             if (plane.len < @as(usize, self.append_capacity) * text.hidden_size * 2) return error.InvalidInkling2DraftContext;
         }
         if (speculativeBlockContextSupported(text, self.max_tokens))
-            self.verification_history = try DeviceBuffer.allocWithPurpose(self.model.ctx, 4 * widths * checkpoint.visit_count * dspark.block_rows, .command_workspace);
+            self.verification_history = try DeviceBuffer.allocWithPurpose(self.model.ctx, verificationHistoryBytes(text), .command_workspace);
         self.draft = draft;
     }
 

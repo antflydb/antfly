@@ -132,7 +132,14 @@ pub const Workspace = struct {
     slices: TempArray,
     rows: u32,
 
-    pub fn init(ctx: *Context, text: model.TextConfig, rows: u32) !Workspace {
+    pub const Layout = struct {
+        offsets: [@typeInfo(Temp).@"enum".field_names.len]usize,
+        lengths: [@typeInfo(Temp).@"enum".field_names.len]usize,
+        bytes: usize,
+        rows: u32,
+    };
+
+    pub fn layout(text: model.TextConfig, rows: u32) !Layout {
         if (rows == 0 or rows > 256) return error.InvalidShape;
         const q = @as(usize, text.num_attention_heads) * text.head_dim;
         const kv = @as(usize, text.num_key_value_heads) * text.head_dim;
@@ -153,17 +160,25 @@ pub const Workspace = struct {
             @as(usize, text.num_attention_heads) * text.rel_extent,
             q,
         };
-        var offsets: [widths.len]usize = undefined;
-        var total: usize = 0;
-        for (widths, &offsets) |width, *offset| {
-            offset.* = std.mem.alignForward(usize, total, 256);
-            total = offset.* + @as(usize, rows) * width * 2;
+        var result: Layout = .{ .offsets = undefined, .lengths = undefined, .bytes = 0, .rows = rows };
+        for (widths, &result.offsets, &result.lengths) |width, *offset, *length| {
+            offset.* = std.mem.alignForward(usize, result.bytes, 256);
+            length.* = @as(usize, rows) * width * 2;
+            result.bytes = offset.* + length.*;
         }
-        const backing = try DeviceBuffer.allocWithPurpose(ctx, total, .command_workspace);
+        return result;
+    }
+
+    pub fn init(ctx: *Context, text: model.TextConfig, rows: u32) !Workspace {
+        return allocate(ctx, try layout(text, rows));
+    }
+
+    pub fn allocate(ctx: *Context, plan: Layout) !Workspace {
+        const backing = try DeviceBuffer.allocWithPurpose(ctx, plan.bytes, .command_workspace);
         var slices: TempArray = undefined;
-        for (&slices, widths, offsets) |*slice, width, offset|
-            slice.* = .{ .ptr = backing.ptr + offset, .len = @as(usize, rows) * width * 2, .borrowed = true };
-        return .{ .backing = backing, .slices = slices, .rows = rows };
+        for (&slices, plan.lengths, plan.offsets) |*slice, length, offset|
+            slice.* = .{ .ptr = backing.ptr + offset, .len = length, .borrowed = true };
+        return .{ .backing = backing, .slices = slices, .rows = plan.rows };
     }
 
     pub fn deinit(self: *Workspace, ctx: *Context) void {
