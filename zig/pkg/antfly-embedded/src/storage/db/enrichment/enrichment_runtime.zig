@@ -14393,7 +14393,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
         defer runtime.config.dense_embedder = original;
         runtime.config.dense_embedder.?.dense_embed_part_items_with_context_fn = Harness.embedWithContext;
         runtime.config.dense_embedder.?.part_request_context = .{
-            .io = std.testing.io,
+            .io = concurrencyIo(&runtime),
             .deadline_ns = null,
             .cancellation = CancellationToken.fromAtomic(&inherited),
         };
