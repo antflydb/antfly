@@ -881,7 +881,8 @@ pub const Runtime = struct {
             .metal_last_logits = decoder_routes.shouldUseMetalGemmaTargetLastLogits(backend, model, request.capture_hidden),
             .typed_outputs = typed,
             .shared_kv = typed and !request.checkpoint and !request.capture_hidden and
-                (request.route.exact_hybrid or (build_options.enable_cuda and backend == .cuda and cuda_compute.CudaCompute.gemma4SharedKvPrefillEnabled(context.cb))),
+                (request.route.exact_hybrid or (backend == .native and gpt_arch.nativeSharedKvPrefillEnabled(model.*)) or
+                    (build_options.enable_cuda and backend == .cuda and cuda_compute.CudaCompute.gemma4SharedKvPrefillEnabled(context.cb))),
             .cuda_last_logits = typed and backend == .cuda,
             .compiled_whole_model = !request.selected_kv and context.compiled_partition_backend != null and
                 context.compiled_attachment_target == .whole_model and self.forward.graph_cache != null,
@@ -2815,6 +2816,13 @@ fn checkBatchLastHeadRows(cb: ComputeBackend, _: ComputeBackend) !void {
     }
     try std.testing.expectError(error.InvalidShape, gpt_arch.forwardBatchLastLogits(&cb, a, cfg, &ids, &.{ 0, 3 }, 3, &decode));
     try std.testing.expectError(error.InvalidShape, gpt_arch.forwardBatchLastLogits(&cb, a, cfg, &ids, &.{ 4, 3 }, 3, &decode));
+
+    var ordinary = decoder_forward.Runtime{ .context = .{ .allocator = a, .cb = &cb, .gpt_config = &cfg } };
+    const selected = try ordinary.forwardLastLogits(ids[0..3], 1, 3, &decode);
+    defer a.free(selected);
+    try std.testing.expectEqual(@as(usize, cfg.vocab_size), selected.len);
+    for (all[2 * cfg.vocab_size ..][0..cfg.vocab_size], selected) |want, got|
+        try std.testing.expectApproxEqAbs(want, got, 0.00001);
 }
 
 test "prefill compact Native vocabulary rows match full head at unequal actual query ends" {

@@ -300,6 +300,14 @@ pub const Config = struct {
             config.num_key_value_heads != 2 or config.attention_head_dim != 256 or
             config.global_head_dim != 512 or config.position_encoding != .rope or
             config.gemma4_mtp_assistant or config.usesMoe()) return null;
+        return config.sharedKvFunctionalDonorLayers();
+    }
+
+    /// A suffix can omit dead rows when each layer reads an earlier producer's
+    /// KV with the same attention geometry and writes no independent KV.
+    pub fn sharedKvFunctionalDonorLayers(config: Config) ?usize {
+        if (config.family != .gemma or config.position_encoding != .rope or config.gemma4_mtp_assistant or
+            config.usesMoe() or config.num_kv_shared_layers == 0 or config.num_kv_shared_layers >= config.num_hidden_layers) return null;
         const boundary = config.num_hidden_layers - config.num_kv_shared_layers;
         for (boundary..config.num_hidden_layers) |layer| {
             const donor = config.kvDonorGeometry(layer) catch return null;
@@ -3334,6 +3342,8 @@ test "parse gguf metadata for gemma4 shared kv config" {
     const config = parseGgufMetadata(view).?;
     try std.testing.expectEqual(ModelFamily.gemma, config.family);
     try std.testing.expectEqual(@as(u32, 20), config.num_kv_shared_layers);
+    try std.testing.expectEqual(@as(?usize, 15), config.sharedKvFunctionalDonorLayers());
+    try std.testing.expectEqual(@as(?usize, null), config.sharedKvPrefillDonorLayers());
     try std.testing.expectEqual(@as(u32, 512), config.global_head_dim);
     try std.testing.expectEqual(@as(u32, 256), config.attention_head_dim);
     try std.testing.expectEqual(@as(u32, 6144), config.intermediate_size);

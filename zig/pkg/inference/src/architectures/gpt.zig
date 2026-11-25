@@ -877,12 +877,9 @@ pub fn forwardHiddenTensorWithCudaReplay(
     return hidden_result.hidden;
 }
 
-/// Last-row logits through the decoder-runtime forward (CUDA graph replay
-/// capable). Same result shape as the interpreter's last-row logits, but the
-/// layer stack runs through the fused decoder-runtime path — this is what
-/// lets sampled (non-greedy) decoding reuse the fast machinery the greedy
-/// loop gets from forwardGreedyLastToken.
-pub fn forwardLastLogitsWithCudaReplay(
+/// Project only the final hidden row. The hidden producer can replay its
+/// decoder runtime on CUDA or run the ordinary forward on other providers.
+pub fn forwardLastLogitsFromTokens(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     config: Config,
@@ -1414,15 +1411,19 @@ pub fn forwardPrefillHiddenFromEmbeddingsWithLayer0Overrides(
     decode_context: ?*const DecodeContext,
     ple_vectors: ?CT,
 ) !HiddenTensorResult {
-    const output: SharedKvPrefillOutput = if (batch == 1 and cb.kind() == .cuda and
-        (getenvBool("ANTFLY_INFERENCE_CUDA_MULTIMODAL_SHARED_KV_PREFILL") or
+    const can_prune = switch (cb.kind()) {
+        .native => nativeSharedKvPrefillEnabled(config) and layer0DecoderOverridesEmpty(overrides),
+        .cuda => getenvBool("ANTFLY_INFERENCE_CUDA_MULTIMODAL_SHARED_KV_PREFILL") or
             @import("../ops/cuda/cuda_compute.zig").CudaCompute.nativePrefillPolicySelected(cb) or
             (@import("../ops/cuda/cuda_compute.zig").CudaCompute.gemma4SharedKvPrefillEnabled(cb) and
                 platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_E4B_PREPARED_SHARED_KV_PREFILL", true) and
-                preparedSharedKvPrefillEligible(config, overrides, batch, seq_len, decode_context))) and !disableSharedKvDebug() and
+                preparedSharedKvPrefillEligible(config, overrides, batch, seq_len, decode_context)),
+        else => false,
+    };
+    const output: SharedKvPrefillOutput = if (batch == 1 and can_prune and !disableSharedKvDebug() and
         decode_context != null and
         decode_context.?.query_sequence_len > 1 and decode_context.?.query_sequence_len <= seq_len and decode_context.?.total_sequence_len == seq_len and
-        sharedKvPrefillBoundary(config, decode_context.?.*) != null)
+        sharedKvPrefillBoundaryForBackend(cb.kind(), config, decode_context.?.*) != null)
         .last
     else
         .all;
@@ -2986,7 +2987,19 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithLayer0OverridesAndTrace(
 pub const SharedKvPrefillOutput = enum { all, last, kv_only };
 
 fn sharedKvPrefillBoundary(config: Config, dc: DecodeContext) ?usize {
-    const donor_layers = config.sharedKvPrefillDonorLayers() orelse return null;
+    return sharedKvBoundary(config.sharedKvPrefillDonorLayers(), dc);
+}
+
+pub fn nativeSharedKvPrefillEnabled(config: Config) bool {
+    return platform.env.getenvBool("ANTFLY_INFERENCE_NATIVE_SHARED_KV_PREFILL") and config.sharedKvFunctionalDonorLayers() != null;
+}
+
+fn sharedKvPrefillBoundaryForBackend(backend: ops.BackendKind, config: Config, dc: DecodeContext) ?usize {
+    return sharedKvBoundary(if (backend == .native) config.sharedKvFunctionalDonorLayers() else config.sharedKvPrefillDonorLayers(), dc);
+}
+
+fn sharedKvBoundary(donors: ?usize, dc: DecodeContext) ?usize {
+    const donor_layers = donors orelse return null;
     const functional = dc.attention_mode == .full_recompute and dc.forward_kv_reuse != null and dc.kv_cache == null;
     if ((!functional and (dc.attention_mode != .paged_prefill or dc.kv_cache == null)) or dc.query_sequence_len <= 1 or
         dc.query_sequence_len > dc.total_sequence_len or
@@ -3179,7 +3192,7 @@ pub fn projectPrefillHead(cb: *const ComputeBackend, allocator: std.mem.Allocato
     };
 }
 
-/// E4B's shared suffix produces no KV. KV-only chunks can omit it, and a
+/// A shared suffix produces no KV. KV-only chunks can omit it, and a
 /// final-logit chunk only needs its last row. Null always precedes KV writes;
 /// errors after execution begins must be handled by the caller's rollback.
 pub fn trySharedKvPrefill(
@@ -3194,6 +3207,7 @@ pub fn trySharedKvPrefill(
     if (disableSharedKvDebug() or intent.capturesHidden()) return null;
     const want_last_row = intent != .kv_only;
     const enabled = switch (cb.kind()) {
+        .native => nativeSharedKvPrefillEnabled(config),
         .metal => platform.env.getenvBoolDefault("ANTFLY_INFERENCE_METAL_SHARED_KV_PREFILL", true),
         .cuda => if (comptime build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig").CudaCompute.gemma4SharedKvPrefillEnabled(cb) else false,
         else => false,
@@ -3208,7 +3222,7 @@ pub fn trySharedKvPrefill(
             (config.video_token_index >= 0 and token == config.video_token_index) or
             (config.boi_token_index >= 0 and token == config.boi_token_index)) return null;
     }
-    _ = sharedKvPrefillBoundary(config, dc.*) orelse return null;
+    _ = sharedKvPrefillBoundaryForBackend(cb.kind(), config, dc.*) orelse return null;
     if (input_ids.len != dc.query_sequence_len or seq_len != dc.total_sequence_len) return null;
     if (cb.kind() == .metal) {
         if (want_last_row) return null;
@@ -3337,7 +3351,7 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
     }
     const shared_boundary: ?usize = if (output == .all) null else blk: {
         if (batch != 1 or pre_norm_out != null or trace_sink != null) return error.UnsupportedShape;
-        break :blk sharedKvPrefillBoundary(config, (decode_context orelse return error.UnsupportedShape).*) orelse return error.UnsupportedShape;
+        break :blk sharedKvPrefillBoundaryForBackend(cb.kind(), config, (decode_context orelse return error.UnsupportedShape).*) orelse return error.UnsupportedShape;
     };
     var shared_context: DecodeContext = undefined;
     var layer_context = decode_context;

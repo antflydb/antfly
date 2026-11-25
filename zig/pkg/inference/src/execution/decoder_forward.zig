@@ -1116,7 +1116,7 @@ pub const Runtime = struct {
         // per-op host overhead. Escape hatch:
         // ANTFLY_INFERENCE_CUDA_REPLAY_LAST_LOGITS=0.
         if (self.context.cb.kind() == .cuda and cudaReplayLastLogitsEnabled()) {
-            if (gpt_arch.forwardLastLogitsWithCudaReplay(
+            if (gpt_arch.forwardLastLogitsFromTokens(
                 self.context.cb,
                 self.context.allocator,
                 self.context.gpt_config.*,
@@ -1134,6 +1134,19 @@ pub const Runtime = struct {
                     .{@errorName(err)},
                 );
             }
+        }
+
+        if (self.context.cb.kind() == .native and batch == 1 and query_seq_len > 1) {
+            return gpt_arch.forwardLastLogitsFromTokens(
+                self.context.cb,
+                self.context.allocator,
+                self.context.gpt_config.*,
+                input_ids,
+                batch,
+                seq_len,
+                decode_context,
+                "gpt.standard_last_logits",
+            );
         }
 
         const logits = try gpt_arch.forward(self.context.cb, self.context.allocator, self.context.gpt_config.*, input_ids, batch, seq_len, decode_context);

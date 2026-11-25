@@ -124,7 +124,7 @@ fn forwardAllUnobserved(
     if (context.cb.kind() == .cuda and batch_size == 1 and
         decode_context.query_sequence_len == 1 and cudaReplayLastLogitsEnabled())
     {
-        if (gpt_arch.forwardLastLogitsWithCudaReplay(context.cb, context.allocator, context.gpt_config.*, input_ids, batch_size, seq_len, decode_context, "gpt.standard_last_logits")) |logits| {
+        if (gpt_arch.forwardLastLogitsFromTokens(context.cb, context.allocator, context.gpt_config.*, input_ids, batch_size, seq_len, decode_context, "gpt.standard_last_logits")) |logits| {
             return logits;
         } else |err| {
             replay_fallbacks.* += 1;
@@ -1705,7 +1705,7 @@ pub const Executor = struct {
         if (cuda_lighton and claimed.len == 1 and claimed[0].phase == .prefill) {
             // Only the final prefix row is sampled. Avoid constructing and
             // downloading a vocabulary distribution for every image token.
-            const logits = try gpt_arch.forwardLastLogitsWithCudaReplay(self.context.cb, self.context.allocator, self.context.gpt_config.*, input_ids, 1, max_query_seq_len, &owned_ctx.context, "gpt.cuda_lighton_prefill");
+            const logits = try gpt_arch.forwardLastLogitsFromTokens(self.context.cb, self.context.allocator, self.context.gpt_config.*, input_ids, 1, max_query_seq_len, &owned_ctx.context, "gpt.cuda_lighton_prefill");
             return .{ .logits = logits, .max_query_seq_len = max_query_seq_len, .last_rows_only = true };
         }
         // Preserve batching and physical KV ownership; prune only vocabulary
