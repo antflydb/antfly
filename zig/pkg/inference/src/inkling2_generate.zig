@@ -88,8 +88,6 @@ pub fn main(init: std.process.Init) !void {
     const prompt_count = try std.math.add(usize, prompt_ids.len, prefix_rows + image_rows);
     const tokens = try std.math.add(usize, prompt_count, limit);
     if (tokens - 1 > source.config.value.text_config.model_max_length) return error.InvalidInkling2Context;
-    if (draft_enabled and !decoder.speculativeContextSupported(source.config.value.text_config, tokens - 1))
-        return error.UnsupportedInkling2SpeculativeContext;
     var ctx = try Context.initDefault();
     defer ctx.deinit();
     const gb10 = ctx.info.compute_major == 12 and ctx.info.compute_minor == 1;
@@ -129,7 +127,10 @@ pub fn main(init: std.process.Init) !void {
         var embeddings = try encoder.encodeRgb(&model.blas, value.data, value.width, value.height);
         defer embeddings.deinit(&ctx);
         for (prefix_ids.?) |id| try request.append(try inputToken(id));
-        try request.appendEmbeddings(embeddings.device, embeddings.rows);
+        const verify_rowwise = draft_enabled and !decoder.speculativeBlockContextSupported(model.text, tokens - 1);
+        if (verify_rowwise and !batch_prompt) {
+            for (0..embeddings.rows) |index| try request.appendEmbedding(try embeddings.row(@intCast(index)));
+        } else try request.appendEmbeddings(embeddings.device, embeddings.rows);
     }
     const text_prefill = try allocator.alloc(u32, prompt_ids.len - 1);
     defer allocator.free(text_prefill);

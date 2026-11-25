@@ -206,6 +206,7 @@ pub const dense_bf16_matvec_entries = .{
     .packed_f32_2304 = "antfly_dense_packed_bf16_matvec_f32_2304",
     .packed_bf16_2304 = "antfly_dense_interleaved_bf16_matvec_bf16_2304",
     .packed_bf16_3072 = "antfly_dense_interleaved_bf16_matvec_bf16_3072",
+    .packed_batch_bf16_3072 = "antfly_dense_interleaved_bf16_matvec_batch_bf16_3072",
     .segmented_bf16_2304 = "antfly_dense_interleaved_bf16_segmented_matvec_bf16_2304",
     .pack_shortlist = "antfly_pack_q4_projection_bounds_2304",
     .quantize_shortlist = "antfly_quantize_q8_projection_bounds_2304",

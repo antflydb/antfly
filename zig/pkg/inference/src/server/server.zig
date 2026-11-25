@@ -29401,11 +29401,15 @@ pub const Node = struct {
         if (comptime build_options.enable_cuda) {
             const inkling = @import("../architectures/inkling2_session.zig");
             var paired_steps: u64 = 0;
+            var batched_tokens: u64 = 0;
             for (loaded_snapshot.handles) |handle| {
-                if (inkling.Runtime.fromSession(handle.get().session)) |model|
+                if (inkling.Runtime.fromSession(handle.get().session)) |model| {
                     paired_steps +|= model.pairedDecodeSteps();
+                    batched_tokens +|= model.batchedDecodeTokens();
+                }
             }
             try appendPromMetric(&writer.writer, "antfly_inference_inkling_paired_decode_steps_total", "counter", "Inkling CUDA decode steps that share a routed feed-forward batch across two sequences", paired_steps);
+            try appendPromMetric(&writer.writer, "antfly_inference_inkling_batched_decode_tokens_total", "counter", "Inkling CUDA tokens decoded in a shared routed feed-forward batch", batched_tokens);
         }
         try generation_stats.queue_wait.render(&writer.writer, "antfly_inference_generation_queue_wait_seconds", "Time waiting for a generation slot before device-memory admission");
         try generation_stats.first_content.render(&writer.writer, "antfly_inference_generation_first_content_seconds", "Server-observed first public content availability including queue and prefill; excludes network transit");
@@ -46131,7 +46135,6 @@ fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
         error.InvalidInkling2ToolOutput => .{ .status = 422, .code = "INVALID_TOOL_OUTPUT", .message = "Inkling 2 did not emit a complete call to a declared tool", .retryable = false },
         error.UnsupportedInkling2Request => .{ .status = 400, .code = "UNSUPPORTED_FEATURE", .message = "Inkling 2 does not support the requested generation option", .retryable = false },
         error.UnsupportedInkling2Speculation => .{ .status = 400, .code = "UNSUPPORTED_FEATURE", .message = "Inkling 2 speculation requires mtp.safetensors, greedy decoding and speculative_k between 1 and 7", .retryable = false },
-        error.UnsupportedInkling2SpeculativeContext => .{ .status = 400, .code = "UNSUPPORTED_FEATURE", .message = "Inkling 2 speculation is limited to 8192 context tokens", .retryable = false },
         error.InvalidInkling2Context, error.InferenceInputTokensExceeded => .{ .status = 400, .code = "INPUT_TOKENS_EXCEEDED", .message = "the generation request exceeds the input or model context limit", .retryable = false },
         error.InvalidInkling2Image => .{ .status = 400, .code = "INVALID_MEDIA_LAYOUT", .message = "Inkling 2 accepts one valid user image up to 4096 pixels per side", .retryable = false },
         error.UnsupportedVideoBackend => .{ .status = 400, .code = "UNSUPPORTED_VIDEO_BACKEND", .message = "video input requires a Gemma 4 generator with its projector", .retryable = false },

@@ -30,7 +30,7 @@ const StepScheduler = @import("../runtime/embedding_scheduler.zig").Scheduler;
 const Embeddings = vision.Embeddings;
 const sync = @import("antfly_platform").sync;
 
-pub const max_active_requests = 4;
+pub const max_active_requests = decoder.decode_batch_rows;
 
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
@@ -43,10 +43,10 @@ pub const Runtime = struct {
     resident_bytes: usize,
     execution_gate: std.atomic.Mutex,
     steps: StepScheduler,
-    pair_lock: std.atomic.Mutex,
+    batch_lock: std.atomic.Mutex,
     unmatched_decode: ?*DecodeStep,
     active_greedy: std.atomic.Value(u32),
-    paired_steps: std.atomic.Value(u64),
+    batch_steps: [max_active_requests - 1]std.atomic.Value(u64),
 
     pub fn load(allocator: std.mem.Allocator, manifest: *const Manifest) !backends.Session {
         var source = try checkpoint.Checkpoint.openFiles(
@@ -60,10 +60,10 @@ pub const Runtime = struct {
         self.allocator = allocator;
         self.execution_gate = .unlocked;
         self.steps = .{};
-        self.pair_lock = .unlocked;
+        self.batch_lock = .unlocked;
         self.unmatched_decode = null;
         self.active_greedy = .init(0);
-        self.paired_steps = .init(0);
+        self.batch_steps = @splat(.init(0));
         self.ctx = try Context.initDefault();
         errdefer self.ctx.deinit();
         self.fast_matvec = self.ctx.info.compute_major == 12 and self.ctx.info.compute_minor == 1;
@@ -110,30 +110,40 @@ pub const Runtime = struct {
         request: *decoder.Request,
         token: u32,
         io: std.Io,
-        peer: ?*DecodeStep = null,
+        peers: [max_active_requests - 1]*DecodeStep = undefined,
+        peer_count: usize = 0,
+        peer_limit: usize = 0,
         result: anyerror!u32 = error.InklingDecodeStepIncomplete,
         done: std.Io.Event = .unset,
     };
 
     pub fn pairedDecodeSteps(self: *const Runtime) u64 {
-        return self.paired_steps.load(.monotonic);
+        return self.batch_steps[0].load(.monotonic);
+    }
+
+    pub fn batchedDecodeTokens(self: *const Runtime) u64 {
+        var tokens: u64 = 0;
+        for (&self.batch_steps, 2..) |*steps, lanes| tokens +|= steps.load(.monotonic) *| lanes;
+        return tokens;
     }
 
     fn decodeGreedy(self: *Runtime, request: *decoder.Request, token: u32, control: Control) !u32 {
         try control.check();
-        if (!self.fast_matvec or !request.canBatchGreedy() or control.io == null or self.active_greedy.load(.acquire) < 2) {
+        const lanes = @min(request.append_capacity, max_active_requests, self.active_greedy.load(.acquire));
+        if (!self.fast_matvec or !request.canBatchGreedy() or control.io == null or lanes < 2) {
             var turn: StepScheduler.Waiter = .{};
             try self.enterStep(&turn, control);
             defer StepScheduler.leave(&turn);
             return request.stepGreedy(token);
         }
 
-        var step: DecodeStep = .{ .request = request, .token = token, .io = control.io.? };
-        sync.lockYielding(&self.pair_lock);
+        var step: DecodeStep = .{ .request = request, .token = token, .io = control.io.?, .peer_limit = lanes - 1 };
+        sync.lockYielding(&self.batch_lock);
         if (self.unmatched_decode) |leader| {
-            leader.peer = &step;
-            self.unmatched_decode = null;
-            self.pair_lock.unlock();
+            leader.peers[leader.peer_count] = &step;
+            leader.peer_count += 1;
+            if (leader.peer_count == leader.peer_limit) self.unmatched_decode = null;
+            self.batch_lock.unlock();
             // Once claimed, the leader borrows this request's GPU state until
             // the stream drains. Cancellation must not unwind that storage.
             step.done.waitUncancelable(step.io);
@@ -141,41 +151,50 @@ pub const Runtime = struct {
             return step.result;
         }
         self.unmatched_decode = &step;
-        self.pair_lock.unlock();
+        self.batch_lock.unlock();
 
         var turn: StepScheduler.Waiter = .{};
         const entered = self.enterStep(&turn, .{});
         defer StepScheduler.leave(&turn);
         if (entered) |_| {
-            sync.lockYielding(&self.pair_lock);
-            const waiting = step.peer == null;
-            self.pair_lock.unlock();
+            sync.lockYielding(&self.batch_lock);
+            const waiting = step.peer_count < step.peer_limit;
+            self.batch_lock.unlock();
             if (waiting) std.Io.sleep(step.io, .fromMicroseconds(150), .awake) catch {};
         } else |_| {}
 
-        sync.lockYielding(&self.pair_lock);
+        sync.lockYielding(&self.batch_lock);
         if (self.unmatched_decode == &step) self.unmatched_decode = null;
-        const peer = step.peer;
-        self.pair_lock.unlock();
-        if (entered) |_| {
-            if (peer) |follower| {
-                const pair = decoder.Request.stepGreedyPair(.{ request, follower.request }, .{ token, follower.token });
-                if (pair) |result| {
-                    _ = self.paired_steps.fetchAdd(1, .monotonic);
-                    follower.result = result[1];
-                    follower.done.set(follower.io);
-                    try control.check();
-                    return result[0];
-                } else |err| {
-                    follower.result = err;
-                    follower.done.set(follower.io);
-                    return err;
-                }
+        self.batch_lock.unlock();
+        const peers = step.peers[0..step.peer_count];
+        const count = peers.len + 1;
+        var results: [max_active_requests]u32 = undefined;
+        const completed: anyerror!void = blk: {
+            entered catch |err| break :blk err;
+            if (peers.len == 0) {
+                try control.check();
+                return request.stepGreedy(token);
+            }
+            var requests: [max_active_requests]*decoder.Request = undefined;
+            var tokens: [max_active_requests]u32 = undefined;
+            requests[0] = request;
+            tokens[0] = token;
+            for (peers, requests[1..count], tokens[1..count]) |follower, *member, *id| {
+                member.* = follower.request;
+                id.* = follower.token;
+            }
+            break :blk decoder.Request.stepGreedyBatch(requests[0..count], tokens[0..count], results[0..count]);
+        };
+        if (completed) |_| {
+            _ = self.batch_steps[count - 2].fetchAdd(1, .monotonic);
+            for (peers, results[1..count]) |follower, result| {
+                follower.result = result;
+                follower.done.set(follower.io);
             }
             try control.check();
-            return request.stepGreedy(token);
+            return results[0];
         } else |err| {
-            if (peer) |follower| {
+            for (peers) |follower| {
                 follower.result = err;
                 follower.done.set(follower.io);
             }
@@ -459,14 +478,18 @@ pub const Pipeline = struct {
         const context = prompt.count() +| @as(usize, @intCast(config.max_tokens)) - 1;
         if (context > model.model.text.model_max_length) return error.InvalidInkling2Context;
         const speculation_requested = config.speculation_requested and config.speculation_policy != .off;
-        const unsupported_context = speculation_requested and !decoder.speculativeContextSupported(model.model.text, context);
-        if (unsupported_context and config.speculation_policy == .force) return error.UnsupportedInkling2SpeculativeContext;
-        const speculate = speculation_requested and !unsupported_context;
+        const block_verification = decoder.speculativeBlockContextSupported(model.model.text, context);
+        const auto_context_disabled = speculation_requested and config.speculation_policy == .auto and
+            !block_verification;
+        const speculate = speculation_requested and !auto_context_disabled;
         if (speculate and (model.draft == null or !usesGreedy(config) or config.speculative_k == 0 or
             config.speculative_k > dspark.proposal_rows)) return error.UnsupportedInkling2Speculation;
         if (speculate and context > model.draft.?.max_capacity) return error.InvalidInkling2Context;
         const batch_prompt = model.fast_matvec and prompt.count() > decoder.prefill_chunk_rows;
-        const prefill_rows: u32 = if (batch_prompt or speculate) @intCast(@min(decoder.prefill_chunk_rows, context)) else 1;
+        const prefill_rows: u32 = if (batch_prompt or (speculate and block_verification)) @intCast(@min(decoder.prefill_chunk_rows, context)) else 1;
+        // The row-wise verifier must start from the same prefill as regular
+        // decoding. Reserve its draft block capacity independently.
+        const decode_rows: u32 = if (speculate) dspark.block_rows else if (model.fast_matvec and usesGreedy(config)) max_active_requests else 1;
         return .{
             .allocator = allocator,
             .model = model,
@@ -476,9 +499,9 @@ pub const Pipeline = struct {
             .prompt = prompt,
             .context_tokens = @intCast(context),
             .prefill_rows = prefill_rows,
-            .chunk_rows = if (model.fast_matvec and !speculate and usesGreedy(config) and context >= 2) @max(prefill_rows, 2) else prefill_rows,
+            .chunk_rows = @max(prefill_rows, @min(decode_rows, context)),
             .speculate = speculate,
-            .speculation_context_disabled = unsupported_context,
+            .speculation_context_disabled = auto_context_disabled,
             .options = options,
         };
     }

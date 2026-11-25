@@ -164,7 +164,7 @@ __device__ void dense(Result* out, Input input, Weights weights, unsigned n) {
     if (threadIdx.x % LaneCount == 0) out[row] = Result(sum);
 }
 
-template<unsigned Lanes, unsigned Width, typename Input>
+template<unsigned Lanes, unsigned Width, unsigned Batch = 1, typename Input>
 __device__ void dense_interleaved(__nv_bfloat16* out, Input input, PackedWeights weights, unsigned n) {
     constexpr unsigned vectors = Width / 8;
     const unsigned lane = threadIdx.x % Lanes;
@@ -173,25 +173,32 @@ __device__ void dense_interleaved(__nv_bfloat16* out, Input input, PackedWeights
     const uint4* activation = row_input(input, row);
     const auto* tile_ids = weights.tiles + (size_t)row * (vectors / vectors_per_tile);
     const size_t first_packet = interleaved_index(row, lane, vectors, Lanes);
-    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    float s0[Batch] = {}, s1[Batch] = {}, s2[Batch] = {}, s3[Batch] = {};
     for (unsigned tile = 0; tile < vectors / vectors_per_tile; ++tile) {
         const unsigned id = tile_ids[tile];
         const unsigned base = tile * vectors_per_tile;
         #pragma unroll
         for (unsigned x = lane; x < vectors_per_tile; x += Lanes) {
-            const uint4 a = activation[base + x];
+            const uint4 first = activation[base + x];
             const uint4 w = id ? weights.spilled(id, x) : weights.compact(first_packet + (base + x) / Lanes * 32);
-            dot_pair(s0, s1, a.x, w.x);
-            dot_pair(s2, s3, a.y, w.y);
-            dot_pair(s0, s1, a.z, w.z);
-            dot_pair(s2, s3, a.w, w.w);
+            #pragma unroll
+            for (unsigned item = 0; item < Batch; ++item) {
+                const uint4 a = item == 0 ? first : activation[item * vectors + base + x];
+                dot_pair(s0[item], s1[item], a.x, w.x);
+                dot_pair(s2[item], s3[item], a.y, w.y);
+                dot_pair(s0[item], s1[item], a.z, w.z);
+                dot_pair(s2[item], s3[item], a.w, w.w);
+            }
         }
     }
-    float sum = (s0 + s1) + (s2 + s3);
     #pragma unroll
-    for (unsigned offset = Lanes / 2; offset != 0; offset /= 2)
-        sum += __shfl_down_sync(__activemask(), sum, offset, Lanes);
-    if (lane == 0) out[row] = __float2bfloat16_rn(sum);
+    for (unsigned item = 0; item < Batch; ++item) {
+        float sum = (s0[item] + s1[item]) + (s2[item] + s3[item]);
+        #pragma unroll
+        for (unsigned offset = Lanes / 2; offset != 0; offset /= 2)
+            sum += __shfl_down_sync(__activemask(), sum, offset, Lanes);
+        if (lane == 0) out[(size_t)item * n + row] = __float2bfloat16_rn(sum);
+    }
 }
 } // namespace
 
@@ -258,6 +265,16 @@ extern "C" __global__ void antfly_dense_interleaved_bf16_matvec_bf16_3072(
     __nv_bfloat16* out, const uint4* input, const __grid_constant__ PackedWeights weights, unsigned n
 ) {
     dense_interleaved<16, 3072>(out, input, weights, n);
+}
+
+extern "C" __global__ void antfly_dense_interleaved_bf16_matvec_batch_bf16_3072(
+    __nv_bfloat16* out, const uint4* input, const __grid_constant__ PackedWeights weights, unsigned n, unsigned batch
+) {
+    switch (batch) {
+        case 2: dense_interleaved<16, 3072, 2>(out, input, weights, n); break;
+        case 3: dense_interleaved<16, 3072, 3>(out, input, weights, n); break;
+        case 4: dense_interleaved<16, 3072, 4>(out, input, weights, n); break;
+    }
 }
 
 extern "C" __global__ void antfly_dense_interleaved_bf16_segmented_matvec_bf16_2304(

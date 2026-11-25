@@ -79,6 +79,7 @@ pub const Scratch = struct {
     blas: DeviceBuffer,
     routed: DeviceBuffer,
     activation_precision: ActivationPrecision = .block_scaled,
+    rowwise_router: bool = false,
 };
 
 pub const ScratchBytes = struct {
@@ -146,7 +147,17 @@ pub const Forward = struct {
         ffn.output = output;
         ffn.scratch = scratch.routed;
         ffn.activation_precision = scratch.activation_precision;
-        try blas.matmulBf16WeightF32Out(ctx, scratch.logits, input, layer.router_weight, scratch.blas, rows, text.hidden_size, text.n_routed_experts);
+        if (scratch.rowwise_router) {
+            // The router's scores determine discrete expert selection. Keep
+            // the same cuBLAS plan as a single request for each decode lane.
+            const input_bytes = @as(usize, text.hidden_size) * 2;
+            const logits_bytes = @as(usize, text.n_routed_experts) * @sizeOf(f32);
+            for (0..rows) |lane| {
+                const source: DeviceBuffer = .{ .ptr = input.ptr + lane * input_bytes, .len = input_bytes, .borrowed = true };
+                const logits: DeviceBuffer = .{ .ptr = scratch.logits.ptr + lane * logits_bytes, .len = logits_bytes, .borrowed = true };
+                try blas.matmulBf16WeightF32Out(ctx, logits, source, layer.router_weight, scratch.blas, 1, text.hidden_size, text.n_routed_experts);
+            }
+        } else try blas.matmulBf16WeightF32Out(ctx, scratch.logits, input, layer.router_weight, scratch.blas, rows, text.hidden_size, text.n_routed_experts);
         try self.projections.runFfn(ctx, ffn);
     }
 };

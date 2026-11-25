@@ -265,6 +265,24 @@ pub const Module = struct {
         return self.run(ctx, dst, input, .{ .encoded = .{ .matrix = matrix, .first_row = first_row } }, matrix.k, n, result);
     }
 
+    pub fn tryRunPackedBatch(self: *Module, ctx: *Context, dst: DeviceBuffer, input: DeviceBuffer, matrix: Packed, rows: u32) !bool {
+        if (!supported(ctx) or matrix.storage.ptr == 0 or matrix.k != 3072 or matrix.lanes_per_row != 16 or matrix.n < 1024 or rows < 2 or rows > 4)
+            return false;
+        try buffer.validateRegions(3, .{ input, matrix.storage, dst }, .{
+            @as(usize, rows) * matrix.k * 2, matrix.storage.len, @as(usize, rows) * matrix.n * 2,
+        }, .{ 16, 16, 2 }, 2);
+        try self.program.init(ctx);
+        var output_address = dst.ptr;
+        var input_address = input.ptr;
+        var encoded = matrix.pointers(0);
+        var n = matrix.n;
+        var count = rows;
+        const columns = threads / 16;
+        var args = [_]?*anyopaque{ &output_address, &input_address, &encoded, &n, &count };
+        try self.program.launch(ctx, .packed_batch_bf16_3072, (n - 1) / columns + 1, 1, threads, &args);
+        return true;
+    }
+
     pub fn tryRunSegmented(self: *Module, ctx: *Context, dst: DeviceBuffer, inputs: [3]DeviceBuffer, matrix: Packed, output_widths: [3]u32) !bool {
         if (!supported(ctx) or matrix.storage.ptr == 0 or matrix.k != 2304 or matrix.lanes_per_row != 8) return false;
         const second_end = try std.math.add(u32, output_widths[0], output_widths[1]);

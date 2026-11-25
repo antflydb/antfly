@@ -795,13 +795,33 @@ errors for captured text decode.
 
 The HTTP worker admits up to four Inkling requests per loaded model, subject
 to the server's work-unit and memory limits. It yields the CUDA turn after
-each prefill chunk or decode step. On GB10, two ready greedy streams can share
-a routed feed-forward pass while keeping separate attention and KV state.
-`antfly_inference_inkling_paired_decode_steps_total` counts those passes.
+each prefill chunk or decode step. On GB10, up to four ready greedy streams
+can share attention output projection and a routed feed-forward pass while
+keeping separate KV state.
+`antfly_inference_inkling_batched_decode_tokens_total` counts tokens processed
+in those batches. `antfly_inference_inkling_paired_decode_steps_total` counts
+the two-stream batches.
+
+On GB10, the ReleaseFast HTTP worker raised median aggregate throughput at
+four clients from 36.6 to 42.1 tokens/s on a repeated prompt and from 34.4 to
+38.6 tokens/s on four distinct prompts. Each median covers three trials of
+96 output tokens per request against commit `8360c5450f`. All 12 distinct
+responses matched their scalar references. The baseline differed on eight.
+An exploratory batched cuBLAS output projection differed on two of four
+distinct responses. The packed projection preserves the row-one reduction
+order, and the router uses the row-one cuBLAS plan for each stream.
+Packed batch output matched row-one BF16 bits and sampled CPU dots at widths
+two through four. The compiled batch entry used 60 registers and zero spills
+on SM120 and SM121.
+
 DSpark requests take an exclusive model slot because the drafter owns shared
-request workspace. DSpark verification is limited to 8,192 context tokens.
-Beyond that limit, `speculation_policy: auto` uses the regular decoder and
-reports `inkling_speculative_context_limit`. `force` returns an error.
+request workspace. DSpark uses block verification up to 8,192 reserved
+context tokens. Beyond that limit, `force` verifies proposals with the
+regular greedy decoder one token at a time and stops at the first mismatch.
+`auto` uses regular decoding and reports `inkling_speculative_context_limit`,
+since row-wise verification adds drafting work to the same target computation.
+The ReleaseFast CLI matched the reference text and 70-token output length on
+the 11,067-token catalog retrieval case, with 47 draft tokens accepted.
 
 `/ai/v1/chat/completions` and `/ai/v1/generate` accept
 `chat_template_kwargs.enable_thinking` and `reasoning_effort`. Set

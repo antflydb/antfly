@@ -188,6 +188,7 @@ pub const Request = struct {
     matvec: ?*Dense = null,
     use_packed: bool = true,
     output: DeviceBuffer,
+    project_output: bool = true,
     workspace: Workspace,
     blas_space: DeviceBuffer,
     attention_space: DeviceBuffer,
@@ -224,6 +225,20 @@ pub const Forward = struct {
         self.attention.deinit(ctx);
         self.convolution.deinit(ctx);
         self.normalization.deinit(ctx);
+    }
+
+    pub fn projectOutputBatch(dense: *Dense, blas: *Blas, ctx: *Context, text: model.TextConfig, layer: *const Layer, rows: u32, input: DeviceBuffer, output: DeviceBuffer, scratch: DeviceBuffer) !void {
+        if (try dense.tryRunPackedBatch(ctx, output, input, layer.packed_output_weights, rows)) return;
+        const heads = projectionWidth(text, .q);
+        const input_bytes = @as(usize, heads) * 2;
+        const output_bytes = @as(usize, text.hidden_size) * 2;
+        for (0..rows) |lane| {
+            const source = view(input, lane * input_bytes, input_bytes);
+            const destination = view(output, lane * output_bytes, output_bytes);
+            if (try dense.tryRunPacked(ctx, destination, source, layer.packed_output_weights, 0, text.hidden_size, .bf16)) continue;
+            if (try dense.tryRun(ctx, destination, source, layer.get(.out), heads, text.hidden_size, .bf16)) continue;
+            try blas.matmulBf16WeightBf16Out(ctx, destination, source, layer.get(.out), scratch, 1, heads, text.hidden_size);
+        }
     }
 
     pub fn run(self: *Forward, ctx: *Context, blas: *Blas, text: model.TextConfig, layer: *const Layer, r: Request) !void {
@@ -336,9 +351,9 @@ pub const Forward = struct {
             .sinks = projected[@backingInt(Temp.sink)],
             .gate = projected[@backingInt(Temp.gate)],
             .scratch = r.attention_space,
-            .output = r.workspace.get(.attention),
+            .output = if (r.project_output) r.workspace.get(.attention) else r.output,
         });
-        try projectBf16(ctx, blas, r, r.output, r.workspace.get(.attention), .{
+        if (r.project_output) try projectBf16(ctx, blas, r, r.output, r.workspace.get(.attention), .{
             .raw = layer.get(.out),
             .encoded = layer.packed_output_weights,
         }, q_width, text.hidden_size);

@@ -161,8 +161,7 @@ fn verifyBatchedImagePrefill(allocator: std.mem.Allocator, model: *decoder.Decod
     try std.testing.expect(max_difference <= 4.0);
 }
 
-fn verifyDSparkTransactions(allocator: std.mem.Allocator, model: *decoder.Decoder, model_dir: []const u8, config: checkpoint.DraftConfig) !void {
-    const limit = 64;
+fn verifyDSparkTransactions(allocator: std.mem.Allocator, model: *decoder.Decoder, model_dir: []const u8, config: checkpoint.DraftConfig, limit: u32) !void {
     var draft = try dspark.Draft.load(allocator, model.ctx, &model.blas, model_dir, config, model.sharedDraftWeights(), limit, decoder.prefill_chunk_rows);
     defer draft.deinit();
     var reference: decoder.Request = undefined;
@@ -181,6 +180,8 @@ fn verifyDSparkTransactions(allocator: std.mem.Allocator, model: *decoder.Decode
     }
     var anchor = try reference.stepGreedy(head_tokens[3]);
     try std.testing.expectEqual(anchor, try actual.stepGreedy(head_tokens[3]));
+    try std.testing.expectError(error.InvalidInkling2Token, actual.verifyDraft(anchor, &.{ 42, model.text.unpadded_vocab_size }));
+    try std.testing.expectEqual(reference.position(), actual.position());
     for ([_]u32{ 0, 2, 7 }) |accepted| {
         var guesses: [dspark.proposal_rows]u32 = @splat(42);
         var expected: [dspark.block_rows]u32 = undefined;
@@ -198,7 +199,8 @@ fn verifyDSparkTransactions(allocator: std.mem.Allocator, model: *decoder.Decode
         try std.testing.expectEqual(actual.position(), draft.position);
         if (accepted == 0) {
             try std.testing.expectEqual(null, actual.kv.sequence.pageId(.full, 1));
-            try std.testing.expectEqual(@as(usize, 1), actual.kv.full.storage.hostPool().?.freeListBlocks());
+            const prepared_tail: usize = @intFromBool(decoder.speculativeBlockContextSupported(model.text, limit));
+            try std.testing.expectEqual(prepared_tail, actual.kv.full.storage.hostPool().?.freeListBlocks());
         }
         anchor = token;
     }
@@ -360,41 +362,106 @@ fn verifyGreedyShortlist(allocator: std.mem.Allocator, model: *decoder.Decoder) 
     std.debug.print("Packed greedy selection preserved soft-cap ties, non-finite errors and the out-of-range exact scan\n", .{});
 }
 
-fn verifyPairedDecode(allocator: std.mem.Allocator, model: *decoder.Decoder) !void {
+fn verifyPackedBatchProjection(model: *decoder.Decoder) !void {
+    const ctx = model.ctx;
+    const width = 3072;
+    const columns = 1024;
+    const lanes = decoder.decode_batch_rows;
+    var host_weights = try buffer.HostBuffer.alloc(ctx, width * columns * 2);
+    defer host_weights.free(ctx);
+    var host_input = try buffer.HostBuffer.alloc(ctx, width * lanes * 2);
+    defer host_input.free(ctx);
+    var actual = try buffer.HostBuffer.alloc(ctx, lanes * columns * 2);
+    defer actual.free(ctx);
+    var expected = try buffer.HostBuffer.alloc(ctx, lanes * columns * 2);
+    defer expected.free(ctx);
+    var weights = try buffer.DeviceBuffer.alloc(ctx, host_weights.len);
+    defer weights.free(ctx);
+    var inputs = try buffer.DeviceBuffer.alloc(ctx, host_input.len);
+    defer inputs.free(ctx);
+    var output = try buffer.DeviceBuffer.alloc(ctx, actual.len);
+    defer output.free(ctx);
+    errdefer ctx.synchronize() catch {};
+
+    const weight_bits: []u16 = std.mem.bytesAsSlice(u16, @as([]align(2) u8, @alignCast(host_weights.bytes())));
+    const input_bits: []u16 = std.mem.bytesAsSlice(u16, @as([]align(2) u8, @alignCast(host_input.bytes())));
+    const values = [_]u16{ 0x3f80, 0x3fc0, 0xbf80, 0xbfc0, 0x4000, 0xc000 };
+    for (weight_bits, 0..) |*value, index| value.* = values[(index ^ (index >> 9)) % values.len] - 0x0500;
+    weight_bits[0] = 0x3f80; // One tile needs the out-of-range exponent path.
+    for (input_bits, 0..) |*value, index| value.* = values[(index ^ (index >> 5)) % values.len];
+    try weights.copyFromHost(ctx, host_weights.constBytes());
+    try inputs.copyFromHost(ctx, host_input.constBytes());
+    var matrix = try model.matvec.tryPack(ctx, weights, width, columns, .bf16);
+    defer matrix.deinit(ctx);
+    try std.testing.expect(matrix.storage.ptr != 0);
+    for (0..lanes) |lane| {
+        const source: buffer.DeviceBuffer = .{ .ptr = inputs.ptr + lane * width * 2, .len = width * 2, .borrowed = true };
+        const destination: buffer.DeviceBuffer = .{ .ptr = output.ptr + lane * columns * 2, .len = columns * 2, .borrowed = true };
+        try std.testing.expect(try model.matvec.tryRunPacked(ctx, destination, source, matrix, 0, columns, .bf16));
+    }
+    try output.copyToHost(ctx, expected.bytes());
+    for (2..lanes + 1) |count| {
+        try std.testing.expect(try model.matvec.tryRunPackedBatch(ctx, output, inputs, matrix, @intCast(count)));
+        try output.copyToHost(ctx, actual.bytes());
+        try ctx.synchronize();
+        const compared = count * columns * 2;
+        try std.testing.expectEqualSlices(u8, expected.constBytes()[0..compared], actual.constBytes()[0..compared]);
+        for (0..count) |lane| {
+            for ([_]usize{ 0, 1, 13, 461, columns - 1 }) |col| {
+                var sum: f32 = 0;
+                for (input_bits[lane * width ..][0..width], weight_bits[col * width ..][0..width]) |a, b| {
+                    sum += @as(f32, @bitCast(@as(u32, a) << 16)) * @as(f32, @bitCast(@as(u32, b) << 16));
+                }
+                const bits: u32 = @bitCast(sum);
+                const rounded: u16 = @truncate((bits + 0x7fff + ((bits >> 16) & 1)) >> 16);
+                try std.testing.expectEqual(rounded, std.mem.readInt(u16, actual.constBytes()[(lane * columns + col) * 2 ..][0..2], .little));
+            }
+        }
+    }
+    std.debug.print("Packed batch projection matched row-one BF16 bits and sampled CPU dots for widths 2–4\n", .{});
+}
+
+fn verifyBatchedDecode(allocator: std.mem.Allocator, model: *decoder.Decoder) !void {
     if (model.ctx.info.compute_major != 12 or model.ctx.info.compute_minor != 1) return;
-    var paired: [2]decoder.Request = undefined;
-    var scalars: [2]decoder.Request = undefined;
-    const limits = [_]u32{ 38, 53 };
+    try verifyPackedBatchProjection(model);
+    var batched: [decoder.decode_batch_rows]decoder.Request = undefined;
+    var scalars: [decoder.decode_batch_rows]decoder.Request = undefined;
+    const limits = [_]u32{ 38, 53, 68, 83 };
     var initialized: usize = 0;
     defer for (0..initialized) |lane| {
-        paired[lane].deinit() catch @panic("unable to drain paired decode");
+        batched[lane].deinit() catch @panic("unable to drain batched decode");
         scalars[lane].deinit() catch @panic("unable to drain scalar decode");
     };
-    for (&paired, &scalars, limits, 0..) |*pair, *scalar, limit, lane| {
-        try pair.initWithPrefill(allocator, model, limit, 2);
+    for (&batched, &scalars, limits, 0..) |*member, *scalar, limit, lane| {
+        try member.initWithPrefill(allocator, model, limit, decoder.decode_batch_rows);
         scalar.init(allocator, model, limit) catch |err| {
-            pair.deinit() catch @panic("unable to drain paired decode");
+            member.deinit() catch @panic("unable to drain batched decode");
             return err;
         };
         initialized += 1;
-        pair.use_dense = true;
+        member.use_dense = true;
         scalar.use_dense = true;
         for (0..3 + 12 * lane) |index| {
             const token = head_tokens[index % head_tokens.len];
-            try pair.append(token);
+            try member.append(token);
             try scalar.append(token);
         }
     }
-    try std.testing.expectError(error.InvalidInkling2Token, decoder.Request.stepGreedyPair(.{ &paired[0], &paired[1] }, .{ 42, model.text.unpadded_vocab_size }));
+    var requests: [decoder.decode_batch_rows]*decoder.Request = undefined;
+    for (&requests, &batched) |*request, *member| request.* = member;
+    var tokens: [decoder.decode_batch_rows]u32 = .{ 42, model.text.unpadded_vocab_size, 42, 42 };
+    var results: [decoder.decode_batch_rows]u32 = undefined;
+    try std.testing.expectError(error.InvalidInkling2Token, decoder.Request.stepGreedyBatch(&requests, &tokens, &results));
     for (0..24) |index| {
-        const tokens = [2]u32{ head_tokens[index % head_tokens.len], head_tokens[(index + 7) % head_tokens.len] };
-        const result = try decoder.Request.stepGreedyPair(.{ &paired[0], &paired[1] }, tokens);
-        for (&paired, &scalars, tokens, result) |*pair, *scalar, token, actual| {
+        const lanes = 2 + index % (decoder.decode_batch_rows - 1);
+        for (tokens[0..lanes], 0..) |*token, lane| token.* = head_tokens[(index + lane * 7) % head_tokens.len];
+        try decoder.Request.stepGreedyBatch(requests[0..lanes], tokens[0..lanes], results[0..lanes]);
+        for (batched[0..lanes], scalars[0..lanes], tokens[0..lanes], results[0..lanes]) |*member, *scalar, token, actual| {
             try std.testing.expectEqual(try scalar.stepGreedy(token), actual);
-            try std.testing.expectEqual(scalar.position(), pair.position());
+            try std.testing.expectEqual(scalar.position(), member.position());
         }
     }
-    std.debug.print("Inkling paired decode matched both scalar streams at 24 heterogeneous positions\n", .{});
+    std.debug.print("Inkling batched decode matched scalar streams at 24 heterogeneous positions with 2 to 4 lanes\n", .{});
 }
 
 test "CUDA Inkling 2 runs the fixed loop with all released text weights" {
@@ -438,7 +505,7 @@ test "CUDA Inkling 2 runs the fixed loop with all released text weights" {
         null;
     const long_qualification = platform.env.getenv("ANTFLY_INKLING2_QUALIFICATION_LONG") != null;
     defer if (qualification_dir) |dir_handle| dir_handle.close(std.testing.io);
-    try verifyPairedDecode(allocator, &model);
+    try verifyBatchedDecode(allocator, &model);
     try verifyReplay(allocator, &model, if (long_qualification) model.text.sliding_window_size else 130);
     try verifyOutputHead(allocator, &model);
     try verifyPackedWeights(allocator, &model);
@@ -469,7 +536,10 @@ test "CUDA Inkling 2 runs the fixed loop with all released text weights" {
     if (qualification_dir) |dir_handle| try exportQualificationImage(allocator, &model, image, dir_handle);
     if (ctx.info.compute_major == 12 and ctx.info.compute_minor <= 1) try verifyBatchedImagePrefill(allocator, &model, &encoder);
     if (ctx.info.compute_major == 12 and ctx.info.compute_minor == 1) {
-        if (source.config.value.mtp_config) |config| try verifyDSparkTransactions(allocator, &model, dir, config);
+        if (source.config.value.mtp_config) |config| {
+            try verifyDSparkTransactions(allocator, &model, dir, config, 64);
+            try verifyDSparkTransactions(allocator, &model, dir, config, model.text.log_scaling_n_floor + 1);
+        }
     }
     if (long_qualification) try verifyLongContext(allocator, &model);
 }

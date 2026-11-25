@@ -537,6 +537,7 @@
       "antfly_dense_packed_bf16_matvec_f32_2304",
       "antfly_dense_interleaved_bf16_matvec_bf16_2304",
       "antfly_dense_interleaved_bf16_matvec_bf16_3072",
+      "antfly_dense_interleaved_bf16_matvec_batch_bf16_3072",
       "antfly_dense_interleaved_bf16_segmented_matvec_bf16_2304",
       "antfly_pack_q4_projection_bounds_2304",
       "antfly_quantize_q8_projection_bounds_2304",

@@ -37,8 +37,9 @@ const streams = 4;
 const block_slots = 5;
 const page_tokens = 16;
 pub const prefill_chunk_rows = 16;
+pub const decode_batch_rows = 4;
 
-pub fn speculativeContextSupported(text: checkpoint.TextConfig, tokens: usize) bool {
+pub fn speculativeBlockContextSupported(text: checkpoint.TextConfig, tokens: usize) bool {
     // The multirow target verifier has diverged from row-one greedy decoding
     // in the long-context log-scaling regime.
     return tokens <= text.log_scaling_n_floor;
@@ -367,7 +368,10 @@ pub const Request = struct {
             .{ .normalized, activation_bytes },              .{ .logits, @as(usize, text.vocab_size) * 4 }, .{ .blas, 8 * 1024 * 1024 },              .{ .relative, relative_bytes },
             .{ .router, @max(nv.logits, mx.logits) },        .{ .routed, @max(nv.routed, mx.routed) },      .{ .pages, 2 * ids },
         }) |item| self.temps[@backingInt(item[0])] = try DeviceBuffer.allocWithPurpose(ctx, item[1], .command_workspace);
-        if (chunk_rows >= 2) self.temps[@backingInt(Temp.cohort)] = try DeviceBuffer.allocWithPurpose(ctx, 4 * hidden, .command_workspace);
+        if (chunk_rows >= 2) {
+            const head_bytes = @as(usize, text.num_attention_heads) * text.head_dim * 2;
+            self.temps[@backingInt(Temp.cohort)] = try DeviceBuffer.allocWithPurpose(ctx, (head_bytes + hidden) * @min(chunk_rows, decode_batch_rows), .command_workspace);
+        }
         if (model.head_shortlist.workspaceBytes() != 0) {
             self.shortlist_workspace = DeviceBuffer.allocWithPurpose(ctx, model.head_shortlist.workspaceBytes(), .command_workspace) catch |err| switch (err) {
                 error.CudaMemoryLimitExceeded => .{},
@@ -406,7 +410,8 @@ pub const Request = struct {
         for (draft.stage) |plane| {
             if (plane.len < @as(usize, self.append_capacity) * text.hidden_size * 2) return error.InvalidInkling2DraftContext;
         }
-        self.verification_history = try DeviceBuffer.allocWithPurpose(self.model.ctx, 4 * widths * checkpoint.visit_count * dspark.block_rows, .command_workspace);
+        if (speculativeBlockContextSupported(text, self.max_tokens))
+            self.verification_history = try DeviceBuffer.allocWithPurpose(self.model.ctx, 4 * widths * checkpoint.visit_count * dspark.block_rows, .command_workspace);
         self.draft = draft;
     }
 
@@ -485,12 +490,12 @@ pub const Request = struct {
         }
     }
 
-    fn hiddenConv(self: *Request, weight: DeviceBuffer, old: DeviceBuffer, next: DeviceBuffer, output: DeviceBuffer) !void {
+    fn hiddenConv(self: *Request, weight: DeviceBuffer, old: DeviceBuffer, next: DeviceBuffer, input: DeviceBuffer, output: DeviceBuffer) !void {
         try self.model.conv.run(self.model.ctx, .{
             .rows = self.workspace.rows,
             .channels = self.model.text.hidden_size,
             .head_size = self.model.text.hidden_size,
-            .input = self.get(.raw),
+            .input = input,
             .weight = weight,
             .history = old,
             .next_history = next,
@@ -610,7 +615,7 @@ pub const Request = struct {
         try m.mix.blendThree(m.ctx, group, dest, messages, gates, gammas, m.text.rms_norm_eps, self.get(.inputs));
     }
 
-    fn prepareVisit(self: *Request, visit: checkpoint.Visit, ordinal: usize, stack_depth: usize, replay: DeviceBuffer) !usize {
+    fn prepareAttention(self: *Request, visit: checkpoint.Visit, ordinal: usize, stack_depth: usize, replay: DeviceBuffer, raw_heads: ?DeviceBuffer) !void {
         const m = self.model;
         const ctx = m.ctx;
         const text = m.text;
@@ -655,7 +660,8 @@ pub const Request = struct {
             .matvec = if (self.use_dense) &m.matvec else null,
             .use_packed = self.use_packed_weights,
             .input = .{ .q = input[0], .k = input[1], .v = input[2] },
-            .output = self.get(.raw),
+            .output = raw_heads orelse self.get(.raw),
+            .project_output = raw_heads == null,
             .workspace = self.workspace,
             .blas_space = self.get(.blas),
             .attention_space = self.get(.relative),
@@ -674,13 +680,23 @@ pub const Request = struct {
             try stage[1].copyFromDevice(ctx, raw_kv.value, kv_bytes);
             try stage[2].copyFromDevice(ctx, self.get(.raw), self.blockBytes());
         }
+    }
+
+    fn prepareFfn(self: *Request, visit: checkpoint.Visit, ordinal: usize, stack_depth: usize, projected_attention: DeviceBuffer, mlp_input: DeviceBuffer) !usize {
+        const m = self.model;
+        const ctx = m.ctx;
+        const text = m.text;
+        const i = visit.weight_layer;
+        const layer = &m.layers[i];
+        const eps = text.rms_norm_eps;
+        const old = self.histories(ordinal, self.history_side);
+        const next = self.histories(ordinal, 1 - self.history_side);
         const attn = self.get(.attn);
-        try self.hiddenConv(layer.weight(.attn_taps), old[2], next[2], attn);
+        try self.hiddenConv(layer.weight(.attn_taps), old[2], next[2], projected_attention, attn);
         const boundary = i % text.n_layers_per_attn_res_block == 0;
         const completed = stack_depth + @intFromBool(boundary);
-        const previous = if (boundary) DeviceBuffer{} else partial;
-        const mlp_input = self.get(.normalized);
-        if (looped) {
+        const previous = if (boundary) DeviceBuffer{} else self.block(stack_depth);
+        if (visit.pass > 0) {
             try m.mix.mix(ctx, self.shape(), self.get(.stack), attn, previous, @intCast(completed + 1), layer.weight(.mlp_query), self.get(.mix));
             try self.controller(layer, i, .mlp, layer.weight(.mlp_norm), mlp_input);
         } else {
@@ -689,7 +705,7 @@ pub const Request = struct {
         return completed;
     }
 
-    fn finishVisit(self: *Request, visit: checkpoint.Visit, ordinal: usize, completed: usize) !void {
+    fn finishVisit(self: *Request, visit: checkpoint.Visit, ordinal: usize, completed: usize, mlp_output: DeviceBuffer) !void {
         const m = self.model;
         const ctx = m.ctx;
         const text = m.text;
@@ -697,13 +713,14 @@ pub const Request = struct {
         const old = self.histories(ordinal, self.history_side);
         const next = self.histories(ordinal, 1 - self.history_side);
         const previous = if (visit.weight_layer % text.n_layers_per_attn_res_block == 0) DeviceBuffer{} else self.block(completed);
-        if (self.record_history) try self.verificationHistory(ordinal)[3].copyFromDevice(ctx, self.get(.raw), self.blockBytes());
-        try self.hiddenConv(layer.weight(.mlp_taps), old[3], next[3], self.get(.mlp));
+        if (self.record_history) try self.verificationHistory(ordinal)[3].copyFromDevice(ctx, mlp_output, self.blockBytes());
+        try self.hiddenConv(layer.weight(.mlp_taps), old[3], next[3], mlp_output, self.get(.mlp));
         try m.mix.sum(ctx, self.shape(), previous, self.get(.attn), self.get(.mlp), self.block(completed));
     }
 
     fn runVisit(self: *Request, visit: checkpoint.Visit, ordinal: usize, stack_depth: usize, replay: DeviceBuffer) !usize {
-        const completed = try self.prepareVisit(visit, ordinal, stack_depth, replay);
+        try self.prepareAttention(visit, ordinal, stack_depth, replay, null);
+        const completed = try self.prepareFfn(visit, ordinal, stack_depth, self.get(.raw), self.get(.normalized));
         const m = self.model;
         try m.ffn.run(m.ctx, &m.blas, m.text, &m.layers[visit.weight_layer].ffn, self.workspace.rows, self.get(.normalized), self.get(.raw), .{
             .logits = self.get(.router),
@@ -711,7 +728,7 @@ pub const Request = struct {
             .routed = self.get(.routed),
             .activation_precision = m.expert_activation_precision,
         });
-        try self.finishVisit(visit, ordinal, completed);
+        try self.finishVisit(visit, ordinal, completed, self.get(.raw));
         return completed;
     }
 
@@ -728,22 +745,23 @@ pub const Request = struct {
     }
 
     pub fn canBatchGreedy(self: *const Request) bool {
-        return self.append_capacity >= 2 and self.draft == null and self.shortlist_workspace.ptr != 0 and
+        return self.use_dense and self.get(.cohort).ptr != 0 and self.draft == null and self.shortlist_workspace.ptr != 0 and
             !self.use_reference_head and self.use_packed_weights;
     }
 
-    /// Share the routed FFN for two independent sequences. Each attention
-    /// call reads its own staged pages and each convolution advances its own
-    /// history. The row-one head still produces each exact greedy token.
-    pub fn stepGreedyPair(requests: [2]*Request, tokens: [2]u32) ![2]u32 {
+    /// Share the attention output projection and routed FFN. Attention scores,
+    /// convolution histories and vocabulary heads stay per sequence.
+    pub fn stepGreedyBatch(requests: []const *Request, tokens: []const u32, results: []u32) !void {
+        std.debug.assert(requests.len >= 2 and requests.len <= decode_batch_rows and tokens.len == requests.len and results.len == requests.len);
         const leader = requests[0];
+        std.debug.assert(requests.len <= leader.append_capacity);
         const m = leader.model;
         const ctx = m.ctx;
         const text = m.text;
         const hidden = @as(usize, text.hidden_size) * 2;
-        std.debug.assert(requests[1] != leader and requests[1].model == m);
-        for (requests, tokens) |request, token| {
-            std.debug.assert(request.canBatchGreedy() and request.workspace.rows == 1);
+        for (requests, tokens, 0..) |request, token, index| {
+            std.debug.assert(request.model == m and request.canBatchGreedy() and request.workspace.rows == 1);
+            std.debug.assert(std.mem.indexOfScalar(*Request, requests[0..index], request) == null);
             try request.validateInput(.{ .tokens = &.{token} }, 1);
         }
         var staged: usize = 0;
@@ -753,32 +771,44 @@ pub const Request = struct {
             staged += 1;
             try request.stageInput(.{ .tokens = &.{token} });
         }
-        const in_pair = sub(leader.get(.cohort), 0, 2 * hidden);
-        const out_pair = sub(leader.get(.cohort), 2 * hidden, 2 * hidden);
-        var cursors: [2]VisitCursor = @splat(.{});
+        const head_bytes = @as(usize, text.num_attention_heads) * text.head_dim * 2;
+        const heads = sub(leader.get(.cohort), 0, requests.len * head_bytes);
+        // Once the output projection consumes the heads, its input storage
+        // becomes the FFN input. The projected rows are consumed before the
+        // FFN writes its outputs back into the second region.
+        const inputs = sub(heads, 0, requests.len * hidden);
+        const outputs = sub(leader.get(.cohort), heads.len, requests.len * hidden);
+        var cursor_storage: [decode_batch_rows]VisitCursor = @splat(.{});
+        const cursors = cursor_storage[0..requests.len];
         for (m.schedule, 0..) |visit, ordinal| {
-            for (requests, &cursors, 0..) |request, *cursor, lane| {
+            const layer = &m.layers[visit.weight_layer];
+            for (requests, cursors, 0..) |request, *cursor, lane| {
                 try request.advanceVisit(visit, ordinal, cursor);
-                cursor.depth = try request.prepareVisit(visit, ordinal, cursor.depth, .{});
-                try row(in_pair, lane, hidden).copyFromDevice(ctx, request.get(.normalized), hidden);
+                try request.prepareAttention(visit, ordinal, cursor.depth, .{}, row(heads, lane, head_bytes));
             }
-            try m.ffn.run(ctx, &m.blas, text, &m.layers[visit.weight_layer].ffn, 2, in_pair, out_pair, .{
+            try attention.Forward.projectOutputBatch(&m.matvec, &m.blas, ctx, text, &layer.attn, @intCast(requests.len), heads, outputs, leader.get(.blas));
+            for (requests, cursors, 0..) |request, *cursor, lane| {
+                cursor.depth = try request.prepareFfn(visit, ordinal, cursor.depth, row(outputs, lane, hidden), row(inputs, lane, hidden));
+            }
+            try m.ffn.run(ctx, &m.blas, text, &layer.ffn, @intCast(requests.len), inputs, outputs, .{
                 .logits = leader.get(.router),
                 .blas = leader.get(.blas),
                 .routed = leader.get(.routed),
                 .activation_precision = m.expert_activation_precision,
+                .rowwise_router = true,
             });
             for (requests, cursors, 0..) |request, cursor, lane| {
-                try request.get(.raw).copyFromDevice(ctx, row(out_pair, lane, hidden), hidden);
-                try request.finishVisit(visit, ordinal, cursor.depth);
+                try request.finishVisit(visit, ordinal, cursor.depth, row(outputs, lane, hidden));
             }
         }
-        var results: [2]u32 = undefined;
-        for (requests, tokens, cursors, &results) |request, token, cursor, *result| {
-            try request.finishAppend(.{ .tokens = &.{token} }, 1, .greedy, cursor.depth);
+        for (requests, cursors) |request, cursor| {
+            try request.normalizeOutput(cursor.depth);
+            try request.submitGreedy();
+        }
+        for (requests, results) |request, *result| {
+            try request.commitAppend(1);
             result.* = try request.greedyToken();
         }
-        return results;
     }
 
     /// The shortlist certifies which rows may tie or beat an exact capped
@@ -848,20 +878,33 @@ pub const Request = struct {
         count: u32,
     };
 
-    /// Verify the anchor and the proposed suffix in a single target pass.
-    /// The final returned token is the target's continuation after the last
-    /// accepted input. It has not been appended to the cache.
+    /// The final returned token is the continuation after the last accepted
+    /// input. It has not been appended to the cache.
     pub fn verifyDraft(self: *Request, anchor: u32, proposed: []const u32) !Verification {
         if (self.draft == null or proposed.len == 0 or proposed.len >= dspark.block_rows or
             proposed.len >= self.append_capacity) return error.InvalidInkling2DraftContext;
-        if (!speculativeContextSupported(self.model.text, self.position() + proposed.len + 1))
-            return error.UnsupportedInkling2SpeculativeContext;
         var tokens: [dspark.block_rows]u32 = undefined;
         tokens[0] = anchor;
         @memcpy(tokens[1..][0..proposed.len], proposed);
+        const input = tokens[0 .. proposed.len + 1];
+        if (!speculativeBlockContextSupported(self.model.text, self.max_tokens))
+            return self.verifyDraftGreedy(input);
         var result: Verification = undefined;
-        try self.run(.{ .tokens = tokens[0 .. proposed.len + 1] }, @intCast(proposed.len + 1), .{ .verify = &result });
+        try self.run(.{ .tokens = input }, @intCast(input.len), .{ .verify = &result });
         return result;
+    }
+
+    fn verifyDraftGreedy(self: *Request, tokens: []const u32) !Verification {
+        if (tokens.len > self.max_tokens - self.position()) return error.InvalidInkling2Context;
+        try self.validateInput(.{ .tokens = tokens }, @intCast(tokens.len));
+        var verification: Verification = .{ .ids = undefined, .count = 0 };
+        for (tokens, 0..) |token, index| {
+            const next = try self.stepGreedy(token);
+            verification.ids[index] = next;
+            verification.count += 1;
+            if (index + 1 < tokens.len and next != tokens[index + 1]) break;
+        }
+        return verification;
     }
 
     const VisitCursor = struct {
@@ -997,12 +1040,11 @@ pub const Request = struct {
         const text = m.text;
         const ctx = m.ctx;
         const normalized = self.get(.normalized);
-        if (output != .none or self.draft != null)
-            try m.mix.mixAndNorm(ctx, self.shape(), self.get(.stack), self.block(depth), .{}, @intCast(depth + 1), m.weight(.output_query), m.weight(.final_norm), text.rms_norm_eps, normalized);
+        if (output != .none or self.draft != null) try self.normalizeOutput(depth);
         var committed = rows;
         switch (output) {
             .none => {},
-            .greedy => try m.matvec.runGreedy(ctx, normalized, m.packed_head, m.head_shortlist, self.shortlist_workspace, self.logits.bytes()[0..4], text.final_logit_softcapping),
+            .greedy => try self.submitGreedy(),
             .logits => {
                 const logits = self.get(.logits);
                 try self.projectLogits(logits, normalized);
@@ -1021,6 +1063,20 @@ pub const Request = struct {
             try draft.stage[3].copyFromDevice(ctx, normalized, self.blockBytes());
             try draft.stageContext(&m.blas, @intCast(self.position()), committed);
         }
+        try self.commitAppend(committed);
+    }
+
+    fn normalizeOutput(self: *Request, depth: usize) !void {
+        const m = self.model;
+        try m.mix.mixAndNorm(m.ctx, self.shape(), self.get(.stack), self.block(depth), .{}, @intCast(depth + 1), m.weight(.output_query), m.weight(.final_norm), m.text.rms_norm_eps, self.get(.normalized));
+    }
+
+    fn submitGreedy(self: *Request) !void {
+        const m = self.model;
+        try m.matvec.runGreedy(m.ctx, self.get(.normalized), m.packed_head, m.head_shortlist, self.shortlist_workspace, self.logits.bytes()[0..4], m.text.final_logit_softcapping);
+    }
+
+    fn commitAppend(self: *Request, committed: u32) !void {
         try self.kv.commitPrefix(committed);
         if (self.draft) |draft| draft.commitContext(committed);
         self.history_side = 1 - self.history_side;
