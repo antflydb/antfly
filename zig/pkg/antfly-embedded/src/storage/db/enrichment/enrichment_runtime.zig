@@ -14496,7 +14496,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
         try scheduler.consumers.?[4].plans.resize(alloc, 3);
         scheduler.consumers.?[4].plans.items[2] = try Harness.partMemory(&harness, "visual", .{ .item_count = 2 }, 2, null);
         for ([_]usize{ 1, 2 }) |text_index| {
-            for ([_]?anyerror{ null, error.InvalidProducedBatchCardinality, error.Canceled, error.Cancelled }, 0..) |failure, scenario| {
+            for ([_]?anyerror{ error.Canceled, error.Cancelled, null, error.InvalidProducedBatchCardinality }, 0..) |failure, scenario| {
                 try scheduler.cleanupSpool();
                 scheduler.consumers.?[1].enabled = text_index == 1;
                 scheduler.consumers.?[2].enabled = text_index == 2;
@@ -25841,6 +25841,8 @@ fn recoverRuntimeGeneratedTextBatch(
     err: anyerror,
 ) !void {
     if (requests.len != unit_indices.len) return error.InvalidAssetProducerResponse;
+    // The canceled invocation may still be unwinding on the provider.
+    if (err == error.AssetInvocationCanceled) return err;
     if (generatedTextBatchFailureIsAttributable(kind, err, requests.len)) {
         try markRuntimeGeneratedUnitFailuresTransactional(alloc, working_alloc, units, unit_indices, method, kind, err);
         clearRuntimeGeneratedTextBatchParts(working_alloc, parts_values);
