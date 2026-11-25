@@ -59,6 +59,47 @@ class MemoryStore:
 
 
 class MaintenanceChannelTests(unittest.TestCase):
+    def test_embedded_snapshot_retention_matches_publication_policy(self):
+        for tag, publish in (
+            ("v0.4.0", "true"),
+            ("v0.3.4", "true"),
+            ("v0.4.0-rc.1", "false"),
+            ("v0.3.4-rc.1", "false"),
+            ("v0.0.0-dev.42", "false"),
+        ):
+            with self.subTest(tag=tag):
+                name, policy = channels.resolve_channel(
+                    tag, "nightly" if tag.startswith("v0.0.0-dev.") else "auto"
+                )
+                outputs = channels.github_outputs(name, policy, tag)
+                self.assertEqual(outputs["publish_embedded"], publish)
+
+        workflow = (ROOT / ".github/workflows/antfly-artifact-build.yml").read_text()
+        self.assertIn(
+            "publish_embedded: ${{ steps.channel.outputs.publish_embedded }}", workflow
+        )
+        self.assertIn(
+            "retain_snapshot: ${{ needs.release-plan.outputs.publish_embedded == 'true' }}",
+            workflow,
+        )
+        publisher = (
+            ROOT / "scripts/release/verify_embedded_publish_inputs.py"
+        ).read_text()
+        self.assertIn(
+            '"publish": str(embedded_publication_enabled(channel)).lower()', publisher
+        )
+
+    def test_embedded_publication_uses_capabilities_instead_of_channel_name(self):
+        _, stable = channels.resolve_channel("v0.3.4")
+        self.assertEqual(
+            channels.github_outputs("renamed-maintenance", stable)["publish_embedded"],
+            "true",
+        )
+        disabled = {**stable, "publish_npm": False}
+        self.assertEqual(
+            channels.github_outputs("v0-3", disabled)["publish_embedded"], "false"
+        )
+
     def test_routing_preserves_historical_specs(self):
         for tag, expected in (
             ("v0.3.3", "v0-3"),

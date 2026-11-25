@@ -133,6 +133,7 @@ jobs:
     uses: ./.github/workflows/antfly-artifact-build.yml
     permissions:
       contents: read
+      actions: read
       id-token: write
     with:
       tag_name: ${{ needs.resolve.outputs.tag }}

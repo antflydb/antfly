@@ -184,7 +184,10 @@ workflow copies their TypeScript build into the staged wrapper before packing.
 The Homebrew C smoke test checks the installed library against
 `ANTFLY_ABI_VERSION` and the open-options layout in its installed header.
 `.github/workflows/embedded-release-publish.yml` automatically publishes embedded
-packages to npm, PyPI, and crates.io after a successful stable or RC build.
+packages to npm, PyPI, and crates.io after a successful registry-enabled stable
+build, including maintenance stable channels such as `v0-3`. Snapshot retention
+and publication share the policy-derived `publish_embedded` capability;
+prereleases and nightlies do not retain registry publication inputs.
 The build-completion event validates source identity and dispatches the publisher
 on `main`; registry credentials are issued only to the dispatched run, since
 crates.io rejects `workflow_run` tokens.
@@ -197,6 +200,31 @@ the sealed package checksums before they can be skipped on retry. Go and Rust li
 [licensing maintenance](docs/reference/licensing.md) for trusted publisher setup.
 Registry ownership and all three trusted-publisher configurations are described
 in [registry publishing setup](docs/reference/registry-publishing.md).
+
+### Recovering an omitted embedded package snapshot
+
+A failed publisher cannot recover a snapshot that its successful native build
+never uploaded. After the controller fix has merged, start a fresh dispatch on
+`main`; rerunning an older failed workflow keeps its original workflow code.
+For example, recover the v0.3.4 package snapshot from its successful build:
+
+```sh
+gh workflow run embedded-release-publish.yml --ref main \
+  -f tag_name=v0.3.4 -f build_run_id=45557564757 \
+  -f rebuild_snapshot=true
+```
+
+Recovery is explicit and defaults off. The read-only admission job authenticates
+the original successful controller, immutable release request, tag, source
+commit, and release-line ancestry. A packaging job with only read access to
+repository contents and Actions artifacts downloads
+that build's existing native archives, checks out its pinned source, rebuilds
+only wheels/npm packages, qualifies the bindings, and uploads a new sealed
+snapshot in the recovery run. It does not rebuild native archives or move tags.
+The verification job checks snapshot hashes, licenses, native-archive equivalence,
+and registry preflight before any registry publisher starts. All registry
+approval gates remain in place; existing versions must still match their sealed
+checksums. Normal retries continue to consume the original retained snapshot.
 
 Linux has an explicit two-ABI contract:
 

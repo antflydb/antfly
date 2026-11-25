@@ -51,6 +51,155 @@ def producer(commit="1" * 40):
 
 
 class EmbeddedPublishTests(unittest.TestCase):
+    def test_snapshot_recovery_is_explicit_read_only_and_bound_to_original_build(self):
+        workflow = (
+            Path(__file__).resolve().parents[2]
+            / ".github/workflows/embedded-release-publish.yml"
+        ).read_text()
+        jobs = dict(
+            re.findall(
+                r"^  ([\w-]+):\n(.*?)(?=^  [\w-]+:|\Z)",
+                workflow.split("\njobs:\n", 1)[1],
+                re.MULTILINE | re.DOTALL,
+            )
+        )
+        recovery = jobs["rebuild-snapshot"]
+        self.assertIn("github.event_name == 'workflow_dispatch'", recovery)
+        self.assertIn("inputs.rebuild_snapshot", recovery)
+        self.assertIn("needs.prepare.outputs.publish == 'true'", recovery)
+        self.assertIn(
+            "archive_run_id: ${{ needs.prepare.outputs.build_run_id }}", recovery
+        )
+        self.assertIn("source_commit: ${{ needs.prepare.outputs.commit }}", recovery)
+        self.assertIn("version: ${{ needs.prepare.outputs.version }}", recovery)
+        self.assertIn("retain_snapshot: true", recovery)
+        self.assertNotIn("id-token: write", recovery)
+        self.assertNotIn("environment:", recovery)
+        verification = jobs["verify-snapshot"]
+        self.assertIn("needs: [prepare, rebuild-snapshot]", verification)
+        self.assertIn("needs.rebuild-snapshot.result == 'success'", verification)
+        self.assertIn("needs.rebuild-snapshot.result == 'skipped'", verification)
+        self.assertIn("!cancelled()", verification)
+        self.assertIn(
+            "inputs.rebuild_snapshot && github.run_id || needs.prepare.outputs.build_run_id",
+            verification,
+        )
+        self.assertIn("run-id: ${{ needs.prepare.outputs.build_run_id }}", verification)
+        self.assertIn("lite_snapshot.py verify", verification)
+        self.assertIn("verify_lite_release.py", verification)
+        self.assertIn("embedded_registry_preflight.py", verification)
+        self.assertNotIn("id-token: write", verification)
+        self.assertIn("needs: [prepare, verify-snapshot]", jobs["prepare-cargo"])
+        for name in ["publish-npm", "publish-pypi"]:
+            self.assertIn(
+                "needs: [prepare, prepare-cargo, verify-snapshot]", jobs[name]
+            )
+            self.assertIn(
+                "run-id: ${{ needs.verify-snapshot.outputs.snapshot_run_id }}",
+                jobs[name],
+            )
+        package = (
+            Path(__file__).resolve().parents[2]
+            / ".github/workflows/embedded-package.yml"
+        ).read_text()
+        self.assertIn("run-id: ${{ inputs.archive_run_id || github.run_id }}", package)
+        self.assertNotIn("zig build", package)
+
+    def test_snapshot_verification_waits_for_recovery_and_admits_normal_skips(self):
+        from test_promotion_job_conditions import admitted
+
+        workflow = (
+            Path(__file__).resolve().parents[2]
+            / ".github/workflows/embedded-release-publish.yml"
+        ).read_text()
+        job = re.search(
+            r"^  verify-snapshot:\n(.*?)(?=^  [\w-]+:|\Z)",
+            workflow,
+            re.MULTILINE | re.DOTALL,
+        )[1]
+        guard = re.search(r"^    if: \$\{\{ (.*?) \}\}$", job, re.MULTILINE)[1]
+        for event in ["workflow_dispatch", "workflow_run"]:
+            for publish in ["true", "false"]:
+                for cancelled in [False, True]:
+                    for prepare in ["success", "failure", "skipped"]:
+                        for recovery in ["success", "skipped", "failure", "cancelled"]:
+                            with self.subTest(
+                                event=event,
+                                publish=publish,
+                                cancelled=cancelled,
+                                prepare=prepare,
+                                recovery=recovery,
+                            ):
+                                expression = guard.replace(
+                                    "github.event_name", repr(event)
+                                )
+                                expression = expression.replace(
+                                    "needs.prepare.outputs.publish", repr(publish)
+                                )
+                                expected = (
+                                    event == "workflow_dispatch"
+                                    and publish == "true"
+                                    and not cancelled
+                                    and prepare == "success"
+                                    and recovery in {"success", "skipped"}
+                                )
+                                self.assertEqual(
+                                    admitted(
+                                        expression,
+                                        {
+                                            "prepare": prepare,
+                                            "rebuild-snapshot": recovery,
+                                        },
+                                        cancelled=cancelled,
+                                        ancestor="skipped",
+                                    ),
+                                    expected,
+                                )
+
+    def test_registry_jobs_allow_skipped_recovery_but_require_successful_verification(
+        self,
+    ):
+        from test_promotion_job_conditions import admitted
+
+        workflow = (
+            Path(__file__).resolve().parents[2]
+            / ".github/workflows/embedded-release-publish.yml"
+        ).read_text()
+        jobs = dict(
+            re.findall(
+                r"^  ([\w-]+):\n(.*?)(?=^  [\w-]+:|\Z)",
+                workflow.split("\njobs:\n", 1)[1],
+                re.MULTILINE | re.DOTALL,
+            )
+        )
+        for name in ["prepare-cargo", "publish-cargo", "publish-pypi", "publish-npm"]:
+            job = jobs[name]
+            guard = re.search(r"^    if: \$\{\{ (.*?) \}\}$", job, re.MULTILINE)[1]
+            guard = guard.replace("github.event_name", repr("workflow_dispatch"))
+            guard = guard.replace("needs.prepare.outputs.publish", repr("true"))
+            guard = guard.replace(
+                "needs.prepare-cargo.outputs.has_packages", repr("true")
+            )
+            dependencies = re.search(r"^    needs: \[([^\]]+)\]", job, re.MULTILINE)[1]
+            results = dict.fromkeys(
+                (d.strip() for d in dependencies.split(",")), "success"
+            )
+            with self.subTest(job=name):
+                self.assertTrue(admitted(guard, results, ancestor="skipped"))
+                self.assertFalse(
+                    admitted(guard, results, ancestor="skipped", cancelled=True)
+                )
+            for dependency in results:
+                for failure in ["failure", "cancelled", "skipped"]:
+                    with self.subTest(job=name, dependency=dependency, result=failure):
+                        self.assertFalse(
+                            admitted(
+                                guard,
+                                {**results, dependency: failure},
+                                ancestor="skipped",
+                            )
+                        )
+
     def test_automatic_workflow_preserves_credential_separation(self):
         workflow = (
             Path(__file__).resolve().parents[2]
@@ -107,9 +256,11 @@ class EmbeddedPublishTests(unittest.TestCase):
             Path(__file__).resolve().parents[2]
             / ".github/workflows/embedded-release-publish.yml"
         ).read_text()
-        relay = workflow.split("  dispatch-publication:\n", 1)[1].split(
-            "  prepare-cargo:", 1
-        )[0]
+        relay = re.search(
+            r"^  dispatch-publication:\n(.*?)(?=^  [\w-]+:|\Z)",
+            workflow,
+            re.MULTILINE | re.DOTALL,
+        )[1]
         script = textwrap.dedent(relay.split("        run: |\n", 1)[1])
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
