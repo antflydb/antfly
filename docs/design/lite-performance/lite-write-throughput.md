@@ -199,6 +199,28 @@ Installing it is now the largest serialized cost: 99 µs syncing the catalog
 mirror and 93 µs publishing the segment. That is what the memtable (4)
 removes.
 
+## Measured after 4
+
+ReleaseFast, 8 writers, 10 s runs interleaved with main (`81e1d96af5`) at
+load average 9-11:
+
+| | main | after |
+|---|---|---|
+| full text, 8 threads | 1,049–1,309/s | 1,486–1,870/s |
+| plain, 8 threads | 4,859–6,746/s | 8,527–10,777/s |
+| full text, 8 processes | 5 of 10 runs stalled | 0 of 10 stalled |
+| plain, 8 processes | 3,760–4,589/s | 2,974–5,889/s (noise) |
+
+Per full-text write (8 threads): installing the level-0 segment went from
+99 + 93 µs to 3 + 5 µs. The 8-process stalls were
+`TextMergeBackpressureTimeout`: a merge refused at the tip
+(`IndexScopeChanged`) was planned again from the same stale view while a
+producer waited for it; it now refreshes the index from the tip first.
+
+Next, from the same profile: groups now average about one write (each pays
+both redo barriers), full_index catch-up runs for writes not served inline,
+and merges run about once per six writes.
+
 ## Status
 
 | change | state |
