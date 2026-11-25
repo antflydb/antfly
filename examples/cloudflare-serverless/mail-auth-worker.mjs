@@ -132,13 +132,43 @@ export class MailAuth extends DurableObject {
       return mailbox;
     });
   }
+  async personalMailbox(user) {
+    const loginDomain = this.env.MAIL_ACCESS_PERSONAL_LOGIN_DOMAIN;
+    if (!loginDomain) return null;
+    const [local, domain, extra] = user.email.toLowerCase().split("@");
+    if (extra !== undefined || domain !== loginDomain || !/^[a-z0-9][a-z0-9._-]{0,62}$/.test(local)) return null;
+    const alias = address(local + "@" + this.env.MAIL_DOMAIN);
+    const membership = "mail-access-personal/v1/" + (await digest(user.id));
+    return this.store.transaction(async (tx) => {
+      const existing = await tx.get(membership);
+      if (existing) return existing;
+      const key = "mail-alias/v1/" + alias;
+      if (alias === address(this.env.MAIL_TEAM_ADDRESS) || await tx.get(key)) return null;
+      const id = crypto.randomUUID();
+      const mailbox = { id, address: alias };
+      await tx.put(membership, mailbox);
+      await tx.put(key, mailbox);
+      await tx.put("mail-directory/v1/" + id, id);
+      return mailbox;
+    });
+  }
   async session(headerEntries) {
     if (this.access) {
-      const token = new Headers(headerEntries).get("Cf-Access-Jwt-Assertion");
+      const headers = new Headers(headerEntries);
+      const token = headers.get("Cf-Access-Jwt-Assertion");
       let accessError;
       const user = await accessIdentity(token, this.access, (reason) => { accessError = reason; });
+      let session = null;
+      if (user) {
+        const scope = headers.get("X-Antfly-Mailbox") ?? "team";
+        const team = await this.teamMailbox();
+        const personal = await this.personalMailbox(user);
+        const mailbox = scope === "team" ? team : scope === "personal" ? personal : null;
+        if (mailbox) session = { user, mailbox, auth: "access", mailboxes: { team, personal } };
+        else accessError = "MailboxNotAvailable";
+      }
       return {
-        session: user ? { user, mailbox: await this.teamMailbox(), auth: "access" } : null,
+        session,
         cookies: [],
         ...(accessError ? { accessError } : {}),
       };
@@ -168,8 +198,8 @@ export class MailAuth extends DurableObject {
     return { session: { user, mailbox }, cookies };
   }
   async recipient(to) {
-    if (this.access) return address(to) === address(this.env.MAIL_TEAM_ADDRESS) ? this.teamMailbox() : null;
-    await this.ensureReady();
+    if (this.access && address(to) === address(this.env.MAIL_TEAM_ADDRESS)) return this.teamMailbox();
+    if (!this.access) await this.ensureReady();
     return this.store.transaction((tx) => tx.get("mail-alias/v1/" + address(to)));
   }
   async mailboxes() {

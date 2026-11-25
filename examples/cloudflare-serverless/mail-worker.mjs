@@ -162,7 +162,9 @@ export default {
     };
     const reply = (body, status = 200) => withCookies(response(body, status));
     try {
-      const result = await takeRpcData(env.AUTH_SERVICE.session([...request.headers]));
+      const authHeaders = new Headers(request.headers);
+      authHeaders.set("X-Antfly-Mailbox", url.searchParams.get("mailbox") ?? "team");
+      const result = await takeRpcData(env.AUTH_SERVICE.session([...authHeaders]));
       cookies = result.cookies;
       const session = result.session;
       if (!session) return reply({ error: result.accessError ?? "SignInRequired" }, 401);

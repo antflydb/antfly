@@ -99,8 +99,15 @@ function status(text, error = false, timeout = error ? 0 : 5000) {
   $("status").classList.toggle("error", error);
   if (text && timeout) statusTimer = setTimeout(() => ($("status").textContent = ""), timeout);
 }
+const mailboxScope = new URLSearchParams(location.search).get("mailbox") === "personal" ? "personal" : "team";
+function mailboxPath(path) {
+  if (mailboxScope !== "personal") return path;
+  const url = new URL(path, location.origin);
+  url.searchParams.set("mailbox", "personal");
+  return url.pathname + url.search;
+}
 async function api(path, body, method = body ? "POST" : "GET") {
-  const result = await fetch(path, {
+  const result = await fetch(mailboxPath(path), {
     method,
     headers: body ? { "Content-Type": "application/json" } : {},
     ...(body ? { body: JSON.stringify(body) } : {}),
@@ -360,7 +367,7 @@ async function openMessage(id) {
     for (const part of message.attachments) {
       const link = document.createElement("a");
       link.className = "attachment";
-      link.href = "/mail/messages/" + id + "/attachments/" + part.index;
+      link.href = mailboxPath("/mail/messages/" + id + "/attachments/" + part.index);
       link.download = part.filename;
       link.innerHTML = '<svg class="icon" aria-hidden="true"><use href="#i-clip"/></svg>';
       link.append(text("span", part.filename), span("size", size(part.size)));
@@ -497,6 +504,16 @@ async function refresh() {
   $("mail").hidden = !me;
   $("logout").hidden = !me;
   $("identity").textContent = $("identity").title = me?.user.email ?? "";
+  const switcher = $("mailbox-switcher");
+  if (switcher) {
+    switcher.hidden = !me?.mailboxes?.personal || offline;
+    switcher.value = mailboxScope;
+    switcher.onchange = () => {
+      const url = new URL(location.href);
+      url.searchParams.set("mailbox", switcher.value);
+      location.assign(url);
+    };
+  }
   if (me) {
     $("address").textContent = $("address").title = me.mailbox.address;
     $("local").hidden = !localSupported();

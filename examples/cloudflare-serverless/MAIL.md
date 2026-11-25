@@ -285,3 +285,11 @@ has approved keeping offline copies on staff devices.
 
 This mode supports one shared inbox per deployment. Mailbox switching,
 assignments and per-user unread state are separate work.
+
+Set `MAIL_ACCESS_PERSONAL_LOGIN_DOMAIN=antfly.io` on the auth Worker to
+offer personal inboxes alongside the shared inbox. On first authenticated
+access, an eligible `name@antfly.io` identity gets `name@antfly.ai` if the
+address is available. Ownership follows the stable Access subject. A
+different subject cannot claim an address already provisioned to another
+user. Add an exact Email Routing rule for each personal address that should
+receive external mail. Select the inbox in the web app before composing.
