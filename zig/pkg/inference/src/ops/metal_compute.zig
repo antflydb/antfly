@@ -5417,7 +5417,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var linear_it = self.dynamic_linear_slots.iterator();
         while (linear_it.next()) |entry| {
             const key = entry.key_ptr.*;
-            if (key.weight_buf == dense_identity or key.bias_buf == dense_identity or
+            if (key.weight_buf == dense_identity or (key.bias_buf != 0 and key.bias_buf == dense_identity) or
                 (quantized_identity != 0 and
                     (key.weight_buf == quantized_identity or key.quantized_storage == quantized_identity)))
             {
@@ -6821,8 +6821,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return gop.value_ptr.*;
     }
 
-    // Final-address synchronous CT view. Prepared slots copy bias bytes and
-    // retain only the stable zero-array identity, never this Buf or shape.
+    // Final-address synchronous CT view. Prepared slots copy the zero bytes.
+    // Output width identifies the canonical zero bias in preparation keys.
     fn borrowedZeroBiasBuf(self: *MetalCompute, buf: *Buf, shape: *[1]i64, out_dim: usize) !CT {
         const data = try self.getOrInsertZeroBias(out_dim);
         shape.* = .{@intCast(out_dim)};
@@ -8284,7 +8284,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .weight_value = parameterIdentity(weight_buf),
             .bias_value = parameterIdentity(bias_buf),
             .weight_buf = if (quantized_storage) |storage| @intFromPtr(storage) else dynamicLinearDenseBufferKey(weight_buf),
-            .bias_buf = dynamicLinearDenseBufferKey(bias_buf),
+            .bias_buf = if (bias_buf.canonical_zero_bias) 0 else dynamicLinearDenseBufferKey(bias_buf),
             .quantized_storage = if (quantized_storage) |storage| @intFromPtr(storage) else 0,
             .in_dim = in_dim,
             .out_dim = out_dim,
@@ -12429,7 +12429,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (known.implementation.context != @as(*anyopaque, @ptrCast(compute)) or !acceptsPhysicalImplementation(known.implementation.table)) return null;
             }
             const linear = descriptor.operation.linear;
-            return compute.assignedDenseLinearKey(linear, bindings[1].tensor.value, if (linear.bias) bindings[2].tensor.value else null);
+            return assignedDenseLinearKey(linear, bindings[1].tensor.value, if (linear.bias) bindings[2].tensor.value else null);
         }
         fn directInputs(compute: *MetalCompute, descriptor: *const ops.kernel_descriptor.Descriptor, bindings: []const route.Binding, facts: *[3]route.Binding, host_planes: *[2]@import("../execution/storage_ownership.zig").Plane) ?[]const route.Binding {
             @memcpy(facts[0..bindings.len], bindings);
@@ -12538,7 +12538,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (self.compute != compute or !self.pinValid()) return error.PreparedKernelBindingChanged;
             try @import("../execution/assigned_kernel_route.zig").validateDescriptor(&self.direct, request.descriptor);
             const linear = request.descriptor.operation.linear;
-            const key = compute.assignedDenseLinearKey(linear, request.inputs[1], if (linear.bias) request.inputs[2] else null) orelse return error.PreparedKernelBindingChanged;
+            const key = assignedDenseLinearKey(linear, request.inputs[1], if (linear.bias) request.inputs[2] else null) orelse return error.PreparedKernelBindingChanged;
             const ready = if (owned.requirements.opaque_workspace)
                 assignedMpsRowsReady(compute, self.slot, linear)
             else
@@ -13580,7 +13580,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (fact != .tensor or fact.tensor.implementation.context != ctx or !acceptsPhysicalImplementation(fact.tensor.implementation.table)) continue;
                 break :bias fact.tensor.value;
             } else null;
-            const key = self.assignedDenseLinearKey(descriptor.operation.linear, known.value, bias) orelse continue;
+            const key = assignedDenseLinearKey(descriptor.operation.linear, known.value, bias) orelse continue;
             const slot = self.assignedDenseLinearSlot(key);
             try watched.append(request.allocator, .{ .key = key, .slot = slot, .declaration = if (slot) |value| self.provider_impl.privateSlotDeclaration(.linear, value) else 0 });
         }
@@ -13755,7 +13755,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (operand.implementation.context != cb.ptr or !acceptsPhysicalImplementation(operand.implementation.table)) return null;
                 break :bias operand.value;
             } else null;
-            const key = self.assignedDenseLinearKey(linear, source.value, bias) orelse return null;
+            const key = assignedDenseLinearKey(linear, source.value, bias) orelse return null;
             const slot = self.assignedDenseLinearSlot(key) orelse return null;
             members[index] = .{ .slot = slot, .geometry = linear };
         }
@@ -14185,7 +14185,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return std.math.add(usize, try std.math.add(usize, @sizeOf(PackedProjectionEntry), try ProjectionPack.Owner.requestedMetadataBytes()), metal_runtime.antfly_metal_packed_projection_metadata_bytes());
     }
 
-    fn assignedDenseLinearKey(self: *MetalCompute, linear: ops.kernel_descriptor.Linear, weight_ct: CT, bias_ct: ?CT) ?DynamicLinearSlotKey {
+    fn assignedDenseLinearKey(linear: ops.kernel_descriptor.Linear, weight_ct: CT, bias_ct: ?CT) ?DynamicLinearSlotKey {
         const weight = toBuf(weight_ct);
         if (weight.mutable_state or bufHasAnyQuantizedStorage(weight) or weight.native_dense_dtype != null) return null;
         if (linear.bias) {
@@ -14193,8 +14193,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (toBuf(bias).mutable_state) return null;
             return dynamicLinearSlotKey(weight_ct, bias, linear.in_dim, linear.out_dim);
         }
-        const zeros = self.zero_bias_cache.get(linear.out_dim) orelse return null;
-        return .{ .weight_value = parameterIdentity(weight), .bias_value = .{ .value = 0, .version = 0 }, .weight_buf = dynamicLinearDenseBufferKey(weight), .bias_buf = @intFromPtr(zeros.ptr), .quantized_storage = 0, .in_dim = linear.in_dim, .out_dim = linear.out_dim };
+        return .{ .weight_value = parameterIdentity(weight), .bias_value = .{ .value = 0, .version = 0 }, .weight_buf = dynamicLinearDenseBufferKey(weight), .bias_buf = 0, .quantized_storage = 0, .in_dim = linear.in_dim, .out_dim = linear.out_dim };
     }
     fn assignedDenseLinearSlot(self: *MetalCompute, key: DynamicLinearSlotKey) ?usize {
         const entry = self.livePreparedSlot("dynamic_linear_slots", .linear, key) orelse return null;
@@ -14209,7 +14208,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn assignedLinearSlot(self: *MetalCompute, request: ops.kernel_descriptor.Invocation) ?usize {
         if (request.auxiliaries.len != 0) return null;
         const linear = request.descriptor.operation.linear;
-        const key = self.assignedDenseLinearKey(linear, request.inputs[1], if (linear.bias) request.inputs[2] else null) orelse return null;
+        const key = assignedDenseLinearKey(linear, request.inputs[1], if (linear.bias) request.inputs[2] else null) orelse return null;
         return self.assignedDenseLinearSlot(key);
     }
 
@@ -62714,6 +62713,17 @@ test "Gemma zero bias borrowed view uses cached data with no metadata allocation
     try std.testing.expect(view.data.ptr == data.ptr);
     try std.testing.expectEqualSlices(i64, &.{768}, view.logical_shape.?);
     for (view.data) |value| try std.testing.expectEqual(@as(f32, 0), value);
+
+    var separate_zeros: [768]f32 = @splat(0);
+    var other = view;
+    other.data = &separate_zeros;
+    const geometry = try ops.kernel_descriptor.Linear.init(1, 768, 768, false);
+    var weight = view;
+    weight.canonical_zero_bias = false;
+    const first_key = MetalCompute.dynamicLinearSlotKey(@ptrCast(&weight), ct, 768, 768);
+    const second_key = MetalCompute.dynamicLinearSlotKey(@ptrCast(&weight), @ptrCast(&other), 768, 768);
+    try std.testing.expectEqualDeep(first_key, second_key);
+    try std.testing.expectEqualDeep(first_key, MetalCompute.assignedDenseLinearKey(geometry, @ptrCast(&weight), null).?);
 }
 
 test "projection metadata exact capacity rejects duplicate widths and receiver authority before access" {
