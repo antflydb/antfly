@@ -455,6 +455,7 @@ pub const Pipeline = struct {
     prefill_rows: u32,
     chunk_rows: u32,
     speculate: bool,
+    draft_verification: decoder.Request.DraftVerification,
     speculation_context_disabled: bool,
     options: ChatOptions,
     reasoning_ctx: ?*anyopaque = null,
@@ -486,7 +487,12 @@ pub const Pipeline = struct {
             config.speculative_k > dspark.proposal_rows)) return error.UnsupportedInkling2Speculation;
         if (speculate and context > model.draft.?.max_capacity) return error.InvalidInkling2Context;
         const batch_prompt = model.fast_matvec and prompt.count() > decoder.prefill_chunk_rows;
-        const prefill_rows: u32 = if (batch_prompt or (speculate and block_verification)) @intCast(@min(decoder.prefill_chunk_rows, context)) else 1;
+        const prefill_rows: u32 = if (batch_prompt) @intCast(@min(decoder.prefill_chunk_rows, context)) else 1;
+        const draft_verification: decoder.Request.DraftVerification = if (block_verification and
+            @import("antfly_platform").env.getenvBool("ANTFLY_INFERENCE_INKLING_BATCHED_SPECULATION"))
+            .batched
+        else
+            .exact_greedy;
         // The row-wise verifier must start from the same prefill as regular
         // decoding. Reserve its draft block capacity independently.
         const decode_rows: u32 = if (speculate) dspark.block_rows else if (model.fast_matvec and usesGreedy(config)) max_active_requests else 1;
@@ -501,6 +507,7 @@ pub const Pipeline = struct {
             .prefill_rows = prefill_rows,
             .chunk_rows = @max(prefill_rows, @min(decode_rows, context)),
             .speculate = speculate,
+            .draft_verification = draft_verification,
             .speculation_context_disabled = auto_context_disabled,
             .options = options,
         };
@@ -553,7 +560,7 @@ pub const Pipeline = struct {
         if (draft) |active| {
             try active.beginRequest(self.context_tokens, request.append_capacity);
             errdefer active.endRequest();
-            try request.attachDraft(active);
+            try request.attachDraftWithVerification(active, self.draft_verification);
         }
     }
 
@@ -623,7 +630,7 @@ pub const Pipeline = struct {
         const session = self.session.withAdmissionControl(self.control);
         const pixels = @as(usize, self.prompt.image_width) * self.prompt.image_height;
         const plan = try decoder.RequestPlan.init(&model.model, self.context_tokens, self.chunk_rows);
-        const amount = try plan.memory(self.speculate);
+        const amount = try plan.memory(self.speculate, self.draft_verification == .batched);
         const draft_kv = if (self.speculate) dspark.Draft.requestKvBytes(self.context_tokens) else 0;
         const image_workspace = if (self.prompt.image != null) vision.requestWorkspaceBytes(self.prompt.imageRows(), pixels) else 0;
         var admission = try session.admitRetainedStateWithWorkspace(

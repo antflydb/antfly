@@ -331,14 +331,14 @@ pub const RequestPlan = struct {
         };
     }
 
-    pub fn memory(self: RequestPlan, speculative: bool) !struct { host: usize, kv: usize, workspace: usize } {
+    pub fn memory(self: RequestPlan, speculative: bool, batched_verification: bool) !struct { host: usize, kv: usize, workspace: usize } {
         var workspace = self.attention_space.bytes + self.shortlist_bytes;
         for (self.temp_bytes.values) |bytes| workspace = try std.math.add(usize, workspace, bytes);
         const legacy_floor = 64 * 1024 * 1024 + 2 * self.page_table_bytes +
             self.temp_bytes.get(.relative) + self.temp_bytes.get(.router) + self.temp_bytes.get(.routed);
         if (speculative) {
             workspace = try std.math.add(usize, workspace, dspark.Draft.requestWorkspaceBytes(self.chunk_rows));
-            if (speculativeBlockContextSupported(self.model.text, self.max_tokens))
+            if (batched_verification and speculativeBlockContextSupported(self.model.text, self.max_tokens))
                 workspace = try std.math.add(usize, workspace, verificationHistoryBytes(self.model.text));
         }
         return .{
@@ -386,6 +386,7 @@ pub const Request = struct {
     history: DeviceBuffer = .{},
     verification_history: DeviceBuffer = .{},
     record_history: bool = false,
+    batched_verification: bool = false,
     draft: ?*dspark.Draft = null,
     temps: Weights(Temp) = @splat(.{}),
     history_side: usize = 0,
@@ -458,13 +459,20 @@ pub const Request = struct {
     /// Attach before the first append so every prompt row can seed the
     /// drafter. Request graphs borrow the drafter's feature staging planes.
     pub fn attachDraft(self: *Request, draft: *dspark.Draft) !void {
+        return self.attachDraftWithVerification(draft, .batched);
+    }
+
+    pub const DraftVerification = enum { exact_greedy, batched };
+
+    pub fn attachDraftWithVerification(self: *Request, draft: *dspark.Draft, verification: DraftVerification) !void {
         if (self.position() != 0 or self.draft != null or draft.ctx != self.model.ctx or
             draft.capacity != self.max_tokens or draft.position != 0) return error.InvalidInkling2DraftContext;
         const text = self.model.text;
         for (draft.stage) |plane| {
             if (plane.len < @as(usize, self.append_capacity) * text.hidden_size * 2) return error.InvalidInkling2DraftContext;
         }
-        if (speculativeBlockContextSupported(text, self.max_tokens))
+        self.batched_verification = verification == .batched and speculativeBlockContextSupported(text, self.max_tokens);
+        if (self.batched_verification)
             self.verification_history = try DeviceBuffer.allocWithPurpose(self.model.ctx, verificationHistoryBytes(text), .command_workspace);
         self.draft = draft;
     }
@@ -941,8 +949,7 @@ pub const Request = struct {
         tokens[0] = anchor;
         @memcpy(tokens[1..][0..proposed.len], proposed);
         const input = tokens[0 .. proposed.len + 1];
-        if (!speculativeBlockContextSupported(self.model.text, self.max_tokens))
-            return self.verifyDraftGreedy(input);
+        if (!self.batched_verification) return self.verifyDraftGreedy(input);
         var result: Verification = undefined;
         try self.run(.{ .tokens = input }, @intCast(input.len), .{ .verify = &result });
         return result;

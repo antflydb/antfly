@@ -480,7 +480,7 @@ test "CUDA Inkling 2 runs the fixed loop with all released text weights" {
     var request: decoder.Request = undefined;
     const context_limit = 18;
     const plan = try decoder.RequestPlan.init(&model, context_limit, 1);
-    const amounts = try plan.memory(false);
+    const amounts = try plan.memory(false, false);
     const before = ctx.device_allocations.snapshot().physical_live;
     try request.initWithPlan(allocator, plan);
     defer request.deinit() catch @panic("unable to drain Inkling decode request");
