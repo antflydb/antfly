@@ -233,63 +233,66 @@ kernel void antfly_routed_block_scaled_bf16_grouped(
     device const uint *groups [[buffer(7)]],
     constant RoutedBlockScaledParams &p [[buffer(8)]],
     uint2 group [[threadgroup_position_in_grid]],
+    uint warp [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
 ) {
-    const uint first_col = group.x * 8u, route = group.y;
+    const uint column = group.x * 4u + warp;
+    const uint route = group.y;
+    if (column >= p.output_width) return;
     const device uint *entry = groups + ulong(route) * 9u;
     const uint count = entry[0];
     if (count == 0u) return;
     const uint expert = expert_ids[route];
     if (expert >= p.expert_count) {
-        for (uint i = lane; i < count * 8u; i += 32u) {
-            const uint destination = count == 1u ? route : entry[1u + i / 8u];
-            output[ulong(destination) * p.output_width + first_col + i % 8u] = bfloat(0.0f);
-        }
-        return;
-    }
-    const bool fp4 = p.format == 0u;
-    const uint packed_width = fp4 ? p.input_width / 2u : p.input_width;
-    const uint blocks = p.input_width / (fp4 ? 16u : 32u);
-    const ulong first_weight = ulong(expert) * p.output_width + first_col;
-    const float outer = fp4 ? outer_amax[expert] / outer_denominator[0] : 1.0f;
-    if (count == 1u) {
-        const device bfloat *a = input + ulong(route / p.input_repeat) * p.input_width;
-        for (uint c = 0u; c < 8u; ++c) {
-            const device uchar *w = values + (first_weight + c) * packed_width;
-            const device uchar *s = scales + (first_weight + c) * blocks;
-            float sum = 0.0f;
-            for (uint k = lane; k < p.input_width; k += 32u)
-                sum = fma(float(a[k]), float(antfly_routed_weight(w, s, k, fp4, outer)), sum);
-            const float dot = simd_sum(sum);
-            if (lane == 0u) output[ulong(route) * p.output_width + first_col + c] = bfloat(dot);
+        if (lane == 0u) {
+            for (uint i = 0u; i < count; ++i) {
+                const uint destination = count == 1u ? route : entry[1u + i];
+                output[ulong(destination) * p.output_width + column] = bfloat(0.0f);
+            }
         }
         return;
     }
 
-    threadgroup bfloat activation_tile[8][32];
-    threadgroup bfloat weight_tile[8][32];
-    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
-    for (uint base = 0u; base < p.input_width; base += 32u) {
-        const uint k = base + lane;
-        for (uint i = 0u; i < 8u; ++i) {
-            const uint src = i < count ? entry[1u + i] / p.input_repeat : 0u;
-            activation_tile[i][lane] = i < count ? input[ulong(src) * p.input_width + k] : bfloat(0.0f);
-            const device uchar *w = values + (first_weight + i) * packed_width;
-            const device uchar *s = scales + (first_weight + i) * blocks;
-            weight_tile[i][lane] = antfly_routed_weight(w, s, k, fp4, outer);
+    const bool fp4 = p.format == 0u;
+    const uint packed_width = fp4 ? p.input_width / 2u : p.input_width;
+    const uint blocks = p.input_width / (fp4 ? 16u : 32u);
+    const ulong weight_row = ulong(expert) * p.output_width + column;
+    const device uchar *weight = values + weight_row * packed_width;
+    const device uchar *weight_scales = scales + weight_row * blocks;
+    const float outer = fp4 ? outer_amax[expert] / outer_denominator[0] : 1.0f;
+    if (count == 1u) {
+        const device bfloat *activation = input + ulong(route / p.input_repeat) * p.input_width;
+        float accumulator = 0.0f;
+        for (uint k = lane; k < p.input_width; k += 32u) {
+            const float w = float(antfly_routed_weight(weight, weight_scales, k, fp4, outer));
+            accumulator = fma(float(activation[k]), w, accumulator);
         }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint tile = 0u; tile < 32u; tile += 8u) {
-            simdgroup_matrix<bfloat, 8, 8> a, b;
-            simdgroup_load(a, &activation_tile[0][tile], 32u);
-            simdgroup_load(b, &weight_tile[0][tile], 32u, ulong2(0, 0), true);
-            simdgroup_multiply_accumulate(acc, a, b, acc);
-        }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
+        const float dot = simd_sum(accumulator);
+        if (lane == 0u) output[ulong(route) * p.output_width + column] = bfloat(dot);
+        return;
     }
-    threadgroup float dots[64];
-    simdgroup_store(acc, dots, 8u);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = lane; i < count * 8u; i += 32u)
-        output[ulong(entry[1u + i / 8u]) * p.output_width + first_col + i % 8u] = bfloat(dots[i]);
+
+    uint rows[8];
+    float accum[8] = {0.0f};
+    ulong offsets[8];
+    #pragma unroll
+    for (uint i = 0u; i < 8u; ++i) {
+        rows[i] = i < count ? entry[1u + i] : 0u;
+        offsets[i] = ulong(rows[i] / p.input_repeat) * p.input_width;
+    }
+    for (uint k = lane; k < p.input_width; k += 32u) {
+        const float w = float(antfly_routed_weight(weight, weight_scales, k, fp4, outer));
+        // Keep the per-lane accumulation and reduction order of the one-row
+        // kernel. Only the decoded weight is shared across grouped rows.
+        #pragma unroll
+        for (uint i = 0u; i < 8u; ++i)
+            if (i < count) accum[i] = fma(float(input[offsets[i] + k]), w, accum[i]);
+    }
+    #pragma unroll
+    for (uint i = 0u; i < 8u; ++i) {
+        if (i < count) {
+            const float dot = simd_sum(accum[i]);
+            if (lane == 0u) output[ulong(rows[i]) * p.output_width + column] = bfloat(dot);
+        }
+    }
 }

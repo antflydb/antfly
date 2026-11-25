@@ -532,8 +532,9 @@ test "Inkling Metal resident decoder runs the released text checkpoint" {
         }
         try std.testing.expect(logits[next] > 0);
         try std.testing.expectEqual(position, request.state.sequence.committed_tokens);
-        std.debug.print("Inkling Metal text position={d} token={d} next={d} peak={d:.5} latency_ms={d:.3}\n", .{
-            position, token, next, logits[next], @as(f64, @floatFromInt(time.monotonicNs() - step_start)) / 1e6,
+        std.debug.print("Inkling Metal text position={d} token={d} next={d} peak={d:.5} latency_ms={d:.3} gpu_ms={d:.3}\n", .{
+            position,                                                                token, next, logits[next], @as(f64, @floatFromInt(time.monotonicNs() - step_start)) / 1e6,
+            @as(f64, @floatFromInt(metal.lastFrameGpuNanos(decoder.runtime))) / 1e6,
         });
         token = @intCast(next);
     }
@@ -574,6 +575,8 @@ test "Inkling Metal resident decoder runs the released text checkpoint" {
         try std.testing.expect(std.math.isFinite(actual));
         max_delta = @max(max_delta, @abs(expected - actual));
     }
+    if (!platform.env.getenvBool("ANTFLY_METAL_BF16_TILED_PROJECTION"))
+        try std.testing.expectEqualSlices(f32, reference, candidate);
     std.debug.print("Inkling Metal prefill rows={d} serial_ms={d:.3} batched_ms={d:.3} peak_id={d} max_logit_delta={d:.5}\n", .{
         prefix.len, @as(f64, @floatFromInt(serial_ns)) / 1e6, @as(f64, @floatFromInt(batch_ns)) / 1e6, argmax(candidate), max_delta,
     });
@@ -581,16 +584,31 @@ test "Inkling Metal resident decoder runs the released text checkpoint" {
     if (groupedPrefillEnabled()) {
         var tokens: [grouped_prefill_chunk_rows]i32 = undefined;
         for (&tokens, 0..) |*id, i| id.* = prefix[i % prefix.len];
+        var baseline_plan = try RequestPlan.initPrefill(decoder, tokens.len + 1, prefill_chunk_rows);
+        baseline_plan.prefill.?.group_elements = 0;
+        var baseline: Request = undefined;
+        try baseline.initWithPlan(a, decoder, baseline_plan);
+        defer baseline.deinit();
+        const base_start = time.monotonicNs();
+        var offset: usize = 0;
+        while (offset < tokens.len) : (offset += prefill_chunk_rows)
+            try baseline.appendTokens(tokens[offset..][0..prefill_chunk_rows]);
+        const baseline_ns = time.monotonicNs() - base_start;
+        const baseline_logits = try baseline.step(last);
+
         var large: Request = undefined;
         try large.initWithPlan(a, decoder, try RequestPlan.initPrefill(decoder, tokens.len + 1, tokens.len));
         defer large.deinit();
         const started = time.monotonicNs();
         try large.appendTokens(&tokens);
         const elapsed = time.monotonicNs() - started;
-        const next = try large.stepGreedy(last);
+        const grouped = try large.step(last);
+        try std.testing.expectEqual(argmax(baseline_logits), argmax(grouped));
+        if (!platform.env.getenvBool("ANTFLY_METAL_BF16_TILED_PROJECTION"))
+            try std.testing.expectEqualSlices(f32, baseline_logits, grouped);
         try std.testing.expectEqual(tokens.len + 1, large.state.sequence.committed_tokens);
-        std.debug.print("Inkling Metal grouped prefill rows={d} latency_ms={d:.3} next={d}\n", .{
-            tokens.len, @as(f64, @floatFromInt(elapsed)) / 1e6, next,
+        std.debug.print("Inkling Metal grouped prefill rows={d} default_ms={d:.3} grouped_ms={d:.3} next={d}\n", .{
+            tokens.len, @as(f64, @floatFromInt(baseline_ns)) / 1e6, @as(f64, @floatFromInt(elapsed)) / 1e6, argmax(grouped),
         });
     }
 

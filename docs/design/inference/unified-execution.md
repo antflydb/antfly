@@ -923,15 +923,18 @@ and changed some logits by up to 1.54. The tiles require
 pending.
 
 The grouped routed projection builds a device-side map of tokens sharing an
-expert and reuses it across the gate/up and down projections. It matched
-the scalar kernel exactly on a synthetic route mix with 60 grouped and
-four scalar routes. In the released-model suite, the final prefill visit
-grouped 102 of 128 routes. Measured prefill took 371.49 ms for 16 tokens
-and 1,014.57 ms for 64 tokens. The 16-token candidate selected the same
-next token as the 530.86 ms default path and shifted individual logits by
-up to 1.26. All 84 tests passed with the grouped candidate enabled through
-`ANTFLY_METAL_GROUPED_ROUTED_PREFILL=1`. Accuracy and HTTP latency across a
-broader workload remain qualification gates.
+expert and reuses it across the gate/up and down projections. Its precise
+variant shares the decoded weight while preserving scalar accumulation
+order. All 294,912 BF16 outputs matched bit for bit on the synthetic
+model-width fixture, where the grouped path took 2.86 ms versus 5.51 ms for
+the scalar kernel.
+
+On the released checkpoint, the 16-token grouped prefill took 438.86 ms.
+The 64-token prefill took 1,312.42 ms versus 2,089.60 ms for four ungrouped
+16-token chunks. Both comparisons matched the complete next-token logit
+vectors. All 84 tests passed with grouping enabled. The final two warm
+decode steps took about 62 ms wall time and 59–60 ms of GPU time, so most
+decode latency is on the device.
 
 ### Official Gemma 4 E2B QAT serving comparison
 
