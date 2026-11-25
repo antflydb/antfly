@@ -17397,11 +17397,20 @@ fn recycleTempPinnedSlotsUnlocked(self: *CudaCompute, reuse: TempSlotReuse) !voi
 }
 
 fn installLearnedTempArenaPlan(self: *CudaCompute) !bool {
-    const lengths = self.temp_arena_planner.candidate_lengths.items;
-    if (!self.temp_arena_planner.active or lengths.len == 0 or lengths.len > max_temp_pinned_slots) {
-        return error.InvalidCudaState;
-    }
-    const admission = self.temp_arena_planner.admitCandidate(cudaTempArenaAdmissionBudgetBytes(self));
+    const proposal = proposal: {
+        while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.temp_buffer_mutex.unlock();
+        const planner = &self.temp_arena_planner;
+        const count = planner.candidate_lengths.items.len;
+        if (!planner.active or !planner.installation_pending or count == 0 or count > max_temp_pinned_slots)
+            return error.InvalidCudaState;
+        break :proposal .{
+            .admission = planner.admitCandidate(cudaTempArenaAdmissionBudgetBytes(self)),
+            .count = count,
+            .sequence = planner.allocation_seq_base,
+        };
+    };
+    const admission = proposal.admission;
     if (!admission.admitted) {
         // Admission is evaluated before installing or allocating a single new
         // pinned address. Destroy any older graph/arena state as well: its
@@ -17410,7 +17419,7 @@ fn installLearnedTempArenaPlan(self: *CudaCompute) !bool {
         std.log.warn(
             "cuda_temp_arena_plan: admission_denied slots={d} physical_high_water_bytes={d} largest_slot_bytes={d} budget_bytes={d} overflowed={}",
             .{
-                lengths.len,
+                proposal.count,
                 admission.physical_high_water_bytes,
                 admission.largest_slot_bytes,
                 admission.budget_bytes,
@@ -17425,13 +17434,21 @@ fn installLearnedTempArenaPlan(self: *CudaCompute) !bool {
 
     // The boundary proposed the ABI. Publish its usable slot mappings only
     // if all descriptor capacity and retirement checks succeed.
-    errdefer self.temp_arena_planner.abandonInstallation();
+    const planner = &self.temp_arena_planner;
+    const lengths = planner.candidate_lengths.items;
+    if (!planner.installation_pending or planner.allocation_seq_base != proposal.sequence or lengths.len != proposal.count) return false;
+    if (planner.disabled or planner.pinned_validation_failed) {
+        planner.abandonInstallation();
+        return false;
+    }
+    errdefer planner.abandonInstallation();
     try self.temp_pinned_slots.ensureTotalCapacity(self.allocator, lengths.len);
     try recycleTempPinnedSlotsUnlocked(self, .{ .plan = lengths });
     try ensureTempPinnedSlots(self, lengths.len);
     for (lengths, 0..) |len, index| {
         self.temp_pinned_slots.items[index].requested_len = len;
     }
+    planner.publishInstallation();
     return true;
 }
 
@@ -19210,6 +19227,7 @@ test "CUDA decoder workspace recycling does not grow a full cache" {
     try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0x2000), compute.temp_pinned_slots.items[0].buffer.ptr);
 
     compute.temp_arena_planner.active = true;
+    compute.temp_arena_planner.installation_pending = true;
     try std.testing.expectError(error.OutOfMemory, installLearnedTempArenaPlan(&compute));
     try std.testing.expect(!compute.temp_arena_planner.active);
     try std.testing.expect(!compute.temp_arena_planner.ready_for_capture);
