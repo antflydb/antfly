@@ -269,6 +269,13 @@ completion without invalidating an existing retained query snapshot. Status
 observations are not certificates of extraction coverage for an arbitrary query
 snapshot.
 
+Hierarchy member navigation enumerates published logical members in the retained
+store even when a different source is incomplete. An empty member page is not a
+producer-completion certificate. Selected immutable chunk heads still shadow
+legacy rows and unpublished tails; staging data is not exposed as a logical
+member. Parent authorization, retention, cursor validation and cancellation
+checks continue to apply.
+
 Antfly-grep searches available artifact content when the index is queryable. It
 retains the query snapshot across pages and checks the artifact binding before
 and after scanning. Incomplete source coverage emits a `coverage` JSON event with
