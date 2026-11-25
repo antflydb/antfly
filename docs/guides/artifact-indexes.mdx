@@ -9,6 +9,7 @@ order: 3
 - How do I search document-level and chunk-level embeddings in one index?
 - How do full-text sources select different content fields?
 - What identity does an artifact-backed result use?
+- How do I refresh an enrichment when a document in another table changes?
 - Which request forms are canonical, alternative, legacy, or deprecated?
 </Questions>
 
@@ -435,6 +436,111 @@ Antfly cannot infer a common vector space from an alias or matching dimensions.
 Use an immutable provider revision and, where supported by the provider, an
 explicit `model_identity` pin that can be verified against its response.
 Changing an alias without an enforceable revision is not a fenced model upgrade.
+
+## Keep an enrichment current with data from another table
+
+A support ticket summary can use both the ticket body and the customer's
+current plan. Declare the customer record as a live `context_sources` entry.
+When the plan changes, Antfly queues the affected summaries for regeneration.
+
+Run this example against an Antfly HTTP server with `OPENAI_API_KEY` set in
+the server's environment. The requests assume local development with
+authentication disabled. If your server requires authentication, include
+credentials with permission to create, write, and read both tables.
+
+### Create the tables and register the enrichment
+
+```bash
+api=http://127.0.0.1:8080/db/v1
+
+curl -fsS "$api/tables/context_customers" --json '{"num_shards":1}'
+curl -fsS "$api/tables/context_tickets" --json '{"num_shards":1}'
+
+curl -fsS "$api/tables/context_customers/batch" --json '{
+  "inserts": {"acme": {"plan": "Standard"}},
+  "sync_level": "write"
+}'
+
+curl -fsS -X PUT "$api/tables/context_tickets/artifacts/summary/enrichment" --json '{
+  "kind": "asset",
+  "field": "body",
+  "content_type": "application/json",
+  "producer": {
+    "type": "generator",
+    "config": {
+      "generator": {"provider": "openai", "model": "gpt-4.1"},
+      "output": "auto",
+      "output_schema": {
+        "type": "object",
+        "properties": {"summary": {"type": "string"}},
+        "required": ["summary"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "context_sources": {
+    "customer": {
+      "document": {"table": "context_customers", "key_from": "/customer_id"},
+      "fields": ["plan"],
+      "required": true,
+      "tracking": "live"
+    }
+  }
+}'
+```
+
+`key_from` is a JSON Pointer into each ticket. It supplies the customer
+document key. The generator receives the ticket body and the customer's
+`plan` field. The registration response reports `customer` as a live document source.
+
+### Write a ticket and check its dependencies
+
+```bash
+curl -fsS "$api/tables/context_tickets/batch" --json '{
+  "inserts": {
+    "ticket-1": {
+      "customer_id": "acme",
+      "body": "Summarize this ticket and include the customer plan from context. The customer cannot export a report."
+    }
+  },
+  "sync_level": "write"
+}'
+
+ticket="$api/tables/context_tickets/documents/ticket-1"
+deps="$ticket/artifacts/summary/dependencies"
+current="$deps?freshness=require_current&wait_timeout_ms=30000"
+
+curl --fail-with-body -sS -i "$current" &&
+  curl -fsS "$ticket?fields=_artifacts.summary"
+```
+
+The dependency endpoint reports the source, freshness, and retained lineage.
+When the first request returns HTTP `200` with `current: true`, the document
+read shows the generated value under `_artifacts.summary.value`. If the
+dependency request returns HTTP `409` with `artifact_not_current`, retry it
+before reading the generated value.
+
+### Update the customer and wait for the rebuilt summary
+
+```bash
+curl -fsS "$api/tables/context_customers/batch" --json '{
+  "inserts": {"acme": {"plan": "Premium"}},
+  "sync_level": "write"
+}'
+
+curl -fsS "$deps"
+curl --fail-with-body -sS -i "$current" &&
+  curl -fsS "$ticket?fields=_artifacts.summary"
+```
+
+The customer write can return while Antfly is still rebuilding the summary.
+The plain dependency request shows the available freshness and lineage
+immediately. Wait for `current: true` from the second request before comparing
+the new summary and lineage with the first version.
+
+Use live document lookups or supported filters when changes should trigger
+rebuilds. Ranked search, SQL, and Cypher context sources use snapshots and
+report `unverified`. Refresh those on a schedule or on demand.
 
 ## Next Steps
 
