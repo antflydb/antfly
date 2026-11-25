@@ -302,7 +302,7 @@ test "Inkling Metal attention weights preserve packed offsets and local/global l
     }
 }
 
-test "Inkling Metal attention weights drive a full local visit on device" {
+test "Inkling Metal attention weights drive local and global visits across committed pages" {
     if (!@import("build_options").enable_metal or !metal.metalDeviceAvailable()) return error.SkipZigTest;
     const a = std.testing.allocator;
     const kv = @import("../runtime/kv/hybrid_paged.zig");
@@ -314,12 +314,14 @@ test "Inkling Metal attention weights drive a full local visit on device" {
     const Fixture = struct {
         const zeros: [512]u16 = @splat(0);
         const ones: [128]u16 = @splat(0x3f80);
+        const dynamic = [4]u16{ 0x3f00, 0, 0, 0 };
 
         fn layerTensor(_: @This(), _: usize, name: []const u8) ![]const u8 {
             if (std.mem.eql(u8, name, "attn.wv_dv.weight") or std.mem.eql(u8, name, "attn.wo_ud.weight"))
                 return std.mem.asBytes(&ones);
-            if (std.mem.eql(u8, name, "attn.k_sconv.weight") or std.mem.eql(u8, name, "attn.v_sconv.weight"))
+            if (std.mem.endsWith(u8, name, "sconv.weight") or std.mem.endsWith(u8, name, "sconv.static_w"))
                 return std.mem.asBytes(&zeros);
+            if (std.mem.endsWith(u8, name, "sconv.weight_proj")) return std.mem.asBytes(&dynamic);
             if (std.mem.eql(u8, name, "attn.wq_du.weight") or std.mem.eql(u8, name, "attn.wk_dv.weight") or
                 std.mem.eql(u8, name, "attn.gate_attn.weight") or std.mem.eql(u8, name, "attn.q_l2_clip.scale"))
                 return std.mem.sliceAsBytes(zeros[0..128]);
@@ -336,84 +338,94 @@ test "Inkling Metal attention weights drive a full local visit on device" {
     text.sconv_kernel_size = 4;
     text.sliding_window_size = 1;
     text.log_scaling_alpha = 1;
+    text.log_scaling_n_floor = 1;
     text.qk_l2_clip_threshold = 1;
     text.rel_l2_clip_threshold = 1;
     text.rms_norm_eps = 0.000001;
     @memset(&text.local_layer_ids, 0);
-    var layer = try Layer.loadTensors(a, runtime, Fixture{}, text, 0);
-    defer layer.deinit();
+    for ([_]usize{ 0, 1 }) |index| {
+        var layer = try Layer.loadTensors(a, runtime, Fixture{}, text, index);
+        defer layer.deinit();
+        const group: kv.Group = if (layer.local) .sliding else .full;
+        const config: @import("../runtime/kv/pool.zig").KvPoolConfig = .{
+            .backend = .metal,
+            .dtype = .bf16,
+            .page_size_tokens = 1,
+            .num_layers_packed = 1,
+            .num_kv_heads = 1,
+            .head_dim = 128,
+            .store_cpu_bytes = false,
+        };
+        var full = try storage.initHost(a, config);
+        defer full.deinit(a);
+        var sliding = try storage.initHost(a, config);
+        defer sliding.deinit(a);
+        var sequence = try kv.Sequence.init(a, .{
+            .page_tokens = 1,
+            .max_tokens = 2,
+            .window_tokens = 1,
+            .max_append_tokens = 1,
+        }, &full, &sliding);
+        defer sequence.deinit();
 
-    const config: @import("../runtime/kv/pool.zig").KvPoolConfig = .{
-        .backend = .metal,
-        .dtype = .bf16,
-        .page_size_tokens = 1,
-        .num_layers_packed = 1,
-        .num_kv_heads = 1,
-        .head_dim = 128,
-        .store_cpu_bytes = false,
-    };
-    var full = try storage.initHost(a, config);
-    defer full.deinit(a);
-    var sliding = try storage.initHost(a, config);
-    defer sliding.deinit(a);
-    var sequence = try kv.Sequence.init(a, .{
-        .page_tokens = 1,
-        .max_tokens = 1,
-        .window_tokens = 1,
-        .max_append_tokens = 1,
-    }, &full, &sliding);
-    defer sequence.deinit();
-    var append = try sequence.prepareAppend(1);
-    defer append.abort();
-    var ids: [1]u32 = undefined;
-    _ = try append.stagedPageIds(.sliding, &ids);
-
-    var source = try upload(a, runtime, std.mem.sliceAsBytes(Fixture.ones[0..1]));
-    defer source.deinit();
-    var page_ids = try Tensor.deviceAllocateTyped(a, runtime, .i32, .shared, &.{1});
-    defer page_ids.deinit();
-    try page_ids.uploadBytes(std.mem.asBytes(&ids));
-    var scratch = try Tensor.deviceAllocateTyped(a, runtime, .f32, .shared, &.{130});
-    defer scratch.deinit();
-    const sizes = [_]usize{ 128, 1, 128, 1, 128, 128, 128, 1, 1, 128, 128, 128, 128, 128, 384, 384, 1 };
-    var buffers: [sizes.len]MetalTensor.MetalTensor = undefined;
-    var count: usize = 0;
-    defer for (buffers[0..count]) |*buffer| buffer.deinit();
-    for (&buffers, sizes) |*buffer, size| {
-        buffer.* = try allocate(a, runtime, size);
-        count += 1;
+        var source = try allocate(a, runtime, 1);
+        defer source.deinit();
+        var page_ids = try Tensor.deviceAllocateTyped(a, runtime, .i32, .shared, &.{2});
+        defer page_ids.deinit();
+        var scratch = try Tensor.deviceAllocateTyped(a, runtime, .f32, .shared, &.{130});
+        defer scratch.deinit();
+        const sizes = [_]usize{ 128, 1, 128, 1, 128, 128, 128, 1, 1, 128, 128, 128, 256, 256, 384, 384, 1, 4, 4, 384, 384 };
+        var buffers: [sizes.len]MetalTensor.MetalTensor = undefined;
+        var count: usize = 0;
+        defer for (buffers[0..count]) |*buffer| buffer.deinit();
+        for (&buffers, sizes) |*buffer, size| {
+            buffer.* = try allocate(a, runtime, size);
+            count += 1;
+        }
+        for ([_]u16{ 0x3f80, 0xbf80 }, 0..) |activation, position| {
+            var append = try sequence.prepareAppend(1);
+            defer append.abort();
+            var ids: [2]u32 = @splat(0);
+            _ = try append.stagedPageIds(group, &ids);
+            try page_ids.uploadBytes(std.mem.asBytes(&ids));
+            try source.uploadBytes(std.mem.asBytes(&activation));
+            try metal.beginFrame(runtime);
+            errdefer metal.cancelFrame(runtime) catch {};
+            try layer.encode(runtime, text, &append, .{ .query = &source, .key = &source, .value = &source }, &page_ids, .{
+                .key = &buffers[12],
+                .value = &buffers[13],
+            }, .{
+                .key = if (position == 0) null else &buffers[14],
+                .value = if (position == 0) null else &buffers[15],
+                .next_key = &buffers[14 + position * 5],
+                .next_value = &buffers[15 + position * 5],
+            }, .{
+                .projected = .{
+                    .query = &buffers[0],
+                    .relative = &buffers[1],
+                    .gate = &buffers[2],
+                    .sink = &buffers[3],
+                    .key = &buffers[4],
+                    .value = &buffers[5],
+                    .key_taps = if (layer.local) null else &buffers[17],
+                    .value_taps = if (layer.local) null else &buffers[18],
+                },
+                .normalized_query = &buffers[6],
+                .normalized_relative = &buffers[7],
+                .relative_logits = &buffers[8],
+                .staged_key = &buffers[9],
+                .staged_value = &buffers[10],
+                .heads = &buffers[11],
+                .attention_scratch = &scratch,
+            }, &buffers[16]);
+            try metal.submitFrame(runtime);
+            try metal.waitFrame(runtime);
+            append.commit();
+            var result: u16 = undefined;
+            try buffers[16].downloadBytesInto(std.mem.asBytes(&result));
+            // Global retains +1 and -1 values, while the one-token window sees only -1.
+            const expected: u16 = if (position == 0) 0x4200 else if (layer.local) 0xc200 else 0;
+            try std.testing.expectEqual(expected, result);
+        }
     }
-    try metal.beginFrame(runtime);
-    errdefer metal.cancelFrame(runtime) catch {};
-    try layer.encode(runtime, text, &append, .{ .query = &source, .key = &source, .value = &source }, &page_ids, .{
-        .key = &buffers[12],
-        .value = &buffers[13],
-    }, .{
-        .key = null,
-        .value = null,
-        .next_key = &buffers[14],
-        .next_value = &buffers[15],
-    }, .{
-        .projected = .{
-            .query = &buffers[0],
-            .relative = &buffers[1],
-            .gate = &buffers[2],
-            .sink = &buffers[3],
-            .key = &buffers[4],
-            .value = &buffers[5],
-        },
-        .normalized_query = &buffers[6],
-        .normalized_relative = &buffers[7],
-        .relative_logits = &buffers[8],
-        .staged_key = &buffers[9],
-        .staged_value = &buffers[10],
-        .heads = &buffers[11],
-        .attention_scratch = &scratch,
-    }, &buffers[16]);
-    try metal.submitFrame(runtime);
-    try metal.waitFrame(runtime);
-    append.commit();
-    var result: u16 = undefined;
-    try buffers[16].downloadBytesInto(std.mem.asBytes(&result));
-    try std.testing.expectEqual(@as(u16, 0x4200), result);
 }
