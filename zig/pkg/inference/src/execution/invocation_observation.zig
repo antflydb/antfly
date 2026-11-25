@@ -218,7 +218,7 @@ noinline fn observedInputs(comptime stages: bool, binding: Binding, inputs: anyt
     for (inputs) |input| {
         if (comptime stages) {
             if (input == .resident) input.resident.backend.registerTensorOwnershipObservation(input.resident.value);
-        } else if (!input.metadata_only) input.backend.registerTensorOwnershipObservation(input.value);
+        } else if (input.binding == .provider_tensor) input.backend.registerTensorOwnershipObservation(input.value);
     }
     const result = @call(.auto, callback, args) catch |err| {
         scope.error_name = @errorName(err);

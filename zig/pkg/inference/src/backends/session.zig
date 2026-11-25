@@ -36,10 +36,13 @@ fn unsupportedControlledRun(
 
 pub const ResidentInput = struct {
     value: ops.CT,
-    // Only a selected prepared stage can omit the tensor payload.
-    metadata_only: bool = false,
-    // A selected physical ingress plan consumes this host binding directly.
-    planned_host: ?*const Tensor = null,
+    /// Ordinary inputs hold a provider tensor. Only selected prepared stages
+    /// construct the other bindings, whose value must never be dereferenced.
+    binding: union(enum) {
+        provider_tensor,
+        omitted,
+        planned_host: *const Tensor,
+    } = .provider_tensor,
     backend: *const ops.ComputeBackend,
     estimated_bytes: usize = 0,
     shape: []const i64 = &.{},
@@ -930,7 +933,11 @@ pub const ShapeInputs = union(enum) {
         return switch (self) {
             .tensors, .host_shapes => .host_dense,
             .shapes => .unknown,
-            .resident_inputs => |v| if (v.values[i].planned_host != null) .host_dense else .{ .resident = v.values[i] },
+            .resident_inputs => |v| switch (v.values[i].binding) {
+                .provider_tensor => .{ .resident = v.values[i] },
+                .planned_host => .host_dense,
+                .omitted => .unknown,
+            },
             .stage_inputs => |v| switch (v.values[i]) {
                 .host => .host_dense,
                 .resident => |value| .{ .resident = value },
@@ -3250,7 +3257,7 @@ pub const Session = struct {
         const stage_backend = shared.stableBackend();
         for (inputs, self.inputInfo()) |input, info| switch (input) {
             .host => |host| if (!std.mem.eql(u8, host.name, info.name) or host.dtype != info.dtype) return false,
-            .resident => |value| if (value.metadata_only or value.planned_host != null or !ResidentInput.backendCompatible(value.backend, stage_backend)) return false,
+            .resident => |value| if (value.binding != .provider_tensor or !ResidentInput.backendCompatible(value.backend, stage_backend)) return false,
         };
         return true;
     }
@@ -5889,22 +5896,27 @@ pub const RunPermit = struct {
         defer if (allocate) allocator.free(resident);
         var initialized: usize = 0;
         defer for (inputs[0..initialized], resident[0..initialized]) |input, value| {
-            if (input == .host and !value.metadata_only) backend.free(value.value);
+            if (input == .host and value.binding == .provider_tensor) backend.free(value.value);
         };
-        var omitted_payload = false;
+        var needs_prepared_dispatch = false;
         for (inputs, resident, 0..) |*input, *value, index| {
             if (control) |active| try active.check();
-            if (input.* == .host) if (self.prepared) |*selected| if (!selected.executed and selected.stageInputUsesPlannedHost(index)) {
-                value.* = .{ .value = backend.ptr, .metadata_only = true, .planned_host = &input.host, .backend = backend, .shape = input.host.shape };
-                omitted_payload = true;
-                initialized += 1;
-                continue;
-            };
-            if (input.* == .host) if (self.prepared) |*selected| if (!selected.executed and selected.stageInputUnused(index)) {
-                value.* = .{ .value = backend.ptr, .metadata_only = true, .backend = backend, .shape = input.host.shape };
-                omitted_payload = true;
-                initialized += 1;
-                continue;
+            if (input.* == .host) if (self.prepared) |*selected| {
+                const binding = selected.hostStageBinding(index);
+                switch (binding) {
+                    .import => {},
+                    .omitted, .planned_host => {
+                        value.* = .{
+                            .value = backend.ptr,
+                            .binding = if (binding == .omitted) .omitted else .{ .planned_host = &input.host },
+                            .backend = backend,
+                            .shape = input.host.shape,
+                        };
+                        needs_prepared_dispatch = true;
+                        initialized += 1;
+                        continue;
+                    },
+                }
             };
             value.* = switch (input.*) {
                 .host => |host| .{
@@ -5918,7 +5930,7 @@ pub const RunPermit = struct {
             initialized += 1;
         }
         if (try self.executePreparedResident(.{ .resident = resident }, allocator, control)) |outputs| return outputs;
-        if (omitted_payload) return error.UnpreparedStagePayload;
+        if (needs_prepared_dispatch) return error.UnpreparedStagePayload;
         var outputs = (if (control) |active|
             try @import("../execution/invocation_observation.zig").callResident(self.session.invocation_diagnostics, resident, self.session.vtable.runResidentInputsWithControl.?, .{ self.session.ptr, resident, allocator, active })
         else
@@ -6110,7 +6122,7 @@ fn residentShapeInfo(session: Session, inputs: []const ResidentInput, allocator:
     for (inputs, session.inputInfo(), info) |input, declared, *actual| actual.* = .{
         .name = declared.name,
         .dtype = declared.dtype,
-        .shape = if (input.shape.len != 0) input.shape else try input.backend.tensorShape(input.value, allocator),
+        .shape = if (input.binding != .provider_tensor or input.shape.len != 0) input.shape else try input.backend.tensorShape(input.value, allocator),
     };
     return info;
 }
