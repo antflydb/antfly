@@ -1780,6 +1780,7 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> paged_relative_bf16_pipelines[2];
     id<MTLComputePipelineState> causal_depthwise4_bf16_pipeline;
     id<MTLComputePipelineState> dense_bf16_projection_pipeline;
+    id<MTLComputePipelineState> head_norm_bf16_pipeline;
     TermiteMetalMtpHeadWorkspace *mtp_head_workspace;
     id<MTLDevice> device;
     // Opt-in dense embedding workspace guard. Counts fresh allocations until
@@ -12920,6 +12921,47 @@ static NSString *termite_metal_shader_source(void) {
            "    uint total = p.rows * p.dim; if (gid >= total) return; uint row = gid / p.dim; uint col = gid % p.dim; float value = 0.0f; uint route_base = row * p.top_k; for (uint k = 0u; k < p.top_k; ++k) { uint route = route_base + k; float scale = p.has_expert_scale != 0u ? expert_scale[expert_ids[route]] : 1.0f; value += (route_output[route * p.dim + col] * scale) * route_weights[route]; } output[gid] = value;\n"
            "}\n"
            // tile-codegen:end expert.projection.direct.7 family
+           // tile-codegen:begin normalization.head_bf16 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+           "struct HeadNormBf16Params {\n"
+           "    uint rows, heads, dim, position, log_floor, weighted;\n"
+           "    float clip, epsilon, log_alpha;\n"
+           "};\n"
+           "\n"
+           "kernel void antfly_head_norm_bf16_simd32(\n"
+           "    device const bfloat *input [[buffer(0)]],\n"
+           "    device const bfloat *gamma [[buffer(1)]],\n"
+           "    device bfloat *output [[buffer(2)]],\n"
+           "    constant HeadNormBf16Params &p [[buffer(3)]],\n"
+           "    uint row_head [[threadgroup_position_in_grid]],\n"
+           "    uint lane [[thread_index_in_simdgroup]]\n"
+           ") {\n"
+           "    const ulong base = ulong(row_head) * p.dim;\n"
+           "    const ulong gamma_base = ulong(row_head % p.heads) * p.dim;\n"
+           "    float4 values = 0.0f;\n"
+           "    float square = 0.0f;\n"
+           "    for (uint i = 0u; i < 4u; ++i) {\n"
+           "        const uint d = i * 32u + lane;\n"
+           "        if (d >= p.dim) continue;\n"
+           "        const float value = float(input[base + d]);\n"
+           "        values[i] = p.weighted ? value * float(gamma[gamma_base + d]) : value;\n"
+           "        square = fma(values[i], values[i], square);\n"
+           "    }\n"
+           "    for (uint delta = 16u; delta != 0u; delta >>= 1u)\n"
+           "        square += simd_shuffle_down(square, delta);\n"
+           "    square = simd_broadcast(square, 0);\n"
+           "    const float factor = p.clip > 0.0f ? min(1.0f, p.clip / (sqrt(square) + p.epsilon))\n"
+           "                                       : rsqrt(square / float(p.dim) + p.epsilon);\n"
+           "    const uint absolute = p.position + row_head / p.heads + 1u;\n"
+           "    const float tau = p.log_floor != 0u && absolute > p.log_floor\n"
+           "        ? 1.0f + p.log_alpha * log(float(absolute) / float(p.log_floor)) : 1.0f;\n"
+           "    for (uint i = 0u; i < 4u; ++i) {\n"
+           "        const uint d = i * 32u + lane;\n"
+           "        if (d >= p.dim) continue;\n"
+           "        const bfloat rounded = bfloat(values[i] * factor);\n"
+           "        output[base + d] = tau == 1.0f ? rounded : bfloat(float(rounded) * tau);\n"
+           "    }\n"
+           "}\n"
+           // tile-codegen:end normalization.head_bf16 family
            // tile-codegen:begin projection.dense_bf16 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "struct DenseBf16ProjectionParams {\n"
            "    uint rows, input_width, output_width, f32_output;\n"
@@ -33706,6 +33748,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     for (size_t index = 0; index < 2; ++index) runtime->paged_relative_bf16_pipelines[index] = nil;
     runtime->causal_depthwise4_bf16_pipeline = nil;
     runtime->dense_bf16_projection_pipeline = nil;
+    runtime->head_norm_bf16_pipeline = nil;
     free(runtime);
     }
 }
@@ -36954,6 +36997,29 @@ int antfly_metal_dispatch_dense_bf16_projection(
     return antfly_metal_encode_typed_stage(runtime, @"antfly_dense_bf16_projection_simd4",
         &runtime->dense_bf16_projection_pipeline, views, required, alignment, 3, 1u << 2,
         p, sizeof(*p), MTLSizeMake(((size_t)p->output_width + 3u) / 4u, p->rows, 1), MTLSizeMake(128, 1, 1));
+}
+
+typedef struct {
+    uint32_t rows, heads, dim, position, log_floor, weighted;
+    float clip, epsilon, log_alpha;
+} antfly_metal_head_norm_bf16_params;
+
+int antfly_metal_dispatch_head_norm_bf16(
+    termite_metal_decode_runtime *runtime, const antfly_metal_routed_buffer views[3],
+    const antfly_metal_head_norm_bf16_params *p
+) {
+    if (!runtime || !views || !p || !p->rows || !p->heads || !p->dim || p->dim > 128 ||
+        p->position > UINT32_MAX - p->rows || !isfinite(p->clip) || p->clip < 0 ||
+        !isfinite(p->epsilon) || p->epsilon <= 0 || !isfinite(p->log_alpha) || p->log_alpha < 0) return -1;
+    size_t row_heads, io_bytes, gamma_bytes;
+    if (!termite_metal_size_mul(p->rows, p->heads, &row_heads) || row_heads > UINT32_MAX ||
+        !termite_metal_size_mul(row_heads, (size_t)p->dim * 2u, &io_bytes) ||
+        !termite_metal_size_mul(p->heads, (size_t)p->dim * 2u, &gamma_bytes)) return -1;
+    const size_t required[3] = {io_bytes, p->weighted ? gamma_bytes : 0, io_bytes};
+    const size_t alignment[3] = {2, 2, 2};
+    return antfly_metal_encode_typed_stage(runtime, @"antfly_head_norm_bf16_simd32",
+        &runtime->head_norm_bf16_pipeline, views, required, alignment, 3, 1u << 2,
+        p, sizeof(*p), MTLSizeMake(row_heads, 1, 1), MTLSizeMake(32, 1, 1));
 }
 
 typedef struct { uint32_t rows, hidden, head_dim, grid_x, grid_y; float eps, theta, scale; uint32_t stride, start, rotate, weighted, cached_rotary; } termite_vision_norm_rope_params;

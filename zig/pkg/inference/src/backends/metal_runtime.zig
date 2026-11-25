@@ -53635,3 +53635,52 @@ test "Metal dense BF16 projection publishes typed rows and router logits" {
     try std.testing.expectEqual([4]u16{ 0x4080, 0x3fc0, 0, 0xbfc0 }, bf16);
     try std.testing.expectEqual([4]f32{ 4, 1.5, 0, -1.5 }, logits);
 }
+
+/// BF16 boundary between weighted clipping/RMS and optional position scaling.
+pub const HeadNormBf16 = struct {
+    rows: u32,
+    heads: u32,
+    dim: u32,
+    position: u32,
+    log_floor: u32,
+    clip: f32,
+    epsilon: f32,
+    log_alpha: f32,
+
+    const Buffer = RoutedBlockScaledProjection.Buffer;
+    const Wire = extern struct {
+        rows: u32,
+        heads: u32,
+        dim: u32,
+        position: u32,
+        log_floor: u32,
+        weighted: u32,
+        clip: f32,
+        epsilon: f32,
+        log_alpha: f32,
+    };
+
+    extern fn antfly_metal_dispatch_head_norm_bf16(runtime: *RawMetalDecodeRuntime, views: *const [3]Buffer, params: *const Wire) c_int;
+
+    pub fn encode(self: HeadNormBf16, runtime: *RawMetalDecodeRuntime, input: *const MetalTensor, gamma: ?*const MetalTensor, output: *MetalTensor) !void {
+        if (!hasActiveFrame(runtime)) return error.MetalFrameRequired;
+        if (output.isReadOnlyPhysical()) return error.ReadOnlyPhysicalStorage;
+        const views: [3]Buffer = .{
+            try .fromTensor(input, .i16),
+            if (gamma) |weight| try .fromTensor(weight, .i16) else .{},
+            try .fromTensor(output, .i16),
+        };
+        if (antfly_metal_dispatch_head_norm_bf16(runtime, &views, &.{
+            .rows = self.rows,
+            .heads = self.heads,
+            .dim = self.dim,
+            .position = self.position,
+            .log_floor = self.log_floor,
+            .weighted = @intFromBool(gamma != null),
+            .clip = self.clip,
+            .epsilon = self.epsilon,
+            .log_alpha = self.log_alpha,
+        }) != 0) return error.MetalKernelDispatchFailed;
+        output.invalidateHostMirror();
+    }
+};

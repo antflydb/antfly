@@ -85,6 +85,23 @@ pub const Layer = struct {
         }
     }
 
+    pub fn normalizeHeads(self: *const Layer, runtime: *metal.RawMetalDecodeRuntime, text: checkpoint.TextConfig, rows: u32, position: u32, query: *const Tensor, relative: *const Tensor, output_query: *Tensor, output_relative: *Tensor) !void {
+        var norm: metal.HeadNormBf16 = .{
+            .rows = rows,
+            .heads = text.num_attention_heads,
+            .dim = text.head_dim,
+            .position = position,
+            .log_floor = if (self.local) 0 else text.log_scaling_n_floor,
+            .clip = text.qk_l2_clip_threshold,
+            .epsilon = text.rms_norm_eps,
+            .log_alpha = text.log_scaling_alpha,
+        };
+        try norm.encode(runtime, query, self.get(.q_scale) orelse return error.MissingWeight, output_query);
+        norm.dim = text.d_rel;
+        norm.clip = text.rel_l2_clip_threshold;
+        try norm.encode(runtime, relative, self.get(.r_scale) orelse return error.MissingWeight, output_relative);
+    }
+
     pub fn projectRelative(self: *const Layer, runtime: *metal.RawMetalDecodeRuntime, text: checkpoint.TextConfig, rows: u32, input: *const Tensor, output: *Tensor) !void {
         const head_rows = try std.math.mul(u32, rows, text.num_attention_heads);
         try self.project(runtime, .relative_basis, head_rows, text.d_rel, text.rel_extent, input, output);
@@ -151,6 +168,11 @@ test "Inkling Metal attention weights preserve packed offsets and local/global l
     text.d_rel = 1;
     text.rel_extent = 1;
     text.sconv_kernel_size = 1;
+    text.log_scaling_n_floor = 1;
+    text.log_scaling_alpha = 1;
+    text.qk_l2_clip_threshold = 1;
+    text.rel_l2_clip_threshold = 1;
+    text.rms_norm_eps = 0.000001;
     @memset(&text.local_layer_ids, 0);
     for ([_]usize{ 0, 1 }) |index| {
         var layer = try Layer.loadTensors(std.testing.allocator, runtime, Fixture{}, text, index);
@@ -169,7 +191,7 @@ test "Inkling Metal attention weights preserve packed offsets and local/global l
 
         var source = try upload(std.testing.allocator, runtime, &Fixture.data_b);
         defer source.deinit();
-        var projected: [10]Tensor = undefined;
+        var projected: [12]Tensor = undefined;
         var count: usize = 0;
         defer for (projected[0..count]) |*output| output.deinit();
         for (&projected) |*output| {
@@ -188,11 +210,13 @@ test "Inkling Metal attention weights preserve packed offsets and local/global l
             .key_taps = if (layer.local) null else &projected[6],
             .value_taps = if (layer.local) null else &projected[7],
         });
-        try layer.projectRelative(runtime, text, 1, &projected[1], &projected[8]);
+        try layer.normalizeHeads(runtime, text, 1, 1, &projected[0], &projected[1], &projected[10], &projected[11]);
+        try layer.projectRelative(runtime, text, 1, &projected[11], &projected[8]);
         try layer.projectOutput(runtime, text, 1, &projected[0], &projected[9]);
         try metal.submitFrame(runtime);
         try metal.waitFrame(runtime);
-        const expected = [_]u16{ 0x4080, 0x4000, 0x4000, 0x4000, 0x4000, 0x4000, 0x4080, 0x4000, 0x4000, 0x4080 };
+        const normalized: u16 = if (layer.local) 0x3f80 else 0x3fd9;
+        const expected = [_]u16{ 0x4080, 0x4000, 0x4000, 0x4000, 0x4000, 0x4000, 0x4080, 0x4000, normalized, 0x4080, normalized, normalized };
         for (&projected, expected, 0..) |*output, bits, slot| {
             if (layer.local and (slot == 6 or slot == 7)) continue;
             var actual: u16 = undefined;
