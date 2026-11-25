@@ -36066,7 +36066,10 @@ fn processPdfPageImageEmbeddingWithAllocator(
     const fetched = try fetchEnrichmentSource(runtime, prepared_sources, source_url, null, request, raw);
     var prepared_source_lease = switch (fetched) {
         .ok => |lease| lease,
-        .http_error => return error.RemoteDocumentFetchFailed,
+        .http_error => {
+            try embedding_lease_guard.check();
+            return error.RemoteDocumentFetchFailed;
+        },
     };
     defer prepared_source_lease.deinit();
     try embedding_lease_guard.check();
