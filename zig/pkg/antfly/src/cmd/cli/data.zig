@@ -595,7 +595,7 @@ const LoadProcessor = struct {
                 .sync_level = effectiveLoadSyncLevel(self.opts.sync_level),
             });
             defer resp.deinit();
-            if (cli.isAgent()) try cli.output.mutationResponse(resp);
+            if (cli.output.policy.enveloped()) try cli.output.mutationResponse(resp);
             self.stats.committed += @intCast(self.batch.docs);
             if (self.opts.checkpoint_enabled) {
                 if (self.checkpoint_path) |path| try self.writeCheckpoint(path);
@@ -954,7 +954,19 @@ fn runLoad(
             processor.stats.duplicate_in_batch,
         },
     );
-    if (cli.isAgent()) try cli.writeJson(allocator, io, .{ .load = processor.stats });
+    if (cli.output.useJson()) {
+        const previous = cli.output.context;
+        defer cli.output.context = previous;
+        cli.output.context = .{
+            .scope = .operation,
+            .execution = if (processor.stats.rejected() == 0) .complete else .partial,
+        };
+        try cli.writeJson(allocator, io, .{
+            .load = processor.stats,
+            .sync_level = @tagName(effectiveLoadSyncLevel(opts.sync_level)),
+            .dry_run = opts.dry_run,
+        });
+    }
     return processor.stats;
 }
 

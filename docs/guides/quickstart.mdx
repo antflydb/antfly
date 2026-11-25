@@ -127,7 +127,8 @@ antfly table create --table wikipedia \
   --index '{
     "name": "title_body",
     "type": "embeddings",
-    "template": "{{title}} {{body}}",
+    "coverage_policy": "partial",
+    "template": "{{#if (scrubHtml title)}}{{#if (scrubHtml body)}}{{title}} {{body}}{{/if}}{{/if}}",
     "embedder": {
       "provider": "antfly",
       "model": "google/embeddinggemma-2:bf16-safetensors-bundle-v1"
@@ -151,7 +152,8 @@ curl -X POST http://127.0.0.1:8080/db/v1/tables/wikipedia \
     "indexes": {
       "title_body": {
         "type": "embeddings",
-        "template": "{{title}} {{body}}",
+        "coverage_policy": "partial",
+        "template": "{{#if (scrubHtml title)}}{{#if (scrubHtml body)}}{{title}} {{body}}{{/if}}{{/if}}",
         "embedder": {
           "provider": "antfly",
           "model": "google/embeddinggemma-2:bf16-safetensors-bundle-v1"
@@ -191,6 +193,9 @@ antfly load --table wikipedia \
 ```
 
 The CLI reads the JSONL and batches it for you. `--sync-level full_text` returns once each batch is keyword-searchable; embeddings keep generating in the background. (An application that owns its own ingestion uses the SDK [batch operations](/docs/api/data-operations) with bounded batches and retries.)
+
+The text index embeds articles whose title and body both contain text. Articles
+skipped by the text index remain available for thumbnail indexing.
 
 Wait until 10% of documents have searchable embeddings:
 
@@ -238,6 +243,8 @@ curl -X POST http://127.0.0.1:8080/db/v1/query \
   </TabsContent>
 
 </Tabs>
+
+For scripts, pass the global option `--output json` before `query` to get the complete JSON payload.
 
 ### Semantic Search
 
@@ -352,7 +359,7 @@ to the query builder, searches, and answers from the results.
   <TabsContent value="cli">
 ```bash
 antfly agents retrieval --table wikipedia \
-  --intent "What are the major events in Korean history?" \
+  --intent "How do scientists monitor volcanoes for signs of an eruption?" \
   --fields "title,body" \
   --limit 5 \
   --generator '{
@@ -371,7 +378,7 @@ curl -N -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
   -H "Content-Type: application/json" \
   -H "Accept: text/event-stream" \
   -d '{
-    "query": "What are the major events in Korean history?",
+    "query": "How do scientists monitor volcanoes for signs of an eruption?",
     "queries": [{
       "table": "wikipedia",
       "fields": ["title", "body"],
@@ -413,7 +420,7 @@ Requires a [Google AI API key](https://aistudio.google.com/apikey), exported in 
 export GEMINI_API_KEY="your-api-key-here"
 
 antfly agents retrieval --table wikipedia \
-  --semantic-search "What are the major events in Korean history?" \
+  --semantic-search "How do scientists monitor volcanoes for signs of an eruption?" \
   --indexes "title_body" \
   --fields "title,body" \
   --limit 5 \
@@ -430,7 +437,7 @@ Requires an [OpenAI API key](https://platform.openai.com/api-keys), exported in 
 export OPENAI_API_KEY="your-api-key-here"
 
 antfly agents retrieval --table wikipedia \
-  --semantic-search "What are the major events in Korean history?" \
+  --semantic-search "How do scientists monitor volcanoes for signs of an eruption?" \
   --indexes "title_body" \
   --fields "title,body" \
   --limit 5 \
@@ -447,7 +454,7 @@ Requires [Ollama](https://ollama.com) running locally. Pull the model first:
 ollama pull gemma3:4b-it-qat
 
 antfly agents retrieval --table wikipedia \
-  --semantic-search "What are the major events in Korean history?" \
+  --semantic-search "How do scientists monitor volcanoes for signs of an eruption?" \
   --indexes "title_body" \
   --fields "title,body" \
   --limit 5 \
@@ -471,10 +478,10 @@ curl -N -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
   -H "Content-Type: application/json" \
   -H "Accept: text/event-stream" \
   -d '{
-    "query": "What are the major events in Korean history?",
+    "query": "How do scientists monitor volcanoes for signs of an eruption?",
     "queries": [{
       "table": "wikipedia",
-      "semantic_search": "What are the major events in Korean history?",
+      "semantic_search": "How do scientists monitor volcanoes for signs of an eruption?",
       "indexes": ["title_body"],
       "fields": ["title", "body"],
       "limit": 5

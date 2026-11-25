@@ -220,6 +220,19 @@ pub fn runFromIterator(
     const io = init.io;
 
     const command = args.next() orelse "run";
+    if (std.mem.startsWith(u8, command, "--") and
+        !std.mem.eql(u8, command, "--help"))
+    {
+        if (std.mem.eql(u8, command, "--output")) {
+            const format = std.meta.stringToEnum(engine.ModelListFormat, args.next() orelse "") orelse {
+                std.debug.print("inference list: --output requires auto, table, json, or compact\n", .{});
+                return error.CliDiagnosticReported;
+            };
+            if (std.mem.eql(u8, args.next() orelse "", "list")) return try listModels(alloc, io, args, format);
+        }
+        std.debug.print("inference: supported global option is --output auto|table|json|compact before inference list\n", .{});
+        return error.CliDiagnosticReported;
+    }
 
     if (std.mem.eql(u8, command, "_worker")) {
         return if (engine.enabled) engine.runCommand(.worker, init, &.{}, "") else @import("antfly_inference_host").worker_module.runChild(alloc, io);
@@ -294,7 +307,7 @@ pub fn runFromIterator(
     } else if (std.mem.eql(u8, command, "smoke")) {
         return try (if (engine.enabled) engine.runCommand(.smoke, init, try collectArgs(alloc, args), "") else inference.native_smoke.main(alloc, io, try collectArgs(alloc, args)));
     } else if (std.mem.eql(u8, command, "list")) {
-        return try listModels(alloc, io, args);
+        return try listModels(alloc, io, args, .auto);
     } else if (std.mem.eql(u8, command, "pull")) {
         return try pullModel(alloc, io, args);
     } else if (std.mem.eql(u8, command, "convert")) {
@@ -845,23 +858,18 @@ pub fn spawnServerProcess(
     };
 }
 
-pub fn listModels(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
-    const configured_models_dir = try parseListModelsDir(args);
+fn listModels(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator, format: engine.ModelListFormat) !void {
+    const configured_models_dir = parseListModelsDir(args) catch {
+        std.debug.print("usage: antfly inference list [--models-dir <dir>]\n", .{});
+        return error.CliDiagnosticReported;
+    };
     const models_dir: []const u8 = configured_models_dir orelse defaultModelsDir(alloc);
 
     var reg = if (engine.enabled) try ModelRegistry.init(alloc, models_dir) else ModelRegistry.init(alloc, models_dir);
     defer reg.deinit();
 
-    if (comptime engine.enabled) return reg.list(io);
-
-    const models = try reg.discover(io);
-    defer alloc.free(models);
-
-    for (models) |m| {
-        if (m.load_error) |err| {
-            std.debug.print("{s:<12} {s}  unusable: {s}\n", .{ @tagName(m.kind), m.name, @errorName(err) });
-        } else std.debug.print("{s:<12} {s}\n", .{ @tagName(m.kind), m.name });
-    }
+    if (comptime engine.enabled) return reg.list(io, format);
+    return try engine.writeModelList(alloc, io, &reg, format);
 }
 
 fn parseListModelsDir(args: *std.process.Args.Iterator) !?[]const u8 {
@@ -1112,6 +1120,7 @@ fn parseHostPort(base_uri: []const u8) !struct { host: []const u8, port: u16 } {
 fn printUsage() void {
     std.debug.print(
         \\usage: antfly inference <command> [options]
+        \\       antfly --output auto|table|json|compact inference list [--models-dir <dir>]
         \\
         \\Commands:
         \\  run         Start the inference server (default)
