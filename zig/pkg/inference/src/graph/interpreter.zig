@@ -185,6 +185,9 @@ pub const ExecuteOptions = struct {
     /// forbid every host access. Final output materialization is outside this
     /// submission scope.
     activation_readbacks: enum { allowed, forbidden } = .allowed,
+    /// Decline before numerical dispatch if the physical replay plan or its
+    /// bindings are unavailable. An admitted plan may execute its warmup.
+    require_physical_replay_admission: bool = false,
     /// Request lifetime checked before graph setup and at every reachable node.
     /// A backend operation that is already executing still owns its buffers and
     /// must return before cleanup, but graph-scale work can no longer ignore a

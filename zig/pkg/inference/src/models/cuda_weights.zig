@@ -719,7 +719,10 @@ pub fn prepareWithOptions(
 
             plan.warp_decode = plan.warp_decode and (qualified_warp or requested_sm89);
             if (plan.warp_decode) {
-                cuda_compute.kernels.e4b_f16_warp_split_enabled = true;
+                cuda_compute.kernels.f16_gqa_warp_split_enabled = true;
+                cuda_compute.kernels.f16_mqa_warp_split_enabled = qualified_warp and
+                    host_weights_owner.architecture.gpt.num_key_value_heads == 1 and
+                    platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_F16_MQA_WARP_SPLIT");
                 cuda_compute.kernels.gqa_score_prework_mode = @import("../ops/cuda/kernels.zig").scorePreworkModeForPartitionedDecode(
                     cuda_compute.kernels.gqa_score_prework_mode,
                     cuda_compute.kernels.gqa_score_prework_consumer_mode,

@@ -9111,7 +9111,14 @@ pub const CudaCompute = struct {
         var inputs: [2]Capture.Input = undefined;
         inputs[0] = .{ .tensor = .{ .name = "hidden", .data = &.{}, .dtype = .f32, .shape = &hidden_shape, .allocator = a, .owns_data = false, .owns_shape = false }, .resident = .{ .backend = cb, .value = input } };
         if (ple) |value| inputs[1] = .{ .tensor = .{ .name = "ple", .data = &.{}, .dtype = .f32, .shape = &ple_shape, .allocator = a, .owns_data = false, .owns_shape = false }, .resident = .{ .backend = cb, .value = value } };
-        var result = self.prefill_programs.runDevice(self.allocator, .{ .context = self, .create = createPrefillFrame, .import = importPrefillControl }, spec.resolve(), inputs[0..if (ple != null) @as(usize, 2) else 1], a, cb.execution_control) catch |err| {
+        // Preserve the measured eager functional schedule on the existing
+        // qualified profile. New geometries require a physical capture plan.
+        const replay_policy: @import("../../execution/captured_forward.zig").Cache.ReplayPolicy = if (config.sharedKvPrefillDonorLayers() != null) .allow_eager else .require_admission;
+        var result = self.prefill_programs.runDeviceWithReplayPolicy(self.allocator, .{ .context = self, .create = createPrefillFrame, .import = importPrefillControl }, spec.resolve(), inputs[0..if (ple != null) @as(usize, 2) else 1], a, cb.execution_control, replay_policy) catch |err| {
+            if (err == error.PhysicalReplayUnavailableBeforeSubmission) {
+                if (plan.trace_prefill) std.log.info("native_prefill_program result=replay_admission_declined", .{});
+                return null;
+            }
             switch (err) {
                 error.CudaMemoryLimitExceeded, error.MemoryBudgetExceeded, error.ResourceLimitExceeded, error.OutOfMemory => self.prefill_cache_pressure.store(true, .release),
                 else => {},
@@ -9327,7 +9334,7 @@ pub const CudaCompute = struct {
         // Split attention avoids serial per-key decode at long contexts. Its
         // F16 storage and exact E4B geometry are checked again at dispatch.
         if (platform.env.getenv("ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT") == null)
-            self.kernels.e4b_f16_warp_split_enabled = self.kernels.gqa_attention_decode_f16_warp_stage1_f32 != null;
+            self.kernels.f16_gqa_warp_split_enabled = self.kernels.gqa_attention_decode_f16_warp_stage1_f32 != null;
         if (self.runtime_policy.split_attention == null) self.runtime_policy.split_attention = true;
         if (self.runtime_policy.split_attention_chunk == null) self.runtime_policy.split_attention_chunk = 64;
         // Exact-size reuse prevents small decoder temporaries from occupying
@@ -9339,7 +9346,7 @@ pub const CudaCompute = struct {
         std.log.info("cuda_gemma4_e4b_policy raw_q4={} cublas_prefill={} cublas_min_rows={d} prefill={s} decode_scores={s} decode_consumer={s} warp_split={}", .{
             self.gemma4_raw_q4_prefill,              self.tuned_route_gates.q4_0_cublas_prefill,    self.tuned_route_gates.q4_0_cublas_prefill_min_rows,
             self.kernels.gqa_prefill_profile.name(), @tagName(self.kernels.gqa_score_prework_mode), self.kernels.gqa_score_prework_consumer_mode.name(),
-            self.kernels.e4b_f16_warp_split_enabled,
+            self.kernels.f16_gqa_warp_split_enabled,
         });
     }
 
@@ -31781,7 +31788,7 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
         self.ctx.info.compute_minor,
     ) != null;
     const native_warp_decode = if (self.gemma4_native_plan) |plan|
-        plan.warp_decode and self.kernels.e4bF16WarpSplitSelected(num_heads, num_kv_heads, head_dim, paged.format, layer.value_format)
+        plan.warp_decode and self.kernels.f16WarpSplitSelected(num_heads, num_kv_heads, head_dim, paged.format, layer.value_format)
     else
         false;
     if (!self.kernels.gqaSplitkOnlineDecodeProfileSelected() and
@@ -31799,7 +31806,7 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
         else
             self.runtime_policy.splitAttentionChunk(self.capability_profile == .lightonocr3);
         if (configured_chunk_size == 0) break :split_attention_blk;
-        const warp_f16 = self.kernels.e4bF16WarpSplitSelected(num_heads, num_kv_heads, head_dim, paged.format, layer.value_format);
+        const warp_f16 = self.kernels.f16WarpSplitSelected(num_heads, num_kv_heads, head_dim, paged.format, layer.value_format);
         const full_capacity = cudaSplitAttentionCapacity(
             attention.kv_sequence_len,
             layer.capacity_tokens,
@@ -40396,7 +40403,7 @@ const DenseAssignedAttention = struct {
             if (result.compact_kv) {
                 const capacity = std.mem.alignForward(usize, result.keys, 16);
                 result.kv_bytes = try checkedMul(try checkedMul(try checkedMul(capacity, result.kv_heads), result.dimension), 4);
-                const native_warp = self.gemma4_native_plan.?.warp_decode and self.kernels.e4bF16WarpSplitSelected(result.heads, result.kv_heads, result.dimension, 2, 2);
+                const native_warp = self.gemma4_native_plan.?.warp_decode and self.kernels.f16WarpSplitSelected(result.heads, result.kv_heads, result.dimension, 2, 2);
                 // Keep explicit schedule overrides and the eager kernel's
                 // short-context decline. Only a single final query can split.
                 if (native_warp and result.queries == 1 and !self.kernels.gqaSplitkOnlineDecodeProfileSelected() and
@@ -61417,10 +61424,10 @@ test "admitted BF16 singleton mirrors bypass quantized fused gate-up before subm
 }
 
 fn qualifyFunctionalGroupedProgram(compact: bool, owned_inputs: bool, comptime suffix: u2) !void {
-    try qualifyFunctionalGroupedProgramSized(compact, owned_inputs, suffix, null, null);
+    try qualifyFunctionalGroupedProgramSized(compact, owned_inputs, suffix, null, null, 2);
 }
 
-fn qualifyFunctionalGroupedProgramSized(compact: bool, owned_inputs: bool, comptime suffix: u2, comptime key_count: ?usize, comptime head_dim: ?usize) !void {
+fn qualifyFunctionalGroupedProgramSized(compact: bool, owned_inputs: bool, comptime suffix: u2, comptime key_count: ?usize, comptime head_dim: ?usize, comptime kv_heads: usize) !void {
     if (comptime !cuda_enabled) return error.SkipZigTest;
     const a = std.testing.allocator;
     const shared = if (owned_inputs) try @import("../../backends/compute_context.zig").SharedBackendContext.init(a, .cuda, null) else null;
@@ -61441,7 +61448,8 @@ fn qualifyFunctionalGroupedProgramSized(compact: bool, owned_inputs: bool, compt
         compute.kernels.grouped_f16_flash_prefill = true;
         if (suffix != 0) {
             compute.gemma4_native_plan.?.warp_decode = true;
-            compute.kernels.e4b_f16_warp_split_enabled = true;
+            compute.kernels.f16_gqa_warp_split_enabled = kv_heads == 2;
+            compute.kernels.f16_mqa_warp_split_enabled = kv_heads == 1;
             if (key_count != null) compute.kernels.gqa_score_prework_mode = kernels_mod.scorePreworkModeForPartitionedDecode(compute.kernels.gqa_score_prework_mode, .serial, true);
         }
     }
@@ -61451,7 +61459,6 @@ fn qualifyFunctionalGroupedProgramSized(compact: bool, owned_inputs: bool, compt
     const queries: usize = if (suffix == 0) 3 else 1;
     const keys: usize = key_count orelse if (suffix == 0) 5 else 257;
     const heads: usize = if (compact) 8 else 4;
-    const kv_heads: usize = 2;
     const dim: usize = head_dim orelse if (compact) 256 else 32;
     const window: usize = if (suffix == 2) 0 else if (suffix == 1) (if (key_count != null) @as(usize, 512) else 129) else if (compact) 512 else 4;
     const width = heads * dim;
@@ -61667,9 +61674,14 @@ fn qualifyFunctionalGroupedProgramSized(compact: bool, owned_inputs: bool, compt
 
 test "CUDA partitioned F16 decode crossover matches frozen and F64 local global attention" {
     inline for (.{ 513, 2048, 4037 }) |keys| {
-        try qualifyFunctionalGroupedProgramSized(true, false, 1, keys, 256);
-        try qualifyFunctionalGroupedProgramSized(true, false, 2, keys, 512);
+        try qualifyFunctionalGroupedProgramSized(true, false, 1, keys, 256, 2);
+        try qualifyFunctionalGroupedProgramSized(true, false, 2, keys, 512, 2);
     }
+}
+
+test "CUDA partitioned F16 MQA decode matches frozen and F64 local global attention" {
+    try qualifyFunctionalGroupedProgramSized(true, false, 1, 305, 256, 1);
+    try qualifyFunctionalGroupedProgramSized(true, false, 2, 514, 512, 1);
 }
 
 test "CUDA functional grouped prefix captures current values against frozen and F64 attention" {
@@ -62488,7 +62500,7 @@ test "Gemma4 CUDA dense defaults preserve explicit rollbacks and unrelated model
     if (compute.ctx.info.compute_major == 8 and compute.ctx.info.compute_minor == 9) {
         try std.testing.expectEqual(.flash_f16_sm89, compute.kernels.gqa_prefill_profile);
         try std.testing.expectEqual(.disabled, compute.kernels.gqa_score_prework_mode);
-        try std.testing.expect(compute.kernels.e4b_f16_warp_split_enabled);
+        try std.testing.expect(compute.kernels.f16_gqa_warp_split_enabled);
         try std.testing.expectEqual(@as(?bool, true), compute.runtime_policy.split_attention);
         try std.testing.expectEqual(@as(?usize, 64), compute.runtime_policy.split_attention_chunk);
         try std.testing.expectEqual(@as(?usize, 2048), compute.runtime_policy.max_temp_buffers);

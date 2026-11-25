@@ -512,6 +512,7 @@ pub const Runtime = struct {
         output.allocator = allocator;
         switch (self.strategy) {
             .interpreter => {
+                if (options.require_physical_replay_admission) return error.PhysicalReplayUnavailableBeforeSubmission;
                 if (options.host_inputs != null) return error.PreparedHostIngressUnavailable;
                 // This branch already passes options by value to the public
                 // interpreter API. The hot planned branch keeps its borrowed
@@ -543,6 +544,13 @@ pub const Runtime = struct {
                     }
                     break :selected routes.pool;
                 } else self.physical_pool;
+                if (options.require_physical_replay_admission and (selected_pool == null or selected_pool.?.replay_backend == null)) {
+                    if (graphPartitionReportRequested()) {
+                        const reason = if (selected_pool) |pool| @tagName(pool.replay_decision) else "no_physical_pool";
+                        std.debug.print("graph-partition-report physical replay admission declined reason={s}\n", .{reason});
+                    }
+                    return error.PhysicalReplayUnavailableBeforeSubmission;
+                }
                 const strict_cuda = self.strictCudaPlan();
                 if (strict_cuda and (options.prepared_routes == null or selected_pool.?.completeOwnedPayload() == null)) {
                     if (graphPartitionReportRequested()) {
@@ -571,7 +579,10 @@ pub const Runtime = struct {
                 defer if (physical_epoch) |*epoch| epoch.release();
                 const physical_cleanup = @import("cleanup_context.zig").Context{ .operation = backend_operation, .boundary = if (physical_epoch) |*epoch| epoch else null };
                 const frame = if (selected_pool) |pool| try pool.acquirePreparedWithRegionsAndOperation(options.storage_admission, options.physical_frame_claim, options.region_claims, graph, backend_operation) else null;
-                if (options.prepared_routes != null and frame == null) return error.PreparedPhysicalFrameUnavailable;
+                if (frame == null) {
+                    if (options.require_physical_replay_admission) return error.PhysicalReplayUnavailableBeforeSubmission;
+                    if (options.prepared_routes != null) return error.PreparedPhysicalFrameUnavailable;
+                }
                 var frame_finished = false;
                 defer if (frame) |active| {
                     if (!frame_finished) {
@@ -630,6 +641,13 @@ pub const Runtime = struct {
                     planned_options.runtime_inputs = merged;
                 };
                 const replay_inputs = if (frame) |active| try active.bindReplayInputs(&planned_options) else null;
+                if (options.require_physical_replay_admission and replay_inputs == null) {
+                    if (frame) |active| {
+                        frame_finished = true;
+                        _ = try active.finishWithCleanup(physical_cleanup);
+                    }
+                    return error.PhysicalReplayUnavailableBeforeSubmission;
+                }
                 defer if (replay_inputs != null) frame.?.releaseReplayInputs();
                 if (replay_inputs) |inputs| planned_options.runtime_inputs = inputs;
                 if (frame) |active| if (replay_inputs != null and active.replay_ready) {

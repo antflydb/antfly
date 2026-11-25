@@ -2647,8 +2647,9 @@ pub const KernelModule = struct {
     gqa_prefill_mma_m32_smem_opted_in: bool = false,
     gqa_prefill_flash_e4b_smem_functions: [2]driver_mod.CUfunction = .{ null, null },
     gqa_attention_decode_f16_warp_stage1_f32: driver_mod.CUfunction = null,
-    e4b_f16_warp_split_enabled: bool = false,
-    e4b_f16_warp_split_used: bool = false,
+    f16_gqa_warp_split_enabled: bool = false,
+    f16_mqa_warp_split_enabled: bool = false,
+    f16_warp_split_used: bool = false,
     gqa_attention_decode_turboquant_split_stage1_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_turboquant_split_stage2_f32: driver_mod.CUfunction = null,
@@ -3874,7 +3875,7 @@ pub const KernelModule = struct {
         loaded.gqa_score_prework_mode = gqa_score_prework_mode;
         loaded.gqa_score_prework_consumer_mode = gqa_score_prework_consumer_mode;
         loaded.gliner25_attention = gliner25_attention;
-        loaded.e4b_f16_warp_split_enabled = ctx.info.compute_major == 8 and ctx.info.compute_minor == 9 and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT", false);
+        loaded.f16_gqa_warp_split_enabled = ctx.info.compute_major == 8 and ctx.info.compute_minor == 9 and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT", false);
         return loaded;
     }
 
@@ -3970,8 +3971,9 @@ pub const KernelModule = struct {
             self.gqa_prefill_mma_smem_opted_in = false;
             self.gqa_prefill_mma_m32_smem_opted_in = false;
             self.gqa_prefill_flash_e4b_smem_functions = .{ null, null };
-            self.e4b_f16_warp_split_enabled = false;
-            self.e4b_f16_warp_split_used = false;
+            self.f16_gqa_warp_split_enabled = false;
+            self.f16_mqa_warp_split_enabled = false;
+            self.f16_warp_split_used = false;
             self.gliner25_attention = @splat(null);
         }
         self.clearBundledFunctions();
@@ -10430,10 +10432,15 @@ pub const KernelModule = struct {
         };
     }
 
-    pub fn e4bF16WarpSplitSelected(self: *const KernelModule, num_heads: usize, num_kv_heads: usize, head_dim: usize, format: u32, value_format: u32) bool {
-        return self.e4b_f16_warp_split_enabled and self.gqa_attention_decode_f16_warp_stage1_f32 != null and
+    pub fn f16WarpSplitSelected(self: *const KernelModule, num_heads: usize, num_kv_heads: usize, head_dim: usize, format: u32, value_format: u32) bool {
+        const enabled = switch (num_kv_heads) {
+            1 => self.f16_mqa_warp_split_enabled,
+            2 => self.f16_gqa_warp_split_enabled,
+            else => false,
+        };
+        return enabled and self.gqa_attention_decode_f16_warp_stage1_f32 != null and
             self.gqa_attention_decode_turboquant_split_stage2_f32 != null and
-            num_heads == 8 and num_kv_heads == 2 and (head_dim == 256 or head_dim == 512) and
+            num_heads == 8 and (head_dim == 256 or head_dim == 512) and
             format == 2 and value_format == 2;
     }
 
@@ -10466,7 +10473,7 @@ pub const KernelModule = struct {
         chunk_size: usize,
         chunk_count: usize,
     ) driver_mod.Error!bool {
-        const warp_f16 = self.e4bF16WarpSplitSelected(num_heads, num_kv_heads, head_dim, format, value_format);
+        const warp_f16 = self.f16WarpSplitSelected(num_heads, num_kv_heads, head_dim, format, value_format);
         const stage1 = if (warp_f16)
             self.gqa_attention_decode_f16_warp_stage1_f32.?
         else if (format == 0 and value_format == 1 and block_count == 0)
@@ -10514,9 +10521,9 @@ pub const KernelModule = struct {
         };
         var stage1_params = launch_abi.fieldsFor("TQ_SPLIT_STAGE1", &stage1_arguments);
         try launch2d(stage1, ctx, num_heads, chunk_count, if (warp_f16 or head_dim <= 256) 256 else 512, &stage1_params);
-        if (warp_f16 and !self.e4b_f16_warp_split_used) {
-            self.e4b_f16_warp_split_used = true;
-            std.log.info("cuda_e4b_f16_warp_split: status=active kernel=termite_gqa_attention_decode_f16_warp_stage1_f32", .{});
+        if (warp_f16 and !self.f16_warp_split_used) {
+            self.f16_warp_split_used = true;
+            std.log.info("cuda_f16_warp_split: status=active query_heads={d} kv_heads={d} head_dim={d}", .{ num_heads, num_kv_heads, head_dim });
         }
 
         var dst_ptr = dst.ptr;
@@ -23118,25 +23125,30 @@ test "E4B Flash prefill target gate keeps GB10 qualification narrow" {
     try std.testing.expect(!gqaFlashPrefillTargetSupported(9, 0, 2));
 }
 
-test "E4B Flash warp decode selection preserves compressed and E2B routes" {
+test "F16 warp split decode admits only independently enabled head groups" {
     var module: KernelModule = undefined;
-    module.e4b_f16_warp_split_enabled = true;
+    module.f16_gqa_warp_split_enabled = true;
+    module.f16_mqa_warp_split_enabled = false;
     module.gqa_attention_decode_f16_warp_stage1_f32 = @ptrFromInt(1);
     module.gqa_attention_decode_turboquant_split_stage2_f32 = @ptrFromInt(1);
-    try std.testing.expect(module.e4bF16WarpSplitSelected(8, 2, 256, 2, 2));
-    try std.testing.expect(module.e4bF16WarpSplitSelected(8, 2, 512, 2, 2));
-    try std.testing.expect(!module.e4bF16WarpSplitSelected(8, 1, 256, 2, 2));
-    try std.testing.expect(!module.e4bF16WarpSplitSelected(8, 2, 128, 2, 2));
-    try std.testing.expect(!module.e4bF16WarpSplitSelected(8, 2, 256, 0, 1));
-    try std.testing.expect(!module.e4bF16WarpSplitSelected(8, 2, 256, 2, 1));
-    module.e4b_f16_warp_split_enabled = false;
-    try std.testing.expect(!module.e4bF16WarpSplitSelected(8, 2, 256, 2, 2));
-    module.e4b_f16_warp_split_enabled = true;
+    try std.testing.expect(module.f16WarpSplitSelected(8, 2, 256, 2, 2));
+    try std.testing.expect(module.f16WarpSplitSelected(8, 2, 512, 2, 2));
+    try std.testing.expect(!module.f16WarpSplitSelected(8, 1, 256, 2, 2));
+    module.f16_mqa_warp_split_enabled = true;
+    try std.testing.expect(module.f16WarpSplitSelected(8, 1, 256, 2, 2));
+    try std.testing.expect(module.f16WarpSplitSelected(8, 1, 512, 2, 2));
+    try std.testing.expect(!module.f16WarpSplitSelected(8, 4, 256, 2, 2));
+    try std.testing.expect(!module.f16WarpSplitSelected(8, 2, 128, 2, 2));
+    try std.testing.expect(!module.f16WarpSplitSelected(8, 2, 256, 0, 1));
+    try std.testing.expect(!module.f16WarpSplitSelected(8, 2, 256, 2, 1));
+    module.f16_gqa_warp_split_enabled = false;
+    try std.testing.expect(!module.f16WarpSplitSelected(8, 2, 256, 2, 2));
+    module.f16_gqa_warp_split_enabled = true;
     module.gqa_attention_decode_turboquant_split_stage2_f32 = null;
-    try std.testing.expect(!module.e4bF16WarpSplitSelected(8, 2, 256, 2, 2));
+    try std.testing.expect(!module.f16WarpSplitSelected(8, 2, 256, 2, 2));
     module.gqa_attention_decode_turboquant_split_stage2_f32 = @ptrFromInt(1);
     module.gqa_attention_decode_f16_warp_stage1_f32 = null;
-    try std.testing.expect(!module.e4bF16WarpSplitSelected(8, 2, 256, 2, 2));
+    try std.testing.expect(!module.f16WarpSplitSelected(8, 2, 256, 2, 2));
 }
 
 test "CUDA GQA request preserves dense scalar and physical paged preflight contracts" {

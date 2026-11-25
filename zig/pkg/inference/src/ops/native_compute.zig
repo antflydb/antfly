@@ -37035,10 +37035,17 @@ fn tryGqaTiledPagedPrefill(
     output: []f32,
 ) !bool {
     const queries = attention.query_sequence_len;
-    const keys = attention.kv_sequence_len;
-    if (attention.mode != .paged_prefill or queries < 16 or queries > attention.total_sequence_len or keys == 0 or
-        attention.kv_position_offset > attention.total_sequence_len or keys > attention.total_sequence_len - attention.kv_position_offset or
+    const live_keys = attention.kv_sequence_len;
+    if (attention.mode != .paged_prefill or queries < 16 or queries > attention.total_sequence_len or live_keys == 0 or
+        attention.kv_position_offset > attention.total_sequence_len or live_keys > attention.total_sequence_len - attention.kv_position_offset or
         (pool.config.dtype != .f16 and pool.config.dtype != .f32)) return false;
+    const query_offset = attention.total_sequence_len - queries;
+    // Visibility overrides may reveal future keys. The earliest query's local
+    // window still excludes the same older keys for every query in the batch.
+    const skipped = if (attention.sliding_window == 0) 0 else (query_offset -| (attention.sliding_window - 1)) -| attention.kv_position_offset;
+    if (skipped >= live_keys) return false;
+    const keys = live_keys - skipped;
+    const key_offset = attention.kv_position_offset + skipped;
 
     const width = try std.math.mul(usize, kv_heads, head_dim);
     const key_values = try std.math.mul(usize, keys, width);
@@ -37061,15 +37068,16 @@ fn tryGqaTiledPagedPrefill(
     // Read each compressed KV row once. The storage view is valid only
     // until the next read, so copy both slices before advancing the page.
     for (0..keys) |index| {
-        const page = index / pool.config.page_size_tokens;
+        const source_index = skipped + index;
+        const page = source_index / pool.config.page_size_tokens;
         if (page >= block_ids.len) return error.InvalidPagedKvState;
-        const row = try pool.readToken(block_ids[page], layer_index, index % pool.config.page_size_tokens);
+        const row = try pool.readToken(block_ids[page], layer_index, source_index % pool.config.page_size_tokens);
         if (row.k.len < width or row.v.len < width) return error.InvalidPagedKvState;
         @memcpy(k[index * width ..][0..width], row.k[0..width]);
         @memcpy(v[index * width ..][0..width], row.v[0..width]);
     }
 
-    try linalg.flashCausalAttentionHostInto(query, k, v, null, attention.attn_or_mask, attention.sliding_window, 1, queries, keys, attention.total_sequence_len - queries, attention.kv_position_offset, heads, kv_heads, head_dim, output, @alignCast(scratch[workspace_offset..]));
+    try linalg.flashCausalAttentionHostInto(query, k, v, null, attention.attn_or_mask, attention.sliding_window, 1, queries, keys, query_offset, key_offset, heads, kv_heads, head_dim, output, @alignCast(scratch[workspace_offset..]));
     return true;
 }
 
@@ -37174,7 +37182,7 @@ test "Native tiled paged prefill preserves grouped F16 rows and mask positions" 
         .query_sequence_len = queries,
         .kv_sequence_len = keys,
         .kv_position_offset = total - keys,
-        .sliding_window = 7,
+        .sliding_window = 4,
         .attn_or_mask = &mask,
         .layer_index = 0,
     };

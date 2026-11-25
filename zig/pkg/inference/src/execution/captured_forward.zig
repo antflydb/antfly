@@ -456,11 +456,17 @@ pub const Cache = struct {
         return outputs;
     }
 
+    pub const ReplayPolicy = enum { allow_eager, require_admission };
+
     pub fn runDevice(self: *Cache, model_allocator: std.mem.Allocator, provider: Provider, forward: capture.Forward, inputs: []const capture.Input, allocator: std.mem.Allocator, control: ?Control) !DeviceResult {
-        return self.runDeviceWithReadbacks(model_allocator, provider, forward, inputs, allocator, control, .forbidden);
+        return self.runDeviceWithReplayPolicy(model_allocator, provider, forward, inputs, allocator, control, .allow_eager);
     }
 
-    fn runDeviceWithReadbacks(self: *Cache, model_allocator: std.mem.Allocator, provider: Provider, forward: capture.Forward, inputs: []const capture.Input, allocator: std.mem.Allocator, control: ?Control, readbacks: @FieldType(interpreter.ExecuteOptions, "activation_readbacks")) !DeviceResult {
+    pub fn runDeviceWithReplayPolicy(self: *Cache, model_allocator: std.mem.Allocator, provider: Provider, forward: capture.Forward, inputs: []const capture.Input, allocator: std.mem.Allocator, control: ?Control, replay: ReplayPolicy) !DeviceResult {
+        return self.runDeviceWithReadbacks(model_allocator, provider, forward, inputs, allocator, control, .forbidden, replay);
+    }
+
+    fn runDeviceWithReadbacks(self: *Cache, model_allocator: std.mem.Allocator, provider: Provider, forward: capture.Forward, inputs: []const capture.Input, allocator: std.mem.Allocator, control: ?Control, readbacks: @FieldType(interpreter.ExecuteOptions, "activation_readbacks"), replay: ReplayPolicy) !DeviceResult {
         if (control) |active| try active.check();
         for (inputs) |input| {
             _ = try input.shape();
@@ -528,7 +534,7 @@ pub const Cache = struct {
             .reprepare => return error.PreparedRegionBindingChanged,
             .ready => |claims| region_claims = claims,
         };
-        var result = try frame_executable.run(allocator, .{ .runtime_inputs = runtime_inputs.items, .prepared_routes = routes, .region_claims = if (region_claims) |*claims| claims else null, .execution_control = control, .output_placement = .producer, .strict_integer_constants = true, .activation_readbacks = readbacks });
+        var result = try frame_executable.run(allocator, .{ .runtime_inputs = runtime_inputs.items, .prepared_routes = routes, .region_claims = if (region_claims) |*claims| claims else null, .execution_control = control, .output_placement = .producer, .strict_integer_constants = true, .activation_readbacks = readbacks, .require_physical_replay_admission = replay == .require_admission });
         errdefer result.deinit(&frame_executable.runtime);
         if (control) |active| try active.check();
         return .{ .entry = entry, .frame = frame, .result = result };
@@ -554,7 +560,7 @@ pub const Cache = struct {
     };
 
     pub fn run(self: *Cache, model_allocator: std.mem.Allocator, provider: Provider, forward: capture.Forward, inputs: []const capture.Input, allocator: std.mem.Allocator, control: ?Control) ![]Tensor {
-        var held = try self.runDeviceWithReadbacks(model_allocator, provider, forward, inputs, allocator, control, .allowed);
+        var held = try self.runDeviceWithReadbacks(model_allocator, provider, forward, inputs, allocator, control, .allowed, .allow_eager);
         defer held.deinit();
         const entry = held.entry;
         const frame_executable = &held.frame.executable.?;
@@ -1152,6 +1158,7 @@ test "device program cache keeps current inputs and pins output frames across ev
         const value = try origin.fromFloat32Shape(&values, &.{ 2, 3 });
         defer origin.free(value);
         const inputs = [_]capture.Input{.{ .tensor = .{ .name = "input", .data = &.{}, .dtype = .f32, .shape = &shape, .allocator = a, .owns_data = false, .owns_shape = false }, .resident = .{ .backend = &origin, .value = value } }};
+        try std.testing.expectError(error.PhysicalReplayUnavailableBeforeSubmission, cache.runDeviceWithReplayPolicy(a, provider, forward, &inputs, a, null, .require_admission));
         var held = try cache.runDevice(a, provider, forward, &inputs, a, null);
         defer held.deinit();
         try std.testing.expectEqual(@as(usize, 1), cache.specializationCount());

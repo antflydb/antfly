@@ -508,9 +508,16 @@ pub fn flashCausalAttentionHostInto(
                 // to `output` at the end.
                 @memset(out_pack[0 .. cur_bq * head_dim], 0.0);
 
+                const first_query = query_position_offset + q_start;
+                const last_query = query_position_offset + q_end - 1;
                 var kv_start: usize = 0;
                 while (kv_start < kv_seq_len) {
-                    const kv_end = @min(kv_start + BLOCK_KV, kv_seq_len);
+                    if (attn_or_mask == null and kv_position_offset + kv_start > last_query) break;
+                    const kv_end = kv_start + @min(BLOCK_KV, kv_seq_len - kv_start);
+                    if (!allowsPastAttention(sliding_window, first_query, kv_position_offset + kv_end - 1)) {
+                        kv_start = kv_end;
+                        continue;
+                    }
                     const cur_bkv = kv_end - kv_start;
 
                     // Pack K and V for this K-block (one head's slab) into
@@ -4336,6 +4343,22 @@ fn declaredCausalIntoCase(a: std.mem.Allocator) !void {
             }
             for (0..2) |d| try std.testing.expectApproxEqAbs(@as(f32, @floatCast(sums[d] / denominator)), result[row * width + head * 2 + d], 0.00001);
         };
+        if (rows > BLOCK_KV) {
+            const mask = try a.alloc(u8, rows * rows);
+            defer a.free(mask);
+            @memset(mask, 0);
+            mask[rows - 1] = 1;
+            const offset = rows - 1;
+            const shifted = q[offset * width ..];
+            const want = try originalFlashCausalForDeclaredTest(a, shifted, k, v, null, mask, 1, 1, 1, rows, offset, 0, 2, 2, 2);
+            defer a.free(want);
+            try flashCausalAttentionHostInto(shifted, k, v, null, mask, 1, 1, 1, rows, offset, 0, 2, 2, 2, result[0..shifted.len], scratch);
+            try std.testing.expectEqualSlices(f32, want, result[0..shifted.len]);
+            const future = try originalFlashCausalForDeclaredTest(a, q, k, v, null, mask, 0, 1, rows, rows, 0, 0, 2, 2, 2);
+            defer a.free(future);
+            try flashCausalAttentionHostInto(q, k, v, null, mask, 0, 1, rows, rows, 0, 0, 2, 2, 2, result, scratch);
+            try std.testing.expectEqualSlices(f32, future, result);
+        }
         @memset(result, 77);
         try std.testing.expectError(error.InvalidAttentionShape, flashCausalAttentionHostInto(q, k, v, null, null, 0, 1, rows, rows, 0, 0, 2, 2, 2, result, scratch[0 .. scratch.len - 1]));
         for (result) |value| try std.testing.expectEqual(@as(f32, 77), value);
