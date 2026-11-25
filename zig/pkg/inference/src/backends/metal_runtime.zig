@@ -28406,7 +28406,7 @@ pub fn decoderRuntimeApplyAudioLinearInto(
     out_dim: usize,
     output: MetalTensor,
 ) !bool {
-    return applyDenseLinearInto(false, false, self, slot, input, rows, in_dim, out_dim, output);
+    return applyDenseLinearInto(false, false, false, self, slot, input, rows, in_dim, out_dim, output);
 }
 
 pub extern fn antfly_metal_dense_linear_assigned_mps_ready(runtime: ?*RawMetalDecodeRuntime, slot: usize, rows: usize) c_int;
@@ -28421,16 +28421,23 @@ pub fn decoderRuntimeApplyLinearDeviceInto(
     out_dim: usize,
     output: MetalTensor,
 ) !bool {
-    return applyDenseLinearInto(true, false, self, slot, input, rows, in_dim, out_dim, output);
+    return applyDenseLinearInto(true, false, false, self, slot, input, rows, in_dim, out_dim, output);
 }
 
 pub fn decoderRuntimeApplyAssignedLinearDeviceInto(self: anytype, slot: usize, input: MetalTensor, rows: usize, in_dim: usize, out_dim: usize, output: MetalTensor) !bool {
-    return applyDenseLinearInto(true, true, self, slot, input, rows, in_dim, out_dim, output);
+    return applyDenseLinearInto(true, true, true, self, slot, input, rows, in_dim, out_dim, output);
+}
+
+/// The K/V pair has one commit boundary. Preserve its tuned linear
+/// schedule and propagate any failure after entering the Metal bridge.
+pub fn decoderRuntimeApplyCacheLinearInto(self: anytype, slot: usize, input: MetalTensor, rows: usize, in_dim: usize, out_dim: usize, output: MetalTensor) !bool {
+    return applyDenseLinearInto(true, false, true, self, slot, input, rows, in_dim, out_dim, output);
 }
 
 inline fn applyDenseLinearInto(
     comptime single_row_schedule: bool,
     comptime assigned_views: bool,
+    comptime strict_dispatch: bool,
     self: anytype,
     slot: usize,
     input: MetalTensor,
@@ -28456,28 +28463,12 @@ inline fn applyDenseLinearInto(
     {
         return false;
     }
-    if (single_row_schedule and rows == 1) return termite_metal_decode_runtime_apply_linear_device(
-        runtime,
-        slot,
-        input.deviceHandle(),
-        input.deviceByteOffset(),
-        in_dim,
-        out_dim,
-        output.deviceHandle(),
-        output.deviceByteOffset(),
-    ) == 0;
     const dispatch = if (assigned_views) antfly_metal_dense_linear_assigned_rows else termite_metal_decode_runtime_apply_linear_multi_row_device;
-    return dispatch(
-        runtime,
-        slot,
-        input.deviceHandle(),
-        input.deviceByteOffset(),
-        rows,
-        in_dim,
-        out_dim,
-        output.deviceHandle(),
-        output.deviceByteOffset(),
-    ) == 0;
+    const status = if (single_row_schedule and rows == 1)
+        termite_metal_decode_runtime_apply_linear_device(runtime, slot, input.deviceHandle(), input.deviceByteOffset(), in_dim, out_dim, output.deviceHandle(), output.deviceByteOffset())
+    else
+        dispatch(runtime, slot, input.deviceHandle(), input.deviceByteOffset(), rows, in_dim, out_dim, output.deviceHandle(), output.deviceByteOffset());
+    return if (strict_dispatch) assignedDenseDispatch(status) else status == 0;
 }
 
 pub fn tryApplyDenseRuntimeMlp2(
@@ -29162,6 +29153,14 @@ pub fn tryApplyQuantizedRuntimeLinearInto(
     out_dim: usize,
     out: MetalTensor,
 ) !bool {
+    return tryApplyQuantizedLinearInto(false, self, slot, input, rows, in_dim, out_dim, out);
+}
+
+pub fn tryApplyQuantizedCacheLinearInto(self: anytype, slot: usize, input: MetalTensor, rows: usize, in_dim: usize, out_dim: usize, out: MetalTensor) !bool {
+    return tryApplyQuantizedLinearInto(true, self, slot, input, rows, in_dim, out_dim, out);
+}
+
+fn tryApplyQuantizedLinearInto(comptime strict_dispatch: bool, self: anytype, slot: usize, input: MetalTensor, rows: usize, in_dim: usize, out_dim: usize, out: MetalTensor) !bool {
     const runtime = self.raw_decode_runtime orelse return false;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
     if (slot >= decoder_runtime_linear_slot_capacity or rows == 0 or in_dim == 0 or out_dim == 0) return false;
@@ -29172,7 +29171,7 @@ pub fn tryApplyQuantizedRuntimeLinearInto(
     const kind = ensureQuantizedRuntimeLinearSlotPrepared(self, slot, in_dim, out_dim);
     if (kind == .none or referenceQuantizedRuntimeLinearDebug()) return false;
     const format = quantizedLinearIntoFormat(self, slot, kind, rows, in_dim, out_dim) orelse return false;
-    return dispatchQuantizedLinearInto(self, runtime, format, slot, input, rows, in_dim, out_dim, out);
+    return dispatchQuantizedLinearInto(strict_dispatch, self, runtime, format, slot, input, rows, in_dim, out_dim, out);
 }
 
 fn quantizedLinearIntoFormat(self: anytype, slot: usize, kind: RawQuantizedRuntimeLinearKind, rows: usize, in_dim: usize, out_dim: usize) ?MetalQuantFormat {
@@ -29188,7 +29187,7 @@ fn quantizedLinearIntoFormat(self: anytype, slot: usize, kind: RawQuantizedRunti
     return format;
 }
 
-fn dispatchQuantizedLinearInto(self: anytype, runtime: *RawMetalDecodeRuntime, format: MetalQuantFormat, slot: usize, input: MetalTensor, rows: usize, in_dim: usize, out_dim: usize, out: MetalTensor) !bool {
+fn dispatchQuantizedLinearInto(comptime strict_dispatch: bool, self: anytype, runtime: *RawMetalDecodeRuntime, format: MetalQuantFormat, slot: usize, input: MetalTensor, rows: usize, in_dim: usize, out_dim: usize, out: MetalTensor) !bool {
     const rc = termite_metal_decode_runtime_apply_quantized_linear_slot_device(
         runtime,
         @backingInt(format),
@@ -29201,7 +29200,7 @@ fn dispatchQuantizedLinearInto(self: anytype, runtime: *RawMetalDecodeRuntime, f
         out.deviceHandle(),
         out.deviceByteOffset(),
     );
-    if (rc != 0) return false;
+    if (rc != 0) return if (strict_dispatch) assignedDenseDispatch(rc) else false;
     var out_mut = out;
     if (!applyRuntimeLinearBiasDevice(self, slot, &out_mut, rows, out_dim)) return error.MetalProjectionBiasDispatchFailed;
     return true;
@@ -29291,10 +29290,10 @@ pub fn tryApplyQuantizedRuntimeLinearQkvInto(
     // Mixed or unfused formats: separate kernels, still into the slab rows.
     const k_format = quantizedLinearIntoFormat(self, k_slot, k_kind, 1, in_dim, kv_out_dim) orelse return null;
     const v_format = quantizedLinearIntoFormat(self, v_slot, v_kind, 1, in_dim, kv_out_dim) orelse return null;
-    if (!try dispatchQuantizedLinearInto(self, runtime, k_format, k_slot, input, 1, in_dim, kv_out_dim, k_out)) return null;
+    _ = try dispatchQuantizedLinearInto(true, self, runtime, k_format, k_slot, input, 1, in_dim, kv_out_dim, k_out);
     // K has already been encoded into a caller-owned row. A subsequent
     // decline cannot reopen the compatibility path for this invocation.
-    if (!try dispatchQuantizedLinearInto(self, runtime, v_format, v_slot, input, 1, in_dim, kv_out_dim, v_out)) return error.MetalProjectionIncomplete;
+    _ = try dispatchQuantizedLinearInto(true, self, runtime, v_format, v_slot, input, 1, in_dim, kv_out_dim, v_out);
     return (try tryApplyQuantizedRuntimeLinear(self, q_slot, input, 1, in_dim, q_out_dim)) orelse error.MetalProjectionIncomplete;
 }
 

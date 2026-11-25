@@ -42222,10 +42222,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const slots = [2]usize{ request.k_slot, request.v_slot };
         const outputs = [2]*MetalTensor{ k_out, v_out };
         for (slots, outputs, 0..) |slot, output, index| {
-            if (!try self.applyPreparedLinearToView(slot, linear_input, rows, in_dim, out_dim, output)) {
+            const wrote = (try metal_runtime.tryApplyQuantizedCacheLinearInto(self.provider_impl, slot, linear_input, rows, in_dim, out_dim, output.*)) or
+                (try metal_runtime.decoderRuntimeApplyCacheLinearInto(self.provider_impl, slot, linear_input, rows, in_dim, out_dim, output.*));
+            if (!wrote) {
                 if (index == 0) return false;
                 return error.PreparedDenseProjectionChanged;
             }
+            output.invalidateHostMirror();
         }
         return true;
     }
